@@ -449,6 +449,76 @@ else
   fi
 fi
 
+# A prompt is only a prompt if it answers the keyboard, and every check above
+# feeds it through a pipe -- the one input path that cannot catch the way this
+# breaks. DuckDB's shell asks the terminal for its background colour (OSC 11)
+# and device attributes, and ignores the keyboard until the replies arrive or it
+# gives up. Against a terminal that never answers that is 5.02s of dead prompt;
+# --dark-mode skips the query and makes it 0.01s.
+#
+# So the assertion is on the *time* to a working prompt, not on eventually
+# getting one: waiting long enough passes either way, which is what made the
+# first version of this check unable to fail. 2.5s sits well clear of both.
+#
+# pty.fork() rather than a pty handed to a subprocess: the child needs the pty
+# as its *controlling* terminal (setsid + TIOCSCTTY), and a line editor without
+# one behaves nothing like a line editor at a real prompt.
+pty_out=$(HARBOR_LAUNCHER="$here/bin/duckdb-harbor" HARBOR_DB="$repl_db" \
+          HARBOR_PORT="$((port + 4))" HARBOR_TOKEN_="$token" python3 - <<'PY' 2>&1
+import fcntl, os, pty, re, select, struct, sys, termios, time
+
+argv = [os.environ["HARBOR_LAUNCHER"], os.environ["HARBOR_DB"], "--repl",
+        "--dark-mode", "--port", os.environ["HARBOR_PORT"],
+        "--token", os.environ["HARBOR_TOKEN_"]]
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp(argv[0], argv)
+    os._exit(127)
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 110, 0, 0))
+
+STRIP = rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[=>]"
+out = bytearray()
+
+def read_for(secs):
+    end = time.time() + secs
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if r:
+            try:
+                b = os.read(fd, 65536)
+            except OSError:
+                return
+            if not b:
+                return
+            out.extend(b)          # deliberately never answers OSC 11 / DA1
+
+t0 = time.time()
+took = None
+while time.time() - t0 < 20:
+    read_for(0.1)
+    if b" D " in re.sub(STRIP, b"", bytes(out)):
+        took = time.time() - t0
+        break
+
+exited = False
+if took is not None:
+    os.write(fd, b".quit\r")
+    read_for(2.0)
+    for _ in range(25):
+        if os.waitpid(pid, os.WNOHANG)[0]:
+            exited = True
+            break
+        time.sleep(0.2)
+if not exited:
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+print("prompt=%s exited=%s" % (int(took is not None and took < 2.5), int(exited)))
+PY
+)
+eq "a real terminal gets a usable prompt without a stall" "prompt=1 exited=1" \
+   "$(printf '%s' "$pty_out" | tail -1)"
+
 printf '\n%s%d passed, %d failed%s\n' "$bold" "$pass" "$fail" "$off"
 if (( fail > 0 )); then
   printf '\n%sfailures:%s\n' "$red" "$off"

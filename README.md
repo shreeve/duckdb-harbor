@@ -62,19 +62,32 @@ itself, in `~/.duckdb/extensions`, or wherever `--extension` /
 `--token` it mints one and prints it as the server binds — the only time it is
 shown; `HARBOR_TOKEN` is honoured if set.
 
-It runs in the foreground, the way launchd, systemd and Docker want it. Pass
-`--repl` to get a DuckDB prompt instead of a blocking daemon, so one terminal
-both serves HTTP clients and runs SQL against the same database:
+At a terminal that is a normal DuckDB shell which happens to be serving HTTP —
+one window that both answers clients and runs your own SQL against the same
+database:
 
 ```console
-$ ./duckdb-harbor mydata.duckdb --token secret --repl
+$ ./duckdb-harbor mydata.duckdb --token secret
 harbor: serving on http://127.0.0.1:9495
 D SELECT count(*) FROM orders;   -- while clients are querying over HTTP
 ```
 
-Either way the exit is clean: `SIGTERM` and `Ctrl-C` drain in-flight requests
-and `CHECKPOINT` before the process goes, and leaving the `--repl` prompt folds
-the WAL too, so the next open never replays one.
+Run it anywhere stdin is not a terminal — a unit file, a container, `nohup`,
+behind a pipe — and it blocks instead, which is what a supervisor wants. Force
+either with `--repl` or `--wait`; `--wait` is worth writing in a unit file even
+though it is already the default there.
+
+Both exits are clean. `SIGTERM` and `Ctrl-C` drain in-flight requests and
+`CHECKPOINT`, and leaving the prompt folds the WAL too, so the next open never
+replays one. At the prompt, `.quit` and `Ctrl-D` leave; `Ctrl-C` does not —
+DuckDB's shell reads it as "cancel this line".
+
+If the prompt draws and then ignores you — Enter gives blank lines, `Ctrl-C`
+and `Ctrl-D` do nothing — pass `--dark-mode` or `--light-mode`. DuckDB's shell
+asks the terminal for its background colour before it will listen, and against
+a terminal that never answers that measures 5.02s of dead keyboard every time,
+versus 0.01s with the colour pinned. Not harbor-specific; plain `duckdb` stalls
+identically.
 
 ### Or straight from a DuckDB shell
 
@@ -92,8 +105,8 @@ CALL harbor_wait();                                    -- blocks until stopped
 
 That is the whole SQL surface, four table functions: `harbor_serve`,
 `harbor_stop`, `harbor_wait`, and `harbor_version`. Skip `harbor_wait` and you
-have what `--repl` gives you; end with `CALL harbor_stop()`, which drains the
-workers and checkpoints.
+have what the launcher gives you at a terminal; end with `CALL harbor_stop()`,
+which drains the workers and checkpoints.
 
 Two things the launcher is doing for you here. First, the file has to be named
 exactly `harbor.duckdb_extension`: DuckDB builds the init symbol from

@@ -7,17 +7,22 @@
 #   bin/duckdb-harbor mydata.db --bind 0.0.0.0     listen beyond loopback
 #   bin/duckdb-harbor mydata.db --token secret     set the bearer token
 #   bin/duckdb-harbor mydata.db --checkpoint 16MB  raise the WAL checkpoint threshold
-#   bin/duckdb-harbor mydata.db --repl             serve, and keep a SQL prompt
+#   bin/duckdb-harbor mydata.db --wait             block instead of prompting
+#   bin/duckdb-harbor mydata.db --dark-mode        for a prompt that ignores you
 #   bin/duckdb-harbor mydata.db --extension ./harbor.duckdb_extension
 #
 # With no --token, harbor mints one and prints it at startup; that is the only
 # time it is shown. HARBOR_TOKEN is honoured if set.
 #
-# --repl serves in the background of an ordinary DuckDB prompt instead of
-# blocking on harbor_wait, so one terminal can both serve HTTP clients and run
-# SQL against the same database. Leaving the prompt stops the server and folds
-# the WAL. Without it the process is a daemon: it blocks until stopped, which is
-# what a supervisor wants and what a person at a keyboard usually does not.
+# At a terminal this is a normal DuckDB shell that happens to be serving HTTP:
+# you get a prompt, and leaving it stops the server and folds the WAL. Piped,
+# redirected, or under a supervisor -- anywhere stdin is not a terminal -- it
+# blocks on harbor_wait instead, because a service whose stdin is /dev/null
+# would otherwise read EOF and exit a millisecond after it started.
+#
+# --repl and --wait force one or the other. --wait is worth writing explicitly
+# in a unit file even though it is already the default there: it says the
+# blocking is intended rather than incidental.
 #
 # The extension is looked for beside this script, then in a built tree, then in
 # ~/.duckdb/extensions. Running a downloaded release build needs no source tree
@@ -35,6 +40,15 @@
 # what launchd, systemd, Docker, and a shell job all want. Background it with
 # & or hand it to a supervisor. SIGTERM and Ctrl-C drain in-flight requests
 # and CHECKPOINT before exiting, so the next open never replays a WAL.
+#
+# At the prompt, .quit and Ctrl-D both leave. Ctrl-C does not: DuckDB's shell
+# takes it as "cancel this line" and prints a fresh prompt.
+#
+# If the prompt appears and then ignores everything -- Enter gives blank lines,
+# Ctrl-C and Ctrl-D do nothing -- that is DuckDB's shell waiting on a terminal
+# that has not answered its background-colour query. It gives up after five
+# seconds; --dark-mode or --light-mode skips the query and the wait. A stall
+# that outlasts that is something else.
 
 set -euo pipefail
 
@@ -52,7 +66,8 @@ port="9495"
 token="${HARBOR_TOKEN:-}"
 workers=""
 checkpoint="1MB"
-repl=""
+mode=""   # "" = decide from whether stdin is a terminal; see below
+colormode=""
 
 # Every flag takes a value, so say so rather than letting `set -u` abort with
 # bash's own "$2: unbound variable" — that reads like a bug in this script.
@@ -68,7 +83,10 @@ while [[ $# -gt 0 ]]; do
     --workers)    need "$@"; workers="$2"; shift 2 ;;
     --checkpoint) need "$@"; checkpoint="$2"; shift 2 ;;
     --extension)  need "$@"; ext="$2"; shift 2 ;;
-    --repl)       repl=1; shift ;;
+    --repl)       mode=repl; shift ;;
+    --wait)       mode=wait; shift ;;
+    --dark-mode|--light-mode)
+                  colormode="${1#-}"; shift ;;
     -h|--help) sed -n '3,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     --)        shift; [[ $# -eq 1 ]] || { echo "duckdb-harbor: expected one database path after --" >&2; exit 2; }
                db="$1"; shift ;;
@@ -81,7 +99,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$db" ]]; then
-  echo "usage: duckdb-harbor <database.db> [--bind HOST] [--port N] [--token T] [--workers N] [--checkpoint SIZE] [--extension PATH] [--repl]" >&2
+  echo "usage: duckdb-harbor <database.db> [--bind HOST] [--port N] [--token T] [--workers N] [--checkpoint SIZE] [--extension PATH] [--repl|--wait]" >&2
   exit 2
 fi
 
@@ -171,7 +189,17 @@ setup="
   CALL harbor_serve($args);
 "
 
-# --repl: serve, then hand the terminal to DuckDB's own prompt. -cmd runs the
+# Which mode, when neither --repl nor --wait said so: a prompt is only useful to
+# something that can type, and blocking forever is only useful to something that
+# cannot. `[[ -t 0 ]]` is that question. Guessing wrong is bad in both
+# directions -- a supervisor handed a prompt reads EOF from /dev/null and the
+# "service" is gone a millisecond after it started, and a person handed
+# harbor_wait gets a terminal that ignores them.
+if [[ -z "$mode" ]]; then
+  if [[ -t 0 ]]; then mode=repl; else mode=wait; fi
+fi
+
+# repl: serve, then hand the terminal to DuckDB's own prompt. -cmd runs the
 # setup before stdin is read and then falls through to the shell, where -c would
 # run it and exit; harbor_wait is deliberately absent, since the whole point is
 # not to block.
@@ -184,10 +212,19 @@ setup="
 # from the prompt drains the workers and folds the WAL itself; this covers .quit,
 # Ctrl-D, and every other way out. Running it on EXIT rather than after the
 # command means a SIGTERM to the launcher is covered too.
-if [[ -n "$repl" ]]; then
+#
+# --dark-mode / --light-mode are passed straight through, and are the answer to
+# a prompt that draws and then ignores everything typed at it. To pick its
+# colours, DuckDB's shell asks the terminal for its background (OSC 11) and for
+# its device attributes, then waits for the replies -- and until they arrive or
+# it gives up, the keyboard does nothing. Against a terminal that never answers,
+# measured at 5.02s every time before the prompt became usable, and 0.01s with
+# either colour pinned. It is DuckDB's shell, not harbor: plain duckdb stalls
+# identically.
+if [[ "$mode" == "repl" ]]; then
   trap 'duckdb -no-init "$db" -c "CHECKPOINT" >/dev/null 2>&1 || true' EXIT
   status=0
-  duckdb -unsigned -no-init "$db" -cmd "$setup" || status=$?
+  duckdb -unsigned -no-init ${colormode:+"-$colormode"} "$db" -cmd "$setup" || status=$?
   exit $status
 fi
 
