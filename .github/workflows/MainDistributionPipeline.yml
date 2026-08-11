@@ -37,3 +37,9 @@ jobs:
       # along with the opt-in targets: linux_amd64_musl (Alpine containers),
       # linux_arm64_musl and windows_arm64.
       exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw'
+      # Turns off fail-fast for the build matrix. A release wants every binary
+      # that can be produced, and one runner's bad day should not cancel the
+      # others: the first v0.7.0 run lost osx_amd64 because osx_arm64 hit a TLS
+      # error fetching the vcpkg bootstrap -- a download we do not even need,
+      # since there is no vcpkg.json and no C/C++ dependencies here.
+      reduced_ci_mode: 'disabled'
