@@ -23,6 +23,17 @@ jobs:
       ci_tools_version: v1.5-variegata
       extension_name: harbor
       extra_toolchains: rust;python3
-      # Internal tool: two platforms is what we actually deploy on.
-      # Add targets back when someone needs them.
-      exclude_archs: 'linux_amd64_musl;osx_amd64;windows_amd64;windows_amd64_mingw;linux_arm64;wasm_mvp;wasm_eh;wasm_threads'
+      # Five native targets: linux amd64/arm64, osx amd64/arm64, windows amd64.
+      #
+      # The three wasm ones cannot work. DuckDB-wasm runs the extension inside
+      # a browser tab, and harbor_serve binds a listening TCP socket through
+      # tiny_http; a browser sandbox has no inbound socket to bind, so a wasm
+      # build would either fail to link or produce a binary that cannot do the
+      # one thing it is for.
+      #
+      # windows_amd64_mingw is dropped as redundant -- windows_amd64 is the
+      # MSVC build every Windows user wants, and the mingw variant mainly
+      # serves the R/Rtools ecosystem. Worth adding when someone needs it,
+      # along with the opt-in targets: linux_amd64_musl (Alpine containers),
+      # linux_arm64_musl and windows_arm64.
+      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw'
