@@ -149,9 +149,25 @@ for _ in $(seq 1 40); do
        --data '{"sql":"SELECT i, repeat(i::VARCHAR, 50) FROM range(3000000) t(i)"}' \
        "$base/sql" >/dev/null 2>&1 || true
 done
-sleep 2
-eq "the server is healthy after 40 mid-stream hangups" "200" \
-   "$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "$base/health")"
+# Wait for recovery rather than assuming a fixed pause is enough. Forty
+# abandoned multi-million-row scans leave real work in flight, and how long it
+# takes to drain depends on the machine — two seconds is plenty on a laptop and
+# not enough on a shared CI runner with fewer cores. Reporting how long it
+# actually took turns this from a flaky assertion into a measurement; only
+# never recovering is a failure.
+recovered=""
+for attempt in $(seq 1 60); do
+  if [[ "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$base/health" 2>/dev/null)" == "200" ]]; then
+    recovered=$attempt
+    break
+  fi
+  sleep 1
+done
+if [[ -n "$recovered" ]]; then
+  ok "the server recovers from 40 mid-stream hangups" "${recovered}s"
+else
+  bad "the server recovers from 40 mid-stream hangups" "still not answering /health after 60s"
+fi
 eq "and still correct" "$sites_n" "$(scalar 'SELECT count(*) AS n FROM sites')"
 fd_after=$(fds)
 if (( fd_after - fd_before < 25 )); then

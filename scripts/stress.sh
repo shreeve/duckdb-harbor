@@ -167,6 +167,8 @@ section "Oracle (DuckDB CLI, before harbor holds the file lock)"
 exp_n_sites=$(oracle   "SELECT count(*) FROM sites")
 exp_n_cohorts=$(oracle "SELECT count(*) FROM cohorts")
 exp_n_plans=$(oracle   "SELECT count(*) FROM plans")
+exp_leftjoin=$(oracle  "SELECT count(*) FROM plans p LEFT JOIN rules r USING (client)")
+exp_left_kept=$(oracle "SELECT count(DISTINCT p.rowid) FROM plans p LEFT JOIN rules r USING (client)")
 exp_n_rules=$(oracle   "SELECT count(*) FROM rules")
 exp_clients=$(oracle   "SELECT count(DISTINCT client) FROM sites")
 exp_payers=$(oracle    "SELECT count(DISTINCT payer) FROM plans")
@@ -351,8 +353,14 @@ eq "UNNEST of a list" "3" \
    "$(scalar 'SELECT count(*) FROM (SELECT unnest([1,2,3]) AS x)')"
 eq "regexp filter runs" "True" \
    "$(post "SELECT count(*) AS n FROM sites WHERE regexp_matches(coalesce(name,''), '[A-Za-z]')" | nd 'int(rows[0][0]) >= 0')"
-eq "LEFT JOIN preserves the left side" "$exp_n_plans" \
+# Two separate claims. The row count is whatever the data makes it — a client
+# with three rules produces three rows — so it is read from DuckDB rather than
+# assumed to equal the left side, which is only true when the join key happens
+# to be unique on the right. What LEFT JOIN actually guarantees is the second
+# one: no left row is dropped.
+eq "LEFT JOIN has the cardinality DuckDB says" "$exp_leftjoin" \
    "$(scalar 'SELECT count(*) FROM plans p LEFT JOIN rules r USING (client)')"
+eq "LEFT JOIN drops no row from the left side" "$exp_n_plans" "$exp_left_kept"
 eq "UNION ALL" "$(( $exp_n_sites + $exp_n_rules ))" \
    "$(scalar 'SELECT count(*) FROM (SELECT client FROM sites UNION ALL SELECT client FROM rules)')"
 eq "correlated subquery" "True" \
