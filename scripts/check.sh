@@ -90,7 +90,7 @@ done
 
 if (( needs_server )); then
   cp "$db" "$work/check.duckdb"
-  "$here/bin/harbor" "$work/check.duckdb" --port "$port" --token "$token" --workers 8 \
+  "$here/bin/duckdb-harbor" "$work/check.duckdb" --port "$port" --token "$token" --workers 8 \
       >"$work/server.log" 2>&1 &
   server_pid=$!
   up=0

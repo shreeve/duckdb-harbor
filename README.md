@@ -42,7 +42,7 @@ CALL harbor_wait();
 Or run a database as a service, which is what the bundled launcher is for:
 
 ```console
-$ bin/harbor mydata.duckdb --port 9495
+$ bin/duckdb-harbor mydata.duckdb --port 9495
 ```
 
 It runs in the foreground and holds the terminal, because that is what launchd,
@@ -140,7 +140,7 @@ to build — `cargo build` and you have an extension. Two files:
 | file | lines | |
 | --- | --: | --- |
 | [`src/lib.rs`](src/lib.rs) | 1,940 | the extension entry, its four table functions, and the whole HTTP server |
-| [`bin/harbor`](bin/harbor) | 87 | run a database as a service |
+| [`bin/duckdb-harbor`](bin/duckdb-harbor) | 87 | run a database as a service |
 
 One source file is a deliberate choice, not laziness. The engine and the four
 table functions that front it are useless apart, and the module boundary

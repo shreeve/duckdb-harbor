@@ -54,7 +54,7 @@ cleanup() {
 trap cleanup EXIT
 
 start_server() { # start_server [extra args]
-  "$here/bin/harbor" "$db" --port "$port" --token "$token" --workers 4 "$@" >>"$work/server.log" 2>&1 &
+  "$here/bin/duckdb-harbor" "$db" --port "$port" --token "$token" --workers 4 "$@" >>"$work/server.log" 2>&1 &
   server_pid=$!
   for _ in $(seq 1 80); do
     curl -sS -m 1 "$base/health" >/dev/null 2>&1 && return 0
@@ -271,7 +271,7 @@ section "Configuration and contention"
 # DuckDB's default checkpoint_threshold is 16MB. At that setting a modest
 # writer can run for weeks with every committed row in the WAL and the .duckdb
 # file near-empty; one hard kill, or one WAL that fails to replay, and the data
-# is gone. bin/harbor lowers it deliberately, so assert the launcher actually
+# is gone. bin/duckdb-harbor lowers it deliberately, so assert the launcher actually
 # applies it rather than trusting that it still does.
 eq "the launcher lowers checkpoint_threshold" "976.5 KiB" \
    "$(scalar "SELECT current_setting('checkpoint_threshold') AS v")"
@@ -281,7 +281,7 @@ eq "the launcher lowers checkpoint_threshold" "976.5 KiB" \
 # than hanging — "clean error or confusing hang" is what someone meets at 2am
 # when a supervisor restarts a service whose predecessor has not yet died.
 second_log="$work/second.log"
-"$here/bin/harbor" "$db" --port "$((port + 1))" --token second --workers 2 \
+"$here/bin/duckdb-harbor" "$db" --port "$((port + 1))" --token second --workers 2 \
     >"$second_log" 2>&1 &
 second_pid=$!
 waited=0

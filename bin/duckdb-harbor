@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# harbor — run a DuckDB database as an HTTP /sql service.
+# duckdb-harbor — run a DuckDB database as an HTTP /sql service.
 #
-#   bin/harbor mydata.db                    serve on 127.0.0.1:9495
-#   bin/harbor mydata.db --port 9600        pick the port
-#   bin/harbor mydata.db --bind 0.0.0.0     listen beyond loopback
-#   bin/harbor mydata.db --token secret     set the bearer token
-#   bin/harbor mydata.db --checkpoint 16MB  raise the WAL checkpoint threshold
+#   bin/duckdb-harbor mydata.db                    serve on 127.0.0.1:9495
+#   bin/duckdb-harbor mydata.db --port 9600        pick the port
+#   bin/duckdb-harbor mydata.db --bind 0.0.0.0     listen beyond loopback
+#   bin/duckdb-harbor mydata.db --token secret     set the bearer token
+#   bin/duckdb-harbor mydata.db --checkpoint 16MB  raise the WAL checkpoint threshold
 #
 # With no --token, harbor mints one and prints it at startup; that is the only
 # time it is shown. HARBOR_TOKEN is honoured if set.
@@ -44,13 +44,13 @@ while [[ $# -gt 0 ]]; do
     --workers) workers="$2"; shift 2 ;;
     --checkpoint) checkpoint="$2"; shift 2 ;;
     -h|--help) sed -n '3,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    -*)        echo "harbor: unknown option $1" >&2; exit 2 ;;
+    -*)        echo "duckdb-harbor: unknown option $1" >&2; exit 2 ;;
     *)         db="$1"; shift ;;
   esac
 done
 
 if [[ -z "$db" ]]; then
-  echo "usage: harbor <database.db> [--bind HOST] [--port N] [--token T] [--workers N] [--checkpoint SIZE]" >&2
+  echo "usage: duckdb-harbor <database.db> [--bind HOST] [--port N] [--token T] [--workers N] [--checkpoint SIZE]" >&2
   exit 2
 fi
 

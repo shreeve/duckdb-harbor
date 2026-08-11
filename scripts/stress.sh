@@ -38,8 +38,8 @@ if [[ ! -f "$src_db" ]]; then
   echo "stress: no database at $src_db" >&2
   exit 2
 fi
-if [[ ! -x "$here/bin/harbor" ]]; then
-  echo "stress: $here/bin/harbor is missing or not executable" >&2
+if [[ ! -x "$here/bin/duckdb-harbor" ]]; then
+  echo "stress: $here/bin/duckdb-harbor is missing or not executable" >&2
   exit 2
 fi
 if [[ ! -f "$here/build/release/harbor.duckdb_extension" ]]; then
@@ -194,7 +194,7 @@ fi
 
 section "Startup"
 
-"$here/bin/harbor" "$db" --port "$port" --token "$token" --workers 6 >"$log" 2>&1 &
+"$here/bin/duckdb-harbor" "$db" --port "$port" --token "$token" --workers 6 >"$log" 2>&1 &
 server_pid=$!
 
 up=0
