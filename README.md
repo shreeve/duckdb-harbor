@@ -41,12 +41,13 @@ GET  /health   liveness, no credential required
 
 ## Get it running
 
-Nothing to compile. Download the extension for your platform from the
-[releases page](https://github.com/shreeve/duckdb-harbor/releases), then point
-DuckDB at it. `-unsigned` is required, since this is not in DuckDB's extension
-registry:
+Nothing to compile. Download the zip for your platform from the
+[releases page](https://github.com/shreeve/duckdb-harbor/releases) and unpack
+it, then point DuckDB at it. `-unsigned` is required, since this is not in
+DuckDB's extension registry:
 
 ```console
+$ unzip harbor-v0.7.0-duckdb-v1.5.5-osx_arm64.zip   # -> harbor.duckdb_extension
 $ duckdb -unsigned mydata.duckdb
 ```
 ```sql
@@ -69,7 +70,13 @@ harbor: serving on http://127.0.0.1:9495  token=4abf6e3696b19601…
 ```
 
 It finds the extension beside itself or in `~/.duckdb/extensions` if you would
-rather not pass `--extension`; `HARBOR_EXTENSION` works too. With no `--token`
+rather not pass `--extension`; `HARBOR_EXTENSION` works too, and unlike a plain
+`LOAD` it accepts the file under any name. That matters because DuckDB builds
+the init symbol from everything before the first dot in the filename, so a
+`LOAD` of `harbor-v0.7.0-osx_arm64.duckdb_extension` looks for
+`harbor-v0_init_c_api` and fails with a `dlsym` error that names nothing
+useful. Keep the file called `harbor.duckdb_extension` when loading it through
+SQL. With no `--token`
 it mints one and prints it as the server binds — the only time it is shown, and
 `HARBOR_TOKEN` is honoured if set. It runs in the foreground, the way launchd,
 systemd and Docker want it, and `SIGTERM` and `Ctrl-C` drain in-flight requests

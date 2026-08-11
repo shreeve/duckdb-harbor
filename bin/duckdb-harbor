@@ -116,6 +116,22 @@ if [[ -z "$ext" || ! -f "$ext" ]]; then
   exit 1
 fi
 
+# DuckDB derives the init symbol from the file name, taking everything before
+# the first dot: loading `harbor-v0.7.0-osx_arm64.duckdb_extension` makes it
+# look for `harbor-v0_init_c_api`, which does not exist, and the load fails with
+# a dlsym error that says nothing about the real cause. The file has to be named
+# exactly harbor.duckdb_extension. Rather than make that the user's problem --
+# a release asset has to carry its platform in the name to be distinguishable --
+# link it under the right name in a per-user staging directory and load that.
+# One stable directory, one link, replaced each run, so nothing accumulates.
+if [[ "$(basename -- "$ext")" != "harbor.duckdb_extension" ]]; then
+  staging="${TMPDIR:-/tmp}/duckdb-harbor-ext.$(id -u)"
+  mkdir -p "$staging" || { echo "duckdb-harbor: cannot create $staging" >&2; exit 1; }
+  abs_ext=$(cd -- "$(dirname -- "$ext")" && pwd)/$(basename -- "$ext")
+  ln -sf "$abs_ext" "$staging/harbor.duckdb_extension"
+  ext="$staging/harbor.duckdb_extension"
+fi
+
 if ! command -v duckdb >/dev/null 2>&1; then
   echo "harbor: no duckdb on PATH" >&2
   exit 1
