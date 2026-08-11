@@ -29,7 +29,7 @@ defaults:
 
 jobs:
   fast:
-    name: unit, sqllogictest, spec, fuzz
+    name: unit, abi, types, sqllogictest, spec, fuzz
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -63,8 +63,8 @@ jobs:
       - name: Build the fixture database
         run: scripts/fixture.sh sample.duckdb
 
-      - name: Unit tests, sqllogictest, spec and fuzz
-        run: SUITES="unit sqllogic spec fuzz" scripts/check.sh
+      - name: Unit tests, ABI stamp, type coverage, sqllogictest, spec and fuzz
+        run: SUITES="unit abi types sqllogic spec fuzz" scripts/check.sh
 
       - name: Server log on failure
         if: failure()

@@ -6,9 +6,18 @@
 #   bin/harbor mydata.db --port 9600        pick the port
 #   bin/harbor mydata.db --bind 0.0.0.0     listen beyond loopback
 #   bin/harbor mydata.db --token secret     set the bearer token
+#   bin/harbor mydata.db --checkpoint 16MB  raise the WAL checkpoint threshold
 #
 # With no --token, harbor mints one and prints it at startup; that is the only
 # time it is shown. HARBOR_TOKEN is honoured if set.
+#
+# checkpoint_threshold defaults to 1MB here rather than DuckDB's 16MB. This
+# launcher serves one database to a long-lived server, and at 16MB a modest
+# writer can run for weeks with every committed row sitting in the WAL while
+# the .duckdb file stays near-empty. One hard kill, or one WAL that fails to
+# replay, and the data is gone — which has happened. Pass --checkpoint 16MB to
+# restore DuckDB's default for bulk-load work, where frequent checkpoints cost
+# throughput.
 #
 # The process runs in the foreground and holds the terminal, because that is
 # what launchd, systemd, Docker, and a shell job all want. Background it with
@@ -25,6 +34,7 @@ bind="127.0.0.1"
 port="9495"
 token="${HARBOR_TOKEN:-}"
 workers=""
+checkpoint="1MB"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -32,14 +42,15 @@ while [[ $# -gt 0 ]]; do
     --port)    port="$2"; shift 2 ;;
     --token)   token="$2"; shift 2 ;;
     --workers) workers="$2"; shift 2 ;;
-    -h|--help) sed -n '3,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --checkpoint) checkpoint="$2"; shift 2 ;;
+    -h|--help) sed -n '3,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)        echo "harbor: unknown option $1" >&2; exit 2 ;;
     *)         db="$1"; shift ;;
   esac
 done
 
 if [[ -z "$db" ]]; then
-  echo "usage: harbor <database.db> [--bind HOST] [--port N] [--token T] [--workers N]" >&2
+  echo "usage: harbor <database.db> [--bind HOST] [--port N] [--token T] [--workers N] [--checkpoint SIZE]" >&2
   exit 2
 fi
 
@@ -68,6 +79,7 @@ args="bind := '${bind//\'/\'\'}', port := $port"
 # that by definition never finishes. Once harbor_wait returns, the workers are
 # stopped and nothing else is in flight, so the WAL folds cleanly.
 exec duckdb -unsigned "$db" -c "
+  SET checkpoint_threshold = '${checkpoint//\'/\'\'}';
   LOAD '$ext';
   CALL harbor_serve($args);
   CALL harbor_wait();

@@ -18,7 +18,17 @@
 set -uo pipefail
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-db=${DB:-$here/../sample.duckdb}
+# Look in the checkout before the parent directory. Locally the fixture tends
+# to sit beside the repo, in CI scripts/fixture.sh writes it into the checkout,
+# and a default that only knew one of those failed every CI run with "no
+# database" while the build and the fixture step had both succeeded.
+db=${DB:-}
+if [[ -z "$db" ]]; then
+  for candidate in "$here/sample.duckdb" "$here/../sample.duckdb"; do
+    [[ -f "$candidate" ]] && { db=$candidate; break; }
+  done
+  db=${db:-$here/sample.duckdb}
+fi
 # Ask the kernel for a port nobody is using rather than hoping a fixed one is
 # free. A leftover server from an earlier debugging session — or another
 # checkout running its own suite — otherwise fails the whole run at startup
@@ -29,7 +39,7 @@ s.bind(("127.0.0.1", 0))
 print(s.getsockname()[1])
 s.close()')}
 token=${TOKEN:-check-$$}
-suites=${SUITES:-unit sqllogic stress spec fuzz differential deploy resilience}
+suites=${SUITES:-unit abi types sqllogic stress spec fuzz differential deploy resilience}
 
 bold=$(tput bold 2>/dev/null || true); red=$(tput setaf 1 2>/dev/null || true)
 green=$(tput setaf 2 2>/dev/null || true); dim=$(tput dim 2>/dev/null || true)
@@ -63,6 +73,10 @@ skip() { skipped+=("$1"); printf '%s— %s skipped: %s%s\n' "$dim" "$1" "$2" "$o
 # ---------------------------------------------------------------------------
 
 run unit     cargo test --release
+# Reads the built artifact rather than a running server: the ABI stamp decides
+# which DuckDB versions will load it at all, and nothing else here looks at it.
+run abi      "$here/scripts/abi.sh"
+run types    "$here/scripts/type_coverage.py"
 run sqllogic make -C "$here" test_release
 
 # ---------------------------------------------------------------------------

@@ -45,6 +45,8 @@ IGNORED_KEYS = {"timeMs", "sessionId"}
 STATUS_MAY_DIFFER = {
     ("types", "varchar-unicode"),
     ("params", "param-unicode"),
+    ("types", "time-ns"),
+    ("types", "variant"),
 }
 
 DELIBERATE = {
@@ -78,6 +80,20 @@ DELIBERATE = {
         "bignum-neg-small", "bignum-json-safe", "bignum-past-safe",
         "bignum-huge", "bignum-neg-huge", "bignum-past-hugeint",
     ]},
+    ("types", "time-ns"):
+        "TIME_NS: the v1 harbor encodes it; harbor-ng refuses with 400. "
+        "duckdb-rs has no decoder for nanosecond TIME and reaches an "
+        "unreachable! rather than returning an error, so attempting it "
+        "panicked the executor thread — the client got 200 with an empty body "
+        "and the connection never returned to the pool. harbor-ng now rejects "
+        "the query before any header is sent and names the cast that works. A "
+        "real limitation, refused loudly instead of silently mis-answered.",
+    ("types", "variant"):
+        "VARIANT: DuckDB's own Arrow layer refuses to decode it ('decoding "
+        "Variant columns is not supported'), so harbor-ng surfaces that as a "
+        "400. The v1 harbor reads DuckDB's vectors directly and never crosses "
+        "Arrow, so it can encode the value. Inherited from the Arrow path, not "
+        "a harbor defect, and it fails cleanly.",
     ("errors", "*"):
         "Error text comes from DuckDB and is reproduced verbatim by both, but "
         "the C++ harbor wraps some failures with its own prefix. Both return "

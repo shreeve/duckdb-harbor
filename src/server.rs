@@ -38,6 +38,7 @@
 
 use std::{
     io::Read,
+    panic::AssertUnwindSafe,
     sync::{
         Arc, Condvar, Mutex, mpsc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -684,6 +685,26 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
             None => (Vec::new(), Vec::new()),
         };
 
+        // duckdb-rs does not return an error for a column type it has no
+        // decoder for — it panics. `SELECT TIME_NS '...'` reaches an
+        // `unreachable!` in its row.rs. Catching that mid-stream is possible
+        // (and is done below), but by then the 200 and the headers are gone
+        // and the client can only be told inside the body. Refusing here,
+        // before anything is sent, is the difference between a 400 that says
+        // what is wrong and a 200 that appears to have returned no rows.
+        if let Some(bad) = types.iter().find(|t| {
+            matches!(t.try_id(), Ok(LogicalTypeId::TimeNs))
+        }) {
+            let _ = ready.send(Err(format!(
+                "harbor cannot encode {} columns: the DuckDB Rust client has no \
+                 decoder for this type. Cast it — {}::VARCHAR, or ::TIME for \
+                 microsecond precision — and the value comes back intact.",
+                type_name(bad),
+                type_name(bad)
+            )));
+            continue;
+        }
+
         if ready.send(Ok(())).is_err() {
             continue;
         }
@@ -703,10 +724,19 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
         loop {
             match rows.next() {
                 Ok(Some(row)) => {
-                    buf.push_str(r#"{"type":"row","values":["#);
+                    // The safety net behind the pre-flight check above. A
+                    // panic in here would otherwise kill this executor
+                    // thread, and the damage is worse than one failed query:
+                    // the client sees 200 with an empty body — success, no
+                    // rows — and the connection never returns to the pool, so
+                    // POOL_SIZE such queries take the server out of service.
+                    // Built into a separate buffer so a half-written row is
+                    // discarded rather than shipped.
+                    let mut cells = String::new();
+                    let encoded = std::panic::catch_unwind(AssertUnwindSafe(|| {
                     for (i, ty) in types.iter().enumerate() {
                         if i > 0 {
-                            buf.push(',');
+                            cells.push(',');
                         }
                         match row.get_ref(i) {
                             // A UNION's tag says which member is set, and
@@ -715,11 +745,33 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
                             // The tag is still on the arrow array underneath.
                             Ok(v) => {
                                 let tag = union_tag(&v);
-                                emit_tagged(&mut buf, tag, &Value::from(v), Some(ty));
+                                emit_tagged(&mut cells, tag, &Value::from(v), Some(ty));
                             }
-                            Err(_) => buf.push_str("null"),
+                            Err(_) => cells.push_str("null"),
                         }
                     }
+                    }));
+
+                    if encoded.is_err() {
+                        // The headers are long gone, so this can only be said
+                        // in the stream — but it is said, rather than the
+                        // client being left to infer it from a short result.
+                        buf.push_str(r#"{"type":"error","code":"unsupported_type","message":"#);
+                        push_json_string(
+                            &mut buf,
+                            "harbor cannot encode a value in this result: the DuckDB Rust \
+                             client has no decoder for one of its column types. The query \
+                             ran; the value cannot be represented. Cast the column to \
+                             VARCHAR to see it.",
+                        );
+                        buf.push_str("}\n");
+                        let _ = body.send(std::mem::take(&mut buf).into_bytes());
+                        gone = true;
+                        break;
+                    }
+
+                    buf.push_str(r#"{"type":"row","values":["#);
+                    buf.push_str(&cells);
                     buf.push_str("]}\n");
                     count += 1;
                     if buf.len() >= FLUSH_AT {

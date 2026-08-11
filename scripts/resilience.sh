@@ -231,6 +231,44 @@ eq "a slow reader gets data without stalling the server" "streaming" \
 eq "other clients are unaffected by the slow one" "$sites_n" "$(scalar 'SELECT count(*) AS n FROM sites')"
 
 # ---------------------------------------------------------------------------
+section "Configuration and contention"
+# ---------------------------------------------------------------------------
+
+# DuckDB's default checkpoint_threshold is 16MB. At that setting a modest
+# writer can run for weeks with every committed row in the WAL and the .duckdb
+# file near-empty; one hard kill, or one WAL that fails to replay, and the data
+# is gone. bin/harbor lowers it deliberately, so assert the launcher actually
+# applies it rather than trusting that it still does.
+eq "the launcher lowers checkpoint_threshold" "976.5 KiB" \
+   "$(scalar "SELECT current_setting('checkpoint_threshold') AS v")"
+
+# DuckDB's file lock is exclusive, even for readers, so a second server on the
+# same database cannot work. What matters is that it says so and exits, rather
+# than hanging — "clean error or confusing hang" is what someone meets at 2am
+# when a supervisor restarts a service whose predecessor has not yet died.
+second_log="$work/second.log"
+"$here/bin/harbor" "$db" --port "$((port + 1))" --token second --workers 2 \
+    >"$second_log" 2>&1 &
+second_pid=$!
+waited=0
+while kill -0 "$second_pid" 2>/dev/null && (( waited < 40 )); do
+  sleep 0.25
+  waited=$((waited + 1))
+done
+if kill -0 "$second_pid" 2>/dev/null; then
+  kill -KILL "$second_pid" 2>/dev/null
+  bad "a second server on a locked database exits" "still running after 10s — it hung rather than failing"
+else
+  ok "a second server on a locked database exits"
+  if grep -qi 'lock\|another process\|being used\|conflict' "$second_log"; then
+    ok "and says the database is locked" "$(grep -io 'lock[^\"]\{0,40\}' "$second_log" | head -1)"
+  else
+    bad "and says the database is locked" "exited, but the message does not mention the lock: $(head -c 160 "$second_log")"
+  fi
+fi
+wait "$second_pid" 2>/dev/null
+
+# ---------------------------------------------------------------------------
 section "Start/stop churn"
 # ---------------------------------------------------------------------------
 

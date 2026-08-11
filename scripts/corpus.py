@@ -84,6 +84,12 @@ TYPES = [
     # three-byte header plus a big-endian magnitude that is one's-complemented
     # when negative — so the sign, the zero case and the boundary where the
     # value stops fitting a double all exercise different code.
+    # TIME_NS and VARIANT: neither was in any suite, and TIME_NS panicked the
+    # executor thread. Present now so they can never leave again unnoticed.
+    ("time-ns",              "SELECT TIME_NS '12:34:56.123456789' AS v"),
+    ("time-ns-cast",         "SELECT TIME_NS '12:34:56.123456789'::VARCHAR AS v"),
+    ("variant",              "SELECT 42::VARIANT AS v"),
+
     ("bignum-zero",          "SELECT 0::VARINT AS v"),
     ("bignum-one",           "SELECT 1::VARINT AS v"),
     ("bignum-neg-one",       "SELECT (-1)::VARINT AS v"),
