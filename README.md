@@ -128,21 +128,26 @@ CALL harbor_wait();
 
 Harbor does not reimplement the other two. `quack` and `ui` are stock,
 unmodified, and maintained by someone else. That is the point — and it is most
-of why this is 2,029 lines where its C++ predecessor is 9,728 across thirty
+of why this is 2,027 lines where its C++ predecessor is 9,728 across thirty
 files. Nearly the whole reduction came from not doing three things, rather
 than from writing denser code.
 
 ## The implementation
 
 Rust, against DuckDB's **C extension API**, so no DuckDB source tree is needed
-to build — `cargo build` and you have an extension. Four files:
+to build — `cargo build` and you have an extension. Two files:
 
 | file | lines | |
 | --- | --: | --- |
-| [`src/server.rs`](src/server.rs) | 1,593 | the entire HTTP side |
-| [`src/lib.rs`](src/lib.rs) | 280 | extension entry, four table functions |
-| [`src/keywords.rs`](src/keywords.rs) | 69 | generated from `duckdb_keywords()` |
+| [`src/lib.rs`](src/lib.rs) | 1,940 | the extension entry, its four table functions, and the whole HTTP server |
 | [`bin/harbor`](bin/harbor) | 87 | run a database as a service |
+
+One source file is a deliberate choice, not laziness. The engine and the four
+table functions that front it are useless apart, and the module boundary
+between them existed only to be crossed — eight `pub` markers whose entire
+purpose was to let the other half call in. Removing it removed them, and
+removed the blanket `#![allow(dead_code)]` that boundary had carried, which
+turned out to be hiding a request counter nothing ever incremented.
 
 Against **3,613 lines of tests** — roughly 1.8 lines of test per line of
 product, and the larger half of the repository.
