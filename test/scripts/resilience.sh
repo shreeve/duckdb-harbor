@@ -362,6 +362,93 @@ eq "the data is there on reopen" "5000" \
 eq "the crash-recovered rows are still there too" "21" \
    "$(duckdb -no-init -readonly -csv -noheader "$db" -c 'SELECT count(*) FROM crash' 2>/dev/null | tail -1)"
 
+# ---------------------------------------------------------------------------
+section "REPL mode"
+# ---------------------------------------------------------------------------
+
+# --repl serves without blocking on harbor_wait, so the same terminal is both a
+# server and a SQL prompt. Two things have to hold that do not hold for free.
+#
+# The prompt has to be live while HTTP is being served — a --repl that hands
+# back a prompt but has not actually bound, or has bound and wedged the shell,
+# looks fine until someone types into it.
+#
+# And leaving the prompt has to fold the WAL. It does not do so on its own:
+# harbor's workers hold pooled connections, DuckDB will not checkpoint past an
+# open connection, and a .quit with the server still up left a WAL behind every
+# time it was tried. The launcher covers that from outside the process, which is
+# only checkable from outside too — hence reading $repl_db.wal after it exits.
+repl_dir="$work/repl"
+mkdir -p "$repl_dir"
+repl_db="$repl_dir/repl.duckdb"
+duckdb -no-init "$repl_db" -c 'CREATE TABLE t AS SELECT i FROM range(3) t(i); CHECKPOINT' >/dev/null 2>&1
+repl_port=$((port + 2))
+{
+  # Sleep first: the prompt is fed from a pipe, so this runs before the shell
+  # reads anything, and the request has to arrive after the listener is up.
+  python3 - <<PY
+import json, time, urllib.request
+for _ in range(80):
+    try:
+        urllib.request.urlopen("http://127.0.0.1:$repl_port/health", timeout=1).read()
+        break
+    except Exception:
+        time.sleep(0.25)
+req = urllib.request.Request("http://127.0.0.1:$repl_port/sql",
+    data=json.dumps({"sql": "INSERT INTO t VALUES (777)"}).encode(),
+    headers={"Authorization": "Bearer $token"})
+urllib.request.urlopen(req, timeout=30).read()
+PY
+  # Written to a file rather than read back off the prompt's own output: the
+  # box-drawn table is a display format, and parsing it makes the assertion
+  # about DuckDB's rendering rather than about the count.
+  printf "COPY (SELECT count(*) AS n FROM t) TO '%s' (FORMAT csv, HEADER false);\n.quit\n" \
+         "$repl_dir/count.csv"
+} | timeout 120 "$here/bin/duckdb-harbor" "$repl_db" --repl --port "$repl_port" \
+      --token "$token" --workers 2 >"$work/repl.log" 2>&1
+repl_status=$?
+
+eq "--repl exits cleanly when the prompt is left" "0" "$repl_status"
+# 4 = the 3 seeded rows plus the one inserted over HTTP, so this is one
+# assertion that the prompt ran SQL and another that the server was serving at
+# the same moment.
+eq "the prompt sees a row written over HTTP while it was open" "4" \
+   "$(cat "$repl_dir/count.csv" 2>/dev/null | tr -d '[:space:]')"
+if [[ -f "$repl_db.wal" ]]; then
+  bad "leaving the --repl prompt folds the WAL" "$repl_db.wal still exists ($(wc -c < "$repl_db.wal") bytes)"
+else
+  ok "leaving the --repl prompt folds the WAL"
+fi
+eq "the HTTP write survived the exit" "4" \
+   "$(duckdb -no-init -readonly -csv -noheader "$repl_db" -c 'SELECT count(*) FROM t' 2>/dev/null | tail -1)"
+
+# The documented install unzips the extension next to the downloaded launcher
+# and runs it with no --extension. That layout is not the source tree's, and the
+# search used to start one directory above the script: every candidate missed,
+# and the launcher reported that no extension existed while it sat beside it.
+solo="$work/solo"
+mkdir -p "$solo"
+cp "$here/bin/duckdb-harbor" "$solo/"
+solo_ext=${HARBOR_EXTENSION:-$here/build/release/harbor.duckdb_extension}
+if [[ ! -f "$solo_ext" ]]; then
+  bad "the launcher finds an extension unzipped beside it" "no extension at $solo_ext to copy"
+else
+  # Named as a release asset is, not as the launcher wants it: that combination
+  # -- unusual name, no --extension, not the source layout -- is exactly what a
+  # first-time install looks like.
+  cp "$solo_ext" "$solo/harbor.duckdb_extension"
+  cp "$src_db" "$solo/solo.duckdb"
+  solo_port=$((port + 3))
+  printf '.quit\n' | timeout 60 env -u HARBOR_EXTENSION "$solo/duckdb-harbor" \
+      "$solo/solo.duckdb" --repl --port "$solo_port" --token "$token" \
+      >"$work/solo.log" 2>&1
+  if grep -q "127.0.0.1:$solo_port" "$work/solo.log"; then
+    ok "the launcher finds an extension unzipped beside it"
+  else
+    bad "the launcher finds an extension unzipped beside it" "$(head -c 200 "$work/solo.log")"
+  fi
+fi
+
 printf '\n%s%d passed, %d failed%s\n' "$bold" "$pass" "$fail" "$off"
 if (( fail > 0 )); then
   printf '\n%sfailures:%s\n' "$red" "$off"

@@ -7,10 +7,17 @@
 #   bin/duckdb-harbor mydata.db --bind 0.0.0.0     listen beyond loopback
 #   bin/duckdb-harbor mydata.db --token secret     set the bearer token
 #   bin/duckdb-harbor mydata.db --checkpoint 16MB  raise the WAL checkpoint threshold
+#   bin/duckdb-harbor mydata.db --repl             serve, and keep a SQL prompt
 #   bin/duckdb-harbor mydata.db --extension ./harbor.duckdb_extension
 #
 # With no --token, harbor mints one and prints it at startup; that is the only
 # time it is shown. HARBOR_TOKEN is honoured if set.
+#
+# --repl serves in the background of an ordinary DuckDB prompt instead of
+# blocking on harbor_wait, so one terminal can both serve HTTP clients and run
+# SQL against the same database. Leaving the prompt stops the server and folds
+# the WAL. Without it the process is a daemon: it blocks until stopped, which is
+# what a supervisor wants and what a person at a keyboard usually does not.
 #
 # The extension is looked for beside this script, then in a built tree, then in
 # ~/.duckdb/extensions. Running a downloaded release build needs no source tree
@@ -31,7 +38,8 @@
 
 set -euo pipefail
 
-here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+mydir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+here=$(cd -- "$mydir/.." && pwd)
 
 # Nothing here needs a build tree. A downloaded release artifact sitting beside
 # the script, or named through --extension / HARBOR_EXTENSION, works the same
@@ -44,6 +52,7 @@ port="9495"
 token="${HARBOR_TOKEN:-}"
 workers=""
 checkpoint="1MB"
+repl=""
 
 # Every flag takes a value, so say so rather than letting `set -u` abort with
 # bash's own "$2: unbound variable" — that reads like a bug in this script.
@@ -59,7 +68,8 @@ while [[ $# -gt 0 ]]; do
     --workers)    need "$@"; workers="$2"; shift 2 ;;
     --checkpoint) need "$@"; checkpoint="$2"; shift 2 ;;
     --extension)  need "$@"; ext="$2"; shift 2 ;;
-    -h|--help) sed -n '3,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --repl)       repl=1; shift ;;
+    -h|--help) sed -n '3,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     --)        shift; [[ $# -eq 1 ]] || { echo "duckdb-harbor: expected one database path after --" >&2; exit 2; }
                db="$1"; shift ;;
     -*)        echo "duckdb-harbor: unknown option $1" >&2; exit 2 ;;
@@ -71,7 +81,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$db" ]]; then
-  echo "usage: duckdb-harbor <database.db> [--bind HOST] [--port N] [--token T] [--workers N] [--checkpoint SIZE] [--extension PATH]" >&2
+  echo "usage: duckdb-harbor <database.db> [--bind HOST] [--port N] [--token T] [--workers N] [--checkpoint SIZE] [--extension PATH] [--repl]" >&2
   exit 2
 fi
 
@@ -98,8 +108,13 @@ if [[ ! -e "$db" ]]; then
 fi
 
 if [[ -z "$ext" ]]; then
+  # $mydir -- the script's own directory -- and not just $here, its parent.
+  # Unzipping a release beside the downloaded launcher is the documented
+  # install, and in that layout $here is one directory too high: it used to look
+  # everywhere except where the file actually was, and report that no extension
+  # existed. A source tree is covered by build/release below.
   for candidate in \
-    "$here/bin/harbor.duckdb_extension" \
+    "$mydir/harbor.duckdb_extension" \
     "$here/harbor.duckdb_extension" \
     "$here/build/release/harbor.duckdb_extension" \
     "$HOME/.duckdb/extensions/harbor.duckdb_extension"
@@ -150,6 +165,32 @@ args="bind := '${bind//\'/\'\'}', port := $port"
 # database or sets memory_limit would otherwise change what this service serves,
 # on one machine and not another, with nothing in the logs to say so.
 #
+setup="
+  SET checkpoint_threshold = '${checkpoint//\'/\'\'}';
+  LOAD '${ext//\'/\'\'}';
+  CALL harbor_serve($args);
+"
+
+# --repl: serve, then hand the terminal to DuckDB's own prompt. -cmd runs the
+# setup before stdin is read and then falls through to the shell, where -c would
+# run it and exit; harbor_wait is deliberately absent, since the whole point is
+# not to block.
+#
+# The checkpoint has to happen in a second process, after this one is gone.
+# harbor's workers hold pooled connections for as long as the server is up, and
+# DuckDB will not checkpoint past an open connection, so closing the shell with
+# the server still running leaves committed rows in the WAL -- measured on exit
+# from a session that had served one INSERT, not assumed. CALL harbor_stop()
+# from the prompt drains the workers and folds the WAL itself; this covers .quit,
+# Ctrl-D, and every other way out. Running it on EXIT rather than after the
+# command means a SIGTERM to the launcher is covered too.
+if [[ -n "$repl" ]]; then
+  trap 'duckdb -no-init "$db" -c "CHECKPOINT" >/dev/null 2>&1 || true' EXIT
+  status=0
+  duckdb -unsigned -no-init "$db" -cmd "$setup" || status=$?
+  exit $status
+fi
+
 # CHECKPOINT comes after harbor_wait, and it has to. While harbor_wait is
 # blocked it is a running query, and a running query is an open transaction
 # older than every write the server has served — DuckDB refuses to CHECKPOINT
@@ -157,9 +198,7 @@ args="bind := '${bind//\'/\'\'}', port := $port"
 # that by definition never finishes. Once harbor_wait returns, the workers are
 # stopped and nothing else is in flight, so the WAL folds cleanly.
 exec duckdb -unsigned -no-init "$db" -c "
-  SET checkpoint_threshold = '${checkpoint//\'/\'\'}';
-  LOAD '${ext//\'/\'\'}';
-  CALL harbor_serve($args);
+  $setup
   CALL harbor_wait();
   CHECKPOINT;
 "

@@ -41,13 +41,47 @@ GET  /health   liveness, no credential required
 
 ## Get it running
 
-Nothing to compile. Download the zip for your platform from the
-[releases page](https://github.com/shreeve/duckdb-harbor/releases) and unpack
-it, then point DuckDB at it. `-unsigned` is required, since this is not in
-DuckDB's extension registry:
+Nothing to compile. Take the extension for your platform and the launcher from
+the [releases page](https://github.com/shreeve/duckdb-harbor/releases) — five
+platforms are built: `osx_arm64`, `osx_amd64`, `linux_amd64`, `linux_arm64`,
+`windows_amd64`.
 
 ```console
+$ base=https://github.com/shreeve/duckdb-harbor/releases/download/v0.7.0
+$ curl -sLO $base/harbor-v0.7.0-duckdb-v1.5.5-osx_arm64.zip
+$ curl -sLO $base/duckdb-harbor
 $ unzip harbor-v0.7.0-duckdb-v1.5.5-osx_arm64.zip   # -> harbor.duckdb_extension
+$ chmod +x duckdb-harbor
+$ ./duckdb-harbor mydata.duckdb --token secret
+harbor: serving on http://127.0.0.1:9495
+```
+
+That is the whole install. The launcher finds `harbor.duckdb_extension` beside
+itself, in `~/.duckdb/extensions`, or wherever `--extension` /
+`HARBOR_EXTENSION` points, and it accepts the file under any name. With no
+`--token` it mints one and prints it as the server binds — the only time it is
+shown; `HARBOR_TOKEN` is honoured if set.
+
+It runs in the foreground, the way launchd, systemd and Docker want it. Pass
+`--repl` to get a DuckDB prompt instead of a blocking daemon, so one terminal
+both serves HTTP clients and runs SQL against the same database:
+
+```console
+$ ./duckdb-harbor mydata.duckdb --token secret --repl
+harbor: serving on http://127.0.0.1:9495
+D SELECT count(*) FROM orders;   -- while clients are querying over HTTP
+```
+
+Either way the exit is clean: `SIGTERM` and `Ctrl-C` drain in-flight requests
+and `CHECKPOINT` before the process goes, and leaving the `--repl` prompt folds
+the WAL too, so the next open never replays one.
+
+### Or straight from a DuckDB shell
+
+The launcher is a convenience, not a dependency. `-unsigned` is required, since
+this is not in DuckDB's extension registry:
+
+```console
 $ duckdb -unsigned mydata.duckdb
 ```
 ```sql
@@ -57,30 +91,18 @@ CALL harbor_wait();                                    -- blocks until stopped
 ```
 
 That is the whole SQL surface, four table functions: `harbor_serve`,
-`harbor_stop`, `harbor_wait`, and `harbor_version`.
+`harbor_stop`, `harbor_wait`, and `harbor_version`. Skip `harbor_wait` and you
+have what `--repl` gives you; end with `CALL harbor_stop()`, which drains the
+workers and checkpoints.
 
-For running a database as a long-lived service, the bundled launcher handles
-the pieces that are easy to get wrong — the shutdown checkpoint and its
-ordering, and a `checkpoint_threshold` that keeps weeks of committed rows out
-of an unfolded WAL:
-
-```console
-$ duckdb-harbor mydata.duckdb --port 9495 --extension ./harbor.duckdb_extension
-harbor: serving on http://127.0.0.1:9495  token=4abf6e3696b19601…
-```
-
-It finds the extension beside itself or in `~/.duckdb/extensions` if you would
-rather not pass `--extension`; `HARBOR_EXTENSION` works too, and unlike a plain
-`LOAD` it accepts the file under any name. That matters because DuckDB builds
-the init symbol from everything before the first dot in the filename, so a
-`LOAD` of `harbor-v0.7.0-osx_arm64.duckdb_extension` looks for
-`harbor-v0_init_c_api` and fails with a `dlsym` error that names nothing
-useful. Keep the file called `harbor.duckdb_extension` when loading it through
-SQL. With no `--token`
-it mints one and prints it as the server binds — the only time it is shown, and
-`HARBOR_TOKEN` is honoured if set. It runs in the foreground, the way launchd,
-systemd and Docker want it, and `SIGTERM` and `Ctrl-C` drain in-flight requests
-and `CHECKPOINT` before exiting, so the next open never replays a WAL.
+Two things the launcher is doing for you here. First, the file has to be named
+exactly `harbor.duckdb_extension`: DuckDB builds the init symbol from
+everything before the first dot, so a `LOAD` of
+`harbor-v0.7.0-osx_arm64.duckdb_extension` looks for `harbor-v0_init_c_api` and
+fails with a `dlsym` error that names nothing useful. Second, it sets
+`checkpoint_threshold` to 1MB rather than DuckDB's 16MB — at 16MB a modest
+writer can run for weeks with every committed row sitting in the WAL and the
+`.duckdb` file near-empty.
 
 ## Any language
 
@@ -245,9 +267,9 @@ self-consistent.
 
 ## Status
 
-Early. No release is published yet, so for the moment the artifact has to be
-built with `make release`; the download path above is how it will work, and is
-already what the launcher expects.
+Early. **v0.7.0** is the first published release, built for five platforms
+against DuckDB v1.5.5. Not in DuckDB's community-extensions registry yet, so
+`-unsigned` is required and there is no `INSTALL harbor`.
 
 ## License
 
