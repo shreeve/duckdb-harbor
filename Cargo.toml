@@ -15,7 +15,7 @@ strip = true
 [dependencies]
 # The `loadable-extension` feature builds against DuckDB's C extension API.
 # NOTE: it currently requires the UNSTABLE band, which pins the binary to one
-# DuckDB version — see the "Versioning" section of README.md.
+# DuckDB version — see "Known limitations" in README.md.
 duckdb = { version = "~1.10505.0", features = ["loadable-extension", "vtab"] }
 
 # HTTP server. Deliberately synchronous: harbor executes a small, bounded
@@ -24,15 +24,13 @@ duckdb = { version = "~1.10505.0", features = ["loadable-extension", "vtab"] }
 # lives.
 tiny_http = "0.12"
 
-# The whole point of the extension: SQL in, NDJSON out.
-serde = { version = "1", features = ["derive"] }
+# The whole point of the extension: SQL in, NDJSON out. `serde` is here for
+# its Value type; harbor derives nothing.
+serde = "1"
 serde_json = "1"
 
-# Cookie signing (HMAC-SHA256) and nonce generation. Pure Rust, so harbor
-# does not link OpenSSL and does not need `LOAD httpfs` the way the C++
-# version did.
-hmac = "0.12"
-sha2 = "0.10"
+# Token minting. Pure Rust, so harbor does not link OpenSSL and does not need
+# `LOAD httpfs` the way the C++ version did.
 rand = "0.8"
 
 # SIGTERM is the difference between a checkpointed database and a WAL replay

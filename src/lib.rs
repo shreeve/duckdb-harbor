@@ -128,7 +128,8 @@ struct ServeConfig {
     port: u16,
     token: Option<String>,
     workers: usize,
-    /// Present only when harbor generated the token, so it can be shown once.
+    /// Whether harbor minted the token rather than being given one, so the
+    /// address it returns can show it the one time anyone will see it.
     generated: bool,
 }
 
@@ -186,6 +187,15 @@ impl VTab for HarborServe {
             text.push_str("  token=");
             text.push_str(cfg.token.as_deref().unwrap_or(""));
         }
+
+        // Also to stderr, right now. Returning the address as a row is not
+        // enough for the case that needs it most: the DuckDB CLI holds its
+        // result output until the process exits, so a daemon started with
+        // `duckdb -c 'CALL harbor_serve(...)'` printed the minted token only
+        // once the server had already shut down — which is to say, never,
+        // while it was of any use. stderr is unbuffered and goes to the
+        // journal, so this is the line an operator actually sees.
+        eprintln!("harbor: serving on {text}");
         output.flat_vector(0).insert(0, CString::new(text)?);
         output.set_len(1);
         Ok(())
@@ -335,7 +345,10 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
 // Concurrency: accept many connections, execute few queries. DuckDB
 // parallelises a single query across all cores, so running hundreds
 // concurrently buys thrashing, not throughput. A fixed worker pool bounds
-// in-flight statements; connections queue in the kernel accept backlog.
+// in-flight statements; a connection past that waits for a worker to come
+// free. It does not wait in the kernel accept backlog — tiny_http accepts
+// eagerly on its own thread and gives each connection an OS thread, so
+// connection count, not worker count, is what a flood actually costs.
 
 
 // duckdb-rs keeps the raw `duckdb_logical_type` private, and two details are
@@ -392,8 +405,9 @@ fn quote_identifier(name: &str) -> String {
 /// exceed this; queries should not.
 const DEFAULT_MAX_INFLIGHT: usize = 6;
 
-/// Largest request body we will read. A statement is text; a megabyte of it
-/// is already pathological.
+/// Largest request body we will read, declared or delivered. A statement is
+/// text, and a megabyte of it is already pathological — the limit sits well
+/// above that so a generous `params` array is never the thing that fails.
 const MAX_BODY: usize = 8 << 20;
 
 /// Rows are buffered to roughly this size before hitting the socket. Small
@@ -447,6 +461,23 @@ struct Running {
 /// entrypoint, and only there — see the note above on why later is too late.
 fn open_pool(con: Connection) -> Result<(), String> {
     let mut pool = POOL.lock().unwrap();
+
+    // Once per process, not once per load. POOL and CONTROL are process-wide,
+    // but the entrypoint runs once per *database instance* — a host that opens
+    // two DuckDB databases and loads harbor into both would otherwise append
+    // eight more connections to the same vector and overwrite CONTROL with the
+    // second database's. `start()` drains from the tail, so harbor_serve on the
+    // first instance would then serve the second one's data, and the shutdown
+    // CHECKPOINT would run against whichever loaded last. Refusing is the only
+    // honest answer: harbor is a process singleton and cannot serve two.
+    if !pool.is_empty() {
+        return Err(
+            "harbor is already loaded in this process and serves a single database; \
+             loading it into a second one is not supported"
+                .to_string(),
+        );
+    }
+
     for _ in 0..POOL_SIZE {
         pool.push(con.try_clone().map_err(|e| format!("harbor: {e}"))?);
     }
@@ -506,7 +537,15 @@ fn start(bind: &str, port: u16, token: Option<String>, workers: usize) -> Result
 }
 
 fn stop() -> Result<String, String> {
-    let Some(r) = RUNNING.lock().unwrap().take() else {
+    // Held for the whole of the shutdown, not just the take(). Releasing it
+    // here — which `RUNNING.lock().unwrap().take()` as a statement does, since
+    // the guard is a temporary — leaves a window in which RUNNING is None while
+    // the listener is still bound and the workers are still draining. A
+    // harbor_serve arriving in that window sees no server, takes whichever
+    // connections happen to be back in the pool, and then fails to bind a port
+    // the old listener has not released yet.
+    let mut running = RUNNING.lock().unwrap();
+    let Some(r) = running.take() else {
         return Err("harbor is not serving".to_string());
     };
     r.stop.store(true, Ordering::SeqCst);
@@ -529,7 +568,7 @@ fn stop() -> Result<String, String> {
     // while harbor_wait is still blocked: that blocked call is itself an open
     // transaction older than every write, and DuckDB will not checkpoint past
     // one. The daemon path covers that case by running CHECKPOINT after
-    // harbor_wait returns — see bin/harbor.
+    // harbor_wait returns — see bin/duckdb-harbor.
     if let Some(c) = CONTROL.lock().unwrap().as_ref() {
         let _ = c.execute_batch("CHECKPOINT");
     }
@@ -537,6 +576,7 @@ fn stop() -> Result<String, String> {
     let (lock, cv) = &STOPPED;
     *lock.lock().unwrap() = true;
     cv.notify_all();
+    drop(running);
     Ok(r.addr)
 }
 
@@ -564,11 +604,18 @@ fn install_signal_handler() {
 
     if let Ok(mut signals) = Signals::new([SIGTERM, SIGINT]) {
         let _ = thread::Builder::new().name("harbor-signals".to_string()).spawn(move || {
+            // No `break`. Breaking out ends the thread, which drops `Signals`
+            // and restores the default disposition — so the *second* signal did
+            // exactly what this function exists to prevent: killed the process
+            // with the WAL unfolded. A supervisor escalating after a timeout,
+            // or an impatient second Ctrl-C, both land in that window, and the
+            // launcher's CHECKPOINT runs after wait() returns — precisely then.
+            // stop() is idempotent enough to call again: the second call finds
+            // RUNNING empty and returns an error nobody reads.
             for _ in signals.forever() {
                 // stop() drains the workers and checkpoints, then wakes
                 // wait(), which lets the main thread exit normally.
                 let _ = stop();
-                break;
             }
         });
     }
@@ -632,7 +679,17 @@ fn worker(
         // A timeout rather than a blocking recv, so `unblock()` is not the
         // only way out and a worker cannot wedge on shutdown.
         match server.recv_timeout(Duration::from_millis(200)) {
-            Ok(Some(req)) => handle(req, &jobs_tx, token.as_ref().as_deref()),
+            // A worker whose executor has died must leave the accept loop. All
+            // workers pull from one shared queue, so one that answers instantly
+            // — which is what a worker with no executor does, 503 by return —
+            // wins races against every worker still doing real work, and
+            // absorbs a growing share of the traffic. The server would look
+            // mostly down while /health kept answering 200.
+            Ok(Some(req)) => {
+                if !handle(req, &jobs_tx, token.as_ref().as_deref()) {
+                    break;
+                }
+            }
             Ok(None) => continue,
             Err(_) => break,
         }
@@ -642,7 +699,9 @@ fn worker(
     executor.join().ok()
 }
 
-fn handle(mut req: Request, jobs: &mpsc::SyncSender<Job>, token: Option<&str>) {
+/// Returns false when the executor behind `jobs` is gone, which is the one
+/// condition the caller must act on rather than merely report.
+fn handle(mut req: Request, jobs: &mpsc::SyncSender<Job>, token: Option<&str>) -> bool {
     let path = req.url().split('?').next().unwrap_or("/").to_string();
     let method = req.method().clone();
 
@@ -656,32 +715,63 @@ fn handle(mut req: Request, jobs: &mpsc::SyncSender<Job>, token: Option<&str>) {
         (Method::Post, "/sql") => {
             if !authorized(&req, token) {
                 let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
-                return;
+                return true;
+            }
+            // Check the declared length before touching the reader. `take()`
+            // bounds what harbor buffers but not what the client may declare,
+            // and tiny_http drains whatever is left undelivered when the
+            // request is dropped — with a single `vec![0; remaining]`. So a
+            // client that declares 600 MB and sends 9 MB costs the process a
+            // 600 MB zeroed allocation it never asked for; the declared length
+            // is attacker-chosen and unbounded. Refusing here means the
+            // allocation never happens.
+            match req.body_length() {
+                Some(n) if n > MAX_BODY => {
+                    let _ = req.respond(error_response(
+                        413,
+                        "body_too_large",
+                        &format!("body is {n} bytes; the limit is {MAX_BODY}"),
+                    ));
+                    return true;
+                }
+                _ => {}
             }
             let mut body = String::new();
             if req.as_reader().take(MAX_BODY as u64).read_to_string(&mut body).is_err() {
                 let _ = req.respond(error_response(400, "bad_request", "body is not valid UTF-8"));
-                return;
+                return true;
             }
-            run_sql(req, jobs, &body);
+            return run_sql(req, jobs, &body);
         }
         _ => {
             let _ = req.respond(error_response(404, "not_found", "no such endpoint"));
         }
     }
+    true
 }
 
 fn authorized(req: &Request, token: Option<&str>) -> bool {
     let Some(expected) = token else { return true };
-    let Some(h) = req
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Authorization"))
-    else {
+
+    // Exactly one Authorization header, or none of them count. Taking the first
+    // and ignoring the rest means harbor and anything in front of it can read
+    // the same request differently, which is how a proxy and an origin end up
+    // disagreeing about who the caller is. Duplicates are not something a
+    // correct client sends, so refusing them costs nothing.
+    let mut found = req.headers().iter().filter(|h| h.field.equiv("Authorization"));
+    let Some(h) = found.next() else { return false };
+    if found.next().is_some() {
         return false;
-    };
+    }
+
+    // RFC 7235 makes the scheme case-insensitive; the value after it is not.
     let value = h.value.as_str();
-    let Some(presented) = value.strip_prefix("Bearer ") else { return false };
+    let split = value.find(' ').unwrap_or(value.len());
+    let (scheme, rest) = value.split_at(split);
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return false;
+    }
+    let Some(presented) = rest.strip_prefix(' ') else { return false };
     constant_time_eq(presented.as_bytes(), expected.as_bytes())
 }
 
@@ -758,7 +848,6 @@ fn json_to_duckdb(v: &serde_json::Value) -> Result<Value, String> {
 fn ensure_single_statement(sql: &str) -> Result<(), String> {
     let b = sql.as_bytes();
     let mut i = 0;
-    let mut terminated_at: Option<usize> = None;
 
     while i < b.len() {
         match b[i] {
@@ -784,7 +873,21 @@ fn ensure_single_statement(sql: &str) -> Result<(), String> {
             q @ (b'\'' | b'"') => {
                 // A doubled quote is an escaped quote, not the end of the
                 // literal. E'...' additionally honours backslash escapes.
-                let escapes = q == b'\'' && i > 0 && (b[i - 1] | 0x20) == b'e';
+                //
+                // That `e` has to be a token on its own. Testing only the byte
+                // before the quote is not enough, and the difference is a hole
+                // rather than a nicety: DuckDB needs no space between a keyword
+                // and a literal, so LIKE', ILIKE', ESCAPE', date' and time' all
+                // end in `e`. Reading one of those as an escape string makes the
+                // scanner honour a backslash, skip the byte after it — the real
+                // closing quote — and swallow every `;` that follows. That is a
+                // second statement smuggled past this function, which is the one
+                // thing it exists to prevent.
+                let standalone_e = |j: usize| {
+                    (b[j] | 0x20) == b'e'
+                        && (j == 0 || !(b[j - 1].is_ascii_alphanumeric() || b[j - 1] == b'_' || b[j - 1] >= 0x80))
+                };
+                let escapes = q == b'\'' && i > 0 && standalone_e(i - 1);
                 i += 1;
                 while i < b.len() {
                     if escapes && b[i] == b'\\' {
@@ -808,7 +911,11 @@ fn ensure_single_statement(sql: &str) -> Result<(), String> {
                     .position(|&c| !(c.is_ascii_alphanumeric() || c == b'_'))
                     .map(|p| i + 1 + p);
                 match tag_end {
-                    Some(end) if b[end] == b'$' => {
+                    // A tag may not start with a digit: `$1$` is a bind
+                    // parameter to DuckDB, not the opening of a string. Reading
+                    // it as one would let `$1$; DROP TABLE t; $1$` hide a
+                    // terminator the two lexers disagree about.
+                    Some(end) if b[end] == b'$' && !b[i + 1].is_ascii_digit() => {
                         let tag = &b[i..=end];
                         let rest = &b[end + 1..];
                         i = rest
@@ -820,20 +927,21 @@ fn ensure_single_statement(sql: &str) -> Result<(), String> {
                 }
             }
             b';' => {
-                terminated_at = Some(i);
-                i += 1;
-            }
-            _ => {
                 // Anything after a terminator is a second statement, even if
                 // it is only a comment — harbor has no reason to accept it.
-                if terminated_at.is_some() && !b[i].is_ascii_whitespace() {
-                    return Err("only one statement per request".to_string());
-                }
-                i += 1;
+                //
+                // Decided once, here, rather than re-tested on every byte that
+                // follows. The earlier form rescanned the whole tail each time
+                // round the loop, which is Θ(n²): a request of `SELECT 1;` plus
+                // trailing whitespace, still inside the 8 MiB body limit, cost
+                // hours of CPU on the worker thread that read it.
+                return if b[i + 1..].iter().all(|c| c.is_ascii_whitespace()) {
+                    Ok(())
+                } else {
+                    Err("only one statement per request".to_string())
+                };
             }
-        }
-        if terminated_at.is_some() && i < b.len() && !b[i..].iter().all(|c| c.is_ascii_whitespace()) {
-            return Err("only one statement per request".to_string());
+            _ => i += 1,
         }
     }
     Ok(())
@@ -856,18 +964,19 @@ struct Job {
 /// How many body batches may be in flight before the query has to wait.
 const BODY_QUEUE: usize = 4;
 
-fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) {
+/// Returns false when the executor is gone; see `handle`.
+fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) -> bool {
     let parsed = match parse_request(body) {
         Ok(p) => p,
         Err(e) => {
             let _ = req.respond(error_response(400, "bad_request", &e));
-            return;
+            return true;
         }
     };
 
     if let Err(e) = ensure_single_statement(&parsed.sql) {
         let _ = req.respond(error_response(400, "bad_request", &e));
-        return;
+        return true;
     }
 
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
@@ -876,7 +985,7 @@ fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) {
 
     if jobs.send(job).is_err() {
         let _ = req.respond(error_response(503, "unavailable", "harbor is shutting down"));
-        return;
+        return false;
     }
 
     match ready_rx.recv() {
@@ -894,13 +1003,77 @@ fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) {
         }
         Err(_) => {
             let _ = req.respond(error_response(500, "internal", "the executor thread is gone"));
+            return false;
         }
     }
+    true
 }
 
-/// The DuckDB side. Owns one connection for the life of the server and runs
-/// one statement at a time; concurrency comes from there being several of
-/// these, not from any one of them interleaving work.
+/// Whether a statement could leave a transaction open behind it.
+///
+/// Only transaction-control statements can, because a statement that runs in
+/// autocommit commits or rolls back its own implicit transaction as it
+/// finishes. So the reset before the next job is only needed after one of
+/// these — or after a job that ended abnormally, which the caller tracks
+/// separately.
+///
+/// Fail-safe by construction: this answers true for anything it does not
+/// recognise, so a statement form nobody thought of costs one `ROLLBACK`
+/// rather than leaving a transaction open. Getting it wrong in the other
+/// direction is what took connections out of service permanently.
+fn may_leave_transaction_open(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    let mut i = 0;
+    // Skip leading whitespace and comments to reach the first real token.
+    loop {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if b[i..].starts_with(b"--") {
+            i = b[i..].iter().position(|&c| c == b'\n').map_or(b.len(), |p| i + p + 1);
+        } else if b[i..].starts_with(b"/*") {
+            let mut depth = 1;
+            i += 2;
+            while i < b.len() && depth > 0 {
+                if b[i..].starts_with(b"/*") {
+                    depth += 1;
+                    i += 2;
+                } else if b[i..].starts_with(b"*/") {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        } else {
+            break;
+        }
+    }
+    let start = i;
+    while i < b.len() && (b[i].is_ascii_alphabetic() || b[i] == b'_') {
+        i += 1;
+    }
+    if i == start {
+        return true;
+    }
+    let word = sql[start..i].to_ascii_uppercase();
+    // Statement kinds that run under autocommit and settle themselves. Anything
+    // absent from this list — BEGIN, START, COMMIT, ROLLBACK, ABORT, END, and
+    // whatever DuckDB adds next — takes the safe path.
+    !matches!(
+        word.as_str(),
+        "SELECT" | "WITH" | "FROM" | "VALUES" | "TABLE"
+            | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "TRUNCATE"
+            | "CREATE" | "DROP" | "ALTER" | "COMMENT"
+            | "COPY" | "EXPORT" | "IMPORT"
+            | "ATTACH" | "DETACH" | "USE"
+            | "PRAGMA" | "SET" | "RESET" | "CHECKPOINT" | "ANALYZE" | "VACUUM"
+            | "EXPLAIN" | "DESCRIBE" | "SHOW" | "SUMMARIZE" | "PIVOT" | "UNPIVOT"
+            | "CALL" | "PREPARE" | "EXECUTE" | "DEALLOCATE"
+            | "INSTALL" | "LOAD"
+    )
+}
+
 /// Return a connection to autocommit before anything else runs on it.
 ///
 /// Pooled connections are handed out per request and are never pinned to a
@@ -916,42 +1089,57 @@ fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) {
 /// Rolling back is the only correct choice here: the client that opened the
 /// transaction has no way to commit it, since its next request will land on a
 /// different connection.
-fn reset_transaction(conn: &Connection, force: bool) {
-    // `force` exists because is_autocommit() is not sufficient on its own. A
-    // query abandoned mid-stream — the client hung up, or a row failed to
-    // encode — can leave the connection in a transaction that DuckDB will not
-    // admit to through that flag, and the next statement on it comes back
-    // "Current transaction is aborted (please ROLLBACK)" for the life of the
-    // process. Checking the flag alone made this look fixed while abandoned
-    // streams kept poisoning connections; it reproduced as 14 of 40 requests
-    // failing after a burst of client hangups.
-    //
-    // The flag is still consulted on the common path so an ordinary request
-    // does not pay for an extra statement. Only a job that ended abnormally
-    // pays, and that one has to be certain.
-    if force || !conn.is_autocommit() {
-        let _ = conn.execute_batch("ROLLBACK");
-    }
+///
+/// Unconditional, and it has to be. This used to run only when a job had ended
+/// abnormally or when `Connection::is_autocommit()` reported a transaction
+/// open, on the reasoning that an ordinary request should not pay for an extra
+/// statement. But `is_autocommit()` in `duckdb-rs` 1.10505.0 is a stub — the
+/// whole body is `true` — so that half of the condition never fired and the
+/// abnormal-exit flag was doing all of the work. An open transaction left by a
+/// plain `BEGIN` survived on the connection until some later job on that same
+/// connection happened to end badly. It is observable: send `BEGIN` once per
+/// worker and the next request on each of those connections fails with
+/// `cannot start a transaction within a transaction`.
+///
+/// A `ROLLBACK` on a connection that has nothing to roll back is cheap, and far
+/// cheaper than the failure it prevents — an open transaction also blocks
+/// `CHECKPOINT`, including the one `stop()` runs, which is how a WAL goes
+/// unfolded.
+fn reset_transaction(conn: &Connection) {
+    let _ = conn.execute_batch("ROLLBACK");
 }
 
+/// The DuckDB side. Owns one connection for the life of the server and runs
+/// one statement at a time; concurrency comes from there being several of
+/// these, not from any one of them interleaving work.
 fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
-    // Set whenever a job ends any way other than running to completion, so the
-    // next one rolls back unconditionally rather than trusting a flag.
-    let mut dirty = false;
+    // Set by the previous job when it could have left a transaction open: a
+    // transaction-control statement, or any exit other than running to
+    // completion. Resetting unconditionally is also correct, and was what this
+    // did for a while, but it puts a `ROLLBACK` in front of every request —
+    // measurably, about 20% of throughput at 16 clients. The flag has to be set
+    // from something real, though: it used to consult
+    // `Connection::is_autocommit()`, which duckdb-rs hardcodes to `true`, so
+    // that half of the condition never fired at all.
+    let mut needs_reset = false;
     for job in jobs {
         // Before, not after: a job can leave the loop by several paths, and
-        // this way none of them can skip the reset. The check is a field read
-        // when there is nothing to undo, which is every ordinary request.
-        reset_transaction(&conn, dirty);
-        dirty = false;
+        // this way none of them can skip the reset.
+        if needs_reset {
+            reset_transaction(&conn);
+        }
 
         let Job { sql, params, ready, body } = job;
         let started = Instant::now();
 
+        // Decided from the statement text before it runs, then widened below by
+        // any path that ends the job early.
+        needs_reset = may_leave_transaction_open(&sql);
+
         let stmt = match conn.prepare(&sql) {
             Ok(s) => s,
             Err(e) => {
-                dirty = true;
+                needs_reset = true;
                 let _ = ready.send(Err(e.to_string()));
                 continue;
             }
@@ -960,7 +1148,7 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
         let mut rows = match stmt.query(params_from_iter(params.iter())) {
             Ok(r) => r,
             Err(e) => {
-                dirty = true;
+                needs_reset = true;
                 let _ = ready.send(Err(e.to_string()));
                 continue;
             }
@@ -986,21 +1174,28 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
         // and the client can only be told inside the body. Refusing here,
         // before anything is sent, is the difference between a 400 that says
         // what is wrong and a 200 that appears to have returned no rows.
-        if let Some(bad) = types.iter().find(|t| {
-            matches!(t.try_id(), Ok(LogicalTypeId::TimeNs))
-        }) {
+        if let Some((name, bad)) = names
+            .iter()
+            .zip(&types)
+            .find(|(_, t)| matches!(t.try_id(), Ok(LogicalTypeId::TimeNs)))
+        {
+            // Name the column, not the type. Substituting the type into both
+            // slots produced "Cast it — TIME_NS::VARCHAR", which reads as
+            // casting the type rather than the thing that has it.
             let _ = ready.send(Err(format!(
                 "harbor cannot encode {} columns: the DuckDB Rust client has no \
-                 decoder for this type. Cast it — {}::VARCHAR, or ::TIME for \
+                 decoder for this type. Cast it — {}::VARCHAR, or {}::TIME for \
                  microsecond precision — and the value comes back intact.",
                 type_name(bad),
-                type_name(bad)
+                name,
+                name
             )));
+            needs_reset = true;
             continue;
         }
 
         if ready.send(Ok(())).is_err() {
-            dirty = true;
+            needs_reset = true;
             continue;
         }
 
@@ -1096,7 +1291,7 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
         }
 
         // An abandoned or failed stream is the case that poisons a connection.
-        dirty = dirty || gone;
+        needs_reset = needs_reset || gone;
 
         if !gone {
             buf.push_str(&format!(
@@ -1111,7 +1306,7 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
     // And once more on the way out, so a connection going back to the pool for
     // the next harbor_serve is clean too. Unconditional here: this runs once
     // per server lifetime, so the extra statement costs nothing.
-    reset_transaction(&conn, true);
+    reset_transaction(&conn);
     conn
 }
 
@@ -1517,7 +1712,13 @@ fn emit_value(out: &mut String, v: &Value, ty: Option<&LogicalTypeHandle>) {
 }
 
 fn push_int(out: &mut String, i: i128) {
-    if i.abs() <= JSON_SAFE {
+    // unsigned_abs, not abs: `i128::MIN` has no positive counterpart, so
+    // `abs()` overflows there. In release that wraps back to `i128::MIN`, which
+    // compares under the threshold, and the HUGEINT minimum went out as a bare
+    // JSON number — the exact silent-reprecision failure this function exists
+    // to prevent, on a value any `SELECT (-170141183460469231731687303715884105728)::HUGEINT`
+    // produces. In debug it panicked instead.
+    if i.unsigned_abs() <= JSON_SAFE as u128 {
         out.push_str(&i.to_string());
     } else {
         push_json_string(out, &i.to_string());
@@ -1739,7 +1940,7 @@ fn bit_string(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(data.len() * 8);
     for (i, byte) in data.iter().enumerate() {
         for bit in (0..8).rev() {
-            if i * 8 + (7 - bit) >= skip || i > 0 {
+            if i * 8 + (7 - bit) >= skip {
                 out.push(if byte >> bit & 1 == 1 { '1' } else { '0' });
             }
         }
@@ -1878,15 +2079,54 @@ mod tests {
             "SELECT ';' AS semi",
             "SELECT 'it''s; fine'",
             "SELECT E'a\\'; b'",
+            "SELECT e'a\\'; b'",
+            "SELECT (E'a\\'; b')",
             r#"SELECT 1 AS "a;b""#,
             "SELECT $$a; b$$",
             "SELECT $tag$a; b$tag$",
             "SELECT 1 -- trailing; comment",
             "/* a; b */ SELECT 1",
             "/* a /* nested; */ b */ SELECT 1",
+            // A keyword ending in `e` butted against a literal. The backslash
+            // is data here, not an escape, and the literal ends at the next
+            // quote — so there is no second statement and nothing to reject.
+            r"SELECT 1 WHERE 'a' LIKE'\'",
         ] {
             assert!(one(sql).is_ok(), "should accept: {sql}");
         }
+    }
+
+    /// Every case here was accepted by the scanner before the `e` in `E'...'`
+    /// was required to be a token of its own, and each one reached DuckDB as
+    /// more than one statement. `duckdb-rs` executes all but the last during
+    /// `prepare`, so accepting these dropped the table.
+    #[test]
+    fn rejects_a_keyword_ending_in_e_used_as_an_escape_string() {
+        for sql in [
+            r"SELECT 1 WHERE 'a' LIKE'\'; DROP TABLE orders; SELECT 1",
+            r"SELECT 1 WHERE 'a' ILIKE'\'; DROP TABLE orders",
+            r"SELECT 'a' LIKE 'b' ESCAPE'\'; DROP TABLE orders",
+            r"SELECT date'2020-01-01'; DROP TABLE orders",
+            r"SELECT time'12:00:00'; DROP TABLE orders",
+            // `$1` is a bind parameter, not a dollar-quote tag, so the
+            // terminator between these markers is a real one.
+            "SELECT $1$; DROP TABLE orders; $1$",
+        ] {
+            assert!(one(sql).is_err(), "should reject: {sql}");
+        }
+    }
+
+    /// The tail after a terminator is checked once. When it was re-checked on
+    /// every following byte the cost was Θ(n²) — measured at 80 seconds for
+    /// 800 KB, so the 8 MiB a request may carry ran for hours on the worker
+    /// thread that read it. This finishes instantly or not at all.
+    #[test]
+    fn scans_a_large_trailing_tail_in_linear_time() {
+        let padded = format!("SELECT 1;{}", " ".repeat(4 << 20));
+        assert!(one(&padded).is_ok());
+        let mut trailing = format!("SELECT 1;{}", " ".repeat(4 << 20));
+        trailing.push('x');
+        assert!(one(&trailing).is_err());
     }
 
     #[test]
