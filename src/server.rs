@@ -640,18 +640,34 @@ fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) {
 /// Rolling back is the only correct choice here: the client that opened the
 /// transaction has no way to commit it, since its next request will land on a
 /// different connection.
-fn reset_transaction(conn: &Connection) {
-    if !conn.is_autocommit() {
+fn reset_transaction(conn: &Connection, force: bool) {
+    // `force` exists because is_autocommit() is not sufficient on its own. A
+    // query abandoned mid-stream — the client hung up, or a row failed to
+    // encode — can leave the connection in a transaction that DuckDB will not
+    // admit to through that flag, and the next statement on it comes back
+    // "Current transaction is aborted (please ROLLBACK)" for the life of the
+    // process. Checking the flag alone made this look fixed while abandoned
+    // streams kept poisoning connections; it reproduced as 14 of 40 requests
+    // failing after a burst of client hangups.
+    //
+    // The flag is still consulted on the common path so an ordinary request
+    // does not pay for an extra statement. Only a job that ended abnormally
+    // pays, and that one has to be certain.
+    if force || !conn.is_autocommit() {
         let _ = conn.execute_batch("ROLLBACK");
     }
 }
 
 fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
+    // Set whenever a job ends any way other than running to completion, so the
+    // next one rolls back unconditionally rather than trusting a flag.
+    let mut dirty = false;
     for job in jobs {
         // Before, not after: a job can leave the loop by several paths, and
         // this way none of them can skip the reset. The check is a field read
         // when there is nothing to undo, which is every ordinary request.
-        reset_transaction(&conn);
+        reset_transaction(&conn, dirty);
+        dirty = false;
 
         let Job { sql, params, ready, body } = job;
         let started = Instant::now();
@@ -659,6 +675,7 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
         let stmt = match conn.prepare(&sql) {
             Ok(s) => s,
             Err(e) => {
+                dirty = true;
                 let _ = ready.send(Err(e.to_string()));
                 continue;
             }
@@ -667,6 +684,7 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
         let mut rows = match stmt.query(params_from_iter(params.iter())) {
             Ok(r) => r,
             Err(e) => {
+                dirty = true;
                 let _ = ready.send(Err(e.to_string()));
                 continue;
             }
@@ -706,6 +724,7 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
         }
 
         if ready.send(Ok(())).is_err() {
+            dirty = true;
             continue;
         }
 
@@ -800,6 +819,9 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
             }
         }
 
+        // An abandoned or failed stream is the case that poisons a connection.
+        dirty = dirty || gone;
+
         if !gone {
             buf.push_str(&format!(
                 r#"{{"type":"end","rowCount":{},"timeMs":{}}}"#,
@@ -811,8 +833,9 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
         }
     }
     // And once more on the way out, so a connection going back to the pool for
-    // the next harbor_serve is clean too.
-    reset_transaction(&conn);
+    // the next harbor_serve is clean too. Unconditional here: this runs once
+    // per server lifetime, so the extra statement costs nothing.
+    reset_transaction(&conn, true);
     conn
 }
 
