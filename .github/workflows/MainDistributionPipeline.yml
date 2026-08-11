@@ -2,10 +2,12 @@
 # This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension
 #
 name: Main Extension Distribution Pipeline
+# Manual / tag-only while we are iterating: local osx_arm64 builds are
+# ~20s (`make release`), so running the full pipeline on every push is
+# pure latency. Push a v* tag or hit "Run workflow" when you want binaries.
 on:
   push:
-    branches: [main]
-  pull_request:
+    tags: ['v*']
   workflow_dispatch:
 
 concurrency:
