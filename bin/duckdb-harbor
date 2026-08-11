@@ -7,9 +7,14 @@
 #   bin/duckdb-harbor mydata.db --bind 0.0.0.0     listen beyond loopback
 #   bin/duckdb-harbor mydata.db --token secret     set the bearer token
 #   bin/duckdb-harbor mydata.db --checkpoint 16MB  raise the WAL checkpoint threshold
+#   bin/duckdb-harbor mydata.db --extension ./harbor.duckdb_extension
 #
 # With no --token, harbor mints one and prints it at startup; that is the only
 # time it is shown. HARBOR_TOKEN is honoured if set.
+#
+# The extension is looked for beside this script, then in a built tree, then in
+# ~/.duckdb/extensions. Running a downloaded release build needs no source tree
+# at all: point --extension at it, or set HARBOR_EXTENSION.
 #
 # checkpoint_threshold defaults to 1MB here rather than DuckDB's 16MB. This
 # launcher serves one database to a long-lived server, and at 16MB a modest
@@ -27,7 +32,11 @@
 set -euo pipefail
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-ext="$here/build/release/harbor.duckdb_extension"
+
+# Nothing here needs a build tree. A downloaded release artifact sitting beside
+# the script, or named through --extension / HARBOR_EXTENSION, works the same
+# way: compiling is one way to obtain the file, not a requirement for using it.
+ext="${HARBOR_EXTENSION:-}"
 
 db=""
 bind="127.0.0.1"
@@ -36,26 +45,74 @@ token="${HARBOR_TOKEN:-}"
 workers=""
 checkpoint="1MB"
 
+# Every flag takes a value, so say so rather than letting `set -u` abort with
+# bash's own "$2: unbound variable" — that reads like a bug in this script.
+need() {
+  [[ $# -ge 2 ]] || { echo "duckdb-harbor: $1 needs a value" >&2; exit 2; }
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --bind)    bind="$2"; shift 2 ;;
-    --port)    port="$2"; shift 2 ;;
-    --token)   token="$2"; shift 2 ;;
-    --workers) workers="$2"; shift 2 ;;
-    --checkpoint) checkpoint="$2"; shift 2 ;;
+    --bind)       need "$@"; bind="$2"; shift 2 ;;
+    --port)       need "$@"; port="$2"; shift 2 ;;
+    --token)      need "$@"; token="$2"; shift 2 ;;
+    --workers)    need "$@"; workers="$2"; shift 2 ;;
+    --checkpoint) need "$@"; checkpoint="$2"; shift 2 ;;
+    --extension)  need "$@"; ext="$2"; shift 2 ;;
     -h|--help) sed -n '3,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --)        shift; [[ $# -eq 1 ]] || { echo "duckdb-harbor: expected one database path after --" >&2; exit 2; }
+               db="$1"; shift ;;
     -*)        echo "duckdb-harbor: unknown option $1" >&2; exit 2 ;;
-    *)         db="$1"; shift ;;
+    # Silently keeping the last of several paths means `duckdb-harbor prod.db
+    # staging.db` serves staging and says nothing about it.
+    *)         [[ -z "$db" ]] || { echo "duckdb-harbor: more than one database given ($db, $1)" >&2; exit 2; }
+               db="$1"; shift ;;
   esac
 done
 
 if [[ -z "$db" ]]; then
-  echo "usage: duckdb-harbor <database.db> [--bind HOST] [--port N] [--token T] [--workers N] [--checkpoint SIZE]" >&2
+  echo "usage: duckdb-harbor <database.db> [--bind HOST] [--port N] [--token T] [--workers N] [--checkpoint SIZE] [--extension PATH]" >&2
   exit 2
 fi
 
-if [[ ! -f "$ext" ]]; then
-  echo "harbor: extension not built — run 'make release' in $here" >&2
+# port and workers land in the SQL unquoted, because they are numbers there and
+# quoting them would make them strings. That makes validating them here the only
+# thing standing between a config value and arbitrary SQL: --workers '2); DROP
+# TABLE sites; CALL harbor_stop(' used to reach DuckDB as three statements and
+# run all of them. Anything a wrapper might forward — a systemd unit, a Helm
+# value, a CI matrix entry — arrives through exactly this path.
+[[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || {
+  echo "duckdb-harbor: --port must be a number from 1 to 65535, got '$port'" >&2; exit 2; }
+if [[ -n "$workers" ]]; then
+  [[ "$workers" =~ ^[0-9]+$ ]] && (( workers >= 1 )) || {
+    echo "duckdb-harbor: --workers must be a positive number, got '$workers'" >&2; exit 2; }
+fi
+
+# A path that is not there is not an empty database to be created. duckdb makes
+# one silently, so a typo'd path or a volume that failed to mount comes up
+# healthy and serves nothing at all.
+if [[ ! -e "$db" ]]; then
+  echo "duckdb-harbor: no database at $db" >&2
+  echo "  (create it first: duckdb '$db' -c 'CHECKPOINT')" >&2
+  exit 1
+fi
+
+if [[ -z "$ext" ]]; then
+  for candidate in \
+    "$here/bin/harbor.duckdb_extension" \
+    "$here/harbor.duckdb_extension" \
+    "$here/build/release/harbor.duckdb_extension" \
+    "$HOME/.duckdb/extensions/harbor.duckdb_extension"
+  do
+    [[ -f "$candidate" ]] && { ext="$candidate"; break; }
+  done
+fi
+
+if [[ -z "$ext" || ! -f "$ext" ]]; then
+  echo "duckdb-harbor: no harbor.duckdb_extension found" >&2
+  echo "  download one for your platform from the releases page and pass" >&2
+  echo "  --extension /path/to/harbor.duckdb_extension (or set HARBOR_EXTENSION)," >&2
+  echo "  or build one here with 'make release'" >&2
   exit 1
 fi
 
@@ -64,13 +121,18 @@ if ! command -v duckdb >/dev/null 2>&1; then
   exit 1
 fi
 
-# Build the argument list rather than interpolating into SQL: a token with a
-# quote in it should be a token, not a syntax error.
+# Quote-double every value that goes into SQL as a string: a token with a quote
+# in it should be a token, not a syntax error. port and workers are validated
+# above instead, because they go in as numbers.
 args="bind := '${bind//\'/\'\'}', port := $port"
 [[ -n "$token"   ]] && args="$args, token := '${token//\'/\'\'}'"
 [[ -n "$workers" ]] && args="$args, workers := $workers"
 
 # -unsigned is required: harbor is not signed by DuckDB's extension registry.
+#
+# -no-init keeps ~/.duckdbrc out of the served process. An rc that ATTACHes a
+# database or sets memory_limit would otherwise change what this service serves,
+# on one machine and not another, with nothing in the logs to say so.
 #
 # CHECKPOINT comes after harbor_wait, and it has to. While harbor_wait is
 # blocked it is a running query, and a running query is an open transaction
@@ -78,9 +140,9 @@ args="bind := '${bind//\'/\'\'}', port := $port"
 # with one of those outstanding, and FORCE CHECKPOINT waits for a transaction
 # that by definition never finishes. Once harbor_wait returns, the workers are
 # stopped and nothing else is in flight, so the WAL folds cleanly.
-exec duckdb -unsigned "$db" -c "
+exec duckdb -unsigned -no-init "$db" -c "
   SET checkpoint_threshold = '${checkpoint//\'/\'\'}';
-  LOAD '$ext';
+  LOAD '${ext//\'/\'\'}';
   CALL harbor_serve($args);
   CALL harbor_wait();
   CHECKPOINT;
