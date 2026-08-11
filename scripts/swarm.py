@@ -91,7 +91,7 @@ class Client:
                 if not self.keepalive:
                     self.close()
                 elapsed = time.perf_counter() - started
-                lines = [json.loads(l) for l in payload.splitlines() if l.strip()]
+                lines = [json.loads(l) for l in payload.split("\n") if l.strip()]
                 return resp.status, elapsed, lines
             except Exception as e:
                 self.close()

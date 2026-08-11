@@ -276,8 +276,16 @@ eq "DATE is ISO" "str:2026-08-11" \
    "$(post "SELECT '2026-08-11'::DATE AS d" | nd 'typed')"
 eq "NULL is JSON null" "NoneType:None" \
    "$(post 'SELECT NULL::VARCHAR AS v' | nd 'typed')"
-eq "non-finite DOUBLE degrades to null" "NoneType:None" \
+# JSON has no Infinity, and null is the wrong stand-in: it makes an overflow
+# indistinguishable from a missing value. Quoted, the distinction survives and
+# a client can decide what to do with it. The C++ harbor does the same, and
+# SPEC 5.4 requires it.
+eq "non-finite DOUBLE is a quoted Infinity" "str:Infinity" \
    "$(post "SELECT 'inf'::DOUBLE AS f" | nd 'typed')"
+eq "negative infinity keeps its sign" "str:-Infinity" \
+   "$(post "SELECT '-inf'::DOUBLE AS f" | nd 'typed')"
+eq "NaN is quoted too" "str:NaN" \
+   "$(post "SELECT 'nan'::DOUBLE AS f" | nd 'typed')"
 eq "LIST nests its child type" "VARCHAR" \
    "$(post "SELECT ['a','b'] AS l" | nd 'cols[0]["child"]["duckdbType"]')"
 eq "LIST value round-trips" "True" \

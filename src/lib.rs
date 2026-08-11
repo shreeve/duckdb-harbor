@@ -26,6 +26,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+mod keywords;
 mod server;
 
 use server::DEFAULT_MAX_INFLIGHT;

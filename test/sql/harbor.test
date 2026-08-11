@@ -1,10 +1,244 @@
 # name: test/sql/harbor.test
-# description: harbor extension load smoke
+# description: harbor's SQL surface — the four functions, their arguments, and
+#              the lifecycle rules that hold between them
 # group: [sql]
+#
+# This covers what a shell script driving HTTP cannot: the behaviour of the
+# functions themselves. Argument validation, the errors for calling things in
+# the wrong order, and the fact that a stopped server can be started again.
+#
+# Ports here are in the high 9600s to stay clear of anything a developer is
+# likely to be running, and each test that binds uses its own.
 
 require harbor
 
+# ---------------------------------------------------------------------------
+# harbor_version
+# ---------------------------------------------------------------------------
+
 query I
-SELECT CASE WHEN length((SELECT version FROM harbor_version())) > 0 THEN 1 ELSE 0 END;
+SELECT count(*) FROM harbor_version();
 ----
 1
+
+# The version is the crate version, so it tracks Cargo.toml rather than a build
+# hash. A non-empty answer proves the extension loaded and its symbols resolve.
+query I
+SELECT CASE WHEN regexp_matches(version, '^\d+\.\d+\.\d+$') THEN 1 ELSE 0 END FROM harbor_version();
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT * FROM harbor_version() UNION ALL SELECT * FROM harbor_version());
+----
+2
+
+# ---------------------------------------------------------------------------
+# Lifecycle errors, before anything is serving
+# ---------------------------------------------------------------------------
+
+statement error
+CALL harbor_stop();
+----
+harbor is not serving
+
+statement error
+CALL harbor_wait();
+----
+harbor is not serving
+
+# ---------------------------------------------------------------------------
+# harbor_serve argument validation — rejected at bind, so nothing is bound and
+# no socket is left behind
+# ---------------------------------------------------------------------------
+
+statement error
+CALL harbor_serve(port := 70000);
+----
+out of range
+
+statement error
+CALL harbor_serve(port := -1);
+----
+out of range
+
+statement error
+CALL harbor_serve(port := 9601, workers := 0);
+----
+workers must be at least 1
+
+statement error
+CALL harbor_serve(port := 9601, workers := -3);
+----
+workers must be at least 1
+
+# A rejected bind must not have started anything.
+statement error
+CALL harbor_stop();
+----
+harbor is not serving
+
+# ---------------------------------------------------------------------------
+# Serve, stop, and serve again
+#
+# The second serve is the point: worker connections are opened once, at load,
+# and handed back to the pool on stop. If they were not returned, this fails.
+# ---------------------------------------------------------------------------
+
+query I
+SELECT CASE WHEN address LIKE 'http://127.0.0.1:9602%' THEN 1 ELSE 0 END
+FROM harbor_serve(port := 9602, token := 'test-token');
+----
+1
+
+# One server per process.
+statement error
+CALL harbor_serve(port := 9603, token := 'test-token');
+----
+already serving
+
+query I
+SELECT CASE WHEN address = '127.0.0.1:9602' THEN 1 ELSE 0 END FROM harbor_stop();
+----
+1
+
+statement error
+CALL harbor_stop();
+----
+harbor is not serving
+
+query I
+SELECT CASE WHEN address LIKE 'http://127.0.0.1:9604%' THEN 1 ELSE 0 END
+FROM harbor_serve(port := 9604, token := 'test-token');
+----
+1
+
+statement ok
+CALL harbor_stop();
+
+# ---------------------------------------------------------------------------
+# Tokens
+# ---------------------------------------------------------------------------
+
+# With no token harbor mints one and shows it once. The address line carries it
+# so there is no path where a server starts with no credential and no notice.
+# Both claims are checked in one call, because a second harbor_serve without
+# an intervening stop is itself an error.
+query II
+SELECT CASE WHEN address LIKE '%token=%' THEN 1 ELSE 0 END,
+       -- 24 bytes of entropy, hex-encoded
+       CASE WHEN length(regexp_extract(address, 'token=([0-9a-f]+)', 1)) = 48 THEN 1 ELSE 0 END
+FROM harbor_serve(port := 9605);
+----
+1	1
+
+statement ok
+CALL harbor_stop();
+
+# An empty token is the explicit opt-out, and then nothing is echoed.
+query I
+SELECT CASE WHEN address LIKE '%token=%' THEN 1 ELSE 0 END
+FROM harbor_serve(port := 9606, token := '');
+----
+0
+
+statement ok
+CALL harbor_stop();
+
+# A supplied token is never echoed back.
+query I
+SELECT CASE WHEN address LIKE '%token=%' THEN 1 ELSE 0 END
+FROM harbor_serve(port := 9607, token := 'sekrit');
+----
+0
+
+statement ok
+CALL harbor_stop();
+
+# ---------------------------------------------------------------------------
+# bind
+# ---------------------------------------------------------------------------
+
+query I
+SELECT CASE WHEN address LIKE 'http://127.0.0.1:9608%' THEN 1 ELSE 0 END
+FROM harbor_serve(bind := '127.0.0.1', port := 9608, token := 't');
+----
+1
+
+statement ok
+CALL harbor_stop();
+
+statement error
+CALL harbor_serve(bind := 'not.a.real.host.invalid', port := 9609, token := 't');
+----
+cannot bind
+
+# A failed bind returns its connections, so the next serve still works.
+query I
+SELECT CASE WHEN address LIKE 'http://%' THEN 1 ELSE 0 END
+FROM harbor_serve(port := 9610, token := 't');
+----
+1
+
+statement ok
+CALL harbor_stop();
+
+# ---------------------------------------------------------------------------
+# workers
+#
+# The pool is fixed at load, so a request for more workers than exist is
+# clamped rather than refused — asking for parallelism you cannot have is not
+# an error, it just does not get you more.
+# ---------------------------------------------------------------------------
+
+query I
+SELECT CASE WHEN address LIKE 'http://%' THEN 1 ELSE 0 END
+FROM harbor_serve(port := 9611, token := 't', workers := 1);
+----
+1
+
+statement ok
+CALL harbor_stop();
+
+query I
+SELECT CASE WHEN address LIKE 'http://%' THEN 1 ELSE 0 END
+FROM harbor_serve(port := 9612, token := 't', workers := 1000);
+----
+1
+
+statement ok
+CALL harbor_stop();
+
+# ---------------------------------------------------------------------------
+# The database is still usable while harbor is serving it
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE lifecycle_check(i INTEGER);
+
+statement ok
+INSERT INTO lifecycle_check VALUES (1), (2), (3);
+
+statement ok
+CALL harbor_serve(port := 9613, token := 't');
+
+query I
+SELECT count(*) FROM lifecycle_check;
+----
+3
+
+statement ok
+INSERT INTO lifecycle_check VALUES (4);
+
+query I
+SELECT count(*) FROM lifecycle_check;
+----
+4
+
+statement ok
+CALL harbor_stop();
+
+query I
+SELECT count(*) FROM lifecycle_check;
+----
+4

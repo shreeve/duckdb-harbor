@@ -1,0 +1,115 @@
+#
+# The suites that live in this repository, as opposed to the distribution
+# pipeline in MainDistributionPipeline.yml, which builds the extension for
+# every platform and does not run them.
+#
+# Split into two jobs on purpose. The fast one gates a pull request: unit
+# tests, sqllogictest, and the two HTTP suites that answer in under a minute.
+# The slow one — resilience, which kills and restarts the server repeatedly,
+# and the load generator — runs on the main branch and on a nightly schedule,
+# where a five-minute job is not in anybody's way.
+#
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  fast:
+    name: unit, sqllogictest, spec, fuzz
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      # The suites read from a fixture database rather than one they build, so
+      # the CLI has to be here to create it.
+      - name: Install the DuckDB CLI
+        run: |
+          curl -fsSL https://install.duckdb.org | sh
+          echo "$HOME/.duckdb/cli/latest" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: make configure && make release
+
+      # A fixture generated here rather than committed: a binary database in
+      # git would have to be regenerated on every DuckDB storage bump, and the
+      # suites care about the shape of the data, not its provenance.
+      - name: Build the fixture database
+        run: scripts/fixture.sh sample.duckdb
+
+      - name: Unit tests, sqllogictest, spec and fuzz
+        run: SUITES="unit sqllogic spec fuzz" scripts/check.sh
+
+      - name: Server log on failure
+        if: failure()
+        run: cat /tmp/harbor-check.*/server.log 2>/dev/null || true
+
+  slow:
+    name: stress, resilience, load
+    # Pull requests get the fast job; this one runs where a slow job is free.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Install the DuckDB CLI
+        run: |
+          curl -fsSL https://install.duckdb.org | sh
+          echo "$HOME/.duckdb/cli/latest" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: make configure && make release
+
+      - name: Build the fixture database
+        run: scripts/fixture.sh sample.duckdb
+
+      - name: Everything except the differential suite
+        # differential needs the C++ harbor built alongside; it is not a build
+        # dependency of this repository, and check.sh skips it when absent.
+        run: SUITES="stress spec fuzz deploy resilience" scripts/check.sh
+
+      - name: Load test
+        run: |
+          cp sample.duckdb /tmp/load.duckdb
+          bin/harbor /tmp/load.duckdb --port 9496 --token ci --workers 8 &
+          for _ in $(seq 1 40); do curl -sf http://127.0.0.1:9496/health && break; sleep 0.5; done
+          scripts/swarm.py --port 9496 --token ci --levels 1,4,16 --seconds 10 --write-pct 20
+
+      - name: Server log on failure
+        if: failure()
+        run: cat /tmp/harbor-check.*/server.log 2>/dev/null || true

@@ -47,11 +47,64 @@ use std::{
 };
 
 use duckdb::{
-    Connection,
+    Connection, ffi,
+    types::ValueRef,
     core::{LogicalTypeHandle, LogicalTypeId},
     params_from_iter,
     types::{TimeUnit, Value},
 };
+
+use crate::keywords::KEYWORDS;
+
+// duckdb-rs keeps the raw `duckdb_logical_type` private, and two details are
+// reachable only through the C API: an ARRAY's length and an ENUM's value
+// list. `LogicalTypeHandle` is a single-field newtype around that pointer, so
+// a copy of its bytes is the pointer. The assertion turns a layout change in
+// duckdb-rs into a compile error instead of a crash at runtime.
+const _: () = assert!(
+    std::mem::size_of::<LogicalTypeHandle>() == std::mem::size_of::<ffi::duckdb_logical_type>()
+);
+
+/// Borrow the handle's pointer. The handle keeps ownership; the result must
+/// not outlive it and must not be destroyed.
+fn raw_type(ty: &LogicalTypeHandle) -> ffi::duckdb_logical_type {
+    unsafe { std::mem::transmute_copy(ty) }
+}
+
+fn array_size(ty: &LogicalTypeHandle) -> u64 {
+    unsafe { ffi::duckdb_array_type_array_size(raw_type(ty)) }
+}
+
+fn enum_values(ty: &LogicalTypeHandle) -> Vec<String> {
+    unsafe {
+        let handle = raw_type(ty);
+        let count = ffi::duckdb_enum_dictionary_size(handle) as usize;
+        (0..count)
+            .map(|i| {
+                let ptr = ffi::duckdb_enum_dictionary_value(handle, i as u64);
+                if ptr.is_null() {
+                    return String::new();
+                }
+                let value = std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned();
+                ffi::duckdb_free(ptr as *mut std::ffi::c_void);
+                value
+            })
+            .collect()
+    }
+}
+
+/// Render an identifier the way DuckDB does inside a type string: bare when it
+/// is a simple lowercase identifier and not a keyword, double-quoted
+/// otherwise, with embedded quotes doubled.
+fn quote_identifier(name: &str) -> String {
+    let simple = !name.is_empty()
+        && name.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if simple && KEYWORDS.binary_search(&name).is_err() {
+        return name.to_string();
+    }
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
 use tiny_http::{Header, Method, Request, Response, Server};
 
 /// Bounded number of statements executing at once. Connections may greatly
@@ -571,8 +624,34 @@ fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) {
 /// The DuckDB side. Owns one connection for the life of the server and runs
 /// one statement at a time; concurrency comes from there being several of
 /// these, not from any one of them interleaving work.
+/// Return a connection to autocommit before anything else runs on it.
+///
+/// Pooled connections are handed out per request and are never pinned to a
+/// client, so a transaction cannot usefully span two requests — but a client
+/// can still send `BEGIN`, and DuckDB will honour it. That leaves the
+/// connection inside a transaction for whoever gets it next, and if the
+/// transaction has already failed, every subsequent statement on it comes back
+/// `Current transaction is aborted` for the life of the process. One request
+/// from one careless client would otherwise take a worker out of service
+/// permanently, and with a pool of eight it takes eight such requests to stop
+/// the server answering at all.
+///
+/// Rolling back is the only correct choice here: the client that opened the
+/// transaction has no way to commit it, since its next request will land on a
+/// different connection.
+fn reset_transaction(conn: &Connection) {
+    if !conn.is_autocommit() {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+}
+
 fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
     for job in jobs {
+        // Before, not after: a job can leave the loop by several paths, and
+        // this way none of them can skip the reset. The check is a field read
+        // when there is nothing to undo, which is every ordinary request.
+        reset_transaction(&conn);
+
         let Job { sql, params, ready, body } = job;
         let started = Instant::now();
 
@@ -630,7 +709,14 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
                             buf.push(',');
                         }
                         match row.get_ref(i) {
-                            Ok(v) => emit_value(&mut buf, &Value::from(v), Some(ty)),
+                            // A UNION's tag says which member is set, and
+                            // `Value` drops it — union_value(a := 2) and
+                            // union_value(b := 2) would be indistinguishable.
+                            // The tag is still on the arrow array underneath.
+                            Ok(v) => {
+                                let tag = union_tag(&v);
+                                emit_tagged(&mut buf, tag, &Value::from(v), Some(ty));
+                            }
                             Err(_) => buf.push_str("null"),
                         }
                     }
@@ -672,6 +758,9 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
             let _ = body.send(buf.into_bytes());
         }
     }
+    // And once more on the way out, so a connection going back to the pool for
+    // the next harbor_serve is clean too.
+    reset_transaction(&conn);
     conn
 }
 
@@ -756,7 +845,9 @@ fn emit_column_schema(out: &mut String, name: Option<&str>, ty: &LogicalTypeHand
             emit_column_schema(out, None, &ty.child(0));
         }
         LogicalTypeId::Array => {
-            out.push_str(r#","lossless":true,"child":"#);
+            out.push_str(r#","lossless":true,"arrayLength":"#);
+            out.push_str(&array_size(ty).to_string());
+            out.push_str(r#","child":"#);
             emit_column_schema(out, None, &ty.child(0));
         }
         LogicalTypeId::Struct => {
@@ -769,6 +860,41 @@ fn emit_column_schema(out: &mut String, name: Option<&str>, ty: &LogicalTypeHand
             }
             out.push(']');
         }
+        LogicalTypeId::Map => {
+            // A SQL MAP has no JSON counterpart — its keys need not be strings
+            // — so values go out as pairs and the encoding says so.
+            out.push_str(r#","lossless":true,"keyType":"#);
+            emit_column_schema(out, None, &ty.child(0));
+            out.push_str(r#","valueType":"#);
+            emit_column_schema(out, None, &ty.child(1));
+            out.push_str(r#","encoding":"pairs""#);
+        }
+        LogicalTypeId::Union => {
+            out.push_str(r#","lossless":true,"members":["#);
+            for i in 0..ty.num_children() {
+                if i > 0 {
+                    out.push(',');
+                }
+                emit_column_schema(out, Some(&ty.child_name(i)), &ty.child(i));
+            }
+            out.push(']');
+        }
+        LogicalTypeId::Enum => {
+            out.push_str(r#","lossless":true,"values":["#);
+            for (i, value) in enum_values(ty).iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_string(out, value);
+            }
+            out.push(']');
+        }
+        // TIME WITH TIME ZONE is the one type harbor-ng cannot carry
+        // losslessly: duckdb-rs decodes it to a local time and drops the UTC
+        // offset before harbor ever sees the value, so the offset cannot be
+        // recovered. Saying so is better than emitting a time that silently
+        // means something else.
+        LogicalTypeId::TimeTZ => out.push_str(r#","lossless":false,"encoding":"time-offset-dropped""#),
         _ if is_lossless(id) => out.push_str(r#","lossless":true"#),
         // User-defined and extension types round-trip as text. Saying so
         // explicitly is better than silently handing back a string that
@@ -799,7 +925,6 @@ fn is_lossless(id: LogicalTypeId) -> bool {
             | Uuid
             | Date
             | Time
-            | TimeTZ
             | Timestamp
             | TimestampS
             | TimestampMs
@@ -852,16 +977,25 @@ fn type_name(ty: &LogicalTypeHandle) -> String {
         Interval => "INTERVAL".into(),
         Decimal => format!("DECIMAL({},{})", ty.decimal_width(), ty.decimal_scale()),
         List => format!("{}[]", type_name(&ty.child(0))),
-        Array => format!("{}[{}]", type_name(&ty.child(0)), ty.num_children()),
-        Enum => "ENUM".into(),
+        Array => format!("{}[{}]", type_name(&ty.child(0)), array_size(ty)),
+        Enum => {
+            let values: Vec<String> =
+                enum_values(ty).iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect();
+            format!("ENUM({})", values.join(", "))
+        }
         Struct => {
             let fields: Vec<String> = (0..ty.num_children())
-                .map(|i| format!("{} {}", ty.child_name(i), type_name(&ty.child(i))))
+                .map(|i| format!("{} {}", quote_identifier(&ty.child_name(i)), type_name(&ty.child(i))))
                 .collect();
             format!("STRUCT({})", fields.join(", "))
         }
-        Map => "MAP".into(),
-        Union => "UNION".into(),
+        Map => format!("MAP({}, {})", type_name(&ty.child(0)), type_name(&ty.child(1))),
+        Union => {
+            let members: Vec<String> = (0..ty.num_children())
+                .map(|i| format!("{} {}", quote_identifier(&ty.child_name(i)), type_name(&ty.child(i))))
+                .collect();
+            format!("UNION({})", members.join(", "))
+        }
         SqlNull => "\"NULL\"".into(),
         Geometry => "GEOMETRY".into(),
         Variant => "VARIANT".into(),
@@ -885,6 +1019,38 @@ fn type_name(ty: &LogicalTypeHandle) -> String {
 /// 9007199254740993 gets 9007199254740992 and never finds out.
 const JSON_SAFE: i128 = 9_007_199_254_740_991;
 
+/// The name of the member a UNION value actually holds, if this is one.
+fn union_tag(v: &ValueRef<'_>) -> Option<String> {
+    use duckdb::arrow::{array::{Array, UnionArray}, datatypes::DataType};
+    let ValueRef::Union(column, idx) = v else {
+        return None;
+    };
+    let union = column.as_any().downcast_ref::<UnionArray>()?;
+    let DataType::Union(fields, _) = column.data_type() else {
+        return None;
+    };
+    let type_id = union.type_id(*idx);
+    fields.iter().find(|(id, _)| *id == type_id).map(|(_, field)| field.name().clone())
+}
+
+/// A UNION goes out as {"tag": member, "value": ...}; everything else is just
+/// its value.
+fn emit_tagged(out: &mut String, tag: Option<String>, v: &Value, ty: Option<&LogicalTypeHandle>) {
+    match (tag, v) {
+        (Some(name), Value::Union(inner)) => {
+            let member = ty.and_then(|t| {
+                (0..t.num_children()).find(|i| t.child_name(*i) == name).map(|i| t.child(i))
+            });
+            out.push_str(r#"{"tag":"#);
+            push_json_string(out, &name);
+            out.push_str(r#","value":"#);
+            emit_value(out, inner, member.as_ref());
+            out.push('}');
+        }
+        (_, value) => emit_value(out, value, ty),
+    }
+}
+
 fn emit_value(out: &mut String, v: &Value, ty: Option<&LogicalTypeHandle>) {
     let id = ty.and_then(|t| t.try_id().ok());
     match v {
@@ -906,7 +1072,7 @@ fn emit_value(out: &mut String, v: &Value, ty: Option<&LogicalTypeHandle>) {
             }
         }
         Value::UHugeInt(i) => {
-            if *i as i128 as u128 == *i && (*i as i128) <= JSON_SAFE {
+            if *i <= JSON_SAFE as u128 {
                 out.push_str(&i.to_string());
             } else {
                 push_json_string(out, &i.to_string());
@@ -916,6 +1082,7 @@ fn emit_value(out: &mut String, v: &Value, ty: Option<&LogicalTypeHandle>) {
         Value::Double(f) => push_float(out, *f),
         Value::Decimal(d) => push_json_string(out, &d.to_string()),
         Value::Text(s) | Value::Enum(s) => push_json_string(out, s),
+        Value::Blob(b) if id == Some(LogicalTypeId::Bit) => push_json_string(out, &bit_string(b)),
         Value::Blob(b) | Value::Geometry(b) => push_json_string(out, &base64(b)),
         Value::Date32(d) => push_json_string(out, &fmt_date(*d)),
         Value::Time64(unit, v) => push_json_string(out, &fmt_time(to_nanos(*unit, *v))),
@@ -992,20 +1159,58 @@ fn push_int(out: &mut String, i: i128) {
 }
 
 fn push_float(out: &mut String, f: f64) {
-    // JSON has no NaN or Infinity. Null is the only honest encoding.
-    if f.is_finite() {
-        out.push_str(&f.to_string());
+    // JSON has no NaN or Infinity, but null is not the answer: it is
+    // indistinguishable from SQL NULL, so a client cannot tell a missing value
+    // from a division that overflowed. The names go out as strings instead.
+    if f.is_nan() {
+        return push_json_string(out, "NaN");
+    }
+    if f.is_infinite() {
+        return push_json_string(out, if f > 0.0 { "Infinity" } else { "-Infinity" });
+    }
+    // Rust's Display never switches to exponent notation for large magnitudes,
+    // so f64::MAX would go out as 309 digits. Switch at 1e21, which is where
+    // JavaScript's own number formatting switches, so the text a client reads
+    // is the text it would have produced itself.
+    if f != 0.0 && f.abs() >= 1e21 {
+        let formatted = format!("{f:e}");
+        match formatted.split_once('e') {
+            Some((mantissa, exponent)) if !exponent.starts_with('-') => {
+                out.push_str(mantissa);
+                out.push_str("e+");
+                out.push_str(exponent);
+            }
+            _ => out.push_str(&formatted),
+        }
     } else {
-        out.push_str("null");
+        out.push_str(&f.to_string());
     }
 }
 
 fn push_json_string(out: &mut String, s: &str) {
     // serde_json owns the escaping rules, including the ones that are easy to
     // get wrong (control characters, lone surrogates).
-    match serde_json::to_string(s) {
-        Ok(encoded) => out.push_str(&encoded),
-        Err(_) => out.push_str("\"\""),
+    let encoded = match serde_json::to_string(s) {
+        Ok(encoded) => encoded,
+        Err(_) => return out.push_str("\"\""),
+    };
+    // One rule serde_json correctly does not apply, because it is about the
+    // container rather than the value: U+2028 LINE SEPARATOR and U+2029
+    // PARAGRAPH SEPARATOR are legal inside a JSON string, but this is a
+    // newline-delimited format and they are line terminators to every
+    // Unicode-aware line splitter. Left raw, one row is read as two — and the
+    // half that is left over is not valid JSON, so a client sees a parse error
+    // whose cause is nowhere near where it happened. Escaping them costs a
+    // scan that almost always finds nothing.
+    if !encoded.contains('\u{2028}') && !encoded.contains('\u{2029}') {
+        return out.push_str(&encoded);
+    }
+    for ch in encoded.chars() {
+        match ch {
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            other => out.push(other),
+        }
     }
 }
 
@@ -1078,11 +1283,38 @@ fn push_fraction(out: &mut String, nanos: i64) {
     if nanos == 0 {
         return;
     }
-    if nanos % 1_000 == 0 {
-        out.push_str(&format!(".{:06}", nanos / 1_000));
+    // Six digits for microsecond precision, nine when the value actually
+    // carries nanoseconds. Trailing zeros come off either way: a TIMESTAMP_MS
+    // of .123 should read as .123, not .123000.
+    let mut digits = if nanos % 1_000 == 0 {
+        format!("{:06}", nanos / 1_000)
     } else {
-        out.push_str(&format!(".{nanos:09}"));
+        format!("{nanos:09}")
+    };
+    while digits.ends_with('0') {
+        digits.pop();
     }
+    out.push('.');
+    out.push_str(&digits);
+}
+
+/// DuckDB stores BIT as a leading pad-count byte followed by the bits, most
+/// significant first. Without this a bit string goes out base64-encoded, which
+/// is not wrong so much as unusable.
+fn bit_string(bytes: &[u8]) -> String {
+    let Some((&padding, data)) = bytes.split_first() else {
+        return String::new();
+    };
+    let skip = padding as usize;
+    let mut out = String::with_capacity(data.len() * 8);
+    for (i, byte) in data.iter().enumerate() {
+        for bit in (0..8).rev() {
+            if i * 8 + (7 - bit) >= skip || i > 0 {
+                out.push(if byte >> bit & 1 == 1 { '1' } else { '0' });
+            }
+        }
+    }
+    out
 }
 
 /// DuckDB stores UUID as a HUGEINT with the high bit flipped, so that the

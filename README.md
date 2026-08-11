@@ -90,17 +90,55 @@ pressure, not throughput. Statements past the limit queue; past the queue
 bound they get `503`. Set `threads` and `memory_limit` per process,
 especially when several databases share a machine.
 
+## Known limitations
+
+**`TIME WITH TIME ZONE` loses its offset.** `duckdb-rs` decodes the value to a
+wall-clock time before harbor sees it, discarding the UTC offset; there is no
+way to recover it at this layer. Rather than emit a time that silently means
+something else, harbor marks the column `lossless: false` with
+`encoding: "time-offset-dropped"`, so a client can detect the loss instead of
+trusting a wrong answer. The C++ harbor preserves the offset. Cast to
+`TIMESTAMP WITH TIME ZONE` if you need it.
+
+## Testing
+
+`make check` runs everything; `make check_quick` runs the subset that finishes
+in under a minute. `scripts/fixture.sh` builds the database they read, either
+from a real CSV export or synthesised deterministically.
+
+| suite | what it establishes |
+|---|---|
+| `cargo test` | the single-statement scanner, over comments, string literals, `E'…'`, quoted identifiers and dollar-quoting |
+| `test/sql/harbor.test` | the SQL surface: argument validation, lifecycle ordering, that a stopped server restarts, that the database stays usable while served |
+| `scripts/stress.sh` | 109 end-to-end assertions against oracle values read from DuckDB before the server takes the file lock |
+| `scripts/spec_types.py` | 80 assertions of the wire format against SPEC §5.4 as written, not against either implementation |
+| `scripts/fuzz.py` | 14,000 random values per run, checked against Python's `datetime`/`base64` rather than against harbor |
+| `scripts/differential.py` | 202 cases sent to both the C++ harbor and this one, classified `same` / deliberate improvement / unexplained |
+| `scripts/resilience.sh` | SIGKILL and WAL replay, descriptor and memory leaks over a soak, abandoned streams, idle connections, slow readers, restart churn |
+| `scripts/validate-deployment.sh` | read-only, against a server that is already running — including production |
+| `scripts/swarm.py` | concurrent load at rising client counts, mixed reads and writes |
+
+Two of these are worth explaining.
+
+The **differential** suite treats the C++ harbor as the reference for what
+clients already expect, not as the specification. Where the two disagree, the
+divergence has to be recorded in the runner with a reason before the run goes
+green — so "improved" is a decision someone made, never something that drifted.
+It currently records four: the `TIME WITH TIME ZONE` limitation above, and
+three cases where the C++ harbor is wrong (it answers `500` to a non-ASCII
+string literal and `400` to a non-ASCII bound parameter; both were found by
+this runner).
+
+The **fuzz** and **spec** suites deliberately never compare harbor to harbor.
+An oracle that shares an implementation with the thing it is checking confirms
+only that the code is self-consistent.
+
 ## Status
 
 **Early.** The Rust rewrite of a working C++ extension
 ([`duckdb-harbor`](https://github.com/shreeve/duckdb-harbor), v0.5.4), which
 remains the version to use today. This repository starts at **0.7.0** to make
 the lineage obvious.
-
-Carried over from the C++ implementation on day one: the golden suites in
-`scripts/`. They drive the server over HTTP with `curl` and do not care what
-language is behind the socket, so they are the acceptance harness for this
-rewrite rather than tests to be written later.
 
 ## Versioning
 

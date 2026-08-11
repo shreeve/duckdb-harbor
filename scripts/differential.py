@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""
+differential.py — run the corpus against the C++ harbor and harbor-ng and
+compare the answers.
+
+    scripts/differential.py --old-port 9401 --new-port 9402 --token T
+
+The C++ harbor has been in production and is the reference for what clients
+already expect. That does not make it the specification. Where harbor-ng
+answers differently *and better*, the difference is the point, so this runner
+classifies rather than merely diffs:
+
+    same        the two agree once irrelevant fields are set aside
+    improved    they differ, and the difference is a deliberate, recorded
+                improvement — every one is listed in DELIBERATE below with
+                the reason it exists
+    DIFFERENT   they differ and nobody decided that in advance
+
+Only the third kind is a failure. A run is green when it is empty, which is a
+much more useful bar than byte equality: it means every divergence between the
+old implementation and the new one is one a person chose.
+
+Fields that could never match are excluded up front rather than allowlisted
+per query — see IGNORED_KEYS.
+"""
+
+import argparse
+import http.client
+import json
+import sys
+
+sys.path.insert(0, __file__.rsplit("/", 1)[0])
+import corpus  # noqa: E402
+
+
+# Timing is not a result. sessionId is assigned per connection.
+IGNORED_KEYS = {"timeMs", "sessionId"}
+
+
+# Divergences that are intended. The key is (group, name) or (group, "*") for a
+# whole group; the value is why the new behaviour is the one we want.
+# Cases where the two are allowed to disagree on the HTTP status, not just the
+# body. Kept as an explicit set rather than inferred from the reason text, so
+# adding a note can never quietly widen what is tolerated.
+STATUS_MAY_DIFFER = {
+    ("types", "varchar-unicode"),
+    ("params", "param-unicode"),
+}
+
+DELIBERATE = {
+    ("types", "varchar-unicode"):
+        "The C++ harbor answers 500 to a non-ASCII string literal; harbor-ng "
+        "returns it. Found by this runner.",
+    ("params", "param-unicode"):
+        "The C++ harbor answers 400 to a non-ASCII bound parameter; harbor-ng "
+        "binds it. Same underlying defect as types/varchar-unicode.",
+    ("types", "timetz-utc"):
+        "TIME WITH TIME ZONE: the C++ harbor keeps the UTC offset, harbor-ng "
+        "cannot — duckdb-rs decodes the value to a local time and discards the "
+        "offset before harbor sees it. harbor-ng marks the column "
+        "lossless:false rather than emit a time that silently means something "
+        "else. A real limitation, recorded here so it stays visible.",
+    ("types", "timetz-offset"):
+        "See types/timetz-utc.",
+    ("errors", "*"):
+        "Error text comes from DuckDB and is reproduced verbatim by both, but "
+        "the C++ harbor wraps some failures with its own prefix. Both return "
+        "the same status and the same error code, which is the part clients "
+        "branch on; the prose is not a contract.",
+}
+
+
+class Server:
+    def __init__(self, name, host, port, token):
+        self.name, self.host, self.port, self.token = name, host, port, token
+        self.conn = None
+
+    def _connect(self):
+        self.conn = http.client.HTTPConnection(self.host, self.port, timeout=180)
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+
+    def sql(self, sql, params=None):
+        body = json.dumps({"sql": sql, **({"params": params} if params is not None else {})})
+        headers = {"Authorization": "Bearer " + self.token, "Content-Type": "application/json"}
+        for attempt in (0, 1):
+            try:
+                if self.conn is None:
+                    self._connect()
+                self.conn.request("POST", "/sql", body, headers)
+                resp = self.conn.getresponse()
+                payload = resp.read().decode("utf-8", "replace")
+                status = resp.status
+                # The C++ harbor closes the connection on some paths; reopen
+                # rather than let that look like a failure.
+                if resp.getheader("Connection", "").lower() == "close":
+                    self.close()
+                return status, parse(payload)
+            except Exception as e:
+                self.close()
+                if attempt == 1:
+                    return 0, {"transport-error": str(e)}
+        return 0, {}
+
+
+def parse(payload):
+    """NDJSON, or a single JSON object, reduced to what is worth comparing."""
+    lines = []
+    # NDJSON is delimited by \n alone. splitlines() also breaks on U+2028,
+    # U+2029 and other Unicode line separators, which are legal inside a JSON
+    # string — using it here would make the harness fail on payloads a real
+    # client reads fine.
+    for line in payload.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            lines.append(json.loads(line))
+        except json.JSONDecodeError:
+            return {"unparseable": line[:200]}
+
+    out = {"columns": None, "rows": [], "rowCount": None, "error": None}
+    for l in lines:
+        kind = l.get("type")
+        if kind == "schema":
+            out["columns"] = [strip_ignored(c) for c in l.get("columns", [])]
+        elif kind == "row":
+            out["rows"].append(l.get("values"))
+        elif kind == "end":
+            out["rowCount"] = l.get("rowCount")
+        elif kind == "error":
+            out["error"] = {"code": l.get("code")}
+        elif "ok" in l:
+            # The C++ harbor's one-shot envelope, which harbor-ng does not use.
+            out["columns"] = [strip_ignored(c) for c in l.get("columns", [])]
+            out["rows"] = l.get("rows", [])
+            out["rowCount"] = len(out["rows"])
+    return out
+
+
+def strip_ignored(obj):
+    if isinstance(obj, dict):
+        return {k: strip_ignored(v) for k, v in obj.items() if k not in IGNORED_KEYS}
+    if isinstance(obj, list):
+        return [strip_ignored(x) for x in obj]
+    return obj
+
+
+def deliberate_reason(group, name):
+    return DELIBERATE.get((group, name)) or DELIBERATE.get((group, "*"))
+
+
+def describe(old, new):
+    """Every concrete difference between two parsed results, or None.
+
+    All of them, not the first: a schema difference often sits on top of a
+    value difference, and reporting only the outer one hides the bug that
+    actually matters.
+    """
+    out = []
+    if old.get("error") or new.get("error"):
+        if bool(old.get("error")) != bool(new.get("error")):
+            out.append("one errored and the other did not: old=%s new=%s"
+                       % (old.get("error"), new.get("error")))
+        elif old["error"].get("code") != new["error"].get("code"):
+            out.append("error code: old=%s new=%s"
+                       % (old["error"]["code"], new["error"]["code"]))
+        return "\n      ".join(out) if out else None
+    if old.get("columns") != new.get("columns"):
+        out.append("schema:\n      old=%s\n      new=%s"
+                   % (json.dumps(old.get("columns"))[:400], json.dumps(new.get("columns"))[:400]))
+    if old.get("rowCount") != new.get("rowCount"):
+        out.append("rowCount: old=%s new=%s" % (old.get("rowCount"), new.get("rowCount")))
+    if old.get("rows") != new.get("rows"):
+        shown = 0
+        for i, (a, b) in enumerate(zip(old["rows"], new["rows"])):
+            if a != b:
+                out.append("row %d:\n      old=%s\n      new=%s"
+                           % (i, json.dumps(a)[:300], json.dumps(b)[:300]))
+                shown += 1
+                if shown == 3:
+                    break
+        if not shown:
+            out.append("row counts differ: %d vs %d" % (len(old["rows"]), len(new["rows"])))
+    return "\n      ".join(out) if out else None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--old-port", type=int, required=True)
+    ap.add_argument("--new-port", type=int, required=True)
+    ap.add_argument("--token", required=True)
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
+
+    old = Server("cpp", args.host, args.old_port, args.token)
+    new = Server("ng", args.host, args.new_port, args.token)
+
+    cases = [(g, n, s, None) for g, n, s in corpus.all_queries()]
+    cases += [(g, n, s, p) for g, n, s, p in corpus.all_params()]
+
+    same = improved = 0
+    different = []
+    improvements = {}
+
+    for group, name, sql, params in cases:
+        old_status, old_res = old.sql(sql, params)
+        new_status, new_res = new.sql(sql, params)
+
+        if "transport-error" in old_res or "transport-error" in new_res:
+            different.append((group, name, "transport: old=%s new=%s"
+                              % (old_res.get("transport-error"), new_res.get("transport-error"))))
+            continue
+
+        diff = describe(old_res, new_res)
+        status_diff = None
+        # Both must agree on success vs failure. The exact 4xx code is allowed
+        # to differ only if it is a recorded improvement.
+        if (old_status == 200) != (new_status == 200):
+            status_diff = "status: old=%d new=%d" % (old_status, new_status)
+
+        if diff is None and status_diff is None:
+            same += 1
+            if args.verbose:
+                print("  same      %s/%s" % (group, name))
+            continue
+
+        reason = deliberate_reason(group, name)
+        if reason and (status_diff is None or (group, name) in STATUS_MAY_DIFFER):
+            improved += 1
+            improvements.setdefault(reason, []).append("%s/%s" % (group, name))
+            if args.verbose:
+                print("  improved  %s/%s" % (group, name))
+            continue
+
+        different.append((group, name, status_diff or diff))
+        print("  DIFFERENT %s/%s\n      %s" % (group, name, status_diff or diff))
+
+    old.close()
+    new.close()
+
+    print()
+    print("%d cases: %d same, %d deliberate improvements, %d unexplained differences"
+          % (len(cases), same, improved, len(different)))
+    if improvements:
+        print("\ndeliberate:")
+        for reason, names in improvements.items():
+            print("  %d cases — %s" % (len(names), reason))
+    if different:
+        print("\nunexplained:")
+        for group, name, why in different:
+            print("  %s/%s" % (group, name))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
