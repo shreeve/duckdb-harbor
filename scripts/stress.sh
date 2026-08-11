@@ -7,7 +7,7 @@
 #   SOAK=30 scripts/stress.sh               # add a 30s sustained-load phase
 #
 # The suite talks to the server the way a client does: curl in, NDJSON out.
-# It knows nothing about Rust, so it is equally valid against the C++ harbor —
+# It knows nothing about Rust, so it is equally valid against the v1 harbor —
 # which is the point. It is the acceptance harness for the rewrite, not a set
 # of unit tests that only prove this implementation agrees with itself.
 #
@@ -280,7 +280,7 @@ eq "NULL is JSON null" "NoneType:None" \
    "$(post 'SELECT NULL::VARCHAR AS v' | nd 'typed')"
 # JSON has no Infinity, and null is the wrong stand-in: it makes an overflow
 # indistinguishable from a missing value. Quoted, the distinction survives and
-# a client can decide what to do with it. The C++ harbor does the same, and
+# a client can decide what to do with it. The v1 harbor does the same, and
 # SPEC 5.4 requires it.
 # BIGNUM is arbitrary precision and is stored as a header plus a big-endian
 # magnitude. Rendered as anything but its decimal digits it is unreadable, and

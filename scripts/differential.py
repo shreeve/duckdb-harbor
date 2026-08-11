@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-differential.py — run the corpus against the C++ harbor and harbor-ng and
+differential.py — run the corpus against the v1 harbor and this one and
 compare the answers.
 
     scripts/differential.py --old-port 9401 --new-port 9402 --token T
 
-The C++ harbor has been in production and is the reference for what clients
-already expect. That does not make it the specification. Where harbor-ng
+The v1 harbor has been in production and is the reference for what clients
+already expect. That does not make it the specification. Where harbor
 answers differently *and better*, the difference is the point, so this runner
 classifies rather than merely diffs:
 
@@ -51,15 +51,15 @@ STATUS_MAY_DIFFER = {
 
 DELIBERATE = {
     ("types", "varchar-unicode"):
-        "The C++ harbor answers 500 to a non-ASCII string literal; harbor-ng "
+        "The v1 harbor answers 500 to a non-ASCII string literal; harbor "
         "returns it. Found by this runner.",
     ("params", "param-unicode"):
-        "The C++ harbor answers 400 to a non-ASCII bound parameter; harbor-ng "
+        "The v1 harbor answers 400 to a non-ASCII bound parameter; harbor "
         "binds it. Same underlying defect as types/varchar-unicode.",
     ("types", "timetz-utc"):
-        "TIME WITH TIME ZONE: the C++ harbor keeps the UTC offset, harbor-ng "
+        "TIME WITH TIME ZONE: the v1 harbor keeps the UTC offset, harbor "
         "cannot — duckdb-rs decodes the value to a local time and discards the "
-        "offset before harbor sees it. harbor-ng marks the column "
+        "offset before harbor sees it. harbor marks the column "
         "lossless:false rather than emit a time that silently means something "
         "else. A real limitation, recorded here so it stays visible.",
     ("types", "timetz-offset"):
@@ -69,10 +69,10 @@ DELIBERATE = {
     # exists to prevent.
     **{("types", name): (
         "BIGNUM: the v1 harbor casts the value to VARCHAR and marks the column "
-        "lossless:false, encoding:'varchar-cast'. harbor-ng decodes DuckDB's "
+        "lossless:false, encoding:'varchar-cast'. harbor decodes DuckDB's "
         "storage directly — three-byte header, big-endian magnitude, one's-"
         "complemented when negative — and reports lossless:true. Both emit the "
-        "same digits; the difference is that harbor-ng's metadata is true. "
+        "same digits; the difference is that harbor's metadata is true. "
         "Small values also go out as bare JSON numbers under the same rule as "
         "every other integer, rather than always as text."
     ) for name in [
@@ -81,22 +81,22 @@ DELIBERATE = {
         "bignum-huge", "bignum-neg-huge", "bignum-past-hugeint",
     ]},
     ("types", "time-ns"):
-        "TIME_NS: the v1 harbor encodes it; harbor-ng refuses with 400. "
+        "TIME_NS: the v1 harbor encodes it; harbor refuses with 400. "
         "duckdb-rs has no decoder for nanosecond TIME and reaches an "
         "unreachable! rather than returning an error, so attempting it "
         "panicked the executor thread — the client got 200 with an empty body "
-        "and the connection never returned to the pool. harbor-ng now rejects "
+        "and the connection never returned to the pool. harbor now rejects "
         "the query before any header is sent and names the cast that works. A "
         "real limitation, refused loudly instead of silently mis-answered.",
     ("types", "variant"):
         "VARIANT: DuckDB's own Arrow layer refuses to decode it ('decoding "
-        "Variant columns is not supported'), so harbor-ng surfaces that as a "
+        "Variant columns is not supported'), so harbor surfaces that as a "
         "400. The v1 harbor reads DuckDB's vectors directly and never crosses "
         "Arrow, so it can encode the value. Inherited from the Arrow path, not "
         "a harbor defect, and it fails cleanly.",
     ("errors", "*"):
         "Error text comes from DuckDB and is reproduced verbatim by both, but "
-        "the C++ harbor wraps some failures with its own prefix. Both return "
+        "the v1 harbor wraps some failures with its own prefix. Both return "
         "the same status and the same error code, which is the part clients "
         "branch on; the prose is not a contract.",
 }
@@ -126,7 +126,7 @@ class Server:
                 resp = self.conn.getresponse()
                 payload = resp.read().decode("utf-8", "replace")
                 status = resp.status
-                # The C++ harbor closes the connection on some paths; reopen
+                # The v1 harbor closes the connection on some paths; reopen
                 # rather than let that look like a failure.
                 if resp.getheader("Connection", "").lower() == "close":
                     self.close()
@@ -166,7 +166,7 @@ def parse(payload):
         elif kind == "error":
             out["error"] = {"code": l.get("code")}
         elif "ok" in l:
-            # The C++ harbor's one-shot envelope, which harbor-ng does not use.
+            # The v1 harbor's one-shot envelope, which harbor does not use.
             out["columns"] = [strip_ignored(c) for c in l.get("columns", [])]
             out["rows"] = l.get("rows", [])
             out["rowCount"] = len(out["rows"])

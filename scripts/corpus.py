@@ -2,8 +2,8 @@
 corpus.py — the shared body of queries every suite runs.
 
 One list, used three ways: the differential runner sends it to both the C++
-harbor and harbor-ng and compares the answers, the type checker asserts the
-spelled-out SPEC §5.4 encoding for the cases where harbor-ng formats values
+harbor and harbor and compares the answers, the type checker asserts the
+spelled-out SPEC §5.4 encoding for the cases where harbor formats values
 itself, and the fuzzer uses the generators at the bottom to produce far more
 of the same shapes than anyone would write by hand.
 
@@ -17,9 +17,9 @@ every entry is deterministic, so two runs against two servers are comparable.
 # ---------------------------------------------------------------------------
 # Types
 #
-# The hand-formatted cases matter most. In the C++ harbor these conversions
+# The hand-formatted cases matter most. In the v1 harbor these conversions
 # were DuckDB's own (Timestamp::ToString, UUID::ToString, Bit::ToString,
-# DecimalToString); harbor-ng reimplements them in Rust — civil_from_days,
+# DecimalToString); harbor reimplements them in Rust — civil_from_days,
 # fmt_time, fmt_timestamp per TimeUnit, the interval micros conversion, the
 # UUID high-bit flip, base64 — so these are original code paths with original
 # bugs available. The boundary values below are chosen to break them.

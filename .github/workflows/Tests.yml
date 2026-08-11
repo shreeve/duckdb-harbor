@@ -99,7 +99,7 @@ jobs:
         run: scripts/fixture.sh sample.duckdb
 
       - name: Everything except the differential suite, load included
-        # differential needs the C++ harbor built alongside; it is not a build
+        # differential needs the v1 harbor built alongside; it is not a build
         # dependency of this repository, and check.sh skips it when absent.
         run: SUITES="stress spec fuzz deploy swarm resilience" scripts/check.sh
 

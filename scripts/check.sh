@@ -11,7 +11,7 @@
 # takes several because it kills and restarts the server repeatedly. A failure
 # early means not paying for the rest.
 #
-# The differential suite needs the C++ harbor built alongside; when it is not
+# The differential suite needs the v1 harbor built alongside; when it is not
 # there it skips rather than fails, because the reference implementation is not
 # a build dependency of this one.
 
@@ -133,7 +133,7 @@ if [[ " $suites " == *" differential "* ]]; then
   if [[ -f "$old_ext" ]]; then
     run differential "$here/scripts/differential.sh" "$db"
   else
-    skip differential "the C++ harbor is not built at $old_ext (set OLD_EXT=...)"
+    skip differential "the v1 harbor is not built at $old_ext (set OLD_EXT=...)"
   fi
 fi
 

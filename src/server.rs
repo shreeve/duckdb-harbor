@@ -5,7 +5,7 @@
 //   POST /sql     run one statement, stream the NDJSON envelope back
 //   GET  /health  liveness, no auth
 //
-// The envelope is the one thing that must not drift from the C++ harbor,
+// The envelope is the one thing that must not drift from the v1 harbor,
 // because it is the contract every client already speaks:
 //
 //   {"type":"schema","columns":[{"name":"id","duckdbType":"BIGINT","lossless":true}]}
@@ -964,7 +964,7 @@ fn emit_column_schema(out: &mut String, name: Option<&str>, ty: &LogicalTypeHand
             }
             out.push(']');
         }
-        // TIME WITH TIME ZONE is the one type harbor-ng cannot carry
+        // TIME WITH TIME ZONE is the one type harbor cannot carry
         // losslessly: duckdb-rs decodes it to a local time and drops the UTC
         // offset before harbor ever sees the value, so the offset cannot be
         // recovered. Saying so is better than emitting a time that silently

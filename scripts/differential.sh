@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# differential.sh — stand up the C++ harbor and harbor-ng side by side on the
+# differential.sh — stand up the v1 harbor and this one side by side on the
 # same data and compare what they answer.
 #
 #   scripts/differential.sh [database.duckdb]
@@ -12,7 +12,7 @@
 # same questions, which is all this needs.
 #
 # Skips cleanly, rather than failing, when the C++ extension is not built:
-# harbor-ng's own suites do not depend on it, and not everyone has a 28 MB
+# harbor's own suites do not depend on it, and not everyone has a 28 MB
 # static DuckDB build lying around.
 
 set -uo pipefail
@@ -26,12 +26,12 @@ new_port=${NEW_PORT:-9402}
 token=${TOKEN:-diff-$$}
 
 if [[ ! -f "$old_ext" ]]; then
-  echo "differential: no C++ harbor at $old_ext — skipping"
+  echo "differential: no v1 harbor at $old_ext — skipping"
   echo "  build it with 'make release' in duckdb-harbor-v1, or set OLD_EXT"
   exit 0
 fi
 if [[ ! -f "$new_ext" ]]; then
-  echo "differential: harbor-ng not built — run 'make release'" >&2
+  echo "differential: harbor not built — run 'make release'" >&2
   exit 2
 fi
 if [[ ! -f "$src_db" ]]; then
@@ -78,8 +78,8 @@ wait_up() { # wait_up <port> <pid> <name>
 old_pid=$(start "$old_ext" "$work/old.duckdb" "$old_port" "$work/old.log")
 new_pid=$(start "$new_ext" "$work/new.duckdb" "$new_port" "$work/new.log")
 
-wait_up "$old_port" "$old_pid" "C++ harbor" || { cat "$work/old.log" >&2; exit 1; }
-wait_up "$new_port" "$new_pid" "harbor-ng"  || { cat "$work/new.log" >&2; exit 1; }
+wait_up "$old_port" "$old_pid" "v1 harbor" || { cat "$work/old.log" >&2; exit 1; }
+wait_up "$new_port" "$new_pid" "harbor"  || { cat "$work/new.log" >&2; exit 1; }
 
 old_version=$(curl -sS -m 5 -H "Authorization: Bearer $token" \
   --data '{"sql":"SELECT harbor_version() AS v"}' "http://127.0.0.1:$old_port/sql" \
@@ -88,7 +88,7 @@ new_version=$(curl -sS -m 5 -H "Authorization: Bearer $token" \
   --data '{"sql":"SELECT * FROM harbor_version()"}' "http://127.0.0.1:$new_port/sql" \
   | python3 -c 'import sys,json;print(next((json.loads(l)["values"][0] for l in sys.stdin if "\"row\"" in l), "?"))' 2>/dev/null)
 
-echo "C++ harbor $old_version on :$old_port   vs   harbor-ng $new_version on :$new_port"
+echo "v1 harbor $old_version on :$old_port   vs   harbor $new_version on :$new_port"
 echo
 
 python3 "$here/scripts/differential.py" \

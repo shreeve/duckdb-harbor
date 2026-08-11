@@ -4,7 +4,7 @@ spec_types.py — assert the encoding harbor produces, spelled out.
 
     scripts/spec_types.py --port 9499 --token T
 
-The differential runner proves harbor-ng and the C++ harbor agree. This one
+The differential runner proves this harbor and the v1 harbor agree. This one
 proves the agreed answer is the right one. Two implementations that share a
 misreading of SPEC §5.4 would sail through the differential and fail here, and
 that is the whole reason it exists.
@@ -13,7 +13,7 @@ Every expectation below is written out by hand from the SQL literal, not
 captured from a run. Capturing output and calling it an expectation only
 records what the code did on the day it was written.
 
-The cases are weighted toward the conversions harbor-ng performs itself —
+The cases are weighted toward the conversions harbor performs itself —
 dates, times, timestamps at each storage unit, intervals, UUID, base64, BIT,
 the JSON-safe integer boundary — because those are the ones where a bug is
 harbor's rather than DuckDB's.

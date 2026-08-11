@@ -7,7 +7,7 @@ against an oracle that is not harbor.
     scripts/fuzz.py --port 9499 --token T --seed 7    # reproduce a failure
 
 The hand-written suites cover the boundaries someone thought of. This covers
-the ones nobody did. It is aimed squarely at the conversions harbor-ng
+the ones nobody did. It is aimed squarely at the conversions harbor
 implements itself — civil_from_days, the per-unit timestamp formatting, base64,
 the JSON-safe integer rule — because a mistake there is harbor's, not DuckDB's,
 and an off-by-one shows up in one date out of a thousand rather than in the
