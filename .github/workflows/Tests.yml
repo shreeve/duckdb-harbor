@@ -63,6 +63,10 @@ jobs:
       - name: Build the fixture database
         run: test/scripts/fixture.sh sample.duckdb
 
+      # A suite that cannot run exits 77 and is reported as skipped rather
+      # than counted as a pass — type coverage needs the duckdb-rs source in
+      # the cargo registry, and a green tick for a gate that never ran is the
+      # failure mode this whole suite exists to avoid.
       - name: Unit tests, ABI stamp, type coverage, sqllogictest, spec and fuzz
         run: SUITES="unit abi types sqllogic spec fuzz" test/scripts/check.sh
 
