@@ -34,3 +34,9 @@ serde_json = "1"
 hmac = "0.12"
 sha2 = "0.10"
 rand = "0.8"
+
+# SIGTERM is the difference between a checkpointed database and a WAL replay
+# on next open, so harbor has to see the signal rather than let the default
+# handler kill the process. Unix only; on Windows harbor_stop is the exit.
+[target.'cfg(unix)'.dependencies]
+signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }

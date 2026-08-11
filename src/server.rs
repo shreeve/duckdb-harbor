@@ -201,12 +201,50 @@ pub fn stop() -> Result<String, String> {
     Ok(r.addr)
 }
 
+/// Turn SIGTERM and SIGINT into a clean `stop()`.
+///
+/// Registered from `wait()` and nowhere else. `wait()` is what makes the
+/// process a daemon — nothing else is going to happen on the main thread —
+/// so that is the one moment where taking over the signals is harbor's call
+/// to make. In an ordinary interactive session the CLI keeps its own Ctrl-C,
+/// which cancels a query rather than shutting the database down.
+///
+/// Without this, a `kill` runs the default handler: the process dies with the
+/// WAL unfolded and the next open has to replay it.
+#[cfg(unix)]
+fn install_signal_handler() {
+    use signal_hook::{
+        consts::{SIGINT, SIGTERM},
+        iterator::Signals,
+    };
+
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    if let Ok(mut signals) = Signals::new([SIGTERM, SIGINT]) {
+        let _ = thread::Builder::new().name("harbor-signals".to_string()).spawn(move || {
+            for _ in signals.forever() {
+                // stop() drains the workers and checkpoints, then wakes
+                // wait(), which lets the main thread exit normally.
+                let _ = stop();
+                break;
+            }
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn install_signal_handler() {}
+
 /// Block until the server stops. Returns the address it was serving on.
 pub fn wait() -> Result<String, String> {
     let addr = match RUNNING.lock().unwrap().as_ref() {
         Some(r) => r.addr.clone(),
         None => return Err("harbor is not serving".to_string()),
     };
+    install_signal_handler();
     let (lock, cv) = &STOPPED;
     let mut stopped = lock.lock().unwrap();
     while !*stopped {
