@@ -37,9 +37,9 @@
 #![allow(dead_code)]
 
 use std::{
-    io::{Read, Write},
+    io::Read,
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, mpsc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
@@ -105,7 +105,7 @@ static STOPPED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 struct Running {
     server: Arc<Server>,
     stop: Arc<AtomicBool>,
-    workers: Vec<JoinHandle<Connection>>,
+    workers: Vec<JoinHandle<Option<Connection>>>,
     addr: String,
 }
 
@@ -183,14 +183,19 @@ pub fn stop() -> Result<String, String> {
     // connection rather than taking the shutdown down with it.
     let mut pool = POOL.lock().unwrap();
     for h in r.workers {
-        if let Ok(conn) = h.join() {
+        if let Ok(Some(conn)) = h.join() {
             pool.push(conn);
         }
     }
     drop(pool);
 
-    // Durability: the point of a clean stop is that the WAL is folded back
-    // into the database file, so the next process opens without a replay.
+    // Fold the WAL back into the database file so the next open needs no
+    // replay. This succeeds when harbor_stop is called from an ordinary
+    // session, and fails harmlessly when it is called from the signal handler
+    // while harbor_wait is still blocked: that blocked call is itself an open
+    // transaction older than every write, and DuckDB will not checkpoint past
+    // one. The daemon path covers that case by running CHECKPOINT after
+    // harbor_wait returns — see bin/harbor.
     if let Some(c) = CONTROL.lock().unwrap().as_ref() {
         let _ = c.execute_batch("CHECKPOINT");
     }
@@ -261,25 +266,53 @@ pub fn address() -> Option<String> {
 // Request handling
 // ---------------------------------------------------------------------------
 
+/// One HTTP worker. It owns the socket side only; the DuckDB connection lives
+/// on a dedicated executor thread it starts and hands work to.
+///
+/// The split is what makes keep-alive possible. tiny_http will frame a
+/// response of unknown length itself — chunked, connection reusable — but
+/// only if it is handed a `Read` to pull from. A query cannot be that `Read`:
+/// the rows come from a borrow chain rooted in a `Connection` that is not
+/// `Sync`. Putting the connection on its own thread and passing byte chunks
+/// through a bounded channel gives tiny_http its reader and keeps the query
+/// streaming.
+///
+/// Before this, harbor took the raw socket with `into_writer()` and wrote the
+/// framing by hand, which forces `Connection: close`. That costs a client one
+/// ephemeral port per request, held for the TIME_WAIT interval — about
+/// 16k ports over 30s on macOS, so a single client hitting a few thousand
+/// requests per second runs out of ports in seconds and starts seeing
+/// `Can't assign requested address`. Reusing the connection removes the cost
+/// entirely.
 fn worker(
     server: Arc<Server>,
     stop: Arc<AtomicBool>,
     token: Arc<Option<String>>,
     conn: Connection,
-) -> Connection {
+) -> Option<Connection> {
+    // Rendezvous: a worker never has more than one statement outstanding, so
+    // there is nothing to queue here.
+    let (jobs_tx, jobs_rx) = mpsc::sync_channel::<Job>(0);
+    let executor = thread::Builder::new()
+        .name("harbor-exec".to_string())
+        .spawn(move || execute_jobs(conn, jobs_rx))
+        .ok()?;
+
     while !stop.load(Ordering::SeqCst) {
         // A timeout rather than a blocking recv, so `unblock()` is not the
         // only way out and a worker cannot wedge on shutdown.
         match server.recv_timeout(Duration::from_millis(200)) {
-            Ok(Some(req)) => handle(req, &conn, token.as_ref().as_deref()),
+            Ok(Some(req)) => handle(req, &jobs_tx, token.as_ref().as_deref()),
             Ok(None) => continue,
             Err(_) => break,
         }
     }
-    conn
+
+    drop(jobs_tx);
+    executor.join().ok()
 }
 
-fn handle(mut req: Request, conn: &Connection, token: Option<&str>) {
+fn handle(mut req: Request, jobs: &mpsc::SyncSender<Job>, token: Option<&str>) {
     let path = req.url().split('?').next().unwrap_or("/").to_string();
     let method = req.method().clone();
 
@@ -300,7 +333,7 @@ fn handle(mut req: Request, conn: &Connection, token: Option<&str>) {
                 let _ = req.respond(error_response(400, "bad_request", "body is not valid UTF-8"));
                 return;
             }
-            run_sql(req, conn, &body);
+            run_sql(req, jobs, &body);
         }
         _ => {
             let _ = req.respond(error_response(404, "not_found", "no such endpoint"));
@@ -476,7 +509,24 @@ fn ensure_single_statement(sql: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run_sql(req: Request, conn: &Connection, body: &str) {
+/// One unit of work for an executor thread.
+struct Job {
+    sql: String,
+    params: Vec<Value>,
+    /// Answered exactly once, before any body byte is produced. `Err` means
+    /// nothing has been written yet, so the worker can still pick a status
+    /// code — which is the whole reason preparation is reported separately
+    /// from streaming.
+    ready: mpsc::SyncSender<Result<(), String>>,
+    /// Body bytes, in envelope-line batches. Bounded, so a slow client
+    /// applies backpressure to the query instead of buffering the result.
+    body: mpsc::SyncSender<Vec<u8>>,
+}
+
+/// How many body batches may be in flight before the query has to wait.
+const BODY_QUEUE: usize = 4;
+
+fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) {
     let parsed = match parse_request(body) {
         Ok(p) => p,
         Err(e) => {
@@ -490,154 +540,177 @@ fn run_sql(req: Request, conn: &Connection, body: &str) {
         return;
     }
 
-    let started = Instant::now();
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let (body_tx, body_rx) = mpsc::sync_channel::<Vec<u8>>(BODY_QUEUE);
+    let job = Job { sql: parsed.sql, params: parsed.params, ready: ready_tx, body: body_tx };
 
-    // Prepare and execute before taking the socket writer, so a failure here
-    // still gets a real HTTP status code instead of a 200 with an error line.
-    let mut stmt = match conn.prepare(&parsed.sql) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = req.respond(error_response(400, "sql_error", &e.to_string()));
-            return;
-        }
-    };
-    let mut rows = match stmt.query(params_from_iter(parsed.params.iter())) {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = req.respond(error_response(400, "sql_error", &e.to_string()));
-            return;
-        }
-    };
-
-    // Column metadata has to be captured now: `Rows` hands back `None` from
-    // `as_ref()` once the result is exhausted.
-    let (names, types) = match rows.as_ref() {
-        Some(s) => {
-            let n = s.column_count();
-            let names: Vec<String> = (0..n).map(|i| s.column_name(i).cloned().unwrap_or_default()).collect();
-            let types: Vec<LogicalTypeHandle> = (0..n).map(|i| s.column_logical_type(i)).collect();
-            (names, types)
-        }
-        None => (Vec::new(), Vec::new()),
-    };
-
-    let mut out = ChunkedWriter::new(req.into_writer());
-    if out.start().is_err() {
+    if jobs.send(job).is_err() {
+        let _ = req.respond(error_response(503, "unavailable", "harbor is shutting down"));
         return;
     }
 
-    let mut line = String::with_capacity(256);
-    line.push_str(r#"{"type":"schema","columns":["#);
-    for (i, (name, ty)) in names.iter().zip(&types).enumerate() {
-        if i > 0 {
-            line.push(',');
+    match ready_rx.recv() {
+        Ok(Ok(())) => {
+            // data_length: None makes tiny_http chunk the body and keep the
+            // connection alive.
+            let headers = vec![
+                Header::from_bytes(&b"Content-Type"[..], &b"application/x-ndjson"[..]).unwrap(),
+                Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..]).unwrap(),
+            ];
+            let _ = req.respond(Response::new(200.into(), headers, ChannelReader::new(body_rx), None, None));
         }
-        emit_column_schema(&mut line, Some(name), ty);
+        Ok(Err(message)) => {
+            let _ = req.respond(error_response(400, "sql_error", &message));
+        }
+        Err(_) => {
+            let _ = req.respond(error_response(500, "internal", "the executor thread is gone"));
+        }
     }
-    line.push_str("]}\n");
-    if out.push(&line).is_err() {
-        return;
-    }
+}
 
-    let mut count: u64 = 0;
-    loop {
-        match rows.next() {
-            Ok(Some(row)) => {
-                line.clear();
-                line.push_str(r#"{"type":"row","values":["#);
-                for (i, ty) in types.iter().enumerate() {
-                    if i > 0 {
-                        line.push(',');
-                    }
-                    match row.get_ref(i) {
-                        Ok(v) => emit_value(&mut line, &Value::from(v), Some(ty)),
-                        Err(_) => line.push_str("null"),
-                    }
-                }
-                line.push_str("]}\n");
-                count += 1;
-                if out.push(&line).is_err() {
-                    return;
-                }
-            }
-            Ok(None) => break,
+/// The DuckDB side. Owns one connection for the life of the server and runs
+/// one statement at a time; concurrency comes from there being several of
+/// these, not from any one of them interleaving work.
+fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
+    for job in jobs {
+        let Job { sql, params, ready, body } = job;
+        let started = Instant::now();
+
+        let stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
             Err(e) => {
-                // Mid-stream failures cannot change the status code — the
-                // headers are long gone. Say so in the stream and stop, so a
-                // client never mistakes a truncated result for a complete one.
-                line.clear();
-                line.push_str(r#"{"type":"error","code":"sql_error","message":"#);
-                push_json_string(&mut line, &e.to_string());
-                line.push_str("}\n");
-                let _ = out.push(&line);
-                let _ = out.finish();
-                return;
+                let _ = ready.send(Err(e.to_string()));
+                continue;
+            }
+        };
+        let mut stmt = stmt;
+        let mut rows = match stmt.query(params_from_iter(params.iter())) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = ready.send(Err(e.to_string()));
+                continue;
+            }
+        };
+
+        // Column metadata has to be captured now: `Rows` hands back `None`
+        // from `as_ref()` once the result is exhausted.
+        let (names, types) = match rows.as_ref() {
+            Some(s) => {
+                let n = s.column_count();
+                let names: Vec<String> =
+                    (0..n).map(|i| s.column_name(i).cloned().unwrap_or_default()).collect();
+                let types: Vec<LogicalTypeHandle> = (0..n).map(|i| s.column_logical_type(i)).collect();
+                (names, types)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+
+        if ready.send(Ok(())).is_err() {
+            continue;
+        }
+
+        let mut buf = String::with_capacity(FLUSH_AT + 8192);
+        buf.push_str(r#"{"type":"schema","columns":["#);
+        for (i, (name, ty)) in names.iter().zip(&types).enumerate() {
+            if i > 0 {
+                buf.push(',');
+            }
+            emit_column_schema(&mut buf, Some(name), ty);
+        }
+        buf.push_str("]}\n");
+
+        let mut count: u64 = 0;
+        let mut gone = false;
+        loop {
+            match rows.next() {
+                Ok(Some(row)) => {
+                    buf.push_str(r#"{"type":"row","values":["#);
+                    for (i, ty) in types.iter().enumerate() {
+                        if i > 0 {
+                            buf.push(',');
+                        }
+                        match row.get_ref(i) {
+                            Ok(v) => emit_value(&mut buf, &Value::from(v), Some(ty)),
+                            Err(_) => buf.push_str("null"),
+                        }
+                    }
+                    buf.push_str("]}\n");
+                    count += 1;
+                    if buf.len() >= FLUSH_AT {
+                        // A send failure means the client hung up. Abandon the
+                        // query rather than finish computing a result nobody
+                        // will read.
+                        if body.send(std::mem::take(&mut buf).into_bytes()).is_err() {
+                            gone = true;
+                            break;
+                        }
+                        buf = String::with_capacity(FLUSH_AT + 8192);
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    // Mid-stream failures cannot change the status code — the
+                    // headers are long gone. Say so in the stream, so a client
+                    // never mistakes a truncated result for a complete one.
+                    buf.push_str(r#"{"type":"error","code":"sql_error","message":"#);
+                    push_json_string(&mut buf, &e.to_string());
+                    buf.push_str("}\n");
+                    let _ = body.send(std::mem::take(&mut buf).into_bytes());
+                    gone = true;
+                    break;
+                }
             }
         }
-    }
 
-    line.clear();
-    line.push_str(&format!(
-        r#"{{"type":"end","rowCount":{},"timeMs":{}}}"#,
-        count,
-        started.elapsed().as_millis()
-    ));
-    line.push('\n');
-    let _ = out.push(&line);
-    let _ = out.finish();
+        if !gone {
+            buf.push_str(&format!(
+                r#"{{"type":"end","rowCount":{},"timeMs":{}}}"#,
+                count,
+                started.elapsed().as_millis()
+            ));
+            buf.push('\n');
+            let _ = body.send(buf.into_bytes());
+        }
+    }
+    conn
+}
+
+/// Adapts the body channel to the `Read` tiny_http wants. Returning `Ok(0)`
+/// when the sender is dropped is what ends the chunked response.
+struct ChannelReader {
+    rx: mpsc::Receiver<Vec<u8>>,
+    current: Vec<u8>,
+    pos: usize,
+}
+
+impl ChannelReader {
+    fn new(rx: mpsc::Receiver<Vec<u8>>) -> Self {
+        Self { rx, current: Vec::new(), pos: 0 }
+    }
+}
+
+impl Read for ChannelReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        while self.pos >= self.current.len() {
+            match self.rx.recv() {
+                Ok(next) => {
+                    self.current = next;
+                    self.pos = 0;
+                }
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = (self.current.len() - self.pos).min(out.len());
+        out[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Responses
 //
-// The streaming path writes the response by hand because tiny_http's
-// `Response` wants either a known length or a `Read` to pull from, and rows
-// are produced by a borrow chain that cannot outlive this stack frame.
-// Chunked framing is a dozen lines; a pipe and a second thread is not.
 // ---------------------------------------------------------------------------
-
-struct ChunkedWriter {
-    w: Box<dyn Write + Send>,
-    buf: String,
-}
-
-impl ChunkedWriter {
-    fn new(w: Box<dyn Write + Send>) -> Self {
-        Self { w, buf: String::with_capacity(FLUSH_AT + 8192) }
-    }
-
-    fn start(&mut self) -> std::io::Result<()> {
-        self.w.write_all(
-            b"HTTP/1.1 200 OK\r\n\
-              Content-Type: application/x-ndjson\r\n\
-              Cache-Control: no-store\r\n\
-              Transfer-Encoding: chunked\r\n\
-              Connection: close\r\n\r\n",
-        )
-    }
-
-    fn push(&mut self, s: &str) -> std::io::Result<()> {
-        self.buf.push_str(s);
-        if self.buf.len() >= FLUSH_AT { self.flush_chunk() } else { Ok(()) }
-    }
-
-    fn flush_chunk(&mut self) -> std::io::Result<()> {
-        if self.buf.is_empty() {
-            return Ok(());
-        }
-        write!(self.w, "{:x}\r\n", self.buf.len())?;
-        self.w.write_all(self.buf.as_bytes())?;
-        self.w.write_all(b"\r\n")?;
-        self.buf.clear();
-        self.w.flush()
-    }
-
-    fn finish(&mut self) -> std::io::Result<()> {
-        self.flush_chunk()?;
-        self.w.write_all(b"0\r\n\r\n")?;
-        self.w.flush()
-    }
-}
 
 fn json_response(status: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     Response::from_string(body)

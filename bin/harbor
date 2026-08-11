@@ -60,8 +60,16 @@ args="bind := '${bind//\'/\'\'}', port := $port"
 [[ -n "$workers" ]] && args="$args, workers := $workers"
 
 # -unsigned is required: harbor is not signed by DuckDB's extension registry.
+#
+# CHECKPOINT comes after harbor_wait, and it has to. While harbor_wait is
+# blocked it is a running query, and a running query is an open transaction
+# older than every write the server has served — DuckDB refuses to CHECKPOINT
+# with one of those outstanding, and FORCE CHECKPOINT waits for a transaction
+# that by definition never finishes. Once harbor_wait returns, the workers are
+# stopped and nothing else is in flight, so the WAL folds cleanly.
 exec duckdb -unsigned "$db" -c "
   LOAD '$ext';
   CALL harbor_serve($args);
   CALL harbor_wait();
+  CHECKPOINT;
 "
