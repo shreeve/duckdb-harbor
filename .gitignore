@@ -1,0 +1,10 @@
+/target
+build
+configure
+.idea
+duckdb_unittest_tempdir
+/test/bin
+venvtarget/
+.venv/
+build/
+.DS_Store

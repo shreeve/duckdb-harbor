@@ -1,0 +1,36 @@
+[package]
+name = "harbor"
+version = "0.7.0"
+edition = "2024"
+description = "HTTP /sql for DuckDB — SQL in, NDJSON out, no driver"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = true
+strip = true
+
+[dependencies]
+# The `loadable-extension` feature builds against DuckDB's C extension API.
+# NOTE: it currently requires the UNSTABLE band, which pins the binary to one
+# DuckDB version — see the "Versioning" section of README.md.
+duckdb = { version = "~1.10505.0", features = ["loadable-extension", "vtab"] }
+
+# HTTP server. Deliberately synchronous: harbor executes a small, bounded
+# number of queries at a time, so an async runtime inside DuckDB's process
+# would buy nothing and complicate shutdown — which is where the checkpoint
+# lives.
+tiny_http = "0.12"
+
+# The whole point of the extension: SQL in, NDJSON out.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Cookie signing (HMAC-SHA256) and nonce generation. Pure Rust, so harbor
+# does not link OpenSSL and does not need `LOAD httpfs` the way the C++
+# version did.
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"

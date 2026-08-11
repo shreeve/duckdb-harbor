@@ -1,0 +1,10 @@
+# name: test/sql/harbor.test
+# description: harbor extension load smoke
+# group: [sql]
+
+require harbor
+
+query I
+SELECT CASE WHEN length((SELECT version FROM harbor_version())) > 0 THEN 1 ELSE 0 END;
+----
+1
