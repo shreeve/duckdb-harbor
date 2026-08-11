@@ -232,7 +232,7 @@ once first to build the database the suites read. It is heavily tested: 11
 suites and roughly 4,100 lines of tests against about 2,200 lines of product.
 Every answer is checked against an oracle that is not DuckDB Harbor — values
 read from the database file before the server takes the lock, Python's own
-`datetime` and `base64` for fuzzed values, and the v1 harbor for differential
+`datetime` and `base64` for fuzzed values, and DuckDB Harbor v1 for differential
 runs, where any divergence has to be recorded with a reason before the run goes
 green. An oracle that shares an implementation with the thing it checks
 confirms only that the code is self-consistent.
@@ -242,7 +242,7 @@ confirms only that the code is self-consistent.
 Early. No release is published yet, so for the moment the artifact has to be
 built with `make release`; the download path above is how it will work, and is
 already what the launcher expects. The
-[v1 harbor](https://github.com/shreeve/duckdb-harbor-v1) is the C++
+[DuckDB Harbor v1](https://github.com/shreeve/duckdb-harbor-v1) is the C++
 implementation this replaces.
 
 ## License
