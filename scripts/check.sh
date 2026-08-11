@@ -39,7 +39,7 @@ s.bind(("127.0.0.1", 0))
 print(s.getsockname()[1])
 s.close()')}
 token=${TOKEN:-check-$$}
-suites=${SUITES:-unit abi types sqllogic stress spec fuzz differential deploy resilience}
+suites=${SUITES:-unit abi types sqllogic stress spec fuzz differential deploy swarm resilience}
 
 bold=$(tput bold 2>/dev/null || true); red=$(tput setaf 1 2>/dev/null || true)
 green=$(tput setaf 2 2>/dev/null || true); dim=$(tput dim 2>/dev/null || true)
@@ -84,7 +84,7 @@ run sqllogic make -C "$here" test_release
 # ---------------------------------------------------------------------------
 
 needs_server=0
-for s in stress spec fuzz deploy; do
+for s in stress spec fuzz deploy swarm; do
   [[ " $suites " == *" $s "* ]] && needs_server=1
 done
 
@@ -113,6 +113,14 @@ run stress "$here/scripts/stress.sh" "$db"
 run spec  "$here/scripts/spec_types.py" --port "$port" --token "$token"
 run fuzz  "$here/scripts/fuzz.py"       --port "$port" --token "$token"
 run deploy "$here/scripts/validate-deployment.sh" --url "http://127.0.0.1:$port" --token "$token"
+# Load runs against the same server as the read-only suites rather than
+# standing up its own. There was a second copy of the start-and-wait logic in
+# the CI workflow doing exactly this, and it was the only place that could not
+# get a server up — one proven path is better than two, one of which is only
+# exercised in CI.
+run swarm  "$here/scripts/swarm.py" --port "$port" --token "$token" \
+           --levels "${SWARM_LEVELS:-1,4,16}" --seconds "${SWARM_SECONDS:-10}" \
+           --write-pct "${SWARM_WRITE_PCT:-20}"
 
 [[ -n "$server_pid" ]] && { kill -TERM "$server_pid" 2>/dev/null; wait "$server_pid" 2>/dev/null; server_pid=""; }
 

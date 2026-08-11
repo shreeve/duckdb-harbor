@@ -98,37 +98,10 @@ jobs:
       - name: Build the fixture database
         run: scripts/fixture.sh sample.duckdb
 
-      - name: Everything except the differential suite
+      - name: Everything except the differential suite, load included
         # differential needs the C++ harbor built alongside; it is not a build
         # dependency of this repository, and check.sh skips it when absent.
-        run: SUITES="stress spec fuzz deploy resilience" scripts/check.sh
-
-      - name: Load test
-        run: |
-          # The server's output goes to a file so a startup failure can be
-          # shown. Without it the only symptom is swarm reporting that nothing
-          # answered, which says where the failure surfaced and nothing about
-          # why. The readiness loop is an if/then rather than `curl && break`:
-          # under `set -e` a failing curl in an && list aborts the step, so the
-          # first attempt — made before the server has finished opening the
-          # database — would end the job.
-          cp sample.duckdb /tmp/load.duckdb
-          bin/harbor /tmp/load.duckdb --port 9496 --token ci --workers 8 \
-              > /tmp/load-server.log 2>&1 &
-          up=0
-          for _ in $(seq 1 60); do
-            if curl -sf -m 2 http://127.0.0.1:9496/health >/dev/null 2>&1; then
-              up=1
-              break
-            fi
-            sleep 1
-          done
-          if [ "$up" != 1 ]; then
-            echo "the load-test server never answered; its output was:"
-            cat /tmp/load-server.log
-            exit 1
-          fi
-          scripts/swarm.py --port 9496 --token ci --levels 1,4,16 --seconds 10 --write-pct 20
+        run: SUITES="stress spec fuzz deploy swarm resilience" scripts/check.sh
 
       - name: Server log on failure
         if: failure()

@@ -87,7 +87,11 @@ class Client:
                     self._connect()
                 self.conn.request("POST", "/sql", body, headers)
                 resp = self.conn.getresponse()
-                payload = resp.read()
+                # Decoded before splitting. NDJSON is delimited by \n alone
+                # and splitlines() would also break on U+2028, which is legal
+                # inside a JSON string — but split("\n") on the raw bytes
+                # needs a bytes separator, so the decode is not optional.
+                payload = resp.read().decode("utf-8", "replace")
                 if not self.keepalive:
                     self.close()
                 elapsed = time.perf_counter() - started
