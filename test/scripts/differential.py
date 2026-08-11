@@ -43,6 +43,12 @@ IGNORED_KEYS = {"timeMs", "sessionId"}
 # body. Kept as an explicit set rather than inferred from the reason text, so
 # adding a note can never quietly widen what is tolerated.
 STATUS_MAY_DIFFER = {
+    ("errors", "multi-statement"),
+    ("errors", "multi-like-escape"),
+    ("errors", "multi-ilike-escape"),
+    ("errors", "multi-escape-keyword"),
+    ("errors", "multi-date-literal"),
+    ("errors", "multi-dollar-param"),
     ("types", "varchar-unicode"),
     ("params", "param-unicode"),
     ("types", "time-ns"),
@@ -94,11 +100,47 @@ DELIBERATE = {
         "400. The v1 harbor reads DuckDB's vectors directly and never crosses "
         "Arrow, so it can encode the value. Inherited from the Arrow path, not "
         "a harbor defect, and it fails cleanly.",
-    ("errors", "*"):
-        "Error text comes from DuckDB and is reproduced verbatim by both, but "
-        "the v1 harbor wraps some failures with its own prefix. Both return "
-        "the same status and the same error code, which is the part clients "
-        "branch on; the prose is not a contract.",
+    # Enumerated, not wildcarded. The two servers disagree about the error
+    # envelope, and that is the whole of the disagreement: v1 answers
+    # {"ok":false,"error":...,"errorCode":"TABLE_NOT_FOUND"}, harbor answers
+    # {"type":"error","code":"sql_error","message":...}. Both answer 400, and
+    # both reproduce DuckDB's message verbatim. The codes are different
+    # vocabularies — DuckDB's own error names against the class a client
+    # branches on — so they are reported as an envelope difference rather than
+    # equated.
+    **{("errors", name): (
+        "Error envelope: v1 answers {ok:false, error, errorCode:<DuckDB's own "
+        "name>}, harbor answers {type:'error', code:<class>, message}. Same "
+        "status, same message text; the code vocabularies differ by design."
+    ) for name in [
+        "unknown-table", "unknown-column", "syntax-error", "cast-failure",
+        "out-of-range-cast", "unknown-function",
+    ]},
+
+    # v1 accepts multi-statement text and runs it. duckdb-rs executes every
+    # statement but the last during prepare, so harbor must refuse it, and
+    # these are the shapes that once got past its scanner: a keyword ending in
+    # `e` butted against a literal reads as an E'...' escape string, the
+    # backslash then hides the closing quote, and the terminator after it goes
+    # unnoticed. Recorded here because it is a divergence, but the direction
+    # matters: each of these dropped a table on the v1 side.
+    **{("errors", name): (
+        "harbor refuses more than one statement per request with a 400; v1 "
+        "accepts the text and executes it. Found by this runner."
+    ) for name in [
+        "multi-statement", "multi-like-escape", "multi-ilike-escape",
+        "multi-escape-keyword", "multi-date-literal", "multi-dollar-param",
+    ]},
+
+    # No ("errors", "*") entry, deliberately. The reason it used to carry —
+    # "both return the same status and the same error code, and the prose is
+    # not a contract" — describes something this runner cannot even see: parse()
+    # keeps only {"code": ...} from an error envelope, so the prose is discarded
+    # before anything is compared. The only difference the wildcard could
+    # actually excuse was a difference in the error *code*, which is precisely
+    # the thing clients branch on and the thing the reason claims is identical.
+    # harbor answering "internal" where v1 answers "sql_error" would have
+    # printed as a deliberate improvement.
 }
 
 
@@ -164,12 +206,20 @@ def parse(payload):
         elif kind == "end":
             out["rowCount"] = l.get("rowCount")
         elif kind == "error":
-            out["error"] = {"code": l.get("code")}
+            out["error"] = {"code": l.get("code"), "vocab": "ng"}
         elif "ok" in l:
             # The v1 harbor's one-shot envelope, which harbor does not use.
-            out["columns"] = [strip_ignored(c) for c in l.get("columns", [])]
-            out["rows"] = l.get("rows", [])
-            out["rowCount"] = len(out["rows"])
+            # A failure comes back through the same object with ok:false, so
+            # without this branch every v1 error parsed as an empty success —
+            # which is why every errors/* case reported "one errored and the
+            # other did not" and was then waved through by a wildcard. Nothing
+            # in that group had ever actually been compared.
+            if l.get("ok") is False or "errorCode" in l:
+                out["error"] = {"code": l.get("errorCode"), "vocab": "v1"}
+            else:
+                out["columns"] = [strip_ignored(c) for c in l.get("columns", [])]
+                out["rows"] = l.get("rows", [])
+                out["rowCount"] = len(out["rows"])
     return out
 
 
@@ -197,6 +247,14 @@ def describe(old, new):
         if bool(old.get("error")) != bool(new.get("error")):
             out.append("one errored and the other did not: old=%s new=%s"
                        % (old.get("error"), new.get("error")))
+        elif old["error"].get("vocab") != new["error"].get("vocab"):
+            # Different envelopes, so different code vocabularies: v1 reports
+            # DuckDB's own error names (TABLE_NOT_FOUND), harbor reports the
+            # class a client branches on (sql_error). Not comparable value for
+            # value, and recorded as such rather than silently equated.
+            out.append("error envelope: old=%s(%s) new=%s(%s)"
+                       % (old["error"].get("vocab"), old["error"].get("code"),
+                          new["error"].get("vocab"), new["error"].get("code")))
         elif old["error"].get("code") != new["error"].get("code"):
             out.append("error code: old=%s new=%s"
                        % (old["error"]["code"], new["error"]["code"]))
@@ -238,6 +296,22 @@ def main():
     same = improved = 0
     different = []
     improvements = {}
+
+    # A precondition, not a case. `describe` returns None when both servers
+    # produced the same thing, and two servers that are both broken produce the
+    # same thing — point this runner at a database without the fixture tables
+    # and all 27 DATA cases fail identically on both, count as "same", and the
+    # run exits 0 having compared nothing. Prove first that both servers can
+    # actually answer.
+    for server in (old, new):
+        status, res = server.sql("SELECT count(*) AS n FROM sites")
+        rows = res.get("rows") or []
+        if status != 200 or not rows or not isinstance(rows[0][0], int) or rows[0][0] <= 0:
+            print("differential: %s cannot answer the fixture (status %s, %s) — "
+                  "the corpus needs the sites/plans/rules/cohorts tables. Without "
+                  "this check both servers failing the same way would have counted "
+                  "as agreement." % (server.name, status, res))
+            return 2
 
     for group, name, sql, params in cases:
         old_status, old_res = old.sql(sql, params)

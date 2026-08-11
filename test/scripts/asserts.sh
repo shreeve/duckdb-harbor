@@ -152,7 +152,9 @@ scalar() { post "$1" | nd 'rows[0][0] if rows else "NO-ROWS"'; }
 # -csv quotes any field containing a comma, so undo that: the value harbor
 # returns is the bare string, not its CSV rendering.
 oracle() {
-  duckdb -readonly -csv -noheader "$db" -c "$1" 2>/dev/null | tail -1 \
+  # -no-init: ~/.duckdbrc is sourced by default, and an rc that prints anything
+  # lands in the same stdout this oracle is read from.
+  duckdb -no-init -readonly -csv -noheader "$db" -c "$1" 2>/dev/null | tail -1 \
     | python3 -c 'import sys; v = sys.stdin.read().rstrip("\n"); print(v[1:-1].replace("\"\"", "\"") if len(v) > 1 and v[0] == v[-1] == "\"" else v)'
 }
 
@@ -173,11 +175,18 @@ exp_n_rules=$(oracle   "SELECT count(*) FROM rules")
 exp_clients=$(oracle   "SELECT count(DISTINCT client) FROM sites")
 exp_payers=$(oracle    "SELECT count(DISTINCT payer) FROM plans")
 exp_join4=$(oracle     "SELECT count(*) FROM sites s JOIN rules r USING (client) JOIN plans p USING (client) JOIN cohorts c USING (client)")
-exp_active=$(oracle    "SELECT count(*) FROM rules WHERE status = 'Active'")
+# Read the value the data actually holds rather than a literal. 'Active' is
+# spelled that way in the local export and lowercase in the synthesised CI
+# fixture, so the assertion below was 0 == 0 in CI — a WHERE-clause test whose
+# predicate never matched anything.
+exp_status=$(oracle    "SELECT status FROM rules WHERE status IS NOT NULL GROUP BY 1 ORDER BY count(*) DESC, 1 LIMIT 1")
+exp_active=$(oracle    "SELECT count(*) FROM rules WHERE status = '$exp_status'")
+exp_inactive=$(oracle  "SELECT count(*) FROM rules WHERE status IS DISTINCT FROM '$exp_status'")
 exp_top_client=$(oracle "SELECT client FROM plans GROUP BY 1 ORDER BY count(*) DESC, client LIMIT 1")
 exp_digest=$(oracle    "SELECT md5(string_agg(account, '|' ORDER BY account)) FROM sites")
 exp_states=$(oracle    "SELECT string_agg(DISTINCT state, ',' ORDER BY state) FROM sites WHERE state IS NOT NULL")
 exp_cross=$(oracle     "SELECT count(*) FROM plans a CROSS JOIN rules b")
+exp_regexp=$(oracle    "SELECT count(*) FROM sites WHERE regexp_matches(coalesce(name,''), '[A-Za-z]')")
 
 printf '  %ssites=%s cohorts=%s plans=%s rules=%s clients=%s cross=%s%s\n' \
   "$dim" "$exp_n_sites" "$exp_n_cohorts" "$exp_n_plans" "$exp_n_rules" \
@@ -336,7 +345,10 @@ eq "distinct payers"        "$exp_payers"    "$(scalar 'SELECT count(DISTINCT pa
 eq "four-way join"          "$exp_join4" \
    "$(scalar 'SELECT count(*) FROM sites s JOIN rules r USING (client) JOIN plans p USING (client) JOIN cohorts c USING (client)')"
 eq "filtered count"         "$exp_active" \
-   "$(scalar "SELECT count(*) FROM rules WHERE status = 'Active'")"
+   "$(scalar "SELECT count(*) FROM rules WHERE status = '$exp_status'")"
+# The predicate has to select something, or the line above passes on 0 == 0.
+eq "and the predicate matched some rows but not all" "True" \
+   "$(python3 -c "print($exp_active > 0 and $exp_inactive > 0)")"
 eq "GROUP BY + ORDER BY"    "$exp_top_client" \
    "$(scalar 'SELECT client FROM plans GROUP BY 1 ORDER BY count(*) DESC, client LIMIT 1')"
 eq "md5 over ordered aggregate" "$exp_digest" \
@@ -351,8 +363,11 @@ eq "HAVING" "True" \
    "$(post 'SELECT client FROM plans GROUP BY 1 HAVING count(*) > 5' | nd 'len(rows) > 0')"
 eq "UNNEST of a list" "3" \
    "$(scalar 'SELECT count(*) FROM (SELECT unnest([1,2,3]) AS x)')"
-eq "regexp filter runs" "True" \
-   "$(post "SELECT count(*) AS n FROM sites WHERE regexp_matches(coalesce(name,''), '[A-Za-z]')" | nd 'int(rows[0][0]) >= 0')"
+# `>= 0` holds for every count there is. Compare against the oracle, which has
+# to be read up top with the others: once the server has the file lock, the CLI
+# cannot open the database and oracle() comes back empty.
+eq "regexp filter runs" "$exp_regexp" \
+   "$(scalar "SELECT count(*) AS n FROM sites WHERE regexp_matches(coalesce(name,''), '[A-Za-z]')")"
 # Two separate claims. The row count is whatever the data makes it — a client
 # with three rules produces three rows — so it is read from DuckDB rather than
 # assumed to equal the left side, which is only true when the join key happens
@@ -360,15 +375,85 @@ eq "regexp filter runs" "True" \
 # one: no left row is dropped.
 eq "LEFT JOIN has the cardinality DuckDB says" "$exp_leftjoin" \
    "$(scalar 'SELECT count(*) FROM plans p LEFT JOIN rules r USING (client)')"
-eq "LEFT JOIN drops no row from the left side" "$exp_n_plans" "$exp_left_kept"
+# Both sides of this used to be oracle values, which made it an assertion that
+# DuckDB's LEFT JOIN preserves left rows — tested against DuckDB. harbor could
+# have answered 0 to every query and it would still have passed. The right-hand
+# side has to come from the server.
+eq "LEFT JOIN drops no row from the left side" "$exp_n_plans" \
+   "$(scalar 'SELECT count(DISTINCT p.rowid) FROM plans p LEFT JOIN rules r USING (client)')"
 eq "UNION ALL" "$(( $exp_n_sites + $exp_n_rules ))" \
    "$(scalar 'SELECT count(*) FROM (SELECT client FROM sites UNION ALL SELECT client FROM rules)')"
 eq "correlated subquery" "True" \
    "$(post 'SELECT count(*) AS n FROM sites s WHERE EXISTS (SELECT 1 FROM rules r WHERE r.client = s.client)' | nd 'int(rows[0][0]) > 0')"
-eq "PIVOT-shaped conditional aggregate" "True" \
-   "$(post "SELECT count(*) FILTER (WHERE status = 'Active') AS a, count(*) AS n FROM rules" | nd 'int(rows[0][0]) <= int(rows[0][1])')"
+# `count(*) FILTER (...) <= count(*)` is true of any data, so it asserted
+# nothing. Hold the filtered half to the oracle instead.
+eq "PIVOT-shaped conditional aggregate" "$exp_active" \
+   "$(post "SELECT count(*) FILTER (WHERE status = '$exp_status') AS a, count(*) AS n FROM rules" | nd 'rows[0][0]')"
 
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+section "One statement per request"
+# ---------------------------------------------------------------------------
+
+# duckdb-rs's prepare() executes every statement but the last, so anything that
+# slips a second statement past the scanner runs it. Each of these was accepted
+# once: DuckDB needs no space between a keyword and a literal, so LIKE', ILIKE'
+# and ESCAPE' end in `e` and were read as the start of an E'...' escape string —
+# the backslash then hid the closing quote and every terminator after it.
+eq "a plain second statement is refused" "400" \
+   "$(status 'SELECT 1; SELECT 2')"
+eq "LIKE against an escape-looking literal is refused" "400" \
+   "$(status "SELECT 1 WHERE 'a' LIKE'\\'; SELECT 2")"
+eq "ILIKE against an escape-looking literal is refused" "400" \
+   "$(status "SELECT 1 WHERE 'a' ILIKE'\\'; SELECT 2")"
+eq "ESCAPE against an escape-looking literal is refused" "400" \
+   "$(status "SELECT 'a' LIKE 'b' ESCAPE'\\'; SELECT 2")"
+eq "a typed date literal is refused" "400" \
+   "$(status "SELECT date'2020-01-01'; SELECT 2")"
+eq "a bind parameter is not a dollar quote" "400" \
+   "$(status 'SELECT $1$; SELECT 2; $1$')"
+# And the legitimate forms still work, or the rule above is just over-rejection.
+eq "a real escape string still works" "a'; b" \
+   "$(scalar "SELECT E'a\\'; b' AS v")"
+eq "LIKE with a backslash literal still works" "0" \
+   "$(scalar "SELECT count(*) AS n FROM sites WHERE 'a' LIKE'\\'")"
+
+# The scan after a terminator is done once, not re-run per byte. At Theta(n^2)
+# a request this size ran for hours on the worker thread that read it. The body
+# goes through a file: four megabytes will not fit in an argv entry.
+python3 -c "
+import json, sys
+sys.stdout.write(json.dumps({'sql': 'SELECT 1;' + ' ' * 4000000}))" > "$work/big.json"
+eq "a megabytes-long trailing tail is scanned promptly" "1" \
+   "$(curl -sS -m 30 -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+        --data-binary "@$work/big.json" "$base/sql" | nd 'rows[0][0]')"
+
+# The declared length is checked before the body is read: tiny_http drains the
+# undelivered remainder into a single zeroed allocation of whatever was claimed.
+eq "an oversized Content-Length is refused" "413" \
+   "$(curl -sS -m 20 -o /dev/null -w '%{http_code}' -X POST "$base/sql" \
+        -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+        -H 'Content-Length: 629145600' --data '{"sql":"SELECT 1"}' 2>/dev/null || echo curl-refused)"
+
+# ---------------------------------------------------------------------------
+section "Pooled connections carry no transaction"
+# ---------------------------------------------------------------------------
+
+# A pooled connection is never pinned to a client, so a BEGIN can never be
+# committed and must not survive to the next request. is_autocommit() in
+# duckdb-rs is a stub that always returns true, so the reset used to fire only
+# for jobs that ended abnormally: one BEGIN per worker, and the next request on
+# each of those connections came back "cannot start a transaction within a
+# transaction".
+begin_failures=0
+for _ in $(seq 1 16); do
+  [[ "$(status 'BEGIN TRANSACTION')" == "200" ]] || begin_failures=$((begin_failures+1))
+done
+eq "16 sequential BEGINs all succeed" "0" "$begin_failures"
+eq "and the pool still answers afterwards" "$exp_n_sites" \
+   "$(scalar 'SELECT count(*) AS n FROM sites')"
+
 section "Parameter binding"
 # ---------------------------------------------------------------------------
 
@@ -567,11 +652,11 @@ else
 fi
 
 eq "the data is there when the file is reopened" "1000" \
-   "$(duckdb -readonly -csv -noheader "$db" -c 'SELECT count(*) FROM durable' 2>/dev/null | tail -1)"
+   "$(duckdb -no-init -readonly -csv -noheader "$db" -c 'SELECT count(*) FROM durable' 2>/dev/null | tail -1)"
 eq "the concurrent inserts are there too" "80" \
-   "$(duckdb -readonly -csv -noheader "$db" -c 'SELECT count(*) FROM hammer' 2>/dev/null | tail -1)"
+   "$(duckdb -no-init -readonly -csv -noheader "$db" -c 'SELECT count(*) FROM hammer' 2>/dev/null | tail -1)"
 eq "the original tables are unharmed" "$exp_digest" \
-   "$(duckdb -readonly -csv -noheader "$db" -c "SELECT md5(string_agg(account, '|' ORDER BY account)) FROM sites" 2>/dev/null | tail -1)"
+   "$(duckdb -no-init -readonly -csv -noheader "$db" -c "SELECT md5(string_agg(account, '|' ORDER BY account)) FROM sites" 2>/dev/null | tail -1)"
 
 # ---------------------------------------------------------------------------
 # Report

@@ -32,7 +32,7 @@ rm -f "$out" "$out.wal"
 
 if [[ -n "$labs" && -d "$labs/synopsis" ]]; then
   echo "fixture: loading from $labs/synopsis"
-  duckdb "$out" <<SQL
+  duckdb -no-init "$out" <<SQL
 CREATE OR REPLACE TABLE sites   AS FROM read_csv('$labs/synopsis/sites.csv',   all_varchar=true);
 CREATE OR REPLACE TABLE cohorts AS FROM read_csv('$labs/synopsis/cohorts.csv', all_varchar=true);
 CREATE OR REPLACE TABLE plans   AS FROM read_csv('$labs/synopsis/plans.csv',   all_varchar=true);
@@ -49,7 +49,7 @@ else
   # through, and the text columns deliberately include non-ASCII, an embedded
   # quote and a newline: the encoder's edge cases should be present in ordinary
   # data, not only in the tests that go looking for them.
-  duckdb "$out" <<'SQL'
+  duckdb -no-init "$out" <<'SQL'
 CREATE OR REPLACE TABLE sites AS
 SELECT
   'A' || lpad(i::VARCHAR, 6, '0')                              AS account,
@@ -118,9 +118,14 @@ fi
 # A fixture with a WAL beside it is a fixture that has not been checkpointed,
 # and copying only the .duckdb file — which every suite does — would silently
 # lose rows.
+# Fatal, not a warning. Every suite copies the .duckdb file alone, and every
+# oracle is then read from that same truncated copy — so oracle and server agree
+# on the wrong data and the whole run goes green over a fixture missing rows.
+# There is no downstream check that can catch this; it has to stop here.
 if [[ -f "$out.wal" ]]; then
-  echo "fixture: warning, $out.wal remains after CHECKPOINT" >&2
+  echo "fixture: $out.wal remains after CHECKPOINT — the fixture is not safe to copy" >&2
+  exit 1
 fi
 
-duckdb -readonly "$out" -c "SELECT table_name, estimated_size AS rows FROM duckdb_tables() ORDER BY 1"
+duckdb -no-init -readonly "$out" -c "SELECT table_name, estimated_size AS rows FROM duckdb_tables() ORDER BY 1"
 echo "fixture: wrote $out ($(du -h "$out" | cut -f1))"

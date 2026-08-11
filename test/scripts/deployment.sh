@@ -9,8 +9,9 @@
 # Every other suite in this directory starts its own server on a copy of a
 # database. This one does not start anything and does not create anything: it
 # is meant to be run against the real deployment, including production, so it
-# is strictly read-only. Nothing here writes, and the one write it performs is
-# a rollback that proves writes are refused or accepted as configured.
+# is strictly read-only: nothing here creates, writes, or begins a transaction.
+# Read-only is not the same as free, though — it runs a 300,000-row scan and a
+# short burst of 12 concurrent clients, so it costs the server real work.
 #
 # The distinction matters because the interesting failures are the ones that
 # only exist in a deployment: a reverse proxy that buffers a streaming response
@@ -275,11 +276,19 @@ if (( rows >= 300000 )); then
 else
   bad "a 300k-row result streams to completion" "only ${rows} rows arrived"
 fi
-if (( first_ms * 2 < total_ms || total_ms < 500 )); then
+# A failure, not a warning. The comment above calls this the single most common
+# way a streaming deployment stops streaming; reporting it as a warning meant
+# the run still exited 0 and printed "the deployment is fit to serve". The
+# total_ms < 500 escape hatch went with it — a response fast enough to look
+# instant is exactly where a buffering proxy hides.
+if (( first_ms * 2 < total_ms )); then
   ok "the first row arrives before the last" "first ${first_ms}ms of ${total_ms}ms"
-else
+elif (( total_ms < 500 )); then
   soft "the first row arrives before the last" \
-       "first row at ${first_ms}ms of ${total_ms}ms — something between here and harbor is buffering the whole response"
+       "the whole result took ${total_ms}ms, too fast to tell buffering from speed — rerun against a larger result to be sure"
+else
+  bad "the first row arrives before the last" \
+      "first row at ${first_ms}ms of ${total_ms}ms — something between here and harbor is buffering the whole response"
 fi
 
 # Keep-alive is what stops a busy client from exhausting its ephemeral ports.
@@ -347,8 +356,16 @@ fi
 # is safe to point at production cannot do that.
 mode=$(scalar "SELECT current_setting('access_mode') AS m")
 case "$mode" in
-  READ_ONLY|read_only) ok "the deployment is read-only" "as configured" ;;
-  *)                   ok "the deployment accepts writes" "access_mode=$mode" ;;
+  # Either answer is a legitimate deployment, so this reports rather than
+  # judges — but it must not report a pass. Both branches used to call ok(),
+  # which meant a query that failed outright came back as
+  # "✓ the deployment accepts writes (access_mode=NO-ROWS)" and added one to
+  # the pass count.
+  READ_ONLY|read_only) record "access mode" ok "read-only, as configured"
+                       say '  %s·%s access mode: read-only\n' "$dim" "$off" ;;
+  NO-ROWS|"")          bad "access mode could not be read" "the server did not answer current_setting('access_mode')" ;;
+  *)                   record "access mode" ok "$mode"
+                       say '  %s·%s access mode: %s (writes accepted)\n' "$dim" "$off" "$mode" ;;
 esac
 
 # ---------------------------------------------------------------------------

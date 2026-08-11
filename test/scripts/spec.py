@@ -182,6 +182,37 @@ CASES = [
     ("null-bigint",    "SELECT NULL::BIGINT AS v",   "BIGINT",   True, None),
     ("null-date",      "SELECT NULL::DATE AS v",     "DATE",     True, None),
     ("null-decimal",   "SELECT NULL::DECIMAL(10,2) AS v", "DECIMAL(10,2)", True, None),
+
+    # -- the lossy column ---------------------------------------------------
+    # Every case above asserts lossless=True, which means the flag had never
+    # been checked in the one state that carries information. A column that
+    # silently started reporting lossless:true would have passed this suite
+    # from top to bottom.
+    #
+    # TIME WITH TIME ZONE is harbor's only lossy type: DuckDB's Arrow exporter
+    # drops the offset before harbor sees the value, keeping the local wall
+    # clock, so 12:34:56+05 and 12:34:56-08 arrive indistinguishable. The
+    # contract is that harbor says so rather than emitting a time that means
+    # something else.
+    ("timetz-utc",     "SELECT '12:34:56+00'::TIMETZ AS v",
+                       "TIME WITH TIME ZONE", False, "12:34:56"),
+    ("timetz-offset",  "SELECT '12:34:56+05'::TIMETZ AS v",
+                       "TIME WITH TIME ZONE", False, "12:34:56"),
+    ("timetz-negative", "SELECT '12:34:56-08'::TIMETZ AS v",
+                       "TIME WITH TIME ZONE", False, "12:34:56"),
+    # The documented recovery: the offset is still reachable through SQL, and
+    # that column is exact.
+    ("timetz-offset-recoverable",
+                       "SELECT date_part('timezone', '12:34:56+05'::TIMETZ) AS v",
+                       "BIGINT", True, 18000),
+
+    # -- HUGEINT minimum ----------------------------------------------------
+    # i128::MIN has no positive counterpart, so the "is this JSON-safe" test
+    # overflowed on exactly this value and let it out as a bare number — the
+    # one thing the envelope exists to prevent, on the type most likely to
+    # carry it. hugeint-max above could not catch it.
+    ("hugeint-min",    "SELECT (-170141183460469231731687303715884105728)::HUGEINT AS v",
+                       "HUGEINT", True, "-170141183460469231731687303715884105728"),
 ]
 
 # Extra schema keys a case must carry, beyond duckdbType and lossless.
@@ -191,6 +222,11 @@ SCHEMA_EXTRAS = {
     "array":          {"arrayLength": 3},
     "map":            {"encoding": "pairs"},
     "enum":           {"values": ["sad", "ok", "happy"]},
+    # Not just lossless:false — the reason, so a client can tell which of the
+    # value's properties it must not trust.
+    "timetz-utc":      {"encoding": "time-offset-dropped"},
+    "timetz-offset":   {"encoding": "time-offset-dropped"},
+    "timetz-negative": {"encoding": "time-offset-dropped"},
 }
 
 

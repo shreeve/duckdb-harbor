@@ -39,6 +39,11 @@ s.bind(("127.0.0.1", 0))
 print(s.getsockname()[1])
 s.close()')}
 token=${TOKEN:-check-$$}
+# Unset, not just shadowed. The suites below read PORT from the environment as
+# their own default, so leaving it set makes every one of them try to bind the
+# port this runner has already given to the shared server — the run dies at
+# startup with "address already in use" and it looks like a harbor bug.
+unset PORT
 suites=${SUITES:-unit abi types sqllogic asserts spec fuzz differential deployment stress resilience}
 
 bold=$(tput bold 2>/dev/null || true); red=$(tput setaf 1 2>/dev/null || true)
@@ -57,12 +62,19 @@ cleanup() {
 trap cleanup EXIT
 
 banner() { printf '\n%s══ %s %s%s\n' "$bold" "$1" "$(printf '═%.0s' $(seq 1 $((60 - ${#1}))))" "$off"; }
+# Exit 77 means "could not run", and it is not a pass. A suite that reports
+# success when its subject is missing is worse than one that fails: it keeps
+# reporting success forever, and the gap it was built to guard goes unwatched.
 run() { # run <name> <command...>
-  local name=$1; shift
+  local name=$1 status=0; shift
   [[ " $suites " == *" $name "* ]] || return 0
   banner "$name"
-  if "$@"; then passed+=("$name"); printf '%s✓ %s%s\n' "$green" "$name" "$off"
-  else failed+=("$name"); printf '%s✗ %s%s\n' "$red" "$name" "$off"; fi
+  "$@" || status=$?
+  case $status in
+    0)  passed+=("$name");  printf '%s✓ %s%s\n' "$green" "$name" "$off" ;;
+    77) skipped+=("$name"); printf '%s— %s skipped%s\n' "$dim" "$name" "$off" ;;
+    *)  failed+=("$name");  printf '%s✗ %s%s\n' "$red" "$name" "$off" ;;
+  esac
 }
 skip() { skipped+=("$1"); printf '%s— %s skipped: %s%s\n' "$dim" "$1" "$2" "$off"; }
 
@@ -76,7 +88,7 @@ run unit     cargo test --release
 # Reads the built artifact rather than a running server: the ABI stamp decides
 # which DuckDB versions will load it at all, and nothing else here looks at it.
 run abi      "$here/test/scripts/abi.sh"
-run types    "$here/test/scripts/types.py"
+
 run sqllogic make -C "$here" test_release
 
 # ---------------------------------------------------------------------------
@@ -84,7 +96,7 @@ run sqllogic make -C "$here" test_release
 # ---------------------------------------------------------------------------
 
 needs_server=0
-for s in asserts spec fuzz deployment stress; do
+for s in types asserts spec fuzz deployment stress; do
   [[ " $suites " == *" $s "* ]] && needs_server=1
 done
 
@@ -106,9 +118,13 @@ if (( needs_server )); then
   fi
 fi
 
-# stress.sh starts its own server, because it needs oracle values read from the
-# database before anything takes the file lock.
+# asserts.sh starts its own server, because it needs oracle values read from
+# the database before anything takes the file lock.
 run asserts "$here/test/scripts/asserts.sh" "$db"
+
+# types.py sends every corpus query and reads the types back out of the
+# schema lines, so it needs a server; it used to grep the query text instead.
+run types "$here/test/scripts/types.py" --port "$port" --token "$token"
 
 run spec  "$here/test/scripts/spec.py" --port "$port" --token "$token"
 run fuzz  "$here/test/scripts/fuzz.py"       --port "$port" --token "$token"
@@ -118,9 +134,24 @@ run deployment "$here/test/scripts/deployment.sh" --url "http://127.0.0.1:$port"
 # the CI workflow doing exactly this, and it was the only place that could not
 # get a server up — one proven path is better than two, one of which is only
 # exercised in CI.
+#
+# The expected answers come from the source database, read here before the
+# server ever opened its copy — not from the server, which is what stress.py
+# used to do. Verifying a server against its own replies cannot detect a server
+# that is consistently wrong.
+if [[ " $suites " == *" stress "* ]]; then
+  oracle_sql=$("$here/test/scripts/stress.py" --dump-oracle-sql)
+  mapfile_compat=()
+  while IFS= read -r line; do mapfile_compat+=("$line"); done <<< "$oracle_sql"
+  expect_sites=$(duckdb -no-init -readonly -csv -noheader "$db" -c "${mapfile_compat[0]}" | tail -1)
+  expect_top=$(duckdb   -readonly -csv -noheader "$db" -c "${mapfile_compat[1]}" | tail -1)
+  expect_join=$(duckdb  -readonly -csv -noheader "$db" -c "${mapfile_compat[2]}" | tail -1)
+fi
 run stress "$here/test/scripts/stress.py" --port "$port" --token "$token" \
            --levels "${SWARM_LEVELS:-1,4,16}" --seconds "${SWARM_SECONDS:-10}" \
-           --write-pct "${SWARM_WRITE_PCT:-20}"
+           --write-pct "${SWARM_WRITE_PCT:-20}" \
+           --expect-sites "${expect_sites:-}" --expect-top-plans "${expect_top:-}" \
+           --expect-join "${expect_join:-}"
 
 [[ -n "$server_pid" ]] && { kill -TERM "$server_pid" 2>/dev/null; wait "$server_pid" 2>/dev/null; server_pid=""; }
 

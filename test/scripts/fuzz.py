@@ -28,8 +28,10 @@ import base64
 import datetime
 import http.client
 import json
+import os
 import random
 import sys
+import tempfile
 
 BATCH = 250
 
@@ -60,8 +62,11 @@ def request(host, port, token, sql):
                 # test. Keep the whole response so the offending bytes can be
                 # looked at, rather than dying with a traceback that says
                 # nothing about which value caused it.
-                dump = "/tmp/harbor-fuzz-bad-envelope.txt"
-                with open(dump, "w") as fh:
+                # A unique path per failure: a fixed one is overwritten by the
+                # next bad line and clobbered by a concurrent run, so the file
+                # named in the message is often not the one that caused it.
+                fd, dump = tempfile.mkstemp(prefix="harbor-fuzz-bad-envelope.", suffix=".txt")
+                with os.fdopen(fd, "w") as fh:
                     fh.write(payload)
                 return resp.status, rows, {
                     "message": "malformed envelope line (%s) at offset %d; full response in %s; line: %r"

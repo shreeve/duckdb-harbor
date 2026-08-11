@@ -120,7 +120,7 @@ def rows_of(lines):
     return [l["values"] for l in lines if l.get("type") == "row"]
 
 
-def run_level(args, clients, expected_sites, stop_after):
+def run_level(args, clients, expected, stop_after):
     """Drive `clients` threads for `stop_after` seconds; return a Level."""
     level = Level(clients)
     barrier = threading.Barrier(clients + 1)
@@ -149,24 +149,21 @@ def run_level(args, clients, expected_sites, stop_after):
                 )
                 ok = code == 200
             else:
+                # All three reads have an answer read from the database file
+                # before the server opened it. Two of these used to carry
+                # want=None, so 55% of the read mix was checked only for
+                # "some rows came back" and the "wrong answers" column could
+                # not have caught a wrong aggregate.
                 choice = rng.random()
                 if choice < 0.45:
-                    sql, want = "SELECT count(*) AS n FROM sites", str(expected_sites)
+                    sql, want = "SELECT count(*) AS n FROM sites", expected["sites"]
                 elif choice < 0.75:
-                    sql, want = (
-                        "SELECT client, count(*) AS n FROM plans GROUP BY 1 "
-                        "ORDER BY n DESC, client LIMIT 5",
-                        None,
-                    )
+                    sql, want = (TOP_PLANS_SQL, expected["top_plans"])
                 else:
-                    sql, want = (
-                        "SELECT s.client, count(*) AS n FROM sites s "
-                        "JOIN plans p USING (client) GROUP BY 1 ORDER BY 1",
-                        None,
-                    )
+                    sql, want = (JOIN_SQL, expected["join"])
                 code, secs, lines = client.request(sql)
                 rows = rows_of(lines)
-                ok = code == 200 and bool(rows) and (want is None or str(rows[0][0]) == want)
+                ok = code == 200 and bool(rows) and str(rows[0][0]) == str(want)
             level.record(secs, code, ok)
         client.close()
 
@@ -189,6 +186,39 @@ def pct(values, p):
     return ordered[k]
 
 
+# The queries the load sends, and — below — the queries whose answers verify
+# them. Kept together so the two can never drift apart.
+#
+# These are ordinary aggregates, deliberately: an earlier version wrapped each
+# one in md5(string_agg(...)) to get a single comparable value, which made the
+# benchmark measure a workload nobody runs — about 24% slower per request than
+# the query it replaced. The first cell of an ordered aggregate is verification
+# enough. A wrong grouping, a wrong join, or a dropped row changes which client
+# sorts first, and it costs nothing to check.
+TOP_PLANS_SQL = (
+    "SELECT client, count(*) AS n FROM plans GROUP BY 1 ORDER BY n DESC, client LIMIT 5"
+)
+JOIN_SQL = (
+    "SELECT s.client, count(*) AS n FROM sites s JOIN plans p USING (client) "
+    "GROUP BY 1 ORDER BY 1"
+)
+
+
+def dump_oracle_sql():
+    """The three queries whose answers the caller must supply.
+
+    Printed rather than duplicated in the runner: the oracle is only an oracle
+    if it answers the same question the load asks, and a copy in a shell script
+    is a copy that drifts.
+    """
+    print("SELECT count(*) FROM sites")
+    # The first cell each load query must produce, in the order it produces it.
+    print("SELECT client FROM plans GROUP BY 1 ORDER BY count(*) DESC, client LIMIT 1")
+    print("SELECT s.client FROM sites s JOIN plans p USING (client) "
+          "GROUP BY 1 ORDER BY 1 LIMIT 1")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
@@ -200,29 +230,56 @@ def main():
                     help="percentage of requests that are INSERTs")
     ap.add_argument("--no-keepalive", action="store_true",
                     help="open a fresh connection per request")
-    args = ap.parse_args()
+    ap.add_argument("--dump-oracle-sql", action="store_true",
+                    help="print the queries the oracle must answer, then exit")
+    ap.add_argument("--expect-sites", required=True,
+                    help="count(*) FROM sites, read from the database file by the caller")
+    ap.add_argument("--expect-top-plans", required=True,
+                    help="digest of the top-plans aggregate, read the same way")
+    ap.add_argument("--expect-join", required=True,
+                    help="digest of the sites/plans join, read the same way")
+    args = ap.parse_args(namespace=None) if "--dump-oracle-sql" not in sys.argv else None
+    if args is None:
+        return dump_oracle_sql()
 
-    code, _, lines = request(args.host, args.port, args.token, "SELECT count(*) AS n FROM sites")
+    code, _, lines = request(args.host, args.port, args.token, "SELECT 1 AS up")
     if code != 200:
         print("stress: server did not answer (status %s)" % code, file=sys.stderr)
         return 2
-    expected_sites = rows_of(lines)[0][0]
+
+    # The expected values are supplied by the caller, which reads them from the
+    # database file directly before the server takes the lock. They used to be
+    # read from the server itself, and the banner still claimed reads were
+    # "verified" — but a server that returned a consistently wrong count under
+    # load would have been compared against its own wrong count and reported
+    # zero wrong answers. An oracle that shares an implementation with the thing
+    # it checks is not an oracle.
+    expected = {
+        "sites": args.expect_sites,
+        "top_plans": args.expect_top_plans,
+        "join": args.expect_join,
+    }
+    if not all(str(v).strip() for v in expected.values()):
+        print("stress: the caller must supply --expect-sites, --expect-top-plans and "
+              "--expect-join, read from the database file. Empty values would make "
+              "every read compare against nothing.", file=sys.stderr)
+        return 2
 
     if args.write_pct > 0:
         request(args.host, args.port, args.token,
                 "CREATE TABLE IF NOT EXISTS stress_log(client BIGINT, n BIGINT)")
 
     print("harbor stress — %.0fs per level, %.0f%% writes, %s connections, "
-          "reads verified against count(sites)=%s"
+          "every read verified against an oracle read from the database file"
           % (args.seconds, args.write_pct,
-             "fresh" if args.no_keepalive else "reused", expected_sites))
+             "fresh" if args.no_keepalive else "reused"))
     print()
     print("  clients      req/s     mean      p50      p95      p99      max   non-200   wrong")
     print("  " + "-" * 84)
 
     regressions = []
     for clients in [int(x) for x in args.levels.split(",")]:
-        lv = run_level(args, clients, expected_sites, args.seconds)
+        lv = run_level(args, clients, expected, args.seconds)
         n = len(lv.latencies)
         rps = n / lv.wall if lv.wall else 0
         ms = lambda v: v * 1000

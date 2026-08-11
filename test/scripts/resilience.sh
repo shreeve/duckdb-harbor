@@ -28,13 +28,18 @@ s.close()')}
 token=${TOKEN:-res-$$}
 base="http://127.0.0.1:$port"
 
+# Exported so the inline python blocks below write their results here too.
+# They used fixed /tmp paths, which survive the run: the assertions that read
+# them back passed off a previous run's file without ever contacting a server,
+# and two runs at once overwrote each other.
 work=$(mktemp -d "${TMPDIR:-/tmp}/harbor-res.XXXXXX")
+export WORK="$work"
 db="$work/res.duckdb"
 cp "$src_db" "$db"
 
 # Read the fixture's own row count rather than hardcoding one, so the suite
 # runs against any database with these tables — including the one CI builds.
-sites_n=$(duckdb -readonly -csv -noheader "$src_db" -c 'SELECT count(*) FROM sites' 2>/dev/null | tail -1)
+sites_n=$(duckdb -no-init -readonly -csv -noheader "$src_db" -c 'SELECT count(*) FROM sites' 2>/dev/null | tail -1)
 
 pass=0; fail=0
 declare -a failures=()
@@ -76,10 +81,10 @@ sql() { curl -sS -m 60 -H "Authorization: Bearer $token" --data "{\"sql\":$(pyth
 scalar() { sql "$1" | python3 -c 'import sys,json
 rows=[json.loads(l)["values"] for l in sys.stdin.read().split("\n") if l.strip() and "\"row\"" in l]
 print(rows[0][0] if rows else "NO-ROWS")'; }
-# Wait until the server is answering normally again. harbor returns 503 when
-# every worker is busy — that is the backpressure working, not a failure — so
-# checks that need a quiet server wait for one instead of counting a busy
-# answer as breakage. Returns non-zero if it never settles.
+# Wait until the server is answering normally again. Requests past the worker
+# count wait for a worker rather than being shed, so a burst leaves later
+# requests queued behind it; checks that need a quiet server wait for one
+# instead of reading that queue as breakage. Non-zero if it never settles.
 settle() {
   for _ in $(seq 1 "${1:-60}"); do
     [[ "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" \
@@ -89,8 +94,28 @@ settle() {
   done
   return 1
 }
-fds()  { lsof -p "$server_pid" 2>/dev/null | wc -l | tr -d ' '; }
-rss()  { ps -o rss= -p "$server_pid" 2>/dev/null | tr -d ' '; }
+# Both of these print nothing when the tool is missing or the process is dead,
+# and an empty sample compares as 0. That made every leak check pass in exactly
+# the two situations it must not: no lsof (0 - 0 < 25), and a server that had
+# crashed during the run (0 - 50 < 25 — a dead server passing a leak test).
+# Print a sentinel instead, and let the comparison refuse it.
+fds()  { local n; n=$(lsof -p "$server_pid" 2>/dev/null | wc -l | tr -d ' '); if [[ -n "$n" && "$n" != 0 ]]; then echo "$n"; else echo unmeasured; fi; }
+rss()  { local n; n=$(ps -o rss= -p "$server_pid" 2>/dev/null | tr -d ' '); if [[ -n "$n" ]]; then echo "$n"; else echo unmeasured; fi; }
+
+# A leak check is only meaningful when both samples are real numbers and the
+# count did not fall — a drop means the subject went away, not that it improved.
+grew_by() {
+  local label=$1 before=$2 after=$3 limit=$4 unit=${5:-}
+  if [[ "$before" == unmeasured || "$after" == unmeasured ]]; then
+    bad "$label" "could not measure (is lsof installed, and is the server alive?)"
+  elif (( after < before )); then
+    bad "$label" "sample fell from ${before}${unit} to ${after}${unit} — the process is gone"
+  elif (( after - before < limit )); then
+    ok "$label (${before}${unit} → ${after}${unit})"
+  else
+    bad "$label" "${before}${unit} → ${after}${unit}"
+  fi
+}
 
 # ---------------------------------------------------------------------------
 section "Crash recovery (SIGKILL, no chance to checkpoint)"
@@ -111,9 +136,9 @@ else
   bad "a WAL survives the kill, as it must" "no $db.wal — the writes were nowhere"
 fi
 eq "every committed row replays on reopen" "20" \
-   "$(duckdb -readonly -csv -noheader "$db" -c 'SELECT count(*) FROM crash' 2>/dev/null | tail -1)"
+   "$(duckdb -no-init -readonly -csv -noheader "$db" -c 'SELECT count(*) FROM crash' 2>/dev/null | tail -1)"
 eq "the original tables are unharmed by the kill" "$sites_n" \
-   "$(duckdb -readonly -csv -noheader "$db" -c 'SELECT count(*) FROM sites' 2>/dev/null | tail -1)"
+   "$(duckdb -no-init -readonly -csv -noheader "$db" -c 'SELECT count(*) FROM sites' 2>/dev/null | tail -1)"
 
 start_server || { echo "resilience: server did not restart after the kill"; exit 1; }
 eq "the server serves the replayed data" "20" "$(scalar 'SELECT count(*) AS n FROM crash')"
@@ -133,20 +158,12 @@ for _ in $(seq 1 500); do sql 'SELECT count(*) AS n FROM sites' > /dev/null; don
 fd_after=$(fds)
 # A per-request descriptor leak would be +500. Allow a small band for the
 # keep-alive connections the harness itself leaves in TIME_WAIT.
-if (( fd_after - fd_before < 25 )); then
-  ok "500 requests leak no descriptors (${fd_before} → ${fd_after})"
-else
-  bad "500 requests leak no descriptors" "${fd_before} → ${fd_after}"
-fi
+grew_by "500 requests leak no descriptors" "$fd_before" "$fd_after" 25
 
 for _ in $(seq 1 200); do sql 'SELECT * FROM plans' > /dev/null; done
 rss_after=$(rss)
 # 200 full-table streams; a result-sized leak would show as tens of megabytes.
-if (( rss_after - rss_before < 51200 )); then
-  ok "200 streamed results leak no memory (${rss_before}K → ${rss_after}K)"
-else
-  bad "200 streamed results leak no memory" "${rss_before}K → ${rss_after}K RSS"
-fi
+grew_by "200 streamed results leak no memory" "$rss_before" "$rss_after" 51200 K
 
 # ---------------------------------------------------------------------------
 section "Clients behaving badly"
@@ -183,11 +200,7 @@ else
 fi
 eq "and still correct" "$sites_n" "$(scalar 'SELECT count(*) AS n FROM sites')"
 fd_after=$(fds)
-if (( fd_after - fd_before < 25 )); then
-  ok "abandoned streams release their descriptors (${fd_before} → ${fd_after})"
-else
-  bad "abandoned streams release their descriptors" "${fd_before} → ${fd_after}"
-fi
+grew_by "abandoned streams release their descriptors" "$fd_before" "$fd_after" 25
 
 # A client that opens a transaction and never closes it. Requests are not
 # pinned to a connection, so that transaction can never be committed — and if
@@ -204,10 +217,17 @@ sql 'BEGIN TRANSACTION' > /dev/null
 # look like a corrupted one, which is how this first failed in CI.
 settle 60 || true
 poisoned=0
+answered=0
 for _ in $(seq 1 40); do
-  sql 'SELECT 1 AS n' | grep -qi 'transaction is aborted\|transaction context' && poisoned=$((poisoned+1))
+  reply=$(sql 'SELECT 1 AS n')
+  grep -qi 'transaction is aborted\|transaction context' <<<"$reply" && poisoned=$((poisoned+1))
+  grep -q '"values":\[1\]' <<<"$reply" && answered=$((answered+1))
 done
+# Both halves matter. Counting only poisoned replies passes when the server is
+# wedged and answers nothing at all — the worst outcome this section exists to
+# catch would have read as a clean run.
 eq "an abandoned transaction does not poison the pool" "0" "$poisoned"
+eq "and all 40 of those requests were answered" "40" "$answered"
 
 # Connections that open and never send anything. A server that dedicates a
 # worker to each would stop answering after four.
@@ -223,22 +243,22 @@ for _ in range(64):
     except OSError:
         pass
 print("  %d idle connections held open" % len(socks))
-import subprocess
+import os, subprocess
 code = subprocess.run(["curl", "-sS", "-m", "10", "-o", "/dev/null",
                        "-w", "%{http_code}", "http://127.0.0.1:%s/health" % sys.argv[1]],
                       capture_output=True, text=True).stdout
 print("  health while they are held: %s" % code)
-open("/tmp/harbor-idle-result.txt", "w").write(code)
+open(os.environ["WORK"] + "/idle-result.txt", "w").write(code)
 for s in socks:
     s.close()
 PY
-eq "answers while 64 connections sit idle" "200" "$(cat /tmp/harbor-idle-result.txt 2>/dev/null)"
+eq "answers while 64 connections sit idle" "200" "$(cat "$work/idle-result.txt" 2>/dev/null)"
 
 # A client that sends a request and then reads one byte at a time, slowly. The
 # bounded body channel should make the query wait for the reader rather than
 # buffer the whole result.
 python3 - "$port" "$token" <<'PY'
-import json, socket, sys, time
+import json, os, socket, sys, time
 port, token = int(sys.argv[1]), sys.argv[2]
 body = json.dumps({"sql": "SELECT i, repeat('x', 200) FROM range(400000) t(i)"})
 s = socket.create_connection(("127.0.0.1", port), timeout=30)
@@ -256,11 +276,11 @@ for _ in range(40):
         break
     got += len(chunk)
 s.close()
-open("/tmp/harbor-slow-result.txt", "w").write("streaming" if got > 0 else "nothing")
+open(os.environ["WORK"] + "/slow-result.txt", "w").write("streaming" if got > 0 else "nothing")
 print("  slow reader received %d bytes in 2s of a ~90 MB result" % got)
 PY
 eq "a slow reader gets data without stalling the server" "streaming" \
-   "$(cat /tmp/harbor-slow-result.txt 2>/dev/null)"
+   "$(cat "$work/slow-result.txt" 2>/dev/null)"
 settle 60 || true
 eq "other clients are unaffected by the slow one" "$sites_n" "$(scalar 'SELECT count(*) AS n FROM sites')"
 
@@ -338,9 +358,9 @@ else
   ok "the WAL is folded in on a clean stop"
 fi
 eq "the data is there on reopen" "5000" \
-   "$(duckdb -readonly -csv -noheader "$db" -c 'SELECT count(*) FROM final' 2>/dev/null | tail -1)"
+   "$(duckdb -no-init -readonly -csv -noheader "$db" -c 'SELECT count(*) FROM final' 2>/dev/null | tail -1)"
 eq "the crash-recovered rows are still there too" "21" \
-   "$(duckdb -readonly -csv -noheader "$db" -c 'SELECT count(*) FROM crash' 2>/dev/null | tail -1)"
+   "$(duckdb -no-init -readonly -csv -noheader "$db" -c 'SELECT count(*) FROM crash' 2>/dev/null | tail -1)"
 
 printf '\n%s%d passed, %d failed%s\n' "$bold" "$pass" "$fail" "$off"
 if (( fail > 0 )); then

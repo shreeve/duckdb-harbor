@@ -273,6 +273,19 @@ ERRORS = [
     ("cast-failure",         "SELECT 'abc'::INTEGER AS v"),
     ("out-of-range-cast",    "SELECT 99999::TINYINT AS v"),
     ("unknown-function",     "SELECT no_such_function(1)"),
+
+    # Multi-statement text must be refused before it reaches DuckDB, because
+    # duckdb-rs executes every statement but the last during prepare. These
+    # are the shapes that got past the scanner: a keyword ending in `e` butted
+    # against a literal reads as an E'...' escape string, so the backslash
+    # hides the closing quote and the terminator after it. Each of these
+    # dropped a table when it was accepted.
+    ("multi-statement",      "SELECT 1; SELECT 2"),
+    ("multi-like-escape",    r"SELECT 1 WHERE 'a' LIKE'\'; SELECT 2"),
+    ("multi-ilike-escape",   r"SELECT 1 WHERE 'a' ILIKE'\'; SELECT 2"),
+    ("multi-escape-keyword", r"SELECT 'a' LIKE 'b' ESCAPE'\'; SELECT 2"),
+    ("multi-date-literal",   "SELECT date'2020-01-01'; SELECT 2"),
+    ("multi-dollar-param",   "SELECT $1$; SELECT 2; $1$"),
 ]
 
 # ---------------------------------------------------------------------------
