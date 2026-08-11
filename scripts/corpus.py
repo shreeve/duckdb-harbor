@@ -79,6 +79,21 @@ TYPES = [
     ("double-huge",          "SELECT 1.7976931348623157e308::DOUBLE AS v"),
     ("double-inf",           "SELECT 'inf'::DOUBLE AS v"),
     ("double-nan",           "SELECT 'nan'::DOUBLE AS v"),
+
+    # BIGNUM (VARINT before v1.5). Arbitrary precision, and stored as a
+    # three-byte header plus a big-endian magnitude that is one's-complemented
+    # when negative — so the sign, the zero case and the boundary where the
+    # value stops fitting a double all exercise different code.
+    ("bignum-zero",          "SELECT 0::VARINT AS v"),
+    ("bignum-one",           "SELECT 1::VARINT AS v"),
+    ("bignum-neg-one",       "SELECT (-1)::VARINT AS v"),
+    ("bignum-small",         "SELECT 42::VARINT AS v"),
+    ("bignum-neg-small",     "SELECT (-255)::VARINT AS v"),
+    ("bignum-json-safe",     "SELECT 9007199254740991::VARINT AS v"),
+    ("bignum-past-safe",     "SELECT 9007199254740993::VARINT AS v"),
+    ("bignum-huge",          "SELECT 123456789012345678901234567890::VARINT AS v"),
+    ("bignum-neg-huge",      "SELECT (-123456789012345678901234567890)::VARINT AS v"),
+    ("bignum-past-hugeint",  "SELECT 170141183460469231731687303715884105728::VARINT AS v"),
     ("double-null",          "SELECT NULL::DOUBLE AS v"),
 
     # -- decimals: width and scale have to survive, and so do trailing zeros

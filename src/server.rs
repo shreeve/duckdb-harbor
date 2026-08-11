@@ -933,6 +933,10 @@ fn is_lossless(id: LogicalTypeId) -> bool {
             | Interval
             | Blob
             | Bit
+            // Lossless because it goes out as its decimal digits — a string
+            // when it exceeds what a double holds, so no precision is lost on
+            // the way through a JSON parser.
+            | Bignum
             | Enum
             | SqlNull
     )
@@ -1083,6 +1087,17 @@ fn emit_value(out: &mut String, v: &Value, ty: Option<&LogicalTypeHandle>) {
         Value::Decimal(d) => push_json_string(out, &d.to_string()),
         Value::Text(s) | Value::Enum(s) => push_json_string(out, s),
         Value::Blob(b) if id == Some(LogicalTypeId::Bit) => push_json_string(out, &bit_string(b)),
+        // Same JSON-safe rule as every other integer: bare when a double holds
+        // it exactly, quoted past that. A BIGNUM is arbitrary precision, so it
+        // is usually quoted — but a small one should not look different from
+        // the same value in a BIGINT column.
+        Value::Blob(b) if id == Some(LogicalTypeId::Bignum) => match varint_to_decimal(b) {
+            Some(digits) => match digits.parse::<i128>() {
+                Ok(v) => push_int(out, v),
+                Err(_) => push_json_string(out, &digits),
+            },
+            None => push_json_string(out, &base64(b)),
+        },
         Value::Blob(b) | Value::Geometry(b) => push_json_string(out, &base64(b)),
         Value::Date32(d) => push_json_string(out, &fmt_date(*d)),
         Value::Time64(unit, v) => push_json_string(out, &fmt_time(to_nanos(*unit, *v))),
@@ -1298,6 +1313,70 @@ fn push_fraction(out: &mut String, nanos: i64) {
     out.push_str(&digits);
 }
 
+/// DuckDB stores BIGNUM (formerly VARINT) as a three-byte header followed by
+/// the magnitude, most significant byte first. Without this the value goes out
+/// base64-encoded — DuckDB's private storage layout, leaked onto the wire,
+/// where no client could read it and nothing would say it was wrong.
+///
+/// The header's top bit is the sign: 1 positive, 0 negative. Its remaining 23
+/// bits are the number of magnitude bytes. For negative values *both* the
+/// length field and the magnitude are stored one's-complemented, which is what
+/// makes the raw bytes sort correctly as unsigned — and what makes a decoder
+/// that only complements the magnitude quietly wrong about the length.
+///
+/// Returns `None` if the bytes are not a well-formed BIGNUM, so the caller can
+/// fall back rather than emit a confidently wrong number.
+fn varint_to_decimal(bytes: &[u8]) -> Option<String> {
+    const HEADER: usize = 3;
+    if bytes.len() < HEADER {
+        return None;
+    }
+    let positive = bytes[0] & 0x80 != 0;
+    let raw = (u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]);
+    let declared = if positive { raw & 0x7f_ffff } else { !raw & 0x7f_ffff };
+    let data = &bytes[HEADER..];
+    if declared as usize != data.len() {
+        return None;
+    }
+
+    let mut magnitude: Vec<u8> =
+        if positive { data.to_vec() } else { data.iter().map(|b| !b).collect() };
+
+    // Long division by 10^9, most significant byte first, taking nine decimal
+    // digits per pass. Each quotient digit is `(rem << 8 | byte) / 10^9` with
+    // `rem < 10^9`, so it is always under 256 and a byte can hold it.
+    let first = magnitude.iter().position(|&b| b != 0).unwrap_or(magnitude.len());
+    magnitude.drain(..first);
+    if magnitude.is_empty() {
+        return Some("0".into());
+    }
+    let mut groups: Vec<u32> = Vec::new();
+    while !magnitude.is_empty() {
+        let mut rem: u64 = 0;
+        let mut quotient: Vec<u8> = Vec::with_capacity(magnitude.len());
+        for &b in &magnitude {
+            let cur = (rem << 8) | u64::from(b);
+            quotient.push((cur / 1_000_000_000) as u8);
+            rem = cur % 1_000_000_000;
+        }
+        groups.push(rem as u32);
+        let nz = quotient.iter().position(|&b| b != 0).unwrap_or(quotient.len());
+        magnitude = quotient[nz..].to_vec();
+    }
+
+    let mut out = String::with_capacity(groups.len() * 9 + 1);
+    if !positive {
+        out.push('-');
+    }
+    // The most significant group carries no leading zeros; every later one is
+    // padded to the full nine digits it was divided out as.
+    out.push_str(&groups.pop().unwrap_or(0).to_string());
+    while let Some(g) = groups.pop() {
+        out.push_str(&format!("{g:09}"));
+    }
+    Some(out)
+}
+
 /// DuckDB stores BIT as a leading pad-count byte followed by the bits, most
 /// significant first. Without this a bit string goes out base64-encoded, which
 /// is not wrong so much as unusable.
@@ -1366,6 +1445,7 @@ pub fn request_count() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::ensure_single_statement as one;
+    use super::varint_to_decimal;
 
     #[test]
     fn accepts_a_single_statement() {
@@ -1399,5 +1479,40 @@ mod tests {
         ] {
             assert!(one(sql).is_err(), "should reject: {sql}");
         }
+    }
+
+    /// The byte strings here are what DuckDB v1.5.5 actually put on the wire
+    /// for these values, captured from a running server rather than derived
+    /// from the format description — a decoder tested only against its own
+    /// author's reading of the spec proves nothing about the encoder.
+    #[test]
+    fn decodes_bignum_wire_format() {
+        fn hex(s: &str) -> Vec<u8> {
+            (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        }
+        for (bytes, want) in [
+            ("80000100", "0"),
+            ("80000101", "1"),
+            ("7ffffefe", "-1"),
+            ("8000017f", "127"),
+            ("7ffffe80", "-127"),
+            ("800001ff", "255"),
+            ("7ffffe00", "-255"),
+            ("80000d018ee90ff6c373e0ee4e3f0ad2", "123456789012345678901234567890"),
+            ("7ffff2fe7116f0093c8c1f11b1c0f52d", "-123456789012345678901234567890"),
+        ] {
+            assert_eq!(varint_to_decimal(&hex(bytes)).as_deref(), Some(want), "for {bytes}");
+        }
+    }
+
+    /// Malformed input must return None so the caller can fall back, rather
+    /// than produce a confidently wrong number from garbage.
+    #[test]
+    fn rejects_malformed_bignum() {
+        // Too short to hold a header at all.
+        assert_eq!(varint_to_decimal(&[]), None);
+        assert_eq!(varint_to_decimal(&[0x80, 0x00]), None);
+        // Header claims four magnitude bytes; only one follows.
+        assert_eq!(varint_to_decimal(&[0x80, 0x00, 0x04, 0x01]), None);
     }
 }

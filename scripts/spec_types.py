@@ -53,6 +53,21 @@ CASES = [
     # JSON has no Infinity or NaN. Emitting null would make an overflow
     # indistinguishable from a SQL NULL, so the names go out as strings.
     ("double-inf",     "SELECT 'inf'::DOUBLE AS v",                   "DOUBLE",   True,  "Infinity"),
+
+    # BIGNUM goes out as its decimal digits, under the same JSON-safe rule as
+    # every other integer: a bare number while a double holds it exactly, a
+    # quoted string past that. Never base64 — that would be DuckDB's private
+    # storage layout leaking onto the wire.
+    ("bignum-zero",    "SELECT 0::VARINT AS v",                       "BIGNUM",   True,  0),
+    ("bignum-one",     "SELECT 1::VARINT AS v",                       "BIGNUM",   True,  1),
+    ("bignum-neg-one", "SELECT (-1)::VARINT AS v",                    "BIGNUM",   True,  -1),
+    ("bignum-neg-255", "SELECT (-255)::VARINT AS v",                  "BIGNUM",   True,  -255),
+    ("bignum-safe",    "SELECT 9007199254740991::VARINT AS v",        "BIGNUM",   True,  9007199254740991),
+    ("bignum-unsafe",  "SELECT 9007199254740993::VARINT AS v",        "BIGNUM",   True,  "9007199254740993"),
+    ("bignum-huge",    "SELECT 123456789012345678901234567890::VARINT AS v",
+                                                                      "BIGNUM",   True,  "123456789012345678901234567890"),
+    ("bignum-neg-huge","SELECT (-123456789012345678901234567890)::VARINT AS v",
+                                                                      "BIGNUM",   True,  "-123456789012345678901234567890"),
     ("double-ninf",    "SELECT '-inf'::DOUBLE AS v",                  "DOUBLE",   True,  "-Infinity"),
     ("double-nan",     "SELECT 'nan'::DOUBLE AS v",                   "DOUBLE",   True,  "NaN"),
     ("float-inf",      "SELECT 'inf'::FLOAT AS v",                    "FLOAT",    True,  "Infinity"),

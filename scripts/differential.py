@@ -62,6 +62,22 @@ DELIBERATE = {
         "else. A real limitation, recorded here so it stays visible.",
     ("types", "timetz-offset"):
         "See types/timetz-utc.",
+    # Listed case by case rather than as ("types", "*"): a wildcard here would
+    # excuse every future type divergence, which is exactly what this ledger
+    # exists to prevent.
+    **{("types", name): (
+        "BIGNUM: the v1 harbor casts the value to VARCHAR and marks the column "
+        "lossless:false, encoding:'varchar-cast'. harbor-ng decodes DuckDB's "
+        "storage directly — three-byte header, big-endian magnitude, one's-"
+        "complemented when negative — and reports lossless:true. Both emit the "
+        "same digits; the difference is that harbor-ng's metadata is true. "
+        "Small values also go out as bare JSON numbers under the same rule as "
+        "every other integer, rather than always as text."
+    ) for name in [
+        "bignum-zero", "bignum-one", "bignum-neg-one", "bignum-small",
+        "bignum-neg-small", "bignum-json-safe", "bignum-past-safe",
+        "bignum-huge", "bignum-neg-huge", "bignum-past-hugeint",
+    ]},
     ("errors", "*"):
         "Error text comes from DuckDB and is reproduced verbatim by both, but "
         "the C++ harbor wraps some failures with its own prefix. Both return "

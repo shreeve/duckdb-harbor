@@ -280,6 +280,20 @@ eq "NULL is JSON null" "NoneType:None" \
 # indistinguishable from a missing value. Quoted, the distinction survives and
 # a client can decide what to do with it. The C++ harbor does the same, and
 # SPEC 5.4 requires it.
+# BIGNUM is arbitrary precision and is stored as a header plus a big-endian
+# magnitude. Rendered as anything but its decimal digits it is unreadable, and
+# base64 of the storage bytes is what it used to be.
+eq "BIGNUM renders its digits, not its storage" "str:123456789012345678901234567890" \
+   "$(post 'SELECT 123456789012345678901234567890::VARINT AS v' | nd 'typed')"
+eq "a negative BIGNUM keeps its sign" "str:-123456789012345678901234567890" \
+   "$(post 'SELECT (-123456789012345678901234567890)::VARINT AS v' | nd 'typed')"
+eq "a small BIGNUM is a bare number" "int:42" \
+   "$(post 'SELECT 42::VARINT AS v' | nd 'typed')"
+eq "BIGNUM zero round-trips" "int:0" \
+   "$(post 'SELECT 0::VARINT AS v' | nd 'typed')"
+eq "BIGNUM is marked lossless" "True" \
+   "$(post 'SELECT 1::VARINT AS v' | nd 'cols[0]["lossless"]')"
+
 eq "non-finite DOUBLE is a quoted Infinity" "str:Infinity" \
    "$(post "SELECT 'inf'::DOUBLE AS f" | nd 'typed')"
 eq "negative infinity keeps its sign" "str:-Infinity" \
