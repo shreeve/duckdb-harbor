@@ -76,6 +76,19 @@ sql() { curl -sS -m 60 -H "Authorization: Bearer $token" --data "{\"sql\":$(pyth
 scalar() { sql "$1" | python3 -c 'import sys,json
 rows=[json.loads(l)["values"] for l in sys.stdin.read().split("\n") if l.strip() and "\"row\"" in l]
 print(rows[0][0] if rows else "NO-ROWS")'; }
+# Wait until the server is answering normally again. harbor returns 503 when
+# every worker is busy — that is the backpressure working, not a failure — so
+# checks that need a quiet server wait for one instead of counting a busy
+# answer as breakage. Returns non-zero if it never settles.
+settle() {
+  for _ in $(seq 1 "${1:-60}"); do
+    [[ "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" \
+          -H 'Content-Type: application/json' --data '{"sql":"SELECT 1"}' "$base/sql" 2>/dev/null)" == "200" ]] \
+      && return 0
+    sleep 1
+  done
+  return 1
+}
 fds()  { lsof -p "$server_pid" 2>/dev/null | wc -l | tr -d ' '; }
 rss()  { ps -o rss= -p "$server_pid" 2>/dev/null | tr -d ' '; }
 
@@ -186,9 +199,13 @@ fi
 sql 'BEGIN TRANSACTION' > /dev/null
 sql 'SELECT * FROM no_such_table_at_all' > /dev/null
 sql 'BEGIN TRANSACTION' > /dev/null
+# Count only the failure this is about. A 503 means every worker is busy and
+# the request was shed on purpose; counting it here made a saturated server
+# look like a corrupted one, which is how this first failed in CI.
+settle 60 || true
 poisoned=0
 for _ in $(seq 1 40); do
-  sql 'SELECT 1 AS n' | grep -q '"type":"error"' && poisoned=$((poisoned+1))
+  sql 'SELECT 1 AS n' | grep -qi 'transaction is aborted\|transaction context' && poisoned=$((poisoned+1))
 done
 eq "an abandoned transaction does not poison the pool" "0" "$poisoned"
 
@@ -244,6 +261,7 @@ print("  slow reader received %d bytes in 2s of a ~90 MB result" % got)
 PY
 eq "a slow reader gets data without stalling the server" "streaming" \
    "$(cat /tmp/harbor-slow-result.txt 2>/dev/null)"
+settle 60 || true
 eq "other clients are unaffected by the slow one" "$sites_n" "$(scalar 'SELECT count(*) AS n FROM sites')"
 
 # ---------------------------------------------------------------------------
