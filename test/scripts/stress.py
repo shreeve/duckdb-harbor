@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-swarm.py — how does harbor behave when many HTTP clients hit it at once?
+stress.py — how does harbor behave when many HTTP clients hit it at once?
 
-    scripts/swarm.py --port 9499 --token T --levels 1,2,4,8,16,32,64
-    scripts/swarm.py --port 9499 --token T --write-pct 25 --seconds 5
+    test/scripts/stress.py --port 9499 --token T --levels 1,2,4,8,16,32,64
+    test/scripts/stress.py --port 9499 --token T --write-pct 25 --seconds 5
 
 Each level runs N client threads for a fixed wall-clock duration, each thread
 issuing requests back to back, and reports throughput and the latency
@@ -144,7 +144,7 @@ def run_level(args, clients, expected_sites, stop_after):
                 # Writes contend: same table, and DuckDB is a single-writer
                 # engine, so this is where queueing shows up first.
                 code, secs, lines = client.request(
-                    "INSERT INTO swarm_log(client, n) VALUES (?, ?)",
+                    "INSERT INTO stress_log(client, n) VALUES (?, ?)",
                     [idx, rng.randint(1, 1_000_000)],
                 )
                 ok = code == 200
@@ -204,15 +204,15 @@ def main():
 
     code, _, lines = request(args.host, args.port, args.token, "SELECT count(*) AS n FROM sites")
     if code != 200:
-        print("swarm: server did not answer (status %s)" % code, file=sys.stderr)
+        print("stress: server did not answer (status %s)" % code, file=sys.stderr)
         return 2
     expected_sites = rows_of(lines)[0][0]
 
     if args.write_pct > 0:
         request(args.host, args.port, args.token,
-                "CREATE TABLE IF NOT EXISTS swarm_log(client BIGINT, n BIGINT)")
+                "CREATE TABLE IF NOT EXISTS stress_log(client BIGINT, n BIGINT)")
 
-    print("harbor swarm — %.0fs per level, %.0f%% writes, %s connections, "
+    print("harbor stress — %.0fs per level, %.0f%% writes, %s connections, "
           "reads verified against count(sites)=%s"
           % (args.seconds, args.write_pct,
              "fresh" if args.no_keepalive else "reused", expected_sites))

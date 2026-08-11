@@ -17,9 +17,9 @@
 
 set -uo pipefail
 
-here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 # Look in the checkout before the parent directory. Locally the fixture tends
-# to sit beside the repo, in CI scripts/fixture.sh writes it into the checkout,
+# to sit beside the repo, in CI test/scripts/fixture.sh writes it into the checkout,
 # and a default that only knew one of those failed every CI run with "no
 # database" while the build and the fixture step had both succeeded.
 db=${DB:-}
@@ -39,7 +39,7 @@ s.bind(("127.0.0.1", 0))
 print(s.getsockname()[1])
 s.close()')}
 token=${TOKEN:-check-$$}
-suites=${SUITES:-unit abi types sqllogic stress spec fuzz differential deploy swarm resilience}
+suites=${SUITES:-unit abi types sqllogic asserts spec fuzz differential deployment stress resilience}
 
 bold=$(tput bold 2>/dev/null || true); red=$(tput setaf 1 2>/dev/null || true)
 green=$(tput setaf 2 2>/dev/null || true); dim=$(tput dim 2>/dev/null || true)
@@ -75,8 +75,8 @@ skip() { skipped+=("$1"); printf '%s— %s skipped: %s%s\n' "$dim" "$1" "$2" "$o
 run unit     cargo test --release
 # Reads the built artifact rather than a running server: the ABI stamp decides
 # which DuckDB versions will load it at all, and nothing else here looks at it.
-run abi      "$here/scripts/abi.sh"
-run types    "$here/scripts/type_coverage.py"
+run abi      "$here/test/scripts/abi.sh"
+run types    "$here/test/scripts/types.py"
 run sqllogic make -C "$here" test_release
 
 # ---------------------------------------------------------------------------
@@ -84,7 +84,7 @@ run sqllogic make -C "$here" test_release
 # ---------------------------------------------------------------------------
 
 needs_server=0
-for s in stress spec fuzz deploy swarm; do
+for s in asserts spec fuzz deployment stress; do
   [[ " $suites " == *" $s "* ]] && needs_server=1
 done
 
@@ -108,17 +108,17 @@ fi
 
 # stress.sh starts its own server, because it needs oracle values read from the
 # database before anything takes the file lock.
-run stress "$here/scripts/stress.sh" "$db"
+run asserts "$here/test/scripts/asserts.sh" "$db"
 
-run spec  "$here/scripts/spec_types.py" --port "$port" --token "$token"
-run fuzz  "$here/scripts/fuzz.py"       --port "$port" --token "$token"
-run deploy "$here/scripts/validate-deployment.sh" --url "http://127.0.0.1:$port" --token "$token"
+run spec  "$here/test/scripts/spec.py" --port "$port" --token "$token"
+run fuzz  "$here/test/scripts/fuzz.py"       --port "$port" --token "$token"
+run deployment "$here/test/scripts/deployment.sh" --url "http://127.0.0.1:$port" --token "$token"
 # Load runs against the same server as the read-only suites rather than
 # standing up its own. There was a second copy of the start-and-wait logic in
 # the CI workflow doing exactly this, and it was the only place that could not
 # get a server up — one proven path is better than two, one of which is only
 # exercised in CI.
-run swarm  "$here/scripts/swarm.py" --port "$port" --token "$token" \
+run stress "$here/test/scripts/stress.py" --port "$port" --token "$token" \
            --levels "${SWARM_LEVELS:-1,4,16}" --seconds "${SWARM_SECONDS:-10}" \
            --write-pct "${SWARM_WRITE_PCT:-20}"
 
@@ -131,13 +131,13 @@ run swarm  "$here/scripts/swarm.py" --port "$port" --token "$token" \
 if [[ " $suites " == *" differential "* ]]; then
   old_ext=${OLD_EXT:-$here/../duckdb-harbor-v1/build/release/extension/harbor/harbor.duckdb_extension}
   if [[ -f "$old_ext" ]]; then
-    run differential "$here/scripts/differential.sh" "$db"
+    run differential "$here/test/scripts/differential.sh" "$db"
   else
     skip differential "the v1 harbor is not built at $old_ext (set OLD_EXT=...)"
   fi
 fi
 
-run resilience "$here/scripts/resilience.sh" "$db"
+run resilience "$here/test/scripts/resilience.sh" "$db"
 
 # ---------------------------------------------------------------------------
 

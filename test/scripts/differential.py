@@ -3,7 +3,7 @@
 differential.py — run the corpus against the v1 harbor and this one and
 compare the answers.
 
-    scripts/differential.py --old-port 9401 --new-port 9402 --token T
+    test/scripts/differential.py --old-port 9401 --new-port 9402 --token T
 
 The v1 harbor has been in production and is the reference for what clients
 already expect. That does not make it the specification. Where harbor

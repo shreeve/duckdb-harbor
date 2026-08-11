@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-spec_types.py — assert the encoding harbor produces, spelled out.
+spec.py — assert the encoding harbor produces, spelled out.
 
-    scripts/spec_types.py --port 9499 --token T
+    test/scripts/spec.py --port 9499 --token T
 
 The differential runner proves this harbor and the v1 harbor agree. This one
 proves the agreed answer is the right one. Two implementations that share a

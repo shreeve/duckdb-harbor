@@ -32,7 +32,7 @@
 
 set -uo pipefail
 
-here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 ext=${1:-$here/build/release/harbor.duckdb_extension}
 
 pass=0; fail=0; skipped=0

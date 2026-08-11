@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-type_coverage.py — fail when a DuckDB type is not exercised by any suite.
+types.py — fail when a DuckDB type is not exercised by any suite.
 
-    scripts/type_coverage.py
+    test/scripts/types.py
 
 Every other suite checks that the types it knows about are encoded correctly.
 None of them notices a type nobody thought to write a case for, and that is not
@@ -101,7 +101,7 @@ def main():
         print("\nnot exercised by any corpus case:")
         for name in missing:
             print("  %s" % name)
-        print("\nAdd a case to scripts/corpus.py, or an entry to EXCUSED here with\n"
+        print("\nAdd a case to test/scripts/corpus.py, or an entry to EXCUSED here with\n"
               "the reason it cannot be produced.")
         return 1
     return 0

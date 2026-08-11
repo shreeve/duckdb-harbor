@@ -2,8 +2,8 @@
 #
 # fixture.sh — build the database the suites run against.
 #
-#   scripts/fixture.sh sample.duckdb
-#   LABS_DATA=/path/to/data scripts/fixture.sh sample.duckdb    # from real CSVs
+#   test/scripts/fixture.sh sample.duckdb
+#   LABS_DATA=/path/to/data test/scripts/fixture.sh sample.duckdb    # from real CSVs
 #
 # The suites need a database with some shape to it: several tables, a few
 # thousand rows, text with the awkward characters in it. This builds one.

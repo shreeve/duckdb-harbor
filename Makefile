@@ -27,13 +27,13 @@ test_debug: test_extension_debug
 test_release: test_extension_release
 
 # check runs every suite: unit tests, sqllogictest, and the HTTP suites that
-# need a live server. See scripts/check.sh for the ordering and for SUITES=.
+# need a live server. See test/scripts/check.sh for the ordering and for SUITES=.
 check: release
-	@scripts/check.sh
+	@test/scripts/check.sh
 
 # The subset that runs in under a minute, for the edit/build/test loop.
 check_quick: release
-	@SUITES="unit sqllogic spec fuzz" scripts/check.sh
+	@SUITES="unit sqllogic spec fuzz" test/scripts/check.sh
 
 clean: clean_build clean_rust
 clean_all: clean_configure clean

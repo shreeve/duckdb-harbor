@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 src_db=${1:-$here/../sample.duckdb}
 old_ext=${OLD_EXT:-$here/../duckdb-harbor-v1/build/release/extension/harbor/harbor.duckdb_extension}
 new_ext=$here/build/release/harbor.duckdb_extension
@@ -91,5 +91,5 @@ new_version=$(curl -sS -m 5 -H "Authorization: Bearer $token" \
 echo "v1 harbor $old_version on :$old_port   vs   harbor $new_version on :$new_port"
 echo
 
-python3 "$here/scripts/differential.py" \
+python3 "$here/test/scripts/differential.py" \
   --old-port "$old_port" --new-port "$new_port" --token "$token" "${@:2}"

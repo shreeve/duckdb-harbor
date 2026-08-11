@@ -57,7 +57,7 @@ folded in.
 ## Performance
 
 DuckDB answers the query; harbor's job is to stay out of the way. Measured by
-[`scripts/swarm.py`](scripts/swarm.py) against a real database, 20% of requests
+[`test/scripts/stress.py`](test/scripts/stress.py) against a real database, 20% of requests
 being `INSERT`s, connections reused, throughput taken from wall-clock across the
 level rather than summed from per-request timings:
 
@@ -155,23 +155,23 @@ product, and the larger half of the repository.
 ## Testing
 
 `make check` runs everything; `make check_quick` runs the subset that finishes
-in under a minute. [`scripts/fixture.sh`](scripts/fixture.sh) builds the
+in under a minute. [`test/scripts/fixture.sh`](test/scripts/fixture.sh) builds the
 database they read, either from a real CSV export or synthesised
 deterministically, so CI needs no binary fixture in git.
 
 | suite | what it establishes |
 |---|---|
 | `cargo test` | the single-statement scanner and the BIGNUM decoder, over comments, string literals, `E'…'`, quoted identifiers and dollar-quoting |
-| [`scripts/abi.sh`](scripts/abi.sh) | the built artifact's metadata footer, the C API version it requests, and whether a different DuckDB engine loads it |
-| [`scripts/type_coverage.py`](scripts/type_coverage.py) | every DuckDB type is exercised by some case, or excused with a reason |
+| [`test/scripts/abi.sh`](test/scripts/abi.sh) | the built artifact's metadata footer, the C API version it requests, and whether a different DuckDB engine loads it |
+| [`test/scripts/types.py`](test/scripts/types.py) | every DuckDB type is exercised by some case, or excused with a reason |
 | [`test/sql/harbor.test`](test/sql/harbor.test) | the SQL surface: argument validation, lifecycle ordering, that a stopped server restarts |
-| [`scripts/stress.sh`](scripts/stress.sh) | 117 assertions against oracle values read from DuckDB before the server takes the file lock |
-| [`scripts/spec_types.py`](scripts/spec_types.py) | 88 assertions of the wire format against the spec as written |
-| [`scripts/fuzz.py`](scripts/fuzz.py) | 14,000 random values a run, checked against Python's `datetime` and `base64` |
-| [`scripts/differential.py`](scripts/differential.py) | 217 cases sent to both the v1 harbor and this one, classified rather than diffed |
-| [`scripts/validate-deployment.sh`](scripts/validate-deployment.sh) | 48 read-only checks against a server already running — safe to point at production |
-| [`scripts/swarm.py`](scripts/swarm.py) | concurrent load at rising client counts, every answer verified |
-| [`scripts/resilience.sh`](scripts/resilience.sh) | `SIGKILL` and WAL replay, descriptor and memory leaks over a soak, abandoned streams, idle connections, slow readers, restart churn, a locked database |
+| [`test/scripts/asserts.sh`](test/scripts/asserts.sh) | 117 assertions against oracle values read from DuckDB before the server takes the file lock |
+| [`test/scripts/spec.py`](test/scripts/spec.py) | 88 assertions of the wire format against the spec as written |
+| [`test/scripts/fuzz.py`](test/scripts/fuzz.py) | 14,000 random values a run, checked against Python's `datetime` and `base64` |
+| [`test/scripts/differential.py`](test/scripts/differential.py) | 217 cases sent to both the v1 harbor and this one, classified rather than diffed |
+| [`test/scripts/deployment.sh`](test/scripts/deployment.sh) | 48 read-only checks against a server already running — safe to point at production |
+| [`test/scripts/stress.py`](test/scripts/stress.py) | concurrent load at rising client counts, every answer verified |
+| [`test/scripts/resilience.sh`](test/scripts/resilience.sh) | `SIGKILL` and WAL replay, descriptor and memory leaks over a soak, abandoned streams, idle connections, slow readers, restart churn, a locked database |
 
 Three of these are worth explaining.
 
@@ -209,7 +209,7 @@ intact.
 `C_STRUCT_UNSTABLE` and pinned to **v1.5.5**, because `duckdb-rs` reads every
 result through three functions in the unstable band of the C API. That band has
 no ordering guarantee across releases. A stable-ABI build of this same binary
-does load into DuckDB v2 and serve correctly — [`scripts/abi.sh`](scripts/abi.sh)
+does load into DuckDB v2 and serve correctly — [`test/scripts/abi.sh`](test/scripts/abi.sh)
 asserts it — so the pin lifts the day `duckdb-rs` stops needing the unstable
 surface, and that suite fails when it does.
 

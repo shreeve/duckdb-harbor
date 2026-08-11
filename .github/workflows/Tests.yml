@@ -61,17 +61,17 @@ jobs:
       # git would have to be regenerated on every DuckDB storage bump, and the
       # suites care about the shape of the data, not its provenance.
       - name: Build the fixture database
-        run: scripts/fixture.sh sample.duckdb
+        run: test/scripts/fixture.sh sample.duckdb
 
       - name: Unit tests, ABI stamp, type coverage, sqllogictest, spec and fuzz
-        run: SUITES="unit abi types sqllogic spec fuzz" scripts/check.sh
+        run: SUITES="unit abi types sqllogic spec fuzz" test/scripts/check.sh
 
       - name: Server log on failure
         if: failure()
         run: cat /tmp/harbor-check.*/server.log 2>/dev/null || true
 
   slow:
-    name: stress, resilience, load
+    name: asserts, stress, resilience
     # Pull requests get the fast job; this one runs where a slow job is free.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -96,12 +96,12 @@ jobs:
         run: make configure && make release
 
       - name: Build the fixture database
-        run: scripts/fixture.sh sample.duckdb
+        run: test/scripts/fixture.sh sample.duckdb
 
       - name: Everything except the differential suite, load included
         # differential needs the v1 harbor built alongside; it is not a build
         # dependency of this repository, and check.sh skips it when absent.
-        run: SUITES="stress spec fuzz deploy swarm resilience" scripts/check.sh
+        run: SUITES="asserts spec fuzz deployment stress resilience" test/scripts/check.sh
 
       - name: Server log on failure
         if: failure()

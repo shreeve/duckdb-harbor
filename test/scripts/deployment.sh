@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# validate-deployment.sh — point this at a server that is already running and
+# deployment.sh — point this at a server that is already running and
 # find out whether it is one you would put traffic on.
 #
-#   scripts/validate-deployment.sh --url http://127.0.0.1:9500 --token T
-#   scripts/validate-deployment.sh --url https://harbor.internal --token "$TOK" --json
+#   scripts/deployment.sh --url http://127.0.0.1:9500 --token T
+#   scripts/deployment.sh --url https://harbor.internal --token "$TOK" --json
 #
 # Every other suite in this directory starts its own server on a copy of a
 # database. This one does not start anything and does not create anything: it

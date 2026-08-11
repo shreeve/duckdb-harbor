@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# stress.sh — drive harbor over HTTP until something breaks.
+# asserts.sh — check harbor's answers against an independent oracle.
 #
-#   scripts/stress.sh                       # uses ../sample.duckdb
-#   scripts/stress.sh path/to/data.duckdb
-#   SOAK=30 scripts/stress.sh               # add a 30s sustained-load phase
+#   test/scripts/asserts.sh                       # uses ../sample.duckdb
+#   test/scripts/asserts.sh path/to/data.duckdb
+#   SOAK=30 test/scripts/asserts.sh               # add a 30s sustained-load phase
 #
 # The suite talks to the server the way a client does: curl in, NDJSON out.
 # It knows nothing about Rust, so it is equally valid against the v1 harbor —
@@ -26,7 +26,7 @@ set -uo pipefail
 # Setup
 # ---------------------------------------------------------------------------
 
-here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 src_db=${1:-$here/../sample.duckdb}
 port=${PORT:-9499}
 token=${TOKEN:-stress-$$}
@@ -35,20 +35,20 @@ base="http://127.0.0.1:$port"
 timeout=${TIMEOUT:-120}
 
 if [[ ! -f "$src_db" ]]; then
-  echo "stress: no database at $src_db" >&2
+  echo "asserts: no database at $src_db" >&2
   exit 2
 fi
 if [[ ! -x "$here/bin/duckdb-harbor" ]]; then
-  echo "stress: $here/bin/duckdb-harbor is missing or not executable" >&2
+  echo "asserts: $here/bin/duckdb-harbor is missing or not executable" >&2
   exit 2
 fi
 if [[ ! -f "$here/build/release/harbor.duckdb_extension" ]]; then
-  echo "stress: extension not built — run 'make release'" >&2
+  echo "asserts: extension not built — run 'make release'" >&2
   exit 2
 fi
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/harbor-stress.XXXXXX")
-db="$work/stress.duckdb"
+work=$(mktemp -d "${TMPDIR:-/tmp}/harbor-asserts.XXXXXX")
+db="$work/asserts.duckdb"
 log="$work/server.log"
 cp "$src_db" "$db"
 
@@ -184,7 +184,7 @@ printf '  %ssites=%s cohorts=%s plans=%s rules=%s clients=%s cross=%s%s\n' \
   "$exp_clients" "$exp_cross" "$off"
 
 if [[ -z "$exp_n_sites" ]]; then
-  echo "stress: oracle produced nothing — is $db a valid DuckDB file?" >&2
+  echo "asserts: oracle produced nothing — is $db a valid DuckDB file?" >&2
   exit 2
 fi
 
@@ -204,7 +204,7 @@ for _ in $(seq 1 80); do
   sleep 0.25
 done
 if [[ $up != 1 ]]; then
-  echo "stress: server never came up. log:" >&2
+  echo "asserts: server never came up. log:" >&2
   cat "$log" >&2
   exit 1
 fi

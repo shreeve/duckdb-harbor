@@ -3,8 +3,8 @@
 fuzz.py — throw a lot of random values at the encoder and check every one
 against an oracle that is not harbor.
 
-    scripts/fuzz.py --port 9499 --token T --cases 20000
-    scripts/fuzz.py --port 9499 --token T --seed 7    # reproduce a failure
+    test/scripts/fuzz.py --port 9499 --token T --cases 20000
+    test/scripts/fuzz.py --port 9499 --token T --seed 7    # reproduce a failure
 
 The hand-written suites cover the boundaries someone thought of. This covers
 the ones nobody did. It is aimed squarely at the conversions harbor

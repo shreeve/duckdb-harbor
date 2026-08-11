@@ -15,7 +15,7 @@
 
 set -uo pipefail
 
-here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 src_db=${1:-$here/../sample.duckdb}
 # A free port from the kernel, not a fixed guess — see the same note in
 # check.sh. This suite restarts the server fifteen times, so a port that is
