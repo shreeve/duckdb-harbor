@@ -107,7 +107,7 @@ run deploy "$here/scripts/validate-deployment.sh" --url "http://127.0.0.1:$port"
 # ---------------------------------------------------------------------------
 
 if [[ " $suites " == *" differential "* ]]; then
-  old_ext=${OLD_EXT:-$here/../duckdb-harbor/build/release/extension/harbor/harbor.duckdb_extension}
+  old_ext=${OLD_EXT:-$here/../duckdb-harbor-v1/build/release/extension/harbor/harbor.duckdb_extension}
   if [[ -f "$old_ext" ]]; then
     run differential "$here/scripts/differential.sh" "$db"
   else

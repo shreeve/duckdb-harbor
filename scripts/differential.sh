@@ -19,7 +19,7 @@ set -uo pipefail
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 src_db=${1:-$here/../sample.duckdb}
-old_ext=${OLD_EXT:-$here/../duckdb-harbor/build/release/extension/harbor/harbor.duckdb_extension}
+old_ext=${OLD_EXT:-$here/../duckdb-harbor-v1/build/release/extension/harbor/harbor.duckdb_extension}
 new_ext=$here/build/release/harbor.duckdb_extension
 old_port=${OLD_PORT:-9401}
 new_port=${NEW_PORT:-9402}
@@ -27,7 +27,7 @@ token=${TOKEN:-diff-$$}
 
 if [[ ! -f "$old_ext" ]]; then
   echo "differential: no C++ harbor at $old_ext — skipping"
-  echo "  build it with 'make release' in duckdb-harbor, or set OLD_EXT"
+  echo "  build it with 'make release' in duckdb-harbor-v1, or set OLD_EXT"
   exit 0
 fi
 if [[ ! -f "$new_ext" ]]; then
