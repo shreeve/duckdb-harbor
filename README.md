@@ -47,13 +47,18 @@ platforms are built: `osx_arm64`, `osx_amd64`, `linux_amd64`, `linux_arm64`,
 `windows_amd64`.
 
 ```console
-$ base=https://github.com/shreeve/duckdb-harbor/releases/download/v0.7.0
-$ curl -sLO $base/harbor-v0.7.0-duckdb-v1.5.5-osx_arm64.zip
+$ base=https://github.com/shreeve/duckdb-harbor/releases/download/v0.8.1
+$ curl -sLO $base/harbor-v0.8.1-duckdb-v1.5.5-osx_arm64.zip
 $ curl -sLO $base/duckdb-harbor
-$ unzip harbor-v0.7.0-duckdb-v1.5.5-osx_arm64.zip   # -> harbor.duckdb_extension
+$ unzip harbor-v0.8.1-duckdb-v1.5.5-osx_arm64.zip   # -> harbor.duckdb_extension
 $ chmod +x duckdb-harbor
 $ ./duckdb-harbor mydata.duckdb --token secret
-harbor: serving on http://127.0.0.1:9495
+┌───────────────┬───────────────────────┐
+│ Service       │ Address               │
+├───────────────┼───────────────────────┤
+│ DuckDB Harbor │ http://127.0.0.1:9495 │
+│ Auth Token    │ secret                │
+└───────────────┴───────────────────────┘
 ```
 
 That is the whole install. The launcher finds `harbor.duckdb_extension` beside
@@ -79,10 +84,21 @@ one window that both answers clients and runs your own SQL against the same
 database:
 
 ```console
-$ ./duckdb-harbor mydata.duckdb --token secret
-harbor: serving on http://127.0.0.1:9495
+$ ./duckdb-harbor mydata.duckdb --token secret --ui --quack
+┌───────────────┬────────────────────────┐
+│ Service       │ Address                │
+├───────────────┼────────────────────────┤
+│ DuckDB Harbor │ http://127.0.0.1:9495  │
+│ DuckDB Quack  │ quack://127.0.0.1:9496 │
+│ DuckDB UI     │ http://localhost:9497  │
+│ Auth Token    │ secret                 │
+└───────────────┴────────────────────────┘
 D SELECT count(*) FROM orders;   -- while clients are querying over HTTP
 ```
+
+A row for each service actually running, and nothing else. It goes to stderr,
+so it stays clear of query output and shows up immediately even under a
+supervisor, where stdout would be buffered until exit.
 
 Run it anywhere stdin is not a terminal — a unit file, a container, `nohup`,
 behind a pipe — and it blocks instead, which is what a supervisor wants. Force
@@ -109,7 +125,7 @@ be megabytes, and on this endpoint it is as likely to hold customer data as the
 tables it reads.
 
 stderr, not stdout, because stdout carries query results and the prompt in
-`--repl` mode and harbor already reports startup on stderr. Send it wherever
+`--repl` mode and the startup summary is already there. Send it wherever
 the log belongs — `2>>/var/log/harbor.log`, a pipe, or a supervisor's
 collector. There is no `--log FILE`: rotation and permissions are the shell's
 job, and it does them better than harbor would.

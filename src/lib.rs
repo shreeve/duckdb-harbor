@@ -117,7 +117,8 @@ impl VTab for HarborVersion {
 }
 
 // ---------------------------------------------------------------------------
-// harbor_serve(bind := ..., port := ..., token := ..., workers := ..., log := ...)
+// harbor_serve(bind := ..., port := ..., token := ..., workers := ..., log := ...,
+//              quiet := ...)
 //
 // Starts the listener and returns immediately with the bound address, so the
 // caller keeps a usable session. Loopback and a required token are the
@@ -136,6 +137,11 @@ struct ServeConfig {
     /// paid on every request and a stream somebody has to rotate, and the
     /// caller that just wants a query endpoint should not inherit either.
     log: bool,
+    /// Suppress the startup line on stderr. For a caller that prints its own
+    /// summary -- the launcher does -- harbor's line is the same address said
+    /// twice. Default off, so calling harbor_serve from a prompt still says
+    /// where it is listening and what the token is.
+    quiet: bool,
     /// Whether harbor minted the token rather than being given one, so the
     /// address it returns can show it the one time anyone will see it.
     generated: bool,
@@ -175,6 +181,7 @@ impl VTab for HarborServe {
         }
 
         let log = bind.get_named_parameter("log").map(|v| v.to_bool()).unwrap_or(false);
+        let quiet = bind.get_named_parameter("quiet").map(|v| v.to_bool()).unwrap_or(false);
 
         Ok(ServeConfig {
             bind: host,
@@ -182,6 +189,7 @@ impl VTab for HarborServe {
             token,
             workers: workers as usize,
             log,
+            quiet,
             generated,
         })
     }
@@ -212,7 +220,9 @@ impl VTab for HarborServe {
         // once the server had already shut down — which is to say, never,
         // while it was of any use. stderr is unbuffered and goes to the
         // journal, so this is the line an operator actually sees.
-        eprintln!("harbor: serving on {text}");
+        if !cfg.quiet {
+            eprintln!("harbor: serving on {text}");
+        }
         output.flat_vector(0).insert(0, CString::new(text)?);
         output.set_len(1);
         Ok(())
@@ -229,6 +239,7 @@ impl VTab for HarborServe {
             ("token".to_string(), varchar()),
             ("workers".to_string(), bigint()),
             ("log".to_string(), boolean()),
+            ("quiet".to_string(), boolean()),
         ])
     }
 }

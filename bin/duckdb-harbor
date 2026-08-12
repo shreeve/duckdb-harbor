@@ -15,8 +15,22 @@
 #   bin/duckdb-harbor mydata.db --load ./harbor.duckdb_extension
 #   bin/duckdb-harbor mydata.db --duckdb /path/to/duckdb    choose the binary
 #
-# With no --token, harbor mints one and prints it at startup; that is the only
-# time it is shown. HARBOR_TOKEN is honoured if set.
+# Everything starts with a summary of what is running and how to reach it:
+#
+#   ┌───────────────┬────────────────────────┐
+#   │ Service       │ Address                │
+#   ├───────────────┼────────────────────────┤
+#   │ DuckDB Harbor │ http://127.0.0.1:9495  │
+#   │ DuckDB Quack  │ quack://127.0.0.1:9496 │
+#   │ DuckDB UI     │ http://localhost:9497  │
+#   │ Auth Token    │ rip-token              │
+#   └───────────────┴────────────────────────┘
+#
+# A row per service actually running, and nothing else. It goes to stderr, so
+# it stays out of query output and appears immediately even under a supervisor.
+#
+# With no --token one is minted and shown there; that is the only time it is
+# shown. HARBOR_TOKEN is honoured if set.
 #
 # One process, up to four ways in. HTTP /sql is always on -- it is the point of
 # the program. The rest are opt-in, because each one costs a port and a loaded
@@ -49,8 +63,8 @@
 #     ATTACH 'quack://127.0.0.1:9496' AS r (TYPE quack, TOKEN '...');
 #     USE r; CREATE TABLE t AS FROM read_csv('big.csv');"
 #
-# which is the CLI that this launcher otherwise occupies. The token is printed
-# at startup alongside harbor's.
+# which is the CLI that this launcher otherwise occupies. One token covers every
+# service, and it is in the summary above.
 #
 # At a terminal this is a normal DuckDB shell that happens to be serving HTTP:
 # you get a prompt, and leaving it stops the server and folds the WAL. Piped,
@@ -89,7 +103,7 @@
 # request body, it can be megabytes, and on this endpoint it is as likely to
 # contain customer data as the tables it reads. stderr rather than stdout
 # because stdout is where query results and the prompt go in --repl mode, and
-# because harbor already reports startup there. Redirect it wherever the log
+# because the startup summary is already there. Redirect it wherever the log
 # belongs: `2>>/var/log/harbor.log`, or let a supervisor collect it.
 #
 # checkpoint_threshold defaults to 1MB here rather than DuckDB's 16MB. This
@@ -300,7 +314,15 @@ if [[ -n "$token" ]] && (( ${#token} < TOKEN_MIN )); then
   echo "duckdb-harbor: --token must be at least $TOKEN_MIN characters, got ${#token}" >&2
   exit 2
 fi
-true
+
+# Minted here when none was given, rather than inside harbor. harbor mints its
+# own and prints it, which is right for someone calling harbor_serve from a
+# prompt, but it happens where this script cannot see it -- and this script has
+# to print the token in the summary below, hand the same one to quack, and be
+# able to say what it was. One token, decided in one place.
+if [[ -z "$token" ]]; then
+  token=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+fi
 
 # A path that is not there is not an empty database to be created. duckdb makes
 # one silently, so a typo'd path or a volume that failed to mount comes up
@@ -423,6 +445,13 @@ args="bind := '${bind//\'/\'\'}', port := $port"
 [[ -n "$workers" ]] && args="$args, workers := $workers"
 (( ! want_log )) || args="$args, log := true"
 
+# harbor announces its address on stderr, which is right for someone calling
+# harbor_serve directly -- the DuckDB shell holds stdout until it exits, so a
+# returned row is no use to a daemon. This script prints the same address in the
+# summary below, immediately and on stderr, so harbor's line would only be the
+# same thing said twice.
+args="$args, quiet := true"
+
 # -unsigned is required: harbor is not signed by DuckDB's extension registry.
 #
 # -no-init keeps ~/.duckdbrc out of the served process. An rc that ATTACHes a
@@ -461,43 +490,65 @@ if (( want_ui )); then
   service_loads="$service_loads
   LOAD ui;"
   ui_sql="
-  CALL start_ui_server();"
+  CREATE OR REPLACE TEMP TABLE _harbor_ui AS FROM start_ui_server();"
 fi
 
 # One token, every service. Anything that gets you into harbor gets you into
 # quack: they are the same process serving the same database, so a second secret
-# would protect nothing and would only be a second thing to lose.
-#
-# quack will not invent a token, and harbor's own minting happens inside the
-# process where this script cannot see it. So when quack is wanted and no
-# --token was given, the token has to be minted out here and handed to both --
-# otherwise they would each end up with a different one.
+# would protect nothing and would only be a second thing to lose. The token is
+# settled above, so both simply use it.
 quack_sql=""
-if (( want_quack )) && [[ -z "$token" ]]; then
-  token=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
-  args="$args, token := '$token'"
-fi
 if (( want_quack )); then
   service_loads="$service_loads
   LOAD quack;"
   quack_sql="
-  CALL quack_serve('quack://${bind//\'/\'\'}:$quack_port', disable_ssl := true, token := '${token//\'/\'\'}');"
-
-  # On stderr, so it stays out of anything parsing this program's stdout.
-  {
-    echo "duckdb-harbor: quack serving on quack://$bind:$quack_port"
-    echo "  attach from another terminal with:"
-    echo "    $duckdb_bin -unsigned -c \"LOAD quack;"
-    echo "      ATTACH 'quack://$bind:$quack_port' AS r (TYPE quack, TOKEN '$token');"
-    echo "      USE r; SELECT 1;\""
-  } >&2
+  CREATE OR REPLACE TEMP TABLE _harbor_quack AS
+    FROM quack_serve('quack://${bind//\'/\'\'}:$quack_port', disable_ssl := true, token := '${token//\'/\'\'}');"
 fi
 
+# Each service returns a row saying where it is listening, and DuckDB prints
+# every one of them -- three boxed tables of things the summary below already
+# says, in front of the prompt. Selecting into a temp table runs the function
+# and keeps its result, without rendering it. Nothing reads these tables; the
+# point is the side effect.
 setup="
   SET checkpoint_threshold = '${checkpoint//\'/\'\'}';$extra_loads$service_loads
   LOAD '${ext//\'/\'\'}';
-  CALL harbor_serve($args);$ui_sql$quack_sql
+  CREATE OR REPLACE TEMP TABLE _harbor_boot AS FROM harbor_serve($args);$ui_sql$quack_sql
 "
+
+# What is running and how to reach it, in one table, on stderr.
+#
+# stderr because stdout belongs to whatever the process is for: query results
+# and the prompt in --repl, and in --wait a stream DuckDB block-buffers, which
+# would hold this until exit -- the exact failure that made harbor print its own
+# address on stderr in the first place. Written before exec rather than after
+# the services answer, because exec is the last thing this script does; the
+# LOADs above are ordered so that the common failures happen before any of this
+# is claimed.
+rows=("DuckDB Harbor" "http://$bind:$port")
+(( ! want_quack )) || rows+=("DuckDB Quack" "quack://$bind:$quack_port")
+# localhost, not $bind: the ui extension has no bind setting and listens on IPv6
+# loopback, so this is the address that answers -- 127.0.0.1 will not.
+(( ! want_ui ))    || rows+=("DuckDB UI" "http://localhost:$ui_port")
+rows+=("Auth Token" "$token")
+
+w1=0; w2=0
+for ((i = 0; i < ${#rows[@]}; i += 2)); do
+  (( ${#rows[i]}   <= w1 )) || w1=${#rows[i]}
+  (( ${#rows[i+1]} <= w2 )) || w2=${#rows[i+1]}
+done
+rule() { printf '%s' "$1"; printf '─%.0s' $(seq 1 $((w1 + 2))); printf '%s' "$2"
+         printf '─%.0s' $(seq 1 $((w2 + 2))); printf '%s\n' "$3"; }
+{
+  rule "┌" "┬" "┐"
+  printf "│ %-*s │ %-*s │\n" "$w1" "Service" "$w2" "Address"
+  rule "├" "┼" "┤"
+  for ((i = 0; i < ${#rows[@]}; i += 2)); do
+    printf "│ %-*s │ %-*s │\n" "$w1" "${rows[i]}" "$w2" "${rows[i+1]}"
+  done
+  rule "└" "┴" "┘"
+} >&2
 
 # Which mode, when neither --repl nor --wait said so: a prompt is only useful to
 # something that can type, and blocking forever is only useful to something that
@@ -537,6 +588,6 @@ fi
 # stopped and nothing else is in flight, so the WAL folds cleanly.
 exec "$duckdb_bin" -unsigned -no-init "$db" -c "
   $setup
-  CALL harbor_wait();
+  CREATE OR REPLACE TEMP TABLE _harbor_wait AS FROM harbor_wait();
   CHECKPOINT;
 "
