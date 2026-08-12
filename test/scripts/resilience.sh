@@ -429,7 +429,21 @@ eq "the HTTP write survived the exit" "4" \
 solo="$work/solo"
 mkdir -p "$solo"
 cp "$here/bin/duckdb-harbor" "$solo/"
-solo_ext=${HARBOR_EXTENSION:-$here/build/release/harbor.duckdb_extension}
+# Prefer the version-stamped build, exactly as the launcher does. build/release
+# holds whichever DuckDB was built for last, so hardcoding it made this the one
+# test in the suite that could not run against a second DuckDB: pointed at a v2
+# nightly it copied a v1.5.5 binary into place, and the launcher rightly refused
+# it -- a real failure, but of the fixture rather than of what is being tested.
+solo_ext=${HARBOR_EXTENSION:-}
+if [[ -z "$solo_ext" ]]; then
+  solo_ddb=$(duckdb -no-init -noheader -list \
+    -c "SELECT library_version FROM pragma_version()" 2>/dev/null | tail -1)
+  for solo_cand in "$here/build/release-$solo_ddb/harbor.duckdb_extension" \
+                   "$here/build/release/harbor.duckdb_extension"; do
+    [[ -f "$solo_cand" ]] && { solo_ext="$solo_cand"; break; }
+  done
+  solo_ext=${solo_ext:-$here/build/release/harbor.duckdb_extension}
+fi
 if [[ ! -f "$solo_ext" ]]; then
   bad "the launcher finds an extension unzipped beside it" "no extension at $solo_ext to copy"
 else
