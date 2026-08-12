@@ -450,7 +450,22 @@ args="bind := '${bind//\'/\'\'}', port := $port"
 # returned row is no use to a daemon. This script prints the same address in the
 # summary below, immediately and on stderr, so harbor's line would only be the
 # same thing said twice.
-args="$args, quiet := true"
+#
+# Asked for rather than assumed. quiet := arrived in harbor 0.8.1, and passing
+# it to an older extension is a bind error -- raised after the summary has
+# printed, so a doomed run looks like a healthy one, which is exactly the
+# failure the LOAD ordering above exists to prevent. An extension that has not
+# got it simply prints its own line: a duplicate address, not a dead server.
+#
+# duckdb_functions() rather than a version comparison, because the version
+# recorded in the extension is whatever `git describe` said when it was built --
+# a tag in a release, a bare commit hash in a local one -- and comparing those
+# is guesswork. Asking what parameters the function actually takes is not.
+quiet_probe=$("$duckdb_bin" -unsigned -no-init -noheader -list -c \
+  "LOAD '${ext//\'/\'\'}';
+   SELECT list_contains(parameters, 'quiet')
+     FROM duckdb_functions() WHERE function_name = 'harbor_serve';" 2>/dev/null | tail -1)
+[[ "$quiet_probe" == "true" ]] && args="$args, quiet := true"
 
 # -unsigned is required: harbor is not signed by DuckDB's extension registry.
 #
