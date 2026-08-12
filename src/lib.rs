@@ -24,7 +24,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use duckdb::{
@@ -81,6 +81,10 @@ fn bigint() -> LogicalTypeHandle {
     LogicalTypeHandle::from(LogicalTypeId::Bigint)
 }
 
+fn boolean() -> LogicalTypeHandle {
+    LogicalTypeHandle::from(LogicalTypeId::Boolean)
+}
+
 // ---------------------------------------------------------------------------
 // harbor_version() -> VARCHAR
 //
@@ -113,7 +117,7 @@ impl VTab for HarborVersion {
 }
 
 // ---------------------------------------------------------------------------
-// harbor_serve(bind := ..., port := ..., token := ..., workers := ...)
+// harbor_serve(bind := ..., port := ..., token := ..., workers := ..., log := ...)
 //
 // Starts the listener and returns immediately with the bound address, so the
 // caller keeps a usable session. Loopback and a required token are the
@@ -128,6 +132,10 @@ struct ServeConfig {
     port: u16,
     token: Option<String>,
     workers: usize,
+    /// One stderr line per request. Off by default: an access log is a cost
+    /// paid on every request and a stream somebody has to rotate, and the
+    /// caller that just wants a query endpoint should not inherit either.
+    log: bool,
     /// Whether harbor minted the token rather than being given one, so the
     /// address it returns can show it the one time anyone will see it.
     generated: bool,
@@ -166,7 +174,16 @@ impl VTab for HarborServe {
             return Err("harbor_serve: workers must be at least 1".into());
         }
 
-        Ok(ServeConfig { bind: host, port: port as u16, token, workers: workers as usize, generated })
+        let log = bind.get_named_parameter("log").map(|v| v.to_bool()).unwrap_or(false);
+
+        Ok(ServeConfig {
+            bind: host,
+            port: port as u16,
+            token,
+            workers: workers as usize,
+            log,
+            generated,
+        })
     }
 
     fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
@@ -179,7 +196,7 @@ impl VTab for HarborServe {
             output.set_len(0);
             return Ok(());
         }
-        let address = start(&cfg.bind, cfg.port, cfg.token.clone(), cfg.workers)?;
+        let address = start(&cfg.bind, cfg.port, cfg.token.clone(), cfg.workers, cfg.log)?;
         let mut text = format!("http://{address}");
         if cfg.generated {
             // The only chance to see a generated token is here; it is never
@@ -211,6 +228,7 @@ impl VTab for HarborServe {
             ("port".to_string(), bigint()),
             ("token".to_string(), varchar()),
             ("workers".to_string(), bigint()),
+            ("log".to_string(), boolean()),
         ])
     }
 }
@@ -489,7 +507,13 @@ fn open_pool(con: Connection) -> Result<(), String> {
 // start / stop / wait
 // ---------------------------------------------------------------------------
 
-fn start(bind: &str, port: u16, token: Option<String>, workers: usize) -> Result<String, String> {
+fn start(
+    bind: &str,
+    port: u16,
+    token: Option<String>,
+    workers: usize,
+    log: bool,
+) -> Result<String, String> {
     let mut running = RUNNING.lock().unwrap();
     if let Some(r) = running.as_ref() {
         return Err(format!("harbor is already serving on {}", r.addr));
@@ -501,7 +525,17 @@ fn start(bind: &str, port: u16, token: Option<String>, workers: usize) -> Result
     if pool.is_empty() {
         return Err("harbor: no database connections (extension not initialised)".to_string());
     }
+    // Say so rather than quietly serving with fewer. workers is capped by the
+    // connection pool, which is fixed at POOL_SIZE, so `workers := 32` gets 8 —
+    // and someone who raised it to fix a throughput problem deserves to know
+    // that the number they set is not the number they got.
+    let requested = workers;
     let workers = workers.clamp(1, pool.len());
+    if requested > workers {
+        eprintln!(
+            "harbor: workers={requested} exceeds the {workers}-connection pool; serving with {workers}"
+        );
+    }
     let keep = pool.len() - workers;
     let mut conns: Vec<Connection> = pool.drain(keep..).collect();
     drop(pool);
@@ -526,7 +560,7 @@ fn start(bind: &str, port: u16, token: Option<String>, workers: usize) -> Result
         handles.push(
             thread::Builder::new()
                 .name(format!("harbor-{i}"))
-                .spawn(move || worker(server, stop, token, conn))
+                .spawn(move || worker(server, stop, token, conn, log))
                 .map_err(|e| e.to_string())?,
         );
     }
@@ -666,6 +700,7 @@ fn worker(
     stop: Arc<AtomicBool>,
     token: Arc<Option<String>>,
     conn: Connection,
+    log: bool,
 ) -> Option<Connection> {
     // Rendezvous: a worker never has more than one statement outstanding, so
     // there is nothing to queue here.
@@ -686,7 +721,7 @@ fn worker(
             // absorbs a growing share of the traffic. The server would look
             // mostly down while /health kept answering 200.
             Ok(Some(req)) => {
-                if !handle(req, &jobs_tx, token.as_ref().as_deref()) {
+                if !handle(req, &jobs_tx, token.as_ref().as_deref(), log) {
                     break;
                 }
             }
@@ -701,21 +736,35 @@ fn worker(
 
 /// Returns false when the executor behind `jobs` is gone, which is the one
 /// condition the caller must act on rather than merely report.
-fn handle(mut req: Request, jobs: &mpsc::SyncSender<Job>, token: Option<&str>) -> bool {
+fn handle(mut req: Request, jobs: &mpsc::SyncSender<Job>, token: Option<&str>, log: bool) -> bool {
     let path = req.url().split('?').next().unwrap_or("/").to_string();
     let method = req.method().clone();
 
-    match (&method, path.as_str()) {
+    // Only when logging. A clock read and a peer-address format are small, but
+    // they are paid on every request by every caller, including the ones that
+    // asked for a query endpoint and nothing else.
+    let started = log.then(Instant::now);
+    let peer = match log {
+        true => req.remote_addr().map_or_else(|| "-".to_string(), |a| a.ip().to_string()),
+        false => String::new(),
+    };
+
+    // Each arm reports the status it sent, so the log line below is written in
+    // one place instead of at all seven `respond` calls. The SQL text is not
+    // logged: it is the request body, it can be enormous, and on this endpoint
+    // it is as likely to hold customer data as anything else in the database.
+    let (keep_going, status) = match (&method, path.as_str()) {
         // Liveness is unauthenticated on purpose: a load balancer should not
         // need a credential to learn whether the process is up, and the
         // answer reveals nothing.
         (Method::Get, "/health") => {
             let _ = req.respond(json_response(200, r#"{"status":"ok"}"#));
+            (true, 200)
         }
         (Method::Post, "/sql") => {
             if !authorized(&req, token) {
                 let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
-                return true;
+                (true, 401)
             }
             // Check the declared length before touching the reader. `take()`
             // bounds what harbor buffers but not what the client may declare,
@@ -725,30 +774,62 @@ fn handle(mut req: Request, jobs: &mpsc::SyncSender<Job>, token: Option<&str>) -
             // 600 MB zeroed allocation it never asked for; the declared length
             // is attacker-chosen and unbounded. Refusing here means the
             // allocation never happens.
-            match req.body_length() {
-                Some(n) if n > MAX_BODY => {
-                    let _ = req.respond(error_response(
-                        413,
-                        "body_too_large",
-                        &format!("body is {n} bytes; the limit is {MAX_BODY}"),
-                    ));
-                    return true;
+            else if let Some(n) = req.body_length().filter(|n| *n > MAX_BODY) {
+                let _ = req.respond(error_response(
+                    413,
+                    "body_too_large",
+                    &format!("body is {n} bytes; the limit is {MAX_BODY}"),
+                ));
+                (true, 413)
+            } else {
+                let mut body = String::new();
+                if req.as_reader().take(MAX_BODY as u64).read_to_string(&mut body).is_err() {
+                    let _ = req.respond(error_response(400, "bad_request", "body is not valid UTF-8"));
+                    (true, 400)
+                } else {
+                    run_sql(req, jobs, &body)
                 }
-                _ => {}
             }
-            let mut body = String::new();
-            if req.as_reader().take(MAX_BODY as u64).read_to_string(&mut body).is_err() {
-                let _ = req.respond(error_response(400, "bad_request", "body is not valid UTF-8"));
-                return true;
-            }
-            return run_sql(req, jobs, &body);
         }
         _ => {
             let _ = req.respond(error_response(404, "not_found", "no such endpoint"));
+            (true, 404)
         }
+    };
+
+    // After respond(), not before: tiny_http writes the body from the reader
+    // inside that call, so for a streamed result this elapsed time covers the
+    // whole query and the whole transfer rather than just the headers.
+    if let Some(t) = started {
+        eprintln!(
+            "harbor: {} {peer} {} {path} {status} {}ms",
+            utc_now(),
+            method.as_str(),
+            t.elapsed().as_millis()
+        );
     }
-    true
+    keep_going
 }
+
+/// UTC, RFC 3339, seconds resolution: `2026-08-12T04:31:07Z`.
+///
+/// No date crate: an access log is unreadable without a timestamp — nothing in
+/// front of harbor supplies one, since launchd and a plain `2>>file` redirect
+/// both pass stderr through verbatim — but one format in one timezone is not
+/// worth a dependency when `civil_from_days` is already here for DATE.
+fn utc_now() -> String {
+    let secs =
+        SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    let tod = secs.rem_euclid(86_400);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
+    )
+}
+
 
 fn authorized(req: &Request, token: Option<&str>) -> bool {
     let Some(expected) = token else { return true };
@@ -964,19 +1045,20 @@ struct Job {
 /// How many body batches may be in flight before the query has to wait.
 const BODY_QUEUE: usize = 4;
 
-/// Returns false when the executor is gone; see `handle`.
-fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) -> bool {
+/// Returns (keep serving, status sent). The first is false when the executor is
+/// gone; see `handle`, which also writes the log line from the second.
+fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) -> (bool, u16) {
     let parsed = match parse_request(body) {
         Ok(p) => p,
         Err(e) => {
             let _ = req.respond(error_response(400, "bad_request", &e));
-            return true;
+            return (true, 400);
         }
     };
 
     if let Err(e) = ensure_single_statement(&parsed.sql) {
         let _ = req.respond(error_response(400, "bad_request", &e));
-        return true;
+        return (true, 400);
     }
 
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
@@ -985,7 +1067,7 @@ fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) -> bool {
 
     if jobs.send(job).is_err() {
         let _ = req.respond(error_response(503, "unavailable", "harbor is shutting down"));
-        return false;
+        return (false, 503);
     }
 
     match ready_rx.recv() {
@@ -997,16 +1079,17 @@ fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) -> bool {
                 Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..]).unwrap(),
             ];
             let _ = req.respond(Response::new(200.into(), headers, ChannelReader::new(body_rx), None, None));
+            (true, 200)
         }
         Ok(Err(message)) => {
             let _ = req.respond(error_response(400, "sql_error", &message));
+            (true, 400)
         }
         Err(_) => {
             let _ = req.respond(error_response(500, "internal", "the executor thread is gone"));
-            return false;
+            (false, 500)
         }
     }
-    true
 }
 
 /// Whether a statement could leave a transaction open behind it.
@@ -1227,6 +1310,22 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
                     for (i, ty) in types.iter().enumerate() {
                         if i > 0 {
                             cells.push(',');
+                        }
+                        // A SQLNULL column — `SELECT NULL AS x`, with no cast
+                        // to give it a type — holds nothing but NULL, and
+                        // duckdb-rs has no decoder for it: reading the value
+                        // panics, and the whole result dies with it. The value
+                        // is not in any doubt, so answer it here instead of
+                        // refusing a row whose contents are already known.
+                        //
+                        // Only DuckDB v2 gets here. v1.5.5 coerces an untyped
+                        // NULL to INTEGER before harbor ever sees the column,
+                        // so the same query took the ordinary path there — the
+                        // kind of difference that only shows up when harbor is
+                        // actually run against v2.
+                        if matches!(ty.try_id(), Ok(LogicalTypeId::SqlNull)) {
+                            cells.push_str("null");
+                            continue;
                         }
                         match row.get_ref(i) {
                             // A UNION's tag says which member is set, and
@@ -2067,8 +2166,31 @@ static KEYWORDS: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
+    use super::civil_from_days;
     use super::ensure_single_statement as one;
     use super::varint_to_decimal;
+
+    /// `civil_from_days` backs both DATE formatting and the log timestamp, and
+    /// it was never covered. Pin it to dates whose answers are known
+    /// independently: the epoch, both sides of a leap day, the 1900/2000
+    /// century rules, and dates before the epoch, where the sign correction on
+    /// the era division matters and a plain truncating divide is a day out.
+    #[test]
+    fn converts_days_to_civil_dates() {
+        for (days, want) in [
+            (0_i64, (1970_i64, 1_u32, 1_u32)),
+            (59, (1970, 3, 1)),      // 1970 is not a leap year
+            (-1, (1969, 12, 31)),    // before the epoch
+            (-719_468, (0, 3, 1)),   // start of the era
+            (11_016, (2000, 2, 29)), // 2000 is a leap year: the /400 rule
+            (11_017, (2000, 3, 1)),
+            (-25_508, (1900, 3, 1)), // 1900 is not: the /100 rule
+            (20_677, (2026, 8, 12)),
+            (2_932_896, (9999, 12, 31)),
+        ] {
+            assert_eq!(civil_from_days(days), want, "days={days}");
+        }
+    }
 
     #[test]
     fn accepts_a_single_statement() {

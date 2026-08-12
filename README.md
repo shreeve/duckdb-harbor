@@ -57,10 +57,22 @@ harbor: serving on http://127.0.0.1:9495
 ```
 
 That is the whole install. The launcher finds `harbor.duckdb_extension` beside
-itself, in `~/.duckdb/extensions`, or wherever `--extension` /
+itself, in `~/.duckdb/extensions`, or wherever `--load` /
 `HARBOR_EXTENSION` points, and it accepts the file under any name. With no
 `--token` it mints one and prints it as the server binds — the only time it is
 shown; `HARBOR_TOKEN` is honoured if set.
+
+To stop naming the file in a plain DuckDB shell, install it once:
+
+```console
+$ duckdb -unsigned -c "INSTALL '/path/to/harbor.duckdb_extension'"
+```
+
+after which `LOAD harbor;` works in any session. DuckDB files installed
+extensions per version and per platform, so installing a build for each DuckDB
+you run leaves `LOAD harbor` resolving to the right one under each. An installed
+copy never updates itself, though, so the launcher still prefers a built source
+tree over it.
 
 At a terminal that is a normal DuckDB shell which happens to be serving HTTP —
 one window that both answers clients and runs your own SQL against the same
@@ -82,12 +94,33 @@ Both exits are clean. `SIGTERM` and `Ctrl-C` drain in-flight requests and
 replays one. At the prompt, `.quit` and `Ctrl-D` leave; `Ctrl-C` does not —
 DuckDB's shell reads it as "cancel this line".
 
-If the prompt draws and then ignores you — Enter gives blank lines, `Ctrl-C`
-and `Ctrl-D` do nothing — pass `--dark-mode` or `--light-mode`. DuckDB's shell
-asks the terminal for its background colour before it will listen, and against
-a terminal that never answers that measures 5.02s of dead keyboard every time,
-versus 0.01s with the colour pinned. Not harbor-specific; plain `duckdb` stalls
-identically.
+### Request logging
+
+`--log` (or `log := true`) writes one line per HTTP request to stderr:
+
+```
+harbor: 2026-08-12T04:31:07Z 127.0.0.1 POST /sql 200 12ms
+```
+
+Timestamp, peer, method, path, status, duration — measured to the last body
+byte rather than the first, so a slow query and a slow client both show. Off by
+default. The SQL itself is never logged: it arrives in the request body, it can
+be megabytes, and on this endpoint it is as likely to hold customer data as the
+tables it reads.
+
+stderr, not stdout, because stdout carries query results and the prompt in
+`--repl` mode and harbor already reports startup on stderr. Send it wherever
+the log belongs — `2>>/var/log/harbor.log`, a pipe, or a supervisor's
+collector. There is no `--log FILE`: rotation and permissions are the shell's
+job, and it does them better than harbor would.
+
+If the prompt draws and then ignores you for about five seconds — Enter gives
+blank lines, `Ctrl-C` and `Ctrl-D` do nothing — that is DuckDB's shell waiting
+on a terminal that answered neither the background-colour query nor the device
+-attributes query it sends alongside it. Almost every terminal answers at least
+one, so this is rare; when it happens `duckdb -dark-mode` pins the colour and
+skips the wait. Not harbor-specific, and not something this launcher forwards:
+run duckdb directly, as below, if you are on such a terminal.
 
 ### Or straight from a DuckDB shell
 

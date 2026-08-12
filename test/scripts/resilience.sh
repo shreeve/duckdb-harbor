@@ -452,9 +452,13 @@ fi
 # A prompt is only a prompt if it answers the keyboard, and every check above
 # feeds it through a pipe -- the one input path that cannot catch the way this
 # breaks. DuckDB's shell asks the terminal for its background colour (OSC 11)
-# and device attributes, and ignores the keyboard until the replies arrive or it
-# gives up. Against a terminal that never answers that is 5.02s of dead prompt;
-# --dark-mode skips the query and makes it 0.01s.
+# and device attributes (DA1), and ignores the keyboard until the replies
+# arrive or it gives up five seconds later.
+#
+# So the pty here answers both, which is what every real terminal does and what
+# makes this a test of the prompt rather than of a workaround. An earlier
+# version answered neither and passed --dark-mode to skip the query, which
+# measured the flag instead of the terminal.
 #
 # So the assertion is on the *time* to a working prompt, not on eventually
 # getting one: waiting long enough passes either way, which is what made the
@@ -468,7 +472,7 @@ pty_out=$(HARBOR_LAUNCHER="$here/bin/duckdb-harbor" HARBOR_DB="$repl_db" \
 import fcntl, os, pty, re, select, struct, sys, termios, time
 
 argv = [os.environ["HARBOR_LAUNCHER"], os.environ["HARBOR_DB"], "--repl",
-        "--dark-mode", "--port", os.environ["HARBOR_PORT"],
+        "--port", os.environ["HARBOR_PORT"],
         "--token", os.environ["HARBOR_TOKEN_"]]
 
 pid, fd = pty.fork()
@@ -480,7 +484,10 @@ fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 110, 0, 0))
 STRIP = rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[=>]"
 out = bytearray()
 
+answered = False
+
 def read_for(secs):
+    global answered
     end = time.time() + secs
     while time.time() < end:
         r, _, _ = select.select([fd], [], [], 0.05)
@@ -491,7 +498,12 @@ def read_for(secs):
                 return
             if not b:
                 return
-            out.extend(b)          # deliberately never answers OSC 11 / DA1
+            out.extend(b)
+            # Answer as a terminal does: the background colour first, then the
+            # device attributes, in the order the queries were sent.
+            if not answered and b"\x1b]11;?" in bytes(out):
+                answered = True
+                os.write(fd, b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07\x1b[?62;c")
 
 t0 = time.time()
 took = None

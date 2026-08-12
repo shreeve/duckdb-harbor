@@ -7,12 +7,50 @@
 #   bin/duckdb-harbor mydata.db --bind 0.0.0.0     listen beyond loopback
 #   bin/duckdb-harbor mydata.db --token secret     set the bearer token
 #   bin/duckdb-harbor mydata.db --checkpoint 16MB  raise the WAL checkpoint threshold
+#   bin/duckdb-harbor mydata.db --log              one line per HTTP request
 #   bin/duckdb-harbor mydata.db --wait             block instead of prompting
-#   bin/duckdb-harbor mydata.db --dark-mode        for a prompt that ignores you
-#   bin/duckdb-harbor mydata.db --extension ./harbor.duckdb_extension
+#   bin/duckdb-harbor mydata.db --ui               also start the DuckDB UI
+#   bin/duckdb-harbor mydata.db --quack            also serve other duckdb CLIs
+#   bin/duckdb-harbor mydata.db --load spatial     load an extension before serving
+#   bin/duckdb-harbor mydata.db --load ./harbor.duckdb_extension
+#   bin/duckdb-harbor mydata.db --duckdb /path/to/duckdb    choose the binary
 #
 # With no --token, harbor mints one and prints it at startup; that is the only
 # time it is shown. HARBOR_TOKEN is honoured if set.
+#
+# One process, up to four ways in. HTTP /sql is always on -- it is the point of
+# the program. The rest are opt-in, because each one costs a port and a loaded
+# extension, and a service that only needs HTTP should not be running a browser
+# UI it will never open:
+#
+#   --ui      the browser UI, via start_ui_server (no browser is launched)
+#   --quack   the client/server protocol, so *other* duckdb CLIs can ATTACH to
+#             this instance and query it as a normal prompt
+#   --repl    this terminal, as a DuckDB prompt (the default at a terminal)
+#
+# Each service has a fixed offset from --port: HTTP on it, quack one above, the
+# UI two above. --port 9600 puts them on 9600, 9601, 9602 whether or not you
+# asked for all three, so enabling one never moves another. --quack-port and
+# --ui-port override individually. Every flag takes --flag=value too.
+#
+# --bind moves HTTP and quack. It does not move the UI: the ui extension has no
+# bind setting and always listens on IPv6 loopback, so the UI is reachable at
+# http://localhost:PORT from this machine and nowhere else -- not even
+# http://127.0.0.1:PORT, which is a different address and will be refused.
+# --bind 0.0.0.0 --ui exposes HTTP and quack to the network and leaves the UI
+# local. Tunnel it (ssh -L) if you need it from somewhere else.
+#
+# --quack is the one worth understanding. DuckDB opens a database file for one
+# process, so a second `duckdb mydata.db` cannot join a running server -- it
+# waits on the lock or refuses. Serving quack here means any number of other
+# CLIs can reach this database, and importantly they can be scripted:
+#
+#   duckdb -unsigned -c "LOAD quack;
+#     ATTACH 'quack://127.0.0.1:9496' AS r (TYPE quack, TOKEN '...');
+#     USE r; CREATE TABLE t AS FROM read_csv('big.csv');"
+#
+# which is the CLI that this launcher otherwise occupies. The token is printed
+# at startup alongside harbor's.
 #
 # At a terminal this is a normal DuckDB shell that happens to be serving HTTP:
 # you get a prompt, and leaving it stops the server and folds the WAL. Piped,
@@ -24,9 +62,35 @@
 # in a unit file even though it is already the default there: it says the
 # blocking is intended rather than incidental.
 #
-# The extension is looked for beside this script, then in a built tree, then in
-# ~/.duckdb/extensions. Running a downloaded release build needs no source tree
-# at all: point --extension at it, or set HARBOR_EXTENSION.
+# --load takes a registry name (spatial) or a path (./thing.duckdb_extension),
+# and may be repeated. harbor's own extension is just another --load: name it
+# and that build is used, or say nothing and it is looked for beside this
+# script, then in a built tree, then in ~/.duckdb/extensions. Running a
+# downloaded release build needs no source tree at all.
+#
+# Naming a path every time gets old. Install it once and it has a name:
+#
+#   duckdb -unsigned -c "INSTALL '/path/to/harbor.duckdb_extension'"
+#
+# after which LOAD harbor works in any session, and this launcher finds it with
+# no --load at all. DuckDB files those per version and per platform, so
+# installing the v1.5.5 build and the v2 build both leaves each duckdb binary
+# resolving `harbor` to the one built for it. The catch is that an installed
+# copy never updates itself, so a rebuilt source tree is preferred over it here
+# -- otherwise a day's work would silently keep serving last week's binary.
+#
+# --log writes one line per HTTP request to stderr:
+#
+#   harbor: 2026-08-12T04:31:07Z 127.0.0.1 POST /sql 200 12ms
+#
+# Timestamp, peer, method, path, status, and how long the request took --
+# measured to the last body byte, not the first, so a slow query and a slow
+# client both show up. Off by default. The SQL is not logged: it arrives in the
+# request body, it can be megabytes, and on this endpoint it is as likely to
+# contain customer data as the tables it reads. stderr rather than stdout
+# because stdout is where query results and the prompt go in --repl mode, and
+# because harbor already reports startup there. Redirect it wherever the log
+# belongs: `2>>/var/log/harbor.log`, or let a supervisor collect it.
 #
 # checkpoint_threshold defaults to 1MB here rather than DuckDB's 16MB. This
 # launcher serves one database to a long-lived server, and at 16MB a modest
@@ -44,11 +108,11 @@
 # At the prompt, .quit and Ctrl-D both leave. Ctrl-C does not: DuckDB's shell
 # takes it as "cancel this line" and prints a fresh prompt.
 #
-# If the prompt appears and then ignores everything -- Enter gives blank lines,
-# Ctrl-C and Ctrl-D do nothing -- that is DuckDB's shell waiting on a terminal
-# that has not answered its background-colour query. It gives up after five
-# seconds; --dark-mode or --light-mode skips the query and the wait. A stall
-# that outlasts that is something else.
+# If the prompt appears and then ignores everything for about five seconds, that
+# is DuckDB's shell waiting on a terminal that answered neither of the two
+# queries it uses to pick its colours. It is DuckDB's shell, not harbor, and
+# `duckdb -dark-mode` is the cure -- run duckdb directly, as below, if you are
+# on a terminal that does this.
 
 set -euo pipefail
 
@@ -56,8 +120,8 @@ mydir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 here=$(cd -- "$mydir/.." && pwd)
 
 # Nothing here needs a build tree. A downloaded release artifact sitting beside
-# the script, or named through --extension / HARBOR_EXTENSION, works the same
-# way: compiling is one way to obtain the file, not a requirement for using it.
+# the script, or named through --load / HARBOR_EXTENSION, works the same way:
+# compiling is one way to obtain the file, not a requirement for using it.
 ext="${HARBOR_EXTENSION:-}"
 
 db=""
@@ -66,14 +130,46 @@ port="9495"
 token="${HARBOR_TOKEN:-}"
 workers=""
 checkpoint="1MB"
+want_log=0
 mode=""   # "" = decide from whether stdin is a terminal; see below
-colormode=""
+
+# Which duckdb runs this. A v2 build living outside PATH is the common reason to
+# care: harbor's extension is version-locked, so the binary and the extension
+# have to agree, and naming the binary is how you pick which pair you get.
+duckdb_bin="${HARBOR_DUCKDB:-duckdb}"
+
+want_ui=0
+ui_port=""
+want_quack=0
+quack_port=""      # empty = one above the HTTP port
+loads=()           # extra extensions, by name or by path, in the order given
+
+# quack will not accept a token shorter than this, and one token covers every
+# service, so it is the floor for --token generally rather than a rule that
+# switches on when --quack happens to be present.
+TOKEN_MIN=4
 
 # Every flag takes a value, so say so rather than letting `set -u` abort with
 # bash's own "$2: unbound variable" — that reads like a bug in this script.
 need() {
   [[ $# -ge 2 ]] || { echo "duckdb-harbor: $1 needs a value" >&2; exit 2; }
 }
+
+# --port=9600 and --port 9600 should be the same thing. Split the joined form
+# once, up front, so the parser below only ever sees the separated form and no
+# flag has to remember to handle both. `--` is left alone, since it has no
+# value, and a database path is not affected: only arguments starting with --
+# are touched. A value that itself contains = survives, because %% takes the
+# shortest key and #* leaves the rest intact: --token=a=b is token "a=b".
+argv=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --*=*) argv+=("${1%%=*}" "${1#*=}") ;;
+    *)     argv+=("$1") ;;
+  esac
+  shift
+done
+set -- ${argv+"${argv[@]}"}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -82,15 +178,64 @@ while [[ $# -gt 0 ]]; do
     --token)      need "$@"; token="$2"; shift 2 ;;
     --workers)    need "$@"; workers="$2"; shift 2 ;;
     --checkpoint) need "$@"; checkpoint="$2"; shift 2 ;;
-    --extension)  need "$@"; ext="$2"; shift 2 ;;
-    --repl)       mode=repl; shift ;;
-    --wait)       mode=wait; shift ;;
-    --dark-mode|--light-mode)
-                  colormode="${1#-}"; shift ;;
-    -h|--help) sed -n '3,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --duckdb)     need "$@"; duckdb_bin="$2"; shift 2 ;;
+    # A switch, not a destination. Where the log goes is the shell's business
+    # and it is already good at it -- 2>>file, a pipe, a supervisor -- and
+    # taking a path here would mean harbor owning file creation, permissions,
+    # and rotation to do worse what `2>>` does in three characters.
+    --log)        want_log=1; shift ;;
+    # One flag for every extension, harbor's own included. A value that names
+    # harbor claims the harbor slot rather than being loaded twice: it is the
+    # one this program is going to call into, so it is also the one that gets
+    # the name-staging and the version check below.
+    #
+    # harbor* rather than harbor or harbor.*, because the version-stamped names
+    # this script itself looks for -- harbor-v2.0.0-alpha37432.duckdb_extension
+    # -- start with harbor and are not followed by a dot. Missing them sent a
+    # perfectly good harbor build down the extras path, where it skipped the
+    # version check and the name staging and failed in dlsym instead.
+    --load)       need "$@"
+                  case "$(basename -- "$2")" in
+                    harbor*) ext="$2" ;;
+                    *)       loads+=("$2") ;;
+                  esac
+                  shift 2 ;;
+    # Naming a service's port is a way of asking for that service: setting a
+    # port for something you did not want has no other meaning.
+    --ui)         want_ui=1; shift ;;
+    --ui-port)    need "$@"; ui_port="$2"; want_ui=1; shift 2 ;;
+    --quack)      want_quack=1; shift ;;
+    --quack-port) need "$@"; quack_port="$2"; want_quack=1; shift 2 ;;
+    # Contradicting yourself is a mistake, not a preference to be resolved by
+    # whichever came last. Silently honouring the second one means a unit file
+    # that grew a --repl during debugging keeps saying --wait and still hands a
+    # supervisor a prompt.
+    --repl|--wait)
+                  want="${1#--}"
+                  [[ -z "$mode" || "$mode" == "$want" ]] || {
+                    echo "duckdb-harbor: --repl and --wait are opposites; pick one" >&2; exit 2; }
+                  mode="$want"; shift ;;
+    # Print the header block, stopping at the first line that is not a comment,
+    # rather than a fixed line range that silently truncates the moment anyone
+    # adds a paragraph above it.
+    -h|--help) sed -n '3,${/^#/!q;p;}' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     --)        shift; [[ $# -eq 1 ]] || { echo "duckdb-harbor: expected one database path after --" >&2; exit 2; }
                db="$1"; shift ;;
-    -*)        echo "duckdb-harbor: unknown option $1" >&2; exit 2 ;;
+    # There is one spelling of each flag, not two, because a second spelling
+    # only rescues the person who guessed the alias somebody thought to add.
+    # Suggesting the nearest real flag rescues every guess, including the ones
+    # nobody anticipated, and it teaches the right name instead of quietly
+    # accepting the wrong one. Word-order swaps (--port-quack for --quack-port)
+    # are the common miss, so compare on the sorted set of characters.
+    -*)        echo "duckdb-harbor: unknown option $1" >&2
+               key=$(tr -d - <<<"$1" | fold -w1 | sort | tr -d '\n')
+               for known in --bind --checkpoint --duckdb --load --log --port \
+                            --quack --quack-port --repl --token --ui --ui-port \
+                            --wait --workers; do
+                 [[ "$(tr -d - <<<"$known" | fold -w1 | sort | tr -d '\n')" == "$key" ]] && {
+                   echo "  did you mean $known?" >&2; break; }
+               done
+               exit 2 ;;
     # Silently keeping the last of several paths means `duckdb-harbor prod.db
     # staging.db` serves staging and says nothing about it.
     *)         [[ -z "$db" ]] || { echo "duckdb-harbor: more than one database given ($db, $1)" >&2; exit 2; }
@@ -99,7 +244,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$db" ]]; then
-  echo "usage: duckdb-harbor <database.db> [--bind HOST] [--port N] [--token T] [--workers N] [--checkpoint SIZE] [--extension PATH] [--repl|--wait]" >&2
+  echo "usage: duckdb-harbor <database.db> [--bind HOST] [--port N] [--token T] [--workers N]" >&2
+  echo "         [--checkpoint SIZE] [--duckdb PATH] [--load NAME|PATH ...] [--log]" >&2
+  echo "         [--quack] [--quack-port N] [--ui] [--ui-port N] [--repl|--wait]" >&2
   exit 2
 fi
 
@@ -116,6 +263,45 @@ if [[ -n "$workers" ]]; then
     echo "duckdb-harbor: --workers must be a positive number, got '$workers'" >&2; exit 2; }
 fi
 
+# Ports the services get when nothing says otherwise: HTTP on --port, quack one
+# above it, the UI two above it. Fixed offsets per service, deliberately, rather
+# than handing out the next free number in the order the flags appeared.
+#
+# Packing them tighter -- giving the UI +1 when quack was not asked for -- would
+# mean that adding --quack to a command that already worked silently moves the
+# UI to a different port. A bookmark, a firewall rule, a reverse proxy, and a
+# note to a colleague all break, and nothing about the flag you added mentions
+# the UI. Ordering by position on the command line is worse still: reordering
+# two flags in a unit file would change which service is where. Two numbers of
+# padding is a cheap price for "the UI is always --port plus two".
+#
+# These reach SQL as numbers, so they are validated here rather than quoted.
+check_port() {
+  [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1 && $2 <= 65535 )) || {
+    echo "duckdb-harbor: $1 must be a number from 1 to 65535, got '$2'" >&2; exit 2; }
+}
+(( ! want_quack )) || { [[ -n "$quack_port" ]] || quack_port=$(( port + 1 )); }
+(( ! want_ui ))    || { [[ -n "$ui_port"    ]] || ui_port=$(( port + 2 )); }
+[[ -z "$quack_port" ]] || check_port --quack-port "$quack_port"
+[[ -z "$ui_port"    ]] || check_port --ui-port    "$ui_port"
+
+# Two services on one port is a startup failure somewhere further in, reported
+# by whichever one lost, about a port the user may never have typed.
+for pair in "HTTP:$port:quack:${quack_port:-}" "HTTP:$port:UI:${ui_port:-}" "quack:${quack_port:-}:UI:${ui_port:-}"; do
+  IFS=: read -r a_name a_port b_name b_port <<<"$pair"
+  [[ -n "$a_port" && -n "$b_port" && "$a_port" == "$b_port" ]] && {
+    echo "duckdb-harbor: $a_name and $b_name would both use port $a_port" >&2; exit 2; }
+done
+
+# Checked here, before anything binds. quack's own refusal of a short token
+# arrives from inside DuckDB, after harbor has already printed that it is
+# serving, which makes a doomed run look half-successful.
+if [[ -n "$token" ]] && (( ${#token} < TOKEN_MIN )); then
+  echo "duckdb-harbor: --token must be at least $TOKEN_MIN characters, got ${#token}" >&2
+  exit 2
+fi
+true
+
 # A path that is not there is not an empty database to be created. duckdb makes
 # one silently, so a typo'd path or a volume that failed to mount comes up
 # healthy and serves nothing at all.
@@ -125,18 +311,54 @@ if [[ ! -e "$db" ]]; then
   exit 1
 fi
 
+# Resolved before the extension search, because which duckdb this is decides
+# which extension can be loaded at all.
+if ! command -v "$duckdb_bin" >/dev/null 2>&1 && [[ ! -x "$duckdb_bin" ]]; then
+  echo "duckdb-harbor: no duckdb at '$duckdb_bin'" >&2
+  echo "  put one on PATH, or name it with --duckdb (or HARBOR_DUCKDB)" >&2
+  exit 1
+fi
+
+# -no-init because ~/.duckdbrc prints into stdout, and this is being captured.
+ddb_version=$("$duckdb_bin" -no-init -noheader -list \
+  -c "SELECT library_version FROM pragma_version()" 2>/dev/null | tail -1) || true
+
 if [[ -z "$ext" ]]; then
   # $mydir -- the script's own directory -- and not just $here, its parent.
   # Unzipping a release beside the downloaded launcher is the documented
   # install, and in that layout $here is one directory too high: it used to look
   # everywhere except where the file actually was, and report that no extension
   # existed. A source tree is covered by build/release below.
-  for candidate in \
-    "$mydir/harbor.duckdb_extension" \
-    "$here/harbor.duckdb_extension" \
-    "$here/build/release/harbor.duckdb_extension" \
-    "$HOME/.duckdb/extensions/harbor.duckdb_extension"
-  do
+  #
+  # The version-stamped directories come first. harbor is built against one
+  # DuckDB version and refuses to load into any other, so a tree that has been
+  # built for both -- `make release` and
+  # `make TARGET_DUCKDB_VERSION=v2.0.0-alphaN release` -- needs the running
+  # binary to decide, not the order the builds happened in.
+  candidates=()
+  if [[ -n "$ddb_version" ]]; then
+    candidates+=(
+      "$mydir/harbor-$ddb_version.duckdb_extension"
+      "$here/build/release-$ddb_version/harbor.duckdb_extension"
+    )
+  fi
+  candidates+=(
+    "$mydir/harbor.duckdb_extension"
+    "$here/harbor.duckdb_extension"
+    "$here/build/release/harbor.duckdb_extension"
+  )
+  # Last, and deliberately so: a copy that INSTALL put in DuckDB's own extension
+  # directory is the one most likely to be stale. It was current on the day
+  # somebody ran INSTALL, and nothing updates it afterwards, so a source tree
+  # that has been rebuilt since should win. DuckDB keeps these per version and
+  # per platform, which is what makes `LOAD harbor` resolve to the right build
+  # under each binary without anyone choosing.
+  if [[ -n "$ddb_version" ]]; then
+    for installed in "$HOME/.duckdb/extensions/$ddb_version"/*/harbor.duckdb_extension; do
+      [[ -f "$installed" ]] && candidates+=("$installed")
+    done
+  fi
+  for candidate in "${candidates[@]}"; do
     [[ -f "$candidate" ]] && { ext="$candidate"; break; }
   done
 fi
@@ -144,8 +366,10 @@ fi
 if [[ -z "$ext" || ! -f "$ext" ]]; then
   echo "duckdb-harbor: no harbor.duckdb_extension found" >&2
   echo "  download one for your platform from the releases page and pass" >&2
-  echo "  --extension /path/to/harbor.duckdb_extension (or set HARBOR_EXTENSION)," >&2
+  echo "  --load /path/to/harbor.duckdb_extension (or set HARBOR_EXTENSION)," >&2
   echo "  or build one here with 'make release'" >&2
+  echo "  installing it once is the way to stop naming it:" >&2
+  echo "    $duckdb_bin -unsigned -c \"INSTALL '/path/to/harbor.duckdb_extension'\"" >&2
   exit 1
 fi
 
@@ -165,9 +389,19 @@ if [[ "$(basename -- "$ext")" != "harbor.duckdb_extension" ]]; then
   ext="$staging/harbor.duckdb_extension"
 fi
 
-if ! command -v duckdb >/dev/null 2>&1; then
-  echo "harbor: no duckdb on PATH" >&2
-  exit 1
+# The extension records the DuckDB it was built against and DuckDB refuses
+# anything else. That refusal is clear enough on its own, but it arrives after
+# the shell has started and says nothing about how to get the right build, so
+# say it here instead, while the fix is still one command away.
+if [[ -n "$ddb_version" ]]; then
+  ext_version=$(tail -c 512 -- "$ext" 2>/dev/null | strings 2>/dev/null | grep -m1 '^v[0-9]' || true)
+  if [[ -n "$ext_version" && "$ext_version" != "$ddb_version" ]]; then
+    echo "duckdb-harbor: $ext" >&2
+    echo "  was built for DuckDB $ext_version, but $duckdb_bin is $ddb_version" >&2
+    echo "  build a matching one:  make TARGET_DUCKDB_VERSION=$ddb_version release" >&2
+    echo "  then put it at:        build/release-$ddb_version/harbor.duckdb_extension" >&2
+    exit 1
+  fi
 fi
 
 # Quote-double every value that goes into SQL as a string: a token with a quote
@@ -176,6 +410,7 @@ fi
 args="bind := '${bind//\'/\'\'}', port := $port"
 [[ -n "$token"   ]] && args="$args, token := '${token//\'/\'\'}'"
 [[ -n "$workers" ]] && args="$args, workers := $workers"
+(( ! want_log )) || args="$args, log := true"
 
 # -unsigned is required: harbor is not signed by DuckDB's extension registry.
 #
@@ -183,10 +418,74 @@ args="bind := '${bind//\'/\'\'}', port := $port"
 # database or sets memory_limit would otherwise change what this service serves,
 # on one machine and not another, with nothing in the logs to say so.
 #
+# --load takes either a registry name or a path, and the two need different SQL:
+# LOAD spatial resolves through DuckDB's extension machinery, LOAD '/path/x' does
+# not. Anything with a slash or a .duckdb_extension suffix is a file.
+extra_loads=""
+for one in ${loads+"${loads[@]}"}; do
+  if [[ "$one" == */* || "$one" == *.duckdb_extension ]]; then
+    extra_loads="$extra_loads
+  LOAD '${one//\'/\'\'}';"
+  else
+    extra_loads="$extra_loads
+  LOAD ${one//[^A-Za-z0-9_]/};"
+  fi
+done
+
+# Every LOAD happens before harbor binds anything, and the CALLs that actually
+# start a service come after. The order matters more than it looks: a missing or
+# unloadable extension is by far the most common way one of these runs fails,
+# and if `LOAD ui` sat where `CALL start_ui_server()` sits, harbor would print
+# that it is serving and the process would then die on the next statement. A run
+# that fails should fail before it claims a port, not after.
+service_loads=""
+
+# start_ui_server rather than start_ui: this launcher is as likely to be under a
+# supervisor as at a desk, and a service that opens a browser on the machine it
+# happens to boot on is a surprise. The URL is printed; open it yourself.
+ui_sql=""
+if (( want_ui )); then
+  [[ -z "$ui_port" ]] || service_loads="$service_loads
+  SET ui_local_port = $ui_port;"
+  service_loads="$service_loads
+  LOAD ui;"
+  ui_sql="
+  CALL start_ui_server();"
+fi
+
+# One token, every service. Anything that gets you into harbor gets you into
+# quack: they are the same process serving the same database, so a second secret
+# would protect nothing and would only be a second thing to lose.
+#
+# quack will not invent a token, and harbor's own minting happens inside the
+# process where this script cannot see it. So when quack is wanted and no
+# --token was given, the token has to be minted out here and handed to both --
+# otherwise they would each end up with a different one.
+quack_sql=""
+if (( want_quack )) && [[ -z "$token" ]]; then
+  token=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  args="$args, token := '$token'"
+fi
+if (( want_quack )); then
+  service_loads="$service_loads
+  LOAD quack;"
+  quack_sql="
+  CALL quack_serve('quack://${bind//\'/\'\'}:$quack_port', disable_ssl := true, token := '${token//\'/\'\'}');"
+
+  # On stderr, so it stays out of anything parsing this program's stdout.
+  {
+    echo "duckdb-harbor: quack serving on quack://$bind:$quack_port"
+    echo "  attach from another terminal with:"
+    echo "    $duckdb_bin -unsigned -c \"LOAD quack;"
+    echo "      ATTACH 'quack://$bind:$quack_port' AS r (TYPE quack, TOKEN '$token');"
+    echo "      USE r; SELECT 1;\""
+  } >&2
+fi
+
 setup="
-  SET checkpoint_threshold = '${checkpoint//\'/\'\'}';
+  SET checkpoint_threshold = '${checkpoint//\'/\'\'}';$extra_loads$service_loads
   LOAD '${ext//\'/\'\'}';
-  CALL harbor_serve($args);
+  CALL harbor_serve($args);$ui_sql$quack_sql
 "
 
 # Which mode, when neither --repl nor --wait said so: a prompt is only useful to
@@ -212,19 +511,10 @@ fi
 # from the prompt drains the workers and folds the WAL itself; this covers .quit,
 # Ctrl-D, and every other way out. Running it on EXIT rather than after the
 # command means a SIGTERM to the launcher is covered too.
-#
-# --dark-mode / --light-mode are passed straight through, and are the answer to
-# a prompt that draws and then ignores everything typed at it. To pick its
-# colours, DuckDB's shell asks the terminal for its background (OSC 11) and for
-# its device attributes, then waits for the replies -- and until they arrive or
-# it gives up, the keyboard does nothing. Against a terminal that never answers,
-# measured at 5.02s every time before the prompt became usable, and 0.01s with
-# either colour pinned. It is DuckDB's shell, not harbor: plain duckdb stalls
-# identically.
 if [[ "$mode" == "repl" ]]; then
-  trap 'duckdb -no-init "$db" -c "CHECKPOINT" >/dev/null 2>&1 || true' EXIT
+  trap '"$duckdb_bin" -no-init "$db" -c "CHECKPOINT" >/dev/null 2>&1 || true' EXIT
   status=0
-  duckdb -unsigned -no-init ${colormode:+"-$colormode"} "$db" -cmd "$setup" || status=$?
+  "$duckdb_bin" -unsigned -no-init "$db" -cmd "$setup" || status=$?
   exit $status
 fi
 
@@ -234,7 +524,7 @@ fi
 # with one of those outstanding, and FORCE CHECKPOINT waits for a transaction
 # that by definition never finishes. Once harbor_wait returns, the workers are
 # stopped and nothing else is in flight, so the WAL folds cleanly.
-exec duckdb -unsigned -no-init "$db" -c "
+exec "$duckdb_bin" -unsigned -no-init "$db" -c "
   $setup
   CALL harbor_wait();
   CHECKPOINT;
