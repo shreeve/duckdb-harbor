@@ -33,7 +33,7 @@ cd
 curl -sL -o ~/bin/duckdb-harbor \
   https://github.com/shreeve/duckdb-harbor/releases/download/v0.8.1/duckdb-harbor
 chmod +x ~/bin/duckdb-harbor
-rm -rf mydata.duckdb ; duckdb mydata.duckdb -c 'CHECKPOINT'
+rm -rf mydata.duckdb ; duckdb mydata.duckdb -c CHECKPOINT
 duckdb-harbor mydata.duckdb --ui --quack --log --token rip-token
 ```
 
@@ -98,7 +98,7 @@ cd
 curl -sL -o ~/bin/duckdb-harbor \
   https://github.com/shreeve/duckdb-harbor/releases/download/v0.8.1/duckdb-harbor
 chmod +x ~/bin/duckdb-harbor
-rm -rf mydata.duckdb ; duckdb mydata.duckdb -c 'CHECKPOINT'
+rm -rf mydata.duckdb ; duckdb mydata.duckdb -c CHECKPOINT
 duckdb-harbor mydata.duckdb --ui --quack --log --token rip-token
 ```
 

@@ -52,7 +52,19 @@
 # http://localhost:PORT from this machine and nowhere else -- not even
 # http://127.0.0.1:PORT, which is a different address and will be refused.
 # --bind 0.0.0.0 --ui exposes HTTP and quack to the network and leaves the UI
-# local. Tunnel it (ssh -L) if you need it from somewhere else.
+# local. Tunnel it if you need it from somewhere else -- and name the IPv6
+# address when you do:
+#
+#   ssh -L 9497:[::1]:9497 myserver     the UI
+#   ssh -L 9495:localhost:9495 myserver harbor, which is on IPv4
+#
+# The forward target is resolved on the *remote* host, where localhost usually
+# means 127.0.0.1 first. Nothing is listening there for the UI, so the tunnel
+# builds fine and every request through it fails with "channel N: open failed:
+# connect failed: Connection refused" -- a message about the far end that looks
+# like a message about the tunnel. `ss -lntp | grep 9497` on the server settles
+# it: [::1]:9497 means use the bracket form, nothing at all means the service is
+# not running.
 #
 # --quack is the one worth understanding. DuckDB opens a database file for one
 # process, so a second `duckdb mydata.db` cannot join a running server -- it
@@ -409,6 +421,44 @@ if [[ "$(basename -- "$ext")" != "harbor.duckdb_extension" ]]; then
   abs_ext=$(cd -- "$(dirname -- "$ext")" && pwd)/$(basename -- "$ext")
   ln -sf "$abs_ext" "$staging/harbor.duckdb_extension"
   ext="$staging/harbor.duckdb_extension"
+fi
+
+# The UI keeps its own state -- notebooks, saved queries -- in a database under
+# ~/.duckdb/extension_data, and whichever DuckDB first starts the UI creates that
+# file in *its* storage format. One machine running both a v2 preview and stable
+# 1.5.5 therefore has one file that only one of them can open, because a newer
+# DuckDB reads an older file but never the reverse.
+#
+# Nothing about the resulting failure points here. The UI loads, the browser
+# shows "Catalog \"_duckdb_ui\" does not exist", and the actual cause -- "database
+# file with version number 999" -- is one frame further up in a console trace
+# most people never open.
+#
+# A warning rather than a refusal: only the UI is broken, and harbor's job is to
+# serve HTTP. Taking the whole service down over the browser console would be
+# the wrong trade, especially under a supervisor.
+#
+# Matched on the version message specifically, not on any failure, because a
+# file held open by another process fails this probe too -- and that one is
+# temporary and none of our business.
+if (( want_ui )); then
+  ui_state="${HOME:-}/.duckdb/extension_data/ui/ui.db"
+  if [[ -n "${HOME:-}" && -f "$ui_state" ]]; then
+    ui_probe=$("$duckdb_bin" -no-init -c \
+      "ATTACH '${ui_state//\'/\'\'}' AS _harbor_ui_probe (READ_ONLY); DETACH _harbor_ui_probe;" 2>&1) || true
+    if [[ "$ui_probe" == *"version number"* ]]; then
+      {
+        echo "duckdb-harbor: the UI's own state database was written by a different DuckDB"
+        echo "  $ui_state"
+        echo "  ${ui_probe%%$'\n'*}"
+        echo "  The UI will load and then fail with: Catalog \"_duckdb_ui\" does not exist"
+        echo "  Move it aside and the UI builds a fresh one:"
+        echo "    mv '$ui_state' '$ui_state.written-by-another-duckdb'"
+        echo "  Move rather than delete -- it holds your UI notebooks, and the DuckDB"
+        echo "  that wrote it can still open it."
+      } >&2
+    fi
+  fi
 fi
 
 # The extension records the DuckDB it was built against and DuckDB refuses
