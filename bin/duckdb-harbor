@@ -393,8 +393,19 @@ fi
 # anything else. That refusal is clear enough on its own, but it arrives after
 # the shell has started and says nothing about how to get the right build, so
 # say it here instead, while the fix is still one command away.
+#
+# Read at a fixed offset rather than by searching. The metadata trailer is eight
+# 32-byte fields followed by 256 bytes of signature space, written in reverse:
+# counting back from the end, the DuckDB version is 352 bytes in. The previous
+# version of this took the first string in the trailer that looked like a
+# version, which happened to work only while the extension's own version was a
+# git hash. Tagging v0.8.0 put "v0.8.0" in the field immediately before this one
+# -- and, because the fields are written backwards, immediately *earlier* in the
+# file -- so every released binary started reporting itself as built for DuckDB
+# v0.8.0 and the launcher refused all of them. An offset cannot pick the wrong
+# field.
 if [[ -n "$ddb_version" ]]; then
-  ext_version=$(tail -c 512 -- "$ext" 2>/dev/null | strings 2>/dev/null | grep -m1 '^v[0-9]' || true)
+  ext_version=$(tail -c 352 -- "$ext" 2>/dev/null | head -c 32 | tr -d '\0' || true)
   if [[ -n "$ext_version" && "$ext_version" != "$ddb_version" ]]; then
     echo "duckdb-harbor: $ext" >&2
     echo "  was built for DuckDB $ext_version, but $duckdb_bin is $ddb_version" >&2
