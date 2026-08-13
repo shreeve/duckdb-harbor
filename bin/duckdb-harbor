@@ -408,7 +408,7 @@ if [[ -z "$ext" || ! -f "$ext" ]]; then
 fi
 
 # DuckDB derives the init symbol from the file name, taking everything before
-# the first dot: loading `harbor-v0.7.0-osx_arm64.duckdb_extension` makes it
+# the first dot: loading `harbor-v0.8.1-osx_arm64.duckdb_extension` makes it
 # look for `harbor-v0_init_c_api`, which does not exist, and the load fails with
 # a dlsym error that says nothing about the real cause. The file has to be named
 # exactly harbor.duckdb_extension. Rather than make that the user's problem --

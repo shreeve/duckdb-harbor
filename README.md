@@ -160,7 +160,7 @@ which drains the workers and checkpoints.
 Two things the launcher is doing for you here. First, the file has to be named
 exactly `harbor.duckdb_extension`: DuckDB builds the init symbol from
 everything before the first dot, so a `LOAD` of
-`harbor-v0.7.0-osx_arm64.duckdb_extension` looks for `harbor-v0_init_c_api` and
+`harbor-v0.8.1-osx_arm64.duckdb_extension` looks for `harbor-v0_init_c_api` and
 fails with a `dlsym` error that names nothing useful. Second, it sets
 `checkpoint_threshold` to 1MB rather than DuckDB's 16MB — at 16MB a modest
 writer can run for weeks with every committed row sitting in the WAL and the
@@ -329,9 +329,10 @@ self-consistent.
 
 ## Status
 
-Early. **v0.7.0** is the first published release, built for five platforms
-against DuckDB v1.5.5. Not in DuckDB's community-extensions registry yet, so
-`-unsigned` is required and there is no `INSTALL harbor`.
+Early. **v0.8.1** is the current release, built for five platforms against both
+DuckDB v1.5.5 and the v2.0.0 alpha. Not in DuckDB's community-extensions
+registry yet, so `-unsigned` is required and there is no `INSTALL harbor` from
+a repository — install a downloaded file by path instead, as above.
 
 ## License
 
