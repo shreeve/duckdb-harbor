@@ -23,7 +23,7 @@ jobs:
       ci_tools_version: v1.5-variegata
       extension_name: harbor
       extra_toolchains: rust;python3
-      # Five native targets: linux amd64/arm64, osx amd64/arm64, windows amd64.
+      # Five native targets: linux amd64/arm64, osx arm64, windows amd64/arm64.
       #
       # The three wasm ones cannot work. DuckDB-wasm runs the extension inside
       # a browser tab, and harbor_serve binds a listening TCP socket through
@@ -31,12 +31,19 @@ jobs:
       # build would either fail to link or produce a binary that cannot do the
       # one thing it is for.
       #
+      # osx_amd64 is dropped: Apple stopped selling Intel Macs in 2023 and
+      # Rosetta runs an arm64 DuckDB, not an amd64 extension inside it. Anyone
+      # still on one builds from source in about twenty seconds.
+      #
       # windows_amd64_mingw is dropped as redundant -- windows_amd64 is the
       # MSVC build every Windows user wants, and the mingw variant mainly
-      # serves the R/Rtools ecosystem. Worth adding when someone needs it,
-      # along with the opt-in targets: linux_amd64_musl (Alpine containers),
-      # linux_arm64_musl and windows_arm64.
-      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw'
+      # serves the R/Rtools ecosystem.
+      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;osx_amd64'
+      # windows_arm64 is not in the default matrix and has to be asked for.
+      # The other opt-in targets are the musl pair (linux_amd64_musl,
+      # linux_arm64_musl) for Alpine containers -- worth adding when someone
+      # needs them.
+      opt_in_archs: 'windows_arm64'
       # Turns off fail-fast for the build matrix. A release wants every binary
       # that can be produced, and one runner's bad day should not cancel the
       # others: the first v0.7.0 run lost osx_amd64 because osx_arm64 hit a TLS

@@ -73,8 +73,8 @@ polling it costs at most one query per second however often it is asked.
 
 Nothing to compile. Take the extension for your platform and the launcher from
 the [releases page](https://github.com/shreeve/duckdb-harbor/releases) — five
-platforms are built: `osx_arm64`, `osx_amd64`, `linux_amd64`, `linux_arm64`,
-`windows_amd64`.
+platforms are built: `osx_arm64`, `linux_amd64`, `linux_arm64`,
+`windows_amd64`, `windows_arm64`.
 
 ```console
 $ base=https://github.com/shreeve/duckdb-harbor/releases/download/v0.8.1
