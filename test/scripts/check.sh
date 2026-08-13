@@ -44,7 +44,7 @@ token=${TOKEN:-check-$$}
 # port this runner has already given to the shared server — the run dies at
 # startup with "address already in use" and it looks like a harbor bug.
 unset PORT
-suites=${SUITES:-unit abi types sqllogic asserts spec fuzz differential deployment stress resilience}
+suites=${SUITES:-unit abi types sqllogic asserts spec fuzz differential deployment stress sessions resilience}
 
 bold=$(tput bold 2>/dev/null || true); red=$(tput setaf 1 2>/dev/null || true)
 green=$(tput setaf 2 2>/dev/null || true); dim=$(tput dim 2>/dev/null || true)
@@ -167,6 +167,11 @@ if [[ " $suites " == *" differential "* ]]; then
     skip differential "the v1 harbor is not built at $old_ext (set OLD_EXT=...)"
   fi
 fi
+
+# sessions.py runs its own server: it needs a pool size the shared one does not
+# use, and it ends by killing the server mid-transaction to check the WAL was
+# folded anyway.
+run sessions "$here/test/scripts/sessions.py"
 
 run resilience "$here/test/scripts/resilience.sh" "$db"
 

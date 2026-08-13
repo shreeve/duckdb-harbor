@@ -32,12 +32,16 @@ One `schema` message, one `row` per row, one `end`. Rows go out as DuckDB
 produces them, so a client can start on row one while the server is still
 producing the last one.
 
-Two routes. That is the whole surface:
+Five routes. That is the whole surface — two of them for queries, three so a
+transaction can outlive one request:
 
 ```
-POST /sql      run one statement, stream the result as NDJSON
-               (Accept: application/json for one document instead)
-GET  /ready    can this server answer a query? no credential required
+POST /sql                  run one statement, stream the result as NDJSON
+                           (Accept: application/json for one document instead)
+GET  /ready                can this server answer a query? no credential required
+POST /sql/sessions/new     take a connection and hold it, for a transaction
+DELETE /sql/sessions/<id>  give it back
+GET  /sessions             what is holding one, and for how long
 ```
 
 `POST /sql` streams by default. Send `Accept: application/json` and the same
@@ -68,6 +72,55 @@ matters: a process can be running while its executor thread is gone, and a
 hardcoded 200 will cheerfully say so while every `/sql` returns 500. Asking the
 database is the only answer worth having. Verdicts are cached for one second, so
 polling it costs at most one query per second however often it is asked.
+
+## Transactions
+
+A transaction lives on a connection and HTTP requests do not, so one request
+per statement means no transaction can span two. A session bridges that: a
+connection pinned to you until you commit, roll back, or stop answering.
+
+```console
+$ sid=$(curl -s localhost:9495/sql/sessions/new -H "$auth" | jq -r .sessionId)
+$ post() { curl -s localhost:9495/sql -H "$auth" -d "{\"sql\":\"$1\",\"sessionId\":\"$sid\"}"; }
+$ post "BEGIN"
+$ post "INSERT INTO orders (total) VALUES (19.99) RETURNING id"
+$ post "INSERT INTO order_items (order_id, price) VALUES (1, 19.99)"
+$ post "COMMIT"
+$ curl -s -X DELETE localhost:9495/sql/sessions/$sid -H "$auth"
+```
+
+This is PgBouncer's transaction pooling, or ActiveRecord checking a connection
+out of its pool — with an HTTP request where they have a socket and a thread.
+Three things follow from that, and they are the parts worth knowing:
+
+**Sessions draw from their own connections.** `HARBOR_POOL_SIZE` (default 16)
+is opened at load and split: the workers take theirs, sessions get the rest. A
+pool serving both would run out of workers the moment enough clients held
+transactions open, and then answer nothing at all. With none free, opening a
+session is a `503` with `Retry-After` — queries keep working throughout.
+
+**Every session has a deadline.** HTTP has no reliable close signal, so a
+client that vanishes mid-transaction looks exactly like one that is thinking,
+and a timer is the only way that connection ever comes back. Ask for a lifetime
+with `{"ttlMs": N}`; harbor caps it at five minutes and answers with what it
+granted, alongside the thirty-second idle timeout it enforces regardless. When
+a session is reclaimed its transaction is rolled back, and so is one released
+with a transaction still open.
+
+**One statement at a time.** A second statement sent while the first is running
+gets a `409`: a transaction is a sequence, and two of them interleaving inside
+one is something no client could reason about.
+
+`GET /sessions` shows what is held — age, idle time, statements, whether a
+transaction is open — and the connection accounting behind it. Free plus live
+plus in-flight always equals total; `balanced` is that checked at the moment
+you asked. A pool leaks connections silently and the symptom shows up weeks
+later as "everything hangs", so the arithmetic is worth being able to read.
+
+Note that DuckDB resolves write conflicts optimistically: two transactions
+touching the same row do not queue, the second is refused the moment it writes.
+The answer is to run the transaction again, which is what `rip/db` does for
+you.
 
 ## Get it running
 
@@ -322,11 +375,6 @@ returning a time that silently means something else. Recover the offset with
 **`TIME_NS` and `VARIANT` are refused with `400`.** Neither can cross the Arrow
 boundary the Rust client uses. Cast to `VARCHAR` and the value comes back
 intact.
-
-**A transaction cannot span requests.** Pooled connections are not pinned to a
-client, so a `BEGIN` has no way to be committed by a later request — it is
-rolled back before the connection is reused. Send a transaction as one
-statement.
 
 **Bodies are capped at 8 MiB**, declared or delivered; over that is a `413`.
 There is no rate limiting, no CORS, and no request logging — defensible for a

@@ -15,6 +15,7 @@
 // embed DuckDB and just want to POST SQL and read JSON back.
 
 use std::{
+    collections::HashMap,
     error::Error,
     ffi::CString,
     io::Read,
@@ -472,9 +473,24 @@ const MAX_JSON_RESPONSE: usize = 32 << 20;
 // Sync — two threads may not share one.
 // ---------------------------------------------------------------------------
 
-/// How many worker connections to open at load. Idle connections are nearly
-/// free; not being able to open one later is not.
-const POOL_SIZE: usize = 8;
+/// How many connections to open at load, when nothing says otherwise. Idle
+/// connections are nearly free; not being able to open one later is not, and
+/// "later" here means "ever" — see the note above.
+///
+/// The default covers the default six workers with ten left over for leases.
+/// `HARBOR_POOL_SIZE` moves it, and has to, because this is the one number
+/// that cannot be changed once the extension is loaded: a deployment that
+/// wants more concurrent transactions than ten has no other way to ask.
+const DEFAULT_POOL_SIZE: usize = 16;
+const MIN_POOL_SIZE: usize = 2;
+const MAX_POOL_SIZE: usize = 256;
+
+fn configured_pool_size() -> usize {
+    match std::env::var("HARBOR_POOL_SIZE").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(n) => n.clamp(MIN_POOL_SIZE, MAX_POOL_SIZE),
+        None => DEFAULT_POOL_SIZE,
+    }
+}
 
 /// Connections handed out to workers when the server starts, returned when it
 /// stops.
@@ -489,10 +505,351 @@ static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
 /// Woken when the server stops, so `harbor_wait()` can block without polling.
 static STOPPED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 
+// ---------------------------------------------------------------------------
+// Leases
+//
+// A transaction lives on a connection, and HTTP requests do not. A lease is
+// the thing that bridges them: a connection pinned to one client until it
+// commits, rolls back, or stops answering. This is PgBouncer's transaction
+// pooling and ActiveRecord's connection checkout, with an HTTP request where
+// they have a socket and a thread.
+//
+// Three properties make it safe rather than merely possible:
+//
+//   1. Leases draw from their own connections, never the workers'. A pool that
+//      serves both runs out of workers the moment enough clients hold
+//      transactions open, and answers nothing at all — which is a deadlock,
+//      not a slowdown.
+//   2. Every lease has a deadline. HTTP has no reliable close signal, so a
+//      client that vanishes mid-transaction is indistinguishable from one that
+//      is thinking, and a timer is the only way the connection ever comes
+//      back. It is not hygiene: an open write transaction makes CHECKPOINT
+//      *fail*, so one abandoned lease would break the shutdown that folds the
+//      WAL.
+//   3. Connections are conserved. Every lease connection is in `free`, inside
+//      a live lease, or counted in `inflight` while it is being handed between
+//      the two — so `free + live + inflight == total` holds at every instant.
+//      A connection pool has one catastrophic bug, which is a connection that
+//      goes out and never comes back, and this is the invariant that makes it
+//      impossible to introduce quietly. `/sessions` reports it.
+// ---------------------------------------------------------------------------
+
+/// A lease connection, identified by the executor it talks to. `slot` is
+/// stable for the life of the server and appears in `/sessions`, so a
+/// connection can be followed across the leases that borrow it.
+struct LeaseConn {
+    slot: usize,
+    jobs: mpsc::SyncSender<Job>,
+}
+
+struct Lease {
+    conn: LeaseConn,
+    opened: Instant,
+    last: Instant,
+    deadline: Instant,
+    statements: u64,
+    /// Whether the last transaction-control statement opened one. This is the
+    /// field an operator actually wants: a lease sitting idle is a curiosity,
+    /// a lease sitting idle inside a write transaction is why the checkpoint
+    /// is failing.
+    in_transaction: bool,
+    /// A statement is running right now. Two requests naming one lease would
+    /// otherwise interleave inside a single transaction, which no client could
+    /// reason about; the second is refused.
+    busy: bool,
+}
+
+struct Leases {
+    free: Vec<LeaseConn>,
+    live: HashMap<String, Lease>,
+    /// Connections between `free` and `live` — released but not yet rolled
+    /// back. Counted so the conservation invariant holds during the handoff
+    /// rather than only at rest.
+    inflight: usize,
+    total: usize,
+    idle_ttl: Duration,
+    max_ttl: Duration,
+}
+
+impl Leases {
+    fn accounted(&self) -> usize {
+        self.free.len() + self.live.len() + self.inflight
+    }
+}
+
+static LEASES: Mutex<Option<Leases>> = Mutex::new(None);
+
+/// How long a lease may sit without a statement before it is reclaimed, and
+/// the longest life it may ask for. The idle timeout is what actually protects
+/// the checkpoint; the ceiling stops a client from asking for a lease that
+/// outlives the reason it was granted.
+const LEASE_IDLE_TTL: Duration = Duration::from_secs(30);
+const LEASE_MAX_TTL: Duration = Duration::from_secs(300);
+const REAP_INTERVAL: Duration = Duration::from_millis(500);
+
+/// 18 bytes of CSPRNG, hex. Sessions are not a privilege boundary here — one
+/// token admits every caller — so this is about never colliding and never
+/// reusing, not about resisting an attacker who already has the token.
+fn new_lease_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 18];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(36);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Run `ROLLBACK` on a lease connection and drain what it says. Called on
+/// every path that returns a connection to the free list, so a lease can never
+/// hand back a connection with a transaction still open on it.
+///
+/// Outside the registry lock, always: this blocks on the executor, and holding
+/// the lock across it would serialise every other lease behind whatever this
+/// connection is doing.
+fn quiesce(conn: &LeaseConn) {
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), Refusal>>(1);
+    let (body_tx, body_rx) = mpsc::sync_channel::<Vec<u8>>(BODY_QUEUE);
+    let job = Job {
+        sql: String::new(),
+        params: Vec::new(),
+        shape: Shape::Ndjson,
+        reset: true,
+        ready: ready_tx,
+        body: body_tx,
+    };
+    if conn.jobs.send(job).is_err() {
+        return;
+    }
+    // Wait for it. A connection is not free until it is clean, and the caller
+    // is about to put it back in the free list.
+    let _ = ready_rx.recv();
+    while body_rx.recv().is_ok() {}
+}
+
+/// Open a lease, or say why not. `Err` carries the status and body to send.
+fn lease_open(requested_ttl: Option<Duration>) -> Result<(String, Duration, Duration), Refusal> {
+    let mut guard = LEASES.lock().unwrap();
+    let Some(leases) = guard.as_mut() else {
+        return Err(Refusal {
+            status: 503,
+            code: "unavailable",
+            message: "harbor is not serving".to_string(),
+        });
+    };
+    if leases.total == 0 {
+        return Err(Refusal {
+            status: 503,
+            code: "no_lease_connections",
+            message: "this harbor has no connections left over for transactions: every one is a \
+                      worker. Raise HARBOR_POOL_SIZE above the worker count, or lower workers."
+                .to_string(),
+        });
+    }
+    // Two clocks, and they answer different questions. The deadline caps how
+    // long a lease may live at all, and the client may ask for less. The idle
+    // timeout is harbor's own and is not negotiable: it is what reclaims a
+    // client that stopped talking mid-transaction, which is the case that
+    // blocks checkpoints, and letting a client raise it would let a client
+    // disable it.
+    let ttl = requested_ttl.unwrap_or(leases.max_ttl).min(leases.max_ttl);
+    let idle_ttl = leases.idle_ttl;
+    let Some(conn) = leases.free.pop() else {
+        return Err(Refusal {
+            status: 503,
+            code: "no_lease_available",
+            message: format!(
+                "all {} transaction connections are in use. Retry, or raise HARBOR_POOL_SIZE.",
+                leases.total
+            ),
+        });
+    };
+    let now = Instant::now();
+    let deadline = now + ttl;
+    let id = new_lease_id();
+    leases.live.insert(
+        id.clone(),
+        Lease {
+            conn,
+            opened: now,
+            last: now,
+            deadline,
+            statements: 0,
+            in_transaction: false,
+            busy: false,
+        },
+    );
+    Ok((id, ttl, idle_ttl))
+}
+
+/// How long a statement will wait for a lease that is busy before refusing.
+///
+/// Not for concurrency — a transaction is a sequence and two statements at
+/// once is a client bug. It is for the seam at the end of the previous
+/// request: the claim is released after the response is written, so a client
+/// that sends its next statement the instant it reads the last byte can arrive
+/// while the server is still a few instructions from letting go. That window
+/// is microseconds and entirely ours, so waiting it out is right where
+/// refusing would be a lie. A genuinely concurrent second statement still gets
+/// its 409, just a quarter-second later.
+const CLAIM_WAIT: Duration = Duration::from_millis(250);
+
+/// Claim a lease for one statement, waiting out the handoff window above.
+fn lease_claim(id: &str) -> Result<mpsc::SyncSender<Job>, Refusal> {
+    let deadline = Instant::now() + CLAIM_WAIT;
+    loop {
+        match try_lease_claim(id) {
+            Err(refusal) if refusal.code == "session_busy" && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            other => return other,
+        }
+    }
+}
+
+fn try_lease_claim(id: &str) -> Result<mpsc::SyncSender<Job>, Refusal> {
+    let mut guard = LEASES.lock().unwrap();
+    let Some(leases) = guard.as_mut() else {
+        return Err(Refusal {
+            status: 503,
+            code: "unavailable",
+            message: "harbor is not serving".to_string(),
+        });
+    };
+    let Some(lease) = leases.live.get_mut(id) else {
+        // Deliberately the same answer whether it never existed, was released,
+        // or timed out: from the client's side those are one situation — the
+        // transaction is gone and the work has to start again.
+        return Err(Refusal {
+            status: 404,
+            code: "no_such_session",
+            message: "no such session: it was released, timed out, or never existed. Open a new \
+                      one and retry the transaction from the beginning."
+                .to_string(),
+        });
+    };
+    if lease.busy {
+        return Err(Refusal {
+            status: 409,
+            code: "session_busy",
+            message: "this session is already running a statement. A transaction is a sequence, \
+                      not a pool; send its statements one after another."
+                .to_string(),
+        });
+    }
+    lease.busy = true;
+    lease.last = Instant::now();
+    Ok(lease.conn.jobs.clone())
+}
+
+/// Give a claim back, recording what the statement did to the transaction.
+fn lease_settle(id: &str, sql: &str) {
+    let mut guard = LEASES.lock().unwrap();
+    let Some(leases) = guard.as_mut() else { return };
+    let Some(lease) = leases.live.get_mut(id) else { return };
+    lease.busy = false;
+    lease.last = Instant::now();
+    lease.statements += 1;
+    if let Some(open) = transaction_effect(sql) {
+        lease.in_transaction = open;
+    }
+}
+
+/// A lease claimed for the length of one request. Dropping it hands the lease
+/// back and records what the statement did to the transaction — on every path
+/// out of `run_sql`, including the ones that return early.
+struct Claim {
+    id: String,
+    sql: String,
+    target: mpsc::SyncSender<Job>,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        lease_settle(&self.id, &self.sql);
+    }
+}
+
+/// Release a lease and return its connection. Idempotent: releasing an already
+/// released lease is a no-op that reports false, so a client retrying a DELETE
+/// can never free a connection twice or free one that has been reissued.
+///
+/// A busy lease is not released — the statement in flight owns the connection
+/// until it finishes, and yanking it would hand the same connection to two
+/// callers at once.
+fn lease_release(id: &str) -> bool {
+    let lease = {
+        let mut guard = LEASES.lock().unwrap();
+        let Some(leases) = guard.as_mut() else { return false };
+        match leases.live.get(id) {
+            Some(l) if l.busy => return false,
+            Some(_) => {}
+            None => return false,
+        }
+        let lease = leases.live.remove(id).expect("checked above");
+        leases.inflight += 1;
+        lease
+    };
+    quiesce(&lease.conn);
+    let mut guard = LEASES.lock().unwrap();
+    if let Some(leases) = guard.as_mut() {
+        leases.free.push(lease.conn);
+        leases.inflight -= 1;
+    }
+    true
+}
+
+/// Reclaim leases that have stopped answering. Two clocks: a lease that has
+/// been idle past its idle timeout, and one that has outlived its deadline
+/// whatever it has been doing.
+fn lease_reap() {
+    let expired: Vec<String> = {
+        let guard = LEASES.lock().unwrap();
+        let Some(leases) = guard.as_ref() else { return };
+        let now = Instant::now();
+        leases
+            .live
+            .iter()
+            .filter(|(_, l)| !l.busy && (now >= l.deadline || now.duration_since(l.last) >= leases.idle_ttl))
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    for id in expired {
+        // Through the same release path as everything else, so a reaped lease
+        // and a released one cannot diverge.
+        lease_release(&id);
+    }
+}
+
+/// Roll back and return every lease connection. Called during shutdown, before
+/// the CHECKPOINT, because an open write transaction makes that checkpoint
+/// fail — which would turn a clean stop into a WAL replay on next open.
+fn lease_drain() {
+    let ids: Vec<String> = {
+        let guard = LEASES.lock().unwrap();
+        match guard.as_ref() {
+            Some(leases) => leases.live.keys().cloned().collect(),
+            None => return,
+        }
+    };
+    for id in &ids {
+        // A lease busy with a statement is left to the executor's own
+        // shutdown: its channel is dropped below, and `execute_jobs` rolls
+        // back on the way out.
+        lease_release(id);
+    }
+}
+
 struct Running {
     server: Arc<Server>,
     stop: Arc<AtomicBool>,
     workers: Vec<JoinHandle<Option<Connection>>>,
+    /// Lease executors. They have no accept loop — they exist only to run
+    /// statements on their own pinned connection — so they end when their
+    /// channel is dropped, which is what `stop` does after draining.
+    leases: Vec<JoinHandle<Option<Connection>>>,
+    reaper: Option<JoinHandle<()>>,
     addr: String,
 }
 
@@ -517,7 +874,7 @@ fn open_pool(con: Connection) -> Result<(), String> {
         );
     }
 
-    for _ in 0..POOL_SIZE {
+    for _ in 0..configured_pool_size() {
         pool.push(con.try_clone().map_err(|e| format!("harbor: {e}"))?);
     }
     *CONTROL.lock().unwrap() = Some(con);
@@ -547,7 +904,8 @@ fn start(
         return Err("harbor: no database connections (extension not initialised)".to_string());
     }
     // Say so rather than quietly serving with fewer. workers is capped by the
-    // connection pool, which is fixed at POOL_SIZE, so `workers := 32` gets 8 —
+    // connection pool, which is fixed at load, so `workers := 32` gets what the
+    // pool has —
     // and someone who raised it to fix a throughput problem deserves to know
     // that the number they set is not the number they got.
     let requested = workers;
@@ -559,12 +917,19 @@ fn start(
     }
     let keep = pool.len() - workers;
     let mut conns: Vec<Connection> = pool.drain(keep..).collect();
+    // Everything the workers did not take becomes lease capacity. Nothing is
+    // held back for later: a connection that is neither serving requests nor
+    // available for a transaction is doing nothing at all, and it cannot be
+    // created on demand, so there is no reason to keep one in reserve.
+    let mut lease_conns: Vec<Connection> = pool.drain(..).collect();
     drop(pool);
 
     let server = match Server::http((bind, port)) {
         Ok(s) => s,
         Err(e) => {
-            POOL.lock().unwrap().append(&mut conns);
+            let mut pool = POOL.lock().unwrap();
+            pool.append(&mut conns);
+            pool.append(&mut lease_conns);
             return Err(format!("harbor: cannot bind {bind}:{port}: {e}"));
         }
     };
@@ -586,8 +951,53 @@ fn start(
         );
     }
 
+    // One executor per lease connection, each owning it for the life of the
+    // server. A lease borrows the executor, not the thread: statements arrive
+    // from whichever worker accepted the request and are answered here, which
+    // is what keeps a transaction on one connection without taking a worker
+    // out of the accept loop to babysit it.
+    let mut lease_handles = Vec::with_capacity(lease_conns.len());
+    let mut free = Vec::with_capacity(lease_conns.len());
+    for (slot, conn) in lease_conns.into_iter().enumerate() {
+        let (tx, rx) = mpsc::sync_channel::<Job>(0);
+        let handle = thread::Builder::new()
+            .name(format!("harbor-lease-{slot}"))
+            .spawn(move || Some(execute_jobs(conn, rx, true)))
+            .map_err(|e| e.to_string())?;
+        lease_handles.push(handle);
+        free.push(LeaseConn { slot, jobs: tx });
+    }
+    let total = free.len();
+    *LEASES.lock().unwrap() = Some(Leases {
+        free,
+        live: HashMap::new(),
+        inflight: 0,
+        total,
+        idle_ttl: LEASE_IDLE_TTL,
+        max_ttl: LEASE_MAX_TTL,
+    });
+
+    // The reaper is what makes a lease safe to hand out at all: without it an
+    // abandoned transaction holds its connection until the process exits, and
+    // blocks every checkpoint in between.
+    let reaper = if total > 0 {
+        let stop = Arc::clone(&stop);
+        thread::Builder::new()
+            .name("harbor-reaper".to_string())
+            .spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    thread::sleep(REAP_INTERVAL);
+                    lease_reap();
+                }
+            })
+            .ok()
+    } else {
+        None
+    };
+
     *STOPPED.0.lock().unwrap() = false;
-    *running = Some(Running { server, stop, workers: handles, addr: addr.clone() });
+    *running =
+        Some(Running { server, stop, workers: handles, leases: lease_handles, reaper, addr: addr.clone() });
     Ok(addr)
 }
 
@@ -606,6 +1016,19 @@ fn stop() -> Result<String, String> {
     r.stop.store(true, Ordering::SeqCst);
     r.server.unblock();
 
+    // Before anything else: roll back every live transaction. This is not
+    // tidiness. An open write transaction makes CHECKPOINT fail outright —
+    // "there are other write transactions active" — so a single client that
+    // opened a transaction and wandered off would turn the clean stop below
+    // into a WAL replay on next open. Draining first is what makes the
+    // checkpoint reachable.
+    lease_drain();
+    // Dropping the registry drops the free list, and with it every sender.
+    // The lease executors see their channel close, roll back once more on the
+    // way out, and hand their connection back through the join below.
+    let leases = LEASES.lock().unwrap().take();
+    drop(leases);
+
     // Workers hand their connection back as they exit, so a later
     // harbor_serve has a pool to draw from. A panicked worker forfeits its
     // connection rather than taking the shutdown down with it.
@@ -615,7 +1038,15 @@ fn stop() -> Result<String, String> {
             pool.push(conn);
         }
     }
+    for h in r.leases {
+        if let Ok(Some(conn)) = h.join() {
+            pool.push(conn);
+        }
+    }
     drop(pool);
+    if let Some(h) = r.reaper {
+        let _ = h.join();
+    }
 
     // Fold the WAL back into the database file so the next open needs no
     // replay. This succeeds when harbor_stop is called from an ordinary
@@ -728,7 +1159,7 @@ fn worker(
     let (jobs_tx, jobs_rx) = mpsc::sync_channel::<Job>(0);
     let executor = thread::Builder::new()
         .name("harbor-exec".to_string())
-        .spawn(move || execute_jobs(conn, jobs_rx))
+        .spawn(move || execute_jobs(conn, jobs_rx, false))
         .ok()?;
 
     while !stop.load(Ordering::SeqCst) {
@@ -781,6 +1212,43 @@ fn handle(mut req: Request, jobs: &mpsc::SyncSender<Job>, token: Option<&str>, l
         // need a credential to learn whether this server can serve, and the
         // answer reveals nothing beyond up or down.
         (Method::Get, "/ready") => run_ready(req, jobs),
+        // Open a transaction lease. Authenticated: it consumes a connection,
+        // which is the scarcest thing here.
+        (Method::Post, "/sql/sessions/new") => {
+            if !authorized(&req, token) {
+                let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
+                (true, 401)
+            } else {
+                run_session_open(req)
+            }
+        }
+        // Release one. Idempotent by design: a client retrying a DELETE it is
+        // not sure landed must not be able to free a connection twice.
+        (Method::Delete, p) if p.starts_with("/sql/sessions/") => {
+            if !authorized(&req, token) {
+                let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
+                (true, 401)
+            } else {
+                let id = p.trim_start_matches("/sql/sessions/").to_string();
+                let released = lease_release(&id);
+                let body = format!(r#"{{"released":{released}}}"#);
+                let _ = req.respond(json_response(200, &body));
+                (true, 200)
+            }
+        }
+        // What is holding a connection, and for how long. The question an
+        // operator asks when everything is suddenly waiting, and the reason
+        // this exists at all: a pool you cannot see into is a pool you debug
+        // by guessing.
+        (Method::Get, "/sessions") => {
+            if !authorized(&req, token) {
+                let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
+                (true, 401)
+            } else {
+                let _ = req.respond(json_response(200, &sessions_report()));
+                (true, 200)
+            }
+        }
         (Method::Post, "/sql") => {
             if !authorized(&req, token) {
                 let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
@@ -889,6 +1357,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 struct SqlRequest {
     sql: String,
     params: Vec<Value>,
+    /// Names a lease. Absent means the statement runs on a worker connection
+    /// and settles itself, which is what almost every request wants.
+    session: Option<String>,
 }
 
 fn parse_request(body: &str) -> Result<SqlRequest, String> {
@@ -906,7 +1377,12 @@ fn parse_request(body: &str) -> Result<SqlRequest, String> {
         Some(serde_json::Value::Array(a)) => a.iter().map(json_to_duckdb).collect::<Result<_, _>>()?,
         Some(_) => return Err("\"params\" must be an array".to_string()),
     };
-    Ok(SqlRequest { sql, params })
+    let session = match v.get("sessionId") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(id)) if !id.is_empty() => Some(id.clone()),
+        Some(_) => return Err("\"sessionId\" must be a non-empty string".to_string()),
+    };
+    Ok(SqlRequest { sql, params, session })
 }
 
 fn json_to_duckdb(v: &serde_json::Value) -> Result<Value, String> {
@@ -1107,6 +1583,14 @@ struct Job {
     sql: String,
     params: Vec<Value>,
     shape: Shape,
+    /// Return this connection to a clean state instead of running `sql`.
+    ///
+    /// Not the same as sending `ROLLBACK` as a statement, which would go
+    /// through prepare, query and row iteration and then fail on the common
+    /// path — a lease released after COMMIT has nothing to roll back, so every
+    /// release would manufacture an error and a result nobody reads. This is
+    /// the call the workers already make between requests.
+    reset: bool,
     /// Answered exactly once, before any body byte is produced. `Err` means
     /// nothing has been written yet, so the worker can still pick a status
     /// code — which is the whole reason preparation is reported separately
@@ -1137,6 +1621,119 @@ const READY_MAX_AGE: Duration = Duration::from_secs(1);
 /// second.
 static LAST_READY: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
 
+/// `POST /sql/sessions/new` — take a connection out of the pool and hold it.
+///
+/// The body may ask for a lifetime (`{"ttlMs": N}`); harbor caps it at its own
+/// maximum and answers with the one it actually granted, alongside the idle
+/// timeout it enforces regardless. Both sides then know when the lease dies,
+/// which beats the client discovering it at COMMIT — the point at which the
+/// work is already done and cannot be redone cheaply.
+fn run_session_open(mut req: Request) -> (bool, u16) {
+    let mut body = String::new();
+    if req.as_reader().take(MAX_BODY as u64).read_to_string(&mut body).is_err() {
+        let _ = req.respond(error_response(400, "bad_request", "body is not valid UTF-8"));
+        return (true, 400);
+    }
+    let requested = match body.trim().is_empty() {
+        true => None,
+        false => match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(v) => match v.get("ttlMs") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(n) => match n.as_u64() {
+                    Some(ms) if ms > 0 => Some(Duration::from_millis(ms)),
+                    _ => {
+                        let _ = req.respond(error_response(
+                            400,
+                            "bad_request",
+                            "\"ttlMs\" must be a positive integer",
+                        ));
+                        return (true, 400);
+                    }
+                },
+            },
+            Err(e) => {
+                let _ = req.respond(error_response(400, "bad_request", &e.to_string()));
+                return (true, 400);
+            }
+        },
+    };
+
+    match lease_open(requested) {
+        Ok((id, ttl, idle_ttl)) => {
+            let body = format!(
+                r#"{{"sessionId":"{}","ttlMs":{},"idleTtlMs":{}}}"#,
+                id,
+                ttl.as_millis(),
+                idle_ttl.as_millis()
+            );
+            let _ = req.respond(json_response(200, &body));
+            (true, 200)
+        }
+        // Exhaustion is temporary by definition — a lease is held for the
+        // length of a transaction, not a session — so say how long to wait
+        // instead of leaving the client to invent a backoff. ActiveRecord
+        // raises ConnectionTimeoutError and tells you nothing; this is the
+        // same situation with the one useful number attached.
+        Err(refusal) => {
+            let mut response = error_response(refusal.status, refusal.code, &refusal.message);
+            if refusal.code == "no_lease_available" {
+                response.add_header(
+                    Header::from_bytes(&b"Retry-After"[..], &b"1"[..]).unwrap(),
+                );
+            }
+            let _ = req.respond(response);
+            (true, refusal.status)
+        }
+    }
+}
+
+/// `GET /sessions` — every lease, and the accounting behind them.
+///
+/// `connections` is the conservation invariant made visible: free plus live
+/// plus inflight always equals total. `balanced` is that equality checked at
+/// the moment of the request. It is not decoration — a pool leaks connections
+/// silently and the symptom arrives weeks later as "everything hangs", so the
+/// arithmetic that would have caught it is worth being able to read.
+fn sessions_report() -> String {
+    let guard = LEASES.lock().unwrap();
+    let Some(leases) = guard.as_ref() else {
+        return r#"{"serving":false,"sessions":[]}"#.to_string();
+    };
+    let now = Instant::now();
+    let mut out = String::from("{\"serving\":true,\"connections\":{");
+    out.push_str(&format!(
+        r#""total":{},"free":{},"live":{},"inflight":{},"balanced":{}"#,
+        leases.total,
+        leases.free.len(),
+        leases.live.len(),
+        leases.inflight,
+        leases.accounted() == leases.total
+    ));
+    out.push_str("},\"sessions\":[");
+    let mut sessions: Vec<(&String, &Lease)> = leases.live.iter().collect();
+    // Oldest first: the one that has been holding a connection longest is the
+    // one being looked for.
+    sessions.sort_by_key(|(_, l)| l.opened);
+    for (i, (id, lease)) in sessions.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            r#"{{"sessionId":"{}","slot":{},"ageMs":{},"idleMs":{},"expiresInMs":{},"statements":{},"inTransaction":{},"busy":{}}}"#,
+            id,
+            lease.conn.slot,
+            now.duration_since(lease.opened).as_millis(),
+            now.duration_since(lease.last).as_millis(),
+            lease.deadline.saturating_duration_since(now).as_millis(),
+            lease.statements,
+            lease.in_transaction,
+            lease.busy
+        ));
+    }
+    out.push_str("]}");
+    out
+}
+
 /// `GET /ready` — does the database actually answer?
 ///
 /// This is deliberately not a liveness check. A static 200 says only that the
@@ -1158,6 +1755,7 @@ fn run_ready(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         sql: "SELECT 1".to_string(),
         params: Vec::new(),
         shape: Shape::Ndjson,
+        reset: false,
         ready: ready_tx,
         body: body_tx,
     };
@@ -1228,11 +1826,39 @@ fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) -> (bool, u16
 
     let shape = if wants_one_shot(&req) { Shape::Json } else { Shape::Ndjson };
 
+    // A statement naming a lease goes to that lease's connection, wherever it
+    // is; everything else runs on the connection belonging to the worker that
+    // accepted the request. The claim is held until this function returns —
+    // `Claim` releases it on drop, so no early return can leave a lease stuck
+    // busy, which would wedge it until the reaper noticed.
+    let claim = match parsed.session.as_deref() {
+        None => None,
+        Some(id) => match lease_claim(id) {
+            Ok(target) => Some(Claim { id: id.to_string(), sql: parsed.sql.clone(), target }),
+            Err(refusal) => {
+                let _ = req.respond(error_response(refusal.status, refusal.code, &refusal.message));
+                return (true, refusal.status);
+            }
+        },
+    };
+    let target = claim.as_ref().map_or(jobs, |c| &c.target);
+
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), Refusal>>(1);
     let (body_tx, body_rx) = mpsc::sync_channel::<Vec<u8>>(BODY_QUEUE);
-    let job = Job { sql: parsed.sql, params: parsed.params, shape, ready: ready_tx, body: body_tx };
+    let job =
+        Job { sql: parsed.sql, params: parsed.params, shape, reset: false, ready: ready_tx, body: body_tx };
 
-    if jobs.send(job).is_err() {
+    if target.send(job).is_err() {
+        // A lease whose executor is gone can never serve another statement, so
+        // it is not merely a failed request — the lease itself is finished.
+        // The worker keeps serving; only the lease dies.
+        if let Some(c) = &claim {
+            let id = c.id.clone();
+            drop(claim);
+            lease_release(&id);
+            let _ = req.respond(error_response(503, "unavailable", "this session is gone"));
+            return (true, 503);
+        }
         let _ = req.respond(error_response(503, "unavailable", "harbor is shutting down"));
         return (false, 503);
     }
@@ -1294,10 +1920,12 @@ fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) -> (bool, u16
 /// recognise, so a statement form nobody thought of costs one `ROLLBACK`
 /// rather than leaving a transaction open. Getting it wrong in the other
 /// direction is what took connections out of service permanently.
-fn may_leave_transaction_open(sql: &str) -> bool {
+/// The first real word of a statement, upper-cased, skipping leading
+/// whitespace and comments. Empty when there is no leading identifier — a
+/// statement starting with `(`, or nothing at all.
+fn first_keyword(sql: &str) -> String {
     let b = sql.as_bytes();
     let mut i = 0;
-    // Skip leading whitespace and comments to reach the first real token.
     loop {
         while i < b.len() && b[i].is_ascii_whitespace() {
             i += 1;
@@ -1326,10 +1954,26 @@ fn may_leave_transaction_open(sql: &str) -> bool {
     while i < b.len() && (b[i].is_ascii_alphabetic() || b[i] == b'_') {
         i += 1;
     }
-    if i == start {
+    sql[start..i].to_ascii_uppercase()
+}
+
+/// What a statement does to the surrounding transaction, when that is knowable
+/// from its first word: `Some(true)` opens one, `Some(false)` ends one, `None`
+/// leaves it as it was. Used to report whether a lease is holding a
+/// transaction open, which is the thing an operator most needs to see.
+fn transaction_effect(sql: &str) -> Option<bool> {
+    match first_keyword(sql).as_str() {
+        "BEGIN" | "START" => Some(true),
+        "COMMIT" | "END" | "ROLLBACK" | "ABORT" => Some(false),
+        _ => None,
+    }
+}
+
+fn may_leave_transaction_open(sql: &str) -> bool {
+    let word = first_keyword(sql);
+    if word.is_empty() {
         return true;
     }
-    let word = sql[start..i].to_ascii_uppercase();
     // Statement kinds that run under autocommit and settle themselves. Anything
     // absent from this list — BEGIN, START, COMMIT, ROLLBACK, ABORT, END, and
     // whatever DuckDB adds next — takes the safe path.
@@ -1385,7 +2029,13 @@ fn reset_transaction(conn: &Connection) {
 /// The DuckDB side. Owns one connection for the life of the server and runs
 /// one statement at a time; concurrency comes from there being several of
 /// these, not from any one of them interleaving work.
-fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
+/// `pinned` marks a lease connection. The reset below exists to stop one
+/// request's stray transaction from leaking into the next request that
+/// happens to land on the same connection — which is precisely the thing a
+/// lease is for, so on a lease connection it must not fire. The rollback still
+/// happens, but at the boundary that matters: when the lease is released, by
+/// commit, by DELETE, or by the reaper.
+fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>, pinned: bool) -> Connection {
     // Set by the previous job when it could have left a transaction open: a
     // transaction-control statement, or any exit other than running to
     // completion. Resetting unconditionally is also correct, and was what this
@@ -1398,11 +2048,21 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
     for job in jobs {
         // Before, not after: a job can leave the loop by several paths, and
         // this way none of them can skip the reset.
-        if needs_reset {
+        if needs_reset && !pinned {
             reset_transaction(&conn);
         }
 
-        let Job { sql, params, shape, ready, body } = job;
+        let Job { sql, params, shape, reset, ready, body } = job;
+        if reset {
+            // Same call the workers make between requests, and unconditional:
+            // this runs once per lease release, not once per statement, so the
+            // throughput argument that made it conditional there does not
+            // apply here.
+            reset_transaction(&conn);
+            needs_reset = false;
+            let _ = ready.send(Ok(()));
+            continue;
+        }
         let started = Instant::now();
 
         // Decided from the statement text before it runs, then widened below by
@@ -1515,7 +2175,7 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
                     // thread, and the damage is worse than one failed query:
                     // the client sees 200 with an empty body — success, no
                     // rows — and the connection never returns to the pool, so
-                    // POOL_SIZE such queries take the server out of service.
+                    // enough such queries take the server out of service.
                     // Built into a separate buffer so a half-written row is
                     // discarded rather than shipped.
                     let mut cells = String::new();
