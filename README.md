@@ -36,8 +36,31 @@ Two routes. That is the whole surface:
 
 ```
 POST /sql      run one statement, stream the result as NDJSON
+               (Accept: application/json for one document instead)
 GET  /ready    can this server answer a query? no credential required
 ```
+
+`POST /sql` streams by default. Send `Accept: application/json` and the same
+result comes back as one document instead:
+
+```json
+{"ok":true,
+ "columns":[{"name":"id","duckdbType":"INTEGER","lossless":true}],
+ "data":[[1],[2]],
+ "rowCount":2,
+ "timeMs":3}
+```
+
+Same columns, same values, same encoder — only the framing differs. It is worth
+asking for when the result is small and a single `JSON.parse` is simpler than
+reading lines; it is the wrong choice for anything large, because a JSON
+document is not valid until its last byte, so nothing can be flushed as it is
+built. Harbor holds at most 32 MiB for one and refuses past that with a `406`
+naming NDJSON as the remedy. Streaming has no such limit.
+
+The one thing one-shot does better: since nothing has been sent when the last
+row lands, a failure is still a real status code. The same query that streams a
+`200` with an `{"type":"error"}` line at the end answers `400` in this shape.
 
 `/ready` runs `SELECT 1` down the same path a query takes, and answers `200
 {"status":"ready"}` or `503`. It is not a liveness check, and the difference

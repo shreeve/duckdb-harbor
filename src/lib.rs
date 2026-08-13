@@ -444,6 +444,16 @@ const MAX_BODY: usize = 8 << 20;
 /// result is not one syscall per row.
 const FLUSH_AT: usize = 64 << 10;
 
+/// The largest one-shot JSON document harbor will build.
+///
+/// A JSON document is not valid until its last byte, so this shape cannot flush
+/// as it goes the way NDJSON does — the whole result is held in memory, once per
+/// concurrent request. Without a ceiling, one `SELECT * FROM a_big_table` with
+/// the wrong Accept header takes the process down. The number is generous for
+/// what one-shot is for (a small result in a single round trip) and the remedy
+/// for anything larger is the default: NDJSON streams with no size limit.
+const MAX_JSON_RESPONSE: usize = 32 << 20;
+
 // ---------------------------------------------------------------------------
 // Process-wide state
 //
@@ -1038,15 +1048,70 @@ fn ensure_single_statement(sql: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Which shape the caller asked for. NDJSON is the default and the only one
+/// that streams; see `wants_one_shot`.
+///
+/// The two are not different encodings of a result — the column schema and
+/// every value are produced by exactly the same code — only different framing
+/// around it. That is deliberate: a second encoder is a second thing to keep
+/// correct, and the values are the part that is hard.
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    Ndjson,
+    Json,
+}
+
+/// `Accept: application/json` asks for the whole result as one document, the
+/// way harbor v1 did. Anything else — no header, `*/*`, `application/x-ndjson`
+/// — streams.
+///
+/// A header naming both wins for NDJSON: it is the shape that cannot fail on
+/// size, so it is the safe reading of an ambiguous request. (`application/json`
+/// is not a substring of `application/x-ndjson`, so a plain `contains` is not
+/// fooled by the streaming type.)
+fn wants_one_shot(req: &Request) -> bool {
+    let mut asked_json = false;
+    for h in req.headers().iter().filter(|h| h.field.equiv("Accept")) {
+        let value = h.value.as_str().to_ascii_lowercase();
+        if value.contains("application/x-ndjson") {
+            return false;
+        }
+        asked_json = asked_json || value.contains("application/json");
+    }
+    asked_json
+}
+
+/// Why a job could not produce a result, and how to say so over HTTP.
+///
+/// The code travels with the message because the two are not derivable from
+/// each other: a result too large for the shape the caller asked for is not a
+/// SQL error, and a client that classifies on `code` — as rip/db does, to tell
+/// a bad query apart from a server it should retry — has to be told which it
+/// was.
+struct Refusal {
+    status: u16,
+    code: &'static str,
+    message: String,
+}
+
+impl Refusal {
+    /// The engine rejected the statement. By far the common case, so it gets
+    /// the short spelling.
+    fn sql(message: impl Into<String>) -> Self {
+        Self { status: 400, code: "sql_error", message: message.into() }
+    }
+}
+
 /// One unit of work for an executor thread.
 struct Job {
     sql: String,
     params: Vec<Value>,
+    shape: Shape,
     /// Answered exactly once, before any body byte is produced. `Err` means
     /// nothing has been written yet, so the worker can still pick a status
     /// code — which is the whole reason preparation is reported separately
     /// from streaming.
-    ready: mpsc::SyncSender<Result<(), String>>,
+    ready: mpsc::SyncSender<Result<(), Refusal>>,
     /// Body bytes, in envelope-line batches. Bounded, so a slow client
     /// applies backpressure to the query instead of buffering the result.
     body: mpsc::SyncSender<Vec<u8>>,
@@ -1087,10 +1152,15 @@ fn run_ready(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         }
     }
 
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), Refusal>>(1);
     let (body_tx, body_rx) = mpsc::sync_channel::<Vec<u8>>(BODY_QUEUE);
-    let job =
-        Job { sql: "SELECT 1".to_string(), params: Vec::new(), ready: ready_tx, body: body_tx };
+    let job = Job {
+        sql: "SELECT 1".to_string(),
+        params: Vec::new(),
+        shape: Shape::Ndjson,
+        ready: ready_tx,
+        body: body_tx,
+    };
 
     // The executor being gone is the failure this endpoint exists to catch, and
     // the one condition the worker must act on rather than merely report: it
@@ -1113,9 +1183,11 @@ fn run_ready(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
             *LAST_READY.lock().unwrap() = Some((Instant::now(), true));
             (true, respond_ready(req, true, ""))
         }
-        Ok(Err(message)) => {
+        Ok(Err(refusal)) => {
+            // Whatever the refusal's own status would be, a database that
+            // cannot answer SELECT 1 is unready — that is the question asked.
             *LAST_READY.lock().unwrap() = Some((Instant::now(), false));
-            let _ = req.respond(error_response(503, "unready", &message));
+            let _ = req.respond(error_response(503, "unready", &refusal.message));
             (true, 503)
         }
         Err(_) => {
@@ -1154,9 +1226,11 @@ fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) -> (bool, u16
         return (true, 400);
     }
 
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let shape = if wants_one_shot(&req) { Shape::Json } else { Shape::Ndjson };
+
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), Refusal>>(1);
     let (body_tx, body_rx) = mpsc::sync_channel::<Vec<u8>>(BODY_QUEUE);
-    let job = Job { sql: parsed.sql, params: parsed.params, ready: ready_tx, body: body_tx };
+    let job = Job { sql: parsed.sql, params: parsed.params, shape, ready: ready_tx, body: body_tx };
 
     if jobs.send(job).is_err() {
         let _ = req.respond(error_response(503, "unavailable", "harbor is shutting down"));
@@ -1165,6 +1239,29 @@ fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) -> (bool, u16
 
     match ready_rx.recv() {
         Ok(Ok(())) => {
+            if shape == Shape::Json {
+                // One message, because that is what the executor sends in this
+                // shape — but drain the channel rather than assume it, so a
+                // future change to how the document is chunked cannot silently
+                // truncate a response.
+                let mut document = Vec::new();
+                while let Ok(chunk) = body_rx.recv() {
+                    document.extend_from_slice(&chunk);
+                }
+                let headers = vec![
+                    Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
+                    Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..]).unwrap(),
+                ];
+                let length = document.len();
+                let _ = req.respond(Response::new(
+                    200.into(),
+                    headers,
+                    std::io::Cursor::new(document),
+                    Some(length),
+                    None,
+                ));
+                return (true, 200);
+            }
             // data_length: None makes tiny_http chunk the body and keep the
             // connection alive.
             let headers = vec![
@@ -1174,9 +1271,9 @@ fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) -> (bool, u16
             let _ = req.respond(Response::new(200.into(), headers, ChannelReader::new(body_rx), None, None));
             (true, 200)
         }
-        Ok(Err(message)) => {
-            let _ = req.respond(error_response(400, "sql_error", &message));
-            (true, 400)
+        Ok(Err(refusal)) => {
+            let _ = req.respond(error_response(refusal.status, refusal.code, &refusal.message));
+            (true, refusal.status)
         }
         Err(_) => {
             let _ = req.respond(error_response(500, "internal", "the executor thread is gone"));
@@ -1305,7 +1402,7 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
             reset_transaction(&conn);
         }
 
-        let Job { sql, params, ready, body } = job;
+        let Job { sql, params, shape, ready, body } = job;
         let started = Instant::now();
 
         // Decided from the statement text before it runs, then widened below by
@@ -1316,7 +1413,7 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
             Ok(s) => s,
             Err(e) => {
                 needs_reset = true;
-                let _ = ready.send(Err(e.to_string()));
+                let _ = ready.send(Err(Refusal::sql(e.to_string())));
                 continue;
             }
         };
@@ -1325,7 +1422,7 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
             Ok(r) => r,
             Err(e) => {
                 needs_reset = true;
-                let _ = ready.send(Err(e.to_string()));
+                let _ = ready.send(Err(Refusal::sql(e.to_string())));
                 continue;
             }
         };
@@ -1358,35 +1455,58 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
             // Name the column, not the type. Substituting the type into both
             // slots produced "Cast it — TIME_NS::VARCHAR", which reads as
             // casting the type rather than the thing that has it.
-            let _ = ready.send(Err(format!(
+            let _ = ready.send(Err(Refusal::sql(format!(
                 "harbor cannot encode {} columns: the DuckDB Rust client has no \
                  decoder for this type. Cast it — {}::VARCHAR, or {}::TIME for \
                  microsecond precision — and the value comes back intact.",
                 type_name(bad),
                 name,
                 name
-            )));
+            ))));
             needs_reset = true;
             continue;
         }
 
-        if ready.send(Ok(())).is_err() {
+        // NDJSON commits to a 200 here, before the first row, because that is
+        // what streaming means. One-shot cannot and must not: nothing goes out
+        // until the result is whole, so a failure at row 900,000 is still free
+        // to be a 400 rather than a 200 with an apology inside it. The
+        // handshake therefore moves to the bottom of the loop in that shape.
+        if shape == Shape::Ndjson && ready.send(Ok(())).is_err() {
             needs_reset = true;
             continue;
         }
 
         let mut buf = String::with_capacity(FLUSH_AT + 8192);
-        buf.push_str(r#"{"type":"schema","columns":["#);
+        match shape {
+            Shape::Ndjson => buf.push_str(r#"{"type":"schema","columns":["#),
+            // v1's envelope also carried `kind`, "select" or "write". It is
+            // not emitted here, because there is no definition of it that is
+            // right: DuckDB answers CREATE TABLE with a one-column `Count`
+            // result, so "did the statement produce columns" calls a write a
+            // select, and deciding from the leading keyword is a parser that
+            // exists only to label something no client needs — `columns` and
+            // `rowCount` already say everything it could. A field that is
+            // absent is easier to handle than one that lies.
+            Shape::Json => buf.push_str(r#"{"ok":true,"columns":["#),
+        }
         for (i, (name, ty)) in names.iter().zip(&types).enumerate() {
             if i > 0 {
                 buf.push(',');
             }
             emit_column_schema(&mut buf, Some(name), ty);
         }
-        buf.push_str("]}\n");
+        match shape {
+            Shape::Ndjson => buf.push_str("]}\n"),
+            Shape::Json => buf.push_str(r#"],"data":["#),
+        }
 
         let mut count: u64 = 0;
         let mut gone = false;
+        // Set when the result cannot be completed. In NDJSON it has already
+        // been written into the stream by the time it is set; in one-shot it is
+        // what the request fails with.
+        let mut failure: Option<Refusal> = None;
         loop {
             match rows.next() {
                 Ok(Some(row)) => {
@@ -1435,64 +1555,147 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>) -> Connection {
                     }));
 
                     if encoded.is_err() {
-                        // The headers are long gone, so this can only be said
-                        // in the stream — but it is said, rather than the
-                        // client being left to infer it from a short result.
-                        buf.push_str(r#"{"type":"error","code":"unsupported_type","message":"#);
-                        push_json_string(
-                            &mut buf,
-                            "harbor cannot encode a value in this result: the DuckDB Rust \
-                             client has no decoder for one of its column types. The query \
-                             ran; the value cannot be represented. Cast the column to \
-                             VARCHAR to see it.",
-                        );
-                        buf.push_str("}\n");
-                        let _ = body.send(std::mem::take(&mut buf).into_bytes());
-                        gone = true;
+                        let message = "harbor cannot encode a value in this result: the DuckDB \
+                             Rust client has no decoder for one of its column types. The query \
+                             ran; the value cannot be represented. Cast the column to VARCHAR \
+                             to see it.";
+                        if shape == Shape::Ndjson {
+                            // The headers are long gone, so this can only be
+                            // said in the stream — but it is said, rather than
+                            // the client being left to infer it from a short
+                            // result.
+                            buf.push_str(
+                                r#"{"type":"error","code":"unsupported_type","message":"#,
+                            );
+                            push_json_string(&mut buf, message);
+                            buf.push_str("}\n");
+                            let _ = body.send(std::mem::take(&mut buf).into_bytes());
+                            gone = true;
+                        }
+                        failure = Some(Refusal {
+                            status: 400,
+                            code: "unsupported_type",
+                            message: message.to_string(),
+                        });
                         break;
                     }
 
-                    buf.push_str(r#"{"type":"row","values":["#);
-                    buf.push_str(&cells);
-                    buf.push_str("]}\n");
-                    count += 1;
-                    if buf.len() >= FLUSH_AT {
-                        // A send failure means the client hung up. Abandon the
-                        // query rather than finish computing a result nobody
-                        // will read.
-                        if body.send(std::mem::take(&mut buf).into_bytes()).is_err() {
-                            gone = true;
-                            break;
+                    match shape {
+                        Shape::Ndjson => {
+                            buf.push_str(r#"{"type":"row","values":["#);
+                            buf.push_str(&cells);
+                            buf.push_str("]}\n");
                         }
-                        buf = String::with_capacity(FLUSH_AT + 8192);
+                        Shape::Json => {
+                            if count > 0 {
+                                buf.push(',');
+                            }
+                            buf.push('[');
+                            buf.push_str(&cells);
+                            buf.push(']');
+                        }
+                    }
+                    count += 1;
+
+                    match shape {
+                        Shape::Ndjson => {
+                            if buf.len() >= FLUSH_AT {
+                                // A send failure means the client hung up.
+                                // Abandon the query rather than finish
+                                // computing a result nobody will read.
+                                if body.send(std::mem::take(&mut buf).into_bytes()).is_err() {
+                                    gone = true;
+                                    break;
+                                }
+                                buf = String::with_capacity(FLUSH_AT + 8192);
+                            }
+                        }
+                        // Nothing can be flushed in this shape — the document
+                        // is not valid until its last byte — so the only
+                        // protection against a result larger than memory is to
+                        // refuse. Streaming has no such limit, and is the
+                        // default, so the remedy is always available.
+                        Shape::Json => {
+                            if buf.len() > MAX_JSON_RESPONSE {
+                                // 406, not 413: nothing is wrong with the
+                                // request or its size. What cannot be done is
+                                // producing this result in the representation
+                                // the Accept header asked for — which is
+                                // exactly what "not acceptable" means, and the
+                                // message names the one that would work.
+                                failure = Some(Refusal {
+                                    status: 406,
+                                    code: "response_too_large",
+                                    message: format!(
+                                        "this result is larger than the {} MiB harbor will hold \
+                                         in memory for a single JSON document. Ask for NDJSON \
+                                         instead — send no Accept header, or Accept: \
+                                         application/x-ndjson — and it streams with no size \
+                                         limit.",
+                                        MAX_JSON_RESPONSE >> 20
+                                    ),
+                                });
+                                break;
+                            }
+                        }
                     }
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    // Mid-stream failures cannot change the status code — the
-                    // headers are long gone. Say so in the stream, so a client
-                    // never mistakes a truncated result for a complete one.
-                    buf.push_str(r#"{"type":"error","code":"sql_error","message":"#);
-                    push_json_string(&mut buf, &e.to_string());
-                    buf.push_str("}\n");
-                    let _ = body.send(std::mem::take(&mut buf).into_bytes());
-                    gone = true;
+                    if shape == Shape::Ndjson {
+                        // Mid-stream failures cannot change the status code —
+                        // the headers are long gone. Say so in the stream, so a
+                        // client never mistakes a truncated result for a
+                        // complete one.
+                        buf.push_str(r#"{"type":"error","code":"sql_error","message":"#);
+                        push_json_string(&mut buf, &e.to_string());
+                        buf.push_str("}\n");
+                        let _ = body.send(std::mem::take(&mut buf).into_bytes());
+                        gone = true;
+                    }
+                    failure = Some(Refusal::sql(e.to_string()));
                     break;
                 }
             }
         }
 
         // An abandoned or failed stream is the case that poisons a connection.
-        needs_reset = needs_reset || gone;
+        needs_reset = needs_reset || gone || failure.is_some();
 
-        if !gone {
-            buf.push_str(&format!(
-                r#"{{"type":"end","rowCount":{},"timeMs":{}}}"#,
-                count,
-                started.elapsed().as_millis()
-            ));
-            buf.push('\n');
-            let _ = body.send(buf.into_bytes());
+        match shape {
+            Shape::Ndjson => {
+                if !gone {
+                    buf.push_str(&format!(
+                        r#"{{"type":"end","rowCount":{},"timeMs":{}}}"#,
+                        count,
+                        started.elapsed().as_millis()
+                    ));
+                    buf.push('\n');
+                    let _ = body.send(buf.into_bytes());
+                }
+            }
+            // The deferred handshake, and the whole reason this shape waits:
+            // a failure at the last row is still a status code and a code the
+            // client can classify on, rather than a 200 with an apology in the
+            // body. Both travel on the refusal, so the same failure reports the
+            // same code in either shape.
+            Shape::Json => match failure {
+                Some(message) => {
+                    let _ = ready.send(Err(message));
+                }
+                None => {
+                    buf.push_str(&format!(
+                        r#"],"rowCount":{},"timeMs":{}}}"#,
+                        count,
+                        started.elapsed().as_millis()
+                    ));
+                    if ready.send(Ok(())).is_err() {
+                        needs_reset = true;
+                        continue;
+                    }
+                    let _ = body.send(buf.into_bytes());
+                }
+            },
         }
     }
     // And once more on the way out, so a connection going back to the pool for

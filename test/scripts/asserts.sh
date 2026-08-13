@@ -512,6 +512,104 @@ eq "the server is still ready after all that" "200" \
    "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$base/ready")"
 
 # ---------------------------------------------------------------------------
+section "Content negotiation: one-shot JSON"
+# ---------------------------------------------------------------------------
+
+# json <sql> [accept] — one statement, asking for the one-shot shape
+json() {
+  local body
+  body=$(SQL="$1" python3 -c '
+import json, os, sys
+sys.stdout.write(json.dumps({"sql": os.environ["SQL"]}))')
+  curl -sS -m "$timeout" -H "Authorization: Bearer $token" \
+       -H "Accept: ${2:-application/json}" --data-binary "$body" "$base/sql"
+}
+
+# jstatus <sql> [accept] — the status code for the same
+jstatus() {
+  local body
+  body=$(SQL="$1" python3 -c '
+import json, os, sys
+sys.stdout.write(json.dumps({"sql": os.environ["SQL"]}))')
+  curl -sS -m "$timeout" -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" \
+       -H "Accept: ${2:-application/json}" --data-binary "$body" "$base/sql"
+}
+
+# js <expr> — evaluate a Python expression over a one-shot document on stdin.
+# Bound names: doc, cols, rows.
+js() {
+  python3 -c '
+import sys, json
+raw = sys.stdin.read()
+try:
+    doc = json.loads(raw)
+except json.JSONDecodeError:
+    print("MALFORMED-JSON: " + raw[:120]); sys.exit(0)
+cols = doc.get("columns", [])
+rows = doc.get("data", [])
+try:
+    print(eval(sys.argv[1]))
+except Exception as e:
+    print("EVAL-ERROR: %s" % e)
+' "$1"
+}
+
+eq "a one-shot body is a single JSON document" "True" \
+   "$(json 'SELECT 1 AS n' | js 'doc["ok"] is True')"
+eq "it carries the same column schema" "n|INTEGER" \
+   "$(json 'SELECT 1 AS n' | js '"%s|%s" % (cols[0]["name"], cols[0]["duckdbType"])')"
+eq "data is an array of row arrays" "[[0], [1], [2]]" \
+   "$(json 'SELECT i FROM range(3) t(i)' | js 'rows')"
+eq "rowCount agrees with the rows" "3|3" \
+   "$(json 'SELECT i FROM range(3) t(i)' | js '"%s|%s" % (doc["rowCount"], len(rows))')"
+eq "an empty result is still a document" "0|[]" \
+   "$(json 'SELECT 1 WHERE false' | js '"%s|%s" % (doc["rowCount"], rows)')"
+eq "it declares Content-Length, not chunked" "True" \
+   "$(curl -sS -m "$timeout" -D - -o /dev/null -H "Authorization: Bearer $token" \
+        -H 'Accept: application/json' --data '{"sql":"SELECT 1"}' "$base/sql" \
+      | tr -d '\r' | grep -qi '^content-length:' && echo True || echo False)"
+eq "and says it is JSON" "True" \
+   "$(curl -sS -m "$timeout" -D - -o /dev/null -H "Authorization: Bearer $token" \
+        -H 'Accept: application/json' --data '{"sql":"SELECT 1"}' "$base/sql" \
+      | tr -d '\r' | grep -qi '^content-type: application/json' && echo True || echo False)"
+
+# Values are produced by the same encoder in both shapes, so a difference here
+# would mean the framing had leaked into the encoding.
+eq "values match the streamed shape exactly" "True" \
+   "$(a=$(post 'SELECT 1, 2.5, NULL, [1,2], {'"'"'x'"'"': 1}' | nd 'json.dumps(rows)'); \
+      b=$(json 'SELECT 1, 2.5, NULL, [1,2], {'"'"'x'"'"': 1}' | js 'json.dumps(rows)'); \
+      [[ "$a" == "$b" ]] && echo True || echo False)"
+
+eq "streaming stays the default with no Accept" "True" \
+   "$(post 'SELECT 1' | head -c 20 | grep -q '"type":"schema"' && echo True || echo False)"
+eq "Accept: */* still streams" "True" \
+   "$(json 'SELECT 1' '*/*' | head -c 20 | grep -q '"type":"schema"' && echo True || echo False)"
+eq "asking for NDJSON explicitly streams" "True" \
+   "$(json 'SELECT 1' 'application/x-ndjson' | head -c 20 | grep -q '"type":"schema"' && echo True || echo False)"
+# Ambiguity resolves to the shape that cannot fail on size.
+eq "naming both shapes streams" "True" \
+   "$(json 'SELECT 1' 'application/json, application/x-ndjson' | head -c 20 \
+      | grep -q '"type":"schema"' && echo True || echo False)"
+
+# The reason one-shot defers its handshake: nothing has been sent, so a failure
+# is still a status code rather than a 200 with an apology in the body.
+eq "a failing statement is a 400, not a 200" "400" "$(jstatus 'SELECT * FROM does_not_exist')"
+eq "and carries the same error envelope" "error|sql_error" \
+   "$(json 'SELECT * FROM does_not_exist' | js '"%s|%s" % (doc["type"], doc["code"])')"
+
+# A document cannot be flushed as it goes, so the only defence against a result
+# larger than memory is to refuse — and to name the shape that has no limit.
+eq "an oversized document is refused with 406" "406" \
+   "$(jstatus "SELECT i, repeat('"'"'x'"'"', 200) FROM range(1000000) t(i)")"
+eq "the refusal names NDJSON as the remedy" "response_too_large|True" \
+   "$(json "SELECT i, repeat('"'"'x'"'"', 200) FROM range(1000000) t(i)" \
+      | js '"%s|%s" % (doc["code"], "NDJSON" in doc["message"])')"
+eq "the same query streams without complaint" "1000000" \
+   "$(post "SELECT i, repeat('"'"'x'"'"', 200) FROM range(1000000) t(i)" | nd 'end["rowCount"]')"
+eq "the server is still ready after refusing one" "200" \
+   "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$base/ready")"
+
+# ---------------------------------------------------------------------------
 section "Volume and streaming"
 # ---------------------------------------------------------------------------
 
