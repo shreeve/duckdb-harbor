@@ -89,21 +89,21 @@ section "Reachability"
 # ---------------------------------------------------------------------------
 
 t0=$(python3 -c 'import time;print(time.time())')
-health=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "$url/health" 2>/dev/null)
+ready=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "$url/ready" 2>/dev/null)
 t1=$(python3 -c 'import time;print(time.time())')
 ms=$(python3 -c "print(int((float('$t1')-float('$t0'))*1000))")
-if [[ "$health" == "200" ]]; then
-  ok "health responds 200" "${ms}ms"
-  (( ms > 1000 )) && soft "health is slow" "${ms}ms for a liveness probe suggests the process is saturated"
+if [[ "$ready" == "200" ]]; then
+  ok "ready responds 200" "${ms}ms"
+  (( ms > 1000 )) && soft "ready is slow" "${ms}ms for a readiness probe suggests the process is saturated"
 else
-  bad "health responds 200" "got [$health] from $url/health — nothing else below will mean anything"
+  bad "ready responds 200" "got [$ready] from $url/ready — nothing else below will mean anything"
   say '\n%sthe deployment is not reachable; stopping here%s\n' "$red" "$off"
   exit 1
 fi
 
-# /health must not need the token, or an orchestrator's probe fails closed and
+# /ready must not need the token, or an orchestrator's probe fails closed and
 # takes a working deployment out of rotation.
-eq "health needs no credential" "200" "$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "$url/health" 2>/dev/null)"
+eq "ready needs no credential" "200" "$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "$url/ready" 2>/dev/null)"
 
 # There is no /version endpoint; the extension reports its version through
 # SQL, which is the route that exists in every build.

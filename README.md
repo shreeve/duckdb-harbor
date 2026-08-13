@@ -36,8 +36,15 @@ Two routes. That is the whole surface:
 
 ```
 POST /sql      run one statement, stream the result as NDJSON
-GET  /health   liveness, no credential required
+GET  /ready    can this server answer a query? no credential required
 ```
+
+`/ready` runs `SELECT 1` down the same path a query takes, and answers `200
+{"status":"ready"}` or `503`. It is not a liveness check, and the difference
+matters: a process can be running while its executor thread is gone, and a
+hardcoded 200 will cheerfully say so while every `/sql` returns 500. Asking the
+database is the only answer worth having. Verdicts are cached for one second, so
+polling it costs at most one query per second however often it is asked.
 
 ## Get it running
 

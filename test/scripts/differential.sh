@@ -67,7 +67,7 @@ start() { # start <ext> <db> <port> <logfile>
 
 wait_up() { # wait_up <port> <pid> <name>
   for _ in $(seq 1 80); do
-    curl -sS -m 1 "http://127.0.0.1:$1/health" >/dev/null 2>&1 && return 0
+    curl -sS -m 1 "http://127.0.0.1:$1/ready" >/dev/null 2>&1 && return 0
     kill -0 "$2" 2>/dev/null || break
     sleep 0.25
   done

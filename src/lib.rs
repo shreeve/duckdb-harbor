@@ -345,7 +345,7 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
 // Shape (deliberately small):
 //
 //   POST /sql     run one statement, stream the NDJSON envelope back
-//   GET  /health  liveness, no auth
+//   GET  /ready   can this server answer a query? no auth
 //
 // The envelope is the one thing that must not drift from the v1 harbor,
 // because it is the contract every client already speaks:
@@ -729,8 +729,10 @@ fn worker(
             // workers pull from one shared queue, so one that answers instantly
             // — which is what a worker with no executor does, 503 by return —
             // wins races against every worker still doing real work, and
-            // absorbs a growing share of the traffic. The server would look
-            // mostly down while /health kept answering 200.
+            // absorbs a growing share of the traffic. `/ready` reports that
+            // honestly now — it runs a real query, so a dead executor answers
+            // 503 rather than a cheerful hardcoded 200 — but reporting it is
+            // not enough: the worker still has to leave.
             Ok(Some(req)) => {
                 if !handle(req, &jobs_tx, token.as_ref().as_deref(), log) {
                     break;
@@ -765,13 +767,10 @@ fn handle(mut req: Request, jobs: &mpsc::SyncSender<Job>, token: Option<&str>, l
     // logged: it is the request body, it can be enormous, and on this endpoint
     // it is as likely to hold customer data as anything else in the database.
     let (keep_going, status) = match (&method, path.as_str()) {
-        // Liveness is unauthenticated on purpose: a load balancer should not
-        // need a credential to learn whether the process is up, and the
-        // answer reveals nothing.
-        (Method::Get, "/health") => {
-            let _ = req.respond(json_response(200, r#"{"status":"ok"}"#));
-            (true, 200)
-        }
+        // Readiness is unauthenticated on purpose: a load balancer should not
+        // need a credential to learn whether this server can serve, and the
+        // answer reveals nothing beyond up or down.
+        (Method::Get, "/ready") => run_ready(req, jobs),
         (Method::Post, "/sql") => {
             if !authorized(&req, token) {
                 let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
@@ -1055,6 +1054,89 @@ struct Job {
 
 /// How many body batches may be in flight before the query has to wait.
 const BODY_QUEUE: usize = 4;
+
+/// How long a `/ready` verdict is served before another query is run to
+/// refresh it.
+///
+/// Readiness has to run a real query to mean anything, and this endpoint takes
+/// no credential, so without a cache anyone who can reach the port has a free
+/// way to make the server work — on the same bounded pool that serves paying
+/// traffic. One second bounds that to one query per second no matter how often
+/// it is asked, which is well inside what any prober polls at. The cost is that
+/// a database that wedges is reported ready for up to a second longer; a probe
+/// interval is measured in seconds, so nothing observes the difference.
+const READY_MAX_AGE: Duration = Duration::from_secs(1);
+
+/// The last verdict and when it was taken. Failures are cached too — a server
+/// that cannot answer is exactly the one that must not be asked N more times a
+/// second.
+static LAST_READY: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+
+/// `GET /ready` — does the database actually answer?
+///
+/// This is deliberately not a liveness check. A static 200 says only that the
+/// HTTP thread is running, which is the one thing least likely to be wrong: the
+/// executor thread can be gone, the connection can be wedged, and a process that
+/// answers a hardcoded string is happy to say so while every `/sql` returns 500.
+/// So this runs `SELECT 1` down the same path a query takes, and reports what
+/// came back.
+fn run_ready(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
+    if let Some((at, ok)) = *LAST_READY.lock().unwrap() {
+        if at.elapsed() < READY_MAX_AGE {
+            return (true, respond_ready(req, ok, "not ready"));
+        }
+    }
+
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let (body_tx, body_rx) = mpsc::sync_channel::<Vec<u8>>(BODY_QUEUE);
+    let job =
+        Job { sql: "SELECT 1".to_string(), params: Vec::new(), ready: ready_tx, body: body_tx };
+
+    // The executor being gone is the failure this endpoint exists to catch, and
+    // the one condition the worker must act on rather than merely report: it
+    // returns `false` so the accept loop is left, exactly as `run_sql` does.
+    if jobs.send(job).is_err() {
+        *LAST_READY.lock().unwrap() = Some((Instant::now(), false));
+        let _ = req.respond(error_response(503, "unready", "harbor is shutting down"));
+        return (false, 503);
+    }
+
+    let verdict = ready_rx.recv();
+    // Drain rather than drop. Dropping the receiver makes the executor's send
+    // fail, which it reads as a client that hung up mid-stream and answers by
+    // rolling back the connection before the next job — a real cost, paid once
+    // a second, for a result that is four rows of nothing.
+    while body_rx.recv().is_ok() {}
+
+    match verdict {
+        Ok(Ok(())) => {
+            *LAST_READY.lock().unwrap() = Some((Instant::now(), true));
+            (true, respond_ready(req, true, ""))
+        }
+        Ok(Err(message)) => {
+            *LAST_READY.lock().unwrap() = Some((Instant::now(), false));
+            let _ = req.respond(error_response(503, "unready", &message));
+            (true, 503)
+        }
+        Err(_) => {
+            *LAST_READY.lock().unwrap() = Some((Instant::now(), false));
+            let _ = req.respond(error_response(503, "unready", "the executor thread is gone"));
+            (false, 503)
+        }
+    }
+}
+
+/// Success is a plain status object; failure rides the same error envelope as
+/// every other refusal, so one client-side reader handles both.
+fn respond_ready(req: Request, ok: bool, message: &str) -> u16 {
+    if ok {
+        let _ = req.respond(json_response(200, r#"{"status":"ready"}"#));
+        200
+    } else {
+        let _ = req.respond(error_response(503, "unready", message));
+        503
+    }
+}
 
 /// Returns (keep serving, status sent). The first is false when the executor is
 /// gone; see `handle`, which also writes the log line from the second.

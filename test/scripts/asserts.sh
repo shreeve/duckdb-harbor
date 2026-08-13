@@ -208,7 +208,7 @@ server_pid=$!
 
 up=0
 for _ in $(seq 1 80); do
-  if curl -sS -m 1 "$base/health" >/dev/null 2>&1; then up=1; break; fi
+  if curl -sS -m 1 "$base/ready" >/dev/null 2>&1; then up=1; break; fi
   kill -0 "$server_pid" 2>/dev/null || break
   sleep 0.25
 done
@@ -220,12 +220,16 @@ fi
 ok "server listening on $base (pid $server_pid)"
 
 # ---------------------------------------------------------------------------
-section "Liveness and authentication"
+section "Readiness and authentication"
 # ---------------------------------------------------------------------------
 
-eq "/health answers without a token" "200" \
+eq "/ready answers without a token" "200" \
+   "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$base/ready")"
+eq "/ready body" '{"status":"ready"}' "$(curl -sS -m 5 "$base/ready")"
+# The endpoint it replaced. Readiness and liveness are not synonyms, and a
+# static 200 answered the question nobody was asking.
+eq "/health is gone" "404" \
    "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$base/health")"
-eq "/health body" '{"status":"ok"}' "$(curl -sS -m 5 "$base/health")"
 eq "/sql refuses a missing token" "401" \
    "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' --data '{"sql":"SELECT 1"}' "$base/sql")"
 eq "/sql refuses a wrong token" "401" \
@@ -504,8 +508,8 @@ eq "an error body is an error envelope" "error|sql_error" \
    "$(post 'SELECT * FROM does_not_exist' | nd '"%s|%s" % (err["type"], err["code"])')"
 eq "the error message survives" "True" \
    "$(post 'SELECT * FROM does_not_exist' | nd '"does_not_exist" in err["message"]')"
-eq "the server is still healthy after all that" "200" \
-   "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$base/health")"
+eq "the server is still ready after all that" "200" \
+   "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$base/ready")"
 
 # ---------------------------------------------------------------------------
 section "Volume and streaming"
@@ -594,7 +598,7 @@ eq "an oversized body does not take the server down" "True" \
 eq "a client that hangs up mid-stream does not wedge a worker" "200" \
    "$(curl -sS -m 1 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" \
         --data '{"sql":"SELECT i FROM range(5000000) t(i)"}' "$base/sql" >/dev/null 2>&1; \
-      sleep 1; curl -sS -m 10 -o /dev/null -w '%{http_code}' "$base/health")"
+      sleep 1; curl -sS -m 10 -o /dev/null -w '%{http_code}' "$base/ready")"
 eq "the server still answers correctly afterwards" "$exp_n_sites" \
    "$(scalar 'SELECT count(*) FROM sites')"
 eq "deeply nested SQL is handled, not crashed" "True" \

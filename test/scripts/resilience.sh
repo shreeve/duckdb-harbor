@@ -62,7 +62,7 @@ start_server() { # start_server [extra args]
   "$here/bin/duckdb-harbor" "$db" --port "$port" --token "$token" --workers 4 "$@" >>"$work/server.log" 2>&1 &
   server_pid=$!
   for _ in $(seq 1 80); do
-    curl -sS -m 1 "$base/health" >/dev/null 2>&1 && return 0
+    curl -sS -m 1 "$base/ready" >/dev/null 2>&1 && return 0
     kill -0 "$server_pid" 2>/dev/null || break
     sleep 0.25
   done
@@ -187,7 +187,7 @@ done
 # never recovering is a failure.
 recovered=""
 for attempt in $(seq 1 60); do
-  if [[ "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$base/health" 2>/dev/null)" == "200" ]]; then
+  if [[ "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$base/ready" 2>/dev/null)" == "200" ]]; then
     recovered=$attempt
     break
   fi
@@ -196,7 +196,7 @@ done
 if [[ -n "$recovered" ]]; then
   ok "the server recovers from 40 mid-stream hangups" "${recovered}s"
 else
-  bad "the server recovers from 40 mid-stream hangups" "still not answering /health after 60s"
+  bad "the server recovers from 40 mid-stream hangups" "still not answering /ready after 60s"
 fi
 eq "and still correct" "$sites_n" "$(scalar 'SELECT count(*) AS n FROM sites')"
 fd_after=$(fds)
@@ -245,7 +245,7 @@ for _ in range(64):
 print("  %d idle connections held open" % len(socks))
 import os, subprocess
 code = subprocess.run(["curl", "-sS", "-m", "10", "-o", "/dev/null",
-                       "-w", "%{http_code}", "http://127.0.0.1:%s/health" % sys.argv[1]],
+                       "-w", "%{http_code}", "http://127.0.0.1:%s/ready" % sys.argv[1]],
                       capture_output=True, text=True).stdout
 print("  health while they are held: %s" % code)
 open(os.environ["WORK"] + "/idle-result.txt", "w").write(code)
@@ -331,7 +331,7 @@ fd_baseline=""
 churn_ok=0
 for i in $(seq 1 15); do
   if start_server; then
-    [[ "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$base/health")" == "200" ]] && churn_ok=$((churn_ok+1))
+    [[ "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$base/ready")" == "200" ]] && churn_ok=$((churn_ok+1))
     [[ $i == 3 ]] && fd_baseline=$(fds)
     [[ $i == 15 ]] && fd_final=$(fds)
     stop_server TERM
@@ -390,7 +390,7 @@ repl_port=$((port + 2))
 import json, time, urllib.request
 for _ in range(80):
     try:
-        urllib.request.urlopen("http://127.0.0.1:$repl_port/health", timeout=1).read()
+        urllib.request.urlopen("http://127.0.0.1:$repl_port/ready", timeout=1).read()
         break
     except Exception:
         time.sleep(0.25)

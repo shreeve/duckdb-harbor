@@ -107,7 +107,7 @@ if (( needs_server )); then
   server_pid=$!
   up=0
   for _ in $(seq 1 80); do
-    curl -sS -m 1 "http://127.0.0.1:$port/health" >/dev/null 2>&1 && { up=1; break; }
+    curl -sS -m 1 "http://127.0.0.1:$port/ready" >/dev/null 2>&1 && { up=1; break; }
     kill -0 "$server_pid" 2>/dev/null || break
     sleep 0.25
   done
