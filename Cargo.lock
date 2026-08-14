@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "harbor"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "duckdb",
  "rand",

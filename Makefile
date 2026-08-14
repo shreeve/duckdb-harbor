@@ -39,19 +39,31 @@ test_release: test_extension_release
 # Add a version here when the tree starts targeting one.
 STAMPED_DUCKDB_VERSIONS ?= v2.0.0-alpha37626
 
+# Never `cp` onto an extension that is already there. cp truncates and rewrites
+# in place, so the file keeps its inode -- and macOS has already cached a
+# code-signature verdict for that inode from the previous binary. The next
+# dlopen finds contents that do not match the cached signature and the kernel
+# SIGKILLs the process: `duckdb -c "LOAD ..."` dies with exit 137, no message,
+# no log line, while a byte-identical copy at any other path loads fine. Writing
+# beside it and renaming gives a fresh inode and no cached verdict.
+define stamp_to
+	mkdir -p build/release-$(1)
+	cp build/release/harbor.duckdb_extension build/release-$(1)/.harbor.next
+	mv -f build/release-$(1)/.harbor.next build/release-$(1)/harbor.duckdb_extension
+endef
+
 .PHONY: release_all
 release_all: release
 	@for v in $(STAMPED_DUCKDB_VERSIONS); do \
 	  echo "==> $$v"; \
 	  $(MAKE) --no-print-directory release TARGET_DUCKDB_VERSION=$$v || exit 1; \
 	  mkdir -p build/release-$$v; \
-	  cp build/release/harbor.duckdb_extension build/release-$$v/harbor.duckdb_extension; \
+	  cp build/release/harbor.duckdb_extension build/release-$$v/.harbor.next; \
+	  mv -f build/release-$$v/.harbor.next build/release-$$v/harbor.duckdb_extension; \
 	done
 	@echo "==> $(TARGET_DUCKDB_VERSION) (left in build/release)"
 	@$(MAKE) --no-print-directory release TARGET_DUCKDB_VERSION=$(TARGET_DUCKDB_VERSION)
-	@mkdir -p build/release-$(TARGET_DUCKDB_VERSION)
-	@cp build/release/harbor.duckdb_extension \
-	    build/release-$(TARGET_DUCKDB_VERSION)/harbor.duckdb_extension
+	@$(call stamp_to,$(TARGET_DUCKDB_VERSION))
 
 # check runs every suite: unit tests, sqllogictest, and the HTTP suites that
 # need a live server. See test/scripts/check.sh for the ordering and for SUITES=.

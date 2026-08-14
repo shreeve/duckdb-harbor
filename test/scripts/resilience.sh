@@ -102,14 +102,22 @@ settle() {
 fds()  { local n; n=$(lsof -p "$server_pid" 2>/dev/null | wc -l | tr -d ' '); if [[ -n "$n" && "$n" != 0 ]]; then echo "$n"; else echo unmeasured; fi; }
 rss()  { local n; n=$(ps -o rss= -p "$server_pid" 2>/dev/null | tr -d ' '); if [[ -n "$n" ]]; then echo "$n"; else echo unmeasured; fi; }
 
-# A leak check is only meaningful when both samples are real numbers and the
-# count did not fall — a drop means the subject went away, not that it improved.
+# A leak check is only meaningful when both samples are real numbers, and
+# `unmeasured` is what a dead process gives — `ps` and `lsof` find nothing to
+# report, so that branch already covers the case where the subject went away.
+#
+# A sample that merely *fell* is not that case, and treating it as one made
+# this flaky: RSS goes down whenever the allocator returns pages or the kernel
+# reclaims them, so a run that leaked nothing at all would fail with "the
+# process is gone" while the process was serving happily. It failed exactly
+# that way in CI on one commit and passed on the next with identical code.
+# Falling is the best possible outcome for a leak check; it passes.
 grew_by() {
   local label=$1 before=$2 after=$3 limit=$4 unit=${5:-}
   if [[ "$before" == unmeasured || "$after" == unmeasured ]]; then
     bad "$label" "could not measure (is lsof installed, and is the server alive?)"
-  elif (( after < before )); then
-    bad "$label" "sample fell from ${before}${unit} to ${after}${unit} — the process is gone"
+  elif (( after <= before )); then
+    ok "$label (${before}${unit} → ${after}${unit})"
   elif (( after - before < limit )); then
     ok "$label (${before}${unit} → ${after}${unit})"
   else

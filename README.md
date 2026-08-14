@@ -473,8 +473,12 @@ self-consistent.
 
 ## Status
 
-Early. **v0.8.1** is the current release, built for five platforms against both
-DuckDB v1.5.5 and the v2.0.0 alpha. Not in DuckDB's community-extensions
+Early. **v0.8.2** is the current release, built for five platforms against both
+DuckDB v1.5.5 and the v2.0.0 alpha. The five moved in v0.8.2: `osx_amd64` is
+gone and `windows_arm64` takes its place — Apple stopped selling Intel Macs in
+2023, and Rosetta runs an arm64 DuckDB, which loads an arm64 extension, so the
+Intel build was not what an Intel Mac ended up using anyway. Building from
+source there takes about twenty seconds. Not in DuckDB's community-extensions
 registry yet, so `-unsigned` is required and there is no `INSTALL harbor` from
 a repository — install a downloaded file by path instead, as above.
 
