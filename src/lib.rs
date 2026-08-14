@@ -22,14 +22,14 @@ use std::{
     panic::AssertUnwindSafe,
     sync::{
         Arc, Condvar, Mutex, mpsc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use duckdb::{
-    Connection, Result, ffi, params_from_iter,
+    Connection, InterruptHandle, Result, ffi, params_from_iter,
     core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
     duckdb_entrypoint_c_api,
     types::{TimeUnit, Value, ValueRef},
@@ -506,6 +506,274 @@ static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
 static STOPPED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 
 // ---------------------------------------------------------------------------
+// Cancellation
+//
+// A statement that has entered DuckDB does not come back until it is done.
+// Harbor executes a small, bounded number of statements at once, so one query
+// that runs forever is not a slow request — it is a worker permanently removed
+// from service, and eight of them are the whole server. Three things can ask a
+// statement to stop:
+//
+//   1. The client, by naming its own `queryId` and sending DELETE to it, or by
+//      releasing a session whose statement is still running.
+//   2. A deadline, when one was asked for.
+//   3. The reaper, when a lease has outlived its TTL while busy. Before this
+//      existed the reaper skipped busy leases, which meant the one lease that
+//      most needed reclaiming — the one wedged inside a runaway statement —
+//      was the one lease it could never take back.
+//
+// `duckdb_interrupt` is per connection, not per database (`InterruptHandle`
+// wraps a `duckdb_connection`), so interrupting one statement cannot disturb
+// another — including `harbor_wait()`, which runs on the caller's own
+// connection and is not in the pool at all.
+//
+// The hazard worth naming is the one that makes this subtle: an interrupt is
+// aimed at a connection, but the thing being cancelled is a *statement*, and
+// between deciding to cancel and firing, the target can finish and the next
+// statement can start on the same connection. Interrupting then kills an
+// innocent query, and the symptom — a query that fails once, at random, under
+// load — is close to undebuggable. So every statement carries a process-unique
+// id, and a cancel is "interrupt job N, if job N is still what is running",
+// checked and fired under the same lock the executor must take to retire it.
+// ---------------------------------------------------------------------------
+
+/// What one executor is doing, and how to stop it.
+struct SlotState {
+    interrupt: Arc<InterruptHandle>,
+    run: Mutex<SlotRun>,
+}
+
+struct SlotRun {
+    /// The statement running right now, or 0 for none. Never reused, so a
+    /// cancel that arrives late matches nothing rather than matching the wrong
+    /// statement.
+    job: u64,
+    /// A cancel that arrived before its statement started.
+    ///
+    /// The gap is small but entirely reachable: a request registers its
+    /// `queryId` before handing the job to an executor, so a client that sends
+    /// a query and immediately presses Stop can have the cancel land while the
+    /// executor is still picking the job up. Without this the cancel would
+    /// match nothing and the query would run to completion having been
+    /// explicitly cancelled — the worst of both answers.
+    pending: Option<u64>,
+    /// Set by a canceller, read and cleared by the executor when the statement
+    /// ends. A flag rather than a match on DuckDB's error text: "Interrupted"
+    /// is a message, not an interface, and a client should not learn why its
+    /// query stopped from prose that may be reworded upstream.
+    cancelled: bool,
+    /// When this statement must stop, if anything asked for a limit.
+    deadline: Option<Instant>,
+}
+
+/// What a cancel request should do, decided from bookkeeping alone.
+///
+/// Split out from `SlotState` so the part that is easy to get wrong can be
+/// tested without a database: this crate builds against DuckDB's loadable
+/// extension API, so a `Connection` — and therefore an `InterruptHandle` —
+/// cannot exist under `cargo test` at all.
+#[derive(Debug, PartialEq, Eq)]
+enum Cancel {
+    /// Interrupt the connection now.
+    Fire,
+    /// The statement has not started; the cancel is held for it.
+    Held,
+    /// Nothing here to cancel.
+    Nothing,
+}
+
+impl SlotRun {
+    /// Claim this slot for `job`. Returns true when the statement was already
+    /// cancelled before it began, in which case it must not run at all.
+    fn begin(&mut self, job: u64, deadline: Option<Instant>) -> bool {
+        self.job = job;
+        self.deadline = deadline;
+        // Any held cancel is consumed here whether or not it matches: it named
+        // a statement that is now either this one or one that will never start,
+        // and either way it has had its say.
+        self.cancelled = self.pending.take() == Some(job);
+        self.cancelled
+    }
+
+    fn end(&mut self) -> bool {
+        self.job = 0;
+        self.deadline = None;
+        std::mem::replace(&mut self.cancelled, false)
+    }
+
+    fn arm(&mut self, job: Option<u64>) -> Cancel {
+        match job {
+            // Named a statement this slot is not running. If it has not started
+            // yet, hold the cancel for it; if it is long gone, `begin` discards
+            // it on the next statement and nothing is interrupted.
+            Some(want) if self.job != want => {
+                self.pending = Some(want);
+                Cancel::Held
+            }
+            _ if self.job == 0 => Cancel::Nothing,
+            _ => {
+                self.cancelled = true;
+                Cancel::Fire
+            }
+        }
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        self.job != 0 && self.deadline.is_some_and(|d| now >= d)
+    }
+}
+
+impl SlotState {
+    fn begin(&self, job: u64, deadline: Option<Instant>) -> bool {
+        self.run.lock().unwrap().begin(job, deadline)
+    }
+
+    /// Retire the statement and report whether it was cancelled. Takes the same
+    /// lock a canceller holds across its interrupt, which is what closes the
+    /// window described above: once this returns, no interrupt aimed at this
+    /// job can still be in flight.
+    fn end(&self) -> bool {
+        self.run.lock().unwrap().end()
+    }
+
+    /// Interrupt the running statement if it is still `job` — or whatever is
+    /// running, when `job` is None. Returns whether the cancel was accepted.
+    fn cancel(&self, job: Option<u64>) -> bool {
+        let mut run = self.run.lock().unwrap();
+        match run.arm(job) {
+            Cancel::Nothing => false,
+            Cancel::Held => true,
+            Cancel::Fire => {
+                // Under the lock, deliberately. `interrupt()` takes its own
+                // mutex and sets a flag through the C API; it cannot re-enter
+                // harbor, so there is no lock-order hazard, and firing it
+                // outside the lock would reopen the race this whole design
+                // exists to close.
+                //
+                // `duckdb_interrupt` is resolved from the host's
+                // function-pointer table and asserts if the host did not
+                // provide it. Every DuckDB harbor can load into has, but a
+                // panic here would poison this mutex and take cancellation out
+                // for the whole process, so it is caught: a harbor that cannot
+                // cancel is much better than one that dies trying.
+                let fired =
+                    std::panic::catch_unwind(AssertUnwindSafe(|| self.interrupt.interrupt()));
+                if fired.is_err() {
+                    eprintln!(
+                        "harbor: this DuckDB does not provide duckdb_interrupt; cannot cancel"
+                    );
+                    run.cancelled = false;
+                    return false;
+                }
+                true
+            }
+        }
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        self.run.lock().unwrap().expired(now)
+    }
+}
+
+/// Every executor's slot, worker and lease alike, for the life of the server.
+static SLOTS: Mutex<Vec<Arc<SlotState>>> = Mutex::new(Vec::new());
+
+/// Statements a client asked to be able to cancel, by the id it chose.
+static QUERIES: Mutex<Option<HashMap<String, (Arc<SlotState>, u64)>>> = Mutex::new(None);
+
+/// Process-unique, monotonic, never reused. Zero means "nothing running", so
+/// ids start at one.
+static NEXT_JOB: AtomicU64 = AtomicU64::new(1);
+
+fn next_job_id() -> u64 {
+    NEXT_JOB.fetch_add(1, Ordering::SeqCst)
+}
+
+/// The longest a statement may run, when nothing asks for something shorter.
+///
+/// Unset by default, and that is a decision rather than an omission: harbor
+/// streams 300,000-row results and is used for analytical queries that take
+/// minutes on purpose, so a default deadline would break correct programs to
+/// protect against incorrect ones. `HARBOR_STATEMENT_TIMEOUT_MS` turns it on
+/// for a deployment; `timeoutMs` on the request turns it on for one statement,
+/// which is what a console with a Stop button actually wants.
+fn configured_statement_timeout() -> Option<Duration> {
+    match std::env::var("HARBOR_STATEMENT_TIMEOUT_MS").ok()?.trim().parse::<u64>() {
+        Ok(0) | Err(_) => None,
+        Ok(ms) => Some(Duration::from_millis(ms)),
+    }
+}
+
+/// A `queryId` registered for the length of one statement. Dropping it
+/// deregisters, on every path out — including the early returns — so a cancel
+/// can never reach a statement that has already finished, and the map cannot
+/// grow without bound.
+struct Cancellable {
+    id: String,
+}
+
+impl Cancellable {
+    fn register(id: &str, slot: &Arc<SlotState>, job: u64) -> Result<Self, Refusal> {
+        let mut guard = QUERIES.lock().unwrap();
+        let Some(queries) = guard.as_mut() else {
+            return Err(Refusal {
+                status: 503,
+                code: "unavailable",
+                message: "harbor is not serving".to_string(),
+            });
+        };
+        if queries.contains_key(id) {
+            // Refuse rather than overwrite. Two live statements under one name
+            // means a cancel is a coin flip, and silently replacing the first
+            // would make the first uncancellable for as long as it runs.
+            return Err(Refusal {
+                status: 409,
+                code: "query_id_in_use",
+                message: format!("queryId {id:?} is already running a statement. Choose another."),
+            });
+        }
+        queries.insert(id.to_string(), (Arc::clone(slot), job));
+        Ok(Self { id: id.to_string() })
+    }
+}
+
+impl Drop for Cancellable {
+    fn drop(&mut self) {
+        let mut guard = QUERIES.lock().unwrap();
+        if let Some(queries) = guard.as_mut() {
+            queries.remove(&self.id);
+        }
+    }
+}
+
+/// Cancel by the id the client chose. The slot and job are looked up together,
+/// so a `queryId` reused after its statement finished cancels nothing.
+fn cancel_query(id: &str) -> bool {
+    let target = {
+        let guard = QUERIES.lock().unwrap();
+        guard.as_ref().and_then(|q| q.get(id).map(|(s, j)| (Arc::clone(s), *j)))
+    };
+    match target {
+        Some((slot, job)) => slot.cancel(Some(job)),
+        None => false,
+    }
+}
+
+/// Stop any statement that has outlived its deadline. Runs on the reaper's
+/// tick, so the granularity of a timeout is the reap interval — which is the
+/// right trade for a limit measured in seconds and enforced by a thread that
+/// would otherwise be asleep.
+fn cancel_expired() {
+    let slots: Vec<Arc<SlotState>> = SLOTS.lock().unwrap().clone();
+    let now = Instant::now();
+    for slot in slots {
+        if slot.expired(now) {
+            slot.cancel(None);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Leases
 //
 // A transaction lives on a connection, and HTTP requests do not. A lease is
@@ -540,6 +808,9 @@ static STOPPED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 struct LeaseConn {
     slot: usize,
     jobs: mpsc::SyncSender<Job>,
+    /// This connection's interrupt, so a session can be cancelled by whoever
+    /// holds it — the client releasing it, or the reaper taking it back.
+    state: Arc<SlotState>,
 }
 
 struct Lease {
@@ -557,6 +828,12 @@ struct Lease {
     /// otherwise interleave inside a single transaction, which no client could
     /// reason about; the second is refused.
     busy: bool,
+    /// Someone asked to release this lease while it was busy. The statement
+    /// owns the connection until it returns, so the release cannot happen
+    /// there and then; the reaper finishes it on the next tick. Without this a
+    /// client that wanted to stop a long statement had no way to say so — the
+    /// DELETE simply reported false and the lease ran on.
+    doomed: bool,
 }
 
 struct Leases {
@@ -615,6 +892,8 @@ fn quiesce(conn: &LeaseConn) {
         sql: String::new(),
         params: Vec::new(),
         shape: Shape::Ndjson,
+        id: next_job_id(),
+        deadline: None,
         reset: true,
         ready: ready_tx,
         body: body_tx,
@@ -678,6 +957,7 @@ fn lease_open(requested_ttl: Option<Duration>) -> Result<(String, Duration, Dura
             statements: 0,
             in_transaction: false,
             busy: false,
+            doomed: false,
         },
     );
     Ok((id, ttl, idle_ttl))
@@ -696,7 +976,11 @@ fn lease_open(requested_ttl: Option<Duration>) -> Result<(String, Duration, Dura
 const CLAIM_WAIT: Duration = Duration::from_millis(250);
 
 /// Claim a lease for one statement, waiting out the handoff window above.
-fn lease_claim(id: &str) -> Result<mpsc::SyncSender<Job>, Refusal> {
+///
+/// Hands back the slot as well as the channel: a statement on a lease is
+/// cancellable by `queryId` exactly like one on a worker, and the registry
+/// needs to know which connection to interrupt.
+fn lease_claim(id: &str) -> Result<(mpsc::SyncSender<Job>, Arc<SlotState>), Refusal> {
     let deadline = Instant::now() + CLAIM_WAIT;
     loop {
         match try_lease_claim(id) {
@@ -708,7 +992,7 @@ fn lease_claim(id: &str) -> Result<mpsc::SyncSender<Job>, Refusal> {
     }
 }
 
-fn try_lease_claim(id: &str) -> Result<mpsc::SyncSender<Job>, Refusal> {
+fn try_lease_claim(id: &str) -> Result<(mpsc::SyncSender<Job>, Arc<SlotState>), Refusal> {
     let mut guard = LEASES.lock().unwrap();
     let Some(leases) = guard.as_mut() else {
         return Err(Refusal {
@@ -740,7 +1024,7 @@ fn try_lease_claim(id: &str) -> Result<mpsc::SyncSender<Job>, Refusal> {
     }
     lease.busy = true;
     lease.last = Instant::now();
-    Ok(lease.conn.jobs.clone())
+    Ok((lease.conn.jobs.clone(), Arc::clone(&lease.conn.state)))
 }
 
 /// Give a claim back, recording what the statement did to the transaction.
@@ -763,6 +1047,7 @@ struct Claim {
     id: String,
     sql: String,
     target: mpsc::SyncSender<Job>,
+    state: Arc<SlotState>,
 }
 
 impl Drop for Claim {
@@ -775,17 +1060,36 @@ impl Drop for Claim {
 /// released lease is a no-op that reports false, so a client retrying a DELETE
 /// can never free a connection twice or free one that has been reissued.
 ///
-/// A busy lease is not released — the statement in flight owns the connection
-/// until it finishes, and yanking it would hand the same connection to two
-/// callers at once.
-fn lease_release(id: &str) -> bool {
+/// A busy lease is not released here — the statement in flight owns the
+/// connection until it finishes, and yanking it would hand the same connection
+/// to two callers at once. It is cancelled and marked instead, and the reaper
+/// releases it as soon as the statement lets go.
+enum Released {
+    /// The connection is back in the free list.
+    Yes,
+    /// No such lease, or it was already gone. Idempotent by design.
+    No,
+    /// It was running a statement; that statement has been interrupted and the
+    /// lease will be released once it unwinds.
+    Cancelling,
+}
+
+fn lease_release(id: &str) -> Released {
     let lease = {
         let mut guard = LEASES.lock().unwrap();
-        let Some(leases) = guard.as_mut() else { return false };
-        match leases.live.get(id) {
-            Some(l) if l.busy => return false,
+        let Some(leases) = guard.as_mut() else { return Released::No };
+        match leases.live.get_mut(id) {
+            Some(l) if l.busy => {
+                l.doomed = true;
+                let state = Arc::clone(&l.conn.state);
+                // Outside the registry lock would be tidier, but `cancel` only
+                // takes the slot's own lock and sets a flag through the C API,
+                // so the nesting is one level deep and cannot cycle back here.
+                state.cancel(None);
+                return Released::Cancelling;
+            }
             Some(_) => {}
-            None => return false,
+            None => return Released::No,
         }
         let lease = leases.live.remove(id).expect("checked above");
         leases.inflight += 1;
@@ -797,28 +1101,62 @@ fn lease_release(id: &str) -> bool {
         leases.free.push(lease.conn);
         leases.inflight -= 1;
     }
-    true
+    Released::Yes
 }
 
 /// Reclaim leases that have stopped answering. Two clocks: a lease that has
 /// been idle past its idle timeout, and one that has outlived its deadline
 /// whatever it has been doing.
+///
+/// A busy lease cannot be released out from under its statement, so an expired
+/// one is cancelled here and released on a later tick, once the statement it
+/// was running has come back. Before cancellation existed the reaper simply
+/// skipped busy leases — which meant a lease wedged inside a runaway statement,
+/// the one case where reclaiming actually matters, was the one case it could
+/// never reclaim. The idle clock deliberately does not apply to a busy lease:
+/// a statement that has been running for a minute is working, not idle.
 fn lease_reap() {
-    let expired: Vec<String> = {
+    enum Action {
+        Release(String),
+        Cancel(Arc<SlotState>),
+    }
+    let actions: Vec<Action> = {
         let guard = LEASES.lock().unwrap();
         let Some(leases) = guard.as_ref() else { return };
         let now = Instant::now();
         leases
             .live
             .iter()
-            .filter(|(_, l)| !l.busy && (now >= l.deadline || now.duration_since(l.last) >= leases.idle_ttl))
-            .map(|(id, _)| id.clone())
+            .filter_map(|(id, l)| match l.busy {
+                // Cancel once per tick while it is over its deadline. Repeating
+                // is deliberate: DuckDB checks the interrupt flag between
+                // pipeline steps, and a statement that swallowed the first one
+                // gets asked again rather than being left to run forever.
+                true if now >= l.deadline || l.doomed => {
+                    Some(Action::Cancel(Arc::clone(&l.conn.state)))
+                }
+                true => None,
+                false if l.doomed
+                    || now >= l.deadline
+                    || now.duration_since(l.last) >= leases.idle_ttl =>
+                {
+                    Some(Action::Release(id.clone()))
+                }
+                false => None,
+            })
             .collect()
     };
-    for id in expired {
-        // Through the same release path as everything else, so a reaped lease
-        // and a released one cannot diverge.
-        lease_release(&id);
+    for action in actions {
+        match action {
+            // Through the same release path as everything else, so a reaped
+            // lease and a released one cannot diverge.
+            Action::Release(id) => {
+                lease_release(&id);
+            }
+            Action::Cancel(state) => {
+                state.cancel(None);
+            }
+        }
     }
 }
 
@@ -834,9 +1172,12 @@ fn lease_drain() {
         }
     };
     for id in &ids {
-        // A lease busy with a statement is left to the executor's own
-        // shutdown: its channel is dropped below, and `execute_jobs` rolls
-        // back on the way out.
+        // A lease busy with a statement is interrupted by this call rather than
+        // waited on. It used to be left to the executor's own shutdown — its
+        // channel is dropped below and `execute_jobs` rolls back on the way out
+        // — but that only unwinds once the statement finishes, so a single long
+        // query held the whole shutdown, and with it the CHECKPOINT that folds
+        // the WAL.
         lease_release(id);
     }
 }
@@ -938,15 +1279,34 @@ fn start(
     let stop = Arc::new(AtomicBool::new(false));
     let token = Arc::new(token);
 
+    // Every executor gets a slot before it gets a thread. The interrupt handle
+    // has to be taken from the connection while it is still here — an executor
+    // owns its connection for the life of the server and nothing else can
+    // reach it afterwards.
+    let mut slots: Vec<Arc<SlotState>> = Vec::with_capacity(workers + lease_conns.len());
+    let new_slot = |conn: &Connection| {
+        Arc::new(SlotState {
+            interrupt: conn.interrupt_handle(),
+            run: Mutex::new(SlotRun {
+                job: 0,
+                pending: None,
+                cancelled: false,
+                deadline: None,
+            }),
+        })
+    };
+
     let mut handles = Vec::with_capacity(workers);
     for (i, conn) in conns.into_iter().enumerate() {
         let server = Arc::clone(&server);
         let stop = Arc::clone(&stop);
         let token = Arc::clone(&token);
+        let state = new_slot(&conn);
+        slots.push(Arc::clone(&state));
         handles.push(
             thread::Builder::new()
                 .name(format!("harbor-{i}"))
-                .spawn(move || worker(server, stop, token, conn, log))
+                .spawn(move || worker(server, stop, token, conn, state, log))
                 .map_err(|e| e.to_string())?,
         );
     }
@@ -960,13 +1320,18 @@ fn start(
     let mut free = Vec::with_capacity(lease_conns.len());
     for (slot, conn) in lease_conns.into_iter().enumerate() {
         let (tx, rx) = mpsc::sync_channel::<Job>(0);
+        let state = new_slot(&conn);
+        slots.push(Arc::clone(&state));
+        let exec_state = Arc::clone(&state);
         let handle = thread::Builder::new()
             .name(format!("harbor-lease-{slot}"))
-            .spawn(move || Some(execute_jobs(conn, rx, true)))
+            .spawn(move || Some(execute_jobs(conn, rx, true, exec_state)))
             .map_err(|e| e.to_string())?;
         lease_handles.push(handle);
-        free.push(LeaseConn { slot, jobs: tx });
+        free.push(LeaseConn { slot, jobs: tx, state });
     }
+    *SLOTS.lock().unwrap() = slots;
+    *QUERIES.lock().unwrap() = Some(HashMap::new());
     let total = free.len();
     *LEASES.lock().unwrap() = Some(Leases {
         free,
@@ -980,19 +1345,21 @@ fn start(
     // The reaper is what makes a lease safe to hand out at all: without it an
     // abandoned transaction holds its connection until the process exits, and
     // blocks every checkpoint in between.
-    let reaper = if total > 0 {
+    // Unconditional now, where it used to be skipped when there were no lease
+    // connections: it also enforces statement deadlines, and those apply to
+    // workers, which always exist.
+    let reaper = {
         let stop = Arc::clone(&stop);
         thread::Builder::new()
             .name("harbor-reaper".to_string())
             .spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
                     thread::sleep(REAP_INTERVAL);
+                    cancel_expired();
                     lease_reap();
                 }
             })
             .ok()
-    } else {
-        None
     };
 
     *STOPPED.0.lock().unwrap() = false;
@@ -1028,6 +1395,19 @@ fn stop() -> Result<String, String> {
     // way out, and hand their connection back through the join below.
     let leases = LEASES.lock().unwrap().take();
     drop(leases);
+
+    // A statement still running on a worker holds a connection this shutdown
+    // is about to wait on, so ask every one of them to stop. Without this a
+    // single long query decides how long the stop takes — and the CHECKPOINT
+    // that folds the WAL is on the other side of it.
+    let slots: Vec<Arc<SlotState>> = std::mem::take(&mut *SLOTS.lock().unwrap());
+    for slot in &slots {
+        slot.cancel(None);
+    }
+    drop(slots);
+    // Nothing can be cancelled by name once the registry is gone, and an id
+    // left behind would outlive the server that could act on it.
+    *QUERIES.lock().unwrap() = None;
 
     // Workers hand their connection back as they exit, so a later
     // harbor_serve has a pool to draw from. A panicked worker forfeits its
@@ -1152,14 +1532,16 @@ fn worker(
     stop: Arc<AtomicBool>,
     token: Arc<Option<String>>,
     conn: Connection,
+    state: Arc<SlotState>,
     log: bool,
 ) -> Option<Connection> {
     // Rendezvous: a worker never has more than one statement outstanding, so
     // there is nothing to queue here.
     let (jobs_tx, jobs_rx) = mpsc::sync_channel::<Job>(0);
+    let exec_state = Arc::clone(&state);
     let executor = thread::Builder::new()
         .name("harbor-exec".to_string())
-        .spawn(move || execute_jobs(conn, jobs_rx, false))
+        .spawn(move || execute_jobs(conn, jobs_rx, false, exec_state))
         .ok()?;
 
     while !stop.load(Ordering::SeqCst) {
@@ -1175,7 +1557,7 @@ fn worker(
             // 503 rather than a cheerful hardcoded 200 — but reporting it is
             // not enough: the worker still has to leave.
             Ok(Some(req)) => {
-                if !handle(req, &jobs_tx, token.as_ref().as_deref(), log) {
+                if !handle(req, &jobs_tx, &state, token.as_ref().as_deref(), log) {
                     break;
                 }
             }
@@ -1190,7 +1572,13 @@ fn worker(
 
 /// Returns false when the executor behind `jobs` is gone, which is the one
 /// condition the caller must act on rather than merely report.
-fn handle(mut req: Request, jobs: &mpsc::SyncSender<Job>, token: Option<&str>, log: bool) -> bool {
+fn handle(
+    mut req: Request,
+    jobs: &mpsc::SyncSender<Job>,
+    state: &Arc<SlotState>,
+    token: Option<&str>,
+    log: bool,
+) -> bool {
     let path = req.url().split('?').next().unwrap_or("/").to_string();
     let method = req.method().clone();
 
@@ -1224,15 +1612,42 @@ fn handle(mut req: Request, jobs: &mpsc::SyncSender<Job>, token: Option<&str>, l
         }
         // Release one. Idempotent by design: a client retrying a DELETE it is
         // not sure landed must not be able to free a connection twice.
+        //
+        // A session running a statement is not simply refused any more: the
+        // statement is interrupted and the release completes on the reaper's
+        // next tick. `released` says whether the connection is back now,
+        // `cancelling` says the work to make it so is under way — so a client
+        // that wants its transaction stopped has one verb for it, and a client
+        // polling for the connection can tell the two apart.
         (Method::Delete, p) if p.starts_with("/sql/sessions/") => {
             if !authorized(&req, token) {
                 let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
                 (true, 401)
             } else {
                 let id = p.trim_start_matches("/sql/sessions/").to_string();
-                let released = lease_release(&id);
-                let body = format!(r#"{{"released":{released}}}"#);
+                let body = match lease_release(&id) {
+                    Released::Yes => r#"{"released":true}"#.to_string(),
+                    Released::No => r#"{"released":false}"#.to_string(),
+                    Released::Cancelling => {
+                        r#"{"released":false,"cancelling":true}"#.to_string()
+                    }
+                };
                 let _ = req.respond(json_response(200, &body));
+                (true, 200)
+            }
+        }
+        // Stop a statement the client named when it sent it. Idempotent and
+        // deliberately unexciting: cancelling something that already finished
+        // is `false`, not an error, because by the time a Stop button is
+        // pressed the query it refers to may well be over.
+        (Method::Delete, p) if p.starts_with("/sql/queries/") => {
+            if !authorized(&req, token) {
+                let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
+                (true, 401)
+            } else {
+                let id = p.trim_start_matches("/sql/queries/").to_string();
+                let cancelled = cancel_query(&id);
+                let _ = req.respond(json_response(200, &format!(r#"{{"cancelled":{cancelled}}}"#)));
                 (true, 200)
             }
         }
@@ -1275,7 +1690,7 @@ fn handle(mut req: Request, jobs: &mpsc::SyncSender<Job>, token: Option<&str>, l
                     let _ = req.respond(error_response(400, "bad_request", "body is not valid UTF-8"));
                     (true, 400)
                 } else {
-                    run_sql(req, jobs, &body)
+                    run_sql(req, jobs, state, &body)
                 }
             }
         }
@@ -1360,6 +1775,14 @@ struct SqlRequest {
     /// Names a lease. Absent means the statement runs on a worker connection
     /// and settles itself, which is what almost every request wants.
     session: Option<String>,
+    /// A name the client chose so it can cancel this statement later. Chosen by
+    /// the client rather than minted here because the alternative — answering
+    /// with an id — cannot work: the response does not begin until the
+    /// statement is finished or streaming, and by then the id is no use.
+    query: Option<String>,
+    /// How long this statement may run. Overrides the deployment default in
+    /// either direction, including downward from unlimited.
+    timeout: Option<Duration>,
 }
 
 fn parse_request(body: &str) -> Result<SqlRequest, String> {
@@ -1382,7 +1805,30 @@ fn parse_request(body: &str) -> Result<SqlRequest, String> {
         Some(serde_json::Value::String(id)) if !id.is_empty() => Some(id.clone()),
         Some(_) => return Err("\"sessionId\" must be a non-empty string".to_string()),
     };
-    Ok(SqlRequest { sql, params, session })
+    let query = match v.get("queryId") {
+        None | Some(serde_json::Value::Null) => None,
+        // Bounded, because it becomes a key in a map that lives as long as the
+        // server and is written by anyone holding the token.
+        Some(serde_json::Value::String(id)) if !id.is_empty() && id.len() <= 128 => {
+            Some(id.clone())
+        }
+        Some(_) => {
+            return Err("\"queryId\" must be a non-empty string of at most 128 characters"
+                .to_string());
+        }
+    };
+    let timeout = match v.get("timeoutMs") {
+        None | Some(serde_json::Value::Null) => configured_statement_timeout(),
+        // Zero means "no limit", so a request can opt out of a deployment-wide
+        // default as well as into a limit of its own.
+        Some(serde_json::Value::Number(n)) => match n.as_u64() {
+            Some(0) => None,
+            Some(ms) => Some(Duration::from_millis(ms)),
+            None => return Err("\"timeoutMs\" must be a non-negative whole number".to_string()),
+        },
+        Some(_) => return Err("\"timeoutMs\" must be a non-negative whole number".to_string()),
+    };
+    Ok(SqlRequest { sql, params, session, query, timeout })
 }
 
 fn json_to_duckdb(v: &serde_json::Value) -> Result<Value, String> {
@@ -1576,6 +2022,34 @@ impl Refusal {
     fn sql(message: impl Into<String>) -> Self {
         Self { status: 400, code: "sql_error", message: message.into() }
     }
+
+    /// Somebody stopped this statement on purpose.
+    ///
+    /// 499 is nginx's, not the RFC's, and it is the right borrow: there is no
+    /// standard code for "the caller withdrew", 400 would blame the statement
+    /// and 500 would blame harbor, when in fact nothing went wrong. Clients
+    /// here branch on `code` rather than status anyway — rip/db keeps
+    /// `harborCode` separate for exactly that — so the status is for logs and
+    /// proxies, and the code is the interface.
+    fn cancelled() -> Self {
+        Self {
+            status: 499,
+            code: "cancelled",
+            message: "this statement was cancelled before it finished".to_string(),
+        }
+    }
+}
+
+/// A DuckDB error is a cancellation when harbor asked for one, and an engine
+/// error otherwise. Decided from the slot's flag rather than by matching
+/// "INTERRUPT" in the message, because an error string is prose and can be
+/// reworded upstream without warning; the flag is harbor's own record of
+/// having fired the interrupt.
+fn refusal_for(cancelled: bool, message: String) -> Refusal {
+    match cancelled {
+        true => Refusal::cancelled(),
+        false => Refusal::sql(message),
+    }
 }
 
 /// One unit of work for an executor thread.
@@ -1583,6 +2057,11 @@ struct Job {
     sql: String,
     params: Vec<Value>,
     shape: Shape,
+    /// Process-unique, assigned before the job is sent, so a cancel arriving
+    /// from another thread can name this statement and no other.
+    id: u64,
+    /// When to stop trying, if anything asked for a limit.
+    deadline: Option<Instant>,
     /// Return this connection to a clean state instead of running `sql`.
     ///
     /// Not the same as sending `ROLLBACK` as a statement, which would go
@@ -1755,6 +2234,11 @@ fn run_ready(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         sql: "SELECT 1".to_string(),
         params: Vec::new(),
         shape: Shape::Ndjson,
+        id: next_job_id(),
+        // No deadline. A readiness probe that can time out would report the
+        // database unready because harbor cancelled the probe, which is a
+        // self-inflicted outage rather than a measurement.
+        deadline: None,
         reset: false,
         ready: ready_tx,
         body: body_tx,
@@ -1810,7 +2294,12 @@ fn respond_ready(req: Request, ok: bool, message: &str) -> u16 {
 
 /// Returns (keep serving, status sent). The first is false when the executor is
 /// gone; see `handle`, which also writes the log line from the second.
-fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) -> (bool, u16) {
+fn run_sql(
+    req: Request,
+    jobs: &mpsc::SyncSender<Job>,
+    state: &Arc<SlotState>,
+    body: &str,
+) -> (bool, u16) {
     let parsed = match parse_request(body) {
         Ok(p) => p,
         Err(e) => {
@@ -1834,7 +2323,9 @@ fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) -> (bool, u16
     let claim = match parsed.session.as_deref() {
         None => None,
         Some(id) => match lease_claim(id) {
-            Ok(target) => Some(Claim { id: id.to_string(), sql: parsed.sql.clone(), target }),
+            Ok((target, state)) => {
+                Some(Claim { id: id.to_string(), sql: parsed.sql.clone(), target, state })
+            }
             Err(refusal) => {
                 let _ = req.respond(error_response(refusal.status, refusal.code, &refusal.message));
                 return (true, refusal.status);
@@ -1842,11 +2333,40 @@ fn run_sql(req: Request, jobs: &mpsc::SyncSender<Job>, body: &str) -> (bool, u16
         },
     };
     let target = claim.as_ref().map_or(jobs, |c| &c.target);
+    // A lease statement runs on the lease's connection; everything else runs on
+    // this worker's own. Cancellation has to name the one that will actually be
+    // executing, not the one that accepted the request.
+    let slot = claim.as_ref().map_or(state, |c| &c.state);
+
+    let id = next_job_id();
+    let deadline = parsed.timeout.map(|t| Instant::now() + t);
+
+    // Registered before the job is sent, so a Stop pressed the instant the
+    // query goes out has something to find. `Cancellable` deregisters on drop,
+    // on every path below including the early returns.
+    let _cancellable = match parsed.query.as_deref() {
+        None => None,
+        Some(name) => match Cancellable::register(name, slot, id) {
+            Ok(guard) => Some(guard),
+            Err(refusal) => {
+                let _ = req.respond(error_response(refusal.status, refusal.code, &refusal.message));
+                return (true, refusal.status);
+            }
+        },
+    };
 
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), Refusal>>(1);
     let (body_tx, body_rx) = mpsc::sync_channel::<Vec<u8>>(BODY_QUEUE);
-    let job =
-        Job { sql: parsed.sql, params: parsed.params, shape, reset: false, ready: ready_tx, body: body_tx };
+    let job = Job {
+        sql: parsed.sql,
+        params: parsed.params,
+        shape,
+        id,
+        deadline,
+        reset: false,
+        ready: ready_tx,
+        body: body_tx,
+    };
 
     if target.send(job).is_err() {
         // A lease whose executor is gone can never serve another statement, so
@@ -2035,7 +2555,42 @@ fn reset_transaction(conn: &Connection) {
 /// lease is for, so on a lease connection it must not fire. The rollback still
 /// happens, but at the boundary that matters: when the lease is released, by
 /// commit, by DELETE, or by the reaper.
-fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>, pinned: bool) -> Connection {
+/// A statement registered on its slot for as long as it runs.
+///
+/// Dropping it retires the statement, so no path out of the loop — and there
+/// are seven — can leave the slot claiming to be running a job that is over.
+/// A cancel that arrives after that matches nothing, which is the point.
+struct OnSlot<'a> {
+    slot: &'a SlotState,
+    done: bool,
+}
+
+impl OnSlot<'_> {
+    /// Retire now, and say whether this statement was cancelled. Called
+    /// explicitly wherever the answer changes what the client is told.
+    fn finish(&mut self) -> bool {
+        if self.done {
+            return false;
+        }
+        self.done = true;
+        self.slot.end()
+    }
+}
+
+impl Drop for OnSlot<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.slot.end();
+        }
+    }
+}
+
+fn execute_jobs(
+    conn: Connection,
+    jobs: mpsc::Receiver<Job>,
+    pinned: bool,
+    state: Arc<SlotState>,
+) -> Connection {
     // Set by the previous job when it could have left a transaction open: a
     // transaction-control statement, or any exit other than running to
     // completion. Resetting unconditionally is also correct, and was what this
@@ -2052,7 +2607,7 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>, pinned: bool) -> Co
             reset_transaction(&conn);
         }
 
-        let Job { sql, params, shape, reset, ready, body } = job;
+        let Job { sql, params, shape, id, deadline, reset, ready, body } = job;
         if reset {
             // Same call the workers make between requests, and unconditional:
             // this runs once per lease release, not once per statement, so the
@@ -2065,6 +2620,20 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>, pinned: bool) -> Co
         }
         let started = Instant::now();
 
+        // Registered before `prepare`, not before the row loop: planning a
+        // pathological query can itself take minutes, and a statement that
+        // cannot be cancelled until it starts producing rows is exactly the
+        // statement worth cancelling.
+        let pre_cancelled = state.begin(id, deadline);
+        let mut on_slot = OnSlot { slot: &state, done: false };
+        if pre_cancelled {
+            // Cancelled between being registered and being picked up. Nothing
+            // has touched the connection, so there is nothing to roll back.
+            on_slot.finish();
+            let _ = ready.send(Err(Refusal::cancelled()));
+            continue;
+        }
+
         // Decided from the statement text before it runs, then widened below by
         // any path that ends the job early.
         needs_reset = may_leave_transaction_open(&sql);
@@ -2073,7 +2642,7 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>, pinned: bool) -> Co
             Ok(s) => s,
             Err(e) => {
                 needs_reset = true;
-                let _ = ready.send(Err(Refusal::sql(e.to_string())));
+                let _ = ready.send(Err(refusal_for(on_slot.finish(), e.to_string())));
                 continue;
             }
         };
@@ -2082,7 +2651,7 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>, pinned: bool) -> Co
             Ok(r) => r,
             Err(e) => {
                 needs_reset = true;
-                let _ = ready.send(Err(Refusal::sql(e.to_string())));
+                let _ = ready.send(Err(refusal_for(on_slot.finish(), e.to_string())));
                 continue;
             }
         };
@@ -2302,18 +2871,27 @@ fn execute_jobs(conn: Connection, jobs: mpsc::Receiver<Job>, pinned: bool) -> Co
                 }
                 Ok(None) => break,
                 Err(e) => {
+                    // Retired here rather than after the loop, because what the
+                    // client is told depends on the answer: the same DuckDB
+                    // error means "your SQL failed" or "you cancelled this",
+                    // and only the slot knows which.
+                    let refusal = refusal_for(on_slot.finish(), e.to_string());
                     if shape == Shape::Ndjson {
                         // Mid-stream failures cannot change the status code —
                         // the headers are long gone. Say so in the stream, so a
                         // client never mistakes a truncated result for a
-                        // complete one.
-                        buf.push_str(r#"{"type":"error","code":"sql_error","message":"#);
-                        push_json_string(&mut buf, &e.to_string());
+                        // complete one. The code travels from the refusal: it
+                        // used to be the literal "sql_error", which labelled a
+                        // cancellation and an unsupported type as bad SQL.
+                        buf.push_str(r#"{"type":"error","code":""#);
+                        buf.push_str(refusal.code);
+                        buf.push_str(r#"","message":"#);
+                        push_json_string(&mut buf, &refusal.message);
                         buf.push_str("}\n");
                         let _ = body.send(std::mem::take(&mut buf).into_bytes());
                         gone = true;
                     }
-                    failure = Some(Refusal::sql(e.to_string()));
+                    failure = Some(refusal);
                     break;
                 }
             }
@@ -3125,6 +3703,96 @@ mod tests {
     use super::civil_from_days;
     use super::ensure_single_statement as one;
     use super::varint_to_decimal;
+    use super::{Cancel, SlotRun};
+    use std::time::{Duration, Instant};
+
+    fn idle() -> SlotRun {
+        SlotRun { job: 0, pending: None, cancelled: false, deadline: None }
+    }
+
+    /// The bug this design exists to prevent: a cancel decided for one
+    /// statement must not fire on the next one to run on that connection.
+    /// Without the id, "is something running?" is true in both cases and the
+    /// interrupt lands on an innocent query.
+    #[test]
+    fn a_cancel_never_lands_on_the_next_statement() {
+        let mut run = idle();
+        run.begin(7, None);
+        // Job 7 finishes before the cancel is decided.
+        assert!(!run.end());
+        // The next statement starts on the same connection.
+        run.begin(8, None);
+        // A cancel aimed at 7 arrives now. It must not touch 8.
+        assert_eq!(run.arm(Some(7)), Cancel::Held);
+        assert!(!run.cancelled, "job 8 was marked cancelled by a cancel aimed at job 7");
+        assert!(!run.end(), "job 8 reported itself cancelled");
+    }
+
+    /// And the held cancel must not survive to ambush a later statement
+    /// either — it named an id that will never run again.
+    #[test]
+    fn a_held_cancel_is_discarded_by_the_next_statement() {
+        let mut run = idle();
+        run.arm(Some(7));
+        assert_eq!(run.pending, Some(7));
+        assert!(!run.begin(9, None), "job 9 inherited a cancel meant for job 7");
+        assert_eq!(run.pending, None);
+    }
+
+    /// The race the held cancel exists for: the client registers a query id,
+    /// presses Stop, and the cancel arrives before the executor has picked the
+    /// job up. The statement must not run.
+    #[test]
+    fn a_cancel_that_beats_its_statement_still_cancels_it() {
+        let mut run = idle();
+        assert_eq!(run.arm(Some(4)), Cancel::Held);
+        assert!(run.begin(4, None), "job 4 ran despite being cancelled before it started");
+    }
+
+    #[test]
+    fn cancelling_an_idle_slot_does_nothing() {
+        let mut run = idle();
+        assert_eq!(run.arm(None), Cancel::Nothing);
+        assert!(!run.cancelled);
+    }
+
+    #[test]
+    fn cancelling_whatever_is_running_does_not_need_an_id() {
+        let mut run = idle();
+        run.begin(3, None);
+        assert_eq!(run.arm(None), Cancel::Fire);
+        assert!(run.end(), "the statement did not report itself cancelled");
+    }
+
+    /// `end` clears the flag as well as reading it, so the next statement on
+    /// this connection starts clean. A latched flag would report every
+    /// subsequent query on that worker as cancelled.
+    #[test]
+    fn the_cancelled_flag_does_not_outlive_its_statement() {
+        let mut run = idle();
+        run.begin(1, None);
+        run.arm(None);
+        assert!(run.end());
+        run.begin(2, None);
+        assert!(!run.end());
+    }
+
+    #[test]
+    fn a_deadline_only_expires_while_something_is_running() {
+        let now = Instant::now();
+        let past = now - Duration::from_secs(1);
+        let mut run = idle();
+        // Nothing running: a deadline in the past is not an expiry.
+        run.deadline = Some(past);
+        assert!(!run.expired(now));
+        run.begin(1, Some(past));
+        assert!(run.expired(now));
+        run.begin(2, Some(now + Duration::from_secs(60)));
+        assert!(!run.expired(now));
+        // And a statement with no deadline never expires.
+        run.begin(3, None);
+        assert!(!run.expired(now + Duration::from_secs(86_400)));
+    }
 
     /// `civil_from_days` backs both DATE formatting and the log timestamp, and
     /// it was never covered. Pin it to dates whose answers are known

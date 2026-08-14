@@ -32,8 +32,8 @@ One `schema` message, one `row` per row, one `end`. Rows go out as DuckDB
 produces them, so a client can start on row one while the server is still
 producing the last one.
 
-Five routes. That is the whole surface — two of them for queries, three so a
-transaction can outlive one request:
+Six routes. That is the whole surface — two of them for queries, three so a
+transaction can outlive one request, one to stop a statement that is running:
 
 ```
 POST /sql                  run one statement, stream the result as NDJSON
@@ -42,6 +42,7 @@ GET  /ready                can this server answer a query? no credential require
 POST /sql/sessions/new     take a connection and hold it, for a transaction
 DELETE /sql/sessions/<id>  give it back
 GET  /sessions             what is holding one, and for how long
+DELETE /sql/queries/<id>   stop a statement the caller named when it sent it
 ```
 
 `POST /sql` streams by default. Send `Accept: application/json` and the same
@@ -72,6 +73,61 @@ matters: a process can be running while its executor thread is gone, and a
 hardcoded 200 will cheerfully say so while every `/sql` returns 500. Asking the
 database is the only answer worth having. Verdicts are cached for one second, so
 polling it costs at most one query per second however often it is asked.
+
+## Stopping a statement
+
+A statement that has entered DuckDB does not come back until it is done, and
+harbor runs a small, bounded number at once. So a query nobody wants any more
+is not a slow request — it is a connection out of service, and enough of them
+are the whole server.
+
+Name a statement when you send it, and you can stop it:
+
+```console
+$ curl -s localhost:9495/sql -H "$auth" \
+       -d '{"sql":"SELECT count(*) FROM huge","queryId":"report-7"}' &
+$ curl -s -X DELETE localhost:9495/sql/queries/report-7 -H "$auth"
+{"cancelled":true}
+```
+
+The cancelled statement answers `499` with `{"code":"cancelled"}` — nginx's
+code, because there is no standard one for "the caller withdrew" and neither
+`400` nor `500` is true. Cancelling something that already finished is
+`{"cancelled":false}`, not an error: by the time a Stop button is pressed, the
+query it refers to may well be over.
+
+The id is chosen by the caller rather than issued by harbor, and it has to be:
+the response does not begin until the statement is streaming or done, so an id
+in the reply would arrive too late to be any use. It is refused with a `409`
+while a statement of that name is already running, so two live queries can
+never share one name and make a cancel a coin flip.
+
+**A deadline is the backstop.** `{"timeoutMs": N}` on a request, or
+`HARBOR_STATEMENT_TIMEOUT_MS` for a whole deployment, stops a statement without
+anyone having to ask. There is no default, deliberately: harbor streams
+300,000-row results and is used for queries that take minutes on purpose, so a
+default deadline would break correct programs to catch incorrect ones. Zero on
+a request means no limit, so one statement can opt out of a deployment default.
+
+The deadline matters most in the case an explicit cancel cannot reach. A
+`DELETE` needs a worker to accept it, and when every worker is blocked inside a
+runaway query there is no worker left — which is exactly when you want to stop
+one. The reaper runs on its own thread and never touches HTTP, so deadlines are
+enforced when nothing else can be. If a deployment's worry is runaway queries
+rather than impatient users, set `HARBOR_STATEMENT_TIMEOUT_MS` and leave it.
+
+Two smaller things follow from the same machinery. Releasing a session whose
+statement is still running now stops it — `{"released":false,"cancelling":true}`
+— and the connection comes back on the reaper's next tick, where before the
+release was simply refused. And a lease that blows its TTL while busy is
+reclaimed, where the reaper used to skip it: the one lease that most needed
+taking back, wedged inside a runaway statement, was the one it could never take.
+
+Cancelling a statement inside a transaction aborts that transaction, exactly as
+it does in Postgres. Harbor does not paper over it — the next statement gets
+`Current transaction is aborted (please ROLLBACK)` until you do. Rolling back
+silently would let the statement after a cancellation commit in autocommit
+under a client that still believed it was in a transaction.
 
 ## Transactions
 

@@ -44,7 +44,7 @@ token=${TOKEN:-check-$$}
 # port this runner has already given to the shared server — the run dies at
 # startup with "address already in use" and it looks like a harbor bug.
 unset PORT
-suites=${SUITES:-unit abi types sqllogic asserts spec fuzz differential deployment stress sessions resilience}
+suites=${SUITES:-unit abi types sqllogic asserts spec fuzz differential deployment stress sessions cancel resilience}
 
 bold=$(tput bold 2>/dev/null || true); red=$(tput setaf 1 2>/dev/null || true)
 green=$(tput setaf 2 2>/dev/null || true); dim=$(tput dim 2>/dev/null || true)
@@ -172,6 +172,10 @@ fi
 # use, and it ends by killing the server mid-transaction to check the WAL was
 # folded anyway.
 run sessions "$here/test/scripts/sessions.py"
+
+# So does cancel.py, and for a sharper reason: it saturates the worker pool on
+# purpose, which no suite may do to a server the other suites are sharing.
+run cancel "$here/test/scripts/cancel.py" --db "$db"
 
 run resilience "$here/test/scripts/resilience.sh" "$db"
 
