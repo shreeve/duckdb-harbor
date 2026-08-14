@@ -297,6 +297,8 @@ DuckDB answers the query; DuckDB Harbor's job is to stay out of the way. It
 sustains thousands of requests per second across concurrent clients on a
 laptop, with sub-millisecond overhead at low concurrency.
 
+**DuckDB v1.5.5**, eight workers:
+
 | clients | req/s | p50 | p95 | p99 | non-200 | wrong answers |
 |--:|--:|--:|--:|--:|--:|--:|
 | 1 | 3,269 | 0.20 ms | 0.58 ms | 0.74 ms | 0 | 0 |
@@ -307,6 +309,14 @@ Mean of five 10-second runs per level on an idle M-series laptop, 20% of
 requests being `INSERT`s, connections reused, throughput taken from wall-clock
 across the level rather than summed from per-request timings. Run-to-run spread
 was under 4% at every level.
+
+The engine version belongs beside the numbers, because it moves them. The same
+harbor build on **v2.0.0-alpha37626** gets roughly half this — 1,352 / 3,667 /
+4,739 req/s at the same three levels. That is not a debug build (it is *faster*
+than v1.5.5 at bulk compute) and it is not harbor: the alpha spends more per
+statement on binding, planning and commit, and harbor is one small statement per
+request, so it pays that on every one. Expect the gap to close as v2.0.0
+settles; until it does, measure against the engine you deploy.
 
 Every read in that run was checked against an answer taken from the database
 file before the server opened it — a benchmark whose oracle is the server it is

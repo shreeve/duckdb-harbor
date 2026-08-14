@@ -142,7 +142,24 @@
 
 set -euo pipefail
 
-mydir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# Follow symlinks to the real script before deciding where "here" is. The
+# documented install is `ln -s .../duckdb-harbor ~/bin/duckdb-harbor`, and
+# without this the extension search below looks for build/release-* beside the
+# LINK -- in ~/bin, where there is nothing -- rather than in the checkout. It
+# then falls through to whatever copy INSTALL once left in ~/.duckdb/extensions
+# and serves it without complaint, so a rebuilt tree keeps running the old
+# harbor and the only symptom is endpoints that 404. `readlink -f` would do
+# this in one line on Linux; this loop is here because macOS did not have it
+# until recently and a launcher that only works on new macOS is worse.
+self=${BASH_SOURCE[0]}
+while [[ -L $self ]]; do
+  link=$(readlink "$self")
+  case $link in
+    /*) self=$link ;;
+    *)  self=$(cd -- "$(dirname -- "$self")" && pwd)/$link ;;
+  esac
+done
+mydir=$(cd -- "$(dirname -- "$self")" && pwd)
 here=$(cd -- "$mydir/.." && pwd)
 
 # Nothing here needs a build tree. A downloaded release artifact sitting beside
