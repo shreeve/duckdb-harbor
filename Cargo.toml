@@ -1,6 +1,6 @@
 [package]
 name = "harbor"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2024"
 description = "HTTP /sql for DuckDB — SQL in, NDJSON out, no driver"
 license = "MIT"
