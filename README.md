@@ -32,13 +32,16 @@ One `schema` message, one `row` per row, one `end`. Rows go out as DuckDB
 produces them, so a client can start on row one while the server is still
 producing the last one.
 
-Six routes. That is the whole surface — two of them for queries, three so a
-transaction can outlive one request, one to stop a statement that is running:
+Seven routes. That is the whole surface — two of them for queries, three so a
+transaction can outlive one request, one to stop a statement that is running,
+one to read the schema without asking five questions:
 
 ```
 POST /sql                  run one statement, stream the result as NDJSON
                            (Accept: application/json for one document instead)
 GET  /ready                can this server answer a query? no credential required
+GET  /catalog              the whole schema — tables, keys, indexes, sequences —
+                           as one stable JSON document
 POST /sql/sessions/new     take a connection and hold it, for a transaction
 DELETE /sql/sessions/<id>  give it back
 GET  /sessions             what is holding one, and for how long
@@ -427,10 +430,6 @@ Harbor does not reimplement the other two — `quack` and `ui` are stock and
 unmodified.
 
 ## Known limitations
-
-**No query timeout and no cancellation.** A runaway query holds its worker
-until it finishes. Six of them and the server stops answering. This is the
-largest gap.
 
 **`TIME WITH TIME ZONE` loses its offset.** DuckDB's Arrow exporter discards it
 before DuckDB Harbor sees the value, so times at different offsets become

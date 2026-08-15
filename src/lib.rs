@@ -1592,7 +1592,7 @@ fn handle(
     };
 
     // Each arm reports the status it sent, so the log line below is written in
-    // one place instead of at all seven `respond` calls. The SQL text is not
+    // one place instead of at every `respond` call. The SQL text is not
     // logged: it is the request body, it can be enormous, and on this endpoint
     // it is as likely to hold customer data as anything else in the database.
     let (keep_going, status) = match (&method, path.as_str()) {
@@ -1662,6 +1662,20 @@ fn handle(
             } else {
                 let _ = req.respond(json_response(200, &sessions_report()));
                 (true, 200)
+            }
+        }
+        // The whole schema — tables, columns, keys, indexes, sequences — in
+        // one call, in one shape. It lives here so a migration differ asks a
+        // single question instead of five, and so the answer never depends on
+        // which DuckDB this binary links: the queries below use whatever the
+        // engine's catalog provides, and version differences die in this
+        // process rather than in every client.
+        (Method::Get, "/catalog") => {
+            if !authorized(&req, token) {
+                let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
+                (true, 401)
+            } else {
+                run_catalog(req, jobs)
             }
         }
         (Method::Post, "/sql") => {
@@ -2211,6 +2225,451 @@ fn sessions_report() -> String {
     }
     out.push_str("]}");
     out
+}
+
+// ---------------------------------------------------------------------------
+// GET /catalog
+// ---------------------------------------------------------------------------
+
+/// Why a catalog query could not answer. `Gone` is the executor being dead —
+/// the one condition the worker must act on (leave its accept loop, exactly
+/// as `run_sql` does) rather than merely report.
+enum CatalogFailure {
+    Refused(Refusal),
+    Gone,
+}
+
+/// Run one catalog query on this worker's own executor — the same connection
+/// and the same discipline as `/sql`, one bounded statement at a time — and
+/// hand back the rows parsed rather than streamed. The one-shot JSON shape is
+/// reused instead of a second reader being written: the executor already
+/// produces `{"ok":true,...,"data":[...]}`, and a catalog result is a few
+/// dozen rows, nowhere near the size that shape refuses.
+fn catalog_rows(
+    jobs: &mpsc::SyncSender<Job>,
+    sql: &str,
+) -> Result<Vec<Vec<serde_json::Value>>, CatalogFailure> {
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), Refusal>>(1);
+    let (body_tx, body_rx) = mpsc::sync_channel::<Vec<u8>>(BODY_QUEUE);
+    let job = Job {
+        sql: sql.to_string(),
+        params: Vec::new(),
+        shape: Shape::Json,
+        id: next_job_id(),
+        // The deployment default applies here as it does to any statement.
+        deadline: configured_statement_timeout().map(|t| Instant::now() + t),
+        reset: false,
+        ready: ready_tx,
+        body: body_tx,
+    };
+    if jobs.send(job).is_err() {
+        return Err(CatalogFailure::Gone);
+    }
+    let verdict = ready_rx.recv();
+    // Drain rather than drop, for the same reason `run_ready` does: a dropped
+    // receiver reads as a client that hung up mid-stream and costs a rollback.
+    let mut document = Vec::new();
+    while let Ok(chunk) = body_rx.recv() {
+        document.extend_from_slice(&chunk);
+    }
+    match verdict {
+        Ok(Ok(())) => {}
+        Ok(Err(refusal)) => return Err(CatalogFailure::Refused(refusal)),
+        Err(_) => return Err(CatalogFailure::Gone),
+    }
+    let doc: serde_json::Value = match serde_json::from_slice(&document) {
+        Ok(doc) => doc,
+        Err(e) => {
+            return Err(CatalogFailure::Refused(Refusal {
+                status: 500,
+                code: "internal",
+                message: format!("a catalog result did not parse: {e}"),
+            }));
+        }
+    };
+    let rows = doc.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+    Ok(rows.into_iter().map(|r| r.as_array().cloned().unwrap_or_default()).collect())
+}
+
+/// The failure paths every catalog query shares.
+fn catalog_refuse(req: Request, failure: CatalogFailure) -> (bool, u16) {
+    match failure {
+        CatalogFailure::Refused(r) => {
+            let _ = req.respond(error_response(r.status, r.code, &r.message));
+            (true, r.status)
+        }
+        CatalogFailure::Gone => {
+            let _ = req.respond(error_response(503, "unavailable", "harbor is shutting down"));
+            (false, 503)
+        }
+    }
+}
+
+// One cell out of a catalog row, by position. The queries below name their
+// columns, so a position is stable; a cell of the wrong type answers the
+// empty value rather than panicking on data a future engine might put there.
+
+fn cell_str(row: &[serde_json::Value], i: usize) -> String {
+    row.get(i).and_then(|v| v.as_str()).unwrap_or_default().to_string()
+}
+
+fn cell_opt_str(row: &[serde_json::Value], i: usize) -> Option<String> {
+    row.get(i).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+fn cell_bool(row: &[serde_json::Value], i: usize) -> bool {
+    row.get(i).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+fn cell_list(row: &[serde_json::Value], i: usize) -> Vec<String> {
+    row.get(i)
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// The column list of an index, recovered from duckdb_indexes()'
+/// `expressions` field.
+///
+/// Neither engine harbor targets exposes the list structurally: the field is
+/// the VARCHAR rendering of a LIST — `[email]`, `[title, user_id]`,
+/// `['(lower("name"))']` — so this undoes exactly that rendering. Items are
+/// comma-separated; an item that is anything beyond a plain identifier is
+/// single-quoted with `\'` and `\\` escapes. This is DuckDB's own
+/// machine-generated list syntax with fixed quoting rules, not prose, so
+/// undoing it is exact.
+fn index_columns(expressions: &str) -> Vec<String> {
+    let trimmed = expressions.trim();
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    let mut items = Vec::new();
+    let mut chars = inner.chars().peekable();
+    loop {
+        while matches!(chars.peek(), Some(' ') | Some(',')) {
+            chars.next();
+        }
+        let Some(&c) = chars.peek() else { break };
+        let mut item = String::new();
+        if c == '\'' {
+            chars.next();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '\\' => {
+                        if let Some(escaped) = chars.next() {
+                            item.push(escaped);
+                        }
+                    }
+                    '\'' => break,
+                    _ => item.push(ch),
+                }
+            }
+        } else {
+            while let Some(&ch) = chars.peek() {
+                if ch == ',' {
+                    break;
+                }
+                item.push(ch);
+                chars.next();
+            }
+            while item.ends_with(' ') {
+                item.pop();
+            }
+        }
+        items.push(item);
+    }
+    items
+}
+
+struct CatalogColumn {
+    name: String,
+    ty: String,
+    not_null: bool,
+    default: Option<String>,
+    primary: bool,
+}
+
+struct CatalogIndex {
+    name: String,
+    columns: Vec<String>,
+    unique: bool,
+}
+
+struct CatalogFk {
+    columns: Vec<String>,
+    ref_table: String,
+    ref_schema: String,
+    ref_columns: Vec<String>,
+}
+
+struct CatalogTable {
+    schema: String,
+    name: String,
+    columns: Vec<CatalogColumn>,
+    primary_key: Vec<String>,
+    indexes: Vec<CatalogIndex>,
+    foreign_keys: Vec<CatalogFk>,
+}
+
+/// `GET /catalog` — the complete schema shape a migration differ needs, as
+/// one stable JSON contract.
+///
+/// The contract is the deliverable. The queries below read whatever catalog
+/// functions the linked engine provides; what goes out never varies with the
+/// engine version, so a client diffing two schemas never has to know which
+/// DuckDB produced either of them. Every query names its columns — an engine
+/// that dropped one fails loudly here rather than silently shifting positions.
+///
+/// Foreign keys come from duckdb_constraints()' structured fields —
+/// constraint_column_names, referenced_table, referenced_column_names —
+/// never from parsing constraint_text prose; ending that parsing in clients
+/// is the reason this endpoint exists. The referenced schema is not a catalog
+/// field, and does not need to be one: DuckDB refuses to create a foreign key
+/// across schemas or catalogs, so the referenced table's schema is the
+/// referencing table's own.
+///
+/// Ordering is part of the contract: tables by (schema, name), columns in
+/// ordinal position, indexes and sequences by name, foreign keys by their
+/// referenced table and column lists. A stable database answers with
+/// byte-identical output.
+fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
+    // System and temp catalogs are excluded by anchoring every query to the
+    // served database: `system` and `temp` are separate databases, so
+    // current_database() never matches them.
+    let version_rows = match catalog_rows(jobs, "SELECT library_version FROM pragma_version()") {
+        Ok(rows) => rows,
+        Err(failure) => return catalog_refuse(req, failure),
+    };
+    let table_rows = match catalog_rows(
+        jobs,
+        "SELECT schema_name, table_name FROM duckdb_tables() \
+         WHERE database_name = current_database() AND NOT internal AND NOT temporary \
+         ORDER BY schema_name, table_name",
+    ) {
+        Ok(rows) => rows,
+        Err(failure) => return catalog_refuse(req, failure),
+    };
+    let column_rows = match catalog_rows(
+        jobs,
+        "SELECT schema_name, table_name, column_name, data_type, is_nullable, column_default \
+         FROM duckdb_columns() \
+         WHERE database_name = current_database() AND NOT internal \
+         ORDER BY schema_name, table_name, column_index",
+    ) {
+        Ok(rows) => rows,
+        Err(failure) => return catalog_refuse(req, failure),
+    };
+    let constraint_rows = match catalog_rows(
+        jobs,
+        "SELECT schema_name, table_name, constraint_type, constraint_column_names, \
+                referenced_table, referenced_column_names \
+         FROM duckdb_constraints() \
+         WHERE database_name = current_database() \
+           AND constraint_type IN ('PRIMARY KEY', 'FOREIGN KEY') \
+         ORDER BY schema_name, table_name, constraint_index",
+    ) {
+        Ok(rows) => rows,
+        Err(failure) => return catalog_refuse(req, failure),
+    };
+    // duckdb_indexes() lists only the indexes CREATE INDEX made; the internal
+    // ART indexes that implement PRIMARY KEY and UNIQUE column constraints are
+    // not in it, which is exactly the distinction the contract wants.
+    let index_rows = match catalog_rows(
+        jobs,
+        "SELECT schema_name, table_name, index_name, is_unique, expressions \
+         FROM duckdb_indexes() \
+         WHERE database_name = current_database() \
+         ORDER BY schema_name, table_name, index_name",
+    ) {
+        Ok(rows) => rows,
+        Err(failure) => return catalog_refuse(req, failure),
+    };
+    let sequence_rows = match catalog_rows(
+        jobs,
+        "SELECT sequence_name, start_value FROM duckdb_sequences() \
+         WHERE database_name = current_database() AND NOT temporary \
+         ORDER BY sequence_name",
+    ) {
+        Ok(rows) => rows,
+        Err(failure) => return catalog_refuse(req, failure),
+    };
+
+    let duckdb_version = version_rows.first().map(|r| cell_str(r, 0)).unwrap_or_default();
+
+    // Assembled in the order the queries delivered — every ORDER BY above is
+    // load-bearing — and looked up by (schema, name), never iterated from the
+    // map, so nothing about the output depends on hash order.
+    let mut tables: Vec<CatalogTable> = Vec::new();
+    let mut index_of: HashMap<(String, String), usize> = HashMap::new();
+    for row in &table_rows {
+        let schema = cell_str(row, 0);
+        let name = cell_str(row, 1);
+        index_of.insert((schema.clone(), name.clone()), tables.len());
+        tables.push(CatalogTable {
+            schema,
+            name,
+            columns: Vec::new(),
+            primary_key: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        });
+    }
+    for row in &column_rows {
+        let Some(&t) = index_of.get(&(cell_str(row, 0), cell_str(row, 1))) else { continue };
+        tables[t].columns.push(CatalogColumn {
+            name: cell_str(row, 2),
+            ty: cell_str(row, 3),
+            not_null: !cell_bool(row, 4),
+            default: cell_opt_str(row, 5),
+            primary: false,
+        });
+    }
+    for row in &constraint_rows {
+        let Some(&t) = index_of.get(&(cell_str(row, 0), cell_str(row, 1))) else { continue };
+        let columns = cell_list(row, 3);
+        match cell_str(row, 2).as_str() {
+            "PRIMARY KEY" => {
+                for column in tables[t].columns.iter_mut() {
+                    if columns.contains(&column.name) {
+                        column.primary = true;
+                    }
+                }
+                tables[t].primary_key = columns;
+            }
+            "FOREIGN KEY" => {
+                let ref_schema = tables[t].schema.clone();
+                tables[t].foreign_keys.push(CatalogFk {
+                    columns,
+                    ref_table: cell_str(row, 4),
+                    ref_schema,
+                    ref_columns: cell_list(row, 5),
+                });
+            }
+            _ => {}
+        }
+    }
+    for row in &index_rows {
+        let Some(&t) = index_of.get(&(cell_str(row, 0), cell_str(row, 1))) else { continue };
+        tables[t].indexes.push(CatalogIndex {
+            name: cell_str(row, 2),
+            columns: index_columns(&cell_str(row, 4)),
+            unique: cell_bool(row, 3),
+        });
+    }
+    for table in tables.iter_mut() {
+        // A foreign key has no name in this shape, so its position cannot be
+        // inherited from catalog storage order; pin it to what the entry says.
+        table.foreign_keys.sort_by(|a, b| {
+            (&a.ref_table, &a.columns, &a.ref_columns).cmp(&(&b.ref_table, &b.columns, &b.ref_columns))
+        });
+    }
+
+    let mut out = String::from("{\"harborVersion\":");
+    push_json_string(&mut out, env!("CARGO_PKG_VERSION"));
+    out.push_str(",\"duckdbVersion\":");
+    push_json_string(&mut out, &duckdb_version);
+    out.push_str(",\"tables\":[");
+    for (i, table) in tables.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"name\":");
+        push_json_string(&mut out, &table.name);
+        out.push_str(",\"schema\":");
+        push_json_string(&mut out, &table.schema);
+        out.push_str(",\"columns\":[");
+        for (j, column) in table.columns.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"name\":");
+            push_json_string(&mut out, &column.name);
+            out.push_str(",\"type\":");
+            push_json_string(&mut out, &column.ty);
+            out.push_str(",\"notNull\":");
+            out.push_str(if column.not_null { "true" } else { "false" });
+            out.push_str(",\"default\":");
+            match &column.default {
+                Some(expression) => push_json_string(&mut out, expression),
+                None => out.push_str("null"),
+            }
+            out.push_str(",\"primary\":");
+            out.push_str(if column.primary { "true" } else { "false" });
+            out.push('}');
+        }
+        out.push_str("],\"primaryKey\":[");
+        for (j, name) in table.primary_key.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            push_json_string(&mut out, name);
+        }
+        out.push_str("],\"indexes\":[");
+        for (j, index) in table.indexes.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"name\":");
+            push_json_string(&mut out, &index.name);
+            out.push_str(",\"columns\":[");
+            for (k, column) in index.columns.iter().enumerate() {
+                if k > 0 {
+                    out.push(',');
+                }
+                push_json_string(&mut out, column);
+            }
+            out.push_str("],\"unique\":");
+            out.push_str(if index.unique { "true" } else { "false" });
+            out.push('}');
+        }
+        out.push_str("],\"foreignKeys\":[");
+        for (j, fk) in table.foreign_keys.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"columns\":[");
+            for (k, column) in fk.columns.iter().enumerate() {
+                if k > 0 {
+                    out.push(',');
+                }
+                push_json_string(&mut out, column);
+            }
+            out.push_str("],\"refTable\":");
+            push_json_string(&mut out, &fk.ref_table);
+            out.push_str(",\"refSchema\":");
+            push_json_string(&mut out, &fk.ref_schema);
+            out.push_str(",\"refColumns\":[");
+            for (k, column) in fk.ref_columns.iter().enumerate() {
+                if k > 0 {
+                    out.push(',');
+                }
+                push_json_string(&mut out, column);
+            }
+            out.push_str("]}");
+        }
+        out.push_str("]}");
+    }
+    out.push_str("],\"sequences\":[");
+    for (i, row) in sequence_rows.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"name\":");
+        push_json_string(&mut out, &cell_str(row, 0));
+        out.push_str(",\"start\":");
+        // The executor already applied harbor's integer policy — bare within
+        // JSON's exact range, quoted past it — so the value re-emits as is.
+        match row.get(1) {
+            Some(value) => out.push_str(&value.to_string()),
+            None => out.push_str("null"),
+        }
+        out.push('}');
+    }
+    out.push_str("]}");
+
+    let _ = req.respond(json_response(200, &out));
+    (true, 200)
 }
 
 /// `GET /ready` — does the database actually answer?
@@ -3702,6 +4161,7 @@ static KEYWORDS: &[&str] = &[
 mod tests {
     use super::civil_from_days;
     use super::ensure_single_statement as one;
+    use super::index_columns;
     use super::varint_to_decimal;
     use super::{Cancel, SlotRun};
     use std::time::{Duration, Instant};
@@ -3911,6 +4371,23 @@ mod tests {
         ] {
             assert_eq!(varint_to_decimal(&hex(bytes)).as_deref(), Some(want), "for {bytes}");
         }
+    }
+
+    /// Every rendering here is what duckdb_indexes() actually produced for
+    /// these indexes, captured from a running engine rather than derived from
+    /// the format description. Plain columns are bare, anything beyond a
+    /// plain identifier is single-quoted with backslash escapes — including
+    /// quoted identifiers, which keep their double quotes.
+    #[test]
+    fn recovers_index_columns_from_the_expressions_rendering() {
+        assert_eq!(index_columns("[email]"), vec!["email"]);
+        assert_eq!(index_columns("[title, user_id]"), vec!["title", "user_id"]);
+        assert_eq!(index_columns(r#"['(lower("name"))']"#), vec![r#"(lower("name"))"#]);
+        assert_eq!(
+            index_columns(r#"['"a, b"', '"c\'d"', plain]"#),
+            vec![r#""a, b""#, r#""c'd""#, "plain"]
+        );
+        assert_eq!(index_columns("[]"), Vec::<String>::new());
     }
 
     /// Malformed input must return None so the caller can fall back, rather
