@@ -4,7 +4,8 @@
 Runs its own server, because it needs fixture databases the shared one does
 not have: one with the shapes a migration differ cares about — a foreign key,
 a compound of schemas, a sequence-backed primary key, a unique index and a
-plain one — and one with nothing in it at all.
+plain one, uniqueness declared inline and table-level — and one with nothing
+in it at all.
 
   test/scripts/catalog.py [--keep]
 
@@ -132,8 +133,14 @@ CREATE TABLE posts (
   title VARCHAR
 );
 CREATE INDEX idx_posts_title ON posts(title);
+CREATE TABLE memberships (
+  org_id INTEGER,
+  user_id INTEGER,
+  via VARCHAR UNIQUE,
+  UNIQUE (user_id, org_id)
+);
 CREATE SCHEMA app;
-CREATE TABLE app.tags (id INTEGER PRIMARY KEY, label VARCHAR);
+CREATE TABLE app.tags (id INTEGER PRIMARY KEY, label VARCHAR UNIQUE);
 CREATE TABLE app.post_tags (
   tag_id INTEGER REFERENCES app.tags(id),
   note VARCHAR
@@ -220,6 +227,7 @@ def run_fixture(base):
              {"name": "note", "type": "VARCHAR", "notNull": False, "default": None, "primary": False},
          ],
          "primaryKey": [],
+         "uniqueConstraints": [],
          "indexes": [],
          "foreignKeys": [
              {"columns": ["tag_id"], "refTable": "tags", "refSchema": "app", "refColumns": ["id"]},
@@ -230,6 +238,22 @@ def run_fixture(base):
              {"name": "label", "type": "VARCHAR", "notNull": False, "default": None, "primary": False},
          ],
          "primaryKey": ["id"],
+         "uniqueConstraints": [
+             {"columns": ["label"]},
+         ],
+         "indexes": [],
+         "foreignKeys": []},
+        {"name": "memberships", "schema": "main",
+         "columns": [
+             {"name": "org_id", "type": "INTEGER", "notNull": False, "default": None, "primary": False},
+             {"name": "user_id", "type": "INTEGER", "notNull": False, "default": None, "primary": False},
+             {"name": "via", "type": "VARCHAR", "notNull": False, "default": None, "primary": False},
+         ],
+         "primaryKey": [],
+         "uniqueConstraints": [
+             {"columns": ["user_id", "org_id"]},
+             {"columns": ["via"]},
+         ],
          "indexes": [],
          "foreignKeys": []},
         {"name": "posts", "schema": "main",
@@ -239,6 +263,7 @@ def run_fixture(base):
              {"name": "title", "type": "VARCHAR", "notNull": False, "default": None, "primary": False},
          ],
          "primaryKey": ["id"],
+         "uniqueConstraints": [],
          "indexes": [
              {"name": "idx_posts_title", "columns": ["title"], "unique": False},
          ],
@@ -252,6 +277,7 @@ def run_fixture(base):
              {"name": "name", "type": "VARCHAR", "notNull": False, "primary": False},
          ],
          "primaryKey": ["id"],
+         "uniqueConstraints": [],
          "indexes": [
              {"name": "idx_users_email", "columns": ["email"], "unique": True},
          ],
@@ -261,16 +287,38 @@ def run_fixture(base):
         got = next((t for t in doc["tables"] if (t["schema"], t["name"]) == (want["schema"], want["name"])), None)
         eq(f"{want['schema']}.{want['name']} answers its whole shape", want, got)
     eq("tables are ordered by (schema, name)",
-       [("app", "post_tags"), ("app", "tags"), ("main", "posts"), ("main", "users")],
+       [("app", "post_tags"), ("app", "tags"), ("main", "memberships"), ("main", "posts"), ("main", "users")],
        [(t["schema"], t["name"]) for t in doc["tables"]])
     eq("the sequence is there, with its start", [{"name": "users_seq", "start": 1}], doc["sequences"])
 
     # The point of the endpoint: the foreign key arrived from structured
     # catalog fields — table, schema and both column lists as JSON, with no
     # constraint prose anywhere in the document to parse.
-    fk = doc["tables"][2]["foreignKeys"][0]
+    fk = next(t for t in doc["tables"] if t["name"] == "posts")["foreignKeys"][0]
     eq("the fk names its referenced table structurally", ("users", "main", ["id"]),
        (fk["refTable"], fk["refSchema"], fk["refColumns"]))
+
+    # -----------------------------------------------------------------------
+    section("Uniqueness declared in the table, not just indexed on")
+    # -----------------------------------------------------------------------
+    # UNIQUE constraints are not indexes to duckdb_indexes(), so before this
+    # field existed a hand-written `CREATE TABLE (... UNIQUE)` schema read as
+    # having no uniqueness at all. Both spellings arrive structurally: inline
+    # on a column and table-level across two.
+    tables = {t["name"]: t for t in doc["tables"]}
+    eq("an inline UNIQUE arrives as a constraint",
+       [{"columns": ["label"]}], tables["tags"]["uniqueConstraints"])
+    # The composite keeps its declaration order — (user_id, org_id), which no
+    # alphabetizer would produce — while the list is sorted by column lists:
+    # the catalog stored the inline `via` constraint first, and it emits last.
+    eq("a composite UNIQUE keeps declaration order, in a sorted list",
+       [{"columns": ["user_id", "org_id"]}, {"columns": ["via"]}],
+       tables["memberships"]["uniqueConstraints"])
+    eq("a table whose uniqueness is an index keeps an empty list",
+       [], tables["users"]["uniqueConstraints"])
+    eq("primary keys never masquerade as unique constraints", [],
+       [u for t in doc["tables"] for u in t["uniqueConstraints"]
+        if set(u["columns"]) & set(t["primaryKey"])])
 
     # -----------------------------------------------------------------------
     section("Two calls, one answer")
@@ -290,6 +338,7 @@ def run_empty(base):
     eq("no sequences", [], doc.get("sequences"))
     eq("but the versions still say who answered", True,
        bool(doc.get("harborVersion")) and bool(doc.get("duckdbVersion")))
+    eq("and it too answers byte-identical documents", body, fetch(base, "/catalog")[1])
 
 
 def harbor_version():

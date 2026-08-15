@@ -2408,6 +2408,7 @@ struct CatalogTable {
     name: String,
     columns: Vec<CatalogColumn>,
     primary_key: Vec<String>,
+    unique_constraints: Vec<Vec<String>>,
     indexes: Vec<CatalogIndex>,
     foreign_keys: Vec<CatalogFk>,
 }
@@ -2429,10 +2430,19 @@ struct CatalogTable {
 /// across schemas or catalogs, so the referenced table's schema is the
 /// referencing table's own.
 ///
+/// Unique constraints come from the same structured fields: an inline
+/// `UNIQUE` on a column and a table-level `UNIQUE (a, b)` both arrive as
+/// `constraint_type = 'UNIQUE'` rows with constraint_column_names in
+/// declaration order. They are the uniqueness `duckdb_indexes()` cannot show
+/// — its list holds only what CREATE INDEX made — so without them a
+/// hand-written `CREATE TABLE (... UNIQUE)` schema reads as having no
+/// uniqueness at all. PRIMARY KEY is its own constraint type and its own
+/// field, and never appears here.
+///
 /// Ordering is part of the contract: tables by (schema, name), columns in
-/// ordinal position, indexes and sequences by name, foreign keys by their
-/// referenced table and column lists. A stable database answers with
-/// byte-identical output.
+/// ordinal position, indexes and sequences by name, unique constraints by
+/// their column lists, foreign keys by their referenced table and column
+/// lists. A stable database answers with byte-identical output.
 fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
     // System and temp catalogs are excluded by anchoring every query to the
     // served database: `system` and `temp` are separate databases, so
@@ -2466,7 +2476,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
                 referenced_table, referenced_column_names \
          FROM duckdb_constraints() \
          WHERE database_name = current_database() \
-           AND constraint_type IN ('PRIMARY KEY', 'FOREIGN KEY') \
+           AND constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY') \
          ORDER BY schema_name, table_name, constraint_index",
     ) {
         Ok(rows) => rows,
@@ -2474,7 +2484,8 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
     };
     // duckdb_indexes() lists only the indexes CREATE INDEX made; the internal
     // ART indexes that implement PRIMARY KEY and UNIQUE column constraints are
-    // not in it, which is exactly the distinction the contract wants.
+    // not in it, which is exactly the distinction the contract wants — that
+    // constraint-borne uniqueness travels in uniqueConstraints above, not here.
     let index_rows = match catalog_rows(
         jobs,
         "SELECT schema_name, table_name, index_name, is_unique, expressions \
@@ -2511,6 +2522,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
             name,
             columns: Vec::new(),
             primary_key: Vec::new(),
+            unique_constraints: Vec::new(),
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
         });
@@ -2537,6 +2549,9 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
                 }
                 tables[t].primary_key = columns;
             }
+            "UNIQUE" => {
+                tables[t].unique_constraints.push(columns);
+            }
             "FOREIGN KEY" => {
                 let ref_schema = tables[t].schema.clone();
                 tables[t].foreign_keys.push(CatalogFk {
@@ -2558,6 +2573,9 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         });
     }
     for table in tables.iter_mut() {
+        // A unique constraint has no name in this shape either, so the same
+        // rule: pin its position to its column list, never to storage order.
+        table.unique_constraints.sort();
         // A foreign key has no name in this shape, so its position cannot be
         // inherited from catalog storage order; pin it to what the entry says.
         table.foreign_keys.sort_by(|a, b| {
@@ -2604,6 +2622,20 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
                 out.push(',');
             }
             push_json_string(&mut out, name);
+        }
+        out.push_str("],\"uniqueConstraints\":[");
+        for (j, unique) in table.unique_constraints.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"columns\":[");
+            for (k, column) in unique.iter().enumerate() {
+                if k > 0 {
+                    out.push(',');
+                }
+                push_json_string(&mut out, column);
+            }
+            out.push_str("]}");
         }
         out.push_str("],\"indexes\":[");
         for (j, index) in table.indexes.iter().enumerate() {

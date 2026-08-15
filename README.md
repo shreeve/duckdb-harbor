@@ -40,8 +40,8 @@ one to read the schema without asking five questions:
 POST /sql                  run one statement, stream the result as NDJSON
                            (Accept: application/json for one document instead)
 GET  /ready                can this server answer a query? no credential required
-GET  /catalog              the whole schema — tables, keys, indexes, sequences —
-                           as one stable JSON document
+GET  /catalog              the whole schema — tables, keys, unique constraints,
+                           indexes, sequences — as one stable JSON document
 POST /sql/sessions/new     take a connection and hold it, for a transaction
 DELETE /sql/sessions/<id>  give it back
 GET  /sessions             what is holding one, and for how long
