@@ -371,8 +371,12 @@ serve/add/ls/stop/rm, the D3 registry (flock claim, json sidecar, token
 files, 2GB memory default), and SIGTERM drain+CHECKPOINT verified. Dual-
 target proof: spec, types, fuzz, cancel, sessions, catalog all PASS against
 the binary (suites gained the `HARBOR_LAUNCHER` axis); extension target
-still green. Remaining: `/info` endpoint, `--boot` units, `--attach`,
-`--idle-exit`, extension deletion, Makefile/CI targets.
+still green. → **Tail landed same day**: GET `/info` (auth, uptimeMs live,
+404-absence = version probe), `--attach` (cross-catalog joins proven),
+`--idle-exit` (D9 reaper: countable-request clock + lease guard; /ready
+does not count), `make binary/binary2/fleet-check`. Remaining: extension
+deletion + check.sh binary-default + MANUAL rewrite (the retirement
+ceremony), `--ui/--quack` flags, `--boot` units (Phase 3).
 Core moves to harbor-core (~90% verbatim); `harbor serve` (UDS+TCP, memory/
 thread defaults, `--attach`, `--ui/--quack`); `add/ls/stop/rm` + registry
 contract; `/info`; dual-target suite green (extension vs binary — the
