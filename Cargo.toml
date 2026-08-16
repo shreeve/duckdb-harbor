@@ -1,3 +1,11 @@
+# Workspace root. The extension package stays here (extension-ci-tools expects
+# it at the root) until the Phase 1 move to crates/harbor-ext; new fleet crates
+# grow under crates/. Spikes are standalone throwaways, outside the workspace.
+[workspace]
+members = ["crates/*"]
+exclude = ["spikes/uds", "spikes/bundled"]
+resolver = "2"
+
 [package]
 name = "harbor"
 version = "0.9.1"

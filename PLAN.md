@@ -334,8 +334,15 @@ retires. Old servers 404 on `/info`; clients degrade gracefully.
 **Phase 0 — spikes (de-risk before committing)**
 1. `duckdb-rs` bundled/lib-dir build against the 2.0-dev C API: port
    `emit_column_schema`/`emit_value` against 2.0 headers. *Biggest unknown.*
+   → **1.5.5 half PASSES** (spikes/bundled: embedded v1.5.5, try_clone
+   pooling, params, complex types; 40MB release binary). 2.0-dev linkage
+   still open — needs `DUCKDB_LIB_DIR` against our prebuilt static lib.
 2. tiny_http `Server::http_unix` + `unblock` graceful-shutdown behavior.
+   → **PASSES** (spikes/uds: binds, serves sequential requests, `unblock()`
+   releases a blocked `recv()` in ~65µs).
 3. Workspace feature-split build (`bundled` vs `loadable-extension`) in CI.
+   → workspace exists (root package + crates/*; spikes excluded); the split
+   lands with the harbor-ext move in Phase 1.
 
 **Phase 1 — the binary** (workspace refactor + fleet + serve)
 Core moves to harbor-core (~90% verbatim); `harbor serve` (UDS+TCP, memory/

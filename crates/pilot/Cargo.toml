@@ -1,0 +1,19 @@
+[package]
+name = "harbor-pilot"
+version = "0.1.0"
+edition = "2024"
+description = "pilot — the Harbor client: fleet-aware SQL over UDS and HTTP"
+license = "MIT"
+
+# Pure protocol client (PLAN.md D8): pilot never links DuckDB. HTTP/1.1 over
+# UnixStream/TcpStream is hand-rolled (~200 lines) because dragging an async
+# stack in for one request at a time buys nothing. https lands with ureq in
+# Phase 2 alongside the REPL.
+[dependencies]
+harbor-protocol = { path = "../harbor-protocol" }
+# preserve_order: --json rows must keep column order, not alphabetize it
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[[bin]]
+name = "pilot"
+path = "src/main.rs"

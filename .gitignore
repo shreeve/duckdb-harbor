@@ -12,3 +12,6 @@ build/
 # Python bytecode from the test harnesses in scripts/
 __pycache__/
 *.pyc
+
+# Spike crates build outside the workspace
+spikes/*/target/
