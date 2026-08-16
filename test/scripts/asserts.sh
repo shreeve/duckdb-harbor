@@ -38,12 +38,9 @@ if [[ ! -f "$src_db" ]]; then
   echo "asserts: no database at $src_db" >&2
   exit 2
 fi
-if [[ ! -x "$here/bin/duckdb-harbor" ]]; then
-  echo "asserts: $here/bin/duckdb-harbor is missing or not executable" >&2
-  exit 2
-fi
-if [[ ! -f "$here/build/release/harbor.duckdb_extension" ]]; then
-  echo "asserts: extension not built — run 'make release'" >&2
+launcher="${HARBOR_LAUNCHER:-$here/target/release/harbor serve}"
+if [[ ! -x "${launcher%% *}" ]]; then
+  echo "asserts: ${launcher%% *} is missing (cargo build -p harbor --release)" >&2
   exit 2
 fi
 
@@ -203,7 +200,7 @@ fi
 
 section "Startup"
 
-"$here/bin/duckdb-harbor" "$db" --port "$port" --token "$token" --workers 6 >"$log" 2>&1 &
+$launcher "$db" --port "$port" --token "$token" --workers 6 >"$log" 2>&1 &
 server_pid=$!
 
 up=0

@@ -1,8 +1,5 @@
 [package]
-# Package is harbor-bin until the root extension package (also named
-# "harbor") is deleted at the end of Phase 1 (PLAN.md D5); the binary users
-# run is `harbor` either way.
-name = "harbor-bin"
+name = "harbor"
 version = "0.10.0"
 edition = "2024"
 description = "harbor — DuckDB wearing a server: fleet manager + HTTP/UDS engine"

@@ -1,49 +1,11 @@
-# Workspace root. The extension package stays here (extension-ci-tools expects
-# it at the root) until the Phase 1 move to crates/harbor-ext; new fleet crates
-# grow under crates/. Spikes are standalone throwaways, outside the workspace.
+# Pure workspace: the extension retired (PLAN.md D5); everything lives in
+# crates/. Spikes are standalone throwaways, outside the workspace.
 [workspace]
 members = ["crates/*"]
-default-members = [".", "crates/harbor-protocol", "crates/pilot"]
+default-members = ["crates/harbor-protocol", "crates/pilot", "crates/harbor"]
 exclude = ["spikes"]
 resolver = "2"
-
-[package]
-name = "harbor"
-version = "0.9.1"
-edition = "2024"
-description = "HTTP /sql for DuckDB — SQL in, NDJSON out, no driver"
-license = "MIT"
-
-[lib]
-crate-type = ["cdylib"]
 
 [profile.release]
 lto = true
 strip = true
-
-[dependencies]
-# The `loadable-extension` feature builds against DuckDB's C extension API.
-# NOTE: it currently requires the UNSTABLE band, which pins the binary to one
-# DuckDB version — see "Known limitations" in README.md.
-duckdb = { version = "~1.10505.0", features = ["loadable-extension", "vtab"] }
-
-# HTTP server. Deliberately synchronous: harbor executes a small, bounded
-# number of queries at a time, so an async runtime inside DuckDB's process
-# would buy nothing and complicate shutdown — which is where the checkpoint
-# lives.
-tiny_http = "0.12"
-
-# The whole point of the extension: SQL in, NDJSON out. `serde` is here for
-# its Value type; harbor derives nothing.
-serde = "1"
-serde_json = "1"
-
-# Token minting. Pure Rust, so harbor does not link OpenSSL and does not need
-# `LOAD httpfs` the way the C++ version did.
-rand = "0.8"
-
-# SIGTERM is the difference between a checkpointed database and a WAL replay
-# on next open, so harbor has to see the signal rather than let the default
-# handler kill the process. Unix only; on Windows harbor_stop is the exit.
-[target.'cfg(unix)'.dependencies]
-signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }

@@ -2,7 +2,7 @@
 
 **Harbor becomes a single Rust binary** that starts, serves, and talks to DuckDB
 databases — fleet manager, HTTP/UDS server, and interactive CLI in one artifact.
-The extension build survives as a secondary artifact for co-residency. This plan
+The extension is retired (D5); the binary is the only artifact. This plan
 was produced from a three-seat internal design review (architecture, CLI/UX,
 protocol/deployment) grounded in the v0.9.1 source, MANUAL.md, and the DuckDB
 2.0-dev checkout.
@@ -368,7 +368,14 @@ retires. Old servers 404 on `/info`; clients degrade gracefully.
    lands with the harbor-ext move in Phase 1.
 
 **Phase 1 — the binary** (workspace refactor + fleet + serve)
-→ **Core landed 2026-08-16.** harbor-core extracted verbatim (4.1k lines,
+→ **COMPLETE 2026-08-16.** The retirement is done: `src/` (extension),
+`extension-ci-tools/`, the bash launcher, and the extension-only suites
+(abi, sqllogic, differential, release) are deleted; the workspace is pure
+(`harbor`, `harbor-core`, `harbor-protocol`, `harbor-pilot`); `make check`
+boots the binary (2.0 channel preferred via `HARBOR_LAUNCHER`, bundled
+fallback); `--init` replaced the planned `--ui/--quack` (one flag, any
+extension); resilience.sh is parked for a Phase 2 rebuild (it tested the
+retired launcher's REPL — pilot's job now). Earlier landing notes: harbor-core extracted verbatim (4.1k lines,
 compiles clean, UDS listener added); `harbor` binary serves both channels
 (bundled 1.5.5: 33MB; linked 2.0-dev: 1.8MB + dylib) with
 serve/add/ls/stop/rm, the D3 registry (flock claim, json sidecar, token

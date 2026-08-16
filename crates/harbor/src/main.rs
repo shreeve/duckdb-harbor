@@ -74,6 +74,8 @@ serve/add options:
   --threads <n>       DuckDB threads (default: DuckDB's own)
   --idle-exit <d>     drain, CHECKPOINT and exit after <d> (e.g. 90s, 10m) with
                       no requests and no live sessions (D9 ephemeral berths)
+  --init <sql>        run SQL at boot, before serving (repeatable) — the door
+                      for extensions: --init 'LOAD ui; CALL start_ui_server()'
   --log               log requests to stderr
 ";
 
@@ -88,6 +90,7 @@ struct Opts {
     memory_limit: String,
     threads: Option<u32>,
     idle_exit: Option<Duration>,
+    init: Vec<String>,
     log: bool,
 }
 
@@ -118,6 +121,7 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
         memory_limit: "2GB".into(),
         threads: None,
         idle_exit: None,
+        init: Vec::new(),
         log: false,
     };
     let mut named: Option<String> = None;
@@ -133,6 +137,7 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
             "--memory-limit" => o.memory_limit = take("memory-limit")?,
             "--threads" => o.threads = Some(take("threads")?.parse().map_err(|_| "bad --threads")?),
             "--idle-exit" => o.idle_exit = Some(parse_duration(&take("idle-exit")?)?),
+            "--init" => o.init.push(take("init")?),
             "--log" => o.log = true,
             _ if db.is_none() && !a.starts_with('-') => db = Some(PathBuf::from(a)),
             other => return Err(format!("unexpected argument: {other}")),
@@ -233,6 +238,13 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
     let duckdb_version: String = con
         .query_row("SELECT version()", [], |r| r.get(0))
         .map_err(|e| format!("version: {e}"))?;
+    // Boot SQL runs on the control connection before the pool forms, so its
+    // effects (LOAD ui, settings, secrets) are instance-wide and in place
+    // before the first request. This one flag is the whole extension story:
+    // ui, quack, httpfs — harbor stays agnostic about all of them.
+    for sql in &o.init {
+        con.execute_batch(sql).map_err(|e| format!("--init {sql:?}: {e}"))?;
+    }
     harbor_core::open_pool(con)?;
 
     let listen = match o.port {

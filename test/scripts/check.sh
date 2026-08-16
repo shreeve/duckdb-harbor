@@ -44,7 +44,7 @@ token=${TOKEN:-check-$$}
 # port this runner has already given to the shared server — the run dies at
 # startup with "address already in use" and it looks like a harbor bug.
 unset PORT
-suites=${SUITES:-unit abi types sqllogic asserts spec fuzz differential deployment stress catalog sessions cancel resilience}
+suites=${SUITES:-unit types asserts spec fuzz deployment stress catalog sessions cancel}
 
 bold=$(tput bold 2>/dev/null || true); red=$(tput setaf 1 2>/dev/null || true)
 green=$(tput setaf 2 2>/dev/null || true); dim=$(tput dim 2>/dev/null || true)
@@ -85,11 +85,6 @@ skip() { skipped+=("$1"); printf '%s— %s skipped: %s%s\n' "$dim" "$1" "$2" "$o
 # ---------------------------------------------------------------------------
 
 run unit     cargo test --release
-# Reads the built artifact rather than a running server: the ABI stamp decides
-# which DuckDB versions will load it at all, and nothing else here looks at it.
-run abi      "$here/test/scripts/abi.sh"
-
-run sqllogic make -C "$here" test_release
 
 # ---------------------------------------------------------------------------
 # One server, shared by the read-only HTTP suites, on its own copy
@@ -102,7 +97,9 @@ done
 
 if (( needs_server )); then
   cp "$db" "$work/check.duckdb"
-  "$here/bin/duckdb-harbor" "$work/check.duckdb" --port "$port" --token "$token" --workers 8 \
+  launcher="${HARBOR_LAUNCHER:-$here/target/release/harbor serve}"
+  ${launcher%% *} --help >/dev/null 2>&1 || cargo build -p harbor --release
+  $launcher "$work/check.duckdb" --port "$port" --token "$token" --workers 8 \
       >"$work/server.log" 2>&1 &
   server_pid=$!
   up=0
@@ -159,15 +156,6 @@ run stress "$here/test/scripts/stress.py" --port "$port" --token "$token" \
 # The suites that manage their own servers
 # ---------------------------------------------------------------------------
 
-if [[ " $suites " == *" differential "* ]]; then
-  old_ext=${OLD_EXT:-$here/../duckdb-harbor-v1/build/release/extension/harbor/harbor.duckdb_extension}
-  if [[ -f "$old_ext" ]]; then
-    run differential "$here/test/scripts/differential.sh" "$db"
-  else
-    skip differential "the v1 harbor is not built at $old_ext (set OLD_EXT=...)"
-  fi
-fi
-
 # catalog.py runs its own servers: the shapes it asserts — a foreign key, a
 # second schema, a sequence-backed pk, an empty database — are not in the
 # shared fixture, and proving byte-stable output wants a database nothing
@@ -182,8 +170,6 @@ run sessions "$here/test/scripts/sessions.py"
 # So does cancel.py, and for a sharper reason: it saturates the worker pool on
 # purpose, which no suite may do to a server the other suites are sharing.
 run cancel "$here/test/scripts/cancel.py" --db "$db"
-
-run resilience "$here/test/scripts/resilience.sh" "$db"
 
 # ---------------------------------------------------------------------------
 
