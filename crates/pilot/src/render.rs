@@ -201,7 +201,7 @@ impl<'a> Renderer<'a> {
         // Column widths from what will be shown, capped; values truncate.
         const MAX_COL: usize = 40;
         let ncols = self.columns.len();
-        let mut widths: Vec<usize> = (0..ncols)
+        let widths: Vec<usize> = (0..ncols)
             .map(|i| {
                 let mut w = display_width(&self.columns[i]);
                 if g.type_row {
@@ -333,9 +333,35 @@ impl<'a> Renderer<'a> {
             out.push_str(&dim(&note));
             out.push('\n');
         }
-        print!("{out}");
-        let _ = std::io::stdout().flush();
+        deliver(out);
     }
+}
+
+/// Boxed output taller than the terminal pages through $PAGER (default
+/// `less -SRFX`: -S no-wrap since widths already fit, -F quit-if-one-screen).
+/// Streaming modes never page — they already left the building.
+fn deliver(out: String) {
+    let term_h = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(40);
+    let tall = out.lines().count() + 2 > term_h;
+    if tall && std::io::stdout().is_terminal() {
+        let pager = std::env::var("PAGER").unwrap_or_else(|_| "less -SRFX".into());
+        let mut parts = pager.split_whitespace();
+        if let Some(cmd) = parts.next() {
+            let mut child = std::process::Command::new(cmd)
+                .args(parts)
+                .stdin(std::process::Stdio::piped())
+                .spawn();
+            if let Ok(ref mut c) = child {
+                if let Some(stdin) = c.stdin.as_mut() {
+                    let _ = stdin.write_all(out.as_bytes());
+                }
+                let _ = c.wait();
+                return;
+            }
+        }
+    }
+    print!("{out}");
+    let _ = std::io::stdout().flush();
 }
 
 struct Glyphs {

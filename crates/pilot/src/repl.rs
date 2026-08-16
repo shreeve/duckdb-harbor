@@ -6,7 +6,8 @@
 use reedline::{
     ColumnarMenu, DefaultHinter, Emacs, FileBackedHistory, KeyCode, KeyModifiers, MenuBuilder,
     Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline,
-    ReedlineEvent, ReedlineMenu, Signal, ValidationResult, Validator, default_emacs_keybindings,
+    ReedlineEvent, ReedlineMenu, Signal, ValidationResult, Validator, Vi,
+    default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
 };
 use std::borrow::Cow;
 
@@ -139,31 +140,54 @@ pub fn statement_complete(buf: &str) -> bool {
     last_code_byte == b';'
 }
 
-pub fn run(conn: &Conn, name: &str) -> std::process::ExitCode {
-    let history = crate::http::harbor_home().join("history");
+fn make_editor(conn: &Conn, vi: bool) -> Reedline {
     // Tab opens the completion menu, then cycles it (PLAN.md lanes A/B/C).
-    let mut keybindings = default_emacs_keybindings();
-    keybindings.add_binding(
-        KeyModifiers::NONE,
-        KeyCode::Tab,
-        ReedlineEvent::UntilFound(vec![
-            ReedlineEvent::Menu("completion_menu".to_string()),
-            ReedlineEvent::MenuNext,
-        ]),
-    );
+    let tab = ReedlineEvent::UntilFound(vec![
+        ReedlineEvent::Menu("completion_menu".to_string()),
+        ReedlineEvent::MenuNext,
+    ]);
+    let edit_mode: Box<dyn reedline::EditMode> = if vi {
+        let mut insert = default_vi_insert_keybindings();
+        insert.add_binding(KeyModifiers::NONE, KeyCode::Tab, tab);
+        Box::new(Vi::new(insert, default_vi_normal_keybindings()))
+    } else {
+        let mut kb = default_emacs_keybindings();
+        kb.add_binding(KeyModifiers::NONE, KeyCode::Tab, tab);
+        Box::new(Emacs::new(kb))
+    };
     let menu = ColumnarMenu::default().with_name("completion_menu");
-    let mut line_editor = Reedline::create()
+    let history = crate::http::harbor_home().join("history");
+    Reedline::create()
         .with_validator(Box::new(SqlValidator))
         .with_highlighter(Box::new(crate::highlight::SqlHighlighter))
         .with_hinter(Box::new(DefaultHinter::default()))
         .with_completer(Box::new(crate::complete::SqlCompleter::new(conn.clone())))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
-        .with_edit_mode(Box::new(Emacs::new(keybindings)))
+        .with_edit_mode(edit_mode)
         .with_history(Box::new(
             FileBackedHistory::with_file(1000, history).expect("history file"),
-        ));
-    let prompt = BerthPrompt { name: name.to_string() };
+        ))
+}
+
+pub fn run(conn: &Conn, name: &str) -> std::process::ExitCode {
+    let mut conn = conn.clone();
+    let mut vi = false;
+    let mut line_editor = make_editor(&conn, vi);
+    let mut prompt = BerthPrompt { name: name.to_string() };
     let mut opts = RenderOpts::default();
+    let d = crate::config::load().defaults;
+    if let Some(m) = d.mode.as_deref().and_then(Mode::parse) {
+        opts.mode = m;
+    }
+    if let Some(t) = d.timer {
+        opts.timer = t;
+    }
+    if let Some(n) = d.maxrows {
+        opts.max_rows = n;
+    }
+    if let Some(nv) = d.nullvalue {
+        opts.null = nv;
+    }
     eprintln!("pilot: connected to {name} (.help for help, .quit to leave)");
 
     loop {
@@ -174,16 +198,36 @@ pub fn run(conn: &Conn, name: &str) -> std::process::ExitCode {
                     continue;
                 }
                 if let Some(cmd) = stmt.strip_prefix('.') {
-                    match dot_command(cmd, conn, &mut opts) {
+                    match dot_command(cmd, &conn, &mut opts) {
                         DotResult::Quit => return std::process::ExitCode::SUCCESS,
                         DotResult::Handled => continue,
+                        DotResult::Open(target) => {
+                            match crate::resolve(&target, None) {
+                                Ok(c) => {
+                                    conn = c;
+                                    prompt = BerthPrompt { name: target.clone() };
+                                    line_editor = make_editor(&conn, vi);
+                                    eprintln!("pilot: connected to {target}");
+                                }
+                                Err(e) => eprintln!("pilot: {e}"),
+                            }
+                            continue;
+                        }
+                        DotResult::Keymode(v) => {
+                            vi = v;
+                            line_editor = make_editor(&conn, vi);
+                            eprintln!("pilot: {} keybindings", if vi { "vi" } else { "emacs" });
+                            continue;
+                        }
                     }
                 }
                 // One statement per request is the protocol's rule; the
-                // trailing terminator is ours to strip.
-                let stmt = stmt.trim_end_matches(';').trim();
-                if !stmt.is_empty() {
-                    let _ = run_sql(conn, stmt, &opts);
+                // trailing terminator is ours to strip. Multi-statement
+                // buffers split at terminators outside strings/comments.
+                for stmt in split_statements(stmt) {
+                    if run_sql(&conn, &stmt, &opts) != std::process::ExitCode::SUCCESS {
+                        break;
+                    }
                 }
             }
             Ok(Signal::CtrlC) => continue, // clear the line, keep the REPL
@@ -197,15 +241,116 @@ pub fn run(conn: &Conn, name: &str) -> std::process::ExitCode {
     }
 }
 
+/// Split a buffer at `;` terminators outside strings, comments, and
+/// dollar-quotes — the scanner statement_complete uses, applied cutwise.
+pub fn split_statements(buf: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let b = buf.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\'' | b'"' => {
+                let q = b[i];
+                i += 1;
+                while i < b.len() {
+                    if b[i] == q {
+                        if i + 1 < b.len() && b[i + 1] == q {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'$' => {
+                let s0 = i;
+                let mut j = i + 1;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    j += 1;
+                }
+                if j < b.len() && b[j] == b'$' {
+                    let tag = &buf[s0..=j];
+                    if let Some(pos) = buf[j + 1..].find(tag) {
+                        i = j + pos + tag.len();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
+                let mut depth = 1;
+                i += 2;
+                while i < b.len() && depth > 0 {
+                    if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'*' {
+                        depth += 1;
+                        i += 2;
+                    } else if i + 1 < b.len() && b[i] == b'*' && b[i + 1] == b'/' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            b';' => {
+                let stmt = buf[start..i].trim();
+                if !stmt.is_empty() {
+                    out.push(stmt.to_string());
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let last = buf[start.min(buf.len())..].trim();
+    if !last.is_empty() {
+        out.push(last.to_string());
+    }
+    out
+}
+
 enum DotResult {
     Quit,
     Handled,
+    Open(String),
+    Keymode(bool),
 }
 
 fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
     let mut parts = cmd.split_whitespace();
     match parts.next().unwrap_or("") {
         "quit" | "exit" | "q" => return DotResult::Quit,
+        "open" => match parts.next() {
+            Some(t) => return DotResult::Open(t.to_string()),
+            None => eprintln!("pilot: .open <berth|path|url>"),
+        },
+        "keymode" => match parts.next() {
+            Some("vi") => return DotResult::Keymode(true),
+            Some("emacs") => return DotResult::Keymode(false),
+            _ => eprintln!("pilot: .keymode vi|emacs"),
+        },
+        "read" => match parts.next() {
+            Some(f) => match std::fs::read_to_string(crate::config::expand(f)) {
+                Ok(text) => {
+                    for stmt in split_statements(&text) {
+                        if run_sql(conn, &stmt, opts) != std::process::ExitCode::SUCCESS {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => eprintln!("pilot: .read {f}: {e}"),
+            },
+            None => eprintln!("pilot: .read <file.sql>"),
+        },
         "databases" | "db" => {
             let _ = crate::list_fleet();
         }
@@ -251,6 +396,9 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
                 "  .tables           SHOW TABLES\n",
                 "  .schema [t]       CREATE statements, one table or all\n",
                 "  .databases        the live fleet\n",
+                "  .open <target>    switch berth (name, path, url)\n",
+                "  .read <file.sql>  run a script, statement by statement\n",
+                "  .keymode vi|emacs keybindings (default emacs)\n",
                 "  .help  .quit      this text; leave (Ctrl-D too)\n",
                 "  statements end with ;   Ctrl-C clears the line\n",
             ));
@@ -264,7 +412,19 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
 
 #[cfg(test)]
 mod tests {
-    use super::statement_complete;
+    use super::{split_statements, statement_complete};
+
+    #[test]
+    fn splitter_respects_quoting() {
+        assert_eq!(split_statements("select 1; select 2;"), vec!["select 1", "select 2"]);
+        assert_eq!(split_statements("select ';'; select 2"), vec!["select ';'", "select 2"]);
+        assert_eq!(split_statements("select $$a;b$$"), vec!["select $$a;b$$"]);
+        assert_eq!(
+            split_statements("-- c;\nselect 1 /* ; */; select \"a;b\""),
+            vec!["-- c;\nselect 1 /* ; */", "select \"a;b\""]
+        );
+        assert!(split_statements("  ;  ; ").is_empty());
+    }
 
     #[test]
     fn terminator_rules() {

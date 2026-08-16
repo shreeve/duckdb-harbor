@@ -125,17 +125,25 @@ pilot — the Harbor client
 
 usage:
   pilot                        list live berths in ~/.harbor
+  pilot <target>               interactive REPL (highlighting, Tab completion)
   pilot <target> -c \"SQL\"      run one statement
   echo \"SQL\" | pilot <target>  same, from stdin
 
 target:
-  name                         a live berth: ~/.harbor/<name>.sock (+ <name>.token)
+  name                         a config.toml entry, else a live berth:
+                               ~/.harbor/<name>.sock (+ <name>.token)
+  path/to.duckdb               join the owning berth, or summon one (idle-exit)
   path/to.sock                 a harbor unix socket
   http://host:port             a harbor TCP listener
 
 options:
   --token <t>                  bearer token (else HARBOR_TOKEN, else <name>.token)
-  --json                       one JSON object per row instead of a table
+  --mode <m>                   duckbox, markdown, csv, json, jsonlines, line, list
+  --json                       shorthand for --mode jsonlines
+
+config: $HARBOR_HOME/config.toml ([defaults] mode/timer/maxrows/nullvalue,
+[connection.<name>] url|path + token-file|token-cmd). Remote TLS is Caddy's
+job (PLAN.md D6); ssh is the human path to a remote berth.
 ";
 
 /// Resolution order (D9/D10a): config.toml name -> live berth name ->
@@ -333,10 +341,20 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> ExitCode {
     .expect("request serializes");
     let fire_cancel = {
         let fired = AtomicBool::new(false);
+        let spun = AtomicU64::new(0);
         let conn = conn.clone();
         let qid = qid.clone();
         move || {
+            // The spinner rides the same ticks as cancellation: half-second
+            // updates on stderr, only at a terminal, erased when data lands.
+            if std::io::stderr().is_terminal() {
+                let halves = wall.elapsed().as_millis() as u64 / 500;
+                if halves > spun.swap(halves, Ordering::Relaxed) {
+                    eprint!("\r\x1b[2K… running {:.1}s (Ctrl-C cancels)", wall.elapsed().as_secs_f32());
+                }
+            }
             if CANCEL.swap(false, Ordering::Relaxed) && !fired.swap(true, Ordering::Relaxed) {
+                eprint!("\r\x1b[2K");
                 eprintln!("Interrupted — cancelling…");
                 let _ = http::request(
                     &conn.transport,
@@ -370,6 +388,9 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> ExitCode {
 
     // Stream the envelope through the renderer: pipe modes emit per row,
     // boxed modes retain O(display) and draw after `end` (render.rs).
+    if std::io::stderr().is_terminal() {
+        eprint!("\r\x1b[2K"); // clear any spinner remnant
+    }
     let mut renderer = Renderer::new(opts);
     let mut body = resp.body;
     let mut line = String::new();
