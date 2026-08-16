@@ -11,7 +11,9 @@
 //!
 //! <target> = berth name | socket path | http://host:port
 
+mod highlight;
 mod http;
+mod keywords;
 mod repl;
 
 use harbor_protocol::{Event, SqlRequest, endpoint};

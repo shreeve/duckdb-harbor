@@ -11,6 +11,7 @@ license = "MIT"
 # Phase 2 alongside the REPL.
 [dependencies]
 harbor-protocol = { path = "../harbor-protocol" }
+nu-ansi-term = "0.50.3"
 reedline = "0.50.0"
 # preserve_order: --json rows must keep column order, not alphabetize it
 serde_json = { version = "1", features = ["preserve_order"] }

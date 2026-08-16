@@ -141,6 +141,7 @@ pub fn run(conn: &Conn, name: &str) -> std::process::ExitCode {
     let history = crate::http::harbor_home().join("history");
     let mut line_editor = Reedline::create()
         .with_validator(Box::new(SqlValidator))
+        .with_highlighter(Box::new(crate::highlight::SqlHighlighter))
         .with_hinter(Box::new(DefaultHinter::default()))
         .with_history(Box::new(
             FileBackedHistory::with_file(1000, history).expect("history file"),

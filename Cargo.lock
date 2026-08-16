@@ -637,6 +637,7 @@ name = "harbor-pilot"
 version = "0.1.0"
 dependencies = [
  "harbor-protocol",
+ "nu-ansi-term",
  "reedline",
  "serde_json",
 ]
