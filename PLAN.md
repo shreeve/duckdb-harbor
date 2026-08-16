@@ -103,7 +103,9 @@ The CLI never needs libduckdb — it speaks the protocol. Split along linkage:
 `harbor` = `serve` (the only subcommand linking DuckDB) + fleet verbs
 (`add/ls/stop/rm/doctor`: filesystem, spawning, HTTP probes). `pilot` = REPL +
 one-shot `pilot sql`, connecting by berth name (via `~/.harbor/`), socket
-path, or `https://` URL through Caddy. Consequences: pilot is ~3–5MB,
+path, or `http://` on a trusted network. **Pilot is TLS-free by design
+(decided 2026-08-16): https/edge auth is Caddy's job for browser and app
+clients; a human with pilot reaches a remote host over ssh.** Consequences: pilot is ~3–5MB,
 installs on machines that never host a database, and is **DuckDB-version-
 agnostic** — one client for a mixed 1.5.5/2.0 fleet, while each harbor build
 pins one engine. Precedent: `psql`/`postgres`, `redis-cli`/`redis-server`.

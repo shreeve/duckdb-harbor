@@ -12,6 +12,7 @@
 //! <target> = berth name | socket path | http://host:port
 
 mod complete;
+mod config;
 mod render;
 mod highlight;
 mod http;
@@ -91,6 +92,19 @@ fn main() -> ExitCode {
     };
 
     let mut opts = RenderOpts::default();
+    let d = config::load().defaults;
+    if let Some(m) = d.mode.as_deref().and_then(Mode::parse) {
+        opts.mode = m;
+    }
+    if let Some(t) = d.timer {
+        opts.timer = t;
+    }
+    if let Some(n) = d.maxrows {
+        opts.max_rows = n;
+    }
+    if let Some(nv) = d.nullvalue {
+        opts.null = nv;
+    }
     if json {
         opts.mode = Mode::JsonLines;
     }
@@ -124,24 +138,39 @@ options:
   --json                       one JSON object per row instead of a table
 ";
 
-/// Zero-config resolution (D9/D10a order, sans config file for now):
-/// live berth name → registry socket; *.sock path → socket; http:// → TCP.
+/// Resolution order (D9/D10a): config.toml name -> live berth name ->
+/// http(s) url -> .duckdb path (join-or-spawn) -> socket path. Zero-config
+/// local always works; the config is purely additive.
 fn resolve(target: &str, flag_token: Option<String>) -> Result<Conn, String> {
     let env_token = std::env::var("HARBOR_TOKEN").ok();
+    let cfg = config::load();
 
-    if let Some(rest) = target.strip_prefix("http://") {
-        let (addr, extra) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
-        if !extra.is_empty() {
-            return Err("path-prefixed URLs arrive with the config address book; use host:port".into());
+    // Explicit config entry shadows a same-named live berth (ssh_config rule).
+    if let Some(entry) = cfg.connection.get(target) {
+        let home = http::harbor_home();
+        if home.join(format!("{target}.sock")).exists() {
+            eprintln!("pilot: config entry {target:?} shadows a live local berth of the same name");
         }
-        let addr = if addr.contains(':') { addr.to_string() } else { format!("{addr}:9495") };
-        return Ok(Conn { transport: Transport::Tcp(addr), token: flag_token.or(env_token) });
+        let token = flag_token.or(env_token).or_else(|| entry.resolve_token());
+        if let Some(url) = &entry.url {
+            return Ok(Conn { transport: url_transport(url)?, token });
+        }
+        if let Some(path) = &entry.path {
+            let idle = entry.idle_exit.as_deref().unwrap_or("90s");
+            let (sock, file_token) = ensure_berth(&config::expand(path), idle)?;
+            return Ok(Conn { transport: Transport::Unix(sock), token: token.or(file_token) });
+        }
+        return Err(format!("config entry {target:?} has neither url nor path"));
     }
-    if target.starts_with("https://") {
-        return Err("https targets land in Phase 2 (ureq); front a socket with Caddy and use http:// or a name".into());
+
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return Ok(Conn { transport: url_transport(target)?, token: flag_token.or(env_token) });
     }
     if target.ends_with(".duckdb") {
-        return Err("spawn-on-demand (PLAN.md D9) needs `harbor serve` — coming with the harbor binary".into());
+        // D9: summon the owner. A second pilot on the same file joins the
+        // same berth instead of "database is locked".
+        let (sock, file_token) = ensure_berth(std::path::Path::new(target), "90s")?;
+        return Ok(Conn { transport: Transport::Unix(sock), token: flag_token.or(env_token).or(file_token) });
     }
 
     let sock: PathBuf;
@@ -163,6 +192,84 @@ fn resolve(target: &str, flag_token: Option<String>) -> Result<Conn, String> {
             .map(|t| t.trim().to_string());
     }
     Ok(Conn { transport: Transport::Unix(sock), token: flag_token.or(env_token).or(file_token) })
+}
+
+fn url_transport(url: &str) -> Result<Transport, String> {
+    if let Some(rest) = url.strip_prefix("http://") {
+        let (addr, extra) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
+        if !extra.is_empty() {
+            return Err("path-prefixed http targets are not supported; use https via Caddy or host:port".into());
+        }
+        let addr = if addr.contains(':') { addr.to_string() } else { format!("{addr}:9495") };
+        return Ok(Transport::Tcp(addr));
+    }
+    if url.starts_with("https://") {
+        return Err(
+            "TLS is Caddy's job, not pilot's (PLAN.md D6): pilot stays TLS-free by design. \
+             Use http:// on a trusted network, or ssh to the host and use the socket"
+                .into(),
+        );
+    }
+    Err(format!("not a url: {url}"))
+}
+
+/// Join the live berth that owns this file, or exec `harbor` to summon an
+/// ephemeral one (idle-exit reaps it; see PLAN.md D9). Returns socket + the
+/// berth's token, if readable.
+fn ensure_berth(path: &std::path::Path, idle_exit: &str) -> Result<(PathBuf, Option<String>), String> {
+    let home = http::harbor_home();
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+    // Already owned? The sidecar json says which berth claims this file.
+    if let Ok(rd) = std::fs::read_dir(&home) {
+        for e in rd.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.extension().is_none_or(|x| x != "json") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&p) else { continue };
+            let Ok(j) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+            if j["db"].as_str() == Some(&canon.display().to_string()) {
+                if let Some(name) = j["name"].as_str() {
+                    let sock = home.join(format!("{name}.sock"));
+                    if sock.exists() {
+                        let tok = std::fs::read_to_string(home.join(format!("{name}.token")))
+                            .ok()
+                            .map(|t| t.trim().to_string());
+                        return Ok((sock, tok));
+                    }
+                }
+            }
+        }
+    }
+
+    // Summon. Pilot never links DuckDB: the owner is the harbor binary.
+    let name: String = canon
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '-' })
+        .collect();
+    if name.is_empty() {
+        return Err(format!("cannot derive a berth name from {}", path.display()));
+    }
+    let harbor = std::env::var("HARBOR_BIN").unwrap_or_else(|_| "harbor".to_string());
+    eprintln!("pilot: summoning a berth for {} (idle-exit {idle_exit})", canon.display());
+    let status = std::process::Command::new(&harbor)
+        .args(["add"])
+        .arg(&canon)
+        .args(["--name", &name, "--idle-exit", idle_exit])
+        .status()
+        .map_err(|e| format!("cannot run {harbor:?} (is harbor installed?): {e}"))?;
+    if !status.success() {
+        return Err(format!("harbor add failed for {}", canon.display()));
+    }
+    let sock = home.join(format!("{name}.sock"));
+    let tok = std::fs::read_to_string(home.join(format!("{name}.token")))
+        .ok()
+        .map(|t| t.trim().to_string());
+    Ok((sock, tok))
 }
 
 fn fleet_hint(home: &std::path::Path) -> String {
