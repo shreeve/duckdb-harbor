@@ -406,6 +406,15 @@ retention; day-one dot-commands incl. fleet-aware `.databases`; the
 for file paths (`--idle-exit` berths, D9); spinner; Ctrl-C cancel; timer;
 pager. *Exit: you stop reaching for the official CLI against harbor
 berths — including `pilot ./file.duckdb` replacing `duckdb ./file.duckdb`.*
+→ **COMPLETE 2026-08-16.** All of the above shipped and pty-verified, plus
+`.open` (switch berths mid-session), `.read file.sql` and multi-statement
+buffers through one quote/comment/dollar-aware splitter, `.keymode vi|emacs`,
+and `$PAGER` (default `less -SRFX`) for tall duckbox output. The spinner
+rides the cancel ticks — the same `on_tick` that fires DELETE paints
+elapsed time, so a berth that hasn't produced headers yet still shows life.
+TLS deliberately absent (D6/D8: Caddy owns the edge; ssh is the human path).
+`.output/.once/.headers`, progress events, and semantic highlighting remain
+Phase 3/4. 1.4MB binary, 9 unit tests, 10 protocol suites green.
 
 **Phase 3 — polish + edge** (~1.5–2 kLOC)
 Remaining display modes; `.output/.once/.headers`; result-value highlighting;
