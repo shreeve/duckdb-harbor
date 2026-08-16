@@ -12,10 +12,11 @@
 //! <target> = berth name | socket path | http://host:port
 
 mod http;
+mod repl;
 
 use harbor_protocol::{Event, SqlRequest, endpoint};
 use http::Transport;
-use std::io::{BufRead, Read};
+use std::io::{BufRead, IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -55,11 +56,14 @@ fn main() -> ExitCode {
 
     let sql = match sql {
         Some(s) => s,
-        // No -c: accept SQL on a pipe; refuse to hang on a TTY.
         None => {
+            // No -c and a real terminal: the REPL. On a pipe: read stdin.
+            if std::io::stdin().is_terminal() {
+                return repl::run(&conn, &target);
+            }
             let mut s = String::new();
             if std::io::stdin().read_to_string(&mut s).is_err() || s.trim().is_empty() {
-                return fail("no SQL given: use -c \"...\" or pipe on stdin (REPL is coming)");
+                return fail("no SQL given: use -c \"...\" or pipe on stdin");
             }
             s
         }
