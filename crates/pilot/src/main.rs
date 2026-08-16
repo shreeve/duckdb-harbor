@@ -24,7 +24,15 @@ use http::Transport;
 use std::io::{BufRead, IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
+
+/// Set by SIGINT while a statement streams (registered in repl::run);
+/// checked at every read tick. Cleared before each statement.
+static CANCEL: LazyLock<std::sync::Arc<AtomicBool>> =
+    LazyLock::new(|| std::sync::Arc::new(AtomicBool::new(false)));
+static QUERY_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct Conn {
@@ -33,6 +41,11 @@ struct Conn {
 }
 
 fn main() -> ExitCode {
+    // Ctrl-C cancels the running statement (via its queryId), it does not
+    // kill pilot. At the REPL prompt reedline runs raw mode, so SIGINT only
+    // fires while a statement streams; in one-shot mode a second Ctrl-C is
+    // the way out (the first one cancels).
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, CANCEL.clone());
     let mut args = std::env::args().skip(1);
     let mut target: Option<String> = None;
     let mut sql: Option<String> = None;
@@ -203,9 +216,33 @@ fn list_fleet() -> ExitCode {
 
 fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> ExitCode {
     let wall = std::time::Instant::now();
-    let body = serde_json::to_string(&SqlRequest { sql: sql.to_string(), ..Default::default() })
-        .expect("request serializes");
-    let resp = match http::request(&conn.transport, "POST", endpoint::SQL, conn.token.as_deref(), Some(&body), None) {
+    let qid = format!("pilot-{}-{}", std::process::id(), QUERY_SEQ.fetch_add(1, Ordering::Relaxed));
+    CANCEL.store(false, Ordering::Relaxed);
+    let body = serde_json::to_string(&SqlRequest {
+        sql: sql.to_string(),
+        query_id: Some(qid.clone()),
+        ..Default::default()
+    })
+    .expect("request serializes");
+    let fire_cancel = {
+        let fired = AtomicBool::new(false);
+        let conn = conn.clone();
+        let qid = qid.clone();
+        move || {
+            if CANCEL.swap(false, Ordering::Relaxed) && !fired.swap(true, Ordering::Relaxed) {
+                eprintln!("Interrupted — cancelling…");
+                let _ = http::request(
+                    &conn.transport,
+                    "DELETE",
+                    &endpoint::query(&qid),
+                    conn.token.as_deref(),
+                    None,
+                    Some(Duration::from_secs(2)),
+                );
+            }
+        }
+    };
+    let resp = match http::request_streaming(&conn.transport, "POST", endpoint::SQL, conn.token.as_deref(), Some(&body), &fire_cancel) {
         Ok(r) => r,
         Err(e) => return fail(&format!("cannot reach harbor: {e}")),
     };
@@ -215,6 +252,10 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> ExitCode {
         let status = resp.status;
         let text = resp.body_string().unwrap_or_default();
         return match Event::parse(text.trim()) {
+            Ok(Event::Error { code, .. }) if code == harbor_protocol::code::CANCELLED => {
+                eprintln!("Interrupted.");
+                ExitCode::SUCCESS
+            }
             Ok(Event::Error { code, message }) => fail(&format!("harbor error ({code}): {message}")),
             _ => fail(&format!("HTTP {status} from harbor: {text}")),
         };
@@ -226,25 +267,37 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> ExitCode {
     let mut body = resp.body;
     let mut line = String::new();
     loop {
-        line.clear();
+        // The socket ticks every 250ms (request_streaming); a tick is where a
+        // Ctrl-C gets noticed. Partial reads stay in `line` across ticks.
         match body.read_line(&mut line) {
             Ok(0) => break,
             Ok(_) => {}
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                fire_cancel();
+                continue;
+            }
             Err(e) => return fail(&format!("stream died: {e}")),
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            line.clear();
             continue;
         }
         let event = match Event::parse(trimmed) {
             Ok(ev) => ev,
             Err(e) => return fail(&format!("bad envelope line ({e}): {trimmed}")),
         };
+        line.clear();
         match event {
             Event::Schema { columns } => renderer.schema(&columns),
             Event::Row { values } => renderer.row(values),
             Event::End { row_count, time_ms } => {
                 renderer.end(row_count, time_ms, wall.elapsed().as_millis());
+                return ExitCode::SUCCESS;
+            }
+            Event::Error { code, message } if code == harbor_protocol::code::CANCELLED => {
+                eprintln!("Interrupted.");
+                let _ = (code, message);
                 return ExitCode::SUCCESS;
             }
             Event::Error { code, message } => {

@@ -16,6 +16,7 @@ nu-ansi-term = "0.50.3"
 reedline = "0.50.0"
 # preserve_order: --json rows must keep column order, not alphabetize it
 serde_json = { version = "1", features = ["preserve_order"] }
+signal-hook = { version = "0.4.4", default-features = false }
 
 [[bin]]
 name = "pilot"

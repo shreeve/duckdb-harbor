@@ -41,6 +41,32 @@ pub fn request(
     body: Option<&str>,
     timeout: Option<Duration>,
 ) -> io::Result<Response> {
+    request_inner(transport, method, path, token, body, timeout, None)
+}
+
+/// Like `request`, but built for long-running /sql streams: the socket gets a
+/// short read timeout so the caller's read loop ticks (and can notice a
+/// Ctrl-C), while status and header reads here retry through those ticks.
+pub fn request_streaming(
+    transport: &Transport,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&str>,
+    on_tick: &dyn Fn(),
+) -> io::Result<Response> {
+    request_inner(transport, method, path, token, body, Some(Duration::from_millis(250)), Some(on_tick))
+}
+
+fn request_inner(
+    transport: &Transport,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&str>,
+    timeout: Option<Duration>,
+    on_tick: Option<&dyn Fn()>,
+) -> io::Result<Response> {
     let (stream, host): (Box<dyn Stream>, String) = match transport {
         Transport::Unix(p) => {
             let s = UnixStream::connect(p)?;
@@ -74,9 +100,26 @@ pub fn request(
     stream.flush()?;
 
     let mut reader = BufReader::new(stream);
+    // Headers may not arrive until the statement completes (the server
+    // responds once execution starts producing), so the wait happens HERE —
+    // which is why the tick callback fires here: it is how a Ctrl-C reaches
+    // a query that has not sent a byte yet.
+    let read_line = |reader: &mut BufReader<Box<dyn Stream>>, line: &mut String| -> io::Result<usize> {
+        loop {
+            match reader.read_line(line) {
+                Err(e) if on_tick.is_some() && matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                    if let Some(f) = on_tick {
+                        f();
+                    }
+                    continue;
+                }
+                other => return other,
+            }
+        }
+    };
     let status = {
         let mut line = String::new();
-        reader.read_line(&mut line)?;
+        read_line(&mut reader, &mut line)?;
         line.split_whitespace()
             .nth(1)
             .and_then(|s| s.parse().ok())
@@ -87,7 +130,7 @@ pub fn request(
     let mut content_length: Option<u64> = None;
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line)?;
+        read_line(&mut reader, &mut line)?;
         let line = line.trim_end();
         if line.is_empty() {
             break;
