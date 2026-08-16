@@ -72,6 +72,10 @@ serve/add options:
   --workers <n>       executor pool size (default 6)
   --memory-limit <s>  DuckDB memory_limit (default 2GB — fleet-safe, D2)
   --threads <n>       DuckDB threads (default: DuckDB's own)
+  --attach <n>=<p>    ATTACH another database file as catalog <n> (repeatable;
+                      append :ro for read-only) — the cross-db-join case (D2)
+  --idle-exit <d>     drain, CHECKPOINT and exit after <d> (e.g. 90s, 10m) with
+                      no requests and no live sessions (D9 ephemeral berths)
   --log               log requests to stderr
 ";
 
@@ -85,7 +89,22 @@ struct Opts {
     workers: usize,
     memory_limit: String,
     threads: Option<u32>,
+    attach: Vec<String>,
+    idle_exit: Option<Duration>,
     log: bool,
+}
+
+/// "90s", "10m", "2h", or bare seconds.
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let (num, unit) = s.split_at(s.len() - s.chars().last().map_or(0, |c| c.is_alphabetic() as usize));
+    let n: u64 = num.parse().map_err(|_| format!("bad duration {s:?}"))?;
+    let secs = match unit {
+        "" | "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        _ => return Err(format!("bad duration unit in {s:?} (use s, m, h)")),
+    };
+    Ok(Duration::from_secs(secs))
 }
 
 fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
@@ -101,6 +120,8 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
         workers: harbor_core::DEFAULT_MAX_INFLIGHT,
         memory_limit: "2GB".into(),
         threads: None,
+        attach: Vec::new(),
+        idle_exit: None,
         log: false,
     };
     let mut named: Option<String> = None;
@@ -115,6 +136,8 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
             "--workers" => o.workers = take("workers")?.parse().map_err(|_| "bad --workers")?,
             "--memory-limit" => o.memory_limit = take("memory-limit")?,
             "--threads" => o.threads = Some(take("threads")?.parse().map_err(|_| "bad --threads")?),
+            "--attach" => o.attach.push(take("attach")?),
+            "--idle-exit" => o.idle_exit = Some(parse_duration(&take("idle-exit")?)?),
             "--log" => o.log = true,
             _ if db.is_none() && !a.starts_with('-') => db = Some(PathBuf::from(a)),
             other => return Err(format!("unexpected argument: {other}")),
@@ -215,6 +238,23 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
     let duckdb_version: String = con
         .query_row("SELECT version()", [], |r| r.get(0))
         .map_err(|e| format!("version: {e}"))?;
+    // ATTACH is instance-wide, so once on the control connection covers the
+    // whole pool — the cross-database-join case that justifies co-locating
+    // files in one berth (D2/PLAN.md §4.3).
+    let mut attached: Vec<String> = Vec::new();
+    for spec in &o.attach {
+        let (aname, rest) = spec
+            .split_once('=')
+            .ok_or_else(|| format!("--attach wants name=/path, got {spec:?}"))?;
+        let aname = normalize(aname)?;
+        let (apath, ro) = match rest.strip_suffix(":ro") {
+            Some(p) => (p, " (READ_ONLY)"),
+            None => (rest, ""),
+        };
+        con.execute_batch(&format!("ATTACH '{}' AS {aname}{ro}", apath.replace('\'', "''")))
+            .map_err(|e| format!("attach {spec:?}: {e}"))?;
+        attached.push(aname);
+    }
     harbor_core::open_pool(con)?;
 
     let listen = match o.port {
@@ -226,11 +266,28 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         let _ = chmod(&sock_path, 0o600);
     }
 
+    // One identity, two consumers: GET /info (auth, live uptime spliced in by
+    // the core) and the <name>.json sidecar `harbor ls` reads without dialing.
+    let db_abs = std::fs::canonicalize(&o.db).unwrap_or(o.db.clone()).display().to_string();
+    let mut databases = vec![o.name.clone()];
+    databases.extend(attached);
+    harbor_core::set_info(serde_json::json!({
+        "protocolVersion": 1,
+        "name": o.name,
+        "harborVersion": VERSION,
+        "duckdbVersion": duckdb_version,
+        "database": db_abs,
+        "databases": databases,
+        "pid": std::process::id(),
+        "mode": "binary",
+        "grammar": false,
+    }));
+
     let started_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
     let info = serde_json::json!({
         "name": o.name,
         "pid": std::process::id(),
-        "db": std::fs::canonicalize(&o.db).unwrap_or(o.db.clone()).display().to_string(),
+        "db": db_abs,
         "socket": if o.port.is_none() { Some(sock_path.display().to_string()) } else { None },
         "port": o.port,
         "harborVersion": VERSION,
@@ -252,7 +309,28 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         o.memory_limit
     );
 
-    // Blocks until harbor_stop / SIGTERM finishes the drain + CHECKPOINT.
+    // D9 ephemeral berths: no countable requests AND no live sessions for the
+    // window → leave through the normal drain + CHECKPOINT door. Nothing
+    // cleverer than this on purpose — no refcounts, no control sockets.
+    if let Some(idle) = o.idle_exit {
+        let tick = idle
+            .div_f32(4.0)
+            .min(Duration::from_secs(5))
+            .max(Duration::from_millis(250));
+        std::thread::spawn(move || loop {
+            std::thread::sleep(tick);
+            if harbor_core::idle_ms() >= idle.as_millis() as u64 && harbor_core::quiet() {
+                eprintln!(
+                    "harbor: idle {}s with no sessions — leaving the berth",
+                    idle.as_secs()
+                );
+                let _ = harbor_core::stop();
+                break;
+            }
+        });
+    }
+
+    // Blocks until harbor_stop / SIGTERM / idle-exit finishes drain + CHECKPOINT.
     let farewell = harbor_core::wait()?;
     if o.port.is_none() {
         let _ = std::fs::remove_file(&sock_path);

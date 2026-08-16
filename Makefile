@@ -76,3 +76,25 @@ check_quick: release
 
 clean: clean_build clean_rust
 clean_all: clean_configure clean
+
+# ==[ Fleet binaries (PLAN.md Phase 1) ]==
+# The bundled channel embeds DuckDB 1.5.5 from crates.io; the 2.0 channel
+# links the prebuilt libduckdb from the duckdb checkout. Separate cargo
+# invocations on purpose: bundled and loadable-extension cannot feature-unify.
+DUCKDB2_LIB ?= $(HOME)/Data/Code/duckdb/build/release/src
+DUCKDB2_INC ?= $(HOME)/Data/Code/duckdb/src/include
+
+.PHONY: binary binary2 fleet-check
+binary:
+	cargo build -p harbor-bin -p harbor-pilot --release
+
+binary2:
+	DUCKDB_LIB_DIR=$(DUCKDB2_LIB) DUCKDB_INCLUDE_DIR=$(DUCKDB2_INC) \
+	cargo build -p harbor-bin --no-default-features --release --target-dir target-2
+	@install_name_tool -add_rpath $(DUCKDB2_LIB) target-2/release/harbor 2>/dev/null || true
+
+fleet-check: binary binary2
+	cd test/scripts && for s in sessions cancel catalog; do \
+	  echo "==[ $$s (binary, 2.0) ]=="; \
+	  HARBOR_LAUNCHER="$(PROJ_DIR)target-2/release/harbor serve" python3 $$s.py || exit 1; \
+	done

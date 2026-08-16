@@ -989,6 +989,7 @@ pub fn start(
         Listen::Tcp { .. } => server.server_addr().to_string(),
         Listen::Unix(path) => path.display().to_string(),
     };
+    *STARTED_AT.lock().unwrap() = Some(Instant::now());
     let server = Arc::new(server);
     let stop = Arc::new(AtomicBool::new(false));
     let token = Arc::new(token);
@@ -1286,6 +1287,68 @@ fn worker(
 
 /// Returns false when the executor behind `jobs` is gone, which is the one
 /// condition the caller must act on rather than merely report.
+// ---------------------------------------------------------------------------
+// Berth identity (GET /info) and idle accounting (--idle-exit)
+// ---------------------------------------------------------------------------
+
+/// Identity document the embedding host sets before `start()`; GET /info
+/// serves it with `uptimeMs` spliced in. The host owns the static fields
+/// (name, database path, pid, mode) because the core cannot know them.
+/// Unset — as in the retiring extension — /info answers 404, which is
+/// exactly the pre-fleet behavior clients use as a version probe.
+static INFO: Mutex<Option<serde_json::Value>> = Mutex::new(None);
+static STARTED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+/// The last moment a countable request began or finished. `/ready` and
+/// `/info` do not count: a fleet `ls` probing liveness must not keep an
+/// --idle-exit berth alive forever.
+static LAST_ACTIVITY: Mutex<Option<Instant>> = Mutex::new(None);
+
+pub fn set_info(base: serde_json::Value) {
+    *INFO.lock().unwrap() = Some(base);
+}
+
+fn touch_activity() {
+    *LAST_ACTIVITY.lock().unwrap() = Some(Instant::now());
+}
+
+/// Milliseconds since the last countable request began or ended. The clock
+/// also resets when a request *finishes*, so a statement that runs longer
+/// than the idle window cannot be idled out from under its caller.
+pub fn idle_ms() -> u64 {
+    let last = *LAST_ACTIVITY.lock().unwrap();
+    let base = last.or(*STARTED_AT.lock().unwrap());
+    base.map_or(0, |t| t.elapsed().as_millis() as u64)
+}
+
+/// True when nothing is held: no live leases, no lease statement in flight.
+/// Plain worker requests are covered by the activity clock; leases are
+/// covered here, because an open transaction with no traffic is still a
+/// claim on this berth.
+pub fn quiet() -> bool {
+    match LEASES.lock().unwrap().as_ref() {
+        Some(l) => l.live.is_empty() && l.inflight == 0,
+        None => false,
+    }
+}
+
+fn run_info(req: Request) -> (bool, u16) {
+    let info = INFO.lock().unwrap().clone();
+    match info {
+        Some(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                let up = STARTED_AT.lock().unwrap().map_or(0, |t| t.elapsed().as_millis() as u64);
+                obj.insert("uptimeMs".to_string(), serde_json::Value::from(up));
+            }
+            let _ = req.respond(json_response(200, &v.to_string()));
+            (true, 200)
+        }
+        None => {
+            let _ = req.respond(error_response(404, "not_found", "no such endpoint"));
+            (true, 404)
+        }
+    }
+}
+
 fn handle(
     mut req: Request,
     jobs: &mpsc::SyncSender<Job>,
@@ -1295,6 +1358,10 @@ fn handle(
 ) -> bool {
     let path = req.url().split('?').next().unwrap_or("/").to_string();
     let method = req.method().clone();
+    let countable = path != "/ready" && path != "/info";
+    if countable {
+        touch_activity();
+    }
 
     // Only when logging. A clock read and a peer-address format are small, but
     // they are paid on every request by every caller, including the ones that
@@ -1378,6 +1445,18 @@ fn handle(
                 (true, 200)
             }
         }
+        // Berth identity: who serves here, which engine, since when. Auth
+        // required — it names filesystem paths and pids. 404 when the host
+        // never set one, which is also what pre-fleet servers answer: absence
+        // is the version probe (PLAN.md §4.2).
+        (Method::Get, "/info") => {
+            if !authorized(&req, token) {
+                let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
+                (true, 401)
+            } else {
+                run_info(req)
+            }
+        }
         // The whole schema — tables, columns, keys, indexes, sequences — in
         // one call, in one shape. It lives here so a migration differ asks a
         // single question instead of five, and so the answer never depends on
@@ -1438,6 +1517,11 @@ fn handle(
             method.as_str(),
             t.elapsed().as_millis()
         );
+    }
+    // The finish also counts (see idle_ms): a long statement resets the idle
+    // clock when it completes, not only when it began.
+    if countable {
+        touch_activity();
     }
     keep_going
 }
