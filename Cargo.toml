@@ -3,6 +3,7 @@
 # grow under crates/. Spikes are standalone throwaways, outside the workspace.
 [workspace]
 members = ["crates/*"]
+default-members = [".", "crates/harbor-protocol", "crates/pilot"]
 exclude = ["spikes"]
 resolver = "2"
 

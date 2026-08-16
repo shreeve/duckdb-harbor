@@ -1,0 +1,26 @@
+[package]
+# Package is harbor-bin until the root extension package (also named
+# "harbor") is deleted at the end of Phase 1 (PLAN.md D5); the binary users
+# run is `harbor` either way.
+name = "harbor-bin"
+version = "0.10.0"
+edition = "2024"
+description = "harbor — DuckDB wearing a server: fleet manager + HTTP/UDS engine"
+license = "MIT"
+
+[features]
+# Default build embeds DuckDB 1.5.5 (crates.io `bundled`). The preferred 2.0
+# channel links our prebuilt libduckdb instead:
+#   DUCKDB_LIB_DIR=... DUCKDB_INCLUDE_DIR=... \
+#   cargo build -p harbor-bin --no-default-features --release
+default = ["bundled"]
+bundled = ["harbor-core/bundled"]
+
+[dependencies]
+harbor-core = { path = "../harbor-core" }
+serde_json = "1"
+libc = "0.2"
+
+[[bin]]
+name = "harbor"
+path = "src/main.rs"

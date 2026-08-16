@@ -364,6 +364,15 @@ retires. Old servers 404 on `/info`; clients degrade gracefully.
    lands with the harbor-ext move in Phase 1.
 
 **Phase 1 — the binary** (workspace refactor + fleet + serve)
+→ **Core landed 2026-08-16.** harbor-core extracted verbatim (4.1k lines,
+compiles clean, UDS listener added); `harbor` binary serves both channels
+(bundled 1.5.5: 33MB; linked 2.0-dev: 1.8MB + dylib) with
+serve/add/ls/stop/rm, the D3 registry (flock claim, json sidecar, token
+files, 2GB memory default), and SIGTERM drain+CHECKPOINT verified. Dual-
+target proof: spec, types, fuzz, cancel, sessions, catalog all PASS against
+the binary (suites gained the `HARBOR_LAUNCHER` axis); extension target
+still green. Remaining: `/info` endpoint, `--boot` units, `--attach`,
+`--idle-exit`, extension deletion, Makefile/CI targets.
 Core moves to harbor-core (~90% verbatim); `harbor serve` (UDS+TCP, memory/
 thread defaults, `--attach`, `--ui/--quack`); `add/ls/stop/rm` + registry
 contract; `/info`; dual-target suite green (extension vs binary — the
