@@ -42,9 +42,12 @@ DuckDB files are single-writer; the code already enforces one-database-per-
 process (`open_pool` refuses a second, by design — the pool/lease/cancel
 machinery is process-wide statics). Keeping that gives crash isolation,
 per-berth DuckDB versions (a 1.5.5 berth beside a 2.0-dev berth), independent
-SIGTERM→drain→CHECKPOINT lifecycles, and the daemonless registry. ATTACH
-multiple files into ONE berth only when cross-db joins are needed (server-side
-`--attach` flag; see D7).
+SIGTERM→drain→CHECKPOINT lifecycles, and the daemonless registry.
+**One berth, one database, one socket, one token — no exceptions shipped**
+(decided 2026-08-16: an implemented `--attach` flag was removed the same day
+to keep the model clean; ~30 lines to restore if a real cross-db-join need
+ever arrives). ATTACH remains available to clients as plain SQL through
+`/sql` — an engine feature harbor neither promotes nor babysits.
 
 **Mandatory guard**: DuckDB defaults to ~80% RAM / all cores *per instance*.
 `harbor serve` ships a conservative default (`--memory-limit`, default 2GB;
@@ -89,9 +92,10 @@ and edge auth, proxies to the socket. The CLI speaks UDS, `http://`, or
 ### D7. Protocol changes are additive only
 The Rip harborAdapter must run unmodified. Two new endpoints (`/info`,
 `/grammar`), zero changes to existing routes, events, fields, or error codes.
-No `database` field on `/sql`: ATTACH is a berth flag; per-session default
-catalog is `USE` on a lease (a lease is a pinned connection — exactly what it
-was built for). Reserve `"catalog"` as a future optional body field; don't
+No `database` field on `/sql`: a berth holds one database (D2); per-session
+work is `USE`/ATTACH as plain SQL on a lease (a lease is a pinned connection —
+exactly what it was built for). Reserve `"catalog"` as a future optional
+body field; don't
 implement it.
 
 ### D8. Two binaries: `harbor` (engine + fleet) and `pilot` (pure client)
@@ -173,7 +177,7 @@ crates/
 │                          #   link mode chosen by leaf-crate feature passthrough
 ├── harbor/                # bin — duckdb {bundled, vtab}; ~50–90MB (the engine)
 │   ├── serve              #   open db → open_pool → start(UDS and/or TCP) → wait
-│   │                      #   flags: --memory-limit --threads --attach --ui
+│   │                      #   flags: --memory-limit --threads --idle-exit --ui
 │   │                      #   --quack --socket-mode/-group --idle-exit
 │   └── add/ls/stop/rm/    #   fleet verbs (filesystem + spawning + HTTP probes;
 │       doctor             #   no duckdb linkage — serve is the only user of it)
@@ -372,13 +376,13 @@ files, 2GB memory default), and SIGTERM drain+CHECKPOINT verified. Dual-
 target proof: spec, types, fuzz, cancel, sessions, catalog all PASS against
 the binary (suites gained the `HARBOR_LAUNCHER` axis); extension target
 still green. → **Tail landed same day**: GET `/info` (auth, uptimeMs live,
-404-absence = version probe), `--attach` (cross-catalog joins proven),
+404-absence = version probe),
 `--idle-exit` (D9 reaper: countable-request clock + lease guard; /ready
 does not count), `make binary/binary2/fleet-check`. Remaining: extension
 deletion + check.sh binary-default + MANUAL rewrite (the retirement
 ceremony), `--ui/--quack` flags, `--boot` units (Phase 3).
 Core moves to harbor-core (~90% verbatim); `harbor serve` (UDS+TCP, memory/
-thread defaults, `--attach`, `--ui/--quack`); `add/ls/stop/rm` + registry
+thread defaults, `--ui/--quack`); `add/ls/stop/rm` + registry
 contract; `/info`; dual-target suite green (extension vs binary — the
 compatibility proof), THEN the extension package, Makefile machinery, and
 bash launcher are deleted (D5). *Exit: MANUAL.md's install section is
@@ -421,6 +425,6 @@ client-side category completion (kills remote-latency); semantic highlighting
 
 Open questions: does `/info` include the absolute db path when exposed through
 Caddy (current answer: yes, but the edge only routes `/sql`+`/catalog` —
-policy lives in the Caddyfile)? Name for the `--attach` default-catalog flag?
+policy lives in the Caddyfile)?
 Does `harbor rm` delete the database file (current answer: never — it removes
 the berth, not the boat)?

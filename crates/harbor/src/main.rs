@@ -72,8 +72,6 @@ serve/add options:
   --workers <n>       executor pool size (default 6)
   --memory-limit <s>  DuckDB memory_limit (default 2GB — fleet-safe, D2)
   --threads <n>       DuckDB threads (default: DuckDB's own)
-  --attach <n>=<p>    ATTACH another database file as catalog <n> (repeatable;
-                      append :ro for read-only) — the cross-db-join case (D2)
   --idle-exit <d>     drain, CHECKPOINT and exit after <d> (e.g. 90s, 10m) with
                       no requests and no live sessions (D9 ephemeral berths)
   --log               log requests to stderr
@@ -89,7 +87,6 @@ struct Opts {
     workers: usize,
     memory_limit: String,
     threads: Option<u32>,
-    attach: Vec<String>,
     idle_exit: Option<Duration>,
     log: bool,
 }
@@ -120,7 +117,6 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
         workers: harbor_core::DEFAULT_MAX_INFLIGHT,
         memory_limit: "2GB".into(),
         threads: None,
-        attach: Vec::new(),
         idle_exit: None,
         log: false,
     };
@@ -136,7 +132,6 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
             "--workers" => o.workers = take("workers")?.parse().map_err(|_| "bad --workers")?,
             "--memory-limit" => o.memory_limit = take("memory-limit")?,
             "--threads" => o.threads = Some(take("threads")?.parse().map_err(|_| "bad --threads")?),
-            "--attach" => o.attach.push(take("attach")?),
             "--idle-exit" => o.idle_exit = Some(parse_duration(&take("idle-exit")?)?),
             "--log" => o.log = true,
             _ if db.is_none() && !a.starts_with('-') => db = Some(PathBuf::from(a)),
@@ -238,23 +233,6 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
     let duckdb_version: String = con
         .query_row("SELECT version()", [], |r| r.get(0))
         .map_err(|e| format!("version: {e}"))?;
-    // ATTACH is instance-wide, so once on the control connection covers the
-    // whole pool — the cross-database-join case that justifies co-locating
-    // files in one berth (D2/PLAN.md §4.3).
-    let mut attached: Vec<String> = Vec::new();
-    for spec in &o.attach {
-        let (aname, rest) = spec
-            .split_once('=')
-            .ok_or_else(|| format!("--attach wants name=/path, got {spec:?}"))?;
-        let aname = normalize(aname)?;
-        let (apath, ro) = match rest.strip_suffix(":ro") {
-            Some(p) => (p, " (READ_ONLY)"),
-            None => (rest, ""),
-        };
-        con.execute_batch(&format!("ATTACH '{}' AS {aname}{ro}", apath.replace('\'', "''")))
-            .map_err(|e| format!("attach {spec:?}: {e}"))?;
-        attached.push(aname);
-    }
     harbor_core::open_pool(con)?;
 
     let listen = match o.port {
@@ -269,15 +247,13 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
     // One identity, two consumers: GET /info (auth, live uptime spliced in by
     // the core) and the <name>.json sidecar `harbor ls` reads without dialing.
     let db_abs = std::fs::canonicalize(&o.db).unwrap_or(o.db.clone()).display().to_string();
-    let mut databases = vec![o.name.clone()];
-    databases.extend(attached);
     harbor_core::set_info(serde_json::json!({
         "protocolVersion": 1,
         "name": o.name,
         "harborVersion": VERSION,
         "duckdbVersion": duckdb_version,
         "database": db_abs,
-        "databases": databases,
+        "databases": [o.name],
         "pid": std::process::id(),
         "mode": "binary",
         "grammar": false,
