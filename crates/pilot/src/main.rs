@@ -11,6 +11,7 @@
 //!
 //! <target> = berth name | socket path | http://host:port
 
+mod complete;
 mod highlight;
 mod http;
 mod keywords;
@@ -23,6 +24,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+#[derive(Clone)]
 struct Conn {
     transport: Transport,
     token: Option<String>,

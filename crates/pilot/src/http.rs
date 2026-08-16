@@ -11,6 +11,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[derive(Clone)]
 pub enum Transport {
     Unix(PathBuf),
     Tcp(String), // host:port

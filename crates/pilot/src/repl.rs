@@ -4,8 +4,9 @@
 //! is a dot-command. History persists at ~/.harbor/history.
 
 use reedline::{
-    DefaultHinter, FileBackedHistory, Prompt, PromptEditMode, PromptHistorySearch,
-    PromptHistorySearchStatus, Reedline, Signal, ValidationResult, Validator,
+    ColumnarMenu, DefaultHinter, Emacs, FileBackedHistory, KeyCode, KeyModifiers, MenuBuilder,
+    Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline,
+    ReedlineEvent, ReedlineMenu, Signal, ValidationResult, Validator, default_emacs_keybindings,
 };
 use std::borrow::Cow;
 
@@ -139,10 +140,24 @@ pub fn statement_complete(buf: &str) -> bool {
 
 pub fn run(conn: &Conn, name: &str) -> std::process::ExitCode {
     let history = crate::http::harbor_home().join("history");
+    // Tab opens the completion menu, then cycles it (PLAN.md lanes A/B/C).
+    let mut keybindings = default_emacs_keybindings();
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Menu("completion_menu".to_string()),
+            ReedlineEvent::MenuNext,
+        ]),
+    );
+    let menu = ColumnarMenu::default().with_name("completion_menu");
     let mut line_editor = Reedline::create()
         .with_validator(Box::new(SqlValidator))
         .with_highlighter(Box::new(crate::highlight::SqlHighlighter))
         .with_hinter(Box::new(DefaultHinter::default()))
+        .with_completer(Box::new(crate::complete::SqlCompleter::new(conn.clone())))
+        .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
+        .with_edit_mode(Box::new(Emacs::new(keybindings)))
         .with_history(Box::new(
             FileBackedHistory::with_file(1000, history).expect("history file"),
         ));
