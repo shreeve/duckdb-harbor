@@ -68,12 +68,18 @@ the drain+CHECKPOINT window). Harbor never becomes a supervisor. **No socket
 activation**: a database should not cold-start (WAL replay) per request, and
 idle-exit fights the lease/checkpoint machinery. Plain always-on units.
 
-### D5. The extension survives as a secondary artifact
-Same core crate, ~350 lines of vtab glue. Its remaining niche: bolting HTTP
-onto someone else's live DuckDB process (stock CLI, DuckDB UI session). The
-embedded binary does NOT lose UI/Quack co-residency — `harbor serve --ui
---quack` loads those extensions into its own DuckDB (same composition the bash
-launcher does today; needs `allow_unsigned_extensions` on the 2.0 channel).
+### D5. The extension retires (decided 2026-08-16)
+Once the binary is validated, the loadable-extension artifact is dropped —
+with it go extension signing, `-unsigned`, `FORCE INSTALL`, the two-artifact
+version-matching dance, the unstable-C-API band pin, the bash launcher, and
+the bundled/loadable feature-split build gotcha. Its one niche (bolting HTTP
+onto someone else's live DuckDB process) is covered well enough by `--quack`
+and by pilot; if ever truly needed, the ~350 lines of vtab glue can be
+resurrected on top of harbor-core. The embedded binary loses no co-residency:
+`harbor serve --ui --quack` loads those extensions into its own DuckDB (same
+composition the bash launcher performs today; `allow_unsigned_extensions` on
+the 2.0 channel). The deployed v0.9.1 extension keeps working during
+migration; it just stops being built.
 
 ### D6. Caddy is the optional edge; UDS is the default face
 Local security = filesystem perms + token. Remote = Caddy terminates TLS/HTTP3
@@ -176,17 +182,21 @@ crates/
 │   │                      #   spawns `harbor serve --idle-exit` for raw paths (D9)
 │   ├── sqllex             #   SQL tokenizer (mirrors DuckDB PEG token stream)
 │   └── duckbox            #   table renderers
-└── harbor-ext/            # cdylib — duckdb {loadable-extension, vtab}; vtab glue only
 ```
+
+(No harbor-ext crate: the extension retires per D5. The root extension
+package and its extension-ci-tools machinery are deleted at the end of
+Phase 1, once the binary passes the dual-target suite.)
 
 - No "connection provider" trait: both link modes yield the same
   `duckdb::Connection`; `open_pool(Connection)` is already the abstraction.
 - `start()` grows a UDS listener (tiny_http 0.12 `Server::http_unix`) beside
   TCP. **Verify `http_unix` + graceful `unblock` early — load-bearing.**
   Fallback: ~100-line hand-rolled accept loop.
-- Build gotcha: `bundled` and `loadable-extension` cannot feature-unify. Never
-  `cargo build --workspace`; `default-members` + separate `cargo build -p
-  harbor-ext` in the Makefile, separate CI jobs.
+- Transitional build gotcha (Phase 1 only, while the root extension package
+  still exists beside crates/harbor): `bundled` and `loadable-extension`
+  cannot feature-unify — build them in separate cargo invocations. The gotcha
+  dies with the extension (D5).
 - Windows: TCP-only, no registry (cfg(unix) throughout today); out of scope.
 
 ## 3. Registry contract
@@ -347,8 +357,10 @@ retires. Old servers 404 on `/info`; clients degrade gracefully.
 **Phase 1 — the binary** (workspace refactor + fleet + serve)
 Core moves to harbor-core (~90% verbatim); `harbor serve` (UDS+TCP, memory/
 thread defaults, `--attach`, `--ui/--quack`); `add/ls/stop/rm` + registry
-contract; `/info`; dual-target test matrix green; extension artifact still
-ships. *Exit: MANUAL.md's install section is `curl && harbor add`.*
+contract; `/info`; dual-target suite green (extension vs binary — the
+compatibility proof), THEN the extension package, Makefile machinery, and
+bash launcher are deleted (D5). *Exit: MANUAL.md's install section is
+`curl && harbor add`, and the repo builds nothing but the binary crates.*
 
 **Phase 2 — pilot, the REPL daily driver** (~2.5–3 kLOC)
 `harbor-protocol` crate; transport + envelope decoder; reedline shell
