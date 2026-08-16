@@ -3,7 +3,7 @@
 # grow under crates/. Spikes are standalone throwaways, outside the workspace.
 [workspace]
 members = ["crates/*"]
-exclude = ["spikes/uds", "spikes/bundled"]
+exclude = ["spikes"]
 resolver = "2"
 
 [package]

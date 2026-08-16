@@ -344,9 +344,18 @@ retires. Old servers 404 on `/info`; clients degrade gracefully.
 **Phase 0 — spikes (de-risk before committing)**
 1. `duckdb-rs` bundled/lib-dir build against the 2.0-dev C API: port
    `emit_column_schema`/`emit_value` against 2.0 headers. *Biggest unknown.*
-   → **1.5.5 half PASSES** (spikes/bundled: embedded v1.5.5, try_clone
-   pooling, params, complex types; 40MB release binary). 2.0-dev linkage
-   still open — needs `DUCKDB_LIB_DIR` against our prebuilt static lib.
+   → **CLOSED, both halves PASS.** spikes/bundled: embedded v1.5.5 via the
+   crate's `bundled` feature (40MB binary). spikes/linked2: the SAME
+   duckdb-rs version (~1.10505, incl. `vtab`) compiles and runs against the
+   2.0-dev libduckdb from our checkout via `DUCKDB_LIB_DIR`/
+   `DUCKDB_INCLUDE_DIR` — the plain C API holds across the 1.5.5 → 2.0 line;
+   the version-pin pain was the loadable-extension pointer band, now retired
+   with the extension. **Release channels (2.0 preferred): `harbor` links
+   our prebuilt 2.0-dev libduckdb (static for shipping; dylib fine for dev),
+   `harbor-1.5` uses `bundled` from crates.io. Same code, link-time choice —
+   and the fleet model (D2) lets both serve side by side.** Remaining build
+   engineering: static-link flags for the shipped 2.0 binary, and re-verify
+   whenever we roll the pinned 2.0 build forward.
 2. tiny_http `Server::http_unix` + `unblock` graceful-shutdown behavior.
    → **PASSES** (spikes/uds: binds, serves sequential requests, `unblock()`
    releases a blocked `recv()` in ~65µs).
@@ -388,7 +397,7 @@ client-side category completion (kills remote-latency); semantic highlighting
 
 | # | Risk | Mitigation |
 |---|------|-----------|
-| 1 | **No published duckdb-rs/libduckdb-sys for 2.0-dev**; library-API compat with the 2.0 C API unverified (extension only exercised the loadable band) | Phase-0 spike first; link 2.0 channel via `DUCKDB_LIB_DIR` against our prebuilt static lib as a second release channel |
+| 1 | ~~No published duckdb-rs for 2.0-dev; C-API compat unverified~~ **RESOLVED** by spikes/linked2: pinned duckdb-rs drives both 1.5.5 (bundled) and 2.0-dev (`DUCKDB_LIB_DIR`) | Residual: pregenerated 1.5.5 bindings won't expose NEW 2.0 C-API entry points; re-run the spike when rolling the 2.0 build forward |
 | 2 | tiny_http UDS support (`http_unix`, graceful `unblock`) unproven for our shutdown path | Phase-0 spike; ~100-line accept-loop fallback acceptable given how little of tiny_http is used |
 | 3 | N berths × DuckDB's 80%-RAM default = OOM | Conservative per-berth defaults in 1.0 (D2), printed at startup |
 | 4 | `cargo build --workspace` feature-unification foot-gun | `default-members`, Makefile, separate CI jobs |
