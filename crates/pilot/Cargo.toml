@@ -10,6 +10,7 @@ license = "MIT"
 # stack in for one request at a time buys nothing. https lands with ureq in
 # Phase 2 alongside the REPL.
 [dependencies]
+crossterm = "0.29.0"
 harbor-protocol = { path = "../harbor-protocol" }
 nu-ansi-term = "0.50.3"
 reedline = "0.50.0"

@@ -10,6 +10,7 @@ use reedline::{
 };
 use std::borrow::Cow;
 
+use crate::render::{Mode, RenderOpts};
 use crate::{Conn, run_sql};
 
 struct BerthPrompt {
@@ -162,6 +163,7 @@ pub fn run(conn: &Conn, name: &str) -> std::process::ExitCode {
             FileBackedHistory::with_file(1000, history).expect("history file"),
         ));
     let prompt = BerthPrompt { name: name.to_string() };
+    let mut opts = RenderOpts::default();
     eprintln!("pilot: connected to {name} (.help for help, .quit to leave)");
 
     loop {
@@ -172,7 +174,7 @@ pub fn run(conn: &Conn, name: &str) -> std::process::ExitCode {
                     continue;
                 }
                 if let Some(cmd) = stmt.strip_prefix('.') {
-                    match dot_command(cmd) {
+                    match dot_command(cmd, conn, &mut opts) {
                         DotResult::Quit => return std::process::ExitCode::SUCCESS,
                         DotResult::Handled => continue,
                     }
@@ -181,7 +183,7 @@ pub fn run(conn: &Conn, name: &str) -> std::process::ExitCode {
                 // trailing terminator is ours to strip.
                 let stmt = stmt.trim_end_matches(';').trim();
                 if !stmt.is_empty() {
-                    let _ = run_sql(conn, stmt, false);
+                    let _ = run_sql(conn, stmt, &opts);
                 }
             }
             Ok(Signal::CtrlC) => continue, // clear the line, keep the REPL
@@ -200,25 +202,64 @@ enum DotResult {
     Handled,
 }
 
-fn dot_command(cmd: &str) -> DotResult {
+fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
     let mut parts = cmd.split_whitespace();
     match parts.next().unwrap_or("") {
-        "quit" | "exit" | "q" => DotResult::Quit,
+        "quit" | "exit" | "q" => return DotResult::Quit,
         "databases" | "db" => {
             let _ = crate::list_fleet();
-            DotResult::Handled
+        }
+        "mode" => match parts.next() {
+            None => println!("mode: {} (duckbox markdown csv json jsonlines line list trash)", opts.mode.name()),
+            Some(m) => match Mode::parse(m) {
+                Some(m) => opts.mode = m,
+                None => eprintln!("pilot: unknown mode {m:?}"),
+            },
+        },
+        "maxrows" => match parts.next().and_then(|n| n.parse::<usize>().ok()) {
+            Some(n) if n > 0 => opts.max_rows = n,
+            _ => println!("maxrows: {}", opts.max_rows),
+        },
+        "nullvalue" => match parts.next() {
+            Some(s) => opts.null = s.to_string(),
+            None => println!("nullvalue: {:?}", opts.null),
+        },
+        "timer" => match parts.next() {
+            Some("on") => opts.timer = true,
+            Some("off") => opts.timer = false,
+            _ => println!("timer: {}", if opts.timer { "on" } else { "off" }),
+        },
+        "tables" => {
+            let _ = run_sql(conn, "SHOW TABLES", opts);
+        }
+        "schema" => {
+            let sql = match parts.next() {
+                Some(t) => format!(
+                    "SELECT sql FROM duckdb_tables() WHERE table_name = '{}'",
+                    t.replace('\'', "''")
+                ),
+                None => "SELECT sql FROM duckdb_tables()".to_string(),
+            };
+            let _ = run_sql(conn, &sql, &RenderOpts { mode: Mode::List, ..opts.clone() });
         }
         "help" | "h" => {
-            print!(
-                "  .help                this text\n  .databases           the live fleet\n  .quit                leave (Ctrl-D works too)\n  statements end with ;   Ctrl-C clears the line\n"
-            );
-            DotResult::Handled
+            print!(concat!(
+                "  .mode [m]         duckbox | markdown | csv | json | jsonlines | line | list | trash\n",
+                "  .maxrows [n]      boxed-mode display cap (head … tail elision past it)\n",
+                "  .nullvalue [s]    how NULL renders\n",
+                "  .timer on|off     server + wall time per statement\n",
+                "  .tables           SHOW TABLES\n",
+                "  .schema [t]       CREATE statements, one table or all\n",
+                "  .databases        the live fleet\n",
+                "  .help  .quit      this text; leave (Ctrl-D too)\n",
+                "  statements end with ;   Ctrl-C clears the line\n",
+            ));
         }
         other => {
             eprintln!("pilot: no such command .{other} (.help lists them)");
-            DotResult::Handled
         }
     }
+    DotResult::Handled
 }
 
 #[cfg(test)]

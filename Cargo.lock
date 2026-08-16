@@ -636,6 +636,7 @@ dependencies = [
 name = "harbor-pilot"
 version = "0.1.0"
 dependencies = [
+ "crossterm 0.29.0",
  "harbor-protocol",
  "nu-ansi-term",
  "reedline",

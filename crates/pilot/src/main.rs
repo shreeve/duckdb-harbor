@@ -12,12 +12,14 @@
 //! <target> = berth name | socket path | http://host:port
 
 mod complete;
+mod render;
 mod highlight;
 mod http;
 mod keywords;
 mod repl;
 
 use harbor_protocol::{Event, SqlRequest, endpoint};
+use render::{Mode, RenderOpts, Renderer};
 use http::Transport;
 use std::io::{BufRead, IsTerminal, Read};
 use std::path::PathBuf;
@@ -36,12 +38,14 @@ fn main() -> ExitCode {
     let mut sql: Option<String> = None;
     let mut token: Option<String> = None;
     let mut json = false;
+    let mut mode: Option<String> = None;
 
     while let Some(a) = args.next() {
         match a.as_str() {
             "-c" | "--command" => sql = args.next(),
             "--token" => token = args.next(),
             "--json" => json = true,
+            "--mode" => mode = args.next(),
             "-h" | "--help" => {
                 print!("{HELP}");
                 return ExitCode::SUCCESS;
@@ -73,7 +77,20 @@ fn main() -> ExitCode {
         }
     };
 
-    run_sql(&conn, sql.trim(), json)
+    let mut opts = RenderOpts::default();
+    if json {
+        opts.mode = Mode::JsonLines;
+    }
+    if let Some(m) = mode {
+        match Mode::parse(&m) {
+            Some(m) => opts.mode = m,
+            None => return fail(&format!("unknown mode {m:?}")),
+        }
+    }
+    if !std::io::stdout().is_terminal() && opts.mode == Mode::Duckbox {
+        eprintln!("hint: boxed output on a pipe; consider --mode csv or --json");
+    }
+    run_sql(&conn, sql.trim(), &opts)
 }
 
 const HELP: &str = "\
@@ -184,7 +201,8 @@ fn list_fleet() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_sql(conn: &Conn, sql: &str, json: bool) -> ExitCode {
+fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> ExitCode {
+    let wall = std::time::Instant::now();
     let body = serde_json::to_string(&SqlRequest { sql: sql.to_string(), ..Default::default() })
         .expect("request serializes");
     let resp = match http::request(&conn.transport, "POST", endpoint::SQL, conn.token.as_deref(), Some(&body), None) {
@@ -202,10 +220,9 @@ fn run_sql(conn: &Conn, sql: &str, json: bool) -> ExitCode {
         };
     }
 
-    // Stream the envelope. json mode emits rows as they arrive (O(1) memory);
-    // table mode buffers — the duckbox head/tail policy replaces that in Phase 2.
-    let mut columns: Vec<String> = Vec::new();
-    let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+    // Stream the envelope through the renderer: pipe modes emit per row,
+    // boxed modes retain O(display) and draw after `end` (render.rs).
+    let mut renderer = Renderer::new(opts);
     let mut body = resp.body;
     let mut line = String::new();
     loop {
@@ -224,27 +241,10 @@ fn run_sql(conn: &Conn, sql: &str, json: bool) -> ExitCode {
             Err(e) => return fail(&format!("bad envelope line ({e}): {trimmed}")),
         };
         match event {
-            Event::Schema { columns: cols } => {
-                columns = cols
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| c.name.clone().unwrap_or_else(|| format!("col{i}")))
-                    .collect();
-            }
-            Event::Row { values } => {
-                if json {
-                    let obj: serde_json::Map<String, serde_json::Value> =
-                        columns.iter().cloned().zip(values).collect();
-                    println!("{}", serde_json::Value::Object(obj));
-                } else {
-                    rows.push(values);
-                }
-            }
+            Event::Schema { columns } => renderer.schema(&columns),
+            Event::Row { values } => renderer.row(values),
             Event::End { row_count, time_ms } => {
-                if !json {
-                    print_table(&columns, &rows);
-                    eprintln!("{row_count} rows ({time_ms} ms)");
-                }
+                renderer.end(row_count, time_ms, wall.elapsed().as_millis());
                 return ExitCode::SUCCESS;
             }
             Event::Error { code, message } => {
@@ -253,39 +253,6 @@ fn run_sql(conn: &Conn, sql: &str, json: bool) -> ExitCode {
         }
     }
     fail("stream ended without an end event")
-}
-
-/// Plain aligned table — the honest placeholder until duckbox (Phase 2).
-fn print_table(columns: &[String], rows: &[Vec<serde_json::Value>]) {
-    let render = |v: &serde_json::Value| -> String {
-        match v {
-            serde_json::Value::Null => "NULL".to_string(),
-            serde_json::Value::String(s) => s.clone(),
-            other => other.to_string(),
-        }
-    };
-    let cells: Vec<Vec<String>> = rows.iter().map(|r| r.iter().map(render).collect()).collect();
-    let mut widths: Vec<usize> = columns.iter().map(|c| c.chars().count()).collect();
-    for row in &cells {
-        for (i, cell) in row.iter().enumerate() {
-            if i < widths.len() {
-                widths[i] = widths[i].max(cell.chars().count());
-            }
-        }
-    }
-    let line = |cells: &[String]| {
-        let padded: Vec<String> = cells
-            .iter()
-            .enumerate()
-            .map(|(i, c)| format!("{:<w$}", c, w = widths.get(i).copied().unwrap_or(0)))
-            .collect();
-        println!("{}", padded.join("  "));
-    };
-    line(&columns.to_vec());
-    line(&widths.iter().map(|w| "-".repeat(*w)).collect::<Vec<_>>());
-    for row in cells {
-        line(&row);
-    }
 }
 
 fn fail(msg: &str) -> ExitCode {
