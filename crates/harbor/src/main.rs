@@ -76,6 +76,8 @@ serve/add options:
                       no requests and no live sessions (D9 ephemeral berths)
   --init <sql>        run SQL at boot, before serving (repeatable) — the door
                       for extensions: --init 'LOAD ui; CALL start_ui_server()'
+  --unsigned          allow unsigned extensions (open-time only; needed to
+                      LOAD an unsigned build, e.g. the duckdb-ui 2.0 fork)
   --log               log requests to stderr
 ";
 
@@ -92,6 +94,7 @@ struct Opts {
     idle_exit: Option<Duration>,
     init: Vec<String>,
     log: bool,
+    unsigned: bool,
 }
 
 /// "90s", "10m", "2h", or bare seconds.
@@ -123,6 +126,7 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
         idle_exit: None,
         init: Vec::new(),
         log: false,
+        unsigned: false,
     };
     let mut named: Option<String> = None;
     while let Some(a) = it.next() {
@@ -139,6 +143,7 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
             "--idle-exit" => o.idle_exit = Some(parse_duration(&take("idle-exit")?)?),
             "--init" => o.init.push(take("init")?),
             "--log" => o.log = true,
+            "--unsigned" => o.unsigned = true,
             _ if db.is_none() && !a.starts_with('-') => db = Some(PathBuf::from(a)),
             other => return Err(format!("unexpected argument: {other}")),
         }
@@ -333,7 +338,22 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
 }
 
 fn duckdb_open(o: &Opts) -> Result<harbor_core::duckdb::Connection, String> {
-    let con = harbor_core::duckdb::Connection::open(&o.db).map_err(|e| format!("open {}: {e}", o.db.display()))?;
+    use harbor_core::duckdb::{Config, Connection};
+    // Signed-only by default. `allow_unsigned_extensions` can only be set at
+    // open time, not with a later SET, so `--unsigned` has to reach the
+    // Connection here — it is the one door for loading an unsigned build (the
+    // duckdb-ui fork for the 2.0 channel, DUCKDB-UI-V2-COMPAT.md), via
+    // `--init 'LOAD ui; CALL start_ui_server()'`. It widens what a LOAD can
+    // pull in, so it stays opt-in and off by default.
+    let con = if o.unsigned {
+        let config = Config::default()
+            .allow_unsigned_extensions()
+            .map_err(|e| format!("config: {e}"))?;
+        Connection::open_with_flags(&o.db, config)
+            .map_err(|e| format!("open {}: {e}", o.db.display()))?
+    } else {
+        Connection::open(&o.db).map_err(|e| format!("open {}: {e}", o.db.display()))?
+    };
     con.execute_batch(&format!("SET memory_limit='{}'", o.memory_limit))
         .map_err(|e| format!("memory_limit: {e}"))?;
     if let Some(t) = o.threads {
