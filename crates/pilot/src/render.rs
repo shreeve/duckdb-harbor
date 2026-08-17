@@ -1,4 +1,4 @@
-//! Result rendering (PLAN.md Phase 2): duckbox and friends.
+//! Result rendering: duckbox and friends.
 //!
 //! The policy split is the whole design: BOXED modes (duckbox, markdown)
 //! retain O(display) — up to max_rows in the head plus a ring of the last

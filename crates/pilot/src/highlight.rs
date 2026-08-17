@@ -1,4 +1,4 @@
-//! Live syntax highlighting (PLAN.md Phase 2, tier 1): a lexical pass, no
+//! Live syntax highlighting (tier 1): a lexical pass, no
 //! grammar. Colors come from the active theme (theme.rs) — resolved once at
 //! startup for the terminal's light/dark background and switchable live with
 //! `.theme`/`.appearance`. The default `duck` theme follows the duckdb shell:

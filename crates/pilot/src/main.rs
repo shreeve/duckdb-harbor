@@ -329,7 +329,7 @@ fn berth_sockets(home: &std::path::Path) -> Vec<PathBuf> {
 }
 
 /// Bare `pilot`: the fleet view. /ready is unauthenticated by design, so this
-/// needs no tokens; config-file remotes join this view in Phase 2.
+/// needs no tokens; config-file remotes join this view too.
 fn list_fleet() -> ExitCode {
     let home = config::harbor_home();
     let socks = berth_sockets(&home);
