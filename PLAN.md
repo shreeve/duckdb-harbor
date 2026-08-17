@@ -179,12 +179,24 @@ fleet needs, all from the same commit: the `libduckdb` harbor links, the
 and the `ui` extension. Same build ⇒ they cannot drift, which is the whole point
 of not mixing a downloaded library with a separately-built anything.
 
-`make fetch-duckdb` (→ `scripts/fetch-duckdb.sh`) pulls the library + headers +
-CLI into `~/.duckdb/cli/<ver>/`; a fresh checkout runs it before `make all`, and
-CI runs the same fetch inline. The only coupling to the release is asset naming,
-isolated to two `case` arms. Source is the duckdb-harbor fork release today;
-when the UI factory pipeline publishes the same `libduckdb`, `RELEASE_BASE`
-moves to it and nothing else changes (the sub-zip layout is identical).
+`make fetch-duckdb` (→ `scripts/fetch-duckdb.sh`) pulls that exact build — the
+library + headers + CLI, and with `UI=1` the extension — into
+`~/.duckdb/cli/<ver>/`. This path is deliberately fork-coupled: the UI extension
+only loads against the precise engine it was compiled against, so a developer
+doing UI work needs *that* build, not just any DuckDB. The only coupling to the
+release is asset naming, isolated to two `case` arms; when the UI factory
+pipeline publishes the same `libduckdb`, `RELEASE_BASE` moves to it and nothing
+else changes.
+
+**CI does not use that path, and must not.** Because harbor is version-agnostic
+(D1), testing it needs *a* DuckDB, not *our* DuckDB — so CI links upstream's
+latest published `libduckdb` (via `.github/actions/duckdb`, one composite action
+both jobs share so they cannot drift) and thereby *exercises* the
+version-agnostic property on every run rather than asserting it. No version
+pinned, no fork URL, no nested archives: whatever `duckdb/duckdb` ships today.
+Verified: a harbor built against 2.0 links and runs clean against upstream
+`libduckdb` v1.5.5. The exact-2.0 engine still gets validated — by local and UI
+work through `make fetch-duckdb`, and in production, where it is what ships.
 
 **The UI extension can be dynamic — and should be.** DuckDB ships loadable
 extensions *statically* (each embeds a private copy of DuckDB, ~37MB, portable

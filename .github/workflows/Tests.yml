@@ -3,7 +3,8 @@
 # shipped build: harbor is dynamically linked (no bundled DuckDB), so CI fetches
 # a libduckdb to link against and a duckdb CLI to build fixtures with, then runs
 # the make targets. The suite list lives in the Makefile (check_quick / check),
-# not here, so it never drifts.
+# not here, so it never drifts; the engine is fetched by the local composite
+# action (.github/actions/duckdb) — upstream's latest, no version pinned.
 #
 # Two jobs: a quick gate on every PR, and the full suite on main and nightly
 # (resilience restarts the server repeatedly; a five-minute job is fine there).
@@ -26,13 +27,6 @@ defaults:
   run:
     shell: bash
 
-env:
-  # The engine CI links against and builds fixtures with: our own 2.0 build,
-  # published on this repo's releases (upstream DuckDB has no 2.0 release — it is
-  # built from source, see D1 and the UI notes). This is the exact engine harbor
-  # ships against, so CI tests it directly rather than a version-agnostic stand-in.
-  DUCKDB_VERSION: v2.0.0-alpha37626
-
 jobs:
   quick:
     name: quick gate
@@ -46,16 +40,7 @@ jobs:
           # Pinned, not '3.x': the suites run from test/scripts/, so a stdlib
           # name collision there breaks on newer Pythons — pin for reproducibility.
           python-version: '3.12'
-
-      # One fetch path, the same one a fresh checkout runs: `make fetch-duckdb`
-      # pulls libduckdb + headers + duckdb CLI (one 2.0 build, so synchronized)
-      # into ~/.duckdb/cli/2.0.0 — the Makefile's default DUCKDB_LIB, whose baked
-      # rpath then resolves libduckdb at runtime with no DYLD/LD. Only the CLI
-      # needs to be found by name, so that dir goes on PATH.
-      - name: Fetch the DuckDB engine (our 2.0 build)
-        run: |
-          make fetch-duckdb
-          echo "$HOME/.duckdb/cli/2.0.0" >> "$GITHUB_PATH"
+      - uses: ./.github/actions/duckdb
 
       - name: Build the fixture database
         run: test/scripts/fixture.sh sample.duckdb
@@ -78,12 +63,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
-
-      - name: Fetch the DuckDB engine (our 2.0 build)
-        run: |
-          make fetch-duckdb
-          echo "$HOME/.duckdb/cli/2.0.0" >> "$GITHUB_PATH"
+          python-version: '3.12'
+      - uses: ./.github/actions/duckdb
 
       - name: Build the fixture database
         run: test/scripts/fixture.sh sample.duckdb

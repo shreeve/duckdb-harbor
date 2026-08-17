@@ -64,11 +64,12 @@ install: binary pilot
 	done
 	@echo "each cli/<ver>/harbor now uses its sibling libduckdb.dylib; pilot is engine-agnostic."
 
-# Pull a synchronized engine (libduckdb + headers + duckdb CLI) from our 2.0
-# release into $(DUCKDB_LIB) — one build, so the three never drift, and the
-# baked rpath then resolves the library in place. `make fetch-duckdb UI=1` also
-# drops the matching ui.duckdb_extension beside them. This is what a fresh
-# checkout runs before `make all`; CI does the same fetch inline.
+# Pull our exact 2.0 build (libduckdb + headers + duckdb CLI) from the release
+# into $(DUCKDB_LIB) — one build, so the three never drift, and the baked rpath
+# then resolves the library in place. `make fetch-duckdb UI=1` also drops the
+# matching ui.duckdb_extension, which only loads against this precise engine.
+# CI does NOT use this: it is version-agnostic (D1) and links upstream's latest
+# instead (.github/actions/duckdb) — this path is for local and UI work.
 fetch-duckdb:
 	DUCKDB_VERSION=$(DUCKDB_VERSION) DEST=$(DUCKDB_LIB) UI=$(UI) scripts/fetch-duckdb.sh
 

@@ -1,0 +1,23 @@
+name: Set up DuckDB
+description: >
+  Put a DuckDB engine where CI can link and run it: upstream's latest published
+  libduckdb (harbor links this) and the matching duckdb CLI (builds the fixture),
+  unpacked into ~/duckdb. harbor is version-agnostic by design (PLAN.md D1) — it
+  links whichever libduckdb it finds — so CI deliberately uses whatever DuckDB
+  ships today rather than the exact build harbor happens to run in production,
+  and thereby exercises that property on every run. Nothing to pin: no version,
+  no fork, no nested archives. One place, so the two jobs cannot drift.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        dir="$HOME/duckdb"; mkdir -p "$dir"
+        base=https://github.com/duckdb/duckdb/releases/latest/download
+        curl -fsSL "$base/libduckdb-linux-amd64.zip"  -o /tmp/libduckdb.zip
+        curl -fsSL "$base/duckdb_cli-linux-amd64.zip" -o /tmp/duckdb-cli.zip
+        unzip -oq /tmp/libduckdb.zip  -d "$dir"   # libduckdb.so (+ headers)
+        unzip -oq /tmp/duckdb-cli.zip -d "$dir"   # duckdb CLI
+        echo "$dir" >> "$GITHUB_PATH"
+        echo "DUCKDB_LIB=$dir" >> "$GITHUB_ENV"
