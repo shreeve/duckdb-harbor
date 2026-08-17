@@ -133,7 +133,7 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
         port: None,
         bind: "127.0.0.1".into(),
         token: None,
-        workers: harbor_core::DEFAULT_MAX_INFLIGHT,
+        workers: harbor::DEFAULT_MAX_INFLIGHT,
         memory_limit: "2GB".into(),
         threads: None,
         idle_exit: None,
@@ -250,7 +250,7 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         None => match std::fs::read_to_string(&token_path) {
             Ok(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
             _ => {
-                let t = harbor_core::random_token();
+                let t = harbor::random_token();
                 std::fs::write(&token_path, &t).map_err(|e| format!("token file: {e}"))?;
                 let _ = chmod(&token_path, 0o600);
                 Some(t)
@@ -258,7 +258,7 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         },
     };
 
-    // A default statement deadline, if asked. harbor-core reads
+    // A default statement deadline, if asked. the engine reads
     // HARBOR_STATEMENT_TIMEOUT_MS per request when a request names no timeout
     // of its own; setting it here, in our own process before serving, turns
     // the flag into that default. Left unset by default on purpose: harbor
@@ -282,13 +282,13 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
     for sql in &o.init {
         con.execute_batch(sql).map_err(|e| format!("--init {sql:?}: {e}"))?;
     }
-    harbor_core::open_pool(con)?;
+    harbor::open_pool(con)?;
 
     let listen = match o.port {
-        Some(port) => harbor_core::Listen::Tcp { bind: o.bind.clone(), port },
-        None => harbor_core::Listen::Unix(sock_path.clone()),
+        Some(port) => harbor::Listen::Tcp { bind: o.bind.clone(), port },
+        None => harbor::Listen::Unix(sock_path.clone()),
     };
-    let addr = harbor_core::start(listen, token, o.workers, o.log)?;
+    let addr = harbor::start(listen, token, o.workers, o.log)?;
     if o.port.is_none() {
         let _ = chmod(&sock_path, 0o600);
     }
@@ -296,7 +296,7 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
     // One identity, two consumers: GET /info (auth, live uptime spliced in by
     // the core) and the <name>.json sidecar `harbor ls` reads without dialing.
     let db_abs = std::fs::canonicalize(&o.db).unwrap_or(o.db.clone()).display().to_string();
-    harbor_core::set_info(serde_json::json!({
+    harbor::set_info(serde_json::json!({
         "protocolVersion": 1,
         "name": o.name,
         "harborVersion": VERSION,
@@ -344,19 +344,19 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
             .max(Duration::from_millis(250));
         std::thread::spawn(move || loop {
             std::thread::sleep(tick);
-            if harbor_core::idle_ms() >= idle.as_millis() as u64 && harbor_core::quiet() {
+            if harbor::idle_ms() >= idle.as_millis() as u64 && harbor::quiet() {
                 eprintln!(
                     "harbor: idle {}s with no sessions — leaving the berth",
                     idle.as_secs()
                 );
-                let _ = harbor_core::stop();
+                let _ = harbor::stop();
                 break;
             }
         });
     }
 
     // Blocks until harbor_stop / SIGTERM / idle-exit finishes drain + CHECKPOINT.
-    let farewell = harbor_core::wait()?;
+    let farewell = harbor::wait()?;
     if o.port.is_none() {
         let _ = std::fs::remove_file(&sock_path);
     }
@@ -369,8 +369,8 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-fn duckdb_open(o: &Opts) -> Result<harbor_core::duckdb::Connection, String> {
-    use harbor_core::duckdb::{Config, Connection};
+fn duckdb_open(o: &Opts) -> Result<harbor::duckdb::Connection, String> {
+    use harbor::duckdb::{Config, Connection};
     // These four settings can only be chosen when the connection is opened,
     // not with a later SET, so they must reach the Connection here:
     //   --unsigned  allow_unsigned_extensions — the one door for loading an

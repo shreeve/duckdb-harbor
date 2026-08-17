@@ -1,4 +1,4 @@
-//! Result rendering (PLAN.md Phase 2): duckbox and friends.
+//! Result rendering: duckbox and friends.
 //!
 //! The policy split is the whole design: BOXED modes (duckbox, markdown)
 //! retain O(display) — up to max_rows in the head plus a ring of the last
@@ -6,7 +6,7 @@
 //! json, jsonlines, line, list, trash) emit each row as it arrives with O(1)
 //! memory. A 100M-row SELECT costs the boxed client nothing but time.
 
-use harbor_protocol::Column;
+use wire::Column;
 use serde_json::Value;
 use std::io::{BufWriter, IsTerminal, Stdout, Write};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};

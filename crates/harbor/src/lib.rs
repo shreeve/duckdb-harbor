@@ -1,10 +1,12 @@
-// harbor-core — the Harbor server engine: pool, leases, cancellation,
+// harbor's library — the server engine: pool, leases, cancellation,
 // timeouts, the NDJSON envelope, /sql /catalog /ready routing, and the
-// SIGTERM → drain → CHECKPOINT shutdown path.
+// SIGTERM → drain → CHECKPOINT shutdown path. The CLI (src/main.rs) is the
+// only consumer; the two were one crate again once the loadable extension
+// that justified a separate harbor-core retired (PLAN.md D5).
 //
-// This is the v0.9.1 extension's server code, moved verbatim (PLAN.md Phase
-// 1). The extension glue (vtab table functions, entrypoint) stayed behind and
-// retires with the extension (D5). The embedding host — `harbor serve` —
+// This is the v0.9.1 extension's server code, moved verbatim. The extension
+// glue (vtab table functions, entrypoint) stayed behind and retired with the
+// extension (D5). The embedding host — `harbor serve` —
 // opens the DuckDB Connection, hands it to `open_pool`, and calls
 // `start`/`wait`/`stop`.
 
@@ -29,8 +31,8 @@ use duckdb::{
 
 use tiny_http::{Header, Method, Request, Response, Server};
 
-/// Re-exported so the embedding host names the engine through harbor-core —
-/// one crate owns the duckdb version pin.
+/// Re-exported so the CLI names the engine through the harbor crate —
+/// one place owns the duckdb version pin.
 pub use duckdb;
 
 mod encode;
@@ -1631,7 +1633,7 @@ fn handle(
             // Berth identity: who serves here, which engine, since when. Auth
             // required — it names filesystem paths and pids. 404 when the host
             // never set one, which is also what pre-fleet servers answer:
-            // absence is the version probe (PLAN.md §4.2).
+            // absence is the version probe.
             (Method::Get, "/info") => run_info(req),
             // The whole schema — tables, columns, keys, indexes, sequences — in
             // one call, in one shape. It lives here so a migration differ asks

@@ -615,16 +615,8 @@ dependencies = [
 name = "harbor"
 version = "0.10.0"
 dependencies = [
- "harbor-core",
- "libc",
- "serde_json",
-]
-
-[[package]]
-name = "harbor-core"
-version = "0.10.0"
-dependencies = [
  "duckdb",
+ "libc",
  "rand",
  "serde",
  "serde_json",
@@ -637,7 +629,6 @@ name = "harbor-pilot"
 version = "0.1.0"
 dependencies = [
  "crossterm 0.29.0",
- "harbor-protocol",
  "libc",
  "nu-ansi-term",
  "reedline",
@@ -646,14 +637,7 @@ dependencies = [
  "signal-hook 0.4.4",
  "toml",
  "unicode-width",
-]
-
-[[package]]
-name = "harbor-protocol"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
+ "wire",
 ]
 
 [[package]]
@@ -1871,6 +1855,14 @@ name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
+
+[[package]]
+name = "wire"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "wit-bindgen"

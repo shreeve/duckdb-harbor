@@ -1,4 +1,4 @@
-//! The one SQL surface scanner (the seed of sqllex, PLAN.md Phase 4).
+//! The one SQL surface scanner (the seed of a future sqllex tokenizer).
 //!
 //! Everything that must agree on where strings, comments, and dollar-quotes
 //! begin and end — the Enter-submits validator, the multi-statement splitter,

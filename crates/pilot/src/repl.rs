@@ -1,4 +1,4 @@
-//! The pilot REPL (PLAN.md Phase 2): reedline with statement-aware
+//! The pilot REPL: reedline with statement-aware
 //! multi-line editing. A buffer is submitted when it ends with `;` outside
 //! any string or comment — the same rule the duckdb shell uses — or when it
 //! is a dot-command. History persists at ~/.harbor/history.
@@ -142,7 +142,7 @@ pub const DOT_COMMANDS: &[(&str, &str, &str)] = &[
 ];
 
 fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
-    // Tab opens the completion menu, then cycles it (PLAN.md lanes A/B/C).
+    // Tab opens the completion menu, then cycles it (the completion lanes).
     let tab = ReedlineEvent::UntilFound(vec![
         ReedlineEvent::Menu("completion_menu".to_string()),
         ReedlineEvent::MenuNext,

@@ -1,4 +1,4 @@
-//! Tab completion (PLAN.md Phase 2, lanes B and C).
+//! Tab completion (lanes B and C).
 //!
 //! Lane B — the default: ask the server. `sql_auto_complete(?)` runs DuckDB's
 //! own grammar-driven completer (PEG-backed on 2.0) against the live catalog,
@@ -14,7 +14,7 @@
 
 use crate::keywords::KEYWORDS;
 use crate::{Conn, http};
-use harbor_protocol::{Event, SqlRequest, endpoint};
+use wire::{Event, SqlRequest, endpoint};
 use reedline::{Completer, CompletionResult, Span, Suggestion};
 use std::io::BufRead;
 use std::sync::{Arc, Mutex};

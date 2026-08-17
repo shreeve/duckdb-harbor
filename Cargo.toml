@@ -2,7 +2,7 @@
 # crates/. Spikes are standalone throwaways, outside the workspace.
 [workspace]
 members = ["crates/*"]
-default-members = ["crates/harbor-protocol", "crates/pilot", "crates/harbor"]
+default-members = ["crates/wire", "crates/pilot", "crates/harbor"]
 exclude = ["spikes"]
 resolver = "2"
 
