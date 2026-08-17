@@ -422,6 +422,16 @@ panics fixed, Ctrl-C aborts scripts and a second one always escapes, the
 chunked decoder survives its own tick timeout, pipe modes write buffered
 (1M-row csv 1.36s → 0.32s), completion setup is lazy and shared across
 editor rebuilds. 17 unit tests.
+→ **Second review round + punch list, same day.** Fresh three-lens review of
+the hardened code: cleanliness A− ("a crate a maintainer would call clean"),
+efficiency verdict "freeze and build" (2.3M rows/s csv, Tab menu 39ms, zero
+pre-prompt connections). Residual findings all closed: comment-only segments
+dropped by the splitter, between-statement Ctrl-C honored, E'...' escape
+strings scanned, JSON modes keep duplicate column names verbatim (matching
+`duckdb -json`), piped multi-statement input splits like .read, renderer
+writes are fallible (EPIPE stops the stream, real errors fail the
+statement), plan_columns extracted + tested, harbor_home moved to config,
+one config load per invocation. 20 unit tests. Phase 3 builds on this.
 
 **Phase 3 — polish + edge** (~1.5–2 kLOC)
 Remaining display modes; `.output/.once/.headers`; result-value highlighting;
