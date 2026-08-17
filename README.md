@@ -11,9 +11,11 @@ DuckDB is embedded: one process opens the file, and that process holds an
 exclusive lock. So "let my app talk to my DuckDB" normally means picking a
 language binding and living inside that one process, forever.
 
-DuckDB Harbor is a DuckDB extension, written in Rust, that turns that one
-process into an HTTP server. Many clients, any language, all at once — no
-driver, no client library, no wire protocol to implement.
+DuckDB Harbor is `harbor`, a small Rust binary that opens a DuckDB database and
+serves it over HTTP. Point it at a file and that one process becomes a server:
+many clients, any language, all at once — no driver, no client library, no wire
+protocol to implement. It ships with `pilot`, a companion CLI that speaks the
+same protocol for a duckdb-shell-class REPL over the socket.
 
 If it can speak HTTP and parse JSON, it can query your database.
 
@@ -183,78 +185,43 @@ you.
 
 ## Get it running
 
-Nothing to compile. Take the extension for your platform and the launcher from
-the [releases page](https://github.com/shreeve/duckdb-harbor/releases) — five
-platforms are built: `osx_arm64`, `linux_amd64`, `linux_arm64`,
-`windows_amd64`, `windows_arm64`.
+Two binaries: **`harbor`** (the server and fleet manager) and **`pilot`** (the
+client). `harbor` links an external `libduckdb` and is version-agnostic — the
+same build serves any DuckDB by the `libduckdb.dylib` sitting beside it — so a
+build needs a libduckdb to link against. See [MANUAL.md](MANUAL.md) for the
+`~/.duckdb/cli/<ver>/` library layout, then:
 
 ```console
-$ base=https://github.com/shreeve/duckdb-harbor/releases/download/v0.8.1
-$ curl -sLO $base/harbor-v0.8.1-duckdb-v1.5.5-osx_arm64.zip
-$ curl -sLO $base/duckdb-harbor
-$ unzip harbor-v0.8.1-duckdb-v1.5.5-osx_arm64.zip   # -> harbor.duckdb_extension
-$ chmod +x duckdb-harbor
-$ ./duckdb-harbor mydata.duckdb --token secret
-┌───────────────┬───────────────────────┐
-│ Service       │ Address               │
-├───────────────┼───────────────────────┤
-│ DuckDB Harbor │ http://127.0.0.1:9495 │
-│ Auth Token    │ secret                │
-└───────────────┴───────────────────────┘
+$ make binary pilot                       # -> target/release/{harbor,pilot}
+$ harbor serve mydata.duckdb --token secret
+harbor 0.10.0: berth "mydata" serving mydata.duckdb on ~/.harbor/mydata.sock (duckdb v1.5.5, memory_limit 2GB)
 ```
 
-That is the whole install. The launcher finds `harbor.duckdb_extension` beside
-itself, in `~/.duckdb/extensions`, or wherever `--load` /
-`HARBOR_EXTENSION` points, and it accepts the file under any name. With no
-`--token` it mints one and prints it as the server binds — the only time it is
-shown; `HARBOR_TOKEN` is honoured if set.
+`harbor serve` runs in the foreground. `harbor add mydata.duckdb` spawns a
+**detached** berth and returns once it answers `/ready`; `harbor ls` lists the
+fleet, `harbor stop <name>` drains and `CHECKPOINT`s, `harbor rm <name>` clears
+the registry (never the database file). With no `--token`, a per-berth token is
+minted and written to `~/.harbor/<name>.token`.
 
-To stop naming the file in a plain DuckDB shell, install it once:
+Exits are clean: `SIGTERM` / `Ctrl-C` drain in-flight requests and `CHECKPOINT`
+so the next open never replays a WAL.
+
+Talk to it with `curl` (above), or with the bundled client — a
+duckdb-shell-class REPL with syntax highlighting and Tab completion:
 
 ```console
-$ duckdb -unsigned -c "INSTALL '/path/to/harbor.duckdb_extension'"
+$ pilot mydata                 # a REPL over the socket
+$ pilot mydata -c "SELECT count(*) FROM orders"   # one-shot
 ```
 
-after which `LOAD harbor;` works in any session. DuckDB files installed
-extensions per version and per platform, so installing a build for each DuckDB
-you run leaves `LOAD harbor` resolving to the right one under each. An installed
-copy never updates itself, though, so the launcher still prefers a built source
-tree over it.
-
-At a terminal that is a normal DuckDB shell which happens to be serving HTTP —
-one window that both answers clients and runs your own SQL against the same
-database:
-
-```console
-$ ./duckdb-harbor mydata.duckdb --token secret --ui --quack
-┌───────────────┬────────────────────────┐
-│ Service       │ Address                │
-├───────────────┼────────────────────────┤
-│ DuckDB Harbor │ http://127.0.0.1:9495  │
-│ DuckDB Quack  │ quack://127.0.0.1:9496 │
-│ DuckDB UI     │ http://localhost:9497  │
-│ Auth Token    │ secret                 │
-└───────────────┴────────────────────────┘
-D SELECT count(*) FROM orders;   -- while clients are querying over HTTP
-```
-
-A row for each service actually running, and nothing else. It goes to stderr,
-so it stays clear of query output and shows up immediately even under a
-supervisor, where stdout would be buffered until exit.
-
-Run it anywhere stdin is not a terminal — a unit file, a container, `nohup`,
-behind a pipe — and it blocks instead, which is what a supervisor wants. Force
-either with `--repl` or `--wait`; `--wait` is worth writing in a unit file even
-though it is already the default there.
-
-Both exits are clean. `SIGTERM` and `Ctrl-C` drain in-flight requests and
-`CHECKPOINT`, and leaving the prompt folds the WAL too, so the next open never
-replays one. At the prompt, `.quit` and `Ctrl-D` leave; `Ctrl-C` does not —
-DuckDB's shell reads it as "cancel this line".
+Remote access is Caddy's job at the edge (TLS + auth); harbor itself speaks
+plain HTTP over a unix socket or a loopback TCP port. See
+[MANUAL.md](MANUAL.md) for the fleet model, deployment, and the version-swap
+install layout.
 
 ### Request logging
 
-`--log` (or `log := true`) writes one line per HTTP request to stderr:
+`--log` writes one line per HTTP request to stderr:
 
 ```
 harbor: 2026-08-12T04:31:07Z 127.0.0.1 POST /sql 200 12ms
@@ -266,47 +233,10 @@ default. The SQL itself is never logged: it arrives in the request body, it can
 be megabytes, and on this endpoint it is as likely to hold customer data as the
 tables it reads.
 
-stderr, not stdout, because stdout carries query results and the prompt in
-`--repl` mode and the startup summary is already there. Send it wherever
-the log belongs — `2>>/var/log/harbor.log`, a pipe, or a supervisor's
+stderr, not stdout, so it stays clear of anything a client reads. Send it
+wherever the log belongs — `2>>/var/log/harbor.log`, a pipe, or a supervisor's
 collector. There is no `--log FILE`: rotation and permissions are the shell's
 job, and it does them better than harbor would.
-
-If the prompt draws and then ignores you for about five seconds — Enter gives
-blank lines, `Ctrl-C` and `Ctrl-D` do nothing — that is DuckDB's shell waiting
-on a terminal that answered neither the background-colour query nor the device
--attributes query it sends alongside it. Almost every terminal answers at least
-one, so this is rare; when it happens `duckdb -dark-mode` pins the colour and
-skips the wait. Not harbor-specific, and not something this launcher forwards:
-run duckdb directly, as below, if you are on such a terminal.
-
-### Or straight from a DuckDB shell
-
-The launcher is a convenience, not a dependency. `-unsigned` is required, since
-this is not in DuckDB's extension registry:
-
-```console
-$ duckdb -unsigned mydata.duckdb
-```
-```sql
-LOAD '/path/to/harbor.duckdb_extension';
-CALL harbor_serve(bind := '127.0.0.1', port := 9495);  -- returns the address
-CALL harbor_wait();                                    -- blocks until stopped
-```
-
-That is the whole SQL surface, four table functions: `harbor_serve`,
-`harbor_stop`, `harbor_wait`, and `harbor_version`. Skip `harbor_wait` and you
-have what the launcher gives you at a terminal; end with `CALL harbor_stop()`,
-which drains the workers and checkpoints.
-
-Two things the launcher is doing for you here. First, the file has to be named
-exactly `harbor.duckdb_extension`: DuckDB builds the init symbol from
-everything before the first dot, so a `LOAD` of
-`harbor-v0.8.1-osx_arm64.duckdb_extension` looks for `harbor-v0_init_c_api` and
-fails with a `dlsym` error that names nothing useful. Second, it sets
-`checkpoint_threshold` to 1MB rather than DuckDB's 16MB — at 16MB a modest
-writer can run for weeks with every committed row sitting in the WAL and the
-`.duckdb` file near-empty.
 
 ## Any language
 
@@ -419,15 +349,16 @@ with `"lossless": false` instead of returning a plausible wrong answer.
 DuckDB's ecosystem already covers two audiences. DuckDB Harbor covers the
 third.
 
-| Extension | Serves | Client needs |
-| --- | --- | --- |
-| `quack` | other DuckDB instances | DuckDB |
-| `ui` | a browser | a browser |
-| **`harbor`** | **everything else** | **`curl`** |
+| Serves | Client needs |
+| --- | --- |
+| `quack` — other DuckDB instances | DuckDB |
+| `ui` — a browser | a browser |
+| **`harbor` — everything else** | **`curl`** |
 
-All three run in one process, over one database file, at the same time. DuckDB
-Harbor does not reimplement the other two — `quack` and `ui` are stock and
-unmodified.
+`quack` and `ui` are DuckDB extensions; `harbor` is a standalone server. It can
+still load them into its own database — `harbor serve db.duckdb --init 'LOAD ui'`
+— so one process can answer HTTP clients, browsers, and other DuckDB instances
+over one file at once, `quack` and `ui` stock and unmodified.
 
 ## Known limitations
 
@@ -442,44 +373,45 @@ boundary the Rust client uses. Cast to `VARCHAR` and the value comes back
 intact.
 
 **Bodies are capped at 8 MiB**, declared or delivered; over that is a `413`.
-There is no rate limiting, no CORS, and no request logging — defensible for a
-loopback service behind a proxy, worth knowing before it faces a browser.
+There is no rate limiting and no CORS — defensible for a service behind a proxy,
+worth knowing before it faces a browser. Request logging is available with
+`--log`, off by default.
 
 **Signal handling is Unix only.** On Windows there is no `SIGTERM` drain and no
-checkpoint on exit; `harbor_stop` is the way out.
+checkpoint on exit; `harbor stop` is the way out.
 
-**One exact DuckDB version per binary.** A build is pinned to **v1.5.5**, and a
-different engine refuses to load it rather than risk mis-reading it.
+**The engine is the sibling `libduckdb`, not the binary.** harbor links
+dynamically and is version-agnostic — the same build serves whichever DuckDB its
+adjacent `libduckdb` provides (verified against 1.5.5 and a 2.0 dev build). The
+caveat that comes with that: point it at a library whose storage format matches
+the database file.
 
 ## Working on it
 
-Building is only needed to change it. DuckDB Harbor is Rust against DuckDB's
-**C extension API**, so no DuckDB source tree is required — a Rust toolchain
-and `make release` produce the artifact. It is two files:
-[`src/lib.rs`](src/lib.rs) is the extension entry, its four table functions,
-and the whole HTTP server; [`bin/duckdb-harbor`](bin/duckdb-harbor) runs a
-database as a service.
+Building is only needed to change it. Three crates: **`harbor`** (the server
+engine and the fleet CLI), **`wire`** (the frozen protocol contract, shared with
+the client), and **`pilot`** (the client). harbor links an external `libduckdb`
+rather than embedding one, so no DuckDB source tree is required — point
+`DUCKDB_LIB` at a library under `~/.duckdb/cli/<ver>/` (see [MANUAL.md](MANUAL.md))
+and run `make binary pilot`. The crate ships pregenerated bindings, so there is
+no bindgen and no headers to find.
 
-`make check` runs the suite and `make check_quick` runs the subset that
-finishes in about a minute; run [`test/scripts/fixture.sh`](test/scripts/fixture.sh)
-once first to build the database the suites read. It is heavily tested: 11
-suites and roughly 4,100 lines of tests against about 2,200 lines of product.
-Every answer is checked against an oracle that is not DuckDB Harbor — values
-read from the database file before the server takes the lock, and Python's own
-`datetime` and `base64` for fuzzed values. An oracle that shares an
+`make check` runs the full suite, `make check_quick` the sub-minute subset; both
+build a fixture database with the local `duckdb` CLI first. It is heavily tested:
+ten suites whose every answer is checked against an oracle that is not harbor —
+values read from the database file before the server takes the lock, and Python's
+own `datetime` and `base64` for fuzzed values. An oracle that shares an
 implementation with the thing it checks confirms only that the code is
 self-consistent.
 
 ## Status
 
-Early. **v0.8.2** is the current release, built for five platforms against both
-DuckDB v1.5.5 and the v2.0.0 alpha. The five moved in v0.8.2: `osx_amd64` is
-gone and `windows_arm64` takes its place — Apple stopped selling Intel Macs in
-2023, and Rosetta runs an arm64 DuckDB, which loads an arm64 extension, so the
-Intel build was not what an Intel Mac ended up using anyway. Building from
-source there takes about twenty seconds. Not in DuckDB's community-extensions
-registry yet, so `-unsigned` is required and there is no `INSTALL harbor` from
-a repository — install a downloaded file by path instead, as above.
+Pre-production. harbor and pilot are two small binaries — no extension, no
+launcher, no signing dance. harbor is dynamically linked and **version-agnostic**:
+one build serves any DuckDB by the `libduckdb` beside it, proven against 1.5.5
+and a 2.0 dev build (the same bytes report each version next to each library).
+Deploy behind Caddy, which owns TLS and per-request timeouts at the edge. See
+[MANUAL.md](MANUAL.md) for the fleet model and deployment.
 
 ## License
 

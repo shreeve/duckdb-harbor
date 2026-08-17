@@ -119,9 +119,11 @@ fi
 # the database before anything takes the file lock.
 run asserts "$here/test/scripts/asserts.sh" "$db"
 
-# types.py sends every corpus query and reads the types back out of the
+# typecov.py sends every corpus query and reads the types back out of the
 # schema lines, so it needs a server; it used to grep the query text instead.
-run types "$here/test/scripts/types.py" --port "$port" --token "$token"
+# (The file is not named types.py: a script dir on sys.path[0] would then
+# shadow the stdlib `types` module and break every Python suite run from here.)
+run types "$here/test/scripts/typecov.py" --port "$port" --token "$token"
 
 run spec  "$here/test/scripts/spec.py" --port "$port" --token "$token"
 run fuzz  "$here/test/scripts/fuzz.py"       --port "$port" --token "$token"

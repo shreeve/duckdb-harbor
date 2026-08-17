@@ -67,6 +67,21 @@ def yes(name, cond, detail=""):
         bad(name, detail or "expected true")
 
 
+def until(fn, want, tries=50, delay=0.1):
+    """Poll fn() until it equals want, up to tries*delay seconds. A connection
+    cancelled by its deadline comes back on the reaper's next tick, so recovery
+    is quick but not instantaneous — a slow runner needs a beat before the next
+    query lands on a reset worker. Returns the last value either way, so a
+    genuine failure to recover still fails the assertion."""
+    last = fn()
+    for _ in range(tries):
+        if last == want:
+            return last
+        time.sleep(delay)
+        last = fn()
+    return last
+
+
 def section(title):
     print(f"\n\033[1m{title}\033[0m")
 
@@ -324,7 +339,7 @@ def run_tests(h, db):
     elapsed = time.monotonic() - started
     eq("all four saturating queries were stopped", [499] * 4, [j.status for j in jobs])
     yes("by the deadline, not by finishing", elapsed < baseline, f"{elapsed:.1f}s")
-    eq("and the server is serving again", 1, h.value("SELECT 1"))
+    eq("and the server is serving again", 1, until(lambda: h.value("SELECT 1"), 1))
 
     # -----------------------------------------------------------------------
     section("Cancelling a statement inside a transaction")
