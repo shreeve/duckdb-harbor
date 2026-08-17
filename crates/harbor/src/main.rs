@@ -324,7 +324,10 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         let _ = std::fs::remove_file(&sock_path);
     }
     let _ = std::fs::remove_file(&json_path);
-    let _ = std::fs::remove_file(&lock_path);
+    // The lock file stays. flock releases with the process, and a lock file
+    // with no holder is harmless — but unlinking it while another claimant
+    // has the old inode open lets a third claimant create a fresh inode and
+    // flock it too: two winners, one database. Never unlink a lock file.
     eprintln!("harbor: berth {:?} closed ({farewell})", o.name);
     Ok(())
 }
@@ -348,19 +351,36 @@ fn add(rest: Vec<String>) -> Result<(), String> {
     let home = harbor_home()?;
     let log_dir = home.join("log");
     std::fs::create_dir_all(&log_dir).map_err(|e| format!("log dir: {e}"))?;
-    let log = std::fs::File::create(log_dir.join(format!("{}.log", o.name)))
+    let log_path = log_dir.join(format!("{}.log", o.name));
+    // Append, never truncate: a berth may already be serving under this name
+    // (this add is then the loser of a race, or a mistake), and File::create
+    // would wipe the live process's history out from under it — the log an
+    // operator needs most at exactly the moment it went missing.
+    let log = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&log_path)
         .map_err(|e| format!("log file: {e}"))?;
 
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let db_abs = std::fs::canonicalize(&o.db).unwrap_or(o.db.clone());
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("serve").arg(&db_abs);
-    let mut pass = rest.into_iter().filter(|a| a != o.db.to_str().unwrap_or(""));
-    // pass through every flag except the db positional
-    let mut passed: Vec<String> = Vec::new();
-    while let Some(a) = pass.next() {
-        passed.push(a);
-    }
+    // Pass every argument through except the db positional — the first
+    // occurrence only, so a flag value that happens to equal the path
+    // survives.
+    let mut skipped_db = false;
+    let passed: Vec<String> = rest
+        .into_iter()
+        .filter(|a| {
+            if !skipped_db && a == o.db.to_str().unwrap_or("") {
+                skipped_db = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
     cmd.args(&passed);
     {
         use std::os::unix::process::CommandExt;
@@ -370,45 +390,66 @@ fn add(rest: Vec<String>) -> Result<(), String> {
             .stderr(Stdio::from(log))
             .process_group(0); // spawn, don't fork (D4): detached from our tty/session
     }
-    let child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
 
     let sock = o.socket.clone().unwrap_or_else(|| home.join(format!("{}.sock", o.name)));
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
+        // The child dying is an answer, not a timeout: it lost the flock to a
+        // berth already serving, or failed outright. Without this check the
+        // existing berth answers /ready and this add reports success with the
+        // dead child's pid — which an orchestrator then records and signals.
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "the berth did not start ({status}); a berth may already serve this name — \
+                 see harbor ls, or {}",
+                log_path.display()
+            ));
+        }
         let (up, at) = match o.port {
             None => (ready(&sock), sock.display().to_string()),
             Some(port) => (ready_tcp(&o.bind, port), format!("{}:{port}", o.bind)),
         };
         if up {
-            println!("berth {:?} ready on {at} (db: {}, pid {})", o.name, db_abs.display(), child.id());
-            return Ok(());
+            // Ready is necessary but not sufficient: on a name collision the
+            // EXISTING berth answers this probe instantly, before our child
+            // has even lost its flock. The sidecar json names who actually
+            // serves — believe it, not the probe. A missing or mismatched
+            // json means our child has not written it (keep polling) or never
+            // will (the try_wait above reports that next lap).
+            let served_by = std::fs::read_to_string(home.join(format!("{}.json", o.name)))
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|j| j["pid"].as_u64());
+            if served_by == Some(u64::from(child.id())) {
+                println!(
+                    "berth {:?} ready on {at} (db: {}, pid {})",
+                    o.name,
+                    db_abs.display(),
+                    child.id()
+                );
+                return Ok(());
+            }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Err(format!(
-        "berth {:?} did not come up in 15s — see {}",
-        o.name,
-        log_dir.join(format!("{}.log", o.name)).display()
-    ))
+    Err(format!("berth {:?} did not come up in 15s — see {}", o.name, log_path.display()))
 }
 
 fn ready_tcp(bind: &str, port: u16) -> bool {
     let Ok(mut s) = std::net::TcpStream::connect((bind, port)) else { return false };
     let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-    if write!(s, "GET /ready HTTP/1.1\r\nHost: harbor\r\nConnection: close\r\n\r\n").is_err() {
-        return false;
-    }
-    let mut buf = [0u8; 64];
-    match s.read(&mut buf) {
-        Ok(n) => String::from_utf8_lossy(&buf[..n]).contains(" 200 "),
-        Err(_) => false,
-    }
+    probe_200(&mut s)
 }
 
 /// GET /ready over the socket — the only HTTP the fleet verbs speak.
 fn ready(sock: &Path) -> bool {
     let Ok(mut s) = UnixStream::connect(sock) else { return false };
     let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+    probe_200(&mut s)
+}
+
+fn probe_200(s: &mut (impl Read + Write)) -> bool {
     if write!(s, "GET /ready HTTP/1.1\r\nHost: harbor\r\nConnection: close\r\n\r\n").is_err() {
         return false;
     }
@@ -421,31 +462,34 @@ fn ready(sock: &Path) -> bool {
 
 fn ls() -> Result<(), String> {
     let home = harbor_home()?;
-    let mut socks: Vec<PathBuf> = std::fs::read_dir(&home)
+    // Keyed off the sidecar json — the file that exists precisely so ls can
+    // read identity without dialing — because a --port berth has no socket
+    // and was invisible when this listed *.sock.
+    let mut jsons: Vec<PathBuf> = std::fs::read_dir(&home)
         .map_err(|e| e.to_string())?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "sock"))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
         .collect();
-    socks.sort();
-    if socks.is_empty() {
+    jsons.sort();
+    if jsons.is_empty() {
         println!("no berths in {} (harbor add <db.duckdb>)", home.display());
         return Ok(());
     }
     println!("{:<20} {:<8} {:<8} {:<24} DB", "BERTH", "STATE", "PID", "DUCKDB");
-    for sock in socks {
-        let name = sock.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-        let state = if ready(&sock) { "ready" } else { "dead" };
-        let (pid, duck, db) = std::fs::read_to_string(home.join(format!("{name}.json")))
+    for path in jsons {
+        let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let j = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .map(|j| {
-                (
-                    j["pid"].as_u64().map(|p| p.to_string()).unwrap_or_default(),
-                    j["duckdbVersion"].as_str().unwrap_or("-").to_string(),
-                    j["db"].as_str().unwrap_or("-").to_string(),
-                )
-            })
             .unwrap_or_default();
+        let state = match (j["socket"].as_str(), j["port"].as_u64()) {
+            (Some(sock), _) if ready(Path::new(sock)) => "ready",
+            (None, Some(port)) if ready_tcp("127.0.0.1", port as u16) => "ready",
+            _ => "dead",
+        };
+        let pid = j["pid"].as_u64().map(|p| p.to_string()).unwrap_or_default();
+        let duck = j["duckdbVersion"].as_str().unwrap_or("-").to_string();
+        let db = j["db"].as_str().unwrap_or("-").to_string();
         println!("{name:<20} {state:<8} {pid:<8} {duck:<24} {db}");
     }
     Ok(())
@@ -464,12 +508,25 @@ fn stop_berth(rest: Vec<String>, remove: bool) -> Result<(), String> {
                 // SIGTERM is the contract: drain, CHECKPOINT, exit (core owns it).
                 unsafe { libc::kill(pid as i32, libc::SIGTERM) };
                 let deadline = Instant::now() + Duration::from_secs(35);
+                let mut died = false;
                 while Instant::now() < deadline {
                     if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                        died = true;
                         println!("berth {name:?} stopped (drained and checkpointed)");
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(100));
+                }
+                if !died {
+                    // Exiting 0 here would be a lie an operator scripts on.
+                    // And removing registry files under a live berth is worse:
+                    // deleting its .lock lets a future serve create a fresh
+                    // inode, flock it, and claim the same name — two berths,
+                    // one database, the exact thing the mutex prevents.
+                    return Err(format!(
+                        "berth {name:?} (pid {pid}) is still running 35s after SIGTERM — \
+                         nothing was removed. Escalate by hand if you mean it: kill -9 {pid}"
+                    ));
                 }
             }
         }
@@ -480,7 +537,9 @@ fn stop_berth(rest: Vec<String>, remove: bool) -> Result<(), String> {
     }
 
     if remove {
-        for f in ["sock", "json", "token", "lock"] {
+        // The lock file stays (see serve): a stale one with no holder is
+        // harmless, and unlinking one is never safe.
+        for f in ["sock", "json", "token"] {
             let _ = std::fs::remove_file(home.join(format!("{name}.{f}")));
         }
         println!("berth {name:?} removed from the registry (database file untouched)");

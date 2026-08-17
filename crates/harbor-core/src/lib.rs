@@ -247,6 +247,9 @@ struct SlotRun {
     /// cancel that arrives late matches nothing rather than matching the wrong
     /// statement.
     job: u64,
+    /// When that statement began; meaningless while job == 0. The probe
+    /// thread reads it to tell wedged workers from merely busy ones.
+    started: Instant,
     /// A cancel that arrived before its statement started.
     ///
     /// The gap is small but entirely reachable: a request registers its
@@ -286,6 +289,7 @@ impl SlotRun {
     /// cancelled before it began, in which case it must not run at all.
     fn begin(&mut self, job: u64, deadline: Option<Instant>) -> bool {
         self.job = job;
+        self.started = Instant::now();
         self.deadline = deadline;
         // Any held cancel is consumed here whether or not it matches: it named
         // a statement that is now either this one or one that will never start,
@@ -369,8 +373,17 @@ impl SlotState {
         }
     }
 
-    fn expired(&self, now: Instant) -> bool {
-        self.run.lock().unwrap().expired(now)
+    /// The running job's id if it has outlived its deadline, else None. Read
+    /// and returned together so the caller can cancel exactly that job.
+    fn expired_job(&self, now: Instant) -> Option<u64> {
+        let run = self.run.lock().unwrap();
+        run.expired(now).then_some(run.job)
+    }
+
+    /// The job running right now (0 = idle). A snapshot for reapers that must
+    /// name their target instead of firing at "whatever is running".
+    fn current_job(&self) -> u64 {
+        self.run.lock().unwrap().job
     }
 }
 
@@ -466,8 +479,13 @@ fn cancel_expired() {
     let slots: Vec<Arc<SlotState>> = SLOTS.lock().unwrap().clone();
     let now = Instant::now();
     for slot in slots {
-        if slot.expired(now) {
-            slot.cancel(None);
+        // By id, never "whatever is running": between noticing the expiry and
+        // firing, the expired statement can finish and a fresh one begin, and
+        // a cancel(None) would kill that innocent — the exact race the job-id
+        // machinery exists to close (see SlotRun). A stale id is harmless: it
+        // is held as pending and discarded when the next statement begins.
+        if let Some(job) = slot.expired_job(now) {
+            slot.cancel(Some(job));
         }
     }
 }
@@ -712,6 +730,19 @@ fn try_lease_claim(id: &str) -> Result<(mpsc::SyncSender<Job>, Arc<SlotState>), 
                 .to_string(),
         });
     };
+    if lease.doomed {
+        // The client asked for this lease's release; honoring new claims while
+        // the cancel unwinds would let a "released" session that keeps sending
+        // short statements stay busy at every reaper tick — held, with its
+        // open transaction, forever. Same answer as absent: it is gone.
+        return Err(Refusal {
+            status: 404,
+            code: "no_such_session",
+            message: "no such session: it was released, timed out, or never existed. Open a new \
+                      one and retry the transaction from the beginning."
+                .to_string(),
+        });
+    }
     if lease.busy {
         return Err(Refusal {
             status: 409,
@@ -817,7 +848,7 @@ fn lease_release(id: &str) -> Released {
 fn lease_reap() {
     enum Action {
         Release(String),
-        Cancel(Arc<SlotState>),
+        Cancel(Arc<SlotState>, u64),
     }
     let actions: Vec<Action> = {
         let guard = LEASES.lock().unwrap();
@@ -831,8 +862,17 @@ fn lease_reap() {
                 // is deliberate: DuckDB checks the interrupt flag between
                 // pipeline steps, and a statement that swallowed the first one
                 // gets asked again rather than being left to run forever.
+                //
+                // The job id is captured with the decision. Between this
+                // snapshot and the fire below sit other actions, each a
+                // blocking quiesce — plenty of time for the doomed statement
+                // to finish and the connection to be reissued to an innocent.
+                // cancel(Some(job)) makes the late fire a no-op instead of a
+                // random casualty. A statement that has not begun yet (job 0)
+                // waits for the next tick.
                 true if now >= l.deadline || l.doomed => {
-                    Some(Action::Cancel(Arc::clone(&l.conn.state)))
+                    let job = l.conn.state.current_job();
+                    (job != 0).then(|| Action::Cancel(Arc::clone(&l.conn.state), job))
                 }
                 true => None,
                 false if l.doomed
@@ -852,8 +892,8 @@ fn lease_reap() {
             Action::Release(id) => {
                 lease_release(&id);
             }
-            Action::Cancel(state) => {
-                state.cancel(None);
+            Action::Cancel(state, job) => {
+                state.cancel(Some(job));
             }
         }
     }
@@ -890,6 +930,9 @@ struct Running {
     /// channel is dropped, which is what `stop` does after draining.
     leases: Vec<JoinHandle<Option<Connection>>>,
     reaper: Option<JoinHandle<()>>,
+    /// The saturation-proof lane: answers /ready when every worker is busy,
+    /// and overflow requests on a borrowed lease connection. See probe_worker.
+    probe: Option<JoinHandle<()>>,
     addr: String,
 }
 
@@ -1004,6 +1047,7 @@ pub fn start(
             interrupt: conn.interrupt_handle(),
             run: Mutex::new(SlotRun {
                 job: 0,
+                started: Instant::now(),
                 pending: None,
                 cancelled: false,
                 deadline: None,
@@ -1045,6 +1089,7 @@ pub fn start(
         lease_handles.push(handle);
         free.push(LeaseConn { slot, jobs: tx, state });
     }
+    *WORKER_SLOTS.lock().unwrap() = slots[..workers].to_vec();
     *SLOTS.lock().unwrap() = slots;
     *QUERIES.lock().unwrap() = Some(HashMap::new());
     let total = free.len();
@@ -1077,9 +1122,36 @@ pub fn start(
             .ok()
     };
 
+    // One thread the fleet can always reach. Workers pair 1:1 with
+    // connections and stream whole responses, so when every worker is busy an
+    // accepted /ready sits in tiny_http's queue until one frees — measured at
+    // 5 seconds under a saturating analytical load — and a load balancer with
+    // an ordinary timeout marks a busy-but-healthy berth dead precisely when
+    // killing it hurts most. This thread never runs a statement of its own:
+    // /ready is answered from the CONTROL connection, and anything else gets
+    // a borrowed lease connection when one is free or an immediate honest 503
+    // when the berth is truly saturated — shedding load instead of queueing
+    // it invisibly.
+    let probe = {
+        let server = Arc::clone(&server);
+        let stop = Arc::clone(&stop);
+        let token = Arc::clone(&token);
+        thread::Builder::new()
+            .name("harbor-probe".to_string())
+            .spawn(move || probe_worker(server, stop, token, log))
+            .ok()
+    };
+
     *STOPPED.0.lock().unwrap() = false;
-    *running =
-        Some(Running { server, stop, workers: handles, leases: lease_handles, reaper, addr: addr.clone() });
+    *running = Some(Running {
+        server,
+        stop,
+        workers: handles,
+        leases: lease_handles,
+        reaper,
+        probe,
+        addr: addr.clone(),
+    });
     Ok(addr)
 }
 
@@ -1127,20 +1199,49 @@ pub fn stop() -> Result<String, String> {
     // Workers hand their connection back as they exit, so a later
     // harbor_serve has a pool to draw from. A panicked worker forfeits its
     // connection rather than taking the shutdown down with it.
+    //
+    // Bounded patience, not join(): a worker whose client stopped reading is
+    // stuck inside a socket write — tiny_http sets no write timeout — and a
+    // plain join would wait on it forever. That wedged this whole function:
+    // the signal thread sat inside stop(), the second SIGTERM queued behind
+    // the RUNNING mutex, and the only exit left was SIGKILL — which forfeits
+    // the CHECKPOINT this drain exists to reach. After the deadline the
+    // straggler is abandoned exactly as a panicked worker would be: its
+    // connection is forfeited, and the checkpoint below runs regardless.
+    let deadline = Instant::now() + Duration::from_secs(10);
     let mut pool = POOL.lock().unwrap();
-    for h in r.workers {
-        if let Ok(Some(conn)) = h.join() {
-            pool.push(conn);
+    let mut pending: Vec<thread::JoinHandle<Option<Connection>>> =
+        r.workers.into_iter().chain(r.leases).collect();
+    loop {
+        let (done, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|h| h.is_finished());
+        for h in done {
+            if let Ok(Some(conn)) = h.join() {
+                pool.push(conn);
+            }
         }
+        pending = rest;
+        if pending.is_empty() || Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
     }
-    for h in r.leases {
-        if let Ok(Some(conn)) = h.join() {
-            pool.push(conn);
-        }
+    if !pending.is_empty() {
+        eprintln!(
+            "harbor: {} executor(s) still writing to stalled clients; abandoning them to checkpoint",
+            pending.len()
+        );
     }
     drop(pool);
     if let Some(h) = r.reaper {
+        // Prompt: the reaper sleeps in short ticks and checks the stop flag.
         let _ = h.join();
+    }
+    if let Some(h) = r.probe {
+        // Same bounded patience as the workers: joined if it made it out of
+        // its recv loop, abandoned if it is wedged writing to a dead client.
+        if h.is_finished() {
+            let _ = h.join();
+        }
     }
 
     // Fold the WAL back into the database file so the next open needs no
@@ -1272,7 +1373,7 @@ fn worker(
             // 503 rather than a cheerful hardcoded 200 — but reporting it is
             // not enough: the worker still has to leave.
             Ok(Some(req)) => {
-                if !handle(req, &jobs_tx, &state, token.as_ref().as_deref(), log) {
+                if !handle(req, Some((&jobs_tx, &state)), token.as_ref().as_deref(), log) {
                     break;
                 }
             }
@@ -1283,6 +1384,79 @@ fn worker(
 
     drop(jobs_tx);
     executor.join().ok()
+}
+
+/// The saturation-proof lane (see the note in `start`): the control plane
+/// that must stay reachable precisely when every worker is busy. /ready so a
+/// load balancer never mistakes busy for dead; cancels and releases because
+/// they are how a saturated berth gets UN-saturated; /sessions and /info
+/// because an operator debugging the saturation needs them. All bounded,
+/// in-memory responses — this thread never streams and never borrows a
+/// connection, so a client that stops reading can wedge a worker but not the
+/// berth's last open door. Statements and /catalog get a fast honest 503
+/// instead of queueing invisibly behind the analytics.
+fn probe_worker(server: Arc<Server>, stop: Arc<AtomicBool>, token: Arc<Option<String>>, log: bool) {
+    while !stop.load(Ordering::SeqCst) {
+        // Only join the accept queue when the workers are WEDGED — every one
+        // of them mid-statement for at least 250ms — not merely busy. All
+        // recv() callers share one queue, so a probe that listened while
+        // workers were healthy would win requests from them and shed load
+        // nobody needed shed; and a storm of quick queries keeps all workers
+        // "busy" while serving thousands per second, which is queueing
+        // working as designed. Six multi-second analytics is the situation
+        // this thread exists for, and statement age is what tells the two
+        // apart. (Verified against the stress suite: 16 fast clients, zero
+        // sheds; 6 slow scans, probe live within a quarter second.)
+        if !workers_wedged(Duration::from_millis(250)) {
+            thread::sleep(Duration::from_millis(25));
+            continue;
+        }
+        match server.recv_timeout(Duration::from_millis(100)) {
+            Ok(Some(req)) => {
+                let _ = handle(req, None, token.as_ref().as_deref(), log);
+            }
+            Ok(None) => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+/// `/ready` as the probe thread answers it: the recent cached verdict, else
+/// SELECT 1 on the CONTROL connection. Shallower than the workers' full-path
+/// probe — but the question under saturation is "is the database alive",
+/// not "is a worker free", and a probe that queues behind the workers turns
+/// a busy berth into a dead one in the eyes of its load balancer.
+fn run_ready_control(req: Request) -> (bool, u16) {
+    if let Some((at, ok)) = *LAST_READY.lock().unwrap() {
+        if at.elapsed() < READY_MAX_AGE {
+            return (true, respond_ready(req, ok, "not ready"));
+        }
+    }
+    let ok = CONTROL
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|c| c.execute_batch("SELECT 1").is_ok());
+    *LAST_READY.lock().unwrap() = Some((Instant::now(), ok));
+    (true, respond_ready(req, ok, "not ready"))
+}
+
+/// Every worker mid-statement, and every one of those statements at least
+/// `min_age` old. See the probe loop for why age is the discriminator.
+fn workers_wedged(min_age: Duration) -> bool {
+    let slots = WORKER_SLOTS.lock().unwrap();
+    !slots.is_empty()
+        && slots.iter().all(|s| {
+            let run = s.run.lock().unwrap();
+            run.job != 0 && run.started.elapsed() >= min_age
+        })
+}
+
+/// The probe thread's answer to work it cannot take: immediate and honest,
+/// instead of an invisible seat in the queue behind the analytics.
+fn shed(req: Request) -> (bool, u16) {
+    let _ = req.respond(error_response(503, "unavailable", "every worker is busy; retry shortly"));
+    (true, 503)
 }
 
 /// Returns false when the executor behind `jobs` is gone, which is the one
@@ -1302,6 +1476,17 @@ static STARTED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 /// `/info` do not count: a fleet `ls` probing liveness must not keep an
 /// --idle-exit berth alive forever.
 static LAST_ACTIVITY: Mutex<Option<Instant>> = Mutex::new(None);
+/// Countable requests currently being served, statement and stream included.
+/// This is what actually protects a long-running statement from --idle-exit:
+/// the activity clock ticks only at request start and finish, so without this
+/// a 5-minute COPY on an otherwise quiet berth would be "idle" at the 90s
+/// mark and cancelled out from under its caller.
+static INFLIGHT_REQUESTS: AtomicU64 = AtomicU64::new(0);
+/// The workers' slots alone (SLOTS holds leases too), set at start(). The
+/// probe thread reads these to decide whether the workers are wedged — every
+/// one of them busy on a statement old enough to matter — which is the only
+/// condition under which it takes requests at all.
+static WORKER_SLOTS: Mutex<Vec<Arc<SlotState>>> = Mutex::new(Vec::new());
 
 pub fn set_info(base: serde_json::Value) {
     *INFO.lock().unwrap() = Some(base);
@@ -1312,19 +1497,23 @@ fn touch_activity() {
 }
 
 /// Milliseconds since the last countable request began or ended. The clock
-/// also resets when a request *finishes*, so a statement that runs longer
-/// than the idle window cannot be idled out from under its caller.
+/// resets at both edges of a request, but the guarantee that a statement
+/// longer than the idle window is never idled out from under its caller
+/// comes from `quiet()`, which refuses while any request is in flight.
 pub fn idle_ms() -> u64 {
     let last = *LAST_ACTIVITY.lock().unwrap();
     let base = last.or(*STARTED_AT.lock().unwrap());
     base.map_or(0, |t| t.elapsed().as_millis() as u64)
 }
 
-/// True when nothing is held: no live leases, no lease statement in flight.
-/// Plain worker requests are covered by the activity clock; leases are
-/// covered here, because an open transaction with no traffic is still a
-/// claim on this berth.
+/// True when nothing is held: no request mid-flight (statement or stream),
+/// no live leases, no lease statement in flight. An --idle-exit berth may
+/// leave only when this is true — an open transaction with no traffic is
+/// still a claim on this berth, and so is a statement in its fifth minute.
 pub fn quiet() -> bool {
+    if INFLIGHT_REQUESTS.load(Ordering::SeqCst) != 0 {
+        return false;
+    }
     match LEASES.lock().unwrap().as_ref() {
         Some(l) => l.live.is_empty() && l.inflight == 0,
         None => false,
@@ -1349,10 +1538,15 @@ fn run_info(req: Request) -> (bool, u16) {
     }
 }
 
+/// One request. `exec` is the accepting thread's executor — its jobs channel
+/// and cancellation slot. The probe thread passes None: it owns no
+/// connection, so the arms that stream (/sql, /catalog, the workers' /ready)
+/// shed load with an immediate 503 instead, and every control-plane verb —
+/// session open/release, query cancel, /sessions, /info — works exactly as
+/// it does on a worker, because none of them touch an executor.
 fn handle(
     mut req: Request,
-    jobs: &mpsc::SyncSender<Job>,
-    state: &Arc<SlotState>,
+    exec: Option<(&mpsc::SyncSender<Job>, &Arc<SlotState>)>,
     token: Option<&str>,
     log: bool,
 ) -> bool {
@@ -1361,6 +1555,7 @@ fn handle(
     let countable = path != "/ready" && path != "/info";
     if countable {
         touch_activity();
+        INFLIGHT_REQUESTS.fetch_add(1, Ordering::SeqCst);
     }
 
     // Only when logging. A clock read and a peer-address format are small, but
@@ -1372,138 +1567,126 @@ fn handle(
         false => String::new(),
     };
 
+    // Two gates before any routing, in this order.
+    //
+    // The declared length first: tiny_http drains an undelivered body when a
+    // request is dropped — with a single `vec![0; remaining]` — and it does so
+    // for EVERY response path, 401s and 404s included. `take()` bounds what
+    // harbor buffers but not what the client may declare, and the declared
+    // length is attacker-chosen; a request declaring 1 GB and sending 9 bytes
+    // used to cost this process a 1 GB zeroed allocation, unauthenticated.
+    // Refusing here, before anything else can respond, means the allocation
+    // never happens on any path.
+    //
+    // Then the token: /ready is the one unauthenticated route (a load balancer
+    // should not need a credential to learn up-or-down, and the answer reveals
+    // nothing else), so the property "everything except /ready requires the
+    // token" is enforced once, here, instead of being re-asserted arm by arm —
+    // where the arm someone adds next year would forget it.
+    //
     // Each arm reports the status it sent, so the log line below is written in
     // one place instead of at every `respond` call. The SQL text is not
     // logged: it is the request body, it can be enormous, and on this endpoint
     // it is as likely to hold customer data as anything else in the database.
-    let (keep_going, status) = match (&method, path.as_str()) {
-        // Readiness is unauthenticated on purpose: a load balancer should not
-        // need a credential to learn whether this server can serve, and the
-        // answer reveals nothing beyond up or down.
-        (Method::Get, "/ready") => run_ready(req, jobs),
-        // Open a transaction lease. Authenticated: it consumes a connection,
-        // which is the scarcest thing here.
-        (Method::Post, "/sql/sessions/new") => {
-            if !authorized(&req, token) {
-                let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
-                (true, 401)
-            } else {
-                run_session_open(req)
-            }
+    let (keep_going, status) = if let Some(n) = req.body_length().filter(|n| *n > MAX_BODY) {
+        let _ = req.respond(error_response(
+            413,
+            "body_too_large",
+            &format!("body is {n} bytes; the limit is {MAX_BODY}"),
+        ));
+        (true, 413)
+    } else if path != "/ready" && !authorized(&req, token) {
+        // Unknown paths stay 404 even unauthenticated — the contract the
+        // clients pinned long before this gate was hoisted. Known endpoints
+        // answer 401 so a caller with a bad token learns which problem it has.
+        if route_exists(&method, &path) {
+            let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
+            (true, 401)
+        } else {
+            let _ = req.respond(error_response(404, "not_found", "no such endpoint"));
+            (true, 404)
         }
-        // Release one. Idempotent by design: a client retrying a DELETE it is
-        // not sure landed must not be able to free a connection twice.
-        //
-        // A session running a statement is not simply refused any more: the
-        // statement is interrupted and the release completes on the reaper's
-        // next tick. `released` says whether the connection is back now,
-        // `cancelling` says the work to make it so is under way — so a client
-        // that wants its transaction stopped has one verb for it, and a client
-        // polling for the connection can tell the two apart.
-        (Method::Delete, p) if p.starts_with("/sql/sessions/") => {
-            if !authorized(&req, token) {
-                let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
-                (true, 401)
-            } else {
+    } else {
+        match (&method, path.as_str()) {
+            // Readiness is unauthenticated on purpose (see the gate above).
+            // Workers answer it down the full query path; the probe thread —
+            // the one still listening when every worker is saturated —
+            // answers from the CONTROL connection instead of queueing.
+            (Method::Get, "/ready") => match exec {
+                Some((jobs, _)) => run_ready(req, jobs),
+                None => run_ready_control(req),
+            },
+            // Open a transaction lease. It consumes a connection, which is the
+            // scarcest thing here.
+            (Method::Post, "/sql/sessions/new") => run_session_open(req),
+            // Release one. Idempotent by design: a client retrying a DELETE it
+            // is not sure landed must not be able to free a connection twice.
+            //
+            // A session running a statement is not simply refused any more: the
+            // statement is interrupted and the release completes on the
+            // reaper's next tick. `released` says whether the connection is
+            // back now, `cancelling` says the work to make it so is under way —
+            // so a client that wants its transaction stopped has one verb for
+            // it, and a client polling for the connection can tell them apart.
+            (Method::Delete, p) if p.starts_with("/sql/sessions/") => {
                 let id = p.trim_start_matches("/sql/sessions/").to_string();
                 let body = match lease_release(&id) {
                     Released::Yes => r#"{"released":true}"#.to_string(),
                     Released::No => r#"{"released":false}"#.to_string(),
-                    Released::Cancelling => {
-                        r#"{"released":false,"cancelling":true}"#.to_string()
-                    }
+                    Released::Cancelling => r#"{"released":false,"cancelling":true}"#.to_string(),
                 };
                 let _ = req.respond(json_response(200, &body));
                 (true, 200)
             }
-        }
-        // Stop a statement the client named when it sent it. Idempotent and
-        // deliberately unexciting: cancelling something that already finished
-        // is `false`, not an error, because by the time a Stop button is
-        // pressed the query it refers to may well be over.
-        (Method::Delete, p) if p.starts_with("/sql/queries/") => {
-            if !authorized(&req, token) {
-                let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
-                (true, 401)
-            } else {
+            // Stop a statement the client named when it sent it. Idempotent and
+            // deliberately unexciting: cancelling something that already
+            // finished is `false`, not an error, because by the time a Stop
+            // button is pressed the query it refers to may well be over.
+            (Method::Delete, p) if p.starts_with("/sql/queries/") => {
                 let id = p.trim_start_matches("/sql/queries/").to_string();
                 let cancelled = cancel_query(&id);
                 let _ = req.respond(json_response(200, &format!(r#"{{"cancelled":{cancelled}}}"#)));
                 (true, 200)
             }
-        }
-        // What is holding a connection, and for how long. The question an
-        // operator asks when everything is suddenly waiting, and the reason
-        // this exists at all: a pool you cannot see into is a pool you debug
-        // by guessing.
-        (Method::Get, "/sessions") => {
-            if !authorized(&req, token) {
-                let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
-                (true, 401)
-            } else {
+            // What is holding a connection, and for how long. The question an
+            // operator asks when everything is suddenly waiting, and the reason
+            // this exists at all: a pool you cannot see into is a pool you
+            // debug by guessing.
+            (Method::Get, "/sessions") => {
                 let _ = req.respond(json_response(200, &sessions_report()));
                 (true, 200)
             }
-        }
-        // Berth identity: who serves here, which engine, since when. Auth
-        // required — it names filesystem paths and pids. 404 when the host
-        // never set one, which is also what pre-fleet servers answer: absence
-        // is the version probe (PLAN.md §4.2).
-        (Method::Get, "/info") => {
-            if !authorized(&req, token) {
-                let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
-                (true, 401)
-            } else {
-                run_info(req)
-            }
-        }
-        // The whole schema — tables, columns, keys, indexes, sequences — in
-        // one call, in one shape. It lives here so a migration differ asks a
-        // single question instead of five, and so the answer never depends on
-        // which DuckDB this binary links: the queries below use whatever the
-        // engine's catalog provides, and version differences die in this
-        // process rather than in every client.
-        (Method::Get, "/catalog") => {
-            if !authorized(&req, token) {
-                let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
-                (true, 401)
-            } else {
-                run_catalog(req, jobs)
-            }
-        }
-        (Method::Post, "/sql") => {
-            if !authorized(&req, token) {
-                let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
-                (true, 401)
-            }
-            // Check the declared length before touching the reader. `take()`
-            // bounds what harbor buffers but not what the client may declare,
-            // and tiny_http drains whatever is left undelivered when the
-            // request is dropped — with a single `vec![0; remaining]`. So a
-            // client that declares 600 MB and sends 9 MB costs the process a
-            // 600 MB zeroed allocation it never asked for; the declared length
-            // is attacker-chosen and unbounded. Refusing here means the
-            // allocation never happens.
-            else if let Some(n) = req.body_length().filter(|n| *n > MAX_BODY) {
-                let _ = req.respond(error_response(
-                    413,
-                    "body_too_large",
-                    &format!("body is {n} bytes; the limit is {MAX_BODY}"),
-                ));
-                (true, 413)
-            } else {
-                let mut body = String::new();
-                if req.as_reader().take(MAX_BODY as u64).read_to_string(&mut body).is_err() {
-                    let _ = req.respond(error_response(400, "bad_request", "body is not valid UTF-8"));
-                    (true, 400)
-                } else {
-                    run_sql(req, jobs, state, &body)
+            // Berth identity: who serves here, which engine, since when. Auth
+            // required — it names filesystem paths and pids. 404 when the host
+            // never set one, which is also what pre-fleet servers answer:
+            // absence is the version probe (PLAN.md §4.2).
+            (Method::Get, "/info") => run_info(req),
+            // The whole schema — tables, columns, keys, indexes, sequences — in
+            // one call, in one shape. It lives here so a migration differ asks
+            // a single question instead of five, and so the answer never
+            // depends on which DuckDB this binary links: the queries below use
+            // whatever the engine's catalog provides, and version differences
+            // die in this process rather than in every client.
+            (Method::Get, "/catalog") => match exec {
+                Some((jobs, _)) => run_catalog(req, jobs),
+                None => shed(req),
+            },
+            (Method::Post, "/sql") => match exec {
+                Some((jobs, state)) => {
+                    let mut body = String::new();
+                    if req.as_reader().take(MAX_BODY as u64).read_to_string(&mut body).is_err() {
+                        let _ = req.respond(error_response(400, "bad_request", "body is not valid UTF-8"));
+                        (true, 400)
+                    } else {
+                        run_sql(req, jobs, state, &body)
+                    }
                 }
+                None => shed(req),
+            },
+            _ => {
+                let _ = req.respond(error_response(404, "not_found", "no such endpoint"));
+                (true, 404)
             }
-        }
-        _ => {
-            let _ = req.respond(error_response(404, "not_found", "no such endpoint"));
-            (true, 404)
         }
     };
 
@@ -1519,9 +1702,11 @@ fn handle(
         );
     }
     // The finish also counts (see idle_ms): a long statement resets the idle
-    // clock when it completes, not only when it began.
+    // clock when it completes, not only when it began. The in-flight count
+    // drops here, after respond() — the whole stream was this request.
     if countable {
         touch_activity();
+        INFLIGHT_REQUESTS.fetch_sub(1, Ordering::SeqCst);
     }
     keep_going
 }
@@ -1545,6 +1730,18 @@ fn utc_now() -> String {
     )
 }
 
+
+/// The route list, method included, for the auth gate above: it must agree
+/// with the match in `handle` so 401-vs-404 answers stay truthful. GET /sql
+/// is not a route (the method matters), and unknown paths are 404 with or
+/// without a token.
+fn route_exists(method: &Method, path: &str) -> bool {
+    matches!(
+        (method, path),
+        (Method::Get, "/ready" | "/sessions" | "/info" | "/catalog") | (Method::Post, "/sql" | "/sql/sessions/new")
+    ) || (*method == Method::Delete
+        && (path.starts_with("/sql/sessions/") || path.starts_with("/sql/queries/")))
+}
 
 fn authorized(req: &Request, token: Option<&str>) -> bool {
     let Some(expected) = token else { return true };
@@ -2602,6 +2799,19 @@ fn run_sql(
         return (true, 400);
     }
 
+    if let Some(setting) = fenced_setting(&parsed.sql) {
+        let _ = req.respond(error_response(
+            400,
+            "sql_error",
+            &format!(
+                "{setting} is fixed when the berth starts (harbor serve --memory-limit/--threads) \
+                 and cannot be changed over the wire: it is process-global, and this berth may \
+                 share its host with others (PLAN.md D2)"
+            ),
+        ));
+        return (true, 400);
+    }
+
     let shape = if wants_one_shot(&req) { Shape::Json } else { Shape::Ndjson };
 
     // A statement naming a lease goes to that lease's connection, wherever it
@@ -2764,6 +2974,64 @@ fn first_keyword(sql: &str) -> String {
         i += 1;
     }
     sql[start..i].to_ascii_uppercase()
+}
+
+/// Settings a client must not change: they are process-global in DuckDB, so
+/// one `SET memory_limit='100GB'` raises it for every neighbor berth on the
+/// host and defeats the fleet-safe cap the operator chose at berth start
+/// (PLAN.md D2). Verified live: the SET took effect for all workers at once.
+///
+/// The scan mirrors first_keyword: comments and whitespace are skipped the
+/// same way, so `/*x*/ SET threads=8` cannot slip past on a technicality.
+fn fenced_setting(sql: &str) -> Option<&'static str> {
+    const FENCED: &[&str] =
+        &["memory_limit", "max_memory", "threads", "worker_threads", "external_threads"];
+    let b = sql.as_bytes();
+    let mut i = 0;
+    let mut next_word = || -> String {
+        loop {
+            while i < b.len() && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if b[i..].starts_with(b"--") {
+                i = b[i..].iter().position(|&c| c == b'\n').map_or(b.len(), |p| i + p + 1);
+            } else if b[i..].starts_with(b"/*") {
+                let mut depth = 1;
+                i += 2;
+                while i < b.len() && depth > 0 {
+                    if b[i..].starts_with(b"/*") {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i..].starts_with(b"*/") {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        let start = i;
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        // Skip one non-word byte so `SET("x")`-style punctuation cannot stall
+        // the scan; the next call resumes past it.
+        if i == start && i < b.len() {
+            i += 1;
+        }
+        sql[start..i].to_ascii_uppercase()
+    };
+    if !matches!(next_word().as_str(), "SET" | "RESET" | "PRAGMA") {
+        return None;
+    }
+    let mut name = next_word();
+    if matches!(name.as_str(), "GLOBAL" | "SESSION" | "LOCAL") {
+        name = next_word();
+    }
+    FENCED.iter().find(|f| name.eq_ignore_ascii_case(f)).copied()
 }
 
 /// What a statement does to the surrounding transaction, when that is knowable
@@ -3997,7 +4265,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn idle() -> SlotRun {
-        SlotRun { job: 0, pending: None, cancelled: false, deadline: None }
+        SlotRun { job: 0, started: Instant::now(), pending: None, cancelled: false, deadline: None }
     }
 
     /// The bug this design exists to prevent: a cancel decided for one
