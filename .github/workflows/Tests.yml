@@ -27,10 +27,10 @@ jobs:
     name: quick gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           # Pinned, not '3.x': the suites run from test/scripts/, so a stdlib
           # name collision there breaks on newer Pythons — pin for reproducibility.
