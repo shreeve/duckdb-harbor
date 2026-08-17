@@ -386,7 +386,7 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
             }
             if CANCEL.swap(false, Ordering::Relaxed) {
                 if !fired.swap(true, Ordering::Relaxed) {
-                    eprint!("\r\x1b[2K");
+                    clear_spinner();
                     eprintln!("Interrupted — cancelling…");
                     let _ = http::request(
                         &conn.transport,
@@ -413,6 +413,7 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
     if resp.status >= 300 {
         let status = resp.status;
         let text = read_patient(resp.body, &on_tick);
+        clear_spinner();
         return match Event::parse(text.trim()) {
             Ok(Event::Error { code, .. }) if code == harbor_protocol::code::CANCELLED => {
                 eprintln!("Interrupted.");
@@ -425,34 +426,45 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
 
     // Stream the envelope through the renderer: pipe modes emit per row,
     // boxed modes retain O(display) and draw after `end` (render.rs).
-    if std::io::stderr().is_terminal() {
-        eprint!("\r\x1b[2K"); // clear any spinner remnant
-    }
+    clear_spinner();
     let mut renderer = Renderer::new(opts);
     let mut body = resp.body;
-    let mut line = String::new();
+    let mut acc: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
     loop {
-        // The socket ticks every 250ms (request_streaming); a tick is where a
-        // Ctrl-C gets noticed. Partial reads stay in `line` across ticks.
-        match body.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                on_tick();
-                continue;
+        // Reading bytes, not read_line: the socket ticks every 250ms
+        // (request_streaming) and a tick can land mid-line. read_line decodes
+        // UTF-8 as it goes, so a tick arriving in the middle of a multi-byte
+        // char (CJK/emoji) makes its guard consume those bytes, fail, and
+        // return InvalidData — aborting a perfectly healthy stream and dropping
+        // data. A byte accumulator has no char-boundary dependency: partial
+        // bytes simply wait in `acc` for the next read.
+        let Some(nl) = acc.iter().position(|&b| b == b'\n') else {
+            match body.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => acc.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    on_tick();
+                }
+                Err(e) => return err(&format!("stream died: {e}")),
             }
-            Err(e) => return err(&format!("stream died: {e}")),
-        }
-        let trimmed = line.trim();
+            continue;
+        };
+        let text = String::from_utf8_lossy(&acc[..=nl]).into_owned();
+        acc.drain(..=nl);
+        let trimmed = text.trim();
         if trimmed.is_empty() {
-            line.clear();
             continue;
         }
         let event = match Event::parse(trimmed) {
             Ok(ev) => ev,
             Err(e) => return err(&format!("bad envelope line ({e}): {trimmed}")),
         };
-        line.clear();
         match event {
             Event::Schema { columns } => renderer.schema(&columns),
             Event::Row { values } => {
@@ -476,6 +488,7 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
                 };
             }
             Event::Error { code, .. } if code == harbor_protocol::code::CANCELLED => {
+                clear_spinner();
                 eprintln!("Interrupted.");
                 return Outcome::Cancelled;
             }
@@ -509,7 +522,19 @@ fn read_patient(mut body: Box<dyn BufRead>, on_tick: &dyn Fn()) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+/// Erase a spinner remnant before printing anything else on stderr. The
+/// spinner paints `\r\x1b[2K… running …` on every half-second tick and only at
+/// a terminal, so a line left mid-spin would otherwise have the next message
+/// (an error, or `Interrupted.`) glued to its tail. No-op when stderr is not a
+/// terminal — nothing was painted.
+fn clear_spinner() {
+    if std::io::stderr().is_terminal() {
+        eprint!("\r\x1b[2K");
+    }
+}
+
 fn err(msg: &str) -> Outcome {
+    clear_spinner();
     eprintln!("pilot: {msg}");
     Outcome::Failed
 }

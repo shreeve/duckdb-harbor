@@ -161,9 +161,22 @@ fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
         .with_completer(Box::new(completer.clone()))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
         .with_edit_mode(edit_mode)
-        .with_history(Box::new(
-            FileBackedHistory::with_file(1000, history).expect("history file"),
-        ))
+        .with_history({
+            // A read-only or unwritable HARBOR_HOME (restrictive perms, a path
+            // component that is a file) must not crash the REPL on startup:
+            // reedline's with_file creates the parent and can fail. Fall back to
+            // in-memory history and say so, rather than .expect() panicking with
+            // a backtrace before the prompt is even drawn.
+            let history: Box<dyn reedline::History> =
+                match FileBackedHistory::with_file(1000, history) {
+                    Ok(h) => Box::new(h),
+                    Err(_) => {
+                        eprintln!("pilot: history file unavailable; using in-memory history");
+                        Box::new(FileBackedHistory::default())
+                    }
+                };
+            history
+        })
 }
 
 pub fn run(conn: &Conn, name: &str, mut opts: RenderOpts) -> std::process::ExitCode {
@@ -210,6 +223,15 @@ pub fn run(conn: &Conn, name: &str, mut opts: RenderOpts) -> std::process::ExitC
                         }
                     }
                 }
+                // A fresh submission starts with a clean cancel flag. The
+                // SIGINT handler sets CANCEL whenever pilot is in cooked mode,
+                // which includes the pager: a Ctrl-C aimed at `less` (or an
+                // external `kill -INT`) would otherwise linger and skip the
+                // next statement the user types. Clearing here, once, drops
+                // that staleness while preserving the intra-buffer skip below
+                // (a Ctrl-C during `a; b; c` still aborts b and c — those
+                // checks are inside this loop, with no read_line between them).
+                crate::CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
                 // One statement per request is the protocol's rule; the
                 // trailing terminator is ours to strip. Multi-statement
                 // buffers split at terminators outside strings/comments,

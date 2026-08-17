@@ -344,20 +344,30 @@ impl<'a> Renderer<'a> {
             out.push_str(&dim(&note));
             out.push('\n');
         }
-        deliver(out);
+        // The frame's rendered width, from geometry rather than measured off
+        // `out` (whose dimmed cells carry ANSI codes display_width would count):
+        // left border + each shown column padded by 2 + inner separators +
+        // right border. plan_columns fits to the terminal but won't prune below
+        // two columns, so two wide columns can still overflow — deliver() pages
+        // on that so the box doesn't soft-wrap and shatter.
+        let frame_width =
+            2 + idx.iter().map(|o| colw(o) + 2).sum::<usize>() + idx.len().saturating_sub(1);
+        deliver(out, frame_width);
     }
 }
 
-/// Boxed output taller than the terminal pages through $PAGER (default
-/// `less -SRFX`: -S no-wrap since widths already fit, -F quit-if-one-screen).
-/// Streaming modes never page — they already left the building.
-fn deliver(out: String) {
-    let term_h = match crossterm::terminal::size() {
-        Ok((_, h)) if h > 0 => h as usize,
-        _ => 40, // unknown height (odd pty): guess, don't page everything
+/// Boxed output taller OR wider than the terminal pages through $PAGER (default
+/// `less -SRFX`: -S no-wrap so a wide box scrolls horizontally instead of
+/// shattering, -F quit-if-one-screen). Streaming modes never page.
+fn deliver(out: String, width: usize) {
+    let (term_w, term_h) = match crossterm::terminal::size() {
+        Ok((w, h)) if h > 0 => (w as usize, h as usize),
+        _ => (0, 40), // unknown size (odd pty): guess height, don't force width paging
     };
     let tall = out.lines().count() + 2 > term_h;
-    if tall && std::io::stdout().is_terminal() {
+    // term_w == 0 means the width could not be read — don't guess it into paging.
+    let wide = term_w > 0 && width > term_w;
+    if (tall || wide) && std::io::stdout().is_terminal() {
         let pager = std::env::var("PAGER").unwrap_or_else(|_| "less -SRFX".into());
         let mut parts = pager.split_whitespace();
         if let Some(cmd) = parts.next() {
