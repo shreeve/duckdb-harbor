@@ -415,6 +415,13 @@ elapsed time, so a berth that hasn't produced headers yet still shows life.
 TLS deliberately absent (D6/D8: Caddy owns the edge; ssh is the human path).
 `.output/.once/.headers`, progress events, and semantic highlighting remain
 Phase 3/4. 1.4MB binary, 9 unit tests, 10 protocol suites green.
+→ **Hardened same day** after a three-lens review (correctness / cleanliness /
+efficiency): scan.rs is now the one quote/comment/dollar automaton (the
+sqllex seed, consumed by validator + splitter + highlighter), multi-byte
+panics fixed, Ctrl-C aborts scripts and a second one always escapes, the
+chunked decoder survives its own tick timeout, pipe modes write buffered
+(1M-row csv 1.36s → 0.32s), completion setup is lazy and shared across
+editor rebuilds. 17 unit tests.
 
 **Phase 3 — polish + edge** (~1.5–2 kLOC)
 Remaining display modes; `.output/.once/.headers`; result-value highlighting;
