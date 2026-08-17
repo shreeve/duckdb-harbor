@@ -77,7 +77,7 @@ jobs:
           "$root/bin/harbor" stop smoke
           echo "smoke: rpath, wire round-trip, and ui load all good"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: harbor-${{ github.ref_name }}-${{ matrix.plat }}
           path: dist/*.tar.gz
@@ -87,7 +87,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { merge-multiple: true }
       - name: Create GitHub Release
         env:
