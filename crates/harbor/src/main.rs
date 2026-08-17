@@ -78,6 +78,12 @@ serve/add options:
                       for extensions: --init 'LOAD ui; CALL start_ui_server()'
   --unsigned          allow unsigned extensions (open-time only; needed to
                       LOAD an unsigned build, e.g. the duckdb-ui 2.0 fork)
+  --sealed            lock the berth to SQL on its own database: no host file
+                      access (read_csv/COPY), no community extensions. For a
+                      berth an untrusted caller can reach
+  --statement-timeout <d>  default deadline per statement (e.g. 30s); a
+                      request's own timeoutMs still overrides it
+  --max-temp-size <s>  cap spill-to-disk (e.g. 10GB; default: DuckDB's own)
   --log               log requests to stderr
 ";
 
@@ -95,6 +101,9 @@ struct Opts {
     init: Vec<String>,
     log: bool,
     unsigned: bool,
+    sealed: bool,
+    statement_timeout: Option<Duration>,
+    max_temp_size: Option<String>,
 }
 
 /// "90s", "10m", "2h", or bare seconds.
@@ -127,6 +136,9 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
         init: Vec::new(),
         log: false,
         unsigned: false,
+        sealed: false,
+        statement_timeout: None,
+        max_temp_size: None,
     };
     let mut named: Option<String> = None;
     while let Some(a) = it.next() {
@@ -144,6 +156,11 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
             "--init" => o.init.push(take("init")?),
             "--log" => o.log = true,
             "--unsigned" => o.unsigned = true,
+            "--sealed" => o.sealed = true,
+            "--statement-timeout" => {
+                o.statement_timeout = Some(parse_duration(&take("statement-timeout")?)?)
+            }
+            "--max-temp-size" => o.max_temp_size = Some(take("max-temp-size")?),
             _ if db.is_none() && !a.starts_with('-') => db = Some(PathBuf::from(a)),
             other => return Err(format!("unexpected argument: {other}")),
         }
@@ -236,6 +253,17 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
             }
         },
     };
+
+    // A default statement deadline, if asked. harbor-core reads
+    // HARBOR_STATEMENT_TIMEOUT_MS per request when a request names no timeout
+    // of its own; setting it here, in our own process before serving, turns
+    // the flag into that default. Left unset by default on purpose: harbor
+    // streams minute-long analytical queries, so a blanket deadline would
+    // break correct programs (a per-request timeoutMs still overrides this).
+    if let Some(d) = o.statement_timeout {
+        // SAFETY: single-threaded here — start() has not spawned the workers.
+        unsafe { std::env::set_var("HARBOR_STATEMENT_TIMEOUT_MS", d.as_millis().to_string()) };
+    }
 
     // The engine. One process, one database (D2): conservative memory default
     // so N berths coexist; printed so nobody is surprised.
@@ -339,16 +367,30 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
 
 fn duckdb_open(o: &Opts) -> Result<harbor_core::duckdb::Connection, String> {
     use harbor_core::duckdb::{Config, Connection};
-    // Signed-only by default. `allow_unsigned_extensions` can only be set at
-    // open time, not with a later SET, so `--unsigned` has to reach the
-    // Connection here — it is the one door for loading an unsigned build (the
-    // duckdb-ui fork for the 2.0 channel, DUCKDB-UI-V2-COMPAT.md), via
-    // `--init 'LOAD ui; CALL start_ui_server()'`. It widens what a LOAD can
-    // pull in, so it stays opt-in and off by default.
-    let con = if o.unsigned {
-        let config = Config::default()
-            .allow_unsigned_extensions()
-            .map_err(|e| format!("config: {e}"))?;
+    // These four settings can only be chosen when the connection is opened,
+    // not with a later SET, so they must reach the Connection here:
+    //   --unsigned  allow_unsigned_extensions — the one door for loading an
+    //               unsigned build (the duckdb-ui 2.0 fork, DUCKDB-UI-V2-
+    //               COMPAT.md) via --init 'LOAD ui; CALL start_ui_server()'.
+    //   --sealed    enable_external_access=false + allow_community_extensions
+    //               =false — shrinks a token from host access (read_csv of any
+    //               file, COPY TO disk, community native code) to a credential
+    //               for this one database. For a berth an untrusted caller can
+    //               reach. Default off: read_csv/COPY are core data workflows
+    //               (the test fixtures themselves load CSV), so the safe edge
+    //               is the operator's to draw, like TLS (D6).
+    // Signed-only, full-access is the default; each is opt-in.
+    let con = if o.unsigned || o.sealed {
+        let mut config = Config::default();
+        if o.unsigned {
+            config = config.allow_unsigned_extensions().map_err(|e| format!("config: {e}"))?;
+        }
+        if o.sealed {
+            config = config
+                .with("enable_external_access", "false")
+                .and_then(|c| c.with("allow_community_extensions", "false"))
+                .map_err(|e| format!("config: {e}"))?;
+        }
         Connection::open_with_flags(&o.db, config)
             .map_err(|e| format!("open {}: {e}", o.db.display()))?
     } else {
@@ -358,6 +400,12 @@ fn duckdb_open(o: &Opts) -> Result<harbor_core::duckdb::Connection, String> {
         .map_err(|e| format!("memory_limit: {e}"))?;
     if let Some(t) = o.threads {
         con.execute_batch(&format!("SET threads={t}")).map_err(|e| format!("threads: {e}"))?;
+    }
+    // A ceiling on spill-to-disk, so one large query cannot fill the host
+    // disk. Default unset (DuckDB's own 90%-of-free); the operator caps it.
+    if let Some(s) = &o.max_temp_size {
+        con.execute_batch(&format!("SET max_temp_directory_size='{s}'"))
+            .map_err(|e| format!("max_temp_size: {e}"))?;
     }
     Ok(con)
 }
