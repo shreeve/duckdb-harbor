@@ -3013,6 +3013,29 @@ fn fenced_setting(sql: &str) -> Option<&'static str> {
                 break;
             }
         }
+        // A double-quoted identifier names the same setting as its bareword:
+        // DuckDB's SET grammar takes a ColId, and `SET "memory_limit"=…`
+        // reaches the same lowercase config key as `SET memory_limit=…`. The
+        // fence must see through the quotes, or they are its bypass. `""` is
+        // an escaped quote inside the identifier.
+        if i < b.len() && b[i] == b'"' {
+            i += 1;
+            let mut ident = String::new();
+            while i < b.len() {
+                if b[i] == b'"' {
+                    if i + 1 < b.len() && b[i + 1] == b'"' {
+                        ident.push('"');
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                ident.push(b[i] as char);
+                i += 1;
+            }
+            return ident.to_ascii_uppercase();
+        }
         let start = i;
         while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
             i += 1;
@@ -4259,6 +4282,7 @@ static KEYWORDS: &[&str] = &[
 mod tests {
     use super::civil_from_days;
     use super::ensure_single_statement as one;
+    use super::fenced_setting;
     use super::index_columns;
     use super::varint_to_decimal;
     use super::{Cancel, SlotRun};
@@ -4497,5 +4521,40 @@ mod tests {
         assert_eq!(varint_to_decimal(&[0x80, 0x00]), None);
         // Header claims four magnitude bytes; only one follows.
         assert_eq!(varint_to_decimal(&[0x80, 0x00, 0x04, 0x01]), None);
+    }
+
+    #[test]
+    fn fences_process_global_settings() {
+        // The fleet-safety fence (D2): these change a DuckDB global and must
+        // not be settable over the wire.
+        for sql in [
+            "SET memory_limit='1TB'",
+            "set MEMORY_LIMIT = '1TB'",
+            "PRAGMA threads=64",
+            "SET GLOBAL max_memory='1TB'",
+            "RESET threads",
+            "/* sneak */ SET memory_limit='1TB'",
+            "SET  --c\n threads=1",
+            // the quoted-identifier bypass: a double-quoted name reaches the
+            // same setting, so the fence must see through the quotes
+            "SET \"memory_limit\"='1TB'",
+            "PRAGMA \"threads\"=64",
+            "SET GLOBAL \"max_memory\"='1TB'",
+            "SET \"me\"\"mory_limit\"='1TB'", // (not a real key, but scanner must unquote)
+        ] {
+            let got = fenced_setting(sql);
+            let expect_fenced = !sql.contains("me\"\"mory");
+            assert_eq!(got.is_some(), expect_fenced, "fence verdict for {sql:?}");
+        }
+        // Ordinary statements and unrelated settings pass.
+        for sql in [
+            "SELECT 1",
+            "SET timezone='UTC'",
+            "SET \"search_path\"='main'",
+            "CREATE TABLE t(x int)",
+            "PRAGMA database_list",
+        ] {
+            assert_eq!(fenced_setting(sql), None, "should pass: {sql:?}");
+        }
     }
 }
