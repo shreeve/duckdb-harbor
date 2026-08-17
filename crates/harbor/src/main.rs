@@ -108,7 +108,11 @@ struct Opts {
 
 /// "90s", "10m", "2h", or bare seconds.
 fn parse_duration(s: &str) -> Result<Duration, String> {
-    let (num, unit) = s.split_at(s.len() - s.chars().last().map_or(0, |c| c.is_alphabetic() as usize));
+    // Split off a trailing alphabetic unit. `trim_end_matches` works in whole
+    // chars, so a multibyte unit (`5µs`, `5é`) can't land `split_at` inside a
+    // UTF-8 char and panic — it just fails the unit match below.
+    let num = s.trim_end_matches(char::is_alphabetic);
+    let unit = &s[num.len()..];
     let n: u64 = num.parse().map_err(|_| format!("bad duration {s:?}"))?;
     let secs = match unit {
         "" | "s" => n,

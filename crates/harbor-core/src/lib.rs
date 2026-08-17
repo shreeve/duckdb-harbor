@@ -1422,8 +1422,6 @@ fn shed(req: Request) -> (bool, u16) {
     (true, 503)
 }
 
-/// Returns false when the executor behind `jobs` is gone, which is the one
-/// condition the caller must act on rather than merely report.
 // ---------------------------------------------------------------------------
 // Berth identity (GET /info) and idle accounting (--idle-exit)
 // ---------------------------------------------------------------------------
@@ -1530,6 +1528,9 @@ fn handle(
         true => req.remote_addr().map_or_else(|| "-".to_string(), |a| a.ip().to_string()),
         false => String::new(),
     };
+    // Cleared here so the reason logged below is this request's, never a
+    // previous one's left on this worker thread.
+    LAST_REASON.with(|c| c.set(""));
 
     // Two gates before any routing, in this order.
     //
@@ -1658,8 +1659,18 @@ fn handle(
     // inside that call, so for a streamed result this elapsed time covers the
     // whole query and the whole transfer rather than just the headers.
     if let Some(t) = started {
+        // On a failure, name why: the refusal code turns an unexplained spike
+        // of 4xx/5xx in the berth's own log into something diagnosable. The SQL
+        // and the message still stay out of the log (privacy, and the message
+        // can be large); the code is a fixed vocabulary and is enough to act on.
+        let reason = LAST_REASON.with(|c| c.get());
+        let reason = if status >= 400 && !reason.is_empty() {
+            format!(" {reason}")
+        } else {
+            String::new()
+        };
         eprintln!(
-            "harbor: {} {peer} {} {path} {status} {}ms",
+            "harbor: {} {peer} {} {path} {status}{reason} {}ms",
             utc_now(),
             method.as_str(),
             t.elapsed().as_millis()
@@ -1810,13 +1821,22 @@ fn parse_request(body: &str) -> Result<SqlRequest, String> {
                 .to_string());
         }
     };
+    // The operator's `--statement-timeout` is a hard ceiling, not just a
+    // default: a request may ask for *less*, but not for more, and `0` ("no
+    // limit") is bounded by it too. Without the clamp, any token holder could
+    // send `timeoutMs:0` and pin a worker indefinitely — defeating the very
+    // knob a `--sealed` deployment leans on. When no cap is configured the cap
+    // is `None`, so the historical behaviour (0 = unlimited, N = exactly N) is
+    // unchanged.
+    let cap = configured_statement_timeout();
     let timeout = match v.get("timeoutMs") {
-        None | Some(serde_json::Value::Null) => configured_statement_timeout(),
-        // Zero means "no limit", so a request can opt out of a deployment-wide
-        // default as well as into a limit of its own.
+        None | Some(serde_json::Value::Null) => cap,
         Some(serde_json::Value::Number(n)) => match n.as_u64() {
-            Some(0) => None,
-            Some(ms) => Some(Duration::from_millis(ms)),
+            Some(0) => cap,
+            Some(ms) => {
+                let want = Duration::from_millis(ms);
+                Some(cap.map_or(want, |c| want.min(c)))
+            }
             None => return Err("\"timeoutMs\" must be a non-negative whole number".to_string()),
         },
         Some(_) => return Err("\"timeoutMs\" must be a non-negative whole number".to_string()),
@@ -2911,21 +2931,6 @@ fn run_sql(
     }
 }
 
-/// Whether a statement could leave a transaction open behind it.
-///
-/// Only transaction-control statements can, because a statement that runs in
-/// autocommit commits or rolls back its own implicit transaction as it
-/// finishes. So the reset before the next job is only needed after one of
-/// these — or after a job that ended abnormally, which the caller tracks
-/// separately.
-///
-/// Fail-safe by construction: this answers true for anything it does not
-/// recognise, so a statement form nobody thought of costs one `ROLLBACK`
-/// rather than leaving a transaction open. Getting it wrong in the other
-/// direction is what took connections out of service permanently.
-/// The first real word of a statement, upper-cased, skipping leading
-/// whitespace and comments. Empty when there is no leading identifier — a
-/// statement starting with `(`, or nothing at all.
 /// Advance `i` past ASCII whitespace and SQL comments — `--` to end of line,
 /// nested `/* */`. The one comment/whitespace skipper the token scanners
 /// share (first_keyword, fenced_setting). `ensure_single_statement` keeps its
@@ -2993,6 +2998,9 @@ fn next_word(b: &[u8], i: &mut usize) -> String {
     std::str::from_utf8(&b[start..*i]).unwrap_or("").to_ascii_uppercase()
 }
 
+/// The first real word of a statement, upper-cased, skipping leading
+/// whitespace and comments. Empty when there is no leading identifier — a
+/// statement starting with `(`, or nothing at all.
 fn first_keyword(sql: &str) -> String {
     next_word(sql.as_bytes(), &mut 0)
 }
@@ -3005,8 +3013,20 @@ fn first_keyword(sql: &str) -> String {
 /// Reads through comments, whitespace, and double-quoting via `next_word`, so
 /// neither `/*x*/ SET threads=8` nor `SET "memory_limit"=…` slips past.
 fn fenced_setting(sql: &str) -> Option<&'static str> {
-    const FENCED: &[&str] =
-        &["memory_limit", "max_memory", "threads", "worker_threads", "external_threads"];
+    const FENCED: &[&str] = &[
+        "memory_limit",
+        "max_memory",
+        "threads",
+        "worker_threads",
+        "external_threads",
+        // Disk spill is process-global too, and the operator caps it with
+        // `--max-temp-size` precisely so one query cannot fill the shared host
+        // disk (PLAN.md D2). Left unfenced, `SET max_temp_directory_size='100TB'`
+        // over the wire erases that cap; `temp_directory` redirects the spill
+        // itself. Both are GLOBAL-scope in DuckDB — same class as the rest here.
+        "max_temp_directory_size",
+        "temp_directory",
+    ];
     let b = sql.as_bytes();
     let mut i = 0;
     if !matches!(next_word(b, &mut i).as_str(), "SET" | "RESET" | "PRAGMA") {
@@ -3031,6 +3051,18 @@ fn transaction_effect(sql: &str) -> Option<bool> {
     }
 }
 
+/// Whether a statement could leave a transaction open behind it.
+///
+/// Only transaction-control statements can, because a statement that runs in
+/// autocommit commits or rolls back its own implicit transaction as it
+/// finishes. So the reset before the next job is only needed after one of
+/// these — or after a job that ended abnormally, which the caller tracks
+/// separately.
+///
+/// Fail-safe by construction: this answers true for anything it does not
+/// recognise, so a statement form nobody thought of costs one `ROLLBACK`
+/// rather than leaving a transaction open. Getting it wrong in the other
+/// direction is what took connections out of service permanently.
 fn may_leave_transaction_open(sql: &str) -> bool {
     let word = first_keyword(sql);
     if word.is_empty() {
@@ -3088,15 +3120,6 @@ fn reset_transaction(conn: &Connection) {
     let _ = conn.execute_batch("ROLLBACK");
 }
 
-/// The DuckDB side. Owns one connection for the life of the server and runs
-/// one statement at a time; concurrency comes from there being several of
-/// these, not from any one of them interleaving work.
-/// `pinned` marks a lease connection. The reset below exists to stop one
-/// request's stray transaction from leaking into the next request that
-/// happens to land on the same connection — which is precisely the thing a
-/// lease is for, so on a lease connection it must not fire. The rollback still
-/// happens, but at the boundary that matters: when the lease is released, by
-/// commit, by DELETE, or by the reaper.
 /// A statement registered on its slot for as long as it runs.
 ///
 /// Dropping it retires the statement, so no path out of the loop — and there
@@ -3127,6 +3150,14 @@ impl Drop for OnSlot<'_> {
     }
 }
 
+/// The DuckDB side. Owns one connection for the life of the server and runs
+/// one statement at a time; concurrency comes from there being several of
+/// these, not from any one of them interleaving work. `pinned` marks a lease
+/// connection: the per-job reset that stops one request's stray transaction
+/// from leaking into the next request on the same connection must not fire on
+/// a lease, because holding that transaction open is precisely what a lease is
+/// for — the rollback happens instead when the lease is released, by commit,
+/// by DELETE, or by the reaper.
 fn execute_jobs(
     conn: Connection,
     jobs: mpsc::Receiver<Job>,
@@ -3528,7 +3559,19 @@ fn json_response(status: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> 
         .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap())
 }
 
-fn error_response(status: u16, code: &str, message: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+// The last refusal code produced on this worker thread. `handle` reads it to
+// name the reason in the log line on a 4xx/5xx, without every route carrying
+// the code back through its `(bool, u16)` return. Cleared at the top of each
+// request and read only on a failure, so a success never reports a stale
+// code. Same thread throughout: `error_response` runs inside `handle`'s
+// synchronous flow, and the streamed body — written by the executor thread —
+// never goes through here.
+thread_local! {
+    static LAST_REASON: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+fn error_response(status: u16, code: &'static str, message: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    LAST_REASON.with(|c| c.set(code));
     let mut s = String::new();
     s.push_str(r#"{"type":"error","code":"#);
     push_json_string(&mut s, code);
@@ -3815,6 +3858,10 @@ mod tests {
             "PRAGMA \"threads\"=64",
             "SET GLOBAL \"max_memory\"='1TB'",
             "SET \"me\"\"mory_limit\"='1TB'", // (not a real key, but scanner must unquote)
+            // disk-spill caps are fenced too — SET around --max-temp-size
+            "SET max_temp_directory_size='100TB'",
+            "SET temp_directory='/tmp/x'",
+            "PRAGMA \"max_temp_directory_size\"='100TB'",
         ] {
             let got = fenced_setting(sql);
             let expect_fenced = !sql.contains("me\"\"mory");
