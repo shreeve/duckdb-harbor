@@ -170,33 +170,32 @@ store. Caddy injects/passes the berth token with *replace* semantics
 `/ready` stays the only unauthenticated route; `/info` requires auth (it leaks
 paths and pids).
 
-### D11. One engine build, fetched — and the UI links against it, not a copy
-Upstream DuckDB has no 2.0 release; it is built from source. We build it once —
-via the `duckdb-ui` extension repo, a sibling that already carries the DuckDB
-submodule and the build machinery — and that one build emits everything the
-fleet needs, all from the same commit: the `libduckdb` harbor links, the
-`duckdb.h`/`duckdb_extension.h` headers, the `duckdb` CLI that builds fixtures,
-and the `ui` extension. Same build ⇒ they cannot drift, which is the whole point
-of not mixing a downloaded library with a separately-built anything.
+### D11. The engine is DuckDB's official v2.0-dev nightly — no fork
+The 2.0 line has no stable release yet, but DuckDB publishes it as an official
+nightly: `artifacts.duckdb.org/latest/duckdb-binaries-<plat>.zip`, a bundle of
+`libduckdb` (+ headers) and the `duckdb` CLI, rebuilt from `main` daily. That is
+the whole engine the fleet needs, from upstream, so there is nothing to build
+and nothing to fork. (An earlier fork release existed only because we thought no
+2.0 was published; it was a frozen copy of this exact artifact and is now
+retired.) `/latest/` is the v2.0-dev channel today — it reported
+`v2.0.0-alpha38069` when this was written; if `main` ever rolls past 2.0, pin
+the v2.0 channel URL.
 
-`make fetch-duckdb` (→ `scripts/fetch-duckdb.sh`) pulls that exact build — the
-library + headers + CLI, and with `UI=1` the extension — into
-`~/.duckdb/cli/<ver>/`. This path is deliberately fork-coupled: the UI extension
-only loads against the precise engine it was compiled against, so a developer
-doing UI work needs *that* build, not just any DuckDB. The only coupling to the
-release is asset naming, isolated to two `case` arms; when the UI factory
-pipeline publishes the same `libduckdb`, `RELEASE_BASE` moves to it and nothing
-else changes.
+**CI links that nightly**, via `.github/actions/duckdb` — one composite action
+both the quick and full jobs share, so they cannot drift (which is what once let
+the full job rot pointing at a tag upstream never had). No version pinned, no
+nested-archive naming in the workflow: it tracks whatever `main` built last,
+which is the 2.0 line harbor targets, so every run tests the real thing.
+Verified: a harbor built against `alpha37626` links and runs clean against the
+newer official `alpha38069`, and against upstream stable `v1.5.5` — the C API is
+stable across the line (D1's version-agnostic property, exercised, not asserted).
 
-**CI does not use that path, and must not.** Because harbor is version-agnostic
-(D1), testing it needs *a* DuckDB, not *our* DuckDB — so CI links upstream's
-latest published `libduckdb` (via `.github/actions/duckdb`, one composite action
-both jobs share so they cannot drift) and thereby *exercises* the
-version-agnostic property on every run rather than asserting it. No version
-pinned, no fork URL, no nested archives: whatever `duckdb/duckdb` ships today.
-Verified: a harbor built against 2.0 links and runs clean against upstream
-`libduckdb` v1.5.5. The exact-2.0 engine still gets validated — by local and UI
-work through `make fetch-duckdb`, and in production, where it is what ships.
+`make fetch-duckdb` (→ `scripts/fetch-duckdb.sh`) pulls the same official nightly
+into `~/.duckdb/cli/2.0.0/` for local work. Its one fork-coupled exception is
+`UI=1`: the `ui` extension loads *only* against the precise engine it was
+compiled with, and the nightly moves daily, so the two must travel as a pinned,
+matched pair from our releases until the UI factory publishes against the
+nightly. Everything else is upstream.
 
 **The UI extension can be dynamic — and should be.** DuckDB ships loadable
 extensions *statically* (each embeds a private copy of DuckDB, ~37MB, portable

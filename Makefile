@@ -24,10 +24,6 @@
 DUCKDB_LIB ?= $(HOME)/.duckdb/cli/2.0.0
 DUCKDB_CLI ?= $(HOME)/.duckdb/cli
 
-# The engine release `fetch-duckdb` pulls. One build supplies the library, the
-# headers, and the CLI, so they are always the same DuckDB (see the target).
-DUCKDB_VERSION ?= v2.0.0-alpha37626
-
 # Every cargo invocation below links against that libduckdb and bakes an rpath
 # to it, so the binary AND the test executables run in place without DYLD_*.
 export DUCKDB_LIB_DIR := $(DUCKDB_LIB)
@@ -64,14 +60,14 @@ install: binary pilot
 	done
 	@echo "each cli/<ver>/harbor now uses its sibling libduckdb.dylib; pilot is engine-agnostic."
 
-# Pull our exact 2.0 build (libduckdb + headers + duckdb CLI) from the release
-# into $(DUCKDB_LIB) — one build, so the three never drift, and the baked rpath
-# then resolves the library in place. `make fetch-duckdb UI=1` also drops the
-# matching ui.duckdb_extension, which only loads against this precise engine.
-# CI does NOT use this: it is version-agnostic (D1) and links upstream's latest
-# instead (.github/actions/duckdb) — this path is for local and UI work.
+# Pull DuckDB's official v2.0-dev nightly (libduckdb + headers + duckdb CLI) from
+# artifacts.duckdb.org into $(DUCKDB_LIB); the baked rpath then resolves the
+# library in place. `make fetch-duckdb UI=1` instead pulls a pinned, matched
+# engine+UI pair from our releases (the ui extension only loads against the exact
+# engine it was built with). CI links the same official nightly via
+# .github/actions/duckdb. See PLAN.md D11.
 fetch-duckdb:
-	DUCKDB_VERSION=$(DUCKDB_VERSION) DEST=$(DUCKDB_LIB) UI=$(UI) scripts/fetch-duckdb.sh
+	DEST=$(DUCKDB_LIB) UI=$(UI) scripts/fetch-duckdb.sh
 
 clean:
 	cargo clean

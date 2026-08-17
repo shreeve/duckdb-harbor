@@ -1,34 +1,32 @@
 #!/usr/bin/env bash
 #
-# fetch-duckdb.sh — pull one synchronized DuckDB engine into ~/.duckdb/cli/<ver>/
+# fetch-duckdb.sh — put a DuckDB engine into ~/.duckdb/cli/2.0.0/
 #
-# harbor carries no engine: it is dynamically linked and resolves whichever
-# libduckdb sits beside it at runtime (PLAN.md D1). This fetches that engine —
-# the library harbor links, the two headers (kept for reference; the crate ships
-# pregenerated bindings, so the build never reads them), and the matching duckdb
-# CLI that builds test fixtures — from ONE release, so the three are the same
-# build and cannot drift.
+# harbor carries no engine (PLAN.md D1); this fetches one for it to link, along
+# with the two headers (kept for reference — the crate ships pregenerated
+# bindings, so the build never reads them) and the duckdb CLI that builds
+# fixtures. Two modes:
 #
-# Called by `make fetch-duckdb`. Run it directly to override any of it:
-#   DUCKDB_VERSION=v2.0.0-alpha37626 DEST=~/.duckdb/cli/2.0.0 scripts/fetch-duckdb.sh
-#   UI=1 scripts/fetch-duckdb.sh        # also drop the matching ui.duckdb_extension
+#   make fetch-duckdb        DuckDB's official v2.0-dev nightly, from
+#                            artifacts.duckdb.org — the current 2.0 line straight
+#                            from upstream. The common case: a working engine,
+#                            no fork, nothing to pin. `/latest/` is the v2.0-dev
+#                            channel today (it reported v2.0.0-alpha38069 when
+#                            this was written); if main ever rolls past 2.0, pin
+#                            the v2.0 channel URL below.
 #
-# The only coupling to the release is the asset naming, spelled out in the two
-# case arms below — change the names on the release and change them here together.
-# Source of truth is currently our own 2.0 build on the duckdb-harbor fork; when
-# the duckdb-ui factory pipeline emits the same libduckdb, point RELEASE_BASE at
-# it — the sub-zip layout is identical, so nothing else here moves.
+#   make fetch-duckdb UI=1   the matched engine+UI pair, pinned, from our own
+#                            releases. The UI extension loads ONLY against the
+#                            exact engine it was built with, and the official
+#                            nightly moves daily, so the two must travel together
+#                            as a frozen pair until the UI factory publishes
+#                            against the nightly.
+#
+# Override DEST to install elsewhere.
 
 set -euo pipefail
 
-version=${DUCKDB_VERSION:-v2.0.0-alpha37626}
-# ~/.duckdb/cli/2.0.0 by default: the tag's marketing version with the leading
-# v and the -alpha<seq> suffix stripped, which is how the cli/<ver> dirs already
-# read. Override DEST to put it anywhere.
-short=$(printf '%s' "$version" | sed -E 's/^v//; s/-alpha[0-9]+$//')
-dest=${DEST:-$HOME/.duckdb/cli/$short}
-release_base=${RELEASE_BASE:-https://github.com/shreeve/duckdb-harbor/releases/download}
-ui_base=${UI_RELEASE_BASE:-https://github.com/shreeve/duckdb-ui/releases/download}
+dest=${DEST:-$HOME/.duckdb/cli/2.0.0}
 want_ui=${UI:-0}
 
 # The engine and the UI release spell platforms differently (osx vs osx_arm64,
@@ -42,46 +40,48 @@ esac
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/fetch-duckdb.XXXXXX")
 trap 'rm -rf "$work"' EXIT
-say()  { printf '  %s\n' "$*"; }
-grab() { find "$work" -type f -name "$1" 2>/dev/null | head -1; }
-place() { # place <name-in-archive> <mode>
-  local src; src=$(grab "$1")
-  [ -n "$src" ] || return 0
-  install -m "$2" "$src" "$dest/$1"; say "-> $dest/$1"
-}
+say()   { printf '  %s\n' "$*"; }
+grab()  { find "$work" -type f -name "$1" 2>/dev/null | head -1; }
+place() { local s; s=$(grab "$1") || true; [ -n "$s" ] && install -m "$2" "$s" "$dest/$1" && say "-> $dest/$1"; return 0; }
 
-# ---- the engine: one binaries zip, two sub-zips nested inside it -----------
-tag="duckdb-$version"
-asset="duckdb-$version-binaries-$duck_plat.zip"
-say "fetching $asset"
-curl -fsSL -o "$work/binaries.zip" "$release_base/$tag/$asset"
+# ---- the engine: one "binaries" zip, two sub-zips nested inside -------------
+if [ "$want_ui" = 1 ]; then
+  version=${DUCKDB_VERSION:-v2.0.0-alpha37626}       # the pinned matched pair
+  engine_url="https://github.com/shreeve/duckdb-harbor/releases/download/duckdb-$version/duckdb-$version-binaries-$duck_plat.zip"
+else
+  engine_url=${ENGINE_URL:-https://artifacts.duckdb.org/latest/duckdb-binaries-$duck_plat.zip}
+fi
+
+say "fetching $engine_url"
+curl -fsSL -o "$work/binaries.zip" "$engine_url"
 ( cd "$work" && unzip -oq binaries.zip )        # -> libduckdb-*.zip, duckdb_cli-*.zip
 ( cd "$work" && unzip -oq 'libduckdb-*.zip' )   # -> libduckdb.{dylib,so} (+ headers)
 ( cd "$work" && unzip -oq 'duckdb_cli-*.zip' )  # -> duckdb CLI
 
 mkdir -p "$dest"
-place libduckdb.dylib      0755
-place libduckdb.so         0755
-place duckdb               0755
-place duckdb.h             0644
-place duckdb_extension.h   0644
+place libduckdb.dylib    0755
+place libduckdb.so       0755
+place duckdb             0755
+place duckdb.h           0644
+place duckdb_extension.h 0644
 
-# ---- optional: the UI extension, from its own (same-build) release ---------
+# ---- optional: the UI extension, from the same pinned release --------------
 if [ "$want_ui" = 1 ]; then
   ui_asset="ui-duckdb-$version-$ui_plat.zip"
   say "fetching $ui_asset"
-  curl -fsSL -o "$work/ui.zip" "$ui_base/ui-$version/$ui_asset"
+  curl -fsSL -o "$work/ui.zip" \
+    "https://github.com/shreeve/duckdb-ui/releases/download/ui-$version/$ui_asset"
   ( cd "$work" && unzip -oq ui.zip )
-  ext=$(grab 'ui.duckdb_extension')
+  ext=$(grab 'ui.duckdb_extension') || true
   [ -n "$ext" ] && install -m 0644 "$ext" "$dest/ui.duckdb_extension" \
     && say "-> $dest/ui.duckdb_extension"
 fi
 
 # ---- point cli/latest at what we just refreshed ----------------------------
-# Only when we filled a dir under ~/.duckdb/cli — a throwaway DEST elsewhere
-# (a scratch test, a one-off build root) has no business owning `latest`.
-if [ "$dest" = "$HOME/.duckdb/cli/$short" ]; then
+# Only when we filled the canonical dir — a throwaway DEST elsewhere (a scratch
+# test, a one-off build root) has no business owning `latest`.
+if [ "$dest" = "$HOME/.duckdb/cli/2.0.0" ]; then
   ln -sfn "$dest" "$HOME/.duckdb/cli/latest"
   say "cli/latest -> $dest"
 fi
-echo "fetch-duckdb: $version ready in $dest"
+echo "fetch-duckdb: ready in $dest"
