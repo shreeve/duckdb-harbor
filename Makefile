@@ -34,7 +34,7 @@ binary:
 	cargo build -p harbor --release
 
 pilot:
-	cargo build -p harbor-pilot --release
+	cargo build -p pilot --release
 
 check: binary pilot
 	test/scripts/check.sh
