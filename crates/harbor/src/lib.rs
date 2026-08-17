@@ -1,6 +1,8 @@
-// harbor-core — the Harbor server engine: pool, leases, cancellation,
+// harbor's library — the server engine: pool, leases, cancellation,
 // timeouts, the NDJSON envelope, /sql /catalog /ready routing, and the
-// SIGTERM → drain → CHECKPOINT shutdown path.
+// SIGTERM → drain → CHECKPOINT shutdown path. The CLI (src/main.rs) is the
+// only consumer; the two were one crate again once the loadable extension
+// that justified a separate harbor-core retired (PLAN.md D5).
 //
 // This is the v0.9.1 extension's server code, moved verbatim (PLAN.md Phase
 // 1). The extension glue (vtab table functions, entrypoint) stayed behind and
@@ -29,8 +31,8 @@ use duckdb::{
 
 use tiny_http::{Header, Method, Request, Response, Server};
 
-/// Re-exported so the embedding host names the engine through harbor-core —
-/// one crate owns the duckdb version pin.
+/// Re-exported so the CLI names the engine through the harbor crate —
+/// one place owns the duckdb version pin.
 pub use duckdb;
 
 mod encode;

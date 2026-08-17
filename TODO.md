@@ -41,7 +41,7 @@ re-apply Patch 2 or accept losing the stalled-reader protection.
 1. Confirm Patch 2 is either upstreamed (in the same release) or you have a
    plan to re-apply it — otherwise do NOT un-vendor yet.
 2. Delete the `[patch.crates-io]` block from the root `Cargo.toml`.
-3. Bump the `tiny_http` version in `crates/harbor-core/Cargo.toml` to the
+3. Bump the `tiny_http` version in `crates/harbor/Cargo.toml` to the
    release that contains the fix(es).
 4. `rm -rf vendor/tiny_http` (and `vendor/` if nothing else lives there).
 5. `make binary && make check` — all 10 suites must pass.

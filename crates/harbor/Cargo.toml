@@ -13,12 +13,25 @@ license = "MIT"
 # `cargo build -p harbor --features bundled` — but is no longer the default or
 # shipped: its one advantage (no sibling dylib) the dylib-swap model removed.
 default = []
-bundled = ["harbor-core/bundled"]
+bundled = ["duckdb/bundled"]
 
 [dependencies]
-harbor-core = { path = "../harbor-core" }
+duckdb = { version = "~1.10505.0", default-features = false, features = ["vtab"] }
+tiny_http = "0.12"
+serde = "1"
 serde_json = "1"
+rand = "0.8"
 libc = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
+
+# The server engine (pool, leases, cancellation, NDJSON /sql) lives in this
+# crate's library beside the CLI in the bin — folded back in once the loadable
+# extension that justified a separate harbor-core was retired (PLAN.md D5).
+[lib]
+name = "harbor"
+path = "src/lib.rs"
 
 [[bin]]
 name = "harbor"
