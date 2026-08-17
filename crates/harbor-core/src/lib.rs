@@ -3150,6 +3150,322 @@ impl Drop for OnSlot<'_> {
     }
 }
 
+/// One statement, start to finish, on the executor's connection: prepare,
+/// stream (NDJSON) or buffer (one-shot JSON) the result, and report the
+/// outcome on `ready`/`body`. Returns whether the connection needs a
+/// `ROLLBACK` before the next job. Split out of `execute_jobs` so the whole
+/// thing runs under one `catch_unwind` there: a panic in the DuckDB client (a
+/// decoder that hits `unreachable!`, a metadata assert) must not take the
+/// executor thread — and with it a worker and a pool slot — down for good.
+fn run_statement(
+    conn: &Connection,
+    on_slot: &mut OnSlot,
+    sql: String,
+    params: Vec<Value>,
+    shape: Shape,
+    ready: mpsc::SyncSender<Result<(), Refusal>>,
+    body: mpsc::SyncSender<Vec<u8>>,
+    started: Instant,
+) -> bool {
+    // Decided from the statement text before it runs, then widened below by
+    // any path that ends the job early.
+    let mut needs_reset = may_leave_transaction_open(&sql);
+
+    let stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = ready.send(Err(refusal_for(on_slot.finish(), e.to_string())));
+            return true;
+        }
+    };
+    let mut stmt = stmt;
+    let mut rows = match stmt.query(params_from_iter(params.iter())) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = ready.send(Err(refusal_for(on_slot.finish(), e.to_string())));
+            return true;
+        }
+    };
+
+    // Column metadata has to be captured now: `Rows` hands back `None`
+    // from `as_ref()` once the result is exhausted.
+    let (names, types) = match rows.as_ref() {
+        Some(s) => {
+            let n = s.column_count();
+            let names: Vec<String> =
+                (0..n).map(|i| s.column_name(i).cloned().unwrap_or_default()).collect();
+            let types: Vec<LogicalTypeHandle> = (0..n).map(|i| s.column_logical_type(i)).collect();
+            (names, types)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+
+    // duckdb-rs does not return an error for a column type it has no
+    // decoder for — it panics. `SELECT TIME_NS '...'` reaches an
+    // `unreachable!` in its row.rs. Catching that mid-stream is possible
+    // (and is done below), but by then the 200 and the headers are gone
+    // and the client can only be told inside the body. Refusing here,
+    // before anything is sent, is the difference between a 400 that says
+    // what is wrong and a 200 that appears to have returned no rows.
+    if let Some((name, bad)) = names
+        .iter()
+        .zip(&types)
+        .find(|(_, t)| matches!(t.try_id(), Ok(LogicalTypeId::TimeNs)))
+    {
+        // Name the column, not the type. Substituting the type into both
+        // slots produced "Cast it — TIME_NS::VARCHAR", which reads as
+        // casting the type rather than the thing that has it.
+        let _ = ready.send(Err(Refusal::sql(format!(
+            "harbor cannot encode {} columns: the DuckDB Rust client has no \
+             decoder for this type. Cast it — {}::VARCHAR, or {}::TIME for \
+             microsecond precision — and the value comes back intact.",
+            type_name(bad),
+            name,
+            name
+        ))));
+        return true;
+    }
+
+    // NDJSON commits to a 200 here, before the first row, because that is
+    // what streaming means. One-shot cannot and must not: nothing goes out
+    // until the result is whole, so a failure at row 900,000 is still free
+    // to be a 400 rather than a 200 with an apology inside it. The
+    // handshake therefore moves to the bottom of the loop in that shape.
+    if shape == Shape::Ndjson && ready.send(Ok(())).is_err() {
+        return true;
+    }
+
+    let mut buf = String::with_capacity(FLUSH_AT + 8192);
+    match shape {
+        Shape::Ndjson => buf.push_str(r#"{"type":"schema","columns":["#),
+        // v1's envelope also carried `kind`, "select" or "write". It is
+        // not emitted here, because there is no definition of it that is
+        // right: DuckDB answers CREATE TABLE with a one-column `Count`
+        // result, so "did the statement produce columns" calls a write a
+        // select, and deciding from the leading keyword is a parser that
+        // exists only to label something no client needs — `columns` and
+        // `rowCount` already say everything it could. A field that is
+        // absent is easier to handle than one that lies.
+        Shape::Json => buf.push_str(r#"{"ok":true,"columns":["#),
+    }
+    for (i, (name, ty)) in names.iter().zip(&types).enumerate() {
+        if i > 0 {
+            buf.push(',');
+        }
+        emit_column_schema(&mut buf, Some(name), ty);
+    }
+    match shape {
+        Shape::Ndjson => buf.push_str("]}\n"),
+        Shape::Json => buf.push_str(r#"],"data":["#),
+    }
+
+    let mut count: u64 = 0;
+    let mut gone = false;
+    // Set when the result cannot be completed. In NDJSON it has already
+    // been written into the stream by the time it is set; in one-shot it is
+    // what the request fails with.
+    let mut failure: Option<Refusal> = None;
+    loop {
+        match rows.next() {
+            Ok(Some(row)) => {
+                // The safety net behind the pre-flight check above. A
+                // panic in here would otherwise kill this executor
+                // thread, and the damage is worse than one failed query:
+                // the client sees 200 with an empty body — success, no
+                // rows — and the connection never returns to the pool, so
+                // enough such queries take the server out of service.
+                // Built into a separate buffer so a half-written row is
+                // discarded rather than shipped.
+                let mut cells = String::new();
+                let encoded = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                for (i, ty) in types.iter().enumerate() {
+                    if i > 0 {
+                        cells.push(',');
+                    }
+                    // A SQLNULL column — `SELECT NULL AS x`, with no cast
+                    // to give it a type — holds nothing but NULL, and
+                    // duckdb-rs has no decoder for it: reading the value
+                    // panics, and the whole result dies with it. The value
+                    // is not in any doubt, so answer it here instead of
+                    // refusing a row whose contents are already known.
+                    //
+                    // Only DuckDB v2 gets here. v1.5.5 coerces an untyped
+                    // NULL to INTEGER before harbor ever sees the column,
+                    // so the same query took the ordinary path there — the
+                    // kind of difference that only shows up when harbor is
+                    // actually run against v2.
+                    if matches!(ty.try_id(), Ok(LogicalTypeId::SqlNull)) {
+                        cells.push_str("null");
+                        continue;
+                    }
+                    match row.get_ref(i) {
+                        // A UNION's tag says which member is set, and
+                        // `Value` drops it — union_value(a := 2) and
+                        // union_value(b := 2) would be indistinguishable.
+                        // The tag is still on the arrow array underneath.
+                        Ok(v) => {
+                            let tag = union_tag(&v);
+                            emit_tagged(&mut cells, tag, &Value::from(v), Some(ty));
+                        }
+                        Err(_) => cells.push_str("null"),
+                    }
+                }
+                }));
+
+                if encoded.is_err() {
+                    let message = "harbor cannot encode a value in this result: the DuckDB \
+                         Rust client has no decoder for one of its column types. The query \
+                         ran; the value cannot be represented. Cast the column to VARCHAR \
+                         to see it.";
+                    if shape == Shape::Ndjson {
+                        // The headers are long gone, so this can only be
+                        // said in the stream — but it is said, rather than
+                        // the client being left to infer it from a short
+                        // result.
+                        buf.push_str(
+                            r#"{"type":"error","code":"unsupported_type","message":"#,
+                        );
+                        push_json_string(&mut buf, message);
+                        buf.push_str("}\n");
+                        let _ = body.send(std::mem::take(&mut buf).into_bytes());
+                        gone = true;
+                    }
+                    failure = Some(Refusal {
+                        status: 400,
+                        code: "unsupported_type",
+                        message: message.to_string(),
+                    });
+                    break;
+                }
+
+                match shape {
+                    Shape::Ndjson => {
+                        buf.push_str(r#"{"type":"row","values":["#);
+                        buf.push_str(&cells);
+                        buf.push_str("]}\n");
+                    }
+                    Shape::Json => {
+                        if count > 0 {
+                            buf.push(',');
+                        }
+                        buf.push('[');
+                        buf.push_str(&cells);
+                        buf.push(']');
+                    }
+                }
+                count += 1;
+
+                match shape {
+                    Shape::Ndjson => {
+                        if buf.len() >= FLUSH_AT {
+                            // A send failure means the client hung up.
+                            // Abandon the query rather than finish
+                            // computing a result nobody will read.
+                            if body.send(std::mem::take(&mut buf).into_bytes()).is_err() {
+                                gone = true;
+                                break;
+                            }
+                            buf = String::with_capacity(FLUSH_AT + 8192);
+                        }
+                    }
+                    // Nothing can be flushed in this shape — the document
+                    // is not valid until its last byte — so the only
+                    // protection against a result larger than memory is to
+                    // refuse. Streaming has no such limit, and is the
+                    // default, so the remedy is always available.
+                    Shape::Json => {
+                        if buf.len() > MAX_JSON_RESPONSE {
+                            // 406, not 413: nothing is wrong with the
+                            // request or its size. What cannot be done is
+                            // producing this result in the representation
+                            // the Accept header asked for — which is
+                            // exactly what "not acceptable" means, and the
+                            // message names the one that would work.
+                            failure = Some(Refusal {
+                                status: 406,
+                                code: "response_too_large",
+                                message: format!(
+                                    "this result is larger than the {} MiB harbor will hold \
+                                     in memory for a single JSON document. Ask for NDJSON \
+                                     instead — send no Accept header, or Accept: \
+                                     application/x-ndjson — and it streams with no size \
+                                     limit.",
+                                    MAX_JSON_RESPONSE >> 20
+                                ),
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                // Retired here rather than after the loop, because what the
+                // client is told depends on the answer: the same DuckDB
+                // error means "your SQL failed" or "you cancelled this",
+                // and only the slot knows which.
+                let refusal = refusal_for(on_slot.finish(), e.to_string());
+                if shape == Shape::Ndjson {
+                    // Mid-stream failures cannot change the status code —
+                    // the headers are long gone. Say so in the stream, so a
+                    // client never mistakes a truncated result for a
+                    // complete one. The code travels from the refusal: it
+                    // used to be the literal "sql_error", which labelled a
+                    // cancellation and an unsupported type as bad SQL.
+                    buf.push_str(r#"{"type":"error","code":""#);
+                    buf.push_str(refusal.code);
+                    buf.push_str(r#"","message":"#);
+                    push_json_string(&mut buf, &refusal.message);
+                    buf.push_str("}\n");
+                    let _ = body.send(std::mem::take(&mut buf).into_bytes());
+                    gone = true;
+                }
+                failure = Some(refusal);
+                break;
+            }
+        }
+    }
+
+    // An abandoned or failed stream is the case that poisons a connection.
+    needs_reset = needs_reset || gone || failure.is_some();
+
+    match shape {
+        Shape::Ndjson => {
+            if !gone {
+                buf.push_str(&format!(
+                    r#"{{"type":"end","rowCount":{},"timeMs":{}}}"#,
+                    count,
+                    started.elapsed().as_millis()
+                ));
+                buf.push('\n');
+                let _ = body.send(buf.into_bytes());
+            }
+        }
+        // The deferred handshake, and the whole reason this shape waits:
+        // a failure at the last row is still a status code and a code the
+        // client can classify on, rather than a 200 with an apology in the
+        // body. Both travel on the refusal, so the same failure reports the
+        // same code in either shape.
+        Shape::Json => match failure {
+            Some(message) => {
+                let _ = ready.send(Err(message));
+            }
+            None => {
+                buf.push_str(&format!(
+                    r#"],"rowCount":{},"timeMs":{}}}"#,
+                    count,
+                    started.elapsed().as_millis()
+                ));
+                if ready.send(Ok(())).is_err() {
+                    return true;
+                }
+                let _ = body.send(buf.into_bytes());
+            }
+        },
+    }
+    needs_reset
+}
+
 /// The DuckDB side. Owns one connection for the life of the server and runs
 /// one statement at a time; concurrency comes from there being several of
 /// these, not from any one of them interleaving work. `pinned` marks a lease
@@ -3207,307 +3523,35 @@ fn execute_jobs(
             continue;
         }
 
-        // Decided from the statement text before it runs, then widened below by
-        // any path that ends the job early.
-        needs_reset = may_leave_transaction_open(&sql);
-
-        let stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(e) => {
-                needs_reset = true;
-                let _ = ready.send(Err(refusal_for(on_slot.finish(), e.to_string())));
-                continue;
+        // A panic below — a duckdb-rs decoder that hits `unreachable!` on some
+        // column type, a metadata call that trips an assert — used to unwind
+        // straight out of this thread. The worker then found the job channel
+        // closed on its next send, left the accept loop (a worker with no
+        // executor answers 503 by return and would win every race), and the
+        // slot was gone for the life of the process; a handful of such queries
+        // retire every worker until the berth answers only 503. The per-row
+        // guard inside `run_statement` catches the common value-decode panic;
+        // catching the whole statement here covers one in prepare, metadata, or
+        // schema too. On a panic the `OnSlot` guard drops — retiring the slot —
+        // the waiting worker is told (500), and this executor takes the next
+        // job. The connection itself is intact (the panic was in Rust-side
+        // encoding, not DuckDB's engine), so the next job resets first.
+        let ready_guard = ready.clone();
+        needs_reset = match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            run_statement(&conn, &mut on_slot, sql, params, shape, ready, body, started)
+        })) {
+            Ok(next_reset) => next_reset,
+            Err(_) => {
+                let _ = ready_guard.send(Err(Refusal {
+                    status: 500,
+                    code: "internal",
+                    message: "harbor recovered from an internal error while \
+                              handling this statement"
+                        .to_string(),
+                }));
+                true
             }
         };
-        let mut stmt = stmt;
-        let mut rows = match stmt.query(params_from_iter(params.iter())) {
-            Ok(r) => r,
-            Err(e) => {
-                needs_reset = true;
-                let _ = ready.send(Err(refusal_for(on_slot.finish(), e.to_string())));
-                continue;
-            }
-        };
-
-        // Column metadata has to be captured now: `Rows` hands back `None`
-        // from `as_ref()` once the result is exhausted.
-        let (names, types) = match rows.as_ref() {
-            Some(s) => {
-                let n = s.column_count();
-                let names: Vec<String> =
-                    (0..n).map(|i| s.column_name(i).cloned().unwrap_or_default()).collect();
-                let types: Vec<LogicalTypeHandle> = (0..n).map(|i| s.column_logical_type(i)).collect();
-                (names, types)
-            }
-            None => (Vec::new(), Vec::new()),
-        };
-
-        // duckdb-rs does not return an error for a column type it has no
-        // decoder for — it panics. `SELECT TIME_NS '...'` reaches an
-        // `unreachable!` in its row.rs. Catching that mid-stream is possible
-        // (and is done below), but by then the 200 and the headers are gone
-        // and the client can only be told inside the body. Refusing here,
-        // before anything is sent, is the difference between a 400 that says
-        // what is wrong and a 200 that appears to have returned no rows.
-        if let Some((name, bad)) = names
-            .iter()
-            .zip(&types)
-            .find(|(_, t)| matches!(t.try_id(), Ok(LogicalTypeId::TimeNs)))
-        {
-            // Name the column, not the type. Substituting the type into both
-            // slots produced "Cast it — TIME_NS::VARCHAR", which reads as
-            // casting the type rather than the thing that has it.
-            let _ = ready.send(Err(Refusal::sql(format!(
-                "harbor cannot encode {} columns: the DuckDB Rust client has no \
-                 decoder for this type. Cast it — {}::VARCHAR, or {}::TIME for \
-                 microsecond precision — and the value comes back intact.",
-                type_name(bad),
-                name,
-                name
-            ))));
-            needs_reset = true;
-            continue;
-        }
-
-        // NDJSON commits to a 200 here, before the first row, because that is
-        // what streaming means. One-shot cannot and must not: nothing goes out
-        // until the result is whole, so a failure at row 900,000 is still free
-        // to be a 400 rather than a 200 with an apology inside it. The
-        // handshake therefore moves to the bottom of the loop in that shape.
-        if shape == Shape::Ndjson && ready.send(Ok(())).is_err() {
-            needs_reset = true;
-            continue;
-        }
-
-        let mut buf = String::with_capacity(FLUSH_AT + 8192);
-        match shape {
-            Shape::Ndjson => buf.push_str(r#"{"type":"schema","columns":["#),
-            // v1's envelope also carried `kind`, "select" or "write". It is
-            // not emitted here, because there is no definition of it that is
-            // right: DuckDB answers CREATE TABLE with a one-column `Count`
-            // result, so "did the statement produce columns" calls a write a
-            // select, and deciding from the leading keyword is a parser that
-            // exists only to label something no client needs — `columns` and
-            // `rowCount` already say everything it could. A field that is
-            // absent is easier to handle than one that lies.
-            Shape::Json => buf.push_str(r#"{"ok":true,"columns":["#),
-        }
-        for (i, (name, ty)) in names.iter().zip(&types).enumerate() {
-            if i > 0 {
-                buf.push(',');
-            }
-            emit_column_schema(&mut buf, Some(name), ty);
-        }
-        match shape {
-            Shape::Ndjson => buf.push_str("]}\n"),
-            Shape::Json => buf.push_str(r#"],"data":["#),
-        }
-
-        let mut count: u64 = 0;
-        let mut gone = false;
-        // Set when the result cannot be completed. In NDJSON it has already
-        // been written into the stream by the time it is set; in one-shot it is
-        // what the request fails with.
-        let mut failure: Option<Refusal> = None;
-        loop {
-            match rows.next() {
-                Ok(Some(row)) => {
-                    // The safety net behind the pre-flight check above. A
-                    // panic in here would otherwise kill this executor
-                    // thread, and the damage is worse than one failed query:
-                    // the client sees 200 with an empty body — success, no
-                    // rows — and the connection never returns to the pool, so
-                    // enough such queries take the server out of service.
-                    // Built into a separate buffer so a half-written row is
-                    // discarded rather than shipped.
-                    let mut cells = String::new();
-                    let encoded = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    for (i, ty) in types.iter().enumerate() {
-                        if i > 0 {
-                            cells.push(',');
-                        }
-                        // A SQLNULL column — `SELECT NULL AS x`, with no cast
-                        // to give it a type — holds nothing but NULL, and
-                        // duckdb-rs has no decoder for it: reading the value
-                        // panics, and the whole result dies with it. The value
-                        // is not in any doubt, so answer it here instead of
-                        // refusing a row whose contents are already known.
-                        //
-                        // Only DuckDB v2 gets here. v1.5.5 coerces an untyped
-                        // NULL to INTEGER before harbor ever sees the column,
-                        // so the same query took the ordinary path there — the
-                        // kind of difference that only shows up when harbor is
-                        // actually run against v2.
-                        if matches!(ty.try_id(), Ok(LogicalTypeId::SqlNull)) {
-                            cells.push_str("null");
-                            continue;
-                        }
-                        match row.get_ref(i) {
-                            // A UNION's tag says which member is set, and
-                            // `Value` drops it — union_value(a := 2) and
-                            // union_value(b := 2) would be indistinguishable.
-                            // The tag is still on the arrow array underneath.
-                            Ok(v) => {
-                                let tag = union_tag(&v);
-                                emit_tagged(&mut cells, tag, &Value::from(v), Some(ty));
-                            }
-                            Err(_) => cells.push_str("null"),
-                        }
-                    }
-                    }));
-
-                    if encoded.is_err() {
-                        let message = "harbor cannot encode a value in this result: the DuckDB \
-                             Rust client has no decoder for one of its column types. The query \
-                             ran; the value cannot be represented. Cast the column to VARCHAR \
-                             to see it.";
-                        if shape == Shape::Ndjson {
-                            // The headers are long gone, so this can only be
-                            // said in the stream — but it is said, rather than
-                            // the client being left to infer it from a short
-                            // result.
-                            buf.push_str(
-                                r#"{"type":"error","code":"unsupported_type","message":"#,
-                            );
-                            push_json_string(&mut buf, message);
-                            buf.push_str("}\n");
-                            let _ = body.send(std::mem::take(&mut buf).into_bytes());
-                            gone = true;
-                        }
-                        failure = Some(Refusal {
-                            status: 400,
-                            code: "unsupported_type",
-                            message: message.to_string(),
-                        });
-                        break;
-                    }
-
-                    match shape {
-                        Shape::Ndjson => {
-                            buf.push_str(r#"{"type":"row","values":["#);
-                            buf.push_str(&cells);
-                            buf.push_str("]}\n");
-                        }
-                        Shape::Json => {
-                            if count > 0 {
-                                buf.push(',');
-                            }
-                            buf.push('[');
-                            buf.push_str(&cells);
-                            buf.push(']');
-                        }
-                    }
-                    count += 1;
-
-                    match shape {
-                        Shape::Ndjson => {
-                            if buf.len() >= FLUSH_AT {
-                                // A send failure means the client hung up.
-                                // Abandon the query rather than finish
-                                // computing a result nobody will read.
-                                if body.send(std::mem::take(&mut buf).into_bytes()).is_err() {
-                                    gone = true;
-                                    break;
-                                }
-                                buf = String::with_capacity(FLUSH_AT + 8192);
-                            }
-                        }
-                        // Nothing can be flushed in this shape — the document
-                        // is not valid until its last byte — so the only
-                        // protection against a result larger than memory is to
-                        // refuse. Streaming has no such limit, and is the
-                        // default, so the remedy is always available.
-                        Shape::Json => {
-                            if buf.len() > MAX_JSON_RESPONSE {
-                                // 406, not 413: nothing is wrong with the
-                                // request or its size. What cannot be done is
-                                // producing this result in the representation
-                                // the Accept header asked for — which is
-                                // exactly what "not acceptable" means, and the
-                                // message names the one that would work.
-                                failure = Some(Refusal {
-                                    status: 406,
-                                    code: "response_too_large",
-                                    message: format!(
-                                        "this result is larger than the {} MiB harbor will hold \
-                                         in memory for a single JSON document. Ask for NDJSON \
-                                         instead — send no Accept header, or Accept: \
-                                         application/x-ndjson — and it streams with no size \
-                                         limit.",
-                                        MAX_JSON_RESPONSE >> 20
-                                    ),
-                                });
-                                break;
-                            }
-                        }
-                    }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    // Retired here rather than after the loop, because what the
-                    // client is told depends on the answer: the same DuckDB
-                    // error means "your SQL failed" or "you cancelled this",
-                    // and only the slot knows which.
-                    let refusal = refusal_for(on_slot.finish(), e.to_string());
-                    if shape == Shape::Ndjson {
-                        // Mid-stream failures cannot change the status code —
-                        // the headers are long gone. Say so in the stream, so a
-                        // client never mistakes a truncated result for a
-                        // complete one. The code travels from the refusal: it
-                        // used to be the literal "sql_error", which labelled a
-                        // cancellation and an unsupported type as bad SQL.
-                        buf.push_str(r#"{"type":"error","code":""#);
-                        buf.push_str(refusal.code);
-                        buf.push_str(r#"","message":"#);
-                        push_json_string(&mut buf, &refusal.message);
-                        buf.push_str("}\n");
-                        let _ = body.send(std::mem::take(&mut buf).into_bytes());
-                        gone = true;
-                    }
-                    failure = Some(refusal);
-                    break;
-                }
-            }
-        }
-
-        // An abandoned or failed stream is the case that poisons a connection.
-        needs_reset = needs_reset || gone || failure.is_some();
-
-        match shape {
-            Shape::Ndjson => {
-                if !gone {
-                    buf.push_str(&format!(
-                        r#"{{"type":"end","rowCount":{},"timeMs":{}}}"#,
-                        count,
-                        started.elapsed().as_millis()
-                    ));
-                    buf.push('\n');
-                    let _ = body.send(buf.into_bytes());
-                }
-            }
-            // The deferred handshake, and the whole reason this shape waits:
-            // a failure at the last row is still a status code and a code the
-            // client can classify on, rather than a 200 with an apology in the
-            // body. Both travel on the refusal, so the same failure reports the
-            // same code in either shape.
-            Shape::Json => match failure {
-                Some(message) => {
-                    let _ = ready.send(Err(message));
-                }
-                None => {
-                    buf.push_str(&format!(
-                        r#"],"rowCount":{},"timeMs":{}}}"#,
-                        count,
-                        started.elapsed().as_millis()
-                    ));
-                    if ready.send(Ok(())).is_err() {
-                        needs_reset = true;
-                        continue;
-                    }
-                    let _ = body.send(buf.into_bytes());
-                }
-            },
-        }
     }
     // And once more on the way out, so a connection going back to the pool for
     // the next harbor_serve is clean too. Unconditional here: this runs once
