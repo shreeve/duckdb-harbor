@@ -1033,6 +1033,15 @@ pub fn start(
         Listen::Unix(path) => path.display().to_string(),
     };
     *STARTED_AT.lock().unwrap() = Some(Instant::now());
+    // Reset the process-global accumulators for this instance. harbor_serve
+    // can follow a harbor_stop in the same process (the extension path), and
+    // a request abandoned by the bounded-join shutdown may decrement
+    // INFLIGHT_REQUESTS late — so a fresh instance must not inherit a nonzero
+    // count (which would wedge quiet()/--idle-exit) or a stale readiness
+    // verdict from its predecessor.
+    INFLIGHT_REQUESTS.store(0, Ordering::SeqCst);
+    *LAST_ACTIVITY.lock().unwrap() = None;
+    *LAST_READY.lock().unwrap() = None;
     let server = Arc::new(server);
     let stop = Arc::new(AtomicBool::new(false));
     let token = Arc::new(token);
@@ -1553,10 +1562,11 @@ fn handle(
     let path = req.url().split('?').next().unwrap_or("/").to_string();
     let method = req.method().clone();
     let countable = path != "/ready" && path != "/info";
-    if countable {
-        touch_activity();
-        INFLIGHT_REQUESTS.fetch_add(1, Ordering::SeqCst);
-    }
+    // A drop guard, not a bare inc/dec, so a panic anywhere in this function
+    // (a poisoned global lock, a panic inside response construction) cannot
+    // leak the count and wedge quiet()/--idle-exit — the same RAII discipline
+    // as Claim/Cancellable/OnSlot. Touches the activity clock on both edges.
+    let _inflight = countable.then(InFlight::enter);
 
     // Only when logging. A clock read and a peer-address format are small, but
     // they are paid on every request by every caller, including the ones that
@@ -1701,14 +1711,34 @@ fn handle(
             t.elapsed().as_millis()
         );
     }
-    // The finish also counts (see idle_ms): a long statement resets the idle
-    // clock when it completes, not only when it began. The in-flight count
-    // drops here, after respond() — the whole stream was this request.
-    if countable {
-        touch_activity();
-        INFLIGHT_REQUESTS.fetch_sub(1, Ordering::SeqCst);
-    }
+    // The finish counts too (see idle_ms): a long statement resets the idle
+    // clock when it completes, not only when it began. `_inflight` drops on
+    // return — after respond(), so the whole stream was this request.
     keep_going
+}
+
+/// Marks a countable request in flight for the life of the value: increments
+/// on `enter`, decrements on drop, and touches the activity clock at both
+/// edges. Dropping on every path (return, `?`, panic) is the point.
+struct InFlight;
+
+impl InFlight {
+    fn enter() -> Self {
+        touch_activity();
+        INFLIGHT_REQUESTS.fetch_add(1, Ordering::SeqCst);
+        InFlight
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        // Saturating, so a request abandoned by one server instance whose
+        // guard drops after the next instance reset the counter to 0 can
+        // never underflow it (u64 wrap would leave quiet() false forever).
+        let _ = INFLIGHT_REQUESTS
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(1)));
+        touch_activity();
+    }
 }
 
 /// UTC, RFC 3339, seconds resolution: `2026-08-12T04:31:07Z`.
@@ -4280,9 +4310,11 @@ static KEYWORDS: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
+    use super::Method;
     use super::civil_from_days;
     use super::ensure_single_statement as one;
     use super::fenced_setting;
+    use super::route_exists;
     use super::index_columns;
     use super::varint_to_decimal;
     use super::{Cancel, SlotRun};
@@ -4555,6 +4587,40 @@ mod tests {
             "PRAGMA database_list",
         ] {
             assert_eq!(fenced_setting(sql), None, "should pass: {sql:?}");
+        }
+    }
+
+    #[test]
+    fn route_exists_matches_the_dispatch_table() {
+        // Guards the hand-maintained coupling between `route_exists` (which
+        // decides 401-vs-404 for an unauthenticated caller) and the dispatch
+        // match in `handle`. Every real endpoint is a route; a known path
+        // with the wrong method, and any unknown path, is not — so adding a
+        // route to `handle` without updating `route_exists` (which would
+        // 404 a real endpoint's unauthenticated caller) fails here.
+        let routes = [
+            (Method::Get, "/ready"),
+            (Method::Get, "/sessions"),
+            (Method::Get, "/info"),
+            (Method::Get, "/catalog"),
+            (Method::Post, "/sql"),
+            (Method::Post, "/sql/sessions/new"),
+            (Method::Delete, "/sql/sessions/abc"),
+            (Method::Delete, "/sql/queries/xyz"),
+        ];
+        for (m, p) in &routes {
+            assert!(route_exists(m, p), "should be a route: {m:?} {p}");
+        }
+        let non_routes = [
+            (Method::Get, "/sql"),      // method matters
+            (Method::Post, "/ready"),   // method matters
+            (Method::Get, "/health"),   // never existed
+            (Method::Get, "/"),
+            (Method::Put, "/sql"),
+            (Method::Post, "/sql/sessions"), // no trailing id/segment
+        ];
+        for (m, p) in &non_routes {
+            assert!(!route_exists(m, p), "should NOT be a route: {m:?} {p}");
         }
     }
 }
