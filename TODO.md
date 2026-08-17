@@ -44,7 +44,7 @@ re-apply Patch 2 or accept losing the stalled-reader protection.
 3. Bump the `tiny_http` version in `crates/harbor-core/Cargo.toml` to the
    release that contains the fix(es).
 4. `rm -rf vendor/tiny_http` (and `vendor/` if nothing else lives there).
-5. `make binary && make binary2 && make check` — all 10 suites must pass.
+5. `make binary && make check` — all 10 suites must pass.
 6. Re-run the DoS check (concurrent `POST /sql` with
    `Content-Length: 1000000000` sending a few bytes must leave RSS flat) AND
    the stalled-reader check (a client that reads headers then stops must have

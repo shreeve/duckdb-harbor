@@ -6,11 +6,13 @@ description = "harbor — DuckDB wearing a server: fleet manager + HTTP/UDS engi
 license = "MIT"
 
 [features]
-# Default build embeds DuckDB 1.5.5 (crates.io `bundled`). The preferred 2.0
-# channel links our prebuilt libduckdb instead:
-#   DUCKDB_LIB_DIR=... DUCKDB_INCLUDE_DIR=... \
-#   cargo build -p harbor-bin --no-default-features --release
-default = ["bundled"]
+# Dynamic by default: harbor links an external libduckdb (DUCKDB_LIB_DIR /
+# DUCKDB_INCLUDE_DIR) and is version-agnostic at runtime — it resolves whichever
+# libduckdb.dylib sits beside it. A self-contained static build (crates.io
+# `bundled` DuckDB 1.5.5) stays available on demand —
+# `cargo build -p harbor --features bundled` — but is no longer the default or
+# shipped: its one advantage (no sibling dylib) the dylib-swap model removed.
+default = []
 bundled = ["harbor-core/bundled"]
 
 [dependencies]
