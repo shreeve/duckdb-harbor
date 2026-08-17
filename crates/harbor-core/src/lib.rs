@@ -1208,14 +1208,21 @@ pub fn stop() -> Result<String, String> {
     }
 
     // Fold the WAL back into the database file so the next open needs no
-    // replay. This succeeds when harbor_stop is called from an ordinary
-    // session, and fails harmlessly when it is called from the signal handler
-    // while harbor_wait is still blocked: that blocked call is itself an open
-    // transaction older than every write, and DuckDB will not checkpoint past
-    // one. The daemon path covers that case by running CHECKPOINT after
-    // harbor_wait returns — see bin/duckdb-harbor.
-    if let Some(c) = CONTROL.lock().unwrap().as_ref() {
-        let _ = c.execute_batch("CHECKPOINT");
+    // replay. By the time we reach here the leases are drained and the workers
+    // are joined (above), so no write transaction is open and this should
+    // succeed. A failure is therefore a real signal — a full or failing disk,
+    // most likely — not a routine outcome to swallow: the database is still
+    // safe (the WAL is intact and replays on next open) but the restart is
+    // slower and the operator should know why, so surface it instead of
+    // reporting a clean "drained and checkpointed" shutdown that did not fully
+    // happen.
+    if let Some(c) = CONTROL.lock().unwrap().as_ref()
+        && let Err(e) = c.execute_batch("CHECKPOINT")
+    {
+        eprintln!(
+            "harbor: shutdown CHECKPOINT failed ({e}); the WAL is intact and \
+             will replay on next open (no data lost, slower restart)"
+        );
     }
 
     let (lock, cv) = &STOPPED;

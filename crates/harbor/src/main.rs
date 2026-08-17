@@ -521,6 +521,22 @@ fn ready(sock: &Path) -> bool {
     probe_200(&mut s)
 }
 
+/// Positive proof that a berth is gone: its `<name>.lock` exists and we can
+/// take the exclusive flock the live berth holds for its whole life (serve).
+/// Only a *definite* death suppresses a stop/rm signal — if the lock file is
+/// missing or unreadable we return false and fall through to the old behaviour,
+/// so a live berth is never left unstoppable. Unlike `GET /ready` this needs no
+/// response from the berth, so a busy one is correctly seen as alive, not dead.
+fn berth_dead(lock_path: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(f) = std::fs::OpenOptions::new().read(true).open(lock_path) else {
+        return false; // unknown, not proven dead
+    };
+    // If we acquire it, nobody holds it → the process is gone. Dropping `f`
+    // (on return) releases the lock we just took; never unlink it (see serve).
+    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
 fn probe_200(s: &mut (impl Read + Write)) -> bool {
     if write!(s, "GET /ready HTTP/1.1\r\nHost: harbor\r\nConnection: close\r\n\r\n").is_err() {
         return false;
@@ -574,9 +590,22 @@ fn stop_berth(rest: Vec<String>, remove: bool) -> Result<(), String> {
     let json_path = home.join(format!("{name}.json"));
     let sock = home.join(format!("{name}.sock"));
 
+    let lock_path = home.join(format!("{name}.lock"));
     if let Ok(s) = std::fs::read_to_string(&json_path) {
         if let Ok(j) = serde_json::from_str::<serde_json::Value>(&s) {
-            if let Some(pid) = j["pid"].as_u64() {
+            if berth_dead(&lock_path) {
+                // Proven dead: no process holds the flock, so the pid recorded
+                // in the json is stale and the OS may have recycled it to an
+                // unrelated process. Signalling it would be signalling a
+                // stranger — so don't. `rm` still cleans the registry below.
+                let pid = j["pid"].as_u64().map(|p| p.to_string()).unwrap_or_default();
+                if !remove {
+                    return Err(format!(
+                        "berth {name:?} is not running (stale pid {pid}); nothing to signal. \
+                         Use `harbor rm {name}` to clear the registry entry."
+                    ));
+                }
+            } else if let Some(pid) = j["pid"].as_u64() {
                 // SIGTERM is the contract: drain, CHECKPOINT, exit (core owns it).
                 unsafe { libc::kill(pid as i32, libc::SIGTERM) };
                 let deadline = Instant::now() + Duration::from_secs(35);
@@ -617,4 +646,38 @@ fn stop_berth(rest: Vec<String>, remove: bool) -> Result<(), String> {
         println!("berth {name:?} removed from the registry (database file untouched)");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::berth_dead;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn berth_dead_reads_the_flock() {
+        // A unique temp path so parallel test runs never collide.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("harbor-test-{}.lock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // No lock file at all → unknown, not proven dead (never strand a live
+        // berth just because its lock file is missing).
+        assert!(!berth_dead(&path), "missing lock file is not proof of death");
+
+        // A lock file that nobody holds → the berth is gone → proven dead.
+        let held = std::fs::File::create(&path).unwrap();
+        assert!(berth_dead(&path), "an unheld lock file means the berth is gone");
+
+        // While a process holds the exclusive flock (as a live berth does), the
+        // berth is not dead — even though it answers nothing here.
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "test should be able to take the lock"
+        );
+        assert!(!berth_dead(&path), "a held lock file means the berth is alive");
+
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) };
+        let _ = std::fs::remove_file(&path);
+    }
 }
