@@ -1,22 +1,17 @@
 #
-# The repository's own test suites (test/scripts/check.sh), run against the
-# shipped build: harbor is dynamically linked (no bundled DuckDB), so CI fetches
-# a libduckdb to link against and a duckdb CLI to build fixtures with, then runs
-# the make targets. The suite list lives in the Makefile (check_quick / check),
-# not here, so it never drifts; the engine is fetched by the local composite
-# action (.github/actions/duckdb) — upstream's latest, no version pinned.
+# Quick gate — the sub-minute suite, on every PR (and manual runs). It is the
+# only check a pull request shows. The full suite (fuzz, stress, deployment,
+# asserts) is a separate workflow, FullSuite.yml, that runs on main and nightly,
+# so it never appears here as a skipped check.
 #
-# Two jobs: a quick gate on every PR, and the full suite on main and nightly
-# (resilience restarts the server repeatedly; a five-minute job is fine there).
+# The suite list lives in the Makefile (check_quick), not here; the engine is
+# fetched by the local composite action (.github/actions/duckdb) — DuckDB's
+# official v2 nightly.
 #
 name: Tests
 
 on:
-  push:
-    branches: [main]
   pull_request:
-  schedule:
-    - cron: '0 7 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -47,30 +42,6 @@ jobs:
 
       - name: Quick suites
         run: make check_quick
-
-      - name: Server log on failure
-        if: failure()
-        run: cat /tmp/harbor-check.*/server.log 2>/dev/null || true
-
-  full:
-    name: full suite
-    # PRs get the quick gate; the full run is for main and the nightly cron.
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: ./.github/actions/duckdb
-
-      - name: Build the fixture database
-        run: test/scripts/fixture.sh sample.duckdb
-
-      - name: All suites
-        run: make check
 
       - name: Server log on failure
         if: failure()
