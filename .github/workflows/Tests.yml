@@ -47,23 +47,15 @@ jobs:
           # name collision there breaks on newer Pythons — pin for reproducibility.
           python-version: '3.12'
 
-      # Our 2.0 build's release bundles the standard DuckDB sub-zips
-      # (libduckdb-* and duckdb_cli-*). harbor links only libduckdb (pregenerated
-      # bindings, no headers); the CLI builds test fixtures. The dir is absolute,
-      # so the Makefile's baked rpath resolves libduckdb at runtime, no DYLD/LD.
-      - name: Fetch the DuckDB engine (our 2.0 release)
+      # One fetch path, the same one a fresh checkout runs: `make fetch-duckdb`
+      # pulls libduckdb + headers + duckdb CLI (one 2.0 build, so synchronized)
+      # into ~/.duckdb/cli/2.0.0 — the Makefile's default DUCKDB_LIB, whose baked
+      # rpath then resolves libduckdb at runtime with no DYLD/LD. Only the CLI
+      # needs to be found by name, so that dir goes on PATH.
+      - name: Fetch the DuckDB engine (our 2.0 build)
         run: |
-          set -euo pipefail
-          dir="$HOME/duckdb"; mkdir -p "$dir"; cd "$dir"
-          tag="duckdb-${DUCKDB_VERSION}"
-          asset="duckdb-${DUCKDB_VERSION}-binaries-linux-amd64.zip"
-          curl -fsSL -o binaries.zip \
-            "https://github.com/shreeve/duckdb-harbor/releases/download/$tag/$asset"
-          unzip -oq binaries.zip           # -> libduckdb-*.zip, duckdb_cli-*.zip
-          unzip -oq libduckdb-*.zip        # -> libduckdb.so (+ headers)
-          unzip -oq duckdb_cli-*.zip       # -> duckdb CLI
-          echo "$dir" >> "$GITHUB_PATH"
-          echo "DUCKDB_LIB=$dir" >> "$GITHUB_ENV"
+          make fetch-duckdb
+          echo "$HOME/.duckdb/cli/2.0.0" >> "$GITHUB_PATH"
 
       - name: Build the fixture database
         run: test/scripts/fixture.sh sample.duckdb
@@ -88,17 +80,10 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Fetch libduckdb + duckdb CLI
+      - name: Fetch the DuckDB engine (our 2.0 build)
         run: |
-          set -euo pipefail
-          dir="$HOME/duckdb"; mkdir -p "$dir"
-          base="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}"
-          curl -fsSL -o /tmp/libduckdb.zip "$base/libduckdb-linux-amd64.zip"
-          curl -fsSL -o /tmp/duckdb-cli.zip "$base/duckdb_cli-linux-amd64.zip"
-          unzip -oq /tmp/libduckdb.zip -d "$dir"
-          unzip -oq /tmp/duckdb-cli.zip -d "$dir"
-          echo "$dir" >> "$GITHUB_PATH"
-          echo "DUCKDB_LIB=$dir" >> "$GITHUB_ENV"
+          make fetch-duckdb
+          echo "$HOME/.duckdb/cli/2.0.0" >> "$GITHUB_PATH"
 
       - name: Build the fixture database
         run: test/scripts/fixture.sh sample.duckdb

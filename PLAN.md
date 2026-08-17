@@ -169,3 +169,35 @@ store. Caddy injects/passes the berth token with *replace* semantics
 (`header_up Authorization …`) — harbor 401s duplicate Authorization headers.
 `/ready` stays the only unauthenticated route; `/info` requires auth (it leaks
 paths and pids).
+
+### D11. One engine build, fetched — and the UI links against it, not a copy
+Upstream DuckDB has no 2.0 release; it is built from source. We build it once —
+via the `duckdb-ui` extension repo, a sibling that already carries the DuckDB
+submodule and the build machinery — and that one build emits everything the
+fleet needs, all from the same commit: the `libduckdb` harbor links, the
+`duckdb.h`/`duckdb_extension.h` headers, the `duckdb` CLI that builds fixtures,
+and the `ui` extension. Same build ⇒ they cannot drift, which is the whole point
+of not mixing a downloaded library with a separately-built anything.
+
+`make fetch-duckdb` (→ `scripts/fetch-duckdb.sh`) pulls the library + headers +
+CLI into `~/.duckdb/cli/<ver>/`; a fresh checkout runs it before `make all`, and
+CI runs the same fetch inline. The only coupling to the release is asset naming,
+isolated to two `case` arms. Source is the duckdb-harbor fork release today;
+when the UI factory pipeline publishes the same `libduckdb`, `RELEASE_BASE`
+moves to it and nothing else changes (the sub-zip layout is identical).
+
+**The UI extension can be dynamic — and should be.** DuckDB ships loadable
+extensions *statically* (each embeds a private copy of DuckDB, ~37MB, portable
+because a stock CLI may have loaded DuckDB `RTLD_LOCAL`). harbor is not a stock
+CLI: it holds one `libduckdb.dylib` in-process, and that dylib exports the full
+C++ ABI (~29.6k `_ZN6duckdb…` symbols beside the 549 stable `duckdb_*` C-API
+ones). So a *dynamically* linked UI extension — built with
+`EXTENSION_STATIC_BUILD=0`, an upstream-supported knob, **not** a source patch —
+loads into harbor and resolves its DuckDB symbols from that shared library. It
+is smaller, and it removes the static model's duplicate-global-state hazard
+(two DuckDB runtimes in one address space). Static is forced only on Windows and
+z/OS; on macOS/Linux the flag is honored — macOS gets `-undefined
+dynamic_lookup`, Linux leaves the symbols for the loader. Trade-off: it is
+CLI-incompatible (fine — harbor is the only host) and leans on
+incidentally-exported C++ internals, so it is sound *only* under the same-build
+guarantee above. Keep the static build as the known-good fallback.

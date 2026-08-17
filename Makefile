@@ -13,7 +13,7 @@
 # build tree) whose one advantage, needing no sibling dylib, the dylib-swap
 # model removed.
 
-.PHONY: all binary pilot check check_quick install clean
+.PHONY: all binary pilot check check_quick install fetch-duckdb clean
 
 # The libduckdb the dynamic build links against — the version installed under
 # ~/.duckdb/cli/<ver>/. Only the library is needed (the crate ships pregenerated
@@ -23,6 +23,10 @@
 #   make binary DUCKDB_LIB=$(HOME)/.duckdb/cli/1.5.5
 DUCKDB_LIB ?= $(HOME)/.duckdb/cli/2.0.0
 DUCKDB_CLI ?= $(HOME)/.duckdb/cli
+
+# The engine release `fetch-duckdb` pulls. One build supplies the library, the
+# headers, and the CLI, so they are always the same DuckDB (see the target).
+DUCKDB_VERSION ?= v2.0.0-alpha37626
 
 # Every cargo invocation below links against that libduckdb and bakes an rpath
 # to it, so the binary AND the test executables run in place without DYLD_*.
@@ -59,6 +63,14 @@ install: binary pilot
 	  echo "  installed harbor + pilot -> $$d"; \
 	done
 	@echo "each cli/<ver>/harbor now uses its sibling libduckdb.dylib; pilot is engine-agnostic."
+
+# Pull a synchronized engine (libduckdb + headers + duckdb CLI) from our 2.0
+# release into $(DUCKDB_LIB) — one build, so the three never drift, and the
+# baked rpath then resolves the library in place. `make fetch-duckdb UI=1` also
+# drops the matching ui.duckdb_extension beside them. This is what a fresh
+# checkout runs before `make all`; CI does the same fetch inline.
+fetch-duckdb:
+	DUCKDB_VERSION=$(DUCKDB_VERSION) DEST=$(DUCKDB_LIB) UI=$(UI) scripts/fetch-duckdb.sh
 
 clean:
 	cargo clean
