@@ -390,6 +390,21 @@ still green. → **Tail landed same day**: GET `/info` (auth, uptimeMs live,
 does not count), `make binary/binary2/fleet-check`. Remaining: extension
 deletion + check.sh binary-default + MANUAL rewrite (the retirement
 ceremony), `--ui/--quack` flags, `--boot` units (Phase 3).
+→ **Hardened 2026-08-16** after a four-lens review (correctness/concurrency,
+cleanliness, efficiency, production robustness). The verdicts: core airtight
+(cancellation, leases, WAL recovery all survived attack), edges leaky — and
+the edges are now fixed, each verified live: the unauthenticated
+Content-Length allocation DoS (vendored tiny_http, chunked drop-drain;
+22 MB RSS under attack, was 2.2 GB), idle-exit sparing mid-flight
+statements (in-flight counter in quiet()), bounded shutdown behind stalled
+clients (10s then abandon-and-CHECKPOINT, was forever), the probe lane
+(/ready 11ms and cancels 15ms against a wedged berth, was 5s; statement-age
+is the wedged-vs-busy discriminator so quick-query storms shed nothing),
+reapers cancelling by job id, doomed leases refusing re-claims, fenced
+memory_limit/threads (D2), and honest fleet verbs (append logs, sidecar-json
+truth for add, no rm under a live berth, never unlink .lock, ls sees TCP
+berths). Review debts deliberately deferred: split lib.rs into modules,
+consume harbor-protocol server-side, /catalog as one transaction.
 Core moves to harbor-core (~90% verbatim); `harbor serve` (UDS+TCP, memory/
 thread defaults, `--ui/--quack`); `add/ls/stop/rm` + registry
 contract; `/info`; dual-target suite green (extension vs binary — the
