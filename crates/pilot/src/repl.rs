@@ -11,8 +11,10 @@ use reedline::{
 };
 use std::borrow::Cow;
 
+use crate::complete::SqlCompleter;
 use crate::render::{Mode, RenderOpts};
-use crate::{Conn, run_sql};
+use crate::scan::{Kind, scan};
+use crate::{Conn, Outcome, run_sql};
 
 struct BerthPrompt {
     name: String,
@@ -53,94 +55,78 @@ impl Validator for SqlValidator {
 }
 
 /// Complete = a dot-command, an empty line, or a buffer whose last
-/// non-whitespace byte is `;` outside strings and comments. This scanner is
-/// the seed of `sqllex` (tier 1): it already speaks single/double quotes with
-/// `''`-style escapes, dollar-quoting, `--` and nested `/* */` comments.
+/// non-whitespace code byte is `;` — judged by the shared scanner (scan.rs),
+/// so the validator, splitter, and highlighter can never disagree.
 pub fn statement_complete(buf: &str) -> bool {
     let t = buf.trim();
     if t.is_empty() || t.starts_with('.') {
         return true;
     }
-    let b = t.as_bytes();
-    let mut i = 0;
-    let mut last_code_byte = 0u8;
-    while i < b.len() {
-        match b[i] {
-            b'\'' | b'"' => {
-                let q = b[i];
-                i += 1;
-                while i < b.len() {
-                    if b[i] == q {
-                        if i + 1 < b.len() && b[i + 1] == q {
-                            i += 2; // '' or "" escape
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-                if i >= b.len() {
-                    return false; // unterminated literal
-                }
-                last_code_byte = q;
-            }
-            b'$' => {
-                // dollar-quote: $tag$ ... $tag$
-                let start = i;
-                let mut j = i + 1;
-                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
-                    j += 1;
-                }
-                if j < b.len() && b[j] == b'$' {
-                    let tag = &t[start..=j];
-                    match t[j + 1..].find(tag) {
-                        Some(pos) => {
-                            i = j + 1 + pos + tag.len() - 1;
-                            last_code_byte = b'$';
-                        }
-                        None => return false, // unterminated
-                    }
-                } else {
-                    last_code_byte = b'$';
-                }
-            }
-            b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-                continue;
-            }
-            b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
-                let mut depth = 1;
-                i += 2;
-                while i < b.len() && depth > 0 {
-                    if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'*' {
-                        depth += 1;
-                        i += 2;
-                    } else if i + 1 < b.len() && b[i] == b'*' && b[i + 1] == b'/' {
-                        depth -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                if depth > 0 {
-                    return false; // unterminated comment
-                }
-                continue;
-            }
-            c => {
-                if !c.is_ascii_whitespace() {
-                    last_code_byte = c;
-                }
-            }
+    let mut last = 0u8;
+    for sp in scan(t) {
+        if !sp.terminated {
+            return false;
         }
-        i += 1;
+        match sp.kind {
+            Kind::Code => {
+                for &c in t[sp.start..sp.end].as_bytes() {
+                    if !c.is_ascii_whitespace() {
+                        last = c;
+                    }
+                }
+            }
+            // A trailing literal is content, not a terminator.
+            Kind::Str | Kind::Dollar => last = b'\'',
+            Kind::LineComment | Kind::BlockComment => {}
+        }
     }
-    last_code_byte == b';'
+    last == b';'
 }
 
-fn make_editor(conn: &Conn, vi: bool) -> Reedline {
+/// Split a buffer at `;` terminators in code spans — same scanner, applied
+/// cutwise, so `.read` scripts and `a; b;` buffers obey the validator's rules.
+pub fn split_statements(buf: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for sp in scan(buf) {
+        if sp.kind != Kind::Code {
+            continue;
+        }
+        for (off, &c) in buf[sp.start..sp.end].as_bytes().iter().enumerate() {
+            if c == b';' {
+                let stmt = buf[start..sp.start + off].trim();
+                if !stmt.is_empty() {
+                    out.push(stmt.to_string());
+                }
+                start = sp.start + off + 1;
+            }
+        }
+    }
+    let last = buf[start..].trim();
+    if !last.is_empty() {
+        out.push(last.to_string());
+    }
+    out
+}
+
+/// The one list of dot-commands: dispatch validates against it, `.help`
+/// prints it, and the completer's lane A suggests from it.
+pub const DOT_COMMANDS: &[(&str, &str, &str)] = &[
+    ("mode", "[m]", "duckbox | markdown | csv | json | jsonlines | line | list | trash"),
+    ("maxrows", "[n]", "boxed-mode display cap (head … tail elision past it)"),
+    ("nullvalue", "[s]", "how NULL renders"),
+    ("timer", "on|off", "server + wall time per statement"),
+    ("tables", "", "SHOW TABLES"),
+    ("schema", "[t]", "CREATE statements, one table or all"),
+    ("databases", "", "the live fleet"),
+    ("open", "<target>", "switch berth (name, path, url)"),
+    ("read", "<file.sql>", "run a script, statement by statement"),
+    ("keymode", "vi|emacs", "keybindings (default emacs)"),
+    ("help", "", "this text"),
+    ("quit", "", "leave (Ctrl-D too)"),
+];
+
+fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
     // Tab opens the completion menu, then cycles it (PLAN.md lanes A/B/C).
     let tab = ReedlineEvent::UntilFound(vec![
         ReedlineEvent::Menu("completion_menu".to_string()),
@@ -161,7 +147,7 @@ fn make_editor(conn: &Conn, vi: bool) -> Reedline {
         .with_validator(Box::new(SqlValidator))
         .with_highlighter(Box::new(crate::highlight::SqlHighlighter))
         .with_hinter(Box::new(DefaultHinter::default()))
-        .with_completer(Box::new(crate::complete::SqlCompleter::new(conn.clone())))
+        .with_completer(Box::new(completer.clone()))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
         .with_edit_mode(edit_mode)
         .with_history(Box::new(
@@ -172,22 +158,12 @@ fn make_editor(conn: &Conn, vi: bool) -> Reedline {
 pub fn run(conn: &Conn, name: &str) -> std::process::ExitCode {
     let mut conn = conn.clone();
     let mut vi = false;
-    let mut line_editor = make_editor(&conn, vi);
+    // One completer for the session: its catalog cache loads lazily on the
+    // first Tab and survives editor rebuilds (.keymode), refreshing on .open.
+    let completer = SqlCompleter::new(conn.clone());
+    let mut line_editor = make_editor(&completer, vi);
     let mut prompt = BerthPrompt { name: name.to_string() };
-    let mut opts = RenderOpts::default();
-    let d = crate::config::load().defaults;
-    if let Some(m) = d.mode.as_deref().and_then(Mode::parse) {
-        opts.mode = m;
-    }
-    if let Some(t) = d.timer {
-        opts.timer = t;
-    }
-    if let Some(n) = d.maxrows {
-        opts.max_rows = n;
-    }
-    if let Some(nv) = d.nullvalue {
-        opts.null = nv;
-    }
+    let mut opts = RenderOpts::with_defaults(&crate::config::load().defaults);
     eprintln!("pilot: connected to {name} (.help for help, .quit to leave)");
 
     loop {
@@ -205,8 +181,8 @@ pub fn run(conn: &Conn, name: &str) -> std::process::ExitCode {
                             match crate::resolve(&target, None) {
                                 Ok(c) => {
                                     conn = c;
+                                    completer.reconnect(conn.clone());
                                     prompt = BerthPrompt { name: target.clone() };
-                                    line_editor = make_editor(&conn, vi);
                                     eprintln!("pilot: connected to {target}");
                                 }
                                 Err(e) => eprintln!("pilot: {e}"),
@@ -215,7 +191,7 @@ pub fn run(conn: &Conn, name: &str) -> std::process::ExitCode {
                         }
                         DotResult::Keymode(v) => {
                             vi = v;
-                            line_editor = make_editor(&conn, vi);
+                            line_editor = make_editor(&completer, vi);
                             eprintln!("pilot: {} keybindings", if vi { "vi" } else { "emacs" });
                             continue;
                         }
@@ -223,9 +199,10 @@ pub fn run(conn: &Conn, name: &str) -> std::process::ExitCode {
                 }
                 // One statement per request is the protocol's rule; the
                 // trailing terminator is ours to strip. Multi-statement
-                // buffers split at terminators outside strings/comments.
+                // buffers split at terminators outside strings/comments,
+                // and stop at the first failure or Ctrl-C.
                 for stmt in split_statements(stmt) {
-                    if run_sql(&conn, &stmt, &opts) != std::process::ExitCode::SUCCESS {
+                    if run_sql(&conn, &stmt, &opts) != Outcome::Done {
                         break;
                     }
                 }
@@ -239,83 +216,6 @@ pub fn run(conn: &Conn, name: &str) -> std::process::ExitCode {
             }
         }
     }
-}
-
-/// Split a buffer at `;` terminators outside strings, comments, and
-/// dollar-quotes — the scanner statement_complete uses, applied cutwise.
-pub fn split_statements(buf: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    let b = buf.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'\'' | b'"' => {
-                let q = b[i];
-                i += 1;
-                while i < b.len() {
-                    if b[i] == q {
-                        if i + 1 < b.len() && b[i + 1] == q {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b'$' => {
-                let s0 = i;
-                let mut j = i + 1;
-                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
-                    j += 1;
-                }
-                if j < b.len() && b[j] == b'$' {
-                    let tag = &buf[s0..=j];
-                    if let Some(pos) = buf[j + 1..].find(tag) {
-                        i = j + pos + tag.len();
-                    } else {
-                        break;
-                    }
-                }
-            }
-            b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
-                let mut depth = 1;
-                i += 2;
-                while i < b.len() && depth > 0 {
-                    if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'*' {
-                        depth += 1;
-                        i += 2;
-                    } else if i + 1 < b.len() && b[i] == b'*' && b[i + 1] == b'/' {
-                        depth -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                continue;
-            }
-            b';' => {
-                let stmt = buf[start..i].trim();
-                if !stmt.is_empty() {
-                    out.push(stmt.to_string());
-                }
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    let last = buf[start.min(buf.len())..].trim();
-    if !last.is_empty() {
-        out.push(last.to_string());
-    }
-    out
 }
 
 enum DotResult {
@@ -342,8 +242,8 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
             Some(f) => match std::fs::read_to_string(crate::config::expand(f)) {
                 Ok(text) => {
                     for stmt in split_statements(&text) {
-                        if run_sql(conn, &stmt, opts) != std::process::ExitCode::SUCCESS {
-                            break;
+                        if run_sql(conn, &stmt, opts) != Outcome::Done {
+                            break; // a failure or a Ctrl-C aborts the script
                         }
                     }
                 }
@@ -388,20 +288,10 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
             let _ = run_sql(conn, &sql, &RenderOpts { mode: Mode::List, ..opts.clone() });
         }
         "help" | "h" => {
-            print!(concat!(
-                "  .mode [m]         duckbox | markdown | csv | json | jsonlines | line | list | trash\n",
-                "  .maxrows [n]      boxed-mode display cap (head … tail elision past it)\n",
-                "  .nullvalue [s]    how NULL renders\n",
-                "  .timer on|off     server + wall time per statement\n",
-                "  .tables           SHOW TABLES\n",
-                "  .schema [t]       CREATE statements, one table or all\n",
-                "  .databases        the live fleet\n",
-                "  .open <target>    switch berth (name, path, url)\n",
-                "  .read <file.sql>  run a script, statement by statement\n",
-                "  .keymode vi|emacs keybindings (default emacs)\n",
-                "  .help  .quit      this text; leave (Ctrl-D too)\n",
-                "  statements end with ;   Ctrl-C clears the line\n",
-            ));
+            for (name, args, what) in DOT_COMMANDS {
+                println!("  {:<18} {what}", format!(".{name} {args}"));
+            }
+            println!("  statements end with ;   Ctrl-C clears the line");
         }
         other => {
             eprintln!("pilot: no such command .{other} (.help lists them)");
@@ -424,6 +314,8 @@ mod tests {
             vec!["-- c;\nselect 1 /* ; */", "select \"a;b\""]
         );
         assert!(split_statements("  ;  ; ").is_empty());
+        // multi-byte chars around terminators never split mid-char
+        assert_eq!(split_statements("select 'あ'; select “x”"), vec!["select 'あ'", "select “x”"]);
     }
 
     #[test]
@@ -445,5 +337,7 @@ mod tests {
         assert!(statement_complete(".quit"));
         assert!(statement_complete(""));
         assert!(statement_complete("SELECT 'it''s'; "));
+        // a$b$c is an identifier, not an open dollar-quote
+        assert!(statement_complete("SELECT a$b$c;"));
     }
 }

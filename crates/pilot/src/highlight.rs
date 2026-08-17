@@ -1,10 +1,11 @@
 //! Live syntax highlighting (PLAN.md Phase 2, tier 1): a lexical pass, no
 //! grammar. Colors follow the duckdb shell's defaults so muscle memory
 //! transfers: keywords green, literals yellow, comments dim, unterminated
-//! literals red. The scanner classes here mirror repl::statement_complete;
-//! both grow into the full sqllex port.
+//! literals red. String/comment/dollar-quote boundaries come from the shared
+//! scanner (scan.rs) — the same spans the validator and splitter obey.
 
 use crate::keywords::KEYWORDS;
+use crate::scan::{Kind, scan};
 use nu_ansi_term::{Color, Style};
 use reedline::{Highlighter, StyledText};
 
@@ -14,7 +15,7 @@ pub struct SqlHighlighter;
 enum Class {
     Plain,
     Keyword,
-    Literal,  // strings + numbers
+    Literal, // strings + numbers
     Comment,
     Error, // unterminated string/comment
 }
@@ -29,82 +30,76 @@ fn style(c: Class) -> Style {
     }
 }
 
+fn push(out: &mut StyledText, c: Class, s: &str) {
+    if !s.is_empty() {
+        out.push((style(c), s.to_string()));
+    }
+}
+
 impl Highlighter for SqlHighlighter {
     fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
         let mut out = StyledText::new();
-        let b = line.as_bytes();
-        let mut i = 0;
-        let push = |out: &mut StyledText, c: Class, s: &str| {
-            if !s.is_empty() {
-                out.push((style(c), s.to_string()));
-            }
-        };
-        while i < b.len() {
-            let start = i;
-            match b[i] {
-                b'\'' | b'"' => {
-                    let q = b[i];
-                    i += 1;
-                    let mut closed = false;
-                    while i < b.len() {
-                        if b[i] == q {
-                            if i + 1 < b.len() && b[i + 1] == q {
-                                i += 2;
-                                continue;
-                            }
-                            i += 1;
-                            closed = true;
-                            break;
-                        }
-                        i += 1;
-                    }
-                    push(&mut out, if closed { Class::Literal } else { Class::Error }, &line[start..i]);
+        for sp in scan(line) {
+            let text = &line[sp.start..sp.end];
+            match sp.kind {
+                Kind::Str | Kind::Dollar => {
+                    push(&mut out, if sp.terminated { Class::Literal } else { Class::Error }, text);
                 }
-                b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
-                    push(&mut out, Class::Comment, &line[start..]);
-                    i = b.len();
+                Kind::LineComment => push(&mut out, Class::Comment, text),
+                Kind::BlockComment => {
+                    push(&mut out, if sp.terminated { Class::Comment } else { Class::Error }, text);
                 }
-                b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
-                    let mut depth = 1;
-                    i += 2;
-                    while i < b.len() && depth > 0 {
-                        if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'*' {
-                            depth += 1;
-                            i += 2;
-                        } else if i + 1 < b.len() && b[i] == b'*' && b[i + 1] == b'/' {
-                            depth -= 1;
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                    push(&mut out, if depth == 0 { Class::Comment } else { Class::Error }, &line[start..i]);
-                }
-                c if c.is_ascii_digit() => {
-                    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'.' || b[i] == b'_') {
-                        i += 1;
-                    }
-                    push(&mut out, Class::Literal, &line[start..i]);
-                }
-                c if c.is_ascii_alphabetic() || c == b'_' => {
-                    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
-                        i += 1;
-                    }
-                    let word = &line[start..i];
-                    let class = if KEYWORDS.binary_search(&word.to_ascii_uppercase().as_str()).is_ok() {
-                        Class::Keyword
-                    } else {
-                        Class::Plain
-                    };
-                    push(&mut out, class, word);
-                }
-                _ => {
-                    i += 1;
-                    push(&mut out, Class::Plain, &line[start..i]);
-                }
+                Kind::Code => highlight_code(&mut out, text),
             }
         }
         out
+    }
+}
+
+/// Words and numbers inside a code span. Char-wise, so multi-byte characters
+/// (identifiers, pasted punctuation) never split a slice mid-char.
+fn highlight_code(out: &mut StyledText, text: &str) {
+    let mut i = 0;
+    while i < text.len() {
+        let start = i;
+        let c = text[i..].chars().next().expect("i is a char boundary");
+        if c.is_alphabetic() || c == '_' {
+            while i < text.len() {
+                let ch = text[i..].chars().next().expect("char boundary");
+                if ch.is_alphanumeric() || ch == '_' {
+                    i += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let word = &text[start..i];
+            let class = if KEYWORDS.binary_search(&word.to_ascii_uppercase().as_str()).is_ok() {
+                Class::Keyword
+            } else {
+                Class::Plain
+            };
+            push(out, class, word);
+        } else if c.is_ascii_digit() {
+            while i < text.len() {
+                let ch = text[i..].chars().next().expect("char boundary");
+                if ch.is_alphanumeric() || ch == '.' || ch == '_' {
+                    i += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            push(out, Class::Literal, &text[start..i]);
+        } else {
+            // A run of punctuation/whitespace up to the next word or number.
+            while i < text.len() {
+                let ch = text[i..].chars().next().expect("char boundary");
+                if ch.is_alphabetic() || ch.is_ascii_digit() || ch == '_' {
+                    break;
+                }
+                i += ch.len_utf8();
+            }
+            push(out, Class::Plain, &text[start..i]);
+        }
     }
 }
 
@@ -134,9 +129,21 @@ mod tests {
         // unterminated string goes red
         let s = spans("SELECT 'oops");
         assert_eq!(s.last().unwrap().0, Some(Color::Red));
+        // dollar-quotes are literals (the old scanner missed these)
+        let s = spans("SELECT $t$ hi $t$;");
+        assert_eq!(s.iter().find(|(_, t)| t == "$t$ hi $t$").unwrap().0, Some(Color::Yellow));
         // reconstruction: spans concatenate back to the source line
         let s = spans("SELECT /* x */ 1;");
         let joined: String = s.into_iter().map(|(_, t)| t).collect();
         assert_eq!(joined, "SELECT /* x */ 1;");
+    }
+
+    #[test]
+    fn multibyte_never_panics_and_reconstructs() {
+        // These inputs panicked the old byte-sliced highlighter.
+        for line in ["SELECT tあ", "SELECT “x”", "SELECT ‘x’", "sélect café", "a€b"] {
+            let joined: String = spans(line).into_iter().map(|(_, t)| t).collect();
+            assert_eq!(joined, line);
+        }
     }
 }

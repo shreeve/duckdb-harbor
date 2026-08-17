@@ -3,34 +3,58 @@
 //! Lane B — the default: ask the server. `sql_auto_complete(?)` runs DuckDB's
 //! own grammar-driven completer (PEG-backed on 2.0) against the live catalog,
 //! through the same POST /sql everything else uses. Sub-ms over UDS.
-//! Lane C — the fallback: a catalog cache fetched at connect plus the
-//! vendored keyword list, used when the server misses the 150ms deadline,
-//! errors, or lacks sql_auto_complete. Tab always answers.
+//! Lane C — the fallback: a catalog cache plus the vendored keyword list,
+//! used when the server misses the 150ms deadline, errors, or lacks
+//! sql_auto_complete. Tab always answers.
+//!
+//! Setup (LOAD autocomplete, catalog fetch) is lazy — it runs on the first
+//! Tab, not at connect, so a slow or extension-less berth never delays the
+//! prompt. The cache lives behind an Arc so editor rebuilds (.keymode) share
+//! it; .open swaps the connection and marks it stale.
 
 use crate::keywords::KEYWORDS;
 use crate::{Conn, http};
 use harbor_protocol::{Event, SqlRequest, endpoint};
 use reedline::{Completer, CompletionResult, Span, Suggestion};
 use std::io::BufRead;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[derive(Clone)]
 pub struct SqlCompleter {
+    inner: Arc<Mutex<Inner>>,
+}
+
+struct Inner {
     conn: Conn,
-    /// Table, column, and schema names from GET /catalog at connect time.
-    catalog: Vec<String>,
+    /// Table, column, and schema names from GET /catalog; None = not yet
+    /// fetched (or stale after .open).
+    catalog: Option<Vec<String>>,
 }
 
 impl SqlCompleter {
     pub fn new(conn: Conn) -> Self {
+        Self { inner: Arc::new(Mutex::new(Inner { conn, catalog: None })) }
+    }
+
+    /// Point at a different berth (.open): drop the cache, refill lazily.
+    pub fn reconnect(&self, conn: Conn) {
+        let mut inner = self.inner.lock().expect("completer lock");
+        inner.conn = conn;
+        inner.catalog = None;
+    }
+}
+
+impl Inner {
+    fn setup(&mut self) {
         // Best-effort: sql_auto_complete lives in the autocomplete extension.
         // LOAD first (usually already installed); INSTALL+LOAD as a second
         // try. Failures are fine — lane C covers a berth without it.
-        if quiet_sql(&conn, "LOAD autocomplete").is_none() {
-            let _ = quiet_sql(&conn, "INSTALL autocomplete");
-            let _ = quiet_sql(&conn, "LOAD autocomplete");
+        if quiet_sql(&self.conn, "LOAD autocomplete").is_none() {
+            let _ = quiet_sql(&self.conn, "INSTALL autocomplete");
+            let _ = quiet_sql(&self.conn, "LOAD autocomplete");
         }
-        let catalog = fetch_catalog_names(&conn).unwrap_or_default();
-        Self { conn, catalog }
+        self.catalog = Some(fetch_catalog_names(&self.conn).unwrap_or_default());
     }
 
     fn server_suggestions(&self, prefix: &str, pos: usize) -> Option<Vec<Suggestion>> {
@@ -55,25 +79,18 @@ impl SqlCompleter {
         let mut out = Vec::new();
         let mut reader = resp.body;
         let mut line = String::new();
-        while let Ok(n) = reader.read_line(&mut line) {
-            if n == 0 {
-                break;
+        loop {
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => return None, // deadline hit mid-stream → lane C
             }
             match Event::parse(line.trim()) {
                 Ok(Event::Row { values }) => {
                     let text = values.first().and_then(|v| v.as_str()).unwrap_or("");
                     let start = values.get(1).and_then(|v| v.as_u64()).unwrap_or(pos as u64);
                     if !text.is_empty() {
-                        out.push(Suggestion {
-                            value: text.trim_end().to_string(),
-                            display_override: None,
-                            description: None,
-                            style: None,
-                            extra: None,
-                            span: Span { start: start as usize, end: pos },
-                            append_whitespace: false,
-                            match_indices: None,
-                        });
+                        out.push(suggest(text.trim_end().to_string(), "", start as usize, pos));
                     }
                 }
                 Ok(Event::Error { .. }) => return None,
@@ -88,15 +105,17 @@ impl SqlCompleter {
         // Complete the word under the cursor from catalog names + keywords.
         let head = &line[..pos];
         let start = head
-            .rfind(|c: char| !c.is_alphanumeric() && c != '_')
-            .map_or(0, |i| i + 1);
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| !c.is_alphanumeric() && c != '_')
+            .map_or(0, |(i, c)| i + c.len_utf8());
         let word = &head[start..];
         if word.is_empty() {
             return Vec::new();
         }
         let wl = word.to_lowercase();
         let mut out: Vec<Suggestion> = Vec::new();
-        for name in &self.catalog {
+        for name in self.catalog.as_deref().unwrap_or_default() {
             if name.to_lowercase().starts_with(&wl) {
                 out.push(suggest(name.clone(), "catalog", start, pos));
             }
@@ -115,7 +134,7 @@ fn suggest(value: String, kind: &str, start: usize, end: usize) -> Suggestion {
     Suggestion {
         value,
         display_override: None,
-        description: Some(kind.to_string()),
+        description: if kind.is_empty() { None } else { Some(kind.to_string()) },
         style: None,
         extra: None,
         span: Span { start, end },
@@ -126,18 +145,23 @@ fn suggest(value: String, kind: &str, start: usize, end: usize) -> Suggestion {
 
 impl Completer for SqlCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
-        let prefix = &line[..pos];
+        let prefix = &line[..pos.min(line.len())];
         let list: Vec<Suggestion> = if prefix.trim_start().starts_with('.') {
-            // Dot-commands are client-side (lane A).
-            let cmds = [".help", ".databases", ".quit", ".exit"];
-            cmds.iter()
+            // Dot-commands are client-side (lane A), from the one list.
+            crate::repl::DOT_COMMANDS
+                .iter()
+                .map(|(name, _, _)| format!(".{name}"))
                 .filter(|c| c.starts_with(prefix.trim_start()))
-                .map(|c| suggest((*c).to_string(), "command", 0, pos))
+                .map(|c| suggest(c, "command", 0, pos))
                 .collect()
         } else {
-            match self.server_suggestions(prefix, pos) {
+            let mut inner = self.inner.lock().expect("completer lock");
+            if inner.catalog.is_none() {
+                inner.setup(); // first Tab pays for it, the prompt never does
+            }
+            match inner.server_suggestions(prefix, pos) {
                 Some(s) if !s.is_empty() => s,
-                _ => self.cache_suggestions(line, pos),
+                _ => inner.cache_suggestions(line, pos),
             }
         };
         CompletionResult::Fresh { suggestions: list.into(), partial: None }
@@ -209,4 +233,27 @@ fn quiet_sql(conn: &Conn, sql: &str) -> Option<()> {
         line.clear();
     }
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::Transport;
+
+    #[test]
+    fn word_boundary_is_char_safe() {
+        // An em dash (or any multi-byte delimiter) before the word must not
+        // slice mid-char — this input panicked the old byte-arithmetic.
+        let inner = Inner {
+            conn: Conn { transport: Transport::Unix("/nonexistent".into()), token: None },
+            catalog: Some(vec!["people".into()]),
+        };
+        for line in ["select —peo", "select “peo", "select peo"] {
+            let s = inner.cache_suggestions(line, line.len());
+            assert!(s.iter().any(|s| s.value == "people"), "{line:?}");
+        }
+        // あ is a letter, so あpeo is one word — no match, and no panic
+        assert!(inner.cache_suggestions("select あpeo", "select あpeo".len()).is_empty());
+        assert!(inner.cache_suggestions("select あ", "select あ".len()).is_empty());
+    }
 }

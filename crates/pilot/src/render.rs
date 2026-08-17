@@ -8,7 +8,8 @@
 
 use harbor_protocol::Column;
 use serde_json::Value;
-use std::io::{IsTerminal, Write};
+use std::io::{BufWriter, IsTerminal, Stdout, Write};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
@@ -67,9 +68,35 @@ impl Default for RenderOpts {
     }
 }
 
+impl RenderOpts {
+    /// Defaults, then the config file's [defaults] on top. Flags and
+    /// dot-commands override the result — the documented precedence.
+    pub fn with_defaults(d: &crate::config::Defaults) -> Self {
+        let mut o = Self::default();
+        if let Some(m) = d.mode.as_deref().and_then(Mode::parse) {
+            o.mode = m;
+        }
+        if let Some(t) = d.timer {
+            o.timer = t;
+        }
+        if let Some(n) = d.maxrows {
+            o.max_rows = n;
+        }
+        if let Some(nv) = &d.nullvalue {
+            o.null = nv.clone();
+        }
+        o
+    }
+}
+
 /// Streaming renderer: fed one event at a time, finishes on `end`.
+///
+/// Pipe modes write through one BufWriter — a large export costs pages, not
+/// a write(2) per row — flushed at `end`. Boxed modes buffer their layout
+/// and hand it to deliver() (pager-aware) instead.
 pub struct Renderer<'a> {
     opts: &'a RenderOpts,
+    out: BufWriter<Stdout>,
     columns: Vec<String>,
     types: Vec<String>,
     head: Vec<Vec<String>>,
@@ -82,6 +109,7 @@ impl<'a> Renderer<'a> {
     pub fn new(opts: &'a RenderOpts) -> Self {
         Self {
             opts,
+            out: BufWriter::new(std::io::stdout()),
             columns: Vec::new(),
             types: Vec::new(),
             head: Vec::new(),
@@ -101,10 +129,10 @@ impl<'a> Renderer<'a> {
         match self.opts.mode {
             Mode::Csv => {
                 let hdr: Vec<String> = self.columns.iter().map(|c| csv_cell(c)).collect();
-                println!("{}", hdr.join(","));
+                let _ = writeln!(self.out, "{}", hdr.join(","));
             }
             Mode::Json => {
-                print!("[");
+                let _ = write!(self.out, "[");
             }
             _ => {}
         }
@@ -112,42 +140,42 @@ impl<'a> Renderer<'a> {
 
     pub fn row(&mut self, values: Vec<Value>) {
         self.total += 1;
-        let o = &self.opts;
-        match o.mode {
+        match self.opts.mode {
             Mode::Trash => {}
             Mode::Csv => {
-                let cells: Vec<String> =
-                    values.iter().map(|v| csv_cell(&self.render(v))).collect();
-                println!("{}", cells.join(","));
+                let line = values.iter().map(|v| csv_cell(&self.render(v))).collect::<Vec<_>>().join(",");
+                let _ = writeln!(self.out, "{line}");
             }
             Mode::JsonLines => {
                 let obj: serde_json::Map<String, Value> =
                     self.columns.iter().cloned().zip(values).collect();
-                println!("{}", Value::Object(obj));
+                let _ = writeln!(self.out, "{}", Value::Object(obj));
             }
             Mode::Json => {
                 let obj: serde_json::Map<String, Value> =
                     self.columns.iter().cloned().zip(values).collect();
-                if self.emitted_first_json {
-                    print!(",\n{}", Value::Object(obj));
-                } else {
-                    print!("\n{}", Value::Object(obj));
-                    self.emitted_first_json = true;
-                }
+                let sep = if self.emitted_first_json { "," } else { "" };
+                self.emitted_first_json = true;
+                let _ = write!(self.out, "{sep}\n{}", Value::Object(obj));
             }
             Mode::Line => {
                 let w = self.columns.iter().map(|c| c.len()).max().unwrap_or(0);
-                for (c, v) in self.columns.iter().zip(values.iter()) {
-                    println!("{c:>w$} = {}", self.render(v));
-                }
-                println!();
+                let lines: Vec<String> = self
+                    .columns
+                    .iter()
+                    .zip(values.iter())
+                    .map(|(c, v)| format!("{c:>w$} = {}", self.render(v)))
+                    .collect();
+                let _ = writeln!(self.out, "{}\n", lines.join("\n"));
             }
             Mode::List => {
-                let cells: Vec<String> = values.iter().map(|v| self.render(v)).collect();
-                println!("{}", cells.join("|"));
+                let line = values.iter().map(|v| self.render(v)).collect::<Vec<_>>().join("|");
+                let _ = writeln!(self.out, "{line}");
             }
             Mode::Duckbox | Mode::Markdown => {
-                let cells: Vec<String> = values.iter().map(|v| self.render(v)).collect();
+                // boxed_safe: a value with an embedded newline/tab must not
+                // shatter the frame; escape it for display only.
+                let cells: Vec<String> = values.iter().map(|v| boxed_safe(&self.render(v))).collect();
                 if self.head.len() < self.opts.max_rows {
                     self.head.push(cells);
                 } else {
@@ -162,11 +190,14 @@ impl<'a> Renderer<'a> {
 
     pub fn end(mut self, row_count: u64, time_ms: u64, wall_ms: u128) {
         match self.opts.mode {
-            Mode::Json => println!("\n]"),
+            Mode::Json => {
+                let _ = writeln!(self.out, "\n]");
+            }
             Mode::Duckbox => self.boxed(row_count, glyphs_duckbox()),
             Mode::Markdown => self.boxed(row_count, glyphs_markdown()),
             _ => {}
         }
+        let _ = self.out.flush();
         if self.opts.timer {
             eprintln!("Run Time: server {time_ms} ms, wall {wall_ms} ms");
         } else if !self.opts.mode.is_streaming() {
@@ -288,20 +319,15 @@ impl<'a> Renderer<'a> {
                 let txt = truncate(&txt, w);
                 let pad = w.saturating_sub(display_width(&txt));
                 let cell = format!(" {txt}{} ", " ".repeat(pad));
-                if styled && (o.is_none() || txt == self.opts.null) {
-                    out.push_str(&dim(&cell));
-                } else if !styled {
-                    out.push_str(&dim(&cell));
-                } else {
-                    out.push_str(&cell);
-                }
+                let dimmed = !styled || o.is_none() || txt == self.opts.null;
+                out.push_str(&if dimmed { dim(&cell) } else { cell });
             }
             out.push_str(g.v);
             out.push('\n');
         };
 
         rule(g.tl, g.tm, g.tr, &mut out);
-        let cols = self.columns.clone();
+        let cols: Vec<String> = self.columns.iter().map(|c| boxed_safe(c)).collect();
         cells_line(&|i| cols[i].clone(), true, &mut out);
         if g.type_row {
             let types = self.types.clone();
@@ -341,7 +367,10 @@ impl<'a> Renderer<'a> {
 /// `less -SRFX`: -S no-wrap since widths already fit, -F quit-if-one-screen).
 /// Streaming modes never page — they already left the building.
 fn deliver(out: String) {
-    let term_h = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(40);
+    let term_h = match crossterm::terminal::size() {
+        Ok((_, h)) if h > 0 => h as usize,
+        _ => 40, // unknown height (odd pty): guess, don't page everything
+    };
     let tall = out.lines().count() + 2 > term_h;
     if tall && std::io::stdout().is_terminal() {
         let pager = std::env::var("PAGER").unwrap_or_else(|_| "less -SRFX".into());
@@ -400,16 +429,42 @@ fn terminal_width() -> usize {
 }
 
 fn display_width(s: &str) -> usize {
-    s.chars().count() // close enough until unicode-width lands with sqllex
+    s.width() // terminal cells, so CJK/emoji columns align
 }
 
 fn truncate(s: &str, w: usize) -> String {
     if display_width(s) <= w {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(w.saturating_sub(1)).collect();
+    let budget = w.saturating_sub(1); // room for the …
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if used + cw > budget {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
     out.push('…');
     out
+}
+
+/// Control characters would shatter the boxed frame; show them escaped.
+fn boxed_safe(s: &str) -> String {
+    if !s.chars().any(|c| c.is_control()) {
+        return s.to_string();
+    }
+    s.chars()
+        .map(|c| match c {
+            '\n' => "\\n".to_string(),
+            '\t' => "\\t".to_string(),
+            '\r' => "\\r".to_string(),
+            c if c.is_control() => '\u{FFFD}'.to_string(),
+            c => c.to_string(),
+        })
+        .collect()
 }
 
 fn csv_cell(s: &str) -> String {

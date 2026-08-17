@@ -1,15 +1,15 @@
 //! pilot — the Harbor client.
 //!
-//! Phase-2 seed (PLAN.md): one-shot SQL and the fleet view. Zero-config local
-//! (D10a): a bare name resolves to ~/.harbor/<name>.sock and its token file;
-//! no config needed. The REPL, config.toml address book, https, and
-//! spawn-on-demand grow here next.
+//! Zero-config local (D10a): a bare name resolves to ~/.harbor/<name>.sock
+//! and its token file; config.toml is purely additive (remotes, aliases,
+//! taste). TLS is Caddy's job (D6) — pilot speaks plain HTTP over UDS/TCP.
 //!
 //!   pilot                          list live berths
+//!   pilot <target>                 the REPL
 //!   pilot <target> -c "SQL"        run one statement
 //!   echo "SQL" | pilot <target>    same, from stdin
 //!
-//! <target> = berth name | socket path | http://host:port
+//! <target> = config entry | berth name | file.duckdb | socket | http://host:port
 
 mod complete;
 mod config;
@@ -18,6 +18,7 @@ mod highlight;
 mod http;
 mod keywords;
 mod repl;
+mod scan;
 
 use harbor_protocol::{Event, SqlRequest, endpoint};
 use render::{Mode, RenderOpts, Renderer};
@@ -41,11 +42,20 @@ struct Conn {
     token: Option<String>,
 }
 
+/// What became of one statement. The REPL and `.read` stop a multi-statement
+/// run on anything but Done; main() maps it to the process exit code.
+#[derive(Clone, Copy, PartialEq)]
+enum Outcome {
+    Done,
+    Cancelled,
+    Failed,
+}
+
 fn main() -> ExitCode {
     // Ctrl-C cancels the running statement (via its queryId), it does not
     // kill pilot. At the REPL prompt reedline runs raw mode, so SIGINT only
-    // fires while a statement streams; in one-shot mode a second Ctrl-C is
-    // the way out (the first one cancels).
+    // fires while a statement streams; a second Ctrl-C while the first
+    // cancel is still pending exits outright (the tick handler enforces it).
     let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, CANCEL.clone());
     let mut args = std::env::args().skip(1);
     let mut target: Option<String> = None;
@@ -56,10 +66,19 @@ fn main() -> ExitCode {
 
     while let Some(a) = args.next() {
         match a.as_str() {
-            "-c" | "--command" => sql = args.next(),
-            "--token" => token = args.next(),
+            "-c" | "--command" => match args.next() {
+                Some(v) => sql = Some(v),
+                None => return fail("-c needs the SQL to run"),
+            },
+            "--token" => match args.next() {
+                Some(v) => token = Some(v),
+                None => return fail("--token needs a value"),
+            },
             "--json" => json = true,
-            "--mode" => mode = args.next(),
+            "--mode" => match args.next() {
+                Some(v) => mode = Some(v),
+                None => return fail("--mode needs a mode name"),
+            },
             "-h" | "--help" => {
                 print!("{HELP}");
                 return ExitCode::SUCCESS;
@@ -91,20 +110,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut opts = RenderOpts::default();
-    let d = config::load().defaults;
-    if let Some(m) = d.mode.as_deref().and_then(Mode::parse) {
-        opts.mode = m;
-    }
-    if let Some(t) = d.timer {
-        opts.timer = t;
-    }
-    if let Some(n) = d.maxrows {
-        opts.max_rows = n;
-    }
-    if let Some(nv) = d.nullvalue {
-        opts.null = nv;
-    }
+    let mut opts = RenderOpts::with_defaults(&config::load().defaults);
     if json {
         opts.mode = Mode::JsonLines;
     }
@@ -117,7 +123,11 @@ fn main() -> ExitCode {
     if !std::io::stdout().is_terminal() && opts.mode == Mode::Duckbox {
         eprintln!("hint: boxed output on a pipe; consider --mode csv or --json");
     }
-    run_sql(&conn, sql.trim(), &opts)
+    match run_sql(&conn, sql.trim(), &opts) {
+        Outcome::Done => ExitCode::SUCCESS,
+        Outcome::Cancelled => ExitCode::from(130), // the shell convention for SIGINT
+        Outcome::Failed => ExitCode::FAILURE,
+    }
 }
 
 const HELP: &str = "\
@@ -138,7 +148,7 @@ target:
 
 options:
   --token <t>                  bearer token (else HARBOR_TOKEN, else <name>.token)
-  --mode <m>                   duckbox, markdown, csv, json, jsonlines, line, list
+  --mode <m>                   duckbox, markdown, csv, json, jsonlines, line, list, trash
   --json                       shorthand for --mode jsonlines
 
 config: $HARBOR_HOME/config.toml ([defaults] mode/timer/maxrows/nullvalue,
@@ -329,7 +339,7 @@ fn list_fleet() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> ExitCode {
+fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
     let wall = std::time::Instant::now();
     let qid = format!("pilot-{}-{}", std::process::id(), QUERY_SEQ.fetch_add(1, Ordering::Relaxed));
     CANCEL.store(false, Ordering::Relaxed);
@@ -339,7 +349,10 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> ExitCode {
         ..Default::default()
     })
     .expect("request serializes");
-    let fire_cancel = {
+    // Runs on every 250ms socket tick: paints the spinner, and turns a
+    // Ctrl-C into a DELETE on the query. A second Ctrl-C while the first
+    // cancel is pending means the berth is not honoring it — exit outright.
+    let on_tick = {
         let fired = AtomicBool::new(false);
         let spun = AtomicU64::new(0);
         let conn = conn.clone();
@@ -353,36 +366,42 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> ExitCode {
                     eprint!("\r\x1b[2K… running {:.1}s (Ctrl-C cancels)", wall.elapsed().as_secs_f32());
                 }
             }
-            if CANCEL.swap(false, Ordering::Relaxed) && !fired.swap(true, Ordering::Relaxed) {
-                eprint!("\r\x1b[2K");
-                eprintln!("Interrupted — cancelling…");
-                let _ = http::request(
-                    &conn.transport,
-                    "DELETE",
-                    &endpoint::query(&qid),
-                    conn.token.as_deref(),
-                    None,
-                    Some(Duration::from_secs(2)),
-                );
+            if CANCEL.swap(false, Ordering::Relaxed) {
+                if !fired.swap(true, Ordering::Relaxed) {
+                    eprint!("\r\x1b[2K");
+                    eprintln!("Interrupted — cancelling…");
+                    let _ = http::request(
+                        &conn.transport,
+                        "DELETE",
+                        &endpoint::query(&qid),
+                        conn.token.as_deref(),
+                        None,
+                        Some(Duration::from_secs(2)),
+                    );
+                } else {
+                    eprintln!("\npilot: second interrupt — leaving (the berth keeps cancelling)");
+                    std::process::exit(130);
+                }
             }
         }
     };
-    let resp = match http::request_streaming(&conn.transport, "POST", endpoint::SQL, conn.token.as_deref(), Some(&body), &fire_cancel) {
+    let resp = match http::request_streaming(&conn.transport, "POST", endpoint::SQL, conn.token.as_deref(), Some(&body), &on_tick) {
         Ok(r) => r,
-        Err(e) => return fail(&format!("cannot reach harbor: {e}")),
+        Err(e) => return err(&format!("cannot reach harbor: {e}")),
     };
 
-    // Non-2xx: the body is one Event::Error document.
+    // Non-2xx: the body is one Event::Error document. The socket still has
+    // the streaming read timeout, so ride the ticks until the body lands.
     if resp.status >= 300 {
         let status = resp.status;
-        let text = resp.body_string().unwrap_or_default();
+        let text = read_patient(resp.body, &on_tick);
         return match Event::parse(text.trim()) {
             Ok(Event::Error { code, .. }) if code == harbor_protocol::code::CANCELLED => {
                 eprintln!("Interrupted.");
-                ExitCode::SUCCESS
+                Outcome::Cancelled
             }
-            Ok(Event::Error { code, message }) => fail(&format!("harbor error ({code}): {message}")),
-            _ => fail(&format!("HTTP {status} from harbor: {text}")),
+            Ok(Event::Error { code, message }) => err(&format!("harbor error ({code}): {message}")),
+            _ => err(&format!("HTTP {status} from harbor: {text}")),
         };
     }
 
@@ -401,10 +420,10 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> ExitCode {
             Ok(0) => break,
             Ok(_) => {}
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                fire_cancel();
+                on_tick();
                 continue;
             }
-            Err(e) => return fail(&format!("stream died: {e}")),
+            Err(e) => return err(&format!("stream died: {e}")),
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -413,7 +432,7 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> ExitCode {
         }
         let event = match Event::parse(trimmed) {
             Ok(ev) => ev,
-            Err(e) => return fail(&format!("bad envelope line ({e}): {trimmed}")),
+            Err(e) => return err(&format!("bad envelope line ({e}): {trimmed}")),
         };
         line.clear();
         match event {
@@ -421,19 +440,45 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> ExitCode {
             Event::Row { values } => renderer.row(values),
             Event::End { row_count, time_ms } => {
                 renderer.end(row_count, time_ms, wall.elapsed().as_millis());
-                return ExitCode::SUCCESS;
+                return Outcome::Done;
             }
-            Event::Error { code, message } if code == harbor_protocol::code::CANCELLED => {
+            Event::Error { code, .. } if code == harbor_protocol::code::CANCELLED => {
                 eprintln!("Interrupted.");
-                let _ = (code, message);
-                return ExitCode::SUCCESS;
+                return Outcome::Cancelled;
             }
             Event::Error { code, message } => {
-                return fail(&format!("harbor error ({code}): {message}"));
+                return err(&format!("harbor error ({code}): {message}"));
             }
         }
     }
-    fail("stream ended without an end event")
+    err("stream ended without an end event")
+}
+
+/// Read a whole (small) body over a socket that has the streaming tick
+/// timeout, retrying through the ticks with a hard 5s ceiling.
+fn read_patient(mut body: Box<dyn BufRead>, on_tick: &dyn Fn()) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match body.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                on_tick();
+                if std::time::Instant::now() > deadline {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn err(msg: &str) -> Outcome {
+    eprintln!("pilot: {msg}");
+    Outcome::Failed
 }
 
 fn fail(msg: &str) -> ExitCode {

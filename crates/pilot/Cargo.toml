@@ -19,6 +19,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 signal-hook = { version = "0.4.4", default-features = false }
 toml = "1.1.4"
+# already in reedline's tree: terminal-cell widths for duckbox alignment
+unicode-width = "0.2"
 
 [[bin]]
 name = "pilot"

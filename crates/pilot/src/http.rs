@@ -156,61 +156,110 @@ fn request_inner(
 }
 
 /// Decodes an HTTP/1.1 chunked body from the inner reader.
+///
+/// Resumable by design: request_streaming sockets tick every 250ms with
+/// WouldBlock, and a tick can land mid-frame — mid-size-line, mid-payload,
+/// mid-CRLF. Every partial (the accumulating `line`, the `remaining` count,
+/// the state itself) lives on self, so an interrupted read picks up exactly
+/// where it stopped instead of corrupting the framing.
 struct ChunkedReader<R: BufRead> {
     inner: R,
-    remaining: u64, // bytes left in the current chunk
-    done: bool,
+    state: ChunkState,
+    line: Vec<u8>,  // partial size/CRLF/trailer line, kept across WouldBlock
+    remaining: u64, // payload bytes left in the current chunk
+}
+
+#[derive(PartialEq)]
+enum ChunkState {
+    Size,    // reading "1a3\r\n"
+    Data,    // reading `remaining` payload bytes
+    DataEnd, // reading the CRLF after the payload
+    Trailers, // after the 0-chunk: lines until a blank one
+    Done,
 }
 
 impl<R: BufRead> ChunkedReader<R> {
     fn new(inner: R) -> Self {
-        Self { inner, remaining: 0, done: false }
+        Self { inner, state: ChunkState::Size, line: Vec::new(), remaining: 0 }
     }
 
-    fn next_chunk(&mut self) -> io::Result<()> {
-        let mut line = String::new();
-        self.inner.read_line(&mut line)?;
-        let size_part = line.trim().split(';').next().unwrap_or("").trim();
-        let size = u64::from_str_radix(size_part, 16)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("bad chunk size: {line:?}")))?;
-        if size == 0 {
-            // consume trailing CRLF (and any trailers) until blank line
-            loop {
-                let mut t = String::new();
-                if self.inner.read_line(&mut t)? == 0 || t.trim_end().is_empty() {
-                    break;
-                }
+    /// Append to self.line until `\n` (kept) or EOF. WouldBlock propagates
+    /// with the partial line intact. Returns whether a full line arrived.
+    fn fill_line(&mut self) -> io::Result<bool> {
+        loop {
+            let avail = self.inner.fill_buf()?;
+            if avail.is_empty() {
+                return Ok(false); // EOF
             }
-            self.done = true;
+            if let Some(pos) = avail.iter().position(|&c| c == b'\n') {
+                self.line.extend_from_slice(&avail[..=pos]);
+                self.inner.consume(pos + 1);
+                return Ok(true);
+            }
+            let n = avail.len();
+            self.line.extend_from_slice(avail);
+            self.inner.consume(n);
         }
-        self.remaining = size;
-        Ok(())
-    }
-
-    fn finish_chunk(&mut self) -> io::Result<()> {
-        let mut crlf = [0u8; 2];
-        self.inner.read_exact(&mut crlf)
     }
 }
 
 impl<R: BufRead> Read for ChunkedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.done {
-            return Ok(0);
-        }
-        if self.remaining == 0 {
-            self.next_chunk()?;
-            if self.done {
-                return Ok(0);
+        loop {
+            match self.state {
+                ChunkState::Done => return Ok(0),
+                ChunkState::Size => {
+                    let eol = self.fill_line()?;
+                    if !eol && self.line.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "connection closed between chunks",
+                        ));
+                    }
+                    let text = String::from_utf8_lossy(&self.line).into_owned();
+                    self.line.clear();
+                    let size_part = text.trim().split(';').next().unwrap_or("").trim();
+                    let size = u64::from_str_radix(size_part, 16).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("bad chunk size: {text:?}"))
+                    })?;
+                    if size == 0 {
+                        self.state = ChunkState::Trailers;
+                    } else {
+                        self.remaining = size;
+                        self.state = ChunkState::Data;
+                    }
+                }
+                ChunkState::Data => {
+                    let want = buf.len().min(self.remaining as usize);
+                    let n = self.inner.read(&mut buf[..want])?;
+                    if n == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "connection closed mid-chunk",
+                        ));
+                    }
+                    self.remaining -= n as u64;
+                    if self.remaining == 0 {
+                        self.state = ChunkState::DataEnd;
+                    }
+                    return Ok(n);
+                }
+                ChunkState::DataEnd => {
+                    self.fill_line()?; // the CRLF after the payload
+                    self.line.clear();
+                    self.state = ChunkState::Size;
+                }
+                ChunkState::Trailers => {
+                    let eol = self.fill_line()?;
+                    let blank = self.line.iter().all(|&c| c == b'\r' || c == b'\n');
+                    self.line.clear();
+                    if blank || !eol {
+                        self.state = ChunkState::Done;
+                        return Ok(0);
+                    }
+                }
             }
         }
-        let want = buf.len().min(self.remaining as usize);
-        let n = self.inner.read(&mut buf[..want])?;
-        self.remaining -= n as u64;
-        if self.remaining == 0 {
-            self.finish_chunk()?;
-        }
-        Ok(n)
     }
 }
 
@@ -246,5 +295,60 @@ mod tests {
         assert_eq!(lines[1], r#"{"type":"end"}"#);
         assert_eq!(lines[2], "xxxx");
         assert_eq!(lines.len(), 3);
+    }
+
+    /// One byte per read, a WouldBlock before every one of them — the worst
+    /// case of the 250ms streaming tick landing mid-size-line, mid-payload,
+    /// and mid-trailer. The decoder must resume, never desync.
+    struct Drip<'a> {
+        data: &'a [u8],
+        pos: usize,
+        ready: bool,
+    }
+
+    impl Read for Drip<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !std::mem::replace(&mut self.ready, true) {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "tick"));
+            }
+            self.ready = false;
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            buf[0] = self.data[self.pos];
+            self.pos += 1;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn chunked_survives_wouldblock_at_every_byte() {
+        let wire = "b\r\n{\"type\":\"ro\r\n11\r\nw\",\"values\":[1]}\n\r\n13\r\n{\"type\":\"end\"}\nxxxx\r\n0\r\nx-trailer: 1\r\n\r\n";
+        let drip = Drip { data: wire.as_bytes(), pos: 0, ready: false };
+        let mut r = ChunkedReader::new(BufReader::new(drip));
+        let mut out = Vec::new();
+        let mut buf = [0u8; 7];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue, // the tick
+                Err(e) => panic!("decoder desynced: {e}"),
+            }
+        }
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{\"type\":\"row\",\"values\":[1]}\n{\"type\":\"end\"}\nxxxx"
+        );
+    }
+
+    #[test]
+    fn eof_mid_chunk_is_an_error_not_silence() {
+        // The server dying mid-payload must not read as a clean end.
+        let wire = "b\r\n{\"type";
+        let mut r = ChunkedReader::new(BufReader::new(Cursor::new(wire.as_bytes())));
+        let mut out = Vec::new();
+        let err = r.read_to_end(&mut out).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 }
