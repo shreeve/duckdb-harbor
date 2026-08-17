@@ -189,11 +189,22 @@ newer official `alpha38069`, and against upstream stable `v1.5.5` — the C API 
 stable across the line (D1's version-agnostic property, exercised, not asserted).
 
 `make fetch-duckdb` (→ `scripts/fetch-duckdb.sh`) pulls the same official nightly
-into `~/.duckdb/cli/2.0.0/` for local work. Its one fork-coupled exception is
-`UI=1`: the `ui` extension loads *only* against the precise engine it was
-compiled with, and the nightly moves daily, so the two must travel as a pinned,
-matched pair from our releases until the UI factory publishes against the
-nightly. Everything else is upstream.
+into `~/.duckdb/cli/2.0.0/` for local work; `make setup` chains it with the
+binary build, `install`, and `make ui`, taking an empty `~/.duckdb` to a working
+fleet in one command.
+
+`make ui` (→ `scripts/build-ui-extension.sh`) builds the UI extension out-of-tree
+against the *exact* nightly just installed: read its commit, fetch DuckDB's
+headers at that commit (cached), compile only the ~11 UI sources, link
+dynamically (`-undefined dynamic_lookup` — symbols resolve from harbor's
+in-process libduckdb at load), and install to
+`~/.duckdb/extensions/<version>/<platform>/` so `LOAD ui` resolves it by name.
+No engine compile (~6s cached vs the 1,511-file, 20–40 min from-source build);
+the version lock the C++ ABI demands is satisfied *by construction*, since
+engine, dylib, and extension all derive from one nightly. The UI source is a
+duckdb-ui checkout carrying the v2 fixes — our fork until duckdb/duckdb-ui#242
+lands, then official. Verified end to end: `harbor serve --unsigned --init 'LOAD
+ui' --init 'FROM start_ui_server()'` serves the UI at `http://localhost:4213/`.
 
 **The UI extension can be dynamic — and should be.** DuckDB ships loadable
 extensions *statically* (each embeds a private copy of DuckDB, ~37MB, portable

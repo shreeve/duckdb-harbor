@@ -8,7 +8,7 @@
 # into every ~/.duckdb/cli/<ver>/. pilot never links an engine and works against
 # all of them.
 
-.PHONY: all binary pilot check check_quick install fetch-duckdb clean
+.PHONY: all binary pilot check check_quick install fetch-duckdb ui setup clean
 
 # The libduckdb the dynamic build links against — the version installed under
 # ~/.duckdb/cli/<ver>/. Only the library is needed (the crate ships pregenerated
@@ -57,12 +57,23 @@ install: binary pilot
 
 # Pull DuckDB's official v2.0-dev nightly (libduckdb + headers + duckdb CLI) from
 # artifacts.duckdb.org into $(DUCKDB_LIB); the baked rpath then resolves the
-# library in place. `make fetch-duckdb UI=1` instead pulls a pinned, matched
-# engine+UI pair from our releases (the ui extension only loads against the exact
-# engine it was built with). CI links the same official nightly via
-# .github/actions/duckdb. See PLAN.md D11.
+# library in place. CI links the same official nightly via .github/actions/duckdb.
+# The matched UI extension is built against this by `make ui`. See PLAN.md D11.
 fetch-duckdb:
-	DEST=$(DUCKDB_LIB) UI=$(UI) scripts/fetch-duckdb.sh
+	DEST=$(DUCKDB_LIB) scripts/fetch-duckdb.sh
+
+# Build the DuckDB UI extension against the exact nightly now in $(DUCKDB_LIB)
+# and install it where `LOAD ui` finds it by name. Everything derives from that
+# one engine, so the UI, the dylib, and harbor are synchronized by construction.
+# See scripts/build-ui-extension.sh (and PLAN.md D11).
+ui:
+	DUCKDB_LIB=$(DUCKDB_LIB) scripts/build-ui-extension.sh
+
+# Reconstruct ~/.duckdb from scratch: fetch the engine, build + install harbor
+# and pilot beside it, and build the matched UI extension. One command to go
+# from an empty ~/.duckdb to a working v2 fleet with the UI.
+setup: fetch-duckdb binary pilot install ui
+	@echo "setup: ~/.duckdb ready — harbor, pilot, and the UI all on $(notdir $(DUCKDB_LIB))"
 
 clean:
 	cargo clean

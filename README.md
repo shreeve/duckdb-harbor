@@ -198,6 +198,25 @@ $ harbor serve mydata.duckdb --token secret
 harbor 0.10.0: berth "mydata" serving mydata.duckdb on ~/.harbor/mydata.sock (duckdb v2.0.0-alpha38069, memory_limit 2GB)
 ```
 
+`make setup` does the whole thing in one shot — fetch the engine, build and install
+`harbor` + `pilot` beside it, and build the matched DuckDB UI extension — taking an
+empty `~/.duckdb` to a working fleet.
+
+### Browser UI
+
+harbor can host the DuckDB UI over a berth. `make ui` builds the `ui` extension
+against the *exact* engine harbor runs (out-of-tree — only the extension, seconds,
+no engine compile) and installs it where `LOAD ui` finds it by name. Then:
+
+```console
+$ harbor serve mydata.duckdb --unsigned \
+    --init "LOAD ui" --init "FROM start_ui_server()"     # UI at http://localhost:4213/
+```
+
+Because harbor carries `libduckdb` in-process, the dynamically-linked extension
+resolves its DuckDB symbols at load, and everything — engine, harbor, extension —
+derives from one nightly, so the versions match by construction (PLAN.md D11).
+
 `harbor serve` runs in the foreground. `harbor add mydata.duckdb` spawns a
 **detached** berth and returns once it answers `/ready`; `harbor ls` lists the
 fleet, `harbor stop <name>` drains and `CHECKPOINT`s, `harbor rm <name>` clears
