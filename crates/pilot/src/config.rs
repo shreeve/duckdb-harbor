@@ -77,8 +77,18 @@ impl Connection {
     }
 }
 
+/// The harbor registry directory: $HARBOR_HOME, else ~/.harbor. This is
+/// where pilot's world lives on disk — sockets, tokens, history, config.
+pub fn harbor_home() -> std::path::PathBuf {
+    if let Ok(h) = std::env::var("HARBOR_HOME") {
+        return std::path::PathBuf::from(h);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::Path::new(&home).join(".harbor")
+}
+
 pub fn load() -> FileConfig {
-    let path = crate::http::harbor_home().join("config.toml");
+    let path = harbor_home().join("config.toml");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return FileConfig::default();
     };

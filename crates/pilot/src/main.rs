@@ -90,27 +90,14 @@ fn main() -> ExitCode {
 
     let Some(target) = target else { return list_fleet() };
 
-    let conn = match resolve(&target, token) {
+    let cfg = config::load(); // once; resolve and the render defaults share it
+    let conn = match resolve(&cfg, &target, token) {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
 
-    let sql = match sql {
-        Some(s) => s,
-        None => {
-            // No -c and a real terminal: the REPL. On a pipe: read stdin.
-            if std::io::stdin().is_terminal() {
-                return repl::run(&conn, &target);
-            }
-            let mut s = String::new();
-            if std::io::stdin().read_to_string(&mut s).is_err() || s.trim().is_empty() {
-                return fail("no SQL given: use -c \"...\" or pipe on stdin");
-            }
-            s
-        }
-    };
-
-    let mut opts = RenderOpts::with_defaults(&config::load().defaults);
+    // config [defaults], then the flags on top — for the REPL and one-shots.
+    let mut opts = RenderOpts::with_defaults(&cfg.defaults);
     if json {
         opts.mode = Mode::JsonLines;
     }
@@ -120,10 +107,36 @@ fn main() -> ExitCode {
             None => return fail(&format!("unknown mode {m:?}")),
         }
     }
+
+    let sql = match sql {
+        Some(s) => s,
+        None => {
+            // No -c and a real terminal: the REPL. On a pipe: read stdin.
+            if std::io::stdin().is_terminal() {
+                return repl::run(&conn, &target, opts);
+            }
+            let mut s = String::new();
+            if std::io::stdin().read_to_string(&mut s).is_err() || s.trim().is_empty() {
+                return fail("no SQL given: use -c \"...\" or pipe on stdin");
+            }
+            s
+        }
+    };
+
     if !std::io::stdout().is_terminal() && opts.mode == Mode::Duckbox {
         eprintln!("hint: boxed output on a pipe; consider --mode csv or --json");
     }
-    match run_sql(&conn, sql.trim(), &opts) {
+    // Piped scripts and -c may carry several statements; the protocol takes
+    // one per request, so split exactly the way the REPL and .read do,
+    // stopping at the first failure or interrupt.
+    let mut last = Outcome::Done;
+    for stmt in repl::split_statements(&sql) {
+        last = run_sql(&conn, &stmt, &opts);
+        if last != Outcome::Done {
+            break;
+        }
+    }
+    match last {
         Outcome::Done => ExitCode::SUCCESS,
         Outcome::Cancelled => ExitCode::from(130), // the shell convention for SIGINT
         Outcome::Failed => ExitCode::FAILURE,
@@ -159,14 +172,13 @@ job (PLAN.md D6); ssh is the human path to a remote berth.
 /// Resolution order (D9/D10a): config.toml name -> live berth name ->
 /// http(s) url -> .duckdb path (join-or-spawn) -> socket path. Zero-config
 /// local always works; the config is purely additive.
-fn resolve(target: &str, flag_token: Option<String>) -> Result<Conn, String> {
+fn resolve(cfg: &config::FileConfig, target: &str, flag_token: Option<String>) -> Result<Conn, String> {
     let env_token = std::env::var("HARBOR_TOKEN").ok();
-    let cfg = config::load();
 
     // Explicit config entry shadows a same-named live berth (ssh_config rule).
     if let Some(entry) = cfg.connection.get(target) {
-        let home = http::harbor_home();
-        if home.join(format!("{target}.sock")).exists() {
+        let home = config::harbor_home();
+        if berth_sock(&home, target).exists() {
             eprintln!("pilot: config entry {target:?} shadows a live local berth of the same name");
         }
         let token = flag_token.or(env_token).or_else(|| entry.resolve_token());
@@ -196,8 +208,8 @@ fn resolve(target: &str, flag_token: Option<String>) -> Result<Conn, String> {
     if target.contains('/') || target.ends_with(".sock") {
         sock = PathBuf::from(target);
     } else {
-        let home = http::harbor_home();
-        sock = home.join(format!("{target}.sock"));
+        let home = config::harbor_home();
+        sock = berth_sock(&home, target);
         if !sock.exists() {
             return Err(format!(
                 "no live berth named {target:?} ({} not found){}",
@@ -205,11 +217,19 @@ fn resolve(target: &str, flag_token: Option<String>) -> Result<Conn, String> {
                 fleet_hint(&home)
             ));
         }
-        file_token = std::fs::read_to_string(home.join(format!("{target}.token")))
-            .ok()
-            .map(|t| t.trim().to_string());
+        file_token = berth_token(&home, target);
     }
     Ok(Conn { transport: Transport::Unix(sock), token: flag_token.or(env_token).or(file_token) })
+}
+
+fn berth_sock(home: &std::path::Path, name: &str) -> PathBuf {
+    home.join(format!("{name}.sock"))
+}
+
+fn berth_token(home: &std::path::Path, name: &str) -> Option<String> {
+    let t = std::fs::read_to_string(home.join(format!("{name}.token"))).ok()?;
+    let t = t.trim().to_string();
+    if t.is_empty() { None } else { Some(t) }
 }
 
 fn url_transport(url: &str) -> Result<Transport, String> {
@@ -235,7 +255,7 @@ fn url_transport(url: &str) -> Result<Transport, String> {
 /// ephemeral one (idle-exit reaps it; see PLAN.md D9). Returns socket + the
 /// berth's token, if readable.
 fn ensure_berth(path: &std::path::Path, idle_exit: &str) -> Result<(PathBuf, Option<String>), String> {
-    let home = http::harbor_home();
+    let home = config::harbor_home();
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
 
     // Already owned? The sidecar json says which berth claims this file.
@@ -249,12 +269,9 @@ fn ensure_berth(path: &std::path::Path, idle_exit: &str) -> Result<(PathBuf, Opt
             let Ok(j) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
             if j["db"].as_str() == Some(&canon.display().to_string()) {
                 if let Some(name) = j["name"].as_str() {
-                    let sock = home.join(format!("{name}.sock"));
+                    let sock = berth_sock(&home, name);
                     if sock.exists() {
-                        let tok = std::fs::read_to_string(home.join(format!("{name}.token")))
-                            .ok()
-                            .map(|t| t.trim().to_string());
-                        return Ok((sock, tok));
+                        return Ok((sock, berth_token(&home, name)));
                     }
                 }
             }
@@ -283,11 +300,7 @@ fn ensure_berth(path: &std::path::Path, idle_exit: &str) -> Result<(PathBuf, Opt
     if !status.success() {
         return Err(format!("harbor add failed for {}", canon.display()));
     }
-    let sock = home.join(format!("{name}.sock"));
-    let tok = std::fs::read_to_string(home.join(format!("{name}.token")))
-        .ok()
-        .map(|t| t.trim().to_string());
-    Ok((sock, tok))
+    Ok((berth_sock(&home, &name), berth_token(&home, &name)))
 }
 
 fn fleet_hint(home: &std::path::Path) -> String {
@@ -313,7 +326,7 @@ fn berth_sockets(home: &std::path::Path) -> Vec<PathBuf> {
 /// Bare `pilot`: the fleet view. /ready is unauthenticated by design, so this
 /// needs no tokens; config-file remotes join this view in Phase 2.
 fn list_fleet() -> ExitCode {
-    let home = http::harbor_home();
+    let home = config::harbor_home();
     let socks = berth_sockets(&home);
     if socks.is_empty() {
         println!("no live berths in {} (start one: harbor add <db>)", home.display());
@@ -342,7 +355,12 @@ fn list_fleet() -> ExitCode {
 fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
     let wall = std::time::Instant::now();
     let qid = format!("pilot-{}-{}", std::process::id(), QUERY_SEQ.fetch_add(1, Ordering::Relaxed));
-    CANCEL.store(false, Ordering::Relaxed);
+    // A Ctrl-C that landed between statements (say, while the pager showed
+    // the last result) aborts before this one starts — never silently clear.
+    if CANCEL.swap(false, Ordering::Relaxed) {
+        eprintln!("Interrupted.");
+        return Outcome::Cancelled;
+    }
     let body = serde_json::to_string(&SqlRequest {
         sql: sql.to_string(),
         query_id: Some(qid.clone()),
@@ -437,10 +455,25 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
         line.clear();
         match event {
             Event::Schema { columns } => renderer.schema(&columns),
-            Event::Row { values } => renderer.row(values),
+            Event::Row { values } => {
+                renderer.row(values);
+                if let Some(kind) = renderer.failed() {
+                    // Stop reading; dropping the connection tells the berth.
+                    // A closed pipe (`pilot … | head`) is the Unix goodbye,
+                    // not an error; anything else gets reported.
+                    return if kind == std::io::ErrorKind::BrokenPipe {
+                        Outcome::Done
+                    } else {
+                        err(&format!("writing output failed: {kind}"))
+                    };
+                }
+            }
             Event::End { row_count, time_ms } => {
-                renderer.end(row_count, time_ms, wall.elapsed().as_millis());
-                return Outcome::Done;
+                return match renderer.end(row_count, time_ms, wall.elapsed().as_millis()) {
+                    Ok(()) => Outcome::Done,
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Outcome::Done,
+                    Err(e) => err(&format!("writing output failed: {e}")),
+                };
             }
             Event::Error { code, .. } if code == harbor_protocol::code::CANCELLED => {
                 eprintln!("Interrupted.");

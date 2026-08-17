@@ -8,7 +8,7 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -261,15 +261,6 @@ impl<R: BufRead> Read for ChunkedReader<R> {
             }
         }
     }
-}
-
-/// The harbor registry directory: $HARBOR_HOME, else ~/.harbor.
-pub fn harbor_home() -> PathBuf {
-    if let Ok(h) = std::env::var("HARBOR_HOME") {
-        return PathBuf::from(h);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    Path::new(&home).join(".harbor")
 }
 
 #[cfg(test)]

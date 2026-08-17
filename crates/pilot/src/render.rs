@@ -97,6 +97,9 @@ impl RenderOpts {
 pub struct Renderer<'a> {
     opts: &'a RenderOpts,
     out: BufWriter<Stdout>,
+    /// First write failure; once set, output stops. EPIPE here is normal
+    /// life (`pilot … | head`), anything else is reported at `end`.
+    broken: Option<std::io::ErrorKind>,
     columns: Vec<String>,
     types: Vec<String>,
     head: Vec<Vec<String>>,
@@ -110,6 +113,7 @@ impl<'a> Renderer<'a> {
         Self {
             opts,
             out: BufWriter::new(std::io::stdout()),
+            broken: None,
             columns: Vec::new(),
             types: Vec::new(),
             head: Vec::new(),
@@ -117,6 +121,20 @@ impl<'a> Renderer<'a> {
             total: 0,
             emitted_first_json: false,
         }
+    }
+
+    fn emit(&mut self, args: std::fmt::Arguments) {
+        if self.broken.is_some() {
+            return;
+        }
+        if let Err(e) = self.out.write_fmt(args) {
+            self.broken = Some(e.kind());
+        }
+    }
+
+    /// Set once a write has failed; the caller should stop feeding rows.
+    pub fn failed(&self) -> Option<std::io::ErrorKind> {
+        self.broken
     }
 
     pub fn schema(&mut self, cols: &[Column]) {
@@ -128,11 +146,11 @@ impl<'a> Renderer<'a> {
         self.types = cols.iter().map(|c| c.duckdb_type.clone()).collect();
         match self.opts.mode {
             Mode::Csv => {
-                let hdr: Vec<String> = self.columns.iter().map(|c| csv_cell(c)).collect();
-                let _ = writeln!(self.out, "{}", hdr.join(","));
+                let hdr = self.columns.iter().map(|c| csv_cell(c)).collect::<Vec<_>>().join(",");
+                self.emit(format_args!("{hdr}\n"));
             }
             Mode::Json => {
-                let _ = write!(self.out, "[");
+                self.emit(format_args!("["));
             }
             _ => {}
         }
@@ -144,33 +162,34 @@ impl<'a> Renderer<'a> {
             Mode::Trash => {}
             Mode::Csv => {
                 let line = values.iter().map(|v| csv_cell(&self.render(v))).collect::<Vec<_>>().join(",");
-                let _ = writeln!(self.out, "{line}");
+                self.emit(format_args!("{line}\n"));
             }
             Mode::JsonLines => {
-                let obj: serde_json::Map<String, Value> =
-                    self.columns.iter().cloned().zip(values).collect();
-                let _ = writeln!(self.out, "{}", Value::Object(obj));
+                let obj = json_row(&self.columns, &values);
+                self.emit(format_args!("{obj}\n"));
             }
             Mode::Json => {
-                let obj: serde_json::Map<String, Value> =
-                    self.columns.iter().cloned().zip(values).collect();
+                let obj = json_row(&self.columns, &values);
                 let sep = if self.emitted_first_json { "," } else { "" };
                 self.emitted_first_json = true;
-                let _ = write!(self.out, "{sep}\n{}", Value::Object(obj));
+                self.emit(format_args!("{sep}\n{obj}"));
             }
             Mode::Line => {
-                let w = self.columns.iter().map(|c| c.len()).max().unwrap_or(0);
+                let w = self.columns.iter().map(|c| display_width(c)).max().unwrap_or(0);
                 let lines: Vec<String> = self
                     .columns
                     .iter()
                     .zip(values.iter())
-                    .map(|(c, v)| format!("{c:>w$} = {}", self.render(v)))
+                    .map(|(c, v)| {
+                        let pad = " ".repeat(w.saturating_sub(display_width(c)));
+                        format!("{pad}{c} = {}", self.render(v))
+                    })
                     .collect();
-                let _ = writeln!(self.out, "{}\n", lines.join("\n"));
+                self.emit(format_args!("{}\n\n", lines.join("\n")));
             }
             Mode::List => {
                 let line = values.iter().map(|v| self.render(v)).collect::<Vec<_>>().join("|");
-                let _ = writeln!(self.out, "{line}");
+                self.emit(format_args!("{line}\n"));
             }
             Mode::Duckbox | Mode::Markdown => {
                 // boxed_safe: a value with an embedded newline/tab must not
@@ -188,20 +207,26 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    pub fn end(mut self, row_count: u64, time_ms: u64, wall_ms: u128) {
+    pub fn end(mut self, row_count: u64, time_ms: u64, wall_ms: u128) -> std::io::Result<()> {
         match self.opts.mode {
-            Mode::Json => {
-                let _ = writeln!(self.out, "\n]");
-            }
+            Mode::Json => self.emit(format_args!("\n]\n")),
             Mode::Duckbox => self.boxed(row_count, glyphs_duckbox()),
             Mode::Markdown => self.boxed(row_count, glyphs_markdown()),
             _ => {}
         }
-        let _ = self.out.flush();
+        if self.broken.is_none() {
+            if let Err(e) = self.out.flush() {
+                self.broken = Some(e.kind());
+            }
+        }
         if self.opts.timer {
             eprintln!("Run Time: server {time_ms} ms, wall {wall_ms} ms");
         } else if !self.opts.mode.is_streaming() {
             eprintln!("{row_count} rows ({time_ms} ms)");
+        }
+        match self.broken {
+            None => Ok(()),
+            Some(kind) => Err(kind.into()),
         }
     }
 
@@ -246,46 +271,9 @@ impl<'a> Renderer<'a> {
             .collect();
 
         // Terminal fit: prune middle columns, marking with a "…" column.
-        let term_w = terminal_width();
-        let fits = |ws: &[usize], n_shown: usize, pruned: bool| {
-            let sep = 3; // " │ " per gap, borders
-            ws.iter().take(n_shown).sum::<usize>()
-                + (n_shown + pruned as usize).saturating_sub(1) * sep
-                + 4
-                + if pruned { 3 } else { 0 }
-                <= term_w
-        };
-        let mut left = ncols; // columns shown from the left before the … column
-        let mut right = 0; // columns shown from the right
-        if !fits(&widths, ncols, false) && ncols > 2 {
-            left = 1;
-            right = 1;
-            loop {
-                let mut ws: Vec<usize> = widths[..left].to_vec();
-                ws.extend_from_slice(&widths[ncols - right..]);
-                if !fits(&ws, ws.len(), true) {
-                    if left + right > 2 {
-                        if left > right { left -= 1 } else { right -= 1 }
-                    }
-                    break;
-                }
-                if left + right >= ncols {
-                    left = ncols;
-                    right = 0;
-                    break;
-                }
-                if left <= right { left += 1 } else { right += 1 }
-            }
-        }
-        let pruned = left < ncols;
-        let idx: Vec<Option<usize>> = if pruned {
-            let mut v: Vec<Option<usize>> = (0..left).map(Some).collect();
-            v.push(None); // the … column
-            v.extend((ncols - right..ncols).map(Some));
-            v
-        } else {
-            (0..ncols).map(Some).collect()
-        };
+        let idx = plan_columns(&widths, terminal_width());
+        let pruned = idx.iter().any(Option::is_none);
+        let shown_cols = idx.iter().filter(|o| o.is_some()).count();
         let colw = |o: &Option<usize>| o.map_or(1, |i| widths[i]);
 
         let mut out = String::new();
@@ -330,18 +318,15 @@ impl<'a> Renderer<'a> {
         let cols: Vec<String> = self.columns.iter().map(|c| boxed_safe(c)).collect();
         cells_line(&|i| cols[i].clone(), true, &mut out);
         if g.type_row {
-            let types = self.types.clone();
-            cells_line(&|i| types[i].clone(), false, &mut out);
+            cells_line(&|i| self.types[i].clone(), false, &mut out);
         }
         rule(g.ml, g.mm, g.mr, &mut out);
         for r in top {
-            let r = r.clone();
             cells_line(&|i| r.get(i).cloned().unwrap_or_default(), true, &mut out);
         }
         if spilled {
             cells_line(&|_i| "·".to_string(), false, &mut out);
             for r in bottom {
-                let r = r.clone();
                 cells_line(&|i| r.get(i).cloned().unwrap_or_default(), true, &mut out);
             }
         }
@@ -354,7 +339,7 @@ impl<'a> Renderer<'a> {
                 note.push_str(&format!(" ({shown} shown)"));
             }
             if pruned {
-                note.push_str(&format!(", {ncols} columns ({} shown)", left + right));
+                note.push_str(&format!(", {ncols} columns ({shown_cols} shown)"));
             }
             out.push_str(&dim(&note));
             out.push('\n');
@@ -428,6 +413,53 @@ fn terminal_width() -> usize {
     crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(120)
 }
 
+/// Which columns a `term_w`-wide terminal shows: every index, or a
+/// left…right selection with `None` marking the "…" elision column.
+/// Growth alternates sides from 1+1 until the next column would not fit.
+fn plan_columns(widths: &[usize], term_w: usize) -> Vec<Option<usize>> {
+    const GAP: usize = 3; // " │ " between cells
+    const EDGES: usize = 4; // the outer borders and their padding
+    const ELLIPSIS: usize = 3; // the "…" column: 1 wide plus its padding
+    let ncols = widths.len();
+    let fits = |ws: &[usize], pruned: bool| {
+        ws.iter().sum::<usize>()
+            + (ws.len() + pruned as usize).saturating_sub(1) * GAP
+            + EDGES
+            + if pruned { ELLIPSIS } else { 0 }
+            <= term_w
+    };
+    let mut left = ncols; // columns shown from the left before the … column
+    let mut right = 0; // columns shown from the right
+    if !fits(widths, false) && ncols > 2 {
+        left = 1;
+        right = 1;
+        loop {
+            let mut ws: Vec<usize> = widths[..left].to_vec();
+            ws.extend_from_slice(&widths[ncols - right..]);
+            if !fits(&ws, true) {
+                if left + right > 2 {
+                    if left > right { left -= 1 } else { right -= 1 }
+                }
+                break;
+            }
+            if left + right >= ncols {
+                left = ncols;
+                right = 0;
+                break;
+            }
+            if left <= right { left += 1 } else { right += 1 }
+        }
+    }
+    if left < ncols {
+        let mut v: Vec<Option<usize>> = (0..left).map(Some).collect();
+        v.push(None); // the … column
+        v.extend((ncols - right..ncols).map(Some));
+        v
+    } else {
+        (0..ncols).map(Some).collect()
+    }
+}
+
 fn display_width(s: &str) -> usize {
     s.width() // terminal cells, so CJK/emoji columns align
 }
@@ -467,6 +499,24 @@ fn boxed_safe(s: &str) -> String {
         .collect()
 }
 
+/// A row as a JSON object with duplicate column names kept verbatim —
+/// `{"a":1,"a":2}` is what `duckdb -json` emits too; syntactically valid,
+/// and the consumer's parser picks its own policy. serde_json::Map would
+/// silently collapse them, so the object is assembled by hand.
+fn json_row(columns: &[String], values: &[Value]) -> String {
+    let mut s = String::from("{");
+    for (i, (c, v)) in columns.iter().zip(values.iter()).enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&serde_json::to_string(c).expect("strings serialize"));
+        s.push(':');
+        s.push_str(&v.to_string());
+    }
+    s.push('}');
+    s
+}
+
 fn csv_cell(s: &str) -> String {
     if s.contains(',') || s.contains('"') || s.contains('\n') {
         format!("\"{}\"", s.replace('"', "\"\""))
@@ -503,6 +553,29 @@ mod tests {
         assert_eq!(csv_cell("plain"), "plain");
         assert_eq!(csv_cell("a,b"), "\"a,b\"");
         assert_eq!(csv_cell("say \"hi\""), "\"say \"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn json_rows_keep_duplicate_keys() {
+        let cols = vec!["a".to_string(), "a".to_string(), "b\"q".to_string()];
+        let vals = vec![json!(1), json!(2), json!(null)];
+        assert_eq!(json_row(&cols, &vals), r#"{"a":1,"a":2,"b\"q":null}"#);
+        assert_eq!(json_row(&[], &[]), "{}");
+    }
+
+    #[test]
+    fn column_plan_fits_the_terminal() {
+        // plenty of room: every column, in order
+        assert_eq!(plan_columns(&[5, 5, 5], 120), vec![Some(0), Some(1), Some(2)]);
+        // too narrow: first … last, the minimal plan
+        assert_eq!(plan_columns(&[20, 20, 20, 20], 40), vec![Some(0), None, Some(3)]);
+        // room for three of four (all four need 53): left gets the extra
+        assert_eq!(plan_columns(&[10, 10, 10, 10], 50), vec![Some(0), Some(1), None, Some(3)]);
+        // two columns are never pruned, even overflowing
+        assert_eq!(plan_columns(&[100, 100], 40), vec![Some(0), Some(1)]);
+        // exact fit: 3 cols of 10 = 30 + 2 gaps (6) + edges (4) = 40
+        assert_eq!(plan_columns(&[10, 10, 10], 40), vec![Some(0), Some(1), Some(2)]);
+        assert_eq!(plan_columns(&[10, 10, 10], 39), vec![Some(0), None, Some(2)]);
     }
 
     #[test]

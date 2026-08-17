@@ -27,6 +27,10 @@ pub struct Span {
     pub terminated: bool,
 }
 
+fn is_ident_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80
+}
+
 pub fn scan(src: &str) -> Vec<Span> {
     let b = src.as_bytes();
     let mut spans = Vec::new();
@@ -45,10 +49,21 @@ pub fn scan(src: &str) -> Vec<Span> {
         match b[i] {
             q @ (b'\'' | b'"') => {
                 flush(&mut spans, code_start, i);
+                // E'...' / e'...' is a Postgres escape string: backslash
+                // escapes count. The E must be a standalone prefix, not the
+                // tail of an identifier (tablE'x' is nonsense anyway).
+                let escapes = q == b'\''
+                    && i >= 1
+                    && (b[i - 1] | 0x20) == b'e'
+                    && (i < 2 || !is_ident_byte(b[i - 2]));
                 let start = i;
                 i += 1;
                 let mut terminated = false;
                 while i < b.len() {
+                    if escapes && b[i] == b'\\' && i + 1 < b.len() {
+                        i += 2; // \' \\ \n … consume both bytes
+                        continue;
+                    }
                     if b[i] == q {
                         if i + 1 < b.len() && b[i + 1] == q {
                             i += 2; // '' or "" escape
@@ -118,7 +133,7 @@ pub fn scan(src: &str) -> Vec<Span> {
                 prev_ident = false;
             }
             c => {
-                prev_ident = c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
+                prev_ident = is_ident_byte(c);
                 i += 1;
             }
         }
@@ -166,6 +181,23 @@ mod tests {
         assert!(scan("SELECT a$b$c;").iter().all(|s| s.kind == Kind::Code));
         // ...but a $tag$ after a delimiter still opens one.
         assert_eq!(kinds("SELECT $b$;$b$")[1], (Kind::Dollar, "$b$;$b$", true));
+    }
+
+    #[test]
+    fn escape_strings() {
+        // E'\'' is a complete Postgres escape string (the span starts at the
+        // quote; the E prefix stays code). Without the prefix, \ is literal.
+        assert_eq!(kinds(r"SELECT E'\''"), vec![
+            (Kind::Code, "SELECT E", true),
+            (Kind::Str, r"'\''", true),
+        ]);
+        assert_eq!(kinds(r"SELECT e'a\\b' x")[1], (Kind::Str, r"'a\\b'", true));
+        // plain strings: backslash is not an escape ('\' is complete)
+        assert_eq!(kinds(r"SELECT '\'")[1], (Kind::Str, r"'\'", true));
+        // tablE'x' is an identifier then a plain string, not an escape string
+        assert_eq!(kinds(r"tablE'\'")[1], (Kind::Str, r"'\'", true));
+        // unterminated E-string stays open
+        assert_eq!(kinds(r"SELECT E'\''oops' -- ").last().unwrap().2, false);
     }
 
     #[test]

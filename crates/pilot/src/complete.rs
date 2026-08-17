@@ -39,7 +39,7 @@ impl SqlCompleter {
 
     /// Point at a different berth (.open): drop the cache, refill lazily.
     pub fn reconnect(&self, conn: Conn) {
-        let mut inner = self.inner.lock().expect("completer lock");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.conn = conn;
         inner.catalog = None;
     }
@@ -155,7 +155,7 @@ impl Completer for SqlCompleter {
                 .map(|c| suggest(c, "command", 0, pos))
                 .collect()
         } else {
-            let mut inner = self.inner.lock().expect("completer lock");
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if inner.catalog.is_none() {
                 inner.setup(); // first Tab pays for it, the prompt never does
             }

@@ -75,8 +75,9 @@ pub fn statement_complete(buf: &str) -> bool {
                     }
                 }
             }
-            // A trailing literal is content, not a terminator.
-            Kind::Str | Kind::Dollar => last = b'\'',
+            // A trailing literal is content, not a terminator (any non-`;`
+            // byte does as the marker).
+            Kind::Str | Kind::Dollar => last = b'x',
             Kind::LineComment | Kind::BlockComment => {}
         }
     }
@@ -85,28 +86,38 @@ pub fn statement_complete(buf: &str) -> bool {
 
 /// Split a buffer at `;` terminators in code spans — same scanner, applied
 /// cutwise, so `.read` scripts and `a; b;` buffers obey the validator's rules.
+/// Segments with no code (a trailing `-- comment`, a stray `;`) are dropped:
+/// the server takes statements, not commentary.
 pub fn split_statements(buf: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut start = 0;
+    let mut push = |stmt: &str| {
+        if has_code(stmt) {
+            out.push(stmt.to_string());
+        }
+    };
     for sp in scan(buf) {
         if sp.kind != Kind::Code {
             continue;
         }
         for (off, &c) in buf[sp.start..sp.end].as_bytes().iter().enumerate() {
             if c == b';' {
-                let stmt = buf[start..sp.start + off].trim();
-                if !stmt.is_empty() {
-                    out.push(stmt.to_string());
-                }
+                push(buf[start..sp.start + off].trim());
                 start = sp.start + off + 1;
             }
         }
     }
-    let last = buf[start..].trim();
-    if !last.is_empty() {
-        out.push(last.to_string());
-    }
+    push(buf[start..].trim());
     out
+}
+
+/// Anything besides whitespace and comments?
+fn has_code(s: &str) -> bool {
+    scan(s).iter().any(|sp| match sp.kind {
+        Kind::Code => s[sp.start..sp.end].bytes().any(|b| !b.is_ascii_whitespace()),
+        Kind::Str | Kind::Dollar => true,
+        Kind::LineComment | Kind::BlockComment => false,
+    })
 }
 
 /// The one list of dot-commands: dispatch validates against it, `.help`
@@ -142,7 +153,7 @@ fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
         Box::new(Emacs::new(kb))
     };
     let menu = ColumnarMenu::default().with_name("completion_menu");
-    let history = crate::http::harbor_home().join("history");
+    let history = crate::config::harbor_home().join("history");
     Reedline::create()
         .with_validator(Box::new(SqlValidator))
         .with_highlighter(Box::new(crate::highlight::SqlHighlighter))
@@ -155,7 +166,7 @@ fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
         ))
 }
 
-pub fn run(conn: &Conn, name: &str) -> std::process::ExitCode {
+pub fn run(conn: &Conn, name: &str, mut opts: RenderOpts) -> std::process::ExitCode {
     let mut conn = conn.clone();
     let mut vi = false;
     // One completer for the session: its catalog cache loads lazily on the
@@ -163,7 +174,6 @@ pub fn run(conn: &Conn, name: &str) -> std::process::ExitCode {
     let completer = SqlCompleter::new(conn.clone());
     let mut line_editor = make_editor(&completer, vi);
     let mut prompt = BerthPrompt { name: name.to_string() };
-    let mut opts = RenderOpts::with_defaults(&crate::config::load().defaults);
     eprintln!("pilot: connected to {name} (.help for help, .quit to leave)");
 
     loop {
@@ -178,7 +188,10 @@ pub fn run(conn: &Conn, name: &str) -> std::process::ExitCode {
                         DotResult::Quit => return std::process::ExitCode::SUCCESS,
                         DotResult::Handled => continue,
                         DotResult::Open(target) => {
-                            match crate::resolve(&target, None) {
+                            // A fresh config read on purpose: .open should
+                            // see entries added since the session began.
+                            let cfg = crate::config::load();
+                            match crate::resolve(&cfg, &target, None) {
                                 Ok(c) => {
                                     conn = c;
                                     completer.reconnect(conn.clone());
@@ -227,6 +240,8 @@ enum DotResult {
 
 fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
     let mut parts = cmd.split_whitespace();
+    // Short aliases (.q .exit .db .h) dispatch here but stay out of
+    // DOT_COMMANDS on purpose: help and completion teach the long names.
     match parts.next().unwrap_or("") {
         "quit" | "exit" | "q" => return DotResult::Quit,
         "open" => match parts.next() {
@@ -316,6 +331,13 @@ mod tests {
         assert!(split_statements("  ;  ; ").is_empty());
         // multi-byte chars around terminators never split mid-char
         assert_eq!(split_statements("select 'あ'; select “x”"), vec!["select 'あ'", "select “x”"]);
+        // comment-only segments are not statements (the server would error)
+        assert_eq!(split_statements("SELECT 1; -- done"), vec!["SELECT 1"]);
+        assert_eq!(
+            split_statements("SELECT 1;\n-- gap\n;\nSELECT 2;"),
+            vec!["SELECT 1", "SELECT 2"]
+        );
+        assert_eq!(split_statements("/* all\ncomment */"), Vec::<String>::new());
     }
 
     #[test]
