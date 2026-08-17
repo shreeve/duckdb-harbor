@@ -5,16 +5,6 @@ edition = "2024"
 description = "harbor — DuckDB wearing a server: fleet manager + HTTP/UDS engine"
 license = "MIT"
 
-[features]
-# Dynamic by default: harbor links an external libduckdb (DUCKDB_LIB_DIR /
-# DUCKDB_INCLUDE_DIR) and is version-agnostic at runtime — it resolves whichever
-# libduckdb.dylib sits beside it. A self-contained static build (crates.io
-# `bundled` DuckDB 1.5.5) stays available on demand —
-# `cargo build -p harbor --features bundled` — but is no longer the default or
-# shipped: its one advantage (no sibling dylib) the dylib-swap model removed.
-default = []
-bundled = ["duckdb/bundled"]
-
 [dependencies]
 duckdb = { version = "~1.10505.0", default-features = false, features = ["vtab"] }
 tiny_http = "0.12"

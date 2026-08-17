@@ -2,16 +2,11 @@
 #
 # One binary, dynamically linked (D1/Phase 0): harbor links an external
 # libduckdb and is version-agnostic at runtime — it resolves whichever
-# libduckdb.dylib sits beside it (@loader_path), so the same bytes serve 1.5.5
-# or 2.0 depending on the directory they run from. `make install` proves it by
-# dropping one harbor + pilot into every ~/.duckdb/cli/<ver>/. pilot never links
-# an engine and works against all of them.
-#
-# A self-contained static build (crates.io `bundled` DuckDB 1.5.5) is still
-# available on demand — `cargo build -p harbor --features bundled` — but is no
-# longer built or shipped: it is a 33MB artifact (and a 17GB from-source C++
-# build tree) whose one advantage, needing no sibling dylib, the dylib-swap
-# model removed.
+# libduckdb.dylib sits beside it (@loader_path), so the same bytes serve any
+# DuckDB depending on the directory they run from. `make fetch-duckdb` pulls the
+# engine (DuckDB's official v2 nightly); `make install` drops one harbor + pilot
+# into every ~/.duckdb/cli/<ver>/. pilot never links an engine and works against
+# all of them.
 
 .PHONY: all binary pilot check check_quick install fetch-duckdb clean
 
