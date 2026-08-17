@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-types.py — fail when a DuckDB type is not exercised by any suite.
+typecov.py — fail when a DuckDB type is not exercised by any suite.
 
-    test/scripts/types.py --port 9495 --token secret
+    test/scripts/typecov.py --port 9495 --token secret
 
 Every other suite checks that the types it knows about are encoded correctly.
 None of them notices a type nobody thought to write a case for, and that is not
