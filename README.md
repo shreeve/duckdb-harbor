@@ -188,13 +188,14 @@ you.
 Two binaries: **`harbor`** (the server and fleet manager) and **`pilot`** (the
 client). `harbor` links an external `libduckdb` and is version-agnostic — the
 same build serves any DuckDB by the `libduckdb.dylib` sitting beside it — so a
-build needs a libduckdb to link against. See [MANUAL.md](MANUAL.md) for the
-`~/.duckdb/cli/<ver>/` library layout, then:
+build needs a libduckdb to link against. `make fetch-duckdb` pulls one (DuckDB's
+official v2 nightly) into `~/.duckdb/cli/2.0.0/`; then:
 
 ```console
+$ make fetch-duckdb                       # libduckdb + duckdb CLI -> ~/.duckdb/cli/2.0.0/
 $ make binary pilot                       # -> target/release/{harbor,pilot}
 $ harbor serve mydata.duckdb --token secret
-harbor 0.10.0: berth "mydata" serving mydata.duckdb on ~/.harbor/mydata.sock (duckdb v1.5.5, memory_limit 2GB)
+harbor 0.10.0: berth "mydata" serving mydata.duckdb on ~/.harbor/mydata.sock (duckdb v2.0.0-alpha38069, memory_limit 2GB)
 ```
 
 `harbor serve` runs in the foreground. `harbor add mydata.duckdb` spawns a
@@ -215,9 +216,7 @@ $ pilot mydata -c "SELECT count(*) FROM orders"   # one-shot
 ```
 
 Remote access is Caddy's job at the edge (TLS + auth); harbor itself speaks
-plain HTTP over a unix socket or a loopback TCP port. See
-[MANUAL.md](MANUAL.md) for the fleet model, deployment, and the version-swap
-install layout.
+plain HTTP over a unix socket or a loopback TCP port.
 
 ### Request logging
 
@@ -391,10 +390,10 @@ the database file.
 Building is only needed to change it. Three crates: **`harbor`** (the server
 engine and the fleet CLI), **`wire`** (the frozen protocol contract, shared with
 the client), and **`pilot`** (the client). harbor links an external `libduckdb`
-rather than embedding one, so no DuckDB source tree is required — point
-`DUCKDB_LIB` at a library under `~/.duckdb/cli/<ver>/` (see [MANUAL.md](MANUAL.md))
-and run `make binary pilot`. The crate ships pregenerated bindings, so there is
-no bindgen and no headers to find.
+rather than embedding one, so no DuckDB source tree is required — `make
+fetch-duckdb` fetches a libduckdb to link against, then `make binary pilot`
+builds. The crate ships pregenerated bindings, so there is no bindgen and no
+headers to find.
 
 `make check` runs the full suite, `make check_quick` the sub-minute subset; both
 build a fixture database with the local `duckdb` CLI first. It is heavily tested:
@@ -410,8 +409,7 @@ Pre-production. harbor and pilot are two small binaries — no extension, no
 launcher, no signing dance. harbor is dynamically linked and **version-agnostic**:
 one build serves any DuckDB by the `libduckdb` beside it, proven against 1.5.5
 and a 2.0 dev build (the same bytes report each version next to each library).
-Deploy behind Caddy, which owns TLS and per-request timeouts at the edge. See
-[MANUAL.md](MANUAL.md) for the fleet model and deployment.
+Deploy behind Caddy, which owns TLS and per-request timeouts at the edge.
 
 ## License
 
