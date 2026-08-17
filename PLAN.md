@@ -169,3 +169,46 @@ store. Caddy injects/passes the berth token with *replace* semantics
 (`header_up Authorization …`) — harbor 401s duplicate Authorization headers.
 `/ready` stays the only unauthenticated route; `/info` requires auth (it leaks
 paths and pids).
+
+### D11. The engine is DuckDB's official v2.0-dev nightly — no fork
+The 2.0 line has no stable release yet, but DuckDB publishes it as an official
+nightly: `artifacts.duckdb.org/latest/duckdb-binaries-<plat>.zip`, a bundle of
+`libduckdb` (+ headers) and the `duckdb` CLI, rebuilt from `main` daily. That is
+the whole engine the fleet needs, from upstream, so there is nothing to build
+and nothing to fork. (An earlier fork release existed only because we thought no
+2.0 was published; it was a frozen copy of this exact artifact and is now
+retired.) `/latest/` is the v2.0-dev channel today — it reported
+`v2.0.0-alpha38069` when this was written; if `main` ever rolls past 2.0, pin
+the v2.0 channel URL.
+
+**CI links that nightly**, via `.github/actions/duckdb` — one composite action
+both the quick and full jobs share, so they cannot drift (which is what once let
+the full job rot pointing at a tag upstream never had). No version pinned, no
+nested-archive naming in the workflow: it tracks whatever `main` built last,
+which is the 2.0 line harbor targets, so every run tests the real thing.
+Verified: a harbor built against `alpha37626` links and runs clean against the
+newer official `alpha38069`, and against upstream stable `v1.5.5` — the C API is
+stable across the line (D1's version-agnostic property, exercised, not asserted).
+
+`make fetch-duckdb` (→ `scripts/fetch-duckdb.sh`) pulls the same official nightly
+into `~/.duckdb/cli/2.0.0/` for local work. Its one fork-coupled exception is
+`UI=1`: the `ui` extension loads *only* against the precise engine it was
+compiled with, and the nightly moves daily, so the two must travel as a pinned,
+matched pair from our releases until the UI factory publishes against the
+nightly. Everything else is upstream.
+
+**The UI extension can be dynamic — and should be.** DuckDB ships loadable
+extensions *statically* (each embeds a private copy of DuckDB, ~37MB, portable
+because a stock CLI may have loaded DuckDB `RTLD_LOCAL`). harbor is not a stock
+CLI: it holds one `libduckdb.dylib` in-process, and that dylib exports the full
+C++ ABI (~29.6k `_ZN6duckdb…` symbols beside the 549 stable `duckdb_*` C-API
+ones). So a *dynamically* linked UI extension — built with
+`EXTENSION_STATIC_BUILD=0`, an upstream-supported knob, **not** a source patch —
+loads into harbor and resolves its DuckDB symbols from that shared library. It
+is smaller, and it removes the static model's duplicate-global-state hazard
+(two DuckDB runtimes in one address space). Static is forced only on Windows and
+z/OS; on macOS/Linux the flag is honored — macOS gets `-undefined
+dynamic_lookup`, Linux leaves the symbols for the loader. Trade-off: it is
+CLI-incompatible (fine — harbor is the only host) and leans on
+incidentally-exported C++ internals, so it is sound *only* under the same-build
+guarantee above. Keep the static build as the known-good fallback.

@@ -3,7 +3,8 @@
 # shipped build: harbor is dynamically linked (no bundled DuckDB), so CI fetches
 # a libduckdb to link against and a duckdb CLI to build fixtures with, then runs
 # the make targets. The suite list lives in the Makefile (check_quick / check),
-# not here, so it never drifts.
+# not here, so it never drifts; the engine is fetched by the local composite
+# action (.github/actions/duckdb) — upstream's latest, no version pinned.
 #
 # Two jobs: a quick gate on every PR, and the full suite on main and nightly
 # (resilience restarts the server repeatedly; a five-minute job is fine there).
@@ -26,13 +27,6 @@ defaults:
   run:
     shell: bash
 
-env:
-  # The engine CI links against and builds fixtures with: our own 2.0 build,
-  # published on this repo's releases (upstream DuckDB has no 2.0 release — it is
-  # built from source, see D1 and the UI notes). This is the exact engine harbor
-  # ships against, so CI tests it directly rather than a version-agnostic stand-in.
-  DUCKDB_VERSION: v2.0.0-alpha37626
-
 jobs:
   quick:
     name: quick gate
@@ -46,24 +40,7 @@ jobs:
           # Pinned, not '3.x': the suites run from test/scripts/, so a stdlib
           # name collision there breaks on newer Pythons — pin for reproducibility.
           python-version: '3.12'
-
-      # Our 2.0 build's release bundles the standard DuckDB sub-zips
-      # (libduckdb-* and duckdb_cli-*). harbor links only libduckdb (pregenerated
-      # bindings, no headers); the CLI builds test fixtures. The dir is absolute,
-      # so the Makefile's baked rpath resolves libduckdb at runtime, no DYLD/LD.
-      - name: Fetch the DuckDB engine (our 2.0 release)
-        run: |
-          set -euo pipefail
-          dir="$HOME/duckdb"; mkdir -p "$dir"; cd "$dir"
-          tag="duckdb-${DUCKDB_VERSION}"
-          asset="duckdb-${DUCKDB_VERSION}-binaries-linux-amd64.zip"
-          curl -fsSL -o binaries.zip \
-            "https://github.com/shreeve/duckdb-harbor/releases/download/$tag/$asset"
-          unzip -oq binaries.zip           # -> libduckdb-*.zip, duckdb_cli-*.zip
-          unzip -oq libduckdb-*.zip        # -> libduckdb.so (+ headers)
-          unzip -oq duckdb_cli-*.zip       # -> duckdb CLI
-          echo "$dir" >> "$GITHUB_PATH"
-          echo "DUCKDB_LIB=$dir" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/duckdb
 
       - name: Build the fixture database
         run: test/scripts/fixture.sh sample.duckdb
@@ -86,19 +63,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
-
-      - name: Fetch libduckdb + duckdb CLI
-        run: |
-          set -euo pipefail
-          dir="$HOME/duckdb"; mkdir -p "$dir"
-          base="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}"
-          curl -fsSL -o /tmp/libduckdb.zip "$base/libduckdb-linux-amd64.zip"
-          curl -fsSL -o /tmp/duckdb-cli.zip "$base/duckdb_cli-linux-amd64.zip"
-          unzip -oq /tmp/libduckdb.zip -d "$dir"
-          unzip -oq /tmp/duckdb-cli.zip -d "$dir"
-          echo "$dir" >> "$GITHUB_PATH"
-          echo "DUCKDB_LIB=$dir" >> "$GITHUB_ENV"
+          python-version: '3.12'
+      - uses: ./.github/actions/duckdb
 
       - name: Build the fixture database
         run: test/scripts/fixture.sh sample.duckdb

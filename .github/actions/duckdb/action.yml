@@ -1,0 +1,23 @@
+name: Set up DuckDB
+description: >
+  Put a DuckDB engine where CI can link and run it: DuckDB's official v2.0-dev
+  nightly — libduckdb (harbor links this) plus the duckdb CLI (builds the
+  fixture) — from artifacts.duckdb.org, unpacked into ~/duckdb. This is the 2.0
+  line harbor targets, straight from upstream: no version pinned, no fork, it
+  just tracks whatever main built last. `/latest/` is the v2.0-dev channel
+  today; if DuckDB's main ever rolls past 2.0, pin the v2.0 channel URL here.
+  One place, so the two jobs cannot drift.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        dir="$HOME/duckdb"; mkdir -p "$dir"; cd "$dir"
+        curl -fsSL -o binaries.zip \
+          https://artifacts.duckdb.org/latest/duckdb-binaries-linux-amd64.zip
+        unzip -oq binaries.zip         # -> libduckdb-*.zip, duckdb_cli-*.zip
+        unzip -oq 'libduckdb-*.zip'    # -> libduckdb.so (+ headers)
+        unzip -oq 'duckdb_cli-*.zip'   # -> duckdb CLI
+        echo "$dir" >> "$GITHUB_PATH"
+        echo "DUCKDB_LIB=$dir" >> "$GITHUB_ENV"

@@ -13,7 +13,7 @@
 # build tree) whose one advantage, needing no sibling dylib, the dylib-swap
 # model removed.
 
-.PHONY: all binary pilot check check_quick install clean
+.PHONY: all binary pilot check check_quick install fetch-duckdb clean
 
 # The libduckdb the dynamic build links against — the version installed under
 # ~/.duckdb/cli/<ver>/. Only the library is needed (the crate ships pregenerated
@@ -59,6 +59,15 @@ install: binary pilot
 	  echo "  installed harbor + pilot -> $$d"; \
 	done
 	@echo "each cli/<ver>/harbor now uses its sibling libduckdb.dylib; pilot is engine-agnostic."
+
+# Pull DuckDB's official v2.0-dev nightly (libduckdb + headers + duckdb CLI) from
+# artifacts.duckdb.org into $(DUCKDB_LIB); the baked rpath then resolves the
+# library in place. `make fetch-duckdb UI=1` instead pulls a pinned, matched
+# engine+UI pair from our releases (the ui extension only loads against the exact
+# engine it was built with). CI links the same official nightly via
+# .github/actions/duckdb. See PLAN.md D11.
+fetch-duckdb:
+	DEST=$(DUCKDB_LIB) UI=$(UI) scripts/fetch-duckdb.sh
 
 clean:
 	cargo clean
