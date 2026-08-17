@@ -1,9 +1,8 @@
 # Pure workspace: the extension retired (PLAN.md D5); everything lives in
-# crates/. Spikes are standalone throwaways, outside the workspace.
+# crates/.
 [workspace]
 members = ["crates/*"]
 default-members = ["crates/wire", "crates/pilot", "crates/harbor"]
-exclude = ["spikes"]
 resolver = "2"
 
 [profile.release]
