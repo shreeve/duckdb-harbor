@@ -1,8 +1,9 @@
 //! pilot — the Harbor client.
 //!
-//! Zero-config local (D10a): a bare name resolves to ~/.harbor/<name>.sock
-//! and its token file; config.toml is purely additive (remotes, aliases,
-//! taste). TLS is Caddy's job (D6) — pilot speaks plain HTTP over UDS/TCP.
+//! Zero-config local (D10a): a bare name resolves to ~/.harbor/<name>.sock —
+//! or, for a --port berth, the TCP address its sidecar json registered — plus
+//! its token file; config.toml is purely additive (remotes, aliases, taste).
+//! TLS is Caddy's job (D6) — pilot speaks plain HTTP over UDS/TCP.
 //!
 //!   pilot                          list live berths
 //!   pilot <target>                 the REPL
@@ -158,8 +159,8 @@ usage:
   echo \"SQL\" | pilot <target>  same, from stdin
 
 target:
-  name                         a config.toml entry, else a live berth:
-                               ~/.harbor/<name>.sock (+ <name>.token)
+  name                         a config.toml entry, else a live berth: its
+                               socket or registered TCP port (+ <name>.token)
   path/to.duckdb               join the owning berth, or summon one (idle-exit)
   path/to.sock                 a harbor unix socket
   http://host:port             a harbor TCP listener
@@ -216,6 +217,12 @@ fn resolve(cfg: &config::FileConfig, target: &str, flag_token: Option<String>) -
         let home = config::harbor_home();
         sock = berth_sock(&home, target);
         if !sock.exists() {
+            // A --port berth has no socket; its sidecar json registers the
+            // TCP address instead. The bare name works for both transports.
+            if let Some(t) = berth_tcp(&home, target) {
+                let file_token = berth_token(&home, target);
+                return Ok(Conn { transport: t, token: flag_token.or(env_token).or(file_token) });
+            }
             return Err(format!(
                 "no live berth named {target:?} ({} not found){}",
                 sock.display(),
@@ -235,6 +242,39 @@ fn berth_token(home: &std::path::Path, name: &str) -> Option<String> {
     let t = std::fs::read_to_string(home.join(format!("{name}.token"))).ok()?;
     let t = t.trim().to_string();
     if t.is_empty() { None } else { Some(t) }
+}
+
+/// The TCP address a --port berth registered in its sidecar json. Dials the
+/// bind address, or loopback when the berth bound every interface.
+fn berth_tcp(home: &std::path::Path, name: &str) -> Option<Transport> {
+    let text = std::fs::read_to_string(home.join(format!("{name}.json"))).ok()?;
+    let j: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let port = j["port"].as_u64()?;
+    let bind = match j["bind"].as_str() {
+        Some("0.0.0.0") | Some("::") | None => "127.0.0.1",
+        Some(b) => b,
+    };
+    Some(Transport::Tcp(format!("{bind}:{port}")))
+}
+
+/// Every berth the registry knows, with how to dial it — the same sidecar
+/// jsons `harbor ls` reads, so socket and --port berths both appear.
+fn berth_entries(home: &std::path::Path) -> Vec<(String, Transport)> {
+    let mut v: Vec<(String, Transport)> = std::fs::read_dir(home)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                .filter_map(|p| {
+                    let name = p.file_stem()?.to_string_lossy().into_owned();
+                    let sock = berth_sock(home, &name);
+                    let t = if sock.exists() { Transport::Unix(sock) } else { berth_tcp(home, &name)? };
+                    Some((name, t))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
 }
 
 fn url_transport(url: &str) -> Result<Transport, String> {
@@ -309,39 +349,23 @@ fn ensure_berth(path: &std::path::Path, idle_exit: &str) -> Result<(PathBuf, Opt
 }
 
 fn fleet_hint(home: &std::path::Path) -> String {
-    let names: Vec<String> = berth_sockets(home)
-        .iter()
-        .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
-        .collect();
+    let names: Vec<String> = berth_entries(home).into_iter().map(|(n, _)| n).collect();
     if names.is_empty() { String::new() } else { format!("; live berths: {}", names.join(", ")) }
-}
-
-fn berth_sockets(home: &std::path::Path) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = std::fs::read_dir(home)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|x| x == "sock"))
-                .collect()
-        })
-        .unwrap_or_default();
-    v.sort();
-    v
 }
 
 /// Bare `pilot`: the fleet view. /ready is unauthenticated by design, so this
 /// needs no tokens; config-file remotes join this view too.
 fn list_fleet() -> ExitCode {
     let home = config::harbor_home();
-    let socks = berth_sockets(&home);
-    if socks.is_empty() {
+    let berths = berth_entries(&home);
+    if berths.is_empty() {
         println!("no live berths in {} (start one: harbor add <db>)", home.display());
         return ExitCode::SUCCESS;
     }
-    println!("{:<20} {:<8} SOCKET", "BERTH", "STATE");
-    for sock in socks {
-        let name = sock.file_stem().unwrap_or_default().to_string_lossy();
+    println!("{:<20} {:<8} ADDRESS", "BERTH", "STATE");
+    for (name, transport) in berths {
         let state = match http::request(
-            &Transport::Unix(sock.clone()),
+            &transport,
             "GET",
             endpoint::READY,
             None,
@@ -352,7 +376,11 @@ fn list_fleet() -> ExitCode {
             Ok(_) => "unready",
             Err(_) => "dead",
         };
-        println!("{name:<20} {state:<8} {}", sock.display());
+        let addr = match &transport {
+            Transport::Unix(p) => p.display().to_string(),
+            Transport::Tcp(a) => a.clone(),
+        };
+        println!("{name:<20} {state:<8} {addr}");
     }
     ExitCode::SUCCESS
 }
