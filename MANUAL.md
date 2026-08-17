@@ -155,7 +155,7 @@ mcd ~/tmp-duckdb
   curl -sLO "${URL}"
   unzip -oq "${URL:t}"
   mcd ~/.duckdb/cli/$VER
-  mv ~/tmp-duckdb/duckdb*.h .
+  mv ~/tmp-duckdb/{libduckdb.*,duckdb*.h} .
   ln -snf ~/.duckdb/cli/{$VER,latest}
 rm -rf ~/tmp-duckdb
 cd
@@ -399,3 +399,23 @@ matching `duckdb_indexes()`; the users example above is the distinction in
 one glance: its uniqueness is a constraint, so `indexes` is empty.
 `duckdbVersion` is read from the running engine (`pragma_version()`), so
 the same harbor build reports whichever DuckDB it is actually serving.
+
+The per-version CLI layout `make install` populates — one dynamic harbor +
+pilot beside each engine's `libduckdb.dylib`, chosen by the directory it runs
+from:
+
+```text
+/Users/shreeve/.duckdb/
+├── cli/
+│   ├── 1.5.5/
+│   │   ├── duckdb*
+│   │   ├── duckdb.h
+│   │   ├── duckdb_extension.h
+│   │   └── libduckdb.dylib*
+│   ├── 2.0.0/
+│   │   ├── duckdb*
+│   │   ├── duckdb.h
+│   │   ├── duckdb_extension.h
+│   │   └── libduckdb.dylib*
+│   └── latest -> /Users/shreeve/.duckdb/cli/1.5.5/
+```
