@@ -8,6 +8,8 @@
 //! [defaults]
 //! mode = "duckbox"
 //! timer = true
+//! theme = "duck"           # duck | mono | vivid
+//! appearance = "auto"      # auto | light | dark
 //!
 //! [connection.medlabs]
 //! url = "https://remote.example.com/db/sales"
@@ -37,6 +39,11 @@ pub struct Defaults {
     pub timer: Option<bool>,
     pub maxrows: Option<usize>,
     pub nullvalue: Option<String>,
+    /// Syntax-highlight theme name: duck | mono | vivid (default duck).
+    pub theme: Option<String>,
+    /// Palette to build the theme for: auto | light | dark (default auto,
+    /// which asks the terminal for its background color).
+    pub appearance: Option<String>,
 }
 
 #[derive(Deserialize, Default)]

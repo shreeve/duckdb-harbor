@@ -1,12 +1,15 @@
 //! Live syntax highlighting (PLAN.md Phase 2, tier 1): a lexical pass, no
-//! grammar. Colors follow the duckdb shell's defaults so muscle memory
-//! transfers: keywords green, literals yellow, comments dim, unterminated
-//! literals red. String/comment/dollar-quote boundaries come from the shared
-//! scanner (scan.rs) — the same spans the validator and splitter obey.
+//! grammar. Colors come from the active theme (theme.rs) — resolved once at
+//! startup for the terminal's light/dark background and switchable live with
+//! `.theme`/`.appearance`. The default `duck` theme follows the duckdb shell:
+//! keywords green, literals yellow, comments dim, unterminated literals red.
+//! String/comment/dollar-quote boundaries come from the shared scanner
+//! (scan.rs) — the same spans the validator and splitter obey.
 
 use crate::keywords::KEYWORDS;
 use crate::scan::{Kind, scan};
-use nu_ansi_term::{Color, Style};
+use crate::theme;
+use nu_ansi_term::Style;
 use reedline::{Highlighter, StyledText};
 
 pub struct SqlHighlighter;
@@ -15,18 +18,21 @@ pub struct SqlHighlighter;
 enum Class {
     Plain,
     Keyword,
-    Literal, // strings + numbers
+    String,
+    Number,
     Comment,
     Error, // unterminated string/comment
 }
 
 fn style(c: Class) -> Style {
+    let t = theme::current();
     match c {
-        Class::Plain => Style::new(),
-        Class::Keyword => Style::new().fg(Color::Green),
-        Class::Literal => Style::new().fg(Color::Yellow),
-        Class::Comment => Style::new().fg(Color::DarkGray),
-        Class::Error => Style::new().fg(Color::Red),
+        Class::Plain => t.plain,
+        Class::Keyword => t.keyword,
+        Class::String => t.string,
+        Class::Number => t.number,
+        Class::Comment => t.comment,
+        Class::Error => t.error,
     }
 }
 
@@ -43,7 +49,7 @@ impl Highlighter for SqlHighlighter {
             let text = &line[sp.start..sp.end];
             match sp.kind {
                 Kind::Str | Kind::Dollar => {
-                    push(&mut out, if sp.terminated { Class::Literal } else { Class::Error }, text);
+                    push(&mut out, if sp.terminated { Class::String } else { Class::Error }, text);
                 }
                 Kind::LineComment => push(&mut out, Class::Comment, text),
                 Kind::BlockComment => {
@@ -88,7 +94,7 @@ fn highlight_code(out: &mut StyledText, text: &str) {
                     break;
                 }
             }
-            push(out, Class::Literal, &text[start..i]);
+            push(out, Class::Number, &text[start..i]);
         } else {
             // A run of punctuation/whitespace up to the next word or number.
             while i < text.len() {
@@ -106,6 +112,7 @@ fn highlight_code(out: &mut StyledText, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nu_ansi_term::Color;
 
     fn spans(line: &str) -> Vec<(Option<Color>, String)> {
         SqlHighlighter

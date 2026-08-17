@@ -133,6 +133,8 @@ pub const DOT_COMMANDS: &[(&str, &str, &str)] = &[
     ("open", "<target>", "switch berth (name, path, url)"),
     ("read", "<file.sql>", "run a script, statement by statement"),
     ("keymode", "vi|emacs", "keybindings (default emacs)"),
+    ("theme", "[name]", "syntax colors: duck | mono | vivid"),
+    ("appearance", "auto|light|dark", "light/dark palette (auto detects)"),
     ("help", "", "this text"),
     ("quit", "", "leave (Ctrl-D too)"),
 ];
@@ -275,6 +277,29 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
             Some("emacs") => return DotResult::Keymode(false),
             _ => eprintln!("pilot: .keymode vi|emacs"),
         },
+        "theme" => match parts.next() {
+            None => {
+                let (name, _) = crate::theme::describe();
+                println!("theme: {name} ({})", crate::theme::NAMES.join(" "));
+            }
+            Some(name) if crate::theme::set_theme(name) => eprintln!("pilot: theme {name}"),
+            Some(name) => {
+                eprintln!("pilot: unknown theme {name:?} ({})", crate::theme::NAMES.join(" "))
+            }
+        },
+        "appearance" => {
+            use crate::theme::Appearance::{Dark, Light};
+            match parts.next() {
+                None => {
+                    let (_, a) = crate::theme::describe();
+                    println!("appearance: {}", if a == Light { "light" } else { "dark" });
+                }
+                Some("light") => crate::theme::set_appearance(Light),
+                Some("dark") => crate::theme::set_appearance(Dark),
+                Some("auto") => crate::theme::set_appearance(crate::theme::detect_appearance()),
+                Some(other) => eprintln!("pilot: .appearance auto|light|dark (got {other:?})"),
+            }
+        }
         "read" => match parts.next() {
             Some(f) => match std::fs::read_to_string(crate::config::expand(f)) {
                 Ok(text) => {

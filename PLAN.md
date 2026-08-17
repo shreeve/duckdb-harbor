@@ -256,8 +256,10 @@ History: reedline `FileBackedHistory` at `~/.harbor/history`.
   STRING / NUMBER / OPERATOR / IDENTIFIER / COMMENT / TERMINATOR +
   `unterminated` flags; handles dollar-quoting, nested comments, `''`/`""`
   escapes, maximal-munch operators. Colors mirror the duckdb shell defaults
-  (keyword green, literals yellow, comments gray, lexical errors red),
-  overridable via `.highlight`. Keyword `.list` files (527 entries) vendored
+  (keyword green, literals yellow, comments gray, lexical errors red) via the
+  `duck` theme; `mono`/`vivid` themes and a light/dark palette ship too,
+  chosen with `.theme`/`.appearance` (auto-detects the terminal background by
+  OSC 11) or the `[defaults] theme`/`appearance` config keys. Keyword `.list` files (527 entries) vendored
   from the pinned DuckDB commit by `scripts/sync-keywords.sh`; harbor-core's
   existing `KEYWORDS` table moves into `sqllex` so server and REPL can't
   disagree. The PEG matcher is packrat-over-*tokens*, so this tokenizer is

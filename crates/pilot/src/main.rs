@@ -19,6 +19,7 @@ mod http;
 mod keywords;
 mod repl;
 mod scan;
+mod theme;
 
 use harbor_protocol::{Event, SqlRequest, endpoint};
 use render::{Mode, RenderOpts, Renderer};
@@ -113,6 +114,10 @@ fn main() -> ExitCode {
         None => {
             // No -c and a real terminal: the REPL. On a pipe: read stdin.
             if std::io::stdin().is_terminal() {
+                // Resolve the highlight theme now, while we own the tty: the
+                // "auto" appearance queries the terminal (OSC 11), which needs
+                // an interactive stdin/stdout and must run before reedline does.
+                theme::init(cfg.defaults.theme.as_deref(), cfg.defaults.appearance.as_deref());
                 return repl::run(&conn, &target, opts);
             }
             let mut s = String::new();
