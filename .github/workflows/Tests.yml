@@ -1,13 +1,12 @@
 #
-# The suites that live in this repository, as opposed to the distribution
-# pipeline in MainDistributionPipeline.yml, which builds the extension for
-# every platform and does not run them.
+# The repository's own test suites (test/scripts/check.sh), run against the
+# shipped build: harbor is dynamically linked (no bundled DuckDB), so CI fetches
+# a libduckdb to link against and a duckdb CLI to build fixtures with, then runs
+# the make targets. The suite list lives in the Makefile (check_quick / check),
+# not here, so it never drifts.
 #
-# Split into two jobs on purpose. The fast one gates a pull request: unit
-# tests, sqllogictest, and the two HTTP suites that answer in under a minute.
-# The slow one — resilience, which kills and restarts the server repeatedly,
-# and the load generator — runs on the main branch and on a nightly schedule,
-# where a five-minute job is not in anybody's way.
+# Two jobs: a quick gate on every PR, and the full suite on main and nightly
+# (resilience restarts the server repeatedly; a five-minute job is fine there).
 #
 name: Tests
 
@@ -27,85 +26,84 @@ defaults:
   run:
     shell: bash
 
-jobs:
-  fast:
-    name: unit, abi, types, sqllogictest, spec, fuzz
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+env:
+  # DuckDB release to link against and to build fixtures with. 2.0 is not a
+  # published release (only a from-source dev build), so CI uses the newest
+  # downloadable stable — which is fine: harbor is version-agnostic (PLAN.md D1,
+  # C ABI stable 1.5→2.0), so this validates the code, while local `make check`
+  # links the developer's 2.0 build and covers that engine on every change.
+  # Bump this the day a newer engine publishes downloadable libduckdb assets.
+  DUCKDB_VERSION: v1.5.5
 
+jobs:
+  quick:
+    name: quick gate
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
         with:
-          workspaces: . -> target
+          python-version: '3.x'
 
-      # The suites read from a fixture database rather than one they build, so
-      # the CLI has to be here to create it.
-      - name: Install the DuckDB CLI
+      # libduckdb (the link target — only the library is needed; the dynamic
+      # build uses pregenerated bindings, no headers) and the duckdb CLI (the
+      # suites read from a fixture it builds). Both from the same release, so
+      # fixture and engine agree. The dir is absolute, so the Makefile's baked
+      # rpath resolves libduckdb at runtime with no LD_LIBRARY_PATH.
+      - name: Fetch libduckdb + duckdb CLI
         run: |
-          curl -fsSL https://install.duckdb.org | sh
-          echo "$HOME/.duckdb/cli/latest" >> "$GITHUB_PATH"
+          set -euo pipefail
+          dir="$HOME/duckdb"; mkdir -p "$dir"
+          base="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}"
+          curl -fsSL -o /tmp/libduckdb.zip "$base/libduckdb-linux-amd64.zip"
+          curl -fsSL -o /tmp/duckdb-cli.zip "$base/duckdb_cli-linux-amd64.zip"
+          unzip -oq /tmp/libduckdb.zip -d "$dir"
+          unzip -oq /tmp/duckdb-cli.zip -d "$dir"
+          echo "$dir" >> "$GITHUB_PATH"
+          echo "DUCKDB_LIB=$dir" >> "$GITHUB_ENV"
 
-      - name: Build
-        run: make configure && make release
-
-      # A fixture generated here rather than committed: a binary database in
-      # git would have to be regenerated on every DuckDB storage bump, and the
-      # suites care about the shape of the data, not its provenance.
       - name: Build the fixture database
         run: test/scripts/fixture.sh sample.duckdb
 
-      # A suite that cannot run exits 77 and is reported as skipped rather
-      # than counted as a pass — type coverage needs the duckdb-rs source in
-      # the cargo registry, and a green tick for a gate that never ran is the
-      # failure mode this whole suite exists to avoid.
-      - name: Unit tests, ABI stamp, type coverage, sqllogictest, spec and fuzz
-        run: SUITES="unit abi types sqllogic spec fuzz" test/scripts/check.sh
+      - name: Quick suites
+        run: make check_quick
 
       - name: Server log on failure
         if: failure()
         run: cat /tmp/harbor-check.*/server.log 2>/dev/null || true
 
-  slow:
-    name: asserts, stress, resilience
-    # Pull requests get the fast job; this one runs where a slow job is free.
+  full:
+    name: full suite
+    # PRs get the quick gate; the full run is for main and the nightly cron.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
         with:
-          workspaces: . -> target
+          python-version: '3.x'
 
-      - name: Install the DuckDB CLI
+      - name: Fetch libduckdb + duckdb CLI
         run: |
-          curl -fsSL https://install.duckdb.org | sh
-          echo "$HOME/.duckdb/cli/latest" >> "$GITHUB_PATH"
-
-      - name: Build
-        run: make configure && make release
+          set -euo pipefail
+          dir="$HOME/duckdb"; mkdir -p "$dir"
+          base="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}"
+          curl -fsSL -o /tmp/libduckdb.zip "$base/libduckdb-linux-amd64.zip"
+          curl -fsSL -o /tmp/duckdb-cli.zip "$base/duckdb_cli-linux-amd64.zip"
+          unzip -oq /tmp/libduckdb.zip -d "$dir"
+          unzip -oq /tmp/duckdb-cli.zip -d "$dir"
+          echo "$dir" >> "$GITHUB_PATH"
+          echo "DUCKDB_LIB=$dir" >> "$GITHUB_ENV"
 
       - name: Build the fixture database
         run: test/scripts/fixture.sh sample.duckdb
 
-      - name: Everything except the differential suite, load included
-        # differential needs the v1 harbor built alongside; it is not a build
-        # dependency of this repository, and check.sh skips it when absent.
-        run: SUITES="asserts spec fuzz deployment stress resilience" test/scripts/check.sh
+      - name: All suites
+        run: make check
 
       - name: Server log on failure
         if: failure()

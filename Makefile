@@ -15,18 +15,19 @@
 
 .PHONY: all binary pilot check check_quick install clean
 
-# The libduckdb the dynamic build links against (headers + dylib). Any
-# compatible build works; the *runtime* engine is chosen by the sibling dylib,
-# not by this.
-DUCKDB_LIB     ?= $(HOME)/Data/Code/duckdb/build/release/src
-DUCKDB_INCLUDE ?= $(HOME)/Data/Code/duckdb/src/include
-DUCKDB_CLI     ?= $(HOME)/.duckdb/cli
+# The libduckdb the dynamic build links against — the version installed under
+# ~/.duckdb/cli/<ver>/. Only the library is needed (the crate ships pregenerated
+# bindings, so there is no bindgen and no header requirement). The binary is
+# version-agnostic at runtime, so this only picks what the dev build links;
+# override to build against another, e.g.
+#   make binary DUCKDB_LIB=$(HOME)/.duckdb/cli/1.5.5
+DUCKDB_LIB ?= $(HOME)/.duckdb/cli/2.0.0
+DUCKDB_CLI ?= $(HOME)/.duckdb/cli
 
 # Every cargo invocation below links against that libduckdb and bakes an rpath
 # to it, so the binary AND the test executables run in place without DYLD_*.
-export DUCKDB_LIB_DIR     := $(DUCKDB_LIB)
-export DUCKDB_INCLUDE_DIR := $(DUCKDB_INCLUDE)
-export RUSTFLAGS          := -C link-args=-Wl,-rpath,$(DUCKDB_LIB)
+export DUCKDB_LIB_DIR := $(DUCKDB_LIB)
+export RUSTFLAGS      := -C link-args=-Wl,-rpath,$(DUCKDB_LIB)
 
 all: binary pilot
 
