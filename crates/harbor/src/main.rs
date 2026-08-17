@@ -315,6 +315,7 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         "db": db_abs,
         "socket": if o.port.is_none() { Some(sock_path.display().to_string()) } else { None },
         "port": o.port,
+        "bind": if o.port.is_some() { Some(o.bind.clone()) } else { None },
         "harborVersion": VERSION,
         "duckdbVersion": duckdb_version,
         "startedAtMs": started_ms,
@@ -563,7 +564,7 @@ fn ls() -> Result<(), String> {
         println!("no berths in {} (harbor add <db.duckdb>)", home.display());
         return Ok(());
     }
-    println!("{:<20} {:<8} {:<8} {:<24} DB", "BERTH", "STATE", "PID", "DUCKDB");
+    println!("{:<20} {:<8} {:<8} {:<24} {:<22} DB", "BERTH", "STATE", "PID", "DUCKDB", "ADDRESS");
     for path in jsons {
         let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         let j = std::fs::read_to_string(&path)
@@ -575,12 +576,26 @@ fn ls() -> Result<(), String> {
             (None, Some(port)) if ready_tcp("127.0.0.1", port as u16) => "ready",
             _ => "dead",
         };
+        // How to dial it — the answer "ready" begs for. Socket berths show the
+        // path (~-shortened), TCP berths bind:port; pilot accepts either form.
+        let addr = match (j["socket"].as_str(), j["port"].as_u64()) {
+            (Some(sock), _) => tilde(sock),
+            (None, Some(port)) => format!("{}:{port}", j["bind"].as_str().unwrap_or("127.0.0.1")),
+            _ => "-".to_string(),
+        };
         let pid = j["pid"].as_u64().map(|p| p.to_string()).unwrap_or_default();
         let duck = j["duckdbVersion"].as_str().unwrap_or("-").to_string();
         let db = j["db"].as_str().unwrap_or("-").to_string();
-        println!("{name:<20} {state:<8} {pid:<8} {duck:<24} {db}");
+        println!("{name:<20} {state:<8} {pid:<8} {duck:<24} {addr:<22} {db}");
     }
     Ok(())
+}
+
+fn tilde(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(h) if path.starts_with(&h) => format!("~{}", &path[h.len()..]),
+        _ => path.to_string(),
+    }
 }
 
 fn stop_berth(rest: Vec<String>, remove: bool) -> Result<(), String> {
