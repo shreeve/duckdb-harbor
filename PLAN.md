@@ -23,7 +23,7 @@ pilot ./ad-hoc.duckdb             → summon an ephemeral berth, connect (D9)
 
 The workspace is three crates: **`harbor`** (bin + library — the engine folded
 in beside the CLI), **`wire`** (the frozen protocol contract, shared with
-pilot), and **`harbor-pilot`** (the `pilot` client, links no engine).
+pilot), and **`pilot`** (the client, links no engine).
 
 ---
 

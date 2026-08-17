@@ -625,22 +625,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "harbor-pilot"
-version = "0.1.0"
-dependencies = [
- "crossterm 0.29.0",
- "libc",
- "nu-ansi-term",
- "reedline",
- "serde",
- "serde_json",
- "signal-hook 0.4.4",
- "toml",
- "unicode-width",
- "wire",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -990,6 +974,22 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "pilot"
+version = "0.1.0"
+dependencies = [
+ "crossterm 0.29.0",
+ "libc",
+ "nu-ansi-term",
+ "reedline",
+ "serde",
+ "serde_json",
+ "signal-hook 0.4.4",
+ "toml",
+ "unicode-width",
+ "wire",
+]
 
 [[package]]
 name = "pin-project-lite"
