@@ -289,11 +289,28 @@ impl Server {
             // a tasks pool is used to dispatch the connections into threads
             let tasks_pool = util::TaskPool::new();
 
+            // harbor patch (see TODO.md): the ceiling on how long a single
+            // response write may block before the connection is dropped. A dead
+            // reader is finite, not precise — 10s reads as "this peer is gone,"
+            // and the edge proxy owns precise per-request timeouts. Because
+            // write_all resets this per syscall on any forward progress, the
+            // real reclaim is somewhat longer, which is fine for a backstop.
+            const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
             log::debug!("Running accept thread");
             while !inside_close_trigger.load(Relaxed) {
                 let new_client = match server.accept() {
                     Ok((sock, _)) => {
                         use util::RefinedTcpStream;
+                        // Bound how long a single response write may block, so
+                        // a client that stops reading cannot park a server
+                        // thread inside `write` forever. Read side is left
+                        // untouched — keep-alive connections must wait
+                        // indefinitely between requests. Only a fully stalled
+                        // peer trips it; a draining client resets the timer
+                        // every write. Best-effort — a socket that rejects the
+                        // option just keeps tiny_http's original behavior.
+                        let _ = sock.set_write_timeout(Some(WRITE_TIMEOUT));
                         let (read_closable, write_closable) = match ssl {
                             None => RefinedTcpStream::new(sock),
                             #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]

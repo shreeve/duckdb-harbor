@@ -95,6 +95,23 @@ impl Connection {
         }
     }
 
+    /// Bound how long a single write to this socket may block. tiny_http
+    /// otherwise sets no write timeout, so a client that stops reading its
+    /// response leaves the server thread parked in a `write` forever. A client
+    /// that keeps draining resets the timer on every write; only a fully
+    /// stalled peer trips it, after which the write errors and the connection
+    /// is dropped. (harbor patch — see vendor note in TODO.md.)
+    pub(crate) fn set_write_timeout(
+        &self,
+        dur: Option<std::time::Duration>,
+    ) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(s) => s.set_write_timeout(dur),
+            #[cfg(unix)]
+            Self::Unix(s) => s.set_write_timeout(dur),
+        }
+    }
+
     pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
         match self {
             Self::Tcp(s) => s.try_clone().map(Self::from),

@@ -112,38 +112,57 @@ ln -snf ~/.duckdb/cli/{1.5.5,latest}
 # macOS version
 
 ```
-
-
-# DuckDB Harbor v0.8.2
-https://github.com/shreeve/duckdb-harbor/releases/download/v0.8.2/duckdb-harbor
-
-
-
-
-DUCKDB_VER="2.0.0"
-DUCKDB_TAG="alpha37626"
-DUCKDB_SYS="linux-arm64"
-DUCKDB_SYS="linux-amd64"
-DUCKDB_SYS="osx" # adds "-universal" to some
-DUCKDB_HBV="0.8.2"
-
-DUCKDB_ALL="v${DUCKDB_VER}-${DUCKDB_TAG}"
-DUCKDB_BIN="https://github.com/shreeve/duckdb-harbor/releases/download/duckdb-${DUCKDB_ALL}/duckdb-${DUCKDB_ALL}-binaries-${DUCKDB_SYS}.zip"
-DUCKDB_UIX="https://github.com/shreeve/duckdb-ui/releases/download/ui-${DUCKDB_ALL}/ui-duckdb-${DUCKDB_ALL}-linux_amd64.zip"
-DUCKDB_UIX="https://github.com/shreeve/duckdb-ui/releases/download/ui-v2.0.0-alpha37626/ui-duckdb-v2.0.0-alpha37626-osx_arm64.zip"
-DUCKDB_HBX="https://github.com/shreeve/duckdb-harbor/releases/download/v0.8.1/harbor-v0.8.1-duckdb-v2.0.0-alpha37626-linux_amd64.zip"
-DUCKDB_HBX="https://github.com/shreeve/duckdb-harbor/releases/download/v0.8.1/harbor-v0.8.1-duckdb-v2.0.0-alpha37626-osx_arm64.zip"
-DUCKDB_HBL="https://github.com/shreeve/duckdb-harbor/releases/download/v0.8.1/duckdb-harbor"
-
-# ==[ Install DuckDB CLI ]==
+# ==[ DuckDB v1.5.5 CLI ]==
 
 item=(
   https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip
   https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-arm64.zip
-  https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-osx-universal.zip
+  https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-osx-arm64.zip
   https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-windows-amd64.zip
   https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-windows-arm64.zip
 )
+
+URL=$item[3]
+VER=${${URL#*/download/v}%%/*}
+
+rm -rf ~/tmp-duckdb
+mcd ~/tmp-duckdb
+  curl -sLO "${URL}"
+  unzip -oq "${URL:t}"
+  mcd ~/.duckdb/cli/$VER
+  mv ~/tmp-duckdb/duckdb .
+  ln -snf ~/.duckdb/cli/{$VER,latest}
+rm -rf ~/tmp-duckdb
+cd
+
+duckdb -c 'PRAGMA version'
+
+# ==[ DuckDB v1.5.5 Libraries ]==
+
+item=(
+  https://github.com/duckdb/duckdb/releases/download/v1.5.5/libduckdb-linux-amd64.zip
+  https://github.com/duckdb/duckdb/releases/download/v1.5.5/libduckdb-linux-arm64.zip
+  https://github.com/duckdb/duckdb/releases/download/v1.5.5/libduckdb-osx-universal.zip
+  https://github.com/duckdb/duckdb/releases/download/v1.5.5/libduckdb-windows-amd64.zip
+  https://github.com/duckdb/duckdb/releases/download/v1.5.5/libduckdb-windows-arm64.zip
+)
+
+URL=$item[3]
+VER=${${URL#*/download/v}%%/*}
+
+rm -rf ~/tmp-duckdb
+mcd ~/tmp-duckdb
+  curl -sLO "${URL}"
+  unzip -oq "${URL:t}"
+  mcd ~/.duckdb/cli/$VER
+  mv ~/tmp-duckdb/duckdb*.h .
+  ln -snf ~/.duckdb/cli/{$VER,latest}
+rm -rf ~/tmp-duckdb
+cd
+
+duckdb -c 'PRAGMA version'
+
+# ==[ DuckDB v2.0.0 CLI ]==
 
 item=(
   https://github.com/shreeve/duckdb-harbor/releases/download/duckdb-v2.0.0-alpha37626/duckdb-v2.0.0-alpha37626-binaries-linux-amd64.zip
