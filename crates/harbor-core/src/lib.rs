@@ -1,23 +1,16 @@
-// harbor — HTTP /sql for DuckDB: SQL in, NDJSON out, no driver.
+// harbor-core — the Harbor server engine: pool, leases, cancellation,
+// timeouts, the NDJSON envelope, /sql /catalog /ready routing, and the
+// SIGTERM → drain → CHECKPOINT shutdown path.
 //
-// This is the extension entry point. harbor registers a small SQL surface
-// and nothing else; every other capability lives on the HTTP side.
-//
-// What harbor deliberately does NOT do, and why:
-//
-//   - It does not serve the DuckDB UI. The upstream `ui` extension serves
-//     itself in the same process: LOAD ui; CALL start_ui_server();
-//   - It does not implement a client/server protocol for DuckDB clients.
-//     The upstream `quack` extension does that: CALL quack_serve(...).
-//   - It does not terminate TLS. Put Caddy (or any reverse proxy) in front.
-//
-// harbor's job is the audience neither of those serves: clients that do not
-// embed DuckDB and just want to POST SQL and read JSON back.
+// This is the v0.9.1 extension's server code, moved verbatim (PLAN.md Phase
+// 1). The extension glue (vtab table functions, entrypoint) stayed behind and
+// retires with the extension (D5). The embedding host — `harbor serve` —
+// opens the DuckDB Connection, hands it to `open_pool`, and calls
+// `start`/`wait`/`stop`.
 
 use std::{
     collections::HashMap,
-    error::Error,
-    ffi::CString,
+
     io::Read,
     panic::AssertUnwindSafe,
     sync::{
@@ -29,310 +22,19 @@ use std::{
 };
 
 use duckdb::{
-    Connection, InterruptHandle, Result, ffi, params_from_iter,
-    core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
-    duckdb_entrypoint_c_api,
-    types::{TimeUnit, Value, ValueRef},
-    vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
+    Connection, InterruptHandle, Result, params_from_iter,
+    core::{LogicalTypeHandle, LogicalTypeId},
+    types::Value,
 };
 
 use tiny_http::{Header, Method, Request, Response, Server};
 
+/// Re-exported so the embedding host names the engine through harbor-core —
+/// one crate owns the duckdb version pin.
+pub use duckdb;
 
-// ==========================================================================
-//
-// The SQL surface
-//
-// ==========================================================================
-
-
-
-/// Every function harbor exposes answers with one row and one VARCHAR
-/// column. `init` tracks whether that row has been emitted; DuckDB calls
-/// `func` until it returns an empty chunk.
-struct OneShotInit {
-    done: AtomicBool,
-}
-
-fn one_shot_init(_: &InitInfo) -> Result<OneShotInit, Box<dyn Error>> {
-    Ok(OneShotInit { done: AtomicBool::new(false) })
-}
-
-/// Write `text` as the single output row, or close the stream if the row has
-/// already gone out.
-fn one_shot_emit(
-    done: &AtomicBool,
-    output: &mut DataChunkHandle,
-    text: impl FnOnce() -> String,
-) -> Result<(), Box<dyn Error>> {
-    if done.swap(true, Ordering::Relaxed) {
-        output.set_len(0);
-        return Ok(());
-    }
-    output.flat_vector(0).insert(0, CString::new(text())?);
-    output.set_len(1);
-    Ok(())
-}
-
-fn varchar() -> LogicalTypeHandle {
-    LogicalTypeHandle::from(LogicalTypeId::Varchar)
-}
-
-fn bigint() -> LogicalTypeHandle {
-    LogicalTypeHandle::from(LogicalTypeId::Bigint)
-}
-
-fn boolean() -> LogicalTypeHandle {
-    LogicalTypeHandle::from(LogicalTypeId::Boolean)
-}
-
-// ---------------------------------------------------------------------------
-// harbor_version() -> VARCHAR
-//
-// The smoke-test surface. If this answers, the extension loaded and harbor's
-// symbols are reachable.
-// ---------------------------------------------------------------------------
-
-struct HarborVersion;
-
-impl VTab for HarborVersion {
-    type InitData = OneShotInit;
-    type BindData = ();
-
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
-        bind.add_result_column("version", varchar());
-        Ok(())
-    }
-
-    fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
-        one_shot_init(init)
-    }
-
-    fn func(func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle) -> Result<(), Box<dyn Error>> {
-        one_shot_emit(&func.get_init_data().done, output, || env!("CARGO_PKG_VERSION").to_string())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![])
-    }
-}
-
-// ---------------------------------------------------------------------------
-// harbor_serve(bind := ..., port := ..., token := ..., workers := ..., log := ...,
-//              quiet := ...)
-//
-// Starts the listener and returns immediately with the bound address, so the
-// caller keeps a usable session. Loopback and a required token are the
-// defaults because the alternative — a database exposed to the network with
-// no credential — should never be one keystroke away.
-// ---------------------------------------------------------------------------
-
-struct HarborServe;
-
-struct ServeConfig {
-    bind: String,
-    port: u16,
-    token: Option<String>,
-    workers: usize,
-    /// One stderr line per request. Off by default: an access log is a cost
-    /// paid on every request and a stream somebody has to rotate, and the
-    /// caller that just wants a query endpoint should not inherit either.
-    log: bool,
-    /// Suppress the startup line on stderr. For a caller that prints its own
-    /// summary -- the launcher does -- harbor's line is the same address said
-    /// twice. Default off, so calling harbor_serve from a prompt still says
-    /// where it is listening and what the token is.
-    quiet: bool,
-    /// Whether harbor minted the token rather than being given one, so the
-    /// address it returns can show it the one time anyone will see it.
-    generated: bool,
-}
-
-impl VTab for HarborServe {
-    type InitData = OneShotInit;
-    type BindData = ServeConfig;
-
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
-        bind.add_result_column("address", varchar());
-
-        let host = bind
-            .get_named_parameter("bind")
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "127.0.0.1".to_string());
-
-        let port = bind.get_named_parameter("port").map(|v| v.to_int64()).unwrap_or(9495);
-        if !(0..=65535).contains(&port) {
-            return Err(format!("harbor_serve: port {port} is out of range").into());
-        }
-
-        // No token means harbor mints one and prints it, not that the
-        // endpoint is open. `token := ''` is the explicit opt-out.
-        let (token, generated) = match bind.get_named_parameter("token").map(|v| v.to_string()) {
-            Some(t) if t.is_empty() => (None, false),
-            Some(t) => (Some(t), false),
-            None => (Some(random_token()), true),
-        };
-
-        let workers = bind
-            .get_named_parameter("workers")
-            .map(|v| v.to_int64())
-            .unwrap_or(DEFAULT_MAX_INFLIGHT as i64);
-        if workers < 1 {
-            return Err("harbor_serve: workers must be at least 1".into());
-        }
-
-        let log = bind.get_named_parameter("log").map(|v| v.to_bool()).unwrap_or(false);
-        let quiet = bind.get_named_parameter("quiet").map(|v| v.to_bool()).unwrap_or(false);
-
-        Ok(ServeConfig {
-            bind: host,
-            port: port as u16,
-            token,
-            workers: workers as usize,
-            log,
-            quiet,
-            generated,
-        })
-    }
-
-    fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
-        one_shot_init(init)
-    }
-
-    fn func(func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle) -> Result<(), Box<dyn Error>> {
-        let cfg = func.get_bind_data();
-        if func.get_init_data().done.swap(true, Ordering::Relaxed) {
-            output.set_len(0);
-            return Ok(());
-        }
-        let address = start(&cfg.bind, cfg.port, cfg.token.clone(), cfg.workers, cfg.log)?;
-        let mut text = format!("http://{address}");
-        if cfg.generated {
-            // The only chance to see a generated token is here; it is never
-            // stored and never echoed again.
-            text.push_str("  token=");
-            text.push_str(cfg.token.as_deref().unwrap_or(""));
-        }
-
-        // Also to stderr, right now. Returning the address as a row is not
-        // enough for the case that needs it most: the DuckDB CLI holds its
-        // result output until the process exits, so a daemon started with
-        // `duckdb -c 'CALL harbor_serve(...)'` printed the minted token only
-        // once the server had already shut down — which is to say, never,
-        // while it was of any use. stderr is unbuffered and goes to the
-        // journal, so this is the line an operator actually sees.
-        if !cfg.quiet {
-            eprintln!("harbor: serving on {text}");
-        }
-        output.flat_vector(0).insert(0, CString::new(text)?);
-        output.set_len(1);
-        Ok(())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![])
-    }
-
-    fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
-        Some(vec![
-            ("bind".to_string(), varchar()),
-            ("port".to_string(), bigint()),
-            ("token".to_string(), varchar()),
-            ("workers".to_string(), bigint()),
-            ("log".to_string(), boolean()),
-            ("quiet".to_string(), boolean()),
-        ])
-    }
-}
-
-// ---------------------------------------------------------------------------
-// harbor_stop() — stop the listener, drain the workers, CHECKPOINT
-// ---------------------------------------------------------------------------
-
-struct HarborStop;
-
-impl VTab for HarborStop {
-    type InitData = OneShotInit;
-    type BindData = ();
-
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
-        bind.add_result_column("address", varchar());
-        Ok(())
-    }
-
-    fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
-        one_shot_init(init)
-    }
-
-    fn func(func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle) -> Result<(), Box<dyn Error>> {
-        if func.get_init_data().done.swap(true, Ordering::Relaxed) {
-            output.set_len(0);
-            return Ok(());
-        }
-        let address = stop()?;
-        output.flat_vector(0).insert(0, CString::new(address)?);
-        output.set_len(1);
-        Ok(())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![])
-    }
-}
-
-// ---------------------------------------------------------------------------
-// harbor_wait() — block until the server stops
-//
-// This is what turns a DuckDB CLI invocation into a daemon: run harbor_serve,
-// then harbor_wait, and the process stays up serving until something calls
-// harbor_stop.
-// ---------------------------------------------------------------------------
-
-struct HarborWait;
-
-impl VTab for HarborWait {
-    type InitData = OneShotInit;
-    type BindData = ();
-
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
-        bind.add_result_column("address", varchar());
-        Ok(())
-    }
-
-    fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
-        one_shot_init(init)
-    }
-
-    fn func(func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle) -> Result<(), Box<dyn Error>> {
-        if func.get_init_data().done.swap(true, Ordering::Relaxed) {
-            output.set_len(0);
-            return Ok(());
-        }
-        let address = wait()?;
-        output.flat_vector(0).insert(0, CString::new(address)?);
-        output.set_len(1);
-        Ok(())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![])
-    }
-}
-
-#[duckdb_entrypoint_c_api]
-pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
-    con.register_table_function::<HarborVersion>("harbor_version")?;
-    con.register_table_function::<HarborServe>("harbor_serve")?;
-    con.register_table_function::<HarborStop>("harbor_stop")?;
-    con.register_table_function::<HarborWait>("harbor_wait")?;
-
-    // Open the worker connections. This has to happen here, inside the load
-    // callback: the database handle an extension is given does not outlive
-    // it, so a connection opened later fails — see the note above POOL.
-    open_pool(con)?;
-
-    Ok(())
-}
+mod encode;
+use encode::*;
 
 // ==========================================================================
 //
@@ -381,59 +83,10 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
 // connection count, not worker count, is what a flood actually costs.
 
 
-// duckdb-rs keeps the raw `duckdb_logical_type` private, and two details are
-// reachable only through the C API: an ARRAY's length and an ENUM's value
-// list. `LogicalTypeHandle` is a single-field newtype around that pointer, so
-// a copy of its bytes is the pointer. The assertion turns a layout change in
-// duckdb-rs into a compile error instead of a crash at runtime.
-const _: () = assert!(
-    std::mem::size_of::<LogicalTypeHandle>() == std::mem::size_of::<ffi::duckdb_logical_type>()
-);
-
-/// Borrow the handle's pointer. The handle keeps ownership; the result must
-/// not outlive it and must not be destroyed.
-fn raw_type(ty: &LogicalTypeHandle) -> ffi::duckdb_logical_type {
-    unsafe { std::mem::transmute_copy(ty) }
-}
-
-fn array_size(ty: &LogicalTypeHandle) -> u64 {
-    unsafe { ffi::duckdb_array_type_array_size(raw_type(ty)) }
-}
-
-fn enum_values(ty: &LogicalTypeHandle) -> Vec<String> {
-    unsafe {
-        let handle = raw_type(ty);
-        let count = ffi::duckdb_enum_dictionary_size(handle) as usize;
-        (0..count)
-            .map(|i| {
-                let ptr = ffi::duckdb_enum_dictionary_value(handle, i as u64);
-                if ptr.is_null() {
-                    return String::new();
-                }
-                let value = std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned();
-                ffi::duckdb_free(ptr as *mut std::ffi::c_void);
-                value
-            })
-            .collect()
-    }
-}
-
-/// Render an identifier the way DuckDB does inside a type string: bare when it
-/// is a simple lowercase identifier and not a keyword, double-quoted
-/// otherwise, with embedded quotes doubled.
-fn quote_identifier(name: &str) -> String {
-    let simple = !name.is_empty()
-        && name.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
-        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-    if simple && KEYWORDS.binary_search(&name).is_err() {
-        return name.to_string();
-    }
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
 
 /// Bounded number of statements executing at once. Connections may greatly
 /// exceed this; queries should not.
-const DEFAULT_MAX_INFLIGHT: usize = 6;
+pub const DEFAULT_MAX_INFLIGHT: usize = 6;
 
 /// Largest request body we will read, declared or delivered. A statement is
 /// text, and a megabyte of it is already pathological — the limit sits well
@@ -548,6 +201,9 @@ struct SlotRun {
     /// cancel that arrives late matches nothing rather than matching the wrong
     /// statement.
     job: u64,
+    /// When that statement began; meaningless while job == 0. The probe
+    /// thread reads it to tell wedged workers from merely busy ones.
+    started: Instant,
     /// A cancel that arrived before its statement started.
     ///
     /// The gap is small but entirely reachable: a request registers its
@@ -587,6 +243,7 @@ impl SlotRun {
     /// cancelled before it began, in which case it must not run at all.
     fn begin(&mut self, job: u64, deadline: Option<Instant>) -> bool {
         self.job = job;
+        self.started = Instant::now();
         self.deadline = deadline;
         // Any held cancel is consumed here whether or not it matches: it named
         // a statement that is now either this one or one that will never start,
@@ -670,8 +327,17 @@ impl SlotState {
         }
     }
 
-    fn expired(&self, now: Instant) -> bool {
-        self.run.lock().unwrap().expired(now)
+    /// The running job's id if it has outlived its deadline, else None. Read
+    /// and returned together so the caller can cancel exactly that job.
+    fn expired_job(&self, now: Instant) -> Option<u64> {
+        let run = self.run.lock().unwrap();
+        run.expired(now).then_some(run.job)
+    }
+
+    /// The job running right now (0 = idle). A snapshot for reapers that must
+    /// name their target instead of firing at "whatever is running".
+    fn current_job(&self) -> u64 {
+        self.run.lock().unwrap().job
     }
 }
 
@@ -767,8 +433,13 @@ fn cancel_expired() {
     let slots: Vec<Arc<SlotState>> = SLOTS.lock().unwrap().clone();
     let now = Instant::now();
     for slot in slots {
-        if slot.expired(now) {
-            slot.cancel(None);
+        // By id, never "whatever is running": between noticing the expiry and
+        // firing, the expired statement can finish and a fresh one begin, and
+        // a cancel(None) would kill that innocent — the exact race the job-id
+        // machinery exists to close (see SlotRun). A stale id is harmless: it
+        // is held as pending and discarded when the next statement begins.
+        if let Some(job) = slot.expired_job(now) {
+            slot.cancel(Some(job));
         }
     }
 }
@@ -1013,6 +684,19 @@ fn try_lease_claim(id: &str) -> Result<(mpsc::SyncSender<Job>, Arc<SlotState>), 
                 .to_string(),
         });
     };
+    if lease.doomed {
+        // The client asked for this lease's release; honoring new claims while
+        // the cancel unwinds would let a "released" session that keeps sending
+        // short statements stay busy at every reaper tick — held, with its
+        // open transaction, forever. Same answer as absent: it is gone.
+        return Err(Refusal {
+            status: 404,
+            code: "no_such_session",
+            message: "no such session: it was released, timed out, or never existed. Open a new \
+                      one and retry the transaction from the beginning."
+                .to_string(),
+        });
+    }
     if lease.busy {
         return Err(Refusal {
             status: 409,
@@ -1118,7 +802,7 @@ fn lease_release(id: &str) -> Released {
 fn lease_reap() {
     enum Action {
         Release(String),
-        Cancel(Arc<SlotState>),
+        Cancel(Arc<SlotState>, u64),
     }
     let actions: Vec<Action> = {
         let guard = LEASES.lock().unwrap();
@@ -1132,8 +816,17 @@ fn lease_reap() {
                 // is deliberate: DuckDB checks the interrupt flag between
                 // pipeline steps, and a statement that swallowed the first one
                 // gets asked again rather than being left to run forever.
+                //
+                // The job id is captured with the decision. Between this
+                // snapshot and the fire below sit other actions, each a
+                // blocking quiesce — plenty of time for the doomed statement
+                // to finish and the connection to be reissued to an innocent.
+                // cancel(Some(job)) makes the late fire a no-op instead of a
+                // random casualty. A statement that has not begun yet (job 0)
+                // waits for the next tick.
                 true if now >= l.deadline || l.doomed => {
-                    Some(Action::Cancel(Arc::clone(&l.conn.state)))
+                    let job = l.conn.state.current_job();
+                    (job != 0).then(|| Action::Cancel(Arc::clone(&l.conn.state), job))
                 }
                 true => None,
                 false if l.doomed
@@ -1153,8 +846,8 @@ fn lease_reap() {
             Action::Release(id) => {
                 lease_release(&id);
             }
-            Action::Cancel(state) => {
-                state.cancel(None);
+            Action::Cancel(state, job) => {
+                state.cancel(Some(job));
             }
         }
     }
@@ -1191,12 +884,15 @@ struct Running {
     /// channel is dropped, which is what `stop` does after draining.
     leases: Vec<JoinHandle<Option<Connection>>>,
     reaper: Option<JoinHandle<()>>,
+    /// The saturation-proof lane: answers /ready when every worker is busy,
+    /// and overflow requests on a borrowed lease connection. See probe_worker.
+    probe: Option<JoinHandle<()>>,
     addr: String,
 }
 
 /// Open every connection harbor will need. Called once, from the extension
 /// entrypoint, and only there — see the note above on why later is too late.
-fn open_pool(con: Connection) -> Result<(), String> {
+pub fn open_pool(con: Connection) -> Result<(), String> {
     let mut pool = POOL.lock().unwrap();
 
     // Once per process, not once per load. POOL and CONTROL are process-wide,
@@ -1226,9 +922,15 @@ fn open_pool(con: Connection) -> Result<(), String> {
 // start / stop / wait
 // ---------------------------------------------------------------------------
 
-fn start(
-    bind: &str,
-    port: u16,
+/// Where the server listens. Unix sockets are the fleet's default face
+/// (PLAN.md D3/D6); TCP remains for loopback and trusted-LAN use.
+pub enum Listen {
+    Tcp { bind: String, port: u16 },
+    Unix(std::path::PathBuf),
+}
+
+pub fn start(
+    listen: Listen,
     token: Option<String>,
     workers: usize,
     log: bool,
@@ -1265,16 +967,35 @@ fn start(
     let mut lease_conns: Vec<Connection> = pool.drain(..).collect();
     drop(pool);
 
-    let server = match Server::http((bind, port)) {
+    let bound = match &listen {
+        Listen::Tcp { bind, port } => Server::http((bind.as_str(), *port))
+            .map_err(|e| format!("harbor: cannot bind {bind}:{port}: {e}")),
+        Listen::Unix(path) => Server::http_unix(path.as_path())
+            .map_err(|e| format!("harbor: cannot bind {}: {e}", path.display())),
+    };
+    let server = match bound {
         Ok(s) => s,
-        Err(e) => {
+        Err(msg) => {
             let mut pool = POOL.lock().unwrap();
             pool.append(&mut conns);
             pool.append(&mut lease_conns);
-            return Err(format!("harbor: cannot bind {bind}:{port}: {e}"));
+            return Err(msg);
         }
     };
-    let addr = server.server_addr().to_string();
+    let addr = match &listen {
+        Listen::Tcp { .. } => server.server_addr().to_string(),
+        Listen::Unix(path) => path.display().to_string(),
+    };
+    *STARTED_AT.lock().unwrap() = Some(Instant::now());
+    // Reset the process-global accumulators for this instance. harbor_serve
+    // can follow a harbor_stop in the same process (the extension path), and
+    // a request abandoned by the bounded-join shutdown may decrement
+    // INFLIGHT_REQUESTS late — so a fresh instance must not inherit a nonzero
+    // count (which would wedge quiet()/--idle-exit) or a stale readiness
+    // verdict from its predecessor.
+    INFLIGHT_REQUESTS.store(0, Ordering::SeqCst);
+    *LAST_ACTIVITY.lock().unwrap() = None;
+    *LAST_READY.lock().unwrap() = None;
     let server = Arc::new(server);
     let stop = Arc::new(AtomicBool::new(false));
     let token = Arc::new(token);
@@ -1289,6 +1010,7 @@ fn start(
             interrupt: conn.interrupt_handle(),
             run: Mutex::new(SlotRun {
                 job: 0,
+                started: Instant::now(),
                 pending: None,
                 cancelled: false,
                 deadline: None,
@@ -1330,6 +1052,7 @@ fn start(
         lease_handles.push(handle);
         free.push(LeaseConn { slot, jobs: tx, state });
     }
+    *WORKER_SLOTS.lock().unwrap() = slots[..workers].to_vec();
     *SLOTS.lock().unwrap() = slots;
     *QUERIES.lock().unwrap() = Some(HashMap::new());
     let total = free.len();
@@ -1362,13 +1085,40 @@ fn start(
             .ok()
     };
 
+    // One thread the fleet can always reach. Workers pair 1:1 with
+    // connections and stream whole responses, so when every worker is busy an
+    // accepted /ready sits in tiny_http's queue until one frees — measured at
+    // 5 seconds under a saturating analytical load — and a load balancer with
+    // an ordinary timeout marks a busy-but-healthy berth dead precisely when
+    // killing it hurts most. This thread never runs a statement of its own:
+    // /ready is answered from the CONTROL connection, and anything else gets
+    // a borrowed lease connection when one is free or an immediate honest 503
+    // when the berth is truly saturated — shedding load instead of queueing
+    // it invisibly.
+    let probe = {
+        let server = Arc::clone(&server);
+        let stop = Arc::clone(&stop);
+        let token = Arc::clone(&token);
+        thread::Builder::new()
+            .name("harbor-probe".to_string())
+            .spawn(move || probe_worker(server, stop, token, log))
+            .ok()
+    };
+
     *STOPPED.0.lock().unwrap() = false;
-    *running =
-        Some(Running { server, stop, workers: handles, leases: lease_handles, reaper, addr: addr.clone() });
+    *running = Some(Running {
+        server,
+        stop,
+        workers: handles,
+        leases: lease_handles,
+        reaper,
+        probe,
+        addr: addr.clone(),
+    });
     Ok(addr)
 }
 
-fn stop() -> Result<String, String> {
+pub fn stop() -> Result<String, String> {
     // Held for the whole of the shutdown, not just the take(). Releasing it
     // here — which `RUNNING.lock().unwrap().take()` as a statement does, since
     // the guard is a temporary — leaves a window in which RUNNING is None while
@@ -1412,31 +1162,67 @@ fn stop() -> Result<String, String> {
     // Workers hand their connection back as they exit, so a later
     // harbor_serve has a pool to draw from. A panicked worker forfeits its
     // connection rather than taking the shutdown down with it.
+    //
+    // Bounded patience, not join(): a worker whose client stopped reading is
+    // stuck inside a socket write — tiny_http sets no write timeout — and a
+    // plain join would wait on it forever. That wedged this whole function:
+    // the signal thread sat inside stop(), the second SIGTERM queued behind
+    // the RUNNING mutex, and the only exit left was SIGKILL — which forfeits
+    // the CHECKPOINT this drain exists to reach. After the deadline the
+    // straggler is abandoned exactly as a panicked worker would be: its
+    // connection is forfeited, and the checkpoint below runs regardless.
+    let deadline = Instant::now() + Duration::from_secs(10);
     let mut pool = POOL.lock().unwrap();
-    for h in r.workers {
-        if let Ok(Some(conn)) = h.join() {
-            pool.push(conn);
+    let mut pending: Vec<thread::JoinHandle<Option<Connection>>> =
+        r.workers.into_iter().chain(r.leases).collect();
+    loop {
+        let (done, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|h| h.is_finished());
+        for h in done {
+            if let Ok(Some(conn)) = h.join() {
+                pool.push(conn);
+            }
         }
+        pending = rest;
+        if pending.is_empty() || Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
     }
-    for h in r.leases {
-        if let Ok(Some(conn)) = h.join() {
-            pool.push(conn);
-        }
+    if !pending.is_empty() {
+        eprintln!(
+            "harbor: {} executor(s) still writing to stalled clients; abandoning them to checkpoint",
+            pending.len()
+        );
     }
     drop(pool);
     if let Some(h) = r.reaper {
+        // Prompt: the reaper sleeps in short ticks and checks the stop flag.
         let _ = h.join();
+    }
+    if let Some(h) = r.probe {
+        // Same bounded patience as the workers: joined if it made it out of
+        // its recv loop, abandoned if it is wedged writing to a dead client.
+        if h.is_finished() {
+            let _ = h.join();
+        }
     }
 
     // Fold the WAL back into the database file so the next open needs no
-    // replay. This succeeds when harbor_stop is called from an ordinary
-    // session, and fails harmlessly when it is called from the signal handler
-    // while harbor_wait is still blocked: that blocked call is itself an open
-    // transaction older than every write, and DuckDB will not checkpoint past
-    // one. The daemon path covers that case by running CHECKPOINT after
-    // harbor_wait returns — see bin/duckdb-harbor.
-    if let Some(c) = CONTROL.lock().unwrap().as_ref() {
-        let _ = c.execute_batch("CHECKPOINT");
+    // replay. By the time we reach here the leases are drained and the workers
+    // are joined (above), so no write transaction is open and this should
+    // succeed. A failure is therefore a real signal — a full or failing disk,
+    // most likely — not a routine outcome to swallow: the database is still
+    // safe (the WAL is intact and replays on next open) but the restart is
+    // slower and the operator should know why, so surface it instead of
+    // reporting a clean "drained and checkpointed" shutdown that did not fully
+    // happen.
+    if let Some(c) = CONTROL.lock().unwrap().as_ref()
+        && let Err(e) = c.execute_batch("CHECKPOINT")
+    {
+        eprintln!(
+            "harbor: shutdown CHECKPOINT failed ({e}); the WAL is intact and \
+             will replay on next open (no data lost, slower restart)"
+        );
     }
 
     let (lock, cv) = &STOPPED;
@@ -1491,7 +1277,7 @@ fn install_signal_handler() {
 fn install_signal_handler() {}
 
 /// Block until the server stops. Returns the address it was serving on.
-fn wait() -> Result<String, String> {
+pub fn wait() -> Result<String, String> {
     let addr = match RUNNING.lock().unwrap().as_ref() {
         Some(r) => r.addr.clone(),
         None => return Err("harbor is not serving".to_string()),
@@ -1557,7 +1343,7 @@ fn worker(
             // 503 rather than a cheerful hardcoded 200 — but reporting it is
             // not enough: the worker still has to leave.
             Ok(Some(req)) => {
-                if !handle(req, &jobs_tx, &state, token.as_ref().as_deref(), log) {
+                if !handle(req, Some((&jobs_tx, &state)), token.as_ref().as_deref(), log) {
                     break;
                 }
             }
@@ -1570,17 +1356,176 @@ fn worker(
     executor.join().ok()
 }
 
-/// Returns false when the executor behind `jobs` is gone, which is the one
-/// condition the caller must act on rather than merely report.
+/// The saturation-proof lane (see the note in `start`): the control plane
+/// that must stay reachable precisely when every worker is busy. /ready so a
+/// load balancer never mistakes busy for dead; cancels and releases because
+/// they are how a saturated berth gets UN-saturated; /sessions and /info
+/// because an operator debugging the saturation needs them. All bounded,
+/// in-memory responses — this thread never streams and never borrows a
+/// connection, so a client that stops reading can wedge a worker but not the
+/// berth's last open door. Statements and /catalog get a fast honest 503
+/// instead of queueing invisibly behind the analytics.
+fn probe_worker(server: Arc<Server>, stop: Arc<AtomicBool>, token: Arc<Option<String>>, log: bool) {
+    while !stop.load(Ordering::SeqCst) {
+        // Only join the accept queue when the workers are WEDGED — every one
+        // of them mid-statement for at least 250ms — not merely busy. All
+        // recv() callers share one queue, so a probe that listened while
+        // workers were healthy would win requests from them and shed load
+        // nobody needed shed; and a storm of quick queries keeps all workers
+        // "busy" while serving thousands per second, which is queueing
+        // working as designed. Six multi-second analytics is the situation
+        // this thread exists for, and statement age is what tells the two
+        // apart. (Verified against the stress suite: 16 fast clients, zero
+        // sheds; 6 slow scans, probe live within a quarter second.)
+        if !workers_wedged(Duration::from_millis(250)) {
+            thread::sleep(Duration::from_millis(25));
+            continue;
+        }
+        match server.recv_timeout(Duration::from_millis(100)) {
+            Ok(Some(req)) => {
+                let _ = handle(req, None, token.as_ref().as_deref(), log);
+            }
+            Ok(None) => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+/// `/ready` as the probe thread answers it: the recent cached verdict, else
+/// SELECT 1 on the CONTROL connection. Shallower than the workers' full-path
+/// probe — but the question under saturation is "is the database alive",
+/// not "is a worker free", and a probe that queues behind the workers turns
+/// a busy berth into a dead one in the eyes of its load balancer.
+fn run_ready_control(req: Request) -> (bool, u16) {
+    if let Some((at, ok)) = *LAST_READY.lock().unwrap() {
+        if at.elapsed() < READY_MAX_AGE {
+            return (true, respond_ready(req, ok, "not ready"));
+        }
+    }
+    let ok = CONTROL
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|c| c.execute_batch("SELECT 1").is_ok());
+    *LAST_READY.lock().unwrap() = Some((Instant::now(), ok));
+    (true, respond_ready(req, ok, "not ready"))
+}
+
+/// Every worker mid-statement, and every one of those statements at least
+/// `min_age` old. See the probe loop for why age is the discriminator.
+fn workers_wedged(min_age: Duration) -> bool {
+    let slots = WORKER_SLOTS.lock().unwrap();
+    !slots.is_empty()
+        && slots.iter().all(|s| {
+            let run = s.run.lock().unwrap();
+            run.job != 0 && run.started.elapsed() >= min_age
+        })
+}
+
+/// The probe thread's answer to work it cannot take: immediate and honest,
+/// instead of an invisible seat in the queue behind the analytics.
+fn shed(req: Request) -> (bool, u16) {
+    let _ = req.respond(error_response(503, "unavailable", "every worker is busy; retry shortly"));
+    (true, 503)
+}
+
+// ---------------------------------------------------------------------------
+// Berth identity (GET /info) and idle accounting (--idle-exit)
+// ---------------------------------------------------------------------------
+
+/// Identity document the embedding host sets before `start()`; GET /info
+/// serves it with `uptimeMs` spliced in. The host owns the static fields
+/// (name, database path, pid, mode) because the core cannot know them.
+/// Unset — as in the retiring extension — /info answers 404, which is
+/// exactly the pre-fleet behavior clients use as a version probe.
+static INFO: Mutex<Option<serde_json::Value>> = Mutex::new(None);
+static STARTED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+/// The last moment a countable request began or finished. `/ready` and
+/// `/info` do not count: a fleet `ls` probing liveness must not keep an
+/// --idle-exit berth alive forever.
+static LAST_ACTIVITY: Mutex<Option<Instant>> = Mutex::new(None);
+/// Countable requests currently being served, statement and stream included.
+/// This is what actually protects a long-running statement from --idle-exit:
+/// the activity clock ticks only at request start and finish, so without this
+/// a 5-minute COPY on an otherwise quiet berth would be "idle" at the 90s
+/// mark and cancelled out from under its caller.
+static INFLIGHT_REQUESTS: AtomicU64 = AtomicU64::new(0);
+/// The workers' slots alone (SLOTS holds leases too), set at start(). The
+/// probe thread reads these to decide whether the workers are wedged — every
+/// one of them busy on a statement old enough to matter — which is the only
+/// condition under which it takes requests at all.
+static WORKER_SLOTS: Mutex<Vec<Arc<SlotState>>> = Mutex::new(Vec::new());
+
+pub fn set_info(base: serde_json::Value) {
+    *INFO.lock().unwrap() = Some(base);
+}
+
+fn touch_activity() {
+    *LAST_ACTIVITY.lock().unwrap() = Some(Instant::now());
+}
+
+/// Milliseconds since the last countable request began or ended. The clock
+/// resets at both edges of a request, but the guarantee that a statement
+/// longer than the idle window is never idled out from under its caller
+/// comes from `quiet()`, which refuses while any request is in flight.
+pub fn idle_ms() -> u64 {
+    let last = *LAST_ACTIVITY.lock().unwrap();
+    let base = last.or(*STARTED_AT.lock().unwrap());
+    base.map_or(0, |t| t.elapsed().as_millis() as u64)
+}
+
+/// True when nothing is held: no request mid-flight (statement or stream),
+/// no live leases, no lease statement in flight. An --idle-exit berth may
+/// leave only when this is true — an open transaction with no traffic is
+/// still a claim on this berth, and so is a statement in its fifth minute.
+pub fn quiet() -> bool {
+    if INFLIGHT_REQUESTS.load(Ordering::SeqCst) != 0 {
+        return false;
+    }
+    match LEASES.lock().unwrap().as_ref() {
+        Some(l) => l.live.is_empty() && l.inflight == 0,
+        None => false,
+    }
+}
+
+fn run_info(req: Request) -> (bool, u16) {
+    let info = INFO.lock().unwrap().clone();
+    match info {
+        Some(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                let up = STARTED_AT.lock().unwrap().map_or(0, |t| t.elapsed().as_millis() as u64);
+                obj.insert("uptimeMs".to_string(), serde_json::Value::from(up));
+            }
+            let _ = req.respond(json_response(200, &v.to_string()));
+            (true, 200)
+        }
+        None => {
+            let _ = req.respond(error_response(404, "not_found", "no such endpoint"));
+            (true, 404)
+        }
+    }
+}
+
+/// One request. `exec` is the accepting thread's executor — its jobs channel
+/// and cancellation slot. The probe thread passes None: it owns no
+/// connection, so the arms that stream (/sql, /catalog, the workers' /ready)
+/// shed load with an immediate 503 instead, and every control-plane verb —
+/// session open/release, query cancel, /sessions, /info — works exactly as
+/// it does on a worker, because none of them touch an executor.
 fn handle(
     mut req: Request,
-    jobs: &mpsc::SyncSender<Job>,
-    state: &Arc<SlotState>,
+    exec: Option<(&mpsc::SyncSender<Job>, &Arc<SlotState>)>,
     token: Option<&str>,
     log: bool,
 ) -> bool {
     let path = req.url().split('?').next().unwrap_or("/").to_string();
     let method = req.method().clone();
+    let countable = path != "/ready" && path != "/info";
+    // A drop guard, not a bare inc/dec, so a panic anywhere in this function
+    // (a poisoned global lock, a panic inside response construction) cannot
+    // leak the count and wedge quiet()/--idle-exit — the same RAII discipline
+    // as Claim/Cancellable/OnSlot. Touches the activity clock on both edges.
+    let _inflight = countable.then(InFlight::enter);
 
     // Only when logging. A clock read and a peer-address format are small, but
     // they are paid on every request by every caller, including the ones that
@@ -1590,127 +1535,130 @@ fn handle(
         true => req.remote_addr().map_or_else(|| "-".to_string(), |a| a.ip().to_string()),
         false => String::new(),
     };
+    // Cleared here so the reason logged below is this request's, never a
+    // previous one's left on this worker thread.
+    LAST_REASON.with(|c| c.set(""));
 
+    // Two gates before any routing, in this order.
+    //
+    // The declared length first: tiny_http drains an undelivered body when a
+    // request is dropped — with a single `vec![0; remaining]` — and it does so
+    // for EVERY response path, 401s and 404s included. `take()` bounds what
+    // harbor buffers but not what the client may declare, and the declared
+    // length is attacker-chosen; a request declaring 1 GB and sending 9 bytes
+    // used to cost this process a 1 GB zeroed allocation, unauthenticated.
+    // Refusing here, before anything else can respond, means the allocation
+    // never happens on any path.
+    //
+    // Then the token: /ready is the one unauthenticated route (a load balancer
+    // should not need a credential to learn up-or-down, and the answer reveals
+    // nothing else), so the property "everything except /ready requires the
+    // token" is enforced once, here, instead of being re-asserted arm by arm —
+    // where the arm someone adds next year would forget it.
+    //
     // Each arm reports the status it sent, so the log line below is written in
     // one place instead of at every `respond` call. The SQL text is not
     // logged: it is the request body, it can be enormous, and on this endpoint
     // it is as likely to hold customer data as anything else in the database.
-    let (keep_going, status) = match (&method, path.as_str()) {
-        // Readiness is unauthenticated on purpose: a load balancer should not
-        // need a credential to learn whether this server can serve, and the
-        // answer reveals nothing beyond up or down.
-        (Method::Get, "/ready") => run_ready(req, jobs),
-        // Open a transaction lease. Authenticated: it consumes a connection,
-        // which is the scarcest thing here.
-        (Method::Post, "/sql/sessions/new") => {
-            if !authorized(&req, token) {
-                let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
-                (true, 401)
-            } else {
-                run_session_open(req)
-            }
+    let (keep_going, status) = if let Some(n) = req.body_length().filter(|n| *n > MAX_BODY) {
+        let _ = req.respond(error_response(
+            413,
+            "body_too_large",
+            &format!("body is {n} bytes; the limit is {MAX_BODY}"),
+        ));
+        (true, 413)
+    } else if path != "/ready" && !authorized(&req, token) {
+        // Unknown paths stay 404 even unauthenticated — the contract the
+        // clients pinned long before this gate was hoisted. Known endpoints
+        // answer 401 so a caller with a bad token learns which problem it has.
+        if route_exists(&method, &path) {
+            let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
+            (true, 401)
+        } else {
+            let _ = req.respond(error_response(404, "not_found", "no such endpoint"));
+            (true, 404)
         }
-        // Release one. Idempotent by design: a client retrying a DELETE it is
-        // not sure landed must not be able to free a connection twice.
-        //
-        // A session running a statement is not simply refused any more: the
-        // statement is interrupted and the release completes on the reaper's
-        // next tick. `released` says whether the connection is back now,
-        // `cancelling` says the work to make it so is under way — so a client
-        // that wants its transaction stopped has one verb for it, and a client
-        // polling for the connection can tell the two apart.
-        (Method::Delete, p) if p.starts_with("/sql/sessions/") => {
-            if !authorized(&req, token) {
-                let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
-                (true, 401)
-            } else {
+    } else {
+        match (&method, path.as_str()) {
+            // Readiness is unauthenticated on purpose (see the gate above).
+            // Workers answer it down the full query path; the probe thread —
+            // the one still listening when every worker is saturated —
+            // answers from the CONTROL connection instead of queueing.
+            (Method::Get, "/ready") => match exec {
+                Some((jobs, _)) => run_ready(req, jobs),
+                None => run_ready_control(req),
+            },
+            // Open a transaction lease. It consumes a connection, which is the
+            // scarcest thing here.
+            (Method::Post, "/sql/sessions/new") => run_session_open(req),
+            // Release one. Idempotent by design: a client retrying a DELETE it
+            // is not sure landed must not be able to free a connection twice.
+            //
+            // A session running a statement is not simply refused any more: the
+            // statement is interrupted and the release completes on the
+            // reaper's next tick. `released` says whether the connection is
+            // back now, `cancelling` says the work to make it so is under way —
+            // so a client that wants its transaction stopped has one verb for
+            // it, and a client polling for the connection can tell them apart.
+            (Method::Delete, p) if p.starts_with("/sql/sessions/") => {
                 let id = p.trim_start_matches("/sql/sessions/").to_string();
                 let body = match lease_release(&id) {
                     Released::Yes => r#"{"released":true}"#.to_string(),
                     Released::No => r#"{"released":false}"#.to_string(),
-                    Released::Cancelling => {
-                        r#"{"released":false,"cancelling":true}"#.to_string()
-                    }
+                    Released::Cancelling => r#"{"released":false,"cancelling":true}"#.to_string(),
                 };
                 let _ = req.respond(json_response(200, &body));
                 (true, 200)
             }
-        }
-        // Stop a statement the client named when it sent it. Idempotent and
-        // deliberately unexciting: cancelling something that already finished
-        // is `false`, not an error, because by the time a Stop button is
-        // pressed the query it refers to may well be over.
-        (Method::Delete, p) if p.starts_with("/sql/queries/") => {
-            if !authorized(&req, token) {
-                let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
-                (true, 401)
-            } else {
+            // Stop a statement the client named when it sent it. Idempotent and
+            // deliberately unexciting: cancelling something that already
+            // finished is `false`, not an error, because by the time a Stop
+            // button is pressed the query it refers to may well be over.
+            (Method::Delete, p) if p.starts_with("/sql/queries/") => {
                 let id = p.trim_start_matches("/sql/queries/").to_string();
                 let cancelled = cancel_query(&id);
                 let _ = req.respond(json_response(200, &format!(r#"{{"cancelled":{cancelled}}}"#)));
                 (true, 200)
             }
-        }
-        // What is holding a connection, and for how long. The question an
-        // operator asks when everything is suddenly waiting, and the reason
-        // this exists at all: a pool you cannot see into is a pool you debug
-        // by guessing.
-        (Method::Get, "/sessions") => {
-            if !authorized(&req, token) {
-                let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
-                (true, 401)
-            } else {
+            // What is holding a connection, and for how long. The question an
+            // operator asks when everything is suddenly waiting, and the reason
+            // this exists at all: a pool you cannot see into is a pool you
+            // debug by guessing.
+            (Method::Get, "/sessions") => {
                 let _ = req.respond(json_response(200, &sessions_report()));
                 (true, 200)
             }
-        }
-        // The whole schema — tables, columns, keys, indexes, sequences — in
-        // one call, in one shape. It lives here so a migration differ asks a
-        // single question instead of five, and so the answer never depends on
-        // which DuckDB this binary links: the queries below use whatever the
-        // engine's catalog provides, and version differences die in this
-        // process rather than in every client.
-        (Method::Get, "/catalog") => {
-            if !authorized(&req, token) {
-                let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
-                (true, 401)
-            } else {
-                run_catalog(req, jobs)
-            }
-        }
-        (Method::Post, "/sql") => {
-            if !authorized(&req, token) {
-                let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
-                (true, 401)
-            }
-            // Check the declared length before touching the reader. `take()`
-            // bounds what harbor buffers but not what the client may declare,
-            // and tiny_http drains whatever is left undelivered when the
-            // request is dropped — with a single `vec![0; remaining]`. So a
-            // client that declares 600 MB and sends 9 MB costs the process a
-            // 600 MB zeroed allocation it never asked for; the declared length
-            // is attacker-chosen and unbounded. Refusing here means the
-            // allocation never happens.
-            else if let Some(n) = req.body_length().filter(|n| *n > MAX_BODY) {
-                let _ = req.respond(error_response(
-                    413,
-                    "body_too_large",
-                    &format!("body is {n} bytes; the limit is {MAX_BODY}"),
-                ));
-                (true, 413)
-            } else {
-                let mut body = String::new();
-                if req.as_reader().take(MAX_BODY as u64).read_to_string(&mut body).is_err() {
-                    let _ = req.respond(error_response(400, "bad_request", "body is not valid UTF-8"));
-                    (true, 400)
-                } else {
-                    run_sql(req, jobs, state, &body)
+            // Berth identity: who serves here, which engine, since when. Auth
+            // required — it names filesystem paths and pids. 404 when the host
+            // never set one, which is also what pre-fleet servers answer:
+            // absence is the version probe (PLAN.md §4.2).
+            (Method::Get, "/info") => run_info(req),
+            // The whole schema — tables, columns, keys, indexes, sequences — in
+            // one call, in one shape. It lives here so a migration differ asks
+            // a single question instead of five, and so the answer never
+            // depends on which DuckDB this binary links: the queries below use
+            // whatever the engine's catalog provides, and version differences
+            // die in this process rather than in every client.
+            (Method::Get, "/catalog") => match exec {
+                Some((jobs, _)) => run_catalog(req, jobs),
+                None => shed(req),
+            },
+            (Method::Post, "/sql") => match exec {
+                Some((jobs, state)) => {
+                    let mut body = String::new();
+                    if req.as_reader().take(MAX_BODY as u64).read_to_string(&mut body).is_err() {
+                        let _ = req.respond(error_response(400, "bad_request", "body is not valid UTF-8"));
+                        (true, 400)
+                    } else {
+                        run_sql(req, jobs, state, &body)
+                    }
                 }
+                None => shed(req),
+            },
+            _ => {
+                let _ = req.respond(error_response(404, "not_found", "no such endpoint"));
+                (true, 404)
             }
-        }
-        _ => {
-            let _ = req.respond(error_response(404, "not_found", "no such endpoint"));
-            (true, 404)
         }
     };
 
@@ -1718,14 +1666,51 @@ fn handle(
     // inside that call, so for a streamed result this elapsed time covers the
     // whole query and the whole transfer rather than just the headers.
     if let Some(t) = started {
+        // On a failure, name why: the refusal code turns an unexplained spike
+        // of 4xx/5xx in the berth's own log into something diagnosable. The SQL
+        // and the message still stay out of the log (privacy, and the message
+        // can be large); the code is a fixed vocabulary and is enough to act on.
+        let reason = LAST_REASON.with(|c| c.get());
+        let reason = if status >= 400 && !reason.is_empty() {
+            format!(" {reason}")
+        } else {
+            String::new()
+        };
         eprintln!(
-            "harbor: {} {peer} {} {path} {status} {}ms",
+            "harbor: {} {peer} {} {path} {status}{reason} {}ms",
             utc_now(),
             method.as_str(),
             t.elapsed().as_millis()
         );
     }
+    // The finish counts too (see idle_ms): a long statement resets the idle
+    // clock when it completes, not only when it began. `_inflight` drops on
+    // return — after respond(), so the whole stream was this request.
     keep_going
+}
+
+/// Marks a countable request in flight for the life of the value: increments
+/// on `enter`, decrements on drop, and touches the activity clock at both
+/// edges. Dropping on every path (return, `?`, panic) is the point.
+struct InFlight;
+
+impl InFlight {
+    fn enter() -> Self {
+        touch_activity();
+        INFLIGHT_REQUESTS.fetch_add(1, Ordering::SeqCst);
+        InFlight
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        // Saturating, so a request abandoned by one server instance whose
+        // guard drops after the next instance reset the counter to 0 can
+        // never underflow it (u64 wrap would leave quiet() false forever).
+        let _ = INFLIGHT_REQUESTS
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(1)));
+        touch_activity();
+    }
 }
 
 /// UTC, RFC 3339, seconds resolution: `2026-08-12T04:31:07Z`.
@@ -1747,6 +1732,18 @@ fn utc_now() -> String {
     )
 }
 
+
+/// The route list, method included, for the auth gate above: it must agree
+/// with the match in `handle` so 401-vs-404 answers stay truthful. GET /sql
+/// is not a route (the method matters), and unknown paths are 404 with or
+/// without a token.
+fn route_exists(method: &Method, path: &str) -> bool {
+    matches!(
+        (method, path),
+        (Method::Get, "/ready" | "/sessions" | "/info" | "/catalog") | (Method::Post, "/sql" | "/sql/sessions/new")
+    ) || (*method == Method::Delete
+        && (path.starts_with("/sql/sessions/") || path.starts_with("/sql/queries/")))
+}
 
 fn authorized(req: &Request, token: Option<&str>) -> bool {
     let Some(expected) = token else { return true };
@@ -1831,13 +1828,22 @@ fn parse_request(body: &str) -> Result<SqlRequest, String> {
                 .to_string());
         }
     };
+    // The operator's `--statement-timeout` is a hard ceiling, not just a
+    // default: a request may ask for *less*, but not for more, and `0` ("no
+    // limit") is bounded by it too. Without the clamp, any token holder could
+    // send `timeoutMs:0` and pin a worker indefinitely — defeating the very
+    // knob a `--sealed` deployment leans on. When no cap is configured the cap
+    // is `None`, so the historical behaviour (0 = unlimited, N = exactly N) is
+    // unchanged.
+    let cap = configured_statement_timeout();
     let timeout = match v.get("timeoutMs") {
-        None | Some(serde_json::Value::Null) => configured_statement_timeout(),
-        // Zero means "no limit", so a request can opt out of a deployment-wide
-        // default as well as into a limit of its own.
+        None | Some(serde_json::Value::Null) => cap,
         Some(serde_json::Value::Number(n)) => match n.as_u64() {
-            Some(0) => None,
-            Some(ms) => Some(Duration::from_millis(ms)),
+            Some(0) => cap,
+            Some(ms) => {
+                let want = Duration::from_millis(ms);
+                Some(cap.map_or(want, |c| want.min(c)))
+            }
             None => return Err("\"timeoutMs\" must be a non-negative whole number".to_string()),
         },
         Some(_) => return Err("\"timeoutMs\" must be a non-negative whole number".to_string()),
@@ -2804,6 +2810,19 @@ fn run_sql(
         return (true, 400);
     }
 
+    if let Some(setting) = fenced_setting(&parsed.sql) {
+        let _ = req.respond(error_response(
+            400,
+            "sql_error",
+            &format!(
+                "{setting} is fixed when the berth starts (harbor serve --memory-limit/--threads) \
+                 and cannot be changed over the wire: it is process-global, and this berth may \
+                 share its host with others (PLAN.md D2)"
+            ),
+        ));
+        return (true, 400);
+    }
+
     let shape = if wants_one_shot(&req) { Shape::Json } else { Shape::Ndjson };
 
     // A statement naming a lease goes to that lease's connection, wherever it
@@ -2919,53 +2938,112 @@ fn run_sql(
     }
 }
 
-/// Whether a statement could leave a transaction open behind it.
-///
-/// Only transaction-control statements can, because a statement that runs in
-/// autocommit commits or rolls back its own implicit transaction as it
-/// finishes. So the reset before the next job is only needed after one of
-/// these — or after a job that ended abnormally, which the caller tracks
-/// separately.
-///
-/// Fail-safe by construction: this answers true for anything it does not
-/// recognise, so a statement form nobody thought of costs one `ROLLBACK`
-/// rather than leaving a transaction open. Getting it wrong in the other
-/// direction is what took connections out of service permanently.
-/// The first real word of a statement, upper-cased, skipping leading
-/// whitespace and comments. Empty when there is no leading identifier — a
-/// statement starting with `(`, or nothing at all.
-fn first_keyword(sql: &str) -> String {
-    let b = sql.as_bytes();
-    let mut i = 0;
+/// Advance `i` past ASCII whitespace and SQL comments — `--` to end of line,
+/// nested `/* */`. The one comment/whitespace skipper the token scanners
+/// share (first_keyword, fenced_setting). `ensure_single_statement` keeps its
+/// own inline scan: it is a full-byte security lexer, not a tokenizer, and is
+/// pinned by its own tests.
+fn skip_trivia(b: &[u8], i: &mut usize) {
     loop {
-        while i < b.len() && b[i].is_ascii_whitespace() {
-            i += 1;
+        while *i < b.len() && b[*i].is_ascii_whitespace() {
+            *i += 1;
         }
-        if b[i..].starts_with(b"--") {
-            i = b[i..].iter().position(|&c| c == b'\n').map_or(b.len(), |p| i + p + 1);
-        } else if b[i..].starts_with(b"/*") {
+        if b[*i..].starts_with(b"--") {
+            *i = b[*i..].iter().position(|&c| c == b'\n').map_or(b.len(), |p| *i + p + 1);
+        } else if b[*i..].starts_with(b"/*") {
             let mut depth = 1;
-            i += 2;
-            while i < b.len() && depth > 0 {
-                if b[i..].starts_with(b"/*") {
+            *i += 2;
+            while *i < b.len() && depth > 0 {
+                if b[*i..].starts_with(b"/*") {
                     depth += 1;
-                    i += 2;
-                } else if b[i..].starts_with(b"*/") {
+                    *i += 2;
+                } else if b[*i..].starts_with(b"*/") {
                     depth -= 1;
-                    i += 2;
+                    *i += 2;
                 } else {
-                    i += 1;
+                    *i += 1;
                 }
             }
         } else {
             break;
         }
     }
-    let start = i;
-    while i < b.len() && (b[i].is_ascii_alphabetic() || b[i] == b'_') {
-        i += 1;
+}
+
+/// The next token after trivia, uppercased: an identifier run
+/// (`[A-Za-z0-9_]`) or a `"double-quoted"` identifier (`""` escapes an inner
+/// quote). Quoted and bareword forms name the same thing to DuckDB, so the
+/// fence must read both. Empty at end of input; on stray punctuation it
+/// consumes one byte and returns it, so a caller loop always makes progress.
+fn next_word(b: &[u8], i: &mut usize) -> String {
+    skip_trivia(b, i);
+    if *i < b.len() && b[*i] == b'"' {
+        *i += 1;
+        let mut ident = String::new();
+        while *i < b.len() {
+            if b[*i] == b'"' {
+                if b.get(*i + 1) == Some(&b'"') {
+                    ident.push('"');
+                    *i += 2;
+                    continue;
+                }
+                *i += 1;
+                break;
+            }
+            ident.push(b[*i] as char);
+            *i += 1;
+        }
+        return ident.to_ascii_uppercase();
     }
-    sql[start..i].to_ascii_uppercase()
+    let start = *i;
+    while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'_') {
+        *i += 1;
+    }
+    if *i == start && *i < b.len() {
+        *i += 1;
+    }
+    std::str::from_utf8(&b[start..*i]).unwrap_or("").to_ascii_uppercase()
+}
+
+/// The first real word of a statement, upper-cased, skipping leading
+/// whitespace and comments. Empty when there is no leading identifier — a
+/// statement starting with `(`, or nothing at all.
+fn first_keyword(sql: &str) -> String {
+    next_word(sql.as_bytes(), &mut 0)
+}
+
+/// Settings a client must not change: they are process-global in DuckDB, so
+/// one `SET memory_limit='100GB'` raises it for every neighbor berth on the
+/// host and defeats the fleet-safe cap the operator chose at berth start
+/// (PLAN.md D2). Verified live: the SET took effect for all workers at once.
+///
+/// Reads through comments, whitespace, and double-quoting via `next_word`, so
+/// neither `/*x*/ SET threads=8` nor `SET "memory_limit"=…` slips past.
+fn fenced_setting(sql: &str) -> Option<&'static str> {
+    const FENCED: &[&str] = &[
+        "memory_limit",
+        "max_memory",
+        "threads",
+        "worker_threads",
+        "external_threads",
+        // Disk spill is process-global too, and the operator caps it with
+        // `--max-temp-size` precisely so one query cannot fill the shared host
+        // disk (PLAN.md D2). Left unfenced, `SET max_temp_directory_size='100TB'`
+        // over the wire erases that cap; `temp_directory` redirects the spill
+        // itself. Both are GLOBAL-scope in DuckDB — same class as the rest here.
+        "max_temp_directory_size",
+        "temp_directory",
+    ];
+    let b = sql.as_bytes();
+    let mut i = 0;
+    if !matches!(next_word(b, &mut i).as_str(), "SET" | "RESET" | "PRAGMA") {
+        return None;
+    }
+    let mut name = next_word(b, &mut i);
+    if matches!(name.as_str(), "GLOBAL" | "SESSION" | "LOCAL") {
+        name = next_word(b, &mut i);
+    }
+    FENCED.iter().find(|f| name.eq_ignore_ascii_case(f)).copied()
 }
 
 /// What a statement does to the surrounding transaction, when that is knowable
@@ -2980,6 +3058,18 @@ fn transaction_effect(sql: &str) -> Option<bool> {
     }
 }
 
+/// Whether a statement could leave a transaction open behind it.
+///
+/// Only transaction-control statements can, because a statement that runs in
+/// autocommit commits or rolls back its own implicit transaction as it
+/// finishes. So the reset before the next job is only needed after one of
+/// these — or after a job that ended abnormally, which the caller tracks
+/// separately.
+///
+/// Fail-safe by construction: this answers true for anything it does not
+/// recognise, so a statement form nobody thought of costs one `ROLLBACK`
+/// rather than leaving a transaction open. Getting it wrong in the other
+/// direction is what took connections out of service permanently.
 fn may_leave_transaction_open(sql: &str) -> bool {
     let word = first_keyword(sql);
     if word.is_empty() {
@@ -3037,15 +3127,6 @@ fn reset_transaction(conn: &Connection) {
     let _ = conn.execute_batch("ROLLBACK");
 }
 
-/// The DuckDB side. Owns one connection for the life of the server and runs
-/// one statement at a time; concurrency comes from there being several of
-/// these, not from any one of them interleaving work.
-/// `pinned` marks a lease connection. The reset below exists to stop one
-/// request's stray transaction from leaking into the next request that
-/// happens to land on the same connection — which is precisely the thing a
-/// lease is for, so on a lease connection it must not fire. The rollback still
-/// happens, but at the boundary that matters: when the lease is released, by
-/// commit, by DELETE, or by the reaper.
 /// A statement registered on its slot for as long as it runs.
 ///
 /// Dropping it retires the statement, so no path out of the loop — and there
@@ -3076,6 +3157,330 @@ impl Drop for OnSlot<'_> {
     }
 }
 
+/// One statement, start to finish, on the executor's connection: prepare,
+/// stream (NDJSON) or buffer (one-shot JSON) the result, and report the
+/// outcome on `ready`/`body`. Returns whether the connection needs a
+/// `ROLLBACK` before the next job. Split out of `execute_jobs` so the whole
+/// thing runs under one `catch_unwind` there: a panic in the DuckDB client (a
+/// decoder that hits `unreachable!`, a metadata assert) must not take the
+/// executor thread — and with it a worker and a pool slot — down for good.
+fn run_statement(
+    conn: &Connection,
+    on_slot: &mut OnSlot,
+    sql: String,
+    params: Vec<Value>,
+    shape: Shape,
+    ready: mpsc::SyncSender<Result<(), Refusal>>,
+    body: mpsc::SyncSender<Vec<u8>>,
+    started: Instant,
+) -> bool {
+    // Decided from the statement text before it runs, then widened below by
+    // any path that ends the job early.
+    let mut needs_reset = may_leave_transaction_open(&sql);
+
+    let stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = ready.send(Err(refusal_for(on_slot.finish(), e.to_string())));
+            return true;
+        }
+    };
+    let mut stmt = stmt;
+    let mut rows = match stmt.query(params_from_iter(params.iter())) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = ready.send(Err(refusal_for(on_slot.finish(), e.to_string())));
+            return true;
+        }
+    };
+
+    // Column metadata has to be captured now: `Rows` hands back `None`
+    // from `as_ref()` once the result is exhausted.
+    let (names, types) = match rows.as_ref() {
+        Some(s) => {
+            let n = s.column_count();
+            let names: Vec<String> =
+                (0..n).map(|i| s.column_name(i).cloned().unwrap_or_default()).collect();
+            let types: Vec<LogicalTypeHandle> = (0..n).map(|i| s.column_logical_type(i)).collect();
+            (names, types)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+
+    // duckdb-rs does not return an error for a column type it has no
+    // decoder for — it panics. `SELECT TIME_NS '...'` reaches an
+    // `unreachable!` in its row.rs. Catching that mid-stream is possible
+    // (and is done below), but by then the 200 and the headers are gone
+    // and the client can only be told inside the body. Refusing here,
+    // before anything is sent, is the difference between a 400 that says
+    // what is wrong and a 200 that appears to have returned no rows.
+    if let Some((name, bad)) = names
+        .iter()
+        .zip(&types)
+        .find(|(_, t)| matches!(t.try_id(), Ok(LogicalTypeId::TimeNs)))
+    {
+        // Name the column, not the type. Substituting the type into both
+        // slots produced "Cast it — TIME_NS::VARCHAR", which reads as
+        // casting the type rather than the thing that has it.
+        let _ = ready.send(Err(Refusal::sql(format!(
+            "harbor cannot encode {} columns: the DuckDB Rust client has no \
+             decoder for this type. Cast it — {}::VARCHAR, or {}::TIME for \
+             microsecond precision — and the value comes back intact.",
+            type_name(bad),
+            name,
+            name
+        ))));
+        return true;
+    }
+
+    // NDJSON commits to a 200 here, before the first row, because that is
+    // what streaming means. One-shot cannot and must not: nothing goes out
+    // until the result is whole, so a failure at row 900,000 is still free
+    // to be a 400 rather than a 200 with an apology inside it. The
+    // handshake therefore moves to the bottom of the loop in that shape.
+    if shape == Shape::Ndjson && ready.send(Ok(())).is_err() {
+        return true;
+    }
+
+    let mut buf = String::with_capacity(FLUSH_AT + 8192);
+    match shape {
+        Shape::Ndjson => buf.push_str(r#"{"type":"schema","columns":["#),
+        // v1's envelope also carried `kind`, "select" or "write". It is
+        // not emitted here, because there is no definition of it that is
+        // right: DuckDB answers CREATE TABLE with a one-column `Count`
+        // result, so "did the statement produce columns" calls a write a
+        // select, and deciding from the leading keyword is a parser that
+        // exists only to label something no client needs — `columns` and
+        // `rowCount` already say everything it could. A field that is
+        // absent is easier to handle than one that lies.
+        Shape::Json => buf.push_str(r#"{"ok":true,"columns":["#),
+    }
+    for (i, (name, ty)) in names.iter().zip(&types).enumerate() {
+        if i > 0 {
+            buf.push(',');
+        }
+        emit_column_schema(&mut buf, Some(name), ty);
+    }
+    match shape {
+        Shape::Ndjson => buf.push_str("]}\n"),
+        Shape::Json => buf.push_str(r#"],"data":["#),
+    }
+
+    let mut count: u64 = 0;
+    let mut gone = false;
+    // Set when the result cannot be completed. In NDJSON it has already
+    // been written into the stream by the time it is set; in one-shot it is
+    // what the request fails with.
+    let mut failure: Option<Refusal> = None;
+    loop {
+        match rows.next() {
+            Ok(Some(row)) => {
+                // The safety net behind the pre-flight check above. A
+                // panic in here would otherwise kill this executor
+                // thread, and the damage is worse than one failed query:
+                // the client sees 200 with an empty body — success, no
+                // rows — and the connection never returns to the pool, so
+                // enough such queries take the server out of service.
+                // Built into a separate buffer so a half-written row is
+                // discarded rather than shipped.
+                let mut cells = String::new();
+                let encoded = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                for (i, ty) in types.iter().enumerate() {
+                    if i > 0 {
+                        cells.push(',');
+                    }
+                    // A SQLNULL column — `SELECT NULL AS x`, with no cast
+                    // to give it a type — holds nothing but NULL, and
+                    // duckdb-rs has no decoder for it: reading the value
+                    // panics, and the whole result dies with it. The value
+                    // is not in any doubt, so answer it here instead of
+                    // refusing a row whose contents are already known.
+                    //
+                    // Only DuckDB v2 gets here. v1.5.5 coerces an untyped
+                    // NULL to INTEGER before harbor ever sees the column,
+                    // so the same query took the ordinary path there — the
+                    // kind of difference that only shows up when harbor is
+                    // actually run against v2.
+                    if matches!(ty.try_id(), Ok(LogicalTypeId::SqlNull)) {
+                        cells.push_str("null");
+                        continue;
+                    }
+                    match row.get_ref(i) {
+                        // A UNION's tag says which member is set, and
+                        // `Value` drops it — union_value(a := 2) and
+                        // union_value(b := 2) would be indistinguishable.
+                        // The tag is still on the arrow array underneath.
+                        Ok(v) => {
+                            let tag = union_tag(&v);
+                            emit_tagged(&mut cells, tag, &Value::from(v), Some(ty));
+                        }
+                        Err(_) => cells.push_str("null"),
+                    }
+                }
+                }));
+
+                if encoded.is_err() {
+                    let message = "harbor cannot encode a value in this result: the DuckDB \
+                         Rust client has no decoder for one of its column types. The query \
+                         ran; the value cannot be represented. Cast the column to VARCHAR \
+                         to see it.";
+                    if shape == Shape::Ndjson {
+                        // The headers are long gone, so this can only be
+                        // said in the stream — but it is said, rather than
+                        // the client being left to infer it from a short
+                        // result.
+                        buf.push_str(
+                            r#"{"type":"error","code":"unsupported_type","message":"#,
+                        );
+                        push_json_string(&mut buf, message);
+                        buf.push_str("}\n");
+                        let _ = body.send(std::mem::take(&mut buf).into_bytes());
+                        gone = true;
+                    }
+                    failure = Some(Refusal {
+                        status: 400,
+                        code: "unsupported_type",
+                        message: message.to_string(),
+                    });
+                    break;
+                }
+
+                match shape {
+                    Shape::Ndjson => {
+                        buf.push_str(r#"{"type":"row","values":["#);
+                        buf.push_str(&cells);
+                        buf.push_str("]}\n");
+                    }
+                    Shape::Json => {
+                        if count > 0 {
+                            buf.push(',');
+                        }
+                        buf.push('[');
+                        buf.push_str(&cells);
+                        buf.push(']');
+                    }
+                }
+                count += 1;
+
+                match shape {
+                    Shape::Ndjson => {
+                        if buf.len() >= FLUSH_AT {
+                            // A send failure means the client hung up.
+                            // Abandon the query rather than finish
+                            // computing a result nobody will read.
+                            if body.send(std::mem::take(&mut buf).into_bytes()).is_err() {
+                                gone = true;
+                                break;
+                            }
+                            buf = String::with_capacity(FLUSH_AT + 8192);
+                        }
+                    }
+                    // Nothing can be flushed in this shape — the document
+                    // is not valid until its last byte — so the only
+                    // protection against a result larger than memory is to
+                    // refuse. Streaming has no such limit, and is the
+                    // default, so the remedy is always available.
+                    Shape::Json => {
+                        if buf.len() > MAX_JSON_RESPONSE {
+                            // 406, not 413: nothing is wrong with the
+                            // request or its size. What cannot be done is
+                            // producing this result in the representation
+                            // the Accept header asked for — which is
+                            // exactly what "not acceptable" means, and the
+                            // message names the one that would work.
+                            failure = Some(Refusal {
+                                status: 406,
+                                code: "response_too_large",
+                                message: format!(
+                                    "this result is larger than the {} MiB harbor will hold \
+                                     in memory for a single JSON document. Ask for NDJSON \
+                                     instead — send no Accept header, or Accept: \
+                                     application/x-ndjson — and it streams with no size \
+                                     limit.",
+                                    MAX_JSON_RESPONSE >> 20
+                                ),
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                // Retired here rather than after the loop, because what the
+                // client is told depends on the answer: the same DuckDB
+                // error means "your SQL failed" or "you cancelled this",
+                // and only the slot knows which.
+                let refusal = refusal_for(on_slot.finish(), e.to_string());
+                if shape == Shape::Ndjson {
+                    // Mid-stream failures cannot change the status code —
+                    // the headers are long gone. Say so in the stream, so a
+                    // client never mistakes a truncated result for a
+                    // complete one. The code travels from the refusal: it
+                    // used to be the literal "sql_error", which labelled a
+                    // cancellation and an unsupported type as bad SQL.
+                    buf.push_str(r#"{"type":"error","code":""#);
+                    buf.push_str(refusal.code);
+                    buf.push_str(r#"","message":"#);
+                    push_json_string(&mut buf, &refusal.message);
+                    buf.push_str("}\n");
+                    let _ = body.send(std::mem::take(&mut buf).into_bytes());
+                    gone = true;
+                }
+                failure = Some(refusal);
+                break;
+            }
+        }
+    }
+
+    // An abandoned or failed stream is the case that poisons a connection.
+    needs_reset = needs_reset || gone || failure.is_some();
+
+    match shape {
+        Shape::Ndjson => {
+            if !gone {
+                buf.push_str(&format!(
+                    r#"{{"type":"end","rowCount":{},"timeMs":{}}}"#,
+                    count,
+                    started.elapsed().as_millis()
+                ));
+                buf.push('\n');
+                let _ = body.send(buf.into_bytes());
+            }
+        }
+        // The deferred handshake, and the whole reason this shape waits:
+        // a failure at the last row is still a status code and a code the
+        // client can classify on, rather than a 200 with an apology in the
+        // body. Both travel on the refusal, so the same failure reports the
+        // same code in either shape.
+        Shape::Json => match failure {
+            Some(message) => {
+                let _ = ready.send(Err(message));
+            }
+            None => {
+                buf.push_str(&format!(
+                    r#"],"rowCount":{},"timeMs":{}}}"#,
+                    count,
+                    started.elapsed().as_millis()
+                ));
+                if ready.send(Ok(())).is_err() {
+                    return true;
+                }
+                let _ = body.send(buf.into_bytes());
+            }
+        },
+    }
+    needs_reset
+}
+
+/// The DuckDB side. Owns one connection for the life of the server and runs
+/// one statement at a time; concurrency comes from there being several of
+/// these, not from any one of them interleaving work. `pinned` marks a lease
+/// connection: the per-job reset that stops one request's stray transaction
+/// from leaking into the next request on the same connection must not fire on
+/// a lease, because holding that transaction open is precisely what a lease is
+/// for — the rollback happens instead when the lease is released, by commit,
+/// by DELETE, or by the reaper.
 fn execute_jobs(
     conn: Connection,
     jobs: mpsc::Receiver<Job>,
@@ -3125,307 +3530,35 @@ fn execute_jobs(
             continue;
         }
 
-        // Decided from the statement text before it runs, then widened below by
-        // any path that ends the job early.
-        needs_reset = may_leave_transaction_open(&sql);
-
-        let stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(e) => {
-                needs_reset = true;
-                let _ = ready.send(Err(refusal_for(on_slot.finish(), e.to_string())));
-                continue;
+        // A panic below — a duckdb-rs decoder that hits `unreachable!` on some
+        // column type, a metadata call that trips an assert — used to unwind
+        // straight out of this thread. The worker then found the job channel
+        // closed on its next send, left the accept loop (a worker with no
+        // executor answers 503 by return and would win every race), and the
+        // slot was gone for the life of the process; a handful of such queries
+        // retire every worker until the berth answers only 503. The per-row
+        // guard inside `run_statement` catches the common value-decode panic;
+        // catching the whole statement here covers one in prepare, metadata, or
+        // schema too. On a panic the `OnSlot` guard drops — retiring the slot —
+        // the waiting worker is told (500), and this executor takes the next
+        // job. The connection itself is intact (the panic was in Rust-side
+        // encoding, not DuckDB's engine), so the next job resets first.
+        let ready_guard = ready.clone();
+        needs_reset = match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            run_statement(&conn, &mut on_slot, sql, params, shape, ready, body, started)
+        })) {
+            Ok(next_reset) => next_reset,
+            Err(_) => {
+                let _ = ready_guard.send(Err(Refusal {
+                    status: 500,
+                    code: "internal",
+                    message: "harbor recovered from an internal error while \
+                              handling this statement"
+                        .to_string(),
+                }));
+                true
             }
         };
-        let mut stmt = stmt;
-        let mut rows = match stmt.query(params_from_iter(params.iter())) {
-            Ok(r) => r,
-            Err(e) => {
-                needs_reset = true;
-                let _ = ready.send(Err(refusal_for(on_slot.finish(), e.to_string())));
-                continue;
-            }
-        };
-
-        // Column metadata has to be captured now: `Rows` hands back `None`
-        // from `as_ref()` once the result is exhausted.
-        let (names, types) = match rows.as_ref() {
-            Some(s) => {
-                let n = s.column_count();
-                let names: Vec<String> =
-                    (0..n).map(|i| s.column_name(i).cloned().unwrap_or_default()).collect();
-                let types: Vec<LogicalTypeHandle> = (0..n).map(|i| s.column_logical_type(i)).collect();
-                (names, types)
-            }
-            None => (Vec::new(), Vec::new()),
-        };
-
-        // duckdb-rs does not return an error for a column type it has no
-        // decoder for — it panics. `SELECT TIME_NS '...'` reaches an
-        // `unreachable!` in its row.rs. Catching that mid-stream is possible
-        // (and is done below), but by then the 200 and the headers are gone
-        // and the client can only be told inside the body. Refusing here,
-        // before anything is sent, is the difference between a 400 that says
-        // what is wrong and a 200 that appears to have returned no rows.
-        if let Some((name, bad)) = names
-            .iter()
-            .zip(&types)
-            .find(|(_, t)| matches!(t.try_id(), Ok(LogicalTypeId::TimeNs)))
-        {
-            // Name the column, not the type. Substituting the type into both
-            // slots produced "Cast it — TIME_NS::VARCHAR", which reads as
-            // casting the type rather than the thing that has it.
-            let _ = ready.send(Err(Refusal::sql(format!(
-                "harbor cannot encode {} columns: the DuckDB Rust client has no \
-                 decoder for this type. Cast it — {}::VARCHAR, or {}::TIME for \
-                 microsecond precision — and the value comes back intact.",
-                type_name(bad),
-                name,
-                name
-            ))));
-            needs_reset = true;
-            continue;
-        }
-
-        // NDJSON commits to a 200 here, before the first row, because that is
-        // what streaming means. One-shot cannot and must not: nothing goes out
-        // until the result is whole, so a failure at row 900,000 is still free
-        // to be a 400 rather than a 200 with an apology inside it. The
-        // handshake therefore moves to the bottom of the loop in that shape.
-        if shape == Shape::Ndjson && ready.send(Ok(())).is_err() {
-            needs_reset = true;
-            continue;
-        }
-
-        let mut buf = String::with_capacity(FLUSH_AT + 8192);
-        match shape {
-            Shape::Ndjson => buf.push_str(r#"{"type":"schema","columns":["#),
-            // v1's envelope also carried `kind`, "select" or "write". It is
-            // not emitted here, because there is no definition of it that is
-            // right: DuckDB answers CREATE TABLE with a one-column `Count`
-            // result, so "did the statement produce columns" calls a write a
-            // select, and deciding from the leading keyword is a parser that
-            // exists only to label something no client needs — `columns` and
-            // `rowCount` already say everything it could. A field that is
-            // absent is easier to handle than one that lies.
-            Shape::Json => buf.push_str(r#"{"ok":true,"columns":["#),
-        }
-        for (i, (name, ty)) in names.iter().zip(&types).enumerate() {
-            if i > 0 {
-                buf.push(',');
-            }
-            emit_column_schema(&mut buf, Some(name), ty);
-        }
-        match shape {
-            Shape::Ndjson => buf.push_str("]}\n"),
-            Shape::Json => buf.push_str(r#"],"data":["#),
-        }
-
-        let mut count: u64 = 0;
-        let mut gone = false;
-        // Set when the result cannot be completed. In NDJSON it has already
-        // been written into the stream by the time it is set; in one-shot it is
-        // what the request fails with.
-        let mut failure: Option<Refusal> = None;
-        loop {
-            match rows.next() {
-                Ok(Some(row)) => {
-                    // The safety net behind the pre-flight check above. A
-                    // panic in here would otherwise kill this executor
-                    // thread, and the damage is worse than one failed query:
-                    // the client sees 200 with an empty body — success, no
-                    // rows — and the connection never returns to the pool, so
-                    // enough such queries take the server out of service.
-                    // Built into a separate buffer so a half-written row is
-                    // discarded rather than shipped.
-                    let mut cells = String::new();
-                    let encoded = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    for (i, ty) in types.iter().enumerate() {
-                        if i > 0 {
-                            cells.push(',');
-                        }
-                        // A SQLNULL column — `SELECT NULL AS x`, with no cast
-                        // to give it a type — holds nothing but NULL, and
-                        // duckdb-rs has no decoder for it: reading the value
-                        // panics, and the whole result dies with it. The value
-                        // is not in any doubt, so answer it here instead of
-                        // refusing a row whose contents are already known.
-                        //
-                        // Only DuckDB v2 gets here. v1.5.5 coerces an untyped
-                        // NULL to INTEGER before harbor ever sees the column,
-                        // so the same query took the ordinary path there — the
-                        // kind of difference that only shows up when harbor is
-                        // actually run against v2.
-                        if matches!(ty.try_id(), Ok(LogicalTypeId::SqlNull)) {
-                            cells.push_str("null");
-                            continue;
-                        }
-                        match row.get_ref(i) {
-                            // A UNION's tag says which member is set, and
-                            // `Value` drops it — union_value(a := 2) and
-                            // union_value(b := 2) would be indistinguishable.
-                            // The tag is still on the arrow array underneath.
-                            Ok(v) => {
-                                let tag = union_tag(&v);
-                                emit_tagged(&mut cells, tag, &Value::from(v), Some(ty));
-                            }
-                            Err(_) => cells.push_str("null"),
-                        }
-                    }
-                    }));
-
-                    if encoded.is_err() {
-                        let message = "harbor cannot encode a value in this result: the DuckDB \
-                             Rust client has no decoder for one of its column types. The query \
-                             ran; the value cannot be represented. Cast the column to VARCHAR \
-                             to see it.";
-                        if shape == Shape::Ndjson {
-                            // The headers are long gone, so this can only be
-                            // said in the stream — but it is said, rather than
-                            // the client being left to infer it from a short
-                            // result.
-                            buf.push_str(
-                                r#"{"type":"error","code":"unsupported_type","message":"#,
-                            );
-                            push_json_string(&mut buf, message);
-                            buf.push_str("}\n");
-                            let _ = body.send(std::mem::take(&mut buf).into_bytes());
-                            gone = true;
-                        }
-                        failure = Some(Refusal {
-                            status: 400,
-                            code: "unsupported_type",
-                            message: message.to_string(),
-                        });
-                        break;
-                    }
-
-                    match shape {
-                        Shape::Ndjson => {
-                            buf.push_str(r#"{"type":"row","values":["#);
-                            buf.push_str(&cells);
-                            buf.push_str("]}\n");
-                        }
-                        Shape::Json => {
-                            if count > 0 {
-                                buf.push(',');
-                            }
-                            buf.push('[');
-                            buf.push_str(&cells);
-                            buf.push(']');
-                        }
-                    }
-                    count += 1;
-
-                    match shape {
-                        Shape::Ndjson => {
-                            if buf.len() >= FLUSH_AT {
-                                // A send failure means the client hung up.
-                                // Abandon the query rather than finish
-                                // computing a result nobody will read.
-                                if body.send(std::mem::take(&mut buf).into_bytes()).is_err() {
-                                    gone = true;
-                                    break;
-                                }
-                                buf = String::with_capacity(FLUSH_AT + 8192);
-                            }
-                        }
-                        // Nothing can be flushed in this shape — the document
-                        // is not valid until its last byte — so the only
-                        // protection against a result larger than memory is to
-                        // refuse. Streaming has no such limit, and is the
-                        // default, so the remedy is always available.
-                        Shape::Json => {
-                            if buf.len() > MAX_JSON_RESPONSE {
-                                // 406, not 413: nothing is wrong with the
-                                // request or its size. What cannot be done is
-                                // producing this result in the representation
-                                // the Accept header asked for — which is
-                                // exactly what "not acceptable" means, and the
-                                // message names the one that would work.
-                                failure = Some(Refusal {
-                                    status: 406,
-                                    code: "response_too_large",
-                                    message: format!(
-                                        "this result is larger than the {} MiB harbor will hold \
-                                         in memory for a single JSON document. Ask for NDJSON \
-                                         instead — send no Accept header, or Accept: \
-                                         application/x-ndjson — and it streams with no size \
-                                         limit.",
-                                        MAX_JSON_RESPONSE >> 20
-                                    ),
-                                });
-                                break;
-                            }
-                        }
-                    }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    // Retired here rather than after the loop, because what the
-                    // client is told depends on the answer: the same DuckDB
-                    // error means "your SQL failed" or "you cancelled this",
-                    // and only the slot knows which.
-                    let refusal = refusal_for(on_slot.finish(), e.to_string());
-                    if shape == Shape::Ndjson {
-                        // Mid-stream failures cannot change the status code —
-                        // the headers are long gone. Say so in the stream, so a
-                        // client never mistakes a truncated result for a
-                        // complete one. The code travels from the refusal: it
-                        // used to be the literal "sql_error", which labelled a
-                        // cancellation and an unsupported type as bad SQL.
-                        buf.push_str(r#"{"type":"error","code":""#);
-                        buf.push_str(refusal.code);
-                        buf.push_str(r#"","message":"#);
-                        push_json_string(&mut buf, &refusal.message);
-                        buf.push_str("}\n");
-                        let _ = body.send(std::mem::take(&mut buf).into_bytes());
-                        gone = true;
-                    }
-                    failure = Some(refusal);
-                    break;
-                }
-            }
-        }
-
-        // An abandoned or failed stream is the case that poisons a connection.
-        needs_reset = needs_reset || gone || failure.is_some();
-
-        match shape {
-            Shape::Ndjson => {
-                if !gone {
-                    buf.push_str(&format!(
-                        r#"{{"type":"end","rowCount":{},"timeMs":{}}}"#,
-                        count,
-                        started.elapsed().as_millis()
-                    ));
-                    buf.push('\n');
-                    let _ = body.send(buf.into_bytes());
-                }
-            }
-            // The deferred handshake, and the whole reason this shape waits:
-            // a failure at the last row is still a status code and a code the
-            // client can classify on, rather than a 200 with an apology in the
-            // body. Both travel on the refusal, so the same failure reports the
-            // same code in either shape.
-            Shape::Json => match failure {
-                Some(message) => {
-                    let _ = ready.send(Err(message));
-                }
-                None => {
-                    buf.push_str(&format!(
-                        r#"],"rowCount":{},"timeMs":{}}}"#,
-                        count,
-                        started.elapsed().as_millis()
-                    ));
-                    if ready.send(Ok(())).is_err() {
-                        needs_reset = true;
-                        continue;
-                    }
-                    let _ = body.send(buf.into_bytes());
-                }
-            },
-        }
     }
     // And once more on the way out, so a connection going back to the pool for
     // the next harbor_serve is clean too. Unconditional here: this runs once
@@ -3477,7 +3610,19 @@ fn json_response(status: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> 
         .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap())
 }
 
-fn error_response(status: u16, code: &str, message: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+// The last refusal code produced on this worker thread. `handle` reads it to
+// name the reason in the log line on a 4xx/5xx, without every route carrying
+// the code back through its `(bool, u16)` return. Cleared at the top of each
+// request and read only on a failure, so a success never reports a stale
+// code. Same thread throughout: `error_response` runs inside `handle`'s
+// synchronous flow, and the streamed body — written by the executor thread —
+// never goes through here.
+thread_local! {
+    static LAST_REASON: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+fn error_response(status: u16, code: &'static str, message: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    LAST_REASON.with(|c| c.set(code));
     let mut s = String::new();
     s.push_str(r#"{"type":"error","code":"#);
     push_json_string(&mut s, code);
@@ -3488,718 +3633,31 @@ fn error_response(status: u16, code: &str, message: &str) -> Response<std::io::C
 }
 
 // ---------------------------------------------------------------------------
-// Schema emission
-// ---------------------------------------------------------------------------
-
-fn emit_column_schema(out: &mut String, name: Option<&str>, ty: &LogicalTypeHandle) {
-    out.push('{');
-    if let Some(n) = name.filter(|n| !n.is_empty()) {
-        out.push_str(r#""name":"#);
-        push_json_string(out, n);
-        out.push(',');
-    }
-    out.push_str(r#""duckdbType":"#);
-    push_json_string(out, &type_name(ty));
-
-    let id = ty.try_id().unwrap_or(LogicalTypeId::Unsupported);
-    match id {
-        LogicalTypeId::Decimal => {
-            out.push_str(r#","lossless":true,"decimal":{"width":"#);
-            out.push_str(&ty.decimal_width().to_string());
-            out.push_str(r#","scale":"#);
-            out.push_str(&ty.decimal_scale().to_string());
-            out.push('}');
-        }
-        LogicalTypeId::List => {
-            out.push_str(r#","lossless":true,"child":"#);
-            emit_column_schema(out, None, &ty.child(0));
-        }
-        LogicalTypeId::Array => {
-            out.push_str(r#","lossless":true,"arrayLength":"#);
-            out.push_str(&array_size(ty).to_string());
-            out.push_str(r#","child":"#);
-            emit_column_schema(out, None, &ty.child(0));
-        }
-        LogicalTypeId::Struct => {
-            out.push_str(r#","lossless":true,"fields":["#);
-            for i in 0..ty.num_children() {
-                if i > 0 {
-                    out.push(',');
-                }
-                emit_column_schema(out, Some(&ty.child_name(i)), &ty.child(i));
-            }
-            out.push(']');
-        }
-        LogicalTypeId::Map => {
-            // A SQL MAP has no JSON counterpart — its keys need not be strings
-            // — so values go out as pairs and the encoding says so.
-            out.push_str(r#","lossless":true,"keyType":"#);
-            emit_column_schema(out, None, &ty.child(0));
-            out.push_str(r#","valueType":"#);
-            emit_column_schema(out, None, &ty.child(1));
-            out.push_str(r#","encoding":"pairs""#);
-        }
-        LogicalTypeId::Union => {
-            out.push_str(r#","lossless":true,"members":["#);
-            for i in 0..ty.num_children() {
-                if i > 0 {
-                    out.push(',');
-                }
-                emit_column_schema(out, Some(&ty.child_name(i)), &ty.child(i));
-            }
-            out.push(']');
-        }
-        LogicalTypeId::Enum => {
-            out.push_str(r#","lossless":true,"values":["#);
-            for (i, value) in enum_values(ty).iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                push_json_string(out, value);
-            }
-            out.push(']');
-        }
-        // TIME WITH TIME ZONE is the one type harbor cannot carry
-        // losslessly: duckdb-rs decodes it to a local time and drops the UTC
-        // offset before harbor ever sees the value, so the offset cannot be
-        // recovered. Saying so is better than emitting a time that silently
-        // means something else.
-        LogicalTypeId::TimeTZ => out.push_str(r#","lossless":false,"encoding":"time-offset-dropped""#),
-        _ if is_lossless(id) => out.push_str(r#","lossless":true"#),
-        // User-defined and extension types round-trip as text. Saying so
-        // explicitly is better than silently handing back a string that
-        // looks like a native value.
-        _ => out.push_str(r#","lossless":false,"encoding":"varchar-cast""#),
-    }
-    out.push('}');
-}
-
-fn is_lossless(id: LogicalTypeId) -> bool {
-    use LogicalTypeId::*;
-    matches!(
-        id,
-        Boolean
-            | Tinyint
-            | Smallint
-            | Integer
-            | Bigint
-            | Hugeint
-            | UHugeint
-            | UTinyint
-            | USmallint
-            | UInteger
-            | UBigint
-            | Float
-            | Double
-            | Varchar
-            | Uuid
-            | Date
-            | Time
-            | Timestamp
-            | TimestampS
-            | TimestampMs
-            | TimestampNs
-            | TimestampTZ
-            | Interval
-            | Blob
-            | Bit
-            // Lossless because it goes out as its decimal digits — a string
-            // when it exceeds what a double holds, so no precision is lost on
-            // the way through a JSON parser.
-            | Bignum
-            | Enum
-            | SqlNull
-    )
-}
-
-fn type_name(ty: &LogicalTypeHandle) -> String {
-    use LogicalTypeId::*;
-    // An alias is the user's own name for the type (JSON, for one); it is
-    // more informative than the storage type underneath it.
-    if let Some(alias) = ty.get_alias() {
-        if !alias.is_empty() {
-            return alias;
-        }
-    }
-    match ty.try_id().unwrap_or(Unsupported) {
-        Boolean => "BOOLEAN".into(),
-        Tinyint => "TINYINT".into(),
-        Smallint => "SMALLINT".into(),
-        Integer => "INTEGER".into(),
-        Bigint => "BIGINT".into(),
-        Hugeint => "HUGEINT".into(),
-        UHugeint => "UHUGEINT".into(),
-        UTinyint => "UTINYINT".into(),
-        USmallint => "USMALLINT".into(),
-        UInteger => "UINTEGER".into(),
-        UBigint => "UBIGINT".into(),
-        Float => "FLOAT".into(),
-        Double => "DOUBLE".into(),
-        Varchar | StringLiteral => "VARCHAR".into(),
-        Blob => "BLOB".into(),
-        Bit => "BIT".into(),
-        Uuid => "UUID".into(),
-        Date => "DATE".into(),
-        Time => "TIME".into(),
-        TimeTZ => "TIME WITH TIME ZONE".into(),
-        TimeNs => "TIME_NS".into(),
-        Timestamp => "TIMESTAMP".into(),
-        TimestampS => "TIMESTAMP_S".into(),
-        TimestampMs => "TIMESTAMP_MS".into(),
-        TimestampNs => "TIMESTAMP_NS".into(),
-        TimestampTZ => "TIMESTAMP WITH TIME ZONE".into(),
-        Interval => "INTERVAL".into(),
-        Decimal => format!("DECIMAL({},{})", ty.decimal_width(), ty.decimal_scale()),
-        List => format!("{}[]", type_name(&ty.child(0))),
-        Array => format!("{}[{}]", type_name(&ty.child(0)), array_size(ty)),
-        Enum => {
-            let values: Vec<String> =
-                enum_values(ty).iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect();
-            format!("ENUM({})", values.join(", "))
-        }
-        Struct => {
-            let fields: Vec<String> = (0..ty.num_children())
-                .map(|i| format!("{} {}", quote_identifier(&ty.child_name(i)), type_name(&ty.child(i))))
-                .collect();
-            format!("STRUCT({})", fields.join(", "))
-        }
-        Map => format!("MAP({}, {})", type_name(&ty.child(0)), type_name(&ty.child(1))),
-        Union => {
-            let members: Vec<String> = (0..ty.num_children())
-                .map(|i| format!("{} {}", quote_identifier(&ty.child_name(i)), type_name(&ty.child(i))))
-                .collect();
-            format!("UNION({})", members.join(", "))
-        }
-        SqlNull => "\"NULL\"".into(),
-        Geometry => "GEOMETRY".into(),
-        Variant => "VARIANT".into(),
-        Bignum => "BIGNUM".into(),
-        _ => "UNKNOWN".into(),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Value emission
-//
-// Dispatch is on the decoded value rather than the column type, because the
-// value already carries what it needs — DECIMAL brings its width and scale,
-// TIMESTAMP brings its unit. The column type is consulted only where the
-// value is genuinely ambiguous: UUID and TIMESTAMP WITH TIME ZONE share a
-// representation with plain integers and naive timestamps.
-// ---------------------------------------------------------------------------
-
-/// IEEE-754 doubles hold integers exactly only up to 2^53 - 1. Anything
-/// wider goes out quoted; a JavaScript client parsing a bare
-/// 9007199254740993 gets 9007199254740992 and never finds out.
-const JSON_SAFE: i128 = 9_007_199_254_740_991;
-
-/// The name of the member a UNION value actually holds, if this is one.
-fn union_tag(v: &ValueRef<'_>) -> Option<String> {
-    use duckdb::arrow::{array::{Array, UnionArray}, datatypes::DataType};
-    let ValueRef::Union(column, idx) = v else {
-        return None;
-    };
-    let union = column.as_any().downcast_ref::<UnionArray>()?;
-    let DataType::Union(fields, _) = column.data_type() else {
-        return None;
-    };
-    let type_id = union.type_id(*idx);
-    fields.iter().find(|(id, _)| *id == type_id).map(|(_, field)| field.name().clone())
-}
-
-/// A UNION goes out as {"tag": member, "value": ...}; everything else is just
-/// its value.
-fn emit_tagged(out: &mut String, tag: Option<String>, v: &Value, ty: Option<&LogicalTypeHandle>) {
-    match (tag, v) {
-        (Some(name), Value::Union(inner)) => {
-            let member = ty.and_then(|t| {
-                (0..t.num_children()).find(|i| t.child_name(*i) == name).map(|i| t.child(i))
-            });
-            out.push_str(r#"{"tag":"#);
-            push_json_string(out, &name);
-            out.push_str(r#","value":"#);
-            emit_value(out, inner, member.as_ref());
-            out.push('}');
-        }
-        (_, value) => emit_value(out, value, ty),
-    }
-}
-
-fn emit_value(out: &mut String, v: &Value, ty: Option<&LogicalTypeHandle>) {
-    let id = ty.and_then(|t| t.try_id().ok());
-    match v {
-        Value::Null => out.push_str("null"),
-        Value::Boolean(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::TinyInt(i) => out.push_str(&i.to_string()),
-        Value::SmallInt(i) => out.push_str(&i.to_string()),
-        Value::Int(i) => out.push_str(&i.to_string()),
-        Value::UTinyInt(i) => out.push_str(&i.to_string()),
-        Value::USmallInt(i) => out.push_str(&i.to_string()),
-        Value::UInt(i) => out.push_str(&i.to_string()),
-        Value::BigInt(i) => push_int(out, *i as i128),
-        Value::UBigInt(i) => push_int(out, *i as i128),
-        Value::HugeInt(i) => {
-            if id == Some(LogicalTypeId::Uuid) {
-                push_json_string(out, &uuid_to_string(*i));
-            } else {
-                push_int(out, *i)
-            }
-        }
-        Value::UHugeInt(i) => {
-            if *i <= JSON_SAFE as u128 {
-                out.push_str(&i.to_string());
-            } else {
-                push_json_string(out, &i.to_string());
-            }
-        }
-        Value::Float(f) => push_float(out, *f as f64),
-        Value::Double(f) => push_float(out, *f),
-        Value::Decimal(d) => push_json_string(out, &d.to_string()),
-        Value::Text(s) | Value::Enum(s) => push_json_string(out, s),
-        Value::Blob(b) if id == Some(LogicalTypeId::Bit) => push_json_string(out, &bit_string(b)),
-        // Same JSON-safe rule as every other integer: bare when a double holds
-        // it exactly, quoted past that. A BIGNUM is arbitrary precision, so it
-        // is usually quoted — but a small one should not look different from
-        // the same value in a BIGINT column.
-        Value::Blob(b) if id == Some(LogicalTypeId::Bignum) => match varint_to_decimal(b) {
-            Some(digits) => match digits.parse::<i128>() {
-                Ok(v) => push_int(out, v),
-                Err(_) => push_json_string(out, &digits),
-            },
-            None => push_json_string(out, &base64(b)),
-        },
-        Value::Blob(b) | Value::Geometry(b) => push_json_string(out, &base64(b)),
-        Value::Date32(d) => push_json_string(out, &fmt_date(*d)),
-        Value::Time64(unit, v) => push_json_string(out, &fmt_time(to_nanos(*unit, *v))),
-        Value::Timestamp(unit, v) => {
-            let mut s = fmt_timestamp(to_nanos(*unit, *v), *unit);
-            if id == Some(LogicalTypeId::TimestampTZ) {
-                s.push('Z');
-            }
-            push_json_string(out, &s);
-        }
-        Value::Interval { months, days, nanos } => {
-            // micros as a string: it is an int64 and JSON numbers are not.
-            out.push_str(&format!(
-                r#"{{"months":{},"days":{},"micros":"{}"}}"#,
-                months,
-                days,
-                nanos / 1_000
-            ));
-        }
-        Value::List(items) | Value::Array(items) => {
-            let child = ty.map(|t| t.child(0));
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                emit_value(out, item, child.as_ref());
-            }
-            out.push(']');
-        }
-        Value::Struct(fields) => {
-            out.push('{');
-            for (i, (k, val)) in fields.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                push_json_string(out, k);
-                out.push(':');
-                emit_value(out, val, ty.map(|t| t.child(i)).as_ref());
-            }
-            out.push('}');
-        }
-        Value::Map(entries) => {
-            // A SQL MAP has no JSON counterpart: its keys need not be
-            // strings. Pairs keep it lossless; the schema line says so with
-            // "encoding":"pairs".
-            out.push('[');
-            for (i, (k, val)) in entries.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                out.push('[');
-                emit_value(out, k, None);
-                out.push(',');
-                emit_value(out, val, None);
-                out.push(']');
-            }
-            out.push(']');
-        }
-        Value::Union(inner) => emit_value(out, inner, None),
-        // `Value` is #[non_exhaustive]: a later DuckDB can add a variant this
-        // build has never seen. The schema line already flags such a column
-        // lossless:false, so a client knows not to trust the payload.
-        _ => out.push_str("null"),
-    }
-}
-
-fn push_int(out: &mut String, i: i128) {
-    // unsigned_abs, not abs: `i128::MIN` has no positive counterpart, so
-    // `abs()` overflows there. In release that wraps back to `i128::MIN`, which
-    // compares under the threshold, and the HUGEINT minimum went out as a bare
-    // JSON number — the exact silent-reprecision failure this function exists
-    // to prevent, on a value any `SELECT (-170141183460469231731687303715884105728)::HUGEINT`
-    // produces. In debug it panicked instead.
-    if i.unsigned_abs() <= JSON_SAFE as u128 {
-        out.push_str(&i.to_string());
-    } else {
-        push_json_string(out, &i.to_string());
-    }
-}
-
-fn push_float(out: &mut String, f: f64) {
-    // JSON has no NaN or Infinity, but null is not the answer: it is
-    // indistinguishable from SQL NULL, so a client cannot tell a missing value
-    // from a division that overflowed. The names go out as strings instead.
-    if f.is_nan() {
-        return push_json_string(out, "NaN");
-    }
-    if f.is_infinite() {
-        return push_json_string(out, if f > 0.0 { "Infinity" } else { "-Infinity" });
-    }
-    // Rust's Display never switches to exponent notation for large magnitudes,
-    // so f64::MAX would go out as 309 digits. Switch at 1e21, which is where
-    // JavaScript's own number formatting switches, so the text a client reads
-    // is the text it would have produced itself.
-    if f != 0.0 && f.abs() >= 1e21 {
-        let formatted = format!("{f:e}");
-        match formatted.split_once('e') {
-            Some((mantissa, exponent)) if !exponent.starts_with('-') => {
-                out.push_str(mantissa);
-                out.push_str("e+");
-                out.push_str(exponent);
-            }
-            _ => out.push_str(&formatted),
-        }
-    } else {
-        out.push_str(&f.to_string());
-    }
-}
-
-fn push_json_string(out: &mut String, s: &str) {
-    // serde_json owns the escaping rules, including the ones that are easy to
-    // get wrong (control characters, lone surrogates).
-    let encoded = match serde_json::to_string(s) {
-        Ok(encoded) => encoded,
-        Err(_) => return out.push_str("\"\""),
-    };
-    // One rule serde_json correctly does not apply, because it is about the
-    // container rather than the value: U+2028 LINE SEPARATOR and U+2029
-    // PARAGRAPH SEPARATOR are legal inside a JSON string, but this is a
-    // newline-delimited format and they are line terminators to every
-    // Unicode-aware line splitter. Left raw, one row is read as two — and the
-    // half that is left over is not valid JSON, so a client sees a parse error
-    // whose cause is nowhere near where it happened. Escaping them costs a
-    // scan that almost always finds nothing.
-    if !encoded.contains('\u{2028}') && !encoded.contains('\u{2029}') {
-        return out.push_str(&encoded);
-    }
-    for ch in encoded.chars() {
-        match ch {
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            other => out.push(other),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Scalar formatting
-// ---------------------------------------------------------------------------
-
-fn to_nanos(unit: TimeUnit, v: i64) -> i128 {
-    let v = v as i128;
-    match unit {
-        TimeUnit::Second => v * 1_000_000_000,
-        TimeUnit::Millisecond => v * 1_000_000,
-        TimeUnit::Microsecond => v * 1_000,
-        TimeUnit::Nanosecond => v,
-    }
-}
-
-/// Days since 1970-01-01 to a civil date, by Howard Hinnant's
-/// `civil_from_days`. Correct for the proleptic Gregorian calendar over the
-/// whole int32 range, which is more than DATE can hold.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
-fn fmt_date(days: i32) -> String {
-    let (y, m, d) = civil_from_days(days as i64);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
-/// HH:MM:SS, with a fraction only when there is one. Six digits unless the
-/// value carries sub-microsecond precision.
-fn fmt_time(nanos: i128) -> String {
-    let (h, min, s, frac) = split_time(nanos.rem_euclid(86_400_000_000_000));
-    let mut out = format!("{h:02}:{min:02}:{s:02}");
-    push_fraction(&mut out, frac);
-    out
-}
-
-fn fmt_timestamp(nanos: i128, unit: TimeUnit) -> String {
-    let day = 86_400_000_000_000i128;
-    let days = nanos.div_euclid(day);
-    let rest = nanos.rem_euclid(day);
-    let (y, m, d) = civil_from_days(days as i64);
-    let (h, min, s, frac) = split_time(rest);
-    let mut out = format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}");
-    // TIMESTAMP_S has no fractional part by definition; emitting one would
-    // invent precision the column does not have.
-    if unit != TimeUnit::Second {
-        push_fraction(&mut out, frac);
-    }
-    out
-}
-
-fn split_time(nanos_in_day: i128) -> (i64, i64, i64, i64) {
-    let total_s = (nanos_in_day / 1_000_000_000) as i64;
-    let frac = (nanos_in_day % 1_000_000_000) as i64;
-    (total_s / 3_600, (total_s % 3_600) / 60, total_s % 60, frac)
-}
-
-fn push_fraction(out: &mut String, nanos: i64) {
-    if nanos == 0 {
-        return;
-    }
-    // Six digits for microsecond precision, nine when the value actually
-    // carries nanoseconds. Trailing zeros come off either way: a TIMESTAMP_MS
-    // of .123 should read as .123, not .123000.
-    let mut digits = if nanos % 1_000 == 0 {
-        format!("{:06}", nanos / 1_000)
-    } else {
-        format!("{nanos:09}")
-    };
-    while digits.ends_with('0') {
-        digits.pop();
-    }
-    out.push('.');
-    out.push_str(&digits);
-}
-
-/// DuckDB stores BIGNUM (formerly VARINT) as a three-byte header followed by
-/// the magnitude, most significant byte first. Without this the value goes out
-/// base64-encoded — DuckDB's private storage layout, leaked onto the wire,
-/// where no client could read it and nothing would say it was wrong.
-///
-/// The header's top bit is the sign: 1 positive, 0 negative. Its remaining 23
-/// bits are the number of magnitude bytes. For negative values *both* the
-/// length field and the magnitude are stored one's-complemented, which is what
-/// makes the raw bytes sort correctly as unsigned — and what makes a decoder
-/// that only complements the magnitude quietly wrong about the length.
-///
-/// Returns `None` if the bytes are not a well-formed BIGNUM, so the caller can
-/// fall back rather than emit a confidently wrong number.
-fn varint_to_decimal(bytes: &[u8]) -> Option<String> {
-    const HEADER: usize = 3;
-    if bytes.len() < HEADER {
-        return None;
-    }
-    let positive = bytes[0] & 0x80 != 0;
-    let raw = (u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]);
-    let declared = if positive { raw & 0x7f_ffff } else { !raw & 0x7f_ffff };
-    let data = &bytes[HEADER..];
-    if declared as usize != data.len() {
-        return None;
-    }
-
-    let mut magnitude: Vec<u8> =
-        if positive { data.to_vec() } else { data.iter().map(|b| !b).collect() };
-
-    // Long division by 10^9, most significant byte first, taking nine decimal
-    // digits per pass. Each quotient digit is `(rem << 8 | byte) / 10^9` with
-    // `rem < 10^9`, so it is always under 256 and a byte can hold it.
-    let first = magnitude.iter().position(|&b| b != 0).unwrap_or(magnitude.len());
-    magnitude.drain(..first);
-    if magnitude.is_empty() {
-        return Some("0".into());
-    }
-    let mut groups: Vec<u32> = Vec::new();
-    while !magnitude.is_empty() {
-        let mut rem: u64 = 0;
-        let mut quotient: Vec<u8> = Vec::with_capacity(magnitude.len());
-        for &b in &magnitude {
-            let cur = (rem << 8) | u64::from(b);
-            quotient.push((cur / 1_000_000_000) as u8);
-            rem = cur % 1_000_000_000;
-        }
-        groups.push(rem as u32);
-        let nz = quotient.iter().position(|&b| b != 0).unwrap_or(quotient.len());
-        magnitude = quotient[nz..].to_vec();
-    }
-
-    let mut out = String::with_capacity(groups.len() * 9 + 1);
-    if !positive {
-        out.push('-');
-    }
-    // The most significant group carries no leading zeros; every later one is
-    // padded to the full nine digits it was divided out as.
-    out.push_str(&groups.pop().unwrap_or(0).to_string());
-    while let Some(g) = groups.pop() {
-        out.push_str(&format!("{g:09}"));
-    }
-    Some(out)
-}
-
-/// DuckDB stores BIT as a leading pad-count byte followed by the bits, most
-/// significant first. Without this a bit string goes out base64-encoded, which
-/// is not wrong so much as unusable.
-fn bit_string(bytes: &[u8]) -> String {
-    let Some((&padding, data)) = bytes.split_first() else {
-        return String::new();
-    };
-    let skip = padding as usize;
-    let mut out = String::with_capacity(data.len() * 8);
-    for (i, byte) in data.iter().enumerate() {
-        for bit in (0..8).rev() {
-            if i * 8 + (7 - bit) >= skip {
-                out.push(if byte >> bit & 1 == 1 { '1' } else { '0' });
-            }
-        }
-    }
-    out
-}
-
-/// DuckDB stores UUID as a HUGEINT with the high bit flipped, so that the
-/// integer ordering matches the textual ordering.
-fn uuid_to_string(v: i128) -> String {
-    let bits = (v as u128) ^ (1u128 << 127);
-    let b = bits.to_be_bytes();
-    let hex = |r: &[u8]| r.iter().map(|x| format!("{x:02x}")).collect::<String>();
-    format!(
-        "{}-{}-{}-{}-{}",
-        hex(&b[0..4]),
-        hex(&b[4..6]),
-        hex(&b[6..8]),
-        hex(&b[8..10]),
-        hex(&b[10..16])
-    )
-}
-
-fn base64(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for c in data.chunks(3) {
-        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(T[(n >> 18) as usize & 63] as char);
-        out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
-    }
-    out
-}
 
 /// Bytes of entropy, for a token nobody has to invent. Not a hot path, so the
 /// cost of `getrandom` per call is irrelevant.
-fn random_token() -> String {
+pub fn random_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 24];
     rand::thread_rng().fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-// ==========================================================================
-//
-// DuckDB's reserved words, generated
-//
-// ==========================================================================
-
-
-// Generated from `SELECT keyword_name FROM duckdb_keywords()` on DuckDB v1.5.5.
-//
-// DuckDB quotes an identifier in a type string when it is any keyword at all,
-// reserved or not — which is why a STRUCT field called `name` comes back as
-// STRUCT("name" VARCHAR). Reproducing that keeps the duckdbType string valid
-// SQL, so a client can paste it back into a CREATE TABLE.
-
-/// Sorted, lowercase. Binary-searched, so it must stay sorted.
-
-static KEYWORDS: &[&str] = &[
-    "abort", "absolute", "access", "action", "add", "admin", "after", "aggregate", "all",
-    "also", "alter", "always", "analyse", "analyze", "and", "anti", "any", "array", "as",
-    "asc", "asof", "assertion", "assignment", "asymmetric", "at", "attach", "attribute",
-    "authorization", "backward", "before", "begin", "between", "bigint", "binary", "bit",
-    "boolean", "both", "by", "cache", "call", "called", "cascade", "cascaded", "case", "cast",
-    "catalog", "centuries", "century", "chain", "char", "character", "characteristics",
-    "check", "checkpoint", "class", "close", "cluster", "coalesce", "collate", "collation",
-    "column", "columns", "comment", "comments", "commit", "committed", "compression",
-    "concurrently", "configuration", "conflict", "connection", "constraint", "constraints",
-    "content", "continue", "conversion", "copy", "cost", "create", "cross", "csv", "cube",
-    "current", "cursor", "cycle", "data", "database", "day", "days", "deallocate", "dec",
-    "decade", "decades", "decimal", "declare", "default", "defaults", "deferrable", "deferred",
-    "definer", "delete", "delimiter", "delimiters", "depends", "desc", "describe", "detach",
-    "dictionary", "disable", "discard", "distinct", "do", "document", "domain", "double",
-    "drop", "each", "else", "enable", "encoding", "encrypted", "end", "enum", "error",
-    "escape", "event", "except", "exclude", "excluding", "exclusive", "execute", "exists",
-    "explain", "export", "export_state", "extension", "extensions", "external", "extract",
-    "false", "family", "fetch", "filter", "first", "float", "following", "for", "force",
-    "foreign", "forward", "freeze", "from", "full", "function", "functions", "generated",
-    "glob", "global", "grant", "granted", "group", "grouping", "grouping_id", "groups",
-    "handler", "having", "header", "hold", "hour", "hours", "identity", "if", "ignore",
-    "ilike", "immediate", "immutable", "implicit", "import", "in", "include", "including",
-    "increment", "index", "indexes", "inherit", "inherits", "initially", "inline", "inner",
-    "inout", "input", "insensitive", "insert", "install", "instead", "int", "integer",
-    "intersect", "interval", "into", "invoker", "is", "isnull", "isolation", "join", "json",
-    "key", "label", "lambda", "language", "large", "last", "lateral", "leading", "leakproof",
-    "left", "level", "like", "limit", "listen", "load", "local", "location", "lock", "locked",
-    "logged", "macro", "map", "mapping", "match", "matched", "materialized", "maxvalue",
-    "merge", "method", "microsecond", "microseconds", "millennia", "millennium", "millisecond",
-    "milliseconds", "minute", "minutes", "minvalue", "mode", "month", "months", "move", "name",
-    "names", "national", "natural", "nchar", "new", "next", "no", "none", "not", "nothing",
-    "notify", "notnull", "nowait", "null", "nullif", "nulls", "numeric", "object", "of", "off",
-    "offset", "oids", "old", "on", "only", "operator", "option", "options", "or", "order",
-    "ordinality", "others", "out", "outer", "over", "overlaps", "overlay", "overriding",
-    "owned", "owner", "parallel", "parser", "partial", "partition", "partitioned", "passing",
-    "password", "percent", "persistent", "pivot", "pivot_longer", "pivot_wider", "placing",
-    "plans", "policy", "position", "positional", "pragma", "preceding", "precision", "prepare",
-    "prepared", "preserve", "primary", "prior", "privileges", "procedural", "procedure",
-    "program", "publication", "qualify", "quarter", "quarters", "quote", "range", "read",
-    "real", "reassign", "recheck", "recursive", "ref", "references", "referencing", "refresh",
-    "reindex", "relative", "release", "rename", "repeatable", "replace", "replica", "reset",
-    "respect", "restart", "restrict", "returning", "returns", "revoke", "right", "role",
-    "rollback", "rollup", "row", "rows", "rule", "sample", "savepoint", "schema", "schemas",
-    "scope", "scroll", "search", "second", "seconds", "secret", "security", "select", "semi",
-    "sequence", "sequences", "serializable", "server", "session", "set", "setof", "sets",
-    "share", "show", "similar", "simple", "skip", "smallint", "snapshot", "some", "sorted",
-    "source", "sql", "stable", "standalone", "start", "statement", "statistics", "stdin",
-    "stdout", "storage", "stored", "strict", "strip", "struct", "subscription", "substring",
-    "summarize", "symmetric", "sysid", "system", "table", "tables", "tablesample",
-    "tablespace", "target", "temp", "template", "temporary", "text", "then", "ties", "time",
-    "timestamp", "to", "trailing", "transaction", "transform", "treat", "trigger", "trim",
-    "true", "truncate", "trusted", "try_cast", "type", "types", "unbounded", "uncommitted",
-    "unencrypted", "union", "unique", "unknown", "unlisten", "unlogged", "unpack", "unpivot",
-    "until", "update", "use", "user", "using", "vacuum", "valid", "validate", "validator",
-    "value", "values", "varchar", "variable", "variadic", "varying", "verbose", "version",
-    "view", "views", "virtual", "volatile", "week", "weeks", "when", "where", "whitespace",
-    "window", "with", "within", "without", "work", "wrapper", "write", "xml", "xmlattributes",
-    "xmlconcat", "xmlelement", "xmlexists", "xmlforest", "xmlnamespaces", "xmlparse", "xmlpi",
-    "xmlroot", "xmlserialize", "xmltable", "year", "years", "yes", "zone",
-];
 
 #[cfg(test)]
 mod tests {
-    use super::civil_from_days;
+    use super::Method;
+    use crate::encode::civil_from_days;
     use super::ensure_single_statement as one;
+    use super::fenced_setting;
+    use super::route_exists;
     use super::index_columns;
-    use super::varint_to_decimal;
+    use crate::encode::varint_to_decimal;
     use super::{Cancel, SlotRun};
     use std::time::{Duration, Instant};
 
     fn idle() -> SlotRun {
-        SlotRun { job: 0, pending: None, cancelled: false, deadline: None }
+        SlotRun { job: 0, started: Instant::now(), pending: None, cancelled: false, deadline: None }
     }
 
     /// The bug this design exists to prevent: a cancel decided for one
@@ -4431,5 +3889,78 @@ mod tests {
         assert_eq!(varint_to_decimal(&[0x80, 0x00]), None);
         // Header claims four magnitude bytes; only one follows.
         assert_eq!(varint_to_decimal(&[0x80, 0x00, 0x04, 0x01]), None);
+    }
+
+    #[test]
+    fn fences_process_global_settings() {
+        // The fleet-safety fence (D2): these change a DuckDB global and must
+        // not be settable over the wire.
+        for sql in [
+            "SET memory_limit='1TB'",
+            "set MEMORY_LIMIT = '1TB'",
+            "PRAGMA threads=64",
+            "SET GLOBAL max_memory='1TB'",
+            "RESET threads",
+            "/* sneak */ SET memory_limit='1TB'",
+            "SET  --c\n threads=1",
+            // the quoted-identifier bypass: a double-quoted name reaches the
+            // same setting, so the fence must see through the quotes
+            "SET \"memory_limit\"='1TB'",
+            "PRAGMA \"threads\"=64",
+            "SET GLOBAL \"max_memory\"='1TB'",
+            "SET \"me\"\"mory_limit\"='1TB'", // (not a real key, but scanner must unquote)
+            // disk-spill caps are fenced too — SET around --max-temp-size
+            "SET max_temp_directory_size='100TB'",
+            "SET temp_directory='/tmp/x'",
+            "PRAGMA \"max_temp_directory_size\"='100TB'",
+        ] {
+            let got = fenced_setting(sql);
+            let expect_fenced = !sql.contains("me\"\"mory");
+            assert_eq!(got.is_some(), expect_fenced, "fence verdict for {sql:?}");
+        }
+        // Ordinary statements and unrelated settings pass.
+        for sql in [
+            "SELECT 1",
+            "SET timezone='UTC'",
+            "SET \"search_path\"='main'",
+            "CREATE TABLE t(x int)",
+            "PRAGMA database_list",
+        ] {
+            assert_eq!(fenced_setting(sql), None, "should pass: {sql:?}");
+        }
+    }
+
+    #[test]
+    fn route_exists_matches_the_dispatch_table() {
+        // Guards the hand-maintained coupling between `route_exists` (which
+        // decides 401-vs-404 for an unauthenticated caller) and the dispatch
+        // match in `handle`. Every real endpoint is a route; a known path
+        // with the wrong method, and any unknown path, is not — so adding a
+        // route to `handle` without updating `route_exists` (which would
+        // 404 a real endpoint's unauthenticated caller) fails here.
+        let routes = [
+            (Method::Get, "/ready"),
+            (Method::Get, "/sessions"),
+            (Method::Get, "/info"),
+            (Method::Get, "/catalog"),
+            (Method::Post, "/sql"),
+            (Method::Post, "/sql/sessions/new"),
+            (Method::Delete, "/sql/sessions/abc"),
+            (Method::Delete, "/sql/queries/xyz"),
+        ];
+        for (m, p) in &routes {
+            assert!(route_exists(m, p), "should be a route: {m:?} {p}");
+        }
+        let non_routes = [
+            (Method::Get, "/sql"),      // method matters
+            (Method::Post, "/ready"),   // method matters
+            (Method::Get, "/health"),   // never existed
+            (Method::Get, "/"),
+            (Method::Put, "/sql"),
+            (Method::Post, "/sql/sessions"), // no trailing id/segment
+        ];
+        for (m, p) in &non_routes {
+            assert!(!route_exists(m, p), "should NOT be a route: {m:?} {p}");
+        }
     }
 }

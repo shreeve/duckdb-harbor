@@ -88,7 +88,7 @@ def start_server(db, port):
     log = open(db + ".log", "w")
     proc = subprocess.Popen(
         [
-            os.path.join(HERE, "bin", "duckdb-harbor"), db,
+            *os.environ.get("HARBOR_LAUNCHER", os.path.join(HERE, "target", "release", "harbor") + " serve").split(), db,
             "--port", str(port), "--token", TOKEN, "--workers", "2",
         ],
         stdout=log, stderr=log, stdin=subprocess.DEVNULL,
@@ -342,8 +342,9 @@ def run_empty(base):
 
 
 def harbor_version():
-    """The crate version, read from the one place it is written."""
-    with open(os.path.join(HERE, "Cargo.toml")) as f:
+    """The crate version, read from the one place it is written: harbor-core."""
+    crate = os.path.join(HERE, "crates", "harbor-core")
+    with open(os.path.join(crate, "Cargo.toml")) as f:
         for line in f:
             if line.startswith("version"):
                 return line.split('"')[1]

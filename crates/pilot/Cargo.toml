@@ -1,0 +1,30 @@
+[package]
+name = "harbor-pilot"
+version = "0.1.0"
+edition = "2024"
+description = "pilot — the Harbor client: fleet-aware SQL over UDS and HTTP"
+license = "MIT"
+
+# Pure protocol client (PLAN.md D8): pilot never links DuckDB. HTTP/1.1 over
+# UnixStream/TcpStream is hand-rolled (~200 lines) because dragging an async
+# stack in for one request at a time buys nothing. https lands with ureq in
+# Phase 2 alongside the REPL.
+[dependencies]
+crossterm = "0.29.0"
+harbor-protocol = { path = "../harbor-protocol" }
+# OSC 11 background query for light/dark auto-detection: poll(2)+read(2) on the
+# tty with a timeout. crossterm handles raw mode; the timed read needs libc.
+libc = "0.2"
+nu-ansi-term = "0.50.3"
+reedline = "0.50.0"
+serde = { version = "1.0.229", features = ["derive"] }
+# preserve_order: --json rows must keep column order, not alphabetize it
+serde_json = { version = "1", features = ["preserve_order"] }
+signal-hook = { version = "0.4.4", default-features = false }
+toml = "1.1.4"
+# already in reedline's tree: terminal-cell widths for duckbox alignment
+unicode-width = "0.2"
+
+[[bin]]
+name = "pilot"
+path = "src/main.rs"
