@@ -14,7 +14,7 @@
 
 use crate::keywords::KEYWORDS;
 use crate::{Conn, http};
-use harbor_protocol::{Event, SqlRequest, endpoint};
+use wire::{Event, SqlRequest, endpoint};
 use reedline::{Completer, CompletionResult, Span, Suggestion};
 use std::io::BufRead;
 use std::sync::{Arc, Mutex};

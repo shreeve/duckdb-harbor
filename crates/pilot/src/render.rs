@@ -6,7 +6,7 @@
 //! json, jsonlines, line, list, trash) emit each row as it arrives with O(1)
 //! memory. A 100M-row SELECT costs the boxed client nothing but time.
 
-use harbor_protocol::Column;
+use wire::Column;
 use serde_json::Value;
 use std::io::{BufWriter, IsTerminal, Stdout, Write};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};

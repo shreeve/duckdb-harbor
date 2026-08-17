@@ -11,7 +11,7 @@ license = "MIT"
 # Phase 2 alongside the REPL.
 [dependencies]
 crossterm = "0.29.0"
-harbor-protocol = { path = "../harbor-protocol" }
+wire = { path = "../wire" }
 # OSC 11 background query for light/dark auto-detection: poll(2)+read(2) on the
 # tty with a timeout. crossterm handles raw mode; the timed read needs libc.
 libc = "0.2"

@@ -21,7 +21,7 @@ mod repl;
 mod scan;
 mod theme;
 
-use harbor_protocol::{Event, SqlRequest, endpoint};
+use wire::{Event, SqlRequest, endpoint};
 use render::{Mode, RenderOpts, Renderer};
 use http::Transport;
 use std::io::{BufRead, IsTerminal, Read};
@@ -420,7 +420,7 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
         let text = read_patient(resp.body, &on_tick);
         clear_spinner();
         return match Event::parse(text.trim()) {
-            Ok(Event::Error { code, .. }) if code == harbor_protocol::code::CANCELLED => {
+            Ok(Event::Error { code, .. }) if code == wire::code::CANCELLED => {
                 eprintln!("Interrupted.");
                 Outcome::Cancelled
             }
@@ -492,7 +492,7 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
                     Err(e) => err(&format!("writing output failed: {e}")),
                 };
             }
-            Event::Error { code, .. } if code == harbor_protocol::code::CANCELLED => {
+            Event::Error { code, .. } if code == wire::code::CANCELLED => {
                 clear_spinner();
                 eprintln!("Interrupted.");
                 return Outcome::Cancelled;

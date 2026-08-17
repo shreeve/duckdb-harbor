@@ -168,16 +168,18 @@ protocol seat's leak argument wins.)*
 ```
 Cargo.toml                 # [workspace], resolver = "2", default-members = ["crates/harbor"]
 crates/
-├── harbor-protocol/       # lib — the wire contract: envelope/event types,
+├── wire/                  # lib — the wire contract: envelope/event types,
 │                          #   error codes, request shapes. No I/O. Shared by
-│                          #   harbor-core (encode) and pilot (decode).
-├── harbor-core/           # lib — ~90% of today's lib.rs, near-verbatim:
+│                          #   harbor (encode) and pilot (decode).
+│                          #   (was harbor-protocol; renamed for brevity)
+├── harbor/                # bin + lib — the engine folded in beside the CLI
+│                          #   (was a separate harbor-core; the loadable
+│                          #   extension that split them retired, PLAN.md D5):
 │                          #   pool, leases, cancellation, timeouts, signal/
 │                          #   checkpoint, worker/routing, /sql /catalog /ready
-│                          #   handlers, NDJSON schema/value emitter, KEYWORDS
-│                          #   duckdb = { default-features = false, features = ["vtab"] }
-│                          #   link mode chosen by leaf-crate feature passthrough
-├── harbor/                # bin — duckdb {bundled, vtab}; ~50–90MB (the engine)
+│                          #   handlers, NDJSON schema/value emitter, KEYWORDS.
+│                          #   duckdb { default-features = false, features = ["vtab"] };
+│                          #   dynamic by default (bundled is opt-in), ~1.9MB
 │   ├── serve              #   open db → open_pool → start(UDS and/or TCP) → wait
 │   │                      #   flags: --memory-limit --threads --idle-exit --ui
 │   │                      #   --quack --socket-mode/-group --idle-exit
