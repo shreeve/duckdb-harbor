@@ -22,7 +22,9 @@ struct BerthPrompt {
 
 impl Prompt for BerthPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("{} ", self.name))
+        // No trailing space: the "> " indicator abuts the berth name, so the
+        // prompt reads `chk> `, not `chk > `.
+        Cow::Borrowed(self.name.as_str())
     }
     fn render_prompt_right(&self) -> Cow<'_, str> {
         Cow::Borrowed("")
