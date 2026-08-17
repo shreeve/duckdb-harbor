@@ -25,10 +25,16 @@ as_owner "$LIB" install -d -m 0755 "$LIB"
 as_owner "$BIN" install -m 0755 bin/harbor bin/pilot "$BIN"
 as_owner "$LIB" install -m 0755 lib/libduckdb.* "$LIB"
 
-ext_dir="$HOME/.duckdb/extensions/$version/$ext_plat"
+# The extension belongs to the *invoking user's* ~/.duckdb even when the whole
+# script is run under sudo — a root-owned ~/.duckdb breaks the ui extension,
+# whose init mkdirs extension_data there as the user.
+user=${SUDO_USER:-$(id -un)}
+home=$(eval echo "~$user")
+ext_dir="$home/.duckdb/extensions/$version/$ext_plat"
 mkdir -p "$ext_dir"
 install -m 0644 extensions/ui.duckdb_extension "$ext_dir/ui.duckdb_extension"
+if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ]; then chown -R "$user" "$home/.duckdb"; fi
 
 echo "installed: harbor + pilot -> $BIN, libduckdb -> $LIB"
-echo "           ui extension   -> $ext_dir  (engine $version)"
+echo "           ui extension   -> $ext_dir  (engine $version, owner $user)"
 echo "try: harbor add mydata.duckdb --unsigned --init 'LOAD ui; FROM start_ui_server();'"
