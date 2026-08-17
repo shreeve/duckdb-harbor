@@ -187,8 +187,8 @@ you.
 
 Two binaries: **`harbor`** (the server and fleet manager) and **`pilot`** (the
 client). `harbor` links an external `libduckdb` and is version-agnostic — the
-same build serves any DuckDB by the `libduckdb.dylib` sitting beside it — so a
-build needs a libduckdb to link against. `make fetch-duckdb` pulls one (DuckDB's
+same build serves any DuckDB by the `libduckdb.dylib` it resolves — so a build
+needs a libduckdb to link against. `make fetch-duckdb` pulls one (DuckDB's
 official v2 nightly) into `~/.duckdb/cli/2.0.0/`; then:
 
 ```console
@@ -198,9 +198,15 @@ $ harbor serve mydata.duckdb --token secret
 harbor 0.10.0: berth "mydata" serving mydata.duckdb on ~/.harbor/mydata.sock (duckdb v2.0.0-alpha38069, memory_limit 2GB)
 ```
 
-`make setup` does the whole thing in one shot — fetch the engine, build and install
-`harbor` + `pilot` beside it, and build the matched DuckDB UI extension — taking an
-empty `~/.duckdb` to a working fleet.
+`make setup` does the whole thing in one shot — fetch the engine into `~/.duckdb`,
+build and install `harbor` + `pilot` onto PATH in `/usr/local/bin`, and build the
+matched DuckDB UI extension — taking an empty `~/.duckdb` to a working fleet.
+
+No toolchain? Each [release](../../releases) ships one self-contained archive per
+platform (osx-arm64, linux-amd64, linux-arm64): harbor + pilot, the exact
+`libduckdb` they were built against, and the matched `ui` extension — all from
+one DuckDB v2 nightly. Extract and run `bin/harbor` in place, or `./install.sh`
+to copy the pieces into `/usr/local/{bin,lib}` and `~/.duckdb/extensions/`.
 
 ### Browser UI
 
@@ -398,11 +404,13 @@ worth knowing before it faces a browser. Request logging is available with
 **Signal handling is Unix only.** On Windows there is no `SIGTERM` drain and no
 checkpoint on exit; `harbor stop` is the way out.
 
-**The engine is the sibling `libduckdb`, not the binary.** harbor links
-dynamically and is version-agnostic — the same build serves whichever DuckDB its
-adjacent `libduckdb` provides (verified against 1.5.5 and a 2.0 dev build). The
-caveat that comes with that: point it at a library whose storage format matches
-the database file.
+**The engine is the linked `libduckdb`, not the binary.** harbor links
+dynamically and is version-agnostic — the same build serves whichever DuckDB the
+`libduckdb` it resolves provides (verified against 1.5.5 and a 2.0 dev build).
+`make install` puts harbor + pilot on PATH in `/usr/local/bin`, and harbor's
+baked rpath resolves the engine in `~/.duckdb` — DuckDB's own world, disposable
+and refetchable. The caveat that comes with that: point it at a library whose
+storage format matches the database file.
 
 ## Working on it
 

@@ -23,7 +23,7 @@ set -euo pipefail
 DUCKDB_LIB=${DUCKDB_LIB:-$HOME/.duckdb/cli/2.0.0}
 UI_DIR=${DUCKDB_UI_DIR:-$HOME/Data/Code/duckdb-ui}
 CACHE=${DUCKDB_SRC_CACHE:-$HOME/.cache/duckdb-src}
-OPENSSL=${OPENSSL:-$(brew --prefix openssl@3 2>/dev/null || echo /opt/homebrew/opt/openssl@3)}
+CXX=${CXX:-clang++}
 say() { printf '  %s\n' "$*"; }
 
 [ -x "$DUCKDB_LIB/duckdb" ] || { echo "build-ui: no duckdb CLI at $DUCKDB_LIB (run make fetch-duckdb)" >&2; exit 2; }
@@ -35,10 +35,14 @@ say "engine: $version ($source_id)"
 sha=$(gh api "repos/duckdb/duckdb/commits/$source_id" --jq .sha 2>/dev/null) \
   || { echo "build-ui: could not resolve $source_id to a full SHA" >&2; exit 3; }
 
+# Platform also picks the link model: macOS bundles leave DuckDB symbols
+# unresolved via -undefined dynamic_lookup; Linux shared objects allow
+# unresolved symbols by default. Both resolve from the host's libduckdb at load.
 case "$(uname -s)/$(uname -m)" in
-  Darwin/*)                  plat=osx_arm64  ;;
-  Linux/x86_64)              plat=linux_amd64 ;;
-  Linux/aarch64|Linux/arm64) plat=linux_arm64 ;;
+  Darwin/*)                  plat=osx_arm64;   ldflags=(-bundle -undefined dynamic_lookup)
+                             OPENSSL=${OPENSSL:-$(brew --prefix openssl@3 2>/dev/null || echo /opt/homebrew/opt/openssl@3)} ;;
+  Linux/x86_64)              plat=linux_amd64; ldflags=(-shared); OPENSSL=${OPENSSL:-} ;;
+  Linux/aarch64|Linux/arm64) plat=linux_arm64; ldflags=(-shared); OPENSSL=${OPENSSL:-} ;;
   *) echo "build-ui: unsupported platform" >&2; exit 2 ;;
 esac
 
@@ -72,8 +76,10 @@ incs=(
   -I"$tp/pdqsort" -I"$tp/tdigest" -I"$tp/mbedtls/include" -I"$tp/httplib"
   -I"$tp/jaro_winkler" -I"$tp/vergesort" -I"$tp/yyjson/include" -I"$tp/zstd/include"
   -I"$UI_DIR/src/include" -I"$UI_DIR/third_party/httplib"
-  -isystem "$OPENSSL/include"
 )
+# OpenSSL powers the UI's HTTPS *client* (it proxies the front-end from
+# ui.duckdb.org). macOS points at brew's; Linux finds the system one.
+[ -n "$OPENSSL" ] && incs+=(-isystem "$OPENSSL/include") && sslflags=(-L"$OPENSSL/lib") || sslflags=()
 
 # 4. version stamps the source expects (cosmetic — reported by ui_version())
 IFS=. read -r maj min pat <<<"${version#v}"; pat=${pat%%-*}
@@ -91,14 +97,15 @@ say "compiling ${#srcs[@]} sources"
 pids=(); objs=()
 for src in "${srcs[@]}"; do
   obj="$work/$(basename "$src").o"; objs+=("$obj")
-  clang++ -std=c++17 -O2 -fPIC -fvisibility=hidden "${defs[@]}" "${incs[@]}" -c "$src" -o "$obj" &
+  "$CXX" -std=c++17 -O2 -fPIC -fvisibility=hidden "${defs[@]}" "${incs[@]}" -c "$src" -o "$obj" &
   pids+=($!)
 done
 fail=0; for p in "${pids[@]}"; do wait "$p" || fail=1; done
 [ "$fail" = 0 ] || { echo "build-ui: a source failed to compile against $version" >&2; exit 4; }
 
 raw="$work/ui.raw"
-clang++ -bundle -undefined dynamic_lookup -o "$raw" "${objs[@]}" -L"$OPENSSL/lib" -lssl -lcrypto
+# bash 3.2 + set -u: an empty sslflags array can't expand bare, hence the idiom.
+"$CXX" "${ldflags[@]}" -o "$raw" "${objs[@]}" ${sslflags[@]+"${sslflags[@]}"} -lssl -lcrypto
 say "linked ($(du -h "$raw" | cut -f1)) — links no engine"
 
 # 6. stamp DuckDB extension metadata, matched to the running engine

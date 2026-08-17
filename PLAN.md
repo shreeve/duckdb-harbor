@@ -37,8 +37,9 @@ dynamically-linked `harbor` bytes drive whichever `libduckdb.dylib` they resolve
 at runtime (`@rpath` / `@loader_path`) — verified by one binary reporting
 v1.5.5 beside the 1.5.5 dylib and v2.0.0-alpha beside the 2.0 one. So harbor is
 **dynamic by default and version-agnostic**: one build serves a mixed fleet, the
-engine chosen by the dylib beside it (`make install` drops one harbor + pilot
-into each `~/.duckdb/cli/<ver>/`). The static `bundled` build was dropped
+engine chosen by the dylib it links (`make install` puts harbor + pilot on PATH
+in `/usr/local/bin`; harbor's baked absolute rpath resolves the engine in
+`~/.duckdb`, DuckDB's own world). The static `bundled` build was dropped
 entirely: it cost a 33MB binary and a 17GB from-source build tree for an
 advantage — needing no sibling dylib — the swap model removed. Distribution is
 `curl && chmod +x` plus the sibling dylib; the version pin *is* the dylib.
