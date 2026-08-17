@@ -1,23 +1,23 @@
 # harbor — the fleet Makefile
 #
-# One binary, dynamically linked (D1/Phase 0): harbor links an external
-# libduckdb and is version-agnostic at runtime — it resolves whichever
-# libduckdb.dylib sits beside it (@loader_path), so the same bytes serve any
-# DuckDB depending on the directory they run from. `make fetch-duckdb` pulls the
-# engine (DuckDB's official v2 nightly); `make install` drops one harbor + pilot
-# into every ~/.duckdb/cli/<ver>/. pilot never links an engine and works against
-# all of them.
+# Two binaries, dynamically linked (D1): `harbor` links an external libduckdb by
+# an absolute rpath (baked at build time), `pilot` links no engine at all. The
+# engine lives in ~/.duckdb (DuckDB's world: dylib + extensions); the two
+# binaries install onto PATH in /usr/local/bin. `make fetch-duckdb` pulls the
+# engine (DuckDB's official v2 nightly) into ~/.duckdb; `make install` copies
+# both binaries to $(BIN) (using sudo only if the dir is root-owned).
 
 .PHONY: all binary pilot check check_quick install fetch-duckdb ui setup clean
 
-# The libduckdb the dynamic build links against — the version installed under
-# ~/.duckdb/cli/<ver>/. Only the library is needed (the crate ships pregenerated
-# bindings, so there is no bindgen and no header requirement). The binary is
-# version-agnostic at runtime, so this only picks what the dev build links;
-# override to build against another, e.g.
-#   make binary DUCKDB_LIB=$(HOME)/.duckdb/cli/1.5.5
+# The libduckdb the build links against, by absolute rpath — the engine
+# `make fetch-duckdb` installs. Only the library is needed (the crate ships
+# pregenerated bindings, so there is no bindgen and no header requirement).
+# Override to link a different one.
 DUCKDB_LIB ?= $(HOME)/.duckdb/cli/2.0.0
-DUCKDB_CLI ?= $(HOME)/.duckdb/cli
+
+# Where the two binaries land — a stable dir on PATH, outside DuckDB's ~/.duckdb
+# world (which is disposable/refetchable). Override to install elsewhere.
+BIN ?= /usr/local/bin
 
 # Every cargo invocation below links against that libduckdb and bakes an rpath
 # to it, so the binary AND the test executables run in place without DYLD_*.
@@ -38,22 +38,16 @@ check: binary pilot
 check_quick: binary pilot
 	SUITES="unit types spec catalog sessions cancel" test/scripts/check.sh
 
-# Drop one dynamic harbor + the engine-agnostic pilot into every
-# ~/.duckdb/cli/<ver>/ that has a libduckdb.dylib. The dev-tree rpath is stripped
-# from the installed copy and replaced with @loader_path, so each copy resolves
-# ONLY its sibling dylib (otherwise it would prefer the build-dir dylib in every
-# dir). Re-runnable; each copy is fresh, so the strip stays idempotent.
+# Copy the two binaries onto PATH in $(BIN). harbor keeps its baked absolute
+# rpath to $(DUCKDB_LIB), so it finds libduckdb from anywhere — no @loader_path,
+# no sibling dylib. pilot links no engine and runs on any machine. sudo is used
+# only when $(BIN) is root-owned (the /usr/local/bin default on macOS).
 install: binary pilot
-	@for d in $(DUCKDB_CLI)/*/; do \
-	  case "$$d" in *latest/) continue;; esac; \
-	  [ -f "$${d}libduckdb.dylib" ] || continue; \
-	  cp target/release/harbor "$${d}harbor"; \
-	  cp target/release/pilot "$${d}pilot"; \
-	  install_name_tool -delete_rpath $(DUCKDB_LIB) "$${d}harbor" 2>/dev/null || true; \
-	  install_name_tool -add_rpath @loader_path "$${d}harbor" 2>/dev/null || true; \
-	  echo "  installed harbor + pilot -> $$d"; \
-	done
-	@echo "each cli/<ver>/harbor now uses its sibling libduckdb.dylib; pilot is engine-agnostic."
+	@sudo= ; [ -w "$(BIN)" ] || { sudo=sudo; echo "  $(BIN) is root-owned — using sudo"; }; \
+	  $$sudo install -d -m 0755 "$(BIN)"; \
+	  $$sudo install -m 0755 target/release/harbor "$(BIN)/harbor"; \
+	  $$sudo install -m 0755 target/release/pilot  "$(BIN)/pilot"; \
+	  echo "installed harbor + pilot -> $(BIN)  (on your PATH)"
 
 # Pull DuckDB's official v2.0-dev nightly (libduckdb + headers + duckdb CLI) from
 # artifacts.duckdb.org into $(DUCKDB_LIB); the baked rpath then resolves the
@@ -69,11 +63,11 @@ fetch-duckdb:
 ui:
 	DUCKDB_LIB=$(DUCKDB_LIB) scripts/build-ui-extension.sh
 
-# Reconstruct ~/.duckdb from scratch: fetch the engine, build + install harbor
-# and pilot beside it, and build the matched UI extension. One command to go
-# from an empty ~/.duckdb to a working v2 fleet with the UI.
+# Reconstruct a working fleet from scratch: fetch the engine into ~/.duckdb,
+# build + install harbor and pilot onto PATH ($(BIN)), and build the matched UI
+# extension. One command from an empty ~/.duckdb to a working v2 fleet with the UI.
 setup: fetch-duckdb binary pilot install ui
-	@echo "setup: ~/.duckdb ready — harbor, pilot, and the UI all on $(notdir $(DUCKDB_LIB))"
+	@echo "setup: engine + UI in ~/.duckdb, harbor + pilot in $(BIN) — all on $(notdir $(DUCKDB_LIB))"
 
 clean:
 	cargo clean

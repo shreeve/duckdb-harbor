@@ -1,0 +1,96 @@
+# Release — push a v* tag and three self-contained archives appear on the
+# GitHub Release: osx-arm64, linux-amd64, linux-arm64. Each is built on a
+# native runner from the same recipe as `make setup`: fetch DuckDB's official
+# v2 nightly, build harbor + pilot against it (with a RELATIVE rpath, so the
+# archive is relocatable — unlike the dev build's absolute one), compile the
+# ui extension out-of-tree against that same engine, smoke-test the packaged
+# layout, and upload. No engine compile anywhere; each job takes minutes.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-15,        plat: osx-arm64,   rpath: '@loader_path' }
+          - { runner: ubuntu-24.04,     plat: linux-amd64, rpath: '$ORIGIN' }
+          - { runner: ubuntu-24.04-arm, plat: linux-arm64, rpath: '$ORIGIN' }
+    runs-on: ${{ matrix.runner }}
+    env:
+      DUCKDB_LIB: ${{ github.workspace }}/.duckdb-engine
+    steps:
+      - uses: actions/checkout@v5
+
+      # The ui source (our fork until duckdb/duckdb-ui#242 lands) and the
+      # metadata stamper it vendors. Only that one submodule — not duckdb.
+      - uses: actions/checkout@v5
+        with:
+          repository: shreeve/duckdb-ui
+          path: duckdb-ui
+      - run: git -C duckdb-ui submodule update --init extension-ci-tools
+
+      - name: Fetch DuckDB engine (official v2 nightly)
+        run: DEST="$DUCKDB_LIB" scripts/fetch-duckdb.sh
+
+      # Relative rpath instead of the Makefile's absolute one: the binary
+      # looks beside itself and in ../lib, so the archive works anywhere.
+      - name: Build harbor + pilot
+        run: |
+          export DUCKDB_LIB_DIR="$DUCKDB_LIB"
+          export RUSTFLAGS='-C link-args=-Wl,-rpath,${{ matrix.rpath }} -C link-args=-Wl,-rpath,${{ matrix.rpath }}/../lib'
+          cargo build -p harbor -p pilot --release
+
+      - name: Build ui extension
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DUCKDB_UI_DIR="$PWD/duckdb-ui" OUT="$PWD/ui.duckdb_extension" \
+            scripts/build-ui-extension.sh
+
+      - name: Package
+        run: |
+          TAG="$GITHUB_REF_NAME" PLAT=${{ matrix.plat }} UI_EXT="$PWD/ui.duckdb_extension" \
+            scripts/package-release.sh
+
+      # Prove the archive as shipped: extract, run harbor from bin/ (exercises
+      # the relative rpath -> lib/), query it through pilot, LOAD the ui.
+      - name: Smoke-test packaged layout
+        run: |
+          tar -C /tmp -xzf dist/harbor-"$GITHUB_REF_NAME"-${{ matrix.plat }}.tar.gz
+          root=/tmp/harbor-"$GITHUB_REF_NAME"-${{ matrix.plat }}
+          "$root/bin/harbor" add /tmp/smoke.duckdb --name smoke --unsigned \
+            --init "LOAD '$root/extensions/ui.duckdb_extension';"
+          "$root/bin/pilot" smoke -c "SELECT 42 AS ok" --mode csv | grep -q 42
+          "$root/bin/harbor" stop smoke
+          echo "smoke: rpath, wire round-trip, and ui load all good"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: harbor-${{ github.ref_name }}-${{ matrix.plat }}
+          path: dist/*.tar.gz
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { merge-multiple: true }
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" *.tar.gz \
+            --repo "$GITHUB_REPOSITORY" --title "harbor $GITHUB_REF_NAME" \
+            --notes "harbor + pilot + ui extension, each archive self-contained \
+          and version-locked to one DuckDB v2 nightly. Extract and run in place, \
+          or ./install.sh to put the pieces in their homes."
