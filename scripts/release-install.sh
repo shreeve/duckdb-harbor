@@ -22,6 +22,11 @@ read -r version ext_plat < ENGINE
 as_owner() { if [ -w "$(dirname "$1")" ] || [ -w "$1" ]; then "${@:2}"; else sudo "${@:2}"; fi; }
 as_owner "$BIN" install -d -m 0755 "$BIN"
 as_owner "$LIB" install -d -m 0755 "$LIB"
+# rm first, install second: macOS caches a binary's code signature per inode,
+# and overwriting in place leaves every later exec SIGKILL'd against the stale
+# cache. A fresh inode gets a fresh verdict; upgrades stay safe.
+as_owner "$BIN" rm -f "$BIN/harbor" "$BIN/pilot"
+as_owner "$LIB" rm -f "$LIB"/libduckdb.dylib "$LIB"/libduckdb.so
 as_owner "$BIN" install -m 0755 bin/harbor bin/pilot "$BIN"
 as_owner "$LIB" install -m 0755 lib/libduckdb.* "$LIB"
 
