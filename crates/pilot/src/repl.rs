@@ -125,7 +125,7 @@ fn has_code(s: &str) -> bool {
 /// The one list of dot-commands: dispatch validates against it, `.help`
 /// prints it, and the completer's lane A suggests from it.
 pub const DOT_COMMANDS: &[(&str, &str, &str)] = &[
-    ("mode", "[m]", "duckbox | markdown | csv | json | jsonlines | line | list | trash"),
+    ("mode", "[m]", "duckbox | duckboxy | markdown | csv | json | jsonlines | line | list | trash"),
     ("maxrows", "[n]", "boxed-mode display cap (head … tail elision past it)"),
     ("nullvalue", "[s]", "how NULL renders"),
     ("timer", "on|off", "server + wall time per statement"),
@@ -319,7 +319,7 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
             let _ = crate::list_fleet();
         }
         "mode" => match parts.next() {
-            None => println!("mode: {} (duckbox markdown csv json jsonlines line list trash)", opts.mode.name()),
+            None => println!("mode: {} (duckbox duckboxy markdown csv json jsonlines line list trash)", opts.mode.name()),
             Some(m) => match Mode::parse(m) {
                 Some(m) => opts.mode = m,
                 None => eprintln!("pilot: unknown mode {m:?}"),

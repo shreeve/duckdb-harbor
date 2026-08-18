@@ -14,6 +14,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
     Duckbox,
+    Duckboxy, // duckbox minus the type row
     Markdown,
     Csv,
     Json,
@@ -27,6 +28,7 @@ impl Mode {
     pub fn parse(s: &str) -> Option<Mode> {
         Some(match s {
             "duckbox" | "box" => Mode::Duckbox,
+            "duckboxy" | "boxy" => Mode::Duckboxy,
             "markdown" | "md" => Mode::Markdown,
             "csv" => Mode::Csv,
             "json" => Mode::Json,
@@ -40,6 +42,7 @@ impl Mode {
     pub fn name(&self) -> &'static str {
         match self {
             Mode::Duckbox => "duckbox",
+            Mode::Duckboxy => "duckboxy",
             Mode::Markdown => "markdown",
             Mode::Csv => "csv",
             Mode::Json => "json",
@@ -50,7 +53,7 @@ impl Mode {
         }
     }
     pub fn is_streaming(&self) -> bool {
-        !matches!(self, Mode::Duckbox | Mode::Markdown)
+        !matches!(self, Mode::Duckbox | Mode::Duckboxy | Mode::Markdown)
     }
 }
 
@@ -193,7 +196,7 @@ impl<'a> Renderer<'a> {
                 let line = values.iter().map(|v| self.render(v)).collect::<Vec<_>>().join("|");
                 self.emit(format_args!("{line}\n"));
             }
-            Mode::Duckbox | Mode::Markdown => {
+            Mode::Duckbox | Mode::Duckboxy | Mode::Markdown => {
                 // boxed_safe: a value with an embedded newline/tab must not
                 // shatter the frame; escape it for display only.
                 let cells: Vec<String> = values.iter().map(|v| boxed_safe(&self.render(v))).collect();
@@ -213,6 +216,7 @@ impl<'a> Renderer<'a> {
         match self.opts.mode {
             Mode::Json => self.emit(format_args!("\n]\n")),
             Mode::Duckbox => self.boxed(row_count, glyphs_duckbox()),
+            Mode::Duckboxy => self.boxed(row_count, Glyphs { type_row: false, ..glyphs_duckbox() }),
             Mode::Markdown => self.boxed(row_count, glyphs_markdown()),
             _ => {}
         }
