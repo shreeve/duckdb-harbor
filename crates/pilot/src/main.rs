@@ -167,7 +167,7 @@ target:
 
 options:
   --token <t>                  bearer token (else HARBOR_TOKEN, else <name>.token)
-  --mode <m>                   duckbox, markdown, csv, json, jsonlines, line, list, trash
+  --mode <m>                   duckbox, duckboxy, markdown, csv, json, jsonlines, line, list, trash
   --json                       shorthand for --mode jsonlines
 
 config: $HARBOR_HOME/config.toml ([defaults] mode/timer/maxrows/nullvalue,
