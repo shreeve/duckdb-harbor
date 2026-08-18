@@ -254,10 +254,11 @@ impl<'a> Renderer<'a> {
             (&head[..], &[])
         };
 
-        // Column widths from what will be shown, capped; values truncate.
-        const MAX_COL: usize = 40;
+        // Column widths from what will be shown: natural when the frame fits
+        // the terminal, else the widest columns shrink first (fit_widths, to a
+        // floor of MAX_COL); values truncate only to their column's width.
         let ncols = self.columns.len();
-        let widths: Vec<usize> = (0..ncols)
+        let mut widths: Vec<usize> = (0..ncols)
             .map(|i| {
                 let mut w = display_width(&self.columns[i]);
                 if g.type_row {
@@ -266,12 +267,14 @@ impl<'a> Renderer<'a> {
                 for r in top.iter().chain(bottom.iter()) {
                     w = w.max(display_width(r.get(i).map(String::as_str).unwrap_or("")));
                 }
-                w.min(MAX_COL)
+                w
             })
             .collect();
+        let term_w = terminal_width();
+        fit_widths(&mut widths, term_w);
 
         // Terminal fit: prune middle columns, marking with a "…" column.
-        let idx = plan_columns(&widths, terminal_width());
+        let idx = plan_columns(&widths, term_w);
         let pruned = idx.iter().any(Option::is_none);
         let shown_cols = idx.iter().filter(|o| o.is_some()).count();
         let colw = |o: &Option<usize>| o.map_or(1, |i| widths[i]);
@@ -421,6 +424,38 @@ fn glyphs_markdown() -> Glyphs {
 
 fn terminal_width() -> usize {
     crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(120)
+}
+
+/// The floor a column shrinks to before pruning takes over — and, on a narrow
+/// terminal, the effective cap a wide value is cut back to.
+const MAX_COL: usize = 40;
+
+/// Fit natural column widths to the terminal. A frame that fits keeps every
+/// column at its natural width; one that doesn't shrinks the widest columns
+/// first — all ties together, down to the runner-up level — never below
+/// MAX_COL. Whatever still cannot fit at the floor is plan_columns's problem.
+fn fit_widths(widths: &mut [usize], term_w: usize) {
+    const GAP: usize = 3; // " │ " between cells
+    const EDGES: usize = 4; // the outer borders and their padding
+    let budget = term_w.saturating_sub(EDGES + widths.len().saturating_sub(1) * GAP);
+    loop {
+        let total: usize = widths.iter().sum();
+        if total <= budget {
+            return;
+        }
+        let mx = widths.iter().copied().max().unwrap_or(0);
+        if mx <= MAX_COL {
+            return;
+        }
+        let at_max = widths.iter().filter(|&&w| w == mx).count();
+        let next = widths.iter().copied().filter(|&w| w < mx).max().unwrap_or(0);
+        let target = next.max(MAX_COL).max(mx.saturating_sub((total - budget).div_ceil(at_max)));
+        for w in widths.iter_mut() {
+            if *w == mx {
+                *w = target;
+            }
+        }
+    }
 }
 
 /// Which columns a `term_w`-wide terminal shows: every index, or a
@@ -592,5 +627,28 @@ mod tests {
     fn truncate_marks_elision() {
         assert_eq!(truncate("abcdef", 4), "abc…");
         assert_eq!(truncate("abc", 4), "abc");
+    }
+
+    #[test]
+    fn wide_terminal_keeps_natural_widths() {
+        // 138 wide + 2 gaps (6) + edges (4) = 148: fits 200, nothing shrinks
+        let mut w = vec![8, 120, 10];
+        fit_widths(&mut w, 200);
+        assert_eq!(w, vec![8, 120, 10]);
+    }
+
+    #[test]
+    fn widest_column_shrinks_first() {
+        // budget 90: only the 120 gives ground, and only by what's needed
+        let mut w = vec![8, 120, 10];
+        fit_widths(&mut w, 100);
+        assert_eq!(w, vec![8, 72, 10]);
+    }
+
+    #[test]
+    fn ties_shrink_together_and_stop_at_the_floor() {
+        let mut w = vec![60, 60, 60];
+        fit_widths(&mut w, 60);
+        assert_eq!(w, vec![40, 40, 40]); // pruning takes it from here
     }
 }
