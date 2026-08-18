@@ -42,9 +42,13 @@ check_quick: binary pilot
 # rpath to $(DUCKDB_LIB), so it finds libduckdb from anywhere — no @loader_path,
 # no sibling dylib. pilot links no engine and runs on any machine. sudo is used
 # only when $(BIN) is root-owned (the /usr/local/bin default on macOS).
+# The rm first is load-bearing on macOS: overwriting a binary in place leaves
+# the kernel's per-inode signature cache stale, and every exec dies by SIGKILL
+# ("valid on disk", still killed). A fresh inode gets a fresh verdict.
 install: binary pilot
 	@sudo= ; [ -w "$(BIN)" ] || { sudo=sudo; echo "  $(BIN) is root-owned — using sudo"; }; \
 	  $$sudo install -d -m 0755 "$(BIN)"; \
+	  $$sudo rm -f "$(BIN)/harbor" "$(BIN)/pilot"; \
 	  $$sudo install -m 0755 target/release/harbor "$(BIN)/harbor"; \
 	  $$sudo install -m 0755 target/release/pilot  "$(BIN)/pilot"; \
 	  echo "installed harbor + pilot -> $(BIN)  (on your PATH)"
