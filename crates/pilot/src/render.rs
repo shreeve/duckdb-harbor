@@ -143,7 +143,9 @@ impl<'a> Renderer<'a> {
             .enumerate()
             .map(|(i, c)| c.name.clone().unwrap_or_else(|| format!("col{i}")))
             .collect();
-        self.types = cols.iter().map(|c| c.duckdb_type.clone()).collect();
+        // Lowercased for the type row, duckbox-style: quieter under the
+        // headers, and how DuckDB's own CLI prints them.
+        self.types = cols.iter().map(|c| c.duckdb_type.to_lowercase()).collect();
         match self.opts.mode {
             Mode::Csv => {
                 let hdr = self.columns.iter().map(|c| csv_cell(c)).collect::<Vec<_>>().join(",");
