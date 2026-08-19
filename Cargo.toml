@@ -3,6 +3,9 @@
 [workspace]
 members = ["crates/*"]
 default-members = ["crates/wire", "crates/pilot", "crates/harbor"]
+# Vendored crates are patch sources, not members — excluded so their own
+# test suites can run in place (cd vendor/<crate> && cargo test).
+exclude = ["vendor/tiny_http", "vendor/reedline"]
 resolver = "2"
 
 [profile.release]
@@ -13,5 +16,10 @@ strip = true
 # drains an unread body with a fixed 64 KiB buffer instead of allocating the
 # client's whole declared Content-Length (an unauthenticated allocation DoS;
 # see the note in vendor/tiny_http/src/util/equal_reader.rs).
+# vendor/reedline is 0.50.0 verbatim except two patches in src/engine.rs (both
+# proposed upstream; see TODO.md): a completion menu with zero suggestions no
+# longer swallows Enter, and typing a word boundary closes the menu — together
+# they stop a stale menu from inserting a stray word instead of submitting.
 [patch.crates-io]
 tiny_http = { path = "vendor/tiny_http" }
+reedline = { path = "vendor/reedline" }
