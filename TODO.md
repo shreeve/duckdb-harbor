@@ -53,42 +53,38 @@ re-apply Patch 2 or accept losing the stalled-reader protection.
 Until then the vendored copy is correct and harbor is safe; this is cleanup,
 not a fix.
 
-## Fix: pilot autocomplete inserts a stray word on Enter (diagnosed, unfixed)
+## Watch: vendored reedline — stray-word-on-Enter fixed, un-vendor when upstream lands
 
-The bug: sometimes accepting/ignoring completion leaves an extra word (e.g.
-`table`) appended at the end of the line. Fully diagnosed 2026-08-18 — it is
-NOT in pilot's completer (`crates/pilot/src/complete.rs` is span-correct); it
-is a reedline 0.50.0 design flaw pilot inherits through the standard menu
-wiring in `crates/pilot/src/repl.rs::make_editor`:
+FIXED 2026-08-19 by vendoring reedline 0.50.0 at `vendor/reedline/` (wired via
+`[patch.crates-io]`) with two patches in `src/engine.rs`, both covered by
+tests in the vendored copy (`enter_with_an_empty_menu_submits_the_line`,
+`a_word_boundary_closes_the_menu`,
+`typing_past_a_completion_then_enter_runs_the_line`):
 
-1. Tab opens the completion menu — and reedline keeps it ACTIVE for the whole
-   rest of the line. It refilters on every keystroke but only closes on Esc,
-   Enter, or an empty buffer (`engine.rs` Edit arm, ~line 1692: no
-   deactivate-on-empty, no deactivate-on-word-boundary).
-2. Any Enter while any menu is active is CONSUMED to insert the highlighted
-   suggestion at the cursor instead of submitting (`engine.rs` ~line 1575,
-   the `Enter | Submit | SubmitOrNewline if menu.is_active()` arm). Cursor is
-   at end of line → stray word appended.
-3. Sub-case: menu refiltered to zero matches still eats the Enter and inserts
-   nothing — the "had to press Enter twice" ghost.
+- **Patch A** — a completion menu whose filtered suggestions are EMPTY no
+  longer swallows Enter: the Enter/Submit guard skips valueless menus so the
+  event falls through to submit, and `submit_buffer` deactivates straggler
+  menus. (The bug: Tab opened the menu, it stayed active for the whole rest
+  of the line, and Enter was routed to it — inserting the highlighted word
+  at end of line, or dying on an empty menu.)
+- **Patch B** — typing a word boundary (whitespace) deactivates the menu,
+  fish/zsh-style, so a stale menu can't linger to intercept a later Enter.
 
-The complete fix cannot be made from pilot's side (acceptance is hardwired to
-Enter; menus expose no deactivate hook to the completer). Options weighed:
+Upstream status (check with `gh pr view 1175 --repo nushell/reedline` and
+`gh issue view 1176 --repo nushell/reedline`):
 
-- **(1) Vendor reedline + two-line patch** (the tiny_http precedent).
-  Patch A: an active menu with ZERO suggestions must not eat Enter — fall
-  through to submit. Patch B: typing a word boundary (whitespace, `;`)
-  deactivates the menu, fish/zsh-style. Together the menu can only intercept
-  Enter while visibly showing matches for the word under the cursor —
-  standard shell behavior. Cost: ~15k-line crate vendored for two lines.
-- **(2) Pilot-side mitigation only**: return no server-lane suggestions when
-  the cursor is not on a word (cache lane already does). Shrinks the window,
-  cannot close it — a statement ending in a matching word still gets
-  intercepted, and the double-Enter ghost remains.
-- **(3) Both + upstream PR** — RECOMMENDED. Do (1) now, file Patch A+B as a
-  reedline PR, un-vendor when it lands (add a Watch section here like
-  tiny_http's, with the `gh pr view` check).
+- **Patch A PR: https://github.com/nushell/reedline/pull/1175**
+- **Patch B proposal: https://github.com/nushell/reedline/issues/1176**
+  (offered as-is or behind an option; PR it when maintainers pick a shape)
 
-Repro for verification, before and after: type `create or replace ta`, Tab
-(menu opens), keep typing the rest of the statement, Enter — a keyword is
-appended at end of line instead of the statement running.
+When A is merged AND released (and B is either upstream or consciously
+dropped): delete `reedline` from `[patch.crates-io]` and the `exclude` list
+in the root Cargo.toml, `rm -rf vendor/reedline`, bump the reedline version
+in `crates/pilot/Cargo.toml`, then `cargo test -p pilot && make check_quick`
+and re-run the repro: `create or replace ta`, Tab, keep typing, Enter — the
+statement must run with no stray word appended.
+
+Known upstream flake, not ours: `cargo test --all-features` on macOS
+segfaults intermittently in the system-clipboard tests (parallel pasteboard
+access) — it does so on CLEAN main too; default-feature and single-threaded
+runs are green.

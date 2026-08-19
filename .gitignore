@@ -1,4 +1,5 @@
 /target
+vendor/*/target
 build
 configure
 .idea
