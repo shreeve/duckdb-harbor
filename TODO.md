@@ -43,8 +43,13 @@ tests in the vendored copy (`enter_with_an_empty_menu_submits_the_line`,
   menus. (The bug: Tab opened the menu, it stayed active for the whole rest
   of the line, and Enter was routed to it — inserting the highlighted word
   at end of line, or dying on an empty menu.)
-- **Patch B** — typing a word boundary (whitespace) deactivates the menu,
-  fish/zsh-style, so a stale menu can't linger to intercept a later Enter.
+- **Patch B** — typing a word boundary deactivates the menu, fish/zsh-style,
+  so a stale menu can't linger to intercept a later Enter. Boundary = any
+  char that can't extend a completable word (whitespace, `;`, `)`, quotes…);
+  only word chars and `.` (qualified names) keep it. Whitespace-only proved
+  insufficient in the field: after `;` DuckDB's grammar completer suggests
+  next-statement keywords, so the menu was non-empty and Patch A couldn't
+  save the Enter (`show tab` Tab `les;` Enter appended "table").
 
 Upstream status (check with `gh pr view 1175 --repo nushell/reedline` and
 `gh issue view 1176 --repo nushell/reedline`):

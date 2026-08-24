@@ -1699,8 +1699,14 @@ impl Reedline {
                     // opened for; keeping it active past that point leaves a
                     // stale menu to swallow a later Enter (fish/zsh close
                     // their completion pagers on space for the same reason).
+                    // Any char that cannot extend a completable word counts —
+                    // ';' after a finished statement burned us: the completer
+                    // still offers next-statement keywords there, so an
+                    // empty-menu check alone does not save the Enter. Only
+                    // word chars and '.' (qualified names) keep the menu.
                     let word_boundary = matches!(commands.first(),
-                        Some(EditCommand::InsertChar(c)) if c.is_whitespace());
+                        Some(EditCommand::InsertChar(c))
+                            if !c.is_alphanumeric() && *c != '_' && *c != '.');
                     if !self.persistent_menus
                         && (word_boundary || self.editor.line_buffer().get_buffer().is_empty())
                     {
@@ -4350,14 +4356,68 @@ mod tests {
 
     /// Typing a word boundary ends the completion the menu was opened for;
     /// the menu closes rather than lingering to intercept a later Enter.
+    /// Whitespace and statement punctuation are boundaries; word characters
+    /// and '.' (qualified names) are not.
     #[test]
     fn a_word_boundary_closes_the_menu() {
-        let mut reedline = engine_with_active_menu(false, false);
+        for (c, closes) in [(' ', true), (';', true), (')', true), ('e', false), ('.', false)] {
+            let mut reedline = engine_with_active_menu(false, false);
+            let prompt = DefaultPrompt::default();
+            reedline
+                .handle_event(&prompt, ReedlineEvent::Edit(vec![EditCommand::InsertChar(c)]))
+                .unwrap();
+            assert_eq!(!menu_is_active(&reedline), closes, "inserting {c:?}");
+        }
+    }
+
+    /// A completer that always has something to offer, like a grammar-driven
+    /// SQL completer that suggests next-statement keywords after a ';'. The
+    /// empty-menu guard alone cannot save Enter from a menu fed by one of
+    /// these — only the word-boundary close does.
+    struct AlwaysSuggests;
+    impl Completer for AlwaysSuggests {
+        fn complete(&mut self, _line: &str, pos: usize) -> CompletionResult {
+            CompletionResult::fresh(vec![Suggestion {
+                value: String::from("table"),
+                span: Span { start: pos, end: pos },
+                ..Default::default()
+            }])
+        }
+    }
+
+    /// The reported repro, byte for byte: `show tab`, Tab (menu opens), type
+    /// `les;`, Enter. The completer still suggests after the ';', so the menu
+    /// is never empty — before the word-boundary close, Enter appended the
+    /// highlighted "table" instead of running the statement.
+    #[test]
+    fn statement_punctuation_defuses_an_always_suggesting_menu() {
+        let completion_menu = ReedlineMenu::EngineCompleter(Box::new(
+            ColumnarMenu::default().with_name("completion_menu"),
+        ));
+        let mut reedline = Reedline::create()
+            .with_completer(Box::new(AlwaysSuggests))
+            .with_menu(completion_menu);
+        reedline.painter.force_prompt_anchored_for_test(0);
         let prompt = DefaultPrompt::default();
+
+        reedline.run_edit_commands(&[EditCommand::InsertString(String::from("show tab"))]);
         reedline
-            .handle_event(&prompt, ReedlineEvent::Edit(vec![EditCommand::InsertChar(' ')]))
+            .handle_event(&prompt, ReedlineEvent::Menu(String::from("completion_menu")))
             .unwrap();
-        assert!(!menu_is_active(&reedline));
+        assert!(menu_is_active(&reedline));
+
+        for c in "les;".chars() {
+            reedline
+                .handle_event(&prompt, ReedlineEvent::Edit(vec![EditCommand::InsertChar(c)]))
+                .unwrap();
+        }
+        assert!(!menu_is_active(&reedline), "';' must close the menu");
+
+        let status = reedline.handle_event(&prompt, ReedlineEvent::Enter).unwrap();
+        assert!(
+            matches!(status, EventStatus::Exits(Signal::Success(ref s)) if s == "show tables;"),
+            "the statement must run with no stray word appended"
+        );
     }
 
     /// The reported repro, end to end: Tab opens the menu mid-line, the user
