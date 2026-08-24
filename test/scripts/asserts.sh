@@ -430,7 +430,7 @@ eq "a megabytes-long trailing tail is scanned promptly" "1" \
    "$(curl -sS -m 30 -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
         --data-binary "@$work/big.json" "$base/sql" | nd 'rows[0][0]')"
 
-# The declared length is checked before the body is read: tiny_http drains the
+# The declared length is checked before the body is read: justhttp drains the
 # undelivered remainder into a single zeroed allocation of whatever was claimed.
 eq "an oversized Content-Length is refused" "413" \
    "$(curl -sS -m 20 -o /dev/null -w '%{http_code}' -X POST "$base/sql" \

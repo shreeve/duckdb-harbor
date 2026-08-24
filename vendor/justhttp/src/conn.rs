@@ -7,9 +7,9 @@ use std::io::{BufReader, BufWriter, ErrorKind, Read};
 use std::net::SocketAddr;
 use std::str::FromStr;
 
-use crate::common::{HTTPVersion, Method};
-use crate::util::RefinedTcpStream;
-use crate::util::{SequentialReader, SequentialReaderBuilder, SequentialWriterBuilder};
+use crate::http::{HttpVersion, Method};
+use crate::stream::RefinedTcpStream;
+use sequential::{SequentialReader, SequentialReaderBuilder, SequentialWriterBuilder};
 use crate::Request;
 
 /// A ClientConnection is an object that will store a socket to a client
@@ -31,18 +31,15 @@ pub struct ClientConnection {
 
     // set to true if we know that the previous request is the last one
     no_more_requests: bool,
-
-    // true if the connection goes through SSL
-    secure: bool,
 }
 
 /// Error that can happen when reading a request.
 #[derive(Debug)]
 enum ReadError {
     WrongRequestLine,
-    WrongHeader(HTTPVersion),
+    WrongHeader(HttpVersion),
     /// the client sent an unrecognized `Expect` header
-    ExpectationFailed(HTTPVersion),
+    ExpectationFailed(HttpVersion),
     ReadIoError(IoError),
 }
 
@@ -53,7 +50,6 @@ impl ClientConnection {
         mut read_socket: RefinedTcpStream,
     ) -> ClientConnection {
         let remote_addr = read_socket.peer_addr();
-        let secure = read_socket.secure();
 
         let mut source = SequentialReaderBuilder::new(BufReader::with_capacity(1024, read_socket));
         let first_header = source.next().unwrap();
@@ -64,13 +60,7 @@ impl ClientConnection {
             remote_addr,
             next_header_source: first_header,
             no_more_requests: false,
-            secure,
         }
-    }
-
-    /// true if the connection is HTTPS
-    pub fn secure(&self) -> bool {
-        self.secure
     }
 
     /// Reads the next line from self.next_header_source.
@@ -145,7 +135,6 @@ impl ClientConnection {
 
         // building the next reader
         let request = crate::request::new_request(
-            self.secure,
             method,
             path,
             version.clone(),
@@ -187,9 +176,9 @@ impl Iterator for ClientConnection {
             let rq = match self.read() {
                 Err(ReadError::WrongRequestLine) => {
                     let writer = self.sink.next().unwrap();
-                    let response = Response::new_empty(StatusCode(400));
+                    let response = Response::empty(StatusCode(400));
                     response
-                        .raw_print(writer, HTTPVersion(1, 1), &[], false, None)
+                        .raw_print(writer, HttpVersion(1, 1), &[], false)
                         .ok();
                     return None; // we don't know where the next request would start,
                                  // se we have to close
@@ -197,8 +186,8 @@ impl Iterator for ClientConnection {
 
                 Err(ReadError::WrongHeader(ver)) => {
                     let writer = self.sink.next().unwrap();
-                    let response = Response::new_empty(StatusCode(400));
-                    response.raw_print(writer, ver, &[], false, None).ok();
+                    let response = Response::empty(StatusCode(400));
+                    response.raw_print(writer, ver, &[], false).ok();
                     return None; // we don't know where the next request would start,
                                  // se we have to close
                 }
@@ -206,17 +195,17 @@ impl Iterator for ClientConnection {
                 Err(ReadError::ReadIoError(ref err)) if err.kind() == ErrorKind::TimedOut => {
                     // request timeout
                     let writer = self.sink.next().unwrap();
-                    let response = Response::new_empty(StatusCode(408));
+                    let response = Response::empty(StatusCode(408));
                     response
-                        .raw_print(writer, HTTPVersion(1, 1), &[], false, None)
+                        .raw_print(writer, HttpVersion(1, 1), &[], false)
                         .ok();
                     return None; // closing the connection
                 }
 
                 Err(ReadError::ExpectationFailed(ver)) => {
                     let writer = self.sink.next().unwrap();
-                    let response = Response::new_empty(StatusCode(417));
-                    response.raw_print(writer, ver, &[], true, None).ok();
+                    let response = Response::empty(StatusCode(417));
+                    response.raw_print(writer, ver, &[], true).ok();
                     return None; // TODO: should be recoverable, but needs handling in case of body
                 }
 
@@ -233,7 +222,7 @@ impl Iterator for ClientConnection {
                 )
                 .with_status_code(StatusCode(505));
                 response
-                    .raw_print(writer, HTTPVersion(1, 1), &[], false, None)
+                    .raw_print(writer, HttpVersion(1, 1), &[], false)
                     .ok();
                 continue;
             }
@@ -251,11 +240,11 @@ impl Iterator for ClientConnection {
                 Some(ref val) if val.contains("close") => self.no_more_requests = true,
                 Some(ref val) if val.contains("upgrade") => self.no_more_requests = true,
                 Some(ref val)
-                    if !val.contains("keep-alive") && *rq.http_version() == HTTPVersion(1, 0) =>
+                    if !val.contains("keep-alive") && *rq.http_version() == HttpVersion(1, 0) =>
                 {
                     self.no_more_requests = true
                 }
-                None if *rq.http_version() == HTTPVersion(1, 0) => self.no_more_requests = true,
+                None if *rq.http_version() == HttpVersion(1, 0) => self.no_more_requests = true,
                 _ => (),
             };
 
@@ -266,7 +255,7 @@ impl Iterator for ClientConnection {
 }
 
 /// Parses a "HTTP/1.1" string.
-fn parse_http_version(version: &str) -> Result<HTTPVersion, ReadError> {
+fn parse_http_version(version: &str) -> Result<HttpVersion, ReadError> {
     let (major, minor) = match version {
         "HTTP/0.9" => (0, 9),
         "HTTP/1.0" => (1, 0),
@@ -276,12 +265,12 @@ fn parse_http_version(version: &str) -> Result<HTTPVersion, ReadError> {
         _ => return Err(ReadError::WrongRequestLine),
     };
 
-    Ok(HTTPVersion(major, minor))
+    Ok(HttpVersion(major, minor))
 }
 
 /// Parses the request line of the request.
 /// eg. GET / HTTP/1.1
-fn parse_request_line(line: &str) -> Result<(Method, String, HTTPVersion), ReadError> {
+fn parse_request_line(line: &str) -> Result<(Method, String, HttpVersion), ReadError> {
     let mut parts = line.split(' ');
 
     let method = parts.next().and_then(|w| w.parse().ok());
@@ -301,9 +290,186 @@ mod test {
 
         assert!(method == crate::Method::Get);
         assert!(path == "/hello");
-        assert!(ver == crate::common::HTTPVersion(1, 1));
+        assert!(ver == crate::http::HttpVersion(1, 1));
 
         assert!(super::parse_request_line("GET /hello").is_err());
         assert!(super::parse_request_line("qsd qsd qsd").is_err());
+    }
+}
+
+mod sequential {
+    use std::io::Result as IoResult;
+    use std::io::{Read, Write};
+    
+    use std::sync::mpsc::channel;
+    use std::sync::mpsc::{Receiver, Sender};
+    use std::sync::{Arc, Mutex};
+    
+    use std::mem;
+    
+    pub struct SequentialReaderBuilder<R>
+    where
+        R: Read + Send,
+    {
+        inner: SequentialReaderBuilderInner<R>,
+    }
+    
+    enum SequentialReaderBuilderInner<R>
+    where
+        R: Read + Send,
+    {
+        First(R),
+        NotFirst(Receiver<R>),
+    }
+    
+    pub struct SequentialReader<R>
+    where
+        R: Read + Send,
+    {
+        inner: SequentialReaderInner<R>,
+        next: Sender<R>,
+    }
+    
+    enum SequentialReaderInner<R>
+    where
+        R: Read + Send,
+    {
+        MyTurn(R),
+        Waiting(Receiver<R>),
+        Empty,
+    }
+    
+    pub struct SequentialWriterBuilder<W>
+    where
+        W: Write + Send,
+    {
+        writer: Arc<Mutex<W>>,
+        next_trigger: Option<Receiver<()>>,
+    }
+    
+    pub struct SequentialWriter<W>
+    where
+        W: Write + Send,
+    {
+        trigger: Option<Receiver<()>>,
+        writer: Arc<Mutex<W>>,
+        on_finish: Sender<()>,
+    }
+    
+    impl<R: Read + Send> SequentialReaderBuilder<R> {
+        pub fn new(reader: R) -> SequentialReaderBuilder<R> {
+            SequentialReaderBuilder {
+                inner: SequentialReaderBuilderInner::First(reader),
+            }
+        }
+    }
+    
+    impl<W: Write + Send> SequentialWriterBuilder<W> {
+        pub fn new(writer: W) -> SequentialWriterBuilder<W> {
+            SequentialWriterBuilder {
+                writer: Arc::new(Mutex::new(writer)),
+                next_trigger: None,
+            }
+        }
+    }
+    
+    impl<R: Read + Send> Iterator for SequentialReaderBuilder<R> {
+        type Item = SequentialReader<R>;
+    
+        fn next(&mut self) -> Option<SequentialReader<R>> {
+            let (tx, rx) = channel();
+    
+            let inner = mem::replace(&mut self.inner, SequentialReaderBuilderInner::NotFirst(rx));
+    
+            match inner {
+                SequentialReaderBuilderInner::First(reader) => Some(SequentialReader {
+                    inner: SequentialReaderInner::MyTurn(reader),
+                    next: tx,
+                }),
+    
+                SequentialReaderBuilderInner::NotFirst(previous) => Some(SequentialReader {
+                    inner: SequentialReaderInner::Waiting(previous),
+                    next: tx,
+                }),
+            }
+        }
+    }
+    
+    impl<W: Write + Send> Iterator for SequentialWriterBuilder<W> {
+        type Item = SequentialWriter<W>;
+        fn next(&mut self) -> Option<SequentialWriter<W>> {
+            let (tx, rx) = channel();
+            let mut next_next_trigger = Some(rx);
+            ::std::mem::swap(&mut next_next_trigger, &mut self.next_trigger);
+    
+            Some(SequentialWriter {
+                trigger: next_next_trigger,
+                writer: self.writer.clone(),
+                on_finish: tx,
+            })
+        }
+    }
+    
+    impl<R: Read + Send> Read for SequentialReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+            let mut reader = match self.inner {
+                SequentialReaderInner::MyTurn(ref mut reader) => return reader.read(buf),
+                SequentialReaderInner::Waiting(ref mut recv) => recv.recv().unwrap(),
+                SequentialReaderInner::Empty => unreachable!(),
+            };
+    
+            let result = reader.read(buf);
+            self.inner = SequentialReaderInner::MyTurn(reader);
+            result
+        }
+    }
+    
+    impl<W: Write + Send> Write for SequentialWriter<W> {
+        fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+            if let Some(v) = self.trigger.as_mut() {
+                v.recv().unwrap()
+            }
+            self.trigger = None;
+    
+            self.writer.lock().unwrap().write(buf)
+        }
+    
+        fn flush(&mut self) -> IoResult<()> {
+            if let Some(v) = self.trigger.as_mut() {
+                v.recv().unwrap()
+            }
+            self.trigger = None;
+    
+            self.writer.lock().unwrap().flush()
+        }
+    }
+    
+    impl<R> Drop for SequentialReader<R>
+    where
+        R: Read + Send,
+    {
+        fn drop(&mut self) {
+            let inner = mem::replace(&mut self.inner, SequentialReaderInner::Empty);
+    
+            match inner {
+                SequentialReaderInner::MyTurn(reader) => {
+                    self.next.send(reader).ok();
+                }
+                SequentialReaderInner::Waiting(recv) => {
+                    let reader = recv.recv().unwrap();
+                    self.next.send(reader).ok();
+                }
+                SequentialReaderInner::Empty => (),
+            }
+        }
+    }
+    
+    impl<W> Drop for SequentialWriter<W>
+    where
+        W: Write + Send,
+    {
+        fn drop(&mut self) {
+            self.on_finish.send(()).ok();
+        }
     }
 }

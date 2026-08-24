@@ -123,7 +123,7 @@ harbor build resolves whichever engine sits beside it. Precedent: `psql`/
 (envelope types, error codes, request shapes) is the wire contract in
 compilable form — harbor encodes it, pilot decodes it, drift is a compile
 error. Dependency quarantine stays perfect: reedline never in the server tree,
-tiny_http never in the client.
+justhttp never in the client.
 
 ### D9. Pilot spawns the owner on demand (ephemeral berths)
 `pilot ./sales.duckdb` recovers the old `duckdb sales.duckdb` muscle memory
@@ -232,3 +232,28 @@ dynamic_lookup`, Linux leaves the symbols for the loader. Trade-off: it is
 CLI-incompatible (fine — harbor is the only host) and leans on
 incidentally-exported C++ internals, so it is sound *only* under the same-build
 guarantee above. Keep the static build as the known-good fallback.
+
+### D12. The HTTP layer becomes first-party: justhttp (decided 2026-08-24)
+The vendored tiny_http 0.12.0 already carried two harbor patches (the bounded
+unread-body drain and the 10s response write timeout) that upstream had not
+absorbed, and a survey of the sync-HTTP field found no replacement matching
+harbor's needs — synchronous workers, unix sockets, streaming-from-`Read`,
+tiny dependency tree (astra drags hyper; oxhttp self-describes as naive/WIP;
+touche lacks UDS). So the copy stopped pretending to be upstream:
+`vendor/justhttp` is harbor's own HTTP/1.1 crate, derived from tiny_http,
+MIT, consumed as a plain path dependency (the `[patch.crates-io]` indirection
+retired with the name). Everything harbor does not use went away — TLS,
+websocket upgrades, `TestRequest`, dead response constructors and getters,
+the notify/secure rendezvous, `log` — leaving ~2,800 lines in seven one-word
+files (lib, http, stream, conn, request, response, pool), edition 2024,
+`forbid(unsafe_code)`, zero warnings. The two patches are now just code, with
+regression tests (`tests/drain.rs` asserts a dropped 1 GiB-declared body
+allocates < 1 MiB via a measuring global allocator; the `stall` test proves a
+stalled reader is reclaimed). The inherited suite was kept and extended
+(keep-alive reuse + chunked streaming, previously untested), and the two
+promptness tests that failed on macOS were fixed (a cleanup `shutdown` unwrap
+on an already-reset socket — Linux says Ok, BSD says ENOTCONN). Wire-visible
+change: the `Server:` header now says `justhttp`. The delicate cores —
+response-ordering (pipelining), half-close semantics, the keep-alive state
+machine, byte-at-a-time CRLF framing — moved verbatim, on the advice that
+they are semantics, not style.

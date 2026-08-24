@@ -2,56 +2,32 @@
 
 Ongoing maintenance items. Not the roadmap — that's [PLAN.md](PLAN.md).
 
-## Watch: vendored tiny_http — TWO patches, un-vendor carefully
+## justhttp — harbor's first-party HTTP layer (no un-vendor plan; it's ours)
 
-We carry a **vendored tiny_http** at `vendor/tiny_http/` (wired in via
-`[patch.crates-io]` in the root `Cargo.toml`) with **two independent harbor
-patches**. Only the first is filed upstream — so un-vendoring naively would
-silently drop the second. Track them separately.
+`vendor/justhttp` is harbor's own synchronous HTTP/1.1 crate — a plain path
+dependency of `crates/harbor`, derived from tiny_http 0.12.0 and permanently
+first-party (decision record: PLAN.md D12; lineage + license:
+`vendor/justhttp/README.md`). Its test suite (`cargo test` in
+`vendor/justhttp/`, all green on macOS and Linux) is the safety net for any
+change; `cargo test --test suite -- --ignored` runs the one slow (~35s)
+write-timeout test.
 
-### Patch 1 — unauthenticated memory-exhaustion DoS (filed upstream)
+Maintenance notes:
 
-`EqualReader::drop` drained an unread request body with
-`vec![0; declared_content_length]`, so a request declaring a huge
-`Content-Length` while sending a few bytes cost the process that whole
-allocation at drop time. Measured before the fix: RSS 22 MB → 2.2 GB under
-a handful of concurrent probes. See the note in
-`vendor/tiny_http/src/util/equal_reader.rs`.
-
-- **PR: https://github.com/tiny-http/tiny-http/pull/290**
-
-```sh
-gh pr view 290 --repo tiny-http/tiny-http --json state,mergedAt
-```
-
-### Patch 2 — response write timeout (NOT yet upstreamed)
-
-`Connection::set_write_timeout` (`src/connection.rs`) plus a
-`WRITE_TIMEOUT` (10s) applied to every accepted socket in the accept loop
-(`src/lib.rs`). Fixes "B": a client that stops reading its response otherwise
-pins a worker thread inside `write` forever (tiny_http sets no write timeout).
-Read side is deliberately untouched so keep-alive idle still waits. This is a
-small, general-purpose addition — **it should be upstreamed too** (file a PR
-for `set_write_timeout` on the accept path), so that un-vendoring restores the
-backstop for free instead of losing it. Until then, if you un-vendor you MUST
-re-apply Patch 2 or accept losing the stalled-reader protection.
-
-### When Patch 1 is merged AND released — un-vendor (only if Patch 2 is handled)
-
-1. Confirm Patch 2 is either upstreamed (in the same release) or you have a
-   plan to re-apply it — otherwise do NOT un-vendor yet.
-2. Delete the `[patch.crates-io]` block from the root `Cargo.toml`.
-3. Bump the `tiny_http` version in `crates/harbor/Cargo.toml` to the
-   release that contains the fix(es).
-4. `rm -rf vendor/tiny_http` (and `vendor/` if nothing else lives there).
-5. `make binary && make check` — all 10 suites must pass.
-6. Re-run the DoS check (concurrent `POST /sql` with
-   `Content-Length: 1000000000` sending a few bytes must leave RSS flat) AND
-   the stalled-reader check (a client that reads headers then stops must have
-   its worker reclaimed, not pinned forever).
-
-Until then the vendored copy is correct and harbor is safe; this is cleanup,
-not a fix.
+- **The two hardening behaviors have regression tests** — `tests/drain.rs`
+  (a dropped request with `Content-Length: 1 GiB` must allocate < 1 MiB;
+  measured via a global allocator) and the `stall` module in `tests/suite.rs` (a client that stops
+  reading its response cannot pin a worker; the 10s write timeout frees it).
+  If either test ever fails, that is a security regression, not a flake.
+- **Upstream watch, informational only**: the drain fix was offered to
+  tiny_http as <https://github.com/tiny-http/tiny-http/pull/290> (still open).
+  Its fate no longer affects harbor — justhttp does not track upstream — but
+  if it merges, other tiny_http users stop being DoS-able, which is why it
+  stays filed.
+- **What justhttp deliberately lacks** (do not "fix"): TLS (edge proxy's job,
+  D6), websocket upgrades, HTTP/2 and /3, `TestRequest`/test scaffolding, and
+  every API harbor doesn't call. New surface should be added only when harbor
+  needs it.
 
 ## Watch: vendored reedline — stray-word-on-Enter fixed, un-vendor when upstream lands
 

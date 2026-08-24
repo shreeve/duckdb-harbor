@@ -1,0 +1,4 @@
+# Local build tree from running cargo directly in this directory
+# (e.g. `cargo test`). The committed Cargo.lock pins the three deps for
+# reproducible in-place test runs; harbor's builds use the workspace lock.
+/target/

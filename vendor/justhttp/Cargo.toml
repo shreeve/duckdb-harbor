@@ -1,0 +1,17 @@
+# justhttp — harbor's first-party synchronous HTTP/1.1 layer.
+# Derived from tiny_http 0.12.0 (MIT); see README.md and LICENSE.
+
+[package]
+name = "justhttp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Steve Shreeve <steve.shreeve@gmail.com>"]
+description = "Just HTTP: small synchronous HTTP/1.1 over TCP or unix sockets — no TLS, no upgrades, no plugins"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+ascii = "1.0"
+chunked_transfer = "1"
+httpdate = "1.0.2"

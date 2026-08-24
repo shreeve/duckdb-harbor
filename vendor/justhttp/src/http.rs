@@ -81,23 +81,8 @@ impl StatusCode {
     }
 }
 
-impl From<i8> for StatusCode {
-    fn from(in_code: i8) -> StatusCode {
-        StatusCode(in_code as u16)
-    }
-}
 
-impl From<u8> for StatusCode {
-    fn from(in_code: u8) -> StatusCode {
-        StatusCode(in_code as u16)
-    }
-}
 
-impl From<i16> for StatusCode {
-    fn from(in_code: i16) -> StatusCode {
-        StatusCode(in_code as u16)
-    }
-}
 
 impl From<u16> for StatusCode {
     fn from(in_code: u16) -> StatusCode {
@@ -111,17 +96,7 @@ impl From<i32> for StatusCode {
     }
 }
 
-impl From<u32> for StatusCode {
-    fn from(in_code: u32) -> StatusCode {
-        StatusCode(in_code as u16)
-    }
-}
 
-impl AsRef<u16> for StatusCode {
-    fn as_ref(&self) -> &u16 {
-        &self.0
-    }
-}
 
 impl PartialEq<u16> for StatusCode {
     fn eq(&self, other: &u16) -> bool {
@@ -160,7 +135,7 @@ impl Header {
     /// Example:
     ///
     /// ```
-    /// let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/plain"[..]).unwrap();
+    /// let header = justhttp::Header::from_bytes(&b"Content-Type"[..], &b"text/plain"[..]).unwrap();
     /// ```
     #[allow(clippy::result_unit_err)]
     pub fn from_bytes<B1, B2>(header: B1, value: B2) -> Result<Header, ()>
@@ -333,19 +308,19 @@ impl Display for Method {
 
 /// HTTP version (usually 1.0 or 1.1).
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HTTPVersion(pub u8, pub u8);
+#[derive(Copy, Debug, Clone, PartialEq, Eq)]
+pub struct HttpVersion(pub u8, pub u8);
 
-impl Display for HTTPVersion {
+impl Display for HttpVersion {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> Result<(), fmt::Error> {
         write!(formatter, "{}.{}", self.0, self.1)
     }
 }
 
-impl Ord for HTTPVersion {
+impl Ord for HttpVersion {
     fn cmp(&self, other: &Self) -> Ordering {
-        let HTTPVersion(my_major, my_minor) = *self;
-        let HTTPVersion(other_major, other_minor) = *other;
+        let HttpVersion(my_major, my_minor) = *self;
+        let HttpVersion(other_major, other_minor) = *other;
 
         if my_major != other_major {
             return my_major.cmp(&other_major);
@@ -355,41 +330,41 @@ impl Ord for HTTPVersion {
     }
 }
 
-impl PartialOrd for HTTPVersion {
-    fn partial_cmp(&self, other: &HTTPVersion) -> Option<Ordering> {
+impl PartialOrd for HttpVersion {
+    fn partial_cmp(&self, other: &HttpVersion) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl PartialEq<(u8, u8)> for HTTPVersion {
+impl PartialEq<(u8, u8)> for HttpVersion {
     fn eq(&self, &(major, minor): &(u8, u8)) -> bool {
-        self.eq(&HTTPVersion(major, minor))
+        self.eq(&HttpVersion(major, minor))
     }
 }
 
-impl PartialEq<HTTPVersion> for (u8, u8) {
-    fn eq(&self, other: &HTTPVersion) -> bool {
+impl PartialEq<HttpVersion> for (u8, u8) {
+    fn eq(&self, other: &HttpVersion) -> bool {
         let &(major, minor) = self;
-        HTTPVersion(major, minor).eq(other)
+        HttpVersion(major, minor).eq(other)
     }
 }
 
-impl PartialOrd<(u8, u8)> for HTTPVersion {
+impl PartialOrd<(u8, u8)> for HttpVersion {
     fn partial_cmp(&self, &(major, minor): &(u8, u8)) -> Option<Ordering> {
-        self.partial_cmp(&HTTPVersion(major, minor))
+        self.partial_cmp(&HttpVersion(major, minor))
     }
 }
 
-impl PartialOrd<HTTPVersion> for (u8, u8) {
-    fn partial_cmp(&self, other: &HTTPVersion) -> Option<Ordering> {
+impl PartialOrd<HttpVersion> for (u8, u8) {
+    fn partial_cmp(&self, other: &HttpVersion) -> Option<Ordering> {
         let &(major, minor) = self;
-        HTTPVersion(major, minor).partial_cmp(other)
+        HttpVersion(major, minor).partial_cmp(other)
     }
 }
 
-impl From<(u8, u8)> for HTTPVersion {
-    fn from((major, minor): (u8, u8)) -> HTTPVersion {
-        HTTPVersion(major, minor)
+impl From<(u8, u8)> for HttpVersion {
+    fn from((major, minor): (u8, u8)) -> HttpVersion {
+        HttpVersion(major, minor)
     }
 }
 

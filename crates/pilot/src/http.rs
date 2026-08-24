@@ -2,7 +2,7 @@
 //!
 //! One request per connection (`Connection: close`), blocking reads, chunked
 //! and Content-Length bodies. This is deliberately the whole client: harbor
-//! speaks plain HTTP/1.1 via tiny_http, and pilot's traffic is one request at
+//! speaks plain HTTP/1.1 via justhttp, and pilot's traffic is one request at
 //! a time, so an async stack would be pure weight.
 
 use std::io::{self, BufRead, BufReader, Read, Write};

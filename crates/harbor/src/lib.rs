@@ -29,7 +29,7 @@ use duckdb::{
     types::Value,
 };
 
-use tiny_http::{Header, Method, Request, Response, Server};
+use justhttp::{Header, Method, Request, Response, Server};
 
 /// Re-exported so the CLI names the engine through the harbor crate —
 /// one place owns the duckdb version pin.
@@ -80,7 +80,7 @@ use encode::*;
 // parallelises a single query across all cores, so running hundreds
 // concurrently buys thrashing, not throughput. A fixed worker pool bounds
 // in-flight statements; a connection past that waits for a worker to come
-// free. It does not wait in the kernel accept backlog — tiny_http accepts
+// free. It does not wait in the kernel accept backlog — justhttp accepts
 // eagerly on its own thread and gives each connection an OS thread, so
 // connection count, not worker count, is what a flood actually costs.
 
@@ -1089,7 +1089,7 @@ pub fn start(
 
     // One thread the fleet can always reach. Workers pair 1:1 with
     // connections and stream whole responses, so when every worker is busy an
-    // accepted /ready sits in tiny_http's queue until one frees — measured at
+    // accepted /ready sits in justhttp's queue until one frees — measured at
     // 5 seconds under a saturating analytical load — and a load balancer with
     // an ordinary timeout marks a busy-but-healthy berth dead precisely when
     // killing it hurts most. This thread never runs a statement of its own:
@@ -1166,7 +1166,8 @@ pub fn stop() -> Result<String, String> {
     // connection rather than taking the shutdown down with it.
     //
     // Bounded patience, not join(): a worker whose client stopped reading is
-    // stuck inside a socket write — tiny_http sets no write timeout — and a
+    // stuck inside a socket write — justhttp caps a stalled write at ~10s,
+    // longer than this drain is willing to wait — and a
     // plain join would wait on it forever. That wedged this whole function:
     // the signal thread sat inside stop(), the second SIGTERM queued behind
     // the RUNNING mutex, and the only exit left was SIGKILL — which forfeits
@@ -1300,12 +1301,12 @@ pub fn wait() -> Result<String, String> {
 /// One HTTP worker. It owns the socket side only; the DuckDB connection lives
 /// on a dedicated executor thread it starts and hands work to.
 ///
-/// The split is what makes keep-alive possible. tiny_http will frame a
+/// The split is what makes keep-alive possible. justhttp will frame a
 /// response of unknown length itself — chunked, connection reusable — but
 /// only if it is handed a `Read` to pull from. A query cannot be that `Read`:
 /// the rows come from a borrow chain rooted in a `Connection` that is not
 /// `Sync`. Putting the connection on its own thread and passing byte chunks
-/// through a bounded channel gives tiny_http its reader and keeps the query
+/// through a bounded channel gives justhttp its reader and keeps the query
 /// streaming.
 ///
 /// Before this, harbor took the raw socket with `into_writer()` and wrote the
@@ -1543,7 +1544,7 @@ fn handle(
 
     // Two gates before any routing, in this order.
     //
-    // The declared length first: tiny_http drains an undelivered body when a
+    // The declared length first: justhttp drains an undelivered body when a
     // request is dropped — with a single `vec![0; remaining]` — and it does so
     // for EVERY response path, 401s and 404s included. `take()` bounds what
     // harbor buffers but not what the client may declare, and the declared
@@ -1664,7 +1665,7 @@ fn handle(
         }
     };
 
-    // After respond(), not before: tiny_http writes the body from the reader
+    // After respond(), not before: justhttp writes the body from the reader
     // inside that call, so for a streamed result this elapsed time covers the
     // whole query and the whole transfer rather than just the headers.
     if let Some(t) = started {
@@ -2920,7 +2921,7 @@ fn run_sql(
                 ));
                 return (true, 200);
             }
-            // data_length: None makes tiny_http chunk the body and keep the
+            // data_length: None makes justhttp chunk the body and keep the
             // connection alive.
             let headers = vec![
                 Header::from_bytes(&b"Content-Type"[..], &b"application/x-ndjson"[..]).unwrap(),
@@ -3569,7 +3570,7 @@ fn execute_jobs(
     conn
 }
 
-/// Adapts the body channel to the `Read` tiny_http wants. Returning `Ok(0)`
+/// Adapts the body channel to the `Read` justhttp wants. Returning `Ok(0)`
 /// when the sender is dropped is what ends the chunked response.
 struct ChannelReader {
     rx: mpsc::Receiver<Vec<u8>>,

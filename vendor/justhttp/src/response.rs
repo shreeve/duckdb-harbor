@@ -1,12 +1,10 @@
-use crate::common::{HTTPVersion, Header, StatusCode};
+use crate::http::{HttpVersion, Header, StatusCode};
 use httpdate::HttpDate;
 use std::cmp::Ordering;
 use std::sync::mpsc::Receiver;
 
 use std::io::Result as IoResult;
 use std::io::{self, Cursor, Read, Write};
-
-use std::fs::File;
 
 use std::str::FromStr;
 use std::time::SystemTime;
@@ -45,9 +43,6 @@ pub struct Response<R> {
     chunked_threshold: Option<usize>,
 }
 
-/// A `Response` without a template parameter.
-pub type ResponseBox = Response<Box<dyn Read + Send>>;
-
 /// Transfer encoding to use when sending the message.
 /// Note that only *supported* encoding are listed here.
 #[derive(Copy, Clone)]
@@ -78,7 +73,7 @@ fn build_date_header() -> Header {
 
 fn write_message_header<W>(
     mut writer: W,
-    http_version: &HTTPVersion,
+    http_version: &HttpVersion,
     status_code: &StatusCode,
     headers: &[Header],
 ) -> IoResult<()>
@@ -112,13 +107,11 @@ where
 fn choose_transfer_encoding(
     status_code: StatusCode,
     request_headers: &[Header],
-    http_version: &HTTPVersion,
-    entity_length: &Option<usize>,
+    http_version: &HttpVersion,
+    entity_length: Option<usize>,
     has_additional_headers: bool,
     chunked_threshold: usize,
 ) -> TransferEncoding {
-    use crate::util;
-
     // HTTP 1.0 doesn't support other encoding
     if *http_version <= (1, 0) {
         return TransferEncoding::Identity;
@@ -141,7 +134,7 @@ fn choose_transfer_encoding(
         // getting the corresponding TransferEncoding
         .and_then(|value| {
             // getting list of requested elements
-            let mut parse = util::parse_header_value(value.as_str()); // TODO: remove conversion
+            let mut parse = parse_header_value(value.as_str()); // TODO: remove conversion
 
             // sorting elements by most priority
             parse.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
@@ -172,10 +165,7 @@ fn choose_transfer_encoding(
     }
 
     // if we don't have a Content-Length, or if the Content-Length is too big, using chunks writer
-    if entity_length
-        .as_ref()
-        .map_or(true, |val| *val >= chunked_threshold)
-    {
+    if entity_length.is_none_or(|val| val >= chunked_threshold) {
         return TransferEncoding::Chunked;
     }
 
@@ -226,17 +216,12 @@ where
     /// transfer. Notice that chunked transfer might happen regardless of
     /// this threshold, for instance when the request headers indicate
     /// it is wanted or when there is no `Content-Length`.
+    #[must_use]
     pub fn with_chunked_threshold(mut self, length: usize) -> Response<R> {
         self.chunked_threshold = Some(length);
         self
     }
 
-    /// Convert the response into the underlying `Read` type.
-    ///
-    /// This is mainly useful for testing as it must consume the `Response`.
-    pub fn into_reader(self) -> R {
-        self.reader
-    }
 
     /// The current `Content-Length` threshold for switching over to
     /// chunked transfer. The default is 32768 bytes. Notice that
@@ -290,6 +275,7 @@ where
     /// Some headers cannot be modified and some other have a
     ///  special behavior. See the documentation above.
     #[inline]
+    #[must_use]
     pub fn with_header<H>(mut self, header: H) -> Response<R>
     where
         H: Into<Header>,
@@ -300,6 +286,7 @@ where
 
     /// Returns the same request, but with a different status code.
     #[inline]
+    #[must_use]
     pub fn with_status_code<S>(mut self, code: S) -> Response<R>
     where
         S: Into<StatusCode>,
@@ -309,6 +296,7 @@ where
     }
 
     /// Returns the same request, but with different data.
+    #[must_use]
     pub fn with_data<S>(self, reader: S, data_length: Option<usize>) -> Response<S>
     where
         S: Read,
@@ -334,16 +322,15 @@ where
     pub fn raw_print<W: Write>(
         mut self,
         mut writer: W,
-        http_version: HTTPVersion,
+        http_version: HttpVersion,
         request_headers: &[Header],
         do_not_send_body: bool,
-        upgrade: Option<&str>,
     ) -> IoResult<()> {
-        let mut transfer_encoding = Some(choose_transfer_encoding(
+        let transfer_encoding = Some(choose_transfer_encoding(
             self.status_code,
             request_headers,
             &http_version,
-            &self.data_length,
+            self.data_length,
             false, /* TODO */
             self.chunked_threshold(),
         ));
@@ -357,21 +344,8 @@ where
         if !self.headers.iter().any(|h| h.field.equiv("Server")) {
             self.headers.insert(
                 0,
-                Header::from_bytes(&b"Server"[..], &b"tiny-http (Rust)"[..]).unwrap(),
+                Header::from_bytes(&b"Server"[..], &b"justhttp"[..]).unwrap(),
             );
-        }
-
-        // handling upgrade
-        if let Some(upgrade) = upgrade {
-            self.headers.insert(
-                0,
-                Header::from_bytes(&b"Upgrade"[..], upgrade.as_bytes()).unwrap(),
-            );
-            self.headers.insert(
-                0,
-                Header::from_bytes(&b"Connection"[..], &b"upgrade"[..]).unwrap(),
-            );
-            transfer_encoding = None;
         }
 
         // if the transfer encoding is identity, the content length must be known ; therefore if
@@ -390,12 +364,9 @@ where
             };
 
         // checking whether to ignore the body of the response
-        let do_not_send_body = do_not_send_body
-            || match self.status_code.0 {
-                // status code 1xx, 204 and 304 MUST not include a body
-                100..=199 | 204 | 304 => true,
-                _ => false,
-            };
+        // status code 1xx, 204 and 304 MUST not include a body
+        let do_not_send_body =
+            do_not_send_body || matches!(self.status_code.0, 100..=199 | 204 | 304);
 
         // preparing headers for transfer
         match transfer_encoding {
@@ -410,7 +381,7 @@ where
                 self.headers.push(
                     Header::from_bytes(
                         &b"Content-Length"[..],
-                        format!("{}", data_length).as_bytes(),
+                        data_length.to_string().as_bytes(),
                     )
                     .unwrap(),
                 )
@@ -453,72 +424,17 @@ where
         Ok(())
     }
 
-    /// Retrieves the current value of the `Response` status code
-    pub fn status_code(&self) -> StatusCode {
-        self.status_code
-    }
 
-    /// Retrieves the current value of the `Response` data length
-    pub fn data_length(&self) -> Option<usize> {
-        self.data_length
-    }
 
-    /// Retrieves the current list of `Response` headers
-    pub fn headers(&self) -> &[Header] {
-        &self.headers
-    }
 }
 
 impl<R> Response<R>
 where
     R: Read + Send + 'static,
 {
-    /// Turns this response into a `Response<Box<Read + Send>>`.
-    pub fn boxed(self) -> ResponseBox {
-        Response {
-            reader: Box::new(self.reader) as Box<dyn Read + Send>,
-            status_code: self.status_code,
-            headers: self.headers,
-            data_length: self.data_length,
-            chunked_threshold: self.chunked_threshold,
-        }
-    }
-}
-
-impl Response<File> {
-    /// Builds a new `Response` from a `File`.
-    ///
-    /// The `Content-Type` will **not** be automatically detected,
-    ///  you must set it yourself.
-    pub fn from_file(file: File) -> Response<File> {
-        let file_size = file.metadata().ok().map(|v| v.len() as usize);
-
-        Response::new(
-            StatusCode(200),
-            Vec::with_capacity(0),
-            file,
-            file_size,
-            None,
-        )
-    }
 }
 
 impl Response<Cursor<Vec<u8>>> {
-    pub fn from_data<D>(data: D) -> Response<Cursor<Vec<u8>>>
-    where
-        D: Into<Vec<u8>>,
-    {
-        let data = data.into();
-        let data_len = data.len();
-
-        Response::new(
-            StatusCode(200),
-            Vec::with_capacity(0),
-            Cursor::new(data),
-            Some(data_len),
-            None,
-        )
-    }
 
     pub fn from_string<S>(data: S) -> Response<Cursor<Vec<u8>>>
     where
@@ -555,20 +471,60 @@ impl Response<io::Empty> {
         )
     }
 
-    /// DEPRECATED. Use `empty` instead.
-    pub fn new_empty(status_code: StatusCode) -> Response<io::Empty> {
-        Response::empty(status_code)
-    }
 }
 
-impl Clone for Response<io::Empty> {
-    fn clone(&self) -> Response<io::Empty> {
-        Response {
-            reader: io::empty(),
-            status_code: self.status_code,
-            headers: self.headers.clone(),
-            data_length: self.data_length,
-            chunked_threshold: self.chunked_threshold,
-        }
+
+
+
+/// Parses a the value of a header.
+/// Suitable for `Accept-*`, `TE`, etc.
+///
+/// For example with `text/plain, image/png; q=1.5` this function would
+/// return `[ ("text/plain", 1.0), ("image/png", 1.5) ]`
+fn parse_header_value(input: &str) -> Vec<(&str, f32)> {
+    input
+        .split(',')
+        .filter_map(|elem| {
+            let mut params = elem.split(';');
+
+            let t = params.next()?;
+
+            let mut value = 1.0_f32;
+
+            for p in params {
+                if p.trim_start().starts_with("q=") {
+                    if let Ok(val) = f32::from_str(p.trim_start()[2..].trim()) {
+                        value = val;
+                        break;
+                    }
+                }
+            }
+
+            Some((t.trim(), value))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn test_parse_header() {
+        let result = super::parse_header_value("text/html, text/plain; q=1.5 , image/png ; q=2.0");
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].0, "text/html");
+        assert_eq!(result[0].1, 1.0);
+        assert_eq!(result[1].0, "text/plain");
+        assert_eq!(result[1].1, 1.5);
+        assert_eq!(result[2].0, "image/png");
+        assert_eq!(result[2].1, 2.0);
+    }
+
+    #[test]
+    fn chunked_threshold() {
+        let resp = crate::Response::from_string("test".to_string());
+        assert_eq!(resp.chunked_threshold(), 32768);
+        assert_eq!(resp.with_chunked_threshold(42).chunked_threshold(), 42);
     }
 }

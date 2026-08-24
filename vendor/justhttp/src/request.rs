@@ -5,10 +5,10 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::str::FromStr;
 
-use std::sync::mpsc::Sender;
 
-use crate::util::{EqualReader, FusedReader};
-use crate::{HTTPVersion, Header, Method, Response, StatusCode};
+use equal_reader::EqualReader;
+use fused_reader::FusedReader;
+use crate::{HttpVersion, Header, Method, Response, StatusCode};
 use chunked_transfer::Decoder;
 
 /// Represents an HTTP request made by a client.
@@ -23,30 +23,25 @@ use chunked_transfer::Decoder;
 ///
 /// If a client sends multiple requests in a row (without waiting for the response), then you will
 /// get multiple `Request` objects simultaneously. This is called *requests pipelining*.
-/// Tiny-http automatically reorders the responses so that you don't need to worry about the order
-/// in which you call `respond` or `into_writer`.
+/// justhttp automatically reorders the responses so that you don't need to worry about the
+/// order in which you call `respond`.
 ///
 /// This mechanic is disabled if:
 ///
-///  - The body of a request is large enough (handling requires pipelining requires storing the
-///    body of the request in a buffer ; if the body is too big, tiny-http will avoid doing that)
+///  - The body of a request is large enough (handling pipelining requires storing the
+///    body of the request in a buffer ; if the body is too big, justhttp will avoid doing that)
 ///  - A request sends a `Expect: 100-continue` header (which means that the client waits to
 ///    know whether its body will be processed before sending it)
-///  - A request sends a `Connection: close` header or `Connection: upgrade` header (used for
-///    websockets), which indicates that this is the last request that will be received on this
-///    connection
+///  - A request sends a `Connection: close` header, which indicates that this is the last
+///    request that will be received on this connection
 ///
 /// # Automatic cleanup
 ///
-/// If a `Request` object is destroyed without `into_writer` or `respond` being called,
-/// an empty response with a 500 status code (internal server error) will automatically be
+/// If a `Request` object is destroyed without `respond` being called, an empty response
+/// with a 500 status code (internal server error) will automatically be
 /// sent back to the client.
 /// This means that if your code fails during the handling of a request, this "internal server
 /// error" response will automatically be sent during the stack unwinding.
-///
-/// # Testing
-///
-/// If you want to build fake requests to test your server, use [`TestRequest`](crate::test::TestRequest).
 pub struct Request {
     // where to read the body from
     data_reader: Option<Box<dyn Read + Send + 'static>>,
@@ -56,14 +51,11 @@ pub struct Request {
 
     remote_addr: Option<SocketAddr>,
 
-    // true if HTTPS, false if HTTP
-    secure: bool,
-
     method: Method,
 
     path: String,
 
-    http_version: HTTPVersion,
+    http_version: HttpVersion,
 
     headers: Vec<Header>,
 
@@ -71,33 +63,6 @@ pub struct Request {
 
     // true if a `100 Continue` response must be sent when `as_reader()` is called
     must_send_continue: bool,
-
-    // If Some, a message must be sent after responding
-    notify_when_responded: Option<Sender<()>>,
-}
-
-struct NotifyOnDrop<R> {
-    sender: Sender<()>,
-    inner: R,
-}
-
-impl<R: Read> Read for NotifyOnDrop<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(buf)
-    }
-}
-impl<R: Write> Write for NotifyOnDrop<R> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.write(buf)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-impl<R> Drop for NotifyOnDrop<R> {
-    fn drop(&mut self) {
-        self.sender.send(()).unwrap();
-    }
 }
 
 /// Error that can happen when building a `Request` object.
@@ -125,12 +90,10 @@ impl From<IoError> for RequestCreationError {
 /// It is the responsibility of the `Request` to read only the data of the request and not further.
 ///
 /// The `Write` object will be used by the `Request` to write the response.
-#[allow(clippy::too_many_arguments)]
 pub fn new_request<R, W>(
-    secure: bool,
     method: Method,
     path: String,
-    version: HTTPVersion,
+    version: HttpVersion,
     headers: Vec<Header>,
     remote_addr: Option<SocketAddr>,
     mut source_data: R,
@@ -171,24 +134,11 @@ where
         }
     };
 
-    // true if the client sent a `Connection: upgrade` header
-    let connection_upgrade = {
-        match headers
-            .iter()
-            .find(|h: &&Header| h.field.equiv("Connection"))
-            .map(|h| h.value.as_str())
-        {
-            Some(v) if v.to_ascii_lowercase().contains("upgrade") => true,
-            _ => false,
-        }
-    };
-
     // we wrap `source_data` around a reading whose nature depends on the transfer-encoding and
-    // content-length headers
-    let reader = if connection_upgrade {
-        // if we have a `Connection: upgrade`, always keeping the whole reader
-        Box::new(source_data) as Box<dyn Read + Send + 'static>
-    } else if let Some(content_length) = content_length {
+    // content-length headers. (Upstream special-cased `Connection: upgrade` here, handing the
+    // raw stream to the request; with the upgrade API gone, upgrade requests get normal body
+    // framing and the connection still closes after them — see conn.rs.)
+    let reader = if let Some(content_length) = content_length {
         if content_length == 0 {
             Box::new(io::empty()) as Box<dyn Read + Send + 'static>
         } else if content_length <= 1024 && !expects_continue {
@@ -212,7 +162,7 @@ where
 
             Box::new(Cursor::new(buffer)) as Box<dyn Read + Send + 'static>
         } else {
-            let (data_reader, _) = EqualReader::new(source_data, content_length); // TODO:
+            let data_reader = EqualReader::new(source_data, content_length);
             Box::new(FusedReader::new(data_reader)) as Box<dyn Read + Send + 'static>
         }
     } else if transfer_encoding.is_some() {
@@ -230,24 +180,16 @@ where
         data_reader: Some(reader),
         response_writer: Some(Box::new(writer) as Box<dyn Write + Send + 'static>),
         remote_addr,
-        secure,
         method,
         path,
         http_version: version,
         headers,
         body_length: content_length,
         must_send_continue: expects_continue,
-        notify_when_responded: None,
     })
 }
 
 impl Request {
-    /// Returns true if the request was made through HTTPS.
-    #[inline]
-    pub fn secure(&self) -> bool {
-        self.secure
-    }
-
     /// Returns the method requested by the client (eg. `GET`, `POST`, etc.).
     #[inline]
     pub fn method(&self) -> &Method {
@@ -268,7 +210,7 @@ impl Request {
 
     /// Returns the HTTP version of the request.
     #[inline]
-    pub fn http_version(&self) -> &HTTPVersion {
+    pub fn http_version(&self) -> &HttpVersion {
         &self.http_version
     }
 
@@ -293,66 +235,17 @@ impl Request {
         self.remote_addr.as_ref()
     }
 
-    /// Sends a response with a `Connection: upgrade` header, then turns the `Request` into a `Stream`.
-    ///
-    /// The main purpose of this function is to support websockets.
-    /// If you detect that the request wants to use some kind of protocol upgrade, you can
-    ///  call this function to obtain full control of the socket stream.
-    ///
-    /// If you call this on a non-websocket request, tiny-http will wait until this `Stream` object
-    ///  is destroyed before continuing to read or write on the socket. Therefore you should always
-    ///  destroy it as soon as possible.
-    pub fn upgrade<R: Read>(
-        mut self,
-        protocol: &str,
-        response: Response<R>,
-    ) -> Box<dyn ReadWrite + Send> {
-        use crate::util::CustomStream;
-
-        response
-            .raw_print(
-                self.response_writer.as_mut().unwrap().by_ref(),
-                self.http_version.clone(),
-                &self.headers,
-                false,
-                Some(protocol),
-            )
-            .ok(); // TODO: unused result
-
-        self.response_writer.as_mut().unwrap().flush().ok(); // TODO: unused result
-
-        let stream = CustomStream::new(self.extract_reader_impl(), self.extract_writer_impl());
-        if let Some(sender) = self.notify_when_responded.take() {
-            let stream = NotifyOnDrop {
-                sender,
-                inner: stream,
-            };
-            Box::new(stream) as Box<dyn ReadWrite + Send>
-        } else {
-            Box::new(stream) as Box<dyn ReadWrite + Send>
-        }
-    }
-
     /// Allows to read the body of the request.
     ///
     /// # Example
     ///
     /// ```no_run
-    /// # extern crate rustc_serialize;
-    /// # extern crate tiny_http;
-    /// # use rustc_serialize::json::Json;
     /// # use std::io::Read;
-    /// # fn get_content_type(_: &tiny_http::Request) -> &'static str { "" }
-    /// # fn main() {
-    /// # let server = tiny_http::Server::http("0.0.0.0:0").unwrap();
+    /// # let server = justhttp::Server::http("0.0.0.0:0").unwrap();
     /// let mut request = server.recv().unwrap();
     ///
-    /// if get_content_type(&request) == "application/json" {
-    ///     let mut content = String::new();
-    ///     request.as_reader().read_to_string(&mut content).unwrap();
-    ///     let json: Json = content.parse().unwrap();
-    /// }
-    /// # }
+    /// let mut content = String::new();
+    /// request.as_reader().read_to_string(&mut content).unwrap();
     /// ```
     ///
     /// If the client sent a `Expect: 100-continue` header with the request, calling this
@@ -360,13 +253,12 @@ impl Request {
     #[inline]
     pub fn as_reader(&mut self) -> &mut dyn Read {
         if self.must_send_continue {
-            let msg = Response::new_empty(StatusCode(100));
+            let msg = Response::empty(StatusCode(100));
             msg.raw_print(
                 self.response_writer.as_mut().unwrap().by_ref(),
-                self.http_version.clone(),
+                self.http_version,
                 &self.headers,
                 true,
-                None,
             )
             .ok();
             self.response_writer.as_mut().unwrap().flush().ok();
@@ -376,55 +268,13 @@ impl Request {
         self.data_reader.as_mut().unwrap()
     }
 
-    /// Turns the `Request` into a writer.
-    ///
-    /// The writer has a raw access to the stream to the user.
-    /// This function is useful for things like CGI.
-    ///
-    /// Note that the destruction of the `Writer` object may trigger
-    /// some events. For exemple if a client has sent multiple requests and the requests
-    /// have been processed in parallel, the destruction of a writer will trigger
-    /// the writing of the next response.
-    /// Therefore you should always destroy the `Writer` as soon as possible.
-    #[inline]
-    pub fn into_writer(mut self) -> Box<dyn Write + Send + 'static> {
-        let writer = self.extract_writer_impl();
-        if let Some(sender) = self.notify_when_responded.take() {
-            let writer = NotifyOnDrop {
-                sender,
-                inner: writer,
-            };
-            Box::new(writer) as Box<dyn Write + Send + 'static>
-        } else {
-            writer
-        }
-    }
-
-    /// Extract the response `Writer` object from the Request, dropping this `Writer` has the same side effects
-    /// as the object returned by `into_writer` above.
+    /// Extract the response `Writer` object from the Request. Dropping the
+    /// `Writer` unblocks the next pipelined response on the connection.
     ///
     /// This may only be called once on a single request.
     fn extract_writer_impl(&mut self) -> Box<dyn Write + Send + 'static> {
-        use std::mem;
-
         assert!(self.response_writer.is_some());
-
-        let mut writer = None;
-        mem::swap(&mut self.response_writer, &mut writer);
-        writer.unwrap()
-    }
-
-    /// Extract the body `Reader` object from the Request.
-    ///
-    /// This may only be called once on a single request.
-    fn extract_reader_impl(&mut self) -> Box<dyn Read + Send + 'static> {
-        use std::mem;
-
-        assert!(self.data_reader.is_some());
-
-        let mut reader = None;
-        mem::swap(&mut self.data_reader, &mut reader);
-        reader.unwrap()
+        self.response_writer.take().unwrap()
     }
 
     /// Sends a response to this request.
@@ -433,11 +283,7 @@ impl Request {
     where
         R: Read,
     {
-        let res = self.respond_impl(response);
-        if let Some(sender) = self.notify_when_responded.take() {
-            sender.send(()).unwrap();
-        }
-        res
+        self.respond_impl(response)
     }
 
     fn respond_impl<R>(&mut self, response: Response<R>) -> Result<(), IoError>
@@ -450,10 +296,9 @@ impl Request {
 
         Self::ignore_client_closing_errors(response.raw_print(
             writer.by_ref(),
-            self.http_version.clone(),
+            self.http_version,
             &self.headers,
             do_not_send_body,
-            None,
         ))?;
 
         Self::ignore_client_closing_errors(writer.flush())
@@ -461,18 +306,14 @@ impl Request {
 
     fn ignore_client_closing_errors(result: io::Result<()>) -> io::Result<()> {
         result.or_else(|err| match err.kind() {
-            ErrorKind::BrokenPipe => Ok(()),
-            ErrorKind::ConnectionAborted => Ok(()),
-            ErrorKind::ConnectionRefused => Ok(()),
-            ErrorKind::ConnectionReset => Ok(()),
+            ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset => Ok(()),
             _ => Err(err),
         })
     }
 
-    pub(crate) fn with_notify_sender(mut self, sender: Sender<()>) -> Self {
-        self.notify_when_responded = Some(sender);
-        self
-    }
 }
 
 impl fmt::Debug for Request {
@@ -490,18 +331,9 @@ impl Drop for Request {
         if self.response_writer.is_some() {
             let response = Response::empty(500);
             let _ = self.respond_impl(response); // ignoring any potential error
-            if let Some(sender) = self.notify_when_responded.take() {
-                sender.send(()).unwrap();
-            }
         }
     }
 }
-
-/// Dummy trait that regroups the `Read` and `Write` traits.
-///
-/// Automatically implemented on all types that implement both `Read` and `Write`.
-pub trait ReadWrite: Read + Write {}
-impl<T> ReadWrite for T where T: Read + Write {}
 
 #[cfg(test)]
 mod tests {
@@ -513,6 +345,181 @@ mod tests {
         fn f<T: Send>(_: &T) {}
         fn bar(rq: &Request) {
             f(rq);
+        }
+    }
+}
+
+mod equal_reader {
+    use std::io::Read;
+    use std::io::Result as IoResult;
+    
+    /// A `Reader` that reads exactly the number of bytes from a sub-reader.
+    ///
+    /// If the limit is reached, it returns EOF. If the limit is not reached
+    /// when the destructor is called, the remaining bytes will be read and
+    /// thrown away.
+    pub struct EqualReader<R>
+    where
+        R: Read,
+    {
+        reader: R,
+        size: usize,
+    }
+    
+    impl<R> EqualReader<R>
+    where
+        R: Read,
+    {
+        pub fn new(reader: R, size: usize) -> EqualReader<R> {
+            EqualReader { reader, size }
+        }
+    }
+    
+    impl<R> Read for EqualReader<R>
+    where
+        R: Read,
+    {
+        fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+            if self.size == 0 {
+                return Ok(0);
+            }
+    
+            let buf = if buf.len() < self.size {
+                buf
+            } else {
+                &mut buf[..self.size]
+            };
+    
+            match self.reader.read(buf) {
+                Ok(len) => {
+                    self.size -= len;
+                    Ok(len)
+                }
+                err @ Err(_) => err,
+            }
+        }
+    }
+    
+    impl<R> Drop for EqualReader<R>
+    where
+        R: Read,
+    {
+        fn drop(&mut self) {
+            // THE BOUNDED DRAIN (one of the two hardening behaviors this crate carries,
+            // with a regression test in tests/drain.rs): a fixed 64 KiB buffer instead
+            // of `vec![0; remaining_to_read]`. The
+            // remaining size is the client's *declared* Content-Length minus what
+            // was read — attacker-chosen and unbounded — so the upstream code let
+            // an unauthenticated request declaring 1 GB and sending 9 bytes cost
+            // this process a 1 GB zeroed allocation per connection at drop time,
+            // no matter what the server responded. Measured live before the
+            // patch: 6 such requests drove RSS from 22 MB to 2.2 GB.
+            let mut remaining_to_read = self.size;
+            let mut buf = [0u8; 65536];
+    
+            while remaining_to_read > 0 {
+                let want = remaining_to_read.min(buf.len());
+    
+                match self.reader.read(&mut buf[..want]) {
+                    // an error or EOF ends the drain — a half-closed socket
+                    // must not spin here
+                    Err(_) | Ok(0) => break,
+                    Ok(other) => {
+                        remaining_to_read -= other;
+                    }
+                }
+            }
+        }
+    }
+    
+    #[cfg(test)]
+    mod tests {
+        use super::EqualReader;
+        use std::io::Read;
+    
+        #[test]
+        fn test_limit() {
+            use std::io::Cursor;
+    
+            let mut org_reader = Cursor::new("hello world".to_string().into_bytes());
+    
+            {
+                let mut equal_reader = EqualReader::new(org_reader.by_ref(), 5);
+    
+                let mut string = String::new();
+                equal_reader.read_to_string(&mut string).unwrap();
+                assert_eq!(string, "hello");
+            }
+    
+            let mut string = String::new();
+            org_reader.read_to_string(&mut string).unwrap();
+            assert_eq!(string, " world");
+        }
+    
+        #[test]
+        fn test_not_enough() {
+            use std::io::Cursor;
+    
+            let mut org_reader = Cursor::new("hello world".to_string().into_bytes());
+    
+            {
+                let mut equal_reader = EqualReader::new(org_reader.by_ref(), 5);
+    
+                let mut vec = [0];
+                equal_reader.read_exact(&mut vec).unwrap();
+                assert_eq!(vec[0], b'h');
+            }
+    
+            let mut string = String::new();
+            org_reader.read_to_string(&mut string).unwrap();
+            assert_eq!(string, " world");
+        }
+    }
+}
+
+mod fused_reader {
+    use std::io::{IoSliceMut, Read, Result as IoResult};
+    
+    /// Wraps another reader and provides "fused" behavior.
+    /// When the underlying reader reaches EOF, it is dropped
+    /// and the fused reader becomes an empty stub.
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct FusedReader<R: Read> {
+        inner: Option<R>,
+    }
+    
+    impl<R: Read> FusedReader<R> {
+        pub fn new(inner: R) -> Self {
+            Self { inner: Some(inner) }
+        }
+
+    }
+    
+    impl<R: Read> Read for FusedReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+            match &mut self.inner {
+                Some(r) => {
+                    let l = r.read(buf)?;
+                    if l == 0 {
+                        self.inner = None;
+                    }
+                    Ok(l)
+                }
+                None => Ok(0),
+            }
+        }
+    
+        fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> IoResult<usize> {
+            match &mut self.inner {
+                Some(r) => {
+                    let l = r.read_vectored(bufs)?;
+                    if l == 0 {
+                        self.inner = None;
+                    }
+                    Ok(l)
+                }
+                None => Ok(0),
+            }
         }
     }
 }

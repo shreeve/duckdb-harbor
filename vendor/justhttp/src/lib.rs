@@ -9,7 +9,7 @@
 //! occupied).
 //!
 //! ```no_run
-//! let server = tiny_http::Server::http("0.0.0.0:0").unwrap();
+//! let server = justhttp::Server::http("0.0.0.0:0").unwrap();
 //! ```
 //!
 //! A newly-created `Server` will immediately start listening for incoming connections and HTTP
@@ -21,7 +21,7 @@
 //! This function returns an `IoResult<Request>`, so you need to handle the possible errors.
 //!
 //! ```no_run
-//! # let server = tiny_http::Server::http("0.0.0.0:0").unwrap();
+//! # let server = justhttp::Server::http("0.0.0.0:0").unwrap();
 //!
 //! loop {
 //!     // blocks until the next request is received
@@ -41,7 +41,7 @@
 //! ```no_run
 //! # use std::sync::Arc;
 //! # use std::thread;
-//! # let server = tiny_http::Server::http("0.0.0.0:0").unwrap();
+//! # let server = justhttp::Server::http("0.0.0.0:0").unwrap();
 //! let server = Arc::new(server);
 //! let mut guards = Vec::with_capacity(4);
 //!
@@ -69,61 +69,42 @@
 //! the requested method (`GET`, `POST`, etc.) and url.
 //!
 //! To handle a request, you need to create a `Response` object. See the docs of this object for
-//! more infos. Here is an example of creating a `Response` from a file:
+//! more infos. Here is an example of creating a `Response` from a string, and responding:
 //!
 //! ```no_run
-//! # use std::fs::File;
-//! # use std::path::Path;
-//! let response = tiny_http::Response::from_file(File::open(&Path::new("image.png")).unwrap());
-//! ```
-//!
-//! All that remains to do is call `request.respond()`:
-//!
-//! ```no_run
-//! # use std::fs::File;
-//! # use std::path::Path;
-//! # let server = tiny_http::Server::http("0.0.0.0:0").unwrap();
+//! # let server = justhttp::Server::http("0.0.0.0:0").unwrap();
 //! # let request = server.recv().unwrap();
-//! # let response = tiny_http::Response::from_file(File::open(&Path::new("image.png")).unwrap());
+//! let response = justhttp::Response::from_string("hello world");
 //! let _ = request.respond(response);
 //! ```
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
-#![allow(clippy::match_like_matches_macro)]
-
-#[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
-use zeroize::Zeroizing;
 
 use std::error::Error;
 use std::io::Error as IoError;
-use std::io::ErrorKind as IoErrorKind;
 use std::io::Result as IoResult;
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use client::ClientConnection;
-use connection::Connection;
-use util::MessagesQueue;
+use conn::ClientConnection;
+use stream::Connection;
+use pool::MessagesQueue;
 
-pub use common::{HTTPVersion, Header, HeaderField, Method, StatusCode};
-pub use connection::{ConfigListenAddr, ListenAddr, Listener};
-pub use request::{ReadWrite, Request};
-pub use response::{Response, ResponseBox};
-pub use test::TestRequest;
+pub use http::{HttpVersion, Header, HeaderField, Method, StatusCode};
+pub use stream::ListenAddr;
+pub use request::Request;
+pub use response::Response;
 
-mod client;
-mod common;
-mod connection;
+mod conn;
+mod http;
+mod stream;
 mod request;
 mod response;
-mod ssl;
-mod test;
-mod util;
+mod pool;
 
 /// The main class of this library.
 ///
@@ -159,124 +140,46 @@ impl From<Request> for Message {
     }
 }
 
-// this trait is to make sure that Server implements Share and Send
-#[doc(hidden)]
-trait MustBeShareDummy: Sync + Send {}
-#[doc(hidden)]
-impl MustBeShareDummy for Server {}
+// compile-time proof that Server can be shared across threads
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    let _ = assert_send_sync::<Server>;
+};
 
 pub struct IncomingRequests<'a> {
     server: &'a Server,
 }
 
-/// Represents the parameters required to create a server.
-#[derive(Debug, Clone)]
-pub struct ServerConfig {
-    /// The addresses to try to listen to.
-    pub addr: ConfigListenAddr,
-
-    /// If `Some`, then the server will use SSL to encode the communications.
-    pub ssl: Option<SslConfig>,
-}
-
-/// Configuration of the server for SSL.
-#[derive(Debug, Clone)]
-pub struct SslConfig {
-    /// Contains the public certificate to send to clients.
-    pub certificate: Vec<u8>,
-    /// Contains the ultra-secret private key used to decode communications.
-    pub private_key: Vec<u8>,
-}
-
 impl Server {
-    /// Shortcut for a simple server on a specific address.
+    /// A server on a TCP address.
     #[inline]
     pub fn http<A>(addr: A) -> Result<Server, Box<dyn Error + Send + Sync + 'static>>
     where
         A: ToSocketAddrs,
     {
-        Server::new(ServerConfig {
-            addr: ConfigListenAddr::from_socket_addrs(addr)?,
-            ssl: None,
-        })
-    }
-
-    /// Shortcut for an HTTPS server on a specific address.
-    #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
-    #[inline]
-    pub fn https<A>(
-        addr: A,
-        config: SslConfig,
-    ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>>
-    where
-        A: ToSocketAddrs,
-    {
-        Server::new(ServerConfig {
-            addr: ConfigListenAddr::from_socket_addrs(addr)?,
-            ssl: Some(config),
-        })
+        let listener = std::net::TcpListener::bind(addr)?;
+        Self::start(stream::Listener::Tcp(listener))
     }
 
     #[cfg(unix)]
     #[inline]
-    /// Shortcut for a UNIX socket server at a specific path
+    /// A server on a UNIX socket at a specific path.
     pub fn http_unix(
         path: &std::path::Path,
     ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
-        Server::new(ServerConfig {
-            addr: ConfigListenAddr::unix_from_path(path),
-            ssl: None,
-        })
+        let listener = std::os::unix::net::UnixListener::bind(path)?;
+        Self::start(stream::Listener::Unix(listener))
     }
 
-    /// Builds a new server that listens on the specified address.
-    pub fn new(config: ServerConfig) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
-        let listener = config.addr.bind()?;
-        Self::from_listener(listener, config.ssl)
-    }
-
-    /// Builds a new server using the specified TCP listener.
-    ///
-    /// This is useful if you've constructed TcpListener using some less usual method
-    /// such as from systemd. For other cases, you probably want the `new()` function.
-    pub fn from_listener<L: Into<Listener>>(
-        listener: L,
-        ssl_config: Option<SslConfig>,
-    ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
-        let listener = listener.into();
+    /// Spawns the accept thread over a bound listener.
+    fn start(listener: stream::Listener) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
         // building the "close" variable
         let close_trigger = Arc::new(AtomicBool::new(false));
 
         // building the TcpListener
         let (server, local_addr) = {
             let local_addr = listener.local_addr()?;
-            log::debug!("Server listening on {}", local_addr);
             (listener, local_addr)
-        };
-
-        // building the SSL capabilities
-        #[cfg(all(feature = "ssl-openssl", feature = "ssl-rustls"))]
-        compile_error!(
-            "Features 'ssl-openssl' and 'ssl-rustls' must not be enabled at the same time"
-        );
-        #[cfg(not(any(feature = "ssl-openssl", feature = "ssl-rustls")))]
-        type SslContext = ();
-        #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
-        type SslContext = crate::ssl::SslContextImpl;
-        let ssl: Option<SslContext> = {
-            match ssl_config {
-                #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
-                Some(config) => Some(SslContext::from_pem(
-                    config.certificate,
-                    Zeroizing::new(config.private_key),
-                )?),
-                #[cfg(not(any(feature = "ssl-openssl", feature = "ssl-rustls")))]
-                Some(_) => return Err(
-                    "Building a server with SSL requires enabling the `ssl` feature in tiny-http"
-                        .into(),
-                ),
-                None => None,
-            }
         };
 
         // creating a task where server.accept() is continuously called
@@ -287,9 +190,9 @@ impl Server {
         let inside_messages = messages.clone();
         thread::spawn(move || {
             // a tasks pool is used to dispatch the connections into threads
-            let tasks_pool = util::TaskPool::new();
+            let tasks_pool = pool::TaskPool::new();
 
-            // harbor patch (see TODO.md): the ceiling on how long a single
+            // The ceiling on how long a single
             // response write may block before the connection is dropped. A dead
             // reader is finite, not precise — 10s reads as "this peer is gone,"
             // and the edge proxy owns precise per-request timeouts. Because
@@ -297,11 +200,10 @@ impl Server {
             // real reclaim is somewhat longer, which is fine for a backstop.
             const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
-            log::debug!("Running accept thread");
             while !inside_close_trigger.load(Relaxed) {
                 let new_client = match server.accept() {
                     Ok((sock, _)) => {
-                        use util::RefinedTcpStream;
+                        use crate::stream::RefinedTcpStream;
                         // Bound how long a single response write may block, so
                         // a client that stops reading cannot park a server
                         // thread inside `write` forever. Read side is left
@@ -311,22 +213,7 @@ impl Server {
                         // every write. Best-effort — a socket that rejects the
                         // option just keeps tiny_http's original behavior.
                         let _ = sock.set_write_timeout(Some(WRITE_TIMEOUT));
-                        let (read_closable, write_closable) = match ssl {
-                            None => RefinedTcpStream::new(sock),
-                            #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
-                            Some(ref ssl) => {
-                                // trying to apply SSL over the connection
-                                // if an error occurs, we just close the socket and resume listening
-                                let sock = match ssl.accept(sock) {
-                                    Ok(s) => s,
-                                    Err(_) => continue,
-                                };
-
-                                RefinedTcpStream::new(sock)
-                            }
-                            #[cfg(not(any(feature = "ssl-openssl", feature = "ssl-rustls")))]
-                            Some(ref _ssl) => unreachable!(),
-                        };
+                        let (read_closable, write_closable) = RefinedTcpStream::new(sock);
 
                         Ok(ClientConnection::new(write_closable, read_closable))
                     }
@@ -339,30 +226,20 @@ impl Server {
                         let mut client = Some(client);
                         tasks_pool.spawn(Box::new(move || {
                             if let Some(client) = client.take() {
-                                // Synchronization is needed for HTTPS requests to avoid a deadlock
-                                if client.secure() {
-                                    let (sender, receiver) = mpsc::channel();
-                                    for rq in client {
-                                        messages.push(rq.with_notify_sender(sender.clone()).into());
-                                        receiver.recv().unwrap();
-                                    }
-                                } else {
-                                    for rq in client {
-                                        messages.push(rq.into());
-                                    }
+                                for rq in client {
+                                    messages.push(rq.into());
                                 }
                             }
                         }));
                     }
 
                     Err(e) => {
-                        log::error!("Error accepting new client: {}", e);
+                        // surface the accept error through recv(), then stop accepting
                         inside_messages.push(e.into());
                         break;
                     }
                 }
             }
-            log::debug!("Terminating accept thread");
         });
 
         // result
@@ -387,18 +264,12 @@ impl Server {
         self.listening_addr.clone()
     }
 
-    /// Returns the number of clients currently connected to the server.
-    pub fn num_connections(&self) -> usize {
-        unimplemented!()
-        //self.requests_receiver.lock().len()
-    }
-
     /// Blocks until an HTTP request has been submitted and returns it.
     pub fn recv(&self) -> IoResult<Request> {
         match self.messages.pop() {
             Some(Message::Error(err)) => Err(err),
             Some(Message::NewRequest(rq)) => Ok(rq),
-            None => Err(IoError::new(IoErrorKind::Other, "thread unblocked")),
+            None => Err(IoError::other("thread unblocked")),
         }
     }
 
@@ -440,7 +311,7 @@ impl Drop for Server {
         self.close.store(true, Relaxed);
         // Connect briefly to ourselves to unblock the accept thread
         let maybe_stream = match &self.listening_addr {
-            ListenAddr::IP(addr) => TcpStream::connect(addr).map(Connection::from),
+            ListenAddr::Ip(addr) => TcpStream::connect(addr).map(Connection::from),
             #[cfg(unix)]
             ListenAddr::Unix(addr) => {
                 // TODO: use connect_addr when its stabilized.

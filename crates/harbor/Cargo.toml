@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 duckdb = { version = "~1.10505.0", default-features = false, features = ["vtab"] }
-tiny_http = "0.12"
+justhttp = { path = "../../vendor/justhttp" }
 serde = "1"
 serde_json = "1"
 rand = "0.8"
