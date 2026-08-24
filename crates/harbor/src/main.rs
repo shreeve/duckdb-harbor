@@ -9,6 +9,7 @@
 //!   harbor ls                                the live fleet
 //!   harbor stop  <name>                      SIGTERM → drain, CHECKPOINT
 //!   harbor rm    <name>                      stop + clear registry (never the db)
+//!   harbor version                           print this binary's version
 //!
 //! The registry is the filesystem (D3): <name>.sock is the registration,
 //! <name>.lock (flock) is the mutex, <name>.json is identity, <name>.token
@@ -41,6 +42,10 @@ fn main() -> ExitCode {
             print!("{HELP}");
             Ok(())
         }
+        "-V" | "--version" | "version" => {
+            println!("harbor {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         other => Err(format!("unknown command {other:?} (try: harbor --help)")),
     };
     match result {
@@ -61,6 +66,7 @@ usage:
   harbor ls                         list berths in the harbor
   harbor stop  <name>               SIGTERM the berth: drain, CHECKPOINT, exit
   harbor rm    <name>               stop + remove registry entries (never the db)
+  harbor version                    print this binary's version (also -V)
 
 serve/add options:
   --name <n>          berth name (default: db file stem)
