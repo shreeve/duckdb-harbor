@@ -209,8 +209,6 @@ pub struct InfoResponse {
     pub databases: Vec<String>,
     pub pid: u32,
     pub uptime_ms: u64,
-    /// "binary" | "extension"
-    pub mode: String,
     pub grammar: bool,
 }
 

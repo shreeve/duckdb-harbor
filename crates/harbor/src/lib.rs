@@ -1437,7 +1437,7 @@ fn shed(req: Request) -> (bool, u16) {
 
 /// Identity document the embedding host sets before `start()`; GET /info
 /// serves it with `uptimeMs` spliced in. The host owns the static fields
-/// (name, database path, pid, mode) because the core cannot know them.
+/// (name, database path, pid) because the core cannot know them.
 /// Unset — as in the retiring extension — /info answers 404, which is
 /// exactly the pre-fleet behavior clients use as a version probe.
 static INFO: Mutex<Option<serde_json::Value>> = Mutex::new(None);

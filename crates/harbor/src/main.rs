@@ -304,7 +304,6 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         "database": db_abs,
         "databases": [o.name],
         "pid": std::process::id(),
-        "mode": "binary",
         "grammar": false,
     }));
 
