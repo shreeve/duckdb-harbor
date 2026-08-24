@@ -4,7 +4,7 @@ use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 
 /// Status code of a request or response.
-#[derive(Eq, PartialEq, Copy, Clone, Debug, Ord, PartialOrd)]
+#[derive(Eq, PartialEq, Copy, Clone, Debug)]
 pub struct StatusCode(pub u16);
 
 impl StatusCode {
@@ -81,44 +81,9 @@ impl StatusCode {
     }
 }
 
-
-
-
 impl From<u16> for StatusCode {
     fn from(in_code: u16) -> StatusCode {
         StatusCode(in_code)
-    }
-}
-
-impl From<i32> for StatusCode {
-    fn from(in_code: i32) -> StatusCode {
-        StatusCode(in_code as u16)
-    }
-}
-
-
-
-impl PartialEq<u16> for StatusCode {
-    fn eq(&self, other: &u16) -> bool {
-        &self.0 == other
-    }
-}
-
-impl PartialEq<StatusCode> for u16 {
-    fn eq(&self, other: &StatusCode) -> bool {
-        self == &other.0
-    }
-}
-
-impl PartialOrd<u16> for StatusCode {
-    fn partial_cmp(&self, other: &u16) -> Option<Ordering> {
-        self.0.partial_cmp(other)
-    }
-}
-
-impl PartialOrd<StatusCode> for u16 {
-    fn partial_cmp(&self, other: &StatusCode) -> Option<Ordering> {
-        self.partial_cmp(&other.0)
     }
 }
 
@@ -169,16 +134,10 @@ impl FromStr for Header {
     }
 }
 
-impl Display for Header {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(formatter, "{}: {}", self.field, self.value.as_str())
-    }
-}
-
 /// Field of a header (eg. `Content-Type`, `Content-Length`, etc.)
 ///
 /// Comparison between two `HeaderField`s ignores case.
-#[derive(Debug, Clone, Eq)]
+#[derive(Debug, Clone)]
 pub struct HeaderField(AsciiString);
 
 impl HeaderField {
@@ -210,25 +169,11 @@ impl FromStr for HeaderField {
     }
 }
 
-impl Display for HeaderField {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(formatter, "{}", self.0.as_str())
-    }
-}
-
-impl PartialEq for HeaderField {
-    fn eq(&self, other: &HeaderField) -> bool {
-        let self_str: &str = self.as_str().as_ref();
-        let other_str = other.as_str().as_ref();
-        self_str.eq_ignore_ascii_case(other_str)
-    }
-}
-
 /// HTTP request methods
 ///
 /// As per [RFC 7231](https://tools.ietf.org/html/rfc7231#section-4.1) and
 /// [RFC 5789](https://tools.ietf.org/html/rfc5789)
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Method {
     /// `GET`
     Get,
@@ -300,14 +245,7 @@ impl FromStr for Method {
     }
 }
 
-impl Display for Method {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(formatter, "{}", self.as_str())
-    }
-}
-
 /// HTTP version (usually 1.0 or 1.1).
-#[allow(clippy::upper_case_acronyms)]
 #[derive(Copy, Debug, Clone, PartialEq, Eq)]
 pub struct HttpVersion(pub u8, pub u8);
 
@@ -342,29 +280,9 @@ impl PartialEq<(u8, u8)> for HttpVersion {
     }
 }
 
-impl PartialEq<HttpVersion> for (u8, u8) {
-    fn eq(&self, other: &HttpVersion) -> bool {
-        let &(major, minor) = self;
-        HttpVersion(major, minor).eq(other)
-    }
-}
-
 impl PartialOrd<(u8, u8)> for HttpVersion {
     fn partial_cmp(&self, &(major, minor): &(u8, u8)) -> Option<Ordering> {
         self.partial_cmp(&HttpVersion(major, minor))
-    }
-}
-
-impl PartialOrd<HttpVersion> for (u8, u8) {
-    fn partial_cmp(&self, other: &HttpVersion) -> Option<Ordering> {
-        let &(major, minor) = self;
-        HttpVersion(major, minor).partial_cmp(other)
-    }
-}
-
-impl From<(u8, u8)> for HttpVersion {
-    fn from((major, minor): (u8, u8)) -> HttpVersion {
-        HttpVersion(major, minor)
     }
 }
 
@@ -378,7 +296,7 @@ mod test {
     fn test_parse_header() {
         let header: Header = "Content-Type: text/html".parse().unwrap();
 
-        assert!(header.field.equiv(&"content-type"));
+        assert!(header.field.equiv("content-type"));
         assert!(header.value.as_str() == "text/html");
 
         assert!("hello world".parse::<Header>().is_err());
@@ -395,11 +313,11 @@ mod test {
     fn test_parse_header_with_doublecolon() {
         let header: Header = "Time: 20: 34".parse().unwrap();
 
-        assert!(header.field.equiv(&"time"));
+        assert!(header.field.equiv("time"));
         assert!(header.value.as_str() == "20: 34");
     }
 
-    // This tests reslstance to RUSTSEC-2020-0031: "HTTP Request smuggling
+    // This tests resistance to RUSTSEC-2020-0031: "HTTP Request smuggling
     // through malformed Transfer Encoding headers"
     // (https://rustsec.org/advisories/RUSTSEC-2020-0031.html).
     #[test]

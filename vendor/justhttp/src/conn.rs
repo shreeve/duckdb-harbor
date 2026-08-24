@@ -7,10 +7,10 @@ use std::io::{BufReader, BufWriter, ErrorKind, Read};
 use std::net::SocketAddr;
 use std::str::FromStr;
 
+use crate::Request;
 use crate::http::{HttpVersion, Method};
 use crate::stream::RefinedTcpStream;
 use sequential::{SequentialReader, SequentialReaderBuilder, SequentialWriterBuilder};
-use crate::Request;
 
 /// A ClientConnection is an object that will store a socket to a client
 /// and return Request objects.
@@ -67,6 +67,9 @@ impl ClientConnection {
     ///
     /// Reads until `CRLF` is reached. The next read will start
     ///  at the first byte of the new line.
+    // byte-at-a-time on purpose: the source is already a BufReader, and this
+    // exact framing (CRLF only, Interrupted retried by Bytes) is semantics.
+    #[allow(clippy::unbuffered_bytes)]
     fn read_next_line(&mut self) -> IoResult<AsciiString> {
         let mut buf = Vec::new();
         let mut prev_byte_was_cr = false;
@@ -137,7 +140,7 @@ impl ClientConnection {
         let request = crate::request::new_request(
             method,
             path,
-            version.clone(),
+            version,
             headers,
             *self.remote_addr.as_ref().unwrap(),
             data_source,
@@ -181,7 +184,7 @@ impl Iterator for ClientConnection {
                         .raw_print(writer, HttpVersion(1, 1), &[], false)
                         .ok();
                     return None; // we don't know where the next request would start,
-                                 // se we have to close
+                    // so we have to close
                 }
 
                 Err(ReadError::WrongHeader(ver)) => {
@@ -189,7 +192,7 @@ impl Iterator for ClientConnection {
                     let response = Response::empty(StatusCode(400));
                     response.raw_print(writer, ver, &[], false).ok();
                     return None; // we don't know where the next request would start,
-                                 // se we have to close
+                    // so we have to close
                 }
 
                 Err(ReadError::ReadIoError(ref err)) if err.kind() == ErrorKind::TimedOut => {
@@ -300,20 +303,20 @@ mod test {
 mod sequential {
     use std::io::Result as IoResult;
     use std::io::{Read, Write};
-    
+
     use std::sync::mpsc::channel;
     use std::sync::mpsc::{Receiver, Sender};
     use std::sync::{Arc, Mutex};
-    
+
     use std::mem;
-    
+
     pub struct SequentialReaderBuilder<R>
     where
         R: Read + Send,
     {
         inner: SequentialReaderBuilderInner<R>,
     }
-    
+
     enum SequentialReaderBuilderInner<R>
     where
         R: Read + Send,
@@ -321,7 +324,7 @@ mod sequential {
         First(R),
         NotFirst(Receiver<R>),
     }
-    
+
     pub struct SequentialReader<R>
     where
         R: Read + Send,
@@ -329,7 +332,7 @@ mod sequential {
         inner: SequentialReaderInner<R>,
         next: Sender<R>,
     }
-    
+
     enum SequentialReaderInner<R>
     where
         R: Read + Send,
@@ -338,7 +341,7 @@ mod sequential {
         Waiting(Receiver<R>),
         Empty,
     }
-    
+
     pub struct SequentialWriterBuilder<W>
     where
         W: Write + Send,
@@ -346,7 +349,7 @@ mod sequential {
         writer: Arc<Mutex<W>>,
         next_trigger: Option<Receiver<()>>,
     }
-    
+
     pub struct SequentialWriter<W>
     where
         W: Write + Send,
@@ -355,7 +358,7 @@ mod sequential {
         writer: Arc<Mutex<W>>,
         on_finish: Sender<()>,
     }
-    
+
     impl<R: Read + Send> SequentialReaderBuilder<R> {
         pub fn new(reader: R) -> SequentialReaderBuilder<R> {
             SequentialReaderBuilder {
@@ -363,7 +366,7 @@ mod sequential {
             }
         }
     }
-    
+
     impl<W: Write + Send> SequentialWriterBuilder<W> {
         pub fn new(writer: W) -> SequentialWriterBuilder<W> {
             SequentialWriterBuilder {
@@ -372,21 +375,21 @@ mod sequential {
             }
         }
     }
-    
+
     impl<R: Read + Send> Iterator for SequentialReaderBuilder<R> {
         type Item = SequentialReader<R>;
-    
+
         fn next(&mut self) -> Option<SequentialReader<R>> {
             let (tx, rx) = channel();
-    
+
             let inner = mem::replace(&mut self.inner, SequentialReaderBuilderInner::NotFirst(rx));
-    
+
             match inner {
                 SequentialReaderBuilderInner::First(reader) => Some(SequentialReader {
                     inner: SequentialReaderInner::MyTurn(reader),
                     next: tx,
                 }),
-    
+
                 SequentialReaderBuilderInner::NotFirst(previous) => Some(SequentialReader {
                     inner: SequentialReaderInner::Waiting(previous),
                     next: tx,
@@ -394,14 +397,14 @@ mod sequential {
             }
         }
     }
-    
+
     impl<W: Write + Send> Iterator for SequentialWriterBuilder<W> {
         type Item = SequentialWriter<W>;
         fn next(&mut self) -> Option<SequentialWriter<W>> {
             let (tx, rx) = channel();
             let mut next_next_trigger = Some(rx);
             ::std::mem::swap(&mut next_next_trigger, &mut self.next_trigger);
-    
+
             Some(SequentialWriter {
                 trigger: next_next_trigger,
                 writer: self.writer.clone(),
@@ -409,7 +412,7 @@ mod sequential {
             })
         }
     }
-    
+
     impl<R: Read + Send> Read for SequentialReader<R> {
         fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
             let mut reader = match self.inner {
@@ -417,40 +420,40 @@ mod sequential {
                 SequentialReaderInner::Waiting(ref mut recv) => recv.recv().unwrap(),
                 SequentialReaderInner::Empty => unreachable!(),
             };
-    
+
             let result = reader.read(buf);
             self.inner = SequentialReaderInner::MyTurn(reader);
             result
         }
     }
-    
+
     impl<W: Write + Send> Write for SequentialWriter<W> {
         fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
             if let Some(v) = self.trigger.as_mut() {
                 v.recv().unwrap()
             }
             self.trigger = None;
-    
+
             self.writer.lock().unwrap().write(buf)
         }
-    
+
         fn flush(&mut self) -> IoResult<()> {
             if let Some(v) = self.trigger.as_mut() {
                 v.recv().unwrap()
             }
             self.trigger = None;
-    
+
             self.writer.lock().unwrap().flush()
         }
     }
-    
+
     impl<R> Drop for SequentialReader<R>
     where
         R: Read + Send,
     {
         fn drop(&mut self) {
             let inner = mem::replace(&mut self.inner, SequentialReaderInner::Empty);
-    
+
             match inner {
                 SequentialReaderInner::MyTurn(reader) => {
                     self.next.send(reader).ok();
@@ -463,7 +466,7 @@ mod sequential {
             }
         }
     }
-    
+
     impl<W> Drop for SequentialWriter<W>
     where
         W: Write + Send,

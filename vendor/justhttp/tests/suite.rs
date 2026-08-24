@@ -9,7 +9,7 @@
 //! - `unblock`   — Server::unblock wakes blocked recv()
 //! - `unix`      — unix-domain sockets
 //! - `stall`     — the 10s write-timeout backstop (`#[ignore]`, ~35s by
-//!                 design: `cargo test --test suite -- --ignored`)
+//!   design: `cargo test --test suite -- --ignored`)
 //!
 //! `tests/drain.rs` stays a separate binary on purpose: it measures
 //! allocations with a global allocator, and any other test running in the
@@ -105,14 +105,10 @@ mod support {
     }
 }
 
-
 mod basic {
     use super::support;
 
-
-
     use std::io::{Read, Write};
-
 
     #[test]
     fn basic_handling() {
@@ -125,7 +121,7 @@ mod basic {
 
         let request = server.recv().unwrap();
         assert!(*request.method() == justhttp::Method::Get);
-        //assert!(request.url() == "/");
+        assert_eq!(request.url(), "/");
         request
             .respond(justhttp::Response::from_string("hello world".to_owned()))
             .unwrap();
@@ -138,17 +134,13 @@ mod basic {
     }
 }
 
-
 mod input {
     use super::support;
-
-
 
     use std::io::{Read, Write};
     use std::net::Shutdown;
     use std::sync::mpsc;
     use std::thread;
-
 
     #[test]
     fn basic_string_input() {
@@ -200,7 +192,6 @@ mod input {
             tx.send(()).unwrap();
         });
 
-        // client.set_keepalive(Some(3)).unwrap(); FIXME: reenable this
         let mut content = vec![0; 12];
         client.read_exact(&mut content).unwrap();
         assert!(&content[9..].starts_with(b"100")); // 100 status code
@@ -218,7 +209,6 @@ mod input {
 
         (write!(client, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nExpect: 189-dummy\r\nContent-Type: text/plain; charset=utf8\r\n\r\n")).unwrap();
 
-        // client.set_keepalive(Some(3)).unwrap(); FIXME: reenable this
         let mut content = String::new();
         client.read_to_string(&mut content).unwrap();
         assert!(&content[9..].starts_with("417")); // 417 status code
@@ -264,29 +254,24 @@ mod input {
     }
 }
 
-
 mod network {
     use super::support;
-
-
 
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpStream};
     use std::thread;
     use std::time::Duration;
 
-
     #[test]
     fn connection_close_header() {
         let mut client = support::new_client_to_hello_world_server();
 
         (write!(client, "GET / HTTP/1.1\r\nConnection: keep-alive\r\n\r\n")).unwrap();
-        thread::sleep(Duration::from_millis(1000));
+        thread::sleep(Duration::from_secs(1));
 
         (write!(client, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n")).unwrap();
 
         // if the connection was not closed, this will err with timeout
-        // client.set_keepalive(Some(1)).unwrap(); FIXME: reenable this
         let mut out = Vec::new();
         client.read_to_end(&mut out).unwrap();
     }
@@ -298,7 +283,6 @@ mod network {
         (write!(client, "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")).unwrap();
 
         // if the connection was not closed, this will err with timeout
-        // client.set_keepalive(Some(1)).unwrap(); FIXME: reenable this
         let mut out = Vec::new();
         client.read_to_end(&mut out).unwrap();
     }
@@ -308,12 +292,11 @@ mod network {
         let mut client = support::new_client_to_hello_world_server();
 
         (write!(client, "GET / HTTP/1.1\r\nConnection: keep-alive\r\n\r\n")).unwrap();
-        thread::sleep(Duration::from_millis(1000));
+        thread::sleep(Duration::from_secs(1));
 
         client.shutdown(Shutdown::Write).unwrap();
 
         // if the connection was not closed, this will err with timeout
-        // client.set_keepalive(Some(1)).unwrap(); FIXME: reenable this
         let mut out = Vec::new();
         client.read_to_end(&mut out).unwrap();
     }
@@ -342,7 +325,6 @@ mod network {
         thread::sleep(Duration::from_millis(100));
         (writeln!(client)).unwrap();
 
-        // client.set_keepalive(Some(2)).unwrap(); FIXME: reenable this
         let mut data = String::new();
         client.read_to_string(&mut data).unwrap();
         assert!(data.ends_with("hello world"));
@@ -360,7 +342,6 @@ mod network {
         ))
         .unwrap();
 
-        // client.set_keepalive(Some(2)).unwrap(); FIXME: reenable this
         let mut data = String::new();
         client.read_to_string(&mut data).unwrap();
         assert_eq!(data.split("hello world").count(), 4);
@@ -383,7 +364,6 @@ mod network {
         ))
         .unwrap();
 
-        // client.set_keepalive(Some(2)).unwrap(); FIXME: reenable this
         let mut content = String::new();
         client.read_to_string(&mut content).unwrap();
         assert!(&content[9..].starts_with('5')); // 5xx status code
@@ -405,10 +385,8 @@ mod network {
             let rq2 = server.recv().unwrap();
 
             thread::spawn(move || {
-                rq2.respond(justhttp::Response::from_string(
-                    "second request".to_owned(),
-                ))
-                .unwrap();
+                rq2.respond(justhttp::Response::from_string("second request".to_owned()))
+                    .unwrap();
             });
 
             thread::sleep(Duration::from_millis(100));
@@ -419,7 +397,6 @@ mod network {
             });
         });
 
-        // client.set_keepalive(Some(2)).unwrap(); FIXME: reenable this
         let mut content = String::new();
         client.read_to_string(&mut content).unwrap();
         assert!(content.ends_with("second request"));
@@ -448,42 +425,7 @@ mod network {
         assert!(content.starts_with("HTTP/1.1 204"));
         assert!(!content.contains("Transfer-Encoding: chunked"));
     }
-
-    /* FIXME: uncomment and fix
-    #[test]
-    fn connection_timeout() {
-        let (server, mut client) = {
-            let server = justhttp::ServerBuilder::new()
-                .with_client_connections_timeout(3000)
-                .with_random_port().build().unwrap();
-            let port = server.server_addr().port();
-            let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            (server, client)
-        };
-
-        let (tx_stop, rx_stop) = mpsc::channel();
-
-        // executing server in parallel
-        thread::spawn(move || {
-            loop {
-                server.try_recv();
-                thread::sleep(Duration::from_millis(100));
-                if rx_stop.try_recv().is_ok() { break }
-            }
-        });
-
-        // waiting for the 408 response
-        let mut content = String::new();
-        client.read_to_string(&mut content).unwrap();
-        assert!(&content[9..].starts_with("408"));
-
-        // stopping server
-        tx_stop.send(());
-    }
-    */
-
 }
-
 
 mod keepalive {
     use super::support;
@@ -496,7 +438,6 @@ mod keepalive {
     use std::io::{Cursor, Read, Write};
     use std::sync::mpsc;
     use std::time::Duration;
-
 
     #[test]
     fn chunked_reuse() {
@@ -520,7 +461,9 @@ mod keepalive {
             write!(client, "GET /{i} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
             let (headers, body) = support::read_response(&mut client);
             assert!(
-                headers.to_ascii_lowercase().contains("transfer-encoding: chunked"),
+                headers
+                    .to_ascii_lowercase()
+                    .contains("transfer-encoding: chunked"),
                 "expected chunked framing, headers were: {headers}"
             );
             assert_eq!(body, format!("resp-{i}"));
@@ -604,21 +547,17 @@ mod keepalive {
     }
 }
 
-
 mod buffering {
     use super::support;
 
-
-
     use std::io::{Cursor, Read, Write};
     use std::sync::{
+        Arc,
         atomic::{
             AtomicUsize,
             Ordering::{AcqRel, Acquire},
         },
-        Arc,
     };
-
 
     struct MeteredReader<T> {
         inner: T,
@@ -653,7 +592,7 @@ mod buffering {
     fn identity_served(r: &mut Reader) -> justhttp::Response<&mut Reader> {
         let body_len = r.inner.get_ref().len();
         justhttp::Response::empty(200)
-            .with_chunked_threshold(std::usize::MAX)
+            .with_chunked_threshold(usize::MAX)
             .with_data(r, Some(body_len))
     }
 
@@ -711,18 +650,16 @@ mod buffering {
     }
 }
 
-
 mod prompt {
 
-
-    use std::io::{copy, Read, Write};
+    use justhttp::{Response, Server};
+    use std::io::{Read, Write, copy};
     use std::net::{Shutdown, TcpStream};
     use std::ops::Deref;
-    use std::sync::mpsc::channel;
     use std::sync::Arc;
+    use std::sync::mpsc::channel;
     use std::thread::{sleep, spawn};
     use std::time::Duration;
-    use justhttp::{Response, Server};
 
     /// Stream that produces bytes very slowly
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -730,7 +667,7 @@ mod prompt {
         val: u8,
         len: usize,
     }
-    impl<'b> Read for SlowByteSrc {
+    impl Read for SlowByteSrc {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             sleep(Duration::from_millis(100));
             let l = self.len.min(buf.len()).min(1000);
@@ -768,7 +705,7 @@ mod prompt {
         ) {
             let resp_body = SlowByteSrc {
                 val: 42,
-                len: 1000_000,
+                len: 1_000_000,
             }; // very slow response body
 
             let server = Server::http("0.0.0.0:0").unwrap();
@@ -860,10 +797,12 @@ mod prompt {
             let server = Server::http("0.0.0.0:0").unwrap();
             let client = TcpStream::connect(server.server_addr().to_ip().unwrap()).unwrap();
 
-            spawn(move || loop {
-                // server attempts to respond immediately
-                let req = server.recv().unwrap();
-                req.respond(Response::empty(400)).unwrap();
+            spawn(move || {
+                loop {
+                    // server attempts to respond immediately
+                    let req = server.recv().unwrap();
+                    req.respond(Response::empty(400)).unwrap();
+                }
             });
 
             let client = Arc::new(client);
@@ -880,7 +819,7 @@ mod prompt {
 
         static SLOW_BODY: SlowByteSrc = SlowByteSrc {
             val: 65,
-            len: 1000_000,
+            len: 1_000_000,
         };
 
         #[test]
@@ -922,9 +861,7 @@ mod prompt {
     }
 }
 
-
 mod unblock {
-
 
     use std::sync::Arc;
     use std::thread;
@@ -960,18 +897,14 @@ mod unblock {
     }
 }
 
-
 #[cfg(unix)]
 mod unix {
-
-
 
     use std::{
         io::{Read, Write},
         os::unix::net::UnixStream,
         path::PathBuf,
     };
-
 
     #[test]
     fn unix_basic_handling() {
@@ -995,7 +928,7 @@ mod unix {
 
         let request = server.recv().unwrap();
         assert!(*request.method() == justhttp::Method::Get);
-        //assert!(request.url() == "/");
+        assert_eq!(request.url(), "/");
         request
             .respond(justhttp::Response::from_string("hello world".to_owned()))
             .unwrap();
@@ -1008,21 +941,19 @@ mod unix {
     }
 }
 
-
 mod stall {
     use super::support;
 
     // Regression test for the response write timeout carried in this crate: a
     // client that stops reading its response must not pin a server thread inside
     // `write` forever. Slow by design (the timeout under test is 10s), so it is
-    // `#[ignore]`d: run with `cargo test --test stall -- --ignored`.
+    // `#[ignore]`d: run with `cargo test --test suite -- --ignored`.
 
     use std::io::{Cursor, Write};
     use std::time::{Duration, Instant};
 
-
     #[test]
-    #[ignore = "~10s by design: exercises the 10s stalled-reader write timeout"]
+    #[ignore = "~35s by design: exercises the 10s stalled-reader write timeout"]
     fn stalled_reader_reclaimed() {
         let (server, mut client) = support::new_one_server_one_client();
 

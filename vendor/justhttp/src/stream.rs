@@ -7,13 +7,11 @@ pub(crate) use refined::RefinedTcpStream;
 
 mod listen {
     //! Abstractions of Tcp and Unix socket types
-    
+
+    use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
     #[cfg(unix)]
     use std::os::unix::net as unix_net;
-    use std::{
-        net::{Shutdown, SocketAddr, TcpListener, TcpStream},
-    };
-    
+
     /// Unified listener. Either a [`TcpListener`] or [`std::os::unix::net::UnixListener`]
     pub enum Listener {
         Tcp(TcpListener),
@@ -28,7 +26,7 @@ mod listen {
                 Self::Unix(l) => l.local_addr().map(ListenAddr::from),
             }
         }
-    
+
         pub(crate) fn accept(&self) -> std::io::Result<(Connection, Option<SocketAddr>)> {
             match self {
                 Self::Tcp(l) => l
@@ -50,7 +48,7 @@ mod listen {
             Self::Unix(s)
         }
     }
-    
+
     /// Unified connection. Either a [`TcpStream`] or [`std::os::unix::net::UnixStream`].
     #[derive(Debug)]
     pub(crate) enum Connection {
@@ -75,7 +73,7 @@ mod listen {
                 Self::Unix(s) => s.write(buf),
             }
         }
-    
+
         fn flush(&mut self) -> std::io::Result<()> {
             match self {
                 Self::Tcp(s) => s.flush(),
@@ -93,7 +91,7 @@ mod listen {
                 Self::Unix(_) => Ok(None),
             }
         }
-    
+
         pub(crate) fn shutdown(&self, how: Shutdown) -> std::io::Result<()> {
             match self {
                 Self::Tcp(s) => s.shutdown(how),
@@ -101,9 +99,9 @@ mod listen {
                 Self::Unix(s) => s.shutdown(how),
             }
         }
-    
-        /// Bound how long a single write to this socket may block. tiny_http
-        /// otherwise sets no write timeout, so a client that stops reading its
+
+        /// Bound how long a single write to this socket may block. upstream tiny_http
+        /// otherwise set no write timeout, so a client that stops reading its
         /// response leaves the server thread parked in a `write` forever. A client
         /// that keeps draining resets the timer on every write; only a fully
         /// stalled peer trips it, after which the write errors and the connection
@@ -118,7 +116,7 @@ mod listen {
                 Self::Unix(s) => s.set_write_timeout(dur),
             }
         }
-    
+
         pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
             match self {
                 Self::Tcp(s) => s.try_clone().map(Self::from),
@@ -138,7 +136,7 @@ mod listen {
             Self::Unix(s)
         }
     }
-    
+
     /// Unified listen socket address. Either a [`SocketAddr`] or [`std::os::unix::net::SocketAddr`].
     #[derive(Debug, Clone)]
     pub enum ListenAddr {
@@ -154,7 +152,7 @@ mod listen {
                 Self::Unix(_) => None,
             }
         }
-    
+
         /// Gets the Unix socket address.
         ///
         /// This is also available on non-Unix platforms, for ease of use, but always returns `None`.
@@ -164,10 +162,6 @@ mod listen {
                 Self::Ip(_) => None,
                 Self::Unix(s) => Some(s),
             }
-        }
-        #[cfg(not(unix))]
-        pub fn to_unix(self) -> Option<SocketAddr> {
-            None
         }
     }
     impl From<SocketAddr> for ListenAddr {
@@ -196,9 +190,9 @@ mod refined {
     use std::io::Result as IoResult;
     use std::io::{Read, Write};
     use std::net::{Shutdown, SocketAddr};
-    
+
     use super::listen::Connection;
-    
+
     // harbor: upstream wrapped the connection in a Stream enum whose other
     // variant was Https(SslStream); with TLS stripped the enum collapsed away
     // and RefinedTcpStream holds the Connection directly.
@@ -208,61 +202,61 @@ mod refined {
         close_read: bool,
         close_write: bool,
     }
-    
+
     impl RefinedTcpStream {
         pub(crate) fn new<S>(stream: S) -> (RefinedTcpStream, RefinedTcpStream)
         where
             S: Into<Connection>,
         {
             let stream: Connection = stream.into();
-    
+
             // same panic surface as upstream: a socket whose fd cannot be
             // duplicated is unusable anyway
             let (read, write) = (stream.try_clone().unwrap(), stream);
-    
+
             let read = RefinedTcpStream {
                 stream: read,
                 close_read: true,
                 close_write: false,
             };
-    
+
             let write = RefinedTcpStream {
                 stream: write,
                 close_read: false,
                 close_write: true,
             };
-    
+
             (read, write)
         }
-    
+
         pub(crate) fn peer_addr(&mut self) -> IoResult<Option<SocketAddr>> {
             self.stream.peer_addr()
         }
     }
-    
+
     impl Drop for RefinedTcpStream {
         fn drop(&mut self) {
             if self.close_read {
                 self.stream.shutdown(Shutdown::Read).ok();
             }
-    
+
             if self.close_write {
                 self.stream.shutdown(Shutdown::Write).ok();
             }
         }
     }
-    
+
     impl Read for RefinedTcpStream {
         fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
             self.stream.read(buf)
         }
     }
-    
+
     impl Write for RefinedTcpStream {
         fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
             self.stream.write(buf)
         }
-    
+
         fn flush(&mut self) -> IoResult<()> {
             self.stream.flush()
         }

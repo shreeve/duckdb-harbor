@@ -4,7 +4,7 @@
 //!
 //! The easiest way to create a server is to call `Server::http()`.
 //!
-//! The `http()` function returns an `IoResult<Server>` which will return an error
+//! The `http()` function returns a `Result<Server, _>` which will contain an error
 //! in the case where the server creation fails (for example if the listening port is already
 //! occupied).
 //!
@@ -84,27 +84,27 @@ use std::error::Error;
 use std::io::Error as IoError;
 use std::io::Result as IoResult;
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use conn::ClientConnection;
-use stream::Connection;
 use pool::MessagesQueue;
+use stream::Connection;
 
-pub use http::{HttpVersion, Header, HeaderField, Method, StatusCode};
-pub use stream::ListenAddr;
+pub use http::{Header, Method, StatusCode};
 pub use request::Request;
 pub use response::Response;
+pub use stream::ListenAddr;
 
 mod conn;
 mod http;
-mod stream;
+mod pool;
 mod request;
 mod response;
-mod pool;
+mod stream;
 
 /// The main class of this library.
 ///
@@ -211,7 +211,7 @@ impl Server {
                         // indefinitely between requests. Only a fully stalled
                         // peer trips it; a draining client resets the timer
                         // every write. Best-effort — a socket that rejects the
-                        // option just keeps tiny_http's original behavior.
+                        // option just keeps upstream's original behavior.
                         let _ = sock.set_write_timeout(Some(WRITE_TIMEOUT));
                         let (read_closable, write_closable) = RefinedTcpStream::new(sock);
 

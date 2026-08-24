@@ -2917,7 +2917,6 @@ fn run_sql(
                     headers,
                     std::io::Cursor::new(document),
                     Some(length),
-                    None,
                 ));
                 return (true, 200);
             }
@@ -2927,7 +2926,7 @@ fn run_sql(
                 Header::from_bytes(&b"Content-Type"[..], &b"application/x-ndjson"[..]).unwrap(),
                 Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..]).unwrap(),
             ];
-            let _ = req.respond(Response::new(200.into(), headers, ChannelReader::new(body_rx), None, None));
+            let _ = req.respond(Response::new(200.into(), headers, ChannelReader::new(body_rx), None));
             (true, 200)
         }
         Ok(Err(refusal)) => {

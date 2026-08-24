@@ -49,7 +49,7 @@ Two behaviors here are deliberate local hardening, born in production:
 
 ## Layout
 
-Seven one-word files, ~2,800 lines, edition 2024, `forbid(unsafe_code)`,
+Seven one-word files, ~2,650 lines, edition 2024, `forbid(unsafe_code)`,
 three tiny dependencies (`ascii`, `chunked_transfer`, `httpdate`):
 
 | File | Owns |

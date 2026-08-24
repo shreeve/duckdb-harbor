@@ -1,19 +1,18 @@
 use std::io::Error as IoError;
 use std::io::{self, Cursor, ErrorKind, Read, Write};
 
-use std::fmt;
 use std::net::SocketAddr;
 use std::str::FromStr;
 
-
+use crate::Response;
+use crate::http::{Header, HttpVersion, Method, StatusCode};
+use chunked_transfer::Decoder;
 use equal_reader::EqualReader;
 use fused_reader::FusedReader;
-use crate::{HttpVersion, Header, Method, Response, StatusCode};
-use chunked_transfer::Decoder;
 
 /// Represents an HTTP request made by a client.
 ///
-/// A `Request` object is what is produced by the server, and is your what
+/// A `Request` object is what is produced by the server, and is what
 /// your code must analyse and answer.
 ///
 /// This object implements the `Send` trait, therefore you can dispatch your requests to
@@ -68,7 +67,7 @@ pub struct Request {
 /// Error that can happen when building a `Request` object.
 #[derive(Debug)]
 pub enum RequestCreationError {
-    /// The client sent an `Expect` header that was not recognized by tiny-http.
+    /// The client sent an `Expect` header that was not recognized.
     ExpectationFailed,
 
     /// Error while reading data from the socket during the creation of the `Request`.
@@ -313,17 +312,6 @@ impl Request {
             _ => Err(err),
         })
     }
-
-}
-
-impl fmt::Debug for Request {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(
-            formatter,
-            "Request({} {} from {:?})",
-            self.method, self.path, self.remote_addr
-        )
-    }
 }
 
 impl Drop for Request {
@@ -352,7 +340,7 @@ mod tests {
 mod equal_reader {
     use std::io::Read;
     use std::io::Result as IoResult;
-    
+
     /// A `Reader` that reads exactly the number of bytes from a sub-reader.
     ///
     /// If the limit is reached, it returns EOF. If the limit is not reached
@@ -365,7 +353,7 @@ mod equal_reader {
         reader: R,
         size: usize,
     }
-    
+
     impl<R> EqualReader<R>
     where
         R: Read,
@@ -374,7 +362,7 @@ mod equal_reader {
             EqualReader { reader, size }
         }
     }
-    
+
     impl<R> Read for EqualReader<R>
     where
         R: Read,
@@ -383,13 +371,13 @@ mod equal_reader {
             if self.size == 0 {
                 return Ok(0);
             }
-    
+
             let buf = if buf.len() < self.size {
                 buf
             } else {
                 &mut buf[..self.size]
             };
-    
+
             match self.reader.read(buf) {
                 Ok(len) => {
                     self.size -= len;
@@ -399,7 +387,7 @@ mod equal_reader {
             }
         }
     }
-    
+
     impl<R> Drop for EqualReader<R>
     where
         R: Read,
@@ -416,10 +404,10 @@ mod equal_reader {
             // patch: 6 such requests drove RSS from 22 MB to 2.2 GB.
             let mut remaining_to_read = self.size;
             let mut buf = [0u8; 65536];
-    
+
             while remaining_to_read > 0 {
                 let want = remaining_to_read.min(buf.len());
-    
+
                 match self.reader.read(&mut buf[..want]) {
                     // an error or EOF ends the drain — a half-closed socket
                     // must not spin here
@@ -431,45 +419,45 @@ mod equal_reader {
             }
         }
     }
-    
+
     #[cfg(test)]
     mod tests {
         use super::EqualReader;
         use std::io::Read;
-    
+
         #[test]
         fn test_limit() {
             use std::io::Cursor;
-    
+
             let mut org_reader = Cursor::new("hello world".to_string().into_bytes());
-    
+
             {
                 let mut equal_reader = EqualReader::new(org_reader.by_ref(), 5);
-    
+
                 let mut string = String::new();
                 equal_reader.read_to_string(&mut string).unwrap();
                 assert_eq!(string, "hello");
             }
-    
+
             let mut string = String::new();
             org_reader.read_to_string(&mut string).unwrap();
             assert_eq!(string, " world");
         }
-    
+
         #[test]
         fn test_not_enough() {
             use std::io::Cursor;
-    
+
             let mut org_reader = Cursor::new("hello world".to_string().into_bytes());
-    
+
             {
                 let mut equal_reader = EqualReader::new(org_reader.by_ref(), 5);
-    
+
                 let mut vec = [0];
                 equal_reader.read_exact(&mut vec).unwrap();
                 assert_eq!(vec[0], b'h');
             }
-    
+
             let mut string = String::new();
             org_reader.read_to_string(&mut string).unwrap();
             assert_eq!(string, " world");
@@ -479,22 +467,20 @@ mod equal_reader {
 
 mod fused_reader {
     use std::io::{IoSliceMut, Read, Result as IoResult};
-    
+
     /// Wraps another reader and provides "fused" behavior.
     /// When the underlying reader reaches EOF, it is dropped
     /// and the fused reader becomes an empty stub.
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct FusedReader<R: Read> {
         inner: Option<R>,
     }
-    
+
     impl<R: Read> FusedReader<R> {
         pub fn new(inner: R) -> Self {
             Self { inner: Some(inner) }
         }
-
     }
-    
+
     impl<R: Read> Read for FusedReader<R> {
         fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
             match &mut self.inner {
@@ -508,7 +494,7 @@ mod fused_reader {
                 None => Ok(0),
             }
         }
-    
+
         fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> IoResult<usize> {
             match &mut self.inner {
                 Some(r) => {

@@ -1,7 +1,6 @@
-use crate::http::{HttpVersion, Header, StatusCode};
+use crate::http::{Header, HttpVersion, StatusCode};
 use httpdate::HttpDate;
 use std::cmp::Ordering;
-use std::sync::mpsc::Receiver;
 
 use std::io::Result as IoResult;
 use std::io::{self, Cursor, Read, Write};
@@ -14,26 +13,26 @@ use std::time::SystemTime;
 /// Some headers cannot be changed. Trying to define the value
 /// of one of these will have no effect:
 ///
-///  - `Connection`
-///  - `Trailer`
-///  - `Transfer-Encoding`
-///  - `Upgrade`
+/// - `Connection`
+/// - `Trailer`
+/// - `Transfer-Encoding`
+/// - `Upgrade`
 ///
 /// Some headers have special behaviors:
 ///
-///  - `Content-Encoding`: If you define this header, the library
-///     will assume that the data from the `Read` object has the specified encoding
-///     and will just pass-through.
+/// - `Content-Encoding`: If you define this header, the library
+///   will assume that the data from the `Read` object has the specified encoding
+///   and will just pass-through.
 ///
-///  - `Content-Length`: The length of the data should be set manually
-///     using the `Reponse` object's API. Attempting to set the value of this
-///     header will be equivalent to modifying the size of the data but the header
-///     itself may not be present in the final result.
+/// - `Content-Length`: The length of the data should be set manually
+///   using the `Response` object's API. Attempting to set the value of this
+///   header will be equivalent to modifying the size of the data but the header
+///   itself may not be present in the final result.
 ///
-///  - `Content-Type`: You may only set this header to one value at a time. If you
-///     try to set it more than once, the existing value will be overwritten. This
-///     behavior differs from the default for most headers, which is to allow them to
-///     be set multiple times in the same response.
+/// - `Content-Type`: You may only set this header to one value at a time. If you
+///   try to set it more than once, the existing value will be overwritten. This
+///   behavior differs from the default for most headers, which is to allow them to
+///   be set multiple times in the same response.
 ///
 pub struct Response<R> {
     reader: R,
@@ -44,7 +43,7 @@ pub struct Response<R> {
 }
 
 /// Transfer encoding to use when sending the message.
-/// Note that only *supported* encoding are listed here.
+/// Note that only *supported* encodings are listed here.
 #[derive(Copy, Clone)]
 enum TransferEncoding {
     Identity,
@@ -109,7 +108,6 @@ fn choose_transfer_encoding(
     request_headers: &[Header],
     http_version: &HttpVersion,
     entity_length: Option<usize>,
-    has_additional_headers: bool,
     chunked_threshold: usize,
 ) -> TransferEncoding {
     // HTTP 1.0 doesn't support other encoding
@@ -134,7 +132,7 @@ fn choose_transfer_encoding(
         // getting the corresponding TransferEncoding
         .and_then(|value| {
             // getting list of requested elements
-            let mut parse = parse_header_value(value.as_str()); // TODO: remove conversion
+            let mut parse = parse_header_value(value.as_str());
 
             // sorting elements by most priority
             parse.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
@@ -159,11 +157,6 @@ fn choose_transfer_encoding(
         return user_request;
     }
 
-    // if we have additional headers, using chunked
-    if has_additional_headers {
-        return TransferEncoding::Chunked;
-    }
-
     // if we don't have a Content-Length, or if the Content-Length is too big, using chunks writer
     if entity_length.is_none_or(|val| val >= chunked_threshold) {
         return TransferEncoding::Chunked;
@@ -178,17 +171,11 @@ where
     R: Read,
 {
     /// Creates a new Response object.
-    ///
-    /// The `additional_headers` argument is a receiver that
-    ///  may provide headers even after the response has been sent.
-    ///
-    /// All the other arguments are straight-forward.
     pub fn new(
         status_code: StatusCode,
         headers: Vec<Header>,
         data: R,
         data_length: Option<usize>,
-        additional_headers: Option<Receiver<Header>>,
     ) -> Response<R> {
         let mut response = Response {
             reader: data,
@@ -200,13 +187,6 @@ where
 
         for h in headers {
             response.add_header(h)
-        }
-
-        // dummy implementation
-        if let Some(additional_headers) = additional_headers {
-            for h in additional_headers.iter() {
-                response.add_header(h)
-            }
         }
 
         response
@@ -221,7 +201,6 @@ where
         self.chunked_threshold = Some(length);
         self
     }
-
 
     /// The current `Content-Length` threshold for switching over to
     /// chunked transfer. The default is 32768 bytes. Notice that
@@ -331,7 +310,6 @@ where
             request_headers,
             &http_version,
             self.data_length,
-            false, /* TODO */
             self.chunked_threshold(),
         ));
 
@@ -379,11 +357,8 @@ where
                 let data_length = data_length.unwrap();
 
                 self.headers.push(
-                    Header::from_bytes(
-                        &b"Content-Length"[..],
-                        data_length.to_string().as_bytes(),
-                    )
-                    .unwrap(),
+                    Header::from_bytes(&b"Content-Length"[..], data_length.to_string().as_bytes())
+                        .unwrap(),
                 )
             }
 
@@ -423,19 +398,11 @@ where
 
         Ok(())
     }
-
-
-
-}
-
-impl<R> Response<R>
-where
-    R: Read + Send + 'static,
-{
 }
 
 impl Response<Cursor<Vec<u8>>> {
-
+    /// A 200 response with the string as its body, `Content-Type:
+    /// text/plain; charset=UTF-8`, and a known length (identity framing).
     pub fn from_string<S>(data: S) -> Response<Cursor<Vec<u8>>>
     where
         S: Into<String>,
@@ -451,7 +418,6 @@ impl Response<Cursor<Vec<u8>>> {
             ],
             Cursor::new(data.into_bytes()),
             Some(data_len),
-            None,
         )
     }
 }
@@ -467,16 +433,11 @@ impl Response<io::Empty> {
             Vec::with_capacity(0),
             io::empty(),
             Some(0),
-            None,
         )
     }
-
 }
 
-
-
-
-/// Parses a the value of a header.
+/// Parses the value of a header.
 /// Suitable for `Accept-*`, `TE`, etc.
 ///
 /// For example with `text/plain, image/png; q=1.5` this function would

@@ -8,12 +8,12 @@ mod messages_queue {
     use std::collections::VecDeque;
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
-    
+
     enum Control<T> {
         Elem(T),
         Unblock,
     }
-    
+
     pub struct MessagesQueue<T>
     where
         T: Send,
@@ -21,7 +21,7 @@ mod messages_queue {
         queue: Mutex<VecDeque<Control<T>>>,
         condvar: Condvar,
     }
-    
+
     impl<T> MessagesQueue<T>
     where
         T: Send,
@@ -32,37 +32,37 @@ mod messages_queue {
                 condvar: Condvar::new(),
             })
         }
-    
+
         /// Pushes an element to the queue.
         pub fn push(&self, value: T) {
             let mut queue = self.queue.lock().unwrap();
             queue.push_back(Control::Elem(value));
             self.condvar.notify_one();
         }
-    
+
         /// Unblock one thread stuck in pop loop.
         pub fn unblock(&self) {
             let mut queue = self.queue.lock().unwrap();
             queue.push_back(Control::Unblock);
             self.condvar.notify_one();
         }
-    
+
         /// Pops an element. Blocks until one is available.
         /// Returns None in case unblock() was issued.
         pub fn pop(&self) -> Option<T> {
             let mut queue = self.queue.lock().unwrap();
-    
+
             loop {
                 match queue.pop_front() {
                     Some(Control::Elem(value)) => return Some(value),
                     Some(Control::Unblock) => return None,
                     None => (),
                 }
-    
+
                 queue = self.condvar.wait(queue).unwrap();
             }
         }
-    
+
         /// Tries to pop an element without blocking.
         pub fn try_pop(&self) -> Option<T> {
             let mut queue = self.queue.lock().unwrap();
@@ -71,7 +71,7 @@ mod messages_queue {
                 Some(Control::Unblock) | None => None,
             }
         }
-    
+
         /// Tries to pop an element without blocking
         /// more than the specified timeout duration
         /// or unblock() was issued
@@ -109,7 +109,7 @@ mod task_pool {
     use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
     use std::time::Duration;
-    
+
     /// Manages a collection of threads.
     ///
     /// A new thread is created every time all the existing threads are full.
@@ -117,41 +117,41 @@ mod task_pool {
     pub struct TaskPool {
         sharing: Arc<Sharing>,
     }
-    
+
     struct Sharing {
         // list of the tasks to be done by worker threads
         todo: Mutex<VecDeque<Box<dyn FnMut() + Send>>>,
-    
+
         // condvar that will be notified whenever a task is added to `todo`
         condvar: Condvar,
-    
+
         // number of total worker threads running
         active_tasks: AtomicUsize,
-    
+
         // number of idle worker threads
         waiting_tasks: AtomicUsize,
     }
-    
+
     /// Minimum number of active threads.
     const MIN_THREADS: usize = 4;
-    
+
     struct Registration<'a> {
         nb: &'a AtomicUsize,
     }
-    
+
     impl<'a> Registration<'a> {
         fn new(nb: &'a AtomicUsize) -> Registration<'a> {
             nb.fetch_add(1, Ordering::Release);
             Registration { nb }
         }
     }
-    
+
     impl<'a> Drop for Registration<'a> {
         fn drop(&mut self) {
             self.nb.fetch_sub(1, Ordering::Release);
         }
     }
-    
+
     impl TaskPool {
         pub fn new() -> TaskPool {
             let pool = TaskPool {
@@ -162,19 +162,19 @@ mod task_pool {
                     waiting_tasks: AtomicUsize::new(0),
                 }),
             };
-    
+
             for _ in 0..MIN_THREADS {
                 pool.add_thread(None)
             }
-    
+
             pool
         }
-    
+
         /// Executes a function in a thread.
         /// If no thread is available, spawns a new one.
         pub fn spawn(&self, code: Box<dyn FnMut() + Send>) {
             let mut queue = self.sharing.todo.lock().unwrap();
-    
+
             if self.sharing.waiting_tasks.load(Ordering::Acquire) == 0 {
                 self.add_thread(Some(code));
             } else {
@@ -182,30 +182,30 @@ mod task_pool {
                 self.sharing.condvar.notify_one();
             }
         }
-    
+
         fn add_thread(&self, initial_fn: Option<Box<dyn FnMut() + Send>>) {
             let sharing = self.sharing.clone();
-    
+
             thread::spawn(move || {
                 let sharing = sharing;
                 let _active_guard = Registration::new(&sharing.active_tasks);
-    
+
                 if let Some(mut f) = initial_fn {
                     f();
                 }
-    
+
                 loop {
                     let mut task: Box<dyn FnMut() + Send> = {
                         let mut todo = sharing.todo.lock().unwrap();
-    
+
                         let task;
                         loop {
-                            if let Some(poped_task) = todo.pop_front() {
-                                task = poped_task;
+                            if let Some(popped_task) = todo.pop_front() {
+                                task = popped_task;
                                 break;
                             }
                             let _waiting_guard = Registration::new(&sharing.waiting_tasks);
-    
+
                             let received =
                                 if sharing.active_tasks.load(Ordering::Acquire) <= MIN_THREADS {
                                     todo = sharing.condvar.wait(todo).unwrap();
@@ -218,21 +218,21 @@ mod task_pool {
                                     todo = new_lock;
                                     !waitres.timed_out()
                                 };
-    
+
                             if !received && todo.is_empty() {
                                 return;
                             }
                         }
-    
+
                         task
                     };
-    
+
                     task();
                 }
             });
         }
     }
-    
+
     impl Drop for TaskPool {
         fn drop(&mut self) {
             self.sharing
