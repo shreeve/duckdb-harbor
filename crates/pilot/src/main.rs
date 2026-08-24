@@ -85,6 +85,10 @@ fn main() -> ExitCode {
                 print!("{HELP}");
                 return ExitCode::SUCCESS;
             }
+            "-V" | "--version" | "version" => {
+                println!("pilot {}", env!("CARGO_PKG_VERSION"));
+                return ExitCode::SUCCESS;
+            }
             _ if target.is_none() => target = Some(a),
             _ => return fail(&format!("unexpected argument: {a}")),
         }
@@ -157,6 +161,7 @@ usage:
   pilot <target>               interactive REPL (highlighting, Tab completion)
   pilot <target> -c \"SQL\"      run one statement
   echo \"SQL\" | pilot <target>  same, from stdin
+  pilot version                print this binary's version (also -V)
 
 target:
   name                         a config.toml entry, else a live berth: its
