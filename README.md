@@ -34,9 +34,10 @@ One `schema` message, one `row` per row, one `end`. Rows go out as DuckDB
 produces them, so a client can start on row one while the server is still
 producing the last one.
 
-Seven routes. That is the whole surface — two of them for queries, three so a
+Eight routes. That is the whole surface — two of them for queries, three so a
 transaction can outlive one request, one to stop a statement that is running,
-one to read the schema without asking five questions:
+one to read the schema without asking five questions, one that says who a
+berth is:
 
 ```
 POST /sql                  run one statement, stream the result as NDJSON
@@ -44,6 +45,7 @@ POST /sql                  run one statement, stream the result as NDJSON
 GET  /ready                can this server answer a query? no credential required
 GET  /catalog              the whole schema — tables, keys, unique constraints,
                            indexes, sequences — as one stable JSON document
+GET  /info                 berth identity — name, harbor + DuckDB versions, pid
 POST /sql/sessions/new     take a connection and hold it, for a transaction
 DELETE /sql/sessions/<id>  give it back
 GET  /sessions             what is holding one, and for how long
@@ -195,7 +197,7 @@ official v2 nightly) into `~/.duckdb/cli/2.0.0/`; then:
 $ make fetch-duckdb                       # libduckdb + duckdb CLI -> ~/.duckdb/cli/2.0.0/
 $ make binary pilot                       # -> target/release/{harbor,pilot}
 $ harbor serve mydata.duckdb --token secret
-harbor 0.10.0: berth "mydata" serving mydata.duckdb on ~/.harbor/mydata.sock (duckdb v2.0.0-alpha38069, memory_limit 2GB)
+harbor 0.11.2: berth "mydata" serving mydata.duckdb on ~/.harbor/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
 ```
 
 `make setup` does the whole thing in one shot — fetch the engine into `~/.duckdb`,
@@ -324,12 +326,19 @@ across the level rather than summed from per-request timings. Run-to-run spread
 was under 4% at every level.
 
 The engine version belongs beside the numbers, because it moves them. The same
-harbor build on **v2.0.0-alpha37626** gets roughly half this — 1,352 / 3,667 /
-4,739 req/s at the same three levels. That is not a debug build (it is *faster*
-than v1.5.5 at bulk compute) and it is not harbor: the alpha spends more per
-statement on binding, planning and commit, and harbor is one small statement per
-request, so it pays that on every one. Expect the gap to close as v2.0.0
-settles; until it does, measure against the engine you deploy.
+harbor build on a **v2.0.0** nightly gets roughly half this on small statements
+— 1,352 / 3,667 / 4,739 req/s at the same three levels (alpha37626; still true
+of alpha38195). That is not a debug build and it is not harbor. It is v2's [new
+PEG parser](https://duckdb.org/2026/08/20/duckdb-20-peg-parser), plus a small
+fixed cost per execute — measured by driving each engine directly, no server:
+re-executing an already-prepared statement costs +11 µs on v2, while parsing
+fresh SQL text costs about 2× v1.5.5, growing with statement size. Execution
+itself is at parity or faster (bulk CTAS is quicker on v2 than on 1.5.5).
+harbor parses every request's SQL fresh — one small statement per request — so
+it pays the parser on every one; that is the whole gap. Prepared statements
+sidestep it (a per-berth statement cache is on the roadmap for exactly this),
+upstream is still optimizing the parser pre-GA, and real analytical queries
+never notice either way. Measure against the engine you deploy.
 
 Every read in that run was checked against an answer taken from the database
 file before the server opened it — a benchmark whose oracle is the server it is

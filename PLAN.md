@@ -4,7 +4,7 @@ Harbor is a single Rust binary that starts, serves, and talks to DuckDB
 databases — fleet manager, HTTP/UDS server, and companion CLI. The plan that
 built it shipped: Phases 0–2 are complete and it is pre-production behind Caddy.
 What remains here is the **decision record** — the rationale the code cites by
-number (`PLAN.md D5`, `D8`, …). For usage see [MANUAL.md](MANUAL.md); for
+number (`PLAN.md D5`, `D8`, …). For usage see [README.md](README.md); for
 maintenance items see [TODO.md](TODO.md).
 
 ```
@@ -85,11 +85,11 @@ Once the binary is validated, the loadable-extension artifact is dropped —
 with it go extension signing, `-unsigned`, `FORCE INSTALL`, the two-artifact
 version-matching dance, the unstable-C-API band pin, the bash launcher, and
 the bundled/loadable feature-split build gotcha. Its one niche (bolting HTTP
-onto someone else's live DuckDB process) is covered well enough by `--quack`
-and by pilot; if ever truly needed, the ~350 lines of vtab glue can be
+onto someone else's live DuckDB process) is covered well enough by the quack
+extension and by pilot; if ever truly needed, the ~350 lines of vtab glue can be
 resurrected on top of harbor's library. The embedded binary loses no
-co-residency: `harbor serve --ui --quack` loads those extensions into its own
-DuckDB (`allow_unsigned_extensions` on the 2.0 channel). *(This retirement is
+co-residency: `harbor serve --unsigned --init 'LOAD ui' --init 'LOAD quack'`
+loads those extensions into its own DuckDB. *(This retirement is
 also why `harbor-core` later folded back into `harbor`: the split existed to
 share server logic with the extension, and nothing else ever linked it.)*
 
@@ -99,8 +99,10 @@ and edge auth, proxies to the socket. The CLI speaks UDS, `http://`, or
 `https://` interchangeably — a remote berth is just a URL.
 
 ### D7. Protocol changes are additive only
-The Rip harborAdapter must run unmodified. Two new endpoints (`/info`,
-`/grammar`), zero changes to existing routes, events, fields, or error codes.
+The Rip harborAdapter must run unmodified. Two new endpoints (`/info`, shipped;
+`/grammar`, reserved in the wire contract but not yet served — berths advertise
+`grammar: false` until it is), zero changes to existing routes, events, fields,
+or error codes.
 No `database` field on `/sql`: a berth holds one database (D2); per-session
 work is `USE`/ATTACH as plain SQL on a lease (a lease is a pinned connection —
 exactly what it was built for). Reserve `"catalog"` as a future optional
@@ -188,6 +190,13 @@ which is the 2.0 line harbor targets, so every run tests the real thing.
 Verified: a harbor built against `alpha37626` links and runs clean against the
 newer official `alpha38069`, and against upstream stable `v1.5.5` — the C API is
 stable across the line (D1's version-agnostic property, exercised, not asserted).
+Re-verified 2026-08-24 on `alpha38195`: the same binary answered
+`select version()` as `v2.0.0-alpha38195` via its baked rpath and as `v1.5.5`
+via `DYLD_LIBRARY_PATH`, with the full check suite (10 suites) green on the
+nightly. There is no "1.5 build" and no "2.0 build" — one artifact, and the
+engine is whichever `libduckdb` it resolves at load. (The v2 nightlies do parse
+SQL ~2× slower than 1.5.5 — the new PEG parser; execution is at parity. See the
+README's Performance section for the decomposition.)
 
 `make fetch-duckdb` (→ `scripts/fetch-duckdb.sh`) pulls the same official nightly
 into `~/.duckdb/cli/2.0.0/` for local work; `make setup` chains it with the
@@ -203,8 +212,9 @@ in-process libduckdb at load), and install to
 No engine compile (~6s cached vs the 1,511-file, 20–40 min from-source build);
 the version lock the C++ ABI demands is satisfied *by construction*, since
 engine, dylib, and extension all derive from one nightly. The UI source is a
-duckdb-ui checkout carrying the v2 fixes — our fork until duckdb/duckdb-ui#242
-lands, then official. Verified end to end: `harbor serve --unsigned --init 'LOAD
+duckdb-ui checkout carrying the v2 fixes — our fork until upstream fixes
+duckdb/duckdb-ui#242 (the issue is open; the PRs offering these fixes, #243
+and #244, were closed unmerged), then official. Verified end to end: `harbor serve --unsigned --init 'LOAD
 ui' --init 'FROM start_ui_server()'` serves the UI at `http://localhost:4213/`.
 
 **The UI extension can be dynamic — and should be.** DuckDB ships loadable
