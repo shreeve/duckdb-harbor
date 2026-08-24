@@ -4,12 +4,12 @@ Ongoing maintenance items. Not the roadmap — that's [PLAN.md](PLAN.md).
 
 ## justhttp — harbor's first-party HTTP layer (no un-vendor plan; it's ours)
 
-`vendor/justhttp` is harbor's own synchronous HTTP/1.1 crate — a plain path
-dependency of `crates/harbor`, derived from tiny_http 0.12.0 and permanently
-first-party (decision record: PLAN.md D12; lineage + license:
-`vendor/justhttp/README.md`). Its test suite (`cargo test` in
-`vendor/justhttp/`, all green on macOS and Linux) is the safety net for any
-change; `cargo test --test suite -- --ignored` runs the one slow (~35s)
+`crates/justhttp` is harbor's own synchronous HTTP/1.1 crate — a workspace
+member and plain path dependency of `crates/harbor`, derived from tiny_http
+0.12.0 and permanently first-party (decision record: PLAN.md D12; lineage +
+license: `crates/justhttp/README.md`). Its test suite (`cargo test -p
+justhttp`, all green on macOS and Linux) is the safety net for any change;
+`cargo test -p justhttp --test suite -- --ignored` runs the one slow (~35s)
 write-timeout test.
 
 Maintenance notes:

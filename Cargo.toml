@@ -1,23 +1,22 @@
 # Pure workspace: the extension retired (PLAN.md D5); everything lives in
-# crates/.
+# crates/. That includes crates/justhttp, harbor's first-party HTTP/1.1
+# layer (a plain path dependency of crates/harbor). Derived from tiny_http
+# 0.12.0, kept deliberately smaller: TLS, websocket upgrades and dead API
+# stripped; carries a bounded unread-body drain (DoS fix) and a 10s
+# response write timeout. Full ledger in crates/justhttp/README.md and
+# TODO.md. Test it with `cargo test -p justhttp`.
 [workspace]
 members = ["crates/*"]
 default-members = ["crates/wire", "crates/pilot", "crates/harbor"]
 # Vendored crates are patch sources, not members — excluded so their own
 # test suites can run in place (cd vendor/<crate> && cargo test).
-exclude = ["vendor/justhttp", "vendor/reedline"]
+exclude = ["vendor/reedline"]
 resolver = "2"
 
 [profile.release]
 lto = true
 strip = true
 
-# vendor/justhttp is harbor's first-party HTTP/1.1 layer (a plain path
-# dependency of crates/harbor, not a crates.io patch). Derived from
-# tiny_http 0.12.0, kept deliberately smaller: TLS, websocket upgrades and
-# dead API stripped; carries a bounded unread-body drain (DoS fix) and a
-# 10s response write timeout. Full ledger in vendor/justhttp/README.md and
-# TODO.md.
 # vendor/reedline is 0.50.0 verbatim except two patches in src/engine.rs (both
 # proposed upstream; see TODO.md): a completion menu with zero suggestions no
 # longer swallows Enter, and typing a word boundary closes the menu — together

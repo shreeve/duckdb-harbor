@@ -1,5 +1,4 @@
 # justhttp — harbor's first-party synchronous HTTP/1.1 layer.
-# Derived from tiny_http 0.12.0 (MIT); see README.md and LICENSE.
 
 [package]
 name = "justhttp"

@@ -6,9 +6,9 @@ nothing else. No TLS, no websockets, no HTTP/2, no plugins, no feature
 flags. The edge proxy owns encryption; this crate owns fast, correct
 HTTP over a socket.
 
-justhttp is the HTTP layer under [`harbor`](../../README.md), maintained
-here as first-party code — permanently: there is no upstream to track and
-no un-vendor plan. It began as a TLS-stripped
+justhttp is the HTTP layer under [`harbor`](../../README.md), a workspace
+crate maintained as first-party code — permanently: there is no upstream
+to track. It began as a TLS-stripped
 [tiny_http 0.12.0](https://github.com/tiny-http/tiny-http) and is kept
 deliberately smaller than its ancestor (see **Lineage** below).
 
@@ -64,12 +64,14 @@ three tiny dependencies (`ascii`, `chunked_transfer`, `httpdate`):
 
 ## Tests
 
-`cargo test` runs the whole suite — green on macOS and Linux. Two files:
+`cargo test -p justhttp` (from the repo root) runs the whole suite — green
+on macOS and Linux. Two files:
 `tests/suite.rs`, one module per property (`basic`, `input`, `network`,
 `keepalive` — connection reuse + chunked streaming, `buffering` —
 backpressure, `prompt` — latency properties, `unblock`, `unix`, and
 `stall` — the write-timeout test, `#[ignore]`d because it takes ~35 s by
-design: `cargo test --test suite -- --ignored`); and `tests/drain.rs`,
+design: `cargo test -p justhttp --test suite -- --ignored`); and
+`tests/drain.rs`,
 the DoS regression, alone in its own binary because its measuring global
 allocator must not see other tests' allocations.
 

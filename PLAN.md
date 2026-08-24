@@ -240,11 +240,12 @@ absorbed, and a survey of the sync-HTTP field found no replacement matching
 harbor's needs — synchronous workers, unix sockets, streaming-from-`Read`,
 tiny dependency tree (astra drags hyper; oxhttp self-describes as naive/WIP;
 touche lacks UDS). So the copy stopped pretending to be upstream:
-`vendor/justhttp` is harbor's own HTTP/1.1 crate, derived from tiny_http,
-MIT, consumed as a plain path dependency (the `[patch.crates-io]` indirection
-retired with the name). Everything harbor does not use went away — TLS,
-websocket upgrades, `TestRequest`, dead response constructors and getters,
-the notify/secure rendezvous, `log` — leaving ~2,800 lines in seven one-word
+`crates/justhttp` is harbor's own HTTP/1.1 crate, derived from tiny_http,
+MIT, a workspace member consumed as a plain path dependency (the
+`[patch.crates-io]` indirection retired with the name). Everything harbor
+does not use went away — TLS, websocket upgrades, `TestRequest`, dead
+response constructors and getters,
+the notify/secure rendezvous, `log` — leaving ~2,650 lines in seven one-word
 files (lib, http, stream, conn, request, response, pool), edition 2024,
 `forbid(unsafe_code)`, zero warnings. The two patches are now just code, with
 regression tests (`tests/drain.rs` asserts a dropped 1 GiB-declared body
