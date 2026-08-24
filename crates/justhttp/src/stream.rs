@@ -117,6 +117,21 @@ mod listen {
             }
         }
 
+        /// Disable Nagle's algorithm on TCP connections. The server writes each
+        /// response as one buffered flush, so there is no small-packet spray to
+        /// coalesce — but a response that does take more than one write (headers
+        /// plus a large chunked body, or the chunked terminator after a full
+        /// chunk) must not sit in the kernel waiting on the peer's delayed-ACK
+        /// timer. Unix sockets have no Nagle; the arm is a no-op so both
+        /// transports behave identically.
+        pub(crate) fn set_nodelay(&self, nodelay: bool) -> std::io::Result<()> {
+            match self {
+                Self::Tcp(s) => s.set_nodelay(nodelay),
+                #[cfg(unix)]
+                Self::Unix(_) => Ok(()),
+            }
+        }
+
         pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
             match self {
                 Self::Tcp(s) => s.try_clone().map(Self::from),

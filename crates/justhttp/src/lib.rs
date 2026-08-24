@@ -213,6 +213,11 @@ impl Server {
                         // every write. Best-effort — a socket that rejects the
                         // option just keeps upstream's original behavior.
                         let _ = sock.set_write_timeout(Some(WRITE_TIMEOUT));
+                        // One response = one flush, so Nagle has nothing to
+                        // coalesce here — but it would hold the last small
+                        // segment of a multi-write response (e.g. a chunked
+                        // terminator) against the peer's delayed-ACK timer.
+                        let _ = sock.set_nodelay(true);
                         let (read_closable, write_closable) = RefinedTcpStream::new(sock);
 
                         Ok(ClientConnection::new(write_closable, read_closable))

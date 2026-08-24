@@ -197,7 +197,7 @@ official v2 nightly) into `~/.duckdb/cli/2.0.0/`; then:
 $ make fetch-duckdb                       # libduckdb + duckdb CLI -> ~/.duckdb/cli/2.0.0/
 $ make binary pilot                       # -> target/release/{harbor,pilot}
 $ harbor serve mydata.duckdb --token secret
-harbor 0.12.0: berth "mydata" serving mydata.duckdb on ~/.harbor/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
+harbor 0.13.0: berth "mydata" serving mydata.duckdb on ~/.harbor/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
 ```
 
 `make setup` does the whole thing in one shot — fetch the engine into `~/.duckdb`,
@@ -309,10 +309,28 @@ for await (const chunk of res.body) {
 ## Performance
 
 DuckDB answers the query; DuckDB Harbor's job is to stay out of the way. It
-sustains thousands of requests per second across concurrent clients on a
-laptop, with sub-millisecond overhead at low concurrency.
+sustains tens of thousands of requests per second across concurrent clients
+on a laptop, with sub-100µs round trips at low concurrency.
 
-**DuckDB v1.5.5**, eight workers:
+**harbor 0.13.0, DuckDB v2.0.0 nightly** (alpha38195), eight workers, pure
+read path — `POST /sql` with `{"sql":"select 1"}` over keep-alive loopback
+TCP, 10-second `oha` runs, every response a 200:
+
+| clients | req/s | p50 | p99 |
+|--:|--:|--:|--:|
+| 1 | 10,914 | 0.09 ms | 0.12 ms |
+| 4 | 28,167 | 0.14 ms | 0.22 ms |
+| 16 | 44,079 | 0.24 ms | 0.61 ms |
+
+The HTTP layer is not the ceiling: `GET /ready` — the same plumbing with no
+SQL — measures ~99,000 req/s at 16 clients. Most of the per-request engine
+cost is amortized by the per-connection prepared-statement cache (below);
+0.13.0 also coalesced each response head into a single buffered write, set
+`TCP_NODELAY`, and removed most per-request allocations from the HTTP layer.
+
+An earlier, deliberately harsher benchmark — 20% `INSERT`s, every read
+checked against an oracle, harbor 0.12.0 (no statement cache), **DuckDB
+v1.5.5**, eight workers:
 
 | clients | req/s | p50 | p95 | p99 | non-200 | wrong answers |
 |--:|--:|--:|--:|--:|--:|--:|
@@ -320,10 +338,9 @@ laptop, with sub-millisecond overhead at low concurrency.
 | 4 | 7,012 | 0.50 ms | 1.18 ms | 1.40 ms | 0 | 0 |
 | 16 | 9,096 | 1.66 ms | 2.90 ms | 3.60 ms | 0 | 0 |
 
-Mean of five 10-second runs per level on an idle M-series laptop, 20% of
-requests being `INSERT`s, connections reused, throughput taken from wall-clock
-across the level rather than summed from per-request timings. Run-to-run spread
-was under 4% at every level.
+Mean of five 10-second runs per level on an idle M-series laptop, connections
+reused, throughput taken from wall-clock across the level rather than summed
+from per-request timings. Run-to-run spread was under 4% at every level.
 
 The engine version belongs beside the numbers, because it moves them. The same
 harbor build on a **v2.0.0** nightly gets roughly half this on small statements
@@ -334,13 +351,16 @@ fixed cost per execute — measured by driving each engine directly, no server:
 re-executing an already-prepared statement costs +11 µs on v2, while parsing
 fresh SQL text costs about 2× v1.5.5, growing with statement size. Execution
 itself is at parity or faster (bulk CTAS is quicker on v2 than on 1.5.5).
-harbor parses every request's SQL fresh — one small statement per request — so
-it pays the parser on every one; that is the whole gap. Prepared statements
-sidestep it (a per-berth statement cache is on the roadmap for exactly this),
-upstream is still optimizing the parser pre-GA, and real analytical queries
-never notice either way. Measure against the engine you deploy.
+Before 0.13.0 harbor parsed every request's SQL fresh, paying the parser on
+every statement; that was the whole gap. Since 0.13.0 each executor
+connection keeps an LRU of prepared statements keyed by statement text, so a
+repeated statement skips parse and plan entirely — which is why the pure-read
+numbers above sit where they do on a v2 engine. First-seen statement texts
+still pay the parser once; upstream is still optimizing it pre-GA, and real
+analytical queries never notice either way. Measure against the engine you
+deploy.
 
-Every read in that run was checked against an answer taken from the database
+Every read in the mixed run was checked against an answer taken from the database
 file before the server opened it — a benchmark whose oracle is the server it is
 benchmarking cannot detect a server that is consistently wrong.
 

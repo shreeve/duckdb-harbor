@@ -1,5 +1,3 @@
-use ascii::AsciiString;
-
 use std::io::Error as IoError;
 use std::io::Result as IoResult;
 use std::io::{BufReader, BufWriter, ErrorKind, Read};
@@ -56,7 +54,9 @@ impl ClientConnection {
 
         ClientConnection {
             source,
-            sink: SequentialWriterBuilder::new(BufWriter::with_capacity(1024, write_socket)),
+            // 8192 matches the chunked encoder's internal buffer, so headers +
+            // a full chunk + the terminator coalesce into a single write().
+            sink: SequentialWriterBuilder::new(BufWriter::with_capacity(8192, write_socket)),
             remote_addr,
             next_header_source: first_header,
             no_more_requests: false,
@@ -70,8 +70,8 @@ impl ClientConnection {
     // byte-at-a-time on purpose: the source is already a BufReader, and this
     // exact framing (CRLF only, Interrupted retried by Bytes) is semantics.
     #[allow(clippy::unbuffered_bytes)]
-    fn read_next_line(&mut self) -> IoResult<AsciiString> {
-        let mut buf = Vec::new();
+    fn read_next_line<'b>(&mut self, buf: &'b mut Vec<u8>) -> IoResult<&'b str> {
+        buf.clear();
         let mut prev_byte_was_cr = false;
 
         loop {
@@ -84,8 +84,14 @@ impl ClientConnection {
 
             if byte == b'\n' && prev_byte_was_cr {
                 buf.pop(); // removing the '\r'
-                return AsciiString::from_ascii(buf)
-                    .map_err(|_| IoError::new(ErrorKind::InvalidInput, "Header is not in ASCII"));
+                if !buf.is_ascii() {
+                    return Err(IoError::new(
+                        ErrorKind::InvalidInput,
+                        "Header is not in ASCII",
+                    ));
+                }
+                // ASCII was just verified, and ASCII is valid UTF-8.
+                return Ok(std::str::from_utf8(buf).unwrap());
             }
 
             prev_byte_was_cr = byte == b'\r';
@@ -98,26 +104,30 @@ impl ClientConnection {
     /// Blocks until the header has been read.
     fn read(&mut self) -> Result<Request, ReadError> {
         let (method, path, version, headers) = {
+            // one line buffer reused for the request line and every header line
+            let mut line_buf = Vec::with_capacity(128);
+
             // reading the request line
             let (method, path, version) = {
-                let line = self.read_next_line().map_err(ReadError::ReadIoError)?;
+                let line = self
+                    .read_next_line(&mut line_buf)
+                    .map_err(ReadError::ReadIoError)?;
 
-                parse_request_line(
-                    line.as_str().trim(), // TODO: remove this conversion
-                )?
+                parse_request_line(line.trim())?
             };
 
             // getting all headers
             let headers = {
-                let mut headers = Vec::new();
+                let mut headers = Vec::with_capacity(16);
                 loop {
-                    let line = self.read_next_line().map_err(ReadError::ReadIoError)?;
+                    let line = self
+                        .read_next_line(&mut line_buf)
+                        .map_err(ReadError::ReadIoError)?;
 
                     if line.is_empty() {
                         break;
                     };
-                    headers.push(match FromStr::from_str(line.as_str().trim()) {
-                        // TODO: remove this conversion
+                    headers.push(match FromStr::from_str(line.trim()) {
                         Ok(h) => h,
                         _ => return Err(ReadError::WrongHeader(version)),
                     });
@@ -237,13 +247,20 @@ impl Iterator for ClientConnection {
                 .find(|h| h.field.equiv("Connection"))
                 .map(|h| h.value.as_str());
 
-            let lowercase = connection_header.map(|h| h.to_ascii_lowercase());
+            // case-insensitive substring match (NOT token-wise): exactly the
+            // lowercase-then-contains behavior this replaced, minus the alloc
+            fn contains_ignore_case(hay: &str, needle: &str) -> bool {
+                hay.as_bytes()
+                    .windows(needle.len())
+                    .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+            }
 
-            match lowercase {
-                Some(ref val) if val.contains("close") => self.no_more_requests = true,
-                Some(ref val) if val.contains("upgrade") => self.no_more_requests = true,
-                Some(ref val)
-                    if !val.contains("keep-alive") && *rq.http_version() == HttpVersion(1, 0) =>
+            match connection_header {
+                Some(val) if contains_ignore_case(val, "close") => self.no_more_requests = true,
+                Some(val) if contains_ignore_case(val, "upgrade") => self.no_more_requests = true,
+                Some(val)
+                    if !contains_ignore_case(val, "keep-alive")
+                        && *rq.http_version() == HttpVersion(1, 0) =>
                 {
                     self.no_more_requests = true
                 }

@@ -64,43 +64,29 @@ impl FromStr for TransferEncoding {
     }
 }
 
-/// Builds a Date: header with the current date.
-fn build_date_header() -> Header {
-    let d = HttpDate::from(SystemTime::now());
-    Header::from_bytes(&b"Date"[..], &d.to_string().into_bytes()[..]).unwrap()
-}
-
-fn write_message_header<W>(
-    mut writer: W,
-    http_version: &HttpVersion,
-    status_code: &StatusCode,
-    headers: &[Header],
-) -> IoResult<()>
-where
-    W: Write,
-{
-    // writing status line
-    write!(
-        &mut writer,
-        "HTTP/{}.{} {} {}\r\n",
-        http_version.0,
-        http_version.1,
-        status_code.0,
-        status_code.default_reason_phrase()
-    )?;
-
-    // writing headers
-    for header in headers.iter() {
-        writer.write_all(header.field.as_str().as_ref())?;
-        write!(&mut writer, ": ")?;
-        writer.write_all(header.value.as_str().as_ref())?;
-        write!(&mut writer, "\r\n")?;
+/// Appends a `Date: ...\r\n` line with the current time. The rendered line is
+/// cached per thread and reused until the clock's whole-second changes (the
+/// header's own resolution); compared with `!=`, so a clock stepped backwards
+/// just reformats.
+fn write_date_line(out: &mut Vec<u8>) {
+    use std::cell::RefCell;
+    thread_local! {
+        static CACHED: RefCell<(u64, Vec<u8>)> = const { RefCell::new((u64::MAX, Vec::new())) };
     }
-
-    // separator between header and data
-    write!(&mut writer, "\r\n")?;
-
-    Ok(())
+    let now = SystemTime::now();
+    let secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    CACHED.with(|cell| {
+        let mut cached = cell.borrow_mut();
+        if cached.0 != secs {
+            cached.1.clear();
+            let _ = write!(cached.1, "Date: {}\r\n", HttpDate::from(now));
+            cached.0 = secs;
+        }
+        out.extend_from_slice(&cached.1);
+    });
 }
 
 fn choose_transfer_encoding(
@@ -127,12 +113,10 @@ fn choose_transfer_encoding(
         .iter()
         // finding TE
         .find(|h| h.field.equiv("TE"))
-        // getting its value
-        .map(|h| h.value.clone())
         // getting the corresponding TransferEncoding
-        .and_then(|value| {
+        .and_then(|header| {
             // getting list of requested elements
-            let mut parse = parse_header_value(value.as_str());
+            let mut parse = parse_header_value(header.value.as_str());
 
             // sorting elements by most priority
             parse.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
@@ -313,17 +297,31 @@ where
             self.chunked_threshold(),
         ));
 
-        // add `Date` if not in the headers
-        if !self.headers.iter().any(|h| h.field.equiv("Date")) {
-            self.headers.insert(0, build_date_header());
-        }
-
-        // add `Server` if not in the headers
+        // The whole head — status line through the blank separator — is
+        // assembled in one local buffer and sent with a single write, instead
+        // of allocating Header objects for Server/Date/Content-Length and
+        // pushing each fragment through the (mutex-guarded) writer. Wire
+        // order is unchanged: Server, Date, user headers, then TE/CL.
+        let mut head = Vec::with_capacity(256);
+        write!(
+            head,
+            "HTTP/{}.{} {} {}\r\n",
+            http_version.0,
+            http_version.1,
+            self.status_code.0,
+            self.status_code.default_reason_phrase()
+        )?;
         if !self.headers.iter().any(|h| h.field.equiv("Server")) {
-            self.headers.insert(
-                0,
-                Header::from_bytes(&b"Server"[..], &b"justhttp"[..]).unwrap(),
-            );
+            head.extend_from_slice(b"Server: justhttp\r\n");
+        }
+        if !self.headers.iter().any(|h| h.field.equiv("Date")) {
+            write_date_line(&mut head);
+        }
+        for header in &self.headers {
+            head.extend_from_slice(header.field.as_str().as_ref());
+            head.extend_from_slice(b": ");
+            head.extend_from_slice(header.value.as_str().as_ref());
+            head.extend_from_slice(b"\r\n");
         }
 
         // if the transfer encoding is identity, the content length must be known ; therefore if
@@ -346,32 +344,21 @@ where
         let do_not_send_body =
             do_not_send_body || matches!(self.status_code.0, 100..=199 | 204 | 304);
 
-        // preparing headers for transfer
+        // framing header, then the blank separator, then the single head write
         match transfer_encoding {
-            Some(TransferEncoding::Chunked) => self
-                .headers
-                .push(Header::from_bytes(&b"Transfer-Encoding"[..], &b"chunked"[..]).unwrap()),
+            Some(TransferEncoding::Chunked) => {
+                head.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+            }
 
             Some(TransferEncoding::Identity) => {
                 assert!(data_length.is_some());
-                let data_length = data_length.unwrap();
-
-                self.headers.push(
-                    Header::from_bytes(&b"Content-Length"[..], data_length.to_string().as_bytes())
-                        .unwrap(),
-                )
+                write!(head, "Content-Length: {}\r\n", data_length.unwrap())?;
             }
 
             _ => (),
         };
-
-        // sending headers
-        write_message_header(
-            writer.by_ref(),
-            &http_version,
-            &self.status_code,
-            &self.headers,
-        )?;
+        head.extend_from_slice(b"\r\n");
+        writer.write_all(&head)?;
 
         // sending the body
         if !do_not_send_body {

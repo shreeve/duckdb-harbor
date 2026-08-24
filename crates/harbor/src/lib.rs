@@ -13,10 +13,11 @@
 use std::{
     collections::HashMap,
 
+    fmt::Write as _,
     io::Read,
     panic::AssertUnwindSafe,
     sync::{
-        Arc, Condvar, Mutex, mpsc,
+        Arc, Condvar, Mutex, OnceLock, mpsc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
@@ -366,10 +367,15 @@ fn next_job_id() -> u64 {
 /// for a deployment; `timeoutMs` on the request turns it on for one statement,
 /// which is what a console with a Stop button actually wants.
 fn configured_statement_timeout() -> Option<Duration> {
-    match std::env::var("HARBOR_STATEMENT_TIMEOUT_MS").ok()?.trim().parse::<u64>() {
-        Ok(0) | Err(_) => None,
-        Ok(ms) => Some(Duration::from_millis(ms)),
-    }
+    // Read once: the env cannot legitimately change after start, and this is
+    // on the per-request path. (A runtime setenv no longer takes effect.)
+    static CONFIGURED: OnceLock<Option<Duration>> = OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        match std::env::var("HARBOR_STATEMENT_TIMEOUT_MS").ok()?.trim().parse::<u64>() {
+            Ok(0) | Err(_) => None,
+            Ok(ms) => Some(Duration::from_millis(ms)),
+        }
+    })
 }
 
 /// A `queryId` registered for the length of one statement. Dropping it
@@ -1043,7 +1049,9 @@ pub fn start(
     let mut lease_handles = Vec::with_capacity(lease_conns.len());
     let mut free = Vec::with_capacity(lease_conns.len());
     for (slot, conn) in lease_conns.into_iter().enumerate() {
-        let (tx, rx) = mpsc::sync_channel::<Job>(0);
+        // Capacity 1 for the same reason as the worker executors: one job
+        // outstanding by construction, so the slot only skips a double park.
+        let (tx, rx) = mpsc::sync_channel::<Job>(1);
         let state = new_slot(&conn);
         slots.push(Arc::clone(&state));
         let exec_state = Arc::clone(&state);
@@ -1324,9 +1332,11 @@ fn worker(
     state: Arc<SlotState>,
     log: bool,
 ) -> Option<Connection> {
-    // Rendezvous: a worker never has more than one statement outstanding, so
-    // there is nothing to queue here.
-    let (jobs_tx, jobs_rx) = mpsc::sync_channel::<Job>(0);
+    // Capacity 1, not a rendezvous: a worker never has more than one
+    // statement outstanding (it waits on `ready` before its next request), so
+    // nothing can queue — but the buffer slot lets the sender hand off and
+    // proceed straight to that wait instead of parking twice per request.
+    let (jobs_tx, jobs_rx) = mpsc::sync_channel::<Job>(1);
     let exec_state = Arc::clone(&state);
     let executor = thread::Builder::new()
         .name("harbor-exec".to_string())
@@ -1648,7 +1658,11 @@ fn handle(
             },
             (Method::Post, "/sql") => match exec {
                 Some((jobs, state)) => {
-                    let mut body = String::new();
+                    // Pre-size from the declared length, capped: the value is
+                    // client-chosen (up to MAX_BODY), so trust it only up to
+                    // 16KB and let anything larger grow normally.
+                    let mut body =
+                        String::with_capacity(req.body_length().unwrap_or(0).min(16 * 1024));
                     if req.as_reader().take(MAX_BODY as u64).read_to_string(&mut body).is_err() {
                         let _ = req.respond(error_response(400, "bad_request", "body is not valid UTF-8"));
                         (true, 400)
@@ -1800,12 +1814,12 @@ struct SqlRequest {
 }
 
 fn parse_request(body: &str) -> Result<SqlRequest, String> {
-    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
-    let sql = v
-        .get("sql")
-        .and_then(|s| s.as_str())
-        .ok_or_else(|| "missing \"sql\"".to_string())?
-        .to_string();
+    let mut v: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    // take() moves the String serde already built instead of copying it
+    let sql = match v.get_mut("sql").map(serde_json::Value::take) {
+        Some(serde_json::Value::String(s)) => s,
+        _ => return Err("missing \"sql\"".to_string()),
+    };
     if sql.trim().is_empty() {
         return Err("\"sql\" is empty".to_string());
     }
@@ -2015,13 +2029,20 @@ enum Shape {
 /// is not a substring of `application/x-ndjson`, so a plain `contains` is not
 /// fooled by the streaming type.)
 fn wants_one_shot(req: &Request) -> bool {
+    // case-insensitive substring scan, allocation-free (same semantics as
+    // the lowercase-then-contains it replaced)
+    fn contains_ignore_case(hay: &str, needle: &str) -> bool {
+        hay.as_bytes()
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+    }
     let mut asked_json = false;
     for h in req.headers().iter().filter(|h| h.field.equiv("Accept")) {
-        let value = h.value.as_str().to_ascii_lowercase();
-        if value.contains("application/x-ndjson") {
+        let value = h.value.as_str();
+        if contains_ignore_case(value, "application/x-ndjson") {
             return false;
         }
-        asked_json = asked_json || value.contains("application/json");
+        asked_json = asked_json || contains_ignore_case(value, "application/json");
     }
     asked_json
 }
@@ -3180,7 +3201,12 @@ fn run_statement(
     // any path that ends the job early.
     let mut needs_reset = may_leave_transaction_open(&sql);
 
-    let stmt = match conn.prepare(&sql) {
+    // Cached by SQL text (per-connection LRU in duckdb-rs), so a repeated
+    // statement skips DuckDB's parse+plan — the dominant engine cost for
+    // small SQL, and the mitigation for v2's slower parser. Behavior across
+    // catalog changes is gated empirically by test/sql (drop/recreate a
+    // referenced table, then re-run the identical text).
+    let stmt = match conn.prepare_cached(&sql) {
         Ok(s) => s,
         Err(e) => {
             let _ = ready.send(Err(refusal_for(on_slot.finish(), e.to_string())));
@@ -3244,7 +3270,11 @@ fn run_statement(
         return true;
     }
 
-    let mut buf = String::with_capacity(FLUSH_AT + 8192);
+    // Small results (the common case) use a few hundred bytes; start small
+    // and let a large result grow toward FLUSH_AT instead of paying a 72KB
+    // large-path allocation per statement. The post-flush refill below keeps
+    // the full capacity, so a streaming result allocates big exactly once.
+    let mut buf = String::with_capacity(4096);
     match shape {
         Shape::Ndjson => buf.push_str(r#"{"type":"schema","columns":["#),
         // v1's envelope also carried `kind`, "select" or "write". It is
@@ -3283,13 +3313,23 @@ fn run_statement(
                 // the client sees 200 with an empty body — success, no
                 // rows — and the connection never returns to the pool, so
                 // enough such queries take the server out of service.
-                // Built into a separate buffer so a half-written row is
-                // discarded rather than shipped.
-                let mut cells = String::new();
+                // Encoded straight into `buf` behind a mark: a panicking
+                // decoder discards the half-written row with truncate()
+                // instead of paying a scratch String + copy per row.
+                let mark = buf.len();
                 let encoded = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                match shape {
+                    Shape::Ndjson => buf.push_str(r#"{"type":"row","values":["#),
+                    Shape::Json => {
+                        if count > 0 {
+                            buf.push(',');
+                        }
+                        buf.push('[');
+                    }
+                }
                 for (i, ty) in types.iter().enumerate() {
                     if i > 0 {
-                        cells.push(',');
+                        buf.push(',');
                     }
                     // A SQLNULL column — `SELECT NULL AS x`, with no cast
                     // to give it a type — holds nothing but NULL, and
@@ -3304,7 +3344,7 @@ fn run_statement(
                     // kind of difference that only shows up when harbor is
                     // actually run against v2.
                     if matches!(ty.try_id(), Ok(LogicalTypeId::SqlNull)) {
-                        cells.push_str("null");
+                        buf.push_str("null");
                         continue;
                     }
                     match row.get_ref(i) {
@@ -3314,14 +3354,19 @@ fn run_statement(
                         // The tag is still on the arrow array underneath.
                         Ok(v) => {
                             let tag = union_tag(&v);
-                            emit_tagged(&mut cells, tag, &Value::from(v), Some(ty));
+                            emit_tagged(&mut buf, tag, &Value::from(v), Some(ty));
                         }
-                        Err(_) => cells.push_str("null"),
+                        Err(_) => buf.push_str("null"),
                     }
+                }
+                match shape {
+                    Shape::Ndjson => buf.push_str("]}\n"),
+                    Shape::Json => buf.push(']'),
                 }
                 }));
 
                 if encoded.is_err() {
+                    buf.truncate(mark);
                     let message = "harbor cannot encode a value in this result: the DuckDB \
                          Rust client has no decoder for one of its column types. The query \
                          ran; the value cannot be represented. Cast the column to VARCHAR \
@@ -3347,21 +3392,6 @@ fn run_statement(
                     break;
                 }
 
-                match shape {
-                    Shape::Ndjson => {
-                        buf.push_str(r#"{"type":"row","values":["#);
-                        buf.push_str(&cells);
-                        buf.push_str("]}\n");
-                    }
-                    Shape::Json => {
-                        if count > 0 {
-                            buf.push(',');
-                        }
-                        buf.push('[');
-                        buf.push_str(&cells);
-                        buf.push(']');
-                    }
-                }
                 count += 1;
 
                 match shape {
@@ -3441,11 +3471,12 @@ fn run_statement(
     match shape {
         Shape::Ndjson => {
             if !gone {
-                buf.push_str(&format!(
+                let _ = write!(
+                    buf,
                     r#"{{"type":"end","rowCount":{},"timeMs":{}}}"#,
                     count,
                     started.elapsed().as_millis()
-                ));
+                );
                 buf.push('\n');
                 let _ = body.send(buf.into_bytes());
             }
@@ -3460,11 +3491,12 @@ fn run_statement(
                 let _ = ready.send(Err(message));
             }
             None => {
-                buf.push_str(&format!(
+                let _ = write!(
+                    buf,
                     r#"],"rowCount":{},"timeMs":{}}}"#,
                     count,
                     started.elapsed().as_millis()
-                ));
+                );
                 if ready.send(Ok(())).is_err() {
                     return true;
                 }
@@ -3489,6 +3521,9 @@ fn execute_jobs(
     pinned: bool,
     state: Arc<SlotState>,
 ) -> Connection {
+    // Room for a working set of distinct statement texts (dashboards cycle
+    // through dozens); duckdb-rs's default LRU of 16 thrashes too easily.
+    conn.set_prepared_statement_cache_capacity(64);
     // Set by the previous job when it could have left a transaction open: a
     // transaction-control statement, or any exit other than running to
     // completion. Resetting unconditionally is also correct, and was what this
