@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "justhttp"
-version = "0.1.1"
+version = "0.13.0"
 dependencies = [
  "ascii",
  "chunked_transfer",
