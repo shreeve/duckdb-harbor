@@ -14,7 +14,10 @@ on:
   push:
     branches: [main]
   schedule:
-    - cron: '0 7 * * *'
+    # Odd minute on purpose: the :00 stampede is when shared runners are most
+    # starved (a 07:00 run flunked stress purely on runner congestion). 23:41
+    # UTC has a healthy track record here and dodges both stampede and peak.
+    - cron: '41 23 * * *'
   workflow_dispatch:
 
 concurrency:
