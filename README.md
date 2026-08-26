@@ -74,12 +74,12 @@ The one thing one-shot does better: since nothing has been sent when the last
 row lands, a failure is still a real status code. The same query that streams a
 `200` with an `{"type":"error"}` line at the end answers `400` in this shape.
 
-`/ready` runs `SELECT 1` down the same path a query takes, and answers `200
-{"status":"ready"}` or `503`. It is not a liveness check, and the difference
-matters: a process can be running while its executor thread is gone, and a
-hardcoded 200 will cheerfully say so while every `/sql` returns 500. Asking the
-database is the only answer worth having. Verdicts are cached for one second, so
-polling it costs at most one query per second however often it is asked.
+`/ready` normally runs `SELECT 1` through an ordinary executor and answers `200
+{"status":"ready"}` or `503`. Under sustained worker saturation, the dedicated
+probe lane asks the control connection instead, so a load balancer can still
+distinguish busy from dead. It is not a process-liveness check: a process can be
+running while its database path is broken. Verdicts are cached for one second,
+so polling costs at most one probe query per second however often it is asked.
 
 ## Stopping a statement
 
@@ -97,11 +97,14 @@ $ curl -s -X DELETE localhost:9495/sql/queries/report-7 -H "$auth"
 {"cancelled":true}
 ```
 
-The cancelled statement answers `499` with `{"code":"cancelled"}` — nginx's
-code, because there is no standard one for "the caller withdrew" and neither
-`400` nor `500` is true. Cancelling something that already finished is
-`{"cancelled":false}`, not an error: by the time a Stop button is pressed, the
-query it refers to may well be over.
+When cancellation lands before streaming begins, the statement answers `499`
+with `{"code":"cancelled"}` — nginx's code, because there is no standard one
+for "the caller withdrew" and neither `400` nor `500` is true. If a streaming
+response already began with `200`, cancellation arrives as its final NDJSON
+error event instead; an HTTP status cannot be changed after its headers were
+sent. Cancelling something that already finished is `{"cancelled":false}`, not
+an error: by the time a Stop button is pressed, the query it refers to may well
+be over.
 
 The id is chosen by the caller rather than issued by harbor, and it has to be:
 the response does not begin until the statement is streaming or done, so an id
@@ -113,15 +116,19 @@ never share one name and make a cancel a coin flip.
 `HARBOR_STATEMENT_TIMEOUT_MS` for a whole deployment, stops a statement without
 anyone having to ask. There is no default, deliberately: harbor streams
 300,000-row results and is used for queries that take minutes on purpose, so a
-default deadline would break correct programs to catch incorrect ones. Zero on
-a request means no limit, so one statement can opt out of a deployment default.
+default deadline would break correct programs to catch incorrect ones. With no
+deployment cap, zero on a request means no limit. When a deployment cap is set,
+it is a hard ceiling: a request may ask for less time, but neither a larger value
+nor zero can opt out of the operator's limit.
 
-The deadline matters most in the case an explicit cancel cannot reach. A
-`DELETE` needs a worker to accept it, and when every worker is blocked inside a
-runaway query there is no worker left — which is exactly when you want to stop
-one. The reaper runs on its own thread and never touches HTTP, so deadlines are
-enforced when nothing else can be. If a deployment's worry is runaway queries
-rather than impatient users, set `HARBOR_STATEMENT_TIMEOUT_MS` and leave it.
+Explicit cancellation remains reachable when every executor is inside a long
+statement: after sustained saturation, a connection-free probe lane accepts
+query cancellation, session release, readiness, and inspection requests. The
+reaper is the independent backstop. It runs on its own thread and never touches
+HTTP, so deadlines are still enforced if no cancellation request arrives or a
+client disappears. If a deployment's worry is runaway queries rather than
+impatient users, set `HARBOR_STATEMENT_TIMEOUT_MS` or
+`--statement-timeout <duration>`.
 
 Two smaller things follow from the same machinery. Releasing a session whose
 statement is still running now stops it — `{"released":false,"cancelling":true}`
@@ -188,23 +195,28 @@ you.
 ## Get it running
 
 Two binaries: **`harbor`** (the server and fleet manager) and **`pilot`** (the
-client). `harbor` links an external `libduckdb` and is version-agnostic — the
-same build serves any DuckDB by the `libduckdb.dylib` it resolves — so a build
-needs a libduckdb to link against. `make fetch-duckdb` pulls one (DuckDB's
-official v2 nightly) into `~/.duckdb/cli/2.0.0/`; then:
+client). `harbor` links an external `libduckdb`; the same build has been
+verified against DuckDB 1.5.5 and current 2.0 nightlies by resolving a
+compatible library at runtime. A build needs a libduckdb to link against.
+`make fetch-duckdb` pulls DuckDB's official v2 nightly into
+`~/.duckdb/cli/2.0.0/`; then:
 
 ```console
 $ make fetch-duckdb                       # libduckdb + duckdb CLI -> ~/.duckdb/cli/2.0.0/
 $ make binary pilot                       # -> target/release/{harbor,pilot}
 $ harbor serve mydata.duckdb --token secret
-harbor 0.13.0: berth "mydata" serving mydata.duckdb on ~/.harbor/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
+harbor 0.13.1: berth "mydata" serving mydata.duckdb on ~/.harbor/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
 ```
 
 `make setup` does the whole thing in one shot — fetch the engine into `~/.duckdb`,
 build and install `harbor` + `pilot` onto PATH in `/usr/local/bin`, and build the
-matched DuckDB UI extension — taking an empty `~/.duckdb` to a working fleet.
+matched DuckDB UI extension. Building the UI additionally requires a compatible
+`duckdb-ui` checkout (`DUCKDB_UI_DIR`, default `~/Data/Code/duckdb-ui`), a C++
+toolchain, `gh`, and OpenSSL. With those prerequisites present, it takes an empty
+`~/.duckdb` to a working fleet.
 
-No toolchain? Each [release](../../releases) ships one self-contained archive per
+No toolchain? Each [release](https://github.com/shreeve/duckdb-harbor/releases)
+ships one self-contained archive per
 platform (osx-arm64, linux-amd64, linux-arm64): harbor + pilot, the exact
 `libduckdb` they were built against, and the matched `ui` extension — all from
 one DuckDB v2 nightly. Extract and run `bin/harbor` in place, or `./install.sh`
@@ -244,6 +256,13 @@ $ pilot mydata -c "SELECT count(*) FROM orders"   # one-shot
 
 Remote access is Caddy's job at the edge (TLS + auth); harbor itself speaks
 plain HTTP over a unix socket or a loopback TCP port.
+
+A bearer token grants the ability to run SQL, and ordinary DuckDB SQL can read
+host files or load extensions. For a berth reachable by an untrusted token
+holder, `--sealed` disables host-file access and community extensions.
+`--max-temp-size` bounds disk spill, and `--statement-timeout` places the hard
+statement ceiling described above. These are independent of Caddy's transport
+and HTTP policy.
 
 ### Request logging
 
@@ -294,15 +313,30 @@ JavaScript, with `fetch` — and `params`, which is how values are passed:
 ```js
 const res = await fetch("http://127.0.0.1:9495/sql", {
   method: "POST",
-  headers: { Authorization: `Bearer ${token}` },
+  headers: {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+  },
   body: JSON.stringify({ sql: "SELECT id, total FROM orders WHERE id > ?",
                          params: [100] }),
 });
+
+const decoder = new TextDecoder();
+let pending = "";
 for await (const chunk of res.body) {
-  for (const line of new TextDecoder().decode(chunk).trim().split("\n")) {
+  pending += decoder.decode(chunk, { stream: true });
+  const lines = pending.split("\n");
+  pending = lines.pop();
+  for (const line of lines) {
+    if (!line.trim()) continue;
     const msg = JSON.parse(line);
     if (msg.type === "row") console.log(msg.values);
   }
+}
+pending += decoder.decode();
+if (pending.trim()) {
+  const msg = JSON.parse(pending);
+  if (msg.type === "row") console.log(msg.values);
 }
 ```
 
@@ -375,7 +409,10 @@ Many connections, few queries: DuckDB Harbor accepts many concurrent
 connections and executes a small, bounded number of statements — six by
 default, settable with `--workers`. DuckDB parallelises a *single* query across
 every core, so running hundreds at once produces thrashing, not throughput. A
-request arriving when every worker is busy waits for one to come free.
+request normally waits for a worker. If every worker has been inside a
+statement for at least 250 ms, the dedicated probe lane keeps control routes
+responsive and may shed new `/sql` or `/catalog` work with a retryable `503`
+instead of hiding an unbounded queue behind saturated analytics.
 
 ## Why it looks like this
 
@@ -409,9 +446,12 @@ third.
 | **`harbor` — everything else** | **`curl`** |
 
 `quack` and `ui` are DuckDB extensions; `harbor` is a standalone server. It can
-still load them into its own database — `harbor serve db.duckdb --init 'LOAD ui'`
-— so one process can answer HTTP clients, browsers, and other DuckDB instances
-over one file at once, `quack` and `ui` stock and unmodified.
+still load them into its own database with
+`harbor serve db.duckdb --unsigned --init 'LOAD ui'`, so one process can answer
+HTTP clients, browsers, and other DuckDB instances over one file at once. The
+current 2.0 UI build comes from the Harbor-compatible `shreeve/duckdb-ui` fork
+until its [upstream compatibility issue](https://github.com/duckdb/duckdb-ui/issues/242)
+lands; Harbor does not patch extension source while loading it.
 
 ## Known limitations
 
@@ -430,12 +470,14 @@ There is no rate limiting and no CORS — defensible for a service behind a prox
 worth knowing before it faces a browser. Request logging is available with
 `--log`, off by default.
 
-**Signal handling is Unix only.** On Windows there is no `SIGTERM` drain and no
-checkpoint on exit; `harbor stop` is the way out.
+**The current binaries are Unix-only.** Harbor and Pilot use Unix sockets and
+Unix process/signal APIs, and releases currently target macOS and Linux. There
+is no Windows build today.
 
 **The engine is the linked `libduckdb`, not the binary.** harbor links
-dynamically and is version-agnostic — the same build serves whichever DuckDB the
-`libduckdb` it resolves provides (verified against 1.5.5 and a 2.0 dev build).
+dynamically, and the same build has been verified against DuckDB 1.5.5 and a
+2.0 development build. Treat that as tested compatibility, not a promise that
+an arbitrary past or future DuckDB ABI will work.
 `make install` puts harbor + pilot on PATH in `/usr/local/bin`, and harbor's
 baked rpath resolves the engine in `~/.duckdb` — DuckDB's own world, disposable
 and refetchable. The caveat that comes with that: point it at a library whose
@@ -443,29 +485,38 @@ storage format matches the database file.
 
 ## Working on it
 
-Building is only needed to change it. Three crates: **`harbor`** (the server
-engine and the fleet CLI), **`wire`** (the frozen protocol contract, shared with
-the client), and **`pilot`** (the client). harbor links an external `libduckdb`
-rather than embedding one, so no DuckDB source tree is required — `make
-fetch-duckdb` fetches a libduckdb to link against, then `make binary pilot`
-builds. The crate ships pregenerated bindings, so there is no bindgen and no
-headers to find.
+Building is only needed to change it. The workspace has four first-party
+crates:
 
-`make check` runs the full suite, `make check_quick` the sub-minute subset; both
-build a fixture database with the local `duckdb` CLI first. It is heavily tested:
-ten suites whose every answer is checked against an oracle that is not harbor —
-values read from the database file before the server takes the lock, and Python's
-own `datetime` and `base64` for fuzzed values. An oracle that shares an
-implementation with the thing it checks confirms only that the code is
-self-consistent.
+- **`harbor`** — the server engine and fleet CLI;
+- **`pilot`** — the DuckDB-shell-class Harbor client;
+- **`wire`** — protocol request and response types consumed by Pilot; and
+- **`justhttp`** — Harbor's small synchronous HTTP/1.1 server over TCP and Unix
+  sockets.
+
+Harbor currently implements its protocol shapes directly rather than depending
+on `wire`, so a wire change needs tests on both sides; drift is not a Rust
+compile error. Harbor links an external `libduckdb` rather than embedding one,
+so no DuckDB source tree is required — `make fetch-duckdb` fetches a libduckdb
+to link against, then `make binary pilot` builds. The crate ships pregenerated
+bindings, so there is no bindgen and no headers to find.
+
+`make check` runs the full suite and `make check_quick` the focused subset. Both
+expect `sample.duckdb`; create it with
+`test/scripts/fixture.sh sample.duckdb` when it is absent. CI performs that
+fixture step explicitly. The ten suites use independent oracles where answers
+need comparison — values read from the database file before the server takes
+the lock, and Python's own `datetime` and `base64` for fuzzed values. An oracle
+that shares an implementation with the thing it checks confirms only that the
+code is self-consistent.
 
 ## Status
 
-Pre-production. harbor and pilot are two small binaries — no extension, no
-launcher, no signing dance. harbor is dynamically linked and **version-agnostic**:
-one build serves any DuckDB by the `libduckdb` beside it, proven against 1.5.5
-and a 2.0 dev build (the same bytes report each version next to each library).
-Deploy behind Caddy, which owns TLS and per-request timeouts at the edge.
+Pre-production. harbor and pilot are two small binaries — no Harbor extension,
+launcher, or signing dance. Harbor is dynamically linked: the same build has
+served DuckDB 1.5.5 and a 2.0 development build by resolving the compatible
+`libduckdb` beside it. Deploy remote TCP behind Caddy, which owns TLS and edge
+request policy; Harbor independently owns SQL statement deadlines.
 
 ## License
 

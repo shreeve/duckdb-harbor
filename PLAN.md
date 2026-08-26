@@ -1,48 +1,53 @@
 # Harbor — decision record
 
-Harbor is a single Rust binary that starts, serves, and talks to DuckDB
-databases — fleet manager, HTTP/UDS server, and companion CLI. The plan that
-built it shipped: Phases 0–2 are complete and it is pre-production behind Caddy.
-What remains here is the **decision record** — the rationale the code cites by
-number (`PLAN.md D5`, `D8`, …). For usage see [README.md](README.md); for
-maintenance items see [TODO.md](TODO.md).
+DuckDB Harbor ships two Rust binaries: `harbor` owns DuckDB databases and their
+HTTP/UDS fleet lifecycle; `pilot` is the engine-free client. The core plan that
+built them shipped and is pre-production behind Caddy. What remains here is the
+**decision record** — the rationale the code cites by number (`PLAN.md D5`,
+`D8`, …), reconciled with what is actually present today. An idea that remains
+unshipped is labeled as such rather than described as a compatibility mode. For
+usage see [README.md](README.md); for maintenance items see [TODO.md](TODO.md).
 
 ```
 ~/.harbor/                        ← the harbor IS a directory (no daemon)
 ├── sales.sock                    ← berth: one harbor serve process, one .duckdb
+├── sales.lock                    ← process-lifetime ownership mutex
 ├── sales.token                   ← per-berth bearer token, 0600
 ├── sales.json                    ← identity sidecar (pid, paths, versions)
 └── log/sales.log
 
 harbor add ./sales.duckdb         → spawn a detached berth, bind the socket
-harbor ls                         → readdir + /ready probe + /info
+harbor ls                         → read sidecars + /ready probe
 harbor stop sales                 → drain, CHECKPOINT, socket gone
-pilot sales                       → duckdb-CLI-class REPL over UDS (or https via Caddy)
+pilot sales                       → duckdb-CLI-class REPL over UDS or plain HTTP
 pilot ./ad-hoc.duckdb             → summon an ephemeral berth, connect (D9)
 ```
 
-The workspace is three crates: **`harbor`** (bin + library — the engine folded
-in beside the CLI), **`wire`** (the frozen protocol contract, shared with
-pilot), and **`pilot`** (the client, links no engine).
+The workspace has four first-party crates: **`harbor`** (bin + library),
+**`pilot`** (the client, links no engine), **`wire`** (Pilot's protocol types),
+and **`justhttp`** (Harbor's synchronous HTTP/1.1 server). Harbor currently
+implements the same wire shapes directly rather than consuming the `wire`
+crate, so protocol changes require tests on both sides.
 
 ---
 
 ## Decisions (with rationale)
 
-### D1. One binary, dynamically linked (the engine swaps by dylib)
+### D1. One Harbor engine binary, dynamically linked (the engine swaps by dylib)
 Originally the binary embedded DuckDB statically via the `duckdb` crate's
 `bundled` feature. That shipped and worked — but the Phase-0 spike proved
 something better. Because duckdb-rs uses *pregenerated* bindings, the SAME
 dynamically-linked `harbor` bytes drive whichever `libduckdb.dylib` they resolve
 at runtime (`@rpath` / `@loader_path`) — verified by one binary reporting
 v1.5.5 beside the 1.5.5 dylib and v2.0.0-alpha beside the 2.0 one. So harbor is
-**dynamic by default and version-agnostic**: one build serves a mixed fleet, the
-engine chosen by the dylib it links (`make install` puts harbor + pilot on PATH
+**dynamic by default and compatible across the tested line**: one build has
+served a mixed DuckDB 1.5.5/2.0-nightly fleet, with the engine chosen by the
+dylib it links (`make install` puts harbor + pilot on PATH
 in `/usr/local/bin`; harbor's baked absolute rpath resolves the engine in
 `~/.duckdb`, DuckDB's own world). The static `bundled` build was dropped
 entirely: it cost a 33MB binary and a 17GB from-source build tree for an
 advantage — needing no sibling dylib — the swap model removed. Distribution is
-`curl && chmod +x` plus the sibling dylib; the version pin *is* the dylib.
+the release archive plus its sibling dylib; the engine pin *is* the dylib.
 
 ### D2. One process per database (the fleet is N `harbor serve` processes)
 DuckDB files are single-writer; the code already enforces one-database-per-
@@ -50,7 +55,8 @@ process (`open_pool` refuses a second, by design — the pool/lease/cancel
 machinery is process-wide statics). Keeping that gives crash isolation,
 per-berth DuckDB versions (a 1.5.5 berth beside a 2.0-dev berth), independent
 SIGTERM→drain→CHECKPOINT lifecycles, and the daemonless registry.
-**One berth, one database, one socket, one token — no exceptions shipped**
+**One berth, one database, one listen endpoint, and one token by default — no
+multi-database mode shipped**
 (decided 2026-08-16: an implemented `--attach` flag was removed the same day
 to keep the model clean; ~30 lines to restore if a real cross-db-join need
 ever arrives). ATTACH remains available to clients as plain SQL through
@@ -61,42 +67,47 @@ ever arrives). ATTACH remains available to clients as plain SQL through
 `--threads`) and prints it at startup. Not a follow-up — a 1.0 requirement.
 
 ### D3. No daemon — the filesystem is the registry
-A berth's UDS socket in `~/.harbor/` IS its registration. Discovery = readdir;
-liveness = connect + `GET /ready`; identity = `GET /info`. Claim protocol:
-`flock(LOCK_EX|LOCK_NB)` on `<name>.lock` is the real mutex (held for process
-life); if acquired and a socket file exists, it is stale by definition → unlink
-and bind. Never unlink a socket without a failed `/ready` dial first. Clean
-shutdown removes socket + json. `harbor ls` reaps stale entries (flock-guarded).
-The same flock is proof-of-life for `stop`/`rm`: if we can take it, the berth is
-gone and its recorded pid may be recycled, so we do not signal it.
+`~/.harbor/<name>.json` is the discoverable identity and dial record for both
+UDS and TCP berths; liveness is a `GET /ready` probe. The process-lifetime
+`flock(LOCK_EX|LOCK_NB)` on `<name>.lock` is the ownership mutex. Once `serve`
+holds that lock, an existing socket path belongs to no live process under that
+name and can be replaced before bind. Clean shutdown removes the socket and
+JSON sidecar but deliberately leaves the lock inode in place. `harbor ls` reads
+sidecars and reports dead entries; it does not silently reap them. The same
+flock is proof-of-death for `stop`/`rm`: if we can take it, the recorded pid may
+have been recycled, so Harbor does not signal it. `rm` is the explicit registry
+cleanup operation and never removes the database file.
 
 ### D4. Spawn, don't fork; persist via the init system
-`harbor add` runs `current_exe() serve …` detached (setsid, stdin null,
-stderr → `~/.harbor/log/<name>.log`), then polls `/ready` before reporting
-success. Identical on macOS/Linux. Boot persistence is a separate verb:
-`harbor add --boot` generates and loads a launchd plist / systemd user unit
-(`KeepAlive` / `Restart=on-failure`, `ExitTimeOut`/`TimeoutStopSec=30` to honor
-the drain+CHECKPOINT window). Harbor never becomes a supervisor. **No socket
-activation**: a database should not cold-start (WAL replay) per request, and
-idle-exit fights the lease/checkpoint machinery. Plain always-on units.
+`harbor add` runs `current_exe() serve …` detached in a new process group, with
+stdin null and stdout/stderr appended to `~/.harbor/log/<name>.log`, then polls
+`/ready` before reporting success. Identical on macOS/Linux. Harbor never becomes a supervisor. Boot
+persistence belongs in launchd or a systemd user unit, but an automatic
+`harbor add --boot` generator is not shipped. **No socket activation**: a
+database should not cold-start (WAL replay) per request. An always-on unit and
+an explicitly ephemeral `--idle-exit` berth are separate operating choices.
 
 ### D5. The extension retires (decided 2026-08-16)
 Once the binary is validated, the loadable-extension artifact is dropped —
-with it go extension signing, `-unsigned`, `FORCE INSTALL`, the two-artifact
-version-matching dance, the unstable-C-API band pin, the bash launcher, and
-the bundled/loadable feature-split build gotcha. Its one niche (bolting HTTP
-onto someone else's live DuckDB process) is covered well enough by the quack
-extension and by pilot; if ever truly needed, the ~350 lines of vtab glue can be
-resurrected on top of harbor's library. The embedded binary loses no
-co-residency: `harbor serve --unsigned --init 'LOAD ui' --init 'LOAD quack'`
-loads those extensions into its own DuckDB. *(This retirement is
-also why `harbor-core` later folded back into `harbor`: the split existed to
-share server logic with the extension, and nothing else ever linked it.)*
+with it go Harbor-extension signing, `FORCE INSTALL`, the two-artifact
+version-matching dance, the unstable-extension-API band pin, the bash launcher,
+and the bundled/loadable feature-split build gotcha. The current
+`harbor serve --unsigned` flag is unrelated: it lets the owned DuckDB process
+load an unsigned DuckDB extension such as the current UI build. The retired
+extension's one niche (bolting HTTP onto someone else's live DuckDB process) is
+covered well enough by the quack extension and by Pilot; if ever truly needed,
+the old vtab glue can be rebuilt on top of Harbor's library. The standalone
+binary loses no co-residency:
+`harbor serve --unsigned --init 'LOAD ui' --init 'LOAD quack'` loads those
+extensions into its own DuckDB. *(This retirement is also why `harbor-core`
+later folded back into `harbor`: the split existed to share server logic with
+the extension, and nothing else ever linked it.)*
 
 ### D6. Caddy is the optional edge; UDS is the default face
 Local security = filesystem perms + token. Remote = Caddy terminates TLS/HTTP3
-and edge auth, proxies to the socket. The CLI speaks UDS, `http://`, or
-`https://` interchangeably — a remote berth is just a URL.
+and edge auth, proxies to the socket. Pilot deliberately speaks UDS and plain
+`http://` only. A human reaches a remote berth through SSH or runs Pilot on the
+host; browser and application clients may use HTTPS through Caddy.
 
 ### D7. Protocol changes are additive only
 The Rip harborAdapter must run unmodified. Two new endpoints (`/info`, shipped;
@@ -111,34 +122,38 @@ body field; don't implement it.
 ### D8. Two binaries: `harbor` (engine + fleet) and `pilot` (pure client)
 The CLI never needs libduckdb — it speaks the protocol. Split along linkage:
 `harbor` = `serve` (the only subcommand linking DuckDB) + fleet verbs
-(`add/ls/stop/rm/doctor`: filesystem, spawning, HTTP probes). `pilot` = REPL +
-one-shot `pilot sql`, connecting by berth name (via `~/.harbor/`), socket
-path, or `http://` on a trusted network. **Pilot is TLS-free by design
+(`add/ls/stop/rm`: filesystem, spawning, HTTP probes). `pilot` = REPL plus
+one-shot `pilot <target> -c "SQL"`, connecting by berth name (via
+`~/.harbor/`), socket path, database path, or `http://` on a trusted network.
+There is no `doctor` verb today. **Pilot is TLS-free by design
 (decided 2026-08-16): https/edge auth is Caddy's job for browser and app
 clients; a human with pilot reaches a remote host over ssh.** Consequences:
 pilot is ~1.5MB, installs on machines that never host a database, and is
 **DuckDB-version-agnostic** — one client for a mixed 1.5.5/2.0 fleet, while each
 harbor build resolves whichever engine sits beside it. Precedent: `psql`/
-`postgres`, `redis-cli`/`redis-server`. A small shared **`wire`** crate
-(envelope types, error codes, request shapes) is the wire contract in
-compilable form — harbor encodes it, pilot decodes it, drift is a compile
-error. Dependency quarantine stays perfect: reedline never in the server tree,
-justhttp never in the client.
+`postgres`, `redis-cli`/`redis-server`. The small **`wire`** crate contains the
+request, envelope, error-code, and endpoint types Pilot consumes. Harbor
+currently owns its encoder and request parser directly, so drift is caught by
+cross-side protocol tests rather than by a shared Rust dependency. Dependency
+quarantine stays clean: reedline never enters the server tree, and justhttp
+never enters the client.
 
 ### D9. Pilot spawns the owner on demand (ephemeral berths)
 `pilot ./sales.duckdb` recovers the old `duckdb sales.duckdb` muscle memory
 via the agent pattern (gpg-agent/emacsclient): resolve the target — name in
-`config.toml` (D10a) → that entry; live berth name → registry socket; URL →
-connect; file path → connect to the live berth whose sidecar claims that
-path, else exec `harbor serve` from PATH (pilot never links DuckDB), poll
-`/ready`, connect. This factors out DuckDB's single-writer lock pain: a second
-`pilot` on the same file joins the same berth instead of "database is locked".
-Pilot-spawned berths run with `--idle-exit <dur>`: zero connections AND zero
-leases for the window → drain, CHECKPOINT, unlink, exit — robust against pilot
-crashes, no refcounting, no orphans. (Not the rejected socket activation:
-idle-exit is opt-in per spawn, exits through the normal checkpoint path;
-permanent berths never idle-exit.) `--moor` / `harbor add` promotes ephemeral →
-permanent. No cleverer lifecycle rules than these.
+`config.toml` (D10a) → that entry; live berth name → registered endpoint; URL →
+connect when it is a path-free plain-HTTP origin; file path → connect to the
+live berth whose sidecar claims that path, else run
+`harbor add ... --idle-exit` from PATH (Pilot never links DuckDB), wait for its
+readiness result, then connect. This factors out DuckDB's single-writer lock
+pain: a second Pilot on the same file joins the same berth instead of reporting
+"database is locked".
+
+Pilot-spawned berths run with `--idle-exit <dur>`: no active countable requests
+and no live sessions for the window → drain, CHECKPOINT, unlink, exit. Idle
+keep-alive TCP connections are not reference-counted. The lifecycle is robust
+against Pilot crashes and has no client refcount. `--moor` is not shipped;
+starting a permanent berth explicitly with `harbor add` is the current choice.
 
 ### D10a. Client address book: `~/.harbor/config.toml` — purely additive
 **Zero-config is the local default**: with no config file, `pilot <berth>`
@@ -148,18 +163,19 @@ permanent. No cleverer lifecycle rules than these.
 state (what's running, discovered by readdir, never configured); the config
 is the address book (how to reach non-local things: remotes, tokens, taste),
 read by **pilot only** — the server has no config file, ever (`harbor` =
-flags + registry). Name collisions: an explicit config entry shadows a live
+flags + registry). Name collisions: an explicit config entry shadows any live
 local berth of the same name (ssh_config precedent: explicit mapping beats
-ambient discovery), with a one-line notice. `pilot medlabs` resolves
-`[connection.medlabs]` → `url` (https via Caddy) or `path` (spawn-on-demand
-alias with per-entry `idle-exit`), plus `[defaults]` for REPL prefs (mode,
-timer, maxrows, nullvalue, theme, appearance). Credentials never touch argv:
-per connection `token-file` (default) or `token-cmd` (prints token — keychain/
-1Password); inline `token` and URL userinfo accepted but documented as the
-lazy path. Lives in `$HARBOR_HOME` (default `~/.harbor/`, 0700, files 0600)
-beside sockets/tokens/history — the harbor stays one directory. Bare `pilot`
-lists address book ∪ live registry: the fleet dashboard from any machine,
-including database-less ones.
+ambient discovery). Pilot prints a notice when the local berth has a UDS
+socket; a same-name TCP sidecar is currently shadowed silently. `pilot medlabs`
+resolves `[connection.medlabs]` → path-free plain-HTTP `url` or `path`
+(spawn-on-demand alias with per-entry `idle-exit`), plus `[defaults]` for REPL
+prefs (mode, timer, maxrows, nullvalue, theme, appearance). Credentials can
+come from `--token`,
+`HARBOR_TOKEN`, inline config `token`, `token-file`, or `token-cmd`; URL userinfo
+is not parsed. Harbor creates `$HARBOR_HOME` as mode 0700 and minted token files
+as 0600, while a user-authored config file retains the permissions its creator
+gave it. Bare `pilot` currently lists the live local registry; configured
+remotes are resolved when named, not merged into that fleet view.
 
 ### D10b. Defense in depth on auth
 Token required on ALL faces by default, including UDS (the janus lesson:
@@ -189,7 +205,8 @@ nested-archive naming in the workflow: it tracks whatever `main` built last,
 which is the 2.0 line harbor targets, so every run tests the real thing.
 Verified: a harbor built against `alpha37626` links and runs clean against the
 newer official `alpha38069`, and against upstream stable `v1.5.5` — the C API is
-stable across the line (D1's version-agnostic property, exercised, not asserted).
+compatible for Harbor's exercised surface across those builds. This is tested
+compatibility, not a claim about every past or future DuckDB ABI.
 Re-verified 2026-08-24 on `alpha38195`: the same binary answered
 `select version()` as `v2.0.0-alpha38195` via its baked rpath and as `v1.5.5`
 via `DYLD_LIBRARY_PATH`, with the full check suite (10 suites) green on the
@@ -200,8 +217,10 @@ README's Performance section for the decomposition.)
 
 `make fetch-duckdb` (→ `scripts/fetch-duckdb.sh`) pulls the same official nightly
 into `~/.duckdb/cli/2.0.0/` for local work; `make setup` chains it with the
-binary build, `install`, and `make ui`, taking an empty `~/.duckdb` to a working
-fleet in one command.
+binary build, `install`, and `make ui`. The UI step also requires a compatible
+`duckdb-ui` checkout (`DUCKDB_UI_DIR`), a C++ toolchain, `gh`, and OpenSSL. With
+those prerequisites present, the command takes an empty `~/.duckdb` to a
+working fleet.
 
 `make ui` (→ `scripts/build-ui-extension.sh`) builds the UI extension out-of-tree
 against the *exact* nightly just installed: read its commit, fetch DuckDB's
@@ -214,8 +233,9 @@ the version lock the C++ ABI demands is satisfied *by construction*, since
 engine, dylib, and extension all derive from one nightly. The UI source is a
 duckdb-ui checkout carrying the v2 fixes — our fork until upstream fixes
 duckdb/duckdb-ui#242 (the issue is open; the PRs offering these fixes, #243
-and #244, were closed unmerged), then official. Verified end to end: `harbor serve --unsigned --init 'LOAD
-ui' --init 'FROM start_ui_server()'` serves the UI at `http://localhost:4213/`.
+and #244, were closed unmerged), then official. Verified end to end:
+`harbor serve --unsigned --init 'LOAD ui' --init 'FROM start_ui_server()'`
+serves the UI at `http://localhost:4213/`.
 
 **The UI extension can be dynamic — and should be.** DuckDB ships loadable
 extensions *statically* (each embeds a private copy of DuckDB, ~37MB, portable
@@ -234,27 +254,24 @@ incidentally-exported C++ internals, so it is sound *only* under the same-build
 guarantee above. Keep the static build as the known-good fallback.
 
 ### D12. The HTTP layer becomes first-party: justhttp (decided 2026-08-24)
-The vendored tiny_http 0.12.0 already carried two harbor patches (the bounded
-unread-body drain and the 10s response write timeout) that upstream had not
-absorbed, and a survey of the sync-HTTP field found no replacement matching
-harbor's needs — synchronous workers, unix sockets, streaming-from-`Read`,
-tiny dependency tree (astra drags hyper; oxhttp self-describes as naive/WIP;
-touche lacks UDS). So the copy stopped pretending to be upstream:
-`crates/justhttp` is harbor's own HTTP/1.1 crate, derived from tiny_http,
-MIT, a workspace member consumed as a plain path dependency (the
-`[patch.crates-io]` indirection retired with the name). Everything harbor
-does not use went away — TLS, websocket upgrades, `TestRequest`, dead
-response constructors and getters,
-the notify/secure rendezvous, `log` — leaving ~2,650 lines in seven one-word
-files (lib, http, stream, conn, request, response, pool), edition 2024,
-`forbid(unsafe_code)`, zero warnings. The two patches are now just code, with
-regression tests (`tests/drain.rs` asserts a dropped 1 GiB-declared body
-allocates < 1 MiB via a measuring global allocator; the `stall` test proves a
-stalled reader is reclaimed). The inherited suite was kept and extended
-(keep-alive reuse + chunked streaming, previously untested), and the two
-promptness tests that failed on macOS were fixed (a cleanup `shutdown` unwrap
-on an already-reset socket — Linux says Ok, BSD says ENOTCONN). Wire-visible
-change: the `Server:` header now says `justhttp`. The delicate cores —
-response-ordering (pipelining), half-close semantics, the keep-alive state
-machine, byte-at-a-time CRLF framing — moved verbatim, on the advice that
-they are semantics, not style.
+Harbor owns its HTTP layer as the first-party workspace crate
+`crates/justhttp`, consumed through a plain path dependency. It is not vendored
+tiny_http, has no tiny_http dependency, and does not track an upstream HTTP
+crate. Historical lineage is retained only for licensing: justhttp began from
+the relevant synchronous HTTP/1.1 core of tiny_http 0.12.0 and was reduced and
+maintained as Harbor's own crate.
+
+The resulting surface matches Harbor's needs — synchronous workers, Unix
+sockets, TCP, streaming from `Read`, and a tiny dependency tree. TLS, WebSocket
+upgrades, `TestRequest`, unused response APIs, the notify/secure rendezvous, and
+`log` are absent. The crate is roughly 2,650 lines in seven one-word files
+(lib, http, stream, conn, request, response, pool), edition 2024,
+`forbid(unsafe_code)`, with three small dependencies.
+
+Two Harbor hardening behaviors are part of justhttp itself: unread request
+bodies drain through a fixed 64 KiB buffer, and every accepted socket has a
+10-second response write timeout. Regression tests pin both behaviors
+(`tests/drain.rs` and the separately run ignored `stall` test). The suite also
+covers keep-alive reuse, chunked streaming, response ordering, half-close
+semantics, and byte-at-a-time CRLF framing. The wire-visible `Server:` header
+identifies `justhttp`.

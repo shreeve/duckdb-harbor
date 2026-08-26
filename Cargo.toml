@@ -1,10 +1,10 @@
 # Pure workspace: the extension retired (PLAN.md D5); everything lives in
 # crates/. That includes crates/justhttp, harbor's first-party HTTP/1.1
-# layer (a plain path dependency of crates/harbor). Derived from tiny_http
-# 0.12.0, kept deliberately smaller: TLS, websocket upgrades and dead API
-# stripped; carries a bounded unread-body drain (DoS fix) and a 10s
-# response write timeout. Full ledger in crates/justhttp/README.md and
-# TODO.md. Test it with `cargo test -p justhttp`.
+# layer and a plain path dependency of crates/harbor. Its historical lineage
+# is recorded for licensing, but it has no upstream HTTP-crate dependency.
+# justhttp carries a bounded unread-body drain and a 10s response write
+# timeout. Full ledger in crates/justhttp/README.md and TODO.md. Test it with
+# `cargo test -p justhttp`.
 [workspace]
 members = ["crates/*"]
 default-members = ["crates/wire", "crates/pilot", "crates/harbor"]

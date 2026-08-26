@@ -100,12 +100,12 @@ mod listen {
             }
         }
 
-        /// Bound how long a single write to this socket may block. upstream tiny_http
-        /// otherwise set no write timeout, so a client that stops reading its
-        /// response leaves the server thread parked in a `write` forever. A client
-        /// that keeps draining resets the timer on every write; only a fully
-        /// stalled peer trips it, after which the write errors and the connection
-        /// is dropped. (One of the two hardening behaviors this crate carries; see README.md.)
+        /// Bound how long a single write to this socket may block. Without a
+        /// timeout, a client that stops reading its response leaves the server
+        /// thread parked in a `write` forever. A client that keeps draining
+        /// resets the timer on every write; only a fully stalled peer trips it,
+        /// after which the write errors and the connection is dropped. (One of
+        /// the two hardening behaviors this crate carries; see README.md.)
         pub(crate) fn set_write_timeout(
             &self,
             dur: Option<std::time::Duration>,

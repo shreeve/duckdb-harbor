@@ -1,16 +1,18 @@
 # TODO
 
-Ongoing maintenance items. Not the roadmap — that's [PLAN.md](PLAN.md).
+Ongoing maintenance items. Architecture rationale and shipped/unshipped
+decisions live in [PLAN.md](PLAN.md).
 
 ## justhttp — harbor's first-party HTTP layer (no un-vendor plan; it's ours)
 
 `crates/justhttp` is harbor's own synchronous HTTP/1.1 crate — a workspace
-member and plain path dependency of `crates/harbor`, derived from tiny_http
-0.12.0 and permanently first-party (decision record: PLAN.md D12; lineage +
-license: `crates/justhttp/README.md`). Its test suite (`cargo test -p
-justhttp`, all green on macOS and Linux) is the safety net for any change;
-`cargo test -p justhttp --test suite -- --ignored` runs the one slow (~35s)
-write-timeout test.
+member and plain path dependency of `crates/harbor`, designed and maintained in
+this repository (decision record: PLAN.md D12; historical lineage and license:
+`crates/justhttp/README.md`). It is not vendored and has no upstream HTTP-crate
+dependency or synchronization work. The default suite (`cargo test -p
+justhttp`) is green on macOS and Linux;
+`cargo test -p justhttp --test suite -- --ignored` separately runs the one slow
+(~35s) write-timeout test.
 
 Maintenance notes:
 
@@ -19,11 +21,6 @@ Maintenance notes:
   measured via a global allocator) and the `stall` module in `tests/suite.rs` (a client that stops
   reading its response cannot pin a worker; the 10s write timeout frees it).
   If either test ever fails, that is a security regression, not a flake.
-- **Upstream watch, informational only**: the drain fix was offered to
-  tiny_http as <https://github.com/tiny-http/tiny-http/pull/290> (still open).
-  Its fate no longer affects harbor — justhttp does not track upstream — but
-  if it merges, other tiny_http users stop being DoS-able, which is why it
-  stays filed.
 - **What justhttp deliberately lacks** (do not "fix"): TLS (edge proxy's job,
   D6), websocket upgrades, HTTP/2 and /3, `TestRequest`/test scaffolding, and
   every API harbor doesn't call. New surface should be added only when harbor

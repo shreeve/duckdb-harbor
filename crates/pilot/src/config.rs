@@ -12,7 +12,7 @@
 //! appearance = "auto"      # auto | light | dark
 //!
 //! [connection.medlabs]
-//! url = "https://remote.example.com/db/sales"
+//! url = "http://127.0.0.1:9495"
 //! token-file = "~/.harbor/medlabs.token"     # or token-cmd = "op read ..."
 //!
 //! [connection.scratch]
@@ -131,7 +131,7 @@ mod tests {
             timer = true
 
             [connection.medlabs]
-            url = "https://remote.example.com"
+            url = "http://127.0.0.1:9495"
             token-file = "~/.harbor/medlabs.token"
 
             [connection.scratch]
@@ -141,7 +141,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.defaults.mode.as_deref(), Some("csv"));
-        assert_eq!(c.connection["medlabs"].url.as_deref(), Some("https://remote.example.com"));
+        assert_eq!(c.connection["medlabs"].url.as_deref(), Some("http://127.0.0.1:9495"));
         assert_eq!(c.connection["scratch"].idle_exit.as_deref(), Some("10m"));
     }
 

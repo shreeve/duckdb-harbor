@@ -181,7 +181,7 @@ job (PLAN.md D6); ssh is the human path to a remote berth.
 ";
 
 /// Resolution order (D9/D10a): config.toml name -> live berth name ->
-/// http(s) url -> .duckdb path (join-or-spawn) -> socket path. Zero-config
+/// plain-HTTP url -> .duckdb path (join-or-spawn) -> socket path. Zero-config
 /// local always works; the config is purely additive.
 fn resolve(cfg: &config::FileConfig, target: &str, flag_token: Option<String>) -> Result<Conn, String> {
     let env_token = std::env::var("HARBOR_TOKEN").ok();
@@ -286,7 +286,7 @@ fn url_transport(url: &str) -> Result<Transport, String> {
     if let Some(rest) = url.strip_prefix("http://") {
         let (addr, extra) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
         if !extra.is_empty() {
-            return Err("path-prefixed http targets are not supported; use https via Caddy or host:port".into());
+            return Err("path-prefixed HTTP targets are not supported; use a Harbor host:port or SSH to its socket".into());
         }
         let addr = if addr.contains(':') { addr.to_string() } else { format!("{addr}:9495") };
         return Ok(Transport::Tcp(addr));
@@ -358,8 +358,9 @@ fn fleet_hint(home: &std::path::Path) -> String {
     if names.is_empty() { String::new() } else { format!("; live berths: {}", names.join(", ")) }
 }
 
-/// Bare `pilot`: the fleet view. /ready is unauthenticated by design, so this
-/// needs no tokens; config-file remotes join this view too.
+/// Bare `pilot`: the live local fleet view. /ready is unauthenticated by
+/// design, so this needs no tokens. Named config entries resolve on demand but
+/// are not merged into this list.
 fn list_fleet() -> ExitCode {
     let home = config::harbor_home();
     let berths = berth_entries(&home);

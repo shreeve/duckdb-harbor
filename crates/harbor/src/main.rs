@@ -87,8 +87,8 @@ serve/add options:
   --sealed            lock the berth to SQL on its own database: no host file
                       access (read_csv/COPY), no community extensions. For a
                       berth an untrusted caller can reach
-  --statement-timeout <d>  default deadline per statement (e.g. 30s); a
-                      request's own timeoutMs still overrides it
+  --statement-timeout <d>  hard deadline ceiling per statement (e.g. 30s); a
+                      request may ask for a shorter timeout, but not a longer one
   --max-temp-size <s>  cap spill-to-disk (e.g. 10GB; default: DuckDB's own)
   --log               log requests to stderr
 ";
@@ -264,12 +264,12 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         },
     };
 
-    // A default statement deadline, if asked. the engine reads
-    // HARBOR_STATEMENT_TIMEOUT_MS per request when a request names no timeout
-    // of its own; setting it here, in our own process before serving, turns
-    // the flag into that default. Left unset by default on purpose: harbor
-    // streams minute-long analytical queries, so a blanket deadline would
-    // break correct programs (a per-request timeoutMs still overrides this).
+    // A statement deadline ceiling, if asked. The engine reads
+    // HARBOR_STATEMENT_TIMEOUT_MS per request and clamps a requested timeout
+    // to it; setting the variable here, before serving, turns the CLI flag into
+    // that hard cap. Left unset by default on purpose: harbor streams
+    // minute-long analytical queries, so a blanket deadline would break
+    // correct programs.
     if let Some(d) = o.statement_timeout {
         // SAFETY: single-threaded here — start() has not spawned the workers.
         unsafe { std::env::set_var("HARBOR_STATEMENT_TIMEOUT_MS", d.as_millis().to_string()) };

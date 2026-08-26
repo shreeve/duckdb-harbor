@@ -5,9 +5,9 @@ edition = "2024"
 description = "The Harbor wire contract: request shapes, NDJSON envelope, error codes"
 license = "MIT"
 
-# This crate IS the protocol spec in compilable form (PLAN.md D8). harbor
-# encodes it, pilot decodes it; drift between server and client is a compile
-# error. No I/O here, ever — types and codes only.
+# Pilot's Harbor protocol types (PLAN.md D8). Harbor currently implements its
+# encoder and request parser directly, so cross-side tests—not a shared Rust
+# dependency—pin compatibility. No I/O here, ever: types and codes only.
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

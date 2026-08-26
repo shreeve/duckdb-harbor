@@ -6,9 +6,9 @@ description = "pilot — the Harbor client: fleet-aware SQL over UDS and HTTP"
 license = "MIT"
 
 # Pure protocol client (PLAN.md D8): pilot never links DuckDB. HTTP/1.1 over
-# UnixStream/TcpStream is hand-rolled (~200 lines) because dragging an async
-# stack in for one request at a time buys nothing. https lands with ureq in
-# Phase 2 alongside the REPL.
+# UnixStream/TcpStream is hand-rolled because dragging an async stack in for
+# one request at a time buys nothing. Pilot is deliberately TLS-free; remote
+# human access goes through SSH, while Caddy serves HTTPS application clients.
 [dependencies]
 crossterm = "0.29.0"
 wire = { path = "../wire" }

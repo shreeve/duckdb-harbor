@@ -6,11 +6,11 @@ nothing else. No TLS, no websockets, no HTTP/2, no plugins, no feature
 flags. The edge proxy owns encryption; this crate owns fast, correct
 HTTP over a socket.
 
-justhttp is the HTTP layer under [`harbor`](../../README.md), a workspace
-crate maintained as first-party code — permanently: there is no upstream
-to track. It began as a TLS-stripped
-[tiny_http 0.12.0](https://github.com/tiny-http/tiny-http) and is kept
-deliberately smaller than its ancestor (see **Lineage** below).
+justhttp is the HTTP layer under [`harbor`](../../README.md), created and
+maintained here as a first-party workspace crate. Harbor depends directly on
+this crate by path; justhttp is not vendored and has no upstream HTTP crate to
+track. Its historical ancestry is recorded only for attribution in **Lineage
+and license** below.
 
 ## What it does
 
@@ -64,8 +64,8 @@ three tiny dependencies (`ascii`, `chunked_transfer`, `httpdate`):
 
 ## Tests
 
-`cargo test -p justhttp` (from the repo root) runs the whole suite — green
-on macOS and Linux. Two files:
+`cargo test -p justhttp` (from the repo root) runs the default suite — green on
+macOS and Linux. Two files:
 `tests/suite.rs`, one module per property (`basic`, `input`, `network`,
 `keepalive` — connection reuse + chunked streaming, `buffering` —
 backpressure, `prompt` — latency properties, `unblock`, `unix`, and
@@ -77,15 +77,11 @@ allocator must not see other tests' allocations.
 
 ## Lineage and license
 
-Derived from tiny_http 0.12.0 (MIT OR Apache-2.0), used and relicensed
-here under its MIT option. Removed from the ancestor: TLS (features,
-`src/ssl/`, `Server::https`, and the optional openssl/rustls/zeroize
-dependencies), the websocket upgrade path and `ReadWrite` trait, test
-scaffolding (`TestRequest`), the HTTPS notify/secure rendezvous, unused
-response constructors and getters, the `log` dependency, examples,
-benches, and upstream CI — roughly a quarter of the crate. The delicate
-cores (response ordering, half-close, keep-alive state machine,
-byte-at-a-time CRLF framing) moved verbatim. See [LICENSE](LICENSE) for
-the combined attribution, PLAN.md D12 for the decision record, and the
-**justhttp** section of [TODO.md](../../TODO.md) for the maintenance
-ledger.
+justhttp was originally derived from the synchronous HTTP/1.1 core of
+tiny_http 0.12.0 (MIT OR Apache-2.0) and relicensed here under its MIT option.
+That is historical lineage, not a current dependency, vendoring relationship,
+or upstream synchronization policy. Harbor's crate removed the unrelated
+surface and has since evolved under first-party ownership while retaining the
+delicate HTTP semantics that its tests pin. See [LICENSE](LICENSE) for combined
+attribution, PLAN.md D12 for the decision record, and the **justhttp** section
+of [TODO.md](../../TODO.md) for the maintenance ledger.
