@@ -1,12 +1,12 @@
 #
-# Full suite — every suite (make check), including the slow resilience ones the
+# Full suite — every suite (make test), including the slow resilience ones the
 # quick gate skips: fuzz, stress (restarts the server repeatedly), deployment,
 # asserts. Runs after a merge to main and nightly — NOT on pull requests, which
 # get the quick gate (Tests.yml). Kept out of the PR event on purpose, so it
 # never shows up as a skipped check on a PR.
 #
 # Same engine as the quick gate (the shared .github/actions/duckdb composite
-# action); the suite list lives in the Makefile (check).
+# action); the suite list lives in test/scripts/check.sh.
 #
 name: Full suite
 
@@ -45,7 +45,7 @@ jobs:
         run: test/scripts/fixture.sh sample.duckdb
 
       - name: All suites
-        run: make check
+        run: make test
 
       - name: Server log on failure
         if: failure()

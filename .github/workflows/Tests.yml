@@ -4,9 +4,8 @@
 # asserts) is a separate workflow, FullSuite.yml, that runs on main and nightly,
 # so it never appears here as a skipped check.
 #
-# The suite list lives in the Makefile (check_quick), not here; the engine is
-# fetched by the local composite action (.github/actions/duckdb) — DuckDB's
-# official v2 nightly.
+# The focused suite selection is explicit below; the engine is fetched by the
+# local composite action (.github/actions/duckdb) — DuckDB's official v2 nightly.
 #
 name: Tests
 
@@ -41,7 +40,7 @@ jobs:
         run: test/scripts/fixture.sh sample.duckdb
 
       - name: Quick suites
-        run: make check_quick
+        run: make test SUITES="unit types spec catalog sessions cancel"
 
       - name: Server log on failure
         if: failure()

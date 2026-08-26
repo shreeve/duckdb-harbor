@@ -58,7 +58,7 @@ Upstream status (check with `gh pr view 1175 --repo nushell/reedline` and
 When A is merged AND released (and B is either upstream or consciously
 dropped): delete `reedline` from `[patch.crates-io]` and the `exclude` list
 in the root Cargo.toml, `rm -rf vendor/reedline`, bump the reedline version
-in `crates/pilot/Cargo.toml`, then `cargo test -p pilot && make check_quick`
+in `crates/pilot/Cargo.toml`, then `cargo test -p pilot && make test SUITES="unit types spec catalog sessions cancel"`
 and re-run the repro: `create or replace ta`, Tab, keep typing, Enter — the
 statement must run with no stray word appended.
 

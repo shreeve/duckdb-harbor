@@ -128,7 +128,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          sha256sum harbor-*.tar.gz harbor-*.zip > "harbor-$GITHUB_REF_NAME-checksums.txt"
           gh release create "$GITHUB_REF_NAME" *.tar.gz *.zip \
+            "harbor-$GITHUB_REF_NAME-checksums.txt" \
             --repo "$GITHUB_REPOSITORY" --title "harbor $GITHUB_REF_NAME" \
             --notes "Self-contained harbor + pilot releases, version-locked to \
           one DuckDB v2 nightly. Unix archives include the matched ui extension \

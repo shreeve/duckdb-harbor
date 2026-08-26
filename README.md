@@ -206,12 +206,12 @@ compatible library at runtime. A build needs a libduckdb to link against.
 
 ```console
 $ make fetch-duckdb                       # libduckdb + duckdb CLI -> ~/.duckdb/cli/2.0.0/
-$ make binary pilot                       # -> target/release/{harbor,pilot}
+$ make harbor pilot                       # -> target/release/{harbor,pilot}
 $ harbor serve mydata.duckdb --token secret
-harbor 0.13.2: berth "mydata" serving mydata.duckdb on ~/.harbor/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
+harbor 0.13.3: berth "mydata" serving mydata.duckdb on ~/.harbor/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
 ```
 
-`make setup` does the whole thing in one shot — fetch the engine into `~/.duckdb`,
+`make bootstrap` does the whole thing in one shot — fetch the engine into `~/.duckdb`,
 build and install `harbor` + `pilot` onto PATH in `/usr/local/bin`, and build the
 matched DuckDB UI extension. Building the UI additionally requires a compatible
 `duckdb-ui` checkout (`DUCKDB_UI_DIR`, default `~/Data/Code/duckdb-ui`), a C++
@@ -504,11 +504,11 @@ Harbor currently implements its protocol shapes directly rather than depending
 on `wire`, so a wire change needs tests on both sides; drift is not a Rust
 compile error. Harbor links an external `libduckdb` rather than embedding one,
 so no DuckDB source tree is required — `make fetch-duckdb` fetches a libduckdb
-to link against, then `make binary pilot` builds. The crate ships pregenerated
+to link against, then `make harbor pilot` builds. The crate ships pregenerated
 bindings, so there is no bindgen and no headers to find.
 
-`make check` runs the full suite and `make check_quick` the focused subset. Both
-expect `sample.duckdb`; create it with
+`make unit` runs the fast Rust tests and `make test` runs the full suite. The
+full suite expects `sample.duckdb`; create it with
 `test/scripts/fixture.sh sample.duckdb` when it is absent. CI performs that
 fixture step explicitly. The ten suites use independent oracles where answers
 need comparison — values read from the database file before the server takes

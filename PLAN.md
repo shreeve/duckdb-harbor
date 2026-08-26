@@ -221,7 +221,7 @@ SQL ~2× slower than 1.5.5 — the new PEG parser; execution is at parity. See t
 README's Performance section for the decomposition.)
 
 `make fetch-duckdb` (→ `scripts/fetch-duckdb.sh`) pulls the same official nightly
-into `~/.duckdb/cli/2.0.0/` for local work; `make setup` chains it with the
+into `~/.duckdb/cli/2.0.0/` for local work; `make bootstrap` chains it with the
 binary build, `install`, and `make ui`. The UI step also requires a compatible
 `duckdb-ui` checkout (`DUCKDB_UI_DIR`), a C++ toolchain, `gh`, and OpenSSL. With
 those prerequisites present, the command takes an empty `~/.duckdb` to a

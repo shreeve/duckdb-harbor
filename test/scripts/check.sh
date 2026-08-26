@@ -2,10 +2,10 @@
 #
 # check.sh — run every suite, in the order that fails cheapest first.
 #
-#   make check                    everything
-#   make check SUITES="spec fuzz" just those
+#   make test                    everything
+#   make test SUITES="spec fuzz" just those
 #
-# Invoked by the `check` target in the Makefile; run it directly if you want
+# Invoked by the `test` target in the Makefile; run it directly if you want
 # the arguments. The ordering is deliberate — unit tests take seconds and catch
 # the compile-level mistakes, the HTTP suites take a minute, and resilience
 # takes several because it kills and restarts the server repeatedly. A failure

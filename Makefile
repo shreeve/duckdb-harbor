@@ -7,7 +7,7 @@
 # engine (DuckDB's official v2 nightly) into ~/.duckdb; `make install` copies
 # both binaries to $(BIN) (using sudo only if the dir is root-owned).
 
-.PHONY: all binary pilot check check_quick install fetch-duckdb ui setup clean
+.PHONY: all harbor pilot unit test install fetch-duckdb ui bootstrap clean
 
 # The libduckdb the build links against, by absolute rpath — the engine
 # `make fetch-duckdb` installs. Only the library is needed (the crate ships
@@ -24,19 +24,19 @@ BIN ?= /usr/local/bin
 export DUCKDB_LIB_DIR := $(DUCKDB_LIB)
 export RUSTFLAGS      := -C link-args=-Wl,-rpath,$(DUCKDB_LIB)
 
-all: binary pilot
+all: harbor pilot
 
-binary:
+harbor:
 	cargo build -p harbor --release
 
 pilot:
 	cargo build -p pilot --release
 
-check: binary pilot
-	test/scripts/check.sh
+unit:
+	cargo test --release
 
-check_quick: binary pilot
-	SUITES="unit types spec catalog sessions cancel" test/scripts/check.sh
+test: harbor pilot
+	test/scripts/check.sh
 
 # Copy the two binaries onto PATH in $(BIN). harbor keeps its baked absolute
 # rpath to $(DUCKDB_LIB), so it finds libduckdb from anywhere — no @loader_path,
@@ -45,8 +45,11 @@ check_quick: binary pilot
 # The rm first is load-bearing on macOS: overwriting a binary in place leaves
 # the kernel's per-inode signature cache stale, and every exec dies by SIGKILL
 # ("valid on disk", still killed). A fresh inode gets a fresh verdict.
-install: binary pilot
-	@sudo= ; [ -w "$(BIN)" ] || { sudo=sudo; echo "  $(BIN) is root-owned — using sudo"; }; \
+install: harbor pilot
+	@sudo= ; \
+	  if [ ! -d "$(BIN)" ]; then install -d -m 0755 "$(BIN)" 2>/dev/null || sudo=sudo; fi; \
+	  [ -w "$(BIN)" ] || sudo=sudo; \
+	  [ -z "$$sudo" ] || echo "  $(BIN) needs elevated access — using sudo"; \
 	  $$sudo install -d -m 0755 "$(BIN)"; \
 	  $$sudo rm -f "$(BIN)/harbor" "$(BIN)/pilot"; \
 	  $$sudo install -m 0755 target/release/harbor "$(BIN)/harbor"; \
@@ -70,8 +73,8 @@ ui:
 # Reconstruct a working fleet from scratch: fetch the engine into ~/.duckdb,
 # build + install harbor and pilot onto PATH ($(BIN)), and build the matched UI
 # extension. One command from an empty ~/.duckdb to a working v2 fleet with the UI.
-setup: fetch-duckdb binary pilot install ui
-	@echo "setup: engine + UI in ~/.duckdb, harbor + pilot in $(BIN) — all on $(notdir $(DUCKDB_LIB))"
+bootstrap: fetch-duckdb install ui
+	@echo "bootstrap: engine + UI in ~/.duckdb, harbor + pilot in $(BIN) — all on $(notdir $(DUCKDB_LIB))"
 
 clean:
 	cargo clean
