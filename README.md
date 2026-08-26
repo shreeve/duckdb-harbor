@@ -34,10 +34,11 @@ One `schema` message, one `row` per row, one `end`. Rows go out as DuckDB
 produces them, so a client can start on row one while the server is still
 producing the last one.
 
-Nine routes. That is the whole surface — two of them for queries, three so a
+Ten routes. That is the whole surface — two of them for queries, three so a
 transaction can outlive one request, one to stop a statement that is running,
 one to read the schema without asking five questions, one that says who a
-berth is, and one cheap activity pulse for an interactive Pilot:
+berth is, one cheap activity pulse for an interactive Pilot, and one graceful
+fleet shutdown route:
 
 ```
 POST /sql                  run one statement, stream the result as NDJSON
@@ -47,6 +48,7 @@ GET  /catalog              the whole schema — tables, keys, unique constraints
                            indexes, sequences — as one stable JSON document
 GET  /info                 berth identity — name, harbor + DuckDB versions, pid
 GET  /keepalive            keep an idle-exit berth alive while Pilot has a prompt
+DELETE /shutdown           authenticated drain, checkpoint, and stop
 POST /sql/sessions/new     take a connection and hold it, for a transaction
 DELETE /sql/sessions/<id>  give it back
 GET  /sessions             what is holding one, and for how long
@@ -206,7 +208,7 @@ compatible library at runtime. A build needs a libduckdb to link against.
 $ make fetch-duckdb                       # libduckdb + duckdb CLI -> ~/.duckdb/cli/2.0.0/
 $ make binary pilot                       # -> target/release/{harbor,pilot}
 $ harbor serve mydata.duckdb --token secret
-harbor 0.13.1: berth "mydata" serving mydata.duckdb on ~/.harbor/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
+harbor 0.13.2: berth "mydata" serving mydata.duckdb on ~/.harbor/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
 ```
 
 `make setup` does the whole thing in one shot — fetch the engine into `~/.duckdb`,
@@ -218,10 +220,10 @@ toolchain, `gh`, and OpenSSL. With those prerequisites present, it takes an empt
 
 No toolchain? Each [release](https://github.com/shreeve/duckdb-harbor/releases)
 ships one self-contained archive per
-platform (osx-arm64, linux-amd64, linux-arm64): harbor + pilot, the exact
-`libduckdb` they were built against, and the matched `ui` extension — all from
-one DuckDB v2 nightly. Extract and run `bin/harbor` in place, or `./install.sh`
-to copy the pieces into `/usr/local/{bin,lib}` and `~/.duckdb/extensions/`.
+platform (osx-arm64, linux-amd64, linux-arm64, windows-amd64, windows-arm64):
+harbor + pilot and the exact DuckDB shared library they were built against.
+Unix archives also carry the matched `ui` extension and `install.sh`; Windows
+archives put `duckdb.dll` beside the two executables and run in place.
 
 ### Browser UI
 
@@ -473,9 +475,10 @@ There is no rate limiting and no CORS — defensible for a service behind a prox
 worth knowing before it faces a browser. Request logging is available with
 `--log`, off by default.
 
-**The current binaries are Unix-only.** Harbor and Pilot use Unix sockets and
-Unix process/signal APIs, and releases currently target macOS and Linux. There
-is no Windows build today.
+**Windows berths use loopback TCP.** Unix keeps its Unix-socket default and
+SIGTERM lifecycle. Windows assigns each berth a loopback port, records it in
+the same sidecar registry, and uses Harbor's authenticated shutdown route to
+drain and checkpoint. The Windows release does not include the UI extension.
 
 **The engine is the linked `libduckdb`, not the binary.** harbor links
 dynamically, and the same build has been verified against DuckDB 1.5.5 and a

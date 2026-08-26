@@ -245,7 +245,7 @@ mod tests {
         // An em dash (or any multi-byte delimiter) before the word must not
         // slice mid-char — this input panicked the old byte-arithmetic.
         let inner = Inner {
-            conn: Conn { transport: Transport::Unix("/nonexistent".into()), token: None },
+            conn: Conn { transport: Transport::Tcp("127.0.0.1:1".into()), token: None },
             catalog: Some(vec!["people".into()]),
         };
         for line in ["select —peo", "select “peo", "select peo"] {

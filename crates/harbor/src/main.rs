@@ -16,6 +16,7 @@
 //! is the credential. No daemon anywhere.
 
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -70,7 +71,7 @@ usage:
 
 serve/add options:
   --name <n>          berth name (default: db file stem)
-  --socket <path>     unix socket (default: $HARBOR_HOME/<name>.sock)
+  --socket <path>     unix socket (Unix only; default there: $HARBOR_HOME/<name>.sock)
   --port <p>          listen on TCP 127.0.0.1:<p> instead of a unix socket
   --bind <addr>       TCP bind address (with --port; default 127.0.0.1)
   --token <t>         bearer token ('' disables auth; default: <name>.token,
@@ -205,7 +206,9 @@ fn harbor_home() -> Result<PathBuf, String> {
     let home = match std::env::var("HARBOR_HOME") {
         Ok(h) => PathBuf::from(h),
         Err(_) => {
-            let h = std::env::var("HOME").map_err(|_| "no $HOME")?;
+            let h = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .map_err(|_| "neither $HOME nor %USERPROFILE% is set")?;
             Path::new(&h).join(".harbor")
         }
     };
@@ -217,8 +220,42 @@ fn harbor_home() -> Result<PathBuf, String> {
 }
 
 fn chmod(path: &Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        Ok(())
+    }
+}
+
+/// Claim a berth name for this process's lifetime. Unix uses flock so the
+/// inode can remain forever; Windows opens the file with no sharing, which is
+/// the native equivalent and releases automatically when the process exits.
+fn claim_lock(path: &Path) -> Result<std::fs::File, String> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let lock = std::fs::File::create(path).map_err(|e| format!("lock: {e}"))?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(format!("berth lock {} is already claimed", path.display()));
+        }
+        Ok(lock)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(0)
+            .open(path)
+            .map_err(|_| format!("berth lock {} is already claimed", path.display()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -233,17 +270,13 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
     // if we hold it and the socket file exists, the socket is stale by
     // definition and safe to unlink. Never unlink without the lock.
     let lock_path = home.join(format!("{}.lock", o.name));
-    let lock = std::fs::File::create(&lock_path).map_err(|e| format!("lock: {e}"))?;
-    unsafe {
-        use std::os::fd::AsRawFd;
-        if libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 {
-            return Err(format!("berth {:?} is already claimed in {}", o.name, home.display()));
-        }
-    }
+    let lock = claim_lock(&lock_path).map_err(|_| {
+        format!("berth {:?} is already claimed in {}", o.name, home.display())
+    })?;
     std::mem::forget(lock); // hold the flock until the process exits
 
     let sock_path = o.socket.clone().unwrap_or_else(|| home.join(format!("{}.sock", o.name)));
-    if o.port.is_none() && sock_path.exists() {
+    if cfg!(unix) && o.port.is_none() && sock_path.exists() {
         std::fs::remove_file(&sock_path).map_err(|e| format!("stale socket: {e}"))?;
     }
 
@@ -290,12 +323,23 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
     }
     harbor::open_pool(con)?;
 
+    #[cfg(unix)]
     let listen = match o.port {
         Some(port) => harbor::Listen::Tcp { bind: o.bind.clone(), port },
         None => harbor::Listen::Unix(sock_path.clone()),
     };
+    // Windows has no Unix-domain fleet face. Port zero asks the OS for a free
+    // loopback port; the actual port is recorded in the sidecar below.
+    #[cfg(windows)]
+    let listen = harbor::Listen::Tcp { bind: o.bind.clone(), port: o.port.unwrap_or(0) };
     let addr = harbor::start(listen, token, o.workers, o.log)?;
-    if o.port.is_none() {
+    let tcp = o.port.is_some() || cfg!(windows);
+    let bound_port = if tcp {
+        addr.parse::<std::net::SocketAddr>().ok().map(|a| a.port()).or(o.port)
+    } else {
+        None
+    };
+    if !tcp {
         let _ = chmod(&sock_path, 0o600);
     }
 
@@ -321,9 +365,9 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         "name": o.name,
         "pid": std::process::id(),
         "db": db_abs,
-        "socket": if o.port.is_none() { Some(sock_path.display().to_string()) } else { None },
-        "port": o.port,
-        "bind": if o.port.is_some() { Some(o.bind.clone()) } else { None },
+        "socket": if tcp { None } else { Some(sock_path.display().to_string()) },
+        "port": bound_port,
+        "bind": if tcp { Some(o.bind.clone()) } else { None },
         "harborVersion": VERSION,
         "duckdbVersion": duckdb_version,
         "startedAtMs": started_ms,
@@ -366,7 +410,7 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
 
     // Blocks until harbor_stop / SIGTERM / idle-exit finishes drain + CHECKPOINT.
     let farewell = harbor::wait()?;
-    if o.port.is_none() {
+    if !tcp {
         let _ = std::fs::remove_file(&sock_path);
     }
     let _ = std::fs::remove_file(&json_path);
@@ -463,6 +507,7 @@ fn add(rest: Vec<String>) -> Result<(), String> {
         })
         .collect();
     cmd.args(&passed);
+    #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         use std::process::Stdio;
@@ -471,8 +516,20 @@ fn add(rest: Vec<String>) -> Result<(), String> {
             .stderr(Stdio::from(log))
             .process_group(0); // spawn, don't fork (D4): detached from our tty/session
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+        // CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS: the child owns no
+        // console and survives the short-lived `harbor add` launcher.
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
+            .stderr(Stdio::from(log))
+            .creation_flags(0x0000_0208);
+    }
     let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
 
+    #[cfg(unix)]
     let sock = o.socket.clone().unwrap_or_else(|| home.join(format!("{}.sock", o.name)));
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
@@ -487,9 +544,17 @@ fn add(rest: Vec<String>) -> Result<(), String> {
                 log_path.display()
             ));
         }
+        #[cfg(windows)]
+        let registered = registered_tcp(&home, &o.name);
+        #[cfg(unix)]
         let (up, at) = match o.port {
             None => (ready(&sock), sock.display().to_string()),
             Some(port) => (ready_tcp(&o.bind, port), format!("{}:{port}", o.bind)),
+        };
+        #[cfg(windows)]
+        let (up, at) = match registered {
+            Some((bind, port)) => (ready_tcp(&bind, port), format!("{bind}:{port}")),
+            None => (false, "a dynamically assigned TCP port".to_string()),
         };
         if up {
             // Ready is necessary but not sufficient: on a name collision the
@@ -518,16 +583,59 @@ fn add(rest: Vec<String>) -> Result<(), String> {
 }
 
 fn ready_tcp(bind: &str, port: u16) -> bool {
+    let bind = match bind {
+        "0.0.0.0" | "::" => "127.0.0.1",
+        other => other,
+    };
     let Ok(mut s) = std::net::TcpStream::connect((bind, port)) else { return false };
     let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
     probe_200(&mut s)
 }
 
+#[cfg(windows)]
+fn registered_tcp(home: &Path, name: &str) -> Option<(String, u16)> {
+    let text = std::fs::read_to_string(home.join(format!("{name}.json"))).ok()?;
+    let j: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let port = u16::try_from(j["port"].as_u64()?).ok()?;
+    let bind = j["bind"].as_str().unwrap_or("127.0.0.1").to_string();
+    Some((bind, port))
+}
+
 /// GET /ready over the socket — the only HTTP the fleet verbs speak.
+#[cfg(unix)]
 fn ready(sock: &Path) -> bool {
     let Ok(mut s) = UnixStream::connect(sock) else { return false };
     let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
     probe_200(&mut s)
+}
+
+#[cfg(windows)]
+fn ready(_sock: &Path) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn shutdown_tcp(bind: &str, port: u16, token: Option<&str>) -> bool {
+    let bind = match bind {
+        "0.0.0.0" | "::" => "127.0.0.1",
+        other => other,
+    };
+    let Ok(mut s) = std::net::TcpStream::connect((bind, port)) else { return false };
+    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut request =
+        "DELETE /shutdown HTTP/1.1\r\nHost: harbor\r\nConnection: close\r\n".to_string();
+    if let Some(token) = token {
+        request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    request.push_str("\r\n");
+    if s.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 128];
+    match s.read(&mut buf) {
+        Ok(n) => String::from_utf8_lossy(&buf[..n]).contains(" 202 "),
+        Err(_) => false,
+    }
 }
 
 /// Positive proof that a berth is gone: its `<name>.lock` exists and we can
@@ -537,13 +645,28 @@ fn ready(sock: &Path) -> bool {
 /// so a live berth is never left unstoppable. Unlike `GET /ready` this needs no
 /// response from the berth, so a busy one is correctly seen as alive, not dead.
 fn berth_dead(lock_path: &Path) -> bool {
-    use std::os::fd::AsRawFd;
-    let Ok(f) = std::fs::OpenOptions::new().read(true).open(lock_path) else {
-        return false; // unknown, not proven dead
-    };
-    // If we acquire it, nobody holds it → the process is gone. Dropping `f`
-    // (on return) releases the lock we just took; never unlink it (see serve).
-    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let Ok(f) = std::fs::OpenOptions::new().read(true).open(lock_path) else {
+            return false; // unknown, not proven dead
+        };
+        // If we acquire it, nobody holds it → the process is gone. Dropping
+        // `f` releases the lock we just took; never unlink it (see serve).
+        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // The live process holds this file with share_mode(0). Successfully
+        // opening it the same way is positive proof that process is gone.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(lock_path)
+            .is_ok()
+    }
 }
 
 fn probe_200(s: &mut (impl Read + Write)) -> bool {
@@ -600,7 +723,7 @@ fn ls() -> Result<(), String> {
 }
 
 fn tilde(path: &str) -> String {
-    match std::env::var("HOME") {
+    match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
         Ok(h) if path.starts_with(&h) => format!("~{}", &path[h.len()..]),
         _ => path.to_string(),
     }
@@ -629,6 +752,8 @@ fn stop_berth(rest: Vec<String>, remove: bool) -> Result<(), String> {
                     ));
                 }
             } else if let Some(pid) = j["pid"].as_u64() {
+                #[cfg(unix)]
+                {
                 // SIGTERM is the contract: drain, CHECKPOINT, exit (core owns it).
                 unsafe { libc::kill(pid as i32, libc::SIGTERM) };
                 let deadline = Instant::now() + Duration::from_secs(35);
@@ -652,6 +777,32 @@ fn stop_berth(rest: Vec<String>, remove: bool) -> Result<(), String> {
                          nothing was removed. Escalate by hand if you mean it: kill -9 {pid}"
                     ));
                 }
+                }
+                #[cfg(windows)]
+                {
+                    let (bind, port) = registered_tcp(&home, &name)
+                        .ok_or_else(|| format!("berth {name:?} has no registered TCP address"))?;
+                    let token = std::fs::read_to_string(home.join(format!("{name}.token")))
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    if !shutdown_tcp(&bind, port, token.as_deref()) {
+                        return Err(format!(
+                            "berth {name:?} (pid {pid}) refused the graceful shutdown request"
+                        ));
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(35);
+                    while Instant::now() < deadline && !berth_dead(&lock_path) {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    if !berth_dead(&lock_path) {
+                        return Err(format!(
+                            "berth {name:?} (pid {pid}) is still running 35s after shutdown — \
+                             nothing was removed. Escalate with Task Manager if you mean it."
+                        ));
+                    }
+                    println!("berth {name:?} stopped (drained and checkpointed)");
+                }
             }
         }
     } else if sock.exists() {
@@ -671,7 +822,7 @@ fn stop_berth(rest: Vec<String>, remove: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::berth_dead;
     use std::os::fd::AsRawFd;

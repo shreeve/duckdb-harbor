@@ -198,8 +198,8 @@ fn resolve(cfg: &config::FileConfig, target: &str, flag_token: Option<String>) -
         }
         if let Some(path) = &entry.path {
             let idle = entry.idle_exit.as_deref().unwrap_or("90s");
-            let (sock, file_token) = ensure_berth(&config::expand(path), idle)?;
-            return Ok(Conn { transport: Transport::Unix(sock), token: token.or(file_token) });
+            let (transport, file_token) = ensure_berth(&config::expand(path), idle)?;
+            return Ok(Conn { transport, token: token.or(file_token) });
         }
         return Err(format!("config entry {target:?} has neither url nor path"));
     }
@@ -210,33 +210,42 @@ fn resolve(cfg: &config::FileConfig, target: &str, flag_token: Option<String>) -
     if target.ends_with(".duckdb") {
         // D9: summon the owner. A second pilot on the same file joins the
         // same berth instead of "database is locked".
-        let (sock, file_token) = ensure_berth(std::path::Path::new(target), "90s")?;
-        return Ok(Conn { transport: Transport::Unix(sock), token: flag_token.or(env_token).or(file_token) });
+        let (transport, file_token) = ensure_berth(std::path::Path::new(target), "90s")?;
+        return Ok(Conn { transport, token: flag_token.or(env_token).or(file_token) });
     }
 
-    let sock: PathBuf;
-    let mut file_token = None;
     if target.contains('/') || target.ends_with(".sock") {
-        sock = PathBuf::from(target);
-    } else {
-        let home = config::harbor_home();
-        sock = berth_sock(&home, target);
-        if !sock.exists() {
-            // A --port berth has no socket; its sidecar json registers the
-            // TCP address instead. The bare name works for both transports.
-            if let Some(t) = berth_tcp(&home, target) {
-                let file_token = berth_token(&home, target);
-                return Ok(Conn { transport: t, token: flag_token.or(env_token).or(file_token) });
-            }
-            return Err(format!(
-                "no live berth named {target:?} ({} not found){}",
-                sock.display(),
-                fleet_hint(&home)
-            ));
-        }
-        file_token = berth_token(&home, target);
+        #[cfg(unix)]
+        return Ok(Conn {
+            transport: Transport::Unix(PathBuf::from(target)),
+            token: flag_token.or(env_token),
+        });
+        #[cfg(windows)]
+        return Err("Unix socket targets are not supported on Windows; use a berth name or http://host:port".into());
     }
-    Ok(Conn { transport: Transport::Unix(sock), token: flag_token.or(env_token).or(file_token) })
+
+    let home = config::harbor_home();
+    #[cfg(unix)]
+    {
+        let sock = berth_sock(&home, target);
+        if sock.exists() {
+            let file_token = berth_token(&home, target);
+            return Ok(Conn {
+                transport: Transport::Unix(sock),
+                token: flag_token.or(env_token).or(file_token),
+            });
+        }
+    }
+    // A --port berth (and every Windows berth) registers its TCP address in
+    // the sidecar. The bare name works for both local transports.
+    if let Some(transport) = berth_tcp(&home, target) {
+        let file_token = berth_token(&home, target);
+        return Ok(Conn {
+            transport,
+            token: flag_token.or(env_token).or(file_token),
+        });
+    }
+    Err(format!("no live berth named {target:?}{}", fleet_hint(&home)))
 }
 
 fn berth_sock(home: &std::path::Path, name: &str) -> PathBuf {
@@ -262,6 +271,17 @@ fn berth_tcp(home: &std::path::Path, name: &str) -> Option<Transport> {
     Some(Transport::Tcp(format!("{bind}:{port}")))
 }
 
+fn berth_transport(home: &std::path::Path, name: &str) -> Option<Transport> {
+    #[cfg(unix)]
+    {
+        let sock = berth_sock(home, name);
+        if sock.exists() {
+            return Some(Transport::Unix(sock));
+        }
+    }
+    berth_tcp(home, name)
+}
+
 /// Every berth the registry knows, with how to dial it — the same sidecar
 /// jsons `harbor ls` reads, so socket and --port berths both appear.
 fn berth_entries(home: &std::path::Path) -> Vec<(String, Transport)> {
@@ -271,8 +291,7 @@ fn berth_entries(home: &std::path::Path) -> Vec<(String, Transport)> {
                 .filter(|p| p.extension().is_some_and(|x| x == "json"))
                 .filter_map(|p| {
                     let name = p.file_stem()?.to_string_lossy().into_owned();
-                    let sock = berth_sock(home, &name);
-                    let t = if sock.exists() { Transport::Unix(sock) } else { berth_tcp(home, &name)? };
+                    let t = berth_transport(home, &name)?;
                     Some((name, t))
                 })
                 .collect()
@@ -304,7 +323,10 @@ fn url_transport(url: &str) -> Result<Transport, String> {
 /// Join the live berth that owns this file, or exec `harbor` to summon an
 /// ephemeral one (idle-exit reaps it; see PLAN.md D9). Returns socket + the
 /// berth's token, if readable.
-fn ensure_berth(path: &std::path::Path, idle_exit: &str) -> Result<(PathBuf, Option<String>), String> {
+fn ensure_berth(
+    path: &std::path::Path,
+    idle_exit: &str,
+) -> Result<(Transport, Option<String>), String> {
     let home = config::harbor_home();
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
 
@@ -319,9 +341,8 @@ fn ensure_berth(path: &std::path::Path, idle_exit: &str) -> Result<(PathBuf, Opt
             let Ok(j) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
             if j["db"].as_str() == Some(&canon.display().to_string()) {
                 if let Some(name) = j["name"].as_str() {
-                    let sock = berth_sock(&home, name);
-                    if sock.exists() {
-                        return Ok((sock, berth_token(&home, name)));
+                    if let Some(transport) = berth_transport(&home, name) {
+                        return Ok((transport, berth_token(&home, name)));
                     }
                 }
             }
@@ -350,7 +371,9 @@ fn ensure_berth(path: &std::path::Path, idle_exit: &str) -> Result<(PathBuf, Opt
     if !status.success() {
         return Err(format!("harbor add failed for {}", canon.display()));
     }
-    Ok((berth_sock(&home, &name), berth_token(&home, &name)))
+    let transport = berth_transport(&home, &name)
+        .ok_or_else(|| format!("harbor add returned without registering berth {name:?}"))?;
+    Ok((transport, berth_token(&home, &name)))
 }
 
 fn fleet_hint(home: &std::path::Path) -> String {
@@ -383,6 +406,7 @@ fn list_fleet() -> ExitCode {
             Err(_) => "dead",
         };
         let addr = match &transport {
+            #[cfg(unix)]
             Transport::Unix(p) => p.display().to_string(),
             Transport::Tcp(a) => a.clone(),
         };

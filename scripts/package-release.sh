@@ -5,8 +5,9 @@
 # A release archive is self-contained and version-locked by construction:
 # harbor + pilot (built with a RELATIVE rpath: @loader_path/../lib on macOS,
 # $ORIGIN/../lib on Linux), the exact libduckdb they were built against, and
-# the ui extension compiled against that same engine. Extract anywhere and
-# bin/harbor runs in place; install.sh copies the pieces into their homes.
+# (on Unix) the ui extension compiled against that same engine. Windows puts
+# duckdb.dll beside the executables. Extract anywhere and run in place;
+# install.sh copies the Unix pieces into their homes.
 #
 #   TAG=v0.11.0 PLAT=osx-arm64 UI_EXT=path/to/ui.duckdb_extension \
 #     scripts/package-release.sh
@@ -16,11 +17,28 @@
 set -euo pipefail
 
 TAG=${TAG:?package-release: set TAG (e.g. v0.11.0)}
-PLAT=${PLAT:?package-release: set PLAT (osx-arm64 | linux-amd64 | linux-arm64)}
-UI_EXT=${UI_EXT:?package-release: set UI_EXT (path to built ui.duckdb_extension)}
+PLAT=${PLAT:?package-release: set PLAT (osx-arm64 | linux-amd64 | linux-arm64 | windows-amd64 | windows-arm64)}
+UI_EXT=${UI_EXT:-}
 DUCKDB_LIB=${DUCKDB_LIB:-$HOME/.duckdb/cli/2.0.0}
 OUT=${OUT:-dist}
 say() { printf '  %s\n' "$*"; }
+
+if [[ "$PLAT" == windows-* ]]; then
+  [ -f target/release/harbor.exe ] && [ -f target/release/pilot.exe ] \
+    || { echo "package-release: build harbor + pilot first" >&2; exit 2; }
+  [ -f "$DUCKDB_LIB/duckdb.dll" ] \
+    || { echo "package-release: no duckdb.dll in $DUCKDB_LIB" >&2; exit 2; }
+
+  name="harbor-$TAG-$PLAT"
+  root="$OUT/$name"
+  rm -rf "$root"; mkdir -p "$root/bin"
+  install -m 0755 target/release/harbor.exe "$root/bin/harbor.exe"
+  install -m 0755 target/release/pilot.exe  "$root/bin/pilot.exe"
+  install -m 0755 "$DUCKDB_LIB/duckdb.dll" "$root/bin/duckdb.dll"
+  ( cd "$OUT" && 7z a -tzip "$name.zip" "$name" >/dev/null )
+  say "-> $OUT/$name.zip ($(du -h "$OUT/$name.zip" | cut -f1))"
+  exit 0
+fi
 
 [ -f "$UI_EXT" ] || { echo "package-release: no ui extension at $UI_EXT" >&2; exit 2; }
 [ -f target/release/harbor ] && [ -f target/release/pilot ] \

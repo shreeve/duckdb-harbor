@@ -90,7 +90,9 @@ pub fn harbor_home() -> std::path::PathBuf {
     if let Ok(h) = std::env::var("HARBOR_HOME") {
         return std::path::PathBuf::from(h);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".into());
     std::path::Path::new(&home).join(".harbor")
 }
 
@@ -111,7 +113,7 @@ pub fn load() -> FileConfig {
 /// `~/` expansion, nothing fancier.
 pub fn expand(p: &str) -> std::path::PathBuf {
     if let Some(rest) = p.strip_prefix("~/") {
-        if let Ok(h) = std::env::var("HOME") {
+        if let Ok(h) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
             return std::path::Path::new(&h).join(rest);
         }
     }

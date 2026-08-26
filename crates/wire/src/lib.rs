@@ -34,6 +34,9 @@ pub mod endpoint {
     /// while waiting at a prompt so an idle-exit berth stays moored without
     /// consuming a transaction lease or a DuckDB connection.
     pub const KEEPALIVE: &str = "/keepalive";
+    /// Authenticated graceful server shutdown. Fleet managers use this on
+    /// platforms without Unix signals; the response is sent before draining.
+    pub const SHUTDOWN: &str = "/shutdown";
     /// The only unauthenticated route, by design.
     pub const READY: &str = "/ready";
     /// Fleet-era: berth identity (auth required — it names paths and pids).

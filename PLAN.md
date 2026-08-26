@@ -44,7 +44,8 @@ v1.5.5 beside the 1.5.5 dylib and v2.0.0-alpha beside the 2.0 one. So harbor is
 served a mixed DuckDB 1.5.5/2.0-nightly fleet, with the engine chosen by the
 dylib it links (`make install` puts harbor + pilot on PATH
 in `/usr/local/bin`; harbor's baked absolute rpath resolves the engine in
-`~/.duckdb`, DuckDB's own world). The static `bundled` build was dropped
+`~/.duckdb`, DuckDB's own world). Windows resolves `duckdb.dll` beside the
+executables. The static `bundled` build was dropped
 entirely: it cost a 33MB binary and a 17GB from-source build tree for an
 advantage — needing no sibling dylib — the swap model removed. Distribution is
 the release archive plus its sibling dylib; the engine pin *is* the dylib.
@@ -110,8 +111,8 @@ and edge auth, proxies to the socket. Pilot deliberately speaks UDS and plain
 host; browser and application clients may use HTTPS through Caddy.
 
 ### D7. Protocol changes are additive only
-The Rip harborAdapter must run unmodified. Fleet additions are `/info` and
-`/keepalive` (shipped), plus `/grammar` (reserved in the wire contract but not
+The Rip harborAdapter must run unmodified. Fleet additions are `/info`,
+`/keepalive`, and `/shutdown` (shipped), plus `/grammar` (reserved in the wire contract but not
 yet served — berths advertise `grammar: false` until it is), with zero changes
 to existing routes, events, fields, or error codes.
 No `database` field on `/sql`: a berth holds one database (D2); per-session

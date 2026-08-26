@@ -7,12 +7,15 @@
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Clone)]
 pub enum Transport {
+    #[cfg(unix)]
     Unix(PathBuf),
     Tcp(String), // host:port
 }
@@ -68,6 +71,7 @@ fn request_inner(
     on_tick: Option<&dyn Fn()>,
 ) -> io::Result<Response> {
     let (stream, host): (Box<dyn Stream>, String) = match transport {
+        #[cfg(unix)]
         Transport::Unix(p) => {
             let s = UnixStream::connect(p)?;
             s.set_read_timeout(timeout)?;

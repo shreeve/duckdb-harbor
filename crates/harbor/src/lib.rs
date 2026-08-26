@@ -934,6 +934,7 @@ pub fn open_pool(con: Connection) -> Result<(), String> {
 /// (PLAN.md D3/D6); TCP remains for loopback and trusted-LAN use.
 pub enum Listen {
     Tcp { bind: String, port: u16 },
+    #[cfg(unix)]
     Unix(std::path::PathBuf),
 }
 
@@ -978,6 +979,7 @@ pub fn start(
     let bound = match &listen {
         Listen::Tcp { bind, port } => Server::http((bind.as_str(), *port))
             .map_err(|e| format!("harbor: cannot bind {bind}:{port}: {e}")),
+        #[cfg(unix)]
         Listen::Unix(path) => Server::http_unix(path.as_path())
             .map_err(|e| format!("harbor: cannot bind {}: {e}", path.display())),
     };
@@ -992,6 +994,7 @@ pub fn start(
     };
     let addr = match &listen {
         Listen::Tcp { .. } => server.server_addr().to_string(),
+        #[cfg(unix)]
         Listen::Unix(path) => path.display().to_string(),
     };
     *STARTED_AT.lock().unwrap() = Some(Instant::now());
@@ -1650,6 +1653,18 @@ fn handle(
                 let _ = req.respond(json_response(200, r#"{"alive":true}"#));
                 (true, 200)
             }
+            // Fleet shutdown is authenticated and returns before the drain
+            // begins. Running stop() on a fresh thread matters: this handler
+            // is itself one of the workers stop() waits to join.
+            (Method::Delete, "/shutdown") => {
+                let _ = req.respond(json_response(202, r#"{"stopping":true}"#));
+                let _ = thread::Builder::new()
+                    .name("harbor-shutdown".to_string())
+                    .spawn(|| {
+                        let _ = stop();
+                    });
+                (false, 202)
+            }
             // Berth identity: who serves here, which engine, since when. Auth
             // required — it names filesystem paths and pids. 404 when the host
             // never set one, which is also what pre-fleet servers answer:
@@ -1767,6 +1782,7 @@ fn route_exists(method: &Method, path: &str) -> bool {
     matches!(
         (method, path),
         (Method::Get, "/ready" | "/sessions" | "/info" | "/catalog" | "/keepalive")
+            | (Method::Delete, "/shutdown")
             | (Method::Post, "/sql" | "/sql/sessions/new")
     ) || (*method == Method::Delete
         && (path.starts_with("/sql/sessions/") || path.starts_with("/sql/queries/")))
@@ -3991,6 +4007,7 @@ mod tests {
             (Method::Get, "/info"),
             (Method::Get, "/catalog"),
             (Method::Get, "/keepalive"),
+            (Method::Delete, "/shutdown"),
             (Method::Post, "/sql"),
             (Method::Post, "/sql/sessions/new"),
             (Method::Delete, "/sql/sessions/abc"),

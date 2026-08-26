@@ -1,10 +1,8 @@
-# Release — push a v* tag and three self-contained archives appear on the
-# GitHub Release: osx-arm64, linux-amd64, linux-arm64. Each is built on a
-# native runner from the same recipe as `make setup`: fetch DuckDB's official
-# v2 nightly, build harbor + pilot against it (with a RELATIVE rpath, so the
-# archive is relocatable — unlike the dev build's absolute one), compile the
-# ui extension out-of-tree against that same engine, smoke-test the packaged
-# layout, and upload. No engine compile anywhere; each job takes minutes.
+# Release — push a v* tag and five self-contained archives appear on the
+# GitHub Release: osx-arm64, linux-amd64, linux-arm64, windows-amd64, and
+# windows-arm64. Each is built on a native runner against DuckDB's official v2
+# nightly and smoke-tested as packaged. Unix archives include the matched ui
+# extension; Windows archives carry harbor.exe, pilot.exe, and duckdb.dll.
 name: Release
 
 on:
@@ -21,9 +19,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: macos-15,        plat: osx-arm64,   rpath: '@loader_path' }
-          - { runner: ubuntu-24.04,     plat: linux-amd64, rpath: '$ORIGIN' }
-          - { runner: ubuntu-24.04-arm, plat: linux-arm64, rpath: '$ORIGIN' }
+          - { runner: macos-15,        plat: osx-arm64,     duck_plat: osx,             rpath: '@loader_path' }
+          - { runner: ubuntu-24.04,     plat: linux-amd64,   duck_plat: linux-amd64,     rpath: '$ORIGIN' }
+          - { runner: ubuntu-24.04-arm, plat: linux-arm64,   duck_plat: linux-arm64,     rpath: '$ORIGIN' }
+          - { runner: windows-2025,     plat: windows-amd64, duck_plat: windows-amd64 }
+          - { runner: windows-11-arm,   plat: windows-arm64, duck_plat: windows-arm64 }
     runs-on: ${{ matrix.runner }}
     env:
       DUCKDB_LIB: ${{ github.workspace }}/.duckdb-engine
@@ -33,23 +33,35 @@ jobs:
       # The ui source (our fork until duckdb/duckdb-ui#242 lands) and the
       # metadata stamper it vendors. Only that one submodule — not duckdb.
       - uses: actions/checkout@v5
+        if: ${{ !startsWith(matrix.plat, 'windows-') }}
         with:
           repository: shreeve/duckdb-ui
           path: duckdb-ui
-      - run: git -C duckdb-ui submodule update --init extension-ci-tools
+      - if: ${{ !startsWith(matrix.plat, 'windows-') }}
+        run: git -C duckdb-ui submodule update --init extension-ci-tools
 
       - name: Fetch DuckDB engine (official v2 nightly)
-        run: DEST="$DUCKDB_LIB" scripts/fetch-duckdb.sh
+        shell: bash
+        run: DEST="$DUCKDB_LIB" DUCKDB_PLATFORM=${{ matrix.duck_plat }} scripts/fetch-duckdb.sh
 
       # Relative rpath instead of the Makefile's absolute one: the binary
       # looks beside itself and in ../lib, so the archive works anywhere.
       - name: Build harbor + pilot
+        if: ${{ !startsWith(matrix.plat, 'windows-') }}
         run: |
           export DUCKDB_LIB_DIR="$DUCKDB_LIB"
           export RUSTFLAGS='-C link-args=-Wl,-rpath,${{ matrix.rpath }} -C link-args=-Wl,-rpath,${{ matrix.rpath }}/../lib'
           cargo build -p harbor -p pilot --release
 
+      - name: Build harbor + pilot (Windows)
+        if: ${{ startsWith(matrix.plat, 'windows-') }}
+        shell: bash
+        run: |
+          export DUCKDB_LIB_DIR="$DUCKDB_LIB"
+          cargo build -p harbor -p pilot --release
+
       - name: Build ui extension
+        if: ${{ !startsWith(matrix.plat, 'windows-') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -57,13 +69,22 @@ jobs:
             scripts/build-ui-extension.sh
 
       - name: Package
+        if: ${{ !startsWith(matrix.plat, 'windows-') }}
         run: |
           TAG="$GITHUB_REF_NAME" PLAT=${{ matrix.plat }} UI_EXT="$PWD/ui.duckdb_extension" \
+            scripts/package-release.sh
+
+      - name: Package (Windows)
+        if: ${{ startsWith(matrix.plat, 'windows-') }}
+        shell: bash
+        run: |
+          TAG="$GITHUB_REF_NAME" PLAT=${{ matrix.plat }} \
             scripts/package-release.sh
 
       # Prove the archive as shipped: extract, run harbor from bin/ (exercises
       # the relative rpath -> lib/), query it through pilot, LOAD the ui.
       - name: Smoke-test packaged layout
+        if: ${{ !startsWith(matrix.plat, 'windows-') }}
         run: |
           tar -C /tmp -xzf dist/harbor-"$GITHUB_REF_NAME"-${{ matrix.plat }}.tar.gz
           root=/tmp/harbor-"$GITHUB_REF_NAME"-${{ matrix.plat }}
@@ -77,10 +98,24 @@ jobs:
           "$root/bin/harbor" stop smoke
           echo "smoke: rpath, wire round-trip, and ui load all good"
 
+      - name: Smoke-test packaged layout (Windows)
+        if: ${{ startsWith(matrix.plat, 'windows-') }}
+        shell: bash
+        run: |
+          archive="dist/harbor-$GITHUB_REF_NAME-${{ matrix.plat }}.zip"
+          7z x "$archive" -o"$RUNNER_TEMP" -y >/dev/null
+          root="$RUNNER_TEMP/harbor-$GITHUB_REF_NAME-${{ matrix.plat }}"
+          export HARBOR_HOME="$RUNNER_TEMP/harbor-home"
+          "$root/bin/harbor.exe" add "$RUNNER_TEMP/smoke.duckdb" \
+            --name smoke --token ''
+          "$root/bin/pilot.exe" smoke -c "SELECT 42 AS ok" --mode csv | grep -q 42
+          "$root/bin/harbor.exe" stop smoke
+          echo "smoke: DLL loading, TCP fleet, and wire round-trip all good"
+
       - uses: actions/upload-artifact@v7
         with:
           name: harbor-${{ github.ref_name }}-${{ matrix.plat }}
-          path: dist/*.tar.gz
+          path: dist/*
 
   release:
     needs: build
@@ -93,8 +128,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" *.tar.gz \
+          gh release create "$GITHUB_REF_NAME" *.tar.gz *.zip \
             --repo "$GITHUB_REPOSITORY" --title "harbor $GITHUB_REF_NAME" \
-            --notes "harbor + pilot + ui extension, each archive self-contained \
-          and version-locked to one DuckDB v2 nightly. Extract and run in place, \
-          or ./install.sh to put the pieces in their homes."
+            --notes "Self-contained harbor + pilot releases, version-locked to \
+          one DuckDB v2 nightly. Unix archives include the matched ui extension \
+          and install.sh; Windows archives include duckdb.dll beside the binaries. \
+          Extract and run in place."

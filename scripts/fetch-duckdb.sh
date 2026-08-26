@@ -18,12 +18,17 @@ set -euo pipefail
 
 dest=${DEST:-$HOME/.duckdb/cli/2.0.0}
 
-case "$(uname -s)/$(uname -m)" in
-  Darwin/*)                  duck_plat=osx         ;;
-  Linux/x86_64)              duck_plat=linux-amd64 ;;
-  Linux/aarch64|Linux/arm64) duck_plat=linux-arm64 ;;
-  *) echo "fetch-duckdb: unsupported platform $(uname -s)/$(uname -m)" >&2; exit 2 ;;
-esac
+duck_plat=${DUCKDB_PLATFORM:-}
+if [ -z "$duck_plat" ]; then
+  case "$(uname -s)/$(uname -m)" in
+    Darwin/*)                  duck_plat=osx         ;;
+    Linux/x86_64)              duck_plat=linux-amd64 ;;
+    Linux/aarch64|Linux/arm64) duck_plat=linux-arm64 ;;
+    MINGW*/*86_64|MSYS*/*86_64) duck_plat=windows-amd64 ;;
+    MINGW*/aarch64|MSYS*/aarch64|MINGW*/arm64|MSYS*/arm64) duck_plat=windows-arm64 ;;
+    *) echo "fetch-duckdb: unsupported platform $(uname -s)/$(uname -m)" >&2; exit 2 ;;
+  esac
+fi
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/fetch-duckdb.XXXXXX")
 trap 'rm -rf "$work"' EXIT
@@ -42,7 +47,10 @@ curl -fsSL -o "$work/binaries.zip" "$engine_url"
 mkdir -p "$dest"
 place libduckdb.dylib    0755
 place libduckdb.so       0755
+place duckdb.dll         0755
+place duckdb.lib         0644
 place duckdb             0755
+place duckdb.exe         0755
 place duckdb.h           0644
 place duckdb_extension.h 0644
 
