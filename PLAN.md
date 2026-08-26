@@ -110,10 +110,10 @@ and edge auth, proxies to the socket. Pilot deliberately speaks UDS and plain
 host; browser and application clients may use HTTPS through Caddy.
 
 ### D7. Protocol changes are additive only
-The Rip harborAdapter must run unmodified. Two new endpoints (`/info`, shipped;
-`/grammar`, reserved in the wire contract but not yet served — berths advertise
-`grammar: false` until it is), zero changes to existing routes, events, fields,
-or error codes.
+The Rip harborAdapter must run unmodified. Fleet additions are `/info` and
+`/keepalive` (shipped), plus `/grammar` (reserved in the wire contract but not
+yet served — berths advertise `grammar: false` until it is), with zero changes
+to existing routes, events, fields, or error codes.
 No `database` field on `/sql`: a berth holds one database (D2); per-session
 work is `USE`/ATTACH as plain SQL on a lease (a lease is a pinned connection —
 exactly what it was built for). Reserve `"catalog"` as a future optional
@@ -154,6 +154,10 @@ and no live sessions for the window → drain, CHECKPOINT, unlink, exit. Idle
 keep-alive TCP connections are not reference-counted. The lifecycle is robust
 against Pilot crashes and has no client refcount. `--moor` is not shipped;
 starting a permanent berth explicitly with `harbor add` is the current choice.
+An interactive Pilot sends cheap authenticated `/keepalive` activity pulses
+while it waits at the prompt; these hold no DuckDB connection and leave no
+server-side record, so exiting or crashing Pilot simply lets the same idle
+window resume. One-shot Pilot invocations do not pulse after their query.
 
 ### D10a. Client address book: `~/.harbor/config.toml` — purely additive
 **Zero-config is the local default**: with no config file, `pilot <berth>`

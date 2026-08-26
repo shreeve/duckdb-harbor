@@ -1094,6 +1094,11 @@ pub enum ReedlineEvent {
     /// Trigger a menu event. It activates a menu with the event name
     Menu(String),
 
+    /// Accept the selected entry when a menu is active, otherwise do nothing.
+    /// Unlike `Enter`, this is safe as the first arm of `UntilFound`: it never
+    /// submits the line when no menu is open.
+    MenuAccept,
+
     /// Next element in the menu
     MenuNext,
 

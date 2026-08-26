@@ -34,10 +34,10 @@ One `schema` message, one `row` per row, one `end`. Rows go out as DuckDB
 produces them, so a client can start on row one while the server is still
 producing the last one.
 
-Eight routes. That is the whole surface — two of them for queries, three so a
+Nine routes. That is the whole surface — two of them for queries, three so a
 transaction can outlive one request, one to stop a statement that is running,
 one to read the schema without asking five questions, one that says who a
-berth is:
+berth is, and one cheap activity pulse for an interactive Pilot:
 
 ```
 POST /sql                  run one statement, stream the result as NDJSON
@@ -46,6 +46,7 @@ GET  /ready                can this server answer a query? no credential require
 GET  /catalog              the whole schema — tables, keys, unique constraints,
                            indexes, sequences — as one stable JSON document
 GET  /info                 berth identity — name, harbor + DuckDB versions, pid
+GET  /keepalive            keep an idle-exit berth alive while Pilot has a prompt
 POST /sql/sessions/new     take a connection and hold it, for a transaction
 DELETE /sql/sessions/<id>  give it back
 GET  /sessions             what is holding one, and for how long
@@ -247,7 +248,9 @@ Exits are clean: `SIGTERM` / `Ctrl-C` drain in-flight requests and `CHECKPOINT`
 so the next open never replays a WAL.
 
 Talk to it with `curl` (above), or with the bundled client — a
-duckdb-shell-class REPL with syntax highlighting and Tab completion:
+duckdb-shell-class REPL with syntax highlighting and completion. Tab accepts
+the inline suggestion or highlighted panel entry; Down opens the completion
+panel, and the arrow keys navigate it:
 
 ```console
 $ pilot mydata                 # a REPL over the socket

@@ -311,6 +311,9 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         "databases": [o.name],
         "pid": std::process::id(),
         "grammar": false,
+        // Pilot uses this to pulse comfortably inside the actual idle window.
+        // null means this berth is permanent and needs no prompt heartbeat.
+        "idleExitMs": o.idle_exit.map(|d| d.as_millis() as u64),
     }));
 
     let started_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;

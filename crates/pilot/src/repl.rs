@@ -5,16 +5,108 @@
 
 use reedline::{
     ColumnarMenu, DefaultHinter, Emacs, FileBackedHistory, KeyCode, KeyModifiers, MenuBuilder,
-    Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline,
+    Keybindings, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline,
     ReedlineEvent, ReedlineMenu, Signal, ValidationResult, Validator, Vi,
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
 };
 use std::borrow::Cow;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use crate::complete::SqlCompleter;
 use crate::render::{Mode, RenderOpts};
 use crate::scan::{Kind, scan};
 use crate::{Conn, Outcome, run_sql};
+
+/// Keep an idle-exit berth alive while Reedline is blocked at the prompt.
+/// This is intentionally an activity pulse rather than a SQL session: a REPL
+/// that is merely waiting for input must not reserve one of Harbor's scarce
+/// transaction connections. The channel makes Drop prompt even when the next
+/// pulse is many seconds away; a vanished Pilot leaves no server-side state.
+struct ReplKeepalive {
+    stop: Option<mpsc::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl ReplKeepalive {
+    fn new(conn: Conn) -> Self {
+        // Pulse synchronously first. Besides closing the race with an idle
+        // deadline that was already near, this also keeps older Harbor builds
+        // alive: their authenticated 404 is still a countable request.
+        pulse(&conn);
+
+        let Some(period) = keepalive_period(&conn) else {
+            return Self { stop: None, thread: None };
+        };
+        let (tx, rx) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            while matches!(rx.recv_timeout(period), Err(mpsc::RecvTimeoutError::Timeout)) {
+                pulse(&conn);
+            }
+        });
+        Self { stop: Some(tx), thread: Some(thread) }
+    }
+}
+
+impl Drop for ReplKeepalive {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn pulse(conn: &Conn) {
+    if let Ok(resp) = crate::http::request(
+        &conn.transport,
+        "GET",
+        wire::endpoint::KEEPALIVE,
+        conn.token.as_deref(),
+        None,
+        Some(Duration::from_secs(2)),
+    ) {
+        // Complete the exchange before closing the socket. The body is tiny;
+        // its contents do not matter because activity was counted at dispatch.
+        let _ = resp.body_string();
+    }
+}
+
+/// New Harbor builds publish the configured idle window in /info. Pulse at a
+/// third of it, capped so long windows do not make recovery from scheduling
+/// stalls fragile. A missing field means an older Harbor; its normal 90s
+/// summon window is safely covered by the compatibility fallback.
+fn keepalive_period(conn: &Conn) -> Option<Duration> {
+    let resp = match crate::http::request(
+        &conn.transport,
+        "GET",
+        wire::endpoint::INFO,
+        conn.token.as_deref(),
+        None,
+        Some(Duration::from_secs(2)),
+    ) {
+        Ok(resp) => resp,
+        Err(_) => return Some(Duration::from_secs(10)),
+    };
+    if resp.status != 200 {
+        return Some(Duration::from_secs(10));
+    }
+    let Ok(text) = resp.body_string() else { return Some(Duration::from_secs(10)) };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Some(Duration::from_secs(10));
+    };
+    match doc.get("idleExitMs") {
+        Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let Some(ms) = v.as_u64() else { return Some(Duration::from_secs(10)) };
+            Some(Duration::from_millis((ms / 3).clamp(1, 10_000)))
+        }
+        None => Some(Duration::from_secs(10)),
+    }
+}
 
 struct BerthPrompt {
     name: String,
@@ -141,19 +233,53 @@ pub const DOT_COMMANDS: &[(&str, &str, &str)] = &[
     ("quit", "", "leave (Ctrl-D too)"),
 ];
 
+fn bind_completion_keys(kb: &mut Keybindings) {
+    // The inline gray suggestion is a history hint. Right accepts it in
+    // Reedline's defaults, which makes ordinary cursor movement surprising;
+    // Tab is the conventional and more reachable acceptance key.
+    kb.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::MenuAccept,
+            ReedlineEvent::HistoryHintComplete,
+        ]),
+    );
+
+    // The panel is visually below the prompt, so Down opens it and subsequent
+    // Down presses move through it. If no menu is installed, retain Reedline's
+    // normal next-line/history behavior as the final fallback.
+    kb.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Down,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::MenuDown,
+            ReedlineEvent::Menu("completion_menu".to_string()),
+            ReedlineEvent::Down,
+        ]),
+    );
+
+    // Right navigates an open panel first. With no panel, it accepts the inline
+    // history suggestion when one exists, then falls back to cursor movement.
+    kb.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Right,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::MenuRight,
+            ReedlineEvent::HistoryHintComplete,
+            ReedlineEvent::Right,
+        ]),
+    );
+}
+
 fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
-    // Tab opens the completion menu, then cycles it (the completion lanes).
-    let tab = ReedlineEvent::UntilFound(vec![
-        ReedlineEvent::Menu("completion_menu".to_string()),
-        ReedlineEvent::MenuNext,
-    ]);
     let edit_mode: Box<dyn reedline::EditMode> = if vi {
         let mut insert = default_vi_insert_keybindings();
-        insert.add_binding(KeyModifiers::NONE, KeyCode::Tab, tab);
+        bind_completion_keys(&mut insert);
         Box::new(Vi::new(insert, default_vi_normal_keybindings()))
     } else {
         let mut kb = default_emacs_keybindings();
-        kb.add_binding(KeyModifiers::NONE, KeyCode::Tab, tab);
+        bind_completion_keys(&mut kb);
         Box::new(Emacs::new(kb))
     };
     let menu = ColumnarMenu::default().with_name("completion_menu");
@@ -185,6 +311,7 @@ fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
 
 pub fn run(conn: &Conn, name: &str, mut opts: RenderOpts) -> std::process::ExitCode {
     let mut conn = conn.clone();
+    let mut _keepalive = ReplKeepalive::new(conn.clone());
     let mut vi = false;
     // One completer for the session: its catalog cache loads lazily on the
     // first Tab and survives editor rebuilds (.keymode), refreshing on .open.
@@ -211,6 +338,7 @@ pub fn run(conn: &Conn, name: &str, mut opts: RenderOpts) -> std::process::ExitC
                             match crate::resolve(&cfg, &target, None) {
                                 Ok(c) => {
                                     conn = c;
+                                    _keepalive = ReplKeepalive::new(conn.clone());
                                     completer.reconnect(conn.clone());
                                     prompt = BerthPrompt { name: target.clone() };
                                     eprintln!("pilot: connected to {target}");
@@ -366,7 +494,38 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{split_statements, statement_complete};
+    use super::{bind_completion_keys, split_statements, statement_complete};
+    use reedline::{KeyCode, KeyModifiers, ReedlineEvent, default_emacs_keybindings};
+
+    #[test]
+    fn completion_keys_follow_the_visual_model() {
+        let mut kb = default_emacs_keybindings();
+        bind_completion_keys(&mut kb);
+
+        assert_eq!(
+            kb.find_binding(KeyModifiers::NONE, KeyCode::Tab),
+            Some(ReedlineEvent::UntilFound(vec![
+                ReedlineEvent::MenuAccept,
+                ReedlineEvent::HistoryHintComplete,
+            ]))
+        );
+        assert_eq!(
+            kb.find_binding(KeyModifiers::NONE, KeyCode::Down),
+            Some(ReedlineEvent::UntilFound(vec![
+                ReedlineEvent::MenuDown,
+                ReedlineEvent::Menu("completion_menu".to_string()),
+                ReedlineEvent::Down,
+            ]))
+        );
+        assert_eq!(
+            kb.find_binding(KeyModifiers::NONE, KeyCode::Right),
+            Some(ReedlineEvent::UntilFound(vec![
+                ReedlineEvent::MenuRight,
+                ReedlineEvent::HistoryHintComplete,
+                ReedlineEvent::Right,
+            ]))
+        );
+    }
 
     #[test]
     fn splitter_respects_quoting() {

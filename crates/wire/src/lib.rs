@@ -30,6 +30,10 @@ pub mod endpoint {
     }
     pub const SESSIONS: &str = "/sessions";
     pub const CATALOG: &str = "/catalog";
+    /// A cheap authenticated activity pulse. Interactive clients send this
+    /// while waiting at a prompt so an idle-exit berth stays moored without
+    /// consuming a transaction lease or a DuckDB connection.
+    pub const KEEPALIVE: &str = "/keepalive";
     /// The only unauthenticated route, by design.
     pub const READY: &str = "/ready";
     /// Fleet-era: berth identity (auth required — it names paths and pids).

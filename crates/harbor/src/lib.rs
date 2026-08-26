@@ -1641,6 +1641,15 @@ fn handle(
                 let _ = req.respond(json_response(200, &sessions_report()));
                 (true, 200)
             }
+            // A Pilot sitting at its prompt is active even though it has no
+            // SQL request in flight. This route deliberately does no engine
+            // work and holds no lease; being a countable request is its whole
+            // job. When Pilot disappears, the pulses disappear too and the
+            // ordinary idle-exit clock reaps the berth.
+            (Method::Get, "/keepalive") => {
+                let _ = req.respond(json_response(200, r#"{"alive":true}"#));
+                (true, 200)
+            }
             // Berth identity: who serves here, which engine, since when. Auth
             // required — it names filesystem paths and pids. 404 when the host
             // never set one, which is also what pre-fleet servers answer:
@@ -1757,7 +1766,8 @@ fn utc_now() -> String {
 fn route_exists(method: &Method, path: &str) -> bool {
     matches!(
         (method, path),
-        (Method::Get, "/ready" | "/sessions" | "/info" | "/catalog") | (Method::Post, "/sql" | "/sql/sessions/new")
+        (Method::Get, "/ready" | "/sessions" | "/info" | "/catalog" | "/keepalive")
+            | (Method::Post, "/sql" | "/sql/sessions/new")
     ) || (*method == Method::Delete
         && (path.starts_with("/sql/sessions/") || path.starts_with("/sql/queries/")))
 }
@@ -3980,6 +3990,7 @@ mod tests {
             (Method::Get, "/sessions"),
             (Method::Get, "/info"),
             (Method::Get, "/catalog"),
+            (Method::Get, "/keepalive"),
             (Method::Post, "/sql"),
             (Method::Post, "/sql/sessions/new"),
             (Method::Delete, "/sql/sessions/abc"),

@@ -1401,6 +1401,7 @@ impl Reedline {
             | ReedlineEvent::HistoryHintWordComplete
             | ReedlineEvent::OpenEditor
             | ReedlineEvent::Menu(_)
+            | ReedlineEvent::MenuAccept
             | ReedlineEvent::MenuNext
             | ReedlineEvent::MenuPrevious
             | ReedlineEvent::MenuUp
@@ -1447,6 +1448,17 @@ impl Reedline {
                     }
                 }
                 Ok(EventStatus::Inapplicable)
+            }
+            ReedlineEvent::MenuAccept => {
+                if self
+                    .menus
+                    .iter()
+                    .any(|menu| menu.is_active() && !menu.get_values().is_empty())
+                {
+                    self.handle_editor_event(prompt, ReedlineEvent::Enter)
+                } else {
+                    Ok(EventStatus::Inapplicable)
+                }
             }
             ReedlineEvent::MenuNext => {
                 if let Some(menu) = self.menus.iter_mut().find(|menu| menu.is_active()) {
@@ -4467,6 +4479,21 @@ mod tests {
             .unwrap();
         assert!(menu_is_active(&reedline));
         reedline
+    }
+
+    #[test]
+    fn menu_accept_only_accepts_an_active_selection() {
+        let mut reedline = engine_with_active_menu(false, false);
+        apply_menu_maintenance(&mut reedline);
+        let prompt = DefaultPrompt::default();
+
+        let status = reedline.handle_event(&prompt, ReedlineEvent::MenuAccept).unwrap();
+        assert!(matches!(status, EventStatus::Handled));
+        assert!(!menu_is_active(&reedline));
+        assert_ne!(reedline.editor.get_buffer(), "th");
+
+        let status = reedline.handle_event(&prompt, ReedlineEvent::MenuAccept).unwrap();
+        assert!(matches!(status, EventStatus::Inapplicable));
     }
 
     /// The anchor cache exists to keep `cursor::position()` off the hot path (#1090),
