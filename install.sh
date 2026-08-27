@@ -81,6 +81,12 @@ main() {
   # --- extract and hand off to the archive's own installer ------------------
   tar -xzf "$tmp/$asset" -C "$tmp"
   bash "$tmp/$NAME-$tag-$plat/install.sh"
+
+  # Heal the runtime dir's permissions: sockets and tokens live in
+  # $HARBOR_HOME, and harbor only chmods it when it creates it — a dir
+  # made earlier by hand (or a sloppy umask) stays world-listable.
+  hh="${HARBOR_HOME:-$HOME/.harbor}"
+  if [ -d "$hh" ]; then chmod 700 "$hh" 2>/dev/null || true; fi
 }
 
 main "$@"
