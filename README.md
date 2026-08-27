@@ -208,7 +208,7 @@ compatible library at runtime. A build needs a libduckdb to link against.
 $ make fetch-duckdb                       # libduckdb + duckdb CLI -> ~/.duckdb/cli/2.0.0/
 $ make harbor pilot                       # -> target/release/{harbor,pilot}
 $ harbor serve mydata.duckdb --token secret
-harbor 0.13.3: berth "mydata" serving mydata.duckdb on ~/.harbor/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
+harbor 0.13.4: berth "mydata" serving mydata.duckdb on ~/.harbor/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
 ```
 
 `make bootstrap` does the whole thing in one shot — fetch the engine into `~/.duckdb`,
