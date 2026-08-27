@@ -2,7 +2,7 @@
 //!
 //! One binary, two jobs (PLAN.md D8): `serve` embeds DuckDB and owns one
 //! database file; the fleet verbs (`add`, `ls`, `stop`, `rm`) manage the
-//! berths of ~/.harbor from outside, linking no engine code paths at all.
+//! berths of ~/.config/harbor/runtime from outside, linking no engine code paths at all.
 //!
 //!   harbor serve db.duckdb [--name n] [--socket p | --port p] [--token t]
 //!   harbor add   db.duckdb [--name n]        spawn a detached berth, wait ready
@@ -74,7 +74,7 @@ serve/add options:
                       positional is a PATH; without this flag a missing
                       file is an error, never a fresh database)
   --name <n>          berth name (default: db file stem)
-  --socket <path>     unix socket (Unix only; default there: $HARBOR_HOME/<name>.sock)
+  --socket <path>     unix socket (Unix only; default there: $HARBOR_HOME/runtime/<name>.sock)
   --port <p>          listen on TCP 127.0.0.1:<p> instead of a unix socket
   --bind <addr>       TCP bind address (with --port; default 127.0.0.1)
   --token <t>         bearer token ('' disables auth; default: <name>.token,
@@ -218,21 +218,31 @@ fn normalize(name: &str) -> Result<String, String> {
     Ok(n)
 }
 
-fn harbor_home() -> Result<PathBuf, String> {
-    let home = match std::env::var("HARBOR_HOME") {
-        Ok(h) => PathBuf::from(h),
+/// The config root: $HARBOR_HOME, else ~/.config/harbor. Holds config.toml
+/// and the runtime/ dir; nothing else.
+fn config_root() -> Result<PathBuf, String> {
+    match std::env::var("HARBOR_HOME") {
+        Ok(h) => Ok(PathBuf::from(h)),
         Err(_) => {
             let h = std::env::var("HOME")
                 .or_else(|_| std::env::var("USERPROFILE"))
                 .map_err(|_| "neither $HOME nor %USERPROFILE% is set")?;
-            Path::new(&h).join(".harbor")
+            Ok(Path::new(&h).join(".config").join("harbor"))
         }
-    };
-    if !home.exists() {
-        std::fs::create_dir_all(&home).map_err(|e| format!("cannot create {}: {e}", home.display()))?;
-        let _ = chmod(&home, 0o700);
     }
-    Ok(home)
+}
+
+/// The runtime dir: $HARBOR_HOME/runtime — sockets, locks, sidecars, tokens,
+/// history, log/. Created on demand; chmod'd 0700 unconditionally, because
+/// sockets and tokens are the local access control and a dir made earlier by
+/// hand (or a sloppy umask) must not stay world-listable.
+fn harbor_home() -> Result<PathBuf, String> {
+    let run = config_root()?.join("runtime");
+    if !run.exists() {
+        std::fs::create_dir_all(&run).map_err(|e| format!("cannot create {}: {e}", run.display()))?;
+    }
+    let _ = chmod(&run, 0o700);
+    Ok(run)
 }
 
 fn chmod(path: &Path, mode: u32) -> std::io::Result<()> {

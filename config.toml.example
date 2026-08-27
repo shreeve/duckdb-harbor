@@ -1,0 +1,27 @@
+# pilot's address book — copy to ~/.config/harbor/config.toml (or
+# $HARBOR_HOME/config.toml). Purely additive: zero-config local always
+# works; this only teaches pilot what the filesystem cannot reveal —
+# remote urls, their credentials, spawn aliases, and taste.
+
+[defaults]
+mode = "duckbox"         # duckbox | duckboxy | markdown | csv | json | jsonlines | line | list | trash
+timer = true
+# maxrows = 40
+# nullvalue = ""
+# theme = "duck"         # duck | mono | vivid
+# appearance = "auto"    # auto | light | dark
+
+# A remote berth (TLS is Caddy's job; this is the plain-HTTP upstream).
+# Never put a token on argv — use token-file or token-cmd.
+#
+# [connection.medlabs]
+# url = "http://127.0.0.1:9495"
+# token-file = "~/.config/harbor/runtime/medlabs.token"
+# # token-cmd = "op read op://vault/medlabs/token"
+
+# A spawn-on-demand alias: `pilot scratch` summons a berth for this file
+# and it exits itself after sitting idle.
+#
+# [connection.scratch]
+# path = "~/Data/scratch.duckdb"
+# idle-exit = "10m"

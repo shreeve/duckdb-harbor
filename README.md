@@ -208,7 +208,7 @@ compatible library at runtime. A build needs a libduckdb to link against.
 $ make fetch-duckdb                       # libduckdb + duckdb CLI -> ~/.duckdb/cli/2.0.0/
 $ make harbor pilot                       # -> target/release/{harbor,pilot}
 $ harbor serve mydata.duckdb --token secret
-harbor 0.13.4: berth "mydata" serving mydata.duckdb on ~/.harbor/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
+harbor 0.14.0: berth "mydata" serving mydata.duckdb on ~/.config/harbor/runtime/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
 ```
 
 `make bootstrap` does the whole thing in one shot — fetch the engine into `~/.duckdb`,
@@ -228,7 +228,7 @@ published checksums, and installs harbor + pilot into `/usr/local/bin` with
 curl -fsSL https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.sh | bash
 ```
 
-Pin a version with `... | bash -s v0.13.4`. Each
+Pin a version with `... | bash -s v0.14.0`. Each
 [release](https://github.com/shreeve/duckdb-harbor/releases)
 ships one self-contained archive per
 platform (osx-arm64, linux-amd64, linux-arm64, windows-amd64, windows-arm64):
@@ -255,7 +255,7 @@ derives from one nightly, so the versions match by construction (PLAN.md D11).
 **detached** berth and returns once it answers `/ready`; `harbor ls` lists the
 fleet, `harbor stop <name>` drains and `CHECKPOINT`s, `harbor rm <name>` clears
 the registry (never the database file). With no `--token`, a per-berth token is
-minted and written to `~/.harbor/<name>.token`.
+minted and written to `~/.config/harbor/runtime/<name>.token`.
 
 Exits are clean: `SIGTERM` / `Ctrl-C` drain in-flight requests and `CHECKPOINT`
 so the next open never replays a WAL.

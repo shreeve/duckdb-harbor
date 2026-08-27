@@ -82,10 +82,31 @@ main() {
   tar -xzf "$tmp/$asset" -C "$tmp"
   bash "$tmp/$NAME-$tag-$plat/install.sh"
 
-  # Heal the runtime dir's permissions: sockets and tokens live in
-  # $HARBOR_HOME, and harbor only chmods it when it creates it — a dir
-  # made earlier by hand (or a sloppy umask) stays world-listable.
-  hh="${HARBOR_HOME:-$HOME/.harbor}"
+  # 0.14.0 moved harbor's home: config.toml at ~/.config/harbor, the live
+  # fleet under ~/.config/harbor/runtime. Move a pre-0.14 ~/.harbor across
+  # once — but never while berths may still be serving out of it.
+  if [ "$(printf '%s\n' v0.14.0 "$tag" | sort -V | head -1)" = v0.14.0 ]; then
+    root="${HARBOR_HOME:-$HOME/.config/harbor}"
+    hh="$root/runtime"
+    old="$HOME/.harbor"
+    if [ -d "$old" ] && [ ! -d "$hh" ]; then
+      if pgrep -x harbor >/dev/null 2>&1; then
+        say "note: ~/.harbor was NOT migrated while harbor is running. Stop the"
+        say "  fleet, then: mkdir -p $hh && mv $old/config.toml $root/; mv $old/* $hh/ && rmdir $old"
+      else
+        mkdir -p "$hh"
+        [ -f "$old/config.toml" ] && mv "$old/config.toml" "$root/config.toml"
+        find "$old" -mindepth 1 -maxdepth 1 -exec mv {} "$hh/" \;
+        rmdir "$old" 2>/dev/null || true
+        say "migrated ~/.harbor -> $root (config.toml at the root, fleet state in runtime/)"
+      fi
+    fi
+  else
+    hh="${HARBOR_HOME:-$HOME/.harbor}"   # pre-0.14 layout
+  fi
+
+  # Sockets and tokens live in the runtime dir; a dir made earlier by hand
+  # (or a sloppy umask) must not stay world-listable.
   if [ -d "$hh" ]; then chmod 700 "$hh" 2>/dev/null || true; fi
 }
 

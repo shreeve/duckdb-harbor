@@ -1,6 +1,6 @@
 [package]
 name = "wire"
-version = "0.13.4"
+version = "0.14.0"
 edition = "2024"
 description = "The Harbor wire contract: request shapes, NDJSON envelope, error codes"
 license = "MIT"

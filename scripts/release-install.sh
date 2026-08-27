@@ -41,9 +41,10 @@ install -m 0644 extensions/ui.duckdb_extension "$ext_dir/ui.duckdb_extension"
 if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ]; then chown -R "$user" "$home/.duckdb"; fi
 
 # Heal the runtime dir's permissions: sockets and tokens live in
-# $HARBOR_HOME, and harbor only chmods it when it creates it — a dir
-# made earlier by hand (or a sloppy umask) stays world-listable.
-hh="${HARBOR_HOME:-$home/.harbor}"
+# $HARBOR_HOME/runtime, and a dir made earlier by hand (or a sloppy
+# umask) must not stay world-listable. harbor also heals this on every
+# run; doing it here covers a fleet that is stopped.
+hh="${HARBOR_HOME:-$home/.config/harbor}/runtime"
 if [ -d "$hh" ]; then chmod 700 "$hh" 2>/dev/null || true; fi
 
 echo "installed: harbor + pilot -> $BIN, libduckdb -> $LIB"

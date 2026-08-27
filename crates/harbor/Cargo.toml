@@ -1,6 +1,6 @@
 [package]
 name = "harbor"
-version = "0.13.4"
+version = "0.14.0"
 edition = "2024"
 description = "harbor — DuckDB wearing a server: fleet manager + HTTP/UDS engine"
 license = "MIT"

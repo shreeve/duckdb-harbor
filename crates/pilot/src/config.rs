@@ -13,7 +13,7 @@
 //!
 //! [connection.medlabs]
 //! url = "http://127.0.0.1:9495"
-//! token-file = "~/.harbor/medlabs.token"     # or token-cmd = "op read ..."
+//! token-file = "~/.config/harbor/runtime/medlabs.token"     # or token-cmd = "op read ..."
 //!
 //! [connection.scratch]
 //! path = "~/Data/scratch.duckdb"             # spawn-on-demand alias (D9)
@@ -84,20 +84,27 @@ impl Connection {
     }
 }
 
-/// The harbor registry directory: $HARBOR_HOME, else ~/.harbor. This is
-/// where pilot's world lives on disk — sockets, tokens, history, config.
-pub fn harbor_home() -> std::path::PathBuf {
+/// The config root: $HARBOR_HOME, else ~/.config/harbor. Holds config.toml
+/// and the runtime/ dir.
+pub fn config_root() -> std::path::PathBuf {
     if let Ok(h) = std::env::var("HARBOR_HOME") {
         return std::path::PathBuf::from(h);
     }
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".into());
-    std::path::Path::new(&home).join(".harbor")
+    std::path::Path::new(&home).join(".config").join("harbor")
+}
+
+/// The runtime dir: $HARBOR_HOME/runtime — where the live fleet lives on
+/// disk (sockets, sidecars, tokens, history). harbor creates and guards it;
+/// pilot only reads and writes inside it.
+pub fn harbor_home() -> std::path::PathBuf {
+    config_root().join("runtime")
 }
 
 pub fn load() -> FileConfig {
-    let path = harbor_home().join("config.toml");
+    let path = config_root().join("config.toml");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return FileConfig::default();
     };
@@ -134,7 +141,7 @@ mod tests {
 
             [connection.medlabs]
             url = "http://127.0.0.1:9495"
-            token-file = "~/.harbor/medlabs.token"
+            token-file = "~/.config/harbor/runtime/medlabs.token"
 
             [connection.scratch]
             path = "~/Data/scratch.duckdb"

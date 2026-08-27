@@ -61,6 +61,8 @@ done
 install -m 0644 "$UI_EXT" "$root/extensions/ui.duckdb_extension"
 printf '%s %s\n' "$version" "$ext_plat" > "$root/ENGINE"
 install -m 0755 scripts/release-install.sh "$root/install.sh"
+# Reference only — never copied over an operator's live config.
+install -m 0644 config.toml.example "$root/config.toml.example"
 
 tar -C "$OUT" -czf "$OUT/$name.tar.gz" "$name"
 say "engine $version ($ext_plat)"
