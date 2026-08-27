@@ -92,7 +92,9 @@ jobs:
           # non-recursively; a virgin runner $HOME has no ~/.duckdb yet
           # (install.sh creates it for real users).
           mkdir -p "$HOME/.duckdb"
-          "$root/bin/harbor" add /tmp/smoke.duckdb --name smoke --unsigned \
+          # --create: a fresh smoke db is the point here; harbor no longer
+          # mints database files implicitly.
+          "$root/bin/harbor" add /tmp/smoke.duckdb --create --name smoke --unsigned \
             --init "LOAD '$root/extensions/ui.duckdb_extension';"
           "$root/bin/pilot" smoke -c "SELECT 42 AS ok" --mode csv | grep -q 42
           "$root/bin/harbor" stop smoke
@@ -107,7 +109,7 @@ jobs:
           root="$RUNNER_TEMP/harbor-$GITHUB_REF_NAME-${{ matrix.plat }}"
           export HARBOR_HOME="$RUNNER_TEMP/harbor-home"
           "$root/bin/harbor.exe" add "$RUNNER_TEMP/smoke.duckdb" \
-            --name smoke --token ''
+            --create --name smoke --token ''
           "$root/bin/pilot.exe" smoke -c "SELECT 42 AS ok" --mode csv | grep -q 42
           "$root/bin/harbor.exe" stop smoke
           echo "smoke: DLL loading, TCP fleet, and wire round-trip all good"
