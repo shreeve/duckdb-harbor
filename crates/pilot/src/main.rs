@@ -190,7 +190,25 @@ fn resolve(cfg: &config::FileConfig, target: &str, flag_token: Option<String>) -
     if let Some(entry) = cfg.connection.get(target) {
         let home = config::harbor_home();
         if berth_sock(&home, target).exists() {
-            eprintln!("pilot: config entry {target:?} shadows a live local berth of the same name");
+            // Warn only when they actually diverge. When the entry's path IS
+            // the database the live berth serves, following the config joins
+            // that berth — nothing is shadowed, and warning here read as
+            // "pilot is about to force a second load" to more than one user.
+            let entry_db = entry.path.as_deref().map(|p| {
+                let expanded = config::expand(p);
+                std::fs::canonicalize(&expanded).unwrap_or(expanded)
+            });
+            let live_db = std::fs::read_to_string(home.join(format!("{target}.json")))
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|j| j["db"].as_str().map(PathBuf::from));
+            let same = match (&entry_db, &live_db) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            };
+            if !same {
+                eprintln!("pilot: config entry {target:?} shadows a live local berth of the same name");
+            }
         }
         let token = flag_token.or(env_token).or_else(|| entry.resolve_token());
         if let Some(url) = &entry.url {
