@@ -48,11 +48,13 @@ main() {
   if [ -n "$tag" ]; then
     case "$tag" in v*) ;; *) tag="v$tag" ;; esac
   else
-    tag=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+    tag=$(curl -fsSLI --retry 3 --retry-delay 1 -o /dev/null -w '%{url_effective}' \
       "https://github.com/$REPO/releases/latest") || fail "cannot reach github.com"
     tag=${tag##*/}
-    [ "$tag" != latest ] || fail "no releases found for $REPO"
   fi
+  # With no releases, GitHub redirects .../latest to .../releases — so the
+  # resolved "tag" is only real if it looks like one.
+  case "$tag" in v*) ;; *) fail "no releases found for $REPO" ;; esac
 
   asset="$NAME-$tag-$plat.tar.gz"
   base="https://github.com/$REPO/releases/download/$tag"
@@ -61,11 +63,11 @@ main() {
   trap 'rm -rf "$tmp"' EXIT
 
   say "installing $NAME $tag ($plat)"
-  curl -fSL --progress-bar -o "$tmp/$asset" "$base/$asset" \
+  curl -fSL --retry 3 --retry-delay 1 --progress-bar -o "$tmp/$asset" "$base/$asset" \
     || fail "download failed: $base/$asset"
 
   # --- verify against the release's published checksums --------------------
-  curl -fsSL -o "$tmp/checksums.txt" "$base/$NAME-$tag-checksums.txt" \
+  curl -fsSL --retry 3 --retry-delay 1 -o "$tmp/checksums.txt" "$base/$NAME-$tag-checksums.txt" \
     || fail "download failed: $NAME-$tag-checksums.txt"
   if command -v sha256sum >/dev/null; then
     sum=$(sha256sum "$tmp/$asset" | cut -d' ' -f1)
