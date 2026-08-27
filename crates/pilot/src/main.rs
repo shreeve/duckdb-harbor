@@ -360,6 +360,23 @@ fn ensure_berth(
     if name.is_empty() {
         return Err(format!("cannot derive a berth name from {}", path.display()));
     }
+    // The sidecar scan above found no berth owning THIS file — so a live
+    // berth under the derived name is serving a DIFFERENT database. Summoning
+    // would only collide on the name, and joining it would silently query the
+    // wrong data. Name both files and the way out instead.
+    let sidecar = home.join(format!("{name}.json"));
+    if berth_sock(&home, &name).exists() || sidecar.exists() {
+        let other = std::fs::read_to_string(&sidecar)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|j| j["db"].as_str().map(str::to_string))
+            .unwrap_or_else(|| "another database".to_string());
+        return Err(format!(
+            "berth {name:?} is live but serves {other}, not {} — stop it (`harbor rm {name}`) or serve this file under a different name (`harbor add {} --name <other>`)",
+            canon.display(),
+            canon.display()
+        ));
+    }
     let harbor = std::env::var("HARBOR_BIN").unwrap_or_else(|_| "harbor".to_string());
     eprintln!("pilot: summoning a berth for {} (idle-exit {idle_exit})", canon.display());
     let status = std::process::Command::new(&harbor)

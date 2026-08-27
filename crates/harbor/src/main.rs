@@ -70,6 +70,9 @@ usage:
   harbor version                    print this binary's version (also -V)
 
 serve/add options:
+  --create            allow a database file that does not exist yet (the
+                      positional is a PATH; without this flag a missing
+                      file is an error, never a fresh database)
   --name <n>          berth name (default: db file stem)
   --socket <path>     unix socket (Unix only; default there: $HARBOR_HOME/<name>.sock)
   --port <p>          listen on TCP 127.0.0.1:<p> instead of a unix socket
@@ -96,6 +99,7 @@ serve/add options:
 
 struct Opts {
     db: PathBuf,
+    create: bool,
     name: String,
     socket: Option<PathBuf>,
     port: Option<u16>,
@@ -135,6 +139,7 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
     let mut db: Option<PathBuf> = None;
     let mut o = Opts {
         db: PathBuf::new(),
+        create: false,
         name: String::new(),
         socket: None,
         port: None,
@@ -155,6 +160,7 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
     while let Some(a) = it.next() {
         let mut take = |what: &str| it.next().ok_or(format!("--{what} needs a value"));
         match a.as_str() {
+            "--create" => o.create = true,
             "--name" => named = Some(take("name")?),
             "--socket" => o.socket = Some(PathBuf::from(take("socket")?)),
             "--port" => o.port = Some(take("port")?.parse().map_err(|_| "bad --port")?),
@@ -177,6 +183,16 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
         }
     }
     o.db = db.ok_or("no database file given")?;
+    // The positional is a PATH — `harbor add medlabs` from ~/x names the
+    // file ~/x/medlabs, and silently creating a fresh database there (then
+    // serving it under the very name clients trust) put an empty impostor
+    // in front of real data once already. Creation is opt-in, loudly.
+    if !o.db.exists() && !o.create {
+        return Err(format!(
+            "database file not found: {} (the argument is a path, not a berth name; pass --create to make a new database here)",
+            o.db.display()
+        ));
+    }
     o.name = match named {
         Some(n) => n,
         None => o
@@ -488,7 +504,12 @@ fn add(rest: Vec<String>) -> Result<(), String> {
         .map_err(|e| format!("log file: {e}"))?;
 
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let db_abs = std::fs::canonicalize(&o.db).unwrap_or(o.db.clone());
+    // canonicalize fails for a --create target that doesn't exist yet;
+    // absolutize by hand so the detached child (and its sidecar) never
+    // depend on inheriting this cwd.
+    let db_abs = std::fs::canonicalize(&o.db).unwrap_or_else(|_| {
+        std::env::current_dir().map(|d| d.join(&o.db)).unwrap_or_else(|_| o.db.clone())
+    });
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("serve").arg(&db_abs);
     // Pass every argument through except the db positional — the first
