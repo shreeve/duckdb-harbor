@@ -218,7 +218,18 @@ matched DuckDB UI extension. Building the UI additionally requires a compatible
 toolchain, `gh`, and OpenSSL. With those prerequisites present, it takes an empty
 `~/.duckdb` to a working fleet.
 
-No toolchain? Each [release](https://github.com/shreeve/duckdb-harbor/releases)
+No toolchain? On macOS and Linux, one command installs the latest release —
+it picks the right archive for the platform, verifies its sha256 against the
+published checksums, and installs harbor + pilot into `/usr/local/bin` with
+`libduckdb` and the `ui` extension in their homes (override with `BIN=...`
+`LIB=...`; sudo only if the destinations are root-owned):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.sh | bash
+```
+
+Pin a version with `... | bash -s v0.13.4`. Each
+[release](https://github.com/shreeve/duckdb-harbor/releases)
 ships one self-contained archive per
 platform (osx-arm64, linux-amd64, linux-arm64, windows-amd64, windows-arm64):
 harbor + pilot and the exact DuckDB shared library they were built against.
