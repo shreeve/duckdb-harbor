@@ -526,6 +526,11 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
     let mut renderer = Renderer::new(opts);
     let mut body = resp.body;
     let mut acc: Vec<u8> = Vec::new();
+    // How far into `acc` the newline search has already looked. Without it the
+    // scan restarted at byte 0 on every 8 KiB read, so one wide row — a large
+    // VARCHAR, a big STRUCT — cost O(row²) byte comparisons to find its single
+    // terminator. Bytes already examined cannot grow a newline later.
+    let mut scanned = 0usize;
     let mut chunk = [0u8; 8192];
     loop {
         // Reading bytes, not read_line: the socket ticks every 250ms
@@ -535,7 +540,9 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
         // return InvalidData — aborting a perfectly healthy stream and dropping
         // data. A byte accumulator has no char-boundary dependency: partial
         // bytes simply wait in `acc` for the next read.
-        let Some(nl) = acc.iter().position(|&b| b == b'\n') else {
+        let found = acc[scanned..].iter().position(|&b| b == b'\n').map(|p| scanned + p);
+        let Some(nl) = found else {
+            scanned = acc.len();
             match body.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => acc.extend_from_slice(&chunk[..n]),
@@ -553,6 +560,7 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
         };
         let text = String::from_utf8_lossy(&acc[..=nl]).into_owned();
         acc.drain(..=nl);
+        scanned = 0;
         let trimmed = text.trim();
         if trimmed.is_empty() {
             continue;
