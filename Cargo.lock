@@ -609,6 +609,7 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook 0.3.18",
+ "wire",
 ]
 
 [[package]]
