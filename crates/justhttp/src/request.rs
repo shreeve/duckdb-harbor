@@ -3,12 +3,35 @@ use std::io::{self, Cursor, ErrorKind, Read, Write};
 
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 use crate::Response;
 use crate::http::{Header, HttpVersion, Method, StatusCode};
+use crate::stream::ShutdownHandle;
+use budgeted_reader::BudgetedReader;
 use chunked_transfer::Decoder;
 use equal_reader::EqualReader;
 use fused_reader::FusedReader;
+
+/// How long a request body may take to arrive, start to finish.
+///
+/// `take(MAX_BODY)` bounds how many BYTES a handler will read; nothing bounded
+/// how LONG it would wait for them. A client dribbling a byte every few
+/// seconds stayed under the per-read socket timeout forever, so the read never
+/// failed and never finished — and it holds the thread that is serving the
+/// request, which on harbor is one of a handful of workers. Eight such
+/// connections took every worker and the berth answered nothing at all,
+/// `/ready` included. (The drop-drain had the same shape and is bounded
+/// separately; this is the other half — the body a handler actually asked
+/// for.)
+///
+/// Thirty seconds is chosen against what this body IS: one SQL statement and
+/// its parameters, where a megabyte is already pathological. Even a maximal
+/// 8 MiB body needs only 273 KB/s to make it, and real ones are kilobytes.
+/// A minimum-throughput floor would be the stricter instrument — it never
+/// punishes a slow-but-honest uploader — but it is more machinery than a
+/// statement endpoint can justify.
+const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Represents an HTTP request made by a client.
 ///
@@ -89,6 +112,7 @@ impl From<IoError> for RequestCreationError {
 /// It is the responsibility of the `Request` to read only the data of the request and not further.
 ///
 /// The `Write` object will be used by the `Request` to write the response.
+#[allow(clippy::too_many_arguments)]
 pub fn new_request<R, W>(
     method: Method,
     path: String,
@@ -97,6 +121,7 @@ pub fn new_request<R, W>(
     remote_addr: Option<SocketAddr>,
     mut source_data: R,
     writer: W,
+    shutdown: Option<ShutdownHandle>,
 ) -> Result<Request, RequestCreationError>
 where
     R: Read + Send + 'static,
@@ -145,8 +170,20 @@ where
 
             let mut buffer = vec![0; content_length];
             let mut offset = 0;
+            // On the same clock as every other body, and it has to be: this
+            // read happens during request construction, before any handler or
+            // route exists to time it out, so a client dribbling into a
+            // declared 1024 bytes held this connection's thread for as long as
+            // it cared to — measured at ~51 minutes a connection, 60 of them at
+            // once, with no credential.
+            let deadline = Instant::now() + BODY_TIMEOUT;
 
             while offset != content_length {
+                if Instant::now() >= deadline {
+                    let info = "the request body did not arrive within the body timeout";
+                    let err = IoError::new(ErrorKind::TimedOut, info);
+                    return Err(RequestCreationError::CreationIoError(err));
+                }
                 let read = source_data.read(&mut buffer[offset..])?;
                 if read == 0 {
                     // the socket returned EOF, but we were before the expected content-length
@@ -161,13 +198,15 @@ where
 
             Box::new(Cursor::new(buffer)) as Box<dyn Read + Send + 'static>
         } else {
-            let data_reader = EqualReader::new(source_data, content_length);
-            Box::new(FusedReader::new(data_reader)) as Box<dyn Read + Send + 'static>
+            let data_reader = EqualReader::new(source_data, content_length, shutdown);
+            Box::new(BudgetedReader::new(FusedReader::new(data_reader), BODY_TIMEOUT))
+                as Box<dyn Read + Send + 'static>
         }
     } else if transfer_encoding.is_some() {
         // if a transfer-encoding was specified, then "chunked" is ALWAYS applied
         // over the message (RFC2616 #3.6)
-        Box::new(FusedReader::new(Decoder::new(source_data))) as Box<dyn Read + Send + 'static>
+        Box::new(BudgetedReader::new(FusedReader::new(Decoder::new(source_data)), BODY_TIMEOUT))
+            as Box<dyn Read + Send + 'static>
     } else {
         // if we have neither a Content-Length nor a Transfer-Encoding,
         // assuming that we have no data
@@ -347,9 +386,117 @@ mod tests {
     }
 }
 
+mod budgeted_reader {
+    use std::io::{Error as IoError, ErrorKind, Read, Result as IoResult};
+    use std::time::{Duration, Instant};
+
+    /// Caps how long a body may take to arrive, however slowly it trickles.
+    ///
+    /// The clock starts on the FIRST read, not when the reader is built, and
+    /// that is the part worth being deliberate about: a request can sit in the
+    /// queue waiting for a free worker, and a budget started at parse time
+    /// would be half spent before anyone tried to read the body — so a busy
+    /// berth would begin rejecting uploads that had merely queued. Starting
+    /// lazily also gets `Expect: 100-continue` right, where the body does not
+    /// begin until the handler asks for it.
+    ///
+    /// Checked before each read rather than interrupting one in progress: the
+    /// socket carries its own per-read timeout, so a single read cannot block
+    /// past it, and the two together bound the total.
+    pub struct BudgetedReader<R> {
+        reader: R,
+        budget: Duration,
+        deadline: Option<Instant>,
+    }
+
+    impl<R: Read> BudgetedReader<R> {
+        pub fn new(reader: R, budget: Duration) -> Self {
+            Self { reader, budget, deadline: None }
+        }
+    }
+
+    impl<R: Read> Read for BudgetedReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+            let deadline = *self.deadline.get_or_insert_with(|| Instant::now() + self.budget);
+            if Instant::now() >= deadline {
+                return Err(IoError::new(
+                    ErrorKind::TimedOut,
+                    "the request body did not arrive within the body timeout",
+                ));
+            }
+            self.reader.read(buf)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::BudgetedReader;
+        use std::io::{ErrorKind, Read};
+        use std::time::Duration;
+
+        /// A reader that always has one more byte, forever — a client that
+        /// keeps the connection technically alive and never finishes.
+        struct Endless;
+        impl Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(10));
+                buf[0] = b'x';
+                Ok(1)
+            }
+        }
+
+        #[test]
+        fn a_body_that_never_ends_is_cut_off() {
+            let mut r = BudgetedReader::new(Endless, Duration::from_millis(200));
+            let mut sink = Vec::new();
+            let err = r.read_to_end(&mut sink).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::TimedOut);
+        }
+
+        #[test]
+        fn a_body_that_arrives_is_not_disturbed() {
+            let mut r = BudgetedReader::new(&b"hello"[..], Duration::from_secs(30));
+            let mut s = String::new();
+            r.read_to_string(&mut s).unwrap();
+            assert_eq!(s, "hello");
+        }
+
+        /// The budget must not start until someone actually reads: a request
+        /// that queued behind a busy worker has not spent any of it yet.
+        #[test]
+        fn the_clock_starts_on_the_first_read() {
+            let mut r = BudgetedReader::new(&b"hi"[..], Duration::from_millis(300));
+            std::thread::sleep(Duration::from_millis(500)); // queued, unread
+            let mut s = String::new();
+            r.read_to_string(&mut s).unwrap();
+            assert_eq!(s, "hi");
+        }
+    }
+}
+
 mod equal_reader {
     use std::io::Read;
     use std::io::Result as IoResult;
+    use std::time::{Duration, Instant};
+
+    use crate::stream::ShutdownHandle;
+
+    /// How long the drop-drain may spend discarding a body nobody asked for.
+    ///
+    /// The buffer was already bounded; the *loop* was not. It follows the
+    /// client's declared Content-Length to completion, and the per-read socket
+    /// timeout only fires on a peer that has stopped entirely — so a client
+    /// dribbling one byte every few seconds kept every read succeeding and the
+    /// drain running forever. That drain runs on the thread that handled the
+    /// request (the `Request` is dropped when the handler returns), and it runs
+    /// *after* the response, so no credential is needed to start one: six of
+    /// them took every harbor worker and the berth answered nothing at all,
+    /// `/ready` included. Measured: 8 connections at one byte per 3s, and
+    /// /ready went from 0.01s to a hard timeout until the drip stopped.
+    ///
+    /// Two seconds is far more than a body already in flight needs and far
+    /// less than a drip can exploit.
+    const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
     /// A `Reader` that reads exactly the number of bytes from a sub-reader.
     ///
@@ -362,14 +509,18 @@ mod equal_reader {
     {
         reader: R,
         size: usize,
+        /// How to end the connection when the drain below gives up. See the
+        /// note there: an abandoned drain leaves the stream at an unknown
+        /// offset, and that is a smuggling primitive, not an untidiness.
+        shutdown: Option<ShutdownHandle>,
     }
 
     impl<R> EqualReader<R>
     where
         R: Read,
     {
-        pub fn new(reader: R, size: usize) -> EqualReader<R> {
-            EqualReader { reader, size }
+        pub fn new(reader: R, size: usize, shutdown: Option<ShutdownHandle>) -> EqualReader<R> {
+            EqualReader { reader, size, shutdown }
         }
     }
 
@@ -412,10 +563,31 @@ mod equal_reader {
             // this process a 1 GB zeroed allocation per connection at drop time,
             // no matter what the server responded. Measured live before the
             // patch: 6 such requests drove RSS from 22 MB to 2.2 GB.
+            //
+            // AND BOUNDED IN TIME, which the buffer alone was not: the loop
+            // followed the declared length to the end, so a client dribbling a
+            // byte at a time kept it running indefinitely on the handler's own
+            // thread. `DRAIN_TIMEOUT` is the ceiling on how long a body nobody
+            // asked for may hold that thread.
             let mut remaining_to_read = self.size;
             let mut buf = [0u8; 65536];
+            let deadline = Instant::now() + DRAIN_TIMEOUT;
 
             while remaining_to_read > 0 {
+                if Instant::now() >= deadline {
+                    // Out of patience with a body still arriving. The stream is
+                    // now at an offset neither side agrees on, and the bytes
+                    // still to come would be read as the next request line on
+                    // this connection — a request the client never sent and the
+                    // server would answer. Ending the connection is the only
+                    // safe close: shutting the read side down turns every later
+                    // read into EOF, so `ClientConnection::next` stops rather
+                    // than parsing whatever arrives next.
+                    if let Some(shutdown) = &self.shutdown {
+                        shutdown.shutdown_read();
+                    }
+                    break;
+                }
                 let want = remaining_to_read.min(buf.len());
 
                 match self.reader.read(&mut buf[..want]) {
@@ -442,7 +614,7 @@ mod equal_reader {
             let mut org_reader = Cursor::new("hello world".to_string().into_bytes());
 
             {
-                let mut equal_reader = EqualReader::new(org_reader.by_ref(), 5);
+                let mut equal_reader = EqualReader::new(org_reader.by_ref(), 5, None);
 
                 let mut string = String::new();
                 equal_reader.read_to_string(&mut string).unwrap();
@@ -461,7 +633,7 @@ mod equal_reader {
             let mut org_reader = Cursor::new("hello world".to_string().into_bytes());
 
             {
-                let mut equal_reader = EqualReader::new(org_reader.by_ref(), 5);
+                let mut equal_reader = EqualReader::new(org_reader.by_ref(), 5, None);
 
                 let mut vec = [0];
                 equal_reader.read_exact(&mut vec).unwrap();

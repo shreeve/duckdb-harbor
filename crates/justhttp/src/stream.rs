@@ -2,6 +2,7 @@
 //! stream that lets one connection be read and written from two threads.
 
 pub use listen::ListenAddr;
+pub use refined::ShutdownHandle;
 pub(crate) use listen::{Connection, Listener};
 pub(crate) use refined::RefinedTcpStream;
 
@@ -264,6 +265,31 @@ mod refined {
 
         pub(crate) fn peer_addr(&mut self) -> IoResult<Option<SocketAddr>> {
             self.stream.peer_addr()
+        }
+
+        /// A handle that can shut the read side down from somewhere that does
+        /// not own the stream.
+        ///
+        /// The one caller is the bounded body drain (request.rs): when it
+        /// gives up on a body the client is still dribbling, the connection is
+        /// left at an unknown offset, and the bytes still to come would
+        /// otherwise be read as the next request line — turning a denial of
+        /// service into request smuggling. Shutting the read side down makes
+        /// every later read return EOF, so the connection ends instead.
+        pub(crate) fn shutdown_handle(&self) -> IoResult<ShutdownHandle> {
+            Ok(ShutdownHandle(std::sync::Arc::new(self.stream.try_clone()?)))
+        }
+    }
+
+    /// A cloned descriptor kept only to shut the read side down. Cheap to
+    /// clone and safe to hold past the stream it came from: shutting down an
+    /// already-closed socket is an error this deliberately ignores.
+    #[derive(Clone)]
+    pub struct ShutdownHandle(std::sync::Arc<Connection>);
+
+    impl ShutdownHandle {
+        pub(crate) fn shutdown_read(&self) {
+            self.0.shutdown(Shutdown::Read).ok();
         }
     }
 
