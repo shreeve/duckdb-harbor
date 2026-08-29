@@ -28,7 +28,11 @@ fn main() {
         gpui_component::init(cx);
 
         cx.spawn(async move |cx| {
-            cx.open_window(WindowOptions::default(), |window, cx| {
+            let options = WindowOptions {
+                window_min_size: Some(size(px(640.), px(400.))),
+                ..Default::default()
+            };
+            cx.open_window(options, |window, cx| {
                 let view = cx.new(|_| DuckTable);
                 cx.new(|cx| Root::new(view, window, cx))
             })?;
