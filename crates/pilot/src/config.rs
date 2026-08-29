@@ -4,6 +4,9 @@
 //! pilot what the filesystem cannot reveal: remote urls, their credentials
 //! (never on argv: token-file or token-cmd), spawn aliases, and taste.
 //!
+//! `token-cmd` is run through `sh -c`, so the file is only read when it — and
+//! the directory holding it — is yours and unwritable by anyone else.
+//!
 //! ```toml
 //! [defaults]
 //! mode = "duckbox"
@@ -104,10 +107,29 @@ pub fn harbor_home() -> std::path::PathBuf {
 }
 
 pub fn load() -> FileConfig {
-    let path = config_root().join("config.toml");
+    load_from(&config_root())
+}
+
+fn load_from(root: &std::path::Path) -> FileConfig {
+    let path = root.join("config.toml");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return FileConfig::default();
     };
+    // Anyone who can rewrite this file is not editing settings, they are
+    // writing a program: `token-cmd` runs through `sh -c`, and `url` decides
+    // who receives the bearer token. So refuse it whole, the way ssh refuses
+    // a loose identity file, rather than trust it in part.
+    if let Some(bad) = [&path, &root.to_path_buf()].into_iter().find(|p| exposed(p)) {
+        let who = match *bad == path {
+            true => "it is".to_string(),
+            false => format!("{} is", bad.display()),
+        };
+        eprintln!(
+            "pilot: ignoring {} — {who} writable by others or not yours (chmod go-w it)",
+            path.display()
+        );
+        return FileConfig::default();
+    }
     match toml::from_str(&text) {
         Ok(c) => c,
         Err(e) => {
@@ -115,6 +137,26 @@ pub fn load() -> FileConfig {
             FileConfig::default()
         }
     }
+}
+
+/// True if someone other than us could swap this path's contents out from
+/// under us: group- or world-writable, or owned by another user. A sticky
+/// directory (/tmp) is writable by all but hijackable by none, so it passes.
+#[cfg(unix)]
+fn exposed(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(md) = std::fs::metadata(path) else {
+        return false;
+    };
+    let mode = md.permissions().mode();
+    let sticky = md.is_dir() && mode & 0o1000 != 0;
+    let uid = unsafe { libc::getuid() };
+    (mode & 0o022 != 0 && !sticky) || (md.uid() != uid && md.uid() != 0)
+}
+
+#[cfg(not(unix))]
+fn exposed(_path: &std::path::Path) -> bool {
+    false
 }
 
 /// `~/` expansion, nothing fancier.
@@ -158,5 +200,57 @@ mod tests {
     fn empty_config_is_fine() {
         let c: FileConfig = toml::from_str("").unwrap();
         assert!(c.connection.is_empty());
+    }
+
+    #[cfg(unix)]
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("pilot-cfg-{}-{tag}", std::process::id()));
+        std::fs::remove_dir_all(&d).ok();
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("config.toml"),
+            "[connection.x]\nurl = \"http://127.0.0.1:1\"\ntoken-cmd = \"echo pwned\"\n",
+        )
+        .unwrap();
+        d
+    }
+
+    #[cfg(unix)]
+    fn chmod(p: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_config_only_its_owner_can_write_is_used() {
+        let d = scratch("ok");
+        chmod(&d, 0o755);
+        chmod(&d.join("config.toml"), 0o644);
+        assert!(load_from(&d).connection.contains_key("x"));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_group_writable_config_is_refused_whole() {
+        let d = scratch("file");
+        chmod(&d, 0o755);
+        chmod(&d.join("config.toml"), 0o664);
+        // Not merely token-cmd: the whole file, url and all, is untrusted.
+        assert!(load_from(&d).connection.is_empty());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_config_in_a_writable_directory_is_refused() {
+        // The file itself is tight, but the directory lets anyone replace it.
+        let d = scratch("dir");
+        chmod(&d.join("config.toml"), 0o600);
+        chmod(&d, 0o777);
+        assert!(load_from(&d).connection.is_empty());
+        chmod(&d, 0o755);
+        std::fs::remove_dir_all(&d).ok();
     }
 }

@@ -13,6 +13,8 @@ timer = true
 
 # A remote berth (TLS is Caddy's job; this is the plain-HTTP upstream).
 # Never put a token on argv — use token-file or token-cmd.
+# Keep this file yours and unwritable by others (chmod 600/644, dir go-w):
+# pilot ignores the whole config otherwise, since token-cmd is run by sh.
 #
 # [connection.medlabs]
 # url = "http://127.0.0.1:9495"

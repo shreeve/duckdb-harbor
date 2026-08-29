@@ -177,8 +177,11 @@ prefs (mode, timer, maxrows, nullvalue, theme, appearance). Credentials can
 come from `--token`,
 `HARBOR_TOKEN`, inline config `token`, `token-file`, or `token-cmd`; URL userinfo
 is not parsed. Harbor creates `$HARBOR_HOME` as mode 0700 and minted token files
-as 0600, while a user-authored config file retains the permissions its creator
-gave it. Bare `pilot` currently lists the live local registry; configured
+as 0600; a user-authored config file keeps whatever permissions its creator gave
+it, but pilot refuses to read one that is group- or world-writable, sits in such
+a directory, or is owned by another user — `token-cmd` runs through `sh -c` and
+`url` chooses who receives the bearer token, so a writable config is a program,
+not a preference. Bare `pilot` currently lists the live local registry; configured
 remotes are resolved when named, not merged into that fleet view.
 
 ### D10b. Defense in depth on auth
