@@ -2061,6 +2061,14 @@ fn json_to_duckdb(v: &serde_json::Value) -> Result<Value, String> {
 /// anything after it. Over-rejecting a statement someone could have written
 /// differently is a much smaller cost than under-rejecting one they should
 /// not have been able to write at all.
+/// A byte that can appear inside a DuckDB identifier. `$` is one of them,
+/// which is why a `$` after one does not open a dollar-quote; bytes >= 0x80
+/// are UTF-8 continuation or lead bytes and belong to whatever identifier
+/// they are part of.
+fn is_ident_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80
+}
+
 fn ensure_single_statement(sql: &str) -> Result<(), String> {
     let b = sql.as_bytes();
     let mut i = 0;
@@ -2135,6 +2143,21 @@ fn ensure_single_statement(sql: &str) -> Result<(), String> {
             }
             b'$' => {
                 // $tag$ ... $tag$, where the tag is empty or an identifier.
+                //
+                // Only when the `$` actually opens something. DuckDB allows
+                // `$` *inside* an identifier, so `a$b$c` is one identifier and
+                // not a dollar-quote — but this scanner read the `$b$` as an
+                // opener, hunted for a closing `$b$` that was never coming,
+                // and swallowed the rest of the input as string content.
+                // Everything after it, terminator included, then looked like
+                // data: `SELECT 1 a$b$c; DROP TABLE orders` was accepted as a
+                // single statement and the DROP ran during `prepare`. Same
+                // shape as the CR-comment hole, same consequence.
+                //
+                // pilot's scanner already guarded this (scan.rs, `prev_ident`)
+                // — the two must agree, and the security lexer was the one
+                // that was wrong.
+                let opens = i == 0 || !is_ident_byte(b[i - 1]);
                 let tag_end = b[i + 1..]
                     .iter()
                     .position(|&c| !(c.is_ascii_alphanumeric() || c == b'_'))
@@ -2144,7 +2167,7 @@ fn ensure_single_statement(sql: &str) -> Result<(), String> {
                     // parameter to DuckDB, not the opening of a string. Reading
                     // it as one would let `$1$; DROP TABLE t; $1$` hide a
                     // terminator the two lexers disagree about.
-                    Some(end) if b[end] == b'$' && !b[i + 1].is_ascii_digit() => {
+                    Some(end) if opens && b[end] == b'$' && !b[i + 1].is_ascii_digit() => {
                         let tag = &b[i..=end];
                         let rest = &b[end + 1..];
                         i = rest
@@ -4012,6 +4035,29 @@ mod tests {
         }
     }
 
+    /// DuckDB allows `$` inside an identifier, so `a$b$c` is one identifier —
+    /// not a dollar-quoted string. Reading it as an opener made the scanner
+    /// hunt for a close that never came and swallow the rest of the input,
+    /// terminator and all, so the second statement ran during `prepare`.
+    /// Found by differential fuzzing against the engine, which is also the
+    /// only way to be confident about the cases still not listed here.
+    #[test]
+    fn rejects_a_statement_after_a_dollar_inside_an_identifier() {
+        for sql in [
+            "SELECT 1 a$b$c; DROP TABLE orders",
+            "SELECT a$b$c; DROP TABLE orders",
+            "SELECT 1 a$b$c$$; DROP TABLE orders",
+            "SELECT 1 a$b$c\r; DROP TABLE orders",
+            "SELECT 1 x$1$; DROP TABLE orders",
+        ] {
+            assert!(one(sql).is_err(), "should reject: {sql:?}");
+        }
+        // ...while a real dollar-quote, opened where one can be opened, still
+        // hides its terminator exactly as before.
+        for sql in ["SELECT a$b$c", "SELECT $$a; b$$", "SELECT $t$a; b$t$", "SELECT 'x'$$a;b$$"] {
+            assert!(one(sql).is_ok(), "should accept: {sql:?}");
+        }
+    }
 
     /// A bare CR ends a `--` comment for DuckDB (Postgres lexer heritage), so
     /// everything after one is a second statement. Scanning for LF alone made

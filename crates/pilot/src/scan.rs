@@ -85,7 +85,15 @@ pub fn scan(src: &str) -> Vec<Span> {
                 while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
                     j += 1;
                 }
-                if j < b.len() && b[j] == b'$' {
+                // A tag may not start with a digit: `$1` is a bind parameter
+                // to DuckDB, so `$1$abc$1$` is a syntax error and not a
+                // dollar-quoted string (verified against the engine). Reading
+                // it as one left an unterminated Dollar span hanging, which
+                // `statement_complete` reads as a buffer still being typed —
+                // so Enter stopped submitting and the prompt got stuck. The
+                // server's own lexer already guards this; the two must agree.
+                let digit_tag = b.get(i + 1).is_some_and(u8::is_ascii_digit);
+                if j < b.len() && b[j] == b'$' && !digit_tag {
                     flush(&mut spans, code_start, i);
                     let tag = &src[start..=j];
                     let (end, terminated) = match src[j + 1..].find(tag) {
@@ -178,6 +186,20 @@ mod tests {
         assert_eq!(kinds("'oops").last().unwrap().2, false);
         assert_eq!(kinds("/* oops").last().unwrap().2, false);
         assert_eq!(kinds("$$ oops").last().unwrap().2, false);
+    }
+
+    /// `$1` is a bind parameter, so a digit-led tag never opens a quote —
+    /// `SELECT $1$abc$1$` is a syntax error to DuckDB, not a string. Reading
+    /// it as an (unterminated) quote is what wedged the Enter-submits
+    /// validator. harbor's `ensure_single_statement` has the same guard.
+    #[test]
+    fn digit_led_tag_is_not_a_dollar_quote() {
+        assert!(scan("SELECT $1$abc$1$").iter().all(|s| s.kind == Kind::Code));
+        // and nothing is left hanging, so the buffer still reads as complete
+        assert!(scan("SELECT $1$").iter().all(|s| s.terminated));
+        // a letter- or underscore-led tag still opens one
+        assert_eq!(kinds("SELECT $t1$;$t1$")[1], (Kind::Dollar, "$t1$;$t1$", true));
+        assert_eq!(kinds("SELECT $_$;$_$")[1], (Kind::Dollar, "$_$;$_$", true));
     }
 
     #[test]
