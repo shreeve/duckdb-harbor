@@ -63,11 +63,29 @@ pub struct RenderOpts {
     pub max_rows: usize,
     pub null: String,
     pub timer: bool,
+    /// Whether output is going to a terminal rather than a file or a pipe.
+    ///
+    /// Only CSV consults this, and only because CSV is the one mode that is
+    /// both a data format and unescaped: the display modes may always render a
+    /// control character harmless, and JSON always escapes one as `\u001b`,
+    /// but doing either to a CSV cell would corrupt the value for the program
+    /// on the other end of the pipe — which is what CSV is for. So the rule is
+    /// the destination, not the mode: bytes headed for a file stay verbatim,
+    /// bytes headed for a terminal are not allowed to drive it.
+    pub tty: bool,
 }
 
 impl Default for RenderOpts {
     fn default() -> Self {
-        Self { mode: Mode::Duckbox, max_rows: 40, null: "NULL".into(), timer: false }
+        Self {
+            mode: Mode::Duckbox,
+            max_rows: 40,
+            null: "NULL".into(),
+            timer: false,
+            // Detected once here rather than per cell; overridden by the CLI,
+            // and false in tests so expectations stay byte-exact.
+            tty: std::io::IsTerminal::is_terminal(&std::io::stdout()),
+        }
     }
 }
 
@@ -151,7 +169,12 @@ impl<'a> Renderer<'a> {
         self.types = cols.iter().map(|c| c.duckdb_type.to_lowercase()).collect();
         match self.opts.mode {
             Mode::Csv => {
-                let hdr = self.columns.iter().map(|c| csv_cell(c)).collect::<Vec<_>>().join(",");
+                let hdr = self
+                    .columns
+                    .iter()
+                    .map(|c| csv_cell_for(c, self.opts.tty))
+                    .collect::<Vec<_>>()
+                    .join(",");
                 self.emit(format_args!("{hdr}\n"));
             }
             Mode::Json => {
@@ -166,7 +189,11 @@ impl<'a> Renderer<'a> {
         match self.opts.mode {
             Mode::Trash => {}
             Mode::Csv => {
-                let line = values.iter().map(|v| csv_cell(&self.render(v))).collect::<Vec<_>>().join(",");
+                let line = values
+                    .iter()
+                    .map(|v| csv_cell_for(&self.render(v), self.opts.tty))
+                    .collect::<Vec<_>>()
+                    .join(",");
                 self.emit(format_args!("{line}\n"));
             }
             Mode::JsonLines => {
@@ -179,6 +206,13 @@ impl<'a> Renderer<'a> {
                 self.emitted_first_json = true;
                 self.emit(format_args!("{sep}\n{obj}"));
             }
+            // line and list are display modes, like the boxed ones, so they
+            // get the same treatment: a value is shown, never executed. Raw
+            // database bytes reaching a terminal means the content chooses the
+            // colors, moves the cursor, retitles the window, or drives OSC 52
+            // — `SELECT chr(27) || '[2J'` should print an escape, not clear the
+            // screen. csv/json deliberately stay raw below: those are
+            // interchange formats and escaping there would corrupt the data.
             Mode::Line => {
                 let w = self.columns.iter().map(|c| display_width(c)).max().unwrap_or(0);
                 let lines: Vec<String> = self
@@ -187,13 +221,17 @@ impl<'a> Renderer<'a> {
                     .zip(values.iter())
                     .map(|(c, v)| {
                         let pad = " ".repeat(w.saturating_sub(display_width(c)));
-                        format!("{pad}{c} = {}", self.render(v))
+                        format!("{pad}{} = {}", shown_safe(c), shown_safe(&self.render(v)))
                     })
                     .collect();
                 self.emit(format_args!("{}\n\n", lines.join("\n")));
             }
             Mode::List => {
-                let line = values.iter().map(|v| self.render(v)).collect::<Vec<_>>().join("|");
+                let line = values
+                    .iter()
+                    .map(|v| shown_safe(&self.render(v)))
+                    .collect::<Vec<_>>()
+                    .join("|");
                 self.emit(format_args!("{line}\n"));
             }
             Mode::Duckbox | Mode::Duckboxy | Mode::Markdown => {
@@ -534,6 +572,14 @@ fn truncate(s: &str, w: usize) -> String {
     out
 }
 
+/// Control characters in a value shown at a terminal are the terminal's
+/// instructions, not the value's content. `boxed_safe` is this with the frame
+/// as its reason; this is the same rule for the unframed display modes, where
+/// the reason is only that a value must not be able to drive the terminal.
+fn shown_safe(s: &str) -> String {
+    boxed_safe(s)
+}
+
 /// Control characters would shatter the boxed frame; show them escaped.
 fn boxed_safe(s: &str) -> String {
     if !s.chars().any(|c| c.is_control()) {
@@ -568,12 +614,31 @@ fn json_row(columns: &[String], values: &[Value]) -> String {
     s
 }
 
-fn csv_cell(s: &str) -> String {
+/// A CSV cell, quoted per RFC 4180.
+///
+/// `tty` is the escape gate described on `RenderOpts::tty`: a value carrying
+/// `ESC [ 31 m` is a colour instruction the moment it reaches a terminal, and
+/// `pilot db --mode csv` at a prompt is a terminal. Piped or redirected, the
+/// bytes go out exactly as the database holds them.
+fn csv_cell_for(s: &str, tty: bool) -> String {
+    let owned;
+    let s = match tty && s.chars().any(char::is_control) {
+        true => {
+            owned = boxed_safe(s);
+            owned.as_str()
+        }
+        false => s,
+    };
     if s.contains(',') || s.contains('"') || s.contains('\n') {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s.to_string()
     }
+}
+
+#[cfg(test)]
+fn csv_cell(s: &str) -> String {
+    csv_cell_for(s, false)
 }
 
 #[cfg(test)]
@@ -599,8 +664,30 @@ mod tests {
         assert_eq!(r.tail.back().unwrap()[0], "999"); // the true tail survived
     }
 
+    /// A value is shown, never executed: an escape sequence in the database
+    /// must not reach the terminal from a display mode. csv/json are
+    /// interchange and stay raw — escaping there would corrupt the data.
+    #[test]
+    fn display_modes_neutralize_control_characters() {
+        let esc = "\u{1b}[31mRED\u{1b}[0m";
+        assert!(!shown_safe(esc).contains('\u{1b}'), "escape survived: {:?}", shown_safe(esc));
+        assert!(!boxed_safe(esc).contains('\u{1b}'));
+        // Ordinary text is untouched, including multi-byte characters.
+        assert_eq!(shown_safe("plain あ"), "plain あ");
+        // The common whitespace escapes stay readable rather than becoming
+        // replacement characters.
+        assert_eq!(shown_safe("a\nb\tc"), "a\\nb\\tc");
+    }
+
     #[test]
     fn csv_quoting() {
+        // Piped (tty=false): bytes go out verbatim, because the consumer is a
+        // program and an escaped value would be a corrupted one.
+        assert_eq!(csv_cell_for("\u{1b}[31mred", false), "\u{1b}[31mred");
+        // At a terminal: the same bytes are instructions, so they are defused.
+        assert!(!csv_cell_for("\u{1b}[31mred", true).contains('\u{1b}'));
+        // Quoting is unaffected by either.
+        assert_eq!(csv_cell_for("a,b", true), "\"a,b\"");
         assert_eq!(csv_cell("plain"), "plain");
         assert_eq!(csv_cell("a,b"), "\"a,b\"");
         assert_eq!(csv_cell("say \"hi\""), "\"say \"\"hi\"\"\"");
