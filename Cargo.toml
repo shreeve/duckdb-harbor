@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/ducktable"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/shreeve/ducktable"
+
+[workspace.dependencies]
+gpui = "0.2.2"
+gpui-component = "0.5.1"
+anyhow = "1"
+
+[profile.dev]
+debug = "limited"
+
+[profile.release]
+lto = "thin"
+strip = true
