@@ -167,10 +167,16 @@ pub fn init(name: Option<&str>, appearance_pref: Option<&str>) {
 /// Best-effort terminal background detection: OSC 11 query, then `$COLORFGBG`,
 /// then dark. Only queries when both stdin and stdout are terminals.
 pub fn detect_appearance() -> Appearance {
-    if let Some(a) = colorfgbg_appearance() {
+    // OSC 11 first, which is what the documentation above and on the module
+    // has always said, and what the two sources deserve on the merits: OSC 11
+    // asks this terminal what its background is right now, while COLORFGBG is
+    // an environment variable a handful of terminals set and everything else
+    // inherits — through tmux, through ssh, through a theme change — so a
+    // stale value was outranking a live answer.
+    if let Some(a) = osc11_appearance() {
         return a;
     }
-    if let Some(a) = osc11_appearance() {
+    if let Some(a) = colorfgbg_appearance() {
         return a;
     }
     Appearance::Dark
