@@ -125,12 +125,15 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     let num = s.trim_end_matches(char::is_alphabetic);
     let unit = &s[num.len()..];
     let n: u64 = num.parse().map_err(|_| format!("bad duration {s:?}"))?;
+    // checked, because `n * 3600` wraps in release: `--idle-exit 9999999999999999h`
+    // parsed fine and then meant something arbitrary and small.
     let secs = match unit {
-        "" | "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
+        "" | "s" => Some(n),
+        "m" => n.checked_mul(60),
+        "h" => n.checked_mul(3600),
         _ => return Err(format!("bad duration unit in {s:?} (use s, m, h)")),
     };
+    let secs = secs.ok_or_else(|| format!("duration {s:?} is too large"))?;
     Ok(Duration::from_secs(secs))
 }
 
@@ -220,6 +223,11 @@ fn normalize(name: &str) -> Result<String, String> {
 
 /// The config root: $HARBOR_HOME, else ~/.config/harbor. Holds config.toml
 /// and the runtime/ dir; nothing else.
+///
+/// Guarded 0700 for the same reason runtime/ is, and it is not a lesser case:
+/// config.toml holds bearer tokens outright, and `token-cmd`, which pilot runs
+/// through `sh -c`. A world-writable config root is therefore not a leak but
+/// code execution as its owner, the next time anyone opens a berth.
 fn config_root() -> Result<PathBuf, String> {
     match std::env::var("HARBOR_HOME") {
         Ok(h) => Ok(PathBuf::from(h)),
@@ -237,12 +245,62 @@ fn config_root() -> Result<PathBuf, String> {
 /// sockets and tokens are the local access control and a dir made earlier by
 /// hand (or a sloppy umask) must not stay world-listable.
 fn harbor_home() -> Result<PathBuf, String> {
-    let run = config_root()?.join("runtime");
+    let root = config_root()?;
+    let run = root.join("runtime");
     if !run.exists() {
-        std::fs::create_dir_all(&run).map_err(|e| format!("cannot create {}: {e}", run.display()))?;
+        // Created 0700 rather than created-then-tightened. `create_dir_all`
+        // applies the umask, so the plain form makes the directory 0755 for
+        // the instant before the chmod below — and this is the directory that
+        // holds every token file, so a race in that window lets another local
+        // user plant a `<name>.token` this process would then adopt as its own
+        // credential. Being born with the right mode has no window at all.
+        create_dir_private(&run)
+            .map_err(|e| format!("cannot create {}: {e}", run.display()))?;
     }
+    // Both, unconditionally, every run: the root carries config.toml (tokens
+    // and token-cmd) and the runtime dir carries sockets and token files, so
+    // neither may be left readable — or writable — by anyone else, whatever
+    // umask or hand-made directory got there first.
+    let _ = chmod(&root, 0o700);
     let _ = chmod(&run, 0o700);
     Ok(run)
+}
+
+/// Create a file that is 0600 from its first byte, and write `contents` to it.
+///
+/// The point is the absence of a window: `fs::write` followed by `chmod` is
+/// correct at rest and wrong in between, and "in between" is where a secret
+/// leaks.
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
+/// Create a directory that is 0700 from the moment it exists. Same reasoning
+/// as `write_private`, for the directory the tokens live in.
+fn create_dir_private(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
 }
 
 fn chmod(path: &Path, mode: u32) -> std::io::Result<()> {
@@ -316,7 +374,12 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
             Ok(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
             _ => {
                 let t = harbor::random_token();
-                std::fs::write(&token_path, &t).map_err(|e| format!("token file: {e}"))?;
+                // 0600 at creation, not after: `fs::write` applies the umask,
+                // so the plain form publishes the bearer token at 0644 for the
+                // instant before the chmod. The chmod stays as well, because
+                // `mode()` only governs a file this call creates and an older
+                // token file may already be sitting there with looser bits.
+                write_private(&token_path, &t).map_err(|e| format!("token file: {e}"))?;
                 let _ = chmod(&token_path, 0o600);
                 Some(t)
             }
@@ -398,7 +461,6 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         "database": db_abs,
         "databases": databases,
         "pid": std::process::id(),
-        "grammar": false,
         // Pilot uses this to pulse comfortably inside the actual idle window.
         // null means this berth is permanent and needs no prompt heartbeat.
         "idleExitMs": o.idle_exit.map(|d| d.as_millis() as u64),
