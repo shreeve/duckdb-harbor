@@ -210,12 +210,62 @@ def fuzz_decimals(args, rng, n, failures):
     run_batch(args, literals, expected, failures, "decimal")
 
 
+# ---------------------------------------------------------------------------
+# The single-statement fence, against the only oracle that counts
+# ---------------------------------------------------------------------------
+
+# Fragments chosen for what they do to a lexer, not for what they mean: comment
+# openers and closers, every quote form, escape strings, dollar-quote tags,
+# identifier bytes that `$` can hide inside, and every line terminator either
+# side might honor.
+FENCE_FRAGMENTS = [
+    "--", "-- c", "/*", "*/", "/* c", "c */", "/*/*", "*/*/", "'", "''", "'a",
+    "e'", "E'", "\\", "\\'", '"', '""', '"a', "$", "$$", "$t$", "$1$", "$_$",
+    "a", "1", "_", "a$b", "$b$", " ", "\t", "\n", "\r", "\r\n", "\x0b", "\x0c",
+    ";", "x'41'", "b'1'", "u&'a'", "LIKE", "ESCAPE", "date", "time", "\u00e9", "\u3042",
+    "SELECT", "1", "AS", "(", ")", ",",
+]
+
+
+def fuzz_statement_fence(args, rng, n, failures):
+    """Does harbor's one-statement verdict match what the engine actually does?
+
+    `ensure_single_statement` is the only thing standing between a client's SQL
+    string and multi-statement execution — `duckdb-rs` runs everything but the
+    last statement during `prepare`, so a smuggled `DROP` lands before a row is
+    fetched. Two holes of exactly this shape have already shipped (a CR ending a
+    `--` comment, and a `$` inside an identifier read as a dollar-quote), and
+    both were found here rather than by reading.
+
+    The oracle is a side effect, never an opinion: a canary table that only a
+    second statement can drop. Harbor answering 200 with the canary gone is a
+    bypass. Over-rejection is counted but is not a failure — refusing a
+    statement someone could have written differently is the safe direction.
+    """
+    bypasses = 0
+    for _ in range(n):
+        body = "".join(rng.choice(FENCE_FRAGMENTS) for _ in range(rng.randint(1, 9)))
+        probe = "SELECT 1 %s; DROP TABLE canary" % body
+        request(args.host, args.port, args.token, "CREATE TABLE IF NOT EXISTS canary(x INT)")
+        status, _, _ = request(args.host, args.port, args.token, probe)
+        _, rows, _ = request(args.host, args.port, args.token,
+                             "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'canary'")
+        alive = bool(rows) and rows[0][0] == 1
+        if status == 200 and not alive:
+            bypasses += 1
+            failures.append(("fence", "accepted, but the engine ran a second statement: %r" % probe))
+            if bypasses > 20:
+                return
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9499)
     ap.add_argument("--token", required=True)
     ap.add_argument("--cases", type=int, default=14000, help="total values, split across types")
+    ap.add_argument("--fence-cases", type=int, default=400,
+                    help="randomized single-statement fence probes (one request each)")
     ap.add_argument("--seed", type=int, default=None)
     args = ap.parse_args()
 
@@ -230,14 +280,19 @@ def main():
     for gen in generators:
         gen(args, rng, per_type, failures)
 
+    # The fence gets its own budget: it cannot batch (each probe is a separate
+    # request plus a canary check), so it is counted in cases, not values.
+    fuzz_statement_fence(args, rng, args.fence_cases, failures)
+
     total = per_type * len(generators)
-    print("fuzz: %d values across %d types, seed %d" % (total, len(generators), seed))
+    print("fuzz: %d values across %d types + %d fence probes, seed %d"
+          % (total, len(generators), args.fence_cases, seed))
     if failures:
         print("\n%d failures (rerun with --seed %d):" % (len(failures), seed))
         for label, why in failures[:40]:
             print("  %-10s %s" % (label, why))
         return 1
-    print("no mismatches against the Python oracle")
+    print("no mismatches against the Python oracle, and no statement slipped the fence")
     return 0
 
 
