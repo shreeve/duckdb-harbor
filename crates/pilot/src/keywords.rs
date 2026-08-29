@@ -1,7 +1,6 @@
 //! DuckDB keywords, vendored from the PEG grammar keyword lists
 //! (src/parser/peg/grammar/keywords/*.list) at duckdb f8e1c96a53.
-//! Regenerate with scripts/sync-keywords; a future GET /grammar could
-//! replace this static list. Sorted for binary search.
+//! Regenerate with scripts/sync-keywords. Sorted for binary search.
 
 pub const KEYWORDS: &[&str] = &[
     "ABORT",

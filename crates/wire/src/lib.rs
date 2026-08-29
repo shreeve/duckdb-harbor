@@ -113,7 +113,6 @@ pub mod code {
     pub const UNAVAILABLE: &str = "unavailable";
     pub const UNREADY: &str = "unready";
     pub const INTERNAL: &str = "internal";
-    pub const NO_GRAMMAR: &str = "no_grammar";
 }
 
 /// POST /sql request body. `sql` must hold exactly one statement.
@@ -265,7 +264,6 @@ pub struct InfoResponse {
     pub databases: Vec<String>,
     pub pid: u32,
     pub uptime_ms: u64,
-    pub grammar: bool,
 }
 
 #[cfg(test)]

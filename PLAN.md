@@ -112,8 +112,7 @@ host; browser and application clients may use HTTPS through Caddy.
 
 ### D7. Protocol changes are additive only
 The Rip harborAdapter must run unmodified. Fleet additions are `/info`,
-`/keepalive`, and `/shutdown` (shipped), plus `/grammar` (reserved in the wire contract but not
-yet served — berths advertise `grammar: false` until it is), with zero changes
+`/keepalive`, and `/shutdown` (shipped), with zero changes
 to existing routes, events, fields, or error codes.
 No `database` field on `/sql`: a berth holds one database (D2); per-session
 work is `USE`/ATTACH as plain SQL on a lease (a lease is a pinned connection —
