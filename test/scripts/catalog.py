@@ -133,6 +133,16 @@ CREATE TABLE posts (
   title VARCHAR
 );
 CREATE INDEX idx_posts_title ON posts(title);
+CREATE TABLE awkward (
+  "a b" INTEGER,
+  "c'd" INTEGER,
+  "é" INTEGER,
+  plain INTEGER
+);
+CREATE INDEX idx_awk_space ON awkward("a b");
+CREATE INDEX idx_awk_quote ON awkward("c'd");
+CREATE INDEX idx_awk_unicode ON awkward("é");
+CREATE INDEX idx_awk_expr ON awkward(lower(CAST(plain AS VARCHAR)));
 CREATE TABLE memberships (
   org_id INTEGER,
   user_id INTEGER,
@@ -265,7 +275,7 @@ def run_fixture(base):
          "primaryKey": ["id"],
          "uniqueConstraints": [],
          "indexes": [
-             {"name": "idx_posts_title", "columns": ["title"], "unique": False},
+             {"name": "idx_posts_title", "columns": ["title"], "expressions": [], "unique": False},
          ],
          "foreignKeys": [
              {"columns": ["user_id"], "refTable": "users", "refSchema": "main", "refColumns": ["id"]},
@@ -279,7 +289,7 @@ def run_fixture(base):
          "primaryKey": ["id"],
          "uniqueConstraints": [],
          "indexes": [
-             {"name": "idx_users_email", "columns": ["email"], "unique": True},
+             {"name": "idx_users_email", "columns": ["email"], "expressions": [], "unique": True},
          ],
          "foreignKeys": []},
     ]
@@ -287,7 +297,8 @@ def run_fixture(base):
         got = next((t for t in doc["tables"] if (t["schema"], t["name"]) == (want["schema"], want["name"])), None)
         eq(f"{want['schema']}.{want['name']} answers its whole shape", want, got)
     eq("tables are ordered by (schema, name)",
-       [("app", "post_tags"), ("app", "tags"), ("main", "memberships"), ("main", "posts"), ("main", "users")],
+       [("app", "post_tags"), ("app", "tags"), ("main", "awkward"), ("main", "memberships"),
+        ("main", "posts"), ("main", "users")],
        [(t["schema"], t["name"]) for t in doc["tables"]])
     eq("the sequence is there, with its start", [{"name": "users_seq", "start": 1}], doc["sequences"])
 
@@ -319,6 +330,27 @@ def run_fixture(base):
     eq("primary keys never masquerade as unique constraints", [],
        [u for t in doc["tables"] for u in t["uniqueConstraints"]
         if set(u["columns"]) & set(t["primaryKey"])])
+
+    # -----------------------------------------------------------------------
+    section("Index columns are column names, and expressions are not columns")
+    # -----------------------------------------------------------------------
+    # The point of this field is to be joined against columns[].name. DuckDB
+    # renders anything beyond a plain identifier single-quoted and keeps the
+    # double quotes, so `"a b"` used to arrive quoted and matched nothing —
+    # three of four names on this table. Every entry now joins, and a computed
+    # index is reported separately instead of posing as a column with an
+    # extraordinary name.
+    awk = tables["awkward"]
+    names = {c["name"] for c in awk["columns"]}
+    by_name = {i["name"]: i for i in awk["indexes"]}
+    eq("a quoted identifier joins to its column", ["a b"], by_name["idx_awk_space"]["columns"])
+    eq("an embedded quote survives the round trip", ["c'd"], by_name["idx_awk_quote"]["columns"])
+    eq("a non-ASCII identifier joins too", ["é"], by_name["idx_awk_unicode"]["columns"])
+    eq("every index column is a real column", [],
+       [c for i in awk["indexes"] for c in i["columns"] if c not in names])
+    eq("a computed index claims no columns", [], by_name["idx_awk_expr"]["columns"])
+    eq("and reports its expression instead", 1, len(by_name["idx_awk_expr"]["expressions"]))
+    eq("a plain index has no expressions", [], by_name["idx_awk_space"]["expressions"])
 
     # -----------------------------------------------------------------------
     section("Two calls, one answer")

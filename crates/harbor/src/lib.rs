@@ -2554,6 +2554,14 @@ fn cell_list(row: &[serde_json::Value], i: usize) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// One entry of an index's column list: a plain column, or a computed
+/// expression. They arrive rendered the same way and mean different things,
+/// so the contract keeps them apart rather than making every client guess.
+enum IndexPart {
+    Column(String),
+    Expression(String),
+}
+
 /// The column list of an index, recovered from duckdb_indexes()'
 /// `expressions` field.
 ///
@@ -2564,6 +2572,60 @@ fn cell_list(row: &[serde_json::Value], i: usize) -> Vec<String> {
 /// single-quoted with `\'` and `\\` escapes. This is DuckDB's own
 /// machine-generated list syntax with fixed quoting rules, not prose, so
 /// undoing it is exact.
+fn index_parts(expressions: &str) -> Vec<IndexPart> {
+    index_columns(expressions)
+        .into_iter()
+        .map(|item| -> IndexPart {
+            // DuckDB single-quotes any item that is not a bare identifier,
+            // which covers two different things: an identifier that needed
+            // double-quoting (`"a b"`, `"é"`) and a real expression
+            // (`(lower("name"))`). Only the first is a column name, and
+            // leaving its quotes on is what made `indexes[].columns` fail to
+            // join against `columns[].name` — three of five names on an
+            // ordinary table. Undo the quoting here, once, instead of asking
+            // every client to reimplement it; anything that is not a
+            // well-formed quoted identifier is an expression and is labelled
+            // as one.
+            if let Some(name) = unquote_identifier(&item) {
+                return IndexPart::Column(name);
+            }
+            // Rendered bare, which DuckDB only does for a name that needs no
+            // quoting at all — so a run of identifier characters is a column,
+            // and anything carrying a paren, an operator, a space or a quote
+            // is an expression.
+            let bare = !item.is_empty()
+                && !item.starts_with(|c: char| c.is_ascii_digit())
+                && item.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+            match bare {
+                true => IndexPart::Column(item),
+                false => IndexPart::Expression(item),
+            }
+        })
+        .collect()
+}
+
+/// `"a b"` -> `a b`, undoubling `""`. None when the text is not exactly one
+/// double-quoted identifier — an expression, or a bare word that needs no
+/// undoing (the caller keeps those as-is via `Column` below).
+fn unquote_identifier(item: &str) -> Option<String> {
+    let inner = item.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '"' {
+            out.push(c);
+            continue;
+        }
+        // A lone `"` inside would have closed the identifier, so the only
+        // legal appearance is a doubled pair.
+        match chars.next() {
+            Some('"') => out.push('"'),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 fn index_columns(expressions: &str) -> Vec<String> {
     let trimmed = expressions.trim();
     let inner = trimmed
@@ -2619,6 +2681,7 @@ struct CatalogColumn {
 struct CatalogIndex {
     name: String,
     columns: Vec<String>,
+    expressions: Vec<String>,
     unique: bool,
 }
 
@@ -2792,9 +2855,17 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
     }
     for row in &index_rows {
         let Some(&t) = index_of.get(&(cell_str(row, 0), cell_str(row, 1))) else { continue };
+        let (mut columns, mut expressions) = (Vec::new(), Vec::new());
+        for part in index_parts(&cell_str(row, 4)) {
+            match part {
+                IndexPart::Column(name) => columns.push(name),
+                IndexPart::Expression(text) => expressions.push(text),
+            }
+        }
         tables[t].indexes.push(CatalogIndex {
             name: cell_str(row, 2),
-            columns: index_columns(&cell_str(row, 4)),
+            columns,
+            expressions,
             unique: cell_bool(row, 3),
         });
     }
@@ -2876,6 +2947,16 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
                     out.push(',');
                 }
                 push_json_string(&mut out, column);
+            }
+            // Kept apart from `columns` on purpose: an entry here is
+            // computed, not a column, and a differ that joined it against
+            // `columns[].name` would be matching on a rendering.
+            out.push_str("],\"expressions\":[");
+            for (k, expression) in index.expressions.iter().enumerate() {
+                if k > 0 {
+                    out.push(',');
+                }
+                push_json_string(&mut out, expression);
             }
             out.push_str("],\"unique\":");
             out.push_str(if index.unique { "true" } else { "false" });
@@ -3895,6 +3976,7 @@ mod tests {
     use super::fenced_setting;
     use super::route_exists;
     use super::index_columns;
+    use super::{IndexPart, index_parts};
     use crate::encode::varint_to_decimal;
     use super::{Cancel, SlotRun};
     use std::time::{Duration, Instant};
@@ -4110,6 +4192,7 @@ mod tests {
         // ...and an unrelated key behind the same comment still passes.
         assert_eq!(fenced_setting("SET --\r timezone='UTC'"), None);
     }
+
     /// Every case here was accepted by the scanner before the `e` in `E'...'`
     /// was required to be a token of its own, and each one reached DuckDB as
     /// more than one statement. `duckdb-rs` executes all but the last during
@@ -4196,6 +4279,44 @@ mod tests {
             vec![r#""a, b""#, r#""c'd""#, "plain"]
         );
         assert_eq!(index_columns("[]"), Vec::<String>::new());
+    }
+
+    /// `indexes[].columns` exists to be joined against `columns[].name`, so
+    /// an identifier that needed quoting has to arrive unquoted — three of
+    /// five names on an ordinary table failed to match before this. Anything
+    /// that is not exactly one double-quoted identifier is an expression and
+    /// is reported as one, so a computed index is never mistaken for a column
+    /// with a peculiar name.
+    #[test]
+    fn index_parts_separate_columns_from_expressions() {
+        let split = |rendering: &str| {
+            let (mut cols, mut exprs) = (Vec::new(), Vec::new());
+            for part in index_parts(rendering) {
+                match part {
+                    IndexPart::Column(c) => cols.push(c),
+                    IndexPart::Expression(e) => exprs.push(e),
+                }
+            }
+            (cols, exprs)
+        };
+        assert_eq!(split("[email]"), (vec!["email".to_string()], vec![]));
+        assert_eq!(split("[title, user_id]"), (vec!["title".to_string(), "user_id".to_string()], vec![]));
+        // quoted identifiers come back bare, so they join
+        assert_eq!(split(r#"['"a b"']"#), (vec!["a b".to_string()], vec![]));
+        assert_eq!(split(r#"['"c\'d"']"#), (vec!["c'd".to_string()], vec![]));
+        assert_eq!(split(r#"['"é"']"#), (vec!["é".to_string()], vec![]));
+        // a doubled quote inside an identifier survives as one quote
+        assert_eq!(split(r#"['"a""b"']"#), (vec![r#"a"b"#.to_string()], vec![]));
+        // an expression is never a column
+        assert_eq!(
+            split(r#"['(lower("name"))']"#),
+            (vec![], vec![r#"(lower("name"))"#.to_string()])
+        );
+        // mixed, in order
+        assert_eq!(
+            split(r#"[plain, '"a b"', '(lower("n"))']"#),
+            (vec!["plain".to_string(), "a b".to_string()], vec![r#"(lower("n"))"#.to_string()])
+        );
     }
 
     /// Malformed input must return None so the caller can fall back, rather
