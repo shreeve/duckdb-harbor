@@ -4001,20 +4001,21 @@ mod tests {
         // with the wrong method, and any unknown path, is not — so adding a
         // route to `handle` without updating `route_exists` (which would
         // 404 a real endpoint's unauthenticated caller) fails here.
-        let routes = [
-            (Method::Get, "/ready"),
-            (Method::Get, "/sessions"),
-            (Method::Get, "/info"),
-            (Method::Get, "/catalog"),
-            (Method::Get, "/keepalive"),
-            (Method::Delete, "/shutdown"),
-            (Method::Post, "/sql"),
-            (Method::Post, "/sql/sessions/new"),
-            (Method::Delete, "/sql/sessions/abc"),
-            (Method::Delete, "/sql/queries/xyz"),
-        ];
-        for (m, p) in &routes {
-            assert!(route_exists(m, p), "should be a route: {m:?} {p}");
+        //
+        // The route list is not transcribed: it comes from the wire crate,
+        // which is what clients read. A verb published there that harbor does
+        // not serve is a 404 in the field and a failure here.
+        fn method(m: &str) -> Method {
+            match m {
+                "GET" => Method::Get,
+                "POST" => Method::Post,
+                "DELETE" => Method::Delete,
+                other => panic!("wire publishes an unmapped method: {other}"),
+            }
+        }
+        let ids = [wire::endpoint::session("abc"), wire::endpoint::query("xyz")];
+        for r in wire::endpoint::FIXED.iter().chain(ids.iter()) {
+            assert!(route_exists(&method(r.method), &r.path), "wire publishes {r}, harbor does not serve it");
         }
         let non_routes = [
             (Method::Get, "/sql"),      // method matters

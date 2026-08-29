@@ -18,31 +18,80 @@ pub const CONTENT_NDJSON: &str = "application/x-ndjson";
 pub const CONTENT_JSON: &str = "application/json";
 
 pub mod endpoint {
-    pub const SQL: &str = "/sql";
-    pub const SESSIONS_NEW: &str = "/sql/sessions/new";
-    /// DELETE `/sql/sessions/<id>` releases a lease; DELETE `/sql/queries/<id>`
-    /// cancels a statement. Builders, since the id is embedded in the path.
-    pub fn session(id: &str) -> String {
-        format!("/sql/sessions/{id}")
+    use std::borrow::Cow;
+
+    /// A route is a method *and* a path. Harbor dispatches on the pair, so a
+    /// path published without its verb is only half the contract — and the
+    /// half that is missing fails quietly: `GET /sql` and `POST /ready` are
+    /// 404s, not 405s, so a client that guesses wrong cannot tell a mistaken
+    /// verb from an endpoint that never existed.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Route {
+        pub method: &'static str,
+        /// Borrowed for the fixed routes; owned by the two builders, whose
+        /// paths carry an id.
+        pub path: Cow<'static, str>,
     }
-    pub fn query(id: &str) -> String {
-        format!("/sql/queries/{id}")
+
+    impl Route {
+        const fn fixed(method: &'static str, path: &'static str) -> Self {
+            Self { method, path: Cow::Borrowed(path) }
+        }
+
+        fn built(method: &'static str, path: String) -> Self {
+            Self { method, path: Cow::Owned(path) }
+        }
     }
-    pub const SESSIONS: &str = "/sessions";
-    pub const CATALOG: &str = "/catalog";
-    /// A cheap authenticated activity pulse. Interactive clients send this
-    /// while waiting at a prompt so an idle-exit berth stays moored without
-    /// consuming a transaction lease or a DuckDB connection.
-    pub const KEEPALIVE: &str = "/keepalive";
-    /// Authenticated graceful server shutdown. Fleet managers use this on
-    /// platforms without Unix signals; the response is sent before draining.
-    pub const SHUTDOWN: &str = "/shutdown";
-    /// The only unauthenticated route, by design.
-    pub const READY: &str = "/ready";
-    /// Fleet-era: berth identity (auth required — it names paths and pids).
-    pub const INFO: &str = "/info";
-    /// Fleet-era: the PEG grammar of the linked DuckDB (2.0+ builds).
-    pub const GRAMMAR: &str = "/grammar";
+
+    impl std::fmt::Display for Route {
+        /// `POST /sql` — the spelling harbor's logs and this crate's docs use.
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{} {}", self.method, self.path)
+        }
+    }
+
+    /// POST — run exactly one statement. NDJSON unless the caller asks for
+    /// `application/json`.
+    pub const SQL: Route = Route::fixed("POST", "/sql");
+    /// POST — open a session: a pinned connection that holds a transaction
+    /// across requests. Release it with [`session`].
+    pub const SESSIONS_NEW: Route = Route::fixed("POST", "/sql/sessions/new");
+    /// GET — the open sessions.
+    pub const SESSIONS: Route = Route::fixed("GET", "/sessions");
+    /// GET — the whole schema as one document, cheaper and more complete than
+    /// walking `duckdb_*()` a table at a time.
+    pub const CATALOG: Route = Route::fixed("GET", "/catalog");
+    /// GET, but not idempotent: it resets the berth's idle clock, which is the
+    /// entire point. Interactive clients pulse this while sitting at a prompt
+    /// so an idle-exit berth stays moored without holding a session or a
+    /// DuckDB connection.
+    pub const KEEPALIVE: Route = Route::fixed("GET", "/keepalive");
+    /// DELETE, not POST — graceful shutdown reads as removing the berth, and
+    /// harbor's dispatch table agrees. Fleet managers use this on platforms
+    /// without Unix signals; the response is sent before draining.
+    pub const SHUTDOWN: Route = Route::fixed("DELETE", "/shutdown");
+    /// GET — the only unauthenticated route, by design.
+    pub const READY: Route = Route::fixed("GET", "/ready");
+    /// GET — berth identity (auth required: it names paths and pids).
+    pub const INFO: Route = Route::fixed("GET", "/info");
+
+    /// Every fixed route, so a client (or a test on harbor's side) can walk
+    /// the contract instead of transcribing it. The two builders below are
+    /// not here: their paths carry an id, so there is nothing to enumerate.
+    pub const FIXED: &[Route] =
+        &[SQL, SESSIONS_NEW, SESSIONS, CATALOG, KEEPALIVE, SHUTDOWN, READY, INFO];
+
+    /// DELETE — release the session `id` holds, rolling back any open
+    /// transaction. A builder, since the id rides in the path.
+    pub fn session(id: &str) -> Route {
+        Route::built("DELETE", format!("/sql/sessions/{id}"))
+    }
+
+    /// DELETE — cancel the in-flight statement the caller tagged `id`. Racing
+    /// a query that already finished is a no-op, not an error.
+    pub fn query(id: &str) -> Route {
+        Route::built("DELETE", format!("/sql/queries/{id}"))
+    }
 }
 
 /// Error codes in the wild. An open set — clients must pass unknown codes

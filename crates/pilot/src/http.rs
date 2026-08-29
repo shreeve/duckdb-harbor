@@ -12,6 +12,7 @@ use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::time::Duration;
+use wire::endpoint::Route;
 
 #[derive(Clone)]
 pub enum Transport {
@@ -36,15 +37,16 @@ impl Response {
 trait Stream: Read + Write {}
 impl<T: Read + Write> Stream for T {}
 
+/// The route carries its own verb, so a caller cannot pair `GET` with a path
+/// harbor only answers to `POST` — the mistake that reads as a 404.
 pub fn request(
     transport: &Transport,
-    method: &str,
-    path: &str,
+    route: &Route,
     token: Option<&str>,
     body: Option<&str>,
     timeout: Option<Duration>,
 ) -> io::Result<Response> {
-    request_inner(transport, method, path, token, body, timeout, None)
+    request_inner(transport, route, token, body, timeout, None)
 }
 
 /// Like `request`, but built for long-running /sql streams: the socket gets a
@@ -52,19 +54,17 @@ pub fn request(
 /// Ctrl-C), while status and header reads here retry through those ticks.
 pub fn request_streaming(
     transport: &Transport,
-    method: &str,
-    path: &str,
+    route: &Route,
     token: Option<&str>,
     body: Option<&str>,
     on_tick: &dyn Fn(),
 ) -> io::Result<Response> {
-    request_inner(transport, method, path, token, body, Some(Duration::from_millis(250)), Some(on_tick))
+    request_inner(transport, route, token, body, Some(Duration::from_millis(250)), Some(on_tick))
 }
 
 fn request_inner(
     transport: &Transport,
-    method: &str,
-    path: &str,
+    route: &Route,
     token: Option<&str>,
     body: Option<&str>,
     timeout: Option<Duration>,
@@ -85,7 +85,7 @@ fn request_inner(
     };
     let mut stream = stream;
 
-    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
+    let mut req = format!("{route} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
     req.push_str("Accept: application/x-ndjson\r\n");
     if let Some(t) = token {
         req.push_str(&format!("Authorization: Bearer {t}\r\n"));

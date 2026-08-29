@@ -13,6 +13,11 @@ serde_json = "1"
 rand = "0.8"
 libc = "0.2"
 
+# Test-only: the route table below is harbor's half of the wire contract, so
+# the tests check it against the crate that publishes it.
+[dev-dependencies]
+wire = { path = "../wire" }
+
 [target.'cfg(unix)'.dependencies]
 signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
 

@@ -66,8 +66,7 @@ impl Inner {
         let body = serde_json::to_string(&req).ok()?;
         let resp = http::request(
             &self.conn.transport,
-            "POST",
-            endpoint::SQL,
+            &endpoint::SQL,
             self.conn.token.as_deref(),
             Some(&body),
             Some(Duration::from_millis(150)),
@@ -171,8 +170,7 @@ impl Completer for SqlCompleter {
 fn fetch_catalog_names(conn: &Conn) -> Option<Vec<String>> {
     let resp = http::request(
         &conn.transport,
-        "GET",
-        endpoint::CATALOG,
+        &endpoint::CATALOG,
         conn.token.as_deref(),
         None,
         Some(Duration::from_secs(2)),
@@ -211,8 +209,7 @@ fn quiet_sql(conn: &Conn, sql: &str) -> Option<()> {
     let body = serde_json::to_string(&SqlRequest { sql: sql.into(), ..Default::default() }).ok()?;
     let resp = http::request(
         &conn.transport,
-        "POST",
-        endpoint::SQL,
+        &endpoint::SQL,
         conn.token.as_deref(),
         Some(&body),
         Some(Duration::from_secs(5)),

@@ -63,8 +63,7 @@ impl Drop for ReplKeepalive {
 fn pulse(conn: &Conn) {
     if let Ok(resp) = crate::http::request(
         &conn.transport,
-        "GET",
-        wire::endpoint::KEEPALIVE,
+        &wire::endpoint::KEEPALIVE,
         conn.token.as_deref(),
         None,
         Some(Duration::from_secs(2)),
@@ -82,8 +81,7 @@ fn pulse(conn: &Conn) {
 fn keepalive_period(conn: &Conn) -> Option<Duration> {
     let resp = match crate::http::request(
         &conn.transport,
-        "GET",
-        wire::endpoint::INFO,
+        &wire::endpoint::INFO,
         conn.token.as_deref(),
         None,
         Some(Duration::from_secs(2)),

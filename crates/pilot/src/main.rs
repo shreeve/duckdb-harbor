@@ -430,8 +430,7 @@ fn list_fleet() -> ExitCode {
     for (name, transport) in berths {
         let state = match http::request(
             &transport,
-            "GET",
-            endpoint::READY,
+            &endpoint::READY,
             None,
             None,
             Some(Duration::from_secs(2)),
@@ -488,7 +487,6 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
                     eprintln!("Interrupted — cancelling…");
                     let _ = http::request(
                         &conn.transport,
-                        "DELETE",
                         &endpoint::query(&qid),
                         conn.token.as_deref(),
                         None,
@@ -501,7 +499,7 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
             }
         }
     };
-    let resp = match http::request_streaming(&conn.transport, "POST", endpoint::SQL, conn.token.as_deref(), Some(&body), &on_tick) {
+    let resp = match http::request_streaming(&conn.transport, &endpoint::SQL, conn.token.as_deref(), Some(&body), &on_tick) {
         Ok(r) => r,
         Err(e) => return err(&format!("cannot reach harbor: {e}")),
     };
