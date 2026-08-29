@@ -145,6 +145,25 @@ except Exception as e:
 # scalar <sql> — the first value of the first row, as text
 scalar() { post "$1" | nd 'rows[0][0] if rows else "NO-ROWS"'; }
 
+# status(), but a 503 is retried rather than recorded.
+#
+# A 503 here is harbor's bounded-queue backpressure working: every worker is
+# mid-statement, so the berth tells the client to come back instead of queueing
+# it invisibly. Whether that happens is a fact about the machine — on a starved
+# shared runner it happens at 16 clients — so a lane that counts 503s as
+# failures is measuring the hardware. The claim worth asserting is that
+# concurrent writes on separate connections all land, which is what retrying
+# preserves. Any other status is returned unchanged and still fails below.
+persist() {
+  local code
+  for _ in $(seq 1 20); do
+    code=$(status "$1" "${2-}")
+    [[ "$code" == "503" ]] || break
+    sleep 0.25
+  done
+  echo "$code"
+}
+
 # oracle <sql> — the same query answered by the DuckDB CLI, out of band.
 # -csv quotes any field containing a comma, so undo that: the value harbor
 # returns is the bare string, not its CSV rendering.
@@ -668,12 +687,12 @@ rm -f "$work"/w.* "$work"/r.*
 pids=""
 for i in $(seq 1 8); do
   ( for j in $(seq 1 10); do
-      status 'INSERT INTO hammer VALUES (?, ?)' "[$j, \"w$i\"]" >> "$work/w.$i"
+      persist 'INSERT INTO hammer VALUES (?, ?)' "[$j, \"w$i\"]" >> "$work/w.$i"
     done ) &
   pids="$pids $!"
 done
 for i in $(seq 1 4); do
-  ( for _ in $(seq 1 10); do status 'SELECT count(*) FROM hammer' >> "$work/r.$i"; done ) &
+  ( for _ in $(seq 1 10); do persist 'SELECT count(*) FROM hammer' >> "$work/r.$i"; done ) &
   pids="$pids $!"
 done
 for p in $pids; do wait "$p"; done
