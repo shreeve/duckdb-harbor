@@ -423,15 +423,28 @@ pub(crate) fn emit_value(out: &mut String, v: &Value, ty: Option<&LogicalTypeHan
             // A SQL MAP has no JSON counterpart: its keys need not be
             // strings. Pairs keep it lossless; the schema line says so with
             // "encoding":"pairs".
+            //
+            // The key and value types travel with the pair, exactly as LIST
+            // passes child(0) and STRUCT passes child(i). They used to be
+            // dropped, and the values that need a type to be written correctly
+            // were then written wrongly *while the schema line above described
+            // them accurately*: a BIT went out as base64 of DuckDB's private
+            // storage ("Bf0=" for "101"), a BIGNUM likewise, and a TIMESTAMPTZ
+            // lost its Z and read as a naive local time — all of them still
+            // labelled "lossless":true.
+            let (key_ty, value_ty) = match ty {
+                Some(t) => (Some(t.child(0)), Some(t.child(1))),
+                None => (None, None),
+            };
             out.push('[');
             for (i, (k, val)) in entries.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
                 }
                 out.push('[');
-                emit_value(out, k, None);
+                emit_value(out, k, key_ty.as_ref());
                 out.push(',');
-                emit_value(out, val, None);
+                emit_value(out, val, value_ty.as_ref());
                 out.push(']');
             }
             out.push(']');
