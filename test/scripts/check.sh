@@ -44,7 +44,7 @@ token=${TOKEN:-check-$$}
 # port this runner has already given to the shared server — the run dies at
 # startup with "address already in use" and it looks like a harbor bug.
 unset PORT
-suites=${SUITES:-unit types asserts spec fuzz deployment stress catalog sessions cancel}
+suites=${SUITES:-unit types asserts spec fuzz hostile deployment stress catalog sessions cancel}
 
 bold=$(tput bold 2>/dev/null || true); red=$(tput setaf 1 2>/dev/null || true)
 green=$(tput setaf 2 2>/dev/null || true); dim=$(tput dim 2>/dev/null || true)
@@ -162,6 +162,11 @@ run stress "$here/test/scripts/stress.py" --port "$port" --token "$token" \
 # second schema, a sequence-backed pk, an empty database — are not in the
 # shared fixture, and proving byte-stable output wants a database nothing
 # else is writing to.
+# hostile.py runs its own server, and has to: every case is designed to hurt
+# it — wedging every worker, flooding the head, stranding connections — which
+# the shared berth could not survive or report cleanly after.
+run hostile "$here/test/scripts/hostile.py"
+
 run catalog "$here/test/scripts/catalog.py"
 
 # sessions.py runs its own server: it needs a pool size the shared one does not
