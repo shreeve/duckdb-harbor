@@ -67,7 +67,20 @@ pub(crate) fn quote_identifier(name: &str) -> String {
 // Schema emission
 // ---------------------------------------------------------------------------
 
+/// Emit one column's schema. `nested` marks a type that sits inside a
+/// container (a list element, a struct field, a map key or value, a union
+/// member) rather than being a column of the result itself. It changes one
+/// verdict — see the `Union` arm — and nothing else.
 pub(crate) fn emit_column_schema(out: &mut String, name: Option<&str>, ty: &LogicalTypeHandle) {
+    emit_schema(out, name, ty, false)
+}
+
+/// A container's element schema: same shape, but flagged as nested.
+fn emit_child_schema(out: &mut String, name: Option<&str>, ty: &LogicalTypeHandle) {
+    emit_schema(out, name, ty, true)
+}
+
+fn emit_schema(out: &mut String, name: Option<&str>, ty: &LogicalTypeHandle, nested: bool) {
     out.push('{');
     if let Some(n) = name.filter(|n| !n.is_empty()) {
         out.push_str(r#""name":"#);
@@ -88,13 +101,13 @@ pub(crate) fn emit_column_schema(out: &mut String, name: Option<&str>, ty: &Logi
         }
         LogicalTypeId::List => {
             out.push_str(r#","lossless":true,"child":"#);
-            emit_column_schema(out, None, &ty.child(0));
+            emit_child_schema(out, None, &ty.child(0));
         }
         LogicalTypeId::Array => {
             out.push_str(r#","lossless":true,"arrayLength":"#);
             out.push_str(&array_size(ty).to_string());
             out.push_str(r#","child":"#);
-            emit_column_schema(out, None, &ty.child(0));
+            emit_child_schema(out, None, &ty.child(0));
         }
         LogicalTypeId::Struct => {
             out.push_str(r#","lossless":true,"fields":["#);
@@ -102,7 +115,7 @@ pub(crate) fn emit_column_schema(out: &mut String, name: Option<&str>, ty: &Logi
                 if i > 0 {
                     out.push(',');
                 }
-                emit_column_schema(out, Some(&ty.child_name(i)), &ty.child(i));
+                emit_child_schema(out, Some(&ty.child_name(i)), &ty.child(i));
             }
             out.push(']');
         }
@@ -110,18 +123,38 @@ pub(crate) fn emit_column_schema(out: &mut String, name: Option<&str>, ty: &Logi
             // A SQL MAP has no JSON counterpart — its keys need not be strings
             // — so values go out as pairs and the encoding says so.
             out.push_str(r#","lossless":true,"keyType":"#);
-            emit_column_schema(out, None, &ty.child(0));
+            emit_child_schema(out, None, &ty.child(0));
             out.push_str(r#","valueType":"#);
-            emit_column_schema(out, None, &ty.child(1));
+            emit_child_schema(out, None, &ty.child(1));
             out.push_str(r#","encoding":"pairs""#);
         }
         LogicalTypeId::Union => {
-            out.push_str(r#","lossless":true,"members":["#);
+            // A UNION's value is only meaningful with its tag: `union_value(a
+            // := 2)` and `union_value(b := 2)` are different values with the
+            // same payload. At the top of a column the tag is recoverable —
+            // `union_tag` reads it off the arrow array through the row's
+            // ValueRef — and the value goes out as {"tag":…,"value":…}.
+            //
+            // Nested, it is not. Inside a container harbor holds a decoded
+            // `Value::Union(Box<Value>)`, which carries the payload and
+            // nothing else, so the tag is already gone by the time this
+            // encoder sees it and the member type cannot be chosen either.
+            // Both `[union_value(a := 2)]` and `[union_value(b := 2)]`
+            // therefore emit `[2]`.
+            //
+            // Saying so is the point. This used to claim lossless:true beside
+            // a members list, which told a client the payload carried
+            // something it does not. Same contract as TimeTZ below: name the
+            // loss rather than let a client discover it.
+            match nested {
+                true => out.push_str(r#","lossless":false,"encoding":"union-tag-dropped","members":["#),
+                false => out.push_str(r#","lossless":true,"members":["#),
+            }
             for i in 0..ty.num_children() {
                 if i > 0 {
                     out.push(',');
                 }
-                emit_column_schema(out, Some(&ty.child_name(i)), &ty.child(i));
+                emit_child_schema(out, Some(&ty.child_name(i)), &ty.child(i));
             }
             out.push(']');
         }
