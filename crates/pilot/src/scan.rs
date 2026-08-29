@@ -105,7 +105,12 @@ pub fn scan(src: &str) -> Vec<Span> {
             b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
                 flush(&mut spans, code_start, i);
                 let start = i;
-                while i < b.len() && b[i] != b'\n' {
+                // CR ends a `--` comment as well as LF, the way DuckDB's own
+                // lexer does. This scanner backs the validator, the statement
+                // splitter, and the highlighter, so all three have to agree
+                // with the engine about where a comment stops — the same
+                // divergence was a statement-smuggling hole on the server.
+                while i < b.len() && b[i] != b'\n' && b[i] != b'\r' {
                     i += 1;
                 }
                 spans.push(Span { start, end: i, kind: Kind::LineComment, terminated: true });
@@ -181,6 +186,23 @@ mod tests {
         assert!(scan("SELECT a$b$c;").iter().all(|s| s.kind == Kind::Code));
         // ...but a $tag$ after a delimiter still opens one.
         assert_eq!(kinds("SELECT $b$;$b$")[1], (Kind::Dollar, "$b$;$b$", true));
+    }
+
+    /// CR ends a `--` comment for DuckDB, so this scanner must stop there
+    /// too — the validator, splitter and highlighter all read these spans,
+    /// and the same divergence was a statement-smuggling hole server-side.
+    #[test]
+    fn cr_ends_a_line_comment() {
+        assert_eq!(
+            kinds("SELECT 1 --c\r; SELECT 2"),
+            vec![
+                (Kind::Code, "SELECT 1 ", true),
+                (Kind::LineComment, "--c", true),
+                (Kind::Code, "\r; SELECT 2", true),
+            ]
+        );
+        // CRLF: the comment stops at the CR, and both bytes stay in code.
+        assert_eq!(kinds("-- c\r\nSELECT 1")[0], (Kind::LineComment, "-- c", true));
     }
 
     #[test]

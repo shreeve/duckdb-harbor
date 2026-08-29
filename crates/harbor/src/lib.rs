@@ -2068,7 +2068,20 @@ fn ensure_single_statement(sql: &str) -> Result<(), String> {
     while i < b.len() {
         match b[i] {
             b'-' if b.get(i + 1) == Some(&b'-') => {
-                i = b[i..].iter().position(|&c| c == b'\n').map_or(b.len(), |p| i + p + 1);
+                // Both terminators, and the second one is not a nicety.
+                // DuckDB inherits Postgres's lexer, which ends a `--` comment
+                // at CR as well as LF. Scanning for LF alone read
+                // `SELECT 1 --\r; DROP TABLE orders` as one statement with a
+                // comment on the end, while the engine read two — and
+                // `duckdb-rs` runs everything but the last during `prepare`,
+                // so the DROP landed before a row was ever fetched. That is
+                // this function's one job, defeated by one byte. (CR is the
+                // only divergence: VT, FF, NEL, U+2028 and U+2029 do not end a
+                // comment for either of us — verified against the engine.)
+                i = b[i..]
+                    .iter()
+                    .position(|&c| c == b'\n' || c == b'\r')
+                    .map_or(b.len(), |p| i + p + 1);
             }
             b'/' if b.get(i + 1) == Some(&b'*') => {
                 // Block comments nest in DuckDB, as they do in Postgres.
@@ -3132,7 +3145,17 @@ fn skip_trivia(b: &[u8], i: &mut usize) {
             *i += 1;
         }
         if b[*i..].starts_with(b"--") {
-            *i = b[*i..].iter().position(|&c| c == b'\n').map_or(b.len(), |p| *i + p + 1);
+            // CR ends the comment too — see ensure_single_statement. The same
+            // one-byte gap defeated the fleet-safety fence from the other
+            // side: `SET --\r memory_limit='1TB'` looked like a bare `SET`
+            // with a trailing comment here, so `fenced_setting` never saw the
+            // key, while the engine set it. memory_limit is process-global,
+            // so that is every neighbor berth's ceiling raised by one caller
+            // (PLAN.md D2) — measured going from 1.8 GiB to 931.3 GiB.
+            *i = b[*i..]
+                .iter()
+                .position(|&c| c == b'\n' || c == b'\r')
+                .map_or(b.len(), |p| *i + p + 1);
         } else if b[*i..].starts_with(b"/*") {
             let mut depth = 1;
             *i += 2;
@@ -3989,6 +4012,58 @@ mod tests {
         }
     }
 
+
+    /// A bare CR ends a `--` comment for DuckDB (Postgres lexer heritage), so
+    /// everything after one is a second statement. Scanning for LF alone made
+    /// each of these look like a single statement with a trailing comment,
+    /// and `duckdb-rs` executes all but the last during `prepare` — so the
+    /// DROP ran before a row was fetched. Verified live against the engine
+    /// before the fix: the table was gone and the response carried the DROP's
+    /// own `Success BOOLEAN` schema.
+    #[test]
+    fn rejects_a_statement_hidden_behind_a_cr_terminated_comment() {
+        for sql in [
+            "SELECT 1 --\r; DROP TABLE orders",
+            "SELECT 1 -- note\r; DROP TABLE orders",
+            "SELECT 1 --\r\n; DROP TABLE orders",
+            "SET --\r memory_limit='1TB'; SELECT 1",
+        ] {
+            assert!(one(sql).is_err(), "should reject: {sql:?}");
+        }
+    }
+
+    /// The other side of the same byte: CR must not end a comment that is only
+    /// data, and a comment that really does run to the end of the input is
+    /// still a single statement.
+    #[test]
+    fn a_cr_inside_a_literal_is_not_a_comment_terminator() {
+        for sql in [
+            "SELECT 1 -- trailing\r",
+            "SELECT 1 -- trailing\r\n",
+            "SELECT '--\r; DROP TABLE orders'",
+            "SELECT 1 /* \r; still one comment */",
+        ] {
+            assert!(one(sql).is_ok(), "should accept: {sql:?}");
+        }
+    }
+
+    /// The fleet-safety fence (D2) reads through comments with the same
+    /// scanner, and fell to the same byte from the other direction: the key
+    /// hid behind a CR-terminated comment, so `fenced_setting` saw a bare
+    /// `SET` and passed it, while the engine set a process-global limit.
+    #[test]
+    fn the_fence_sees_a_key_behind_a_cr_terminated_comment() {
+        for sql in [
+            "SET --\r memory_limit='1TB'",
+            "SET --x\r memory_limit='1TB'",
+            "PRAGMA --\r threads=64",
+            "RESET --\r\n threads",
+        ] {
+            assert!(fenced_setting(sql).is_some(), "should be fenced: {sql:?}");
+        }
+        // ...and an unrelated key behind the same comment still passes.
+        assert_eq!(fenced_setting("SET --\r timezone='UTC'"), None);
+    }
     /// Every case here was accepted by the scanner before the `e` in `E'...'`
     /// was required to be a token of its own, and each one reached DuckDB as
     /// more than one statement. `duckdb-rs` executes all but the last during
