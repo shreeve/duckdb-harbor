@@ -347,6 +347,24 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
     for sql in &o.init {
         con.execute_batch(sql).map_err(|e| format!("--init {sql:?}: {e}"))?;
     }
+    // The ATTACHED CATALOG NAMES, which is what a client must qualify its
+    // queries with — not this berth's name, which is an operator's label and
+    // routinely differs (berth "tpdemo" serving demo.duckdb has catalog
+    // "demo"). Reporting the berth name here made every catalog query a
+    // client wrote filter on a database that does not exist, and the failure
+    // was silent: an empty schema list and no error to explain it.
+    //
+    // Read once, here, because this runs AFTER the boot SQL above — so an
+    // ATTACH in --init is included. A later runtime ATTACH is not; /info is a
+    // pure in-memory read and must stay one, since it has to keep answering
+    // when every worker is busy.
+    let databases: Vec<String> = con
+        .prepare("SELECT database_name FROM duckdb_databases() WHERE NOT internal ORDER BY database_name")
+        .and_then(|mut stmt| {
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<String>, _>>()
+        })
+        .unwrap_or_default();
     harbor::open_pool(con)?;
 
     #[cfg(unix)]
@@ -378,7 +396,7 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         "harborVersion": VERSION,
         "duckdbVersion": duckdb_version,
         "database": db_abs,
-        "databases": [o.name],
+        "databases": databases,
         "pid": std::process::id(),
         "grammar": false,
         // Pilot uses this to pulse comfortably inside the actual idle window.
