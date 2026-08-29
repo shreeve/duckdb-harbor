@@ -156,6 +156,18 @@ static POOL: Mutex<Vec<Connection>> = Mutex::new(Vec::new());
 /// never waiting behind a client query.
 static CONTROL: Mutex<Option<Connection>> = Mutex::new(None);
 
+/// CONTROL's cancellation slot, taken at load beside the connection itself.
+///
+/// Without it CONTROL was the one connection nothing could interrupt, and it
+/// is on the shutdown path: the probe thread answers `/ready` there while
+/// holding CONTROL's mutex, and `stop()` needs that same mutex for the
+/// CHECKPOINT. A readiness query that never returned would have held the lock
+/// and the shutdown with it, with no way to break the tie. Registered in
+/// SLOTS at `start()` like every other executor, so the reaper and the
+/// cancel-all in `stop()` reach it by the same path — and by job id, so a
+/// cancel can never land on the CHECKPOINT, which runs after SLOTS is empty.
+static CONTROL_SLOT: Mutex<Option<Arc<SlotState>>> = Mutex::new(None);
+
 static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
 
 /// Woken when the server stops, so `harbor_wait()` can block without polling.
@@ -932,6 +944,19 @@ pub fn open_pool(con: Connection) -> Result<(), String> {
     for _ in 0..configured_pool_size() {
         pool.push(con.try_clone().map_err(|e| format!("harbor: {e}"))?);
     }
+    // The handle has to be taken while the connection is still here, exactly
+    // as `start()` does for the workers.
+    *CONTROL_SLOT.lock().unwrap() = Some(Arc::new(SlotState {
+        interrupt: con.interrupt_handle(),
+        run: Mutex::new(SlotRun {
+            job: 0,
+            started: Instant::now(),
+            pending: None,
+            cancelled: false,
+            deadline: None,
+            request: None,
+        }),
+    }));
     *CONTROL.lock().unwrap() = Some(con);
     Ok(())
 }
@@ -1077,6 +1102,12 @@ pub fn start(
         free.push(LeaseConn { slot, jobs: tx, state });
     }
     *WORKER_SLOTS.lock().unwrap() = slots[..workers].to_vec();
+    // Appended last, after the workers and the leases, so the worker window
+    // above is untouched. CONTROL is not a worker and must never make the
+    // probe thread think one is wedged.
+    if let Some(control) = CONTROL_SLOT.lock().unwrap().clone() {
+        slots.push(control);
+    }
     *SLOTS.lock().unwrap() = slots;
     *QUERIES.lock().unwrap() = Some(HashMap::new());
     let total = free.len();
@@ -1429,23 +1460,56 @@ fn run_ready_control(req: Request) -> (bool, u16) {
             return (true, respond_ready(req, ok, "not ready"));
         }
     }
-    let ok = CONTROL
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|c| c.execute_batch("SELECT 1").is_ok());
+    // Registered on CONTROL's slot for the length of the query, so a
+    // readiness probe that wedges can be interrupted instead of holding the
+    // connection — and the mutex `stop()` wants — indefinitely. No deadline:
+    // a probe harbor cancelled itself would report the database unready when
+    // the database was fine, which is the same reasoning as `run_ready`.
+    let slot = CONTROL_SLOT.lock().unwrap().clone();
+    let ok = {
+        let guard = CONTROL.lock().unwrap();
+        let job = next_job_id();
+        let _on_slot = slot.as_ref().map(|s| {
+            s.begin(job, None);
+            OnSlot { slot: s, done: false }
+        });
+        guard.as_ref().is_some_and(|c| c.execute_batch("SELECT 1").is_ok())
+    };
     *LAST_READY.lock().unwrap() = Some((Instant::now(), ok));
     (true, respond_ready(req, ok, "not ready"))
 }
 
-/// Every worker mid-statement, and every one of those statements at least
-/// `min_age` old. See the probe loop for why age is the discriminator.
+/// How long a worker must be stuck on a request that has NOT become a
+/// statement before it counts as wedged.
+///
+/// Deliberately far longer than the statement threshold, and the asymmetry is
+/// the point. A statement still running after 250ms while every worker is busy
+/// is the analytical load this lane was built for. A request body still
+/// arriving after five seconds is not load — a real body is one SQL statement
+/// and lands in milliseconds — it is a client that has stopped making
+/// progress. Keeping the two thresholds apart catches the stuck case without
+/// re-tuning the busy case the stress lane pins (16 fast clients, zero sheds).
+const WEDGED_REQUEST_AGE: Duration = Duration::from_secs(5);
+
+/// Every worker occupied, and every one of them occupied long enough to mean
+/// it. See the probe loop for why age is the discriminator.
+///
+/// "Occupied" is not "running a statement". It used to be, and that was the
+/// blind spot behind every denial of service found here: a worker held in a
+/// request body — draining one nobody read, or waiting on one dribbling in a
+/// byte at a time — has no job, so six stuck workers read as six idle ones and
+/// this returned false while the berth answered nothing at all. A worker is
+/// occupied from the moment it picks up a request; whether that request ever
+/// reaches DuckDB is a distinction the load balancer does not care about.
 fn workers_wedged(min_age: Duration) -> bool {
     let slots = WORKER_SLOTS.lock().unwrap();
     !slots.is_empty()
         && slots.iter().all(|s| {
             let run = s.run.lock().unwrap();
-            run.job != 0 && run.started.elapsed() >= min_age
+            match run.job != 0 {
+                true => run.started.elapsed() >= min_age,
+                false => run.request.is_some_and(|t| t.elapsed() >= WEDGED_REQUEST_AGE),
+            }
         })
 }
 
