@@ -361,7 +361,7 @@ pub(crate) fn emit_value(out: &mut String, v: &Value, ty: Option<&LogicalTypeHan
                 push_json_string(out, &i.to_string());
             }
         }
-        Value::Float(f) => push_float(out, *f as f64),
+        Value::Float(f) => push_float32(out, *f),
         Value::Double(f) => push_float(out, *f),
         Value::Decimal(d) => push_json_string(out, &d.to_string()),
         Value::Text(s) | Value::Enum(s) => push_json_string(out, s),
@@ -486,17 +486,45 @@ pub(crate) fn push_float(out: &mut String, f: f64) {
     // JavaScript's own number formatting switches, so the text a client reads
     // is the text it would have produced itself.
     if f != 0.0 && f.abs() >= 1e21 {
-        let formatted = format!("{f:e}");
-        match formatted.split_once('e') {
-            Some((mantissa, exponent)) if !exponent.starts_with('-') => {
-                out.push_str(mantissa);
-                out.push_str("e+");
-                out.push_str(exponent);
-            }
-            _ => out.push_str(&formatted),
-        }
+        push_exponent(out, &format!("{f:e}"));
     } else {
         out.push_str(&f.to_string());
+    }
+}
+
+/// A FLOAT, formatted as the f32 it is.
+///
+/// This used to widen to f64 first and format that, which is lossless but not
+/// faithful: `0.1::FLOAT` went out as 0.10000000149011612 — the same number,
+/// but not the text DuckDB writes, not the text an f32-aware client writes,
+/// and visibly *less* precise than the DOUBLE column holding the same literal
+/// right beside it. `f32::to_string` gives the shortest text that round-trips
+/// back to the same f32, which is what every other numeric type here does.
+pub(crate) fn push_float32(out: &mut String, f: f32) {
+    if f.is_nan() {
+        return push_json_string(out, "NaN");
+    }
+    if f.is_infinite() {
+        return push_json_string(out, if f > 0.0 { "Infinity" } else { "-Infinity" });
+    }
+    // Same 1e21 switch as f64, and it is reachable: f32::MAX is ~3.4e38.
+    if f != 0.0 && f.abs() >= 1e21 {
+        push_exponent(out, &format!("{f:e}"));
+    } else {
+        out.push_str(&f.to_string());
+    }
+}
+
+/// Rust writes `1e21`; JSON and JavaScript write `1e+21`. Only a positive
+/// exponent is missing its sign.
+fn push_exponent(out: &mut String, formatted: &str) {
+    match formatted.split_once('e') {
+        Some((mantissa, exponent)) if !exponent.starts_with('-') => {
+            out.push_str(mantissa);
+            out.push_str("e+");
+            out.push_str(exponent);
+        }
+        _ => out.push_str(formatted),
     }
 }
 
