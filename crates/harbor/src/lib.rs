@@ -223,6 +223,16 @@ struct SlotRun {
     cancelled: bool,
     /// When this statement must stop, if anything asked for a limit.
     deadline: Option<Instant>,
+    /// When this worker began handling an HTTP request, whether or not that
+    /// request has become a statement yet.
+    ///
+    /// A worker reading a request body has no job — `job` is still 0 — so to
+    /// the probe thread it looked idle while being entirely stuck. That is not
+    /// a corner case: every denial of service found against this server has
+    /// worked by occupying workers BEFORE the statement starts, and the one
+    /// thread whose purpose is staying reachable under saturation sat every
+    /// one of them out because it was only ever looking at statements.
+    request: Option<Instant>,
 }
 
 /// What a cancel request should do, decided from bookkeeping alone.
@@ -1025,6 +1035,7 @@ pub fn start(
                 pending: None,
                 cancelled: false,
                 deadline: None,
+                request: None,
             }),
         })
     };
@@ -1542,6 +1553,9 @@ fn handle(
     // leak the count and wedge quiet()/--idle-exit — the same RAII discipline
     // as Claim/Cancellable/OnSlot. Touches the activity clock on both edges.
     let _inflight = countable.then(InFlight::enter);
+    // Only a worker marks a slot: the probe thread owns no connection and is
+    // never what `workers_wedged` is asking about.
+    let _occupied = exec.map(|(_, slot)| OnRequest::enter(slot));
 
     // Only when logging. A clock read and a peer-address format are small, but
     // they are paid on every request by every caller, including the ones that
@@ -1687,8 +1701,15 @@ fn handle(
                     // 16KB and let anything larger grow normally.
                     let mut body =
                         String::with_capacity(req.body_length().unwrap_or(0).min(16 * 1024));
+                    // Not only UTF-8 any more: the socket carries a read
+                    // timeout, so a client that stops mid-body lands here too.
                     if req.as_reader().take(MAX_BODY as u64).read_to_string(&mut body).is_err() {
-                        let _ = req.respond(error_response(400, "bad_request", "body is not valid UTF-8"));
+                        let _ = req.respond(error_response(
+                            400,
+                            "bad_request",
+                            "the request body could not be read: it is not valid UTF-8, or it \
+                             stopped arriving",
+                        ));
                         (true, 400)
                     } else {
                         run_sql(req, jobs, state, &body)
@@ -1728,6 +1749,30 @@ fn handle(
     // clock when it completes, not only when it began. `_inflight` drops on
     // return — after respond(), so the whole stream was this request.
     keep_going
+}
+
+/// Marks this worker's slot occupied for the life of one request, so the
+/// probe thread can tell a worker that is stuck from one that is free even
+/// before a statement exists (see `workers_wedged`).
+///
+/// Same RAII discipline as `Claim`/`Cancellable`/`OnSlot`: cleared on every
+/// path out of `handle`, panic included, because a slot left marked occupied
+/// would make the probe thread believe a free worker was wedged forever.
+struct OnRequest<'a> {
+    slot: &'a Arc<SlotState>,
+}
+
+impl<'a> OnRequest<'a> {
+    fn enter(slot: &'a Arc<SlotState>) -> Self {
+        slot.run.lock().unwrap().request = Some(Instant::now());
+        OnRequest { slot }
+    }
+}
+
+impl Drop for OnRequest<'_> {
+    fn drop(&mut self) {
+        self.slot.run.lock().unwrap().request = None;
+    }
 }
 
 /// Marks a countable request in flight for the life of the value: increments
@@ -2180,7 +2225,11 @@ static LAST_READY: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
 fn run_session_open(mut req: Request) -> (bool, u16) {
     let mut body = String::new();
     if req.as_reader().take(MAX_BODY as u64).read_to_string(&mut body).is_err() {
-        let _ = req.respond(error_response(400, "bad_request", "body is not valid UTF-8"));
+        let _ = req.respond(error_response(
+            400,
+            "bad_request",
+            "the request body could not be read: it is not valid UTF-8, or it stopped arriving",
+        ));
         return (true, 400);
     }
     let requested = match body.trim().is_empty() {
@@ -3720,7 +3769,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn idle() -> SlotRun {
-        SlotRun { job: 0, started: Instant::now(), pending: None, cancelled: false, deadline: None }
+        SlotRun { job: 0, started: Instant::now(), pending: None, cancelled: false, deadline: None, request: None }
     }
 
     /// The bug this design exists to prevent: a cancel decided for one
