@@ -1060,9 +1060,10 @@ mod prompt {
 
 /// The first-request clock (~60s each, so `#[ignore]`d by design; run with
 /// `cargo test -p justhttp --test suite -- --ignored`). A connection that has
-/// never sent a byte is closed; one that has served a request keeps its
-/// keep-alive idle forever. Both halves matter: the first bounds an anonymous
-/// caller holding sockets, the second is what a REPL at its prompt relies on.
+/// never sent a byte is closed; one that has served a request idles on the far
+/// longer keep-alive clock instead. Both halves matter: the first bounds an
+/// anonymous caller holding sockets, the second is what a REPL at its prompt
+/// relies on.
 mod first_request {
     use super::support;
 

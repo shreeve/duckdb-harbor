@@ -147,8 +147,9 @@ impl ClientConnection {
     /// `deadline` is the budget for the whole request head, shared across the
     /// request line and every header line, and started by the head's first
     /// byte — so a client cannot refresh it by dribbling one byte per line.
-    /// `None` on entry means nothing of this request has arrived yet: the
-    /// connection is idle between keep-alive requests and may wait forever.
+    /// `None` on entry means nothing of this request has arrived yet, so the
+    /// connection is merely idle and waits on the longer connection clocks
+    /// (`FIRST_REQUEST_TIMEOUT` or `IDLE_TIMEOUT`) rather than this one.
     /// `too_large` is the status to report if this line runs past `MAX_LINE`.
     // byte-at-a-time on purpose: the source is already a BufReader, and this
     // exact framing (CRLF only, Interrupted retried by Bytes) is semantics.

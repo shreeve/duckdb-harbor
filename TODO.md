@@ -16,11 +16,14 @@ justhttp`) is green on macOS and Linux;
 
 Maintenance notes:
 
-- **The two hardening behaviors have regression tests** — `tests/drain.rs`
+- **Every hardening behavior has a regression test** — `tests/drain.rs`
   (a dropped request with `Content-Length: 1 GiB` must allocate < 1 MiB;
   measured via a global allocator) and the `stall` module in `tests/suite.rs` (a client that stops
-  reading its response cannot pin a worker; the 10s write timeout frees it).
-  If either test ever fails, that is a security regression, not a flake.
+  reading its response cannot pin a worker; the 10s write timeout frees it),
+  plus the `head` module in `tests/suite.rs` for the request-head bounds,
+  the framing checks, and the `TE`/HTTP-1.0 streaming properties. The full
+  list, with the measurement behind each, is in `crates/justhttp/README.md`.
+  If any of these fails, that is a security regression, not a flake.
 - **What justhttp deliberately lacks** (do not "fix"): TLS (edge proxy's job,
   D6), websocket upgrades, HTTP/2 and /3, `TestRequest`/test scaffolding, and
   every API harbor doesn't call. New surface should be added only when harbor
