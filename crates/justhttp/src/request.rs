@@ -213,6 +213,16 @@ impl Request {
         &self.http_version
     }
 
+    /// Answer this request as HTTP/1.1 regardless of what it claimed to be.
+    ///
+    /// Exactly one caller: the 505 for a version this server does not speak.
+    /// A response echoes the request's version, which is right everywhere else
+    /// and wrong there — replying `HTTP/2.0 505 HTTP Version Not Supported`
+    /// asserts the very version the status code exists to refuse.
+    pub(crate) fn answer_as_http11(&mut self) {
+        self.http_version = HttpVersion(1, 1);
+    }
+
     /// Returns the length of the body in bytes.
     ///
     /// Returns `None` if the length is unknown.

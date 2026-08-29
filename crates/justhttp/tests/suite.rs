@@ -2,12 +2,15 @@
 //!
 //! - `basic`     — smoke: one request, one response
 //! - `input`     — request parsing, bodies, malformed input
+//! - `head`      — request-head bounds and unambiguous framing (hardening)
 //! - `network`   — connection lifecycle, pipelining, slow clients
 //! - `keepalive` — connection reuse + chunked streaming from a Reader
 //! - `buffering` — response backpressure against closed/idle clients
 //! - `prompt`    — latency properties: responses leave when they should
 //! - `unblock`   — Server::unblock wakes blocked recv()
 //! - `unix`      — unix-domain sockets
+//! - `first_request` — the first-request idle clock, and that keep-alive is
+//!   exempt from it (`#[ignore]`, ~60s each)
 //! - `stall`     — the 10s write-timeout backstop (`#[ignore]`, ~35s by
 //!   design: `cargo test --test suite -- --ignored`)
 //!
@@ -251,6 +254,200 @@ mod input {
 
         assert!(content.ends_with("{\"custom\": \"Content-Type\"}"));
         assert_ne!(content.find("Content-Type: application/json"), None);
+    }
+}
+
+/// The request head is the one part of a request that is parsed before any
+/// routing, any authentication, and any application code. Everything it costs
+/// is spent on behalf of an anonymous caller, so all of it is bounded, and
+/// anything it cannot frame unambiguously is refused rather than guessed at.
+/// A failure in this module is a security regression, not a flake.
+mod head {
+    use super::support;
+
+    use std::io::{Read, Write};
+
+    /// A header line with no end must not be an unbounded allocation. Before
+    /// `MAX_LINE` this loop had no ceiling: one socket, one never-terminated
+    /// header, and RSS climbed at line speed (30 MB to 1.5 GB in under five
+    /// seconds, measured, with no credential presented).
+    #[test]
+    fn an_endless_header_line_is_refused() {
+        let (_server, mut client) = support::new_one_server_one_client();
+        write!(client, "GET / HTTP/1.1\r\nHost: localhost\r\nX-Junk: ").unwrap();
+
+        // Well past MAX_LINE, and still no CRLF in sight.
+        let blob = "A".repeat(4096);
+        let mut sent = 0;
+        while sent < 512 * 1024 {
+            if client.write_all(blob.as_bytes()).is_err() {
+                break; // the server hung up on us, which is the point
+            }
+            sent += blob.len();
+        }
+
+        // 431, and the connection closes: the head cannot be resynchronized.
+        let mut content = String::new();
+        let _ = client.read_to_string(&mut content);
+        assert!(
+            content.starts_with("HTTP/1.1 431"),
+            "expected 431, got {:?}",
+            content.lines().next()
+        );
+    }
+
+    /// Bounded lines are no defence if there can be any number of them.
+    #[test]
+    fn too_many_headers_are_refused() {
+        let (_server, mut client) = support::new_one_server_one_client();
+        write!(client, "GET / HTTP/1.1\r\nHost: localhost\r\n").unwrap();
+        for i in 0..4096 {
+            if write!(client, "X-Pad-{i}: x\r\n").is_err() {
+                break;
+            }
+        }
+        let _ = write!(client, "\r\n");
+
+        let mut content = String::new();
+        let _ = client.read_to_string(&mut content);
+        assert!(
+            content.starts_with("HTTP/1.1 431"),
+            "expected 431, got {:?}",
+            content.lines().next()
+        );
+    }
+
+    /// Two Content-Lengths that disagree have two answers, and the gap between
+    /// the one this server picks and the one a proxy in front of it picks is a
+    /// request-smuggling desync. Refuse instead of choosing.
+    #[test]
+    fn conflicting_content_lengths_are_refused() {
+        let (_server, mut client) = support::new_one_server_one_client();
+        write!(
+            client,
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 3\r\n\r\nhello"
+        )
+        .unwrap();
+
+        let mut content = String::new();
+        let _ = client.read_to_string(&mut content);
+        assert!(
+            content.starts_with("HTTP/1.1 400"),
+            "expected 400, got {:?}",
+            content.lines().next()
+        );
+    }
+
+    /// Repeating the same value is not ambiguous, so it is not refused.
+    #[test]
+    fn agreeing_content_lengths_are_served() {
+        let (server, mut client) = support::new_one_server_one_client();
+        write!(
+            client,
+            "POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello"
+        )
+        .unwrap();
+
+        let mut request = server.recv().unwrap();
+        let mut body = String::new();
+        request.as_reader().read_to_string(&mut body).unwrap();
+        assert_eq!(body, "hello");
+        request
+            .respond(justhttp::Response::from_string("ok".to_owned()))
+            .unwrap();
+    }
+
+    /// A body framed two ways at once is the other half of the same desync.
+    #[test]
+    fn content_length_with_transfer_encoding_is_refused() {
+        let (_server, mut client) = support::new_one_server_one_client();
+        write!(
+            client,
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+        )
+        .unwrap();
+
+        let mut content = String::new();
+        let _ = client.read_to_string(&mut content);
+        assert!(
+            content.starts_with("HTTP/1.1 400"),
+            "expected 400, got {:?}",
+            content.lines().next()
+        );
+    }
+
+    /// A Content-Length that is not a number used to parse as "no body", so
+    /// the bytes the client did send were read as the next request.
+    #[test]
+    fn unparseable_content_length_is_refused() {
+        let (_server, mut client) = support::new_one_server_one_client();
+        write!(
+            client,
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: abc\r\n\r\nhello"
+        )
+        .unwrap();
+
+        let mut content = String::new();
+        let _ = client.read_to_string(&mut content);
+        assert!(
+            content.starts_with("HTTP/1.1 400"),
+            "expected 400, got {:?}",
+            content.lines().next()
+        );
+    }
+
+    /// `TE: identity` must not be able to turn a streamed response into a
+    /// buffered one. `raw_print` discovers an unknown length by reading the
+    /// whole body, so honoring this header hands control of the server's
+    /// memory to the caller — measured at +316 MB of RSS on one query.
+    #[test]
+    fn te_identity_cannot_unstream_an_unknown_length() {
+        let (server, mut client) = support::new_one_server_one_client();
+        write!(
+            client,
+            "GET / HTTP/1.1\r\nHost: localhost\r\nTE: identity\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+
+        std::thread::spawn(move || {
+            let rq = server.recv().unwrap();
+            // Unknown length: exactly the shape harbor streams /sql with.
+            let body = std::io::Cursor::new(b"streamed".to_vec());
+            rq.respond(justhttp::Response::new(200.into(), Vec::new(), body, None))
+                .unwrap();
+        });
+
+        let (headers, body) = support::read_response(&mut client);
+        let lower = headers.to_ascii_lowercase();
+        assert!(
+            lower.contains("transfer-encoding: chunked"),
+            "unknown length must stay chunked, got: {headers}"
+        );
+        assert!(!lower.contains("content-length:"), "body was buffered: {headers}");
+        assert_eq!(body, "streamed");
+    }
+
+    /// The HTTP/1.0 half of the same property: no chunked encoding available,
+    /// so an unknown length is delimited by the close rather than by reading
+    /// the whole body into memory to measure it.
+    #[test]
+    fn http_1_0_streams_an_unknown_length_to_close() {
+        let (server, mut client) = support::new_one_server_one_client();
+        write!(client, "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n").unwrap();
+
+        std::thread::spawn(move || {
+            let rq = server.recv().unwrap();
+            let body = std::io::Cursor::new(b"streamed".to_vec());
+            rq.respond(justhttp::Response::new(200.into(), Vec::new(), body, None))
+                .unwrap();
+        });
+
+        let mut content = String::new();
+        client.read_to_string(&mut content).unwrap();
+        let lower = content.to_ascii_lowercase();
+        assert!(!lower.contains("content-length:"), "body was buffered: {content}");
+        assert!(!lower.contains("transfer-encoding:"), "1.0 cannot chunk: {content}");
+        assert!(content.ends_with("streamed"), "body truncated: {content}");
     }
 }
 
@@ -858,6 +1055,57 @@ mod prompt {
                 encode_chunked(&mut SLOW_BODY.clone(), wr);
             });
         }
+    }
+}
+
+/// The first-request clock (~60s each, so `#[ignore]`d by design; run with
+/// `cargo test -p justhttp --test suite -- --ignored`). A connection that has
+/// never sent a byte is closed; one that has served a request keeps its
+/// keep-alive idle forever. Both halves matter: the first bounds an anonymous
+/// caller holding sockets, the second is what a REPL at its prompt relies on.
+mod first_request {
+    use super::support;
+
+    use std::io::{Read, Write};
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "~60s by design: exercises the first-request timeout"]
+    fn a_connection_that_never_speaks_is_closed() {
+        let (_server, mut client) = support::new_one_server_one_client();
+        let t0 = Instant::now();
+        let mut content = String::new();
+        let _ = client.read_to_string(&mut content);
+        assert!(
+            content.starts_with("HTTP/1.1 408"),
+            "expected 408, got {:?}",
+            content.lines().next()
+        );
+        assert!(t0.elapsed().as_secs() >= 55, "closed too early: {:?}", t0.elapsed());
+    }
+
+    #[test]
+    #[ignore = "~75s by design: proves keep-alive is not on the first-request clock"]
+    fn a_served_connection_may_idle_past_the_first_request_timeout() {
+        let (server, mut client) = support::new_one_server_one_client();
+        std::thread::spawn(move || {
+            for rq in server.incoming_requests() {
+                let _ = rq.respond(justhttp::Response::from_string("ok".to_owned()));
+            }
+        });
+
+        let req = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
+        write!(client, "{req}").unwrap();
+        let (headers, _) = support::read_response(&mut client);
+        assert!(headers.starts_with("HTTP/1.1 200"), "first request: {headers}");
+
+        // Well past FIRST_REQUEST_TIMEOUT. This connection has served a
+        // request, so it is a keep-alive client and the clock does not apply.
+        std::thread::sleep(std::time::Duration::from_secs(75));
+
+        write!(client, "{req}").expect("connection was closed during keep-alive idle");
+        let (headers, _) = support::read_response(&mut client);
+        assert!(headers.starts_with("HTTP/1.1 200"), "second request: {headers}");
     }
 }
 

@@ -137,11 +137,27 @@ fn choose_transfer_encoding(
             None
         });
 
+    // An unknown length leaves chunked as the only framing that can both start
+    // before the body is complete and delimit it on a reusable connection. The
+    // client does not get a vote here, and that is the point: honoring
+    // `TE: identity` on an unknown-length response sends control of this
+    // server's memory to the caller. `raw_print` would have to read the whole
+    // body to discover its length, so a client could turn any streamed result
+    // into an allocation of that result's size by adding one header —
+    // measured at +316 MB of RSS on a six-million-row query, and neatly
+    // sidestepping the ceiling the one-shot JSON shape enforces for exactly
+    // this reason. `TE` is a hint about what the client can decode, never a
+    // licence to pick the server's buffering strategy. (RFC 7230 dropped
+    // `identity` from `TE` altogether.)
+    if entity_length.is_none() {
+        return TransferEncoding::Chunked;
+    }
+
     if let Some(user_request) = user_request {
         return user_request;
     }
 
-    // if we don't have a Content-Length, or if the Content-Length is too big, using chunks writer
+    // if the Content-Length is too big, using chunks writer
     if entity_length.is_none_or(|val| val >= chunked_threshold) {
         return TransferEncoding::Chunked;
     }
@@ -283,7 +299,7 @@ where
     ///
     /// Note: does not flush the writer.
     pub fn raw_print<W: Write>(
-        mut self,
+        self,
         mut writer: W,
         http_version: HttpVersion,
         request_headers: &[Header],
@@ -324,18 +340,20 @@ where
             head.extend_from_slice(b"\r\n");
         }
 
-        // if the transfer encoding is identity, the content length must be known ; therefore if
-        // we don't know it, we buffer the entire response first here
-        // while this is an expensive operation, it is only ever needed for clients using HTTP 1.0
+        // Identity framing with an unknown length — only reachable for HTTP/1.0
+        // clients now, since 1.1 always chunks an unknown length — is delimited
+        // by the connection close, which is how HTTP/1.0 has always framed a
+        // body of unknown length. `conn.rs` closes after every 1.0 request, so
+        // that delimiter is guaranteed to arrive.
+        //
+        // This used to `read_to_end` the body to discover its length and emit a
+        // Content-Length. That kept the connection reusable, which HTTP/1.0
+        // barely wants, at the cost of holding the entire response in memory —
+        // and harbor streams results with no size limit down this path, so the
+        // cost was unbounded and chosen by the caller.
         let (mut reader, data_length): (Box<dyn Read>, _) =
             match (self.data_length, transfer_encoding) {
                 (Some(l), _) => (Box::new(self.reader), Some(l)),
-                (None, Some(TransferEncoding::Identity)) => {
-                    let mut buf = Vec::new();
-                    self.reader.read_to_end(&mut buf)?;
-                    let l = buf.len();
-                    (Box::new(Cursor::new(buf)), Some(l))
-                }
                 _ => (Box::new(self.reader), None),
             };
 
@@ -350,9 +368,12 @@ where
                 head.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
             }
 
+            // No Content-Length when the length is unknown: the close is the
+            // delimiter (see above).
             Some(TransferEncoding::Identity) => {
-                assert!(data_length.is_some());
-                write!(head, "Content-Length: {}\r\n", data_length.unwrap())?;
+                if let Some(length) = data_length {
+                    write!(head, "Content-Length: {length}\r\n")?;
+                }
             }
 
             _ => (),
@@ -370,13 +391,10 @@ where
                     io::copy(&mut reader, &mut writer)?;
                 }
 
-                Some(TransferEncoding::Identity) => {
-                    assert!(data_length.is_some());
-                    let data_length = data_length.unwrap();
-
-                    if data_length >= 1 {
-                        io::copy(&mut reader, &mut writer)?;
-                    }
+                // An unknown length is a stream: copy it. A known length of
+                // zero has nothing to copy.
+                Some(TransferEncoding::Identity) if data_length != Some(0) => {
+                    io::copy(&mut reader, &mut writer)?;
                 }
 
                 _ => (),

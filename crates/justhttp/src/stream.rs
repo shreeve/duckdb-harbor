@@ -117,6 +117,24 @@ mod listen {
             }
         }
 
+        /// Bound how long a single read from this socket may block. The
+        /// header reader treats a timeout before the request has started as an
+        /// idle keep-alive wait and keeps waiting; once a request is under way
+        /// a timeout is fatal, which is what bounds a slowloris. It also bounds
+        /// the unread-body drain in `EqualReader::drop`, which otherwise reads
+        /// the client's *declared* Content-Length for as long as the client
+        /// cares to dribble it — parking the serving thread indefinitely.
+        pub(crate) fn set_read_timeout(
+            &self,
+            dur: Option<std::time::Duration>,
+        ) -> std::io::Result<()> {
+            match self {
+                Self::Tcp(s) => s.set_read_timeout(dur),
+                #[cfg(unix)]
+                Self::Unix(s) => s.set_read_timeout(dur),
+            }
+        }
+
         /// Disable Nagle's algorithm on TCP connections. The server writes each
         /// response as one buffered flush, so there is no small-packet spray to
         /// coalesce — but a response that does take more than one write (headers

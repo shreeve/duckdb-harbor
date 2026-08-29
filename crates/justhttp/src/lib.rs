@@ -200,6 +200,27 @@ impl Server {
             // real reclaim is somewhat longer, which is fine for a backstop.
             const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+            // The ceiling on how long a single read may block. A request that
+            // has not started yet (an idle keep-alive connection) waits through
+            // these ticks forever; once a request is under way this is what
+            // stops a client from holding a serving thread — or an unbounded
+            // header buffer — open at one byte per minute. See conn.rs.
+            const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+            // How long to wait after a transient accept failure before trying
+            // again, and the ceiling that backoff climbs to.
+            const ACCEPT_BACKOFF_MAX: Duration = Duration::from_millis(200);
+            // How long a transient failure may persist before it stops being
+            // treated as transient. Retrying forever survives an fd storm, but
+            // it also means a listener that is broken in a way this
+            // classifier does not recognize spins here silently for the life
+            // of the process. A full minute without accepting a single
+            // connection is not a storm; report it and stop, the way an
+            // unrecognized error already does, so the host can say so.
+            const ACCEPT_GIVE_UP_AFTER: Duration = Duration::from_secs(60);
+            let mut accept_failures: u32 = 0;
+            let mut failing_since: Option<std::time::Instant> = None;
+
             while !inside_close_trigger.load(Relaxed) {
                 let new_client = match server.accept() {
                     Ok((sock, _)) => {
@@ -213,6 +234,7 @@ impl Server {
                         // every write. Best-effort — a socket that rejects the
                         // option just keeps upstream's original behavior.
                         let _ = sock.set_write_timeout(Some(WRITE_TIMEOUT));
+                        let _ = sock.set_read_timeout(Some(READ_TIMEOUT));
                         // One response = one flush, so Nagle has nothing to
                         // coalesce here — but it would hold the last small
                         // segment of a multi-write response (e.g. a chunked
