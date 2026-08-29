@@ -128,6 +128,54 @@ enum Message {
     NewRequest(Request),
 }
 
+/// Whether an `accept()` failure is one the listener recovers from on its own.
+///
+/// Everything here leaves the listening socket perfectly usable: the peer
+/// vanished before it could be accepted, a signal interrupted the call, or the
+/// process is momentarily out of file descriptors or socket buffers. Only a
+/// failure that means the listener is *gone* — a closed or invalid descriptor —
+/// should end the accept loop.
+///
+/// Descriptor and buffer exhaustion have no stable `ErrorKind`, so they are
+/// matched by errno.
+fn transient_accept_error(e: &IoError) -> bool {
+    use std::io::ErrorKind::{
+        ConnectionAborted, ConnectionRefused, ConnectionReset, Interrupted, OutOfMemory, TimedOut,
+        WouldBlock,
+    };
+    if matches!(
+        e.kind(),
+        ConnectionAborted
+            | ConnectionRefused
+            | ConnectionReset
+            | Interrupted
+            | OutOfMemory
+            | TimedOut
+            | WouldBlock
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        const EINTR: i32 = 4;
+        const ENOMEM: i32 = 12;
+        const ENFILE: i32 = 23;
+        const EMFILE: i32 = 24;
+        #[cfg(target_os = "linux")]
+        const ENOBUFS: i32 = 105;
+        #[cfg(not(target_os = "linux"))]
+        const ENOBUFS: i32 = 55;
+        matches!(
+            e.raw_os_error(),
+            Some(EINTR) | Some(ENOMEM) | Some(ENFILE) | Some(EMFILE) | Some(ENOBUFS)
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 impl From<IoError> for Message {
     fn from(e: IoError) -> Message {
         Message::Error(e)
@@ -249,6 +297,8 @@ impl Server {
 
                 match new_client {
                     Ok(client) => {
+                        accept_failures = 0;
+                        failing_since = None;
                         let messages = inside_messages.clone();
                         let mut client = Some(client);
                         tasks_pool.spawn(Box::new(move || {
@@ -260,8 +310,33 @@ impl Server {
                         }));
                     }
 
+                    Err(e) if transient_accept_error(&e) => {
+                        // Leaving this loop drops the listener and closes the
+                        // listening socket for the life of the process: the
+                        // berth then sits there, alive and holding the database,
+                        // accepting nothing and logging nothing. A single
+                        // ECONNABORTED (the peer reset between the connection
+                        // landing and accept() taking it) or one brush with the
+                        // fd limit is enough to trigger it, and neither says
+                        // anything is wrong with the listener. So retry, with a
+                        // backoff so an fd-exhaustion storm does not spin a core
+                        // while descriptors free up.
+                        accept_failures = accept_failures.saturating_add(1);
+                        let since = *failing_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() >= ACCEPT_GIVE_UP_AFTER {
+                            inside_messages.push(e.into());
+                            break;
+                        }
+                        thread::sleep(
+                            ACCEPT_BACKOFF_MAX
+                                .min(Duration::from_millis(u64::from(accept_failures))),
+                        );
+                        continue;
+                    }
+
                     Err(e) => {
-                        // surface the accept error through recv(), then stop accepting
+                        // Not transient — the listener itself is gone (EBADF,
+                        // EINVAL). Surface it through recv() and stop accepting.
                         inside_messages.push(e.into());
                         break;
                     }
