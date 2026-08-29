@@ -144,7 +144,12 @@ fn suggest(value: String, kind: &str, start: usize, end: usize) -> Suggestion {
 
 impl Completer for SqlCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
-        let prefix = &line[..pos.min(line.len())];
+        // Clamped once, then used everywhere. `prefix` was clamped and
+        // `cache_suggestions` was handed the raw value, which then sliced
+        // `&line[..pos]` unguarded — if the clamp is worth having it is worth
+        // having on both paths.
+        let pos = pos.min(line.len());
+        let prefix = &line[..pos];
         let list: Vec<Suggestion> = if prefix.trim_start().starts_with('.') {
             // Dot-commands are client-side (lane A), from the one list.
             crate::repl::DOT_COMMANDS
