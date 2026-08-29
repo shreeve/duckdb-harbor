@@ -208,7 +208,7 @@ compatible library at runtime. A build needs a libduckdb to link against.
 $ make fetch-duckdb                       # libduckdb + duckdb CLI -> ~/.duckdb/cli/2.0.0/
 $ make harbor pilot                       # -> target/release/{harbor,pilot}
 $ harbor serve mydata.duckdb --token secret
-harbor 0.14.0: berth "mydata" serving mydata.duckdb on ~/.config/harbor/runtime/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
+harbor 0.15.0: berth "mydata" serving mydata.duckdb on ~/.config/harbor/runtime/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
 ```
 
 `make bootstrap` does the whole thing in one shot — fetch the engine into `~/.duckdb`,
@@ -228,7 +228,7 @@ published checksums, and installs harbor + pilot into `/usr/local/bin` with
 curl -fsSL https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.sh | bash
 ```
 
-Pin a version with `... | bash -s v0.14.0`. Each
+Pin a version with `... | bash -s v0.15.0`. Each
 [release](https://github.com/shreeve/duckdb-harbor/releases)
 ships one self-contained archive per
 platform (osx-arm64, linux-amd64, linux-arm64, windows-amd64, windows-arm64):
