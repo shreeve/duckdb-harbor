@@ -1406,7 +1406,20 @@ fn worker(
                 }
             }
             Ok(None) => continue,
-            Err(_) => break,
+            // The listener is gone — justhttp only surfaces an accept error
+            // once it has decided the socket itself is unusable (transient
+            // failures are retried there). This berth will never accept
+            // another connection, and it used to leave without a word: the
+            // process stayed alive, holding the database and the flock, while
+            // every client saw connection-refused and every supervisor
+            // watching the pid saw a healthy berth.
+            Err(e) => {
+                eprintln!(
+                    "harbor: the listener has failed ({e}); this berth can no longer \
+                     accept connections. Stop it and start a new one."
+                );
+                break;
+            }
         }
     }
 
@@ -1444,7 +1457,15 @@ fn probe_worker(server: Arc<Server>, stop: Arc<AtomicBool>, token: Arc<Option<St
                 let _ = handle(req, None, token.as_ref().as_deref(), log);
             }
             Ok(None) => continue,
-            Err(_) => break,
+            // Same as a worker: the listener is gone. Whichever thread pops
+            // the error reports it; the rest simply stop seeing requests.
+            Err(e) => {
+                eprintln!(
+                    "harbor: the listener has failed ({e}); this berth can no longer \
+                     accept connections. Stop it and start a new one."
+                );
+                break;
+            }
         }
     }
 }
