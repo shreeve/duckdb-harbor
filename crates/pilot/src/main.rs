@@ -174,7 +174,8 @@ target:
   name                         a service — starts on use, runs until harbor stop
                                (a stopped-by-hand name stays down until harbor start)
   path/to.duckdb               a session — join its server, or start a temp one
-                               (opens or creates the file; exits when idle)
+                               (opens or creates the file; exits when idle.
+                                a slash or a dot marks a path; a name has neither)
   path/to.sock                 a harbor unix socket
   http://host:port             a harbor TCP listener
 
@@ -199,11 +200,12 @@ fn resolve(
 ) -> Result<Conn, String> {
     let env_token = std::env::var("HARBOR_TOKEN").ok();
 
+    // One classifier for the whole fleet: a name never contains a dot or a
+    // slash, so an argument carrying one is a path — and a url says so
+    // outright. The same law harbor consults, from the same crate.
     let spelled_out = target.starts_with("http://")
         || target.starts_with("https://")
-        || target.ends_with(".duckdb")
-        || target.ends_with(".sock")
-        || target.contains('/');
+        || harbor_common::looks_like_path(target);
 
     // A bare name is a question only the config can answer, so a config that
     // could not be read must not be answered around. Falling through used to
@@ -291,7 +293,22 @@ fn resolve(
     if target.starts_with("http://") || target.starts_with("https://") {
         return Ok(Conn { transport: url_transport(target)?, token: flag_token.or(env_token) });
     }
-    if target.ends_with(".duckdb") {
+    if harbor_common::looks_like_path(target) {
+        let p = config::expand(target);
+        // The filesystem says which kind of path this is: a live socket is
+        // dialled, and everything else is a database file to open. `.sock`
+        // still reads as a socket when the file is not there yet, so a
+        // mistyped socket path fails as a socket, loudly, instead of
+        // quietly becoming a fresh database.
+        if is_socket(&p) || target.ends_with(".sock") {
+            #[cfg(unix)]
+            return Ok(Conn {
+                transport: Transport::Unix(p),
+                token: flag_token.or(env_token),
+            });
+            #[cfg(windows)]
+            return Err("Unix socket targets are not supported on Windows; use a database name or http://host:port".into());
+        }
         // D9: summon the owner. A second pilot on the same file joins the
         // same berth instead of "database is locked".
         let life = harbor_common::lifetime::resolve(
@@ -299,18 +316,8 @@ fn resolve(
             cfg.defaults.temp_idle_exit.as_deref(),
             harbor_common::Summoner::Client,
         )?;
-        let (transport, file_token) = ensure_berth(std::path::Path::new(target), life)?;
+        let (transport, file_token) = ensure_berth(&p, life)?;
         return Ok(Conn { transport, token: flag_token.or(env_token).or(file_token) });
-    }
-
-    if target.contains('/') || target.ends_with(".sock") {
-        #[cfg(unix)]
-        return Ok(Conn {
-            transport: Transport::Unix(PathBuf::from(target)),
-            token: flag_token.or(env_token),
-        });
-        #[cfg(windows)]
-        return Err("Unix socket targets are not supported on Windows; use a database name or http://host:port".into());
     }
 
     let home = config::runtime_dir()?;
@@ -406,12 +413,26 @@ pub fn prompt_name(target: &str) -> String {
     if let Some(rest) = target.split_once("://").map(|(_, r)| r) {
         return rest.trim_end_matches('/').to_string();
     }
-    if target.ends_with(".duckdb") || target.ends_with(".sock") || target.contains('/') {
+    if harbor_common::looks_like_path(target) {
         if let Some(stem) = std::path::Path::new(target).file_stem() {
             return stem.to_string_lossy().into_owned();
         }
     }
     target.to_string()
+}
+
+/// Does this path exist as a unix socket right now?
+fn is_socket(p: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::metadata(p).map(|m| m.file_type().is_socket()).unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        let _ = p;
+        false
+    }
 }
 
 /// Join the live berth that owns this file, or exec `harbor` to summon an

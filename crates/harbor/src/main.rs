@@ -97,7 +97,7 @@ Bare `harbor` is `harbor show`.
 
 A bare word always names a configured database, never a file — which is what
 stops `harbor start medlabs`, run from the wrong directory, from meaning the
-file ./medlabs. A path carries a / or ends in .duckdb.
+file ./medlabs. A path carries a slash or a dot; a name never does.
 
 serve/start options (a config entry may set any of these; a flag here wins):
   --create            allow a database file that does not exist yet (the
@@ -838,7 +838,7 @@ fn unknown_berth(cfg: &harbor_common::config::FileConfig, name: &str) -> String 
         true => msg.push_str("\n        nothing is configured yet — harbor add <db.duckdb>"),
         false => msg.push_str(&format!("\n        configured: {}", known.join(", "))),
     }
-    msg.push_str("\n        (a bare word always names a configured database; a path needs a / or .duckdb)");
+    msg.push_str("\n        (a bare word always names a configured database; a path carries a / or a dot)");
     msg
 }
 
@@ -1134,7 +1134,7 @@ fn add_cmd(rest: Vec<String>) -> Result<(), String> {
     if !harbor_common::looks_like_path(db) {
         return Err(format!(
             "{db:?} reads as a name, not a file — add takes the database file \
-             (a path carries a / or ends in .duckdb)"
+             (a path carries a / or a dot; a name never does)"
         ));
     }
     let canon = std::fs::canonicalize(harbor_common::paths::expand(db))

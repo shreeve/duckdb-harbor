@@ -136,21 +136,19 @@ pub fn normalize(name: &str) -> Result<String, String> {
 
 /// Is this argument a path, or a configured name?
 ///
-/// **A bare word is never a path.** `harbor start medlabs`, run from the wrong
+/// **A name never contains a dot or a slash** — `normalize` maps both to `-`
+/// when a name is minted — so an argument carrying one can only be a path.
+/// That single fact is the whole classifier: no extension whitelist, nothing
+/// for two binaries to disagree about.
+///
+/// It is also the safety law. `harbor start medlabs`, run from the wrong
 /// directory, once named the file `./medlabs`, created it empty, and served
 /// it under the name clients trusted — an empty impostor in front of real
 /// data. Reading a bare word as a name closes that whole class: the argument
 /// either matches something configured or it is an error, and it can never
 /// silently become a file that isn't there.
 pub fn looks_like_path(arg: &str) -> bool {
-    arg.contains('/')
-        || arg.contains('\\')
-        || arg.starts_with('~')
-        || arg == "."
-        || arg == ".."
-        || Path::new(arg)
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("duckdb") || e.eq_ignore_ascii_case("db"))
+    arg.contains(['/', '\\', '.']) || arg.starts_with('~')
 }
 
 /// `~/` expansion, nothing fancier.
@@ -199,14 +197,19 @@ mod tests {
         assert!(!looks_like_path("medlabs"));
         assert!(!looks_like_path("labs"));
         assert!(!looks_like_path("warehouse2"));
-        // And these must stay paths.
+        // A dot or a slash is something a name cannot contain, so any
+        // argument carrying one was typed as a path — whatever the extension.
         assert!(looks_like_path("./medlabs.duckdb"));
         assert!(looks_like_path("medlabs.duckdb"));
         assert!(looks_like_path("data.db"));
+        assert!(looks_like_path("backup.data"));
+        assert!(looks_like_path("sales.2024"));
         assert!(looks_like_path("~/Data/x.duckdb"));
+        assert!(looks_like_path("~backup"));
         assert!(looks_like_path("/srv/db/inventory.duckdb"));
         assert!(looks_like_path("sub/dir"));
         assert!(looks_like_path("."));
+        assert!(looks_like_path(".."));
     }
 
     #[test]
