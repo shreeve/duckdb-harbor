@@ -412,7 +412,16 @@ impl Render for Grid {
                     .border_b_1()
                     .border_color(t.border)
                     .child(
-                        div().flex_1().min_w_0().text_sm().text_color(t.text).truncate().child(title),
+                        // Semibold like the design proof's breadcrumb table
+                        // name (`.crumb b`, weight 600).
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(t.text)
+                            .truncate()
+                            .child(title),
                     )
                     // Status text sits INSIDE the flexible region, before
                     // the toggle track: its width changes as pages land,
