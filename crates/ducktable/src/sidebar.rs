@@ -15,6 +15,11 @@ impl DuckTable {
 
     pub(crate) fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = pal(cx);
+        let berth_filter = self
+            .berth_filter
+            .as_ref()
+            .map(|i| i.read(cx).value().to_string().to_lowercase())
+            .filter(|s| !s.is_empty());
         // The clicked berth highlights the moment it is clicked (the
         // in-flight name wins over the still-rendering old connection).
         let active = match (&self.connecting, &self.phase) {
@@ -35,17 +40,67 @@ impl DuckTable {
             .gap_px()
             .child(
                 div()
-                    .px_2()
+                    .pl_2()
+                    .pr_1()
                     .py_1()
-                    .text_xs()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(t.muted)
-                    // "Berth" is Harbor's word; the UI says what a user
-                    // sees. (Not "CONNECTIONS" — that reads as saved
-                    // connection configs, which this list is not.)
-                    .child("DATABASES"),
+                    .h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(t.muted)
+                            // "Berth" is Harbor's word; the UI says what a
+                            // user sees. (Not "CONNECTIONS" — that reads
+                            // as saved connection configs, which this
+                            // list is not.)
+                            .child("DATABASES"),
+                    )
+                    // A filter earns its glyph past 10 items (and stays
+                    // while open, so it can always be closed).
+                    .when(self.berth_filter.is_some() || self.rows.len() > 10, |d| {
+                        d.child(
+                            head_glyph("filter-berths", self.berth_filter.is_some(), t)
+                                .child(
+                                    gpui_component::Icon::new(
+                                        gpui_component::IconName::Search,
+                                    )
+                                    .size_3p5(),
+                                )
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.toggle_berth_filter(window, cx);
+                                })),
+                        )
+                    })
+                    .child(
+                        head_glyph("refresh-berths", false, t)
+                            .child(
+                                svg()
+                                    .path("icons/refresh-cw.svg")
+                                    .size_3p5()
+                                    .text_color(t.muted),
+                            )
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.refresh(cx);
+                            })),
+                    ),
             )
-            .children(self.rows.iter().map(|row| {
+            .when_some(self.berth_filter.clone(), |d, input| {
+                d.child(
+                    div()
+                        .px_2()
+                        .pb_1()
+                        .child(gpui_component::input::Input::new(&input).xsmall().cleanable(true)),
+                )
+            })
+            .children(self.rows.iter().filter(|row| {
+                match &berth_filter {
+                    Some(f) => row.name.to_lowercase().contains(f.as_str()),
+                    None => true,
+                }
+            }).map(|row| {
                 let name = clone_str(&row.name);
                 let selected = active.as_deref() == Some(row.name.as_str());
                 div()
@@ -83,18 +138,8 @@ impl DuckTable {
                     .h_flex()
                     .items_center()
                     .gap_2()
-                    .child(
-                        div()
-                            .id("refresh")
-                            .px_2()
-                            .py_1()
-                            .text_xs()
-                            .text_color(t.accent)
-                            .cursor_pointer()
-                            .child("refresh")
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.refresh(cx))),
-                    )
-                    .child(div().flex_1())
+                    // The theme cycler leads the footer; the old "refresh"
+                    // link is superseded by the DATABASES header glyph.
                     .child(
                         div()
                             .id("theme")
@@ -108,7 +153,8 @@ impl DuckTable {
                             .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
                                 crate::theme::cycle(cx);
                             })),
-                    ),
+                    )
+                    .child(div().flex_1()),
             )
     }
 
@@ -125,18 +171,8 @@ impl DuckTable {
             .map(|i| i.read(cx).value().to_string().to_lowercase())
             .filter(|s| !s.is_empty());
         let filter_open = self.table_filter.is_some();
-        let glyph = |id: &'static str, on: bool| {
-            div()
-                .id(id)
-                .h_flex()
-                .items_center()
-                .justify_center()
-                .size(px(18.))
-                .rounded(px(4.))
-                .cursor_pointer()
-                .text_color(if on { t.accent } else { t.muted })
-                .hover(|d| d.bg(t.row_hover))
-        };
+        let table_total: usize =
+            catalog.schemas().iter().map(|s| catalog.tables_in(s).len()).sum();
         let mut tree = div().id("catalog").flex_1().min_h_0().overflow_y_scroll().v_flex().gap_px();
         tree = tree.child(
             div()
@@ -155,18 +191,22 @@ impl DuckTable {
                         .text_color(t.muted)
                         .child("TABLES"),
                 )
+                // A filter earns its glyph past 10 items (and stays
+                // while open, so it can always be closed).
+                .when(filter_open || table_total > 10, |d| {
+                    d.child(
+                        head_glyph("filter-tables", filter_open, t)
+                            .child(
+                                gpui_component::Icon::new(gpui_component::IconName::Search)
+                                    .size_3p5(),
+                            )
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.toggle_filter(window, cx);
+                            })),
+                    )
+                })
                 .child(
-                    glyph("filter-tables", filter_open)
-                        .child(
-                            gpui_component::Icon::new(gpui_component::IconName::Search)
-                                .size_3p5(),
-                        )
-                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                            this.toggle_filter(window, cx);
-                        })),
-                )
-                .child(
-                    glyph("refresh-catalog", false)
+                    head_glyph("refresh-catalog", false, t)
                         // A raw svg() does NOT inherit text color (Icon
                         // sets it explicitly); without this it's invisible.
                         .child(svg().path("icons/refresh-cw.svg").size_3p5().text_color(t.muted))
@@ -284,4 +324,18 @@ impl DuckTable {
         }
         tree
     }
+}
+
+/// A small icon button for a sidebar section header (filter, refresh).
+fn head_glyph(id: &'static str, on: bool, t: Pal) -> Stateful<Div> {
+    div()
+        .id(id)
+        .h_flex()
+        .items_center()
+        .justify_center()
+        .size(px(18.))
+        .rounded(px(4.))
+        .cursor_pointer()
+        .text_color(if on { t.accent } else { t.muted })
+        .hover(|d| d.bg(t.row_hover))
 }

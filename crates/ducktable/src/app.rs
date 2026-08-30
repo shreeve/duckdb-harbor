@@ -44,6 +44,8 @@ pub struct DuckTable {
     pub(crate) connecting: Option<String>,
     /// The sidebar's table-name filter; Some = the field is open.
     pub(crate) table_filter: Option<Entity<gpui_component::input::InputState>>,
+    /// The sidebar's database-name filter; Some = the field is open.
+    pub(crate) berth_filter: Option<Entity<gpui_component::input::InputState>>,
     /// Fence for table selection: a first-page fetch that finishes after a
     /// newer click discards itself instead of swapping in a stale grid.
     select_seq: u64,
@@ -59,6 +61,7 @@ impl DuckTable {
             grid: None,
             connecting: None,
             table_filter: None,
+            berth_filter: None,
             select_seq: 0,
         };
         this.refresh(cx);
@@ -141,21 +144,36 @@ impl DuckTable {
         .detach();
     }
 
-    /// Open (focused) or close the sidebar's table filter.
-    pub(crate) fn toggle_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.table_filter.take().is_some() {
-            cx.notify();
-            return;
-        }
+    /// A fresh, focused filter input whose changes repaint the sidebar.
+    fn new_filter(
+        placeholder: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<gpui_component::input::InputState> {
         let input = cx.new(|cx| {
-            gpui_component::input::InputState::new(window, cx).placeholder("Filter tables")
+            gpui_component::input::InputState::new(window, cx).placeholder(placeholder)
         });
         cx.subscribe(&input, |_, _, _: &gpui_component::input::InputEvent, cx| {
             cx.notify();
         })
         .detach();
         input.update(cx, |state, cx| state.focus(window, cx));
-        self.table_filter = Some(input);
+        input
+    }
+
+    /// Open (focused) or close the sidebar's table filter.
+    pub(crate) fn toggle_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_filter.take().is_none() {
+            self.table_filter = Some(Self::new_filter("Filter tables", window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Open (focused) or close the sidebar's database filter.
+    pub(crate) fn toggle_berth_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.berth_filter.take().is_none() {
+            self.berth_filter = Some(Self::new_filter("Filter databases", window, cx));
+        }
         cx.notify();
     }
 
