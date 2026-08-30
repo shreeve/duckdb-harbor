@@ -17,13 +17,17 @@ impl Grid {
     pub(crate) fn footer(&self, cx: &mut Context<Self>) -> Div {
         let t = pal(cx);
         let view = self.view();
-        let s = self.footer_stats(cx);
+        let (count, cols, loading) = self.table_facts(cx);
+        let can_prev = self.page > 0;
+        let can_next = self.has_next(cx);
+        let can_last = matches!(self.last_page(), Some(lp) if self.page < lp);
         let filter_open = self.filter_input.is_some();
-        let (first, last) = (s.page * s.size + 1, s.page * s.size + s.count);
-        let rows_part = if s.count == 0 {
+        let base = self.page * self.page_size;
+        let (first, last) = (base + 1, base + count);
+        let rows_part = if count == 0 {
             "0 rows".to_string()
         } else {
-            match s.total {
+            match self.total_rows {
                 Some(t) => format!(
                     "{}\u{2013}{} of {} rows",
                     commas(first as u64),
@@ -48,12 +52,14 @@ impl Grid {
         // string its glyphs land a subpixel differently and the view
         // switch shows a 1px shift.
         let columns_part =
-            format!("{} {}", s.cols, if s.cols == 1 { "column" } else { "columns" });
-        let loading_empty = s.loading && s.count == 0;
+            format!("{} {}", cols, if cols == 1 { "column" } else { "columns" });
+        let loading_empty = loading && count == 0;
         let pager_visible = view == ViewMode::Data && !loading_empty;
         let status_prefix = match view {
             ViewMode::Data if loading_empty => Some("loading...".to_string()),
-            ViewMode::Data => Some(format!("{} ms \u{00b7} {rows_part}", s.ms)),
+            ViewMode::Data => {
+                Some(format!("{} ms \u{00b7} {rows_part}", self.last_time_ms))
+            }
             ViewMode::Structure => None,
         };
         let status_columns =
@@ -116,7 +122,7 @@ impl Grid {
                             svg()
                                 .path("icons/funnel.svg")
                                 .size_3p5()
-                                .text_color(if s.filter_active || filter_open {
+                                .text_color(if self.filter.is_some() || filter_open {
                                     t.accent
                                 } else {
                                     t.muted
@@ -169,7 +175,7 @@ impl Grid {
                                         arrow(
                                             "page-first",
                                             "icons/chevron-first.svg",
-                                            s.can_prev,
+                                            can_prev,
                                         )
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.jump_first(cx)
@@ -179,7 +185,7 @@ impl Grid {
                                         arrow(
                                             "page-prev",
                                             "icons/chevron-left.svg",
-                                            s.can_prev,
+                                            can_prev,
                                         )
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.prev_page(cx)
@@ -202,7 +208,7 @@ impl Grid {
                                                 )
                                                 .build(window, cx)
                                             })
-                                            .child(format!("{} per", commas(s.size as u64)))
+                                            .child(format!("{} per", commas(self.page_size as u64)))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.cycle_page_size(cx);
                                             })),
@@ -211,7 +217,7 @@ impl Grid {
                                         arrow(
                                             "page-next",
                                             "icons/chevron-right.svg",
-                                            s.can_next,
+                                            can_next,
                                         )
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.next_page(cx)
@@ -221,7 +227,7 @@ impl Grid {
                                         arrow(
                                             "page-last",
                                             "icons/chevron-last.svg",
-                                            s.can_last,
+                                            can_last,
                                         )
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.jump_last(cx)
