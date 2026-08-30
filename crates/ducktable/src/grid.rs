@@ -13,8 +13,11 @@
 //! editing arrives, reads resolve through an identity mapping, never raw
 //! indices.
 
+use crate::chrome::{icon_tile, toggle_tile};
 use crate::prefs::{self, ViewMode};
-use crate::theme::{pal, ui_font, value_font};
+use crate::theme::{
+    pal, ui_font, value_font, CELL_TEXT, GUTTER_TEXT, HEADER_TEXT, TAG_TEXT,
+};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::table::{Column as TableColumn, Table, TableDelegate, TableState};
@@ -30,35 +33,6 @@ use serde_json::Value;
 // ordinary tables a boundary-free read and huge tables honest jumps,
 // constant memory, and consistent snapshots — infinite append would
 // silently stitch separately-queried chunks together.
-
-// Sizes from design/design.css `.grid`: 12px mono values, 600 11.5px UI
-// headers, 11px muted row numbers, 10px NULL tag.
-// Base sizes at zoom 1.0; the data surfaces multiply by the current
-// zoom's factor (prefs::ZOOMS), whose paired table size keeps row
-// heights ahead of the text. The gutter and chrome stay put.
-const CELL_TEXT: f32 = 12.;
-const HEADER_TEXT: f32 = 11.5;
-const GUTTER_TEXT: f32 = 11.;
-const TAG_TEXT: f32 = 10.;
-
-/// A square hover-highlight icon tile — the chassis every header/footer
-/// glyph shares. Callers layer their own colors (state tints, disabled
-/// dimming) on top; a disabled tile skips the pointer and hover.
-pub(crate) fn icon_tile(
-    id: &'static str,
-    size: f32,
-    enabled: bool,
-    t: crate::theme::Pal,
-) -> Stateful<Div> {
-    div()
-        .id(id)
-        .h_flex()
-        .items_center()
-        .justify_center()
-        .size(px(size))
-        .rounded(px(4.))
-        .when(enabled, move |d| d.cursor_pointer().hover(move |d| d.bg(t.row_hover)))
-}
 
 // 7 is Menlo's digit advance at GUTTER_TEXT (11px); 16 is the gutter's
 // horizontal padding. Both move if the value font or size does.
@@ -1394,39 +1368,6 @@ impl Render for Grid {
             })
             .child(self.footer(cx))
     }
-}
-
-/// One tile in the display-toggle track: flat glyph when off, accent-tinted
-/// fill when on, faint hover, tooltip on hover.
-fn toggle_tile(
-    id: &'static str,
-    glyph: &'static str,
-    tip: &'static str,
-    on: bool,
-    t: crate::theme::Pal,
-    handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> Stateful<Div> {
-    div()
-        .id(id)
-        .h_flex()
-        .items_center()
-        .justify_center()
-        .w(px(24.))
-        .h(px(18.))
-        .rounded(px(4.))
-        .cursor_pointer()
-        .text_size(px(11.))
-        .map(|d| {
-            if on {
-                d.bg(t.accent.opacity(0.15)).text_color(t.accent)
-            } else {
-                d.text_color(t.muted)
-            }
-        })
-        .hover(move |d| if on { d } else { d.bg(t.row_hover) })
-        .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
-        .on_click(move |e, window, cx| handler(e, window, cx))
-        .child(glyph)
 }
 
 /// Wire values -> render-ready cell text (None = NULL), once per page.

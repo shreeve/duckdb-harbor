@@ -9,7 +9,7 @@
 //! editor will be one editing session with one owner.
 
 use crate::grid::Grid;
-use crate::theme::{pal, value_font, Pal};
+use crate::theme::{pal, value_font, Pal, CELL_TEXT, HEADER_TEXT};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::StyledExt as _;
@@ -40,7 +40,7 @@ impl Grid {
                 list = list.child(
                     div()
                         .pt_1()
-                        .text_size(px(12. * z))
+                        .text_size(px(CELL_TEXT * z))
                         .text_color(t.muted)
                         .child("Select a row"),
                 );
@@ -97,7 +97,7 @@ fn kv(t: Pal, z: f32, k: SharedString, v: SharedString, is_null: bool) -> impl I
                 .flex_none()
                 .max_w(px(110. * z))
                 .truncate()
-                .text_size(px(12. * z))
+                .text_size(px(CELL_TEXT * z))
                 .text_color(t.muted)
                 .child(k),
         )
@@ -105,7 +105,7 @@ fn kv(t: Pal, z: f32, k: SharedString, v: SharedString, is_null: bool) -> impl I
             div()
                 .min_w_0()
                 .truncate()
-                .text_size(px(11.5 * z))
+                .text_size(px(HEADER_TEXT * z))
                 .font_family(value_font())
                 .text_color(if is_null { t.muted } else { t.text })
                 .when(is_null, |d| d.italic())

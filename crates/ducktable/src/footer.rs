@@ -4,7 +4,8 @@
 //! as `inspector.rs` and `structure.rs` — per-table controls, a
 //! different scope from the header strip's global display prefs.
 
-use crate::grid::{icon_tile, Grid};
+use crate::chrome::{icon_tile, seg_tile};
+use crate::grid::Grid;
 use crate::prefs::ViewMode;
 use crate::theme::pal;
 use crate::util::commas;
@@ -408,36 +409,4 @@ impl Grid {
                     .into_any_element()
             })
     }
-}
-
-/// One segment of the footer's view switcher (design.css `.seg span`):
-/// contiguous segments on a surface track, and the active one is a SOLID
-/// accent fill with on-accent text — a true segmented control, bolder
-/// than the header's independent display toggles.
-fn seg_tile(
-    id: &'static str,
-    label: &'static str,
-    on: bool,
-    (first, last): (bool, bool),
-    t: crate::theme::Pal,
-    handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> Stateful<Div> {
-    let r = px(7.);
-    div()
-        .id(id)
-        .px(px(11.))
-        .py(px(3.))
-        .when(first, |d| d.rounded_tl(r).rounded_bl(r))
-        .when(last, |d| d.rounded_tr(r).rounded_br(r))
-        .cursor_pointer()
-        .text_size(px(12.))
-        .map(|d| {
-            if on {
-                d.bg(t.accent).text_color(t.on_accent).font_weight(FontWeight(560.))
-            } else {
-                d.text_color(t.muted).hover(|d| d.bg(t.row_hover))
-            }
-        })
-        .on_click(move |e, window, cx| handler(e, window, cx))
-        .child(label)
 }

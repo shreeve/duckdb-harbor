@@ -30,7 +30,7 @@ impl Render for CopyButton {
         let copied = self.copied;
         let label = self.label;
         let text = self.text.clone();
-        crate::grid::icon_tile("copy", 20., true, t)
+        crate::chrome::icon_tile("copy", 20., true, t)
             .tooltip(move |window, cx| {
                 gpui_component::tooltip::Tooltip::new(if copied { "Copied" } else { label })
                     .build(window, cx)

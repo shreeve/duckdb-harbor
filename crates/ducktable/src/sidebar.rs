@@ -1,6 +1,7 @@
 //! The sidebar: berth rows with live-state dots, and the catalog tree.
 
 use crate::app::{DuckTable, Phase};
+use crate::chrome::head_glyph;
 use crate::theme::{pal, Pal};
 use crate::util::clone_str;
 use gpui::prelude::FluentBuilder as _;
@@ -376,18 +377,4 @@ impl DuckTable {
         }
         tree
     }
-}
-
-/// A small icon button for a sidebar section header (filter, refresh).
-fn head_glyph(id: &'static str, on: bool, t: Pal) -> Stateful<Div> {
-    div()
-        .id(id)
-        .h_flex()
-        .items_center()
-        .justify_center()
-        .size(px(18.))
-        .rounded(px(4.))
-        .cursor_pointer()
-        .text_color(if on { t.accent } else { t.muted })
-        .hover(|d| d.bg(t.row_hover))
 }

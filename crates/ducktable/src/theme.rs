@@ -6,6 +6,16 @@
 //! design tokens in `design/tokens.css`; switching themes re-derives every
 //! surface because nothing else in the app holds a color.
 
+// The data-surface type scale, from design/design.css `.grid`: 12px mono
+// values, 600 11.5px UI headers, 11px muted row numbers, 10px tags and
+// chips. Base sizes at zoom 1.0; the data surfaces multiply by the
+// current zoom's factor (prefs::ZOOMS), whose paired table size keeps
+// row heights ahead of the text. The gutter and chrome stay put.
+pub const CELL_TEXT: f32 = 12.;
+pub const HEADER_TEXT: f32 = 11.5;
+pub const GUTTER_TEXT: f32 = 11.;
+pub const TAG_TEXT: f32 = 10.;
+
 use gpui::{App, Global, Hsla};
 use gpui_component::theme::{Theme, ThemeConfig, ThemeSet};
 use gpui_component::ActiveTheme as _;

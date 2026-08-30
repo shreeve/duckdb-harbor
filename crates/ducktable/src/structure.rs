@@ -10,7 +10,7 @@
 //! text — so opening the Structure view costs no query at all.
 
 use crate::grid::Grid;
-use crate::theme::{pal, ui_font, value_font, Pal};
+use crate::theme::{pal, ui_font, value_font, Pal, CELL_TEXT, HEADER_TEXT, TAG_TEXT};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::StyledExt as _;
@@ -211,7 +211,7 @@ impl Grid {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(12. * z))
+                            .text_size(px(CELL_TEXT * z))
                             .font_family(value_font())
                             .text_color(t.muted)
                             .child(c.dflt.clone().unwrap_or_default()),
@@ -249,7 +249,7 @@ impl Grid {
             pane = pane.child(
                 gpui_component::input::Input::new(state)
                     .disabled(true)
-                    .text_size(px(12. * z))
+                    .text_size(px(CELL_TEXT * z))
                     .font_family(value_font()),
             );
         }
@@ -263,7 +263,7 @@ fn header_row(t: Pal, z: f32) -> impl IntoElement {
         div()
             .w(px(w * z))
             .flex_none()
-            .text_size(px(11.5 * z))
+            .text_size(px(HEADER_TEXT * z))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(t.text)
             .child(label)
@@ -282,7 +282,7 @@ fn header_row(t: Pal, z: f32) -> impl IntoElement {
         .child(
             div()
                 .flex_1()
-                .text_size(px(11.5 * z))
+                .text_size(px(HEADER_TEXT * z))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(t.text)
                 .child("default"),
@@ -294,7 +294,7 @@ fn cell(t: Pal, z: f32, text: &str, w: f32, muted: bool) -> impl IntoElement + u
         .w(px(w * z))
         .flex_none()
         .truncate()
-        .text_size(px(12. * z))
+        .text_size(px(CELL_TEXT * z))
         .font_family(value_font())
         .text_color(if muted { t.muted } else { t.text })
         .child(text.to_string())
@@ -306,7 +306,7 @@ fn chip(t: Pal, z: f32, label: &'static str, accent: bool) -> impl IntoElement {
         .flex_none()
         .px(px(5.))
         .rounded(px(4.))
-        .text_size(px(10. * z))
+        .text_size(px(TAG_TEXT * z))
         .font_family(ui_font())
         .map(|d| {
             if accent {

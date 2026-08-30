@@ -3,6 +3,7 @@
 //! file (`app.rs` state, `sidebar.rs`, `content.rs`, `theme.rs`).
 
 mod app;
+mod chrome;
 mod content;
 mod copy_button;
 mod footer;
