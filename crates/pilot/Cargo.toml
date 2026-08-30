@@ -23,7 +23,7 @@ reedline = "0.50.0"
 serde = { version = "1.0.229", features = ["derive"] }
 # preserve_order: --json rows must keep column order, not alphabetize it
 serde_json = { version = "1", features = ["preserve_order"] }
-signal-hook = { version = "0.4.4", default-features = false }
+signal-hook = { version = "0.4", default-features = false }
 # already in reedline's tree: terminal-cell widths for duckbox alignment
 unicode-width = "0.2"
 

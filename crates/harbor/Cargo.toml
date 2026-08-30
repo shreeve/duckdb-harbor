@@ -28,7 +28,7 @@ wire = { path = "../wire" }
 toml = "1.1.4"
 
 [target.'cfg(unix)'.dependencies]
-signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
+signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }
 
 # The server engine (pool, leases, cancellation, NDJSON /sql) lives in this
 # crate's library beside the CLI in the bin — one crate, nothing else links

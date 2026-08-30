@@ -74,11 +74,13 @@ fn pulse(conn: &Conn) {
     }
 }
 
-/// New Harbor builds publish the configured idle window in /info. Pulse at a
-/// third of it, capped so long windows do not make recovery from scheduling
-/// stalls fragile. A missing field means an older Harbor; its normal 90s
-/// summon window is safely covered by the compatibility fallback.
+/// The berth publishes its idle window in /info. Pulse at a third of it,
+/// capped so long windows do not make recovery from scheduling stalls
+/// fragile. A permanent berth (null) needs no heartbeat; when /info cannot
+/// be read at all, pulse gently anyway — a spare keepalive is harmless, a
+/// missed one closes the berth under the prompt.
 fn keepalive_period(conn: &Conn) -> Option<Duration> {
+    let fallback = Some(Duration::from_secs(10));
     let resp = match crate::http::request(
         &conn.transport,
         &wire::endpoint::INFO,
@@ -87,23 +89,14 @@ fn keepalive_period(conn: &Conn) -> Option<Duration> {
         Some(Duration::from_secs(2)),
     ) {
         Ok(resp) => resp,
-        Err(_) => return Some(Duration::from_secs(10)),
+        Err(_) => return fallback,
     };
     if resp.status != 200 {
-        return Some(Duration::from_secs(10));
+        return fallback;
     }
-    let Ok(text) = resp.body_string() else { return Some(Duration::from_secs(10)) };
-    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Some(Duration::from_secs(10));
-    };
-    match doc.get("idleExitMs") {
-        Some(serde_json::Value::Null) => None,
-        Some(v) => {
-            let Some(ms) = v.as_u64() else { return Some(Duration::from_secs(10)) };
-            Some(Duration::from_millis((ms / 3).clamp(1, 10_000)))
-        }
-        None => Some(Duration::from_secs(10)),
-    }
+    let Ok(text) = resp.body_string() else { return fallback };
+    let Ok(info) = serde_json::from_str::<wire::InfoResponse>(&text) else { return fallback };
+    info.idle_exit_ms.map(|ms| Duration::from_millis((ms / 3).clamp(1, 10_000)))
 }
 
 struct BerthPrompt {

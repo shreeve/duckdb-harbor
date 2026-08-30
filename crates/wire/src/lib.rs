@@ -274,6 +274,10 @@ pub struct InfoResponse {
     pub databases: Vec<String>,
     pub pid: u32,
     pub uptime_ms: u64,
+    /// The configured idle window, or null on a permanent berth. Clients
+    /// pace their keepalive inside it; null means no heartbeat is needed.
+    #[serde(default)]
+    pub idle_exit_ms: Option<u64>,
 }
 
 #[cfg(test)]
