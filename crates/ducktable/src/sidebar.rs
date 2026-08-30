@@ -153,13 +153,30 @@ impl DuckTable {
                         .when(selected, |d| d.bg(t.row_selected))
                         .hover(|d| d.bg(t.row_hover))
                         .child(
+                            // "users (35)" — the column count hugs the
+                            // name; a long name truncates but keeps its
+                            // count visible.
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .truncate()
-                                .text_sm()
-                                .text_color(t.text)
-                                .child(clone_str(&table.name)),
+                                .h_flex()
+                                .gap_1()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_sm()
+                                        .text_color(t.text)
+                                        .child(clone_str(&table.name)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(t.muted)
+                                        .child(format!("({})", table.columns.len())),
+                                ),
                         )
                         // Row count in compact SI form — rows are what a
                         // scan of a database cares about; column counts
