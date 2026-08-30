@@ -43,9 +43,6 @@ pub(crate) struct GridDelegate {
     source: String,
     title: String,
     cols: Vec<TableColumn>,
-    /// Right-aligned (numeric) columns; the Table never reads
-    /// `Column::align`, so the delegate applies it to th and td itself.
-    right: Vec<bool>,
     rows: Vec<Vec<Value>>,
     eof: bool,
     loading: bool,
@@ -66,7 +63,6 @@ impl Grid {
             source: format!("{}.{}", qident(schema), qident(name)),
             title: format!("{schema}.{name}"),
             cols: Vec::new(),
-            right: Vec::new(),
             rows: Vec::new(),
             eof: false,
             loading: false,
@@ -107,11 +103,6 @@ impl GridDelegate {
                                 d.eof = page.rows.len() < PAGE;
                                 d.last_time_ms = page.time_ms;
                                 if first {
-                                    d.right = page
-                                        .columns
-                                        .iter()
-                                        .map(|c| numeric(&c.duckdb_type.to_uppercase()))
-                                        .collect();
                                     d.cols = build_columns(&page.columns);
                                 }
                                 d.rows.extend(page.rows);
@@ -235,10 +226,6 @@ impl TableDelegate for GridDelegate {
                         .text_size(px(CELL_TEXT))
                         .font_family(value_font())
                         .text_color(t.text)
-                        .when(
-                            self.right.get(data_col).copied().unwrap_or(false),
-                            |d| d.text_right(),
-                        )
                         .child(text),
                 )
                 .into_any_element()
@@ -262,17 +249,15 @@ impl TableDelegate for GridDelegate {
                 .child("#")
                 .into_any_element();
         }
+        // Headers and values are both left-aligned (design proof: only the
+        // row-number gutter right-aligns), so they line up on the shared
+        // 8px wrapper inset by construction.
         div()
             .size_full()
             .truncate()
-            // The header wrapper compensates zeroed paddings with only the
-            // size's default right inset (4px at XSmall); cells put text
-            // 9px in (8px pad + 1px divider). Make the header match.
-            .pr(px(5.))
             .text_size(px(HEADER_TEXT))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(t.text)
-            .when(self.right.get(col_ix - 1).copied().unwrap_or(false), |d| d.text_right())
             .child(self.cols[col_ix].name.clone())
             .into_any_element()
     }
@@ -372,10 +357,9 @@ fn build_columns(cols: &[wire::Column]) -> Vec<TableColumn> {
             // Left padding stays on the table's cell wrapper; the other
             // edges go to zero so render_td can reach them (its divider
             // and text inset live there).
-            let col = TableColumn::new(format!("c{i}"), name)
+            TableColumn::new(format!("c{i}"), name)
                 .width(px(width_for(&ty)))
-                .paddings(Edges { left: px(8.), right: px(0.), top: px(0.), bottom: px(0.) });
-            if numeric(&ty) { col.text_right() } else { col }
+                .paddings(Edges { left: px(8.), right: px(0.), top: px(0.), bottom: px(0.) })
         }))
         .collect()
 }
