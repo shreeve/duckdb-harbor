@@ -1,6 +1,6 @@
 [package]
 name = "harbor"
-version = "0.17.0"
+version.workspace = true
 edition = "2024"
 description = "harbor — DuckDB wearing a server: fleet manager + HTTP/UDS engine"
 license = "MIT"
@@ -28,8 +28,8 @@ toml = "1.1.4"
 signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
 
 # The server engine (pool, leases, cancellation, NDJSON /sql) lives in this
-# crate's library beside the CLI in the bin — folded back in once the loadable
-# extension that justified a separate harbor-core was retired (PLAN.md D5).
+# crate's library beside the CLI in the bin — one crate, nothing else links
+# the engine.
 [lib]
 name = "harbor"
 path = "src/lib.rs"

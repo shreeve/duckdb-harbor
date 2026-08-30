@@ -1,11 +1,11 @@
 [package]
 name = "wire"
-version = "0.15.0"
+version.workspace = true
 edition = "2024"
 description = "The Harbor wire contract: request shapes, NDJSON envelope, error codes"
 license = "MIT"
 
-# Pilot's Harbor protocol types (PLAN.md D8). Harbor currently implements its
+# Pilot's Harbor protocol types. Harbor implements its
 # encoder and request parser directly, so cross-side tests—not a shared Rust
 # dependency—pin compatibility. No I/O here, ever: types and codes only.
 [dependencies]

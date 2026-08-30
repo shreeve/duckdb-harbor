@@ -1,6 +1,6 @@
 [package]
 name = "harbor-common"
-version = "0.15.0"
+version.workspace = true
 edition = "2024"
 description = "harbor-common — what harbor, pilot and ducktable all need: paths, names, permissions, config, lifetimes, states"
 license = "MIT"

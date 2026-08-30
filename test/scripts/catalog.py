@@ -445,9 +445,9 @@ def run_empty(base):
 
 
 def harbor_version():
-    """The crate version, read from the one place it is written: the harbor crate."""
-    crate = os.path.join(HERE, "crates", "harbor")
-    with open(os.path.join(crate, "Cargo.toml")) as f:
+    """The workspace version, read from the one place it is written: the root
+    Cargo.toml's [workspace.package] — every crate inherits it."""
+    with open(os.path.join(HERE, "Cargo.toml")) as f:
         for line in f:
             if line.startswith("version"):
                 return line.split('"')[1]

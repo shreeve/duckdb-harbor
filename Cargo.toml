@@ -1,9 +1,9 @@
-# Pure workspace: the extension retired (PLAN.md D5); everything lives in
-# crates/. That includes crates/justhttp, harbor's first-party HTTP/1.1
-# layer and a plain path dependency of crates/harbor. Its historical lineage
-# is recorded for licensing, but it has no upstream HTTP-crate dependency.
+# Pure workspace: everything lives in crates/. That includes
+# crates/justhttp, harbor's first-party HTTP/1.1 layer and a plain path
+# dependency of crates/harbor. Its lineage is recorded for licensing, but it
+# has no upstream HTTP-crate dependency.
 # justhttp carries a bounded unread-body drain and a 10s response write
-# timeout. Full ledger in crates/justhttp/README.md and TODO.md. Test it with
+# timeout. Full ledger in crates/justhttp/README.md. Test it with
 # `cargo test -p justhttp`.
 [workspace]
 members = ["crates/*"]
@@ -13,13 +13,22 @@ default-members = ["crates/wire", "crates/pilot", "crates/harbor"]
 exclude = ["vendor/reedline"]
 resolver = "2"
 
+# One version for everything the release archive contains. These crates ship
+# together in one tarball under one tag, so a per-crate number can only ever
+# be wrong: harbor drifted to 0.17.0 while pilot sat at 0.15.0, and a v0.17
+# archive would have shipped a `pilot --version` that disagreed with its own
+# filename. Inheriting removes the chance to forget one.
+[workspace.package]
+version = "0.18.0"
+
 [profile.release]
 lto = true
 strip = true
 
 # vendor/reedline is 0.50.0 verbatim except two patches in src/engine.rs (both
-# proposed upstream; see TODO.md): a completion menu with zero suggestions no
-# longer swallows Enter, and typing a word boundary closes the menu — together
-# they stop a stale menu from inserting a stray word instead of submitting.
+# proposed upstream; see vendor/reedline/HARBOR.md): a completion menu with
+# zero suggestions does not swallow Enter, and typing a word boundary closes
+# the menu — together they stop a stale menu from inserting a stray word
+# instead of submitting.
 [patch.crates-io]
 reedline = { path = "vendor/reedline" }
