@@ -2,7 +2,7 @@
 //! flow's states (idle, connecting with cancel, failed with retry).
 
 use crate::app::{DuckTable, Phase};
-use crate::theme::*;
+use crate::theme::{pal, Pal};
 use crate::util::clone_str;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -12,16 +12,17 @@ use harbor_client::Level;
 
 impl DuckTable {
     pub(crate) fn content(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = pal(cx);
         let body = match &self.phase {
             Phase::Idle => div()
                 .v_flex()
                 .gap_2()
                 .items_center()
-                .child(div().text_lg().text_color(rgb(TEXT)).child("DuckTable"))
+                .child(div().text_lg().text_color(t.text).child("DuckTable"))
                 .child(
                     div()
                         .text_sm()
-                        .text_color(rgb(MUTED))
+                        .text_color(t.muted)
                         .child("Pick a berth on the left. A stopped berth with a path spawns on demand."),
                 ),
             Phase::Connecting { name } => div()
@@ -31,7 +32,7 @@ impl DuckTable {
                 .child(
                     div()
                         .text_sm()
-                        .text_color(rgb(MUTED))
+                        .text_color(t.muted)
                         .child(format!("Connecting to {name}...")),
                 )
                 .child(
@@ -46,10 +47,10 @@ impl DuckTable {
                 .child(
                     div()
                         .text_sm()
-                        .text_color(rgb(BAD))
+                        .text_color(t.bad)
                         .child(format!("Couldn't connect to {name}")),
                 )
-                .child(div().text_xs().text_color(rgb(MUTED)).child(clone_str(message)))
+                .child(div().text_xs().text_color(t.muted).child(clone_str(message)))
                 .child({
                     let name = clone_str(name);
                     Button::new("retry").label("Retry").primary().on_click(cx.listener(
@@ -76,20 +77,20 @@ impl DuckTable {
                     .max_w_full()
                     .max_h_full()
                     .overflow_hidden()
-                    .bg(rgb(BG_SURFACE))
+                    .bg(t.surface)
                     .border_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(t.border)
                     .rounded_lg()
                     .child(
                         div()
                             .text_lg()
-                            .text_color(rgb(TEXT))
+                            .text_color(t.text)
                             .child(format!("{schema}.{name}")),
                     )
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(MUTED))
+                            .text_color(t.muted)
                             .pb_2()
                             .child(format!("{} columns", table.columns.len())),
                     )
@@ -104,7 +105,7 @@ impl DuckTable {
                                     .w_48()
                                     .flex_none()
                                     .truncate()
-                                    .text_color(rgb(TEXT))
+                                    .text_color(t.text)
                                     .child(clone_str(&c.name)),
                             )
                             .child(
@@ -112,14 +113,14 @@ impl DuckTable {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_color(rgb(MUTED))
+                                    .text_color(t.muted)
                                     .child(clone_str(&c.duck_type)),
                             )
                             .when(c.primary, |d| {
-                                d.child(div().text_xs().text_color(rgb(ACCENT)).child("PK"))
+                                d.child(div().text_xs().text_color(t.accent).child("PK"))
                             })
                             .when(c.not_null && !c.primary, |d| {
-                                d.child(div().text_xs().text_color(rgb(MUTED)).child("NOT NULL"))
+                                d.child(div().text_xs().text_color(t.muted).child("NOT NULL"))
                             })
                     }))
             }
@@ -131,26 +132,28 @@ impl DuckTable {
                 .min_w(px(440.))
                 .max_w_full()
                 .overflow_hidden()
-                .bg(rgb(BG_SURFACE))
+                .bg(t.surface)
                 .border_1()
-                .border_color(rgb(BORDER))
+                .border_color(t.border)
                 .rounded_lg()
                 .child(
                     div()
                         .h_flex()
                         .gap_2()
                         .items_center()
-                        .child(Self::dot(Level::Good))
-                        .child(div().text_lg().text_color(rgb(TEXT)).child(clone_str(&info.name))),
+                        .child(Self::dot(Level::Good, t))
+                        .child(div().text_lg().text_color(t.text).child(clone_str(&info.name))),
                 )
-                .child(meta("DuckDB", clone_str(&info.duckdb_version)))
-                .child(meta("Harbor", clone_str(&info.harbor_version)))
+                .child(meta(t, "DuckDB", clone_str(&info.duckdb_version)))
+                .child(meta(t, "Harbor", clone_str(&info.harbor_version)))
                 .child(meta(
+                    t,
                     "Database",
                     harbor_client::paths::shorten(std::path::Path::new(&info.database)),
                 ))
-                .child(meta("Uptime", format!("{}s", info.uptime_ms / 1000)))
+                .child(meta(t, "Uptime", format!("{}s", info.uptime_ms / 1000)))
                 .child(meta(
+                    t,
                     "Lifetime",
                     if conn.summoned { "summoned by this window".into() } else { "joined, already running".into() },
                 )),
@@ -159,7 +162,7 @@ impl DuckTable {
             .flex_1()
             .min_w_0()
             .h_full()
-            .bg(rgb(BG_SURFACE))
+            .bg(t.surface)
             .v_flex()
             .items_center()
             .justify_center()
@@ -168,12 +171,12 @@ impl DuckTable {
     }
 }
 
-fn meta(k: &'static str, v: String) -> impl IntoElement {
+fn meta(t: Pal, k: &'static str, v: String) -> impl IntoElement {
     div()
         .h_flex()
         .gap_2()
         .w_full()
         .text_sm()
-        .child(div().w_20().flex_none().text_color(rgb(MUTED)).child(k))
-        .child(div().flex_1().min_w_0().truncate().text_color(rgb(TEXT)).child(v))
+        .child(div().w_20().flex_none().text_color(t.muted).child(k))
+        .child(div().flex_1().min_w_0().truncate().text_color(t.text).child(v))
 }

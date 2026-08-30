@@ -1,7 +1,7 @@
 //! The sidebar: berth rows with live-state dots, and the catalog tree.
 
 use crate::app::{DuckTable, Phase};
-use crate::theme::*;
+use crate::theme::{pal, Pal};
 use crate::util::clone_str;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -9,17 +9,12 @@ use gpui_component::*;
 use harbor_client::Level;
 
 impl DuckTable {
-    pub(crate) fn dot(level: Level) -> Div {
-        let color = match level {
-            Level::Good => rgb(GOOD),
-            Level::Warn => rgb(WARN),
-            Level::Bad => rgb(BAD),
-            Level::Idle => rgb(MUTED),
-        };
-        div().size_2().rounded_full().bg(color)
+    pub(crate) fn dot(level: Level, t: Pal) -> Div {
+        div().size_2().rounded_full().bg(t.level(level))
     }
 
     pub(crate) fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = pal(cx);
         let active = match &self.phase {
             Phase::Connected { conn, .. } => Some(clone_str(&conn.name)),
             Phase::Connecting { name } => Some(clone_str(name)),
@@ -29,9 +24,9 @@ impl DuckTable {
             .w_56()
             .flex_none()
             .h_full()
-            .bg(rgb(BG_SIDEBAR))
+            .bg(t.bg_sidebar)
             .border_r_1()
-            .border_color(rgb(BORDER))
+            .border_color(t.border)
             .p_2()
             .v_flex()
             .gap_px()
@@ -41,7 +36,7 @@ impl DuckTable {
                     .py_1()
                     .text_xs()
                     .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(MUTED))
+                    .text_color(t.muted)
                     .child("BERTHS"),
             )
             .children(self.rows.iter().map(|row| {
@@ -56,12 +51,12 @@ impl DuckTable {
                     .gap_2()
                     .items_center()
                     .cursor_pointer()
-                    .when(selected, |d| d.bg(rgb(0xD6E6FB)))
-                    .hover(|d| d.bg(rgb(0xE4EDF8)))
-                    .child(Self::dot(row.state.level()))
-                    .child(div().flex_1().text_sm().text_color(rgb(TEXT)).child(clone_str(&row.name)))
+                    .when(selected, |d| d.bg(t.row_selected))
+                    .hover(|d| d.bg(t.row_hover))
+                    .child(Self::dot(row.state.level(), t))
+                    .child(div().flex_1().text_sm().text_color(t.text).child(clone_str(&row.name)))
                     .when(row.summonable, |d| {
-                        d.child(div().text_xs().text_color(rgb(MUTED)).child("spawn"))
+                        d.child(div().text_xs().text_color(t.muted).child("spawn"))
                     })
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.connect(clone_str(&name), cx);
@@ -70,20 +65,41 @@ impl DuckTable {
             .child(self.catalog_tree(cx))
             .child(
                 div()
-                    .id("refresh")
                     .mt_2()
-                    .px_2()
-                    .py_1()
                     .flex_none()
-                    .text_xs()
-                    .text_color(rgb(ACCENT))
-                    .cursor_pointer()
-                    .child("refresh")
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.refresh(cx))),
+                    .h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("refresh")
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .text_color(t.accent)
+                            .cursor_pointer()
+                            .child("refresh")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.refresh(cx))),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("theme")
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .text_color(t.muted)
+                            .cursor_pointer()
+                            .hover(|d| d.text_color(t.accent))
+                            .child(crate::theme::current_name(cx))
+                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                                crate::theme::cycle(cx);
+                            })),
+                    ),
             )
     }
 
     pub(crate) fn catalog_tree(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let t = pal(cx);
         let Phase::Connected { catalog, .. } = &self.phase else {
             return div().id("catalog").flex_1();
         };
@@ -97,13 +113,13 @@ impl DuckTable {
                 .pb_1()
                 .text_xs()
                 .font_weight(FontWeight::BOLD)
-                .text_color(rgb(MUTED))
+                .text_color(t.muted)
                 .child("CATALOG"),
         );
         for schema in schemas {
             if many_schemas {
                 tree = tree.child(
-                    div().px_2().py_1().text_xs().text_color(rgb(MUTED)).child(clone_str(schema)),
+                    div().px_2().py_1().text_xs().text_color(t.muted).child(clone_str(schema)),
                 );
             }
             for table in catalog.tables_in(schema) {
@@ -120,21 +136,21 @@ impl DuckTable {
                         .gap_2()
                         .items_center()
                         .cursor_pointer()
-                        .when(selected, |d| d.bg(rgb(0xD6E6FB)))
-                        .hover(|d| d.bg(rgb(0xE4EDF8)))
+                        .when(selected, |d| d.bg(t.row_selected))
+                        .hover(|d| d.bg(t.row_hover))
                         .child(
                             div()
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
                                 .text_sm()
-                                .text_color(rgb(TEXT))
+                                .text_color(t.text)
                                 .child(clone_str(&table.name)),
                         )
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(MUTED))
+                                .text_color(t.muted)
                                 .child(format!("{}", table.columns.len())),
                         )
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -152,7 +168,7 @@ impl DuckTable {
                     .pb_1()
                     .text_xs()
                     .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(MUTED))
+                    .text_color(t.muted)
                     .child("SEQUENCES"),
             );
             for seq in &catalog.sequences {
@@ -161,7 +177,7 @@ impl DuckTable {
                         .pl_4()
                         .py_1()
                         .text_sm()
-                        .text_color(rgb(MUTED))
+                        .text_color(t.muted)
                         .child(clone_str(&seq.name)),
                 );
             }

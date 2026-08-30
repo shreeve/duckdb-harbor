@@ -1436,6 +1436,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "harbor-client",
+ "serde_json",
  "wire",
 ]
 

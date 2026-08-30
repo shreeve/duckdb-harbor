@@ -28,6 +28,7 @@ fn main() {
 
     app.run(move |cx| {
         gpui_component::init(cx);
+        theme::init(cx);
 
         cx.spawn(async move |cx| {
             cx.open_window(
