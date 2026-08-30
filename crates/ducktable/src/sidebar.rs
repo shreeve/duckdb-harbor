@@ -198,7 +198,9 @@ impl DuckTable {
                 tree = tree.child(
                     div()
                         .id(SharedString::from(format!("t-{schema}-{}", table.name)))
-                        .pl_4()
+                        // Text starts on the database names' axis: their
+                        // rows indent 8px pad + 8px dot + 8px gap = 24.
+                        .pl(px(24.))
                         .pr_2()
                         .py_1()
                         .rounded_md()
@@ -270,7 +272,7 @@ impl DuckTable {
             for seq in &catalog.sequences {
                 tree = tree.child(
                     div()
-                        .pl_4()
+                        .pl(px(24.))
                         .py_1()
                         .text_sm()
                         .text_color(t.muted)
