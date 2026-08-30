@@ -832,7 +832,17 @@ impl Grid {
         let ks = &e.keystroke;
         let m = ks.modifiers;
         if self.editor.is_some() {
-            let replace = self.editor.as_ref().is_some_and(|ed| ed.replace);
+            // Focus decides whose grammar a key speaks. The WHERE strip
+            // and the popovers live inside this pane too; their
+            // keystrokes bubble through here and are not ours.
+            let (focused, replace) = self
+                .editor
+                .as_ref()
+                .map(|ed| (ed.input.focus_handle(cx).is_focused(window), ed.replace))
+                .unwrap_or((false, false));
+            if !focused {
+                return;
+            }
             match ks.key.as_str() {
                 "escape" => self.cancel_edit(cx),
                 "enter" if m.platform || m.alt => return, // newline — the input's
@@ -865,7 +875,12 @@ impl Grid {
             cx.stop_propagation();
             return;
         }
-        // Navigating.
+        // Navigating — but only when the table itself holds focus. A key
+        // typed into the WHERE input (or any other input in the pane)
+        // must mean what that input says it means.
+        if !self.table.focus_handle(cx).contains_focused(window, cx) {
+            return;
+        }
         if m.platform && !m.shift && ks.key == "s" {
             self.commit(cx);
             cx.stop_propagation();
@@ -958,6 +973,12 @@ impl Grid {
         if e.click_count != 2 || self.editor.is_some() {
             return;
         }
+        // The header row is the fit gesture's turf (divider_double_click)
+        // — its recorded frame excludes body double-clicks from opening
+        // an editor and vice versa.
+        if self.table_bounds.get().contains(&e.position) {
+            return;
+        }
         if let Some((row, col)) = self.table.read(cx).delegate().active_cell {
             self.open_editor(row, col, None, window, cx);
         }
@@ -994,7 +1015,16 @@ impl Grid {
         let input = cx.new(|cx| {
             gpui_component::input::InputState::new(window, cx).default_value(text)
         });
-        input.update(cx, |state, cx| state.focus(window, cx));
+        input.update(cx, |state, cx| {
+            // Caret at the end (set_cursor_position also focuses):
+            // replace entry keeps typing past its seed; kept-value entry
+            // lands where Sheets puts it. The column clamps to the line.
+            state.set_cursor_position(
+                gpui_component::input::Position::new(0, u32::MAX),
+                window,
+                cx,
+            );
+        });
         // Enter may be consumed by the input before it bubbles; the event
         // subscription is the belt to on_key's suspenders. Idempotent:
         // whoever runs first takes the editor.
@@ -1049,9 +1079,14 @@ impl Grid {
             )
         };
         let staged = if text.is_empty() {
-            // An emptied editor: '' for text (the one honest way to enter
-            // it), NULL for everything else — docs/EDITING.md.
-            if edits::is_text_type(&ty) {
+            if fetched.is_none() {
+                // NULL in, nothing typed, NULL out: confirming an empty
+                // editor over NULL is a no-op (stage_cell auto-cleans),
+                // not a NULL→'' edit.
+                Some((None, Value::Null))
+            } else if edits::is_text_type(&ty) {
+                // An emptied editor: '' for text (the one honest way to
+                // enter it), NULL for everything else — docs/EDITING.md.
                 Some((Some(SharedString::from("")), Value::String(String::new())))
             } else {
                 None // NULL path, checked below
@@ -1222,6 +1257,29 @@ impl Grid {
             cx.notify();
         });
         cx.notify();
+    }
+
+    /// Surrender the staged layer when this grid is being replaced —
+    /// only if there is actually something staged to carry.
+    pub(crate) fn take_edits(&mut self) -> Option<Edits> {
+        let e = self.edits.take()?;
+        let (updates, deletes) = e.counts();
+        if updates + deletes == 0 {
+            self.edits = Some(e);
+            return None;
+        }
+        Some(e)
+    }
+
+    /// Receive a stashed staging set from a previous visit to this
+    /// table. Adopted only when the table still has the same identity
+    /// and columns — a changed schema orphans the stash rather than
+    /// mis-keying it.
+    pub(crate) fn adopt_edits(&mut self, stash: Edits, cx: &mut Context<Self>) {
+        if self.edits.as_ref().is_some_and(|mine| mine.same_shape(&stash)) {
+            self.edits = Some(stash);
+            self.sync_staged(cx);
+        }
     }
 
     /// Discard one staged row change (the review popover's per-entry ✕).
@@ -1878,6 +1936,13 @@ impl Render for Grid {
         if self.needs_focus {
             self.needs_focus = false;
             window.focus(&self.table.focus_handle(cx));
+        }
+        // An editor whose column just got hidden would be invisible but
+        // still focused — cancel it (lossless, like any Esc).
+        if let Some(ed) = &self.editor {
+            if !self.table.read(cx).delegate().visible.contains(&ed.col) {
+                self.cancel_edit(cx);
+            }
         }
         // The inspector slots in BESIDE the table, below the header strip —
         // the title/toggle row keeps the full width, so opening the panel

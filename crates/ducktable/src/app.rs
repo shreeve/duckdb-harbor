@@ -61,6 +61,11 @@ pub struct DuckTable {
     /// "harbor is broken"; a dead refresh click reads as "it worked").
     /// The next fleet refresh rewrites it from the config's truth.
     pub(crate) warning: Option<String>,
+    /// Staged edits parked while their table is off-screen (Law 4 in
+    /// docs/EDITING.md: staged changes belong to the table, not the
+    /// view). Keyed by source; handed back when the table's grid is
+    /// rebuilt, cleared on disconnect (a new berth is a new world).
+    staged: std::collections::HashMap<String, crate::edits::Edits>,
 }
 
 impl DuckTable {
@@ -77,6 +82,7 @@ impl DuckTable {
             select_seq: 0,
             refresh_seq: 0,
             warning: None,
+            staged: std::collections::HashMap::new(),
         };
         this.refresh(cx);
         this
@@ -138,14 +144,28 @@ impl DuckTable {
                 if !matches!(state.phase, Phase::Connected { .. }) {
                     return;
                 }
+                // Staged edits outlive the grid that collected them (Law
+                // 4): park the outgoing table's, keyed by source, before
+                // the swap discards its view.
+                if let Some(old) = state.grid.take() {
+                    if let Some(edits) = old.update(cx, |g, _| g.take_edits()) {
+                        state.staged.insert(edits.source().to_string(), edits);
+                    }
+                }
                 // The Data/Structure choice is a browsing mode, not table
                 // state (prefs.view): it survives this table switch.
-                state.grid = Some(cx.new(|cx| {
+                let grid = cx.new(|cx| {
                     crate::grid::Grid::new(
                         conn, &schema, &name, title, outcome, total, page_size, structure,
                         window, cx,
                     )
-                }));
+                });
+                // And returning to a table hands its parked edits back.
+                let source = crate::queries::source(&schema, &name);
+                if let Some(stash) = state.staged.remove(&source) {
+                    grid.update(cx, |g, cx| g.adopt_edits(stash, cx));
+                }
+                state.grid = Some(grid);
                 cx.notify();
             })
             .ok();
@@ -318,6 +338,7 @@ impl DuckTable {
                 state.connecting = None;
                 state.selected_table = None;
                 state.grid = None;
+                state.staged.clear();
                 state.select_seq += 1;
                 state.phase = match outcome {
                     Ok((conn, info, catalog)) => Phase::Connected { conn, info, catalog },

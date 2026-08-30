@@ -85,6 +85,21 @@ impl Edits {
         self.changes.is_empty()
     }
 
+    /// The quoted `"schema"."table"` these changes target.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// True when another staging set targets the same table with the
+    /// same key and column layout — the safety check for handing edits
+    /// across grid rebuilds (Law 4: staged changes belong to the table,
+    /// not the view).
+    pub fn same_shape(&self, other: &Edits) -> bool {
+        self.source == other.source
+            && self.pk_cols == other.pk_cols
+            && self.columns == other.columns
+    }
+
     /// (updates, deletes) — the verb-split the status line shows.
     pub fn counts(&self) -> (usize, usize) {
         let deletes = self
