@@ -201,6 +201,26 @@ impl Grid {
             }
         })
         .detach();
+        // The Table clears its selection on Escape with NO event (its
+        // Cancel action calls clear_selection, which never emits), so
+        // SelectRow alone lets the mirror drift: ghost tint and ring on
+        // a row the table considers deselected. Reconcile on every
+        // table notify instead; the comparison makes it a no-op when
+        // already in sync.
+        cx.observe(&table, |_, table, cx| {
+            table.update(cx, |state, cx| {
+                let real = state.selected_row();
+                let d = state.delegate_mut();
+                if d.selected != real {
+                    d.selected = real;
+                    if real.is_none() {
+                        d.active_cell = None;
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         let resize = cx.new(|_| ResizableState::default());
         cx.subscribe(&resize, |_, state, _: &ResizablePanelEvent, cx| {
             if let Some(width) = state.read(cx).sizes().get(1).copied() {
