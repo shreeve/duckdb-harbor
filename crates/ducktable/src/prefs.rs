@@ -24,6 +24,10 @@ pub struct Prefs {
 /// each step is a different kind of read (skim / work / bulk-scan).
 pub const PAGE_SIZES: [usize; 3] = [500, 5_000, 50_000];
 
+/// Inspector width bounds — the load clamp and the divider's drag range.
+pub const INSPECTOR_MIN: f32 = 180.;
+pub const INSPECTOR_MAX: f32 = 600.;
+
 impl Default for Prefs {
     fn default() -> Self {
         Self {
@@ -58,7 +62,7 @@ pub fn init(cx: &mut App) {
         prefs.inspector_width = v
             .get("inspector_width")
             .and_then(Value::as_f64)
-            .map(|w| (w as f32).clamp(180., 600.))
+            .map(|w| (w as f32).clamp(INSPECTOR_MIN, INSPECTOR_MAX))
             .unwrap_or(prefs.inspector_width);
         prefs.page_size = v
             .get("page_size")

@@ -233,7 +233,7 @@ impl DuckTable {
                                     .size_3p5(),
                             )
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.toggle_filter(window, cx);
+                                this.toggle_table_filter(window, cx);
                             })),
                     )
                 })

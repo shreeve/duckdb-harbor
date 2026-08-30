@@ -13,6 +13,7 @@
 
 use crate::prefs;
 use crate::theme::{pal, ui_font, value_font};
+use crate::util::qident;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::table::{Column as TableColumn, Table, TableDelegate, TableState};
@@ -263,7 +264,8 @@ impl Grid {
         cx.subscribe(&resize, |_, state, _: &ResizablePanelEvent, cx| {
             if let Some(width) = state.read(cx).sizes().get(1).copied() {
                 crate::prefs::save(cx, |p| {
-                    p.inspector_width = f32::from(width).clamp(180., 600.);
+                    p.inspector_width = f32::from(width)
+                        .clamp(prefs::INSPECTOR_MIN, prefs::INSPECTOR_MAX);
                 });
             }
         })
@@ -430,12 +432,7 @@ impl Grid {
     pub(crate) fn next_page(&mut self, cx: &mut Context<Self>) {
         let (page, more) = {
             let d = self.table.read(cx).delegate();
-            let more = match d.last_page() {
-                Some(last) => d.page < last,
-                // Unknown total: a full page suggests there may be more.
-                None => d.rows.len() == d.page_size,
-            };
-            (d.page, more)
+            (d.page, d.has_next())
         };
         if more {
             self.fetch_page(page + 1, cx);
@@ -497,65 +494,65 @@ impl Grid {
         cx.notify();
     }
 
-    /// Show or hide one column (never the last visible one).
-    pub(crate) fn toggle_column(&mut self, schema_ix: usize, cx: &mut Context<Self>) {
+    /// Shared tail of every column-set mutation (returns false = no
+    /// change): rebuild the display columns, refresh the table, and
+    /// reset the horizontal scroll — the header (overflow_scroll) and
+    /// body (virtual_list) share a scroll handle but clamp a stale
+    /// offset differently once the column set changes width, so origin
+    /// is the one offset they agree on.
+    fn remap_columns(
+        &mut self,
+        cx: &mut Context<Self>,
+        mutate: impl FnOnce(&mut GridDelegate) -> bool,
+    ) {
         self.table.update(cx, |state, cx| {
-            {
-                let d = state.delegate_mut();
-                if !d.hidden.remove(&schema_ix) {
-                    if d.visible.len() <= 1 {
-                        return;
-                    }
-                    d.hidden.insert(schema_ix);
-                }
-                d.rebuild_cols();
+            if !mutate(state.delegate_mut()) {
+                return;
             }
+            state.delegate_mut().rebuild_cols();
             state.refresh(cx);
-            // Header and body clamp stale offsets differently once the
-            // column set changes width; reset to origin so they agree.
             state.scroll_to_col(0, cx);
             cx.notify();
         });
         cx.notify();
     }
 
+    /// Show or hide one column (never the last visible one).
+    pub(crate) fn toggle_column(&mut self, schema_ix: usize, cx: &mut Context<Self>) {
+        self.remap_columns(cx, |d| {
+            if !d.hidden.remove(&schema_ix) {
+                if d.visible.len() <= 1 {
+                    return false;
+                }
+                d.hidden.insert(schema_ix);
+            }
+            true
+        });
+    }
+
     /// Reset every hidden column (the popover's "Show all").
     pub(crate) fn show_all_columns(&mut self, cx: &mut Context<Self>) {
-        self.table.update(cx, |state, cx| {
-            {
-                let d = state.delegate_mut();
-                if d.hidden.is_empty() {
-                    return;
-                }
-                d.hidden.clear();
-                d.rebuild_cols();
+        self.remap_columns(cx, |d| {
+            if d.hidden.is_empty() {
+                return false;
             }
-            state.refresh(cx);
-            state.scroll_to_col(0, cx);
-            cx.notify();
+            d.hidden.clear();
+            true
         });
-        cx.notify();
     }
 
     /// Hide every column but the first visible one (the popover's "Hide
     /// all" — the grid never goes to zero columns, so start-from-nothing
     /// keeps one anchor to build from).
     pub(crate) fn hide_all_columns(&mut self, cx: &mut Context<Self>) {
-        self.table.update(cx, |state, cx| {
-            {
-                let d = state.delegate_mut();
-                if d.visible.len() <= 1 {
-                    return;
-                }
-                let keep = d.visible[0];
-                d.hidden = (0..d.schema_cols.len()).filter(|i| *i != keep).collect();
-                d.rebuild_cols();
+        self.remap_columns(cx, |d| {
+            if d.visible.len() <= 1 {
+                return false;
             }
-            state.refresh(cx);
-            state.scroll_to_col(0, cx);
-            cx.notify();
+            let keep = d.visible[0];
+            d.hidden = (0..d.schema_cols.len()).filter(|i| *i != keep).collect();
+            true
         });
-        cx.notify();
     }
 
     /// (schema index, name, hidden) for the Columns popover.
@@ -609,21 +606,12 @@ impl Grid {
     /// Rebuild the column list after the row-number preference flips.
     fn sync_columns(&mut self, cx: &mut Context<Self>) {
         let want = prefs::get(cx).row_numbers;
-        self.table.update(cx, |state, cx| {
-            if state.delegate().schema_cols.is_empty() || state.delegate().gutter == want {
-                return;
+        self.remap_columns(cx, |d| {
+            if d.schema_cols.is_empty() || d.gutter == want {
+                return false;
             }
-            {
-                let d = state.delegate_mut();
-                d.gutter = want;
-                d.rebuild_cols();
-            }
-            state.refresh(cx);
-            // The header (overflow_scroll) and body (virtual_list) share a
-            // scroll handle but clamp a stale offset differently once the
-            // column set changes width; reset to origin so they agree.
-            state.scroll_to_col(0, cx);
-            cx.notify();
+            d.gutter = want;
+            true
         });
     }
 }
@@ -658,6 +646,15 @@ impl GridDelegate {
     fn last_page(&self) -> Option<usize> {
         let total = self.total_rows?;
         Some((total.max(1) as usize - 1) / self.page_size)
+    }
+
+    /// Whether a next page plausibly exists. Unknown total: a full page
+    /// suggests there may be more.
+    fn has_next(&self) -> bool {
+        match self.last_page() {
+            Some(last) => self.page < last,
+            None => self.rows.len() == self.page_size,
+        }
     }
 
     /// Rebuild the display columns from the schema minus the hidden set
@@ -958,13 +955,14 @@ impl Render for Grid {
         let inspector = (p.inspector && self.view == ViewMode::Data)
             .then(|| self.inspector(cx).into_any_element());
         let view = self.view;
-        let (title, count, total, last_pg, cols, page, size, filter_active, loading, error, ms) = {
+        let (title, count, total, last_pg, can_next, cols, page, size, filter_active, loading, error, ms) = {
             let d = self.table.read(cx).delegate();
             (
                 d.title.clone(),
                 d.rows.len(),
                 d.total_rows,
                 d.last_page(),
+                d.has_next(),
                 d.cols.len().saturating_sub(d.gutter as usize),
                 d.page,
                 d.page_size,
@@ -992,11 +990,6 @@ impl Render for Grid {
             }
         };
         let can_prev = page > 0;
-        let can_next = match total {
-            Some(t) => (last as u64) < t,
-            // Unknown total: a full page suggests there may be more.
-            None => count == size,
-        };
         let can_last = matches!(last_pg, Some(lp) if page < lp);
         let filter_open = self.filter_input.is_some();
         // The footer status is mode-relevant, and "N columns" is ALWAYS
@@ -1194,7 +1187,9 @@ impl Render for Grid {
                                 .child(
                                     resizable_panel()
                                         .size(px(p.inspector_width))
-                                        .size_range(px(180.)..px(600.))
+                                        .size_range(
+                                            px(prefs::INSPECTOR_MIN)..px(prefs::INSPECTOR_MAX),
+                                        )
                                         .child(pane),
                                 ),
                         ),
@@ -1750,10 +1745,6 @@ pub(crate) fn database_size(conn: &Conn) -> Option<(u64, u64)> {
             })
     };
     Some((col("database_size")?, col("wal_size")?))
-}
-
-fn qident(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
 }
 
 fn build_columns(

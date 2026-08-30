@@ -173,7 +173,7 @@ impl DuckTable {
     }
 
     /// Open (focused) or close the sidebar's table filter.
-    pub(crate) fn toggle_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_table_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.table_filter.take().is_none() {
             self.table_filter = Some(Self::new_filter("Filter tables", window, cx));
         }

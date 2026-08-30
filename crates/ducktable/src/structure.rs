@@ -40,8 +40,8 @@ pub(crate) fn table_structure(
     schema: &str,
     name: &str,
 ) -> Option<TableStructure> {
-    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-    let qualified = format!("{}.{}", quote(schema), quote(name));
+    let qualified =
+        format!("{}.{}", crate::util::qident(schema), crate::util::qident(name));
     let sql = format!("PRAGMA table_info('{}')", qualified.replace('\'', "''"));
     let info = harbor_client::query(conn, &sql).ok()?;
     let pos = |key: &str| info.columns.iter().position(|c| c.name.as_deref() == Some(key));

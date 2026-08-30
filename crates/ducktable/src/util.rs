@@ -7,6 +7,11 @@ pub fn clone_str(s: &str) -> String {
     s.to_string()
 }
 
+/// A DuckDB identifier, double-quoted with embedded quotes doubled.
+pub fn qident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
 /// An exact count with thousands separators: 1117569 -> "1,117,569".
 pub fn commas(n: u64) -> String {
     let digits = n.to_string();
