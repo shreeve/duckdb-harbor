@@ -21,19 +21,17 @@ impl DuckTable {
                 .child(grid.clone())
                 .into_any_element();
         }
-        let body = match &self.phase {
-            Phase::Idle => div()
-                .v_flex()
-                .gap_2()
-                .items_center()
-                .child(div().text_lg().text_color(t.text).child("DuckTable"))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(t.muted)
-                        .child("Pick a berth on the left. A stopped berth with a path spawns on demand."),
-                ),
-            Phase::Connecting { name } => div()
+        // While a connect is in flight, whatever is on screen keeps
+        // rendering and the pane swaps in one frame when the outcome lands.
+        // Only the idle and failed cards give way to a connecting card —
+        // they hold nothing worth preserving, and it carries the cancel
+        // affordance a cold summon needs.
+        let in_flight = match &self.phase {
+            Phase::Connected { .. } => None,
+            _ => self.connecting.as_deref(),
+        };
+        let body = if let Some(name) = in_flight {
+            div()
                 .v_flex()
                 .gap_3()
                 .items_center()
@@ -47,6 +45,19 @@ impl DuckTable {
                     Button::new("cancel")
                         .label("Cancel")
                         .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                )
+        } else {
+            match &self.phase {
+            Phase::Idle => div()
+                .v_flex()
+                .gap_2()
+                .items_center()
+                .child(div().text_lg().text_color(t.text).child("DuckTable"))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(t.muted)
+                        .child("Pick a berth on the left. A stopped berth with a path spawns on demand."),
                 ),
             Phase::Failed { name, message } => div()
                 .v_flex()
@@ -98,6 +109,7 @@ impl DuckTable {
                     "Lifetime",
                     if conn.summoned { "summoned by this window".into() } else { "joined, already running".into() },
                 )),
+            }
         };
         div()
             .flex_1()

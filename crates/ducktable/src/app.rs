@@ -19,7 +19,6 @@ pub(crate) struct RowVm {
 
 pub(crate) enum Phase {
     Idle,
-    Connecting { name: String },
     Connected {
         conn: Conn,
         info: wire::InfoResponse,
@@ -37,6 +36,9 @@ pub struct DuckTable {
     pub(crate) attempt: u64,
     pub(crate) selected_table: Option<(String, String)>,
     pub(crate) grid: Option<Entity<crate::grid::Grid>>,
+    /// A connect in flight (berth name). The current phase keeps rendering
+    /// until the outcome lands — a berth click never blanks the pane.
+    pub(crate) connecting: Option<String>,
     /// Fence for table selection: a first-page fetch that finishes after a
     /// newer click discards itself instead of swapping in a stale grid.
     select_seq: u64,
@@ -50,6 +52,7 @@ impl DuckTable {
             attempt: 0,
             selected_table: None,
             grid: None,
+            connecting: None,
             select_seq: 0,
         };
         this.refresh(cx);
@@ -146,13 +149,16 @@ impl DuckTable {
         .detach();
     }
 
+    /// Connect to a berth: the current content keeps rendering while the
+    /// connect chain runs, and the whole pane swaps to the new berth in ONE
+    /// frame when the outcome lands (same fetch-first rule as
+    /// `select_table` — a click never flashes an intermediate state). The
+    /// in-flight name shows on the sidebar row; the idle/failed cards show
+    /// a connecting card since they hold nothing worth preserving.
     pub(crate) fn connect(&mut self, name: String, cx: &mut Context<Self>) {
         self.attempt += 1;
         let fence = self.attempt;
-        self.phase = Phase::Connecting { name: clone_str(&name) };
-        self.selected_table = None;
-        self.grid = None;
-        self.select_seq += 1;
+        self.connecting = Some(clone_str(&name));
         cx.notify();
         cx.spawn(async move |this, cx| {
             let target = clone_str(&name);
@@ -170,6 +176,10 @@ impl DuckTable {
                 if state.attempt != fence {
                     return;
                 }
+                state.connecting = None;
+                state.selected_table = None;
+                state.grid = None;
+                state.select_seq += 1;
                 state.phase = match outcome {
                     Ok((conn, info, catalog, db_size)) => {
                         Phase::Connected { conn, info, catalog, db_size }
@@ -187,12 +197,12 @@ impl DuckTable {
         .detach();
     }
 
+    /// Abort the in-flight connect. The current phase never changed, so
+    /// whatever was on screen simply stays (a cancelled connect is not a
+    /// failed connect).
     pub(crate) fn cancel(&mut self, cx: &mut Context<Self>) {
         self.attempt += 1;
-        self.phase = Phase::Idle;
-        self.selected_table = None;
-        self.grid = None;
-        self.select_seq += 1;
+        self.connecting = None;
         cx.notify();
     }
 
