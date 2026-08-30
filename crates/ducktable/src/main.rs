@@ -12,16 +12,34 @@ mod theme;
 mod util;
 
 use app::DuckTable;
-use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{Root, StyledExt as _};
 
 actions!(ducktable, [ToggleInspector]);
 
+/// gpui-component's `IconName` resolves to `icons/*.svg` asset paths but
+/// ships no files — the app serves them. Each icon used gets an embedded
+/// entry here (Lucide, the set those names come from); a missing entry
+/// renders as an invisible-but-clickable control.
+struct Assets;
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> anyhow::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        Ok(match path {
+            "icons/panel-right.svg" => {
+                Some(include_bytes!("../../../assets/icons/panel-right.svg").into())
+            }
+            _ => None,
+        })
+    }
+
+    fn list(&self, _: &str) -> anyhow::Result<Vec<SharedString>> {
+        Ok(Vec::new())
+    }
+}
+
 impl Render for DuckTable {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let show_inspector =
-            prefs::get(cx).inspector && matches!(self.phase, app::Phase::Connected { .. });
         div()
             .size_full()
             .h_flex()
@@ -31,12 +49,11 @@ impl Render for DuckTable {
             }))
             .child(self.sidebar(cx))
             .child(self.content(cx))
-            .when(show_inspector, |d| d.child(self.inspector(cx)))
     }
 }
 
 fn main() {
-    let app = Application::new();
+    let app = Application::new().with_assets(Assets);
 
     app.run(move |cx| {
         gpui_component::init(cx);

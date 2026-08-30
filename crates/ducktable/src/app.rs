@@ -72,10 +72,17 @@ impl DuckTable {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (conn, solo_schema) = match &self.phase {
-            Phase::Connected { conn, catalog, .. } => {
-                (conn.clone(), catalog.schemas().len() <= 1)
-            }
+        let (conn, solo_schema, meta) = match &self.phase {
+            Phase::Connected { conn, info, catalog, db_size } => (
+                conn.clone(),
+                catalog.schemas().len() <= 1,
+                crate::inspector::BerthMeta {
+                    berth: clone_str(&info.name),
+                    duckdb: clone_str(&info.duckdb_version),
+                    harbor: clone_str(&info.harbor_version),
+                    db_size: db_size.clone(),
+                },
+            ),
             _ => return,
         };
         // "main.tests" earns its prefix only when there is another schema
@@ -112,7 +119,7 @@ impl DuckTable {
                 }
                 state.grid = Some(cx.new(|cx| {
                     crate::grid::Grid::new(
-                        conn, &schema, &name, title, outcome, total, window, cx,
+                        conn, &schema, &name, title, outcome, total, meta, window, cx,
                     )
                 }));
                 cx.notify();

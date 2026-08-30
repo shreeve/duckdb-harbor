@@ -1,24 +1,33 @@
-//! The inspector: the right panel (design/main-window.html, UI.md
-//! "Inspector"). Read-only in this slice — SIZE, STATISTICS, and METADATA
+//! The inspector: the grid's right panel (design/main-window.html, UI.md
+//! "Inspector"). It lives INSIDE the grid, below the header strip — the
+//! title/toggles row keeps the full width and nothing shifts when the
+//! panel opens. Read-only in this slice — SIZE, STATISTICS, and METADATA
 //! from the berth, and ROW showing the selected row's values vertically.
 //! The row editor arrives with the staged/live pipeline (edits.rs); it and
 //! the grid's inline editor will be one editing session with one owner.
 
-use crate::app::{DuckTable, Phase};
+use crate::grid::Grid;
 use crate::theme::{pal, value_font, Pal};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::StyledExt as _;
 
-impl DuckTable {
+/// The berth facts the inspector shows. Fixed for a connection's lifetime,
+/// so they ride into the grid at construction instead of reaching back
+/// into the app's phase.
+pub(crate) struct BerthMeta {
+    pub(crate) berth: String,
+    pub(crate) duckdb: String,
+    pub(crate) harbor: String,
+    /// `PRAGMA database_size` (database_size, wal_size), as the server
+    /// prints them.
+    pub(crate) db_size: Option<(String, String)>,
+}
+
+impl Grid {
     pub(crate) fn inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = pal(cx);
-        let (info, db_size) = match &self.phase {
-            Phase::Connected { info, db_size, .. } => (info, db_size.clone()),
-            _ => {
-                return div().into_any_element();
-            }
-        };
+        let meta = self.meta();
 
         let mut pane = div()
             .id("inspector")
@@ -33,35 +42,32 @@ impl DuckTable {
             .border_color(t.border)
             .overflow_y_scroll();
 
-        if let Some((data, wal)) = db_size {
+        if let Some((data, wal)) = meta.db_size.clone() {
             pane = pane
                 .child(section(t, "SIZE"))
                 .child(kv(t, "Data", data, false))
                 .child(kv(t, "WAL", wal, false));
         }
 
-        if let Some(grid) = &self.grid {
-            let (loaded, total) = grid.read(cx).counts(cx);
-            pane = pane.child(section(t, "STATISTICS")).child(kv(
-                t,
-                "Rows",
-                match total {
-                    Some(n) => format!("{n}"),
-                    None => format!("{loaded}+"),
-                },
-                false,
-            ));
-        }
+        let (loaded, total) = self.counts(cx);
+        pane = pane.child(section(t, "STATISTICS")).child(kv(
+            t,
+            "Rows",
+            match total {
+                Some(n) => format!("{n}"),
+                None => format!("{loaded}+"),
+            },
+            false,
+        ));
 
         pane = pane
             .child(section(t, "METADATA"))
-            .child(kv(t, "DuckDB", info.duckdb_version.clone(), false))
-            .child(kv(t, "Harbor", info.harbor_version.clone(), false))
-            .child(kv(t, "Berth", info.name.clone(), false));
+            .child(kv(t, "DuckDB", meta.duckdb.clone(), false))
+            .child(kv(t, "Harbor", meta.harbor.clone(), false))
+            .child(kv(t, "Berth", meta.berth.clone(), false));
 
-        let row = self.grid.as_ref().and_then(|g| g.read(cx).row_kv(cx));
         pane = pane.child(section(t, "ROW"));
-        match row {
+        match self.row_kv(cx) {
             Some(pairs) => {
                 for (k, v, is_null) in pairs {
                     pane = pane.child(kv(t, k, v, is_null));
@@ -78,7 +84,7 @@ impl DuckTable {
             }
         }
 
-        pane.into_any_element()
+        pane
     }
 }
 

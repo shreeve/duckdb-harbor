@@ -37,6 +37,7 @@ fn gutter_width(rows: usize) -> f32 {
 
 pub(crate) struct Grid {
     table: Entity<TableState<GridDelegate>>,
+    meta: crate::inspector::BerthMeta,
 }
 
 pub(crate) struct GridDelegate {
@@ -72,6 +73,7 @@ impl Grid {
         title: String,
         outcome: Result<harbor_client::QueryResult, String>,
         total_rows: Option<u64>,
+        meta: crate::inspector::BerthMeta,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -113,7 +115,11 @@ impl Grid {
             }
         }
         let table = cx.new(|cx| TableState::new(delegate, window, cx));
-        Self { table }
+        Self { table, meta }
+    }
+
+    pub(crate) fn meta(&self) -> &crate::inspector::BerthMeta {
+        &self.meta
     }
 
     /// The selected row as (column, display value, is_null) pairs, for the
@@ -417,6 +423,10 @@ impl Render for Grid {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = pal(cx);
         let p = prefs::get(cx);
+        // The inspector slots in BESIDE the table, below the header strip —
+        // the title/toggle row keeps the full width, so opening the panel
+        // never shifts it.
+        let inspector = p.inspector.then(|| self.inspector(cx).into_any_element());
         let (title, count, total, cols, eof, loading, error, ms) = {
             let d = self.table.read(cx).delegate();
             (
@@ -570,7 +580,15 @@ impl Render for Grid {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .child(Table::new(&self.table).bordered(false).with_size(GRID_SIZE)),
+                    .h_flex()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(Table::new(&self.table).bordered(false).with_size(GRID_SIZE)),
+                    )
+                    .when_some(inspector, |d, pane| d.child(pane)),
             )
     }
 }
