@@ -148,6 +148,16 @@ impl Grid {
         self.structure.as_ref()
     }
 
+    /// The footer's view choice survives a table switch: the new grid is
+    /// seeded with the outgoing grid's mode (app.rs select_table).
+    pub(crate) fn view(&self) -> ViewMode {
+        self.view
+    }
+
+    pub(crate) fn set_view(&mut self, view: ViewMode) {
+        self.view = view;
+    }
+
     /// The selected row as (column, display value, is_null) pairs, for the
     /// inspector's ROW section.
     pub(crate) fn row_kv(&self, cx: &App) -> Option<Vec<(String, String, bool)>> {

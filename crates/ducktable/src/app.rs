@@ -114,10 +114,19 @@ impl DuckTable {
                 if !matches!(state.phase, Phase::Connected { .. }) {
                     return;
                 }
+                // The Data/Structure choice is a browsing mode, not table
+                // state: it carries over from the grid being replaced.
+                let view = state
+                    .grid
+                    .as_ref()
+                    .map(|g| g.read(cx).view())
+                    .unwrap_or(crate::grid::ViewMode::Data);
                 state.grid = Some(cx.new(|cx| {
-                    crate::grid::Grid::new(
+                    let mut grid = crate::grid::Grid::new(
                         conn, &schema, &name, title, outcome, total, structure, window, cx,
-                    )
+                    );
+                    grid.set_view(view);
+                    grid
                 }));
                 cx.notify();
             })
