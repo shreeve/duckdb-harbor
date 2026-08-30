@@ -271,16 +271,21 @@ Unix archives carry `bin/`, `lib/` and `install.sh`; Windows archives put
 
 `harbor serve` runs in the foreground. `harbor start <name|db.duckdb>` starts a
 database in the **background** and returns once it answers `/ready` — a bare
-word names an entry in your config, a path names a file. A configured name is
-a service: it starts and stops when you say so, and never on demand. A *path*
-handed to `pilot` is the on-demand form: it joins the running server for that
-file or starts a temp one that exits on its own after sitting idle
-(`harbor show` marks these: `● running (temp 1m30s)`). `harbor show` (or bare `harbor`)
-lists the fleet and `harbor show <name>` details one; `harbor stop <name>`
-drains and `CHECKPOINT`s; `harbor forget <name>` clears the registry, never the
-database file; `harbor doctor` checks the config for what nothing else has a
-moment to notice. With no `--token`, a per-berth token is
-minted and written to `~/.local/state/harbor/runtime/<name>.token`.
+word names an entry in your config, a path names a file. `harbor add
+<db.duckdb> [name]` gives a database a name, and the name is the whole
+contract: **a name is a service — it starts on use and runs until you say
+stop.** `pilot <name>` raises it if it is down and leaves it running on exit;
+`harbor stop <name>` drains, `CHECKPOINT`s, and holds it stopped — a held name
+refuses every client's autostart, and only `harbor start` lifts the hold. A
+*path* handed to `pilot` is the other shape: a session — it joins the running
+server for that file or summons a temp one that exits on its own after
+sitting idle (`harbor show` marks these: `● running (temp 1m30s)`).
+`harbor expose <name> <port|off>` moves a service onto loopback TCP and back.
+`harbor show` (or bare `harbor`) lists the fleet and `harbor show <name>`
+details one; `harbor forget <name>` drops the name — registry files and its
+config entry, never the database file; `harbor doctor` checks the config for
+what nothing else has a moment to notice. With no `--token`, a per-berth token
+is minted and written to `~/.local/state/harbor/runtime/<name>.token`.
 
 Exits are clean: `SIGTERM` / `Ctrl-C` drain in-flight requests and `CHECKPOINT`
 so the next open never replays a WAL.
@@ -528,11 +533,13 @@ storage format matches the database file.
 
 ## Working on it
 
-Building is only needed to change it. The workspace has four first-party
+Building is only needed to change it. The workspace has five first-party
 crates:
 
 - **`harbor`** — the server engine and fleet CLI;
 - **`pilot`** — the DuckDB-shell-class Harbor client;
+- **`harbor-common`** — paths, the config schema, fleet reconciliation: the
+  vocabulary both binaries share, so neither can drift from the other;
 - **`wire`** — protocol request and response types consumed by Pilot; and
 - **`justhttp`** — Harbor's small synchronous HTTP/1.1 server over TCP and Unix
   sockets.

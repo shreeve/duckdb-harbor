@@ -1,29 +1,35 @@
-# pilot's address book — copy to ~/.config/harbor/config.toml (or
-# $HARBOR_HOME/config.toml). Purely additive: zero-config local always
-# works; this only teaches pilot what the filesystem cannot reveal —
-# remote urls, their credentials, spawn aliases, and taste.
+# harbor's desired state — copy to ~/.config/harbor/config.toml (or
+# $HARBOR_HOME/config.toml). Zero-config local always works; this file
+# teaches the fleet what the filesystem cannot reveal — which databases
+# have names, remote urls, their credentials, and taste.
+#
+# `harbor add <db.duckdb> [name]` writes an entry here and `harbor forget
+# <name>` removes it; edits by hand are just as welcome — harbor preserves
+# your comments and ordering when it writes.
 
 [defaults]
 mode = "duckbox"         # duckbox | duckboxy | markdown | csv | json | jsonlines | line | list | trash
 timer = true
 # maxrows = 40
 # nullvalue = ""
-# theme = "duck"         # duck | mono | vivid
-# appearance = "auto"    # auto | light | dark
+# theme = "duck"           # duck | mono | vivid
+# appearance = "auto"      # auto | light | dark
+# temp-idle-exit = "10m"   # how long a path-summoned temp berth lingers
+#                          # (default 90s) — a named service never reads this
+
+# A name is a service: it starts on use and runs until `harbor stop`.
+#
+# [connection.medlabs]
+# path = "~/Data/medlabs.duckdb"
+# # port = 9495            # `harbor expose medlabs 9495` writes this
+# # idle-exit = "10m"      # opt this one name into leaving when idle
 
 # A remote berth (TLS is Caddy's job; this is the plain-HTTP upstream).
 # Never put a token on argv — use token-file or token-cmd.
 # Keep this file yours and unwritable by others (chmod 600/644, dir go-w):
 # pilot ignores the whole config otherwise, since token-cmd is run by sh.
 #
-# [connection.medlabs]
+# [connection.reports]
 # url = "http://127.0.0.1:9495"
-# token-file = "~/.local/state/harbor/runtime/medlabs.token"
-# # token-cmd = "op read op://vault/medlabs/token"
-
-# A spawn-on-demand alias: `pilot scratch` summons a berth for this file
-# and it exits itself after sitting idle.
-#
-# [connection.scratch]
-# path = "~/Data/scratch.duckdb"
-# idle-exit = "10m"
+# token-file = "~/.local/state/harbor/runtime/reports.token"
+# # token-cmd = "op read op://vault/reports/token"

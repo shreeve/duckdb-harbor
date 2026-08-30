@@ -14,18 +14,19 @@ usage see [README.md](README.md).
 ├── sales.json                    ← identity sidecar (pid, paths, versions)
 └── log/sales.log
 
-harbor start ./sales.duckdb       → spawn a detached berth, bind the socket
+harbor add ./sales.duckdb         → name it: a name is a service
 harbor show                       → reconcile config, sidecars and locks
-harbor stop sales                 → drain, CHECKPOINT, socket gone
-pilot sales                       → duckdb-CLI-class REPL over UDS or plain HTTP
-pilot ./ad-hoc.duckdb             → start a temp database, connect
+harbor stop sales                 → drain, CHECKPOINT, hold it stopped
+pilot sales                       → duckdb-CLI-class REPL; raises the service if down
+pilot ./ad-hoc.duckdb             → summon a temp berth, connect; it leaves when idle
 ```
 
-The workspace has four first-party crates: **`harbor`** (bin + library),
-**`pilot`** (the client, links no engine), **`wire`** (Pilot's protocol types),
-and **`justhttp`** (Harbor's synchronous HTTP/1.1 server). Harbor implements
-the same wire shapes directly rather than consuming the `wire` crate, so
-protocol changes require tests on both sides.
+The workspace has five first-party crates: **`harbor`** (bin + library),
+**`pilot`** (the client, links no engine), **`harbor-common`** (paths, the
+config schema, fleet reconciliation — the vocabulary both binaries share),
+**`wire`** (Pilot's protocol types), and **`justhttp`** (Harbor's synchronous
+HTTP/1.1 server). Harbor implements the same wire shapes directly rather than
+consuming the `wire` crate, so protocol changes require tests on both sides.
 
 ---
 
@@ -69,9 +70,10 @@ holds that lock, an existing socket path belongs to no live process under that
 name and can be replaced before bind. Clean shutdown removes the socket and
 JSON sidecar but deliberately leaves the lock inode in place. `harbor show`
 reads sidecars and reports dead entries; it does not silently reap them. The
-same flock is proof-of-death for `stop`/`rm`: if we can take it, the recorded
-pid may have been recycled, so Harbor does not signal it. `rm` is the explicit
-registry cleanup operation and never removes the database file.
+same flock is proof-of-death for `stop`/`forget`: if we can take it, the
+recorded pid may have been recycled, so Harbor does not signal it. `forget` is
+the explicit cleanup operation — registry files and the config entry, never
+the database file.
 
 ## Spawn, don't fork; persist via the init system
 
@@ -103,7 +105,8 @@ as a future optional body field, not implemented.
 
 The CLI never needs libduckdb — it speaks the protocol. Split along linkage:
 `harbor` = `serve` (the only subcommand linking DuckDB) + fleet verbs
-(`start/show/stop/forget/doctor`: filesystem, spawning, HTTP probes).
+(`add/start/show/expose/stop/forget/doctor`: filesystem, config edits,
+spawning, HTTP probes).
 `pilot` = REPL plus one-shot `pilot <target> -c "SQL"`, connecting by berth
 name (via the runtime registry), socket path, database path, or `http://` on a
 trusted network. **Pilot is TLS-free by design: https/edge auth is Caddy's job
@@ -121,10 +124,13 @@ server tree, and justhttp never enters the client.
 ## A path summons a temp database; a name is a service
 
 The semantics follow how the target is written. A **name** is a service: it
-starts when the operator says `harbor start` and stops when they say
-`harbor stop` — connecting to it never starts it, and a stopped name stays
-stopped (`pilot <name>` on a stopped entry answers with the `harbor start`
-hint rather than a berth). A **path** is a session: `pilot ./sales.duckdb`
+starts on use and runs until the operator says `harbor stop`. `harbor add
+<db.duckdb> [name]` writes the config entry that makes it one; from then on
+`pilot <name>` raises the berth if it is down and leaves it running on exit.
+`harbor stop` is the operator's last word — it drains, CHECKPOINTs, and
+writes a hold, and a held name refuses every client's autostart (`pilot
+<name>` answers with the `harbor start` hint rather than a berth) until
+`harbor start` lifts it. A **path** is a session: `pilot ./sales.duckdb`
 gives the `duckdb sales.duckdb` muscle memory via the agent pattern
 (gpg-agent/emacsclient) — connect to the live berth whose sidecar claims
 that file, else run `harbor start ... --idle-exit` from PATH (Pilot never
@@ -132,9 +138,10 @@ links DuckDB), wait for readiness, connect. This factors out DuckDB's
 single-writer lock pain: a second Pilot on the same file joins the same
 berth instead of reporting "database is locked".
 
-These temp databases run with `--idle-exit <dur>`: no active countable
-requests and no live sessions for the window → drain, CHECKPOINT, unlink,
-exit. `harbor show` marks them — `● running (temp 1m30s)` — so a berth that
+These temp databases run with `--idle-exit <dur>` (`[defaults]
+temp-idle-exit` sets the window; 90s otherwise — a named service never reads
+it): no active countable requests and no live sessions for the window →
+drain, CHECKPOINT, unlink, exit. `harbor show` marks them — `● running (temp 1m30s)` — so a berth that
 appears and leaves on its own always says so. Idle keep-alive TCP
 connections are not reference-counted. The lifecycle is robust against
 Pilot crashes and has no client refcount. An interactive Pilot sends cheap
@@ -144,12 +151,16 @@ connection and leave no server-side record, so exiting or crashing Pilot
 simply lets the same idle window resume. One-shot Pilot invocations do not
 pulse after their query.
 
-## One config, two readers: `~/.config/harbor/config.toml`
+## One config, two readers, one writer: `~/.config/harbor/config.toml`
 
 **Zero-config is the local default**: with no config file, `pilot <berth>`
 (registry socket), `pilot ./file.duckdb` (join-or-spawn), bare `pilot` (what
 is openable), and `harbor start ./file.duckdb` all work — first run is
-`curl && harbor start ./sales.duckdb && pilot sales`, no files edited.
+`curl && harbor add ./sales.duckdb && pilot sales`, no files edited by hand.
+The config has exactly one writer: `add`, `expose`, and `forget` edit it
+through a TOML document model that preserves the operator's comments and
+ordering, behind the same trust gate reads use, and never land bytes the
+shared schema would refuse.
 
 The split that matters is desired versus actual, not client versus server.
 `~/.config/harbor/config.toml` is **desired** state: what you have, and how
@@ -174,8 +185,9 @@ collisions: an explicit config entry shadows any live local berth of the same
 name (ssh_config precedent: explicit mapping beats ambient discovery). Pilot
 prints a notice when the local berth has a UDS socket; a same-name TCP sidecar
 is shadowed silently. `pilot medlabs` resolves `[connection.medlabs]` →
-path-free plain-HTTP `url`, or `path` (joins the running berth; a stopped
-name stays stopped until `harbor start`), plus `[defaults]` for REPL prefs
+path-free plain-HTTP `url`, or `path` (joins the running berth, or raises the
+service — a name starts on use; only a `harbor stop` hold keeps it down),
+plus `[defaults]` for REPL prefs
 (mode, timer, maxrows,
 nullvalue, theme, appearance). Credentials can come from `--token`,
 `HARBOR_TOKEN`, inline config `token`, `token-file`, or `token-cmd`; URL

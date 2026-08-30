@@ -174,6 +174,12 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
     while let Some(a) = it.next() {
         let mut take = |what: &str| it.next().ok_or(format!("--{what} needs a value"));
         match a.as_str() {
+            // Asking any verb for help deserves the help, not "unexpected
+            // argument" — serve's options are documented in the one page.
+            "-h" | "--help" => {
+                print!("{HELP}");
+                std::process::exit(0);
+            }
             "--create" => o.create = true,
             "--name" => named = Some(take("name")?),
             "--socket" => o.socket = Some(PathBuf::from(take("socket")?)),
