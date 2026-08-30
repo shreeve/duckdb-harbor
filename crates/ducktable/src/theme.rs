@@ -18,6 +18,11 @@ pub struct Pal {
     pub bg_sidebar: Hsla,
     pub surface: Hsla,
     pub raised: Hsla,
+    /// One shade beyond `raised`, for a band that must read apart from an
+    /// adjacent raised band (the grid title strip over the column
+    /// headers). Derived, so it tracks every theme: darker than raised in
+    /// light themes, lighter in dark ones.
+    pub strip: Hsla,
     pub text: Hsla,
     pub muted: Hsla,
     pub accent: Hsla,
@@ -38,6 +43,15 @@ pub fn pal(cx: &App) -> Pal {
         bg_sidebar: t.sidebar,
         surface: t.background,
         raised: t.secondary,
+        strip: {
+            let mut c = t.secondary;
+            if t.background.l < 0.5 {
+                c.l = (c.l + 0.045).min(1.);
+            } else {
+                c.l = (c.l - 0.045).max(0.);
+            }
+            c
+        },
         text: t.foreground,
         muted: t.muted_foreground,
         accent: t.primary,

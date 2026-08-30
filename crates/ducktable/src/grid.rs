@@ -506,10 +506,9 @@ impl Render for Grid {
                     .gap_3()
                     .flex_none()
                     .items_center()
-                    // Raised like the proof's tab strip (design.css
-                    // `.tabs`) — the white grid sits between raised
-                    // strips instead of white-on-white.
-                    .bg(t.raised)
+                    // A shade beyond raised: the column-header row below
+                    // is raised, and two identical bands would merge.
+                    .bg(t.strip)
                     .border_b_1()
                     .border_color(t.border)
                     .child(
