@@ -232,7 +232,9 @@ impl Grid {
                     .collect();
                 delegate.schema_cols = page.columns;
                 delegate.rows = display_rows(page.rows);
-                delegate.rebuild_cols();
+                // The first page sizes the columns to their content; from
+                // here on widths hold still (pages replace, fits don't).
+                delegate.fit_widths(p.zoom_factor());
             }
             Err(message) => {
                 delegate.error = Some(message);
@@ -399,6 +401,7 @@ impl Grid {
                     return;
                 }
                 grid.table.update(cx, |state, cx| {
+                    let zoom = prefs::get(cx).zoom_factor();
                     let ok = {
                         let d = state.delegate_mut();
                         d.loading = false;
@@ -411,16 +414,22 @@ impl Grid {
                                 // first fetch that succeeds, or the rows
                                 // land invisible and the gutter resize
                                 // below indexes an empty column list.
-                                if d.schema_cols.is_empty() {
+                                let born = d.schema_cols.is_empty();
+                                if born {
                                     d.numeric = result
                                         .columns
                                         .iter()
                                         .map(|c| numeric(&c.duckdb_type.to_uppercase()))
                                         .collect();
                                     d.schema_cols = result.columns;
-                                    d.rebuild_cols();
                                 }
                                 d.rows = display_rows(result.rows);
+                                if born {
+                                    // Its first real rows: give this grid
+                                    // the same content-fit a normal birth
+                                    // gets in Grid::new.
+                                    d.fit_widths(zoom);
+                                }
                                 d.page = page;
                                 d.page_size = size;
                                 if let Some(f) = filter {
@@ -598,6 +607,18 @@ impl Grid {
     }
 
     /// Reset every hidden column (the popover's "Show all").
+    /// Re-fit every column to the page on screen (View menu / Cmd-Shift-F)
+    /// — the manual Sheets move, for after drags or a page whose content
+    /// outgrew the first page's fit.
+    pub(crate) fn fit_columns(&mut self, cx: &mut Context<Self>) {
+        let zoom = prefs::get(cx).zoom_factor();
+        self.table.update(cx, |state, cx| {
+            state.delegate_mut().fit_widths(zoom);
+            state.refresh(cx);
+        });
+        cx.notify();
+    }
+
     pub(crate) fn show_all_columns(&mut self, cx: &mut Context<Self>) {
         self.remap_columns(cx, |d| {
             if d.hidden.is_empty() {
@@ -745,6 +766,42 @@ impl GridDelegate {
 
     /// Rebuild the display columns from the schema minus the hidden set
     /// (plus the gutter), refreshing the visible→schema map.
+    /// Content-fit every visible column from the rows in hand, Sheets
+    /// style. The value font is monospace, so a column's width is its
+    /// longest cell's character count times the glyph advance — no text
+    /// measurement pass. Fits land in `widths`, the same slot drag-resizes
+    /// use: later rebuilds keep them, page flips never re-fit, and a drag
+    /// still overrides a fit.
+    fn fit_widths(&mut self, zoom: f32) {
+        // Menlo's advance scales linearly (7px at 11px); the header is the
+        // proportional UI font, estimated a touch narrower. 18 covers the
+        // cell's own insets (8px pad + 1px divider + breathing room).
+        const CAP: usize = 60;
+        let advance = CELL_TEXT * (7. / 11.) * zoom;
+        let header_advance = HEADER_TEXT * (7. / 11.) * zoom;
+        self.rebuild_cols();
+        for &schema_ix in &self.visible {
+            let mut chars = 4; // the NULL tag's footprint
+            for row in &self.rows {
+                if let Some(Some(s)) = row.get(schema_ix) {
+                    chars = chars.max(s.chars().count());
+                    if chars >= CAP {
+                        break;
+                    }
+                }
+            }
+            let name_len = self.schema_cols[schema_ix]
+                .name
+                .as_deref()
+                .map_or(4, |n| n.chars().count());
+            let content = chars.min(CAP) as f32 * advance;
+            let header = name_len as f32 * header_advance;
+            let w = (content.max(header) + 18.).clamp(60. * zoom, 460. * zoom);
+            self.widths.insert(schema_ix, px(w));
+        }
+        self.rebuild_cols();
+    }
+
     fn rebuild_cols(&mut self) {
         self.visible =
             (0..self.schema_cols.len()).filter(|i| !self.hidden.contains(i)).collect();

@@ -19,7 +19,7 @@ use app::DuckTable;
 use gpui::*;
 use gpui_component::{Root, StyledExt as _};
 
-actions!(ducktable, [ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset]);
+actions!(ducktable, [ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset, FitColumns]);
 
 /// The macOS menu bar. The first menu becomes the application menu; the
 /// About item opens the platform's standard dialog (window.prompt ->
@@ -43,6 +43,7 @@ fn app_menus() -> Vec<Menu> {
                 MenuItem::action("Zoom Out", ZoomOut),
                 MenuItem::action("Actual Size", ZoomReset),
                 MenuItem::separator(),
+                MenuItem::action("Fit Column Widths", FitColumns),
                 MenuItem::action("Toggle Inspector", ToggleInspector),
             ],
         },
@@ -127,6 +128,11 @@ impl Render for DuckTable {
             .on_action(cx.listener(|_, _: &ToggleInspector, _, cx| {
                 prefs::toggle(cx, |p| p.inspector = !p.inspector);
             }))
+            .on_action(cx.listener(|this, _: &FitColumns, _, cx| {
+                if let Some(grid) = &this.grid {
+                    grid.update(cx, |grid, cx| grid.fit_columns(cx));
+                }
+            }))
             .child(self.sidebar(cx))
             .child(self.content(cx))
     }
@@ -148,6 +154,7 @@ fn main() {
             KeyBinding::new("cmd-shift-=", ZoomIn, None),
             KeyBinding::new("cmd--", ZoomOut, None),
             KeyBinding::new("cmd-0", ZoomReset, None),
+            KeyBinding::new("cmd-shift-f", FitColumns, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(|_: &ZoomIn, cx| {
@@ -164,6 +171,22 @@ fn main() {
         // handled action never reaches here (no double toggle).
         cx.on_action(|_: &ToggleInspector, cx| {
             prefs::toggle(cx, |p| p.inspector = !p.inspector);
+        });
+        // FitColumns needs the window's grid, which a global cannot reach —
+        // this handler exists so the menu item validates, and if it ever
+        // actually fires (the window listener was somehow skipped) it
+        // re-dispatches into the active window, deferred out of the menu's
+        // window lease (the About lesson). A handled dispatch never returns
+        // here, so there is no loop.
+        cx.on_action(|_: &FitColumns, cx| {
+            if let Some(w) = cx.active_window() {
+                cx.defer(move |cx| {
+                    w.update(cx, |_, window, cx| {
+                        window.dispatch_action(Box::new(FitColumns), cx);
+                    })
+                    .ok();
+                });
+            }
         });
         // Global, not view-scoped: menu items must work regardless of
         // which pane holds focus. The prompt needs a window — but a menu
