@@ -44,7 +44,6 @@ impl DuckTable {
             .children(self.rows.iter().map(|row| {
                 let name = clone_str(&row.name);
                 let selected = active.as_deref() == Some(row.name.as_str());
-                let in_flight = self.connecting.as_deref() == Some(row.name.as_str());
                 div()
                     .id(SharedString::from(clone_str(&row.name)))
                     .px_2()
@@ -58,10 +57,7 @@ impl DuckTable {
                     .hover(|d| d.bg(t.row_hover))
                     .child(Self::dot(row.state.level(), t))
                     .child(div().flex_1().text_sm().text_color(t.text).child(clone_str(&row.name)))
-                    .when(in_flight, |d| {
-                        d.child(div().text_xs().text_color(t.muted).child("…"))
-                    })
-                    .when(row.summonable && !in_flight, |d| {
+                    .when(row.summonable, |d| {
                         d.child(div().text_xs().text_color(t.muted).child("spawn"))
                     })
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
