@@ -230,18 +230,31 @@ impl DuckTable {
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
         self.refresh_seq += 1;
         let fence = self.refresh_seq;
+        // The connected berth's catalog is already in hand; its row must
+        // not pay a second connect + catalog download just for a count.
+        let connected: Option<(String, usize)> = match &self.phase {
+            Phase::Connected { conn, catalog, .. } => Some((
+                clone_str(&conn.name),
+                catalog.schemas().iter().map(|s| catalog.tables_in(s).len()).sum(),
+            )),
+            _ => None,
+        };
         cx.spawn(async move |this, cx| {
-            let rows = cx
-                .background_executor()
-                .spawn(async move {
-                    fleet::list()
-                        .into_iter()
-                        .map(|row| {
-                            let live = row.transport.as_ref().map(fleet::probe);
-                            // Table count needs the database open, so only
-                            // live berths answer; size comes from the file
-                            // on disk and works for every berth.
-                            let tables = (live == Some(true))
+            let list = cx.background_executor().spawn(async move { fleet::list() }).await;
+            // One task per berth so the probes run concurrently — a dead
+            // berth's probe timeout no longer serializes behind the rest.
+            let tasks: Vec<_> = list
+                .into_iter()
+                .map(|row| {
+                    let known = connected.clone();
+                    cx.background_executor().spawn(async move {
+                        let live = row.transport.as_ref().map(fleet::probe);
+                        // Table count needs the database open, so only
+                        // live berths answer; size comes from the file
+                        // on disk and works for every berth.
+                        let tables = match &known {
+                            Some((name, count)) if *name == row.name => Some(*count),
+                            _ => (live == Some(true))
                                 .then(|| {
                                     let conn = fleet::connect(&row.name).ok()?;
                                     let cat = harbor_client::catalog(&conn).ok()?;
@@ -252,17 +265,21 @@ impl DuckTable {
                                             .sum(),
                                     )
                                 })
-                                .flatten();
-                            RowVm {
-                                state: fleet::state_of(&row, live),
-                                tables,
-                                size: row.size_on_disk(),
-                                name: row.name,
-                            }
-                        })
-                        .collect::<Vec<_>>()
+                                .flatten(),
+                        };
+                        RowVm {
+                            state: fleet::state_of(&row, live),
+                            tables,
+                            size: row.size_on_disk(),
+                            name: row.name,
+                        }
+                    })
                 })
-                .await;
+                .collect();
+            let mut rows = Vec::with_capacity(tasks.len());
+            for task in tasks {
+                rows.push(task.await);
+            }
             this.update(cx, |state, cx| {
                 if state.refresh_seq != fence {
                     return;
