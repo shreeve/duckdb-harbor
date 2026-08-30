@@ -21,6 +21,8 @@ pub struct Pal {
     pub text: Hsla,
     pub muted: Hsla,
     pub accent: Hsla,
+    /// Text painted ON a solid accent fill (tokens.css `--on-accent`).
+    pub on_accent: Hsla,
     pub border: Hsla,
     pub good: Hsla,
     pub warn: Hsla,
@@ -39,6 +41,7 @@ pub fn pal(cx: &App) -> Pal {
         text: t.foreground,
         muted: t.muted_foreground,
         accent: t.primary,
+        on_accent: t.primary_foreground,
         border: t.border,
         good: t.success,
         warn: t.warning,

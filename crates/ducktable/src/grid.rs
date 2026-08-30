@@ -625,29 +625,30 @@ impl Render for Grid {
                     .into_any_element(),
             })
             .child(
-                // The footer (UI.md "Bottom bar"): per-table controls, a
-                // different scope from the header's global display prefs.
-                // The view switcher lives here; columns/filters/paging
-                // join it in later slices.
+                // The footer (UI.md "Bottom bar", design.css `.bbar`):
+                // per-table controls, a different scope from the header's
+                // global display prefs. The view switcher lives here;
+                // columns/filters/paging join it in later slices.
                 div()
                     .h_flex()
-                    .h(px(28.))
+                    .h(px(30.))
                     .flex_none()
                     .items_center()
-                    .pl_2()
-                    .pr_3()
+                    .px(px(10.))
+                    .bg(t.raised)
                     .border_t_1()
                     .border_color(t.border)
                     .child(
+                        // design.css `.seg`: contiguous segments, surface
+                        // track, hairline border, clipped corners.
                         div()
                             .h_flex()
                             .flex_none()
-                            .gap(px(2.))
-                            .p(px(2.))
-                            .rounded(px(6.))
-                            .bg(t.raised)
+                            .rounded(px(8.))
+                            .bg(t.surface)
                             .border_1()
-                            .border_color(t.grid_line)
+                            .border_color(t.border)
+                            .overflow_hidden()
                             .child(seg_tile(
                                 "view-data",
                                 "Data",
@@ -675,9 +676,10 @@ impl Render for Grid {
     }
 }
 
-/// One segment in the footer's view switcher: same recessed-track visual
-/// language as the display toggles, but text-labeled and exactly one
-/// segment active.
+/// One segment of the footer's view switcher (design.css `.seg span`):
+/// contiguous segments on a surface track, and the active one is a SOLID
+/// accent fill with on-accent text — a true segmented control, bolder
+/// than the header's independent display toggles.
 fn seg_tile(
     id: &'static str,
     label: &'static str,
@@ -687,22 +689,17 @@ fn seg_tile(
 ) -> Stateful<Div> {
     div()
         .id(id)
-        .h_flex()
-        .items_center()
-        .justify_center()
-        .px_2()
-        .h(px(18.))
-        .rounded(px(4.))
+        .px(px(11.))
+        .py(px(3.))
         .cursor_pointer()
-        .text_size(px(11.))
+        .text_size(px(12.))
         .map(|d| {
             if on {
-                d.bg(t.accent.opacity(0.15)).text_color(t.accent)
+                d.bg(t.accent).text_color(t.on_accent).font_weight(FontWeight(560.))
             } else {
-                d.text_color(t.muted)
+                d.text_color(t.muted).hover(|d| d.bg(t.row_hover))
             }
         })
-        .hover(move |d| if on { d } else { d.bg(t.row_hover) })
         .on_click(move |e, window, cx| handler(e, window, cx))
         .child(label)
 }
