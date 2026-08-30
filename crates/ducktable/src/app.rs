@@ -26,6 +26,9 @@ pub(crate) enum Phase {
         /// `PRAGMA database_size` key figures for the inspector's SIZE
         /// section: (database_size, wal_size), as the server prints them.
         db_size: Option<(String, String)>,
+        /// Per-table row counts for the sidebar, (schema, table) ->
+        /// estimated_size. Snapshot at connect, like the catalog.
+        row_counts: std::collections::HashMap<(String, String), u64>,
     },
     Failed { name: String, message: String },
 }
@@ -182,7 +185,8 @@ impl DuckTable {
                     let info = fleet::info(&conn)?;
                     let catalog = harbor_client::catalog(&conn)?;
                     let db_size = crate::grid::database_size(&conn);
-                    Ok::<_, String>((conn, info, catalog, db_size))
+                    let row_counts = crate::grid::table_counts(&conn).unwrap_or_default();
+                    Ok::<_, String>((conn, info, catalog, db_size, row_counts))
                 })
                 .await;
             this.update(cx, |state, cx| {
@@ -194,8 +198,8 @@ impl DuckTable {
                 state.grid = None;
                 state.select_seq += 1;
                 state.phase = match outcome {
-                    Ok((conn, info, catalog, db_size)) => {
-                        Phase::Connected { conn, info, catalog, db_size }
+                    Ok((conn, info, catalog, db_size, row_counts)) => {
+                        Phase::Connected { conn, info, catalog, db_size, row_counts }
                     }
                     Err(message) => Phase::Failed { name: clone_str(&name), message },
                 };

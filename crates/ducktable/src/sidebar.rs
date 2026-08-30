@@ -114,7 +114,7 @@ impl DuckTable {
 
     pub(crate) fn catalog_tree(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = pal(cx);
-        let Phase::Connected { catalog, .. } = &self.phase else {
+        let Phase::Connected { catalog, row_counts, .. } = &self.phase else {
             return div().id("catalog").flex_1();
         };
         let schemas = catalog.schemas();
@@ -161,12 +161,17 @@ impl DuckTable {
                                 .text_color(t.text)
                                 .child(clone_str(&table.name)),
                         )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(t.muted)
-                                .child(format!("{}", table.columns.len())),
-                        )
+                        // Row count in compact SI form — rows are what a
+                        // scan of a database cares about; column counts
+                        // live in the footer status and Structure view.
+                        .when_some(row_counts.get(&key).copied(), |d, n| {
+                            d.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(t.muted)
+                                    .child(crate::util::human_count(n)),
+                            )
+                        })
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             this.select_table(
                                 clone_str(&key.0),

@@ -903,6 +903,31 @@ pub(crate) fn total_rows(conn: &Conn, schema: &str, name: &str) -> Option<u64> {
     result.rows.first()?.first()?.as_u64()
 }
 
+/// Row counts for every table in one query, for the sidebar. DuckDB's
+/// `estimated_size` matched exact COUNT(*) on every live table probed,
+/// and the sidebar rounds to SI anyway.
+pub(crate) fn table_counts(
+    conn: &Conn,
+) -> Option<std::collections::HashMap<(String, String), u64>> {
+    let result = harbor_client::query(
+        conn,
+        "SELECT schema_name, table_name, estimated_size FROM duckdb_tables()",
+    )
+    .ok()?;
+    Some(
+        result
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let schema = row.first()?.as_str()?.to_string();
+                let table = row.get(1)?.as_str()?.to_string();
+                let n = row.get(2)?.as_u64()?;
+                Some(((schema, table), n))
+            })
+            .collect(),
+    )
+}
+
 /// `PRAGMA database_size` -> (database_size, wal_size), as the server
 /// prints them, for the inspector's SIZE section.
 pub(crate) fn database_size(conn: &Conn) -> Option<(String, String)> {
