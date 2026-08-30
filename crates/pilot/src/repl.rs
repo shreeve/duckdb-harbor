@@ -442,7 +442,9 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
             None => eprintln!("pilot: .read <file.sql>"),
         },
         "databases" | "db" => {
-            let _ = crate::list_fleet();
+            // Reloaded, not captured at startup: an edit made in another window
+            // is exactly what someone typing `.databases` wants to see.
+            let _ = crate::show_fleet(&crate::config::load());
         }
         "mode" => match parts.next() {
             None => println!("mode: {} (duckbox duckboxy markdown csv json jsonlines line list trash)", opts.mode.name()),

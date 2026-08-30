@@ -18,6 +18,7 @@
 //! `#22c55e`.
 
 pub mod config;
+pub mod fleet;
 pub mod lifetime;
 pub mod paths;
 pub mod perms;

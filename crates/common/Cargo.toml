@@ -19,6 +19,8 @@ term = ["dep:unicode-width"]
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.4"
+# the berth sidecar is a shared format: harbor writes it, pilot and DuckTable read it
+serde_json = "1"
 # terminal-cell widths: a path with CJK or an emoji in it must not shear a
 # table, and counting bytes (or even chars) is exactly how that happens.
 unicode-width = { version = "0.2", optional = true }

@@ -674,6 +674,17 @@ fn spawn_detached(rest: Vec<String>) -> Result<(), String> {
     Err(format!("berth {:?} did not come up in 15s — see {}", o.name, log_path.display()))
 }
 
+/// The dial of last resort, for the one row shape a lock file cannot settle.
+fn probe(a: &harbor_common::fleet::Addr) -> bool {
+    match a {
+        #[cfg(unix)]
+        harbor_common::fleet::Addr::Sock(p) => ready(p),
+        #[cfg(not(unix))]
+        harbor_common::fleet::Addr::Sock(_) => false,
+        harbor_common::fleet::Addr::Tcp(host, port) => ready_tcp(host, *port),
+    }
+}
+
 fn ready_tcp(bind: &str, port: u16) -> bool {
     let bind = match bind {
         "0.0.0.0" | "::" => "127.0.0.1",
@@ -910,7 +921,7 @@ fn start(rest: Vec<String>) -> Result<(), String> {
     // error. `start` names an end state, and a second `start` in a shell you
     // forgot you had should read the same as the first.
     let home = harbor_common::runtime_dir()?;
-    if reconcile(&cfg, &home).iter().any(|r| {
+    if harbor_common::fleet::reconcile(&cfg, &home, &probe).iter().any(|r| {
         r.name == name && r.state == harbor_common::State::Running
     }) && rest.len() == 1
     {
@@ -924,228 +935,11 @@ fn start(rest: Vec<String>) -> Result<(), String> {
     spawn_detached(args)
 }
 
-/// How a berth's lock file reads — the cheapest liveness answer there is.
-///
-/// `berth_dead` collapses this to a bool, which is right for `stop`/`forget`
-/// (where "no evidence" must never be read as "safe to signal") but loses the
-/// bit `show` needs: a lock file that exists and is unheld is the *normal
-/// residue of a clean exit*, and must not be confused with no lock at all.
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum Claim {
-    /// No lock file. Nothing has ever claimed this name, or state was swept.
-    None,
-    /// Someone holds it. The berth is alive — proven, without dialling it.
-    Held,
-    /// The file is there and nobody holds it. Provably not running.
-    Free,
-}
 
-fn claim_state(lock: &Path) -> Claim {
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        let Ok(f) = std::fs::OpenOptions::new().read(true).open(lock) else {
-            return Claim::None;
-        };
-        // Taking it proves nobody else has it; dropping f releases immediately.
-        let free = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
-        match free {
-            true => Claim::Free,
-            false => Claim::Held,
-        }
-    }
-    #[cfg(windows)]
-    {
-        match std::fs::OpenOptions::new().read(true).write(true).share_mode(0).open(lock) {
-            Ok(_) => Claim::Free,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Claim::None,
-            Err(_) => Claim::Held,
-        }
-    }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
-
-/// Where a berth actually answers — read from its sidecar, never guessed.
-///
-/// Guessing is how `show` came to print `<runtime>/<name>.sock` for a berth
-/// that was bound to TCP: a plausible path, a wrong answer, and no way for the
-/// reader to tell. A berth that has not registered has no address, and says so.
-enum Addr {
-    /// A unix socket, by absolute path.
-    Sock(PathBuf),
-    /// host:port, for a berth bound to TCP.
-    Tcp(String, u16),
-}
-
-impl Addr {
-    fn read(j: &serde_json::Value) -> Option<Addr> {
-        if let Some(s) = j["socket"].as_str() {
-            return Some(Addr::Sock(PathBuf::from(s)));
-        }
-        let port = u16::try_from(j["port"].as_u64()?).ok()?;
-        Some(Addr::Tcp(j["bind"].as_str().unwrap_or("127.0.0.1").to_string(), port))
-    }
-
-    /// Copy-pasteable, whole: exactly what another process needs to dial this
-    /// berth. Both forms speak the same HTTP, so the TCP form is written as
-    /// the URL it is rather than as a bare `host:port` you have to dress up.
-    fn full(&self) -> String {
-        match self {
-            Addr::Sock(p) => harbor_common::paths::shorten(p),
-            Addr::Tcp(host, port) => format!("http://{host}:{port}"),
-        }
-    }
-}
-
-/// One berth, from every source that knows anything about it.
-struct Row {
-    name: String,
-    state: harbor_common::State,
-    pid: Option<u64>,
-    uptime: Option<String>,
-    db: String,
-    addr: Option<Addr>,
-    note: Option<String>,
-}
-
-/// Read the runtime directory once, for both sidecars and locks.
-fn scan_runtime(
-    home: &Path,
-) -> (
-    std::collections::BTreeMap<String, serde_json::Value>,
-    std::collections::BTreeSet<String>,
-) {
-    let mut sidecars: std::collections::BTreeMap<String, serde_json::Value> = Default::default();
-    let mut locks = std::collections::BTreeSet::new();
-    let Ok(rd) = std::fs::read_dir(home) else { return (sidecars, locks) };
-    for p in rd.filter_map(|e| e.ok().map(|e| e.path())) {
-        let Some(stem) = p.file_stem().map(|x| x.to_string_lossy().into_owned()) else { continue };
-        match p.extension().and_then(|x| x.to_str()) {
-            Some("json") => {
-                let v = std::fs::read_to_string(&p)
-                    .ok()
-                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-                    .unwrap_or_default();
-                sidecars.insert(stem, v);
-            }
-            Some("lock") => {
-                locks.insert(stem);
-            }
-            _ => {}
-        }
-    }
-    (sidecars, locks)
-}
-
-/// Reconcile desired (config) against actual (runtime) into one row per name.
-///
-/// The flock answers liveness for every row but one, so this makes no network
-/// call in the common case: N cheap local opens instead of N round trips, each
-/// of which could otherwise cost a 2s read timeout.
-///
-/// Drift is a string comparison, never a `canonicalize`. A configured database
-/// on a disconnected mount must not turn an instant command into a hang —
-/// `harbor doctor` is the verb that is allowed to touch the disk.
-fn reconcile(cfg: &harbor_common::config::FileConfig, home: &Path) -> Vec<Row> {
-    use harbor_common::State;
-    let (sidecars, locks) = scan_runtime(home);
-    let configured: std::collections::BTreeMap<&str, &harbor_common::config::Connection> =
-        cfg.berths().into_iter().collect();
-
-    let mut names: std::collections::BTreeSet<String> = Default::default();
-    names.extend(configured.keys().map(|k| k.to_string()));
-    names.extend(sidecars.keys().cloned());
-    names.extend(locks.iter().cloned());
-
-    let mut rows: Vec<Row> = Vec::new();
-    for name in names {
-        let side = sidecars.get(&name);
-        let conf = configured.get(name.as_str()).copied();
-        let claim = claim_state(&home.join(format!("{name}.lock")));
-
-        let live_db = side.and_then(|j| j["db"].as_str()).unwrap_or("").to_string();
-        let want_db = conf
-            .and_then(|c| c.database())
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-
-        let mut note = None;
-        let state = match (claim, side.is_some(), conf.is_some()) {
-            (Claim::Held, true, true) if live_db == want_db => State::Running,
-            (Claim::Held, true, true) => {
-                note = Some(format!(
-                    "config now says {} — harbor stop {name} && harbor start {name}",
-                    harbor_common::paths::shorten(Path::new(&want_db))
-                ));
-                State::Drifted
-            }
-            (Claim::Held, true, false) => {
-                note = Some("not in your config — a client summoned it, or it was started by hand".into());
-                State::Unmanaged
-            }
-            // Alive with no registration: mid-boot, or a forget ran under it.
-            (Claim::Held, false, _) => {
-                note = Some("running but unregistered — starting up, or its sidecar was removed".into());
-                State::Unmanaged
-            }
-            (Claim::Free, true, _) => {
-                note = Some(format!("registry says it is running and the lock says otherwise — harbor forget {name}"));
-                State::Dead
-            }
-            // A lock left by a clean exit is normal residue, not a mess.
-            (Claim::Free, false, true) | (Claim::None, false, true) => State::Stopped,
-            (Claim::Free, false, false) => {
-                note = Some(format!("left by a berth that is gone — harbor forget {name}"));
-                State::Stale
-            }
-            // Sidecar, no lock at all: the only row that has to be dialled.
-            (Claim::None, true, _) => {
-                let alive = match (side.and_then(|j| j["socket"].as_str()), side.and_then(|j| j["port"].as_u64())) {
-                    (Some(sock), _) => ready(Path::new(sock)),
-                    (None, Some(port)) => ready_tcp("127.0.0.1", port as u16),
-                    _ => false,
-                };
-                match alive {
-                    true if conf.is_some() && live_db == want_db => State::Running,
-                    true => State::Unmanaged,
-                    false => {
-                        note = Some(format!("no lock and no answer — harbor forget {name}"));
-                        State::Dead
-                    }
-                }
-            }
-            (Claim::None, false, false) => continue,
-        };
-
-        let uptime = side
-            .and_then(|j| j["startedAtMs"].as_u64())
-            .and_then(|t| now_ms().checked_sub(t))
-            .map(|ms| harbor_common::lifetime::humanize(Duration::from_millis(ms)));
-
-        rows.push(Row {
-            state,
-            pid: side.and_then(|j| j["pid"].as_u64()).filter(|_| state.is_live()),
-            addr: side.and_then(|j| Addr::read(j)).filter(|_| state.is_live()),
-            uptime: uptime.filter(|_| state.is_live()),
-            db: match (live_db.is_empty(), want_db.is_empty()) {
-                (false, _) => harbor_common::paths::shorten(Path::new(&live_db)),
-                (true, false) => harbor_common::paths::shorten(Path::new(&want_db)),
-                _ => "—".into(),
-            },
-            note,
-            name,
-        });
-    }
-    rows.sort_by(|a, b| (a.state.rank(), &a.name).cmp(&(b.state.rank(), &b.name)));
-    rows
-}
 
 /// `harbor show [name]` — the fleet, or one berth in detail.
 fn show(rest: Vec<String>) -> Result<(), String> {
-    use harbor_common::ui::{Cell, Panel, Style, Table};
+    use harbor_common::ui::{Panel, Style};
     if let Some(flag) = rest.iter().find(|a| a.starts_with('-')) {
         return Err(format!("harbor show takes a berth name, not {flag:?}"));
     }
@@ -1155,7 +949,7 @@ fn show(rest: Vec<String>) -> Result<(), String> {
     let cfg = load_config()?;
     // Read-only: never create or chmod anything just to list.
     let home = harbor_common::runtime_dir()?;
-    let rows = reconcile(&cfg, &home);
+    let rows = harbor_common::fleet::reconcile(&cfg, &home, &probe);
     let st = Style::stdout().with_choice(cfg.defaults.color.as_deref());
 
     if let Some(want) = rest.first() {
@@ -1192,6 +986,7 @@ fn show(rest: Vec<String>) -> Result<(), String> {
         if let Some(a) = &row.addr {
             p = p.field("address", a.full());
         }
+
         if let Some(n) = &row.note {
             p = p.field_toned("note", n, row.state.level().into());
         }
@@ -1206,29 +1001,10 @@ fn show(rest: Vec<String>) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut t = Table::new(["NAME", "STATE", "PID", "UPTIME", "ADDRESS", "DATABASE"]);
-    for r in &rows {
-        t.row([
-            Cell::new(&r.name),
-            Cell::new(r.state.label()).tone(r.state.level().into()),
-            Cell::new(r.pid.map(|p| p.to_string()).unwrap_or("—".into())).right(),
-            Cell::new(r.uptime.clone().unwrap_or("—".into())).right(),
-            Cell::new(r.addr.as_ref().map(Addr::full).unwrap_or("—".into())),
-            Cell::new(&r.db),
-        ]);
-        if let Some(n) = &r.note {
-            t.note(r.state.level().into(), n);
-        }
-    }
-    print!("{}", t.render(&st));
+    print!("{}", harbor_common::fleet::table(&rows).render(&st));
 
     if st.boxed {
-        let mut tally: std::collections::BTreeMap<&str, usize> = Default::default();
-        for r in &rows {
-            *tally.entry(r.state.word()).or_default() += 1;
-        }
-        let parts: Vec<String> = tally.iter().map(|(w, n)| format!("{n} {w}")).collect();
-        println!("\n  {}", parts.join(", "));
+        println!("\n  {}", harbor_common::fleet::tally(&rows));
         // The free checks only — an entry on a dead mount must not make this hang.
         if let Some((sev, line)) = doctor::summary(&doctor::quick(&cfg)) {
             println!("  {}", st.paint(sev.tone(), &line));

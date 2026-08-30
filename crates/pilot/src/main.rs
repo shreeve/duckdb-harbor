@@ -94,9 +94,15 @@ fn main() -> ExitCode {
         }
     }
 
-    let Some(target) = target else { return list_fleet() };
-
     let cfg = config::load(); // once; resolve and the render defaults share it
+
+    // Bare `pilot` opens what the config says to open, and otherwise shows what
+    // there is to open. It deliberately does not pick "the only berth" when
+    // there happens to be one — that would make adding a second database
+    // silently change what a bare command does.
+    let Some(target) = target.or_else(|| cfg.defaults.connection.clone()) else {
+        return show_fleet(&cfg);
+    };
     let conn = match resolve(&cfg, &target, token) {
         Ok(c) => c,
         Err(e) => return fail(&e),
@@ -157,7 +163,7 @@ const HELP: &str = "\
 pilot — the Harbor client
 
 usage:
-  pilot                        list live berths in ~/.config/harbor/runtime
+  pilot                        open [defaults] connection, else show the fleet
   pilot <target>               interactive REPL (highlighting, Tab completion)
   pilot <target> -c \"SQL\"      run one statement
   echo \"SQL\" | pilot <target>  same, from stdin
@@ -215,8 +221,18 @@ fn resolve(cfg: &config::FileConfig, target: &str, flag_token: Option<String>) -
             return Ok(Conn { transport: url_transport(url)?, token });
         }
         if let Some(path) = &entry.path {
-            let idle = entry.idle_exit.as_deref().unwrap_or("90s");
-            let (transport, file_token) = ensure_berth(&config::expand(path), idle)?;
+            // The entry, then [defaults], then who asked — the same ladder
+            // harbor climbs. Reading only the entry made `[defaults] idle-exit`
+            // a key that worked for `harbor start` and was silently ignored
+            // for every berth pilot summoned.
+            let life = harbor_common::lifetime::resolve(
+                Default::default(),
+                entry.idle_exit.as_deref(),
+                cfg.defaults.idle_exit.as_deref(),
+                harbor_common::Summoner::Client,
+            )?;
+            let (transport, file_token) =
+                ensure_berth(&config::expand(path), life, entry.create == Some(true))?;
             return Ok(Conn { transport, token: token.or(file_token) });
         }
         return Err(format!("config entry {target:?} has neither url nor path"));
@@ -228,7 +244,13 @@ fn resolve(cfg: &config::FileConfig, target: &str, flag_token: Option<String>) -
     if target.ends_with(".duckdb") {
         // D9: summon the owner. A second pilot on the same file joins the
         // same berth instead of "database is locked".
-        let (transport, file_token) = ensure_berth(std::path::Path::new(target), "90s")?;
+        let life = harbor_common::lifetime::resolve(
+            Default::default(),
+            None,
+            cfg.defaults.idle_exit.as_deref(),
+            harbor_common::Summoner::Client,
+        )?;
+        let (transport, file_token) = ensure_berth(std::path::Path::new(target), life, false)?;
         return Ok(Conn { transport, token: flag_token.or(env_token).or(file_token) });
     }
 
@@ -343,7 +365,8 @@ fn url_transport(url: &str) -> Result<Transport, String> {
 /// berth's token, if readable.
 fn ensure_berth(
     path: &std::path::Path,
-    idle_exit: &str,
+    life: harbor_common::lifetime::Lifetime,
+    create: bool,
 ) -> Result<(Transport, Option<String>), String> {
     let home = config::runtime_dir()?;
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -396,11 +419,16 @@ fn ensure_berth(
         ));
     }
     let harbor = std::env::var("HARBOR_BIN").unwrap_or_else(|_| "harbor".to_string());
-    eprintln!("pilot: summoning a berth for {} (idle-exit {idle_exit})", canon.display());
-    let status = std::process::Command::new(&harbor)
-        .args(["start"])
-        .arg(&canon)
-        .args(["--name", &name, "--idle-exit", idle_exit])
+    eprintln!("pilot: summoning a berth for {} (idle-exit {})", canon.display(), life.describe());
+    let mut cmd = std::process::Command::new(&harbor);
+    cmd.args(["start"]).arg(&canon).args(["--name", &name]);
+    // A Lifetime knows its own argv, so "never" reaches harbor as the absence
+    // of --idle-exit rather than as a duration string harbor cannot parse.
+    cmd.args(life.to_args());
+    if create {
+        cmd.arg("--create");
+    }
+    let status = cmd
         // pilot is about to draw a prompt; harbor's fleet table is not pilot's
         // output. Failures still speak — harbor writes those to stderr.
         .stdout(std::process::Stdio::null())
@@ -419,10 +447,29 @@ fn fleet_hint(home: &std::path::Path) -> String {
     if names.is_empty() { String::new() } else { format!("; live berths: {}", names.join(", ")) }
 }
 
-/// Bare `pilot`: the live local fleet view. /ready is unauthenticated by
-/// design, so this needs no tokens. Named config entries resolve on demand but
-/// are not merged into this list.
-fn list_fleet() -> ExitCode {
+/// The dial reconcile needs for the one row a lock file cannot settle.
+/// `/ready` is unauthenticated by design, so this needs no token.
+fn probe(a: &harbor_common::fleet::Addr) -> bool {
+    let transport = match a {
+        #[cfg(unix)]
+        harbor_common::fleet::Addr::Sock(p) => Transport::Unix(p.clone()),
+        #[cfg(not(unix))]
+        harbor_common::fleet::Addr::Sock(_) => return false,
+        harbor_common::fleet::Addr::Tcp(host, port) => Transport::Tcp(format!("{host}:{port}")),
+    };
+    matches!(
+        http::request(&transport, &endpoint::READY, None, None, Some(Duration::from_secs(2))),
+        Ok(r) if r.status == 200
+    )
+}
+
+/// Bare `pilot` with no default connection: the same fleet `harbor` draws.
+///
+/// The same table from the same reconcile, not a second one that agrees most
+/// of the time. Stopped berths belong here too — pilot summons one on demand,
+/// so "not running" is not "not openable".
+fn show_fleet(cfg: &config::FileConfig) -> ExitCode {
+    use harbor_common::ui::Style;
     let home = match config::runtime_dir() {
         Ok(h) => h,
         Err(e) => {
@@ -430,30 +477,17 @@ fn list_fleet() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let berths = berth_entries(&home);
-    if berths.is_empty() {
-        println!("no live berths in {} (start one: harbor start <db.duckdb>)", home.display());
+    let rows = harbor_common::fleet::reconcile(cfg, &home, &probe);
+    let st = Style::stdout().with_choice(cfg.defaults.color.as_deref());
+    if rows.is_empty() {
+        println!("Nothing configured, nothing running.\n");
+        println!("  pilot <db.duckdb>   open a database — a berth starts itself");
         return ExitCode::SUCCESS;
     }
-    println!("{:<20} {:<8} ADDRESS", "BERTH", "STATE");
-    for (name, transport) in berths {
-        let state = match http::request(
-            &transport,
-            &endpoint::READY,
-            None,
-            None,
-            Some(Duration::from_secs(2)),
-        ) {
-            Ok(r) if r.status == 200 => "ready",
-            Ok(_) => "unready",
-            Err(_) => "dead",
-        };
-        let addr = match &transport {
-            #[cfg(unix)]
-            Transport::Unix(p) => p.display().to_string(),
-            Transport::Tcp(a) => a.clone(),
-        };
-        println!("{name:<20} {state:<8} {addr}");
+    print!("{}", harbor_common::fleet::table(&rows).render(&st));
+    if st.boxed {
+        println!("\n  {}", harbor_common::fleet::tally(&rows));
+        println!("  pilot <name> to open one");
     }
     ExitCode::SUCCESS
 }

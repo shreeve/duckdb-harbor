@@ -620,6 +620,7 @@ version = "0.15.0"
 dependencies = [
  "libc",
  "serde",
+ "serde_json",
  "toml",
  "unicode-width",
 ]
