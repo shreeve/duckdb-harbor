@@ -5,6 +5,7 @@
 mod app;
 mod content;
 mod grid;
+mod prefs;
 mod sidebar;
 mod theme;
 mod util;
@@ -30,6 +31,7 @@ fn main() {
     app.run(move |cx| {
         gpui_component::init(cx);
         theme::init(cx);
+        prefs::init(cx);
 
         cx.spawn(async move |cx| {
             cx.open_window(

@@ -160,8 +160,15 @@ metadata shows a follow arrow that opens the referenced row; when the
 metadata is absent or composite the arrow simply does not appear.
 
 Bottom bar per table tab: Data | Structure | JSON views, column
-show/hide, filters, a NULL-tag visibility toggle (chip vs blank cell),
-page size, pagination. Structure shows the table's
+show/hide, filters, page size, pagination.
+
+Display preferences are global, not per-table: row numbers, numeric
+right-alignment, NULL-tag visibility. They live as a quiet toggle
+cluster in the middle of the grid header strip (title left, toggles
+center, status right), each with a tooltip, persisted in
+`~/.config/ducktable/prefs.json`. They sit on the grid rather than in
+the sidebar because controls live nearest what they change; beside
+CATALOG they would read as catalog filters. Structure shows the table's
 DDL and columns; JSON shows the current page as JSON. In a query-results
 grid, Structure and edit mode are absent and JSON shows the fetched
 result.

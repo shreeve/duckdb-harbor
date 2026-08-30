@@ -10,11 +10,13 @@
 //! or editing arrives, reads resolve through an identity mapping, never
 //! raw indices.
 
+use crate::prefs;
 use crate::theme::{pal, ui_font, value_font};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::table::{Column as TableColumn, Table, TableDelegate, TableState};
-use gpui_component::{Sizable as _, Size, StyledExt as _};
+use gpui_component::{Selectable as _, Sizable as _, Size, StyledExt as _};
 use harbor_client::Conn;
 use serde_json::Value;
 
@@ -43,6 +45,12 @@ pub(crate) struct GridDelegate {
     source: String,
     title: String,
     cols: Vec<TableColumn>,
+    /// The result schema, kept so the column list can be rebuilt when the
+    /// row-number preference flips.
+    schema_cols: Vec<wire::Column>,
+    numeric: Vec<bool>,
+    /// Whether the column list currently includes the row-number gutter.
+    gutter: bool,
     rows: Vec<Vec<Value>>,
     eof: bool,
     loading: bool,
@@ -63,6 +71,9 @@ impl Grid {
             source: format!("{}.{}", qident(schema), qident(name)),
             title: format!("{schema}.{name}"),
             cols: Vec::new(),
+            schema_cols: Vec::new(),
+            numeric: Vec::new(),
+            gutter: prefs::get(cx).row_numbers,
             rows: Vec::new(),
             eof: false,
             loading: false,
@@ -75,6 +86,26 @@ impl Grid {
             state
         });
         Self { table }
+    }
+
+    /// Rebuild the column list after the row-number preference flips.
+    fn sync_columns(&mut self, cx: &mut Context<Self>) {
+        let want = prefs::get(cx).row_numbers;
+        self.table.update(cx, |state, cx| {
+            if state.delegate().schema_cols.is_empty() || state.delegate().gutter == want {
+                return;
+            }
+            {
+                let d = state.delegate_mut();
+                d.gutter = want;
+                d.cols = build_columns(&d.schema_cols, want);
+                if want {
+                    d.cols[0].width = px(gutter_width(d.rows.len()));
+                }
+            }
+            state.refresh(cx);
+            cx.notify();
+        });
     }
 }
 
@@ -103,7 +134,13 @@ impl GridDelegate {
                                 d.eof = page.rows.len() < PAGE;
                                 d.last_time_ms = page.time_ms;
                                 if first {
-                                    d.cols = build_columns(&page.columns);
+                                    d.numeric = page
+                                        .columns
+                                        .iter()
+                                        .map(|c| numeric(&c.duckdb_type.to_uppercase()))
+                                        .collect();
+                                    d.cols = build_columns(&page.columns, d.gutter);
+                                    d.schema_cols = page.columns;
                                 }
                                 d.rows.extend(page.rows);
                             }
@@ -113,11 +150,12 @@ impl GridDelegate {
                     // The row-number gutter widens as pages land; a width
                     // change needs the col groups re-prepared.
                     let want = px(gutter_width(state.delegate().rows.len()));
-                    let widen = state
-                        .delegate()
-                        .cols
-                        .first()
-                        .is_some_and(|c| c.width != want);
+                    let widen = state.delegate().gutter
+                        && state
+                            .delegate()
+                            .cols
+                            .first()
+                            .is_some_and(|c| c.width != want);
                     if widen {
                         state.delegate_mut().cols[0].width = want;
                     }
@@ -159,9 +197,10 @@ impl TableDelegate for GridDelegate {
         // row height explicitly and draw their own bottom border; vertical
         // and horizontal lines meet at the corners.
         let row_h = GRID_SIZE.table_row_height();
+        let p = prefs::get(cx);
         // Column 0 is the row-number gutter: raised, muted, and a firmer
         // divider than the data cells (design.css `.grid td.num`).
-        if col_ix == 0 {
+        if self.gutter && col_ix == 0 {
             return div()
                 .h_flex()
                 .relative()
@@ -186,7 +225,8 @@ impl TableDelegate for GridDelegate {
                 .child(div().absolute().right_0().top_0().bottom_0().w(px(1.)).bg(t.border))
                 .into_any_element();
         }
-        let data_col = col_ix - 1;
+        let data_col = col_ix - self.gutter as usize;
+        let right = p.right_align && self.numeric.get(data_col).copied().unwrap_or(false);
         let value = self.rows.get(row_ix).and_then(|r| r.get(data_col));
         // The column paddings are zeroed (build_columns), so this div owns
         // the cell: full height, the vertical divider on its right edge,
@@ -201,19 +241,24 @@ impl TableDelegate for GridDelegate {
             .border_b_1()
             .border_color(t.grid_line);
         match value {
-            None | Some(Value::Null) => cell
-                .child(
-                    div()
-                        .flex_none()
-                        .px(px(5.))
-                        .rounded(px(4.))
-                        .bg(t.grid_line.opacity(0.55))
-                        .text_size(px(TAG_TEXT))
-                        .font_family(ui_font())
-                        .text_color(t.muted.opacity(0.65))
-                        .child("NULL"),
-                )
-                .into_any_element(),
+            None | Some(Value::Null) => {
+                if !p.null_tags {
+                    return cell.into_any_element();
+                }
+                cell.when(right, |d| d.justify_end())
+                    .child(
+                        div()
+                            .flex_none()
+                            .px(px(5.))
+                            .rounded(px(4.))
+                            .bg(t.grid_line.opacity(0.55))
+                            .text_size(px(TAG_TEXT))
+                            .font_family(ui_font())
+                            .text_color(t.muted.opacity(0.65))
+                            .child("NULL"),
+                    )
+                    .into_any_element()
+            }
             Some(v) => {
                 let text = match v {
                     Value::String(s) => s.clone(),
@@ -226,6 +271,7 @@ impl TableDelegate for GridDelegate {
                         .text_size(px(CELL_TEXT))
                         .font_family(value_font())
                         .text_color(t.text)
+                        .when(right, |d| d.text_right())
                         .child(text),
                 )
                 .into_any_element()
@@ -240,7 +286,7 @@ impl TableDelegate for GridDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let t = pal(cx);
-        if col_ix == 0 {
+        if self.gutter && col_ix == 0 {
             return div()
                 .size_full()
                 .text_right()
@@ -249,15 +295,20 @@ impl TableDelegate for GridDelegate {
                 .child("#")
                 .into_any_element();
         }
-        // Headers and values are both left-aligned (design proof: only the
-        // row-number gutter right-aligns), so they line up on the shared
-        // 8px wrapper inset by construction.
+        let data_col = col_ix - self.gutter as usize;
+        let right = prefs::get(cx).right_align
+            && self.numeric.get(data_col).copied().unwrap_or(false);
+        // Left-aligned headers line up with values on the shared 8px
+        // wrapper inset by construction. A right-aligned header needs 5px
+        // of its own: the wrapper compensates zeroed paddings with only
+        // 4px, while cell text sits 9px in (8px pad + 1px divider).
         div()
             .size_full()
             .truncate()
             .text_size(px(HEADER_TEXT))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(t.text)
+            .when(right, |d| d.text_right().pr(px(5.)))
             .child(self.cols[col_ix].name.clone())
             .into_any_element()
     }
@@ -278,12 +329,13 @@ impl TableDelegate for GridDelegate {
 impl Render for Grid {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = pal(cx);
+        let p = prefs::get(cx);
         let (title, count, cols, eof, loading, error, ms) = {
             let d = self.table.read(cx).delegate();
             (
                 d.title.clone(),
                 d.rows.len(),
-                d.cols.len().saturating_sub(1),
+                d.cols.len().saturating_sub(d.gutter as usize),
                 d.eof,
                 d.loading,
                 d.error.clone(),
@@ -309,12 +361,54 @@ impl Render for Grid {
                     .h_flex()
                     .h_8()
                     .px_3()
+                    .gap_3()
                     .flex_none()
                     .items_center()
-                    .justify_between()
                     .border_b_1()
                     .border_color(t.border)
-                    .child(div().text_sm().text_color(t.text).truncate().child(title))
+                    .child(
+                        div().flex_1().min_w_0().text_sm().text_color(t.text).truncate().child(title),
+                    )
+                    .child(
+                        div()
+                            .h_flex()
+                            .gap_1()
+                            .flex_none()
+                            .child(
+                                Button::new("toggle-rows")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("#")
+                                    .tooltip("Show row numbers")
+                                    .selected(p.row_numbers)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        prefs::toggle(cx, |p| p.row_numbers = !p.row_numbers);
+                                        this.sync_columns(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("toggle-align")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("\u{21e5}")
+                                    .tooltip("Right-align numeric columns")
+                                    .selected(p.right_align)
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        prefs::toggle(cx, |p| p.right_align = !p.right_align);
+                                    })),
+                            )
+                            .child(
+                                Button::new("toggle-nulls")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("\u{2205}")
+                                    .tooltip("Show NULL tags")
+                                    .selected(p.null_tags)
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        prefs::toggle(cx, |p| p.null_tags = !p.null_tags);
+                                    })),
+                            ),
+                    )
                     .child(div().text_xs().text_color(t.muted).flex_none().child(status)),
             )
             .when_some(error, |d, message| {
@@ -342,15 +436,18 @@ fn qident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
-fn build_columns(cols: &[wire::Column]) -> Vec<TableColumn> {
+fn build_columns(cols: &[wire::Column], with_gutter: bool) -> Vec<TableColumn> {
     // Column 0 is the row-number gutter; its render_td owns every edge.
-    let gutter = TableColumn::new("#", "#")
-        .width(px(gutter_width(1)))
-        .paddings(Edges::all(px(0.)))
-        .resizable(false)
-        .movable(false)
-        .selectable(false);
-    std::iter::once(gutter)
+    let gutter = with_gutter.then(|| {
+        TableColumn::new("#", "#")
+            .width(px(gutter_width(1)))
+            .paddings(Edges::all(px(0.)))
+            .resizable(false)
+            .movable(false)
+            .selectable(false)
+    });
+    gutter
+        .into_iter()
         .chain(cols.iter().enumerate().map(|(i, c)| {
             let name = c.name.clone().unwrap_or_else(|| format!("col{i}"));
             let ty = c.duckdb_type.to_uppercase();
