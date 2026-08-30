@@ -188,7 +188,7 @@ fn resolve(cfg: &config::FileConfig, target: &str, flag_token: Option<String>) -
 
     // Explicit config entry shadows a same-named live berth (ssh_config rule).
     if let Some(entry) = cfg.connection.get(target) {
-        let home = config::harbor_home();
+        let home = config::runtime_dir()?;
         if berth_sock(&home, target).exists() {
             // Warn only when they actually diverge. When the entry's path IS
             // the database the live berth serves, following the config joins
@@ -210,7 +210,7 @@ fn resolve(cfg: &config::FileConfig, target: &str, flag_token: Option<String>) -
                 eprintln!("pilot: config entry {target:?} shadows a live local berth of the same name");
             }
         }
-        let token = flag_token.or(env_token).or_else(|| entry.resolve_token());
+        let token = flag_token.or(env_token).or_else(|| config::resolve_token(entry));
         if let Some(url) = &entry.url {
             return Ok(Conn { transport: url_transport(url)?, token });
         }
@@ -242,7 +242,7 @@ fn resolve(cfg: &config::FileConfig, target: &str, flag_token: Option<String>) -
         return Err("Unix socket targets are not supported on Windows; use a berth name or http://host:port".into());
     }
 
-    let home = config::harbor_home();
+    let home = config::runtime_dir()?;
     #[cfg(unix)]
     {
         let sock = berth_sock(&home, target);
@@ -345,7 +345,7 @@ fn ensure_berth(
     path: &std::path::Path,
     idle_exit: &str,
 ) -> Result<(Transport, Option<String>), String> {
-    let home = config::harbor_home();
+    let home = config::runtime_dir()?;
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
 
     // Already owned? The sidecar json says which berth claims this file.
@@ -420,7 +420,13 @@ fn fleet_hint(home: &std::path::Path) -> String {
 /// design, so this needs no tokens. Named config entries resolve on demand but
 /// are not merged into this list.
 fn list_fleet() -> ExitCode {
-    let home = config::harbor_home();
+    let home = match config::runtime_dir() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("pilot: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let berths = berth_entries(&home);
     if berths.is_empty() {
         println!("no live berths in {} (start one: harbor add <db>)", home.display());

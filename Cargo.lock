@@ -978,6 +978,7 @@ name = "pilot"
 version = "0.15.0"
 dependencies = [
  "crossterm 0.29.0",
+ "harbor-common",
  "libc",
  "nu-ansi-term",
  "reedline",

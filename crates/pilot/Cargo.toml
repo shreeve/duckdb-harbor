@@ -10,6 +10,9 @@ license = "MIT"
 # one request at a time buys nothing. Pilot is deliberately TLS-free; remote
 # human access goes through SSH, while Caddy serves HTTPS application clients.
 [dependencies]
+# Paths, names, the permission gate and the config schema — shared with harbor
+# so client and server cannot disagree about where anything lives.
+harbor-common = { path = "../common" }
 crossterm = "0.29.0"
 wire = { path = "../wire" }
 # OSC 11 background query for light/dark auto-detection: poll(2)+read(2) on the

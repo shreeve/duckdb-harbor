@@ -281,7 +281,7 @@ fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
         Box::new(Emacs::new(kb))
     };
     let menu = ColumnarMenu::default().with_name("completion_menu");
-    let history = crate::config::harbor_home().join("history");
+    let history = crate::config::history_file();
     Reedline::create()
         .with_validator(Box::new(SqlValidator))
         .with_highlighter(Box::new(crate::highlight::SqlHighlighter))
@@ -296,9 +296,9 @@ fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
             // in-memory history and say so, rather than .expect() panicking with
             // a backtrace before the prompt is even drawn.
             let history: Box<dyn reedline::History> =
-                match FileBackedHistory::with_file(1000, history) {
-                    Ok(h) => Box::new(h),
-                    Err(_) => {
+                match history.map(|p| FileBackedHistory::with_file(1000, p)) {
+                    Some(Ok(h)) => Box::new(h),
+                    _ => {
                         eprintln!("pilot: history file unavailable; using in-memory history");
                         Box::new(FileBackedHistory::default())
                     }
