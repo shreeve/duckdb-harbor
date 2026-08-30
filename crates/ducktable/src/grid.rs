@@ -113,7 +113,10 @@ pub(crate) struct GridDelegate {
     page_size: usize,
     /// Raw SQL WHERE clause text, verbatim from the filter strip.
     filter: Option<String>,
-    rows: Vec<Vec<Value>>,
+    /// Render-ready cell text (None = NULL), converted once at page
+    /// commit — render_td runs per visible cell per frame and must not
+    /// allocate, so it only bumps these SharedStrings.
+    rows: Vec<Vec<Option<SharedString>>>,
     /// Mirror of the table's selected row (synced from TableEvent), so
     /// render_tr can tint the selection — the delegate cannot read the
     /// TableState it is rendering inside.
@@ -180,7 +183,7 @@ impl Grid {
                     .map(|c| numeric(&c.duckdb_type.to_uppercase()))
                     .collect();
                 delegate.schema_cols = page.columns;
-                delegate.rows = page.rows;
+                delegate.rows = display_rows(page.rows);
                 delegate.rebuild_cols();
             }
             Err(message) => {
@@ -346,7 +349,7 @@ impl Grid {
                                     d.schema_cols = result.columns;
                                     d.rebuild_cols();
                                 }
-                                d.rows = result.rows;
+                                d.rows = display_rows(result.rows);
                                 d.page = page;
                                 d.page_size = size;
                                 if let Some(f) = filter {
@@ -593,9 +596,8 @@ impl Grid {
                 .map(|(i, c)| {
                     let name = c.name.clone().unwrap_or_else(|| format!("col{i}"));
                     match row.get(i) {
-                        None | Some(Value::Null) => (name, "NULL".to_string(), true),
-                        Some(Value::String(s)) => (name, s.clone(), false),
-                        Some(v) => (name, v.to_string(), false),
+                        None | Some(None) => (name, "NULL".to_string(), true),
+                        Some(Some(s)) => (name, s.to_string(), false),
                     }
                 })
                 .collect(),
@@ -799,7 +801,7 @@ impl TableDelegate for GridDelegate {
                 )
             });
         match value {
-            None | Some(Value::Null) => {
+            None | Some(None) => {
                 if !p.null_tags {
                     return cell.into_any_element();
                 }
@@ -817,11 +819,8 @@ impl TableDelegate for GridDelegate {
                     )
                     .into_any_element()
             }
-            Some(v) => {
-                let text = match v {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
+            Some(Some(text)) => {
+                let text = text.clone();
                 cell.child(
                     div()
                         .w_full()
@@ -1713,6 +1712,23 @@ pub(crate) fn table_counts(
             })
             .collect(),
     )
+}
+
+/// Wire values -> render-ready cell text (None = NULL), once per page.
+/// The String arm moves the buffer instead of cloning; everything else
+/// pays its Display cost here so render never does.
+fn display_rows(rows: Vec<Vec<Value>>) -> Vec<Vec<Option<SharedString>>> {
+    rows.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|v| match v {
+                    Value::Null => None,
+                    Value::String(s) => Some(SharedString::from(s)),
+                    other => Some(SharedString::from(other.to_string())),
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// `PRAGMA database_size` -> (data bytes, wal bytes). The server prints
