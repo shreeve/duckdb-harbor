@@ -21,7 +21,9 @@ impl Grid {
         let mut pane = div()
             .id("inspector")
             .v_flex()
-            .w(px(260.))
+            // Wide enough that a full microsecond timestamp
+            // (26 mono chars) survives the key column and padding.
+            .w(px(290.))
             .flex_none()
             .h_full()
             .px_3()
