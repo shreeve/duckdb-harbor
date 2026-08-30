@@ -89,9 +89,22 @@ impl Catalog {
 }
 
 pub fn catalog(conn: &Conn) -> Result<Catalog, String> {
+    fetch(conn, &wire::endpoint::CATALOG)
+}
+
+/// The catalog's lite style (harbor 0.17+): the versions, the sizes, and
+/// each table as name, schema, and `estimatedRows` — enough to draw a
+/// database list without paying for columns, DDL, or sequences. An older
+/// harbor ignores the parameter and answers the full document, so this
+/// degrades to correct-but-heavier, never to an error.
+pub fn catalog_lite(conn: &Conn) -> Result<Catalog, String> {
+    fetch(conn, &wire::endpoint::catalog_lite())
+}
+
+fn fetch(conn: &Conn, route: &wire::endpoint::Route) -> Result<Catalog, String> {
     let r = request(
         &conn.transport,
-        &wire::endpoint::CATALOG,
+        route,
         conn.token.as_deref(),
         None,
         Some(Duration::from_secs(15)),

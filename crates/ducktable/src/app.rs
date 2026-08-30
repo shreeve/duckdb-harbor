@@ -250,7 +250,9 @@ impl DuckTable {
                                 .is_live()
                                 .then(|| {
                                     let conn = fleet::connect(&row.name).ok()?;
-                                    let cat = harbor_client::catalog(&conn).ok()?;
+                                    // Lite: this sweep only counts tables,
+                                    // so it never pays for columns or DDL.
+                                    let cat = harbor_client::catalog_lite(&conn).ok()?;
                                     Some(
                                         cat.schemas()
                                             .iter()
