@@ -175,7 +175,11 @@ impl Grid {
             .id("structure")
             .v_flex()
             .size_full()
-            .px_3()
+            // Left inset matches the title strip and the data grid's
+            // first column (8px cell padding), so switching views never
+            // shifts the leftmost text.
+            .pl_2()
+            .pr_3()
             .py_2()
             .overflow_y_scroll();
         let Some(s) = self.structure() else {

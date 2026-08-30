@@ -71,7 +71,11 @@ impl Grid {
             .h(px(38.))
             .flex_none()
             .items_center()
-            .px(px(10.))
+            // Left inset matches the title strip and the grid text (8px),
+            // so the view switcher sits on the same axis as everything
+            // above it; the right keeps its slightly wider margin.
+            .pl_2()
+            .pr(px(10.))
             .bg(t.raised)
             .border_t_1()
             .border_color(t.border)
