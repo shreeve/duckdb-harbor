@@ -117,7 +117,7 @@ fn color_allowed(tty: bool) -> bool {
 /// Strip anything that could move the cursor, change the color, or forge a
 /// border. Replaces rather than deletes, so a hostile name still occupies
 /// space and stays visible instead of quietly vanishing.
-pub fn sanitize(s: &str) -> String {
+fn sanitize(s: &str) -> String {
     s.chars().map(|c| if c == '\u{1b}' || c.is_control() { '\u{fffd}' } else { c }).collect()
 }
 
@@ -136,7 +136,7 @@ fn pad(s: &str, to: usize, right: bool) -> String {
 }
 
 /// Shorten to fit, with an ellipsis, measured in cells.
-pub fn elide(s: &str, max: usize) -> String {
+fn elide(s: &str, max: usize) -> String {
     if cells(s) <= max || max == 0 {
         return s.to_string();
     }
@@ -158,7 +158,7 @@ pub fn elide(s: &str, max: usize) -> String {
 // box drawing
 // ---------------------------------------------------------------------------
 
-pub struct Charset {
+struct Charset {
     pub tl: &'static str,
     pub tm: &'static str,
     pub tr: &'static str,
@@ -174,7 +174,7 @@ pub struct Charset {
 
 /// Rounded corners. The straight-cornered set stays in pilot's `render.rs`
 /// for duckbox, which deliberately mirrors the DuckDB shell.
-pub const ROUNDED: Charset = Charset {
+const ROUNDED: Charset = Charset {
     tl: "╭",
     tm: "┬",
     tr: "╮",

@@ -219,20 +219,6 @@ pub fn load() -> Result<FileConfig, Error> {
     toml::from_str(&text).map_err(|e| Error::Invalid { file, why: e.to_string() })
 }
 
-/// Load, or carry on with nothing. A missing file is silent — that is the
-/// zero-config path, not a problem. Anything else is worth a line on stderr,
-/// because it means settings the user wrote are not in effect.
-pub fn load_or_empty(who: &str) -> FileConfig {
-    match load() {
-        Ok(c) => c,
-        Err(Error::Missing(_)) => FileConfig::default(),
-        Err(e) => {
-            eprintln!("{who}: {e}");
-            FileConfig::default()
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

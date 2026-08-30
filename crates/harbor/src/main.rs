@@ -786,10 +786,10 @@ fn probe_200(s: &mut (impl Read + Write)) -> bool {
 
 /// The config, or a clear reason why not.
 ///
-/// `load_or_empty` is wrong for the fleet verbs: a refused or invalid config
-/// returns *empty*, which would silently reclassify every configured berth as
-/// unmanaged and make every stopped one vanish. A confidently wrong table is
-/// worse than an error.
+/// Fleet verbs never shrug off a refused or invalid config: treating it as
+/// empty would silently reclassify every configured berth as unmanaged and
+/// make every stopped one vanish. A confidently wrong table is worse than
+/// an error. (Only a MISSING file is the zero-config path.)
 fn load_config() -> Result<harbor_common::config::FileConfig, String> {
     match harbor_common::config::load() {
         Ok(c) => Ok(c),

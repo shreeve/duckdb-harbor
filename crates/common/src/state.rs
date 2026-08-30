@@ -88,15 +88,6 @@ impl State {
         matches!(self, State::Running | State::Drifted | State::Unmanaged)
     }
 
-    /// systemctl's, so a script written for one works on the other:
-    /// 0 running, 3 known but not running, 4 nothing by that name.
-    pub fn exit_code(self) -> u8 {
-        match self {
-            s if s.is_live() => 0,
-            _ => 3,
-        }
-    }
-
     /// Sort order for the fleet view: what you have, then what is running
     /// without being configured, then the mess to sweep. Stale goes last
     /// because it is acted on in bulk, not one at a time.
@@ -128,14 +119,6 @@ mod tests {
             assert!(!s.word().is_empty() && !s.glyph().is_empty());
             assert!(s.label().contains(s.word()));
         }
-    }
-
-    #[test]
-    fn exit_codes_match_systemctl() {
-        assert_eq!(State::Running.exit_code(), 0);
-        assert_eq!(State::Unmanaged.exit_code(), 0);
-        assert_eq!(State::Stopped.exit_code(), 3);
-        assert_eq!(State::Stale.exit_code(), 3);
     }
 
     #[test]
