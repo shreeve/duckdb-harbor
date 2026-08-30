@@ -76,6 +76,10 @@ pub(crate) struct GridDelegate {
     /// render_tr can tint the selection — the delegate cannot read the
     /// TableState it is rendering inside.
     selected: Option<usize>,
+    /// The active cell (row, data column), Sheets-style: the clicked cell
+    /// carries an accent ring on top of the row tint, and keyboard row
+    /// moves carry the ring to the same column of the new row.
+    active_cell: Option<(usize, usize)>,
     eof: bool,
     loading: bool,
     error: Option<String>,
@@ -110,6 +114,7 @@ impl Grid {
             total_rows,
             rows: Vec::new(),
             selected: None,
+            active_cell: None,
             eof: false,
             loading: false,
             error: None,
@@ -141,7 +146,13 @@ impl Grid {
             if let gpui_component::table::TableEvent::SelectRow(ix) = event {
                 let ix = *ix;
                 table.update(cx, |state, cx| {
-                    state.delegate_mut().selected = Some(ix);
+                    let d = state.delegate_mut();
+                    d.selected = Some(ix);
+                    // Keyboard row moves carry the active-cell ring to the
+                    // same column of the new row (Sheets' arrow behavior).
+                    if let Some((_, col)) = d.active_cell {
+                        d.active_cell = Some((ix, col));
+                    }
                     cx.notify();
                 });
                 cx.notify();
@@ -331,15 +342,39 @@ impl TableDelegate for GridDelegate {
         // The column paddings are zeroed (build_columns), so this div owns
         // the cell: full height, the vertical divider on its right edge,
         // and its own text inset.
+        let active = self.active_cell == Some((row_ix, data_col));
         let cell = div()
             .h_flex()
+            .relative()
             .w_full()
             .h(row_h)
             .items_center()
             .pr_2()
             .border_r_1()
             .border_b_1()
-            .border_color(t.grid_line);
+            .border_color(t.grid_line)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |state, _, _, cx| {
+                    state.delegate_mut().active_cell = Some((row_ix, data_col));
+                    cx.notify();
+                }),
+            )
+            .when(active, |d| {
+                d.child(
+                    // Sheets' active-cell ring. The wrapper owns 8px of
+                    // left padding, so the ring reaches left(-8) to sit
+                    // on the cell's true grid box.
+                    div()
+                        .absolute()
+                        .left(px(-8.))
+                        .right_0()
+                        .top_0()
+                        .bottom_0()
+                        .border_2()
+                        .border_color(t.accent),
+                )
+            });
         match value {
             None | Some(Value::Null) => {
                 if !p.null_tags {
