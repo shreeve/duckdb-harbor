@@ -974,10 +974,11 @@ impl TableDelegate for GridDelegate {
         let data_col =
             self.visible.get(col_ix - self.gutter as usize).copied().unwrap_or(usize::MAX);
         let right = p.right_align && self.numeric.get(data_col).copied().unwrap_or(false);
-        // Left-aligned headers line up with values on the shared 8px
-        // wrapper inset by construction. A right-aligned header needs 5px
-        // of its own: the wrapper compensates zeroed paddings with only
-        // 4px, while cell text sits 9px in (8px pad + 1px divider).
+        // Left-aligned headers line up with values on the shared wrapper
+        // inset by construction. A right-aligned header aims for the cell
+        // text's edge, 9px in (8px pad + 1px divider): the wrapper already
+        // padded `comp` of it, and the margin supplies the difference
+        // (negative when the wrapper alone overshoots).
         div()
             .relative()
             .h_flex()
@@ -991,7 +992,7 @@ impl TableDelegate for GridDelegate {
                 div()
                     .w_full()
                     .truncate()
-                    .when(right, |d| d.text_right().pr(px(5.)))
+                    .when(right, |d| d.text_right().mr(px(9.) - comp))
                     .child(self.cols[col_ix].name.clone()),
             )
             .child(edge(t.grid_line))
