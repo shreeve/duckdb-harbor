@@ -18,7 +18,41 @@ use app::DuckTable;
 use gpui::*;
 use gpui_component::{Root, StyledExt as _};
 
-actions!(ducktable, [ToggleInspector]);
+actions!(ducktable, [ToggleInspector, About, Quit]);
+
+/// The macOS menu bar. The first menu becomes the application menu; the
+/// About item opens the platform's standard dialog (window.prompt ->
+/// NSAlert) with the version and a GitHub link.
+fn app_menus() -> Vec<Menu> {
+    vec![Menu {
+        name: "DuckTable".into(),
+        items: vec![
+            MenuItem::action("About DuckTable", About),
+            MenuItem::separator(),
+            MenuItem::action("Quit DuckTable", Quit),
+        ],
+    }]
+}
+
+/// The About dialog: native, version-stamped, with a link out.
+fn about(window: &mut Window, cx: &mut App) {
+    let answer = window.prompt(
+        PromptLevel::Info,
+        concat!("DuckTable ", env!("CARGO_PKG_VERSION")),
+        Some(
+            "A fast, minimal desktop client for DuckDB, speaking to \
+             DuckDB Harbor.\n\nMIT License \u{00b7} \u{00a9} 2026 Steve Shreeve",
+        ),
+        &["OK", "View on GitHub"],
+        cx,
+    );
+    cx.spawn(async move |cx| {
+        if answer.await == Ok(1) {
+            cx.update(|cx| cx.open_url("https://github.com/shreeve/ducktable")).ok();
+        }
+    })
+    .detach();
+}
 
 /// gpui-component's `IconName` resolves to `icons/*.svg` asset paths but
 /// ships no files — the app serves them. Each icon used gets an embedded
@@ -90,7 +124,20 @@ fn main() {
         gpui_component::init(cx);
         theme::init(cx);
         prefs::init(cx);
-        cx.bind_keys([KeyBinding::new("cmd-alt-0", ToggleInspector, None)]);
+        cx.bind_keys([
+            KeyBinding::new("cmd-alt-0", ToggleInspector, None),
+            KeyBinding::new("cmd-q", Quit, None),
+        ]);
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        // Global, not view-scoped: menu items must work regardless of
+        // which pane holds focus. The prompt needs a window, so the
+        // handler reaches for whichever one is active.
+        cx.on_action(|_: &About, cx| {
+            if let Some(w) = cx.active_window() {
+                w.update(cx, |_, window, cx| about(window, cx)).ok();
+            }
+        });
+        cx.set_menus(app_menus());
 
         cx.spawn(async move |cx| {
             cx.open_window(
