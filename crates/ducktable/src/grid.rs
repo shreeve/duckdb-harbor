@@ -465,7 +465,22 @@ impl TableDelegate for GridDelegate {
         // themes zero it out.
         div()
             .id(("row", row_ix))
-            .when(self.selected == Some(row_ix), |d| d.bg(t.row_active))
+            .relative()
+            .when(self.selected == Some(row_ix), |d| {
+                d.bg(t.row_active).child(
+                    // The Table makes the selected row's own bottom border
+                    // transparent (expecting its overlay border, which the
+                    // themes zero). Repaint the divider on that exact
+                    // pixel — bottom(-1) lands on the border-box pixel.
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom(px(-1.))
+                        .h(px(1.))
+                        .bg(t.grid_line),
+                )
+            })
     }
 
     fn is_eof(&self, _: &App) -> bool {
