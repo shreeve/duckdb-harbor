@@ -149,7 +149,7 @@ impl DuckTable {
                             div()
                                 .text_xs()
                                 .text_color(t.muted)
-                                .child(crate::util::human_bytes(s)),
+                                .child(crate::util::human(s, "B")),
                         )
                     })
                     .when_some(row.note.clone(), |d, note| {
@@ -327,7 +327,7 @@ impl DuckTable {
                                 div()
                                     .text_xs()
                                     .text_color(t.muted)
-                                    .child(crate::util::human_count(n)),
+                                    .child(crate::util::human(n, "")),
                             )
                         })
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {

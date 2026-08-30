@@ -25,43 +25,27 @@ pub fn commas(n: u64) -> String {
     out
 }
 
-/// A size in compact decimal form (Finder-style units, no "i"): "8.5MB",
-/// "242MB", "1.2GB" — one decimal below 10, integers to 999.
-pub fn human_bytes(n: u64) -> String {
+/// A number in compact decimal form: exact under 1000, then scaled by
+/// thousands with one decimal below 10 and integers to 999; the
+/// tenth-rounded value rolls to the next magnitude at 999.5. `unit`
+/// suffixes every form — "B" gives Finder-style sizes ("999B", "8.5MB",
+/// "1.2GB"), "" gives bare counts ("999", "13k", "4.6M") — and the kilo
+/// prefix follows it: lowercase alone ("13k"), uppercase with a unit
+/// ("13KB").
+pub fn human(n: u64, unit: &str) -> String {
     if n < 1000 {
-        return format!("{n}B");
+        return format!("{n}{unit}");
     }
+    let kilo = if unit.is_empty() { "k" } else { "K" };
     let mut value = n as f64;
-    for unit in ["KB", "MB", "GB", "TB"] {
+    for prefix in [kilo, "M", "G", "T"] {
         value /= 1000.;
-        if value < 999.5 || unit == "TB" {
+        if value < 999.5 || prefix == "T" {
             let tenth = (value * 10.).round() / 10.;
             return if tenth >= 10. {
-                format!("{}{unit}", value.round())
+                format!("{}{prefix}{unit}", value.round())
             } else {
-                format!("{tenth:.1}{unit}")
-            };
-        }
-    }
-    unreachable!()
-}
-
-/// A count in compact SI form: exact under 1000, then k/M/G/T with one
-/// decimal below 10 ("4.6M") and integers to 999 ("13k", "999k"); the
-/// tenth-rounded value rolls to the next unit at 999.5.
-pub fn human_count(n: u64) -> String {
-    if n < 1000 {
-        return n.to_string();
-    }
-    let mut value = n as f64;
-    for unit in ["k", "M", "G", "T"] {
-        value /= 1000.;
-        if value < 999.5 || unit == "T" {
-            let tenth = (value * 10.).round() / 10.;
-            return if tenth >= 10. {
-                format!("{}{unit}", value.round())
-            } else {
-                format!("{tenth:.1}{unit}")
+                format!("{tenth:.1}{prefix}{unit}")
             };
         }
     }
@@ -70,20 +54,30 @@ pub fn human_count(n: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::human_count;
+    use super::human;
 
     #[test]
     fn si_boundaries() {
-        assert_eq!(human_count(0), "0");
-        assert_eq!(human_count(999), "999");
-        assert_eq!(human_count(1_000), "1.0k");
-        assert_eq!(human_count(9_949), "9.9k");
-        assert_eq!(human_count(9_999), "10k");
-        assert_eq!(human_count(99_999), "100k");
-        assert_eq!(human_count(999_499), "999k");
-        assert_eq!(human_count(999_500), "1.0M");
-        assert_eq!(human_count(4_600_000), "4.6M");
-        assert_eq!(human_count(14_964), "15k");
-        assert_eq!(human_count(89_607), "90k");
+        assert_eq!(human(0, ""), "0");
+        assert_eq!(human(999, ""), "999");
+        assert_eq!(human(1_000, ""), "1.0k");
+        assert_eq!(human(9_949, ""), "9.9k");
+        assert_eq!(human(9_999, ""), "10k");
+        assert_eq!(human(99_999, ""), "100k");
+        assert_eq!(human(999_499, ""), "999k");
+        assert_eq!(human(999_500, ""), "1.0M");
+        assert_eq!(human(4_600_000, ""), "4.6M");
+        assert_eq!(human(14_964, ""), "15k");
+        assert_eq!(human(89_607, ""), "90k");
+    }
+
+    #[test]
+    fn unit_boundaries() {
+        assert_eq!(human(0, "B"), "0B");
+        assert_eq!(human(999, "B"), "999B");
+        assert_eq!(human(13_000, "B"), "13KB");
+        assert_eq!(human(8_500_000, "B"), "8.5MB");
+        assert_eq!(human(242_000_000, "B"), "242MB");
+        assert_eq!(human(1_200_000_000, "B"), "1.2GB");
     }
 }

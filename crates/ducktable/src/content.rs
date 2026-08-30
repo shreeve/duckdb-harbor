@@ -105,7 +105,7 @@ impl DuckTable {
                     harbor_client::paths::shorten(std::path::Path::new(&info.database)),
                 ))
                 .when_some(catalog.database_size_bytes, |d, data| {
-                    let h = crate::util::human_bytes;
+                    let h = |n| crate::util::human(n, "B");
                     d.child(meta(
                         t,
                         "Size",
