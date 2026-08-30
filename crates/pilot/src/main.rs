@@ -401,6 +401,9 @@ fn ensure_berth(
         .args(["start"])
         .arg(&canon)
         .args(["--name", &name, "--idle-exit", idle_exit])
+        // pilot is about to draw a prompt; harbor's fleet table is not pilot's
+        // output. Failures still speak — harbor writes those to stderr.
+        .stdout(std::process::Stdio::null())
         .status()
         .map_err(|e| format!("cannot run {harbor:?} (is harbor installed?): {e}"))?;
     if !status.success() {

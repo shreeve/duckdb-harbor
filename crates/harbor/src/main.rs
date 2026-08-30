@@ -639,17 +639,17 @@ fn spawn_detached(rest: Vec<String>) -> Result<(), String> {
                 log_path.display()
             ));
         }
-        #[cfg(windows)]
-        let registered = registered_tcp(&home, &o.name);
         #[cfg(unix)]
-        let (up, at) = match o.port {
-            None => (ready(&sock), sock.display().to_string()),
-            Some(port) => (ready_tcp(&o.bind, port), format!("{}:{port}", o.bind)),
+        let up = match o.port {
+            None => ready(&sock),
+            Some(port) => ready_tcp(&o.bind, port),
         };
+        // On Windows the child picks its own port, so the sidecar is the only
+        // place that says where to knock.
         #[cfg(windows)]
-        let (up, at) = match registered {
-            Some((bind, port)) => (ready_tcp(&bind, port), format!("{bind}:{port}")),
-            None => (false, "a dynamically assigned TCP port".to_string()),
+        let up = match registered_tcp(&home, &o.name) {
+            Some((bind, port)) => ready_tcp(&bind, port),
+            None => false,
         };
         if up {
             // Ready is necessary but not sufficient: on a name collision the
@@ -663,13 +663,10 @@ fn spawn_detached(rest: Vec<String>) -> Result<(), String> {
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
                 .and_then(|j| j["pid"].as_u64());
             if served_by == Some(u64::from(child.id())) {
-                println!(
-                    "berth {:?} ready on {at} (db: {}, pid {})",
-                    o.name,
-                    db_abs.display(),
-                    child.id()
-                );
-                return Ok(());
+                // The receipt is the fleet. A one-line "ready on <socket>"
+                // restated the flags you just typed; the table answers the
+                // question you actually had, which is what changed.
+                return show(Vec::new());
             }
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -909,6 +906,16 @@ fn start(rest: Vec<String>) -> Result<(), String> {
             harbor_common::paths::shorten(&db)
         ));
     }
+    // Already serving what was asked for? Then the answer is yes, not an
+    // error. `start` names an end state, and a second `start` in a shell you
+    // forgot you had should read the same as the first.
+    let home = harbor_common::runtime_dir()?;
+    if reconcile(&cfg, &home).iter().any(|r| {
+        r.name == name && r.state == harbor_common::State::Running
+    }) && rest.len() == 1
+    {
+        return show(Vec::new());
+    }
     // Config first, then whatever was typed: parse_opts keeps the last
     // assignment, so an explicit flag wins over the file.
     let mut args = vec![db.display().to_string(), "--name".to_string(), name];
@@ -961,6 +968,38 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+/// Where a berth actually answers — read from its sidecar, never guessed.
+///
+/// Guessing is how `show` came to print `<runtime>/<name>.sock` for a berth
+/// that was bound to TCP: a plausible path, a wrong answer, and no way for the
+/// reader to tell. A berth that has not registered has no address, and says so.
+enum Addr {
+    /// A unix socket, by absolute path.
+    Sock(PathBuf),
+    /// host:port, for a berth bound to TCP.
+    Tcp(String, u16),
+}
+
+impl Addr {
+    fn read(j: &serde_json::Value) -> Option<Addr> {
+        if let Some(s) = j["socket"].as_str() {
+            return Some(Addr::Sock(PathBuf::from(s)));
+        }
+        let port = u16::try_from(j["port"].as_u64()?).ok()?;
+        Some(Addr::Tcp(j["bind"].as_str().unwrap_or("127.0.0.1").to_string(), port))
+    }
+
+    /// Copy-pasteable, whole: exactly what another process needs to dial this
+    /// berth. Both forms speak the same HTTP, so the TCP form is written as
+    /// the URL it is rather than as a bare `host:port` you have to dress up.
+    fn full(&self) -> String {
+        match self {
+            Addr::Sock(p) => harbor_common::paths::shorten(p),
+            Addr::Tcp(host, port) => format!("http://{host}:{port}"),
+        }
+    }
+}
+
 /// One berth, from every source that knows anything about it.
 struct Row {
     name: String,
@@ -968,6 +1007,7 @@ struct Row {
     pid: Option<u64>,
     uptime: Option<String>,
     db: String,
+    addr: Option<Addr>,
     note: Option<String>,
 }
 
@@ -1088,6 +1128,7 @@ fn reconcile(cfg: &harbor_common::config::FileConfig, home: &Path) -> Vec<Row> {
         rows.push(Row {
             state,
             pid: side.and_then(|j| j["pid"].as_u64()).filter(|_| state.is_live()),
+            addr: side.and_then(|j| Addr::read(j)).filter(|_| state.is_live()),
             uptime: uptime.filter(|_| state.is_live()),
             db: match (live_db.is_empty(), want_db.is_empty()) {
                 (false, _) => harbor_common::paths::shorten(Path::new(&live_db)),
@@ -1148,8 +1189,8 @@ fn show(rest: Vec<String>) -> Result<(), String> {
                 ),
             );
         }
-        if row.state.is_live() {
-            p = p.field("address", harbor_common::paths::shorten(&home.join(format!("{name}.sock"))));
+        if let Some(a) = &row.addr {
+            p = p.field("address", a.full());
         }
         if let Some(n) = &row.note {
             p = p.field_toned("note", n, row.state.level().into());
@@ -1165,13 +1206,14 @@ fn show(rest: Vec<String>) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut t = Table::new(["NAME", "STATE", "PID", "UPTIME", "DATABASE"]);
+    let mut t = Table::new(["NAME", "STATE", "PID", "UPTIME", "ADDRESS", "DATABASE"]);
     for r in &rows {
         t.row([
             Cell::new(&r.name),
             Cell::new(r.state.label()).tone(r.state.level().into()),
             Cell::new(r.pid.map(|p| p.to_string()).unwrap_or("—".into())).right(),
             Cell::new(r.uptime.clone().unwrap_or("—".into())).right(),
+            Cell::new(r.addr.as_ref().map(Addr::full).unwrap_or("—".into())),
             Cell::new(&r.db),
         ]);
         if let Some(n) = &r.note {
@@ -1329,7 +1371,11 @@ fn stop_berth(rest: Vec<String>, remove: bool) -> Result<(), String> {
             ),
         }
     }
-    Ok(())
+    // What it did, then what the fleet looks like now: the line above names
+    // the thing the table cannot show (that it checkpointed, what was
+    // removed), and the table answers the question that follows.
+    println!();
+    show(Vec::new())
 }
 
 #[cfg(all(test, unix))]
