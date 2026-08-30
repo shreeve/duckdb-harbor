@@ -296,6 +296,9 @@ fn derived_name(path: &Path) -> Option<String> {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '-' })
         .collect();
+    // A leading '-' (e.g. from "/data/ my.duckdb") would read as a flag
+    // when passed to `harbor start --name`.
+    let name = name.trim_start_matches('-').to_string();
     if name.is_empty() { None } else { Some(name) }
 }
 
@@ -383,6 +386,8 @@ mod tests {
     fn derived_names_are_filesystem_tame() {
         assert_eq!(derived_name(Path::new("/a/My Data.duckdb")), Some("my-data".into()));
         assert_eq!(derived_name(Path::new("/a/medlabs.duckdb")), Some("medlabs".into()));
+        assert_eq!(derived_name(Path::new("/a/ my.duckdb")), Some("my".into()));
+        assert_eq!(derived_name(Path::new("/a/---.duckdb")), None);
     }
 
     #[test]
