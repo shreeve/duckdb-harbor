@@ -324,7 +324,9 @@ impl<'a> Renderer<'a> {
         let colw = |o: &Option<usize>| o.map_or(1, |i| widths[i]);
 
         let mut out = String::new();
-        let color = std::io::stdout().is_terminal() && g.color;
+        // The same say the fleet table gets: NO_COLOR, CLICOLOR_FORCE and
+        // TERM=dumb all speak here, not only at a terminal check.
+        let color = harbor_common::ui::Style::stdout().color && g.color;
         let dim = |s: &str| if color { format!("\x1b[90m{s}\x1b[0m") } else { s.to_string() };
 
         let rule = |l: &str, m: &str, r: &str, out: &mut String| {

@@ -56,10 +56,6 @@ pub enum Summoner {
 }
 
 impl Lifetime {
-    pub fn is_persistent(self) -> bool {
-        self == Lifetime::Persistent
-    }
-
     /// The `harbor serve` argv this lifetime means. Config is translated into
     /// flags rather than read twice, so `serve` stays flag-complete and a
     /// systemd unit or a container never needs a config file at all.

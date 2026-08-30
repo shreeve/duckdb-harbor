@@ -215,13 +215,13 @@ fn resolve(
     // silently joins the LOCAL berth that happens to share the name. Same
     // prompt, different data, one warning line scrolled past. A spelled-out
     // target says what it means without the config's help; a name does not.
-    if let Some(e) = cfg_err {
-        if !spelled_out {
-            return Err(format!(
-                "{e}\n        so there is no way to know what {target:?} names. \
-                 Fix the config, or say what you mean: a path, or http://host:port"
-            ));
-        }
+    if let Some(e) = cfg_err
+        && !spelled_out
+    {
+        return Err(format!(
+            "{e}\n        so there is no way to know what {target:?} names. \
+             Fix the config, or say what you mean: a path, or http://host:port"
+        ));
     }
 
     // One name law for the whole fleet: harbor normalizes every name it
@@ -315,8 +315,8 @@ fn resolve(
             #[cfg(windows)]
             return Err("Unix socket targets are not supported on Windows; use a database name or http://host:port".into());
         }
-        // D9: summon the owner. A second pilot on the same file joins the
-        // same berth instead of "database is locked".
+        // Summon the owner. A second pilot on the same file joins the same
+        // berth instead of "database is locked".
         let life = harbor_common::lifetime::resolve(
             None,
             cfg.defaults.temp_idle_exit.as_deref(),
@@ -360,15 +360,9 @@ fn berth_transport(home: &std::path::Path, name: &str) -> Option<Transport> {
 
 /// Every berth the registry knows, with how to dial it — the same sidecar
 /// jsons `harbor show` reads, so socket and --port berths both appear.
-fn berth_entries(home: &std::path::Path) -> Vec<(String, Transport)> {
+fn berth_names(home: &std::path::Path) -> Vec<String> {
     let (sidecars, _, _) = harbor_common::fleet::scan_runtime(home);
-    sidecars
-        .into_keys()
-        .filter_map(|name| {
-            let t = berth_transport(home, &name)?;
-            Some((name, t))
-        })
-        .collect()
+    sidecars.into_keys().collect()
 }
 
 fn url_transport(url: &str) -> Result<Transport, String> {
@@ -397,10 +391,10 @@ pub fn prompt_name(target: &str) -> String {
     if let Some(rest) = target.split_once("://").map(|(_, r)| r) {
         return rest.trim_end_matches('/').to_string();
     }
-    if harbor_common::looks_like_path(target) {
-        if let Some(stem) = std::path::Path::new(target).file_stem() {
-            return stem.to_string_lossy().into_owned();
-        }
+    if harbor_common::looks_like_path(target)
+        && let Some(stem) = std::path::Path::new(target).file_stem()
+    {
+        return stem.to_string_lossy().into_owned();
     }
     target.to_string()
 }
@@ -518,7 +512,7 @@ fn exec_harbor_start(args: &[std::ffi::OsString]) -> Result<(), String> {
 }
 
 fn fleet_hint(home: &std::path::Path) -> String {
-    let names: Vec<String> = berth_entries(home).into_iter().map(|(n, _)| n).collect();
+    let names = berth_names(home);
     if names.is_empty() { String::new() } else { format!("; running: {}", names.join(", ")) }
 }
 

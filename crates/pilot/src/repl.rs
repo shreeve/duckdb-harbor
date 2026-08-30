@@ -31,9 +31,8 @@ struct ReplKeepalive {
 
 impl ReplKeepalive {
     fn new(conn: Conn) -> Self {
-        // Pulse synchronously first. Besides closing the race with an idle
-        // deadline that was already near, this also keeps older Harbor builds
-        // alive: their authenticated 404 is still a countable request.
+        // Pulse synchronously first, closing the race with an idle deadline
+        // that was already near before the thread below takes over.
         pulse(&conn);
 
         let Some(period) = keepalive_period(&conn) else {
@@ -302,6 +301,9 @@ fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
 
 pub fn run(conn: &Conn, name: &str, mut opts: RenderOpts) -> std::process::ExitCode {
     let mut conn = conn.clone();
+    // Never read, deliberately: this binding is the pulse thread's anchor —
+    // its Drop stops the thread, and .open reassigns it to re-anchor onto
+    // the new connection. The underscore says "held, not consulted".
     let mut _keepalive = ReplKeepalive::new(conn.clone());
     let mut vi = false;
     // One completer for the session: its catalog cache loads lazily on the

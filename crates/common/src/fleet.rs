@@ -201,9 +201,21 @@ pub fn reconcile(cfg: &FileConfig, home: &Path, probe: &dyn Fn(&Addr) -> bool) -
             conf.and_then(|c| c.database()).map(|p| p.display().to_string()).unwrap_or_default();
         let addr = side.and_then(Sidecar::addr);
 
+        // Same file? Spelling first, then the filesystem's answer — /tmp and
+        // /private/tmp are one place on macOS, and a drift verdict built on
+        // strings alone reports a berth that is exactly where the config put
+        // it.
+        let same_db = live_db == want_db
+            || (!live_db.is_empty()
+                && !want_db.is_empty()
+                && match (std::fs::canonicalize(&live_db), std::fs::canonicalize(&want_db)) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => false,
+                });
+
         let mut note = None;
         let state = match (claim, side.is_some(), conf.is_some()) {
-            (Claim::Held, true, true) if live_db == want_db => State::Running,
+            (Claim::Held, true, true) if same_db => State::Running,
             (Claim::Held, true, true) => {
                 note = Some(format!(
                     "config now says {} — harbor stop {name} && harbor start {name}",
@@ -243,7 +255,7 @@ pub fn reconcile(cfg: &FileConfig, home: &Path, probe: &dyn Fn(&Addr) -> bool) -
             }
             // Sidecar, no lock at all: the only row that has to be dialled.
             (Claim::None, true, _) => match addr.as_ref().is_some_and(probe) {
-                true if conf.is_some() && live_db == want_db => State::Running,
+                true if conf.is_some() && same_db => State::Running,
                 true => State::Unmanaged,
                 false => {
                     note = Some(format!("no lock and no answer — harbor forget {name}"));
@@ -315,11 +327,12 @@ pub fn table(rows: &[Row]) -> crate::ui::Table {
     t
 }
 
-/// "2 running, 1 stopped" — the one-line count under the table.
+/// "2 running, 1 stopped" — the one-line count under the table, in the same
+/// order the table sorts its rows (live first), not the alphabet's.
 pub fn tally(rows: &[Row]) -> String {
-    let mut counts: BTreeMap<&str, usize> = Default::default();
+    let mut counts: BTreeMap<(u8, &str), usize> = Default::default();
     for r in rows {
-        *counts.entry(r.state.word()).or_default() += 1;
+        *counts.entry((r.state.rank(), r.state.word())).or_default() += 1;
     }
-    counts.iter().map(|(w, n)| format!("{n} {w}")).collect::<Vec<_>>().join(", ")
+    counts.iter().map(|((_, w), n)| format!("{n} {w}")).collect::<Vec<_>>().join(", ")
 }

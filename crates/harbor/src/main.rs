@@ -12,7 +12,7 @@
 //!   harbor expose <name> <port|off>          move it onto TCP, or back off it
 //!   harbor stop   <name>                     SIGTERM → drain, CHECKPOINT, hold
 //!   harbor forget <name>                     stop + clear registry and entry (never the db)
-//!   harbor doctor                            what nothing else has a moment to see
+//!   harbor doctor                            check the config for what nothing else sees
 //!   harbor version                           print this binary's version
 //!
 //! The registry is the filesystem: <name>.sock is the registration,
@@ -61,7 +61,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         "-V" | "--version" | "version" => {
-            println!("harbor {}", env!("CARGO_PKG_VERSION"));
+            println!("harbor {VERSION}");
             Ok(())
         }
         other => Err(format!("unknown command {other:?} (try: harbor --help)")),
@@ -236,7 +236,7 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
 ///
 /// The config root is tightened only if it already exists. Nothing of
 /// harbor's lives there, and a server should not conjure a config directory.
-fn harbor_home() -> Result<PathBuf, String> {
+fn ensure_runtime_dir() -> Result<PathBuf, String> {
     let run = harbor_common::runtime_dir()?;
     harbor_common::perms::ensure_private_dir(&run)?;
     if let Ok(state) = harbor_common::state_root() {
@@ -349,15 +349,15 @@ fn unlink_lock_if_free(path: &Path) -> bool {
 
 fn serve(rest: Vec<String>) -> Result<(), String> {
     let o = parse_opts(rest)?;
-    let home = harbor_home()?;
+    let home = ensure_runtime_dir()?;
 
     // The flock on <name>.lock is the real mutex: held for process life;
     // if we hold it and the socket file exists, the socket is stale by
     // definition and safe to unlink. Never unlink without the lock.
     let lock_path = harbor_common::lock_file(&home, &o.name);
-    let lock = claim_lock(&lock_path).map_err(|_| {
-        format!("{:?} is already claimed in {}", o.name, home.display())
-    })?;
+    // The real reason travels: "already claimed" and "permission denied"
+    // send an operator to two different places.
+    let lock = claim_lock(&lock_path).map_err(|e| format!("{:?}: {e}", o.name))?;
     std::mem::forget(lock); // hold the flock until the process exits
 
     let sock_path = o.socket.clone().unwrap_or_else(|| harbor_common::sock_file(&home, &o.name));
@@ -581,7 +581,7 @@ fn duckdb_open(o: &Opts) -> Result<harbor::duckdb::Connection, String> {
 
 fn spawn_detached(rest: Vec<String>) -> Result<(), String> {
     let o = parse_opts(rest.clone())?;
-    let home = harbor_home()?;
+    let home = ensure_runtime_dir()?;
     // start means "desired state: running", whatever spelling asked for it.
     // The hold lifts here — the one place every start funnels through — so a
     // path start is not a back door that leaves the operator's stop
@@ -737,10 +737,7 @@ fn ready(_sock: &Path) -> bool {
 
 #[cfg(windows)]
 fn shutdown_tcp(bind: &str, port: u16, token: Option<&str>) -> bool {
-    let bind = match bind {
-        "0.0.0.0" | "::" => "127.0.0.1",
-        other => other,
-    };
+    let bind = harbor_common::fleet::dial_host(bind);
     let Ok(mut s) = std::net::TcpStream::connect((bind, port)) else { return false };
     let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
     let mut request =
@@ -913,11 +910,17 @@ fn start(rest: Vec<String>) -> Result<(), String> {
     if std::fs::remove_file(harbor_common::hold_file(&home, &name)).is_ok() {
         println!("{name:?} was held — start lifts it");
     }
-    if harbor_common::fleet::reconcile(&cfg, &home, &probe).iter().any(|r| {
-        r.name == name && r.state == harbor_common::State::Running
-    }) && rest.len() == 1
+    if harbor_common::fleet::reconcile(&cfg, &home, &probe)
+        .iter()
+        .any(|r| r.name == name && r.state == harbor_common::State::Running)
     {
-        return show_after_change(false);
+        if rest.len() == 1 {
+            return show_after_change(false);
+        }
+        // start with flags names a different end state than the one running.
+        // Drain first — spawning against the live flock is a race the child
+        // always loses, reported as a failure the operator didn't cause.
+        drain_live(&home, &name)?;
     }
     // Config first, then whatever was typed: parse_opts keeps the last
     // assignment, so an explicit flag wins over the file.
@@ -987,7 +990,14 @@ fn show(rest: Vec<String>) -> Result<(), String> {
                 None,
                 harbor_common::Summoner::Operator,
             )?;
-            p = p.field("idle-exit", life.describe());
+            // The running berth outranks the entry: a temp summoned before
+            // the name was added really will leave, and the panel must not
+            // say "never" while the table says "(temp 90s)".
+            let idle = match row.idle_exit_ms {
+                Some(ms) => harbor_common::lifetime::humanize(Duration::from_millis(ms)),
+                None => life.describe().to_string(),
+            };
+            p = p.field("idle-exit", idle);
             p = p.field(
                 "config",
                 format!(
@@ -1046,10 +1056,10 @@ fn doctor_cmd(rest: Vec<String>) -> Result<(), String> {
         }
         println!("    {}\n", st.paint(Tone::Cyan, &f.fix));
     }
-    match doctor::exit_code(&findings) {
-        0 => Ok(()),
-        _ => Err(format!("{} problem(s) — see above", findings.len())),
-    }
+    // The empty case returned above, so this is always the error exit — a
+    // health check reads the code, a human reads the count.
+    let n = findings.len();
+    Err(format!("{n} problem{} — see above", if n == 1 { "" } else { "s" }))
 }
 
 /// Drain one live berth — signal, wait out the CHECKPOINT — and say nothing.
@@ -1137,7 +1147,7 @@ fn add_cmd(rest: Vec<String>) -> Result<(), String> {
     // If a temp berth is already serving this very file under this name, the
     // promotion finishes on the spot: restart it as the service it just
     // became, so its idle-exit dies with it.
-    let home = harbor_home()?;
+    let home = ensure_runtime_dir()?;
     if let Some(side) = harbor_common::fleet::Sidecar::read(&home, &name)
         && side.idle_exit_ms.is_some()
         && side
@@ -1186,8 +1196,9 @@ fn expose_cmd(rest: Vec<String>) -> Result<(), String> {
             Ok(())
         }
         Some("off") => {
+            // Only what expose wrote comes back out: a hand-written bind is
+            // the operator's prose, kept for the next expose.
             config_edit::set_entry_key(&name, "port", None)?;
-            config_edit::set_entry_key(&name, "bind", None)?;
             println!("{name:?} back on its unix socket");
             reapply(&name)
         }
@@ -1198,7 +1209,9 @@ fn expose_cmd(rest: Vec<String>) -> Result<(), String> {
                 return Err("port 0 means \"any\" to the OS — pick a real one".into());
             }
             config_edit::set_entry_key(&name, "port", Some(toml_edit::Value::from(port as i64)))?;
-            let home = harbor_home()?;
+            // Rendering a path must not conjure directories: the pure
+            // spelling, not the ensure-and-chmod door.
+            let home = harbor_common::runtime_dir()?;
             println!(
                 "{name:?} will listen on {}:{port} — token: {}",
                 entry.bind.as_deref().unwrap_or("127.0.0.1"),
@@ -1219,17 +1232,26 @@ fn reapply(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Drain a proven-live berth and start it again under current config; leave
-/// anything else at rest and say so with `false`. Proof means the flock —
-/// a sidecar alone is a claim, not a heartbeat. `start` prints the receipt.
-fn restart_live(name: &str) -> Result<bool, String> {
+/// Drain the berth if — and only if — the flock proves it live. Quiet: the
+/// caller owns the receipt. A sidecar alone is a claim, not a heartbeat.
+/// Returns whether anything was drained.
+fn drain_live(home: &Path, name: &str) -> Result<bool, String> {
     use harbor_common::fleet::{Claim, claim_state};
-    let home = harbor_home()?;
-    let lock_path = harbor_common::lock_file(&home, name);
+    let lock_path = harbor_common::lock_file(home, name);
     if claim_state(&lock_path) == Claim::Held
-        && let Some(pid) = harbor_common::fleet::Sidecar::read(&home, name).and_then(|s| s.pid)
+        && let Some(pid) = harbor_common::fleet::Sidecar::read(home, name).and_then(|s| s.pid)
     {
-        stop_core(&home, name, pid, &lock_path)?;
+        stop_core(home, name, pid, &lock_path)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Drain a proven-live berth and start it again under current config; leave
+/// anything else at rest and say so with `false`. `start` prints the receipt.
+fn restart_live(name: &str) -> Result<bool, String> {
+    let home = ensure_runtime_dir()?;
+    if drain_live(&home, name)? {
         start(vec![name.to_string()])?;
         return Ok(true);
     }
@@ -1246,7 +1268,7 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
         return Err(format!("{verb} takes a database name, not a path — harbor show lists them"));
     }
     let name = normalize(raw)?;
-    let home = harbor_home()?;
+    let home = ensure_runtime_dir()?;
     let sock = harbor_common::sock_file(&home, &name);
     let lock_path = harbor_common::lock_file(&home, &name);
 

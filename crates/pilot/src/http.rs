@@ -86,7 +86,7 @@ fn request_inner(
     let mut stream = stream;
 
     let mut req = format!("{route} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
-    req.push_str("Accept: application/x-ndjson\r\n");
+    req.push_str(&format!("Accept: {}\r\n", wire::CONTENT_NDJSON));
     if let Some(t) = token {
         // The token reaches here from argv, the environment, a token-file,
         // or a token-cmd — one gate for all four. A control byte in a header

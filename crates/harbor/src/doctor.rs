@@ -100,9 +100,11 @@ pub fn check_duplicates(cfg: &FileConfig, canon: impl Fn(&Path) -> PathBuf) -> V
                 severity: Severity::Error,
                 title: format!("{} names one database", names.join(" and ")),
                 detail: vec![shorten(&path)],
+                // Which one to keep is the author's call, not sort order's —
+                // and the remedy is an edit, not a destructive fleet verb.
                 fix: format!(
-                    "DuckDB allows one writer — drop all but one of them (harbor forget {})",
-                    names[1..].join(", harbor forget ")
+                    "DuckDB allows one writer — keep one of [connection.{}] and delete the rest in your config",
+                    names.join("], [connection.")
                 ),
             }
         })
@@ -217,12 +219,6 @@ pub fn examine(cfg: &FileConfig) -> Vec<Finding> {
     out
 }
 
-/// Non-zero when anything needs a human, so `harbor doctor` works in a health
-/// check.
-pub fn exit_code(findings: &[Finding]) -> u8 {
-    u8::from(!findings.is_empty())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,7 +241,10 @@ mod tests {
         assert_eq!(f.len(), 1, "{f:?}");
         assert_eq!(f[0].severity, Severity::Error);
         assert!(f[0].title.contains("backup and medlabs"), "{}", f[0].title);
-        assert!(f[0].fix.contains("harbor forget"));
+        // The remedy is an edit that names both entries — never a
+        // destructive verb aimed by sort order.
+        assert!(f[0].fix.contains("[connection.backup]"), "{}", f[0].fix);
+        assert!(f[0].fix.contains("[connection.medlabs]"), "{}", f[0].fix);
     }
 
     #[test]
@@ -323,12 +322,6 @@ mod tests {
             assert!(!f.fix.trim().is_empty(), "no fix: {}", f.title);
             assert!(!f.title.trim().is_empty());
         }
-        assert_eq!(exit_code(&all), 1);
-    }
-
-    #[test]
-    fn a_clean_config_exits_zero() {
-        assert_eq!(exit_code(&[]), 0);
     }
 
     #[test]
