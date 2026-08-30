@@ -110,11 +110,11 @@ impl DuckTable {
             // not the sum. A failed page drops the other two unawaited.
             let page_task = cx.background_executor().spawn({
                 let (conn, schema, name) = (conn.clone(), clone_str(&schema), clone_str(&name));
-                async move { crate::grid::first_page(&conn, &schema, &name, page_size) }
+                async move { crate::queries::first_page(&conn, &schema, &name, page_size) }
             });
             let total_task = cx.background_executor().spawn({
                 let (conn, schema, name) = (conn.clone(), clone_str(&schema), clone_str(&name));
-                async move { crate::grid::total_rows(&conn, &schema, &name) }
+                async move { crate::queries::total_rows(&conn, &schema, &name) }
             });
             let struct_task = cx.background_executor().spawn({
                 let (conn, schema, name) = (conn.clone(), clone_str(&schema), clone_str(&name));
@@ -203,8 +203,8 @@ impl DuckTable {
                 .background_executor()
                 .spawn(async move {
                     let catalog = harbor_client::catalog(&conn)?;
-                    let db_size = crate::grid::database_size(&conn);
-                    let counts = crate::grid::table_counts(&conn).unwrap_or_default();
+                    let db_size = crate::queries::database_size(&conn);
+                    let counts = crate::queries::table_counts(&conn).unwrap_or_default();
                     Ok::<_, String>((catalog, db_size, counts))
                 })
                 .await;
@@ -312,8 +312,8 @@ impl DuckTable {
                     let conn = fleet::connect(&target)?;
                     let info = fleet::info(&conn)?;
                     let catalog = harbor_client::catalog(&conn)?;
-                    let db_size = crate::grid::database_size(&conn);
-                    let row_counts = crate::grid::table_counts(&conn).unwrap_or_default();
+                    let db_size = crate::queries::database_size(&conn);
+                    let row_counts = crate::queries::table_counts(&conn).unwrap_or_default();
                     Ok::<_, String>((conn, info, catalog, db_size, row_counts))
                 })
                 .await;

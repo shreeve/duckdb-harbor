@@ -7,6 +7,7 @@ mod content;
 mod grid;
 mod inspector;
 mod prefs;
+mod queries;
 mod sidebar;
 mod structure;
 mod theme;
