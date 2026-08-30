@@ -409,7 +409,19 @@ fn ensure_berth(
     life: harbor_common::lifetime::Lifetime,
 ) -> Result<(Transport, Option<String>), String> {
     let home = config::runtime_dir()?;
-    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // A file being created has no inode to canonicalize yet — resolve its
+    // parent instead, so the sidecar still records one absolute truth per
+    // file and a later pilot from another cwd joins instead of colliding.
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| {
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => std::path::Path::new("."),
+        };
+        match std::fs::canonicalize(parent) {
+            Ok(p) => p.join(path.file_name().unwrap_or_default()),
+            Err(_) => path.to_path_buf(),
+        }
+    });
 
     // Already owned? The sidecar json says which berth claims this file.
     if let Ok(rd) = std::fs::read_dir(&home) {
@@ -462,6 +474,12 @@ fn ensure_berth(
     // prompt, not a narration. `harbor show` carries the lifetime story.
     let mut cmd = std::process::Command::new(&harbor);
     cmd.args(["start"]).arg(&canon).args(["--name", &name]);
+    // A typed path is the duckdb-cli contract: open it, existing or not.
+    // A configured NAME over a missing file still blocks — that guard
+    // protects names clients trust; a path names only itself.
+    if !canon.exists() {
+        cmd.arg("--create");
+    }
     // A Lifetime knows its own argv, so "never" reaches harbor as the absence
     // of --idle-exit rather than as a duration string harbor cannot parse.
     cmd.args(life.to_args());
