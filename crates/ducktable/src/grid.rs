@@ -948,6 +948,9 @@ impl TableDelegate for GridDelegate {
                 .items_center()
                 .px_1p5()
                 .bg(t.raised)
+                // Select-all darkens the number rail a shade deeper than
+                // the cells, the way Sheets treats its row headers.
+                .when(self.all_selected, |d| d.bg(t.accent.opacity(0.16)))
                 .border_b_1()
                 .border_color(t.grid_line)
                 .on_mouse_down(
@@ -994,8 +997,21 @@ impl TableDelegate for GridDelegate {
             .border_b_1()
             .border_color(t.grid_line)
             // The corner's select-all, made visible (Sheets: every cell
-            // highlights until an ordinary click disarms it).
-            .when(self.all_selected, |d| d.bg(t.accent.opacity(0.08)))
+            // highlights until an ordinary click disarms it). The tint is
+            // a full-bleed layer reaching back across the column wrapper's
+            // 8px left padding — on the cell box alone, the padding shows
+            // through as white stripes between columns.
+            .when(self.all_selected, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(-8.))
+                        .right_0()
+                        .bg(t.accent.opacity(0.08)),
+                )
+            })
             // The cell starts 8px in (wrapper padding), so its bottom
             // border leaves a notch there. Every row but the LAST hides
             // it under the tr's full-width border, which the Table skips
