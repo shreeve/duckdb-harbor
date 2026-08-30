@@ -1,5 +1,8 @@
 //! Small shared helpers.
 
+/// A deliberate, greppable string clone: call sites that copy a name to
+/// move it into a task or a new owner say so by name, so an audit for
+/// accidental cloning can skip them.
 pub fn clone_str(s: &str) -> String {
     s.to_string()
 }

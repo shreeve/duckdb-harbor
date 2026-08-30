@@ -4,11 +4,12 @@
 //! presentation, and its header/status strips. Editing layers on later
 //! (`edits.rs`); display ships first.
 //!
-//! Rows arrive in pages and append; a later page never clears earlier ones
-//! (DESIGN.md: a refresh never clears the cache it is refreshing). Row
-//! indices here are display positions in server order — the moment sorting
-//! or editing arrives, reads resolve through an identity mapping, never
-//! raw indices.
+//! Rows arrive as explicit pages: a fetched page REPLACES the rows in one
+//! frame (DESIGN.md: fetch first, commit over the old value), so the grid
+//! always shows one internally consistent snapshot. Row indices here are
+//! display positions within the current page — the moment sorting or
+//! editing arrives, reads resolve through an identity mapping, never raw
+//! indices.
 
 use crate::prefs;
 use crate::theme::{pal, ui_font, value_font};
@@ -24,11 +25,10 @@ use gpui_component::{Sizable as _, Size, StyledExt as _};
 use harbor_client::Conn;
 use serde_json::Value;
 
-// Rows arrive as explicit pages (prefs.page_size, default 5,000): a page
-// replaces the rows in one frame, so ordinary tables never hit a boundary
-// and huge tables get honest jumps, constant memory, and internally
-// consistent snapshots. The old infinite-append model silently stitched
-// separately-queried chunks together.
+// Page sizes live in prefs::PAGE_SIZES (default 500); explicit pages give
+// ordinary tables a boundary-free read and huge tables honest jumps,
+// constant memory, and consistent snapshots — infinite append would
+// silently stitch separately-queried chunks together.
 
 // Sizes from design/design.css `.grid`: 12px mono values, 600 11.5px UI
 // headers, 11px muted row numbers, 10px NULL tag.
@@ -38,6 +38,8 @@ const HEADER_TEXT: f32 = 11.5;
 const GUTTER_TEXT: f32 = 11.;
 const TAG_TEXT: f32 = 10.;
 
+// 7 is Menlo's digit advance at GUTTER_TEXT (11px); 16 is the gutter's
+// horizontal padding. Both move if the value font or size does.
 fn gutter_width(max_row: u64) -> f32 {
     let digits = max_row.max(1).ilog10() as f32 + 1.;
     (16. + digits * 7.).max(34.)
@@ -1211,9 +1213,9 @@ impl Render for Grid {
             })
             .child(
                 // The footer (UI.md "Bottom bar", design.css `.bbar`):
-                // per-table controls, a different scope from the header's
-                // global display prefs. The view switcher lives here;
-                // columns/filters/paging join it in later slices.
+                // per-table controls — view switcher, filter, columns,
+                // pager, status — a different scope from the header's
+                // global display prefs.
                 div()
                     .h_flex()
                     .h(px(38.))

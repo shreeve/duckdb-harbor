@@ -171,8 +171,7 @@ impl DuckTable {
                     .h_flex()
                     .items_center()
                     .gap_2()
-                    // The theme cycler leads the footer; the old "refresh"
-                    // link is superseded by the DATABASES header glyph.
+                    // The theme cycler leads the footer.
                     .child(
                         div()
                             .id("theme")
