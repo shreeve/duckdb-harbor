@@ -107,7 +107,10 @@ pub fn resolve(
     if flags.keep {
         return Ok(Lifetime::Persistent);
     }
-    for spec in [entry, defaults].into_iter().flatten() {
+    // The first rung that exists wins outright; the ones below it are never
+    // consulted. `next()` says that, where a loop that returns on its first
+    // pass reads as a search for something.
+    if let Some(spec) = [entry, defaults].into_iter().flatten().next() {
         return parse(spec);
     }
     Ok(match who {

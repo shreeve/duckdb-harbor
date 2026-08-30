@@ -135,10 +135,11 @@ pub fn looks_like_path(arg: &str) -> bool {
 
 /// `~/` expansion, nothing fancier.
 pub fn expand(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Ok(h) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-            return Path::new(&h).join(rest);
-        }
+    if let (Some(rest), Ok(h)) = (
+        p.strip_prefix("~/"),
+        std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")),
+    ) {
+        return Path::new(&h).join(rest);
     }
     PathBuf::from(p)
 }
@@ -153,7 +154,7 @@ pub fn shorten(p: &Path) -> String {
         return s;
     }
     match s.strip_prefix(&h) {
-        Some(rest) if rest.is_empty() => "~".to_string(),
+        Some("") => "~".to_string(),
         Some(rest) if rest.starts_with('/') || rest.starts_with('\\') => format!("~{rest}"),
         _ => s,
     }
