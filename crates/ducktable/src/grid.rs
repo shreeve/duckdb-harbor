@@ -316,16 +316,18 @@ impl Grid {
                 .placeholder("Search columns\u{2026}")
         });
         let ddl_input = structure.as_ref().and_then(|s| s.ddl.clone()).map(|ddl| {
-            // A fixed height, never a measured one: the text is one
-            // definition per line, so the line count IS the height (capped
-            // at 24, the rest reachable by scroll). Auto-grow would ask
-            // the text wrapper instead and apply the answer a frame late,
-            // which showed as the DDL flapping between two rows and full
-            // size with mouse activity.
+            // Auto-grow mode with the height seeded AND capped to the line
+            // count (one definition per line, so the count IS the height,
+            // ceiling 24 with the rest reachable by scroll). This exact
+            // spelling is load-bearing: unseeded auto-grow applies its
+            // measured height a frame late (the DDL flapped between two
+            // rows and full size with mouse activity), and the plainer
+            // `.multi_line(true).rows(n)` renders ONE row in this crate
+            // version. Verified working as written; change with proof.
             let rows = ddl.lines().count().clamp(2, 24);
             cx.new(|cx| {
                 gpui_component::input::InputState::new(window, cx)
-                    .multi_line(true)
+                    .auto_grow(2, 24)
                     .rows(rows)
                     .default_value(ddl)
             })
