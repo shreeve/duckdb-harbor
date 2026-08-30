@@ -12,11 +12,13 @@ pub struct Prefs {
     pub row_numbers: bool,
     pub right_align: bool,
     pub null_tags: bool,
+    /// The inspector pane's open state (UI.md: persists per window).
+    pub inspector: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { row_numbers: true, right_align: false, null_tags: true }
+        Self { row_numbers: true, right_align: false, null_tags: true, inspector: false }
     }
 }
 
@@ -37,6 +39,7 @@ pub fn init(cx: &mut App) {
         prefs.row_numbers = read("row_numbers", prefs.row_numbers);
         prefs.right_align = read("right_align", prefs.right_align);
         prefs.null_tags = read("null_tags", prefs.null_tags);
+        prefs.inspector = read("inspector", prefs.inspector);
     }
     cx.set_global(prefs);
 }
@@ -53,6 +56,7 @@ pub fn toggle(cx: &mut App, change: impl FnOnce(&mut Prefs)) {
         "row_numbers": prefs.row_numbers,
         "right_align": prefs.right_align,
         "null_tags": prefs.null_tags,
+        "inspector": prefs.inspector,
     });
     if let Some(p) = file() {
         if let Some(dir) = p.parent() {

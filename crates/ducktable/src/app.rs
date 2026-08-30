@@ -20,7 +20,14 @@ pub(crate) struct RowVm {
 pub(crate) enum Phase {
     Idle,
     Connecting { name: String },
-    Connected { conn: Conn, info: wire::InfoResponse, catalog: harbor_client::Catalog },
+    Connected {
+        conn: Conn,
+        info: wire::InfoResponse,
+        catalog: harbor_client::Catalog,
+        /// `PRAGMA database_size` key figures for the inspector's SIZE
+        /// section: (database_size, wal_size), as the server prints them.
+        db_size: Option<(String, String)>,
+    },
     Failed { name: String, message: String },
 }
 
@@ -77,13 +84,20 @@ impl DuckTable {
         let fence = self.select_seq;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let outcome = cx
+            let (outcome, total) = cx
                 .background_executor()
                 .spawn({
                     let conn = conn.clone();
                     let schema = clone_str(&schema);
                     let name = clone_str(&name);
-                    async move { crate::grid::first_page(&conn, &schema, &name) }
+                    async move {
+                        let page = crate::grid::first_page(&conn, &schema, &name);
+                        let total = page
+                            .is_ok()
+                            .then(|| crate::grid::total_rows(&conn, &schema, &name))
+                            .flatten();
+                        (page, total)
+                    }
                 })
                 .await;
             this.update_in(cx, |state, window, cx| {
@@ -94,7 +108,9 @@ impl DuckTable {
                     return;
                 }
                 state.grid = Some(cx.new(|cx| {
-                    crate::grid::Grid::new(conn, &schema, &name, title, outcome, window, cx)
+                    crate::grid::Grid::new(
+                        conn, &schema, &name, title, outcome, total, window, cx,
+                    )
                 }));
                 cx.notify();
             })
@@ -146,7 +162,8 @@ impl DuckTable {
                     let conn = fleet::connect(&target)?;
                     let info = fleet::info(&conn)?;
                     let catalog = harbor_client::catalog(&conn)?;
-                    Ok::<_, String>((conn, info, catalog))
+                    let db_size = crate::grid::database_size(&conn);
+                    Ok::<_, String>((conn, info, catalog, db_size))
                 })
                 .await;
             this.update(cx, |state, cx| {
@@ -154,7 +171,9 @@ impl DuckTable {
                     return;
                 }
                 state.phase = match outcome {
-                    Ok((conn, info, catalog)) => Phase::Connected { conn, info, catalog },
+                    Ok((conn, info, catalog, db_size)) => {
+                        Phase::Connected { conn, info, catalog, db_size }
+                    }
                     Err(message) => Phase::Failed { name: clone_str(&name), message },
                 };
                 if let Phase::Connected { .. } = state.phase {

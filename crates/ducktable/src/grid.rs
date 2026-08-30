@@ -51,6 +51,8 @@ pub(crate) struct GridDelegate {
     numeric: Vec<bool>,
     /// Whether the column list currently includes the row-number gutter.
     gutter: bool,
+    /// Exact server-side row count, when the count query succeeded.
+    pub(crate) total_rows: Option<u64>,
     rows: Vec<Vec<Value>>,
     eof: bool,
     loading: bool,
@@ -69,6 +71,7 @@ impl Grid {
         name: &str,
         title: String,
         outcome: Result<harbor_client::QueryResult, String>,
+        total_rows: Option<u64>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -81,6 +84,7 @@ impl Grid {
             schema_cols: Vec::new(),
             numeric: Vec::new(),
             gutter,
+            total_rows,
             rows: Vec::new(),
             eof: false,
             loading: false,
@@ -110,6 +114,34 @@ impl Grid {
         }
         let table = cx.new(|cx| TableState::new(delegate, window, cx));
         Self { table }
+    }
+
+    /// The selected row as (column, display value, is_null) pairs, for the
+    /// inspector's ROW section.
+    pub(crate) fn row_kv(&self, cx: &App) -> Option<Vec<(String, String, bool)>> {
+        let state = self.table.read(cx);
+        let d = state.delegate();
+        let row = d.rows.get(state.selected_row()?)?;
+        Some(
+            d.schema_cols
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let name = c.name.clone().unwrap_or_else(|| format!("col{i}"));
+                    match row.get(i) {
+                        None | Some(Value::Null) => (name, "NULL".to_string(), true),
+                        Some(Value::String(s)) => (name, s.clone(), false),
+                        Some(v) => (name, v.to_string(), false),
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// (rows loaded, exact total when known), for the inspector.
+    pub(crate) fn counts(&self, cx: &App) -> (usize, Option<u64>) {
+        let d = self.table.read(cx).delegate();
+        (d.rows.len(), d.total_rows)
     }
 
     /// Rebuild the column list after the row-number preference flips.
@@ -385,11 +417,12 @@ impl Render for Grid {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = pal(cx);
         let p = prefs::get(cx);
-        let (title, count, cols, eof, loading, error, ms) = {
+        let (title, count, total, cols, eof, loading, error, ms) = {
             let d = self.table.read(cx).delegate();
             (
                 d.title.clone(),
                 d.rows.len(),
+                d.total_rows,
                 d.cols.len().saturating_sub(d.gutter as usize),
                 d.eof,
                 d.loading,
@@ -397,13 +430,20 @@ impl Render for Grid {
                 d.last_time_ms,
             )
         };
+        let rows_part = match total {
+            Some(n) if (count as u64) < n => format!("{count} of {n} rows"),
+            Some(n) => format!("{n} {}", if n == 1 { "row" } else { "rows" }),
+            None => format!(
+                "{count}{} {}",
+                if eof { "" } else { "+" },
+                if count == 1 && eof { "row" } else { "rows" }
+            ),
+        };
         let status = if loading && count == 0 {
             "loading...".to_string()
         } else {
             format!(
-                "{count}{} {} \u{00b7} {cols} {} \u{00b7} {ms} ms",
-                if eof { "" } else { "+" },
-                if count == 1 && eof { "row" } else { "rows" },
+                "{rows_part} \u{00b7} {cols} {} \u{00b7} {ms} ms",
                 if cols == 1 { "column" } else { "columns" },
             )
         };
@@ -486,6 +526,32 @@ impl Render for Grid {
                                     prefs::toggle(cx, |p| p.null_tags = !p.null_tags);
                                 }),
                             )),
+                    )
+                    .child(
+                        // The inspector's panel glyph (Finder/Xcode
+                        // convention), right of the lozenge.
+                        div()
+                            .id("toggle-inspector")
+                            .h_flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(22.))
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .text_color(if p.inspector { t.accent } else { t.muted })
+                            .hover(|d| d.bg(t.row_hover))
+                            .tooltip(|window, cx| {
+                                Tooltip::new("Show inspector (\u{2318}\u{2325}0)").build(window, cx)
+                            })
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                prefs::toggle(cx, |p| p.inspector = !p.inspector);
+                            }))
+                            .child(
+                                gpui_component::Icon::new(
+                                    gpui_component::IconName::PanelRight,
+                                )
+                                .size_4(),
+                            ),
                     ),
             )
             .when_some(error, |d, message| {
@@ -552,6 +618,31 @@ pub(crate) fn first_page(
 ) -> Result<harbor_client::QueryResult, String> {
     let sql = format!("SELECT * FROM {}.{} LIMIT {}", qident(schema), qident(name), PAGE);
     harbor_client::query(conn, &sql)
+}
+
+/// The table's exact row count, for the inspector and the status line.
+pub(crate) fn total_rows(conn: &Conn, schema: &str, name: &str) -> Option<u64> {
+    let sql = format!("SELECT count(*) FROM {}.{}", qident(schema), qident(name));
+    let result = harbor_client::query(conn, &sql).ok()?;
+    result.rows.first()?.first()?.as_u64()
+}
+
+/// `PRAGMA database_size` -> (database_size, wal_size), as the server
+/// prints them, for the inspector's SIZE section.
+pub(crate) fn database_size(conn: &Conn) -> Option<(String, String)> {
+    let result = harbor_client::query(conn, "PRAGMA database_size").ok()?;
+    let col = |key: &str| {
+        result
+            .columns
+            .iter()
+            .position(|c| c.name.as_deref() == Some(key))
+            .and_then(|i| result.rows.first()?.get(i).cloned())
+            .map(|v| match v {
+                Value::String(s) => s,
+                other => other.to_string(),
+            })
+    };
+    Some((col("database_size")?, col("wal_size")?))
 }
 
 fn qident(s: &str) -> String {
