@@ -35,18 +35,18 @@ impl Grid {
                 }
             }
         };
-        // The footer status is mode-relevant, and "N columns" is ALWAYS
-        // the last element: it stays fixed at the right edge when the
-        // view switches, and the data-only facts simply disappear. The
-        // columns text is its OWN node — as a suffix of one longer string
-        // its glyphs land a subpixel differently and the switch shows a
-        // 1px shift.
-        //
         // Ordering rule for a jitter-free footer: in a right-justified
         // cluster an element only moves when something to its RIGHT
-        // changes width, so the per-page variables (ms, row range) sit
-        // leftmost and everything right of them — pager glyphs, "N per",
-        // columns — is fixed. Page flips never move the arrows.
+        // changes width. The pager — the only interactive element — is
+        // therefore RIGHTMOST: constant-width glyphs pinned to the
+        // corner, so neither page flips nor table switches ever move the
+        // click targets ("N per" grows only when the user cycles it).
+        // "N columns" sits just left of it, beside the row range it
+        // describes; the per-page variables (ms, range) stay leftmost.
+        // Table switches shift only text whose content changed anyway.
+        // The columns text is its OWN node — as a suffix of one longer
+        // string its glyphs land a subpixel differently and the view
+        // switch shows a 1px shift.
         let columns_part =
             format!("{} {}", s.cols, if s.cols == 1 { "column" } else { "columns" });
         let loading_empty = s.loading && s.count == 0;
@@ -132,7 +132,7 @@ impl Grid {
             })
             .child(div().flex_1())
             .child(
-                // One right-anchored line: ms · range · pager · columns
+                // One right-anchored line: ms · range · columns · pager
                 // (see the ordering rule above).
                 div()
                     .ml_2()
@@ -143,6 +143,10 @@ impl Grid {
                     .text_xs()
                     .text_color(t.muted)
                     .when_some(status_prefix, |d, text| d.child(div().child(text)))
+                    .when_some(status_columns, |d, text| {
+                        d.when(view == ViewMode::Data, |d| d.child(div().child("\u{00b7}")))
+                            .child(div().child(text))
+                    })
                     .when(pager_visible, |d| {
                         let arrow = |id: &'static str,
                                      path: &'static str,
@@ -224,9 +228,7 @@ impl Grid {
                                         })),
                                     ),
                             )
-                            .child(div().child("\u{00b7}"))
-                    })
-                    .when_some(status_columns, |d, text| d.child(div().child(text))),
+                    }),
             )
     }
 
