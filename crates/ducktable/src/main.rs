@@ -30,6 +30,12 @@ impl AssetSource for Assets {
             "icons/panel-right.svg" => {
                 Some(include_bytes!("../../../assets/icons/panel-right.svg").into())
             }
+            "icons/search.svg" => {
+                Some(include_bytes!("../../../assets/icons/search.svg").into())
+            }
+            "icons/refresh-cw.svg" => {
+                Some(include_bytes!("../../../assets/icons/refresh-cw.svg").into())
+            }
             _ => None,
         })
     }

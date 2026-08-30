@@ -119,17 +119,68 @@ impl DuckTable {
         };
         let schemas = catalog.schemas();
         let many_schemas = schemas.len() > 1;
+        let filter = self
+            .table_filter
+            .as_ref()
+            .map(|i| i.read(cx).value().to_string().to_lowercase())
+            .filter(|s| !s.is_empty());
+        let filter_open = self.table_filter.is_some();
+        let glyph = |id: &'static str, on: bool| {
+            div()
+                .id(id)
+                .h_flex()
+                .items_center()
+                .justify_center()
+                .size(px(18.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .text_color(if on { t.accent } else { t.muted })
+                .hover(|d| d.bg(t.row_hover))
+        };
         let mut tree = div().id("catalog").flex_1().min_h_0().overflow_y_scroll().v_flex().gap_px();
         tree = tree.child(
             div()
-                .px_2()
+                .pl_2()
+                .pr_1()
                 .pt_3()
                 .pb_1()
-                .text_xs()
-                .font_weight(FontWeight::BOLD)
-                .text_color(t.muted)
-                .child("TABLES"),
+                .h_flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(t.muted)
+                        .child("TABLES"),
+                )
+                .child(
+                    glyph("filter-tables", filter_open)
+                        .child(
+                            gpui_component::Icon::new(gpui_component::IconName::Search)
+                                .size_3p5(),
+                        )
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.toggle_filter(window, cx);
+                        })),
+                )
+                .child(
+                    glyph("refresh-catalog", false)
+                        .child(svg().path("icons/refresh-cw.svg").size_3p5())
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.refresh_catalog(cx);
+                        })),
+                ),
         );
+        if let Some(input) = &self.table_filter {
+            tree = tree.child(
+                div()
+                    .px_2()
+                    .pb_1()
+                    .child(gpui_component::input::Input::new(input).xsmall().cleanable(true)),
+            );
+        }
         for schema in schemas {
             if many_schemas {
                 tree = tree.child(
@@ -137,6 +188,11 @@ impl DuckTable {
                 );
             }
             for table in catalog.tables_in(schema) {
+                if let Some(f) = &filter {
+                    if !table.name.to_lowercase().contains(f.as_str()) {
+                        continue;
+                    }
+                }
                 let key = (clone_str(schema), clone_str(&table.name));
                 let selected = self.selected_table.as_ref() == Some(&key);
                 tree = tree.child(

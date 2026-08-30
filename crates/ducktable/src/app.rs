@@ -42,6 +42,8 @@ pub struct DuckTable {
     /// A connect in flight (berth name). The current phase keeps rendering
     /// until the outcome lands — a berth click never blanks the pane.
     pub(crate) connecting: Option<String>,
+    /// The sidebar's table-name filter; Some = the field is open.
+    pub(crate) table_filter: Option<Entity<gpui_component::input::InputState>>,
     /// Fence for table selection: a first-page fetch that finishes after a
     /// newer click discards itself instead of swapping in a stale grid.
     select_seq: u64,
@@ -56,6 +58,7 @@ impl DuckTable {
             selected_table: None,
             grid: None,
             connecting: None,
+            table_filter: None,
             select_seq: 0,
         };
         this.refresh(cx);
@@ -132,6 +135,64 @@ impl DuckTable {
                     grid
                 }));
                 cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Open (focused) or close the sidebar's table filter.
+    pub(crate) fn toggle_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_filter.take().is_some() {
+            cx.notify();
+            return;
+        }
+        let input = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx).placeholder("Filter tables")
+        });
+        cx.subscribe(&input, |_, _, _: &gpui_component::input::InputEvent, cx| {
+            cx.notify();
+        })
+        .detach();
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.table_filter = Some(input);
+        cx.notify();
+    }
+
+    /// Re-pull the catalog, row counts, and size for the live connection —
+    /// the sidebar's snapshot goes stale when something else writes to the
+    /// database. Fetch first; the old catalog stays until the new one
+    /// lands, and a failed refresh changes nothing.
+    pub(crate) fn refresh_catalog(&mut self, cx: &mut Context<Self>) {
+        let conn = match &self.phase {
+            Phase::Connected { conn, .. } => conn.clone(),
+            _ => return,
+        };
+        let fence = self.attempt;
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    let catalog = harbor_client::catalog(&conn)?;
+                    let db_size = crate::grid::database_size(&conn);
+                    let counts = crate::grid::table_counts(&conn).unwrap_or_default();
+                    Ok::<_, String>((catalog, db_size, counts))
+                })
+                .await;
+            this.update(cx, |state, cx| {
+                if state.attempt != fence {
+                    return;
+                }
+                if let (
+                    Phase::Connected { catalog, db_size, row_counts, .. },
+                    Ok((new_catalog, new_size, new_counts)),
+                ) = (&mut state.phase, outcome)
+                {
+                    *catalog = new_catalog;
+                    *db_size = new_size;
+                    *row_counts = new_counts;
+                    cx.notify();
+                }
             })
             .ok();
         })
