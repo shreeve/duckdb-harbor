@@ -28,8 +28,20 @@ pub fn history_file() -> Option<PathBuf> {
     harbor_common::history_file().ok()
 }
 
-pub fn load() -> FileConfig {
-    harbor_common::config::load_or_empty("pilot")
+/// The config, and the reason there isn't one.
+///
+/// `Missing` is not a reason: zero-config local always works, and an absent
+/// file is the ordinary case. Every other error is one the caller has to
+/// decide about, which is why this hands it back instead of printing it and
+/// carrying on. Downstream, "the file could not be read" and "the file says
+/// nothing about this name" look identical — and only the first can connect
+/// you to a database you did not ask for.
+pub fn load() -> (FileConfig, Option<harbor_common::config::Error>) {
+    match harbor_common::config::load() {
+        Ok(c) => (c, None),
+        Err(harbor_common::config::Error::Missing(_)) => (FileConfig::default(), None),
+        Err(e) => (FileConfig::default(), Some(e)),
+    }
 }
 
 /// flag > env beat the config; within it: token > token-file > token-cmd.

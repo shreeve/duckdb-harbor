@@ -332,8 +332,8 @@ pub fn run(conn: &Conn, name: &str, mut opts: RenderOpts) -> std::process::ExitC
                         DotResult::Open(target) => {
                             // A fresh config read on purpose: .open should
                             // see entries added since the session began.
-                            let cfg = crate::config::load();
-                            match crate::resolve(&cfg, &target, None) {
+                            let (cfg, cfg_err) = crate::config::load();
+                            match crate::resolve(&cfg, &target, None, cfg_err.as_ref()) {
                                 Ok(c) => {
                                     conn = c;
                                     _keepalive = ReplKeepalive::new(conn.clone());
@@ -444,7 +444,7 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
         "databases" | "db" => {
             // Reloaded, not captured at startup: an edit made in another window
             // is exactly what someone typing `.databases` wants to see.
-            let _ = crate::show_fleet(&crate::config::load());
+            let _ = crate::show_fleet(&crate::config::load().0);
         }
         "mode" => match parts.next() {
             None => println!("mode: {} (duckbox duckboxy markdown csv json jsonlines line list trash)", opts.mode.name()),

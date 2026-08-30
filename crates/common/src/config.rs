@@ -92,11 +92,6 @@ pub struct Connection {
     pub init: Option<Vec<String>>,
     pub port: Option<u16>,
     pub bind: Option<String>,
-    /// Start this berth at login. The flag lives here, in the file you edit,
-    /// and never in runtime state — launchd moved exactly one field of
-    /// desired state (`Disabled`) out into an opaque database and spent a
-    /// decade explaining why editing the plist did nothing.
-    pub autostart: Option<bool>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -157,13 +152,6 @@ impl FileConfig {
 
     pub fn get(&self, name: &str) -> Option<&Connection> {
         self.connection.get(name)
-    }
-
-    /// Berths marked `autostart`, sorted. One platform unit runs `harbor
-    /// boot`, which starts these — rather than one unit per berth, so this
-    /// file stays the only place that says what starts at login.
-    pub fn autostarted(&self) -> Vec<(&str, &Connection)> {
-        self.berths().into_iter().filter(|(_, c)| c.autostart == Some(true)).collect()
     }
 
     /// Entries that set neither `path` nor `url`, or both. Reported rather

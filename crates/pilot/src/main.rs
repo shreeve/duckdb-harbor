@@ -94,7 +94,8 @@ fn main() -> ExitCode {
         }
     }
 
-    let cfg = config::load(); // once; resolve and the render defaults share it
+    // Once; resolve and the render defaults share it.
+    let (cfg, cfg_err) = config::load();
 
     // Bare `pilot` opens what the config says to open, and otherwise shows what
     // there is to open. It deliberately does not pick "the only berth" when
@@ -103,7 +104,7 @@ fn main() -> ExitCode {
     let Some(target) = target.or_else(|| cfg.defaults.connection.clone()) else {
         return show_fleet(&cfg);
     };
-    let conn = match resolve(&cfg, &target, token) {
+    let conn = match resolve(&cfg, &target, token, cfg_err.as_ref()) {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
@@ -189,8 +190,35 @@ job (PLAN.md D6); ssh is the human path to a remote berth.
 /// Resolution order (D9/D10a): config.toml name -> live berth name ->
 /// plain-HTTP url -> .duckdb path (join-or-spawn) -> socket path. Zero-config
 /// local always works; the config is purely additive.
-fn resolve(cfg: &config::FileConfig, target: &str, flag_token: Option<String>) -> Result<Conn, String> {
+fn resolve(
+    cfg: &config::FileConfig,
+    target: &str,
+    flag_token: Option<String>,
+    cfg_err: Option<&harbor_common::config::Error>,
+) -> Result<Conn, String> {
     let env_token = std::env::var("HARBOR_TOKEN").ok();
+
+    // A bare name is a question only the config can answer, so a config that
+    // could not be read must not be answered around. Falling through used to
+    // mean: one typo anywhere in the file, the whole file discarded (it is
+    // deny_unknown_fields, so a single bad key takes all of it), and then
+    // `pilot medlabs` — which the file may well have defined as a remote —
+    // silently joins the LOCAL berth that happens to share the name. Same
+    // prompt, different data, one warning line scrolled past. A spelled-out
+    // target says what it means without the config's help; a name does not.
+    if let Some(e) = cfg_err {
+        let spelled_out = target.starts_with("http://")
+            || target.starts_with("https://")
+            || target.ends_with(".duckdb")
+            || target.ends_with(".sock")
+            || target.contains('/');
+        if !spelled_out {
+            return Err(format!(
+                "{e}\n        so there is no way to know what {target:?} names. \
+                 Fix the config, or say what you mean: a path, or http://host:port"
+            ));
+        }
+    }
 
     // Explicit config entry shadows a same-named live berth (ssh_config rule).
     if let Some(entry) = cfg.connection.get(target) {
@@ -220,19 +248,19 @@ fn resolve(cfg: &config::FileConfig, target: &str, flag_token: Option<String>) -
         if let Some(url) = &entry.url {
             return Ok(Conn { transport: url_transport(url)?, token });
         }
-        if let Some(path) = &entry.path {
+        if entry.path.is_some() {
             // The entry, then [defaults], then who asked — the same ladder
-            // harbor climbs. Reading only the entry made `[defaults] idle-exit`
-            // a key that worked for `harbor start` and was silently ignored
-            // for every berth pilot summoned.
+            // harbor climbs. Only the lifetime is resolved here, because only
+            // the lifetime depends on WHO asked: `harbor start` is an operator
+            // and would pin the berth up, while pilot is a client and its
+            // berths retire. Every other key is harbor's to apply.
             let life = harbor_common::lifetime::resolve(
                 Default::default(),
                 entry.idle_exit.as_deref(),
                 cfg.defaults.idle_exit.as_deref(),
                 harbor_common::Summoner::Client,
             )?;
-            let (transport, file_token) =
-                ensure_berth(&config::expand(path), life, entry.create == Some(true))?;
+            let (transport, file_token) = ensure_named_berth(target, &home, life)?;
             return Ok(Conn { transport, token: token.or(file_token) });
         }
         return Err(format!("config entry {target:?} has neither url nor path"));
@@ -250,7 +278,7 @@ fn resolve(cfg: &config::FileConfig, target: &str, flag_token: Option<String>) -
             cfg.defaults.idle_exit.as_deref(),
             harbor_common::Summoner::Client,
         )?;
-        let (transport, file_token) = ensure_berth(std::path::Path::new(target), life, false)?;
+        let (transport, file_token) = ensure_berth(std::path::Path::new(target), life)?;
         return Ok(Conn { transport, token: flag_token.or(env_token).or(file_token) });
     }
 
@@ -360,13 +388,55 @@ fn url_transport(url: &str) -> Result<Transport, String> {
     Err(format!("not a url: {url}"))
 }
 
+/// Join the berth a config entry names, or ask harbor to start it BY NAME.
+///
+/// By name, and that is the whole point. harbor owns how a configured berth
+/// starts — `sealed`, `unsigned`, `memory-limit`, `threads`, `workers`,
+/// `statement-timeout`, `init`, `port`, `create`, all of it — and
+/// `harbor start <name>` is the single call that applies the entry entire.
+/// Re-deriving a spawn from the entry's path meant pilot passed only the
+/// flags somebody had remembered to thread through, so `sealed = true` got an
+/// unsealed berth whenever a client happened to summon it first: one name,
+/// two security postures, decided by who got there first. It also named the
+/// berth after the database file rather than the section key, which is the
+/// exact failure `[connection.warehouse]` -> `inventory.duckdb` is documented
+/// to prevent — harbor is the only place that knows the name is the key.
+///
+/// The lifetime rides as a flag because it is the one thing harbor cannot
+/// know: the ladder's last rung is who asked, and from here the answer is
+/// always "a client".
+fn ensure_named_berth(
+    name: &str,
+    home: &std::path::Path,
+    life: harbor_common::lifetime::Lifetime,
+) -> Result<(Transport, Option<String>), String> {
+    if let Some(t) = berth_transport(home, name) {
+        return Ok((t, berth_token(home, name)));
+    }
+    let harbor = std::env::var("HARBOR_BIN").unwrap_or_else(|_| "harbor".to_string());
+    eprintln!("pilot: summoning the {name:?} berth (idle-exit {})", life.describe());
+    let status = std::process::Command::new(&harbor)
+        .args(["start", name])
+        .args(life.to_args())
+        // pilot is about to draw a prompt; harbor's fleet table is not pilot's
+        // output. Failures still speak — harbor writes those to stderr.
+        .stdout(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("cannot run {harbor:?} (is harbor installed?): {e}"))?;
+    if !status.success() {
+        return Err(format!("harbor start {name} failed"));
+    }
+    let transport = berth_transport(home, name)
+        .ok_or_else(|| format!("harbor start returned without registering berth {name:?}"))?;
+    Ok((transport, berth_token(home, name)))
+}
+
 /// Join the live berth that owns this file, or exec `harbor` to summon an
 /// ephemeral one (idle-exit reaps it; see PLAN.md D9). Returns socket + the
 /// berth's token, if readable.
 fn ensure_berth(
     path: &std::path::Path,
     life: harbor_common::lifetime::Lifetime,
-    create: bool,
 ) -> Result<(Transport, Option<String>), String> {
     let home = config::runtime_dir()?;
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -425,9 +495,6 @@ fn ensure_berth(
     // A Lifetime knows its own argv, so "never" reaches harbor as the absence
     // of --idle-exit rather than as a duration string harbor cannot parse.
     cmd.args(life.to_args());
-    if create {
-        cmd.arg("--create");
-    }
     let status = cmd
         // pilot is about to draw a prompt; harbor's fleet table is not pilot's
         // output. Failures still speak — harbor writes those to stderr.

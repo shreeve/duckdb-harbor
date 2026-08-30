@@ -114,8 +114,8 @@ pub fn check_duplicates(cfg: &FileConfig, canon: impl Fn(&Path) -> PathBuf) -> V
 /// Berths whose database is not where the config says.
 ///
 /// Latent by nature: the entry is fine, the file moved, and you find out the
-/// next time you start it — which for an `autostart` berth is at login, in a
-/// context with nobody watching.
+/// next time you start it — which is why this is doctor's business and not
+/// something any other command would notice.
 pub fn check_databases(cfg: &FileConfig, exists: impl Fn(&Path) -> bool) -> Vec<Finding> {
     let mut out = Vec::new();
     for (name, c) in cfg.berths() {
@@ -123,17 +123,10 @@ pub fn check_databases(cfg: &FileConfig, exists: impl Fn(&Path) -> bool) -> Vec<
         if exists(&p) {
             continue;
         }
-        let auto = c.autostart == Some(true);
         out.push(Finding {
-            severity: if auto { Severity::Error } else { Severity::Warn },
+            severity: Severity::Warn,
             title: format!("{name} points at a database that is not there"),
-            detail: {
-                let mut d = vec![shorten(&p)];
-                if auto {
-                    d.push("and it is marked autostart, so this fails at login".into());
-                }
-                d
-            },
+            detail: vec![shorten(&p)],
             fix: format!("fix the path in [connection.{name}], or harbor forget {name}"),
         });
     }
@@ -270,20 +263,18 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_database_is_worse_when_it_autostarts() {
+    fn every_missing_database_is_reported_and_named() {
         let c = cfg(r#"
-            [connection.quiet]
+            [connection.one]
             path = "/gone/a.duckdb"
-            [connection.loud]
+            [connection.two]
             path = "/gone/b.duckdb"
-            autostart = true
         "#);
         let f = check_databases(&c, |_| false);
-        let loud = f.iter().find(|f| f.title.starts_with("loud")).unwrap();
-        let quiet = f.iter().find(|f| f.title.starts_with("quiet")).unwrap();
-        assert_eq!(loud.severity, Severity::Error);
-        assert_eq!(quiet.severity, Severity::Warn);
-        assert!(loud.detail.iter().any(|d| d.contains("at login")));
+        assert_eq!(f.len(), 2);
+        assert!(f.iter().all(|f| f.severity == Severity::Warn));
+        // The path is the whole point: "not there" without saying where.
+        assert!(f.iter().any(|f| f.detail.iter().any(|d| d.contains("a.duckdb"))));
     }
 
     #[test]
