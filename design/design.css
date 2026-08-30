@@ -239,3 +239,14 @@ body {
 .panewrap.collapsed { width: 0; }
 .panewrap.collapsed .grabber.gl { right: -14px; }
 .panewrap.collapsed .grabber.gr { left: -14px; }
+
+/* panel-toggle glyphs (SF Symbols sidebar.left / sidebar.trailing style) */
+.ic-panel {
+  display: inline-block; width: 16px; height: 12px;
+  border: 1.5px solid currentColor; border-radius: 3.5px; position: relative;
+}
+.ic-panel::before {
+  content: ""; position: absolute; top: 1px; bottom: 1px; left: 1px;
+  width: 4.5px; border-radius: 1.5px; background: currentColor; opacity: 0.5;
+}
+.ic-panel.r::before { left: auto; right: 1px; }

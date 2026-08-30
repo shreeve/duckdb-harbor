@@ -38,14 +38,14 @@ Three vertical panes. Sidebar and inspector collapse independently and
 auto-collapse when the window is too narrow to keep the content pane at
 least 480pt wide; divider positions persist. Minimum window 640x400.
 
-Collapsing is offered four redundant ways, all reaching the same state:
-toolbar toggle buttons at each end (the Xcode/Finder pattern, showing
-active state); a grabber riding each divider, a small always-visible
-pill with a chevron pointing the collapse direction, which stays on the
-window edge pointing back in when the pane is closed; dragging a
-divider past the pane's minimum snaps it closed; and Cmd+0 (sidebar) /
-Cmd+Alt+0 (inspector). Double-clicking a divider also toggles.
-Collapse animates briefly; state persists per window.
+Collapsing is offered three redundant ways, all reaching the same
+state: toolbar toggle buttons at each end using the split-rectangle
+panel glyph (the Finder/Xcode convention; never a hamburger, which
+reads as a menu, and never a bare chevron, which reads as navigation),
+with the shaded side naming the pane and an active tint when hidden;
+dragging a divider past the pane's minimum snaps it closed, and
+double-clicking a divider toggles; and Cmd+0 (sidebar) / Cmd+Alt+0
+(inspector). Collapse animates briefly; state persists per window.
 
 Keyboard shortcuts are written as Cmd here; on Linux and Windows every
 Cmd reads as Ctrl.
