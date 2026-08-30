@@ -2758,6 +2758,27 @@ struct CatalogTable {
     foreign_keys: Vec<CatalogFk>,
 }
 
+/// The document's opening run, shared by both styles: versions and sizes,
+/// with the object left open for the style's own `tables` emission.
+fn catalog_header(duckdb_version: &str) -> String {
+    let (database_size, wal_size) = database_disk_sizes();
+    let mut out = String::from("{\"harborVersion\":");
+    push_json_string(&mut out, env!("CARGO_PKG_VERSION"));
+    out.push_str(",\"duckdbVersion\":");
+    push_json_string(&mut out, duckdb_version);
+    out.push_str(",\"databaseSizeBytes\":");
+    match database_size {
+        Some(bytes) => out.push_str(&bytes.to_string()),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"walSizeBytes\":");
+    match wal_size {
+        Some(bytes) => out.push_str(&bytes.to_string()),
+        None => out.push_str("null"),
+    }
+    out
+}
+
 /// The served file's actual bytes on disk, from the one process that can
 /// stat them. `(data, wal)` — a checkpointed database legitimately has no
 /// WAL file, which is 0 bytes of WAL, not an unknown. A berth serving no
@@ -2773,6 +2794,35 @@ fn database_disk_sizes() -> (Option<u64>, Option<u64>) {
     let Ok(data) = std::fs::metadata(path) else { return (None, None) };
     let wal = std::fs::metadata(format!("{path}.wal")).map(|m| m.len()).unwrap_or(0);
     (Some(data.len()), Some(wal))
+}
+
+/// Which fidelity `/catalog` answers at. Lite is the inventory — what
+/// exists and how big; full adds how everything is built.
+enum CatalogStyle {
+    Full,
+    Lite,
+}
+
+/// `?style=` from the request url. No query and no `style` mean full. An
+/// unknown *value* is refused loudly — a style the caller asked for and did
+/// not get would corrupt silently — while unknown *parameters* pass, because
+/// that tolerance is exactly what lets a 0.17 client send `style=lite` to a
+/// 0.16 server and still get a correct (full) answer.
+fn catalog_style(url: &str) -> Result<CatalogStyle, String> {
+    let Some(query) = url.splitn(2, '?').nth(1) else { return Ok(CatalogStyle::Full) };
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == "style" {
+            return match value {
+                "full" => Ok(CatalogStyle::Full),
+                "lite" => Ok(CatalogStyle::Lite),
+                other => Err(format!(
+                    "unknown catalog style {other:?} — this harbor answers full (the default) and lite"
+                )),
+            };
+        }
+    }
+    Ok(CatalogStyle::Full)
 }
 
 /// `GET /catalog` — the complete schema shape a migration differ needs, as
@@ -2809,11 +2859,25 @@ fn database_disk_sizes() -> (Option<u64>, Option<u64>) {
 /// never the engine's pretty-printed strings, and null for a berth serving
 /// no file.
 ///
+/// `?style=lite` answers the inventory alone: the versions, the sizes, and
+/// each table as name, schema, and `estimatedRows` — enough to draw a
+/// database list without paying for columns, constraints, indexes, DDL, or
+/// sequences, in queries here or in bytes on the wire. It is the same
+/// document family at lower fidelity, not a second contract: a field a
+/// style omits is absent, never differently shaped.
+///
 /// Ordering is part of the contract: tables by (schema, name), columns in
 /// ordinal position, indexes and sequences by name, unique constraints by
 /// their column lists, foreign keys by their referenced table and column
 /// lists. A stable database answers with byte-identical output.
 fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
+    let style = match catalog_style(req.url()) {
+        Ok(style) => style,
+        Err(message) => {
+            let _ = req.respond(error_response(400, "bad_request", &message));
+            return (true, 400);
+        }
+    };
     // System and temp catalogs are excluded by anchoring every query to the
     // served database: `system` and `temp` are separate databases, so
     // current_database() never matches them.
@@ -2830,6 +2894,30 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
     };
+    let duckdb_version = version_rows.first().map(|r| cell_str(r, 0)).unwrap_or_default();
+
+    // The lite style stops here: everything it answers is already in hand,
+    // and the four shape queries below never run.
+    if let CatalogStyle::Lite = style {
+        let mut out = catalog_header(&duckdb_version);
+        out.push_str(",\"tables\":[");
+        for (i, row) in table_rows.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"name\":");
+            push_json_string(&mut out, &cell_str(row, 1));
+            out.push_str(",\"schema\":");
+            push_json_string(&mut out, &cell_str(row, 0));
+            out.push_str(",\"estimatedRows\":");
+            out.push_str(&cell_u64(row, 2).to_string());
+            out.push('}');
+        }
+        out.push_str("]}");
+        let _ = req.respond(json_response(200, &out));
+        return (true, 200);
+    }
+
     let column_rows = match catalog_rows(
         jobs,
         "SELECT schema_name, table_name, column_name, data_type, is_nullable, column_default \
@@ -2875,8 +2963,6 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
     };
-
-    let duckdb_version = version_rows.first().map(|r| cell_str(r, 0)).unwrap_or_default();
 
     // Assembled in the order the queries delivered — every ORDER BY above is
     // load-bearing — and looked up by (schema, name), never iterated from the
@@ -2963,21 +3049,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         });
     }
 
-    let (database_size, wal_size) = database_disk_sizes();
-    let mut out = String::from("{\"harborVersion\":");
-    push_json_string(&mut out, env!("CARGO_PKG_VERSION"));
-    out.push_str(",\"duckdbVersion\":");
-    push_json_string(&mut out, &duckdb_version);
-    out.push_str(",\"databaseSizeBytes\":");
-    match database_size {
-        Some(bytes) => out.push_str(&bytes.to_string()),
-        None => out.push_str("null"),
-    }
-    out.push_str(",\"walSizeBytes\":");
-    match wal_size {
-        Some(bytes) => out.push_str(&bytes.to_string()),
-        None => out.push_str("null"),
-    }
+    let mut out = catalog_header(&duckdb_version);
     out.push_str(",\"tables\":[");
     for (i, table) in tables.iter().enumerate() {
         if i > 0 {

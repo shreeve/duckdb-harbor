@@ -382,6 +382,35 @@ def run_fixture(base):
     eq("a plain index has no expressions", [], by_name["idx_awk_space"]["expressions"])
 
     # -----------------------------------------------------------------------
+    section("The lite style: what exists and how big, not how it is built")
+    # -----------------------------------------------------------------------
+    # Same document family at lower fidelity: the versions, the sizes, and
+    # each table as name/schema/estimatedRows — nothing else, so a client
+    # drawing a database list pays neither the shape queries nor the DDL
+    # bytes. A field a style omits is absent, never differently shaped.
+    st, lbody, _ = fetch(base, "/catalog?style=lite")
+    eq("lite is a 200", 200, st)
+    lite = json.loads(lbody)
+    eq("its keys are the inventory alone",
+       ["harborVersion", "duckdbVersion", "databaseSizeBytes", "walSizeBytes", "tables"],
+       list(lite.keys()))
+    eq("a lite table is name, schema, estimatedRows — nothing else",
+       [], [t for t in lite["tables"] if sorted(t.keys()) != ["estimatedRows", "name", "schema"]])
+    eq("the same tables in the same order as the full document",
+       [(t["schema"], t["name"], t["estimatedRows"]) for t in doc["tables"]],
+       [(t["schema"], t["name"], t["estimatedRows"]) for t in lite["tables"]])
+    eq("and the same sizes", (doc["databaseSizeBytes"], doc["walSizeBytes"]),
+       (lite["databaseSizeBytes"], lite["walSizeBytes"]))
+    eq("lite too answers byte-identical documents", lbody, fetch(base, "/catalog?style=lite")[1])
+    eq("style=full is the default document, byte for byte", body,
+       fetch(base, "/catalog?style=full")[1])
+    st, ebody, _ = fetch(base, "/catalog?style=fancy")
+    eq("an unknown style is refused loudly", 400, st)
+    eq("with the usual envelope", "bad_request", json.loads(ebody).get("code"))
+    eq("an unknown parameter passes — that tolerance is version grace", 200,
+       fetch(base, "/catalog?future=1")[0])
+
+    # -----------------------------------------------------------------------
     section("Sizes are exact bytes, from the server's own stat")
     # -----------------------------------------------------------------------
     # The engine pretty-prints its sizes ("1.2 MiB"); the contract never
