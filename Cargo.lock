@@ -1430,7 +1430,7 @@ checksum = "7454e41ff9012c00d53cf7f475c5e3afa3b91b7c90568495495e8d9bf47a1055"
 
 [[package]]
 name = "ducktable"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "gpui",
@@ -2498,7 +2498,7 @@ dependencies = [
 
 [[package]]
 name = "harbor-client"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "harbor-common",
  "serde",

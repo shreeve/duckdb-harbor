@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/ducktable", "crates/harbor-client"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/shreeve/ducktable"
