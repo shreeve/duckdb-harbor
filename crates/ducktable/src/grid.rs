@@ -931,6 +931,13 @@ impl Grid {
             cx.stop_propagation();
             return;
         }
+        if m.platform && m.shift && ks.key == "backspace" {
+            // ⌘⇧⌫, TablePlus's own chord: discard everything staged —
+            // each discard is an undo entry, so even this is reversible.
+            self.discard_all(cx);
+            cx.stop_propagation();
+            return;
+        }
         if m.platform && ks.key == "backspace" {
             self.stage_delete_row(cx);
             cx.stop_propagation();
@@ -968,13 +975,26 @@ impl Grid {
             // drive the pager, the ring keeping its seat across the flip.
             // ⌥↑/⌥↓ alias the Page keys — reachable without Fn.
             match ks.key.as_str() {
+                // Home/End take the row's edges; with ⌘ they take the
+                // page's corners (Sheets' ⌘Home = A1, ⌘End = end of
+                // data, scoped to the page like every other jump).
                 "home" => {
-                    self.move_ring(0, -JUMP, cx);
+                    self.move_ring(if m.platform { -JUMP } else { 0 }, -JUMP, cx);
                     cx.stop_propagation();
                     return;
                 }
                 "end" => {
-                    self.move_ring(0, JUMP, cx);
+                    self.move_ring(if m.platform { JUMP } else { 0 }, JUMP, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                // F2, the third door into the kept-value editor (Sheets
+                // and every clone bind it) — and the one that works
+                // mid-Tab-run, where Enter means carriage return.
+                "f2" => {
+                    if let Some((row, col)) = self.table.read(cx).delegate().active_cell {
+                        self.open_editor(row, col, None, window, cx);
+                    }
                     cx.stop_propagation();
                     return;
                 }
@@ -1350,9 +1370,11 @@ impl Grid {
         self.move_ring(0, dc, cx);
         if let Some(col) = col {
             // move_ring ends runs; a Tab re-arms, keeping the original
-            // anchor if the run was already going.
+            // anchor if the run was already going. Only a FORWARD Tab
+            // starts a run (the Excel/Univer reference rule): ⇧Tab
+            // retreats within one but never begins one.
             self.table.update(cx, |state, _| {
-                state.delegate_mut().tab_anchor = Some(had.unwrap_or(col));
+                state.delegate_mut().tab_anchor = had.or((dc > 0).then_some(col));
             });
         }
     }

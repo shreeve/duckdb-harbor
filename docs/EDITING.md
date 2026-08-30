@@ -59,8 +59,11 @@ combination has a deliberate answer:
 | ⌘↑ / ⌘↓ | first / last row of the page |
 | ⌘← / ⌘→ | first / last visible column |
 | Home / End | first / last visible column |
+| ⌘Home / ⌘End | first / last cell of the page (Sheets' A1 / end-of-data, page-scoped) |
+| F2 | opens the kept-value editor (the third door, with Enter and double-click — and the one that works mid-Tab-run) |
 | PageUp / PageDown | previous / next page — the ring keeps its seat (same column, row clamped) |
 | ⌥↑ / ⌥↓ | previous / next page (same as the Page keys, reachable without Fn) |
+| ⌘⇧⌫ | discard all staged changes (TablePlus's chord; every discard stays undoable) |
 | ⇧ + arrows | deliberately inert — range selection's seat, reserved until ranges ship; a ring that moved when you expected a range to grow would lie |
 | ⌃ + arrows | never bound — macOS owns them (Mission Control, Spaces) |
 
@@ -68,8 +71,10 @@ combination has a deliberate answer:
 keyboard operates on *what you are looking at*. Crossing pages is always
 an explicit act (the Page keys, ⌥↑/⌥↓, or the pager).
 
-**The typewriter sweep** (Sheets' own physics): the first Tab of a run
-remembers its column. Enter during the run — whether confirming an edit
+**The typewriter sweep** (Sheets' own physics, and the reference rules
+from Univer — the only open-source implementation that has it): the
+first **forward** Tab of a run remembers its column (⇧Tab retreats
+within a run but never begins one). Enter during the run — whether confirming an edit
 or just navigating — returns to that column one row down, like a
 carriage return; ⇧Enter sweeps up. Any arrow, click, Esc, or page
 change ends the run. Tab a row's cells, edit some, press Enter, and you
