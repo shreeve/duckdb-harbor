@@ -778,6 +778,7 @@ impl Drop for Claim {
 /// connection until it finishes, and yanking it would hand the same connection
 /// to two callers at once. It is cancelled and marked instead, and the reaper
 /// releases it as soon as the statement lets go.
+#[derive(PartialEq, Eq, Clone, Copy)]
 enum Released {
     /// The connection is back in the free list.
     Yes,
@@ -894,6 +895,7 @@ fn lease_drain() {
             None => return,
         }
     };
+    let mut cancelling = false;
     for id in &ids {
         // A lease busy with a statement is interrupted by this call rather than
         // waited on. It used to be left to the executor's own shutdown — its
@@ -901,7 +903,34 @@ fn lease_drain() {
         // — but that only unwinds once the statement finishes, so a single long
         // query held the whole shutdown, and with it the CHECKPOINT that folds
         // the WAL.
-        lease_release(id);
+        cancelling |= lease_release(id) == Released::Cancelling;
+    }
+
+    // Bounded patience, the same bargain the worker join makes below. A
+    // cancelled statement unwinds on its own thread, and until it does its
+    // lease still holds an open transaction — which is exactly what makes the
+    // CHECKPOINT fail, so charging straight at it wins nothing. Waiting
+    // forever is worse: this runs on the signal thread, so a statement that
+    // never unwinds makes the whole process deaf to SIGTERM, and the only way
+    // out is the SIGKILL that forfeits the checkpoint this drain exists to
+    // reach. So: give it a moment, then go on regardless.
+    if cancelling {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            lease_reap();
+            let clear = match LEASES.lock().unwrap().as_ref() {
+                Some(l) => l.live.is_empty(),
+                None => true,
+            };
+            if clear {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!(
+            "harbor: a transaction did not unwind in 5s; checkpointing without it \
+             (the WAL is intact and replays on next open)"
+        );
     }
 }
 
@@ -1590,12 +1619,21 @@ pub fn idle_ms() -> u64 {
 /// no live leases, no lease statement in flight. An --idle-exit berth may
 /// leave only when this is true — an open transaction with no traffic is
 /// still a claim on this berth, and so is a statement in its fifth minute.
+///
+/// A *doomed* lease is not a claim. It is one the server has already decided
+/// to reclaim, waiting only for a cancelled statement to unwind, and a client
+/// that asked to be released is not asking to be kept alive. Counting one is
+/// how a single cancel that never lands turns `--idle-exit` off permanently:
+/// `live` never empties, `quiet()` is false forever, and the berth outlives
+/// every clock meant to retire it. That is not hypothetical — it is the shape
+/// of a berth found still serving hours after its last session, deaf to the
+/// idle timer that should have ended it.
 pub fn quiet() -> bool {
     if INFLIGHT_REQUESTS.load(Ordering::SeqCst) != 0 {
         return false;
     }
     match LEASES.lock().unwrap().as_ref() {
-        Some(l) => l.live.is_empty() && l.inflight == 0,
+        Some(l) => l.live.values().all(|lease| lease.doomed) && l.inflight == 0,
         None => false,
     }
 }

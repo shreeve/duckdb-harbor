@@ -435,13 +435,46 @@ def run_all(h, leases, proc, db, port):
     h.sql("UPDATE t SET n = 12345 WHERE id = 9", sid)   # left open, deliberately
     ok("a lease is holding an open write transaction", "committed row 9, then began another")
 
+    # And a SECOND lease, busy inside a statement long enough that SIGTERM is
+    # guaranteed to land mid-flight. The idle case above is released outright;
+    # this one can only be CANCELLED, and the drain has to wait for it to
+    # unwind before the CHECKPOINT can run. Waiting without a bound is how the
+    # signal thread ends up parked inside stop() forever: the process keeps
+    # serving, ignores every further SIGTERM, and only SIGKILL ends it — which
+    # forfeits the very checkpoint the drain existed to reach.
+    busy_sid = h.open(ttl_ms=300000)[1]["sessionId"]
+    busy = {}
+
+    def hold():
+        try:
+            busy["result"] = h.sql(
+                "SELECT count(DISTINCT i) FROM range(300000000) t(i)", busy_sid)[0]
+        except Exception as e:      # the server goes away underneath it
+            busy["error"] = str(e)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    time.sleep(1.0)                 # let the statement actually start
+    ok("a second lease is busy inside a long statement", "cancelled, not waited on")
+
+    sent = time.monotonic()
     proc.send_signal(signal.SIGTERM)
     try:
         proc.wait(timeout=30)
-        ok("SIGTERM stops the server")
+        took = time.monotonic() - sent
+        ok("SIGTERM stops the server", f"{took:.1f}s, with a statement still running")
+        # The drain gives a cancelled statement 5s and then goes on regardless.
+        # Anything near the 30s ceiling means it is waiting, not bounded.
+        if took < 20:
+            ok("and did not wait on the running statement", f"{took:.1f}s")
+        else:
+            bad("and did not wait on the running statement",
+                f"took {took:.1f}s — the drain is unbounded again")
     except subprocess.TimeoutExpired:
         proc.kill()
-        bad("SIGTERM stops the server", "still running after 30s")
+        bad("SIGTERM stops the server",
+            "still running after 30s — the drain is parked on a busy lease")
+    holder.join(timeout=5)
 
     wal = db + ".wal"
     eq("the WAL was folded in on shutdown", False, os.path.exists(wal))
