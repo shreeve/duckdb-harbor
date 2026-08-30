@@ -9,7 +9,8 @@ unshipped is labeled as such rather than described as a compatibility mode. For
 usage see [README.md](README.md); for maintenance items see [TODO.md](TODO.md).
 
 ```
-~/.harbor/                        ← the harbor IS a directory (no daemon)
+~/.config/harbor/config.toml      ← desired state: yours to edit
+~/.local/state/harbor/runtime/    ← actual state: harbor's to write, safe to delete
 ├── sales.sock                    ← berth: one harbor serve process, one .duckdb
 ├── sales.lock                    ← process-lifetime ownership mutex
 ├── sales.token                   ← per-berth bearer token, 0600
@@ -68,7 +69,7 @@ ever arrives). ATTACH remains available to clients as plain SQL through
 `--threads`) and prints it at startup. Not a follow-up — a 1.0 requirement.
 
 ### D3. No daemon — the filesystem is the registry
-`~/.harbor/<name>.json` is the discoverable identity and dial record for both
+`<runtime>/<name>.json` is the discoverable identity and dial record for both
 UDS and TCP berths; liveness is a `GET /ready` probe. The process-lifetime
 `flock(LOCK_EX|LOCK_NB)` on `<name>.lock` is the ownership mutex. Once `serve`
 holds that lock, an existing socket path belongs to no live process under that
@@ -81,7 +82,7 @@ cleanup operation and never removes the database file.
 
 ### D4. Spawn, don't fork; persist via the init system
 `harbor start` runs `current_exe() serve …` detached in a new process group, with
-stdin null and stdout/stderr appended to `~/.harbor/log/<name>.log`, then polls
+stdin null and stdout/stderr appended to `<runtime>/log/<name>.log`, then polls
 `/ready` before reporting success. Identical on macOS/Linux. Harbor never becomes a supervisor. Boot
 persistence belongs in launchd or a systemd user unit, but an automatic
 `harbor start --boot` generator is not shipped. **No socket activation**: a
@@ -205,7 +206,7 @@ remotes are resolved when named, not merged into that fleet view.
 Token required on ALL faces by default, including UDS (the janus lesson:
 sockets get their modes widened; a proxy misconfiguration must not equal full
 DB access). `--token ''` remains the explicit opt-out. Per-berth token files
-(`~/.harbor/<name>.token`, 0600) beside the sockets — no shared credentials
+(`<runtime>/<name>.token`, 0600) beside the sockets — no shared credentials
 store. Caddy injects/passes the berth token with *replace* semantics
 (`header_up Authorization …`) — harbor 401s duplicate Authorization headers.
 `/ready` stays the only unauthenticated route; `/info` requires auth (it leaks

@@ -18,7 +18,7 @@ timer = true
 #
 # [connection.medlabs]
 # url = "http://127.0.0.1:9495"
-# token-file = "~/.config/harbor/runtime/medlabs.token"
+# token-file = "~/.local/state/harbor/runtime/medlabs.token"
 # # token-cmd = "op read op://vault/medlabs/token"
 
 # A spawn-on-demand alias: `pilot scratch` summons a berth for this file

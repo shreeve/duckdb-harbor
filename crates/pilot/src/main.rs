@@ -1,6 +1,6 @@
 //! pilot — the Harbor client.
 //!
-//! Zero-config local (D10a): a bare name resolves to ~/.config/harbor/runtime/<name>.sock —
+//! Zero-config local (D10a): a bare name resolves to ~/.local/state/harbor/runtime/<name>.sock —
 //! or, for a --port berth, the TCP address its sidecar json registered — plus
 //! its token file; config.toml is purely additive (remotes, aliases, taste).
 //! TLS is Caddy's job (D6) — pilot speaks plain HTTP over UDS/TCP.
