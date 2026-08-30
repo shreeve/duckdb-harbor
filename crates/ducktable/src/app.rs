@@ -18,6 +18,9 @@ pub(crate) struct RowVm {
     pub(crate) tables: Option<usize>,
     /// Size on disk (data + WAL) — knowable for every berth.
     pub(crate) size: Option<u64>,
+    /// reconcile's human-readable fix for an unhealthy row
+    /// ("… harbor forget x"), surfaced as the row's tooltip.
+    pub(crate) note: Option<String>,
 }
 
 pub(crate) enum Phase {
@@ -241,21 +244,23 @@ impl DuckTable {
             _ => None,
         };
         cx.spawn(async move |this, cx| {
-            let list = cx.background_executor().spawn(async move { fleet::list() }).await;
-            // One task per berth so the probes run concurrently — a dead
-            // berth's probe timeout no longer serializes behind the rest.
+            // survey() answers liveness from the lock files (flock is
+            // proof of life), so this makes no probe in the common case
+            // — and sees rows the old sidecar-only scan could not
+            // (stale locks, running-but-unregistered berths).
+            let list = cx.background_executor().spawn(async move { fleet::survey() }).await;
+            // One task per berth for the catalog fetches (table counts
+            // need the database open; only live berths answer).
             let tasks: Vec<_> = list
                 .into_iter()
                 .map(|row| {
                     let known = connected.clone();
                     cx.background_executor().spawn(async move {
-                        let live = row.transport.as_ref().map(fleet::probe);
-                        // Table count needs the database open, so only
-                        // live berths answer; size comes from the file
-                        // on disk and works for every berth.
                         let tables = match &known {
                             Some((name, count)) if *name == row.name => Some(*count),
-                            _ => (live == Some(true))
+                            _ => row
+                                .state
+                                .is_live()
                                 .then(|| {
                                     let conn = fleet::connect(&row.name).ok()?;
                                     let cat = harbor_client::catalog(&conn).ok()?;
@@ -269,9 +274,10 @@ impl DuckTable {
                                 .flatten(),
                         };
                         RowVm {
-                            state: fleet::state_of(&row, live),
+                            state: row.state,
                             tables,
-                            size: row.size_on_disk(),
+                            size: row.size,
+                            note: row.note,
                             name: row.name,
                         }
                     })

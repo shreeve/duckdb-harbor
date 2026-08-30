@@ -152,6 +152,15 @@ impl DuckTable {
                                 .child(crate::util::human_bytes(s)),
                         )
                     })
+                    .when_some(row.note.clone(), |d, note| {
+                        // reconcile's fix-it line ("… harbor forget x")
+                        // rides the row as a tooltip: the unhealthy dot
+                        // explains itself.
+                        d.tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(clone_str(&note))
+                                .build(window, cx)
+                        })
+                    })
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.connect(clone_str(&name), cx);
                     }))

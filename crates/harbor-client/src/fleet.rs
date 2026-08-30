@@ -1,17 +1,17 @@
 //! The fleet as a GUI sees it: every berth the config or the runtime dir
 //! knows, how to dial it, and what state it is honestly in.
 //!
-//! State derivation is client-side and probe-backed: a sidecar json is a
-//! claim, `GET /ready` is the truth. The mapping onto
-//! [`harbor_common::State`] follows the vocabulary's own definitions —
-//! Running only when configured, live, and serving the database the config
-//! names; Drifted when live but disagreeing with the file; Unmanaged when
-//! live with no entry; Dead when the registry claims a process the probe
-//! cannot find; Stopped and Stale for the quiet cases.
+//! State truth comes from [`harbor_common::fleet::reconcile`], shared with
+//! `harbor show` and `pilot` so the three views can never disagree about
+//! whether a berth is running. Liveness is flock-backed (a held lock is
+//! proof of life without a round trip); the probe only dials the one row
+//! shape a lock cannot settle. This file layers on what only this client
+//! wants: the remotes reconcile excludes by design, size on disk, and the
+//! whole connection half (Conn, connect, keepalive).
 
 use crate::http::{request, Transport};
 use crate::tokens;
-use harbor_common::config::{self, Connection};
+use harbor_common::config;
 use harbor_common::fleet::Addr;
 use harbor_common::paths::runtime_dir;
 use harbor_common::State;
@@ -26,38 +26,26 @@ pub struct Sidecar {
     pub addr: Option<Addr>,
 }
 
-/// One row of the fleet view: a name, what the config says about it, and
-/// what the runtime dir says about it. Either half may be absent; a row
-/// exists because at least one of them mentions the name.
+/// One sidebar row: reconcile's truth about a berth, plus the size on
+/// disk only a GUI wants.
 #[derive(Debug, Clone)]
-pub struct BerthRow {
+pub struct Survey {
     pub name: String,
-    pub configured: Option<Connection>,
-    pub sidecar: Option<Sidecar>,
-    pub transport: Option<Transport>,
+    pub state: State,
+    /// A human-readable fix for an unhealthy row, verbatim from
+    /// reconcile ("… harbor forget x").
+    pub note: Option<String>,
+    /// Size on disk (data file + WAL) — knowable without a connection,
+    /// so stopped berths answer too.
+    pub size: Option<u64>,
 }
 
-impl BerthRow {
-    /// Spawn-on-demand candidate: configured with a path and not running.
-    pub fn summonable(&self) -> bool {
-        self.transport.is_none()
-            && self.configured.as_ref().is_some_and(|c| c.database().is_some())
-    }
-
-    /// The database's size on disk (data file + WAL), from whichever half
-    /// names the path. Needs no connection, so it works for stopped
-    /// berths too.
-    pub fn size_on_disk(&self) -> Option<u64> {
-        let db = self
-            .sidecar
-            .as_ref()
-            .and_then(|s| s.db.clone())
-            .or_else(|| self.configured.as_ref().and_then(|c| c.database()))?;
-        let main = std::fs::metadata(&db).ok()?.len();
-        let mut wal = db.into_os_string();
-        wal.push(".wal");
-        Some(main + std::fs::metadata(wal).map(|m| m.len()).unwrap_or(0))
-    }
+/// db file + its `.wal`, when the file exists.
+fn disk_size(db: &Path) -> Option<u64> {
+    let main = std::fs::metadata(db).ok()?.len();
+    let mut wal = db.as_os_str().to_owned();
+    wal.push(".wal");
+    Some(main + std::fs::metadata(wal).map(|m| m.len()).unwrap_or(0))
 }
 
 fn berth_sock(home: &Path, name: &str) -> PathBuf {
@@ -85,7 +73,12 @@ fn read_sidecar(home: &Path, name: &str) -> Option<Sidecar> {
 /// is not there and report a live berth as Dead. The berth records where it
 /// actually bound; that is the answer.
 fn berth_transport(sidecar: Option<&Sidecar>) -> Option<Transport> {
-    match sidecar?.addr.as_ref()? {
+    addr_transport(sidecar?.addr.as_ref()?)
+}
+
+/// Where the berth recorded it bound -> how this process dials it.
+fn addr_transport(addr: &Addr) -> Option<Transport> {
+    match addr {
         #[cfg(unix)]
         Addr::Sock(p) => p.exists().then(|| Transport::Unix(p.clone())),
         #[cfg(not(unix))]
@@ -100,44 +93,55 @@ fn berth_transport(sidecar: Option<&Sidecar>) -> Option<Transport> {
     }
 }
 
-/// Every berth the config or the runtime dir knows, sorted by name. A
-/// missing config file or an unreachable runtime dir contributes nothing
-/// rather than failing the view; the GUI's empty state says where the
-/// config lives.
-pub fn list() -> Vec<BerthRow> {
+/// Every berth the config or the runtime dir knows, sorted by name,
+/// with reconcile's flock-backed state. A missing config file or an
+/// unreachable runtime dir contributes nothing rather than failing the
+/// view; the GUI's empty state says where the config lives.
+pub fn survey() -> Vec<Survey> {
     let cfg = config::load_or_empty("ducktable");
-    let home = runtime_dir().ok();
+    let mut out: Vec<Survey> = Vec::new();
 
-    let mut names: Vec<String> = cfg.berths().iter().map(|(n, _)| n.to_string()).collect();
-    names.extend(cfg.remotes().iter().map(|(n, _)| n.to_string()));
-    if let Some(home) = &home {
-        if let Ok(rd) = std::fs::read_dir(home) {
-            for e in rd.filter_map(|e| e.ok()) {
-                let p = e.path();
-                if p.extension().is_some_and(|x| x == "json") {
-                    if let Some(stem) = p.file_stem() {
-                        names.push(stem.to_string_lossy().into_owned());
-                    }
-                }
-            }
+    if let Ok(home) = runtime_dir() {
+        // Re-scan for the db PATHS: reconcile's Row carries the display
+        // (shortened) path, and the size wants the real one.
+        let (sidecars, _) = harbor_common::fleet::scan_runtime(&home);
+        let dial = |addr: &Addr| addr_transport(addr).is_some_and(|t| probe(&t));
+        for r in harbor_common::fleet::reconcile(&cfg, &home, &dial) {
+            let db = sidecars
+                .get(&r.name)
+                .and_then(|j| j["db"].as_str())
+                .map(PathBuf::from)
+                .or_else(|| cfg.get(&r.name).and_then(|c| c.database()));
+            out.push(Survey {
+                size: db.and_then(|p| disk_size(&p)),
+                name: r.name,
+                state: r.state,
+                note: r.note,
+            });
         }
     }
-    names.sort();
-    names.dedup();
 
-    names
-        .into_iter()
-        .map(|name| {
-            let sidecar = home.as_deref().and_then(|h| read_sidecar(h, &name));
-            let transport = berth_transport(sidecar.as_ref());
-            BerthRow {
-                configured: cfg.get(&name).cloned(),
-                sidecar,
-                transport,
-                name,
-            }
-        })
-        .collect()
+    // Remotes are excluded from reconcile by design (they have no local
+    // runtime state to reconcile); a probe answers for them.
+    for (name, entry) in cfg.remotes() {
+        if out.iter().any(|s| s.name == name) {
+            continue;
+        }
+        let live = entry
+            .url
+            .as_deref()
+            .and_then(|u| url_transport(u).ok())
+            .is_some_and(|t| probe(&t));
+        out.push(Survey {
+            name: name.to_string(),
+            state: if live { State::Running } else { State::Stopped },
+            note: None,
+            size: None,
+        });
+    }
+
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
 /// `GET /ready` — the only unauthenticated route, and the truth test.
@@ -145,30 +149,6 @@ pub fn probe(transport: &Transport) -> bool {
     request(transport, &wire::endpoint::READY, None, None, Some(Duration::from_millis(800)))
         .map(|r| r.status == 200)
         .unwrap_or(false)
-}
-
-/// The honest state of a row given the probe's answer (None when there was
-/// nothing to dial).
-pub fn state_of(row: &BerthRow, live: Option<bool>) -> State {
-    match (&row.configured, &row.transport, live) {
-        (_, Some(_), Some(false)) => State::Dead,
-        (Some(c), Some(_), Some(true)) => {
-            let entry_db = c.database().map(canonical);
-            let live_db = row.sidecar.as_ref().and_then(|s| s.db.clone()).map(canonical);
-            match (entry_db, live_db) {
-                (Some(a), Some(b)) if a != b => State::Drifted,
-                _ => State::Running,
-            }
-        }
-        (None, Some(_), Some(true)) => State::Unmanaged,
-        (Some(_), None, _) => State::Stopped,
-        (None, None, _) => State::Stale,
-        (_, Some(_), None) => State::Dead,
-    }
-}
-
-fn canonical(p: PathBuf) -> PathBuf {
-    std::fs::canonicalize(&p).unwrap_or(p)
 }
 
 /// A dialable, authenticated connection to one berth.
@@ -355,31 +335,9 @@ pub fn keepalive(conn: &Conn) -> bool {
 mod tests {
     use super::*;
 
-    fn row(configured: bool, transport: bool, db: (&str, &str)) -> BerthRow {
-        let cfg: harbor_common::config::FileConfig = toml::from_str(&format!(
-            "[connection.x]\npath = \"{}\"\n",
-            db.0
-        ))
-        .unwrap();
-        BerthRow {
-            name: "x".into(),
-            configured: configured.then(|| cfg.connection["x"].clone()),
-            sidecar: Some(Sidecar { db: Some(PathBuf::from(db.1)), ..Default::default() }),
-            transport: transport.then(|| Transport::Tcp("127.0.0.1:1".into())),
-        }
-    }
-
-    #[test]
-    fn the_state_table() {
-        let same = ("/tmp/a.duckdb", "/tmp/a.duckdb");
-        let differ = ("/tmp/a.duckdb", "/tmp/b.duckdb");
-        assert_eq!(state_of(&row(true, true, same), Some(true)), State::Running);
-        assert_eq!(state_of(&row(true, true, differ), Some(true)), State::Drifted);
-        assert_eq!(state_of(&row(false, true, same), Some(true)), State::Unmanaged);
-        assert_eq!(state_of(&row(true, true, same), Some(false)), State::Dead);
-        assert_eq!(state_of(&row(true, false, same), None), State::Stopped);
-        assert_eq!(state_of(&row(false, false, same), None), State::Stale);
-    }
+    // The state table itself lives in harbor_common::fleet::reconcile,
+    // shared with `harbor show` and `pilot` — no client-side copy to
+    // drift.
 
     #[test]
     fn derived_names_are_filesystem_tame() {

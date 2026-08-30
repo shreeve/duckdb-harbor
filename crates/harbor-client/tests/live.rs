@@ -7,12 +7,13 @@ use harbor_client::{connect, fleet, info};
 #[test]
 #[ignore]
 fn the_real_fleet_lists_and_answers() {
-    let rows = fleet::list();
+    let rows = fleet::survey();
     println!("fleet:");
     for row in &rows {
-        let live = row.transport.as_ref().map(fleet::probe);
-        let state = fleet::state_of(row, live);
-        println!("  {} {} (summonable: {})", state.label(), row.name, row.summonable());
+        println!("  {} {}", row.state.label(), row.name);
+        if let Some(note) = &row.note {
+            println!("    note: {note}");
+        }
     }
     assert!(!rows.is_empty(), "no berths known to config or runtime");
 }
@@ -20,9 +21,7 @@ fn the_real_fleet_lists_and_answers() {
 #[test]
 #[ignore]
 fn a_live_berth_yields_identity() {
-    let live = fleet::list()
-        .into_iter()
-        .find(|r| r.transport.as_ref().map(fleet::probe).unwrap_or(false));
+    let live = fleet::survey().into_iter().find(|r| r.state.is_live());
     let Some(row) = live else {
         println!("no live berth to test against; skipping");
         return;
@@ -40,9 +39,7 @@ fn a_live_berth_yields_identity() {
 #[test]
 #[ignore]
 fn a_live_berth_answers_sql() {
-    let live = fleet::list()
-        .into_iter()
-        .find(|r| r.transport.as_ref().map(fleet::probe).unwrap_or(false));
+    let live = fleet::survey().into_iter().find(|r| r.state.is_live());
     let Some(row) = live else {
         println!("no live berth to test against; skipping");
         return;
