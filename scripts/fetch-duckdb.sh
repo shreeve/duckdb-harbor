@@ -10,7 +10,7 @@
 # nothing to pin. `/latest/` is the v2.0-dev channel today (it reported
 # v2.0.0-alpha38069 when this was written); if main ever rolls past 2.0, pin the
 # v2.0 channel URL below. The matched UI extension is built separately against
-# whatever this installs — see scripts/build-ui-extension.sh (`make ui`).
+# whatever this installs.
 #
 # Override DEST to install elsewhere.
 
