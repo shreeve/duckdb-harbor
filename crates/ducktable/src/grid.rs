@@ -458,17 +458,23 @@ impl Render for Grid {
         };
         // The footer status is mode-relevant, and "N columns" is ALWAYS
         // the last element: it stays fixed at the right edge when the
-        // view switches, and the data-only facts simply disappear.
+        // view switches, and the data-only facts simply disappear. The
+        // columns text is its OWN node — as a suffix of one longer string
+        // its glyphs land a subpixel differently and the switch shows a
+        // 1px shift.
         let columns_part = format!("{cols} {}", if cols == 1 { "column" } else { "columns" });
-        let status = match view {
+        let (status_prefix, status_columns) = match view {
             ViewMode::Data => {
                 if loading && count == 0 {
-                    "loading...".to_string()
+                    (Some("loading...".to_string()), None)
                 } else {
-                    format!("{ms} ms \u{00b7} {rows_part} \u{00b7} {columns_part}")
+                    (
+                        Some(format!("{ms} ms \u{00b7} {rows_part} \u{00b7}")),
+                        Some(columns_part),
+                    )
                 }
             }
-            ViewMode::Structure => columns_part,
+            ViewMode::Structure => (None, Some(columns_part)),
         };
         div()
             .size_full()
@@ -658,7 +664,16 @@ impl Render for Grid {
                             )),
                     )
                     .child(div().flex_1())
-                    .child(div().text_xs().text_color(t.muted).flex_none().child(status)),
+                    .child(
+                        div()
+                            .h_flex()
+                            .flex_none()
+                            .gap_1()
+                            .text_xs()
+                            .text_color(t.muted)
+                            .when_some(status_prefix, |d, s| d.child(div().child(s)))
+                            .when_some(status_columns, |d, s| d.child(div().child(s))),
+                    ),
             )
     }
 }
