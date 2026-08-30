@@ -544,6 +544,20 @@ impl TableDelegate for GridDelegate {
             .border_r_1()
             .border_b_1()
             .border_color(t.grid_line)
+            // The cell starts 8px in (wrapper padding), so its bottom
+            // border leaves a notch there. Every row but the LAST hides
+            // it under the tr's full-width border, which the Table skips
+            // on the last row; this strip patches the notch on the
+            // border's own pixel (bottom -1).
+            .child(
+                div()
+                    .absolute()
+                    .left(px(-8.))
+                    .w(px(8.))
+                    .bottom(px(-1.))
+                    .h(px(1.))
+                    .bg(t.grid_line),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |state, _, _, cx| {
