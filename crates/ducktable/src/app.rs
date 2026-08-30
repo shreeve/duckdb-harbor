@@ -14,7 +14,10 @@ use std::time::Duration;
 pub(crate) struct RowVm {
     pub(crate) name: String,
     pub(crate) state: State,
-    pub(crate) summonable: bool,
+    /// Table count, knowable only for live berths (a catalog fetch).
+    pub(crate) tables: Option<usize>,
+    /// Size on disk (data + WAL) — knowable for every berth.
+    pub(crate) size: Option<u64>,
 }
 
 pub(crate) enum Phase {
@@ -226,9 +229,25 @@ impl DuckTable {
                         .into_iter()
                         .map(|row| {
                             let live = row.transport.as_ref().map(fleet::probe);
+                            // Table count needs the database open, so only
+                            // live berths answer; size comes from the file
+                            // on disk and works for every berth.
+                            let tables = (live == Some(true))
+                                .then(|| {
+                                    let conn = fleet::connect(&row.name).ok()?;
+                                    let cat = harbor_client::catalog(&conn).ok()?;
+                                    Some(
+                                        cat.schemas()
+                                            .iter()
+                                            .map(|s| cat.tables_in(s).len())
+                                            .sum(),
+                                    )
+                                })
+                                .flatten();
                             RowVm {
                                 state: fleet::state_of(&row, live),
-                                summonable: row.summonable(),
+                                tables,
+                                size: row.size_on_disk(),
                                 name: row.name,
                             }
                         })

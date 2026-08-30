@@ -17,6 +17,27 @@ pub fn commas(n: u64) -> String {
     out
 }
 
+/// A size in compact binary form: "242MiB", "8.5MiB" — one decimal below
+/// 10, integers to 1023, rolling at the unit boundary.
+pub fn human_bytes(n: u64) -> String {
+    if n < 1024 {
+        return format!("{n}B");
+    }
+    let mut value = n as f64;
+    for unit in ["KiB", "MiB", "GiB", "TiB"] {
+        value /= 1024.;
+        if value < 1023.5 || unit == "TiB" {
+            let tenth = (value * 10.).round() / 10.;
+            return if tenth >= 10. {
+                format!("{}{unit}", value.round())
+            } else {
+                format!("{tenth:.1}{unit}")
+            };
+        }
+    }
+    unreachable!()
+}
+
 /// A count in compact SI form: exact under 1000, then k/M/G/T with one
 /// decimal below 10 ("4.6M") and integers to 999 ("13k", "999k"); the
 /// tenth-rounded value rolls to the next unit at 999.5.

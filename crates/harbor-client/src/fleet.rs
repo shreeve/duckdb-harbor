@@ -43,6 +43,21 @@ impl BerthRow {
         self.transport.is_none()
             && self.configured.as_ref().is_some_and(|c| c.database().is_some())
     }
+
+    /// The database's size on disk (data file + WAL), from whichever half
+    /// names the path. Needs no connection, so it works for stopped
+    /// berths too.
+    pub fn size_on_disk(&self) -> Option<u64> {
+        let db = self
+            .sidecar
+            .as_ref()
+            .and_then(|s| s.db.clone())
+            .or_else(|| self.configured.as_ref().and_then(|c| c.database()))?;
+        let main = std::fs::metadata(&db).ok()?.len();
+        let mut wal = db.into_os_string();
+        wal.push(".wal");
+        Some(main + std::fs::metadata(wal).map(|m| m.len()).unwrap_or(0))
+    }
 }
 
 fn berth_sock(home: &Path, name: &str) -> PathBuf {
