@@ -14,12 +14,8 @@ use std::time::Duration;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Catalog {
-    // Identity comes from /info; these stay optional so catalog decoding
-    // never breaks if the server stops sending them.
-    #[serde(default)]
-    pub harbor_version: String,
-    #[serde(default)]
-    pub duckdb_version: String,
+    // The response also carries harbor/duckdb versions; identity comes
+    // from /info, so they are not modeled here.
     #[serde(default)]
     pub tables: Vec<Table>,
     #[serde(default)]

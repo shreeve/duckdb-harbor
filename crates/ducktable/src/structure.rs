@@ -250,7 +250,9 @@ impl Grid {
             );
         }
 
-        if let Some(ddl) = &s.ddl {
+        // ddl and ddl_input come from the same source in Grid::new, so
+        // they are Some together.
+        if let (Some(ddl), Some(state)) = (&s.ddl, &self.ddl_input) {
             let ddl_text = ddl.clone();
             pane = pane.child(
                 div()
@@ -286,31 +288,18 @@ impl Grid {
                             }),
                     ),
             );
-            pane = pane.child(match &self.ddl_input {
-                // A disabled Input keeps native text selection (drag,
-                // Cmd+C) while gating off every mutation — read-only
-                // selectable text, which gpui divs cannot give. Styles
-                // go ON the Input: it overrides the inherited text size
-                // (input_text_size), and only its own refinement, which
-                // applies last, beats that. Same 12px value font as the
-                // columns table above.
-                Some(state) => gpui_component::input::Input::new(state)
+            // A disabled Input keeps native text selection (drag, Cmd+C)
+            // while gating off every mutation — read-only selectable
+            // text, which gpui divs cannot give. Styles go ON the Input:
+            // it overrides the inherited text size (input_text_size),
+            // and only its own refinement, which applies last, beats
+            // that. Same 12px value font as the columns table above.
+            pane = pane.child(
+                gpui_component::input::Input::new(state)
                     .disabled(true)
                     .text_size(px(12.))
-                    .font_family(value_font())
-                    .into_any_element(),
-                None => div()
-                    .p_2()
-                    .rounded(px(6.))
-                    .bg(t.raised)
-                    .border_1()
-                    .border_color(t.grid_line)
-                    .text_size(px(11.5))
-                    .font_family(value_font())
-                    .text_color(t.text)
-                    .child(ddl.clone())
-                    .into_any_element(),
-            });
+                    .font_family(value_font()),
+            );
         }
 
         pane

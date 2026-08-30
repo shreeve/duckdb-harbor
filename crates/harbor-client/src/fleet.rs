@@ -18,14 +18,6 @@ use harbor_common::State;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// What a berth's sidecar json registered at start.
-#[derive(Debug, Clone, Default)]
-pub struct Sidecar {
-    pub db: Option<PathBuf>,
-    /// Where the berth actually answers, as the berth itself recorded it.
-    pub addr: Option<Addr>,
-}
-
 /// One sidebar row: reconcile's truth about a berth, plus the size on
 /// disk only a GUI wants.
 #[derive(Debug, Clone)]
@@ -58,12 +50,6 @@ fn berth_token(home: &Path, name: &str) -> Option<String> {
     if t.is_empty() { None } else { Some(t) }
 }
 
-fn read_sidecar(home: &Path, name: &str) -> Option<Sidecar> {
-    let text = std::fs::read_to_string(home.join(format!("{name}.json"))).ok()?;
-    let j: serde_json::Value = serde_json::from_str(&text).ok()?;
-    Some(Sidecar { db: j["db"].as_str().map(PathBuf::from), addr: Addr::read(&j) })
-}
-
 /// How to dial a live local berth: whatever its sidecar says it bound.
 ///
 /// Read, not derived. This used to guess `<runtime>/<name>.sock` and fall
@@ -72,8 +58,10 @@ fn read_sidecar(home: &Path, name: &str) -> Option<Sidecar> {
 /// answers somewhere else entirely, and the guess would then dial a path that
 /// is not there and report a live berth as Dead. The berth records where it
 /// actually bound; that is the answer.
-fn berth_transport(sidecar: Option<&Sidecar>) -> Option<Transport> {
-    addr_transport(sidecar?.addr.as_ref()?)
+fn read_transport(home: &Path, name: &str) -> Option<Transport> {
+    let text = std::fs::read_to_string(home.join(format!("{name}.json"))).ok()?;
+    let j: serde_json::Value = serde_json::from_str(&text).ok()?;
+    addr_transport(&Addr::read(&j)?)
 }
 
 /// Where the berth recorded it bound -> how this process dials it.
@@ -145,7 +133,7 @@ pub fn survey() -> Vec<Survey> {
 }
 
 /// `GET /ready` — the only unauthenticated route, and the truth test.
-pub fn probe(transport: &Transport) -> bool {
+fn probe(transport: &Transport) -> bool {
     request(transport, &wire::endpoint::READY, None, None, Some(Duration::from_millis(800)))
         .map(|r| r.status == 200)
         .unwrap_or(false)
@@ -195,8 +183,7 @@ pub fn connect(name: &str) -> Result<Conn, String> {
     }
 
     let home = runtime_dir()?;
-    let sidecar = read_sidecar(&home, name);
-    if let Some(transport) = berth_transport(sidecar.as_ref()) {
+    if let Some(transport) = read_transport(&home, name) {
         return Ok(Conn {
             name: name.to_string(),
             transport,
@@ -228,8 +215,7 @@ fn ensure_berth(
             let Ok(j) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
             if j["db"].as_str() == Some(&canon.display().to_string()) {
                 if let Some(name) = j["name"].as_str() {
-                    let sc = read_sidecar(&home, name);
-                    if let Some(t) = berth_transport(sc.as_ref()) {
+                    if let Some(t) = read_transport(&home, name) {
                         return Ok((t, berth_token(&home, name), false));
                     }
                 }
@@ -261,8 +247,7 @@ fn ensure_berth(
     if !status.success() {
         return Err(format!("harbor start failed for {}", canon.display()));
     }
-    let sc = read_sidecar(&home, &name);
-    let transport = berth_transport(sc.as_ref())
+    let transport = read_transport(&home, &name)
         .ok_or_else(|| format!("harbor start returned without registering {name:?}"))?;
     Ok((transport, berth_token(&home, &name), true))
 }
