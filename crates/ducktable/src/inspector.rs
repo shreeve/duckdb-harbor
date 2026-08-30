@@ -26,7 +26,9 @@ impl Grid {
             .h_full()
             .px_3()
             .py_2()
-            .bg(t.surface)
+            // Raised, like the proof's inspector pane — not another white
+            // panel against the white grid.
+            .bg(t.raised)
             .border_l_1()
             .border_color(t.border)
             .overflow_y_scroll()

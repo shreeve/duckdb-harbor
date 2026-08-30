@@ -491,6 +491,10 @@ impl Render for Grid {
                     .gap_3()
                     .flex_none()
                     .items_center()
+                    // Raised like the proof's tab strip (design.css
+                    // `.tabs`) — the white grid sits between raised
+                    // strips instead of white-on-white.
+                    .bg(t.raised)
                     .border_b_1()
                     .border_color(t.border)
                     .child(
@@ -519,7 +523,9 @@ impl Render for Grid {
                             .gap(px(2.))
                             .p(px(2.))
                             .rounded(px(6.))
-                            .bg(t.raised)
+                            // Surface track on the raised strip, the same
+                            // relationship the footer seg has to its bar.
+                            .bg(t.surface)
                             .border_1()
                             .border_color(t.grid_line)
                             .child(toggle_tile(
