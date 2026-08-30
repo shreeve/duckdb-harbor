@@ -1378,16 +1378,13 @@ impl Render for Grid {
                                 .bordered(false)
                                 .with_size(prefs::get(cx).table_size()),
                         )
-                        .child(
-                            canvas(move |b, _, _| bounds_store.set(b), |_, _, _, _| {})
-                                .absolute()
-                                .size_full(),
-                        )
                         // Painted AFTER the table, so nothing the table
                         // occludes (drag handles, scroll containers) can
                         // eclipse it — while, carrying no occlusion of its
                         // own, everything beneath still hears its events
-                        // (dragging on the line keeps working).
+                        // (dragging on the line keeps working). The canvas
+                        // rides INSIDE the strip: the strip's own bounds
+                        // are the header-row frame the hit-test needs.
                         .child(
                             div()
                                 .absolute()
@@ -1398,6 +1395,10 @@ impl Render for Grid {
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(Self::divider_double_click),
+                                )
+                                .child(
+                                    canvas(move |b, _, _| bounds_store.set(b), |_, _, _, _| {})
+                                        .size_full(),
                                 ),
                         );
                     let body = div().flex_1().min_h_0().w_full();
