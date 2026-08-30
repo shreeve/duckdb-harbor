@@ -213,9 +213,10 @@ pub fn connect(name: &str) -> Result<Conn, String> {
     Err(format!("no running database named {name:?}"))
 }
 
-/// Join the berth serving this file, else summon one via `harbor add` —
-/// pilot's D9 semantics, including the name-collision guard that keeps a
-/// summon from silently querying the wrong database.
+/// Join the berth serving this file, else summon one via `harbor start`
+/// (named `harbor add` before 0.15.0) — pilot's D9 semantics, including
+/// the name-collision guard that keeps a summon from silently querying
+/// the wrong database.
 fn ensure_berth(
     path: &Path,
     idle_exit: &str,
@@ -258,17 +259,17 @@ fn ensure_berth(
     }
     let harbor = std::env::var("HARBOR_BIN").unwrap_or_else(|_| "harbor".to_string());
     let status = std::process::Command::new(&harbor)
-        .arg("add")
+        .arg("start")
         .arg(&canon)
         .args(["--name", &name, "--idle-exit", idle_exit])
         .status()
         .map_err(|e| format!("cannot run {harbor:?} (is harbor installed?): {e}"))?;
     if !status.success() {
-        return Err(format!("harbor add failed for {}", canon.display()));
+        return Err(format!("harbor start failed for {}", canon.display()));
     }
     let sc = read_sidecar(&home, &name);
     let transport = berth_transport(&home, &name, sc.as_ref())
-        .ok_or_else(|| format!("harbor add returned without registering {name:?}"))?;
+        .ok_or_else(|| format!("harbor start returned without registering {name:?}"))?;
     Ok((transport, berth_token(&home, &name), true))
 }
 
