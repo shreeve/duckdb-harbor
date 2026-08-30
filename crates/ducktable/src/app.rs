@@ -30,6 +30,9 @@ pub struct DuckTable {
     pub(crate) attempt: u64,
     pub(crate) selected_table: Option<(String, String)>,
     pub(crate) grid: Option<Entity<crate::grid::Grid>>,
+    /// Fence for table selection: a first-page fetch that finishes after a
+    /// newer click discards itself instead of swapping in a stale grid.
+    select_seq: u64,
 }
 
 impl DuckTable {
@@ -40,11 +43,18 @@ impl DuckTable {
             attempt: 0,
             selected_table: None,
             grid: None,
+            select_seq: 0,
         };
         this.refresh(cx);
         this
     }
 
+    /// Select a table: highlight immediately, fetch its first page in the
+    /// background, and swap the grid in ONE frame once the data is ready.
+    /// The old grid stays on screen until then — a click never shows a
+    /// skeleton or columns popping in (DESIGN.md: fetch first, commit over
+    /// the old value). The fence discards a stale fetch when the user has
+    /// already clicked elsewhere.
     pub(crate) fn select_table(
         &mut self,
         schema: String,
@@ -57,8 +67,34 @@ impl DuckTable {
             _ => return,
         };
         self.selected_table = Some((clone_str(&schema), clone_str(&name)));
-        self.grid = Some(cx.new(|cx| crate::grid::Grid::new(conn, &schema, &name, window, cx)));
+        self.select_seq += 1;
+        let fence = self.select_seq;
         cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn({
+                    let conn = conn.clone();
+                    let schema = clone_str(&schema);
+                    let name = clone_str(&name);
+                    async move { crate::grid::first_page(&conn, &schema, &name) }
+                })
+                .await;
+            this.update_in(cx, |state, window, cx| {
+                if state.select_seq != fence {
+                    return;
+                }
+                if !matches!(state.phase, Phase::Connected { .. }) {
+                    return;
+                }
+                state.grid = Some(cx.new(|cx| {
+                    crate::grid::Grid::new(conn, &schema, &name, outcome, window, cx)
+                }));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -94,6 +130,7 @@ impl DuckTable {
         self.phase = Phase::Connecting { name: clone_str(&name) };
         self.selected_table = None;
         self.grid = None;
+        self.select_seq += 1;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let target = clone_str(&name);
@@ -130,6 +167,7 @@ impl DuckTable {
         self.phase = Phase::Idle;
         self.selected_table = None;
         self.grid = None;
+        self.select_seq += 1;
         cx.notify();
     }
 

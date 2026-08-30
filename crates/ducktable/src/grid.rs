@@ -59,32 +59,55 @@ pub(crate) struct GridDelegate {
 }
 
 impl Grid {
+    /// Build a grid from an already-fetched first page. The caller fetches
+    /// BEFORE constructing (DESIGN.md: fetch first, commit over the old
+    /// value), so the swap from the previous grid is one complete frame —
+    /// no skeleton, no columns popping in, no gutter re-widening.
     pub(crate) fn new(
         conn: Conn,
         schema: &str,
         name: &str,
+        outcome: Result<harbor_client::QueryResult, String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let delegate = GridDelegate {
+        let gutter = prefs::get(cx).row_numbers;
+        let mut delegate = GridDelegate {
             conn,
             source: format!("{}.{}", qident(schema), qident(name)),
             title: format!("{schema}.{name}"),
             cols: Vec::new(),
             schema_cols: Vec::new(),
             numeric: Vec::new(),
-            gutter: prefs::get(cx).row_numbers,
+            gutter,
             rows: Vec::new(),
             eof: false,
             loading: false,
             error: None,
             last_time_ms: 0,
         };
-        let table = cx.new(|cx| {
-            let mut state = TableState::new(delegate, window, cx);
-            state.delegate_mut().fetch_next_page(cx);
-            state
-        });
+        match outcome {
+            Ok(page) => {
+                delegate.eof = page.rows.len() < PAGE;
+                delegate.last_time_ms = page.time_ms;
+                delegate.numeric = page
+                    .columns
+                    .iter()
+                    .map(|c| numeric(&c.duckdb_type.to_uppercase()))
+                    .collect();
+                delegate.cols = build_columns(&page.columns, gutter);
+                if gutter {
+                    delegate.cols[0].width = px(gutter_width(page.rows.len()));
+                }
+                delegate.schema_cols = page.columns;
+                delegate.rows = page.rows;
+            }
+            Err(message) => {
+                delegate.error = Some(message);
+                delegate.eof = true;
+            }
+        }
+        let table = cx.new(|cx| TableState::new(delegate, window, cx));
         Self { table }
     }
 
@@ -125,7 +148,6 @@ impl GridDelegate {
                 .await;
             state
                 .update(cx, |state, cx| {
-                    let first = state.delegate().cols.is_empty();
                     {
                         let d = state.delegate_mut();
                         d.loading = false;
@@ -133,15 +155,6 @@ impl GridDelegate {
                             Ok(page) => {
                                 d.eof = page.rows.len() < PAGE;
                                 d.last_time_ms = page.time_ms;
-                                if first {
-                                    d.numeric = page
-                                        .columns
-                                        .iter()
-                                        .map(|c| numeric(&c.duckdb_type.to_uppercase()))
-                                        .collect();
-                                    d.cols = build_columns(&page.columns, d.gutter);
-                                    d.schema_cols = page.columns;
-                                }
                                 d.rows.extend(page.rows);
                             }
                             Err(message) => d.error = Some(message),
@@ -158,8 +171,6 @@ impl GridDelegate {
                             .is_some_and(|c| c.width != want);
                     if widen {
                         state.delegate_mut().cols[0].width = want;
-                    }
-                    if first || widen {
                         state.refresh(cx);
                     }
                     cx.notify();
@@ -287,12 +298,17 @@ impl TableDelegate for GridDelegate {
     ) -> impl IntoElement {
         let t = pal(cx);
         if self.gutter && col_ix == 0 {
+            // Same firm divider as the gutter's body cells, so the line is
+            // continuous from the header down.
             return div()
+                .relative()
                 .size_full()
+                .px_1p5()
                 .text_right()
                 .text_size(px(GUTTER_TEXT))
                 .text_color(t.muted)
                 .child("#")
+                .child(div().absolute().right_0().top_0().bottom_0().w(px(1.)).bg(t.border))
                 .into_any_element();
         }
         let data_col = col_ix - self.gutter as usize;
@@ -430,6 +446,18 @@ impl Render for Grid {
                     .child(Table::new(&self.table).bordered(false).with_size(GRID_SIZE)),
             )
     }
+}
+
+/// Fetch a table's first page. SQL construction (quoting, paging) is this
+/// module's business; app.rs calls this on a background thread before it
+/// builds the grid.
+pub(crate) fn first_page(
+    conn: &Conn,
+    schema: &str,
+    name: &str,
+) -> Result<harbor_client::QueryResult, String> {
+    let sql = format!("SELECT * FROM {}.{} LIMIT {}", qident(schema), qident(name), PAGE);
+    harbor_client::query(conn, &sql)
 }
 
 fn qident(s: &str) -> String {
