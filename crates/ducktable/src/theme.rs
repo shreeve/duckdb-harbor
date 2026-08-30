@@ -42,7 +42,15 @@ pub struct Pal {
     pub grid_line: Hsla,
 }
 
+impl gpui::Global for Pal {}
+
+/// The derived palette. Cached as a global by `apply` — pal() runs per
+/// cell per frame, so it must be a plain global read, not a re-derive.
 pub fn pal(cx: &App) -> Pal {
+    *cx.global::<Pal>()
+}
+
+fn compute_pal(cx: &App) -> Pal {
     let t = &cx.theme().colors;
     Pal {
         bg_sidebar: t.sidebar,
@@ -146,6 +154,7 @@ fn apply(config: &Rc<ThemeConfig>, cx: &mut App) {
     }
     theme.mode = config.mode;
     theme.apply_config(config);
+    cx.set_global(compute_pal(cx));
 }
 
 pub fn current_name(cx: &App) -> String {
