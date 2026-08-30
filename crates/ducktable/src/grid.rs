@@ -207,10 +207,10 @@ impl TableDelegate for GridDelegate {
                         .flex_none()
                         .px(px(5.))
                         .rounded(px(4.))
-                        .bg(t.grid_line)
+                        .bg(t.grid_line.opacity(0.55))
                         .text_size(px(TAG_TEXT))
                         .font_family(ui_font())
-                        .text_color(t.muted)
+                        .text_color(t.muted.opacity(0.65))
                         .child("NULL"),
                 )
                 .into_any_element(),
