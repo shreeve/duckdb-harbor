@@ -233,7 +233,7 @@ impl Grid {
     }
 
     /// Column show/hide, in a popover that stays open across toggles.
-    fn columns_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn columns_popover(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let grid = cx.entity();
         gpui_component::popover::Popover::new("columns-popover")
             .anchor(Corner::BottomLeft)

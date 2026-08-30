@@ -13,7 +13,7 @@ impl DuckTable {
         div().size_2().rounded_full().bg(t.level(level))
     }
 
-    pub(crate) fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let t = pal(cx);
         let berth_filter = self
             .berth_filter

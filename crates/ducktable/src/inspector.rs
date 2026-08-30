@@ -15,7 +15,7 @@ use gpui::*;
 use gpui_component::StyledExt as _;
 
 impl Grid {
-    pub(crate) fn inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn inspector(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let t = pal(cx);
         let z = crate::prefs::get(cx).zoom_factor();
 

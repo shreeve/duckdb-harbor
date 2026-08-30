@@ -11,7 +11,7 @@ use gpui_component::*;
 use harbor_client::Level;
 
 impl DuckTable {
-    pub(crate) fn content(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn content(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let t = pal(cx);
         if let (Phase::Connected { .. }, Some(grid)) = (&self.phase, &self.grid) {
             return div()

@@ -163,7 +163,7 @@ const TYPE_W: f32 = 180.;
 const ATTR_W: f32 = 130.;
 
 impl Grid {
-    pub(crate) fn structure_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn structure_view(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let t = pal(cx);
         let z = crate::prefs::get(cx).zoom_factor();
         let mut pane = div()
@@ -284,7 +284,7 @@ fn header_row(t: Pal, z: f32) -> impl IntoElement {
         )
 }
 
-fn cell(t: Pal, z: f32, text: &str, w: f32, muted: bool) -> impl IntoElement {
+fn cell(t: Pal, z: f32, text: &str, w: f32, muted: bool) -> impl IntoElement + use<> {
     div()
         .w(px(w * z))
         .flex_none()
