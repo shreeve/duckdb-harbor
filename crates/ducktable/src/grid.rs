@@ -316,16 +316,16 @@ impl Grid {
                 .placeholder("Search columns\u{2026}")
         });
         let ddl_input = structure.as_ref().and_then(|s| s.ddl.clone()).map(|ddl| {
-            // Seed the real height up front: an auto-grow input first
-            // paints at min_rows and only reaches its measured height on a
-            // later repaint (often the next blink tick), which read as the
-            // DDL arriving in two stages. The text is one definition per
-            // line, so the line count IS the height; `.rows(n)` also caps
-            // growth there, which keeps the old 24-row ceiling.
+            // A fixed height, never a measured one: the text is one
+            // definition per line, so the line count IS the height (capped
+            // at 24, the rest reachable by scroll). Auto-grow would ask
+            // the text wrapper instead and apply the answer a frame late,
+            // which showed as the DDL flapping between two rows and full
+            // size with mouse activity.
             let rows = ddl.lines().count().clamp(2, 24);
             cx.new(|cx| {
                 gpui_component::input::InputState::new(window, cx)
-                    .auto_grow(2, 24)
+                    .multi_line(true)
                     .rows(rows)
                     .default_value(ddl)
             })
