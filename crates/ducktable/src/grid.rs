@@ -89,6 +89,10 @@ pub(crate) struct Grid {
     /// The Columns popover's search box — persistent so the query
     /// survives re-renders while the popover is open.
     pub(crate) col_search: Entity<gpui_component::input::InputState>,
+    /// The Structure view's DDL block: a DISABLED multi-line Input, so
+    /// the text is natively selectable (mouse drag, Cmd+C) while every
+    /// mutation stays gated off. None when the table has no DDL.
+    pub(crate) ddl_input: Option<Entity<gpui_component::input::InputState>>,
     /// Fence for page fetches: a newer fetch supersedes an older one in
     /// flight, whose outcome is then discarded instead of committing
     /// stale rows.
@@ -311,6 +315,13 @@ impl Grid {
             gpui_component::input::InputState::new(window, cx)
                 .placeholder("Search columns\u{2026}")
         });
+        let ddl_input = structure.as_ref().and_then(|s| s.ddl.clone()).map(|ddl| {
+            cx.new(|cx| {
+                gpui_component::input::InputState::new(window, cx)
+                    .auto_grow(2, 24)
+                    .default_value(ddl)
+            })
+        });
         cx.subscribe(&col_search, |_, _, _: &gpui_component::input::InputEvent, cx| {
             cx.notify();
         })
@@ -322,6 +333,7 @@ impl Grid {
             structure,
             resize,
             col_search,
+            ddl_input,
             fetch_seq: 0,
         }
     }

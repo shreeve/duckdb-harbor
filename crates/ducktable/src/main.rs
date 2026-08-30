@@ -54,6 +54,9 @@ impl AssetSource for Assets {
             "icons/check.svg" => {
                 Some(include_bytes!("../../../assets/icons/check.svg").into())
             }
+            "icons/copy.svg" => {
+                Some(include_bytes!("../../../assets/icons/copy.svg").into())
+            }
             "icons/funnel.svg" => {
                 Some(include_bytes!("../../../assets/icons/funnel.svg").into())
             }
