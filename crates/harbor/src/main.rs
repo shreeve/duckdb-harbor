@@ -24,6 +24,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod doctor;
 
+// Paths, names, permissions and durations live in harbor-common so pilot and
+// ducktable cannot drift from them. What stays here is what only a server
+// does: claiming a berth, and creating the directory it claims in.
+use harbor_common::lifetime::parse_duration;
+use harbor_common::perms::{chmod, write_private};
+use harbor_common::normalize;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> ExitCode {
@@ -119,25 +126,6 @@ struct Opts {
     max_temp_size: Option<String>,
 }
 
-/// "90s", "10m", "2h", or bare seconds.
-fn parse_duration(s: &str) -> Result<Duration, String> {
-    // Split off a trailing alphabetic unit. `trim_end_matches` works in whole
-    // chars, so a multibyte unit (`5µs`, `5é`) can't land `split_at` inside a
-    // UTF-8 char and panic — it just fails the unit match below.
-    let num = s.trim_end_matches(char::is_alphabetic);
-    let unit = &s[num.len()..];
-    let n: u64 = num.parse().map_err(|_| format!("bad duration {s:?}"))?;
-    // checked, because `n * 3600` wraps in release: `--idle-exit 9999999999999999h`
-    // parsed fine and then meant something arbitrary and small.
-    let secs = match unit {
-        "" | "s" => Some(n),
-        "m" => n.checked_mul(60),
-        "h" => n.checked_mul(3600),
-        _ => return Err(format!("bad duration unit in {s:?} (use s, m, h)")),
-    };
-    let secs = secs.ok_or_else(|| format!("duration {s:?} is too large"))?;
-    Ok(Duration::from_secs(secs))
-}
 
 fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
     let mut it = rest.into_iter();
@@ -210,112 +198,29 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
     Ok(o)
 }
 
-/// Berth names are registry filenames: [a-z0-9_-], 1..=64.
-fn normalize(name: &str) -> Result<String, String> {
-    let n: String = name
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '-' })
-        .collect();
-    if n.is_empty() || n.len() > 64 {
-        return Err(format!("bad berth name {name:?}"));
-    }
-    Ok(n)
-}
 
-/// The config root: $HARBOR_HOME, else ~/.config/harbor. Holds config.toml
-/// and the runtime/ dir; nothing else.
+/// The runtime dir, created and tightened before use.
 ///
-/// Guarded 0700 for the same reason runtime/ is, and it is not a lesser case:
-/// config.toml holds bearer tokens outright, and `token-cmd`, which pilot runs
-/// through `sh -c`. A world-writable config root is therefore not a leak but
-/// code execution as its owner, the next time anyone opens a berth.
-fn config_root() -> Result<PathBuf, String> {
-    match std::env::var("HARBOR_HOME") {
-        Ok(h) => Ok(PathBuf::from(h)),
-        Err(_) => {
-            let h = std::env::var("HOME")
-                .or_else(|_| std::env::var("USERPROFILE"))
-                .map_err(|_| "neither $HOME nor %USERPROFILE% is set")?;
-            Ok(Path::new(&h).join(".config").join("harbor"))
+/// Harbor is the only thing that writes here, so it is the only thing that
+/// creates it. Both this and the state root are chmod'd on every run, not
+/// just at creation: they hold sockets and token files, which are the local
+/// access control, and a directory made earlier by hand or under a sloppy
+/// umask must not be allowed to stay world-listable.
+///
+/// The config root is tightened only if it already exists. Nothing of
+/// harbor's lives there, and a server should not conjure a config directory.
+fn harbor_home() -> Result<PathBuf, String> {
+    let run = harbor_common::runtime_dir()?;
+    harbor_common::perms::ensure_private_dir(&run)?;
+    if let Ok(state) = harbor_common::state_root() {
+        let _ = chmod(&state, 0o700);
+    }
+    if let Ok(cfg) = harbor_common::config_root() {
+        if cfg.exists() {
+            let _ = chmod(&cfg, 0o700);
         }
     }
-}
-
-/// The runtime dir: $HARBOR_HOME/runtime — sockets, locks, sidecars, tokens,
-/// history, log/. Created on demand; chmod'd 0700 unconditionally, because
-/// sockets and tokens are the local access control and a dir made earlier by
-/// hand (or a sloppy umask) must not stay world-listable.
-fn harbor_home() -> Result<PathBuf, String> {
-    let root = config_root()?;
-    let run = root.join("runtime");
-    if !run.exists() {
-        // Created 0700 rather than created-then-tightened. `create_dir_all`
-        // applies the umask, so the plain form makes the directory 0755 for
-        // the instant before the chmod below — and this is the directory that
-        // holds every token file, so a race in that window lets another local
-        // user plant a `<name>.token` this process would then adopt as its own
-        // credential. Being born with the right mode has no window at all.
-        create_dir_private(&run)
-            .map_err(|e| format!("cannot create {}: {e}", run.display()))?;
-    }
-    // Both, unconditionally, every run: the root carries config.toml (tokens
-    // and token-cmd) and the runtime dir carries sockets and token files, so
-    // neither may be left readable — or writable — by anyone else, whatever
-    // umask or hand-made directory got there first.
-    let _ = chmod(&root, 0o700);
-    let _ = chmod(&run, 0o700);
     Ok(run)
-}
-
-/// Create a file that is 0600 from its first byte, and write `contents` to it.
-///
-/// The point is the absence of a window: `fs::write` followed by `chmod` is
-/// correct at rest and wrong in between, and "in between" is where a secret
-/// leaks.
-fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(contents.as_bytes())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents)
-    }
-}
-
-/// Create a directory that is 0700 from the moment it exists. Same reasoning
-/// as `write_private`, for the directory the tokens live in.
-fn create_dir_private(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(path)
-    }
-}
-
-fn chmod(path: &Path, mode: u32) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-    use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-        Ok(())
-    }
 }
 
 /// Claim a berth name for this process's lifetime. Unix uses flock so the

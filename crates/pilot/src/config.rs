@@ -1,256 +1,108 @@
-//! The client address book: $HARBOR_HOME/config.toml (PLAN.md D10a).
+//! pilot's half of the config.
 //!
-//! Purely additive — zero-config local always works. The config only teaches
-//! pilot what the filesystem cannot reveal: remote urls, their credentials
-//! (never on argv: token-file or token-cmd), spawn aliases, and taste.
-//!
-//! `token-cmd` is run through `sh -c`, so the file is only read when it — and
-//! the directory holding it — is yours and unwritable by anyone else.
-//!
-//! ```toml
-//! [defaults]
-//! mode = "duckbox"
-//! timer = true
-//! theme = "duck"           # duck | mono | vivid
-//! appearance = "auto"      # auto | light | dark
-//!
-//! [connection.medlabs]
-//! url = "http://127.0.0.1:9495"
-//! token-file = "~/.config/harbor/runtime/medlabs.token"     # or token-cmd = "op read ..."
-//!
-//! [connection.scratch]
-//! path = "~/Data/scratch.duckdb"             # spawn-on-demand alias (D9)
-//! idle-exit = "10m"
-//! ```
+//! The schema, the roots and the trust check live in `harbor-common`, so the
+//! client and the server cannot drift on where config lives or what a berth
+//! is called. What stays here is the one thing that must not be shared:
+//! [`resolve_token`] runs `token-cmd` through `sh -c`, and harbor has no
+//! business linking a code path that shells out for a credential.
 
-use serde::Deserialize;
-use std::collections::HashMap;
+pub use harbor_common::config::{Connection, Defaults, FileConfig};
+pub use harbor_common::paths::expand;
 
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub struct FileConfig {
-    #[serde(default)]
-    pub defaults: Defaults,
-    #[serde(default)]
-    pub connection: HashMap<String, Connection>,
+use std::path::PathBuf;
+
+/// Where the live fleet is on disk. harbor creates and guards it; pilot only
+/// reads and writes inside it.
+///
+/// A `Result`, deliberately. The old version fell back to `"."` when no home
+/// variable was set, which meant pilot silently looked for sockets in a
+/// *relative* directory and found none — a failure that looked like an empty
+/// fleet rather than a broken environment.
+pub fn runtime_dir() -> Result<PathBuf, String> {
+    harbor_common::runtime_dir()
 }
 
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub struct Defaults {
-    pub mode: Option<String>,
-    pub timer: Option<bool>,
-    pub maxrows: Option<usize>,
-    pub nullvalue: Option<String>,
-    /// Syntax-highlight theme name: duck | mono | vivid (default duck).
-    pub theme: Option<String>,
-    /// Palette to build the theme for: auto | light | dark (default auto,
-    /// which asks the terminal for its background color).
-    pub appearance: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub struct Connection {
-    pub url: Option<String>,
-    pub path: Option<String>,
-    pub token: Option<String>,
-    pub token_file: Option<String>,
-    pub token_cmd: Option<String>,
-    pub idle_exit: Option<String>,
-}
-
-impl Connection {
-    /// flag > env beat the config; within it: token > token-file > token-cmd.
-    pub fn resolve_token(&self) -> Option<String> {
-        if let Some(t) = &self.token {
-            return Some(t.clone());
-        }
-        if let Some(f) = &self.token_file {
-            if let Ok(t) = std::fs::read_to_string(expand(f)) {
-                let t = t.trim().to_string();
-                if !t.is_empty() {
-                    return Some(t);
-                }
-            }
-        }
-        if let Some(cmd) = &self.token_cmd {
-            let out = std::process::Command::new("sh").arg("-c").arg(cmd).output().ok()?;
-            if out.status.success() {
-                let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !t.is_empty() {
-                    return Some(t);
-                }
-            }
-        }
-        None
-    }
-}
-
-/// The config root: $HARBOR_HOME, else ~/.config/harbor. Holds config.toml
-/// and the runtime/ dir.
-pub fn config_root() -> std::path::PathBuf {
-    if let Ok(h) = std::env::var("HARBOR_HOME") {
-        return std::path::PathBuf::from(h);
-    }
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".into());
-    std::path::Path::new(&home).join(".config").join("harbor")
-}
-
-/// The runtime dir: $HARBOR_HOME/runtime — where the live fleet lives on
-/// disk (sockets, sidecars, tokens, history). harbor creates and guards it;
-/// pilot only reads and writes inside it.
-pub fn harbor_home() -> std::path::PathBuf {
-    config_root().join("runtime")
+/// The REPL history file, or nothing if there is no home to put it in — in
+/// which case the caller keeps history in memory and says so.
+pub fn history_file() -> Option<PathBuf> {
+    harbor_common::history_file().ok()
 }
 
 pub fn load() -> FileConfig {
-    load_from(&config_root())
+    harbor_common::config::load_or_empty("pilot")
 }
 
-fn load_from(root: &std::path::Path) -> FileConfig {
-    let path = root.join("config.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return FileConfig::default();
-    };
-    // Anyone who can rewrite this file is not editing settings, they are
-    // writing a program: `token-cmd` runs through `sh -c`, and `url` decides
-    // who receives the bearer token. So refuse it whole, the way ssh refuses
-    // a loose identity file, rather than trust it in part.
-    if let Some(bad) = [&path, &root.to_path_buf()].into_iter().find(|p| exposed(p)) {
-        let who = match *bad == path {
-            true => "it is".to_string(),
-            false => format!("{} is", bad.display()),
-        };
-        eprintln!(
-            "pilot: ignoring {} — {who} writable by others or not yours (chmod go-w it)",
-            path.display()
-        );
-        return FileConfig::default();
+/// flag > env beat the config; within it: token > token-file > token-cmd.
+pub fn resolve_token(c: &Connection) -> Option<String> {
+    if let Some(t) = &c.token {
+        return Some(t.clone());
     }
-    match toml::from_str(&text) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("pilot: {} is not valid: {e}", path.display());
-            FileConfig::default()
+    if let Some(f) = &c.token_file {
+        if let Ok(t) = std::fs::read_to_string(expand(f)) {
+            let t = t.trim().to_string();
+            if !t.is_empty() {
+                return Some(t);
+            }
         }
     }
-}
-
-/// True if someone other than us could swap this path's contents out from
-/// under us: group- or world-writable, or owned by another user. A sticky
-/// directory (/tmp) is writable by all but hijackable by none, so it passes.
-#[cfg(unix)]
-fn exposed(path: &std::path::Path) -> bool {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let Ok(md) = std::fs::metadata(path) else {
-        return false;
-    };
-    let mode = md.permissions().mode();
-    let sticky = md.is_dir() && mode & 0o1000 != 0;
-    let uid = unsafe { libc::getuid() };
-    (mode & 0o022 != 0 && !sticky) || (md.uid() != uid && md.uid() != 0)
-}
-
-#[cfg(not(unix))]
-fn exposed(_path: &std::path::Path) -> bool {
-    false
-}
-
-/// `~/` expansion, nothing fancier.
-pub fn expand(p: &str) -> std::path::PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Ok(h) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-            return std::path::Path::new(&h).join(rest);
+    if let Some(cmd) = &c.token_cmd {
+        let out = std::process::Command::new("sh").arg("-c").arg(cmd).output().ok()?;
+        if out.status.success() {
+            let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !t.is_empty() {
+                return Some(t);
+            }
         }
     }
-    std::path::PathBuf::from(p)
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn conn(toml_src: &str) -> Connection {
+        let c: FileConfig = toml::from_str(toml_src).unwrap();
+        c.connection.into_values().next().unwrap()
+    }
+
     #[test]
-    fn parses_the_documented_shape() {
-        let c: FileConfig = toml::from_str(
+    fn a_literal_token_beats_a_command_that_would_run() {
+        // If precedence ever inverted, this would shell out. It must not.
+        let c = conn(
             r#"
-            [defaults]
-            mode = "csv"
-            timer = true
-
-            [connection.medlabs]
-            url = "http://127.0.0.1:9495"
-            token-file = "~/.config/harbor/runtime/medlabs.token"
-
-            [connection.scratch]
-            path = "~/Data/scratch.duckdb"
-            idle-exit = "10m"
+            [connection.x]
+            url = "https://h"
+            token = "literal"
+            token-cmd = "exit 1"
             "#,
-        )
-        .unwrap();
-        assert_eq!(c.defaults.mode.as_deref(), Some("csv"));
-        assert_eq!(c.connection["medlabs"].url.as_deref(), Some("http://127.0.0.1:9495"));
-        assert_eq!(c.connection["scratch"].idle_exit.as_deref(), Some("10m"));
+        );
+        assert_eq!(resolve_token(&c), Some("literal".into()));
     }
 
     #[test]
-    fn empty_config_is_fine() {
-        let c: FileConfig = toml::from_str("").unwrap();
-        assert!(c.connection.is_empty());
-    }
-
-    #[cfg(unix)]
-    fn scratch(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("pilot-cfg-{}-{tag}", std::process::id()));
-        std::fs::remove_dir_all(&d).ok();
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(
-            d.join("config.toml"),
-            "[connection.x]\nurl = \"http://127.0.0.1:1\"\ntoken-cmd = \"echo pwned\"\n",
-        )
-        .unwrap();
-        d
-    }
-
-    #[cfg(unix)]
-    fn chmod(p: &std::path::Path, mode: u32) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    fn token_cmd_is_the_last_resort_and_its_output_is_trimmed() {
+        let c = conn(
+            r#"
+            [connection.x]
+            url = "https://h"
+            token-cmd = "printf '  shelled  \n'"
+            "#,
+        );
+        assert_eq!(resolve_token(&c), Some("shelled".into()));
     }
 
     #[test]
-    #[cfg(unix)]
-    fn a_config_only_its_owner_can_write_is_used() {
-        let d = scratch("ok");
-        chmod(&d, 0o755);
-        chmod(&d.join("config.toml"), 0o644);
-        assert!(load_from(&d).connection.contains_key("x"));
-        std::fs::remove_dir_all(&d).ok();
+    fn a_failing_or_empty_token_cmd_yields_nothing() {
+        for cmd in ["exit 1", "printf ''", "printf '   '"] {
+            let c = conn(&format!("[connection.x]\nurl = \"https://h\"\ntoken-cmd = \"{cmd}\"\n"));
+            assert_eq!(resolve_token(&c), None, "{cmd:?}");
+        }
     }
 
     #[test]
-    #[cfg(unix)]
-    fn a_group_writable_config_is_refused_whole() {
-        let d = scratch("file");
-        chmod(&d, 0o755);
-        chmod(&d.join("config.toml"), 0o664);
-        // Not merely token-cmd: the whole file, url and all, is untrusted.
-        assert!(load_from(&d).connection.is_empty());
-        std::fs::remove_dir_all(&d).ok();
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn a_config_in_a_writable_directory_is_refused() {
-        // The file itself is tight, but the directory lets anyone replace it.
-        let d = scratch("dir");
-        chmod(&d.join("config.toml"), 0o600);
-        chmod(&d, 0o777);
-        assert!(load_from(&d).connection.is_empty());
-        chmod(&d, 0o755);
-        std::fs::remove_dir_all(&d).ok();
+    fn nothing_configured_is_not_an_error() {
+        let c = conn("[connection.x]\nurl = \"https://h\"\n");
+        assert_eq!(resolve_token(&c), None);
     }
 }
