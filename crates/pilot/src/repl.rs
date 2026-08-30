@@ -315,8 +315,9 @@ pub fn run(conn: &Conn, name: &str, mut opts: RenderOpts) -> std::process::ExitC
     // first Tab and survives editor rebuilds (.keymode), refreshing on .open.
     let completer = SqlCompleter::new(conn.clone());
     let mut line_editor = make_editor(&completer, vi);
+    // No greeting: the prompt appearing IS the connection confirmed, and
+    // its name says to what. Discovery lives in .help; fanfare helps no one.
     let mut prompt = BerthPrompt { name: name.to_string() };
-    eprintln!("pilot: connected to {name} (.help for help, .quit to leave)");
 
     loop {
         match line_editor.read_line(&prompt) {
@@ -338,8 +339,8 @@ pub fn run(conn: &Conn, name: &str, mut opts: RenderOpts) -> std::process::ExitC
                                     conn = c;
                                     _keepalive = ReplKeepalive::new(conn.clone());
                                     completer.reconnect(conn.clone());
-                                    prompt = BerthPrompt { name: target.clone() };
-                                    eprintln!("pilot: connected to {target}");
+                                    // The prompt changing name announces the switch.
+                                    prompt = BerthPrompt { name: crate::prompt_name(&target) };
                                 }
                                 Err(e) => eprintln!("pilot: {e}"),
                             }

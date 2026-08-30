@@ -130,7 +130,7 @@ fn main() -> ExitCode {
                 // "auto" appearance queries the terminal (OSC 11), which needs
                 // an interactive stdin/stdout and must run before reedline does.
                 theme::init(cfg.defaults.theme.as_deref(), cfg.defaults.appearance.as_deref());
-                return repl::run(&conn, &target, opts);
+                return repl::run(&conn, &prompt_name(&target), opts);
             }
             let mut s = String::new();
             if std::io::stdin().read_to_string(&mut s).is_err() || s.trim().is_empty() {
@@ -386,6 +386,21 @@ fn url_transport(url: &str) -> Result<Transport, String> {
     Err(format!("not a url: {url}"))
 }
 
+/// The short name a prompt wears: a berth name stays itself, a path or
+/// socket shows its stem, a url drops its scheme. The prompt orients; the
+/// full target is one `harbor show` away.
+pub fn prompt_name(target: &str) -> String {
+    if let Some(rest) = target.split_once("://").map(|(_, r)| r) {
+        return rest.trim_end_matches('/').to_string();
+    }
+    if target.ends_with(".duckdb") || target.ends_with(".sock") || target.contains('/') {
+        if let Some(stem) = std::path::Path::new(target).file_stem() {
+            return stem.to_string_lossy().into_owned();
+        }
+    }
+    target.to_string()
+}
+
 /// Join the live berth that owns this file, or exec `harbor` to summon an
 /// ephemeral one (idle-exit reaps it). Returns socket + the
 /// berth's token, if readable.
@@ -443,7 +458,8 @@ fn ensure_berth(
         ));
     }
     let harbor = std::env::var("HARBOR_BIN").unwrap_or_else(|_| "harbor".to_string());
-    eprintln!("pilot: starting a temp database for {} (exits after {} idle)", canon.display(), life.describe());
+    // No announcement: the operator asked for this database and gets a
+    // prompt, not a narration. `harbor show` carries the lifetime story.
     let mut cmd = std::process::Command::new(&harbor);
     cmd.args(["start"]).arg(&canon).args(["--name", &name]);
     // A Lifetime knows its own argv, so "never" reaches harbor as the absence
