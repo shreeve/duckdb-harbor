@@ -167,7 +167,9 @@ impl DuckTable {
                 )
                 .child(
                     glyph("refresh-catalog", false)
-                        .child(svg().path("icons/refresh-cw.svg").size_3p5())
+                        // A raw svg() does NOT inherit text color (Icon
+                        // sets it explicitly); without this it's invisible.
+                        .child(svg().path("icons/refresh-cw.svg").size_3p5().text_color(t.muted))
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                             this.refresh_catalog(cx);
                         })),
