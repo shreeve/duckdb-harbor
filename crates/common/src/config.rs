@@ -244,7 +244,7 @@ mod tests {
         [connection.warehouse]
         path = "/srv/data/inventory.duckdb"
         memory-limit = "8GB"
-        init = ["LOAD ui"]
+        init = ["SET threads=4"]
 
         [connection.prod]
         url = "https://db.example.com"
@@ -264,7 +264,7 @@ mod tests {
 
         let w = c.get("warehouse").unwrap();
         assert_eq!(w.memory_limit.as_deref(), Some("8GB"));
-        assert_eq!(w.init.as_deref(), Some(&["LOAD ui".to_string()][..]));
+        assert_eq!(w.init.as_deref(), Some(&["SET threads=4".to_string()][..]));
     }
 
     #[test]

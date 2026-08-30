@@ -128,6 +128,20 @@ tiny_http 0.12.0 (MIT OR Apache-2.0) and relicensed here under its MIT option.
 That is historical lineage, not a current dependency, vendoring relationship,
 or upstream synchronization policy. Harbor's crate removed the unrelated
 surface and has since evolved under first-party ownership while retaining the
-delicate HTTP semantics that its tests pin. See [LICENSE](LICENSE) for combined
-attribution, PLAN.md D12 for the decision record, and the **justhttp** section
-of [TODO.md](../../TODO.md) for the maintenance ledger.
+delicate HTTP semantics that its tests pin. See [LICENSE](LICENSE) for
+combined attribution.
+
+## Maintenance
+
+- **Every hardening behavior has a regression test** — `tests/drain.rs`
+  (a dropped request with `Content-Length: 1 GiB` must allocate < 1 MiB;
+  measured via a global allocator) and the `stall` module in
+  `tests/suite.rs` (a client that stops reading its response cannot pin a
+  worker; the 10s write timeout frees it), plus the `head` module in
+  `tests/suite.rs` for the request-head bounds, the framing checks, and the
+  `TE`/HTTP-1.0 streaming properties. If any of these fails, that is a
+  security regression, not a flake.
+- **What justhttp deliberately lacks** (do not "fix"): TLS (the edge
+  proxy's job), websocket upgrades, HTTP/2 and /3, `TestRequest`/test
+  scaffolding, and every API harbor doesn't call. New surface should be
+  added only when harbor needs it.

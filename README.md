@@ -134,11 +134,10 @@ impatient users, set `HARBOR_STATEMENT_TIMEOUT_MS` or
 `--statement-timeout <duration>`.
 
 Two smaller things follow from the same machinery. Releasing a session whose
-statement is still running now stops it — `{"released":false,"cancelling":true}`
-— and the connection comes back on the reaper's next tick, where before the
-release was simply refused. And a lease that blows its TTL while busy is
-reclaimed, where the reaper used to skip it: the one lease that most needed
-taking back, wedged inside a runaway statement, was the one it could never take.
+statement is still running stops it — `{"released":false,"cancelling":true}`
+— and the connection comes back on the reaper's next tick. And a lease that
+blows its TTL while busy is reclaimed: the lease that most needs taking back
+is the one wedged inside a runaway statement.
 
 Cancelling a statement inside a transaction aborts that transaction, exactly as
 it does in Postgres. Harbor does not paper over it — the next statement gets
@@ -448,23 +447,23 @@ with `"lossless": false` instead of returning a plausible wrong answer.
 
 ## Where it fits
 
-DuckDB's ecosystem already covers two audiences. DuckDB Harbor covers the
-third.
+DuckDB's ecosystem already covers DuckDB talking to DuckDB. DuckDB Harbor
+covers everyone else.
 
 | Serves | Client needs |
 | --- | --- |
 | `quack` — other DuckDB instances | DuckDB |
-| `ui` — a browser | a browser |
 | **`harbor` — everything else** | **`curl`** |
 
-`quack` and `ui` are DuckDB extensions; `harbor` is a standalone server. It can
+`quack` is a DuckDB extension; `harbor` is a standalone server. It can
 still load an extension into its own database with
 `harbor serve db.duckdb --unsigned --init 'LOAD <ext>'`, so one process can answer
-HTTP clients, browsers, and other DuckDB instances over one file at once. Harbor
+HTTP clients and other DuckDB instances over one file at once. Harbor
 ships no extension of its own — whatever `LOAD` resolves by name in `~/.duckdb`
-is what it gets, and matching that to the linked engine is the operator's call.
-[upstream compatibility issue](https://github.com/duckdb/duckdb-ui/issues/242)
-lands; Harbor does not patch extension source while loading it.
+is what it gets, matching that to the linked engine is the operator's call, and
+Harbor does not patch extension source while loading it. For a desktop face on
+a Harbor fleet, [DuckTable](https://github.com/shreeve/ducktable) is the
+native client.
 
 ## Known limitations
 
@@ -486,7 +485,7 @@ worth knowing before it faces a browser. Request logging is available with
 **Windows berths use loopback TCP.** Unix keeps its Unix-socket default and
 SIGTERM lifecycle. Windows assigns each berth a loopback port, records it in
 the same sidecar registry, and uses Harbor's authenticated shutdown route to
-drain and checkpoint. The Windows release does not include the UI extension.
+drain and checkpoint.
 
 **The engine is the linked `libduckdb`, not the binary.** harbor links
 dynamically, and the same build has been verified against DuckDB 1.5.5 and a

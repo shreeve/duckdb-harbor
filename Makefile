@@ -1,6 +1,6 @@
 # harbor — the fleet Makefile
 #
-# Two binaries, dynamically linked (D1): `harbor` links an external libduckdb by
+# Two binaries, dynamically linked: `harbor` links an external libduckdb by
 # an absolute rpath (baked at build time), `pilot` links no engine at all. The
 # engine lives in ~/.duckdb (DuckDB's world), version-scoped so several can
 # coexist; the two binaries install into ~/.local/bin. `make fetch-duckdb`
@@ -58,7 +58,7 @@ install: harbor pilot
 # Pull DuckDB's official v2.0-dev nightly (libduckdb + headers + duckdb CLI) from
 # artifacts.duckdb.org into $(DUCKDB_LIB); the baked rpath then resolves the
 # library in place. CI links the same official nightly via .github/actions/duckdb.
-# The matched UI extension is built against this by `make ui`. See PLAN.md D11.
+# Everything links against this one engine.
 fetch-duckdb:
 	DEST=$(DUCKDB_LIB) scripts/fetch-duckdb.sh
 

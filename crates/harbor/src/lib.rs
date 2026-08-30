@@ -1,14 +1,9 @@
 // harbor's library — the server engine: pool, leases, cancellation,
 // timeouts, the NDJSON envelope, /sql /catalog /ready routing, and the
 // SIGTERM → drain → CHECKPOINT shutdown path. The CLI (src/main.rs) is the
-// only consumer; the two were one crate again once the loadable extension
-// that justified a separate harbor-core retired (PLAN.md D5).
-//
-// This is the v0.9.1 extension's server code, moved verbatim. The extension
-// glue (vtab table functions, entrypoint) stayed behind and retired with the
-// extension (D5). The embedding host — `harbor serve` —
-// opens the DuckDB Connection, hands it to `open_pool`, and calls
-// `start`/`wait`/`stop`.
+// only consumer — one crate, bin beside lib. The embedding host —
+// `harbor serve` — opens the DuckDB Connection, hands it to `open_pool`, and
+// calls `start`/`wait`/`stop`.
 
 use std::{
     collections::HashMap,
@@ -1002,8 +997,8 @@ pub fn open_pool(con: Connection) -> Result<(), String> {
 // start / stop / wait
 // ---------------------------------------------------------------------------
 
-/// Where the server listens. Unix sockets are the fleet's default face
-/// (PLAN.md D3/D6); TCP remains for loopback and trusted-LAN use.
+/// Where the server listens. Unix sockets are the fleet's default face;
+/// TCP remains for loopback and trusted-LAN use.
 pub enum Listen {
     Tcp { bind: String, port: u16 },
     #[cfg(unix)]
@@ -2809,7 +2804,7 @@ enum CatalogStyle {
 /// that tolerance is exactly what lets a 0.17 client send `style=lite` to a
 /// 0.16 server and still get a correct (full) answer.
 fn catalog_style(url: &str) -> Result<CatalogStyle, String> {
-    let Some(query) = url.splitn(2, '?').nth(1) else { return Ok(CatalogStyle::Full) };
+    let Some(query) = url.split_once('?').map(|x| x.1) else { return Ok(CatalogStyle::Full) };
     for pair in query.split('&') {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         if key == "style" {
@@ -3293,7 +3288,7 @@ fn run_sql(
             &format!(
                 "{setting} is fixed when the berth starts (harbor serve --memory-limit/--threads) \
                  and cannot be changed over the wire: it is process-global, and this berth may \
-                 share its host with others (PLAN.md D2)"
+                 share its host with others"
             ),
         ));
         return (true, 400);
@@ -3430,7 +3425,7 @@ fn skip_trivia(b: &[u8], i: &mut usize) {
             // with a trailing comment here, so `fenced_setting` never saw the
             // key, while the engine set it. memory_limit is process-global,
             // so that is every neighbor berth's ceiling raised by one caller
-            // (PLAN.md D2) — measured going from 1.8 GiB to 931.3 GiB.
+            // — measured going from 1.8 GiB to 931.3 GiB.
             *i = b[*i..]
                 .iter()
                 .position(|&c| c == b'\n' || c == b'\r')
@@ -3499,8 +3494,8 @@ fn first_keyword(sql: &str) -> String {
 
 /// Settings a client must not change: they are process-global in DuckDB, so
 /// one `SET memory_limit='100GB'` raises it for every neighbor berth on the
-/// host and defeats the fleet-safe cap the operator chose at berth start
-/// (PLAN.md D2). Verified live: the SET took effect for all workers at once.
+/// host and defeats the fleet-safe cap the operator chose at berth start.
+/// Verified live: the SET took effect for all workers at once.
 ///
 /// Reads through comments, whitespace, and double-quoting via `next_word`, so
 /// neither `/*x*/ SET threads=8` nor `SET "memory_limit"=…` slips past.
@@ -3513,7 +3508,7 @@ fn fenced_setting(sql: &str) -> Option<&'static str> {
         "external_threads",
         // Disk spill is process-global too, and the operator caps it with
         // `--max-temp-size` precisely so one query cannot fill the shared host
-        // disk (PLAN.md D2). Left unfenced, `SET max_temp_directory_size='100TB'`
+        // disk. Left unfenced, `SET max_temp_directory_size='100TB'`
         // over the wire erases that cap; `temp_directory` redirects the spill
         // itself. Both are GLOBAL-scope in DuckDB — same class as the rest here.
         "max_temp_directory_size",
@@ -4355,7 +4350,7 @@ mod tests {
         }
     }
 
-    /// The fleet-safety fence (D2) reads through comments with the same
+    /// The fleet-safety fence reads through comments with the same
     /// scanner, and fell to the same byte from the other direction: the key
     /// hid behind a CR-terminated comment, so `fenced_setting` saw a bare
     /// `SET` and passed it, while the engine set a process-global limit.
@@ -4512,7 +4507,7 @@ mod tests {
 
     #[test]
     fn fences_process_global_settings() {
-        // The fleet-safety fence (D2): these change a DuckDB global and must
+        // The fleet-safety fence: these change a DuckDB global and must
         // not be settable over the wire.
         for sql in [
             "SET memory_limit='1TB'",

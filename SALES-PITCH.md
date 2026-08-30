@@ -1,6 +1,6 @@
 # Harbor vs. Quack: The Sales Pitch
 
-Yes—after reading the current Harbor code and DuckDB's announcement, I think **Harbor + Pilot + UI stacks up extremely nicely**.
+Yes—after reading the current Harbor code and DuckDB's announcement, I think **Harbor + Pilot + DuckTable stacks up extremely nicely**.
 
 The important distinction is:
 
@@ -46,7 +46,7 @@ That distinction is enormous for application development.
 | Result efficiency | Excellent for app-sized and streaming results    | Better for huge typed analytical transfers   |
 | Operations        | Fleet, readiness, shutdown, cancellation, leases | Native DuckDB server/session model           |
 | Human client      | Pilot                                            | DuckDB CLI with Quack                        |
-| UI                | Matched DuckDB UI served alongside Harbor        | Not the core Quack proposition               |
+| UI                | DuckTable, the native desktop client             | Not the core Quack proposition               |
 
 ## Harbor's strongest advantage
 
@@ -57,7 +57,7 @@ flowchart TD
     A["Web apps, Rip, workers, scripts"] -->|"HTTP + JSON"| H["Harbor"]
     P["Pilot"] -->|"HTTP + NDJSON"| H
     H --> D["One owned DuckDB process"]
-    U["DuckDB UI"] --> D
+    U["DuckTable"] -->|"HTTP + JSON"| H
 ```
 
 The application does not care:
@@ -116,18 +116,16 @@ The last point is particularly good. Pilot generates a query ID, streams the res
 
 And the vendored Reedline fixes demonstrate that you have worked through the irritating details that determine whether a REPL actually feels polished.
 
-## The fixed UI rounds out the product
-
-Once the exact matching DuckDB UI extension works against the exact engine Harbor loads, the package becomes:
+## The package is coherent
 
 * **Harbor:** programmatic and operational interface;
 * **Pilot:** excellent terminal interface;
-* **DuckDB UI:** visual SQL/notebook interface;
+* **DuckTable:** native desktop interface;
 * **DuckDB 2.0:** the engine.
 
 That is a coherent database product rather than merely a server experiment.
 
-The version-matching approach is especially defensible: Harbor, `libduckdb`, and the UI extension all derive from the same nightly. You are not pretending DuckDB's current extension ABI problem does not exist—you have made matching deterministic.
+The version-matching approach is especially defensible: Harbor, Pilot, and `libduckdb` all derive from the same nightly and ship in one archive. You are not pretending DuckDB's current extension ABI problem does not exist—anything an operator chooses to `LOAD` must match the linked engine, and Harbor makes that engine explicit.
 
 ## Where Quack is honestly better
 
@@ -179,4 +177,4 @@ I would pitch it as the missing application-facing counterpart:
 
 > DuckDB 2.0 gives DuckDB a native server protocol. Harbor gives every language, browser, worker, script, and application an immediately usable DuckDB service—with no driver and no protocol implementation.
 
-And yes: **Harbor + Pilot + the working UI is now an unusually complete and genuinely compelling package.** Quack does not obsolete it. DuckDB declaring "this is the year of DuckDB as a server" actually validates Harbor's premise—and greatly increases the number of people who will understand why Harbor exists.
+And yes: **Harbor + Pilot + DuckTable is an unusually complete and genuinely compelling package.** Quack does not obsolete it. DuckDB declaring "this is the year of DuckDB as a server" actually validates Harbor's premise—and greatly increases the number of people who will understand why Harbor exists.

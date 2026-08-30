@@ -2,15 +2,15 @@
 #
 # fetch-duckdb.sh — put a DuckDB engine into ~/.duckdb/cli/2.0.0/
 #
-# harbor carries no engine (PLAN.md D1); this fetches one for it to link, along
+# harbor carries no engine; this fetches one for it to link, along
 # with the two headers (kept for reference — the crate ships pregenerated
 # bindings, so the build never reads them) and the duckdb CLI that builds
 # fixtures. The source is DuckDB's official v2.0-dev nightly, from
 # artifacts.duckdb.org — the current 2.0 line straight from upstream, no fork,
 # nothing to pin. `/latest/` is the v2.0-dev channel today (it reported
 # v2.0.0-alpha38069 when this was written); if main ever rolls past 2.0, pin the
-# v2.0 channel URL below. The matched UI extension is built separately against
-# whatever this installs.
+# v2.0 channel URL below. Every binary a release ships is linked against the
+# one engine this installs — that is what "version-locked" means here.
 #
 # Override DEST to install elsewhere.
 

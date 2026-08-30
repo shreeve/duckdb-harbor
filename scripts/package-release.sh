@@ -4,9 +4,9 @@
 #
 # A release archive is self-contained and version-locked by construction:
 # harbor + pilot (built with a RELATIVE rpath: @loader_path/../lib on macOS,
-# $ORIGIN/../lib on Linux), the exact libduckdb they were built against, and
-# (on Unix) the ui extension compiled against that same engine. Windows puts
-# duckdb.dll beside the executables. Extract anywhere and run in place;
+# $ORIGIN/../lib on Linux) and the exact libduckdb they were built against.
+# Windows puts duckdb.dll beside the executables. Extract anywhere and run
+# in place;
 # install.sh copies the Unix pieces into their homes.
 #
 #   TAG=v0.15.0 PLAT=osx-arm64 scripts/package-release.sh

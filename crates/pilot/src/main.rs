@@ -1,9 +1,9 @@
 //! pilot — the Harbor client.
 //!
-//! Zero-config local (D10a): a bare name resolves to ~/.local/state/harbor/runtime/<name>.sock —
+//! Zero-config local: a bare name resolves to ~/.local/state/harbor/runtime/<name>.sock —
 //! or, for a --port berth, the TCP address its sidecar json registered — plus
 //! its token file; config.toml is purely additive (remotes, aliases, taste).
-//! TLS is Caddy's job (D6) — pilot speaks plain HTTP over UDS/TCP.
+//! TLS is Caddy's job — pilot speaks plain HTTP over UDS/TCP.
 //!
 //!   pilot                          list live berths
 //!   pilot <target>                 the REPL
@@ -184,10 +184,10 @@ options:
 
 config: $HARBOR_HOME/config.toml ([defaults] mode/timer/maxrows/nullvalue,
 [connection.<name>] url|path + token-file|token-cmd). Remote TLS is Caddy's
-job (PLAN.md D6); ssh is the human path to a remote berth.
+job; ssh is the human path to a remote berth.
 ";
 
-/// Resolution order (D9/D10a): config.toml name -> live berth name ->
+/// Resolution order: config.toml name -> live berth name ->
 /// plain-HTTP url -> .duckdb path (join-or-spawn) -> socket path. Zero-config
 /// local always works; the config is purely additive.
 fn resolve(
@@ -380,7 +380,7 @@ fn url_transport(url: &str) -> Result<Transport, String> {
     }
     if url.starts_with("https://") {
         return Err(
-            "TLS is Caddy's job, not pilot's (PLAN.md D6): pilot stays TLS-free by design. \
+            "TLS is Caddy's job, not pilot's: pilot stays TLS-free by design. \
              Use http:// on a trusted network, or ssh to the host and use the socket"
                 .into(),
         );
@@ -432,7 +432,7 @@ fn ensure_named_berth(
 }
 
 /// Join the live berth that owns this file, or exec `harbor` to summon an
-/// ephemeral one (idle-exit reaps it; see PLAN.md D9). Returns socket + the
+/// ephemeral one (idle-exit reaps it). Returns socket + the
 /// berth's token, if readable.
 fn ensure_berth(
     path: &std::path::Path,

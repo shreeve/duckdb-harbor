@@ -1,8 +1,8 @@
 # Release — push a v* tag and five self-contained archives appear on the
 # GitHub Release: osx-arm64, linux-amd64, linux-arm64, windows-amd64, and
 # windows-arm64. Each is built on a native runner against DuckDB's official v2
-# nightly and smoke-tested as packaged. Unix archives include the matched ui
-# extension; Windows archives carry harbor.exe, pilot.exe, and duckdb.dll.
+# nightly and smoke-tested as packaged. Unix archives carry harbor, pilot and
+# libduckdb; Windows archives carry harbor.exe, pilot.exe, and duckdb.dll.
 name: Release
 
 on:
@@ -30,15 +30,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # The ui source (our fork until duckdb/duckdb-ui#242 lands) and the
-      # metadata stamper it vendors. Only that one submodule — not duckdb.
-      - uses: actions/checkout@v5
-        if: ${{ !startsWith(matrix.plat, 'windows-') }}
-        with:
-          repository: shreeve/duckdb-ui
-          path: duckdb-ui
-      - if: ${{ !startsWith(matrix.plat, 'windows-') }}
-        run: git -C duckdb-ui submodule update --init extension-ci-tools
 
       - name: Fetch DuckDB engine (official v2 nightly)
         shell: bash
@@ -73,7 +64,7 @@ jobs:
         run: |
           tar -C /tmp -xzf dist/harbor-"$GITHUB_REF_NAME"-${{ matrix.plat }}.tar.gz
           root=/tmp/harbor-"$GITHUB_REF_NAME"-${{ matrix.plat }}
-          # --create: a fresh smoke db is the point here; harbor no longer
+          # --create: a fresh smoke db is the point here; harbor never
           # mints database files implicitly.
           "$root/bin/harbor" start /tmp/smoke.duckdb --create --name smoke
           "$root/bin/pilot" smoke -c "SELECT 42 AS ok" --mode csv | grep -q 42
@@ -115,6 +106,6 @@ jobs:
             "harbor-$GITHUB_REF_NAME-checksums.txt" \
             --repo "$GITHUB_REPOSITORY" --title "harbor $GITHUB_REF_NAME" \
             --notes "Self-contained harbor + pilot releases, version-locked to \
-          one DuckDB v2 nightly. Unix archives include the matched ui extension \
-          and install.sh; Windows archives include duckdb.dll beside the binaries. \
+          one DuckDB v2 nightly. Unix archives carry libduckdb and install.sh; \
+          Windows archives carry duckdb.dll beside the binaries. \
           Extract and run in place."

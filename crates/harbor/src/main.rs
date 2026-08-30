@@ -1,6 +1,6 @@
 //! harbor — DuckDB wearing a server.
 //!
-//! One binary, two jobs (PLAN.md D8): `serve` embeds DuckDB and owns one
+//! One binary, two jobs: `serve` embeds DuckDB and owns one
 //! database file; the fleet verbs (`start`, `show`, `stop`, `forget`, `doctor`)
 //! manage the berths of ~/.local/state/harbor/runtime from outside, linking no
 //! engine code paths at all.
@@ -13,7 +13,7 @@
 //!   harbor doctor                            what nothing else has a moment to see
 //!   harbor version                           print this binary's version
 //!
-//! The registry is the filesystem (D3): <name>.sock is the registration,
+//! The registry is the filesystem: <name>.sock is the registration,
 //! <name>.lock (flock) is the mutex, <name>.json is identity, <name>.token
 //! is the credential. No daemon anywhere.
 
@@ -99,14 +99,14 @@ serve/start options (a config entry may set any of these; a flag here wins):
   --token <t>         bearer token ('' disables auth; default: <name>.token,
                       minted on first serve)
   --workers <n>       executor pool size (default 6)
-  --memory-limit <s>  DuckDB memory_limit (default 2GB — fleet-safe, D2)
+  --memory-limit <s>  DuckDB memory_limit (default 2GB — fleet-safe)
   --threads <n>       DuckDB threads (default: DuckDB's own)
   --idle-exit <d>     drain, CHECKPOINT and exit after <d> (e.g. 90s, 10m) with
-                      no requests and no live sessions (D9 ephemeral berths)
+                      no requests and no live sessions (ephemeral berths)
   --init <sql>        run SQL at boot, before serving (repeatable) — the door
-                      for extensions: --init 'LOAD ui; CALL start_ui_server()'
+                      for extensions: --init 'LOAD <ext>'
   --unsigned          allow unsigned extensions (open-time only; needed to
-                      LOAD an unsigned build, e.g. the duckdb-ui 2.0 fork)
+                      LOAD a locally built, unsigned extension)
   --sealed            lock the berth to SQL on its own database: no host file
                       access (read_csv/COPY), no community extensions. For a
                       berth an untrusted caller can reach
@@ -334,7 +334,7 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
     let o = parse_opts(rest)?;
     let home = harbor_home()?;
 
-    // The flock on <name>.lock is the real mutex (D3): held for process life;
+    // The flock on <name>.lock is the real mutex: held for process life;
     // if we hold it and the socket file exists, the socket is stale by
     // definition and safe to unlink. Never unlink without the lock.
     let lock_path = home.join(format!("{}.lock", o.name));
@@ -381,16 +381,16 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         unsafe { std::env::set_var("HARBOR_STATEMENT_TIMEOUT_MS", d.as_millis().to_string()) };
     }
 
-    // The engine. One process, one database (D2): conservative memory default
+    // The engine. One process, one database: conservative memory default
     // so N berths coexist; printed so nobody is surprised.
     let con = duckdb_open(&o)?;
     let duckdb_version: String = con
         .query_row("SELECT version()", [], |r| r.get(0))
         .map_err(|e| format!("version: {e}"))?;
     // Boot SQL runs on the control connection before the pool forms, so its
-    // effects (LOAD ui, settings, secrets) are instance-wide and in place
-    // before the first request. This one flag is the whole extension story:
-    // ui, quack, httpfs — harbor stays agnostic about all of them.
+    // effects (LOAD, settings, secrets) are instance-wide and in place
+    // before the first request. This one flag is the whole extension story —
+    // harbor stays agnostic about what an operator loads.
     for sql in &o.init {
         con.execute_batch(sql).map_err(|e| format!("--init {sql:?}: {e}"))?;
     }
@@ -477,7 +477,7 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         o.memory_limit
     );
 
-    // D9 ephemeral berths: no countable requests AND no live sessions for the
+    // Ephemeral berths: no countable requests AND no live sessions for the
     // window → leave through the normal drain + CHECKPOINT door. Nothing
     // cleverer than this on purpose — no refcounts, no control sockets.
     if let Some(idle) = o.idle_exit {
@@ -516,16 +516,15 @@ fn duckdb_open(o: &Opts) -> Result<harbor::duckdb::Connection, String> {
     use harbor::duckdb::{Config, Connection};
     // These four settings can only be chosen when the connection is opened,
     // not with a later SET, so they must reach the Connection here:
-    //   --unsigned  allow_unsigned_extensions — the one door for loading an
-    //               unsigned build (the duckdb-ui 2.0 fork, DUCKDB-UI-V2-
-    //               COMPAT.md) via --init 'LOAD ui; CALL start_ui_server()'.
+    //   --unsigned  allow_unsigned_extensions — the one door for loading a
+    //               locally built, unsigned extension via --init 'LOAD <ext>'.
     //   --sealed    enable_external_access=false + allow_community_extensions
     //               =false — shrinks a token from host access (read_csv of any
     //               file, COPY TO disk, community native code) to a credential
     //               for this one database. For a berth an untrusted caller can
     //               reach. Default off: read_csv/COPY are core data workflows
     //               (the test fixtures themselves load CSV), so the safe edge
-    //               is the operator's to draw, like TLS (D6).
+    //               is the operator's to draw, like TLS.
     // Signed-only, full-access is the default; each is opt-in.
     let con = if o.unsigned || o.sealed {
         let mut config = Config::default();
@@ -609,7 +608,7 @@ fn spawn_detached(rest: Vec<String>) -> Result<(), String> {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
             .stderr(Stdio::from(log))
-            .process_group(0); // spawn, don't fork (D4): detached from our tty/session
+            .process_group(0); // spawn, don't fork: detached from our tty/session
     }
     #[cfg(windows)]
     {

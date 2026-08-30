@@ -10,9 +10,9 @@
 //!     history    pilot's REPL history
 //! ```
 //!
-//! Runtime state used to live under `~/.config/harbor/`, which is how a
-//! config directory came to hold sockets, tombstoned lock files and a shell
-//! history — unreadable enough that deleting it looked like the reasonable
+//! Runtime state does not belong under `~/.config/harbor/`: a config
+//! directory holding sockets, tombstoned lock files and a shell history is
+//! unreadable enough that deleting it looks like the reasonable
 //! move. `~/.local/state` is the XDG home for exactly this: files that
 //! accumulate, that you would not back up, and that you are meant to be able
 //! to throw away. It is also not `/tmp`, which is swept after three days on
