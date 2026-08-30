@@ -127,6 +127,10 @@ impl Grid {
                 }
             }
             state.refresh(cx);
+            // The header (overflow_scroll) and body (virtual_list) share a
+            // scroll handle but clamp a stale offset differently once the
+            // column set changes width; reset to origin so they agree.
+            state.scroll_to_col(0, cx);
             cx.notify();
         });
     }
@@ -297,9 +301,16 @@ impl TableDelegate for GridDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let t = pal(cx);
+        // The th wrapper adds a 4px right compensation for zeroed paddings,
+        // so a strip at right_0 would land 4px inboard of the body cells'
+        // dividers. right(-4px) puts it on the true column edge; the header
+        // row is not clipped there (the clip is the padded cell box). The
+        // strip also spans the full header height, where the built-in
+        // resize-handle line falls short of the top and bottom.
+        let edge = |color: Hsla| {
+            div().absolute().right(px(-4.)).top_0().bottom_0().w(px(1.)).bg(color)
+        };
         if self.gutter && col_ix == 0 {
-            // Same firm divider as the gutter's body cells, so the line is
-            // continuous from the header down.
             return div()
                 .relative()
                 .size_full()
@@ -308,7 +319,7 @@ impl TableDelegate for GridDelegate {
                 .text_size(px(GUTTER_TEXT))
                 .text_color(t.muted)
                 .child("#")
-                .child(div().absolute().right_0().top_0().bottom_0().w(px(1.)).bg(t.border))
+                .child(edge(t.border))
                 .into_any_element();
         }
         let data_col = col_ix - self.gutter as usize;
@@ -319,13 +330,19 @@ impl TableDelegate for GridDelegate {
         // of its own: the wrapper compensates zeroed paddings with only
         // 4px, while cell text sits 9px in (8px pad + 1px divider).
         div()
+            .relative()
             .size_full()
-            .truncate()
             .text_size(px(HEADER_TEXT))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(t.text)
-            .when(right, |d| d.text_right().pr(px(5.)))
-            .child(self.cols[col_ix].name.clone())
+            .child(
+                div()
+                    .size_full()
+                    .truncate()
+                    .when(right, |d| d.text_right().pr(px(5.)))
+                    .child(self.cols[col_ix].name.clone()),
+            )
+            .child(edge(t.grid_line))
             .into_any_element()
     }
 
@@ -386,10 +403,16 @@ impl Render for Grid {
                         div().flex_1().min_w_0().text_sm().text_color(t.text).truncate().child(title),
                     )
                     .child(
+                        // The design system's segmented-control frame
+                        // (design.css `.seg`): one bordered box so the
+                        // toggles read as a set, not free-floating.
                         div()
                             .h_flex()
-                            .gap_1()
                             .flex_none()
+                            .border_1()
+                            .border_color(t.border)
+                            .rounded(px(5.))
+                            .p(px(1.))
                             .child(
                                 Button::new("toggle-rows")
                                     .ghost()
