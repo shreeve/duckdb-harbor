@@ -456,13 +456,35 @@ impl Render for Grid {
                 if count == 1 && eof { "row" } else { "rows" }
             ),
         };
-        let status = if loading && count == 0 {
-            "loading...".to_string()
-        } else {
-            format!(
-                "{rows_part} \u{00b7} {cols} {} \u{00b7} {ms} ms",
-                if cols == 1 { "column" } else { "columns" },
-            )
+        // The footer status is mode-relevant: data facts for Data, schema
+        // facts for Structure.
+        let status = match view {
+            ViewMode::Data => {
+                if loading && count == 0 {
+                    "loading...".to_string()
+                } else {
+                    format!(
+                        "{rows_part} \u{00b7} {cols} {} \u{00b7} {ms} ms",
+                        if cols == 1 { "column" } else { "columns" },
+                    )
+                }
+            }
+            ViewMode::Structure => match &self.structure {
+                Some(s) => {
+                    let n = s.cols.len();
+                    let keys = s.cols.iter().filter(|c| c.pk).count();
+                    let mut text =
+                        format!("{n} {}", if n == 1 { "column" } else { "columns" });
+                    if keys > 0 {
+                        text.push_str(&format!(
+                            " \u{00b7} {keys} key {}",
+                            if keys == 1 { "column" } else { "columns" }
+                        ));
+                    }
+                    text
+                }
+                None => String::new(),
+            },
         };
         div()
             .size_full()
@@ -493,11 +515,9 @@ impl Render for Grid {
                             .truncate()
                             .child(title),
                     )
-                    // Status text sits INSIDE the flexible region, before
-                    // the toggle track: its width changes as pages land,
-                    // and text may move but controls must not.
-                    .child(div().text_xs().text_color(t.muted).flex_none().child(status))
-                    .child(
+                    // The display toggles and inspector glyph are data
+                    // concepts; the Structure view drops them.
+                    .when(view == ViewMode::Data, |d| d.child(
                         // Recessed track, macOS-toolbar style: a subtle
                         // inset container; flat icon tiles with a 2px gap
                         // (edges never touch); the ON state is an
@@ -569,7 +589,7 @@ impl Render for Grid {
                                 )
                                 .size_4(),
                             ),
-                    ),
+                    )),
             )
             .when_some(error, |d, message| {
                 d.child(
@@ -648,7 +668,9 @@ impl Render for Grid {
                                     cx.notify();
                                 }),
                             )),
-                    ),
+                    )
+                    .child(div().flex_1())
+                    .child(div().text_xs().text_color(t.muted).flex_none().child(status)),
             )
     }
 }
