@@ -151,6 +151,7 @@ CREATE TABLE posts (
   title VARCHAR
 );
 CREATE INDEX idx_posts_title ON posts(title);
+INSERT INTO posts VALUES (1, NULL, 'ada'), (2, NULL, 'bo'), (3, NULL, 'cy');
 CREATE TABLE awkward (
   "a b" INTEGER,
   "c'd" INTEGER,
@@ -248,8 +249,18 @@ def run_fixture(base):
     for column in users.get("columns", []):
         column.pop("default", None)
 
+    # The DDL is likewise the engine's own rendering — asserted for presence
+    # and shape, then set aside so the structural expectations below stay
+    # exact without transcribing engine prose.
+    ddl = users.get("ddl") or ""
+    eq("every table carries its own DDL", [],
+       [t["name"] for t in doc["tables"] if not (t.get("ddl") or "").startswith("CREATE TABLE")])
+    eq("and the DDL names its table", True, "users" in ddl)
+    for table in doc["tables"]:
+        table.pop("ddl", None)
+
     expected = [
-        {"name": "post_tags", "schema": "app",
+        {"name": "post_tags", "schema": "app", "estimatedRows": 0,
          "columns": [
              {"name": "tag_id", "type": "INTEGER", "notNull": False, "default": None, "primary": False},
              {"name": "note", "type": "VARCHAR", "notNull": False, "default": None, "primary": False},
@@ -260,7 +271,7 @@ def run_fixture(base):
          "foreignKeys": [
              {"columns": ["tag_id"], "refTable": "tags", "refSchema": "app", "refColumns": ["id"]},
          ]},
-        {"name": "tags", "schema": "app",
+        {"name": "tags", "schema": "app", "estimatedRows": 0,
          "columns": [
              {"name": "id", "type": "INTEGER", "notNull": True, "default": None, "primary": True},
              {"name": "label", "type": "VARCHAR", "notNull": False, "default": None, "primary": False},
@@ -271,7 +282,7 @@ def run_fixture(base):
          ],
          "indexes": [],
          "foreignKeys": []},
-        {"name": "memberships", "schema": "main",
+        {"name": "memberships", "schema": "main", "estimatedRows": 0,
          "columns": [
              {"name": "org_id", "type": "INTEGER", "notNull": False, "default": None, "primary": False},
              {"name": "user_id", "type": "INTEGER", "notNull": False, "default": None, "primary": False},
@@ -284,7 +295,7 @@ def run_fixture(base):
          ],
          "indexes": [],
          "foreignKeys": []},
-        {"name": "posts", "schema": "main",
+        {"name": "posts", "schema": "main", "estimatedRows": 3,
          "columns": [
              {"name": "id", "type": "INTEGER", "notNull": True, "default": None, "primary": True},
              {"name": "user_id", "type": "INTEGER", "notNull": False, "default": None, "primary": False},
@@ -298,7 +309,7 @@ def run_fixture(base):
          "foreignKeys": [
              {"columns": ["user_id"], "refTable": "users", "refSchema": "main", "refColumns": ["id"]},
          ]},
-        {"name": "users", "schema": "main",
+        {"name": "users", "schema": "main", "estimatedRows": 0,
          "columns": [
              {"name": "id", "type": "INTEGER", "notNull": True, "primary": True},
              {"name": "email", "type": "VARCHAR", "notNull": True, "primary": False},
@@ -371,6 +382,17 @@ def run_fixture(base):
     eq("a plain index has no expressions", [], by_name["idx_awk_space"]["expressions"])
 
     # -----------------------------------------------------------------------
+    section("Sizes are exact bytes, from the server's own stat")
+    # -----------------------------------------------------------------------
+    # The engine pretty-prints its sizes ("1.2 MiB"); the contract never
+    # relays that. The server stats the file it serves, so clients render
+    # their own units from real bytes — and a checkpointed database has a
+    # WAL of exactly 0 bytes, not an unknown.
+    eq("databaseSizeBytes is a positive integer", True,
+       isinstance(doc.get("databaseSizeBytes"), int) and doc["databaseSizeBytes"] > 0)
+    eq("walSizeBytes is 0 after CHECKPOINT", 0, doc.get("walSizeBytes"))
+
+    # -----------------------------------------------------------------------
     section("Two calls, one answer")
     # -----------------------------------------------------------------------
     again = fetch(base, "/catalog")[1]
@@ -386,6 +408,8 @@ def run_empty(base):
     doc = json.loads(body)
     eq("no tables", [], doc.get("tables"))
     eq("no sequences", [], doc.get("sequences"))
+    eq("but its file still has a size", True,
+       isinstance(doc.get("databaseSizeBytes"), int) and doc["databaseSizeBytes"] > 0)
     eq("but the versions still say who answered", True,
        bool(doc.get("harborVersion")) and bool(doc.get("duckdbVersion")))
     eq("and it too answers byte-identical documents", body, fetch(base, "/catalog")[1])

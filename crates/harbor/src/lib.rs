@@ -2593,6 +2593,14 @@ fn cell_bool(row: &[serde_json::Value], i: usize) -> bool {
     row.get(i).and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
+fn cell_u64(row: &[serde_json::Value], i: usize) -> u64 {
+    // The executor's integer policy quotes a value past JSON's exact range,
+    // so a cell can arrive as either a number or its decimal string.
+    row.get(i)
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .unwrap_or(0)
+}
+
 fn cell_list(row: &[serde_json::Value], i: usize) -> Vec<String> {
     row.get(i)
         .and_then(|v| v.as_array())
@@ -2741,11 +2749,30 @@ struct CatalogFk {
 struct CatalogTable {
     schema: String,
     name: String,
+    estimated_rows: u64,
+    ddl: Option<String>,
     columns: Vec<CatalogColumn>,
     primary_key: Vec<String>,
     unique_constraints: Vec<Vec<String>>,
     indexes: Vec<CatalogIndex>,
     foreign_keys: Vec<CatalogFk>,
+}
+
+/// The served file's actual bytes on disk, from the one process that can
+/// stat them. `(data, wal)` — a checkpointed database legitimately has no
+/// WAL file, which is 0 bytes of WAL, not an unknown. A berth serving no
+/// file (or one whose path stopped answering) reports neither, and the
+/// engine's pretty-printed sizes ("1.2 MiB") are never in the contract:
+/// clients render their own units from exact bytes or from nothing.
+fn database_disk_sizes() -> (Option<u64>, Option<u64>) {
+    let info = INFO.lock().unwrap();
+    let Some(path) = info.as_ref().and_then(|v| v.get("database")).and_then(|v| v.as_str())
+    else {
+        return (None, None);
+    };
+    let Ok(data) = std::fs::metadata(path) else { return (None, None) };
+    let wal = std::fs::metadata(format!("{path}.wal")).map(|m| m.len()).unwrap_or(0);
+    (Some(data.len()), Some(wal))
 }
 
 /// `GET /catalog` — the complete schema shape a migration differ needs, as
@@ -2774,6 +2801,14 @@ struct CatalogTable {
 /// uniqueness at all. PRIMARY KEY is its own constraint type and its own
 /// field, and never appears here.
 ///
+/// The document also carries what a browsing client otherwise dials three
+/// more queries for: each table's `estimatedRows` (the engine's cardinality
+/// estimate — a sidebar figure, not a COUNT(*)), each table's `ddl` as the
+/// engine renders it, and `databaseSizeBytes`/`walSizeBytes` statted from
+/// the served file by the one process sitting next to it — exact bytes,
+/// never the engine's pretty-printed strings, and null for a berth serving
+/// no file.
+///
 /// Ordering is part of the contract: tables by (schema, name), columns in
 /// ordinal position, indexes and sequences by name, unique constraints by
 /// their column lists, foreign keys by their referenced table and column
@@ -2788,7 +2823,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
     };
     let table_rows = match catalog_rows(
         jobs,
-        "SELECT schema_name, table_name FROM duckdb_tables() \
+        "SELECT schema_name, table_name, estimated_size, sql FROM duckdb_tables() \
          WHERE database_name = current_database() AND NOT internal AND NOT temporary \
          ORDER BY schema_name, table_name",
     ) {
@@ -2855,6 +2890,8 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         tables.push(CatalogTable {
             schema,
             name,
+            estimated_rows: cell_u64(row, 2),
+            ddl: cell_opt_str(row, 3),
             columns: Vec::new(),
             primary_key: Vec::new(),
             unique_constraints: Vec::new(),
@@ -2926,10 +2963,21 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         });
     }
 
+    let (database_size, wal_size) = database_disk_sizes();
     let mut out = String::from("{\"harborVersion\":");
     push_json_string(&mut out, env!("CARGO_PKG_VERSION"));
     out.push_str(",\"duckdbVersion\":");
     push_json_string(&mut out, &duckdb_version);
+    out.push_str(",\"databaseSizeBytes\":");
+    match database_size {
+        Some(bytes) => out.push_str(&bytes.to_string()),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"walSizeBytes\":");
+    match wal_size {
+        Some(bytes) => out.push_str(&bytes.to_string()),
+        None => out.push_str("null"),
+    }
     out.push_str(",\"tables\":[");
     for (i, table) in tables.iter().enumerate() {
         if i > 0 {
@@ -2939,6 +2987,8 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         push_json_string(&mut out, &table.name);
         out.push_str(",\"schema\":");
         push_json_string(&mut out, &table.schema);
+        out.push_str(",\"estimatedRows\":");
+        out.push_str(&table.estimated_rows.to_string());
         out.push_str(",\"columns\":[");
         for (j, column) in table.columns.iter().enumerate() {
             if j > 0 {
@@ -3033,7 +3083,14 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
             }
             out.push_str("]}");
         }
-        out.push_str("]}");
+        // Last in the object on purpose: the engine's own CREATE TABLE text
+        // runs long, and the fields a reader scans for stay up front.
+        out.push_str("],\"ddl\":");
+        match &table.ddl {
+            Some(sql) => push_json_string(&mut out, sql),
+            None => out.push_str("null"),
+        }
+        out.push('}');
     }
     out.push_str("],\"sequences\":[");
     for (i, row) in sequence_rows.iter().enumerate() {
