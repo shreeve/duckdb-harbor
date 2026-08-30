@@ -12,31 +12,30 @@ and a spreadsheet-style live edit mode built on explicit safety rules.
 +------------------------------------------------------------------------+
 | [sidebar toggle]  berth pill (o)   breadcrumb        [timing] [inspect] |
 +----------------+-------------------------------------------+-----------+
-| BERTHS      v  | tab: Invoice | tab: query 1 | +           | DETAILS   |
+| DATABASES      | tab: Invoice | tab: query 1 | +           | ROW       |
 |  o medlabs     +-------------------------------------------+           |
-|  o scratch     | #  InvoiceId  CustomerId  InvoiceDate     | Size      |
-|  - archive     | 1  1          2 ->        2021-01-01 ...  |  Data     |
-|                | 2  2          4 ->        2021-01-02 ...  |  Index    |
-| filter [....]  | 3  3          8 ->        2021-01-03 ...  | Stats     |
-|                |                                           |  Rows     |
-| CATALOG        |                                           | Metadata  |
-|  v memory      |                                           |  DuckDB   |
-|    v main      |                                           |  Harbor   |
-|      Tables    |                                           | Row       |
-|       Invoice  |                                           |  (selected|
-|       Track    |                                           |   values) |
-|      Views     |                                           |           |
-|      Sequences +-------------------------------------------+           |
-|      Macros    | Data | Structure | JSON   [staged|LIVE]   |           |
-|  > chinook_pg  | columns filters   1,000  < 1/1 >          |           |
+|  o scratch     | #  InvoiceId  CustomerId  InvoiceDate     | (selected |
+|  - archive     | 1  1          2 ->        2021-01-01 ...  |  row's    |
+|                | 2  2          4 ->        2021-01-02 ...  |  values,  |
+| TABLES         | 3  3          8 ->        2021-01-03 ...  |  shown    |
+|  Invoice   13k |                                           |  verti-   |
+|  Track    3.5k |                                           |  cally)   |
+|  ...           |                                           |           |
+|  SEQUENCES     +-------------------------------------------+           |
+|                | Data|Structure  filter columns            |           |
+|                |        1 ms . 1-500 of 5,410 rows .       |           |
+|                |        |< < 500 per > >| . 9 columns      |           |
 +----------------+-------------------------------------------+-----------+
-| status: medlabs . 128 of 5,410 rows . engine 1ms . STAGED  |           |
-+------------------------------------------------------------------------+
 ```
 
-Three vertical panes. Sidebar and inspector collapse independently and
-auto-collapse when the window is too narrow to keep the content pane at
-least 480pt wide; divider positions persist. Minimum window 640x400.
+The diagram is the working target: the tab strip, the JSON view, and
+the edit modes below are roadmap, not shipped. On-screen vocabulary is
+the user's, not Harbor's: the sidebar says DATABASES and TABLES even
+though the code and docs keep saying berth internally.
+
+Three vertical panes. Sidebar and inspector collapse independently;
+divider positions persist (the inspector width saves at the end of each
+drag). Minimum window 720x420.
 
 Collapsing is offered three redundant ways, all reaching the same
 state: toolbar toggle buttons at each end using the split-rectangle
@@ -83,28 +82,28 @@ rules, in order:
 
 Two stacked sections, each collapsible.
 
-**Berths** lists every berth Harbor knows: configured berths and
+**DATABASES** lists every berth Harbor knows: configured berths and
 spawn-on-demand aliases, each with a status dot (connected, running,
-stopped). Click connects; connecting shows a spinner with a cancel that
-works synchronously (the attempt is fenced; a late completion discards
-itself). Context menu: connect, disconnect, start, stop, rename. Add and
-remove edit Harbor config and ship after v1; until then the empty state
-says where the config lives. Stopping or disconnecting a berth that has
-tabs with staged edits or a running query lists what would be lost and
-asks. Plain verbs only; the nautical vocabulary is frozen at harbor,
-pilot, berth.
+stopped), the table count in parentheses for live berths, and the size
+on disk right-justified in decimal units (MB/GB, never MiB). Click
+connects; the attempt is fenced, so a late completion discards itself
+and a cancel works synchronously. Context menu (roadmap): connect,
+disconnect, start, stop, rename; add and remove edit Harbor config and
+ship after v1. Plain verbs only; the nautical vocabulary is frozen at
+harbor, pilot, berth — and stays INTERNAL: on-screen labels use user
+words (DATABASES, TABLES, "database").
 
-**Catalog** shows the connected berth's object tree from Harbor's catalog
-endpoint, mirroring DuckDB's model: catalog > schema > Tables, Views,
-Sequences, Macros. No Triggers section; DuckDB has none. An ATTACHed
-database (DuckDB file, SQLite file, Postgres) appears as a sibling
-catalog. Parquet, CSV and JSON reached through table functions or views
-are not catalogs and are not invented as tree nodes; they appear where
-they really live (a view in its schema) and are otherwise the query
-surface's business. One filter field narrows both sections. A refresh
-refetches then swaps, preserving expansion and selection; it never blanks
-the tree while loading, and a failed refresh keeps the old tree with a
-stale badge. DDL run from a query tab refreshes the affected nodes.
+**TABLES** shows the connected berth's tables from Harbor's catalog
+endpoint as a flat list (schema headings appear only when there is more
+than one schema), each row carrying its column count in parentheses and
+an SI-rounded row count right-justified (13k, 4.6M — estimated_size,
+which matches exact counts in practice). Sequences follow in their own
+SEQUENCES section. Views, macros, and ATTACHed sibling catalogs join
+the tree when the catalog endpoint carries them. Each section header
+has its own filter glyph — a filter field only appears once a section
+exceeds 10 items — and a refresh glyph. Refresh refetches then swaps in
+one frame; it never blanks the tree while loading, and a failed refresh
+keeps the old tree unchanged.
 
 Single click selects; Enter or double-click opens a table in a new tab
 (or focuses the already-open tab for that table).
@@ -142,36 +141,46 @@ are not, and the close/quit confirmation says so.
 ## Grid
 
 Virtualized in both axes; scale target is wide analytics results. Row
-numbers on the left. Headers sort: click cycles asc/desc/none,
-shift-click adds with visible priority numbers. Sorting and filtering a
-table tab re-run the query server-side; in a query-results grid they
-operate on the fetched rows only and the bar says so. NULL renders as a
-dimmed tag, distinct from empty string. All values render in the one
-value font; the inline editor shares the cell's exact geometry so
-entering edit mode moves nothing.
+numbers on the left show ABSOLUTE positions (page 2 at 500/page starts
+at 501). Header sorting (click cycles asc/desc/none, shift-click adds
+with priority numbers) is roadmap; the visible→schema column map is
+already shaped for it. NULL renders as a dimmed tag, distinct from
+empty string. All values render in the one value font; the inline
+editor will share the cell's exact geometry so entering edit mode moves
+nothing.
 
-Rows fetch in server-side pages (default 1,000). The status line always
-distinguishes "128 of 5,410 rows" from "first 1,000 (total unknown)";
-fetching more is an explicit action, and the client never materializes
-an unbounded result.
+Rows fetch in explicit server-side pages. The size defaults to 500 and
+cycles 500 / 5,000 / 50,000 — one decade apart, so each step is a
+different kind of read. A fetched page REPLACES the rows in one frame
+(never appended, never stitched), and the client never materializes an
+unbounded result. The status distinguishes a known total ("1–500 of
+5,410 rows") from an unknown one ("1–500 rows").
 
 A cell whose column has a single-column foreign key with resolvable
-metadata shows a follow arrow that opens the referenced row; when the
-metadata is absent or composite the arrow simply does not appear.
+metadata shows a follow arrow that opens the referenced row (roadmap);
+when the metadata is absent or composite the arrow simply does not
+appear.
 
-Bottom bar per table tab: Data | Structure | JSON views, column
-show/hide, filters, page size, pagination.
+Bottom bar per table: the Data | Structure view switcher (JSON view
+later), the raw-SQL filter toggle, the Columns popover (search past 10
+columns, Show all / Hide all, full-row click targets), and the
+right-anchored status line: `1 ms · 1–500 of 5,410 rows · |< < 500 per
+> >| · 9 columns`. The ordering is the anti-jump rule: in a
+right-justified cluster an element only moves when something to its
+RIGHT changes width, so the per-page text sits leftmost and the pager
+glyphs and column count never move under the cursor. The filter is one
+raw SQL WHERE strip under the header (applied on Enter, refetching page
+1 with a fresh count); structured per-column filters layer on later.
 
 Display preferences are global, not per-table: row numbers, numeric
 right-alignment, NULL-tag visibility. They live as a quiet toggle
-cluster in the middle of the grid header strip (title left, toggles
-center, status right), each with a tooltip, persisted in
+cluster on the right of the grid header strip (title left, toggles and
+the inspector glyph right), each with a tooltip, persisted in
 `~/.config/ducktable/prefs.json`. They sit on the grid rather than in
-the sidebar because controls live nearest what they change; beside
-CATALOG they would read as catalog filters. Structure shows the table's
-DDL and columns; JSON shows the current page as JSON. In a query-results
-grid, Structure and edit mode are absent and JSON shows the fetched
-result.
+the sidebar because controls live nearest what they change. Structure
+shows the table's columns (PK and NOT NULL chips, defaults) and DDL;
+the two views are exclusive — a schema change reshapes the data view,
+so they never render side by side.
 
 ### Editability
 
@@ -240,8 +249,12 @@ Details only; no AI chat in v1. The inspector is ROW-LEVEL: the
 selected row's values shown vertically, and nothing else. Berth-level
 facts keep their own homes at their own urgency — versions, database
 path, and size on the berth identity card; row counts in the grid's
-status line. Mixing a row being edited with the database engine's
-version number puts two data urgency levels in one pane. The row editor and the grid's
+footer. Mixing a row being edited with the database engine's version
+number puts two data urgency levels in one pane. The pane slots in
+BESIDE the table, below the grid's header strip (a resizable split
+whose width persists), so opening it never shifts the title row; it
+accompanies the Data view only. Cmd+Alt+0 toggles it, as does the
+panel glyph on the header strip. The row editor and the grid's
 inline editor are one editing session with one owner: opening one
 closes the other, and both write through the same staged/live pipeline.
 If a refresh replaces the selected row, the inspector shows the new

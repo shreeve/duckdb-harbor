@@ -40,9 +40,13 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
   window changes nothing.
 - **UI stack**: GPUI (pinned crates.io release, currently 0.2.2) with
   gpui-component (0.5.1) supplying the virtualized Table and the code editor.
-  Both are pre-1.0; every gpui-component widget is consumed through a thin
-  wrapper module owned by this repo, so a breaking upgrade or a component
-  library pivot is a contained diff.
+  Both are pre-1.0, and the versions are PINNED — an upgrade is a
+  deliberate, review-everything event, not a routine bump. View code uses
+  gpui-component directly (blanket wrapper modules bought indirection
+  without insulation and were dropped); the churn hedge is the pin plus
+  the rule that any widget which fights us gets replaced by first-party
+  drawing at that call site, the way the grid already owns its selection
+  painting and cell borders.
 
 ## Design rules
 

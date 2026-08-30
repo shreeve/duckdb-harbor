@@ -4,9 +4,10 @@ What the UI spec needs versus what gpui-component ships, from a read of
 the 0.5.1 source (2026-08-29). Re-check this file on every
 gpui-component upgrade; it describes a pre-1.0 crate and will drift.
 
-Everything below is consumed through our own wrapper modules, never
-directly from view code, so an upstream break or a component swap stays
-a contained diff.
+Everything below is consumed directly from view code against the PINNED
+versions; an upgrade is a deliberate review-everything event. Widgets
+that fight us get replaced by first-party drawing at the call site (the
+grid's selection painting and cell borders are the pattern), not wrapped.
 
 ## Direct fits
 
@@ -18,7 +19,7 @@ a contained diff.
 | Three-pane layout | `dock/`, `resizable/` | `DockArea`, stack/tab panels, split handles, layout state persistence |
 | Tab strip | `tab/`, dock `tab_panel` | |
 | Notebook panes | `collapsible.rs`, `accordion.rs`, `resizable/`, `v_virtual_list` | Composition; no new primitives needed |
-| Theming | `theme/` | JSON theme files, semantic tokens, `ThemeRegistry`, `watch_dir` hot reload. Our five themes are five JSON files |
+| Theming | `theme/` | JSON theme files, semantic tokens, `ThemeRegistry`, `watch_dir` hot reload. Our five themes are one ThemeSet file (`assets/themes/ducktable.json`) |
 | Platform titlebar | `title_bar.rs` | Per-platform caption handling |
 | Chrome | `menu`, `popover`, `dialog`, `breadcrumb`, `badge`, `spinner`, `skeleton`, `notification`, `kbd` | |
 | Chart pane (later) | `chart/`, `plot/` | Exists; untouched until the notebook chart phase |
