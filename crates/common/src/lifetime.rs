@@ -144,12 +144,19 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(secs))
 }
 
-/// Coarse and readable: `4m`, `1h12m`, `3d`. Precision here is noise.
+/// Coarse and readable: `4m`, `1m30s`, `1h12m`, `3d`.
+///
+/// Coarse, but never lossy in a way that misreports a *configured* value:
+/// truncating 90s to "1m" made `harbor show` describe an idle-exit as
+/// something the operator did not write.
 pub fn humanize(d: Duration) -> String {
     let s = d.as_secs();
     match s {
         0..=59 => format!("{s}s"),
-        60..=3599 => format!("{}m", s / 60),
+        60..=3599 => match (s / 60, s % 60) {
+            (m, 0) => format!("{m}m"),
+            (m, r) => format!("{m}m{r}s"),
+        },
         3600..=86399 => match (s / 3600, (s % 3600) / 60) {
             (h, 0) => format!("{h}h"),
             (h, m) => format!("{h}h{m}m"),
@@ -241,6 +248,8 @@ mod tests {
     fn humanized_uptime_is_coarse() {
         assert_eq!(humanize(Duration::from_secs(14)), "14s");
         assert_eq!(humanize(Duration::from_secs(240)), "4m");
+        // The one that used to lie: a configured 90s must not read as "1m".
+        assert_eq!(humanize(Duration::from_secs(90)), "1m30s");
         assert_eq!(humanize(Duration::from_secs(4320)), "1h12m");
         assert_eq!(humanize(Duration::from_secs(7200)), "2h");
         assert_eq!(humanize(Duration::from_secs(300000)), "3d");

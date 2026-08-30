@@ -45,6 +45,12 @@ if [[ ! -x "${launcher%% *}" ]]; then
 fi
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/harbor-asserts.XXXXXX")
+# Every berth this suite starts registers under $HARBOR_HOME. Without this the
+# sockets, tokens and lock files land in the operator's real runtime directory,
+# and each run leaves a fistful of dead names behind — invisible before
+# `harbor show` learned to report them, and noise in the fleet view now.
+export HARBOR_HOME="$work/harbor-home"
+mkdir -p "$HARBOR_HOME"
 db="$work/asserts.duckdb"
 log="$work/server.log"
 cp "$src_db" "$db"

@@ -75,7 +75,7 @@ jobs:
           root=/tmp/harbor-"$GITHUB_REF_NAME"-${{ matrix.plat }}
           # --create: a fresh smoke db is the point here; harbor no longer
           # mints database files implicitly.
-          "$root/bin/harbor" add /tmp/smoke.duckdb --create --name smoke
+          "$root/bin/harbor" start /tmp/smoke.duckdb --create --name smoke
           "$root/bin/pilot" smoke -c "SELECT 42 AS ok" --mode csv | grep -q 42
           "$root/bin/harbor" stop smoke
           echo "smoke: rpath and wire round-trip both good"
@@ -88,7 +88,7 @@ jobs:
           7z x "$archive" -o"$RUNNER_TEMP" -y >/dev/null
           root="$RUNNER_TEMP/harbor-$GITHUB_REF_NAME-${{ matrix.plat }}"
           export HARBOR_HOME="$RUNNER_TEMP/harbor-home"
-          "$root/bin/harbor.exe" add "$RUNNER_TEMP/smoke.duckdb" \
+          "$root/bin/harbor.exe" start "$RUNNER_TEMP/smoke.duckdb" \
             --create --name smoke --token ''
           "$root/bin/pilot.exe" smoke -c "SELECT 42 AS ok" --mode csv | grep -q 42
           "$root/bin/harbor.exe" stop smoke

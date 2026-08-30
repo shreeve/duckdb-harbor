@@ -301,7 +301,7 @@ fn berth_transport(home: &std::path::Path, name: &str) -> Option<Transport> {
 }
 
 /// Every berth the registry knows, with how to dial it — the same sidecar
-/// jsons `harbor ls` reads, so socket and --port berths both appear.
+/// jsons `harbor show` reads, so socket and --port berths both appear.
 fn berth_entries(home: &std::path::Path) -> Vec<(String, Transport)> {
     let mut v: Vec<(String, Transport)> = std::fs::read_dir(home)
         .map(|rd| {
@@ -390,7 +390,7 @@ fn ensure_berth(
             .and_then(|j| j["db"].as_str().map(str::to_string))
             .unwrap_or_else(|| "another database".to_string());
         return Err(format!(
-            "berth {name:?} is live but serves {other}, not {} — stop it (`harbor rm {name}`) or serve this file under a different name (`harbor add {} --name <other>`)",
+            "berth {name:?} is live but serves {other}, not {} — stop it (`harbor forget {name}`) or serve this file under a different name (`harbor start {} --name <other>`)",
             canon.display(),
             canon.display()
         ));
@@ -398,16 +398,16 @@ fn ensure_berth(
     let harbor = std::env::var("HARBOR_BIN").unwrap_or_else(|_| "harbor".to_string());
     eprintln!("pilot: summoning a berth for {} (idle-exit {idle_exit})", canon.display());
     let status = std::process::Command::new(&harbor)
-        .args(["add"])
+        .args(["start"])
         .arg(&canon)
         .args(["--name", &name, "--idle-exit", idle_exit])
         .status()
         .map_err(|e| format!("cannot run {harbor:?} (is harbor installed?): {e}"))?;
     if !status.success() {
-        return Err(format!("harbor add failed for {}", canon.display()));
+        return Err(format!("harbor start failed for {}", canon.display()));
     }
     let transport = berth_transport(&home, &name)
-        .ok_or_else(|| format!("harbor add returned without registering berth {name:?}"))?;
+        .ok_or_else(|| format!("harbor start returned without registering berth {name:?}"))?;
     Ok((transport, berth_token(&home, &name)))
 }
 
@@ -429,7 +429,7 @@ fn list_fleet() -> ExitCode {
     };
     let berths = berth_entries(&home);
     if berths.is_empty() {
-        println!("no live berths in {} (start one: harbor add <db>)", home.display());
+        println!("no live berths in {} (start one: harbor start <db.duckdb>)", home.display());
         return ExitCode::SUCCESS;
     }
     println!("{:<20} {:<8} ADDRESS", "BERTH", "STATE");

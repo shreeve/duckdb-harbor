@@ -116,7 +116,7 @@ pub fn normalize(name: &str) -> Result<String, String> {
 
 /// Is this argument a path, or a configured name?
 ///
-/// **A bare word is never a path.** `harbor add medlabs`, run from the wrong
+/// **A bare word is never a path.** `harbor start medlabs`, run from the wrong
 /// directory, once named the file `./medlabs`, created it empty, and served
 /// it under the name clients trusted — an empty impostor in front of real
 /// data. Reading a bare word as a name closes that whole class: the argument

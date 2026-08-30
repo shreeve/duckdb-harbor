@@ -4,7 +4,7 @@
 //!
 //! 1. **A pipe gets data, a terminal gets a picture.** Box-drawing and color
 //!    appear only when stdout is a tty. Piped output is tab-separated and
-//!    byte-stable, so `harbor ls | awk` keeps working forever.
+//!    byte-stable, so `harbor show | awk` keeps working forever.
 //! 2. **`NO_COLOR` wins.** It is the de facto standard and it costs one line.
 //! 3. **Nothing from disk is ever printed raw.** A database path containing
 //!    an escape sequence must not be able to repaint the terminal or forge a
@@ -455,7 +455,7 @@ mod tests {
     fn a_pipe_gets_tsv_with_no_escapes() {
         let mut t = Table::new(["NAME", "STATE"]);
         t.row([Cell::new("medlabs"), Cell::new("running").tone(Tone::Green)]);
-        t.note(Tone::Yellow, "config changed — harbor restart medlabs");
+        t.note(Tone::Yellow, "config changed — harbor stop medlabs && harbor start medlabs");
         let out = t.render(&Style::plain());
         assert_eq!(out, "NAME\tSTATE\nmedlabs\trunning\n");
         assert!(!out.contains('\u{1b}'));
