@@ -4,6 +4,7 @@
 
 mod app;
 mod content;
+mod footer;
 mod grid;
 mod inspector;
 mod prefs;
