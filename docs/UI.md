@@ -24,7 +24,7 @@ and a spreadsheet-style live edit mode built on explicit safety rules.
 |  SEQUENCES     +-------------------------------------------+           |
 |                | Data|Structure  filter columns            |           |
 |                |        1 ms . 1-500 of 5,410 rows .       |           |
-|                |        |< < 500 per > >| . 9 columns      |           |
+|                |        9 columns . |< < 500 per > >|      |           |
 +----------------+-------------------------------------------+-----------+
 ```
 
@@ -164,11 +164,14 @@ appear.
 Bottom bar per table: the Data | Structure view switcher (JSON view
 later), the raw-SQL filter toggle, the Columns popover (search past 10
 columns, Show all / Hide all, full-row click targets), and the
-right-anchored status line: `1 ms · 1–500 of 5,410 rows · |< < 500 per
-> >| · 9 columns`. The ordering is the anti-jump rule: in a
+right-anchored status line: `1 ms · 1–500 of 5,410 rows · 9 columns ·
+|< < 500 per > >|`. The ordering is the anti-jump rule: in a
 right-justified cluster an element only moves when something to its
-RIGHT changes width, so the per-page text sits leftmost and the pager
-glyphs and column count never move under the cursor. The filter is one
+RIGHT changes width — so the pager, the only interactive element, is
+rightmost (constant-width glyphs pinned to the corner; neither page
+flips nor table switches move the click targets), the column count
+sits beside the row range it describes, and the per-page text stays
+leftmost. The filter is one
 raw SQL WHERE strip under the header (applied on Enter, refetching page
 1 with a fresh count); structured per-column filters layer on later.
 
