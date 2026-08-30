@@ -603,13 +603,25 @@ name = "harbor"
 version = "0.15.0"
 dependencies = [
  "duckdb",
+ "harbor-common",
  "justhttp",
  "libc",
  "rand",
  "serde",
  "serde_json",
  "signal-hook 0.3.18",
+ "toml",
  "wire",
+]
+
+[[package]]
+name = "harbor-common"
+version = "0.15.0"
+dependencies = [
+ "libc",
+ "serde",
+ "toml",
+ "unicode-width",
 ]
 
 [[package]]

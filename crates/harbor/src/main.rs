@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod doctor;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> ExitCode {

@@ -1,0 +1,31 @@
+[package]
+name = "harbor-common"
+version = "0.15.0"
+edition = "2024"
+description = "harbor-common — what harbor, pilot and ducktable all need: paths, names, permissions, config, lifetimes, states"
+license = "MIT"
+
+# No DuckDB, no HTTP, no process spawning, and nothing that shells out. Both
+# binaries depend on this crate, so anything that lands here lands in the
+# server too — including in the process holding an exclusive write lock on a
+# database. Keep it to files, strings, and formatting.
+[features]
+# The terminal renderer. On by default, for harbor and pilot. A GUI takes
+# `default-features = false` and skips it along with unicode-width — it wants
+# the semantics (see `state::Level`), not the ANSI.
+default = ["term"]
+term = ["dep:unicode-width"]
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.4"
+# terminal-cell widths: a path with CJK or an emoji in it must not shear a
+# table, and counting bytes (or even chars) is exactly how that happens.
+unicode-width = { version = "0.2", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lib]
+name = "harbor_common"
+path = "src/lib.rs"
