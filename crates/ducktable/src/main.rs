@@ -33,7 +33,7 @@ struct RowVm {
 enum Phase {
     Idle,
     Connecting { name: String },
-    Connected { conn: Conn, info: wire::InfoResponse },
+    Connected { conn: Conn, info: wire::InfoResponse, catalog: harbor_client::Catalog },
     Failed { name: String, message: String },
 }
 
@@ -41,11 +41,13 @@ pub struct DuckTable {
     rows: Vec<RowVm>,
     phase: Phase,
     attempt: u64,
+    selected_table: Option<(String, String)>,
 }
 
 impl DuckTable {
     fn new(cx: &mut Context<Self>) -> Self {
-        let mut this = Self { rows: Vec::new(), phase: Phase::Idle, attempt: 0 };
+        let mut this =
+            Self { rows: Vec::new(), phase: Phase::Idle, attempt: 0, selected_table: None };
         this.refresh(cx);
         this
     }
@@ -81,6 +83,7 @@ impl DuckTable {
         self.attempt += 1;
         let fence = self.attempt;
         self.phase = Phase::Connecting { name: clone_str(&name) };
+        self.selected_table = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let target = clone_str(&name);
@@ -89,7 +92,8 @@ impl DuckTable {
                 .spawn(async move {
                     let conn = fleet::connect(&target)?;
                     let info = fleet::info(&conn)?;
-                    Ok::<_, String>((conn, info))
+                    let catalog = harbor_client::catalog(&conn)?;
+                    Ok::<_, String>((conn, info, catalog))
                 })
                 .await;
             this.update(cx, |state, cx| {
@@ -97,7 +101,7 @@ impl DuckTable {
                     return;
                 }
                 state.phase = match outcome {
-                    Ok((conn, info)) => Phase::Connected { conn, info },
+                    Ok((conn, info, catalog)) => Phase::Connected { conn, info, catalog },
                     Err(message) => Phase::Failed { name: clone_str(&name), message },
                 };
                 if let Phase::Connected { .. } = state.phase {
@@ -114,6 +118,7 @@ impl DuckTable {
     fn cancel(&mut self, cx: &mut Context<Self>) {
         self.attempt += 1;
         self.phase = Phase::Idle;
+        self.selected_table = None;
         cx.notify();
     }
 
@@ -196,18 +201,106 @@ impl DuckTable {
                         this.connect(clone_str(&name), cx);
                     }))
             }))
+            .child(self.catalog_tree(cx))
             .child(
                 div()
                     .id("refresh")
                     .mt_2()
                     .px_2()
                     .py_1()
+                    .flex_none()
                     .text_xs()
                     .text_color(rgb(ACCENT))
                     .cursor_pointer()
                     .child("refresh")
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.refresh(cx))),
             )
+    }
+
+    fn catalog_tree(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let Phase::Connected { catalog, .. } = &self.phase else {
+            return div().id("catalog").flex_1();
+        };
+        let schemas = catalog.schemas();
+        let many_schemas = schemas.len() > 1;
+        let mut tree = div().id("catalog").flex_1().min_h_0().overflow_y_scroll().v_flex().gap_px();
+        tree = tree.child(
+            div()
+                .px_2()
+                .pt_3()
+                .pb_1()
+                .text_xs()
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(MUTED))
+                .child("CATALOG"),
+        );
+        for schema in schemas {
+            if many_schemas {
+                tree = tree.child(
+                    div().px_2().py_1().text_xs().text_color(rgb(MUTED)).child(clone_str(schema)),
+                );
+            }
+            for table in catalog.tables_in(schema) {
+                let key = (clone_str(schema), clone_str(&table.name));
+                let selected = self.selected_table.as_ref() == Some(&key);
+                tree = tree.child(
+                    div()
+                        .id(SharedString::from(format!("t-{schema}-{}", table.name)))
+                        .pl_4()
+                        .pr_2()
+                        .py_1()
+                        .rounded_md()
+                        .h_flex()
+                        .gap_2()
+                        .items_center()
+                        .cursor_pointer()
+                        .when(selected, |d| d.bg(rgb(0xD6E6FB)))
+                        .hover(|d| d.bg(rgb(0xE4EDF8)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_sm()
+                                .text_color(rgb(TEXT))
+                                .child(clone_str(&table.name)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .child(format!("{}", table.columns.len())),
+                        )
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.selected_table = Some((clone_str(&key.0), clone_str(&key.1)));
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+        if !catalog.sequences.is_empty() {
+            tree = tree.child(
+                div()
+                    .px_2()
+                    .pt_2()
+                    .pb_1()
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(MUTED))
+                    .child("SEQUENCES"),
+            );
+            for seq in &catalog.sequences {
+                tree = tree.child(
+                    div()
+                        .pl_4()
+                        .py_1()
+                        .text_sm()
+                        .text_color(rgb(MUTED))
+                        .child(clone_str(&seq.name)),
+                );
+            }
+        }
+        tree
     }
 
     fn content(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -255,7 +348,74 @@ impl DuckTable {
                         move |this, _, _, cx| this.connect(clone_str(&name), cx),
                     ))
                 }),
-            Phase::Connected { conn, info } => div()
+            Phase::Connected { catalog, .. }
+                if self.selected_table.as_ref().is_some_and(|(s, n)| {
+                    catalog.tables.iter().any(|t| &t.schema == s && &t.name == n)
+                }) =>
+            {
+                let (schema, name) = self.selected_table.clone().unwrap();
+                let table = catalog
+                    .tables
+                    .iter()
+                    .find(|t| t.schema == schema && t.name == name)
+                    .unwrap();
+                div()
+                    .v_flex()
+                    .gap_1()
+                    .items_start()
+                    .p_4()
+                    .min_w(px(440.))
+                    .max_w_full()
+                    .max_h_full()
+                    .overflow_hidden()
+                    .bg(rgb(BG_SURFACE))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .rounded_lg()
+                    .child(
+                        div()
+                            .text_lg()
+                            .text_color(rgb(TEXT))
+                            .child(format!("{schema}.{name}")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .pb_2()
+                            .child(format!("{} columns", table.columns.len())),
+                    )
+                    .children(table.columns.iter().map(|c| {
+                        div()
+                            .h_flex()
+                            .gap_2()
+                            .w_full()
+                            .text_sm()
+                            .child(
+                                div()
+                                    .w_48()
+                                    .flex_none()
+                                    .truncate()
+                                    .text_color(rgb(TEXT))
+                                    .child(clone_str(&c.name)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(rgb(MUTED))
+                                    .child(clone_str(&c.duck_type)),
+                            )
+                            .when(c.primary, |d| {
+                                d.child(div().text_xs().text_color(rgb(ACCENT)).child("PK"))
+                            })
+                            .when(c.not_null && !c.primary, |d| {
+                                d.child(div().text_xs().text_color(rgb(MUTED)).child("NOT NULL"))
+                            })
+                    }))
+            }
+            Phase::Connected { conn, info, .. } => div()
                 .v_flex()
                 .gap_1()
                 .items_start()

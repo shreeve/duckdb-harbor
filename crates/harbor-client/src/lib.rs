@@ -8,9 +8,11 @@
 //! server links), and the fleet view a GUI needs — every berth the config
 //! or the runtime dir knows, with a probed [`harbor_common::State`].
 
+pub mod catalog;
 pub mod fleet;
 pub mod http;
 pub mod tokens;
 
+pub use catalog::{catalog, Catalog};
 pub use fleet::{connect, info, keepalive, list, probe, state_of, BerthRow, Conn, Sidecar};
 pub use harbor_common::{paths, Level, State};
