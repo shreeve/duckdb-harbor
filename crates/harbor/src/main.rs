@@ -666,7 +666,7 @@ fn spawn_detached(rest: Vec<String>) -> Result<(), String> {
                 // The receipt is the fleet. A one-line "ready on <socket>"
                 // restated the flags you just typed; the table answers the
                 // question you actually had, which is what changed.
-                return show(Vec::new());
+                return show_after_change(false);
             }
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -925,7 +925,7 @@ fn start(rest: Vec<String>) -> Result<(), String> {
         r.name == name && r.state == harbor_common::State::Running
     }) && rest.len() == 1
     {
-        return show(Vec::new());
+        return show_after_change(false);
     }
     // Config first, then whatever was typed: parse_opts keeps the last
     // assignment, so an explicit flag wins over the file.
@@ -936,6 +936,25 @@ fn start(rest: Vec<String>) -> Result<(), String> {
 }
 
 
+
+/// The fleet, drawn after a verb that changed it — but only for a human.
+///
+/// `Style::boxed` is exactly `is_terminal()`, which is the question being
+/// asked: someone who typed `harbor start labs` wants to see what changed,
+/// and a build script that ran the same line wanted a berth, not a TSV dump
+/// in the middle of its log. Quiet on success is the older and better
+/// contract for the scripted case; the verbs keep their own one-line
+/// messages either way, because "drained and checkpointed" and "removed its
+/// sock, json, token" are facts no table carries.
+fn show_after_change(lead: bool) -> Result<(), String> {
+    if !harbor_common::ui::Style::stdout().boxed {
+        return Ok(());
+    }
+    if lead {
+        println!();
+    }
+    show(Vec::new())
+}
 
 /// `harbor show [name]` — the fleet, or one berth in detail.
 fn show(rest: Vec<String>) -> Result<(), String> {
@@ -1150,8 +1169,7 @@ fn stop_berth(rest: Vec<String>, remove: bool) -> Result<(), String> {
     // What it did, then what the fleet looks like now: the line above names
     // the thing the table cannot show (that it checkpointed, what was
     // removed), and the table answers the question that follows.
-    println!();
-    show(Vec::new())
+    show_after_change(true)
 }
 
 #[cfg(all(test, unix))]
