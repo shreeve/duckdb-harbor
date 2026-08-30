@@ -215,8 +215,7 @@ impl Grid {
 
         // ddl and ddl_input come from the same source in Grid::new, so
         // they are Some together.
-        if let (Some(ddl), Some(state)) = (&s.ddl, &self.ddl_input) {
-            let ddl_text = ddl.clone();
+        if let (Some(state), Some(copy)) = (&self.ddl_input, &self.ddl_copy) {
             pane = pane.child(
                 div()
                     .h_flex()
@@ -231,25 +230,9 @@ impl Grid {
                             .text_color(t.muted)
                             .child("DDL"),
                     )
-                    .child(
-                        crate::grid::icon_tile("copy-ddl", 20., true, t)
-                            .tooltip(|window, cx| {
-                                gpui_component::tooltip::Tooltip::new("Copy DDL")
-                                    .build(window, cx)
-                            })
-                            .child(
-                                // Raw svg() does NOT inherit text color.
-                                svg()
-                                    .path("icons/copy.svg")
-                                    .size_3()
-                                    .text_color(t.muted),
-                            )
-                            .on_click(move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                    ddl_text.clone(),
-                                ));
-                            }),
-                    ),
+                    // The copy tile is its own little machine (flash, timer,
+                    // clipboard) — see copy_button.rs.
+                    .child(copy.clone()),
             );
             // A disabled Input keeps native text selection (drag, Cmd+C)
             // while gating off every mutation — read-only selectable

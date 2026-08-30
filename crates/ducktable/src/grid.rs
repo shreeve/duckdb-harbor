@@ -93,6 +93,8 @@ pub(crate) struct Grid {
     /// the text is natively selectable (mouse drag, Cmd+C) while every
     /// mutation stays gated off. None when the table has no DDL.
     pub(crate) ddl_input: Option<Entity<gpui_component::input::InputState>>,
+    /// The DDL block's copy tile, a self-confirming widget (copy_button.rs).
+    pub(crate) ddl_copy: Option<Entity<crate::copy_button::CopyButton>>,
     /// Fence for page fetches: a newer fetch supersedes an older one in
     /// flight, whose outcome is then discarded instead of committing
     /// stale rows.
@@ -332,6 +334,9 @@ impl Grid {
                     .default_value(ddl)
             })
         });
+        let ddl_copy = structure.as_ref().and_then(|s| s.ddl.clone()).map(|ddl| {
+            cx.new(|_| crate::copy_button::CopyButton::new("Copy DDL", ddl))
+        });
         cx.subscribe(&col_search, |_, _, _: &gpui_component::input::InputEvent, cx| {
             cx.notify();
         })
@@ -344,6 +349,7 @@ impl Grid {
             resize,
             col_search,
             ddl_input,
+            ddl_copy,
             fetch_seq: 0,
         }
     }

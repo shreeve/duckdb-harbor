@@ -4,6 +4,7 @@
 
 mod app;
 mod content;
+mod copy_button;
 mod footer;
 mod grid;
 mod inspector;
