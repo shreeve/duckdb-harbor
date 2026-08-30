@@ -19,6 +19,7 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::resizable::{
     h_resizable, resizable_panel, ResizablePanelEvent, ResizableState,
 };
+use gpui_component::button::ButtonVariants as _;
 use gpui_component::{Sizable as _, Size, StyledExt as _};
 use harbor_client::Conn;
 use serde_json::Value;
@@ -73,6 +74,12 @@ pub(crate) struct GridDelegate {
     /// row-number preference flips.
     schema_cols: Vec<wire::Column>,
     numeric: Vec<bool>,
+    /// Schema indices hidden via the Columns popover.
+    hidden: std::collections::HashSet<usize>,
+    /// Schema index for each data column currently displayed — the map
+    /// render_td/th use, since col_ix stops matching schema order once
+    /// anything is hidden.
+    visible: Vec<usize>,
     /// Whether the column list currently includes the row-number gutter.
     gutter: bool,
     /// Exact server-side row count (under the current filter), when the
@@ -122,6 +129,8 @@ impl Grid {
             cols: Vec::new(),
             schema_cols: Vec::new(),
             numeric: Vec::new(),
+            hidden: std::collections::HashSet::new(),
+            visible: Vec::new(),
             gutter,
             total_rows,
             page: 0,
@@ -142,12 +151,9 @@ impl Grid {
                     .iter()
                     .map(|c| numeric(&c.duckdb_type.to_uppercase()))
                     .collect();
-                delegate.cols = build_columns(&page.columns, gutter);
-                if gutter {
-                    delegate.cols[0].width = px(gutter_width(page.rows.len() as u64));
-                }
                 delegate.schema_cols = page.columns;
                 delegate.rows = page.rows;
+                delegate.rebuild_cols();
             }
             Err(message) => {
                 delegate.error = Some(message);
@@ -320,6 +326,41 @@ impl Grid {
         cx.notify();
     }
 
+    /// Show or hide one column (never the last visible one).
+    pub(crate) fn toggle_column(&mut self, schema_ix: usize, cx: &mut Context<Self>) {
+        self.table.update(cx, |state, cx| {
+            {
+                let d = state.delegate_mut();
+                if !d.hidden.remove(&schema_ix) {
+                    if d.visible.len() <= 1 {
+                        return;
+                    }
+                    d.hidden.insert(schema_ix);
+                }
+                d.rebuild_cols();
+            }
+            state.refresh(cx);
+            // Header and body clamp stale offsets differently once the
+            // column set changes width; reset to origin so they agree.
+            state.scroll_to_col(0, cx);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// (schema index, name, hidden) for the Columns popover.
+    pub(crate) fn column_list(&self, cx: &App) -> Vec<(usize, String, bool)> {
+        let d = self.table.read(cx).delegate();
+        d.schema_cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let name = c.name.clone().unwrap_or_else(|| format!("col{i}"));
+                (i, name, d.hidden.contains(&i))
+            })
+            .collect()
+    }
+
     pub(crate) fn structure(&self) -> Option<&crate::structure::TableStructure> {
         self.structure.as_ref()
     }
@@ -366,11 +407,7 @@ impl Grid {
             {
                 let d = state.delegate_mut();
                 d.gutter = want;
-                d.cols = build_columns(&d.schema_cols, want);
-                if want {
-                    let last = (d.page * d.page_size + d.rows.len()) as u64;
-                    d.cols[0].width = px(gutter_width(last));
-                }
+                d.rebuild_cols();
             }
             state.refresh(cx);
             // The header (overflow_scroll) and body (virtual_list) share a
@@ -409,6 +446,18 @@ impl GridDelegate {
     fn last_page(&self) -> Option<usize> {
         let total = self.total_rows?;
         Some((total.max(1) as usize - 1) / self.page_size)
+    }
+
+    /// Rebuild the display columns from the schema minus the hidden set
+    /// (plus the gutter), refreshing the visible→schema map.
+    fn rebuild_cols(&mut self) {
+        self.visible =
+            (0..self.schema_cols.len()).filter(|i| !self.hidden.contains(i)).collect();
+        self.cols = build_columns(&self.schema_cols, &self.visible, self.gutter);
+        if self.gutter {
+            let last = (self.page * self.page_size + self.rows.len()) as u64;
+            self.cols[0].width = px(gutter_width(last));
+        }
     }
 }
 
@@ -475,7 +524,10 @@ impl TableDelegate for GridDelegate {
                 .child(div().absolute().right_0().top_0().bottom_0().w(px(1.)).bg(t.border))
                 .into_any_element();
         }
-        let data_col = col_ix - self.gutter as usize;
+        // Display position -> schema index, through the visible map.
+        let Some(data_col) = self.visible.get(col_ix - self.gutter as usize).copied() else {
+            return div().into_any_element();
+        };
         let right = p.right_align && self.numeric.get(data_col).copied().unwrap_or(false);
         let value = self.rows.get(row_ix).and_then(|r| r.get(data_col));
         // The column paddings are zeroed (build_columns), so this div owns
@@ -603,7 +655,8 @@ impl TableDelegate for GridDelegate {
                 .child(edge(t.border))
                 .into_any_element();
         }
-        let data_col = col_ix - self.gutter as usize;
+        let data_col =
+            self.visible.get(col_ix - self.gutter as usize).copied().unwrap_or(usize::MAX);
         let right = prefs::get(cx).right_align
             && self.numeric.get(data_col).copied().unwrap_or(false);
         // Left-aligned headers line up with values on the shared 8px
@@ -1012,6 +1065,49 @@ impl Render for Grid {
                                 })),
                         )
                     })
+                    .when(view == ViewMode::Data, |d| {
+                        // Column show/hide, in a popover that stays open
+                        // across toggles.
+                        let grid = cx.entity();
+                        d.child(
+                            gpui_component::popover::Popover::new("columns-popover")
+                                .anchor(Corner::BottomLeft)
+                                .trigger(
+                                    gpui_component::button::Button::new("columns-btn")
+                                        .icon(gpui_component::IconName::Eye)
+                                        .ghost()
+                                        .xsmall()
+                                        .tooltip("Show or hide columns"),
+                                )
+                                .content(move |_, _, cx| {
+                                    let list = grid.read(cx).column_list(cx);
+                                    let mut pane = div()
+                                        .id("columns-list")
+                                        .v_flex()
+                                        .p_1()
+                                        .gap_px()
+                                        .min_w(px(180.))
+                                        .max_h(px(320.))
+                                        .overflow_y_scroll();
+                                    for (ix, name, hidden) in list {
+                                        let grid = grid.clone();
+                                        pane = pane.child(
+                                            gpui_component::checkbox::Checkbox::new((
+                                                "col", ix,
+                                            ))
+                                            .label(name)
+                                            .checked(!hidden)
+                                            .on_click(move |_, _, cx| {
+                                                grid.update(cx, |g, cx| {
+                                                    g.toggle_column(ix, cx);
+                                                });
+                                            }),
+                                        );
+                                    }
+                                    pane.into_any_element()
+                                }),
+                        )
+                    })
                     .child(div().flex_1())
                     .when(view == ViewMode::Data, |d| {
                         // Pager: size, then prev/next. Status stays the
@@ -1215,7 +1311,11 @@ fn qident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
-fn build_columns(cols: &[wire::Column], with_gutter: bool) -> Vec<TableColumn> {
+fn build_columns(
+    cols: &[wire::Column],
+    visible: &[usize],
+    with_gutter: bool,
+) -> Vec<TableColumn> {
     // Column 0 is the row-number gutter; its render_td owns every edge.
     let gutter = with_gutter.then(|| {
         TableColumn::new("#", "#")
@@ -1227,7 +1327,8 @@ fn build_columns(cols: &[wire::Column], with_gutter: bool) -> Vec<TableColumn> {
     });
     gutter
         .into_iter()
-        .chain(cols.iter().enumerate().map(|(i, c)| {
+        .chain(visible.iter().map(|&i| {
+            let c = &cols[i];
             let name = c.name.clone().unwrap_or_else(|| format!("col{i}"));
             let ty = c.duckdb_type.to_uppercase();
             // Left padding stays on the table's cell wrapper; the other
