@@ -40,7 +40,7 @@ jobs:
         run: test/scripts/fixture.sh sample.duckdb
 
       - name: Quick suites
-        run: make test SUITES="unit types spec catalog sessions cancel"
+        run: make test SUITES="unit fleet types spec catalog sessions cancel"
 
       - name: Server log on failure
         if: failure()
