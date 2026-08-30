@@ -62,6 +62,9 @@ pub(crate) struct Grid {
     /// The table/inspector divider (UI.md: divider positions persist —
     /// the width saves at the end of each drag).
     resize: Entity<ResizableState>,
+    /// The Columns popover's search box — persistent so the query
+    /// survives re-renders while the popover is open.
+    col_search: Entity<gpui_component::input::InputState>,
 }
 
 pub(crate) struct GridDelegate {
@@ -186,7 +189,15 @@ impl Grid {
             }
         })
         .detach();
-        Self { table, filter_input: None, view: ViewMode::Data, structure, resize }
+        let col_search = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .placeholder("Search columns\u{2026}")
+        });
+        cx.subscribe(&col_search, |_, _, _: &gpui_component::input::InputEvent, cx| {
+            cx.notify();
+        })
+        .detach();
+        Self { table, filter_input: None, view: ViewMode::Data, structure, resize, col_search }
     }
 
     /// Fetch a page (and optionally a fresh count) in the background and
@@ -377,6 +388,27 @@ impl Grid {
                     return;
                 }
                 d.hidden.clear();
+                d.rebuild_cols();
+            }
+            state.refresh(cx);
+            state.scroll_to_col(0, cx);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Hide every column but the first visible one (the popover's "Hide
+    /// all" — the grid never goes to zero columns, so start-from-nothing
+    /// keeps one anchor to build from).
+    pub(crate) fn hide_all_columns(&mut self, cx: &mut Context<Self>) {
+        self.table.update(cx, |state, cx| {
+            {
+                let d = state.delegate_mut();
+                if d.visible.len() <= 1 {
+                    return;
+                }
+                let keep = d.visible[0];
+                d.hidden = (0..d.schema_cols.len()).filter(|i| *i != keep).collect();
                 d.rebuild_cols();
             }
             state.refresh(cx);
@@ -1138,7 +1170,25 @@ impl Render for Grid {
                                 .content(move |_, _, cx| {
                                     let t = pal(cx);
                                     let list = grid.read(cx).column_list(cx);
-                                    let hidden_any = list.iter().any(|&(_, _, h)| h);
+                                    let total = list.len();
+                                    let shown =
+                                        list.iter().filter(|&&(_, _, h)| !h).count();
+                                    let hidden_any = shown < total;
+                                    // Same rule as the sidebar filters: a
+                                    // search box only earns its row past 10
+                                    // items.
+                                    let searchable = total > 10;
+                                    let search = grid.read(cx).col_search.clone();
+                                    let query =
+                                        search.read(cx).value().trim().to_lowercase();
+                                    let matches: Vec<_> = list
+                                        .into_iter()
+                                        .filter(|(_, name, _)| {
+                                            query.is_empty()
+                                                || name.to_lowercase().contains(&query)
+                                        })
+                                        .collect();
+                                    let none = matches.is_empty();
                                     // The whole row is the click target; the
                                     // Checkbox is visual only (its handler-
                                     // less listener no-ops and the click
@@ -1150,7 +1200,7 @@ impl Render for Grid {
                                         .gap_px()
                                         .max_h(px(340.))
                                         .overflow_y_scroll();
-                                    for (ix, name, hidden) in list {
+                                    for (ix, name, hidden) in matches {
                                         let grid = grid.clone();
                                         rows = rows.child(
                                             div()
@@ -1189,13 +1239,29 @@ impl Render for Grid {
                                                 }),
                                         );
                                     }
+                                    // Header links stay put (dimmed when
+                                    // inapplicable) so the row never
+                                    // reflows as columns toggle.
+                                    let link = |id: &'static str,
+                                                label: &'static str,
+                                                enabled: bool| {
+                                        div().id(id).text_xs().map(|d| {
+                                            if enabled {
+                                                d.text_color(t.accent).cursor_pointer()
+                                            } else {
+                                                d.text_color(t.muted.opacity(0.5))
+                                            }
+                                        })
+                                        .child(label)
+                                    };
                                     div()
                                         .v_flex()
-                                        .w(px(240.))
+                                        .w(px(250.))
                                         .child(
                                             div()
                                                 .h_flex()
                                                 .items_center()
+                                                .gap_2()
                                                 .px(px(10.))
                                                 .pt(px(8.))
                                                 .pb(px(6.))
@@ -1208,24 +1274,69 @@ impl Render for Grid {
                                                         .text_color(t.muted)
                                                         .child("COLUMNS"),
                                                 )
-                                                .child(div().flex_1())
                                                 .when(hidden_any, |d| {
-                                                    let grid = grid.clone();
                                                     d.child(
                                                         div()
-                                                            .id("cols-show-all")
                                                             .text_xs()
-                                                            .text_color(t.accent)
-                                                            .cursor_pointer()
-                                                            .child("Show all")
-                                                            .on_click(move |_, _, cx| {
-                                                                grid.update(cx, |g, cx| {
-                                                                    g.show_all_columns(cx);
-                                                                });
-                                                            }),
+                                                            .text_color(t.muted)
+                                                            .child(format!(
+                                                                "{shown} of {total}"
+                                                            )),
                                                     )
-                                                }),
+                                                })
+                                                .child(div().flex_1())
+                                                .child(
+                                                    link(
+                                                        "cols-show-all",
+                                                        "Show all",
+                                                        hidden_any,
+                                                    )
+                                                    .when(hidden_any, |d| {
+                                                        let grid = grid.clone();
+                                                        d.on_click(move |_, _, cx| {
+                                                            grid.update(cx, |g, cx| {
+                                                                g.show_all_columns(cx);
+                                                            });
+                                                        })
+                                                    }),
+                                                )
+                                                .child(
+                                                    link(
+                                                        "cols-hide-all",
+                                                        "Hide all",
+                                                        shown > 1,
+                                                    )
+                                                    .when(shown > 1, |d| {
+                                                        let grid = grid.clone();
+                                                        d.on_click(move |_, _, cx| {
+                                                            grid.update(cx, |g, cx| {
+                                                                g.hide_all_columns(cx);
+                                                            });
+                                                        })
+                                                    }),
+                                                ),
                                         )
+                                        .when(searchable, |d| {
+                                            d.child(
+                                                div().px(px(8.)).pt(px(8.)).child(
+                                                    gpui_component::input::Input::new(
+                                                        &search,
+                                                    )
+                                                    .xsmall()
+                                                    .cleanable(true),
+                                                ),
+                                            )
+                                        })
+                                        .when(none, |d| {
+                                            d.child(
+                                                div()
+                                                    .px(px(10.))
+                                                    .py(px(10.))
+                                                    .text_xs()
+                                                    .text_color(t.muted)
+                                                    .child("No matching columns"),
+                                            )
+                                        })
                                         .child(rows)
                                         .into_any_element()
                                 }),
