@@ -30,7 +30,8 @@
         "table.head.foreground": "#1d1d1f",
         "table.row.border": "#e7e8ec",
         "table.active.background": "#007aff1a",
-        "table.active.border": "#007aff1a"
+        "table.active.border": "#007aff1a",
+        "table.hover.background": "#00000000"
       }
     },
     {
@@ -62,7 +63,8 @@
         "table.head.foreground": "#f2f2f4",
         "table.row.border": "#38383e",
         "table.active.background": "#0a84ff2e",
-        "table.active.border": "#0a84ff2e"
+        "table.active.border": "#0a84ff2e",
+        "table.hover.background": "#00000000"
       }
     },
     {
@@ -94,7 +96,8 @@
         "table.head.foreground": "#3c342a",
         "table.row.border": "#e5dcc8",
         "table.active.background": "#c2540a1a",
-        "table.active.border": "#c2540a1a"
+        "table.active.border": "#c2540a1a",
+        "table.hover.background": "#00000000"
       }
     },
     {
@@ -126,7 +129,8 @@
         "table.head.foreground": "#dbe4f5",
         "table.row.border": "#1f2b44",
         "table.active.background": "#5aa2ff29",
-        "table.active.border": "#5aa2ff29"
+        "table.active.border": "#5aa2ff29",
+        "table.hover.background": "#00000000"
       }
     },
     {
@@ -158,7 +162,8 @@
         "table.head.foreground": "#000000",
         "table.row.border": "#9a9a9a",
         "table.active.background": "#0000d61f",
-        "table.active.border": "#0000d61f"
+        "table.active.border": "#0000d61f",
+        "table.hover.background": "#00000000"
       }
     }
   ]
