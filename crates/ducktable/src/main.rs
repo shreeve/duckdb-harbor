@@ -36,6 +36,16 @@ impl AssetSource for Assets {
             "icons/refresh-cw.svg" => {
                 Some(include_bytes!("../../../assets/icons/refresh-cw.svg").into())
             }
+            "icons/chevron-left.svg" => {
+                Some(include_bytes!("../../../assets/icons/chevron-left.svg").into())
+            }
+            "icons/chevron-right.svg" => {
+                Some(include_bytes!("../../../assets/icons/chevron-right.svg").into())
+            }
+            "icons/eye.svg" => Some(include_bytes!("../../../assets/icons/eye.svg").into()),
+            "icons/funnel.svg" => {
+                Some(include_bytes!("../../../assets/icons/funnel.svg").into())
+            }
             _ => None,
         })
     }

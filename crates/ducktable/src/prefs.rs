@@ -16,7 +16,12 @@ pub struct Prefs {
     pub inspector: bool,
     /// The inspector pane's width (UI.md: divider positions persist).
     pub inspector_width: f32,
+    /// Rows per page in the data grid.
+    pub page_size: usize,
 }
+
+/// The page sizes the footer control cycles through.
+pub const PAGE_SIZES: [usize; 4] = [500, 1_000, 5_000, 10_000];
 
 impl Default for Prefs {
     fn default() -> Self {
@@ -26,6 +31,7 @@ impl Default for Prefs {
             null_tags: true,
             inspector: false,
             inspector_width: 290.,
+            page_size: 5_000,
         }
     }
 }
@@ -53,6 +59,12 @@ pub fn init(cx: &mut App) {
             .and_then(Value::as_f64)
             .map(|w| (w as f32).clamp(180., 600.))
             .unwrap_or(prefs.inspector_width);
+        prefs.page_size = v
+            .get("page_size")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .filter(|n| PAGE_SIZES.contains(n))
+            .unwrap_or(prefs.page_size);
     }
     cx.set_global(prefs);
 }
@@ -78,6 +90,7 @@ pub fn save(cx: &mut App, change: impl FnOnce(&mut Prefs)) {
         "null_tags": prefs.null_tags,
         "inspector": prefs.inspector,
         "inspector_width": prefs.inspector_width,
+        "page_size": prefs.page_size,
     });
     if let Some(p) = file() {
         if let Some(dir) = p.parent() {

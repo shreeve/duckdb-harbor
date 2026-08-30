@@ -97,6 +97,7 @@ impl DuckTable {
         self.selected_table = Some((clone_str(&schema), clone_str(&name)));
         self.select_seq += 1;
         let fence = self.select_seq;
+        let page_size = crate::prefs::get(cx).page_size;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let (outcome, total, structure) = cx
@@ -106,7 +107,7 @@ impl DuckTable {
                     let schema = clone_str(&schema);
                     let name = clone_str(&name);
                     async move {
-                        let page = crate::grid::first_page(&conn, &schema, &name);
+                        let page = crate::grid::first_page(&conn, &schema, &name, page_size);
                         let (total, structure) = if page.is_ok() {
                             (
                                 crate::grid::total_rows(&conn, &schema, &name),

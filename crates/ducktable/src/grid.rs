@@ -23,7 +23,11 @@ use gpui_component::{Sizable as _, Size, StyledExt as _};
 use harbor_client::Conn;
 use serde_json::Value;
 
-const PAGE: usize = 500;
+// Rows arrive as explicit pages (prefs.page_size, default 5,000): a page
+// replaces the rows in one frame, so ordinary tables never hit a boundary
+// and huge tables get honest jumps, constant memory, and internally
+// consistent snapshots. The old infinite-append model silently stitched
+// separately-queried chunks together.
 
 // Sizes from design/design.css `.grid`: 12px mono values, 600 11.5px UI
 // headers, 11px muted row numbers, 10px NULL tag.
@@ -33,8 +37,8 @@ const HEADER_TEXT: f32 = 11.5;
 const GUTTER_TEXT: f32 = 11.;
 const TAG_TEXT: f32 = 10.;
 
-fn gutter_width(rows: usize) -> f32 {
-    let digits = rows.max(1).ilog10() as f32 + 1.;
+fn gutter_width(max_row: u64) -> f32 {
+    let digits = max_row.max(1).ilog10() as f32 + 1.;
     (16. + digits * 7.).max(34.)
 }
 
@@ -49,6 +53,8 @@ pub(crate) enum ViewMode {
 
 pub(crate) struct Grid {
     table: Entity<TableState<GridDelegate>>,
+    /// The filter strip's input; Some = the strip is open.
+    filter_input: Option<Entity<gpui_component::input::InputState>>,
     view: ViewMode,
     /// Prefetched with the first page, so switching views is instant.
     structure: Option<crate::structure::TableStructure>,
@@ -69,8 +75,14 @@ pub(crate) struct GridDelegate {
     numeric: Vec<bool>,
     /// Whether the column list currently includes the row-number gutter.
     gutter: bool,
-    /// Exact server-side row count, when the count query succeeded.
+    /// Exact server-side row count (under the current filter), when the
+    /// count query succeeded.
     pub(crate) total_rows: Option<u64>,
+    /// Current page (0-based) and the size its rows were fetched with.
+    page: usize,
+    page_size: usize,
+    /// Raw SQL WHERE clause text, verbatim from the filter strip.
+    filter: Option<String>,
     rows: Vec<Vec<Value>>,
     /// Mirror of the table's selected row (synced from TableEvent), so
     /// render_tr can tint the selection — the delegate cannot read the
@@ -80,7 +92,6 @@ pub(crate) struct GridDelegate {
     /// carries an accent ring on top of the row tint, and keyboard row
     /// moves carry the ring to the same column of the new row.
     active_cell: Option<(usize, usize)>,
-    eof: bool,
     loading: bool,
     error: Option<String>,
     last_time_ms: u64,
@@ -102,7 +113,8 @@ impl Grid {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let gutter = prefs::get(cx).row_numbers;
+        let p = prefs::get(cx);
+        let gutter = p.row_numbers;
         let mut delegate = GridDelegate {
             conn,
             source: format!("{}.{}", qident(schema), qident(name)),
@@ -112,17 +124,18 @@ impl Grid {
             numeric: Vec::new(),
             gutter,
             total_rows,
+            page: 0,
+            page_size: p.page_size,
+            filter: None,
             rows: Vec::new(),
             selected: None,
             active_cell: None,
-            eof: false,
             loading: false,
             error: None,
             last_time_ms: 0,
         };
         match outcome {
             Ok(page) => {
-                delegate.eof = page.rows.len() < PAGE;
                 delegate.last_time_ms = page.time_ms;
                 delegate.numeric = page
                     .columns
@@ -131,14 +144,13 @@ impl Grid {
                     .collect();
                 delegate.cols = build_columns(&page.columns, gutter);
                 if gutter {
-                    delegate.cols[0].width = px(gutter_width(page.rows.len()));
+                    delegate.cols[0].width = px(gutter_width(page.rows.len() as u64));
                 }
                 delegate.schema_cols = page.columns;
                 delegate.rows = page.rows;
             }
             Err(message) => {
                 delegate.error = Some(message);
-                delegate.eof = true;
             }
         }
         let table = cx.new(|cx| TableState::new(delegate, window, cx));
@@ -168,7 +180,144 @@ impl Grid {
             }
         })
         .detach();
-        Self { table, view: ViewMode::Data, structure, resize }
+        Self { table, filter_input: None, view: ViewMode::Data, structure, resize }
+    }
+
+    /// Fetch a page (and optionally a fresh count) in the background and
+    /// commit everything in one frame. The current page stays on screen
+    /// until then; an error keeps it and shows in the strip.
+    fn fetch(&mut self, page: usize, recount: bool, cx: &mut Context<Self>) {
+        let (conn, sql, count_sql) = {
+            let d = self.table.read(cx).delegate();
+            if d.loading {
+                return;
+            }
+            (d.conn.clone(), d.page_sql(page, d.page_size), recount.then(|| d.count_sql()))
+        };
+        self.table.update(cx, |state, _| state.delegate_mut().loading = true);
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    let result = harbor_client::query(&conn, &sql)?;
+                    let total = count_sql.map(|c| {
+                        harbor_client::query(&conn, &c)
+                            .ok()
+                            .and_then(|r| r.rows.first()?.first()?.as_u64())
+                    });
+                    Ok::<_, String>((result, total))
+                })
+                .await;
+            this.update(cx, |grid, cx| {
+                grid.table.update(cx, |state, cx| {
+                    let ok = {
+                        let d = state.delegate_mut();
+                        d.loading = false;
+                        match outcome {
+                            Ok((result, total)) => {
+                                d.error = None;
+                                d.last_time_ms = result.time_ms;
+                                d.rows = result.rows;
+                                d.page = page;
+                                if let Some(t) = total {
+                                    d.total_rows = t;
+                                }
+                                d.selected = None;
+                                d.active_cell = None;
+                                true
+                            }
+                            Err(message) => {
+                                d.error = Some(message);
+                                false
+                            }
+                        }
+                    };
+                    if ok {
+                        let d = state.delegate();
+                        if d.gutter {
+                            let last = (d.page * d.page_size + d.rows.len()) as u64;
+                            let want = px(gutter_width(last));
+                            if d.cols[0].width != want {
+                                state.delegate_mut().cols[0].width = want;
+                                state.refresh(cx);
+                            }
+                        }
+                        state.clear_selection(cx);
+                        if state.delegate().rows.len() > 0 {
+                            state.scroll_to_row(0, cx);
+                        }
+                    }
+                    cx.notify();
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(crate) fn prev_page(&mut self, cx: &mut Context<Self>) {
+        let page = self.table.read(cx).delegate().page;
+        if page > 0 {
+            self.fetch(page - 1, false, cx);
+        }
+    }
+
+    pub(crate) fn next_page(&mut self, cx: &mut Context<Self>) {
+        let (page, more) = {
+            let d = self.table.read(cx).delegate();
+            let more = match d.last_page() {
+                Some(last) => d.page < last,
+                // Unknown total: a full page suggests there may be more.
+                None => d.rows.len() == d.page_size,
+            };
+            (d.page, more)
+        };
+        if more {
+            self.fetch(page + 1, false, cx);
+        }
+    }
+
+    /// Cycle the page size through PAGE_SIZES (a global preference) and
+    /// refetch from page 1.
+    pub(crate) fn cycle_page_size(&mut self, cx: &mut Context<Self>) {
+        let current = self.table.read(cx).delegate().page_size;
+        let ix = prefs::PAGE_SIZES.iter().position(|s| *s == current).unwrap_or(0);
+        let next = prefs::PAGE_SIZES[(ix + 1) % prefs::PAGE_SIZES.len()];
+        prefs::toggle(cx, |p| p.page_size = next);
+        self.table.update(cx, |state, _| state.delegate_mut().page_size = next);
+        self.fetch(0, false, cx);
+    }
+
+    /// Open or close the raw-SQL filter strip. Closing clears an active
+    /// filter (refetching unfiltered).
+    pub(crate) fn toggle_filter_strip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.filter_input.take().is_some() {
+            let had_filter = self.table.read(cx).delegate().filter.is_some();
+            if had_filter {
+                self.table.update(cx, |state, _| state.delegate_mut().filter = None);
+                self.fetch(0, true, cx);
+            }
+            cx.notify();
+            return;
+        }
+        let input = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .placeholder("e.g. price > 100 AND name LIKE '%panel%'")
+        });
+        cx.subscribe(&input, |grid, input, event: &gpui_component::input::InputEvent, cx| {
+            if matches!(event, gpui_component::input::InputEvent::PressEnter { .. }) {
+                let text = input.read(cx).value().trim().to_string();
+                grid.table.update(cx, |state, _| {
+                    state.delegate_mut().filter = (!text.is_empty()).then_some(text);
+                });
+                grid.fetch(0, true, cx);
+            }
+        })
+        .detach();
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.filter_input = Some(input);
+        cx.notify();
     }
 
     pub(crate) fn structure(&self) -> Option<&crate::structure::TableStructure> {
@@ -219,7 +368,8 @@ impl Grid {
                 d.gutter = want;
                 d.cols = build_columns(&d.schema_cols, want);
                 if want {
-                    d.cols[0].width = px(gutter_width(d.rows.len()));
+                    let last = (d.page * d.page_size + d.rows.len()) as u64;
+                    d.cols[0].width = px(gutter_width(last));
                 }
             }
             state.refresh(cx);
@@ -233,51 +383,32 @@ impl Grid {
 }
 
 impl GridDelegate {
-    fn fetch_next_page(&mut self, cx: &mut Context<TableState<Self>>) {
-        if self.eof || self.loading || self.error.is_some() {
-            return;
+    /// The SELECT for one page under the current filter.
+    fn page_sql(&self, page: usize, size: usize) -> String {
+        format!(
+            "SELECT * FROM {}{} LIMIT {} OFFSET {}",
+            self.source,
+            self.where_part(),
+            size,
+            page * size,
+        )
+    }
+
+    fn count_sql(&self) -> String {
+        format!("SELECT count(*) FROM {}{}", self.source, self.where_part())
+    }
+
+    fn where_part(&self) -> String {
+        match &self.filter {
+            Some(f) => format!(" WHERE {f}"),
+            None => String::new(),
         }
-        self.loading = true;
-        let conn = self.conn.clone();
-        let sql =
-            format!("SELECT * FROM {} LIMIT {} OFFSET {}", self.source, PAGE, self.rows.len());
-        cx.spawn(async move |state, cx| {
-            let outcome = cx
-                .background_executor()
-                .spawn(async move { harbor_client::query(&conn, &sql) })
-                .await;
-            state
-                .update(cx, |state, cx| {
-                    {
-                        let d = state.delegate_mut();
-                        d.loading = false;
-                        match outcome {
-                            Ok(page) => {
-                                d.eof = page.rows.len() < PAGE;
-                                d.last_time_ms = page.time_ms;
-                                d.rows.extend(page.rows);
-                            }
-                            Err(message) => d.error = Some(message),
-                        }
-                    }
-                    // The row-number gutter widens as pages land; a width
-                    // change needs the col groups re-prepared.
-                    let want = px(gutter_width(state.delegate().rows.len()));
-                    let widen = state.delegate().gutter
-                        && state
-                            .delegate()
-                            .cols
-                            .first()
-                            .is_some_and(|c| c.width != want);
-                    if widen {
-                        state.delegate_mut().cols[0].width = want;
-                        state.refresh(cx);
-                    }
-                    cx.notify();
-                })
-                .ok();
-        })
-        .detach();
+    }
+
+    /// Last page index under the current count, when known.
+    fn last_page(&self) -> Option<usize> {
+        let total = self.total_rows?;
+        Some((total.max(1) as usize - 1) / self.page_size)
     }
 }
 
@@ -335,7 +466,9 @@ impl TableDelegate for GridDelegate {
                         .text_size(px(GUTTER_TEXT))
                         .font_family(value_font())
                         .text_color(t.muted)
-                        .child(format!("{}", row_ix + 1)),
+                        // Absolute position: page 2 starts at 5,001, and
+                        // the number says so (plain digits, like Sheets).
+                        .child(format!("{}", self.page * self.page_size + row_ix + 1)),
                 )
                 // The gutter's divider is firmer than the data grid lines
                 // (design.css `.grid td.num`), so it is its own strip.
@@ -528,14 +661,6 @@ impl TableDelegate for GridDelegate {
             })
     }
 
-    fn is_eof(&self, _: &App) -> bool {
-        self.eof
-    }
-
-    fn load_more(&mut self, _: &mut Window, cx: &mut Context<TableState<Self>>) {
-        self.fetch_next_page(cx);
-    }
-
     fn loading(&self, _: &App) -> bool {
         self.loading && self.rows.is_empty()
     }
@@ -551,32 +676,45 @@ impl Render for Grid {
         let inspector = (p.inspector && self.view == ViewMode::Data)
             .then(|| self.inspector(cx).into_any_element());
         let view = self.view;
-        let (title, count, total, cols, eof, loading, error, ms) = {
+        let (title, count, total, cols, page, size, filter_active, loading, error, ms) = {
             let d = self.table.read(cx).delegate();
             (
                 d.title.clone(),
                 d.rows.len(),
                 d.total_rows,
                 d.cols.len().saturating_sub(d.gutter as usize),
-                d.eof,
+                d.page,
+                d.page_size,
+                d.filter.is_some(),
                 d.loading,
                 d.error.clone(),
                 d.last_time_ms,
             )
         };
         let commas = crate::util::commas;
-        let rows_part = match total {
-            Some(n) if (count as u64) < n => {
-                format!("{} of {} rows", commas(count as u64), commas(n))
+        let (first, last) = (page * size + 1, page * size + count);
+        let rows_part = if count == 0 {
+            "0 rows".to_string()
+        } else {
+            match total {
+                Some(t) => format!(
+                    "{}\u{2013}{} of {} rows",
+                    commas(first as u64),
+                    commas(last as u64),
+                    commas(t)
+                ),
+                None => {
+                    format!("{}\u{2013}{} rows", commas(first as u64), commas(last as u64))
+                }
             }
-            Some(n) => format!("{} {}", commas(n), if n == 1 { "row" } else { "rows" }),
-            None => format!(
-                "{}{} {}",
-                commas(count as u64),
-                if eof { "" } else { "+" },
-                if count == 1 && eof { "row" } else { "rows" }
-            ),
         };
+        let can_prev = page > 0;
+        let can_next = match total {
+            Some(t) => (last as u64) < t,
+            // Unknown total: a full page suggests there may be more.
+            None => count == size,
+        };
+        let filter_open = self.filter_input.is_some();
         // The footer status is mode-relevant, and "N columns" is ALWAYS
         // the last element: it stays fixed at the right edge when the
         // view switches, and the data-only facts simply disappear. The
@@ -707,6 +845,40 @@ impl Render for Grid {
                             ),
                     )),
             )
+            .when(view == ViewMode::Data, |d| {
+                // The raw-SQL filter strip (UI.md "filters", v1): one
+                // WHERE input, applied on Enter through the same
+                // fetch-first swap as everything else.
+                d.when_some(self.filter_input.clone(), |d, input| {
+                    d.child(
+                        div()
+                            .h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .bg(t.raised)
+                            .border_b_1()
+                            .border_color(t.border)
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(11.))
+                                    .font_family(value_font())
+                                    .text_color(t.muted)
+                                    .child("WHERE"),
+                            )
+                            .child(
+                                div().flex_1().child(
+                                    gpui_component::input::Input::new(&input)
+                                        .xsmall()
+                                        .cleanable(true),
+                                ),
+                            ),
+                    )
+                })
+            })
             .when_some(error, |d, message| {
                 d.child(
                     div()
@@ -808,9 +980,96 @@ impl Render for Grid {
                                 }),
                             )),
                     )
+                    .when(view == ViewMode::Data, |d| {
+                        // The filter toggle sits by the view switcher;
+                        // accent when a filter is ACTIVE, not just open.
+                        d.child(
+                            div()
+                                .id("toggle-filter")
+                                .ml_2()
+                                .h_flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(22.))
+                                .rounded(px(4.))
+                                .cursor_pointer()
+                                .hover(|d| d.bg(t.row_hover))
+                                .tooltip(|window, cx| {
+                                    Tooltip::new("Filter (raw SQL WHERE)").build(window, cx)
+                                })
+                                .child(
+                                    svg()
+                                        .path("icons/funnel.svg")
+                                        .size_3p5()
+                                        .text_color(if filter_active || filter_open {
+                                            t.accent
+                                        } else {
+                                            t.muted
+                                        }),
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_filter_strip(window, cx);
+                                })),
+                        )
+                    })
                     .child(div().flex_1())
+                    .when(view == ViewMode::Data, |d| {
+                        // Pager: size, then prev/next. Status stays the
+                        // rightmost element (columns-last anchor).
+                        let arrow = |id: &'static str,
+                                     icon: gpui_component::IconName,
+                                     enabled: bool| {
+                            div()
+                                .id(id)
+                                .h_flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(20.))
+                                .rounded(px(4.))
+                                .map(|d| {
+                                    if enabled {
+                                        d.cursor_pointer()
+                                            .text_color(t.text)
+                                            .hover(|d| d.bg(t.row_hover))
+                                    } else {
+                                        d.text_color(t.muted.opacity(0.4))
+                                    }
+                                })
+                                .child(gpui_component::Icon::new(icon).size_4())
+                        };
+                        d.child(
+                            div()
+                                .id("page-size")
+                                .px_2()
+                                .h(px(20.))
+                                .h_flex()
+                                .items_center()
+                                .rounded(px(4.))
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(t.muted)
+                                .hover(|d| d.bg(t.row_hover))
+                                .tooltip(|window, cx| {
+                                    Tooltip::new("Rows per page \u{2014} click to change")
+                                        .build(window, cx)
+                                })
+                                .child(commas(size as u64))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cycle_page_size(cx);
+                                })),
+                        )
+                        .child(
+                            arrow("page-prev", gpui_component::IconName::ChevronLeft, can_prev)
+                                .on_click(cx.listener(|this, _, _, cx| this.prev_page(cx))),
+                        )
+                        .child(
+                            arrow("page-next", gpui_component::IconName::ChevronRight, can_next)
+                                .on_click(cx.listener(|this, _, _, cx| this.next_page(cx))),
+                        )
+                    })
                     .child(
                         div()
+                            .ml_2()
                             .h_flex()
                             .flex_none()
                             .gap_1()
@@ -895,8 +1154,9 @@ pub(crate) fn first_page(
     conn: &Conn,
     schema: &str,
     name: &str,
+    limit: usize,
 ) -> Result<harbor_client::QueryResult, String> {
-    let sql = format!("SELECT * FROM {}.{} LIMIT {}", qident(schema), qident(name), PAGE);
+    let sql = format!("SELECT * FROM {}.{} LIMIT {}", qident(schema), qident(name), limit);
     harbor_client::query(conn, &sql)
 }
 
