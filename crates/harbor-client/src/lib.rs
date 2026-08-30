@@ -13,4 +13,4 @@ pub mod http;
 pub mod tokens;
 
 pub use fleet::{connect, info, keepalive, list, probe, state_of, BerthRow, Conn, Sidecar};
-pub use harbor_common::{Level, State};
+pub use harbor_common::{paths, Level, State};

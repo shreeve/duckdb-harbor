@@ -260,6 +260,9 @@ impl DuckTable {
                 .gap_1()
                 .items_start()
                 .p_4()
+                .min_w(px(440.))
+                .max_w_full()
+                .overflow_hidden()
                 .bg(rgb(BG_SURFACE))
                 .border_1()
                 .border_color(rgb(BORDER))
@@ -274,14 +277,26 @@ impl DuckTable {
                 )
                 .child(meta("DuckDB", clone_str(&info.duckdb_version)))
                 .child(meta("Harbor", clone_str(&info.harbor_version)))
-                .child(meta("Database", clone_str(&info.database)))
+                .child(meta(
+                    "Database",
+                    harbor_client::paths::shorten(std::path::Path::new(&info.database)),
+                ))
                 .child(meta("Uptime", format!("{}s", info.uptime_ms / 1000)))
                 .child(meta(
                     "Lifetime",
                     if conn.summoned { "summoned by this window".into() } else { "joined, already running".into() },
                 )),
         };
-        div().flex_1().h_full().bg(rgb(BG_SURFACE)).v_flex().items_center().justify_center().child(body)
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .bg(rgb(BG_SURFACE))
+            .v_flex()
+            .items_center()
+            .justify_center()
+            .p_6()
+            .child(body)
     }
 }
 
@@ -289,9 +304,10 @@ fn meta(k: &'static str, v: String) -> impl IntoElement {
     div()
         .h_flex()
         .gap_2()
+        .w_full()
         .text_sm()
-        .child(div().w_20().text_color(rgb(MUTED)).child(k))
-        .child(div().text_color(rgb(TEXT)).child(v))
+        .child(div().w_20().flex_none().text_color(rgb(MUTED)).child(k))
+        .child(div().flex_1().min_w_0().truncate().text_color(rgb(TEXT)).child(v))
 }
 
 fn clone_str(s: &str) -> String {
