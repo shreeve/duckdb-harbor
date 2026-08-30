@@ -44,7 +44,7 @@ token=${TOKEN:-check-$$}
 # port this runner has already given to the shared server — the run dies at
 # startup with "address already in use" and it looks like a harbor bug.
 unset PORT
-suites=${SUITES:-unit types asserts spec fuzz hostile deployment stress catalog sessions cancel}
+suites=${SUITES:-unit fleet types asserts spec fuzz hostile deployment stress catalog sessions cancel}
 
 bold=$(tput bold 2>/dev/null || true); red=$(tput setaf 1 2>/dev/null || true)
 green=$(tput setaf 2 2>/dev/null || true); dim=$(tput dim 2>/dev/null || true)
@@ -91,6 +91,9 @@ skip() { skipped+=("$1"); printf '%s— %s skipped: %s%s\n' "$dim" "$1" "$2" "$o
 # ---------------------------------------------------------------------------
 
 run unit     cargo test --release
+# The summon/hold law runs both binaries in its own $HARBOR_HOME sandbox —
+# no shared server, and nothing it starts outlives it.
+run fleet    "$here/test/scripts/fleet.sh"
 
 # ---------------------------------------------------------------------------
 # One server, shared by the read-only HTTP suites, on its own copy
