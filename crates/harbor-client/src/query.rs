@@ -19,8 +19,25 @@ pub struct QueryResult {
 }
 
 pub fn query(conn: &Conn, sql: &str) -> Result<QueryResult, String> {
-    let body = serde_json::to_string(&SqlRequest { sql: sql.to_string(), ..Default::default() })
-        .map_err(|e| e.to_string())?;
+    exec(conn, sql, None, None)
+}
+
+/// One statement with everything the wire offers: bound parameters (never
+/// string-assembled values) and an optional session, whose pinned
+/// connection is what lets a transaction outlive one request.
+pub fn exec(
+    conn: &Conn,
+    sql: &str,
+    params: Option<Vec<serde_json::Value>>,
+    session_id: Option<&str>,
+) -> Result<QueryResult, String> {
+    let body = serde_json::to_string(&SqlRequest {
+        sql: sql.to_string(),
+        params,
+        session_id: session_id.map(str::to_string),
+        ..Default::default()
+    })
+    .map_err(|e| e.to_string())?;
     let resp = http::request(
         &conn.transport,
         &endpoint::SQL,
@@ -60,4 +77,42 @@ pub fn query(conn: &Conn, sql: &str) -> Result<QueryResult, String> {
         }
     }
     Ok(QueryResult { columns, rows, row_count, time_ms })
+}
+
+/// Open a session: a pinned connection that holds a transaction across
+/// requests. Release it with [`session_release`] — which rolls back
+/// anything uncommitted, so an abandoned session can never half-commit.
+pub fn session_new(conn: &Conn) -> Result<String, String> {
+    let resp = http::request(
+        &conn.transport,
+        &endpoint::SESSIONS_NEW,
+        conn.token.as_deref(),
+        Some("{}"),
+        Some(Duration::from_secs(10)),
+    )
+    .map_err(|e| format!("session: {e}"))?;
+    let status = resp.status;
+    let body = resp.body_string().map_err(|e| e.to_string())?;
+    if !(200..300).contains(&status) {
+        return Err(match Event::parse(body.trim()) {
+            Ok(Event::Error { code, message }) => format!("{code}: {message}"),
+            _ => format!("HTTP {status}"),
+        });
+    }
+    serde_json::from_str::<wire::SessionNewResponse>(&body)
+        .map(|r| r.session_id)
+        .map_err(|e| format!("bad session response: {e}"))
+}
+
+/// Release a session's pinned connection, rolling back any open
+/// transaction. Best-effort by design: the server's TTL reaps what a
+/// dropped connection leaves behind.
+pub fn session_release(conn: &Conn, session_id: &str) {
+    let _ = http::request(
+        &conn.transport,
+        &endpoint::session(session_id),
+        conn.token.as_deref(),
+        None,
+        Some(Duration::from_secs(10)),
+    );
 }

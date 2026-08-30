@@ -16,5 +16,5 @@ pub mod tokens;
 
 pub use catalog::{catalog, catalog_lite, Catalog, Table};
 pub use fleet::{connect, info, keepalive, Conn};
-pub use query::{query, QueryResult};
+pub use query::{exec, query, session_new, session_release, QueryResult};
 pub use harbor_common::{paths, Level, State};

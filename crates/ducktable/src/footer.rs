@@ -15,6 +15,15 @@ use gpui_component::button::ButtonVariants as _;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Sizable as _, StyledExt as _};
 
+/// A key value as the review popover shows it: strings bare, everything
+/// else in its JSON spelling.
+fn vtext(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 impl Grid {
     pub(crate) fn footer(&self, cx: &mut Context<Self>) -> Div {
         let t = pal(cx);
@@ -140,6 +149,36 @@ impl Grid {
             .when(view == ViewMode::Data, |d| {
                 d.child(self.columns_popover(cx))
             })
+            // The staging story, told where the eye rests between edits:
+            // the verb-split count while changes wait, "committing…"
+            // while the transaction runs, or the read-only reason when
+            // there is no primary key to key changes by (docs/EDITING.md
+            // — a refusal is stated, never a mystery).
+            .when(view == ViewMode::Data, |d| {
+                let (updates, deletes) =
+                    self.edits.as_ref().map(|e| e.counts()).unwrap_or((0, 0));
+                if self.committing {
+                    d.child(
+                        div()
+                            .ml_2()
+                            .text_xs()
+                            .text_color(t.muted)
+                            .child("committing\u{2026}"),
+                    )
+                } else if updates + deletes > 0 {
+                    d.child(div().ml_2().child(self.staged_popover(updates, deletes, cx)))
+                } else if self.edits.is_none() && !loading_empty {
+                    d.child(
+                        div()
+                            .ml_2()
+                            .text_xs()
+                            .text_color(t.muted.opacity(0.8))
+                            .child("read-only \u{00b7} no primary key"),
+                    )
+                } else {
+                    d
+                }
+            })
             .child(div().flex_1())
             .child(
                 // One right-anchored line: ms · range · columns · pager
@@ -240,6 +279,219 @@ impl Grid {
                             )
                     }),
             )
+    }
+
+    /// The staged-changes chip and its review popover: the count is the
+    /// trigger, the audit is pull-based (docs/EDITING.md). Each entry
+    /// lists its diffs (`column: old → new`) with a per-entry discard;
+    /// Commit and Discard all sit at the bottom.
+    fn staged_popover(
+        &self,
+        updates: usize,
+        deletes: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let grid = cx.entity();
+        let t = pal(cx);
+        let plural = |n: usize, word: &str| {
+            if n == 1 {
+                format!("1 {word}")
+            } else {
+                format!("{n} {word}s")
+            }
+        };
+        // Verb-split label: updates in accent, deletes in the danger
+        // color — destruction never hides inside a neutral count.
+        let mut label = div().h_flex().items_center().gap_1().text_xs();
+        if updates > 0 {
+            label = label.child(div().text_color(t.accent).child(plural(updates, "update")));
+        }
+        if updates > 0 && deletes > 0 {
+            label = label.child(div().text_color(t.muted).child("\u{00b7}"));
+        }
+        if deletes > 0 {
+            label = label.child(div().text_color(t.bad).child(plural(deletes, "delete")));
+        }
+        label = label
+            .child(div().text_color(t.muted).child("\u{00b7} \u{2318}S to commit"));
+        gpui_component::popover::Popover::new("staged-popover")
+            .anchor(Corner::BottomLeft)
+            .trigger(
+                gpui_component::button::Button::new("staged-btn")
+                    .ghost()
+                    .xsmall()
+                    .child(label),
+            )
+            .content(move |_, _, cx| {
+                let t = pal(cx);
+                // Snapshot the entries: (key, row title, diff lines, is_delete).
+                let items: Vec<(String, String, Vec<String>, bool)> = {
+                    let g = grid.read(cx);
+                    match &g.edits {
+                        None => Vec::new(),
+                        Some(e) => e
+                            .entries()
+                            .iter()
+                            .map(|(key, identity, change)| {
+                                let id = identity
+                                    .iter()
+                                    .map(vtext)
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                match change {
+                                    crate::edits::RowChange::Delete => (
+                                        key.to_string(),
+                                        format!("row ({id})"),
+                                        vec!["delete".to_string()],
+                                        true,
+                                    ),
+                                    crate::edits::RowChange::Update(cells) => (
+                                        key.to_string(),
+                                        format!("row ({id})"),
+                                        cells
+                                            .iter()
+                                            .map(|(col, cell)| {
+                                                format!(
+                                                    "{}: {} \u{2192} {}",
+                                                    e.column_name(*col),
+                                                    cell.original
+                                                        .as_ref()
+                                                        .map(|s| s.as_ref())
+                                                        .unwrap_or("NULL"),
+                                                    cell.text
+                                                        .as_ref()
+                                                        .map(|s| s.as_ref())
+                                                        .unwrap_or("NULL"),
+                                                )
+                                            })
+                                            .collect(),
+                                        false,
+                                    ),
+                                }
+                            })
+                            .collect(),
+                    }
+                };
+                let mut rows = div()
+                    .id("staged-list")
+                    .v_flex()
+                    .p(px(4.))
+                    .gap_px()
+                    .max_h(px(340.))
+                    .overflow_y_scroll();
+                for (ix, (key, title, lines, is_delete)) in items.into_iter().enumerate() {
+                    let grid = grid.clone();
+                    rows = rows.child(
+                        div()
+                            .h_flex()
+                            .items_start()
+                            .gap_2()
+                            .px(px(6.))
+                            .py(px(4.))
+                            .rounded(px(5.))
+                            .hover(|d| d.bg(t.row_hover))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .v_flex()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(t.muted)
+                                            .truncate()
+                                            .child(title),
+                                    )
+                                    .children(lines.into_iter().map(|line| {
+                                        div()
+                                            .text_xs()
+                                            .font_family(crate::theme::value_font())
+                                            .text_color(if is_delete { t.bad } else { t.text })
+                                            .truncate()
+                                            .child(line)
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(("staged-discard", ix))
+                                    .flex_none()
+                                    .px(px(4.))
+                                    .rounded(px(4.))
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .text_color(t.muted)
+                                    .hover(|d| d.bg(t.row_hover).text_color(t.bad))
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new("Discard this change").build(window, cx)
+                                    })
+                                    .child("\u{2715}")
+                                    .on_click(move |_, _, cx| {
+                                        grid.update(cx, |g, cx| {
+                                            g.discard_change(&key, cx);
+                                        });
+                                    }),
+                            ),
+                    );
+                }
+                let discard_all = {
+                    let grid = grid.clone();
+                    div()
+                        .id("staged-discard-all")
+                        .text_xs()
+                        .text_color(t.muted)
+                        .cursor_pointer()
+                        .hover(|d| d.text_color(t.bad))
+                        .child("Discard all")
+                        .on_click(move |_, _, cx| {
+                            grid.update(cx, |g, cx| g.discard_all(cx));
+                        })
+                };
+                let commit = {
+                    let grid = grid.clone();
+                    gpui_component::button::Button::new("staged-commit")
+                        .primary()
+                        .xsmall()
+                        .label("Commit (\u{2318}S)")
+                        .on_click(move |_, _, cx| {
+                            grid.update(cx, |g, cx| g.commit(cx));
+                        })
+                };
+                div()
+                    .v_flex()
+                    .w(px(320.))
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .px(px(10.))
+                            .pt(px(8.))
+                            .pb(px(6.))
+                            .border_b_1()
+                            .border_color(t.border)
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight(560.))
+                                    .text_color(t.muted)
+                                    .child("STAGED CHANGES"),
+                            )
+                            .child(div().flex_1())
+                            .child(discard_all),
+                    )
+                    .child(rows)
+                    .child(
+                        div()
+                            .h_flex()
+                            .justify_end()
+                            .px(px(10.))
+                            .py(px(8.))
+                            .border_t_1()
+                            .border_color(t.border)
+                            .child(commit),
+                    )
+                    .into_any_element()
+            })
     }
 
     /// Column show/hide, in a popover that stays open across toggles.

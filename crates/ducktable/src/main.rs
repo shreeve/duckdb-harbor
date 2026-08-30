@@ -6,6 +6,7 @@ mod app;
 mod chrome;
 mod content;
 mod copy_button;
+mod edits;
 mod footer;
 mod grid;
 mod inspector;
