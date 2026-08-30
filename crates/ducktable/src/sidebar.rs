@@ -73,6 +73,9 @@ impl DuckTable {
                     // padding below: refresh and the theme name center on
                     // the same line as the footer's Data/Structure labels.
                     .h(px(38.))
+                    // The grid footer's top border sits inside ITS 38px,
+                    // centering its labels 1px lower; match it.
+                    .pt(px(1.))
                     .flex_none()
                     .h_flex()
                     .items_center()
