@@ -6,7 +6,7 @@
 //! (edits.rs).
 //!
 //! Everything shown here is a projection of the `/catalog` document —
-//! columns, constraints, and (harbor 0.16+) the engine's own CREATE TABLE
+//! columns, constraints, and (harbor 0.18+) the engine's own CREATE TABLE
 //! text — so opening the Structure view costs no query at all.
 
 use crate::grid::Grid;

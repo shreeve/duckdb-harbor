@@ -21,7 +21,7 @@ pub struct Catalog {
     #[serde(default)]
     pub sequences: Vec<Sequence>,
     /// Exact bytes of the served file, statted by the server (harbor
-    /// 0.16+); None from an older Harbor or a berth serving no file.
+    /// 0.18+); None from an older Harbor or a berth serving no file.
     #[serde(default)]
     pub database_size_bytes: Option<u64>,
     /// Exact bytes of the WAL beside it — 0 after a checkpoint, which is
@@ -35,11 +35,11 @@ pub struct Catalog {
 pub struct Table {
     pub name: String,
     pub schema: String,
-    /// The engine's cardinality estimate (harbor 0.16+) — a sidebar
+    /// The engine's cardinality estimate (harbor 0.18+) — a sidebar
     /// figure, not a COUNT(*).
     #[serde(default)]
     pub estimated_rows: Option<u64>,
-    /// The engine's own CREATE TABLE rendering (harbor 0.16+).
+    /// The engine's own CREATE TABLE rendering (harbor 0.18+).
     #[serde(default)]
     pub ddl: Option<String>,
     #[serde(default)]
@@ -92,7 +92,7 @@ pub fn catalog(conn: &Conn) -> Result<Catalog, String> {
     fetch(conn, &wire::endpoint::CATALOG)
 }
 
-/// The catalog's lite style (harbor 0.17+): the versions, the sizes, and
+/// The catalog's lite style (harbor 0.18+): the versions, the sizes, and
 /// each table as name, schema, and `estimatedRows` — enough to draw a
 /// database list without paying for columns, DDL, or sequences. An older
 /// harbor ignores the parameter and answers the full document, so this

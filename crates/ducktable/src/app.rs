@@ -30,7 +30,7 @@ pub(crate) enum Phase {
         info: wire::InfoResponse,
         /// The one snapshot everything schema-shaped renders from: tables,
         /// columns, DDL, row estimates, and the file's size on disk all
-        /// arrive in this single document (harbor 0.16+).
+        /// arrive in this single document (harbor 0.18+).
         catalog: harbor_client::Catalog,
     },
     Failed { name: String, message: String },
