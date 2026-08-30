@@ -24,7 +24,13 @@
         "success.background": "#28a745",
         "warning.background": "#b58a00",
         "danger.background": "#d93025",
-        "caret": "#007aff"
+        "caret": "#007aff",
+        "table.background": "#ffffff",
+        "table.head.background": "#f7f8fa",
+        "table.head.foreground": "#1d1d1f",
+        "table.row.border": "#e7e8ec",
+        "table.active.background": "#007aff1a",
+        "table.active.border": "#007aff1a"
       }
     },
     {
@@ -50,7 +56,13 @@
         "success.background": "#32d074",
         "warning.background": "#ffd60a",
         "danger.background": "#ff6459",
-        "caret": "#0a84ff"
+        "caret": "#0a84ff",
+        "table.background": "#252529",
+        "table.head.background": "#2c2c31",
+        "table.head.foreground": "#f2f2f4",
+        "table.row.border": "#38383e",
+        "table.active.background": "#0a84ff2e",
+        "table.active.border": "#0a84ff2e"
       }
     },
     {
@@ -76,7 +88,13 @@
         "success.background": "#4f7d3a",
         "warning.background": "#9a7b00",
         "danger.background": "#b3362a",
-        "caret": "#c2540a"
+        "caret": "#c2540a",
+        "table.background": "#faf6ec",
+        "table.head.background": "#f3edde",
+        "table.head.foreground": "#3c342a",
+        "table.row.border": "#e5dcc8",
+        "table.active.background": "#c2540a1a",
+        "table.active.border": "#c2540a1a"
       }
     },
     {
@@ -102,7 +120,13 @@
         "success.background": "#46d493",
         "warning.background": "#f5c542",
         "danger.background": "#ff7369",
-        "caret": "#5aa2ff"
+        "caret": "#5aa2ff",
+        "table.background": "#121a2b",
+        "table.head.background": "#182236",
+        "table.head.foreground": "#dbe4f5",
+        "table.row.border": "#1f2b44",
+        "table.active.background": "#5aa2ff29",
+        "table.active.border": "#5aa2ff29"
       }
     },
     {
@@ -128,7 +152,13 @@
         "success.background": "#006b21",
         "warning.background": "#7a5d00",
         "danger.background": "#c40000",
-        "caret": "#0000d6"
+        "caret": "#0000d6",
+        "table.background": "#ffffff",
+        "table.head.background": "#f2f2f2",
+        "table.head.foreground": "#000000",
+        "table.row.border": "#9a9a9a",
+        "table.active.background": "#0000d61f",
+        "table.active.border": "#0000d61f"
       }
     }
   ]

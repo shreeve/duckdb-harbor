@@ -18,7 +18,7 @@ impl Render for DuckTable {
         div()
             .size_full()
             .h_flex()
-            .font_family(".SystemUIFont")
+            .font_family(theme::ui_font())
             .child(self.sidebar(cx))
             .child(self.content(cx))
     }

@@ -28,7 +28,6 @@ pub struct Pal {
     pub row_selected: Hsla,
     pub row_hover: Hsla,
     pub grid_line: Hsla,
-    pub row_even: Hsla,
 }
 
 pub fn pal(cx: &App) -> Pal {
@@ -47,7 +46,6 @@ pub fn pal(cx: &App) -> Pal {
         row_selected: t.list_active,
         row_hover: t.list_hover,
         grid_line: t.table_row_border,
-        row_even: t.table_even,
     }
 }
 
@@ -59,6 +57,11 @@ pub fn value_font() -> &'static str {
     } else {
         "monospace"
     }
+}
+
+/// The UI font, for chrome inside value surfaces (e.g. the NULL tag).
+pub fn ui_font() -> &'static str {
+    ".SystemUIFont"
 }
 
 impl Pal {
