@@ -316,16 +316,19 @@ impl TableDelegate for GridDelegate {
         // short of the header's top and bottom without it.
         let row_h = GRID_SIZE.table_row_height();
         if self.gutter && col_ix == 0 {
-            // Mirror the gutter's body cells exactly (same flex centering,
-            // inset, and font), so "#" sits on the numbers' baseline and
-            // shares their right edge.
+            // Mirror the gutter's body cells (same flex centering, inset,
+            // and font), so "#" sits on the numbers' baseline and shares
+            // their right edge. The th wrapper adds 4px right compensation
+            // the td chain doesn't have, so this cell keeps only 2px of
+            // its own: 2 + 4 = the td's 6px inset.
             return div()
                 .relative()
                 .h_flex()
                 .items_center()
                 .w_full()
                 .h(row_h)
-                .px_1p5()
+                .pl(px(6.))
+                .pr(px(2.))
                 .child(
                     div()
                         .w_full()
