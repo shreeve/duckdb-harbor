@@ -316,15 +316,25 @@ impl TableDelegate for GridDelegate {
         // short of the header's top and bottom without it.
         let row_h = GRID_SIZE.table_row_height();
         if self.gutter && col_ix == 0 {
+            // Mirror the gutter's body cells exactly (same flex centering,
+            // inset, and font), so "#" sits on the numbers' baseline and
+            // shares their right edge.
             return div()
                 .relative()
+                .h_flex()
+                .items_center()
                 .w_full()
                 .h(row_h)
                 .px_1p5()
-                .text_right()
-                .text_size(px(GUTTER_TEXT))
-                .text_color(t.muted)
-                .child("#")
+                .child(
+                    div()
+                        .w_full()
+                        .text_right()
+                        .text_size(px(GUTTER_TEXT))
+                        .font_family(value_font())
+                        .text_color(t.muted)
+                        .child("#"),
+                )
                 .child(edge(t.border))
                 .into_any_element();
         }
