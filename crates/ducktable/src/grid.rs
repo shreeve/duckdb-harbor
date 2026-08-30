@@ -928,26 +928,29 @@ impl TableDelegate for GridDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let t = pal(cx);
-        // The th wrapper adds a 4px right compensation for zeroed paddings,
-        // so a strip at right_0 would land 4px inboard of the body cells'
-        // dividers. right(-4px) puts it on the true column edge; the header
-        // row is not clipped there (the clip is the padded cell box). The
-        // strip also spans the full header height, where the built-in
-        // resize-handle line falls short of the top and bottom.
-        let edge = |color: Hsla| {
-            div().absolute().right(px(-4.)).top_0().bottom_0().w(px(1.)).bg(color)
+        let p = prefs::get(cx);
+        // The th wrapper compensates zeroed column paddings with the
+        // active size's cell padding on the right (4px at XSmall, 12px at
+        // Large), so a strip at right_0 lands that far inboard of the body
+        // cells' dividers. right(-comp) puts it back on the true column
+        // edge at every zoom level; the header row is not clipped there
+        // (the clip is the padded cell box). The strip also spans the full
+        // header height, where the built-in resize-handle line falls short
+        // of the top and bottom.
+        let comp = p.table_size().table_cell_padding().right;
+        let edge = move |color: Hsla| {
+            div().absolute().right(-comp).top_0().bottom_0().w(px(1.)).bg(color)
         };
         // Explicit height, like the body cells: the th sits in a chain
         // that resolves h_full to content height, so the edge strips fall
         // short of the header's top and bottom without it.
-        let p = prefs::get(cx);
         let row_h = p.table_size().table_row_height();
         if self.gutter && col_ix == 0 {
             // Mirror the gutter's body cells (same flex centering, inset,
             // and font), so "#" sits on the numbers' baseline and shares
-            // their right edge. The th wrapper adds 4px right compensation
-            // the td chain doesn't have, so this cell keeps only 2px of
-            // its own: 2 + 4 = the td's 6px inset.
+            // their right edge: the td inset is 6px, the wrapper already
+            // padded `comp` of it, and the margin supplies the difference
+            // (negative when the wrapper alone overshoots).
             return div()
                 .relative()
                 .h_flex()
@@ -955,11 +958,11 @@ impl TableDelegate for GridDelegate {
                 .w_full()
                 .h(row_h)
                 .pl(px(6.))
-                .pr(px(2.))
                 .child(
                     div()
                         .w_full()
                         .text_right()
+                        .mr(px(6.) - comp)
                         .text_size(px(GUTTER_TEXT))
                         .font_family(value_font())
                         .text_color(t.muted)
