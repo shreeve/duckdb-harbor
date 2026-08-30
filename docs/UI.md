@@ -80,13 +80,21 @@ always runs against the berth its tab was born on. A tab is a surface:
 
 - **Table**: the grid, opened from the catalog tree.
 - **Query**: SQL editor above, results grid below, EXPLAIN toggle.
-- **Notebook** (later, not in the v1 build): a vertical document of SQL
-  cells, each followed by its own result grid, run individually
-  (Cmd+Enter) or top to bottom, sharing the tab's berth session so
-  temp tables and variables carry between cells. Cells reuse the same
-  editor and grid components as the other surfaces. The tab model is
-  the extension point; nothing in v1 blocks it and nothing in v1
-  depends on it.
+- **Notebook** (later, not in the v1 build): a vertical stack of
+  independent query panes, not a run-in-order document. Each pane is a
+  collapsible SQL editor above a flexible result grid; either half
+  expands or collapses on its own. A "+" adds a pane above or below.
+  Panes run individually; all panes share the notebook's one berth
+  session, so temp tables and macros defined in one pane are usable in
+  another, and an optional run-all executes top to bottom as a
+  convenience, never as enforced dataflow. A pane may later gain a
+  third collapsible view (a chart) without changing the model. A
+  notebook is a named, saved document, listed in a Notebooks sidebar
+  section under Catalog; opening one makes an ordinary tab in the one
+  tab strip. There is no second-level tab hierarchy. Panes reuse the
+  same editor and grid components as the other surfaces; grids follow
+  the same editability rules. Nothing in v1 blocks this and nothing in
+  v1 depends on it.
 
 Cmd+T new query tab, Cmd+W closes, Cmd+1..9 select. A tab with staged
 edits or unsaved query text shows a dot and confirms before closing.
