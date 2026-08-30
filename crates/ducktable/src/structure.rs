@@ -289,13 +289,15 @@ impl Grid {
             pane = pane.child(match &self.ddl_input {
                 // A disabled Input keeps native text selection (drag,
                 // Cmd+C) while gating off every mutation — read-only
-                // selectable text, which gpui divs cannot give.
-                Some(state) => div()
-                    .text_size(px(11.5))
+                // selectable text, which gpui divs cannot give. Styles
+                // go ON the Input: it overrides the inherited text size
+                // (input_text_size), and only its own refinement, which
+                // applies last, beats that. Same 12px value font as the
+                // columns table above.
+                Some(state) => gpui_component::input::Input::new(state)
+                    .disabled(true)
+                    .text_size(px(12.))
                     .font_family(value_font())
-                    .child(
-                        gpui_component::input::Input::new(state).disabled(true),
-                    )
                     .into_any_element(),
                 None => div()
                     .p_2()
