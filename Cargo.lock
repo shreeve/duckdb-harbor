@@ -2509,8 +2509,8 @@ dependencies = [
 
 [[package]]
 name = "harbor-common"
-version = "0.15.0"
-source = "git+https://github.com/shreeve/duckdb-harbor?rev=4543e65#4543e65f2cb84bdf0fcd8cb674de62259bfd22e1"
+version = "0.19.0"
+source = "git+https://github.com/shreeve/duckdb-harbor?rev=8418541#8418541d5df12ec14e2540c5604d8b57f5923baf"
 dependencies = [
  "libc",
  "serde",
@@ -7245,8 +7245,8 @@ dependencies = [
 
 [[package]]
 name = "wire"
-version = "0.15.0"
-source = "git+https://github.com/shreeve/duckdb-harbor?rev=4543e65#4543e65f2cb84bdf0fcd8cb674de62259bfd22e1"
+version = "0.19.0"
+source = "git+https://github.com/shreeve/duckdb-harbor?rev=8418541#8418541d5df12ec14e2540c5604d8b57f5923baf"
 dependencies = [
  "serde",
  "serde_json",

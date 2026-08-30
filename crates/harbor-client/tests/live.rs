@@ -4,26 +4,37 @@
 
 use harbor_client::{connect, fleet, info};
 
+/// Any berth will do — a name is a service that starts on use, so a stopped
+/// configured berth is as connectable as a live one. Live still wins, to
+/// avoid churning starts when something is already up.
+fn connectable() -> Option<fleet::Survey> {
+    let mut rows = fleet::survey().rows;
+    rows.sort_by_key(|r| !r.state.is_live());
+    rows.into_iter().next()
+}
+
 #[test]
 #[ignore]
 fn the_real_fleet_lists_and_answers() {
-    let rows = fleet::survey();
+    let fleet = fleet::survey();
+    if let Some(w) = &fleet.warning {
+        println!("warning: {w}");
+    }
     println!("fleet:");
-    for row in &rows {
+    for row in &fleet.rows {
         println!("  {} {}", row.state.label(), row.name);
         if let Some(note) = &row.note {
             println!("    note: {note}");
         }
     }
-    assert!(!rows.is_empty(), "no berths known to config or runtime");
+    assert!(!fleet.rows.is_empty(), "no berths known to config or runtime");
 }
 
 #[test]
 #[ignore]
 fn a_live_berth_yields_identity() {
-    let live = fleet::survey().into_iter().find(|r| r.state.is_live());
-    let Some(row) = live else {
-        println!("no live berth to test against; skipping");
+    let Some(row) = connectable() else {
+        println!("no berth to test against; skipping");
         return;
     };
     let conn = connect(&row.name).expect("connect");
@@ -39,9 +50,8 @@ fn a_live_berth_yields_identity() {
 #[test]
 #[ignore]
 fn a_live_berth_answers_sql() {
-    let live = fleet::survey().into_iter().find(|r| r.state.is_live());
-    let Some(row) = live else {
-        println!("no live berth to test against; skipping");
+    let Some(row) = connectable() else {
+        println!("no berth to test against; skipping");
         return;
     };
     let conn = connect(&row.name).expect("connect");

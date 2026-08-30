@@ -30,7 +30,16 @@ pub fn query(conn: &Conn, sql: &str) -> Result<QueryResult, String> {
     )
     .map_err(|e| format!("query: {e}"))?;
 
+    // Status first: a 401 or a proxy's HTML body must answer as itself, not
+    // as "bad wire line" from trying to decode it as NDJSON.
     let status = resp.status;
+    if !(200..300).contains(&status) {
+        let body = resp.body_string().unwrap_or_default();
+        return Err(match Event::parse(body.trim()) {
+            Ok(Event::Error { code, message }) => format!("{code}: {message}"),
+            _ => format!("HTTP {status}"),
+        });
+    }
     let mut columns = Vec::new();
     let mut rows = Vec::new();
     let mut row_count = 0;
@@ -49,9 +58,6 @@ pub fn query(conn: &Conn, sql: &str) -> Result<QueryResult, String> {
             }
             Event::Error { code, message } => return Err(format!("{code}: {message}")),
         }
-    }
-    if !(200..300).contains(&status) {
-        return Err(format!("HTTP {status}"));
     }
     Ok(QueryResult { columns, rows, row_count, time_ms })
 }

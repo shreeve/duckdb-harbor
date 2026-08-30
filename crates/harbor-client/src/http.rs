@@ -2,8 +2,9 @@
 //!
 //! One request per connection (`Connection: close`), blocking reads, chunked
 //! and Content-Length bodies. This is deliberately the whole client: harbor
-//! speaks plain HTTP/1.1 via justhttp, and pilot's traffic is one request at
-//! a time, so an async stack would be pure weight.
+//! speaks plain HTTP/1.1 via justhttp, and DuckTable's traffic is one
+//! request at a time on background executors, so an async stack would be
+//! pure weight.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -46,30 +47,6 @@ pub fn request(
     body: Option<&str>,
     timeout: Option<Duration>,
 ) -> io::Result<Response> {
-    request_inner(transport, route, token, body, timeout, None)
-}
-
-/// Like `request`, but built for long-running /sql streams: the socket gets a
-/// short read timeout so the caller's read loop ticks (and can notice a
-/// Ctrl-C), while status and header reads here retry through those ticks.
-pub fn request_streaming(
-    transport: &Transport,
-    route: &Route,
-    token: Option<&str>,
-    body: Option<&str>,
-    on_tick: &dyn Fn(),
-) -> io::Result<Response> {
-    request_inner(transport, route, token, body, Some(Duration::from_millis(250)), Some(on_tick))
-}
-
-fn request_inner(
-    transport: &Transport,
-    route: &Route,
-    token: Option<&str>,
-    body: Option<&str>,
-    timeout: Option<Duration>,
-    on_tick: Option<&dyn Fn()>,
-) -> io::Result<Response> {
     let (stream, host): (Box<dyn Stream>, String) = match transport {
         #[cfg(unix)]
         Transport::Unix(p) => {
@@ -86,8 +63,17 @@ fn request_inner(
     let mut stream = stream;
 
     let mut req = format!("{route} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
-    req.push_str("Accept: application/x-ndjson\r\n");
+    req.push_str(&format!("Accept: {}\r\n", wire::CONTENT_NDJSON));
     if let Some(t) = token {
+        // The token reaches here from the environment, a token-file, or a
+        // token-cmd — one gate for all three. A control byte in a header is
+        // request splitting, so it is refused, never quoted around.
+        if t.bytes().any(|b| b.is_ascii_control()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "token contains control characters (newline?) — refusing to send it",
+            ));
+        }
         req.push_str(&format!("Authorization: Bearer {t}\r\n"));
     }
     if let Some(b) = body {
@@ -105,25 +91,11 @@ fn request_inner(
 
     let mut reader = BufReader::new(stream);
     // Headers may not arrive until the statement completes (the server
-    // responds once execution starts producing), so the wait happens HERE —
-    // which is why the tick callback fires here: it is how a Ctrl-C reaches
-    // a query that has not sent a byte yet.
-    let read_line = |reader: &mut BufReader<Box<dyn Stream>>, line: &mut String| -> io::Result<usize> {
-        loop {
-            match reader.read_line(line) {
-                Err(e) if on_tick.is_some() && matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                    if let Some(f) = on_tick {
-                        f();
-                    }
-                    continue;
-                }
-                other => return other,
-            }
-        }
-    };
+    // responds once execution starts producing), so the read timeout is the
+    // caller's deadline on the whole wait.
     let status = {
         let mut line = String::new();
-        read_line(&mut reader, &mut line)?;
+        reader.read_line(&mut line)?;
         line.split_whitespace()
             .nth(1)
             .and_then(|s| s.parse().ok())
@@ -134,7 +106,7 @@ fn request_inner(
     let mut content_length: Option<u64> = None;
     loop {
         let mut line = String::new();
-        read_line(&mut reader, &mut line)?;
+        reader.read_line(&mut line)?;
         let line = line.trim_end();
         if line.is_empty() {
             break;
@@ -161,11 +133,10 @@ fn request_inner(
 
 /// Decodes an HTTP/1.1 chunked body from the inner reader.
 ///
-/// Resumable by design: request_streaming sockets tick every 250ms with
-/// WouldBlock, and a tick can land mid-frame — mid-size-line, mid-payload,
-/// mid-CRLF. Every partial (the accumulating `line`, the `remaining` count,
-/// the state itself) lives on self, so an interrupted read picks up exactly
-/// where it stopped instead of corrupting the framing.
+/// Resumable by design: a read timeout can land mid-frame — mid-size-line,
+/// mid-payload, mid-CRLF. Every partial (the accumulating `line`, the
+/// `remaining` count, the state itself) lives on self, so an interrupted
+/// read picks up exactly where it stopped instead of corrupting the framing.
 struct ChunkedReader<R: BufRead> {
     inner: R,
     state: ChunkState,
@@ -293,8 +264,8 @@ mod tests {
     }
 
     /// One byte per read, a WouldBlock before every one of them — the worst
-    /// case of the 250ms streaming tick landing mid-size-line, mid-payload,
-    /// and mid-trailer. The decoder must resume, never desync.
+    /// case of a read timeout landing mid-size-line, mid-payload, and
+    /// mid-trailer. The decoder must resume, never desync.
     struct Drip<'a> {
         data: &'a [u8],
         pos: usize,

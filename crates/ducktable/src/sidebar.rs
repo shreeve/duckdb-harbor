@@ -95,6 +95,18 @@ impl DuckTable {
                         .child(gpui_component::input::Input::new(&input).xsmall().cleanable(true)),
                 )
             })
+            // A config the loader refused would otherwise blank this list
+            // silently — the one failure a GUI must say out loud.
+            .when_some(self.config_warning.clone(), |d, warning| {
+                d.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .text_color(t.warn)
+                        .child(warning),
+                )
+            })
             .children(self.rows.iter().filter(|row| {
                 match &berth_filter {
                     Some(f) => row.name.to_lowercase().contains(f.as_str()),

@@ -56,6 +56,10 @@ pub struct DuckTable {
     /// click racing the one connect fires) commit newest-wins instead of
     /// arbitrary order.
     refresh_seq: u64,
+    /// A config the loader refused, verbatim — shown in the sidebar, since
+    /// a GUI has no stderr and an unexplained empty list reads as "harbor
+    /// is broken".
+    pub(crate) config_warning: Option<String>,
 }
 
 impl DuckTable {
@@ -71,6 +75,7 @@ impl DuckTable {
             berth_filter: None,
             select_seq: 0,
             refresh_seq: 0,
+            config_warning: None,
         };
         this.refresh(cx);
         this
@@ -235,10 +240,12 @@ impl DuckTable {
             // proof of life), so this makes no probe in the common case
             // — and sees rows the old sidecar-only scan could not
             // (stale locks, running-but-unregistered berths).
-            let list = cx.background_executor().spawn(async move { fleet::survey() }).await;
+            let fleet = cx.background_executor().spawn(async move { fleet::survey() }).await;
+            let warning = fleet.warning;
             // One task per berth for the catalog fetches (table counts
             // need the database open; only live berths answer).
-            let tasks: Vec<_> = list
+            let tasks: Vec<_> = fleet
+                .rows
                 .into_iter()
                 .map(|row| {
                     let known = connected.clone();
@@ -281,6 +288,7 @@ impl DuckTable {
                     return;
                 }
                 state.rows = rows;
+                state.config_warning = warning;
                 cx.notify();
             })
             .ok();
