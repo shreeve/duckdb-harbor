@@ -130,12 +130,16 @@ fn main() {
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         // Global, not view-scoped: menu items must work regardless of
-        // which pane holds focus. The prompt needs a window, so the
-        // handler reaches for whichever one is active.
+        // which pane holds focus. The prompt needs a window — but a menu
+        // action arrives INSIDE the active window's update, so touching
+        // that window again here is a re-entrant lease that fails
+        // silently. Defer until the dispatch finishes.
         cx.on_action(|_: &About, cx| {
-            if let Some(w) = cx.active_window() {
-                w.update(cx, |_, window, cx| about(window, cx)).ok();
-            }
+            cx.defer(|cx| {
+                if let Some(w) = cx.active_window() {
+                    w.update(cx, |_, window, cx| about(window, cx)).ok();
+                }
+            });
         });
         cx.set_menus(app_menus());
 
