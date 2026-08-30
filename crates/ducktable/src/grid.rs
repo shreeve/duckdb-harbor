@@ -621,7 +621,7 @@ impl Render for Grid {
                 // columns/filters/paging join it in later slices.
                 div()
                     .h_flex()
-                    .h(px(34.))
+                    .h(px(38.))
                     .flex_none()
                     .items_center()
                     .px(px(10.))
@@ -634,11 +634,14 @@ impl Render for Grid {
                         // to the rounded corners, so instead of clipped
                         // square segments the active one is an inset
                         // rounded pill (the macOS segmented-control shape).
+                        // Concentric radii (track = pill + inset) keep the
+                        // pill's corners parallel to the track's — the
+                        // segmented-control look.
                         div()
                             .h_flex()
                             .flex_none()
                             .p(px(2.))
-                            .rounded(px(8.))
+                            .rounded(px(7.))
                             .bg(t.surface)
                             .border_1()
                             .border_color(t.border)
@@ -691,9 +694,9 @@ fn seg_tile(
 ) -> Stateful<Div> {
     div()
         .id(id)
-        .px(px(10.))
-        .py(px(3.))
-        .rounded(px(6.))
+        .px(px(12.))
+        .py(px(4.))
+        .rounded(px(5.))
         .cursor_pointer()
         .text_size(px(12.))
         .map(|d| {

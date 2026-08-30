@@ -29,7 +29,8 @@ impl DuckTable {
             .bg(t.bg_sidebar)
             .border_r_1()
             .border_color(t.border)
-            .p_2()
+            .px_2()
+            .pt_2()
             .v_flex()
             .gap_px()
             .child(
@@ -68,8 +69,13 @@ impl DuckTable {
             .child(
                 div()
                     .mt_2()
+                    // Same height as the grid footer, with no sidebar
+                    // padding below: refresh and the theme name center on
+                    // the same line as the footer's Data/Structure labels.
+                    .h(px(38.))
                     .flex_none()
                     .h_flex()
+                    .items_center()
                     .gap_2()
                     .child(
                         div()
