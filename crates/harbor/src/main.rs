@@ -835,12 +835,11 @@ fn entry_args(
     d: &harbor_common::config::Defaults,
 ) -> Result<Vec<String>, String> {
     let mut v: Vec<String> = Vec::new();
-    // A human typing `harbor start` asked for a server, so absent means
-    // persistent — but an entry naming its own idle-exit wins over that.
+    // A name is a service: absent an entry idle-exit it is persistent, and
+    // no fleet-wide temp window has any say here.
     let life = harbor_common::lifetime::resolve(
-        Default::default(),
         c.idle_exit.as_deref(),
-        d.idle_exit.as_deref(),
+        None,
         harbor_common::Summoner::Operator,
     )?;
     v.extend(life.to_args());
@@ -982,9 +981,8 @@ fn show(rest: Vec<String>) -> Result<(), String> {
             .field("database", &row.db);
         if let Some(c) = cfg.get(&name) {
             let life = harbor_common::lifetime::resolve(
-                Default::default(),
                 c.idle_exit.as_deref(),
-                cfg.defaults.idle_exit.as_deref(),
+                None,
                 harbor_common::Summoner::Operator,
             )?;
             p = p.field("idle-exit", life.describe());

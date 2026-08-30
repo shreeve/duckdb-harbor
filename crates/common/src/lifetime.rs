@@ -1,26 +1,23 @@
 //! How long a berth lives, and who decides.
 //!
-//! There are only two lifetimes, and one key expresses both:
+//! There are only two lifetimes:
 //!
-//! * **persistent** — runs until someone stops it. `idle-exit = "never"`.
-//! * **ephemeral** — retires once nothing has used it for a while.
-//!   `idle-exit = "90s"`.
+//! * **persistent** — runs until someone stops it.
+//! * **temp** — retires once nothing has used it for a while.
 //!
-//! Everything the CLI can express is one of those two. "Start it and leave
-//! it", "open it and let it go when I quit", "keep it up after ducktable
-//! closes" are not three mechanisms — they are the same knob, set from three
-//! places. Most specific wins:
+//! And one sentence decides which: *a name is a service, a path is a
+//! session.* A configured name is persistent unless its own entry says
+//! `idle-exit = "90s"` — the entry is the operator's word and always wins.
+//! A client-summoned path lives out `[defaults] temp-idle-exit` (or the
+//! built-in grace). The two rungs under the entry never mix: a fleet-wide
+//! temp window must not quietly turn a named service into something that
+//! evaporates.
 //!
 //! ```text
-//! 1. a flag            --keep, --idle-exit 5m
-//! 2. the entry         [connection.medlabs] idle-exit = "90s"
-//! 3. the defaults      [defaults] idle-exit = "90s"
-//! 4. who asked         harbor start -> persistent;  pilot -> ephemeral
+//! 1. the entry         [connection.medlabs] idle-exit = "5m" | "never"
+//! 2. who summoned      operator (a name)  -> persistent
+//!                      client   (a path)  -> [defaults] temp-idle-exit, else 90s
 //! ```
-//!
-//! Step 4 is the DWIM: a human who typed `harbor start` asked for a server
-//! and gets one; a human who typed `pilot` asked for a prompt and gets a
-//! process that cleans up after itself. Neither has to say so.
 //!
 //! # The joiner never changes the lifetime
 //!
@@ -82,41 +79,27 @@ impl Lifetime {
     }
 }
 
-/// What the user wrote on the command line, if anything.
-#[derive(Clone, Copy, Default, Debug)]
-pub struct Override {
-    /// `--keep`: leave it running after I disconnect.
-    pub keep: bool,
-    /// `--idle-exit <d>`: retire it this long after the last use.
-    pub idle_exit: Option<Duration>,
-}
-
 /// Settle the lifetime of a berth about to be **summoned**.
 ///
 /// Never call this for a berth that is already running — see the module note
-/// on joiners.
+/// on joiners. `temp_default` is `[defaults] temp-idle-exit`, and it reaches
+/// only client summons: an operator's name is a service, and a fleet-wide
+/// temp window has no business shortening a service's life.
 pub fn resolve(
-    flags: Override,
     entry: Option<&str>,
-    defaults: Option<&str>,
+    temp_default: Option<&str>,
     who: Summoner,
 ) -> Result<Lifetime, String> {
-    if let Some(d) = flags.idle_exit {
-        return Ok(Lifetime::Idle(d));
-    }
-    if flags.keep {
-        return Ok(Lifetime::Persistent);
-    }
-    // The first rung that exists wins outright; the ones below it are never
-    // consulted. `next()` says that, where a loop that returns on its first
-    // pass reads as a search for something.
-    if let Some(spec) = [entry, defaults].into_iter().flatten().next() {
+    if let Some(spec) = entry {
         return parse(spec);
     }
-    Ok(match who {
-        Summoner::Operator => Lifetime::Persistent,
-        Summoner::Client => Lifetime::Idle(DEFAULT_GRACE),
-    })
+    match who {
+        Summoner::Operator => Ok(Lifetime::Persistent),
+        Summoner::Client => match temp_default {
+            Some(spec) => parse(spec),
+            None => Ok(Lifetime::Idle(DEFAULT_GRACE)),
+        },
+    }
 }
 
 /// `"never"` (or `"off"`), else a duration.
@@ -175,51 +158,37 @@ mod tests {
     const NONE: Option<&str> = None;
 
     #[test]
-    fn who_asked_decides_when_nothing_else_does() {
-        let f = Override::default();
-        assert_eq!(resolve(f, NONE, NONE, Summoner::Operator).unwrap(), Lifetime::Persistent);
-        assert_eq!(
-            resolve(f, NONE, NONE, Summoner::Client).unwrap(),
-            Lifetime::Idle(DEFAULT_GRACE)
-        );
+    fn who_summoned_decides_when_the_entry_is_silent() {
+        assert_eq!(resolve(NONE, NONE, Summoner::Operator).unwrap(), Lifetime::Persistent);
+        assert_eq!(resolve(NONE, NONE, Summoner::Client).unwrap(), Lifetime::Idle(DEFAULT_GRACE));
     }
 
     #[test]
-    fn the_entry_beats_the_defaults_and_who_asked() {
-        let f = Override::default();
+    fn the_entry_beats_everything() {
         // A berth pinned persistent stays persistent even when a client
         // summoned it — this is what `harbor start` then `pilot` then quit
         // must not undo.
         assert_eq!(
-            resolve(f, Some("never"), Some("90s"), Summoner::Client).unwrap(),
+            resolve(Some("never"), Some("90s"), Summoner::Client).unwrap(),
             Lifetime::Persistent
         );
         assert_eq!(
-            resolve(f, Some("5m"), NONE, Summoner::Operator).unwrap(),
+            resolve(Some("5m"), NONE, Summoner::Operator).unwrap(),
             Lifetime::Idle(Duration::from_secs(300))
         );
     }
 
     #[test]
-    fn defaults_apply_to_anything_without_its_own() {
-        let f = Override::default();
+    fn a_name_is_a_service_the_temp_default_cannot_shorten() {
+        // [defaults] temp-idle-exit reaches client summons only. A fleet-wide
+        // temp window must never quietly make a named service evaporate.
         assert_eq!(
-            resolve(f, NONE, Some("30s"), Summoner::Operator).unwrap(),
+            resolve(NONE, Some("30s"), Summoner::Operator).unwrap(),
+            Lifetime::Persistent
+        );
+        assert_eq!(
+            resolve(NONE, Some("30s"), Summoner::Client).unwrap(),
             Lifetime::Idle(Duration::from_secs(30))
-        );
-    }
-
-    #[test]
-    fn flags_win_over_everything() {
-        let keep = Override { keep: true, ..Default::default() };
-        assert_eq!(
-            resolve(keep, Some("90s"), Some("90s"), Summoner::Client).unwrap(),
-            Lifetime::Persistent
-        );
-        let five = Override { idle_exit: Some(Duration::from_secs(300)), ..Default::default() };
-        assert_eq!(
-            resolve(five, Some("never"), NONE, Summoner::Operator).unwrap(),
-            Lifetime::Idle(Duration::from_secs(300))
         );
     }
 

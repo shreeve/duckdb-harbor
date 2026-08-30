@@ -6,7 +6,7 @@
 //! ```toml
 //! [defaults]
 //! mode      = "duckbox"     # pilot's taste
-//! idle-exit = "90s"         # harbor's spawn policy
+//! temp-idle-exit = "90s"    # how long a client-summoned temp outlives its last use
 //!
 //! [connection.medlabs]      # has `path` -> a local berth, harbor can start it
 //! path = "~/Data/Code/medlabs/api/db/medlabs.duckdb"
@@ -64,9 +64,11 @@ pub struct Defaults {
     pub connection: Option<String>,
 
     // --- harbor: how a berth is started ------------------------------------
-    /// Ten lines above the entry it explains, which is the whole reason a
-    /// shared default is tolerable here and would not be across two files.
-    pub idle_exit: Option<String>,
+    /// How long a client-summoned temp lives after its last use. Scope-honest
+    /// by name: this key never touches a configured name — a name is a
+    /// service and defaults persistent; only its own entry's `idle-exit`
+    /// says otherwise.
+    pub temp_idle_exit: Option<String>,
     pub memory_limit: Option<String>,
     pub workers: Option<usize>,
     pub threads: Option<usize>,
@@ -226,7 +228,7 @@ mod tests {
     const SAMPLE: &str = r#"
         [defaults]
         mode = "duckbox"
-        idle-exit = "90s"
+        temp-idle-exit = "90s"
 
         [connection.medlabs]
         path = "~/Data/Code/medlabs/api/db/medlabs.duckdb"
@@ -245,7 +247,7 @@ mod tests {
     fn one_namespace_two_kinds() {
         let c: FileConfig = toml::from_str(SAMPLE).unwrap();
         assert_eq!(c.defaults.mode.as_deref(), Some("duckbox"));
-        assert_eq!(c.defaults.idle_exit.as_deref(), Some("90s"));
+        assert_eq!(c.defaults.temp_idle_exit.as_deref(), Some("90s"));
 
         let berths: Vec<_> = c.berths().iter().map(|(n, _)| *n).collect();
         assert_eq!(berths, ["medlabs", "warehouse"]);

@@ -281,9 +281,8 @@ fn resolve(
         // D9: summon the owner. A second pilot on the same file joins the
         // same berth instead of "database is locked".
         let life = harbor_common::lifetime::resolve(
-            Default::default(),
             None,
-            cfg.defaults.idle_exit.as_deref(),
+            cfg.defaults.temp_idle_exit.as_deref(),
             harbor_common::Summoner::Client,
         )?;
         let (transport, file_token) = ensure_berth(std::path::Path::new(target), life)?;
