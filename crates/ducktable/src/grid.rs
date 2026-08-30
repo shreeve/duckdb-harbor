@@ -311,10 +311,15 @@ impl TableDelegate for GridDelegate {
         let edge = |color: Hsla| {
             div().absolute().right(px(-4.)).top_0().bottom_0().w(px(1.)).bg(color)
         };
+        // Explicit height, like the body cells: the th sits in a chain
+        // that resolves h_full to content height, so the edge strips fall
+        // short of the header's top and bottom without it.
+        let row_h = GRID_SIZE.table_row_height();
         if self.gutter && col_ix == 0 {
             return div()
                 .relative()
-                .size_full()
+                .w_full()
+                .h(row_h)
                 .px_1p5()
                 .text_right()
                 .text_size(px(GUTTER_TEXT))
@@ -332,13 +337,16 @@ impl TableDelegate for GridDelegate {
         // 4px, while cell text sits 9px in (8px pad + 1px divider).
         div()
             .relative()
-            .size_full()
+            .h_flex()
+            .items_center()
+            .w_full()
+            .h(row_h)
             .text_size(px(HEADER_TEXT))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(t.text)
             .child(
                 div()
-                    .size_full()
+                    .w_full()
                     .truncate()
                     .when(right, |d| d.text_right().pr(px(5.)))
                     .child(self.cols[col_ix].name.clone()),
@@ -406,6 +414,10 @@ impl Render for Grid {
                     .child(
                         div().flex_1().min_w_0().text_sm().text_color(t.text).truncate().child(title),
                     )
+                    // Status text sits INSIDE the flexible region, before
+                    // the toggle track: its width changes as pages land,
+                    // and text may move but controls must not.
+                    .child(div().text_xs().text_color(t.muted).flex_none().child(status))
                     .child(
                         // Recessed track, macOS-toolbar style: a subtle
                         // inset container; flat icon tiles with a 2px gap
@@ -452,8 +464,7 @@ impl Render for Grid {
                                     prefs::toggle(cx, |p| p.null_tags = !p.null_tags);
                                 }),
                             )),
-                    )
-                    .child(div().text_xs().text_color(t.muted).flex_none().child(status)),
+                    ),
             )
             .when_some(error, |d, message| {
                 d.child(
