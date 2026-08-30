@@ -14,7 +14,11 @@ use std::time::Duration;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Catalog {
+    // Identity comes from /info; these stay optional so catalog decoding
+    // never breaks if the server stops sending them.
+    #[serde(default)]
     pub harbor_version: String,
+    #[serde(default)]
     pub duckdb_version: String,
     #[serde(default)]
     pub tables: Vec<Table>,
@@ -60,7 +64,6 @@ impl Catalog {
         v.sort_unstable();
         v.dedup();
         if let Some(pos) = v.iter().position(|s| *s == "main") {
-            v.rotate_left(0);
             let main = v.remove(pos);
             v.insert(0, main);
         }

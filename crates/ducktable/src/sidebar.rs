@@ -190,7 +190,7 @@ impl DuckTable {
             )
     }
 
-    pub(crate) fn catalog_tree(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn catalog_tree(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = pal(cx);
         let Phase::Connected { catalog, row_counts, .. } = &self.phase else {
             return div().id("catalog").flex_1();

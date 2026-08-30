@@ -23,7 +23,6 @@ pub struct Sidecar {
     pub db: Option<PathBuf>,
     pub port: Option<u16>,
     pub bind: Option<String>,
-    pub pid: Option<u32>,
 }
 
 /// One row of the fleet view: a name, what the config says about it, and
@@ -77,7 +76,6 @@ fn read_sidecar(home: &Path, name: &str) -> Option<Sidecar> {
         db: j["db"].as_str().map(PathBuf::from),
         port: j["port"].as_u64().map(|p| p as u16),
         bind: j["bind"].as_str().map(str::to_string),
-        pid: j["pid"].as_u64().map(|p| p as u32),
     })
 }
 

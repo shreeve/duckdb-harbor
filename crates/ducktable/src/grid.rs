@@ -124,7 +124,7 @@ pub(crate) struct GridDelegate {
     gutter: bool,
     /// Exact server-side row count (under the current filter), when the
     /// count query succeeded.
-    pub(crate) total_rows: Option<u64>,
+    total_rows: Option<u64>,
     /// Current page (0-based) and the size its rows were fetched with.
     page: usize,
     page_size: usize,
