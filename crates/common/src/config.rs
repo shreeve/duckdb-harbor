@@ -201,6 +201,12 @@ impl std::fmt::Display for Error {
     }
 }
 
+/// Schema-check a candidate config text — the gate a writer runs BEFORE the
+/// bytes land, so an edit can never leave behind a file `load` will refuse.
+pub fn parse(text: &str) -> Result<FileConfig, String> {
+    toml::from_str(text).map_err(|e| e.to_string())
+}
+
 /// Read and parse the config, or say precisely why not.
 pub fn load() -> Result<FileConfig, Error> {
     let root = crate::paths::config_root().map_err(Error::NoHome)?;

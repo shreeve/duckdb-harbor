@@ -1,15 +1,17 @@
 //! harbor — DuckDB wearing a server.
 //!
-//! One binary, two jobs: `serve` embeds DuckDB and owns one
-//! database file; the fleet verbs (`start`, `show`, `stop`, `forget`, `doctor`)
-//! manage the berths of ~/.local/state/harbor/runtime from outside, linking no
-//! engine code paths at all.
+//! One binary, two jobs: `serve` embeds DuckDB and owns one database file;
+//! the fleet verbs (`start`, `show`, `add`, `expose`, `stop`, `forget`,
+//! `doctor`) manage the berths of ~/.local/state/harbor/runtime from outside,
+//! linking no engine code paths at all.
 //!
 //!   harbor serve  db.duckdb [--name n] [--socket p | --port p] [--token t]
 //!   harbor start  <name|db.duckdb>           spawn a detached berth, wait ready
 //!   harbor show   [name]                     the fleet, or one berth in detail
-//!   harbor stop   <name>                     SIGTERM → drain, CHECKPOINT
-//!   harbor forget <name>                     stop + clear registry (never the db)
+//!   harbor add    <db.duckdb> [name]         name a database — a name is a service
+//!   harbor expose <name> <port|off>          move it onto TCP, or back off it
+//!   harbor stop   <name>                     SIGTERM → drain, CHECKPOINT, hold
+//!   harbor forget <name>                     stop + clear registry and entry (never the db)
 //!   harbor doctor                            what nothing else has a moment to see
 //!   harbor version                           print this binary's version
 //!
@@ -24,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod config_edit;
 mod doctor;
 
 // Paths, names, permissions and durations live in harbor-common so pilot and
@@ -48,6 +51,8 @@ fn main() -> ExitCode {
         "serve" => serve(rest),
         "start" => start(rest),
         "show" => show(rest),
+        "add" => add_cmd(rest),
+        "expose" => expose_cmd(rest),
         "stop" => stop_database(rest, false),
         "forget" => stop_database(rest, true),
         "doctor" => doctor_cmd(rest),
@@ -76,9 +81,14 @@ harbor — DuckDB wearing a server
 usage:
   harbor show   [name]              the fleet, or one database in detail
   harbor start  <name|db.duckdb>    start a database in the background, wait ready
+  harbor add    <db.duckdb> [name]  name a database — a name is a service:
+                                    it starts on use and runs until you say stop
+  harbor expose <name> <port|off>   listen on TCP 127.0.0.1:<port> instead of the
+                                    unix socket (off: back to the socket)
   harbor stop   <name>              drain, CHECKPOINT, and hold it stopped
                                     (a held name will not autostart; start lifts the hold)
-  harbor forget <name>              stop it and drop it (never the database)
+  harbor forget <name>              stop it and drop it — registry files and its
+                                    config entry, never the database
   harbor doctor                     check the config for what nothing else sees
   harbor serve  <db.duckdb> [opts]  own a database, serve it (foreground)
   harbor version                    print this binary's version (also -V)
@@ -819,7 +829,7 @@ fn unknown_berth(cfg: &harbor_common::config::FileConfig, name: &str) -> String 
         msg.push_str(&format!("\n        did you mean: {near}?"));
     }
     match known.is_empty() {
-        true => msg.push_str("\n        nothing is configured yet — harbor start <db.duckdb>"),
+        true => msg.push_str("\n        nothing is configured yet — harbor add <db.duckdb>"),
         false => msg.push_str(&format!("\n        configured: {}", known.join(", "))),
     }
     msg.push_str("\n        (a bare word always names a configured database; a path needs a / or .duckdb)");
@@ -1011,8 +1021,8 @@ fn show(rest: Vec<String>) -> Result<(), String> {
 
     if rows.is_empty() {
         println!("Nothing configured, nothing running.\n");
-        println!("  harbor start <db.duckdb>   remember a database and start it");
-        println!("  pilot <db.duckdb>          just open one — served on demand");
+        println!("  harbor add <db.duckdb>   name a database — it becomes a service");
+        println!("  pilot <db.duckdb>        just open one — served on demand");
         return Ok(());
     }
 
@@ -1054,6 +1064,181 @@ fn doctor_cmd(rest: Vec<String>) -> Result<(), String> {
     }
 }
 
+/// Drain one live berth — signal, wait out the CHECKPOINT — and say nothing.
+/// The single verbs own their receipts; the compound ones (`add`, `expose`)
+/// own the silence between their own stop and start.
+fn stop_core(home: &Path, name: &str, pid: u64, lock_path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let _ = (home, lock_path);
+        // SIGTERM is the contract: drain, CHECKPOINT, exit (core owns it).
+        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        let deadline = Instant::now() + Duration::from_secs(35);
+        while Instant::now() < deadline {
+            if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Exiting 0 here would be a lie an operator scripts on. And removing
+        // registry files under a live berth is worse: deleting its .lock lets
+        // a future serve create a fresh inode, flock it, and claim the same
+        // name — two berths, one database, the exact thing the mutex prevents.
+        Err(format!(
+            "{name:?} (pid {pid}) is still running 35s after SIGTERM — \
+             nothing was removed. Escalate by hand if you mean it: kill -9 {pid}"
+        ))
+    }
+    #[cfg(windows)]
+    {
+        let (bind, port) = registered_tcp(home, name)
+            .ok_or_else(|| format!("{name:?} has no registered TCP address"))?;
+        let token = std::fs::read_to_string(harbor_common::token_file(home, name))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if !shutdown_tcp(&bind, port, token.as_deref()) {
+            return Err(format!("{name:?} (pid {pid}) refused the graceful shutdown request"));
+        }
+        let deadline = Instant::now() + Duration::from_secs(35);
+        while Instant::now() < deadline && !berth_dead(lock_path) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        match berth_dead(lock_path) {
+            true => Ok(()),
+            false => Err(format!(
+                "{name:?} (pid {pid}) is still running 35s after shutdown — \
+                 nothing was removed. Escalate with Task Manager if you mean it."
+            )),
+        }
+    }
+}
+
+/// `harbor add <db.duckdb> [name]` — name a database, making it a service.
+///
+/// The entry is the promotion: from here the name starts on use and runs
+/// until you say stop. The file must already exist — add names data, it does
+/// not invent any — and the path lands canonicalized, so the entry means the
+/// same file from every working directory.
+fn add_cmd(rest: Vec<String>) -> Result<(), String> {
+    let db = rest.first().ok_or("add which file? (harbor add <db.duckdb> [name])")?;
+    if rest.len() > 2 {
+        return Err("add takes a database file and, at most, a name".into());
+    }
+    if !harbor_common::looks_like_path(db) {
+        return Err(format!(
+            "{db:?} reads as a name, not a file — add takes the database file \
+             (a path carries a / or ends in .duckdb)"
+        ));
+    }
+    let canon = std::fs::canonicalize(harbor_common::paths::expand(db))
+        .map_err(|_| format!("no database at {db} — add names data that already exists"))?;
+    let name = match rest.get(1) {
+        Some(n) => normalize(n)?,
+        None => normalize(
+            &canon.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+        )?,
+    };
+    let file = config_edit::add_entry(&name, &canon.display().to_string())?;
+    println!(
+        "added {name:?} — {}  [connection.{name}] in {}",
+        harbor_common::paths::shorten(&canon),
+        harbor_common::paths::shorten(&file)
+    );
+    // If a temp berth is already serving this very file under this name, the
+    // promotion finishes on the spot: restart it as the service it just
+    // became, so its idle-exit dies with it.
+    let home = harbor_home()?;
+    let lock_path = harbor_common::lock_file(&home, &name);
+    if let Some(side) = harbor_common::fleet::Sidecar::read(&home, &name)
+        && !berth_dead(&lock_path)
+        && side.idle_exit_ms.is_some()
+        && side
+            .db
+            .as_deref()
+            .and_then(|p| std::fs::canonicalize(harbor_common::paths::expand(p)).ok())
+            .as_deref()
+            == Some(&canon)
+    {
+        if let Some(pid) = side.pid {
+            stop_core(&home, &name, pid, &lock_path)?;
+        }
+        return start(vec![name]);
+    }
+    println!("(starts on use — or right now: harbor start {name})");
+    Ok(())
+}
+
+/// `harbor expose <name> [<port>|off]` — where the berth listens.
+///
+/// Bare `expose <name>` only reports; observation must not mutate. A port
+/// moves the berth onto TCP — serve listens on one address, so this is
+/// instead of the unix socket, not alongside it — and `off` moves it back.
+fn expose_cmd(rest: Vec<String>) -> Result<(), String> {
+    let name = rest.first().ok_or("expose which database? (harbor expose <name> <port|off>)")?;
+    let name = normalize(name)?;
+    if rest.len() > 2 {
+        return Err("expose takes a name and a port (or off)".into());
+    }
+    let cfg = load_config()?;
+    let entry =
+        cfg.get(&name).filter(|c| c.is_berth()).ok_or_else(|| unknown_berth(&cfg, &name))?;
+    match rest.get(1).map(String::as_str) {
+        None => {
+            match entry.port {
+                Some(p) => println!(
+                    "{name:?} listens on {}:{p}",
+                    entry.bind.as_deref().unwrap_or("127.0.0.1")
+                ),
+                None => println!(
+                    "{name:?} listens on its unix socket — \
+                     harbor expose {name} <port> moves it to TCP"
+                ),
+            }
+            Ok(())
+        }
+        Some("off") => {
+            config_edit::set_entry_key(&name, "port", None)?;
+            config_edit::set_entry_key(&name, "bind", None)?;
+            println!("{name:?} back on its unix socket");
+            reapply(&name)
+        }
+        Some(p) => {
+            let port: u16 =
+                p.parse().map_err(|_| format!("{p:?} is not a port (1-65535, or off)"))?;
+            if port == 0 {
+                return Err("port 0 means \"any\" to the OS — pick a real one".into());
+            }
+            config_edit::set_entry_key(&name, "port", Some(toml_edit::Value::from(port as i64)))?;
+            let home = harbor_home()?;
+            println!(
+                "{name:?} will listen on {}:{port} — token: {}",
+                entry.bind.as_deref().unwrap_or("127.0.0.1"),
+                harbor_common::paths::shorten(&harbor_common::token_file(&home, &name))
+            );
+            reapply(&name)
+        }
+    }
+}
+
+/// A config change lands where it matters: on the running berth, by restart.
+/// A berth at rest is left at rest — a name starts on use, and the new
+/// address boards with it.
+fn reapply(name: &str) -> Result<(), String> {
+    let home = harbor_home()?;
+    let lock_path = harbor_common::lock_file(&home, name);
+    if let Some(side) = harbor_common::fleet::Sidecar::read(&home, name)
+        && !berth_dead(&lock_path)
+    {
+        if let Some(pid) = side.pid {
+            stop_core(&home, name, pid, &lock_path)?;
+        }
+        return start(vec![name.to_string()]);
+    }
+    println!("(not running — it takes effect when {name:?} next starts)");
+    Ok(())
+}
+
 fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
     let name = rest.first().ok_or("which database? (try: harbor show)")?;
     let name = normalize(name)?;
@@ -1071,75 +1256,26 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
         let _ = write_private(&harbor_common::hold_file(&home, &name), "");
     }
     if let Some(side) = harbor_common::fleet::Sidecar::read(&home, &name) {
-            if berth_dead(&lock_path) {
-                // Proven dead: no process holds the flock, so the pid recorded
-                // in the json is stale and the OS may have recycled it to an
-                // unrelated process. Signalling it would be signalling a
-                // stranger — so don't. `forget` still cleans the registry below.
-                if !remove {
-                    // The asked-for state already holds, so this is success —
-                    // a berth at rest is not a stranger — but the corpse's
-                    // registry files remain and only forget clears them.
-                    let pid = side.pid.map(|p| p.to_string()).unwrap_or_default();
-                    println!(
-                        "{name:?} is not running (stale pid {pid}) — residue remains; \
-                         harbor forget {name} clears it"
-                    );
-                    return Ok(());
-                }
-            } else if let Some(pid) = side.pid {
-                #[cfg(unix)]
-                {
-                // SIGTERM is the contract: drain, CHECKPOINT, exit (core owns it).
-                unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-                let deadline = Instant::now() + Duration::from_secs(35);
-                let mut died = false;
-                while Instant::now() < deadline {
-                    if unsafe { libc::kill(pid as i32, 0) } != 0 {
-                        died = true;
-                        println!("{name:?} stopped (drained and checkpointed)");
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                if !died {
-                    // Exiting 0 here would be a lie an operator scripts on.
-                    // And removing registry files under a live berth is worse:
-                    // deleting its .lock lets a future serve create a fresh
-                    // inode, flock it, and claim the same name — two berths,
-                    // one database, the exact thing the mutex prevents.
-                    return Err(format!(
-                        "{name:?} (pid {pid}) is still running 35s after SIGTERM — \
-                         nothing was removed. Escalate by hand if you mean it: kill -9 {pid}"
-                    ));
-                }
-                }
-                #[cfg(windows)]
-                {
-                    let (bind, port) = registered_tcp(&home, &name)
-                        .ok_or_else(|| format!("{name:?} has no registered TCP address"))?;
-                    let token = std::fs::read_to_string(harbor_common::token_file(&home, &name))
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty());
-                    if !shutdown_tcp(&bind, port, token.as_deref()) {
-                        return Err(format!(
-                            "{name:?} (pid {pid}) refused the graceful shutdown request"
-                        ));
-                    }
-                    let deadline = Instant::now() + Duration::from_secs(35);
-                    while Instant::now() < deadline && !berth_dead(&lock_path) {
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                    if !berth_dead(&lock_path) {
-                        return Err(format!(
-                            "{name:?} (pid {pid}) is still running 35s after shutdown — \
-                             nothing was removed. Escalate with Task Manager if you mean it."
-                        ));
-                    }
-                    println!("{name:?} stopped (drained and checkpointed)");
-                }
+        if berth_dead(&lock_path) {
+            // Proven dead: no process holds the flock, so the pid recorded
+            // in the json is stale and the OS may have recycled it to an
+            // unrelated process. Signalling it would be signalling a
+            // stranger — so don't. `forget` still cleans the registry below.
+            if !remove {
+                // The asked-for state already holds, so this is success —
+                // a berth at rest is not a stranger — but the corpse's
+                // registry files remain and only forget clears them.
+                let pid = side.pid.map(|p| p.to_string()).unwrap_or_default();
+                println!(
+                    "{name:?} is not running (stale pid {pid}) — residue remains; \
+                     harbor forget {name} clears it"
+                );
+                return Ok(());
             }
+        } else if let Some(pid) = side.pid {
+            stop_core(&home, &name, pid, &lock_path)?;
+            println!("{name:?} stopped (drained and checkpointed)");
+        }
     } else if sock.exists() {
         return Err(format!("{name:?} has a socket but no registry json; kill it by pid"));
     } else if !remove {
@@ -1180,6 +1316,14 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
         // unlink_lock_if_free. Nothing else in this file may unlink one.
         if unlink_lock_if_free(&harbor_common::lock_file(&home, &name)) {
             gone.push("lock");
+        }
+        // add's inverse: forget also drops the [connection.<name>] entry, or
+        // the name would rise again on next use. A config refusing the edit
+        // must not fail the sweep above — say so and finish.
+        match config_edit::remove_entry(&name) {
+            Ok(true) => gone.push("config entry"),
+            Ok(false) => {}
+            Err(e) => eprintln!("harbor: {e}"),
         }
         match gone.is_empty() {
             true => println!("nothing to forget: {name:?} left no state behind"),
