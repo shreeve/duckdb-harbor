@@ -80,8 +80,13 @@ always runs against the berth its tab was born on. A tab is a surface:
 
 - **Table**: the grid, opened from the catalog tree.
 - **Query**: SQL editor above, results grid below, EXPLAIN toggle.
-- **Notebook** (later): the tab model is the extension point; nothing in
-  v1 blocks it and nothing in v1 depends on it.
+- **Notebook** (later, not in the v1 build): a vertical document of SQL
+  cells, each followed by its own result grid, run individually
+  (Cmd+Enter) or top to bottom, sharing the tab's berth session so
+  temp tables and variables carry between cells. Cells reuse the same
+  editor and grid components as the other surfaces. The tab model is
+  the extension point; nothing in v1 blocks it and nothing in v1
+  depends on it.
 
 Cmd+T new query tab, Cmd+W closes, Cmd+1..9 select. A tab with staged
 edits or unsaved query text shows a dot and confirms before closing.
