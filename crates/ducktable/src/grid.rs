@@ -78,6 +78,9 @@ pub(crate) struct Grid {
     /// Focus should return to the table on the next frame — set by paths
     /// that lack a Window (subscriptions), consumed by render.
     needs_focus: bool,
+    /// The ring's seat across a keyboard page flip (page_step): the
+    /// fetch that lands consumes it, row clamped to the new page.
+    ring_keep: Option<(usize, usize)>,
     /// The filter strip's input; Some = the strip is open.
     pub(crate) filter_input: Option<Entity<gpui_component::input::InputState>>,
     /// Prefetched with the first page, so switching views is instant.
@@ -418,6 +421,7 @@ impl Grid {
             not_null,
             committing: false,
             needs_focus: false,
+            ring_keep: None,
             filter_input: None,
             structure,
             resize,
@@ -491,6 +495,9 @@ impl Grid {
                 let base = page * size;
                 let zoom = prefs::get(cx).zoom_factor();
                 let pk_cols = grid.pk_cols.clone();
+                // Taken unconditionally: a failed flip must not park a
+                // stale seat for some later, unrelated fetch to restore.
+                let ring_keep = grid.ring_keep.take();
                 grid.table.update(cx, |state, cx| {
                     state.delegate_mut().loading = false;
                     if let Some(result) = result {
@@ -527,6 +534,26 @@ impl Grid {
                     }
                     cx.notify();
                 });
+                // A keyboard page flip keeps the ring seated: same
+                // column (if still visible), same row clamped to the new
+                // page's rows.
+                if let (Some((r, c)), true) = (ring_keep, grid.error.is_none()) {
+                    grid.table.update(cx, |state, cx| {
+                        let d = state.delegate_mut();
+                        if d.rows.is_empty() {
+                            return;
+                        }
+                        let row = r.min(d.rows.len() - 1);
+                        let col = if d.visible.contains(&c) {
+                            c
+                        } else {
+                            d.visible.first().copied().unwrap_or(0)
+                        };
+                        d.active_cell = Some((row, col));
+                        select_row(state, row, cx);
+                        cx.notify();
+                    });
+                }
                 // An error-born grid earns its staging layer the moment
                 // a schema lands and turns out fully keyed.
                 if grid.edits.is_none() && !grid.pk_cols.is_empty() {
@@ -908,12 +935,75 @@ impl Grid {
             cx.stop_propagation();
             return;
         }
+        // The modified-arrow grammar (docs/EDITING.md "Navigation"), all
+        // of it needing a cell to move. JUMP rides the ring's own clamp:
+        // an impossible distance lands exactly on the edge.
+        const JUMP: i32 = 1_000_000;
+        if self.table.read(cx).delegate().active_cell.is_some() {
+            // ⌘-arrows jump to the edges of the page — Sheets muscle
+            // memory, scoped the way fit is: to what you're looking at.
+            // (⌘⇧-arrows stay inert with the other ⇧ combos: extending a
+            // selection to the edge is range territory, reserved.)
+            if m.platform && !m.alt && !m.control && !m.shift {
+                let (dr, dc) = match ks.key.as_str() {
+                    "up" => (-JUMP, 0),
+                    "down" => (JUMP, 0),
+                    "left" => (0, -JUMP),
+                    "right" => (0, JUMP),
+                    _ => (0, 0),
+                };
+                if (dr, dc) != (0, 0) {
+                    self.move_ring(dr, dc, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+            }
+            // Fn-arrows: Home/End are the column edges; the Page keys
+            // drive the pager, the ring keeping its seat across the flip.
+            // ⌥↑/⌥↓ alias the Page keys — reachable without Fn.
+            match ks.key.as_str() {
+                "home" => {
+                    self.move_ring(0, -JUMP, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "end" => {
+                    self.move_ring(0, JUMP, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "pageup" => {
+                    self.page_step(-1, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "pagedown" => {
+                    self.page_step(1, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "up" if m.alt && !m.platform && !m.control => {
+                    self.page_step(-1, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "down" if m.alt && !m.platform && !m.control => {
+                    self.page_step(1, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
         if m.platform || m.control || m.function {
             return; // chords we don't own keep their meanings
         }
         let Some((row, col)) = self.table.read(cx).delegate().active_cell else {
             return;
         };
+        // ⇧-arrows are deliberately inert: they are range selection's
+        // seat (deferred), and a ring that moves when you expected a
+        // range to grow would lie. A dead key teaches honestly.
         match ks.key.as_str() {
             "enter" => {
                 self.open_editor(row, col, None, window, cx);
@@ -923,24 +1013,24 @@ impl Grid {
                 self.stage_clear(row, col, cx);
                 cx.stop_propagation();
             }
-            "up" => {
+            "up" if !m.shift => {
                 self.move_ring(-1, 0, cx);
                 cx.stop_propagation();
             }
-            "down" => {
+            "down" if !m.shift => {
                 self.move_ring(1, 0, cx);
                 cx.stop_propagation();
             }
-            "left" => {
+            "left" if !m.shift => {
                 self.move_ring(0, -1, cx);
                 cx.stop_propagation();
             }
-            "right" | "tab" if ks.key == "right" || !m.shift => {
+            "right" if !m.shift => {
                 self.move_ring(0, 1, cx);
                 cx.stop_propagation();
             }
             "tab" => {
-                self.move_ring(0, -1, cx);
+                self.move_ring(0, if m.shift { -1 } else { 1 }, cx);
                 cx.stop_propagation();
             }
             "escape" => {
@@ -1202,6 +1292,19 @@ impl Grid {
             edits.stage_delete(identity);
             self.sync_staged(cx);
         }
+    }
+
+    /// PageUp/PageDown (and ⌥↑/⌥↓) from the keyboard: flip the page and
+    /// let the ring keep its seat — same column, same row position
+    /// (clamped), new rows. A flip that cannot happen is a quiet no-op.
+    fn page_step(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let can = if delta < 0 { self.page > 0 } else { self.has_next(cx) };
+        if !can {
+            return;
+        }
+        self.ring_keep = self.table.read(cx).delegate().active_cell;
+        let page = if delta < 0 { self.page - 1 } else { self.page + 1 };
+        self.fetch_page(page, cx);
     }
 
     /// Move the active-cell ring. Columns move along the VISIBLE order,

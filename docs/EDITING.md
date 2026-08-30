@@ -48,6 +48,26 @@ The replace-vs-kept-value arrow split is Sheets' own physics, unnamed:
 the entry gesture *is* the state, your finger chose it a second ago. No
 mode names, no status chip, no mid-edit toggle.
 
+## Navigation
+
+With a cell selected and no editor open, every modifier + arrow
+combination has a deliberate answer:
+
+| Keys | Meaning |
+|---|---|
+| arrows | move the ring one cell |
+| ⌘↑ / ⌘↓ | first / last row of the page |
+| ⌘← / ⌘→ | first / last visible column |
+| Home / End | first / last visible column |
+| PageUp / PageDown | previous / next page — the ring keeps its seat (same column, row clamped) |
+| ⌥↑ / ⌥↓ | previous / next page (same as the Page keys, reachable without Fn) |
+| ⇧ + arrows | deliberately inert — range selection's seat, reserved until ranges ship; a ring that moved when you expected a range to grow would lie |
+| ⌃ + arrows | never bound — macOS owns them (Mission Control, Spaces) |
+
+⌘-arrow edges are page-scoped on purpose, the same ruling as fit: the
+keyboard operates on *what you are looking at*. Crossing pages is always
+an explicit act (the Page keys, ⌥↑/⌥↓, or the pager).
+
 ## Staging
 
 - A staged cell shows a soft accent tint. A staged delete shows the row
