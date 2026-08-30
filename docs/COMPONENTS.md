@@ -38,10 +38,22 @@ a contained diff.
 
 ## Measure before trusting
 
-**Column-axis virtualization is unverified.** The table is virtualized,
-but whether in both axes is not established, and wide analytics results
-are a stated scale target. The first task of the grid phase is an
-empirical probe: render a 500-column x 100,000-row result and measure
-frame time and memory before any editing work builds on top. If only
-rows virtualize, our wrapper windows columns. A client that assumes
-per-cell views scale has been wrong before; this repo does not assume.
+**Column-axis virtualization: verified, 2026-08-29.** Both axes
+virtualize — rows through `uniform_list`, columns through
+`virtual_list`, with `render_td` called only for visible cells
+(gpui-component 0.5.1 `table/state.rs`). The probe lives at
+`crates/ducktable/examples/wide_probe.rs`: a self-driving 500-column x
+100,000-row table that sweeps six scroll patterns and prints frame-time
+stats. Re-run it on every gpui-component bump:
+
+```
+cargo run --release -p ducktable --example wide_probe
+```
+
+Measured on an M-series Mac at a 60 Hz refresh, release build: every
+phase pinned at the 16.7 ms vsync interval — p50 16.7 ms, p95 no worse
+than 17.6 ms, and no frame over 33 ms in any scroll phase, including
+random jumps on both axes at once (full viewport replacement per
+frame). RSS 128.9 MB with no row data stored, which is the
+framework-plus-window baseline. Verdict: the Table is the grid's
+display and scroll foundation; no column-windowing wrapper is needed.
