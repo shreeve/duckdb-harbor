@@ -14,9 +14,9 @@ use crate::prefs;
 use crate::theme::{pal, ui_font, value_font};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::table::{Column as TableColumn, Table, TableDelegate, TableState};
-use gpui_component::{Selectable as _, Sizable as _, Size, StyledExt as _};
+use gpui_component::tooltip::Tooltip;
+use gpui_component::{Sizable as _, Size, StyledExt as _};
 use harbor_client::Conn;
 use serde_json::Value;
 
@@ -403,50 +403,51 @@ impl Render for Grid {
                         div().flex_1().min_w_0().text_sm().text_color(t.text).truncate().child(title),
                     )
                     .child(
-                        // The design system's segmented-control frame
-                        // (design.css `.seg`): one bordered box so the
-                        // toggles read as a set, not free-floating.
+                        // Recessed track, macOS-toolbar style: a subtle
+                        // inset container; flat icon tiles with a 2px gap
+                        // (edges never touch); the ON state is an
+                        // accent-tinted fill. These are independent
+                        // toggles, so no segment ever "wins" the track.
                         div()
                             .h_flex()
                             .flex_none()
+                            .gap(px(2.))
+                            .p(px(2.))
+                            .rounded(px(6.))
+                            .bg(t.raised)
                             .border_1()
-                            .border_color(t.border)
-                            .rounded(px(5.))
-                            .p(px(1.))
-                            .child(
-                                Button::new("toggle-rows")
-                                    .ghost()
-                                    .xsmall()
-                                    .label("#")
-                                    .tooltip("Show row numbers")
-                                    .selected(p.row_numbers)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        prefs::toggle(cx, |p| p.row_numbers = !p.row_numbers);
-                                        this.sync_columns(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("toggle-align")
-                                    .ghost()
-                                    .xsmall()
-                                    .label("\u{21e5}")
-                                    .tooltip("Right-align numeric columns")
-                                    .selected(p.right_align)
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        prefs::toggle(cx, |p| p.right_align = !p.right_align);
-                                    })),
-                            )
-                            .child(
-                                Button::new("toggle-nulls")
-                                    .ghost()
-                                    .xsmall()
-                                    .label("\u{2205}")
-                                    .tooltip("Show NULL tags")
-                                    .selected(p.null_tags)
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        prefs::toggle(cx, |p| p.null_tags = !p.null_tags);
-                                    })),
-                            ),
+                            .border_color(t.grid_line)
+                            .child(toggle_tile(
+                                "toggle-rows",
+                                "#",
+                                "Show row numbers",
+                                p.row_numbers,
+                                t,
+                                cx.listener(|this, _, _, cx| {
+                                    prefs::toggle(cx, |p| p.row_numbers = !p.row_numbers);
+                                    this.sync_columns(cx);
+                                }),
+                            ))
+                            .child(toggle_tile(
+                                "toggle-align",
+                                "\u{21e5}",
+                                "Right-align numeric columns",
+                                p.right_align,
+                                t,
+                                cx.listener(|_, _, _, cx| {
+                                    prefs::toggle(cx, |p| p.right_align = !p.right_align);
+                                }),
+                            ))
+                            .child(toggle_tile(
+                                "toggle-nulls",
+                                "\u{2205}",
+                                "Show NULL tags",
+                                p.null_tags,
+                                t,
+                                cx.listener(|_, _, _, cx| {
+                                    prefs::toggle(cx, |p| p.null_tags = !p.null_tags);
+                                }),
+                            )),
                     )
                     .child(div().text_xs().text_color(t.muted).flex_none().child(status)),
             )
@@ -469,6 +470,39 @@ impl Render for Grid {
                     .child(Table::new(&self.table).bordered(false).with_size(GRID_SIZE)),
             )
     }
+}
+
+/// One tile in the display-toggle track: flat glyph when off, accent-tinted
+/// fill when on, faint hover, tooltip on hover.
+fn toggle_tile(
+    id: &'static str,
+    glyph: &'static str,
+    tip: &'static str,
+    on: bool,
+    t: crate::theme::Pal,
+    handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .h_flex()
+        .items_center()
+        .justify_center()
+        .w(px(24.))
+        .h(px(18.))
+        .rounded(px(4.))
+        .cursor_pointer()
+        .text_size(px(11.))
+        .map(|d| {
+            if on {
+                d.bg(t.accent.opacity(0.15)).text_color(t.accent)
+            } else {
+                d.text_color(t.muted)
+            }
+        })
+        .hover(move |d| if on { d } else { d.bg(t.row_hover) })
+        .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+        .on_click(move |e, window, cx| handler(e, window, cx))
+        .child(glyph)
 }
 
 /// Fetch a table's first page. SQL construction (quoting, paging) is this
