@@ -759,37 +759,6 @@ fn shutdown_tcp(bind: &str, port: u16, token: Option<&str>) -> bool {
     }
 }
 
-/// Positive proof that a berth is gone: its `<name>.lock` exists and we can
-/// take the exclusive flock the live berth holds for its whole life (serve).
-/// Only a *definite* death suppresses a stop/forget signal — if the lock file is
-/// missing or unreadable we return false and fall through to the old behaviour,
-/// so a live berth is never left unstoppable. Unlike `GET /ready` this needs no
-/// response from the berth, so a busy one is correctly seen as alive, not dead.
-fn berth_dead(lock_path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        let Ok(f) = std::fs::OpenOptions::new().read(true).open(lock_path) else {
-            return false; // unknown, not proven dead
-        };
-        // If we acquire it, nobody holds it → the process is gone. Dropping
-        // `f` releases the lock we just took; never unlink it (see serve).
-        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // The live process holds this file with share_mode(0). Successfully
-        // opening it the same way is positive proof that process is gone.
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .share_mode(0)
-            .open(lock_path)
-            .is_ok()
-    }
-}
-
 fn probe_200(s: &mut (impl Read + Write)) -> bool {
     if write!(s, "GET /ready HTTP/1.1\r\nHost: harbor\r\nConnection: close\r\n\r\n").is_err() {
         return false;
@@ -1119,13 +1088,14 @@ fn stop_core(home: &Path, name: &str, pid: u64, lock_path: &Path) -> Result<(), 
         if !shutdown_tcp(&bind, port, token.as_deref()) {
             return Err(format!("{name:?} (pid {pid}) refused the graceful shutdown request"));
         }
+        use harbor_common::fleet::{Claim, claim_state};
         let deadline = Instant::now() + Duration::from_secs(35);
-        while Instant::now() < deadline && !berth_dead(lock_path) {
+        while Instant::now() < deadline && claim_state(lock_path) != Claim::Free {
             std::thread::sleep(Duration::from_millis(100));
         }
-        match berth_dead(lock_path) {
-            true => Ok(()),
-            false => Err(format!(
+        match claim_state(lock_path) {
+            Claim::Free => Ok(()),
+            _ => Err(format!(
                 "{name:?} (pid {pid}) is still running 35s after shutdown — \
                  nothing was removed. Escalate with Task Manager if you mean it."
             )),
@@ -1168,9 +1138,7 @@ fn add_cmd(rest: Vec<String>) -> Result<(), String> {
     // promotion finishes on the spot: restart it as the service it just
     // became, so its idle-exit dies with it.
     let home = harbor_home()?;
-    let lock_path = harbor_common::lock_file(&home, &name);
     if let Some(side) = harbor_common::fleet::Sidecar::read(&home, &name)
-        && !berth_dead(&lock_path)
         && side.idle_exit_ms.is_some()
         && side
             .db
@@ -1178,11 +1146,9 @@ fn add_cmd(rest: Vec<String>) -> Result<(), String> {
             .and_then(|p| std::fs::canonicalize(harbor_common::paths::expand(p)).ok())
             .as_deref()
             == Some(&canon)
+        && restart_live(&name)?
     {
-        if let Some(pid) = side.pid {
-            stop_core(&home, &name, pid, &lock_path)?;
-        }
-        return start(vec![name]);
+        return Ok(());
     }
     println!("(starts on use — or right now: harbor start {name})");
     Ok(())
@@ -1247,18 +1213,27 @@ fn expose_cmd(rest: Vec<String>) -> Result<(), String> {
 /// A berth at rest is left at rest — a name starts on use, and the new
 /// address boards with it.
 fn reapply(name: &str) -> Result<(), String> {
+    if !restart_live(name)? {
+        println!("(not running — it takes effect when {name:?} next starts)");
+    }
+    Ok(())
+}
+
+/// Drain a proven-live berth and start it again under current config; leave
+/// anything else at rest and say so with `false`. Proof means the flock —
+/// a sidecar alone is a claim, not a heartbeat. `start` prints the receipt.
+fn restart_live(name: &str) -> Result<bool, String> {
+    use harbor_common::fleet::{Claim, claim_state};
     let home = harbor_home()?;
     let lock_path = harbor_common::lock_file(&home, name);
-    if let Some(side) = harbor_common::fleet::Sidecar::read(&home, name)
-        && !berth_dead(&lock_path)
+    if claim_state(&lock_path) == Claim::Held
+        && let Some(pid) = harbor_common::fleet::Sidecar::read(&home, name).and_then(|s| s.pid)
     {
-        if let Some(pid) = side.pid {
-            stop_core(&home, name, pid, &lock_path)?;
-        }
-        return start(vec![name.to_string()]);
+        stop_core(&home, name, pid, &lock_path)?;
+        start(vec![name.to_string()])?;
+        return Ok(true);
     }
-    println!("(not running — it takes effect when {name:?} next starts)");
-    Ok(())
+    Ok(false)
 }
 
 fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
@@ -1299,15 +1274,42 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
         let _ = write_private(&harbor_common::hold_file(&home, &name), "");
     }
     if let Some(side) = harbor_common::fleet::Sidecar::read(&home, &name) {
-        if berth_dead(&lock_path) {
-            // Proven dead: no process holds the flock, so the pid recorded
-            // in the json is stale and the OS may have recycled it to an
-            // unrelated process. Signalling it would be signalling a
-            // stranger — so don't. `forget` still cleans the registry below.
+        use harbor_common::fleet::{Claim, claim_state};
+        let claim = claim_state(&lock_path);
+        if claim == Claim::Held {
+            // Someone holds the flock: proven alive, safe to signal — if the
+            // sidecar can say whom. A lenient sidecar may not, and stripping
+            // or guessing under a live berth is the one thing never done.
+            let Some(pid) = side.pid else {
+                return Err(format!(
+                    "{name:?} is alive (its lock is held) but the sidecar records no pid — \
+                     not touching a live berth; find the process, stop it by hand, retry"
+                ));
+            };
+            stop_core(&home, &name, pid, &lock_path)?;
+            match held {
+                true => println!(
+                    "{name:?} stopped (drained, checkpointed, held — harbor start {name} lifts it)"
+                ),
+                false => println!("{name:?} stopped (drained and checkpointed)"),
+            }
+        } else {
+            // No holder (stale residue), or no lock file at all. Either way
+            // the recorded pid is unproven and the OS may have recycled it
+            // to a stranger — so nothing is ever signalled from here. With
+            // no lock the berth itself gets the last word, by the same probe
+            // reconcile uses for exactly this shape.
+            if claim == Claim::None && side.addr().as_ref().is_some_and(probe) {
+                return Err(format!(
+                    "{name:?} still answers but has no lock file — nothing proves pid {} \
+                     is this berth, so nothing was signalled or removed; stop the process by hand",
+                    side.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+                ));
+            }
             if !remove {
                 // The asked-for state already holds, so this is success —
-                // a berth at rest is not a stranger — but the corpse's
-                // registry files remain and only forget clears them.
+                // but the corpse's registry files remain and only forget
+                // clears them.
                 let pid = side.pid.map(|p| p.to_string()).unwrap_or_default();
                 match held {
                     true => println!(
@@ -1321,14 +1323,6 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
                     ),
                 }
                 return Ok(());
-            }
-        } else if let Some(pid) = side.pid {
-            stop_core(&home, &name, pid, &lock_path)?;
-            match held {
-                true => println!(
-                    "{name:?} stopped (drained, checkpointed, held — harbor start {name} lifts it)"
-                ),
-                false => println!("{name:?} stopped (drained and checkpointed)"),
             }
         }
     } else if sock.exists() {
@@ -1407,32 +1401,32 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::berth_dead;
+    use harbor_common::fleet::{Claim, claim_state};
     use std::os::fd::AsRawFd;
 
     #[test]
-    fn berth_dead_reads_the_flock() {
+    fn the_flock_answers_liveness_three_ways() {
         // A unique temp path so parallel test runs never collide.
         let dir = std::env::temp_dir();
         let path = dir.join(format!("harbor-test-{}.lock", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
-        // No lock file at all → unknown, not proven dead (never strand a live
-        // berth just because its lock file is missing).
-        assert!(!berth_dead(&path), "missing lock file is not proof of death");
+        // No lock file at all → no evidence either way. Nothing may be
+        // signalled on this answer, and nothing declared dead.
+        assert_eq!(claim_state(&path), Claim::None, "missing lock file proves nothing");
 
-        // A lock file that nobody holds → the berth is gone → proven dead.
+        // A lock file that nobody holds → the berth is provably gone.
         let held = std::fs::File::create(&path).unwrap();
-        assert!(berth_dead(&path), "an unheld lock file means the berth is gone");
+        assert_eq!(claim_state(&path), Claim::Free, "an unheld lock file means the berth is gone");
 
-        // While a process holds the exclusive flock (as a live berth does), the
-        // berth is not dead — even though it answers nothing here.
+        // While a process holds the exclusive flock (as a live berth does),
+        // the berth is alive — even though it answers nothing here.
         assert_eq!(
             unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0,
             "test should be able to take the lock"
         );
-        assert!(!berth_dead(&path), "a held lock file means the berth is alive");
+        assert_eq!(claim_state(&path), Claim::Held, "a held lock file means the berth is alive");
 
         unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) };
         let _ = std::fs::remove_file(&path);

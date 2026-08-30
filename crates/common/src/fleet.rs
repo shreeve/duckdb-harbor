@@ -67,9 +67,14 @@ pub struct Sidecar {
 }
 
 impl Sidecar {
+    /// The one lenient parse every reader shares (see the struct doc).
+    fn parse(text: &str) -> Sidecar {
+        serde_json::from_str(text).unwrap_or_default()
+    }
+
     pub fn read(runtime: &Path, name: &str) -> Option<Sidecar> {
         let text = std::fs::read_to_string(crate::paths::sidecar_file(runtime, name)).ok()?;
-        Some(serde_json::from_str(&text).unwrap_or_default())
+        Some(Sidecar::parse(&text))
     }
 
     /// Where this berth answers, as registered.
@@ -151,8 +156,7 @@ pub fn scan_runtime(home: &Path) -> (BTreeMap<String, Sidecar>, BTreeSet<String>
         match p.extension().and_then(|x| x.to_str()) {
             Some("json") => {
                 let v = std::fs::read_to_string(&p)
-                    .ok()
-                    .and_then(|t| serde_json::from_str::<Sidecar>(&t).ok())
+                    .map(|t| Sidecar::parse(&t))
                     .unwrap_or_default();
                 sidecars.insert(stem, v);
             }
