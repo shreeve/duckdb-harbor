@@ -7,11 +7,23 @@
 use gpui::{App, Global};
 use serde_json::{json, Value};
 
+/// Which view of the table the footer has selected — a browsing mode,
+/// not table state (it survives table switches), so it lives with the
+/// other display prefs. Data and Structure are exclusive by design: a
+/// schema change reshapes the data view, so the two never render side
+/// by side.
+#[derive(Clone, Copy, PartialEq)]
+pub enum ViewMode {
+    Data,
+    Structure,
+}
+
 #[derive(Clone, Copy)]
 pub struct Prefs {
     pub row_numbers: bool,
     pub right_align: bool,
     pub null_tags: bool,
+    pub view: ViewMode,
     /// The inspector pane's open state (UI.md: persists per window).
     pub inspector: bool,
     /// The inspector pane's width (UI.md: divider positions persist).
@@ -62,6 +74,7 @@ impl Default for Prefs {
             row_numbers: true,
             right_align: false,
             null_tags: true,
+            view: ViewMode::Data,
             inspector: false,
             inspector_width: 290.,
             page_size: 500,
@@ -87,6 +100,9 @@ pub fn init(cx: &mut App) {
         prefs.row_numbers = read("row_numbers", prefs.row_numbers);
         prefs.right_align = read("right_align", prefs.right_align);
         prefs.null_tags = read("null_tags", prefs.null_tags);
+        if v.get("view").and_then(Value::as_str) == Some("structure") {
+            prefs.view = ViewMode::Structure;
+        }
         prefs.inspector = read("inspector", prefs.inspector);
         prefs.inspector_width = v
             .get("inspector_width")
@@ -128,6 +144,7 @@ pub fn save(cx: &mut App, change: impl FnOnce(&mut Prefs)) {
         "row_numbers": prefs.row_numbers,
         "right_align": prefs.right_align,
         "null_tags": prefs.null_tags,
+        "view": if prefs.view == ViewMode::Structure { "structure" } else { "data" },
         "inspector": prefs.inspector,
         "inspector_width": prefs.inspector_width,
         "page_size": prefs.page_size,

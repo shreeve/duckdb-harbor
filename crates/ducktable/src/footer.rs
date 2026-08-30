@@ -4,7 +4,8 @@
 //! as `inspector.rs` and `structure.rs` — per-table controls, a
 //! different scope from the header strip's global display prefs.
 
-use crate::grid::{icon_tile, Grid, ViewMode};
+use crate::grid::{icon_tile, Grid};
+use crate::prefs::ViewMode;
 use crate::theme::pal;
 use crate::util::commas;
 use gpui::prelude::FluentBuilder as _;
@@ -16,7 +17,7 @@ use gpui_component::{Sizable as _, StyledExt as _};
 impl Grid {
     pub(crate) fn footer(&self, cx: &mut Context<Self>) -> Div {
         let t = pal(cx);
-        let view = self.view();
+        let view = crate::prefs::get(cx).view;
         let (count, cols, loading) = self.table_facts(cx);
         let can_prev = self.page > 0;
         let can_next = self.has_next(cx);
@@ -92,9 +93,8 @@ impl Grid {
                         view == ViewMode::Data,
                         (true, false),
                         t,
-                        cx.listener(|this, _, _, cx| {
-                            this.set_view(ViewMode::Data);
-                            cx.notify();
+                        cx.listener(|_, _, _, cx| {
+                            crate::prefs::toggle(cx, |p| p.view = ViewMode::Data);
                         }),
                     ))
                     .child(seg_tile(
@@ -103,9 +103,8 @@ impl Grid {
                         view == ViewMode::Structure,
                         (false, true),
                         t,
-                        cx.listener(|this, _, _, cx| {
-                            this.set_view(ViewMode::Structure);
-                            cx.notify();
+                        cx.listener(|_, _, _, cx| {
+                            crate::prefs::toggle(cx, |p| p.view = ViewMode::Structure);
                         }),
                     )),
             )

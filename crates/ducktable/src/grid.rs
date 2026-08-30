@@ -13,7 +13,7 @@
 //! editing arrives, reads resolve through an identity mapping, never raw
 //! indices.
 
-use crate::prefs;
+use crate::prefs::{self, ViewMode};
 use crate::theme::{pal, ui_font, value_font};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -67,15 +67,6 @@ fn gutter_width(max_row: u64) -> f32 {
     (16. + digits * 7.).max(34.)
 }
 
-/// Which view of the table the footer has selected. Data and Structure
-/// are exclusive by design: a schema change reshapes the data view, so
-/// the two never render side by side.
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum ViewMode {
-    Data,
-    Structure,
-}
-
 pub(crate) struct Grid {
     // `table`, `filter_input`, and `col_search` are pub(crate) for the
     // satellite `impl Grid` files (footer.rs); nothing outside those
@@ -97,7 +88,6 @@ pub(crate) struct Grid {
     pub(crate) last_time_ms: u64,
     /// The filter strip's input; Some = the strip is open.
     pub(crate) filter_input: Option<Entity<gpui_component::input::InputState>>,
-    view: ViewMode,
     /// Prefetched with the first page, so switching views is instant.
     structure: Option<crate::structure::TableStructure>,
     /// The table/inspector divider (UI.md: divider positions persist —
@@ -372,7 +362,6 @@ impl Grid {
             error,
             last_time_ms,
             filter_input: None,
-            view: ViewMode::Data,
             structure,
             resize,
             col_search,
@@ -718,16 +707,6 @@ impl Grid {
 
     pub(crate) fn structure(&self) -> Option<&crate::structure::TableStructure> {
         self.structure.as_ref()
-    }
-
-    /// The footer's view choice survives a table switch: the new grid is
-    /// seeded with the outgoing grid's mode (app.rs select_table).
-    pub(crate) fn view(&self) -> ViewMode {
-        self.view
-    }
-
-    pub(crate) fn set_view(&mut self, view: ViewMode) {
-        self.view = view;
     }
 
     /// The row and (visible, gutterless) column counts, plus whether a
@@ -1186,9 +1165,9 @@ impl Render for Grid {
         // The inspector slots in BESIDE the table, below the header strip —
         // the title/toggle row keeps the full width, so opening the panel
         // never shifts it. It is row-level, so it only accompanies Data.
-        let inspector = (p.inspector && self.view == ViewMode::Data)
+        let inspector = (p.inspector && p.view == ViewMode::Data)
             .then(|| self.inspector(cx).into_any_element());
-        let view = self.view;
+        let view = p.view;
         let title = self.title.clone();
         let error = self.error.clone();
         div()
