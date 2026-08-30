@@ -6,6 +6,10 @@ description = "harbor — DuckDB wearing a server: fleet manager + HTTP/UDS engi
 license = "MIT"
 
 [dependencies]
+# Paths, names, the permission gate, the config schema, berth lifetimes and
+# states, and the renderer. Shared with pilot so the two cannot drift, and
+# with ducktable, which takes it without the `term` feature.
+harbor-common = { path = "../common" }
 duckdb = { version = "~1.10505.0", default-features = false, features = ["vtab"] }
 justhttp = { path = "../justhttp" }
 serde = "1"
@@ -17,6 +21,8 @@ libc = "0.2"
 # the tests check it against the crate that publishes it.
 [dev-dependencies]
 wire = { path = "../wire" }
+# Test-only: doctor's checks are driven from config literals.
+toml = "1.1.4"
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
