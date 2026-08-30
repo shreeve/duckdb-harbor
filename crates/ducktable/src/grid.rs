@@ -368,6 +368,24 @@ impl Grid {
         cx.notify();
     }
 
+    /// Reset every hidden column (the popover's "Show all").
+    pub(crate) fn show_all_columns(&mut self, cx: &mut Context<Self>) {
+        self.table.update(cx, |state, cx| {
+            {
+                let d = state.delegate_mut();
+                if d.hidden.is_empty() {
+                    return;
+                }
+                d.hidden.clear();
+                d.rebuild_cols();
+            }
+            state.refresh(cx);
+            state.scroll_to_col(0, cx);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     /// (schema index, name, hidden) for the Columns popover.
     pub(crate) fn column_list(&self, cx: &App) -> Vec<(usize, String, bool)> {
         let d = self.table.read(cx).delegate();
@@ -1118,31 +1136,98 @@ impl Render for Grid {
                                         .tooltip("Show or hide columns"),
                                 )
                                 .content(move |_, _, cx| {
+                                    let t = pal(cx);
                                     let list = grid.read(cx).column_list(cx);
-                                    let mut pane = div()
+                                    let hidden_any = list.iter().any(|&(_, _, h)| h);
+                                    // The whole row is the click target; the
+                                    // Checkbox is visual only (its handler-
+                                    // less listener no-ops and the click
+                                    // bubbles to the row).
+                                    let mut rows = div()
                                         .id("columns-list")
                                         .v_flex()
-                                        .p_1()
+                                        .p(px(4.))
                                         .gap_px()
-                                        .min_w(px(180.))
-                                        .max_h(px(320.))
+                                        .max_h(px(340.))
                                         .overflow_y_scroll();
                                     for (ix, name, hidden) in list {
                                         let grid = grid.clone();
-                                        pane = pane.child(
-                                            gpui_component::checkbox::Checkbox::new((
-                                                "col", ix,
-                                            ))
-                                            .label(name)
-                                            .checked(!hidden)
-                                            .on_click(move |_, _, cx| {
-                                                grid.update(cx, |g, cx| {
-                                                    g.toggle_column(ix, cx);
-                                                });
-                                            }),
+                                        rows = rows.child(
+                                            div()
+                                                .id(("colrow", ix))
+                                                .h_flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .px(px(6.))
+                                                .py(px(3.))
+                                                .rounded(px(5.))
+                                                .cursor_pointer()
+                                                .hover(|d| d.bg(t.row_hover))
+                                                .child(
+                                                    gpui_component::checkbox::Checkbox::new((
+                                                        "col", ix,
+                                                    ))
+                                                    .checked(!hidden)
+                                                    .small(),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(13.))
+                                                        .map(|d| {
+                                                            if hidden {
+                                                                d.text_color(t.muted)
+                                                            } else {
+                                                                d.text_color(t.text)
+                                                            }
+                                                        })
+                                                        .child(name),
+                                                )
+                                                .on_click(move |_, _, cx| {
+                                                    grid.update(cx, |g, cx| {
+                                                        g.toggle_column(ix, cx);
+                                                    });
+                                                }),
                                         );
                                     }
-                                    pane.into_any_element()
+                                    div()
+                                        .v_flex()
+                                        .w(px(240.))
+                                        .child(
+                                            div()
+                                                .h_flex()
+                                                .items_center()
+                                                .px(px(10.))
+                                                .pt(px(8.))
+                                                .pb(px(6.))
+                                                .border_b_1()
+                                                .border_color(t.border)
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .font_weight(FontWeight(560.))
+                                                        .text_color(t.muted)
+                                                        .child("COLUMNS"),
+                                                )
+                                                .child(div().flex_1())
+                                                .when(hidden_any, |d| {
+                                                    let grid = grid.clone();
+                                                    d.child(
+                                                        div()
+                                                            .id("cols-show-all")
+                                                            .text_xs()
+                                                            .text_color(t.accent)
+                                                            .cursor_pointer()
+                                                            .child("Show all")
+                                                            .on_click(move |_, _, cx| {
+                                                                grid.update(cx, |g, cx| {
+                                                                    g.show_all_columns(cx);
+                                                                });
+                                                            }),
+                                                    )
+                                                }),
+                                        )
+                                        .child(rows)
+                                        .into_any_element()
                                 }),
                         )
                     })

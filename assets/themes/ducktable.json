@@ -31,7 +31,8 @@
         "table.row.border": "#e7e8ec",
         "table.active.background": "#00000000",
         "table.active.border": "#00000000",
-        "table.hover.background": "#00000000"
+        "table.hover.background": "#00000000",
+        "popover.background": "#ffffff"
       }
     },
     {
@@ -64,7 +65,8 @@
         "table.row.border": "#38383e",
         "table.active.background": "#00000000",
         "table.active.border": "#00000000",
-        "table.hover.background": "#00000000"
+        "table.hover.background": "#00000000",
+        "popover.background": "#2e2e35"
       }
     },
     {
@@ -97,7 +99,8 @@
         "table.row.border": "#e5dcc8",
         "table.active.background": "#00000000",
         "table.active.border": "#00000000",
-        "table.hover.background": "#00000000"
+        "table.hover.background": "#00000000",
+        "popover.background": "#fffdf4"
       }
     },
     {
@@ -130,7 +133,8 @@
         "table.row.border": "#1f2b44",
         "table.active.background": "#00000000",
         "table.active.border": "#00000000",
-        "table.hover.background": "#00000000"
+        "table.hover.background": "#00000000",
+        "popover.background": "#192338"
       }
     },
     {
@@ -163,7 +167,8 @@
         "table.row.border": "#9a9a9a",
         "table.active.background": "#00000000",
         "table.active.border": "#00000000",
-        "table.hover.background": "#00000000"
+        "table.hover.background": "#00000000",
+        "popover.background": "#ffffff"
       }
     }
   ]
