@@ -18,11 +18,38 @@ pub struct Prefs {
     pub inspector_width: f32,
     /// Rows per page in the data grid.
     pub page_size: usize,
+    /// Index into [`ZOOMS`].
+    pub zoom: usize,
+}
+
+impl Prefs {
+    /// The current zoom's font multiplier for data-surface text.
+    pub fn zoom_factor(&self) -> f32 {
+        ZOOMS[self.zoom].0
+    }
+
+    /// The table chrome size matched to the current zoom.
+    pub fn table_size(&self) -> gpui_component::Size {
+        ZOOMS[self.zoom].1
+    }
 }
 
 /// The page sizes the footer control cycles through: one decade apart, so
 /// each step is a different kind of read (skim / work / bulk-scan).
 pub const PAGE_SIZES: [usize; 3] = [500, 5_000, 50_000];
+
+/// Zoom steps for the data surfaces (Cmd-= / Cmd-- / Cmd-0): a font
+/// multiplier paired with the table chrome size whose row height fits it,
+/// so zoomed text never clips its row. Chrome (sidebar, footer, labels)
+/// stays put; the data is what zooms.
+pub const ZOOMS: [(f32, gpui_component::Size); 5] = [
+    (0.85, gpui_component::Size::XSmall),
+    (1.0, gpui_component::Size::XSmall),
+    (1.15, gpui_component::Size::Small),
+    (1.3, gpui_component::Size::Medium),
+    (1.5, gpui_component::Size::Large),
+];
+pub const DEFAULT_ZOOM: usize = 1;
 
 /// Inspector width bounds — the load clamp and the divider's drag range.
 pub const INSPECTOR_MIN: f32 = 180.;
@@ -37,6 +64,7 @@ impl Default for Prefs {
             inspector: false,
             inspector_width: 290.,
             page_size: 500,
+            zoom: DEFAULT_ZOOM,
         }
     }
 }
@@ -70,6 +98,12 @@ pub fn init(cx: &mut App) {
             .map(|n| n as usize)
             .filter(|n| PAGE_SIZES.contains(n))
             .unwrap_or(prefs.page_size);
+        prefs.zoom = v
+            .get("zoom")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .filter(|n| *n < ZOOMS.len())
+            .unwrap_or(prefs.zoom);
     }
     cx.set_global(prefs);
 }
@@ -96,6 +130,7 @@ pub fn save(cx: &mut App, change: impl FnOnce(&mut Prefs)) {
         "inspector": prefs.inspector,
         "inspector_width": prefs.inspector_width,
         "page_size": prefs.page_size,
+        "zoom": prefs.zoom,
     });
     if let Some(p) = file() {
         if let Some(dir) = p.parent() {

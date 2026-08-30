@@ -19,7 +19,7 @@ use app::DuckTable;
 use gpui::*;
 use gpui_component::{Root, StyledExt as _};
 
-actions!(ducktable, [ToggleInspector, About, Quit]);
+actions!(ducktable, [ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset]);
 
 /// The macOS menu bar. The first menu becomes the application menu; the
 /// About item opens the platform's standard dialog (window.prompt ->
@@ -128,8 +128,23 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("cmd-alt-0", ToggleInspector, None),
             KeyBinding::new("cmd-q", Quit, None),
+            // Cmd-Plus arrives as cmd-= (unshifted) or cmd-shift-= — bind
+            // both, the way browsers treat the pair.
+            KeyBinding::new("cmd-=", ZoomIn, None),
+            KeyBinding::new("cmd-shift-=", ZoomIn, None),
+            KeyBinding::new("cmd--", ZoomOut, None),
+            KeyBinding::new("cmd-0", ZoomReset, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.on_action(|_: &ZoomIn, cx| {
+            prefs::toggle(cx, |p| p.zoom = (p.zoom + 1).min(prefs::ZOOMS.len() - 1));
+        });
+        cx.on_action(|_: &ZoomOut, cx| {
+            prefs::toggle(cx, |p| p.zoom = p.zoom.saturating_sub(1));
+        });
+        cx.on_action(|_: &ZoomReset, cx| {
+            prefs::toggle(cx, |p| p.zoom = prefs::DEFAULT_ZOOM);
+        });
         // Global, not view-scoped: menu items must work regardless of
         // which pane holds focus. The prompt needs a window — but a menu
         // action arrives INSIDE the active window's update, so touching

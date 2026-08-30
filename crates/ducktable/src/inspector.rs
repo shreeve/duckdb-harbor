@@ -17,6 +17,7 @@ use gpui_component::StyledExt as _;
 impl Grid {
     pub(crate) fn inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = pal(cx);
+        let z = crate::prefs::get(cx).zoom_factor();
 
         // The width belongs to the resizable panel wrapping this pane
         // (grid.rs), so the pane just fills it.
@@ -32,14 +33,14 @@ impl Grid {
         match self.row_kv(cx) {
             Some(pairs) => {
                 for (k, v, is_null) in pairs {
-                    list = list.child(kv(t, k, v, is_null));
+                    list = list.child(kv(t, z, k, v, is_null));
                 }
             }
             None => {
                 list = list.child(
                     div()
                         .pt_1()
-                        .text_size(px(12.))
+                        .text_size(px(12. * z))
                         .text_color(t.muted)
                         .child("Select a row"),
                 );
@@ -83,7 +84,7 @@ fn section(t: Pal, label: &'static str) -> impl IntoElement {
         .child(label)
 }
 
-fn kv(t: Pal, k: impl Into<SharedString>, v: String, is_null: bool) -> impl IntoElement {
+fn kv(t: Pal, z: f32, k: impl Into<SharedString>, v: String, is_null: bool) -> impl IntoElement {
     div()
         .h_flex()
         .justify_between()
@@ -94,9 +95,9 @@ fn kv(t: Pal, k: impl Into<SharedString>, v: String, is_null: bool) -> impl Into
         .child(
             div()
                 .flex_none()
-                .max_w(px(110.))
+                .max_w(px(110. * z))
                 .truncate()
-                .text_size(px(12.))
+                .text_size(px(12. * z))
                 .text_color(t.muted)
                 .child(k.into()),
         )
@@ -104,7 +105,7 @@ fn kv(t: Pal, k: impl Into<SharedString>, v: String, is_null: bool) -> impl Into
             div()
                 .min_w_0()
                 .truncate()
-                .text_size(px(11.5))
+                .text_size(px(11.5 * z))
                 .font_family(value_font())
                 .text_color(if is_null { t.muted } else { t.text })
                 .when(is_null, |d| d.italic())

@@ -165,6 +165,7 @@ const ATTR_W: f32 = 130.;
 impl Grid {
     pub(crate) fn structure_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = pal(cx);
+        let z = crate::prefs::get(cx).zoom_factor();
         let mut pane = div()
             .id("structure")
             .v_flex()
@@ -178,34 +179,34 @@ impl Grid {
             );
         };
 
-        pane = pane.child(header_row(t));
+        pane = pane.child(header_row(t, z));
         for c in &s.cols {
             pane = pane.child(
                 div()
                     .h_flex()
-                    .h(px(ROW_H))
+                    .h(px(ROW_H * z))
                     .flex_none()
                     .items_center()
                     .gap_2()
                     .border_b_1()
                     .border_color(t.grid_line)
-                    .child(cell(t, &c.name, NAME_W, false))
-                    .child(cell(t, &c.ty, TYPE_W, true))
+                    .child(cell(t, z, &c.name, NAME_W, false))
+                    .child(cell(t, z, &c.ty, TYPE_W, true))
                     .child(
                         div()
                             .h_flex()
-                            .w(px(ATTR_W))
+                            .w(px(ATTR_W * z))
                             .flex_none()
                             .gap_1()
-                            .when(c.pk, |d| d.child(chip(t, "PK", true)))
-                            .when(c.notnull, |d| d.child(chip(t, "NOT NULL", false))),
+                            .when(c.pk, |d| d.child(chip(t, z, "PK", true)))
+                            .when(c.notnull, |d| d.child(chip(t, z, "NOT NULL", false))),
                     )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(12.))
+                            .text_size(px(12. * z))
                             .font_family(value_font())
                             .text_color(t.muted)
                             .child(c.dflt.clone().unwrap_or_default()),
@@ -243,7 +244,7 @@ impl Grid {
             pane = pane.child(
                 gpui_component::input::Input::new(state)
                     .disabled(true)
-                    .text_size(px(12.))
+                    .text_size(px(12. * z))
                     .font_family(value_font()),
             );
         }
@@ -252,19 +253,19 @@ impl Grid {
     }
 }
 
-fn header_row(t: Pal) -> impl IntoElement {
-    let th = |label: &'static str, w: f32| {
+fn header_row(t: Pal, z: f32) -> impl IntoElement {
+    let th = move |label: &'static str, w: f32| {
         div()
-            .w(px(w))
+            .w(px(w * z))
             .flex_none()
-            .text_size(px(11.5))
+            .text_size(px(11.5 * z))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(t.text)
             .child(label)
     };
     div()
         .h_flex()
-        .h(px(ROW_H))
+        .h(px(ROW_H * z))
         .flex_none()
         .items_center()
         .gap_2()
@@ -276,19 +277,19 @@ fn header_row(t: Pal) -> impl IntoElement {
         .child(
             div()
                 .flex_1()
-                .text_size(px(11.5))
+                .text_size(px(11.5 * z))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(t.text)
                 .child("default"),
         )
 }
 
-fn cell(t: Pal, text: &str, w: f32, muted: bool) -> impl IntoElement {
+fn cell(t: Pal, z: f32, text: &str, w: f32, muted: bool) -> impl IntoElement {
     div()
-        .w(px(w))
+        .w(px(w * z))
         .flex_none()
         .truncate()
-        .text_size(px(12.))
+        .text_size(px(12. * z))
         .font_family(value_font())
         .text_color(if muted { t.muted } else { t.text })
         .child(text.to_string())
@@ -335,12 +336,12 @@ mod tests {
     }
 }
 
-fn chip(t: Pal, label: &'static str, accent: bool) -> impl IntoElement {
+fn chip(t: Pal, z: f32, label: &'static str, accent: bool) -> impl IntoElement {
     div()
         .flex_none()
         .px(px(5.))
         .rounded(px(4.))
-        .text_size(px(10.))
+        .text_size(px(10. * z))
         .font_family(ui_font())
         .map(|d| {
             if accent {

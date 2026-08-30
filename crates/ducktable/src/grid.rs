@@ -21,7 +21,7 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::resizable::{
     h_resizable, resizable_panel, ResizablePanelEvent, ResizableState,
 };
-use gpui_component::{Sizable as _, Size, StyledExt as _};
+use gpui_component::{Sizable as _, StyledExt as _};
 use harbor_client::Conn;
 use serde_json::Value;
 
@@ -32,7 +32,9 @@ use serde_json::Value;
 
 // Sizes from design/design.css `.grid`: 12px mono values, 600 11.5px UI
 // headers, 11px muted row numbers, 10px NULL tag.
-const GRID_SIZE: Size = Size::XSmall;
+// Base sizes at zoom 1.0; the data surfaces multiply by the current
+// zoom's factor (prefs::ZOOMS), whose paired table size keeps row
+// heights ahead of the text. The gutter and chrome stay put.
 const CELL_TEXT: f32 = 12.;
 const HEADER_TEXT: f32 = 11.5;
 const GUTTER_TEXT: f32 = 11.;
@@ -786,8 +788,8 @@ impl TableDelegate for GridDelegate {
         // dividers fall short of the row lines. Cells therefore take the
         // row height explicitly and draw their own bottom border; vertical
         // and horizontal lines meet at the corners.
-        let row_h = GRID_SIZE.table_row_height();
         let p = prefs::get(cx);
+        let row_h = p.table_size().table_row_height();
         // Column 0 is the row-number gutter: raised, muted, and a firmer
         // divider than the data cells (design.css `.grid td.num`).
         if self.gutter && col_ix == 0 {
@@ -895,7 +897,7 @@ impl TableDelegate for GridDelegate {
                             .px(px(5.))
                             .rounded(px(4.))
                             .bg(t.grid_line.opacity(0.55))
-                            .text_size(px(TAG_TEXT))
+                            .text_size(px(TAG_TEXT * p.zoom_factor()))
                             .font_family(ui_font())
                             .text_color(t.muted.opacity(0.65))
                             .child("NULL"),
@@ -908,7 +910,7 @@ impl TableDelegate for GridDelegate {
                     div()
                         .w_full()
                         .truncate()
-                        .text_size(px(CELL_TEXT))
+                        .text_size(px(CELL_TEXT * p.zoom_factor()))
                         .font_family(value_font())
                         .text_color(t.text)
                         .when(right, |d| d.text_right())
@@ -938,7 +940,8 @@ impl TableDelegate for GridDelegate {
         // Explicit height, like the body cells: the th sits in a chain
         // that resolves h_full to content height, so the edge strips fall
         // short of the header's top and bottom without it.
-        let row_h = GRID_SIZE.table_row_height();
+        let p = prefs::get(cx);
+        let row_h = p.table_size().table_row_height();
         if self.gutter && col_ix == 0 {
             // Mirror the gutter's body cells (same flex centering, inset,
             // and font), so "#" sits on the numbers' baseline and shares
@@ -967,8 +970,7 @@ impl TableDelegate for GridDelegate {
         }
         let data_col =
             self.visible.get(col_ix - self.gutter as usize).copied().unwrap_or(usize::MAX);
-        let right = prefs::get(cx).right_align
-            && self.numeric.get(data_col).copied().unwrap_or(false);
+        let right = p.right_align && self.numeric.get(data_col).copied().unwrap_or(false);
         // Left-aligned headers line up with values on the shared 8px
         // wrapper inset by construction. A right-aligned header needs 5px
         // of its own: the wrapper compensates zeroed paddings with only
@@ -979,7 +981,7 @@ impl TableDelegate for GridDelegate {
             .items_center()
             .w_full()
             .h(row_h)
-            .text_size(px(HEADER_TEXT))
+            .text_size(px(HEADER_TEXT * p.zoom_factor()))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(t.text)
             .child(
@@ -1192,8 +1194,9 @@ impl Render for Grid {
             })
             .child(match view {
                 ViewMode::Data => {
-                    let table_el =
-                        Table::new(&self.table).bordered(false).with_size(GRID_SIZE);
+                    let table_el = Table::new(&self.table)
+                        .bordered(false)
+                        .with_size(prefs::get(cx).table_size());
                     let body = div().flex_1().min_h_0().w_full();
                     match inspector {
                         // With the inspector open, the two panes share a
