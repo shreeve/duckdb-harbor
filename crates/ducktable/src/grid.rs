@@ -322,6 +322,12 @@ impl TableDelegate for GridDelegate {
                 .bg(t.raised)
                 .border_b_1()
                 .border_color(t.grid_line)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |state, _, _, cx| {
+                        state.set_selected_row(row_ix, cx);
+                    }),
+                )
                 .child(
                     div()
                         .w_full()
@@ -356,7 +362,11 @@ impl TableDelegate for GridDelegate {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |state, _, _, cx| {
+                    // Row and cell select together on mouse DOWN — the
+                    // Table's own row selection waits for the click (mouse
+                    // up), which reads as lag next to the ring.
                     state.delegate_mut().active_cell = Some((row_ix, data_col));
+                    state.set_selected_row(row_ix, cx);
                     cx.notify();
                 }),
             )
