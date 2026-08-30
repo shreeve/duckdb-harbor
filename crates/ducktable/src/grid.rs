@@ -773,33 +773,48 @@ impl GridDelegate {
     /// use: later rebuilds keep them, page flips never re-fit, and a drag
     /// still overrides a fit.
     fn fit_widths(&mut self, zoom: f32) {
-        // Menlo's advance scales linearly (7px at 11px); the header is the
-        // proportional UI font, estimated a touch narrower. 18 covers the
-        // cell's own insets (8px pad + 1px divider + breathing room).
+        self.rebuild_cols();
+        let fits: Vec<(usize, Pixels)> = self
+            .visible
+            .iter()
+            .map(|&ix| (ix, self.fitted_width(ix, zoom)))
+            .collect();
+        self.widths.extend(fits);
+        self.rebuild_cols();
+    }
+
+    /// Fit a single column (double-click on its header).
+    fn fit_one(&mut self, schema_ix: usize, zoom: f32) {
+        if schema_ix >= self.schema_cols.len() {
+            return; // the header's usize::MAX sentinel for an unmapped column
+        }
+        let w = self.fitted_width(schema_ix, zoom);
+        self.widths.insert(schema_ix, w);
+        self.rebuild_cols();
+    }
+
+    /// One column's content-fit width. Menlo's advance scales linearly
+    /// (7px at 11px); the header is the proportional UI font, estimated a
+    /// touch narrower. 18 covers the cell's own insets (8px pad + 1px
+    /// divider + breathing room).
+    fn fitted_width(&self, schema_ix: usize, zoom: f32) -> Pixels {
         const CAP: usize = 60;
         let advance = CELL_TEXT * (7. / 11.) * zoom;
         let header_advance = HEADER_TEXT * (7. / 11.) * zoom;
-        self.rebuild_cols();
-        for &schema_ix in &self.visible {
-            let mut chars = 4; // the NULL tag's footprint
-            for row in &self.rows {
-                if let Some(Some(s)) = row.get(schema_ix) {
-                    chars = chars.max(s.chars().count());
-                    if chars >= CAP {
-                        break;
-                    }
+        let mut chars = 4; // the NULL tag's footprint
+        for row in &self.rows {
+            if let Some(Some(s)) = row.get(schema_ix) {
+                chars = chars.max(s.chars().count());
+                if chars >= CAP {
+                    break;
                 }
             }
-            let name_len = self.schema_cols[schema_ix]
-                .name
-                .as_deref()
-                .map_or(4, |n| n.chars().count());
-            let content = chars.min(CAP) as f32 * advance;
-            let header = name_len as f32 * header_advance;
-            let w = (content.max(header) + 18.).clamp(60. * zoom, 460. * zoom);
-            self.widths.insert(schema_ix, px(w));
         }
-        self.rebuild_cols();
+        let name_len =
+            self.schema_cols[schema_ix].name.as_deref().map_or(4, |n| n.chars().count());
+        let content = chars.min(CAP) as f32 * advance;
+        let header = name_len as f32 * header_advance;
+        px((content.max(header) + 18.).clamp(60. * zoom, 460. * zoom))
     }
 
     fn rebuild_cols(&mut self) {
@@ -1015,6 +1030,18 @@ impl TableDelegate for GridDelegate {
                 .w_full()
                 .h(row_h)
                 .pl(px(6.))
+                // The Sheets corner gesture, one step condensed: double-
+                // click "#" fits every column to the page on screen.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|state, e: &MouseDownEvent, _, cx| {
+                        if e.click_count == 2 {
+                            let zoom = prefs::get(cx).zoom_factor();
+                            state.delegate_mut().fit_widths(zoom);
+                            state.refresh(cx);
+                        }
+                    }),
+                )
                 .child(
                     div()
                         .w_full()
@@ -1045,6 +1072,20 @@ impl TableDelegate for GridDelegate {
             .text_size(px(HEADER_TEXT * p.zoom_factor()))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(t.text)
+            // Double-click a header to fit its column — the divider itself
+            // belongs to the library's drag handle, but the header is a
+            // bigger target anyway. Single clicks stay free for the
+            // sorting that arrives later.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |state, e: &MouseDownEvent, _, cx| {
+                    if e.click_count == 2 {
+                        let zoom = prefs::get(cx).zoom_factor();
+                        state.delegate_mut().fit_one(data_col, zoom);
+                        state.refresh(cx);
+                    }
+                }),
+            )
             .child(
                 div()
                     .w_full()
