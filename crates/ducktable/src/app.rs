@@ -52,6 +52,10 @@ pub struct DuckTable {
     /// Fence for table selection: a first-page fetch that finishes after a
     /// newer click discards itself instead of swapping in a stale grid.
     select_seq: u64,
+    /// Fence for the berth-list refresh: overlapping sweeps (a manual
+    /// click racing the one connect fires) commit newest-wins instead of
+    /// arbitrary order.
+    refresh_seq: u64,
 }
 
 impl DuckTable {
@@ -66,6 +70,7 @@ impl DuckTable {
             table_filter: None,
             berth_filter: None,
             select_seq: 0,
+            refresh_seq: 0,
         };
         this.refresh(cx);
         this
@@ -223,6 +228,8 @@ impl DuckTable {
     }
 
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh_seq += 1;
+        let fence = self.refresh_seq;
         cx.spawn(async move |this, cx| {
             let rows = cx
                 .background_executor()
@@ -257,6 +264,9 @@ impl DuckTable {
                 })
                 .await;
             this.update(cx, |state, cx| {
+                if state.refresh_seq != fence {
+                    return;
+                }
                 state.rows = rows;
                 cx.notify();
             })
