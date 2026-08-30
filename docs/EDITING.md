@@ -31,9 +31,9 @@ One meaning per key. No contextual double-agents.
 | Key | In the grid (navigating) | In the cell editor |
 |---|---|---|
 | typing | opens the editor **replacing** the value, seeded with the keystroke | inserts text |
-| Enter | opens the editor **keeping** the value, caret at end | confirms the cell, ring moves down |
-| ⇧Enter | (same as Enter) | confirms, ring moves up |
-| Tab / ⇧Tab | moves the ring right / left | confirms, ring moves right / left |
+| Enter | opens the editor **keeping** the value, caret at end — but during a Tab run, sweeps to the run's anchor column one row down (the carriage return) | confirms the cell, ring moves down — or sweeps, if a Tab run is going |
+| ⇧Enter | (same as Enter, sweeping/moving up) | confirms, ring moves up (or sweeps up) |
+| Tab / ⇧Tab | moves the ring right / left, arming the typewriter anchor | confirms, ring moves right / left, anchor kept |
 | arrows | move the ring | *replace entry:* confirm + move the ring · *kept-value entry:* move the caret |
 | double-click | opens the editor keeping the value, caret at the click | — |
 | Esc | clears the selection | cancels the edit, restores what was there, ring stays |
@@ -67,6 +67,38 @@ combination has a deliberate answer:
 ⌘-arrow edges are page-scoped on purpose, the same ruling as fit: the
 keyboard operates on *what you are looking at*. Crossing pages is always
 an explicit act (the Page keys, ⌥↑/⌥↓, or the pager).
+
+**The typewriter sweep** (Sheets' own physics): the first Tab of a run
+remembers its column. Enter during the run — whether confirming an edit
+or just navigating — returns to that column one row down, like a
+carriage return; ⇧Enter sweeps up. Any arrow, click, Esc, or page
+change ends the run. Tab a row's cells, edit some, press Enter, and you
+are at the start of the next row.
+
+### How the whole space is defined
+
+Five modifiers times four arrows times their combinations is hundreds of
+chords; nobody enumerates that, and we don't either. Every keystroke
+falls through a decision ladder to exactly one rung, so every
+combination has a defined outcome without a defined row:
+
+1. Editor open → the editor grammar; everything unmatched falls through
+   to the text input, whose answers we inherit whole.
+2. Focus outside the table → not ours; each input owns its keys.
+3. An exact chord we bound → it means what the tables above say.
+4. Any other chord containing ⌘, ⌃, or Fn → passes through untouched;
+   menus and the OS own that space. This one rung defines most of the
+   hundreds.
+5. ⇧ + arrows → inert, range selection's reserved seat.
+6. A bare printable character → type-to-edit.
+7. Anything left → nothing, on purpose.
+
+"What does ⌘⌥⇧↑ do?" is answered by rung 4, not by a missing row.
+
+Porting note: gpui's `platform` modifier is ⌘ on macOS, the Win key on
+Windows, Super on Linux. A Windows/Linux build swaps the primary chord
+modifier to Ctrl in one helper at rungs 3–4 — the ladder itself does
+not change, and printable exotica (AltGr, IME) already land on rung 6.
 
 ## Staging
 

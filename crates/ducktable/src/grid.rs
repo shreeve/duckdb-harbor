@@ -169,6 +169,10 @@ pub(crate) struct GridDelegate {
     deleted: std::collections::HashSet<usize>,
     /// The cell whose editor is open, and the editor to render there.
     editing: Option<(usize, usize)>,
+    /// The column where the current Tab run began — Sheets' typewriter
+    /// anchor. Enter during a run sweeps back to it, one row on; any
+    /// arrow, click, or Esc ends the run.
+    tab_anchor: Option<usize>,
     editor_input: Option<Entity<gpui_component::input::InputState>>,
     numeric: Vec<bool>,
     /// Schema indices hidden via the Columns popover.
@@ -243,6 +247,7 @@ impl Grid {
             staged: std::collections::HashMap::new(),
             deleted: std::collections::HashSet::new(),
             editing: None,
+            tab_anchor: None,
             editor_input: None,
             numeric: Vec::new(),
             hidden: std::collections::HashSet::new(),
@@ -517,6 +522,7 @@ impl Grid {
                             d.active_cell = None;
                             d.editing = None;
                             d.editor_input = None;
+                            d.tab_anchor = None;
                         }
                         let d = state.delegate();
                         if d.gutter {
@@ -874,26 +880,26 @@ impl Grid {
                 "escape" => self.cancel_edit(cx),
                 "enter" if m.platform || m.alt => return, // newline — the input's
                 "enter" => {
-                    self.confirm_and_move(if m.shift { -1 } else { 1 }, 0, cx);
+                    self.confirm_and_move(if m.shift { -1 } else { 1 }, 0, false, cx);
                 }
                 "tab" => {
-                    self.confirm_and_move(0, if m.shift { -1 } else { 1 }, cx);
+                    self.confirm_and_move(0, if m.shift { -1 } else { 1 }, true, cx);
                 }
                 "up" if replace => {
-                    self.confirm_and_move(-1, 0, cx);
+                    self.confirm_and_move(-1, 0, false, cx);
                 }
                 "down" if replace => {
-                    self.confirm_and_move(1, 0, cx);
+                    self.confirm_and_move(1, 0, false, cx);
                 }
                 "left" if replace => {
-                    self.confirm_and_move(0, -1, cx);
+                    self.confirm_and_move(0, -1, false, cx);
                 }
                 "right" if replace => {
-                    self.confirm_and_move(0, 1, cx);
+                    self.confirm_and_move(0, 1, false, cx);
                 }
                 "s" if m.platform => {
                     // "I'm done, make it real": confirm in place, commit.
-                    if self.confirm_and_move(0, 0, cx) {
+                    if self.confirm_and_move(0, 0, false, cx) {
                         self.commit(cx);
                     }
                 }
@@ -1006,7 +1012,15 @@ impl Grid {
         // range to grow would lie. A dead key teaches honestly.
         match ks.key.as_str() {
             "enter" => {
-                self.open_editor(row, col, None, window, cx);
+                // Sheets' split personality, faithfully: Enter normally
+                // opens the editor keeping the value — but during a Tab
+                // run it is a carriage return, sweeping to the run's
+                // anchor column one row on, no editor.
+                let anchor = self.table.read(cx).delegate().tab_anchor;
+                match anchor {
+                    Some(a) => self.sweep(if m.shift { -1 } else { 1 }, a, cx),
+                    None => self.open_editor(row, col, None, window, cx),
+                }
                 cx.stop_propagation();
             }
             "backspace" | "delete" => {
@@ -1030,14 +1044,16 @@ impl Grid {
                 cx.stop_propagation();
             }
             "tab" => {
-                self.move_ring(0, if m.shift { -1 } else { 1 }, cx);
+                self.tab_move(if m.shift { -1 } else { 1 }, cx);
                 cx.stop_propagation();
             }
             "escape" => {
                 // Esc while navigating clears the selection — the same
                 // panic key, the same "nothing happened" result.
                 self.table.update(cx, |state, cx| {
-                    state.delegate_mut().active_cell = None;
+                    let d = state.delegate_mut();
+                    d.active_cell = None;
+                    d.tab_anchor = None;
                     state.clear_selection(cx);
                     cx.notify();
                 });
@@ -1120,7 +1136,7 @@ impl Grid {
         // whoever runs first takes the editor.
         cx.subscribe(&input, |grid, _, ev: &gpui_component::input::InputEvent, cx| {
             if matches!(ev, gpui_component::input::InputEvent::PressEnter { .. }) {
-                grid.confirm_and_move(1, 0, cx);
+                grid.confirm_and_move(1, 0, false, cx);
             }
         })
         .detach();
@@ -1155,9 +1171,18 @@ impl Grid {
     }
 
     /// Confirm the open editor: validate, stage (auto-clean if equal to
-    /// the fetched original), close, move the ring. Returns false when
-    /// validation refused — the editor stays open with the reason.
-    fn confirm_and_move(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) -> bool {
+    /// the fetched original), close, move the ring. `via_tab` keeps the
+    /// Tab run's anchor alive; a vertical confirm during a run sweeps
+    /// back to the anchor column (Sheets' carriage return). Returns
+    /// false when validation refused — the editor stays open with the
+    /// reason.
+    fn confirm_and_move(
+        &mut self,
+        dr: i32,
+        dc: i32,
+        via_tab: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(ed) = self.editor.take() else { return true };
         let text = ed.input.read(cx).value().to_string();
         let (ty, fetched, identity) = {
@@ -1211,7 +1236,15 @@ impl Grid {
         }
         self.close_editor_cell(cx);
         self.sync_staged(cx);
-        if dr != 0 || dc != 0 {
+        if via_tab && dc != 0 {
+            self.tab_move(dc, cx);
+        } else if dr != 0 && dc == 0 {
+            let anchor = self.table.read(cx).delegate().tab_anchor;
+            match anchor {
+                Some(col) => self.sweep(dr, col, cx),
+                None => self.move_ring(dr, 0, cx),
+            }
+        } else if dr != 0 || dc != 0 {
             self.move_ring(dr, dc, cx);
         }
         true
@@ -1307,11 +1340,50 @@ impl Grid {
         self.fetch_page(page, cx);
     }
 
+    /// Tab / ⇧Tab: move along the row, remembering where the run began
+    /// (Sheets' typewriter anchor) so Enter can sweep back to it.
+    fn tab_move(&mut self, dc: i32, cx: &mut Context<Self>) {
+        let (col, had) = {
+            let d = self.table.read(cx).delegate();
+            (d.active_cell.map(|(_, c)| c), d.tab_anchor)
+        };
+        self.move_ring(0, dc, cx);
+        if let Some(col) = col {
+            // move_ring ends runs; a Tab re-arms, keeping the original
+            // anchor if the run was already going.
+            self.table.update(cx, |state, _| {
+                state.delegate_mut().tab_anchor = Some(had.unwrap_or(col));
+            });
+        }
+    }
+
+    /// The carriage return: Enter after a Tab run goes back to the run's
+    /// anchor column, one row on — the typewriter physics that makes
+    /// entering a row of data feel effortless in Sheets.
+    fn sweep(&mut self, dr: i32, col: usize, cx: &mut Context<Self>) {
+        self.table.update(cx, |state, cx| {
+            let d = state.delegate_mut();
+            d.tab_anchor = None;
+            let Some((r, _)) = d.active_cell else { return };
+            if d.rows.is_empty() || d.visible.is_empty() {
+                return;
+            }
+            let nr = (r as i32 + dr).clamp(0, d.rows.len() as i32 - 1) as usize;
+            let nc = if d.visible.contains(&col) { col } else { d.visible[0] };
+            d.active_cell = Some((nr, nc));
+            select_row(state, nr, cx);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     /// Move the active-cell ring. Columns move along the VISIBLE order,
-    /// so hidden columns don't swallow a keystroke.
+    /// so hidden columns don't swallow a keystroke. Any ring move ends a
+    /// Tab run (tab_move re-arms after calling this).
     fn move_ring(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) {
         self.table.update(cx, |state, cx| {
             let d = state.delegate_mut();
+            d.tab_anchor = None;
             let Some((r, c)) = d.active_cell else { return };
             if d.rows.is_empty() || d.visible.is_empty() {
                 return;
@@ -1892,6 +1964,7 @@ impl TableDelegate for GridDelegate {
                     let d = state.delegate_mut();
                     d.all_selected = false;
                     d.active_cell = Some((row_ix, data_col));
+                    d.tab_anchor = None;
                     select_row(state, row_ix, cx);
                     cx.notify();
                 }),
