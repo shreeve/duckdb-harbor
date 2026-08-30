@@ -26,9 +26,9 @@ pub(crate) enum Phase {
         conn: Conn,
         info: wire::InfoResponse,
         catalog: harbor_client::Catalog,
-        /// `PRAGMA database_size` key figures for the inspector's SIZE
-        /// section: (database_size, wal_size), as the server prints them.
-        db_size: Option<(String, String)>,
+        /// `PRAGMA database_size` figures for the identity card:
+        /// (data bytes, wal bytes).
+        db_size: Option<(u64, u64)>,
         /// Per-table row counts for the sidebar, (schema, table) ->
         /// estimated_size. Snapshot at connect, like the catalog.
         row_counts: std::collections::HashMap<(String, String), u64>,

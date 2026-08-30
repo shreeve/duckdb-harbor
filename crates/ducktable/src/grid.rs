@@ -932,9 +932,10 @@ pub(crate) fn table_counts(
     )
 }
 
-/// `PRAGMA database_size` -> (database_size, wal_size), as the server
-/// prints them, for the inspector's SIZE section.
-pub(crate) fn database_size(conn: &Conn) -> Option<(String, String)> {
+/// `PRAGMA database_size` -> (data bytes, wal bytes). The server prints
+/// binary-pretty strings ("175.0 MiB"); parsing to bytes lets the app
+/// render its own decimal units everywhere.
+pub(crate) fn database_size(conn: &Conn) -> Option<(u64, u64)> {
     let result = harbor_client::query(conn, "PRAGMA database_size").ok()?;
     let col = |key: &str| {
         result
@@ -942,9 +943,9 @@ pub(crate) fn database_size(conn: &Conn) -> Option<(String, String)> {
             .iter()
             .position(|c| c.name.as_deref() == Some(key))
             .and_then(|i| result.rows.first()?.get(i).cloned())
-            .map(|v| match v {
-                Value::String(s) => s,
-                other => other.to_string(),
+            .and_then(|v| match v {
+                Value::String(s) => crate::util::parse_pretty_size(&s),
+                other => other.as_u64(),
             })
     };
     Some((col("database_size")?, col("wal_size")?))

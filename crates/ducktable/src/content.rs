@@ -104,11 +104,16 @@ impl DuckTable {
                     "Database",
                     harbor_client::paths::shorten(std::path::Path::new(&info.database)),
                 ))
-                .when_some(db_size.clone(), |d, (data, wal)| {
+                .when_some(*db_size, |d, (data, wal)| {
+                    let h = crate::util::human_bytes;
                     d.child(meta(
                         t,
                         "Size",
-                        if wal == "0 bytes" { data } else { format!("{data} (WAL {wal})") },
+                        if wal == 0 {
+                            h(data)
+                        } else {
+                            format!("{} (WAL {})", h(data), h(wal))
+                        },
                     ))
                 })
                 .child(meta(t, "Uptime", format!("{}s", info.uptime_ms / 1000)))

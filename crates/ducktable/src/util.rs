@@ -17,16 +17,16 @@ pub fn commas(n: u64) -> String {
     out
 }
 
-/// A size in compact binary form: "242MiB", "8.5MiB" — one decimal below
-/// 10, integers to 1023, rolling at the unit boundary.
+/// A size in compact decimal form (Finder-style units, no "i"): "8.5MB",
+/// "242MB", "1.2GB" — one decimal below 10, integers to 999.
 pub fn human_bytes(n: u64) -> String {
-    if n < 1024 {
+    if n < 1000 {
         return format!("{n}B");
     }
     let mut value = n as f64;
-    for unit in ["KiB", "MiB", "GiB", "TiB"] {
-        value /= 1024.;
-        if value < 1023.5 || unit == "TiB" {
+    for unit in ["KB", "MB", "GB", "TB"] {
+        value /= 1000.;
+        if value < 999.5 || unit == "TB" {
             let tenth = (value * 10.).round() / 10.;
             return if tenth >= 10. {
                 format!("{}{unit}", value.round())
@@ -36,6 +36,26 @@ pub fn human_bytes(n: u64) -> String {
         }
     }
     unreachable!()
+}
+
+/// Bytes from a DuckDB pretty size ("175.0 MiB", "123 bytes"), so binary
+/// server strings can re-render in the app's decimal units.
+pub fn parse_pretty_size(s: &str) -> Option<u64> {
+    let mut parts = s.trim().split_whitespace();
+    let value: f64 = parts.next()?.parse().ok()?;
+    let scale = match parts.next().unwrap_or("bytes") {
+        "bytes" | "byte" | "B" => 1.,
+        "KiB" => 1024.,
+        "MiB" => 1024. * 1024.,
+        "GiB" => 1024. * 1024. * 1024.,
+        "TiB" => 1024f64.powi(4),
+        "KB" => 1e3,
+        "MB" => 1e6,
+        "GB" => 1e9,
+        "TB" => 1e12,
+        _ => return None,
+    };
+    Some((value * scale) as u64)
 }
 
 /// A count in compact SI form: exact under 1000, then k/M/G/T with one
