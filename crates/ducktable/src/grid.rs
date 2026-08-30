@@ -22,6 +22,7 @@ const PAGE: usize = 500;
 
 // Sizes from design/design.css `.grid`: 12px mono values, 600 11.5px UI
 // headers, 11px muted row numbers, 10px NULL tag.
+const GRID_SIZE: Size = Size::XSmall;
 const CELL_TEXT: f32 = 12.;
 const HEADER_TEXT: f32 = 11.5;
 const GUTTER_TEXT: f32 = 11.;
@@ -161,17 +162,25 @@ impl TableDelegate for GridDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let t = pal(cx);
+        // The horizontal virtual_list sizes items by MEASURING the first
+        // one, so an h_full cell resolves to its content height and the
+        // dividers fall short of the row lines. Cells therefore take the
+        // row height explicitly and draw their own bottom border; vertical
+        // and horizontal lines meet at the corners.
+        let row_h = GRID_SIZE.table_row_height();
         // Column 0 is the row-number gutter: raised, muted, and a firmer
         // divider than the data cells (design.css `.grid td.num`).
         if col_ix == 0 {
             return div()
                 .h_flex()
-                .size_full()
+                .relative()
+                .w_full()
+                .h(row_h)
                 .items_center()
                 .px_1p5()
                 .bg(t.raised)
-                .border_r_1()
-                .border_color(t.border)
+                .border_b_1()
+                .border_color(t.grid_line)
                 .child(
                     div()
                         .w_full()
@@ -181,6 +190,9 @@ impl TableDelegate for GridDelegate {
                         .text_color(t.muted)
                         .child(format!("{}", row_ix + 1)),
                 )
+                // The gutter's divider is firmer than the data grid lines
+                // (design.css `.grid td.num`), so it is its own strip.
+                .child(div().absolute().right_0().top_0().bottom_0().w(px(1.)).bg(t.border))
                 .into_any_element();
         }
         let data_col = col_ix - 1;
@@ -190,10 +202,12 @@ impl TableDelegate for GridDelegate {
         // and its own text inset.
         let cell = div()
             .h_flex()
-            .size_full()
+            .w_full()
+            .h(row_h)
             .items_center()
             .pr_2()
             .border_r_1()
+            .border_b_1()
             .border_color(t.grid_line);
         match value {
             None | Some(Value::Null) => cell
@@ -251,6 +265,10 @@ impl TableDelegate for GridDelegate {
         div()
             .size_full()
             .truncate()
+            // The header wrapper compensates zeroed paddings with only the
+            // size's default right inset (4px at XSmall); cells put text
+            // 9px in (8px pad + 1px divider). Make the header match.
+            .pr(px(5.))
             .text_size(px(HEADER_TEXT))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(t.text)
@@ -330,7 +348,7 @@ impl Render for Grid {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .child(Table::new(&self.table).bordered(false).with_size(Size::XSmall)),
+                    .child(Table::new(&self.table).bordered(false).with_size(GRID_SIZE)),
             )
     }
 }
