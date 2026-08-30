@@ -42,14 +42,15 @@ pub const PAGE_SIZES: [usize; 3] = [500, 5_000, 50_000];
 /// multiplier paired with the table chrome size whose row height fits it,
 /// so zoomed text never clips its row. Chrome (sidebar, footer, labels)
 /// stays put; the data is what zooms.
-pub const ZOOMS: [(f32, gpui_component::Size); 5] = [
+pub const ZOOMS: [(f32, gpui_component::Size); 6] = [
+    (0.7, gpui_component::Size::XSmall),
     (0.85, gpui_component::Size::XSmall),
     (1.0, gpui_component::Size::XSmall),
     (1.15, gpui_component::Size::Small),
     (1.3, gpui_component::Size::Medium),
     (1.5, gpui_component::Size::Large),
 ];
-pub const DEFAULT_ZOOM: usize = 1;
+pub const DEFAULT_ZOOM: usize = 2;
 
 /// Inspector width bounds — the load clamp and the divider's drag range.
 pub const INSPECTOR_MIN: f32 = 180.;
