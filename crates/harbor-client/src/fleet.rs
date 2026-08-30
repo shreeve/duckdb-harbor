@@ -210,7 +210,7 @@ pub fn connect(name: &str) -> Result<Conn, String> {
             summoned: false,
         });
     }
-    Err(format!("no live berth named {name:?}"))
+    Err(format!("no running database named {name:?}"))
 }
 
 /// Join the berth serving this file, else summon one via `harbor add` —
@@ -243,7 +243,7 @@ fn ensure_berth(
     }
 
     let name = derived_name(&canon)
-        .ok_or_else(|| format!("cannot derive a berth name from {}", canon.display()))?;
+        .ok_or_else(|| format!("cannot derive a database name from {}", canon.display()))?;
     let sidecar = home.join(format!("{name}.json"));
     if berth_sock(&home, &name).exists() || sidecar.exists() {
         let other = std::fs::read_to_string(&sidecar)
@@ -252,7 +252,7 @@ fn ensure_berth(
             .and_then(|j| j["db"].as_str().map(str::to_string))
             .unwrap_or_else(|| "another database".to_string());
         return Err(format!(
-            "berth {name:?} is live but serves {other}, not {}",
+            "{name:?} is already running but serves {other}, not {}",
             canon.display()
         ));
     }
@@ -268,7 +268,7 @@ fn ensure_berth(
     }
     let sc = read_sidecar(&home, &name);
     let transport = berth_transport(&home, &name, sc.as_ref())
-        .ok_or_else(|| format!("harbor add returned without registering berth {name:?}"))?;
+        .ok_or_else(|| format!("harbor add returned without registering {name:?}"))?;
     Ok((transport, berth_token(&home, &name), true))
 }
 

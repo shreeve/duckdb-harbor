@@ -58,7 +58,7 @@ impl DuckTable {
                     div()
                         .text_sm()
                         .text_color(t.muted)
-                        .child("Pick a berth on the left. A stopped berth with a path spawns on demand."),
+                        .child("Pick a database on the left. A stopped database starts on demand."),
                 ),
             Phase::Failed { name, message } => div()
                 .v_flex()
@@ -115,7 +115,7 @@ impl DuckTable {
                 .child(meta(
                     t,
                     "Lifetime",
-                    if conn.summoned { "summoned by this window".into() } else { "joined, already running".into() },
+                    if conn.summoned { "started by this window".into() } else { "was already running".into() },
                 )),
             }
         };

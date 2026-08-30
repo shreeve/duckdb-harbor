@@ -62,7 +62,7 @@ impl DuckTable {
                     .child(Self::dot(row.state.level(), t))
                     .child(div().flex_1().text_sm().text_color(t.text).child(clone_str(&row.name)))
                     .when(row.summonable, |d| {
-                        d.child(div().text_xs().text_color(t.muted).child("spawn"))
+                        d.child(div().text_xs().text_color(t.muted).child("on demand"))
                     })
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.connect(clone_str(&name), cx);
