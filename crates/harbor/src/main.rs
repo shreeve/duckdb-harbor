@@ -1138,7 +1138,19 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
     } else if sock.exists() {
         return Err(format!("{name:?} has a socket but no registry json; kill it by pid"));
     } else if !remove {
-        return Err(format!("nothing named {name:?}"));
+        // No runtime state, but the name may still be a configured berth at
+        // rest — and the fleet table just showed it. Calling it unknown here
+        // reads as a registry inconsistency (observed in the field). A berth
+        // already in the asked-for state is success, same outcome-honesty as
+        // the still-running error above; only a genuinely unknown name errs.
+        let cfg = load_config()?;
+        return match cfg.get(&name).filter(|c| c.is_berth()) {
+            Some(_) => {
+                println!("{name:?} is not running — nothing to stop");
+                Ok(())
+            }
+            None => Err(unknown_berth(&cfg, &name)),
+        };
     }
 
     if remove {
