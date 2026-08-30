@@ -11,6 +11,11 @@
 // chips. Base sizes at zoom 1.0; the data surfaces multiply by the
 // current zoom's factor (prefs::ZOOMS), whose paired table size keeps
 // row heights ahead of the text. The gutter and chrome stay put.
+/// The content pane's shared left inset: the title, the grid's first
+/// column text, the Structure view, and the footer's view switcher all
+/// start on this axis, so switching views never shifts the leftmost text.
+pub const PANE_INSET: f32 = 12.;
+
 pub const CELL_TEXT: f32 = 12.;
 pub const HEADER_TEXT: f32 = 11.5;
 pub const GUTTER_TEXT: f32 = 11.;

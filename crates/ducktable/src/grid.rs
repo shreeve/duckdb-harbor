@@ -16,7 +16,7 @@
 use crate::chrome::{icon_tile, toggle_tile};
 use crate::prefs::{self, ViewMode};
 use crate::theme::{
-    pal, ui_font, value_font, CELL_TEXT, GUTTER_TEXT, HEADER_TEXT, TAG_TEXT,
+    pal, ui_font, value_font, CELL_TEXT, GUTTER_TEXT, HEADER_TEXT, PANE_INSET, TAG_TEXT,
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -786,8 +786,8 @@ impl GridDelegate {
 
     /// One column's content-fit width. Menlo's advance scales linearly
     /// (7px at 11px); the header is the proportional UI font, estimated a
-    /// touch narrower. 18 covers the cell's own insets (8px pad + 1px
-    /// divider + breathing room).
+    /// touch narrower. The extra covers the cell's own insets (PANE_INSET
+    /// pad + 1px divider + breathing room).
     fn fitted_width(&self, schema_ix: usize, zoom: f32) -> Pixels {
         const CAP: usize = 60;
         let advance = CELL_TEXT * (7. / 11.) * zoom;
@@ -805,7 +805,7 @@ impl GridDelegate {
             self.schema_cols[schema_ix].name.as_deref().map_or(4, |n| n.chars().count());
         let content = chars.min(CAP) as f32 * advance;
         let header = name_len as f32 * header_advance;
-        px((content.max(header) + 18.).clamp(60. * zoom, 460. * zoom))
+        px((content.max(header) + PANE_INSET + 10.).clamp(60. * zoom, 460. * zoom))
     }
 
     /// Rebuild the display columns from the schema minus the hidden set
@@ -917,29 +917,29 @@ impl TableDelegate for GridDelegate {
             // The corner's select-all, made visible (Sheets: every cell
             // highlights until an ordinary click disarms it). The tint is
             // a full-bleed layer reaching back across the column wrapper's
-            // 8px left padding — on the cell box alone, the padding shows
-            // through as white stripes between columns.
+            // PANE_INSET of left padding — on the cell box alone, the
+            // padding shows through as white stripes between columns.
             .when(self.all_selected, |d| {
                 d.child(
                     div()
                         .absolute()
                         .top_0()
                         .bottom_0()
-                        .left(px(-8.))
+                        .left(px(-PANE_INSET))
                         .right_0()
                         .bg(t.accent.opacity(0.08)),
                 )
             })
-            // The cell starts 8px in (wrapper padding), so its bottom
-            // border leaves a notch there. Every row but the LAST hides
-            // it under the tr's full-width border, which the Table skips
-            // on the last row; this strip patches the notch on the
+            // The cell starts PANE_INSET in (wrapper padding), so its
+            // bottom border leaves a notch there. Every row but the LAST
+            // hides it under the tr's full-width border, which the Table
+            // skips on the last row; this strip patches the notch on the
             // border's own pixel (bottom -1).
             .child(
                 div()
                     .absolute()
-                    .left(px(-8.))
-                    .w(px(8.))
+                    .left(px(-PANE_INSET))
+                    .w(px(PANE_INSET))
                     .bottom(px(-1.))
                     .h(px(1.))
                     .bg(t.grid_line),
@@ -959,12 +959,12 @@ impl TableDelegate for GridDelegate {
             )
             .when(active, |d| {
                 d.child(
-                    // Sheets' active-cell ring. The wrapper owns 8px of
-                    // left padding, so the ring reaches left(-8) to sit
-                    // on the cell's true grid box.
+                    // Sheets' active-cell ring. The wrapper owns PANE_INSET
+                    // of left padding, so the ring reaches back that far to
+                    // sit on the cell's true grid box.
                     div()
                         .absolute()
-                        .left(px(-8.))
+                        .left(px(-PANE_INSET))
                         .right_0()
                         .top_0()
                         .bottom_0()
@@ -1073,7 +1073,7 @@ impl TableDelegate for GridDelegate {
         let right = p.right_align && self.numeric.get(data_col).copied().unwrap_or(false);
         // Left-aligned headers line up with values on the shared wrapper
         // inset by construction. A right-aligned header aims for the cell
-        // text's edge, 9px in (8px pad + 1px divider): the wrapper already
+        // text's edge, PANE_INSET + 1px divider in: the wrapper already
         // padded `comp` of it, and the margin supplies the difference
         // (negative when the wrapper alone overshoots).
         div()
@@ -1089,7 +1089,7 @@ impl TableDelegate for GridDelegate {
                 div()
                     .w_full()
                     .truncate()
-                    .when(right, |d| d.text_right().mr(px(9.) - comp))
+                    .when(right, |d| d.text_right().mr(px(PANE_INSET + 1.) - comp))
                     .child(self.cols[col_ix].name.clone()),
             )
             .child(edge(t.grid_line))
@@ -1152,9 +1152,10 @@ impl Render for Grid {
                 div()
                     .h_flex()
                     .h_8()
-                    // Left inset matches the grid text (8px cell padding),
-                    // so the title sits flush over the first column.
-                    .pl_2()
+                    // Left inset matches the grid text (PANE_INSET cell
+                    // padding), so the title sits flush over the first
+                    // column.
+                    .pl(px(PANE_INSET))
                     .pr_3()
                     .gap_3()
                     .flex_none()
@@ -1257,7 +1258,8 @@ impl Render for Grid {
                             .flex_none()
                             .items_center()
                             .gap_2()
-                            .px_2()
+                            .pl(px(PANE_INSET))
+                            .pr_2()
                             .py_1()
                             .bg(t.raised)
                             .border_b_1()
@@ -1411,7 +1413,12 @@ fn build_columns(
             // first paint.
             TableColumn::new(format!("c{i}"), names[i].clone())
                 .width(px(100.))
-                .paddings(Edges { left: px(8.), right: px(0.), top: px(0.), bottom: px(0.) })
+                .paddings(Edges {
+                    left: px(PANE_INSET),
+                    right: px(0.),
+                    top: px(0.),
+                    bottom: px(0.),
+                })
         }))
         .collect()
 }

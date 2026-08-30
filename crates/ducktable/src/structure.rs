@@ -10,7 +10,7 @@
 //! text — so opening the Structure view costs no query at all.
 
 use crate::grid::Grid;
-use crate::theme::{pal, ui_font, value_font, Pal, CELL_TEXT, HEADER_TEXT, TAG_TEXT};
+use crate::theme::{pal, ui_font, value_font, Pal, CELL_TEXT, HEADER_TEXT, PANE_INSET, TAG_TEXT};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::StyledExt as _;
@@ -176,9 +176,9 @@ impl Grid {
             .v_flex()
             .size_full()
             // Left inset matches the title strip and the data grid's
-            // first column (8px cell padding), so switching views never
-            // shifts the leftmost text.
-            .pl_2()
+            // first column (PANE_INSET), so switching views never shifts
+            // the leftmost text.
+            .pl(px(PANE_INSET))
             .pr_3()
             .py_2()
             .overflow_y_scroll();
