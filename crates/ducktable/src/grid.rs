@@ -136,6 +136,10 @@ impl Grid {
         title: String,
         outcome: Result<harbor_client::QueryResult, String>,
         total_rows: Option<u64>,
+        // The size the first page was FETCHED with — not re-read from
+        // prefs, which may have cycled while the fetch was in flight
+        // (a mismatch makes the first next-click skip rows).
+        page_size: usize,
         structure: Option<crate::structure::TableStructure>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -154,7 +158,7 @@ impl Grid {
             gutter,
             total_rows,
             page: 0,
-            page_size: p.page_size,
+            page_size,
             filter: None,
             rows: Vec::new(),
             selected: None,

@@ -136,7 +136,8 @@ impl DuckTable {
                     .unwrap_or(crate::grid::ViewMode::Data);
                 state.grid = Some(cx.new(|cx| {
                     let mut grid = crate::grid::Grid::new(
-                        conn, &schema, &name, title, outcome, total, structure, window, cx,
+                        conn, &schema, &name, title, outcome, total, page_size, structure,
+                        window, cx,
                     );
                     grid.set_view(view);
                     grid
