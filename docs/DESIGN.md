@@ -77,6 +77,22 @@ DuckDB facts (measured):
 - DuckDB v2's PEG parser costs ~2x on parse only; execution is at parity.
   Mitigation when it matters: a prepared-statement LRU.
 
+## Code layout
+
+One file per surface, one owner per piece of state. `app.rs` is the root
+entity and the only mutator of connection state (phase, attempt fence,
+selection); rendering files (`sidebar.rs`, `content.rs`, and each surface
+that follows: tabs, grid, editor, inspector, status bar) read state and
+call back into `app.rs` methods, never mutating it themselves. All colors
+resolve through `theme.rs`; no other file names one. `main.rs` is only
+the entry point.
+
+The rule this protects: a single type that owns every surface decays into
+an extension-file sprawl nobody can navigate, and a surface that mutates
+shared state from inside a render callback is how two owners of one fact
+are born. When a surface's file grows past a few hundred lines, it splits
+by subsurface (grid: rendering, editing, selection), not by line count.
+
 ## Roadmap
 
 1. **Shell**: window, berth picker (names from Harbor config), connect flow
