@@ -169,6 +169,10 @@ pub(crate) struct GridDelegate {
     /// render_tr can tint the selection — the delegate cannot read the
     /// TableState it is rendering inside.
     selected: Option<usize>,
+    /// The Sheets corner state: "#" was clicked, every cell highlights,
+    /// and the next divider double-click fits the whole table. Any
+    /// ordinary cell or row click disarms it.
+    all_selected: bool,
     /// The active cell (row, data column), Sheets-style: the clicked cell
     /// carries an accent ring on top of the row tint, and keyboard row
     /// moves carry the ring to the same column of the new row.
@@ -217,6 +221,7 @@ impl Grid {
             filter: None,
             rows: Vec::new(),
             selected: None,
+            all_selected: false,
             active_cell: None,
             loading: false,
             error: None,
@@ -268,9 +273,26 @@ impl Grid {
                     // layout from the delegate's original widths and the
                     // user's resize snaps back.
                     let widths = widths.clone();
-                    table.update(cx, |state, _| {
+                    table.update(cx, |state, cx| {
                         let d = state.delegate_mut();
                         let g = d.gutter as usize;
+                        // With the corner's select-all armed, dragging ONE
+                        // divider sizes every column to it, Sheets-style:
+                        // the dragged column is the one whose width moved.
+                        if d.all_selected {
+                            let dragged = widths.iter().enumerate().skip(g).find_map(|(i, w)| {
+                                (d.cols.get(i).map(|c| c.width) != Some(*w)).then_some(*w)
+                            });
+                            if let Some(w) = dragged {
+                                for schema_ix in d.visible.clone() {
+                                    d.widths.insert(schema_ix, w);
+                                }
+                                d.rebuild_cols();
+                                state.refresh(cx);
+                                return;
+                            }
+                        }
+                        let d = state.delegate_mut();
                         for (i, w) in widths.iter().enumerate() {
                             if let Some(col) = d.cols.get_mut(i) {
                                 col.width = *w;
@@ -878,6 +900,7 @@ impl TableDelegate for GridDelegate {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |state, _, _, cx| {
+                        state.delegate_mut().all_selected = false;
                         state.set_selected_row(row_ix, cx);
                     }),
                 )
@@ -917,6 +940,9 @@ impl TableDelegate for GridDelegate {
             .border_r_1()
             .border_b_1()
             .border_color(t.grid_line)
+            // The corner's select-all, made visible (Sheets: every cell
+            // highlights until an ordinary click disarms it).
+            .when(self.all_selected, |d| d.bg(t.accent.opacity(0.08)))
             // The cell starts 8px in (wrapper padding), so its bottom
             // border leaves a notch there. Every row but the LAST hides
             // it under the tr's full-width border, which the Table skips
@@ -937,7 +963,9 @@ impl TableDelegate for GridDelegate {
                     // Row and cell select together on mouse DOWN — the
                     // Table's own row selection waits for the click (mouse
                     // up), which reads as lag next to the ring.
-                    state.delegate_mut().active_cell = Some((row_ix, data_col));
+                    let d = state.delegate_mut();
+                    d.all_selected = false;
+                    d.active_cell = Some((row_ix, data_col));
                     state.set_selected_row(row_ix, cx);
                     cx.notify();
                 }),
@@ -1030,16 +1058,14 @@ impl TableDelegate for GridDelegate {
                 .w_full()
                 .h(row_h)
                 .pl(px(6.))
-                // The Sheets corner gesture, one step condensed: double-
-                // click "#" fits every column to the page on screen.
+                // The Sheets corner: clicking "#" highlights every cell,
+                // arming the divider double-click below to fit the whole
+                // table instead of one column.
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|state, e: &MouseDownEvent, _, cx| {
-                        if e.click_count == 2 {
-                            let zoom = prefs::get(cx).zoom_factor();
-                            state.delegate_mut().fit_widths(zoom);
-                            state.refresh(cx);
-                        }
+                    cx.listener(|state, _: &MouseDownEvent, _, cx| {
+                        state.delegate_mut().all_selected = true;
+                        cx.notify();
                     }),
                 )
                 .child(
@@ -1072,20 +1098,6 @@ impl TableDelegate for GridDelegate {
             .text_size(px(HEADER_TEXT * p.zoom_factor()))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(t.text)
-            // Double-click a header to fit its column — the divider itself
-            // belongs to the library's drag handle, but the header is a
-            // bigger target anyway. Single clicks stay free for the
-            // sorting that arrives later.
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |state, e: &MouseDownEvent, _, cx| {
-                    if e.click_count == 2 {
-                        let zoom = prefs::get(cx).zoom_factor();
-                        state.delegate_mut().fit_one(data_col, zoom);
-                        state.refresh(cx);
-                    }
-                }),
-            )
             .child(
                 div()
                     .w_full()
@@ -1094,6 +1106,38 @@ impl TableDelegate for GridDelegate {
                     .child(self.cols[col_ix].name.clone()),
             )
             .child(edge(t.grid_line))
+            // The Sheets fit gesture, on the line it belongs to: double-
+            // click a column's right divider to fit that column — or, with
+            // the corner's select-all armed, to fit every column. The strip
+            // hugs the line from the left; the library's 2px drag handle
+            // occludes only the line itself, so this stays clickable and
+            // sits inside the resize cursor's approach zone.
+            .child(
+                div()
+                    .id(("fit-divider", col_ix))
+                    .absolute()
+                    .right(-comp)
+                    .top_0()
+                    .bottom_0()
+                    .w(px(8.))
+                    .cursor_col_resize()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |state, e: &MouseDownEvent, _, cx| {
+                            if e.click_count == 2 {
+                                let zoom = prefs::get(cx).zoom_factor();
+                                let d = state.delegate_mut();
+                                if d.all_selected {
+                                    d.all_selected = false;
+                                    d.fit_widths(zoom);
+                                } else {
+                                    d.fit_one(data_col, zoom);
+                                }
+                                state.refresh(cx);
+                            }
+                        }),
+                    ),
+            )
             .into_any_element()
     }
 
