@@ -72,6 +72,10 @@ pub(crate) struct GridDelegate {
     /// Exact server-side row count, when the count query succeeded.
     pub(crate) total_rows: Option<u64>,
     rows: Vec<Vec<Value>>,
+    /// Mirror of the table's selected row (synced from TableEvent), so
+    /// render_tr can tint the selection — the delegate cannot read the
+    /// TableState it is rendering inside.
+    selected: Option<usize>,
     eof: bool,
     loading: bool,
     error: Option<String>,
@@ -105,6 +109,7 @@ impl Grid {
             gutter,
             total_rows,
             rows: Vec::new(),
+            selected: None,
             eof: false,
             loading: false,
             error: None,
@@ -132,6 +137,17 @@ impl Grid {
             }
         }
         let table = cx.new(|cx| TableState::new(delegate, window, cx));
+        cx.subscribe(&table, |_, table, event: &gpui_component::table::TableEvent, cx| {
+            if let gpui_component::table::TableEvent::SelectRow(ix) = event {
+                let ix = *ix;
+                table.update(cx, |state, cx| {
+                    state.delegate_mut().selected = Some(ix);
+                    cx.notify();
+                });
+                cx.notify();
+            }
+        })
+        .detach();
         let resize = cx.new(|_| ResizableState::default());
         cx.subscribe(&resize, |_, state, _: &ResizablePanelEvent, cx| {
             if let Some(width) = state.read(cx).sizes().get(1).copied() {
@@ -434,6 +450,22 @@ impl TableDelegate for GridDelegate {
             )
             .child(edge(t.grid_line))
             .into_any_element()
+    }
+
+    fn render_tr(
+        &mut self,
+        row_ix: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> Stateful<Div> {
+        let t = pal(cx);
+        // The selection tint paints here, UNDER the cell borders, so both
+        // edges of the selected row are ordinary dividers. The Table's own
+        // overlay is 1px-outset (heavier top edge, missing bottom) and the
+        // themes zero it out.
+        div()
+            .id(("row", row_ix))
+            .when(self.selected == Some(row_ix), |d| d.bg(t.row_active))
     }
 
     fn is_eof(&self, _: &App) -> bool {

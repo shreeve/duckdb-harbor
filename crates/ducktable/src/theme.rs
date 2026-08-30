@@ -33,6 +33,11 @@ pub struct Pal {
     pub warn: Hsla,
     pub bad: Hsla,
     pub row_selected: Hsla,
+    /// The grid's selected-row tint. Painted by the delegate's render_tr,
+    /// UNDER the cell borders — the Table's own selection overlay is
+    /// 1px-outset (top darker, bottom missing), so the themes zero
+    /// `table.active.background` and the grid tints rows itself.
+    pub row_active: Hsla,
     pub row_hover: Hsla,
     pub grid_line: Hsla,
 }
@@ -61,6 +66,7 @@ pub fn pal(cx: &App) -> Pal {
         warn: t.warning,
         bad: t.danger,
         row_selected: t.list_active,
+        row_active: t.primary.opacity(if t.background.l < 0.5 { 0.17 } else { 0.10 }),
         row_hover: t.list_hover,
         grid_line: t.table_row_border,
     }
