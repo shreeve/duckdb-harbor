@@ -208,54 +208,47 @@ compatible library at runtime. A build needs a libduckdb to link against.
 $ make fetch-duckdb                       # libduckdb + duckdb CLI -> ~/.duckdb/cli/2.0.0/
 $ make harbor pilot                       # -> target/release/{harbor,pilot}
 $ harbor serve mydata.duckdb --token secret
-harbor 0.15.0: berth "mydata" serving mydata.duckdb on ~/.config/harbor/runtime/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
+harbor 0.15.0: berth "mydata" serving mydata.duckdb on ~/.local/state/harbor/runtime/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
 ```
 
-`make bootstrap` does the whole thing in one shot — fetch the engine into `~/.duckdb`,
-build and install `harbor` + `pilot` onto PATH in `/usr/local/bin`, and build the
-matched DuckDB UI extension. Building the UI additionally requires a compatible
-`duckdb-ui` checkout (`DUCKDB_UI_DIR`, default `~/Data/Code/duckdb-ui`), a C++
-toolchain, `gh`, and OpenSSL. With those prerequisites present, it takes an empty
-`~/.duckdb` to a working fleet.
+`make bootstrap` does the whole thing in one shot — fetch the engine into
+`~/.duckdb`, then build and install `harbor` + `pilot` into `~/.local/bin`. It
+takes an empty `~/.duckdb` to a working fleet, and no step needs root.
 
-No toolchain? On macOS and Linux, one command installs the latest release —
-it picks the right archive for the platform, verifies its sha256 against the
-published checksums, and installs harbor + pilot into `/usr/local/bin` with
-`libduckdb` and the `ui` extension in their homes (override with `BIN=...`
-`LIB=...`; sudo only if the destinations are root-owned):
+No toolchain? One command installs the latest release — it picks the right
+archive for the platform, verifies its sha256 against the published checksums,
+and installs harbor + pilot into `~/.local/bin` with `libduckdb` in
+`~/.local/lib` (override with `BIN=...` `LIB=...`):
 
 ```bash
+# macOS and Linux
 curl -fsSL https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.sh | bash
+
+# Windows
+irm https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.ps1 | iex
 ```
 
-Pin a version with `... | bash -s v0.15.0`. Each
+Nothing there asks for root. `~/.local/bin` is where the XDG base directory
+spec puts user executables; Debian and Fedora already have it on `PATH`, macOS
+does not, and the installer says so rather than putting binaries somewhere you
+cannot see. A system-wide install is `BIN=/usr/local/bin LIB=/usr/local/lib`
+with `sudo` in front of the whole command — the installer never escalates on
+its own. On Windows the binaries land in `%LOCALAPPDATA%\Programs\harbor\bin`,
+which the installer adds to your user `PATH`.
+
+Pin a version with `... | bash -s v0.15.0` (or `-Tag v0.15.0` on Windows). Each
 [release](https://github.com/shreeve/duckdb-harbor/releases)
 ships one self-contained archive per
 platform (osx-arm64, linux-amd64, linux-arm64, windows-amd64, windows-arm64):
 harbor + pilot and the exact DuckDB shared library they were built against.
-Unix archives also carry the matched `ui` extension and `install.sh`; Windows
-archives put `duckdb.dll` beside the two executables and run in place.
-
-### Browser UI
-
-harbor can host the DuckDB UI over a berth. `make ui` builds the `ui` extension
-against the *exact* engine harbor runs (out-of-tree — only the extension, seconds,
-no engine compile) and installs it where `LOAD ui` finds it by name. Then:
-
-```console
-$ harbor serve mydata.duckdb --unsigned \
-    --init "LOAD ui" --init "FROM start_ui_server()"     # UI at http://localhost:4213/
-```
-
-Because harbor carries `libduckdb` in-process, the dynamically-linked extension
-resolves its DuckDB symbols at load, and everything — engine, harbor, extension —
-derives from one nightly, so the versions match by construction (PLAN.md D11).
+Unix archives carry `bin/`, `lib/` and `install.sh`; Windows archives put
+`duckdb.dll` beside the two executables and run in place.
 
 `harbor serve` runs in the foreground. `harbor add mydata.duckdb` spawns a
 **detached** berth and returns once it answers `/ready`; `harbor ls` lists the
 fleet, `harbor stop <name>` drains and `CHECKPOINT`s, `harbor rm <name>` clears
 the registry (never the database file). With no `--token`, a per-berth token is
-minted and written to `~/.config/harbor/runtime/<name>.token`.
+minted and written to `~/.local/state/harbor/runtime/<name>.token`.
 
 Exits are clean: `SIGTERM` / `Ctrl-C` drain in-flight requests and `CHECKPOINT`
 so the next open never replays a WAL.
@@ -462,11 +455,12 @@ third.
 | **`harbor` — everything else** | **`curl`** |
 
 `quack` and `ui` are DuckDB extensions; `harbor` is a standalone server. It can
-still load them into its own database with
-`harbor serve db.duckdb --unsigned --init 'LOAD ui'`, so one process can answer
-HTTP clients, browsers, and other DuckDB instances over one file at once. The
-current 2.0 UI build comes from the Harbor-compatible `shreeve/duckdb-ui` fork
-until its [upstream compatibility issue](https://github.com/duckdb/duckdb-ui/issues/242)
+still load an extension into its own database with
+`harbor serve db.duckdb --unsigned --init 'LOAD <ext>'`, so one process can answer
+HTTP clients, browsers, and other DuckDB instances over one file at once. Harbor
+ships no extension of its own — whatever `LOAD` resolves by name in `~/.duckdb`
+is what it gets, and matching that to the linked engine is the operator's call.
+[upstream compatibility issue](https://github.com/duckdb/duckdb-ui/issues/242)
 lands; Harbor does not patch extension source while loading it.
 
 ## Known limitations
@@ -495,7 +489,7 @@ drain and checkpoint. The Windows release does not include the UI extension.
 dynamically, and the same build has been verified against DuckDB 1.5.5 and a
 2.0 development build. Treat that as tested compatibility, not a promise that
 an arbitrary past or future DuckDB ABI will work.
-`make install` puts harbor + pilot on PATH in `/usr/local/bin`, and harbor's
+`make install` puts harbor + pilot on PATH in `~/.local/bin`, and harbor's
 baked rpath resolves the engine in `~/.duckdb` — DuckDB's own world, disposable
 and refetchable. The caveat that comes with that: point it at a library whose
 storage format matches the database file.

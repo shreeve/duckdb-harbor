@@ -6,13 +6,16 @@
 #
 # Pin a version by passing a tag (with or without the leading v):
 #
-#   curl -fsSL .../install.sh | bash -s v0.13.4
+#   curl -fsSL .../install.sh | bash -s v0.15.0
 #
-# Downloads the release archive for this platform, verifies its sha256
-# against the published checksums, and runs the archive's own installer
-# (binaries -> /usr/local/bin, libduckdb -> /usr/local/lib, ui extension
-# -> ~/.duckdb; override with BIN=... LIB=...). sudo is used only if the
-# destination dirs are root-owned. Windows support comes later.
+# Downloads the release archive for this platform, verifies its sha256 against
+# the published checksums, and runs the archive's own installer — binaries to
+# ~/.local/bin and libduckdb to ~/.local/lib, both overridable with BIN= and
+# LIB=. Nothing here needs root.
+#
+# On Windows use install.ps1 instead:
+#
+#   irm https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.ps1 | iex
 
 set -euo pipefail
 
@@ -39,7 +42,7 @@ main() {
     Linux-x86_64)          plat=linux-amd64  ;;
     Linux-aarch64|Linux-arm64) plat=linux-arm64 ;;
     Darwin-x86_64)         fail "no Intel macOS build is published (Apple Silicon only)" ;;
-    MINGW*|MSYS*|CYGWIN*)  fail "Windows is not supported by this installer yet" ;;
+    MINGW*|MSYS*|CYGWIN*)  fail "on Windows use install.ps1: irm https://raw.githubusercontent.com/$REPO/main/install.ps1 | iex" ;;
     *)                     fail "unsupported platform: $os $arch" ;;
   esac
 
@@ -81,33 +84,6 @@ main() {
   # --- extract and hand off to the archive's own installer ------------------
   tar -xzf "$tmp/$asset" -C "$tmp"
   bash "$tmp/$NAME-$tag-$plat/install.sh"
-
-  # 0.14.0 moved harbor's home: config.toml at ~/.config/harbor, the live
-  # fleet under ~/.config/harbor/runtime. Move a pre-0.14 ~/.harbor across
-  # once — but never while berths may still be serving out of it.
-  if [ "$(printf '%s\n' v0.14.0 "$tag" | sort -V | head -1)" = v0.14.0 ]; then
-    root="${HARBOR_HOME:-$HOME/.config/harbor}"
-    hh="$root/runtime"
-    old="$HOME/.harbor"
-    if [ -d "$old" ] && [ ! -d "$hh" ]; then
-      if pgrep -x harbor >/dev/null 2>&1; then
-        say "note: ~/.harbor was NOT migrated while harbor is running. Stop the"
-        say "  fleet, then: mkdir -p $hh && mv $old/config.toml $root/; mv $old/* $hh/ && rmdir $old"
-      else
-        mkdir -p "$hh"
-        [ -f "$old/config.toml" ] && mv "$old/config.toml" "$root/config.toml"
-        find "$old" -mindepth 1 -maxdepth 1 -exec mv {} "$hh/" \;
-        rmdir "$old" 2>/dev/null || true
-        say "migrated ~/.harbor -> $root (config.toml at the root, fleet state in runtime/)"
-      fi
-    fi
-  else
-    hh="${HARBOR_HOME:-$HOME/.harbor}"   # pre-0.14 layout
-  fi
-
-  # Sockets and tokens live in the runtime dir; a dir made earlier by hand
-  # (or a sloppy umask) must not stay world-listable.
-  if [ -d "$hh" ]; then chmod 700 "$hh" 2>/dev/null || true; fi
 }
 
 main "$@"

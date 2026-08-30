@@ -9,8 +9,7 @@
 # duckdb.dll beside the executables. Extract anywhere and run in place;
 # install.sh copies the Unix pieces into their homes.
 #
-#   TAG=v0.11.0 PLAT=osx-arm64 UI_EXT=path/to/ui.duckdb_extension \
-#     scripts/package-release.sh
+#   TAG=v0.15.0 PLAT=osx-arm64 scripts/package-release.sh
 #
 # Produces $OUT/harbor-$TAG-$PLAT.tar.gz (OUT defaults to dist/).
 
@@ -18,7 +17,6 @@ set -euo pipefail
 
 TAG=${TAG:?package-release: set TAG (e.g. v0.11.0)}
 PLAT=${PLAT:?package-release: set PLAT (osx-arm64 | linux-amd64 | linux-arm64 | windows-amd64 | windows-arm64)}
-UI_EXT=${UI_EXT:-}
 DUCKDB_LIB=${DUCKDB_LIB:-$HOME/.duckdb/cli/2.0.0}
 OUT=${OUT:-dist}
 say() { printf '  %s\n' "$*"; }
@@ -35,35 +33,28 @@ if [[ "$PLAT" == windows-* ]]; then
   install -m 0755 target/release/harbor.exe "$root/bin/harbor.exe"
   install -m 0755 target/release/pilot.exe  "$root/bin/pilot.exe"
   install -m 0755 "$DUCKDB_LIB/duckdb.dll" "$root/bin/duckdb.dll"
+  install -m 0644 scripts/release-install.ps1 "$root/install.ps1"
+  install -m 0644 config.toml.example "$root/config.toml.example"
   ( cd "$OUT" && 7z a -tzip "$name.zip" "$name" >/dev/null )
   say "-> $OUT/$name.zip ($(du -h "$OUT/$name.zip" | cut -f1))"
   exit 0
 fi
 
-[ -f "$UI_EXT" ] || { echo "package-release: no ui extension at $UI_EXT" >&2; exit 2; }
 [ -f target/release/harbor ] && [ -f target/release/pilot ] \
   || { echo "package-release: build harbor + pilot first" >&2; exit 2; }
 
-# The engine's identity, recorded in the archive so install.sh knows which
-# extensions/<version>/<platform>/ directory the ui extension belongs in.
-version=$("$DUCKDB_LIB/duckdb" -no-init -csv -noheader -c "PRAGMA version" | cut -d, -f1)
-ext_plat=$("$DUCKDB_LIB/duckdb" -no-init -csv -noheader -c "PRAGMA platform")
-
 name="harbor-$TAG-$PLAT"
 root="$OUT/$name"
-rm -rf "$root"; mkdir -p "$root/bin" "$root/lib" "$root/extensions"
+rm -rf "$root"; mkdir -p "$root/bin" "$root/lib"
 
 install -m 0755 target/release/harbor "$root/bin/harbor"
 install -m 0755 target/release/pilot  "$root/bin/pilot"
 for lib in libduckdb.dylib libduckdb.so; do
   [ -f "$DUCKDB_LIB/$lib" ] && install -m 0755 "$DUCKDB_LIB/$lib" "$root/lib/$lib"
 done
-install -m 0644 "$UI_EXT" "$root/extensions/ui.duckdb_extension"
-printf '%s %s\n' "$version" "$ext_plat" > "$root/ENGINE"
 install -m 0755 scripts/release-install.sh "$root/install.sh"
 # Reference only — never copied over an operator's live config.
 install -m 0644 config.toml.example "$root/config.toml.example"
 
 tar -C "$OUT" -czf "$OUT/$name.tar.gz" "$name"
-say "engine $version ($ext_plat)"
 say "-> $OUT/$name.tar.gz ($(du -h "$OUT/$name.tar.gz" | cut -f1))"
