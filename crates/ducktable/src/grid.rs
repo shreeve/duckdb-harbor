@@ -1369,13 +1369,10 @@ impl Render for Grid {
                     // 2px the library's drag handle occludes included,
                     // because ancestors still hear what it doesn't consume.
                     let bounds_store = self.table_bounds.clone();
+                    let header_h = prefs::get(cx).table_size().table_row_height();
                     let table_el = div()
                         .relative()
                         .size_full()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(Self::divider_double_click),
-                        )
                         .child(
                             Table::new(&self.table)
                                 .bordered(false)
@@ -1385,6 +1382,23 @@ impl Render for Grid {
                             canvas(move |b, _, _| bounds_store.set(b), |_, _, _, _| {})
                                 .absolute()
                                 .size_full(),
+                        )
+                        // Painted AFTER the table, so nothing the table
+                        // occludes (drag handles, scroll containers) can
+                        // eclipse it — while, carrying no occlusion of its
+                        // own, everything beneath still hears its events
+                        // (dragging on the line keeps working).
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .right_0()
+                                .h(header_h)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(Self::divider_double_click),
+                                ),
                         );
                     let body = div().flex_1().min_h_0().w_full();
                     match inspector {
