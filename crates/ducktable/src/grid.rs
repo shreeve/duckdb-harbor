@@ -30,6 +30,9 @@ pub(crate) struct GridDelegate {
     source: String,
     title: String,
     cols: Vec<TableColumn>,
+    /// Right-aligned (numeric) columns; the Table never reads
+    /// `Column::align`, so the delegate applies it to th and td itself.
+    right: Vec<bool>,
     rows: Vec<Vec<Value>>,
     eof: bool,
     loading: bool,
@@ -50,6 +53,7 @@ impl Grid {
             source: format!("{}.{}", qident(schema), qident(name)),
             title: format!("{schema}.{name}"),
             cols: Vec::new(),
+            right: Vec::new(),
             rows: Vec::new(),
             eof: false,
             loading: false,
@@ -90,6 +94,11 @@ impl GridDelegate {
                                 d.eof = page.rows.len() < PAGE;
                                 d.last_time_ms = page.time_ms;
                                 if first {
+                                    d.right = page
+                                        .columns
+                                        .iter()
+                                        .map(|c| numeric(&c.duckdb_type.to_uppercase()))
+                                        .collect();
                                     d.cols = build_columns(&page.columns);
                                 }
                                 d.rows.extend(page.rows);
@@ -140,7 +149,23 @@ impl TableDelegate for GridDelegate {
             .font_family(value_font())
             .text_color(if is_null { t.muted } else { t.text })
             .when(is_null, |d| d.italic())
+            .when(self.right.get(col_ix).copied().unwrap_or(false) && !is_null, |d| {
+                d.text_right()
+            })
             .child(text)
+    }
+
+    fn render_th(
+        &mut self,
+        col_ix: usize,
+        _: &mut Window,
+        _: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        div()
+            .size_full()
+            .truncate()
+            .when(self.right.get(col_ix).copied().unwrap_or(false), |d| d.text_right())
+            .child(self.cols[col_ix].name.clone())
     }
 
     fn is_eof(&self, _: &App) -> bool {
@@ -175,8 +200,10 @@ impl Render for Grid {
             "loading...".to_string()
         } else {
             format!(
-                "{count}{} rows \u{00b7} {cols} columns \u{00b7} {ms} ms",
-                if eof { "" } else { "+" }
+                "{count}{} {} \u{00b7} {cols} {} \u{00b7} {ms} ms",
+                if eof { "" } else { "+" },
+                if count == 1 && eof { "row" } else { "rows" },
+                if cols == 1 { "column" } else { "columns" },
             )
         };
         div()
