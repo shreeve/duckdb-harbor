@@ -334,7 +334,7 @@ fn main() {
         cx.spawn(async move |cx| {
             cx.open_window(
                 WindowOptions {
-                    window_min_size: Some(size(px(640.), px(400.))),
+                    window_min_size: Some(size(px(720.), px(420.))),
                     ..Default::default()
                 },
                 |window, cx| {
