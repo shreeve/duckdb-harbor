@@ -582,6 +582,13 @@ fn duckdb_open(o: &Opts) -> Result<harbor::duckdb::Connection, String> {
 fn spawn_detached(rest: Vec<String>) -> Result<(), String> {
     let o = parse_opts(rest.clone())?;
     let home = harbor_home()?;
+    // start means "desired state: running", whatever spelling asked for it.
+    // The hold lifts here — the one place every start funnels through — so a
+    // path start is not a back door that leaves the operator's stop
+    // half-standing under the very name it just raised.
+    if std::fs::remove_file(harbor_common::hold_file(&home, &o.name)).is_ok() {
+        println!("{:?} was held — start lifts it", o.name);
+    }
     let log_path = harbor_common::log_file(&home, &o.name);
     if let Some(dir) = log_path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("log dir: {e}"))?;
@@ -933,7 +940,10 @@ fn start(rest: Vec<String>) -> Result<(), String> {
     let home = harbor_common::runtime_dir()?;
     // start means "desired state: running", which by definition lifts the
     // operator's hold — the one word that outranks a client's autostart.
-    let _ = std::fs::remove_file(harbor_common::hold_file(&home, &name));
+    // Said out loud: a durable state change deserves a receipt.
+    if std::fs::remove_file(harbor_common::hold_file(&home, &name)).is_ok() {
+        println!("{name:?} was held — start lifts it");
+    }
     if harbor_common::fleet::reconcile(&cfg, &home, &probe).iter().any(|r| {
         r.name == name && r.state == harbor_common::State::Running
     }) && rest.len() == 1
@@ -1255,10 +1265,12 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
     // stop is a hold: the name stays down against every client's autostart
     // until `harbor start` says otherwise. Written before the signal because
     // the operator's word holds even while the drain runs long — and only
-    // for configured names, since nothing autostarts anything else.
-    if !remove
-        && load_config().ok().and_then(|c| c.get(&name).map(|e| e.is_berth())).unwrap_or(false)
-    {
+    // for configured names, since nothing autostarts anything else. Lenient
+    // on the config read: a broken config must not make a berth unstoppable.
+    let cfg = load_config().ok();
+    let held = !remove
+        && cfg.as_ref().and_then(|c| c.get(&name).map(|e| e.is_berth())).unwrap_or(false);
+    if held {
         let _ = write_private(&harbor_common::hold_file(&home, &name), "");
     }
     if let Some(side) = harbor_common::fleet::Sidecar::read(&home, &name) {
@@ -1272,15 +1284,27 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
                 // a berth at rest is not a stranger — but the corpse's
                 // registry files remain and only forget clears them.
                 let pid = side.pid.map(|p| p.to_string()).unwrap_or_default();
-                println!(
-                    "{name:?} is not running (stale pid {pid}) — residue remains; \
-                     harbor forget {name} clears it"
-                );
+                match held {
+                    true => println!(
+                        "{name:?} is not running (stale pid {pid}) — held now, so it will \
+                         not start on use (harbor start {name} lifts it); \
+                         harbor forget {name} clears the residue"
+                    ),
+                    false => println!(
+                        "{name:?} is not running (stale pid {pid}) — residue remains; \
+                         harbor forget {name} clears it"
+                    ),
+                }
                 return Ok(());
             }
         } else if let Some(pid) = side.pid {
             stop_core(&home, &name, pid, &lock_path)?;
-            println!("{name:?} stopped (drained and checkpointed)");
+            match held {
+                true => println!(
+                    "{name:?} stopped (drained, checkpointed, held — harbor start {name} lifts it)"
+                ),
+                false => println!("{name:?} stopped (drained and checkpointed)"),
+            }
         }
     } else if sock.exists() {
         return Err(format!("{name:?} has a socket but no registry json; kill it by pid"));
@@ -1290,10 +1314,21 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
         // reads as a registry inconsistency (observed in the field). A berth
         // already in the asked-for state is success, same outcome-honesty as
         // the still-running error above; only a genuinely unknown name errs.
-        let cfg = load_config()?;
+        let cfg = match cfg {
+            Some(c) => c,
+            None => load_config()?, // surface the real config error now
+        };
         return match cfg.get(&name).filter(|c| c.is_berth()) {
             Some(_) => {
-                println!("{name:?} is not running — nothing to stop");
+                // "Nothing to stop" would be a lie: the hold above is a
+                // durable change, and it is the whole outcome of this call.
+                match held {
+                    true => println!(
+                        "{name:?} was not running — held now, so it will not start \
+                         on use (harbor start {name} lifts it)"
+                    ),
+                    false => println!("{name:?} is not running — nothing to stop"),
+                }
                 Ok(())
             }
             None => Err(unknown_berth(&cfg, &name)),

@@ -472,6 +472,14 @@ fn ensure_berth(
     let stem = canon.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let name = harbor_common::normalize(&stem)
         .map_err(|_| format!("cannot derive a database name from {}", path.display()))?;
+    // The operator's stop outranks a typed path exactly as it outranks a
+    // typed name: whichever spelling would raise this berth, the hold
+    // refuses it, and only harbor's own verb lifts it.
+    if harbor_common::hold_file(&home, &name).exists() {
+        return Err(format!(
+            "{name:?} is stopped by hand — harbor start {name} brings it back"
+        ));
+    }
     // The sidecar scan above found no berth owning THIS file — so a live
     // berth under the derived name is serving a DIFFERENT database. Summoning
     // would only collide on the name, and joining it would silently query the
