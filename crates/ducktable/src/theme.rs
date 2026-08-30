@@ -27,6 +27,8 @@ pub struct Pal {
     pub bad: Hsla,
     pub row_selected: Hsla,
     pub row_hover: Hsla,
+    pub grid_line: Hsla,
+    pub row_even: Hsla,
 }
 
 pub fn pal(cx: &App) -> Pal {
@@ -44,6 +46,8 @@ pub fn pal(cx: &App) -> Pal {
         bad: t.danger,
         row_selected: t.list_active,
         row_hover: t.list_hover,
+        grid_line: t.table_row_border,
+        row_even: t.table_even,
     }
 }
 

@@ -144,15 +144,39 @@ impl TableDelegate for GridDelegate {
             Some(Value::String(s)) => (s.clone(), false),
             Some(other) => (other.to_string(), false),
         };
+        // The column paddings are zeroed (build_columns), so this div owns
+        // the cell: full height, the vertical divider on its right edge,
+        // and its own text inset.
         div()
-            .truncate()
-            .font_family(value_font())
-            .text_color(if is_null { t.muted } else { t.text })
-            .when(is_null, |d| d.italic())
-            .when(self.right.get(col_ix).copied().unwrap_or(false) && !is_null, |d| {
-                d.text_right()
-            })
-            .child(text)
+            .h_flex()
+            .size_full()
+            .items_center()
+            .pr_2()
+            .border_r_1()
+            .border_color(t.grid_line)
+            .child(
+                div()
+                    .w_full()
+                    .truncate()
+                    .font_family(value_font())
+                    .text_color(if is_null { t.muted } else { t.text })
+                    .when(is_null, |d| d.italic())
+                    .when(
+                        self.right.get(col_ix).copied().unwrap_or(false) && !is_null,
+                        |d| d.text_right(),
+                    )
+                    .child(text),
+            )
+    }
+
+    fn render_tr(
+        &mut self,
+        row_ix: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> Stateful<Div> {
+        let t = pal(cx);
+        div().id(("row", row_ix)).when(row_ix % 2 == 1, |d| d.bg(t.row_even))
     }
 
     fn render_th(
@@ -239,7 +263,7 @@ impl Render for Grid {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .child(Table::new(&self.table).stripe(true).bordered(false)),
+                    .child(Table::new(&self.table).bordered(false)),
             )
     }
 }
@@ -254,7 +278,12 @@ fn build_columns(cols: &[wire::Column]) -> Vec<TableColumn> {
         .map(|(i, c)| {
             let name = c.name.clone().unwrap_or_else(|| format!("col{i}"));
             let ty = c.duckdb_type.to_uppercase();
-            let col = TableColumn::new(format!("c{i}"), name).width(px(width_for(&ty)));
+            // Left padding stays on the table's cell wrapper; the other
+            // edges go to zero so render_td can reach them (its divider
+            // and text inset live there).
+            let col = TableColumn::new(format!("c{i}"), name)
+                .width(px(width_for(&ty)))
+                .paddings(Edges { left: px(8.), right: px(0.), top: px(0.), bottom: px(0.) });
             if numeric(&ty) { col.text_right() } else { col }
         })
         .collect()
