@@ -101,6 +101,9 @@ pub(crate) struct Grid {
     /// flight, whose outcome is then discarded instead of committing
     /// stale rows.
     fetch_seq: u64,
+    /// The table wrapper's window bounds, recorded by a canvas each frame
+    /// so `divider_double_click` can hit-test header dividers.
+    table_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
 }
 
 /// Everything a fetch commits along with its rows. The delegate is not
@@ -377,6 +380,7 @@ impl Grid {
             ddl_input,
             ddl_copy,
             fetch_seq: 0,
+            table_bounds: std::rc::Rc::new(std::cell::Cell::new(Bounds::default())),
         }
     }
 
@@ -629,6 +633,55 @@ impl Grid {
     }
 
     /// Reset every hidden column (the popover's "Show all").
+    /// The Sheets divider gesture, resolved geometrically: a double-click
+    /// in the header row within 4px of a column's right boundary fits that
+    /// column — or, with the corner's select-all armed, every column. The
+    /// boundary positions come from the delegate's own widths plus the
+    /// horizontal scroll offset, so the gesture works at any scroll and on
+    /// the divider line itself.
+    fn divider_double_click(
+        &mut self,
+        e: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if e.click_count != 2 {
+            return;
+        }
+        let bounds = self.table_bounds.get();
+        let zoom = prefs::get(cx).zoom_factor();
+        let header_h = prefs::get(cx).table_size().table_row_height();
+        self.table.update(cx, |state, cx| {
+            let y = e.position.y - bounds.origin.y;
+            if y < px(0.) || y > header_h {
+                return; // the gesture lives in the header row, as in Sheets
+            }
+            let scroll_x = state.horizontal_scroll_handle.base_handle().offset().x;
+            let x = e.position.x - bounds.origin.x - scroll_x;
+            let d = state.delegate_mut();
+            let g = d.gutter as usize;
+            let mut cum = px(0.);
+            for (disp, col) in d.cols.iter().enumerate() {
+                cum += col.width;
+                // The gutter/first-column boundary is not a data divider.
+                if disp < g {
+                    continue;
+                }
+                if (x - cum).abs() <= px(4.) {
+                    let Some(&schema_ix) = d.visible.get(disp - g) else { return };
+                    if d.all_selected {
+                        d.all_selected = false;
+                        d.fit_widths(zoom);
+                    } else {
+                        d.fit_one(schema_ix, zoom);
+                    }
+                    state.refresh(cx);
+                    return;
+                }
+            }
+        });
+    }
+
     /// Re-fit every column to the page on screen (View menu / Cmd-Shift-F)
     /// — the manual Sheets move, for after drags or a page whose content
     /// outgrew the first page's fit.
@@ -1106,38 +1159,6 @@ impl TableDelegate for GridDelegate {
                     .child(self.cols[col_ix].name.clone()),
             )
             .child(edge(t.grid_line))
-            // The Sheets fit gesture, on the line it belongs to: double-
-            // click a column's right divider to fit that column — or, with
-            // the corner's select-all armed, to fit every column. The strip
-            // hugs the line from the left; the library's 2px drag handle
-            // occludes only the line itself, so this stays clickable and
-            // sits inside the resize cursor's approach zone.
-            .child(
-                div()
-                    .id(("fit-divider", col_ix))
-                    .absolute()
-                    .right(-comp)
-                    .top_0()
-                    .bottom_0()
-                    .w(px(8.))
-                    .cursor_col_resize()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |state, e: &MouseDownEvent, _, cx| {
-                            if e.click_count == 2 {
-                                let zoom = prefs::get(cx).zoom_factor();
-                                let d = state.delegate_mut();
-                                if d.all_selected {
-                                    d.all_selected = false;
-                                    d.fit_widths(zoom);
-                                } else {
-                                    d.fit_one(data_col, zoom);
-                                }
-                                state.refresh(cx);
-                            }
-                        }),
-                    ),
-            )
             .into_any_element()
     }
 
@@ -1340,9 +1361,31 @@ impl Render for Grid {
             })
             .child(match view {
                 ViewMode::Data => {
-                    let table_el = Table::new(&self.table)
-                        .bordered(false)
-                        .with_size(prefs::get(cx).table_size());
+                    // The table sits in a wrapper we own, whose bounds a
+                    // canvas records each frame: double-clicks anywhere in
+                    // the header row hit-test against the column boundaries
+                    // geometrically (widths + horizontal scroll), so the
+                    // fit gesture works ON the divider line itself — the
+                    // 2px the library's drag handle occludes included,
+                    // because ancestors still hear what it doesn't consume.
+                    let bounds_store = self.table_bounds.clone();
+                    let table_el = div()
+                        .relative()
+                        .size_full()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(Self::divider_double_click),
+                        )
+                        .child(
+                            Table::new(&self.table)
+                                .bordered(false)
+                                .with_size(prefs::get(cx).table_size()),
+                        )
+                        .child(
+                            canvas(move |b, _, _| bounds_store.set(b), |_, _, _, _| {})
+                                .absolute()
+                                .size_full(),
+                        );
                     let body = div().flex_1().min_h_0().w_full();
                     match inspector {
                         // With the inspector open, the two panes share a
