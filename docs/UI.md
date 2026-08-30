@@ -41,9 +41,20 @@ least 480pt wide; divider positions persist. Minimum window 640x400.
 Rigidity is part of feeling native: every pane and card declares a real
 minimum size, and the window's minimum is derived from those minimums,
 never chosen as a free-standing number. Content pushes back instead of
-flowing; nothing ever mushes the way a web page does. When space runs
-out, the response is a deliberate state change (a pane collapses, a
-value truncates with an ellipsis), not gradual squeezing.
+flowing; nothing ever mushes the way a web page does.
+
+The sizing rules, in order. A component class declares its size as a
+design decision; runtime content never drives layout (one long value
+must not inflate a card, and scanning instances for a max is only
+legitimate for closed, design-time-known sets like a label column).
+Siblings presented in the same slot share the slot's size, so swapping
+content never reflows the frame. Content then adapts within the bounds
+by its kind: a value ellipsizes on one line (recoverable in full via
+tooltip, inspector, or copy; paths prefer middle truncation), prose
+wraps, collections scroll (never a single long item), and a bounded
+container grows to a declared cap then hands off to scroll. When space
+truly runs out, the response is a deliberate state change (a pane
+collapses), not gradual squeezing.
 
 Collapsing is offered three redundant ways, all reaching the same
 state: toolbar toggle buttons at each end using the split-rectangle
