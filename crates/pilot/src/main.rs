@@ -450,12 +450,11 @@ fn ensure_berth(
             }
             let Ok(text) = std::fs::read_to_string(&p) else { continue };
             let Ok(j) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
-            if j["db"].as_str() == Some(&canon.display().to_string()) {
-                if let Some(name) = j["name"].as_str() {
-                    if let Some(transport) = berth_transport(&home, name) {
-                        return Ok((transport, berth_token(&home, name)));
-                    }
-                }
+            if j["db"].as_str() == Some(&canon.display().to_string())
+                && let Some(name) = j["name"].as_str()
+                && let Some(transport) = berth_transport(&home, name)
+            {
+                return Ok((transport, berth_token(&home, name)));
             }
         }
     }

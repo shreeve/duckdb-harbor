@@ -5,7 +5,9 @@ fn main() {
     let st = Style { color: std::env::args().any(|a| a == "--color"), boxed: true };
 
     let mut t = Table::new(["NAME", "STATE", "PID", "UPTIME", "DATABASE"]);
-    let rows: &[(&str, State, &str, &str, &str, Option<&str>)] = &[
+    // name, state, pid, uptime, database, note
+    type Row<'a> = (&'a str, State, &'a str, &'a str, &'a str, Option<&'a str>);
+    let rows: &[Row] = &[
         ("labs", State::Running, "83582", "4m", "~/Data/Code/invoices/data/labs.duckdb", None),
         ("medlabs", State::Drifted, "12699", "1h12m", "~/Data/Code/medlabs/api/db/medlabs.duckdb",
          Some("config now says medlabs-v2.duckdb — harbor stop medlabs && harbor start medlabs")),

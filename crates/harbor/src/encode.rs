@@ -225,10 +225,10 @@ pub(crate) fn type_name(ty: &LogicalTypeHandle) -> String {
     use LogicalTypeId::*;
     // An alias is the user's own name for the type (JSON, for one); it is
     // more informative than the storage type underneath it.
-    if let Some(alias) = ty.get_alias() {
-        if !alias.is_empty() {
-            return alias;
-        }
+    if let Some(alias) = ty.get_alias()
+        && !alias.is_empty()
+    {
+        return alias;
     }
     match ty.try_id().unwrap_or(Unsupported) {
         Boolean => "BOOLEAN".into(),
@@ -767,7 +767,6 @@ pub(crate) fn base64(data: &[u8]) -> String {
 // SQL, so a client can paste it back into a CREATE TABLE.
 
 /// Sorted, lowercase. Binary-searched, so it must stay sorted.
-
 pub(crate) static KEYWORDS: &[&str] = &[
     "abort", "absolute", "access", "action", "add", "admin", "after", "aggregate", "all",
     "also", "alter", "always", "analyse", "analyze", "and", "anti", "any", "array", "as",

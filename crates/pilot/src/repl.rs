@@ -161,7 +161,7 @@ pub fn statement_complete(buf: &str) -> bool {
         }
         match sp.kind {
             Kind::Code => {
-                for &c in t[sp.start..sp.end].as_bytes() {
+                for &c in &t.as_bytes()[sp.start..sp.end] {
                     if !c.is_ascii_whitespace() {
                         last = c;
                     }
@@ -192,7 +192,7 @@ pub fn split_statements(buf: &str) -> Vec<String> {
         if sp.kind != Kind::Code {
             continue;
         }
-        for (off, &c) in buf[sp.start..sp.end].as_bytes().iter().enumerate() {
+        for (off, &c) in buf.as_bytes()[sp.start..sp.end].iter().enumerate() {
             if c == b';' {
                 push(buf[start..sp.start + off].trim());
                 start = sp.start + off + 1;

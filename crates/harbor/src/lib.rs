@@ -369,8 +369,16 @@ impl SlotState {
 /// Every executor's slot, worker and lease alike, for the life of the server.
 static SLOTS: Mutex<Vec<Arc<SlotState>>> = Mutex::new(Vec::new());
 
+/// Where a cancel lands: the slot the statement occupies, and the job id of
+/// this particular run on it. The id matters as much as the slot —
+/// cancelling by slot alone races a statement that finished in the meantime
+/// and takes down whatever was issued next. (`Cancellable`, below, is the
+/// registration guard that puts one of these in the map and takes it out
+/// again; this is the value it stores.)
+type CancelTarget = (Arc<SlotState>, u64);
+
 /// Statements a client asked to be able to cancel, by the id it chose.
-static QUERIES: Mutex<Option<HashMap<String, (Arc<SlotState>, u64)>>> = Mutex::new(None);
+static QUERIES: Mutex<Option<HashMap<String, CancelTarget>>> = Mutex::new(None);
 
 /// Process-unique, monotonic, never reused. Zero means "nothing running", so
 /// ids start at one.
@@ -1505,10 +1513,10 @@ fn probe_worker(server: Arc<Server>, stop: Arc<AtomicBool>, token: Arc<Option<St
 /// not "is a worker free", and a probe that queues behind the workers turns
 /// a busy berth into a dead one in the eyes of its load balancer.
 fn run_ready_control(req: Request) -> (bool, u16) {
-    if let Some((at, ok)) = *LAST_READY.lock().unwrap() {
-        if at.elapsed() < READY_MAX_AGE {
-            return (true, respond_ready(req, ok, "not ready"));
-        }
+    if let Some((at, ok)) = *LAST_READY.lock().unwrap()
+        && at.elapsed() < READY_MAX_AGE
+    {
+        return (true, respond_ready(req, ok, "not ready"));
     }
     // Registered on CONTROL's slot for the length of the query, so a
     // readiness probe that wedges can be interrupted instead of holding the
@@ -3058,10 +3066,10 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
 /// So this runs `SELECT 1` down the same path a query takes, and reports what
 /// came back.
 fn run_ready(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
-    if let Some((at, ok)) = *LAST_READY.lock().unwrap() {
-        if at.elapsed() < READY_MAX_AGE {
-            return (true, respond_ready(req, ok, "not ready"));
-        }
+    if let Some((at, ok)) = *LAST_READY.lock().unwrap()
+        && at.elapsed() < READY_MAX_AGE
+    {
+        return (true, respond_ready(req, ok, "not ready"));
     }
 
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), Refusal>>(1);
@@ -3512,6 +3520,11 @@ impl Drop for OnSlot<'_> {
 /// thing runs under one `catch_unwind` there: a panic in the DuckDB client (a
 /// decoder that hits `unreachable!`, a metadata assert) must not take the
 /// executor thread — and with it a worker and a pool slot — down for good.
+// Eight, and deliberately. This exists to be the whole of what runs under
+// one catch_unwind in execute_jobs, so every value that unwind must not
+// straddle is passed in rather than captured. Bundling them into a struct
+// would hide exactly the thing the split was made to show.
+#[allow(clippy::too_many_arguments)]
 fn run_statement(
     conn: &Connection,
     on_slot: &mut OnSlot,

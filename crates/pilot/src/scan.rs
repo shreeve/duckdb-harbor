@@ -183,9 +183,9 @@ mod tests {
 
     #[test]
     fn unterminated_marks() {
-        assert_eq!(kinds("'oops").last().unwrap().2, false);
-        assert_eq!(kinds("/* oops").last().unwrap().2, false);
-        assert_eq!(kinds("$$ oops").last().unwrap().2, false);
+        assert!(!kinds("'oops").last().unwrap().2);
+        assert!(!kinds("/* oops").last().unwrap().2);
+        assert!(!kinds("$$ oops").last().unwrap().2);
     }
 
     /// `$1` is a bind parameter, so a digit-led tag never opens a quote —
@@ -241,7 +241,7 @@ mod tests {
         // tablE'x' is an identifier then a plain string, not an escape string
         assert_eq!(kinds(r"tablE'\'")[1], (Kind::Str, r"'\'", true));
         // unterminated E-string stays open
-        assert_eq!(kinds(r"SELECT E'\''oops' -- ").last().unwrap().2, false);
+        assert!(!kinds(r"SELECT E'\''oops' -- ").last().unwrap().2);
     }
 
     #[test]

@@ -258,10 +258,10 @@ impl<'a> Renderer<'a> {
             Mode::Markdown => self.boxed(row_count, glyphs_markdown()),
             _ => {}
         }
-        if self.broken.is_none() {
-            if let Err(e) = self.out.flush() {
-                self.broken = Some(e.kind());
-            }
+        if self.broken.is_none()
+            && let Err(e) = self.out.flush()
+        {
+            self.broken = Some(e.kind());
         }
         if self.opts.timer {
             eprintln!("Run Time: server {time_ms} ms, wall {wall_ms} ms");

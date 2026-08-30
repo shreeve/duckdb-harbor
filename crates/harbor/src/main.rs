@@ -225,10 +225,10 @@ fn harbor_home() -> Result<PathBuf, String> {
     if let Ok(state) = harbor_common::state_root() {
         let _ = chmod(&state, 0o700);
     }
-    if let Ok(cfg) = harbor_common::config_root() {
-        if cfg.exists() {
-            let _ = chmod(&cfg, 0o700);
-        }
+    if let Ok(cfg) = harbor_common::config_root()
+        && cfg.exists()
+    {
+        let _ = chmod(&cfg, 0o700);
     }
     Ok(run)
 }

@@ -49,12 +49,12 @@ pub fn resolve_token(c: &Connection) -> Option<String> {
     if let Some(t) = &c.token {
         return Some(t.clone());
     }
-    if let Some(f) = &c.token_file {
-        if let Ok(t) = std::fs::read_to_string(expand(f)) {
-            let t = t.trim().to_string();
-            if !t.is_empty() {
-                return Some(t);
-            }
+    if let Some(f) = &c.token_file
+        && let Ok(t) = std::fs::read_to_string(expand(f))
+    {
+        let t = t.trim().to_string();
+        if !t.is_empty() {
+            return Some(t);
         }
     }
     if let Some(cmd) = &c.token_cmd {
