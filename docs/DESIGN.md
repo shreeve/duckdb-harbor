@@ -74,7 +74,8 @@ DuckDB facts (measured):
 1. **Shell**: window, berth picker (names from Harbor config), connect flow
    with cancel, status line.
 2. **Catalog**: schema tree from Harbor `/catalog`.
-3. **Grid**: results in the wrapped virtualized Table; value font; NULL
+3. **Grid**: starts with the wide-table probe (see COMPONENTS.md), then
+   results in the wrapped virtualized Table; value font; NULL
    presentation; copy.
 4. **Editor**: SQL editing with DuckDB keywords, Cmd+Enter to run, statement
    splitting server-side.
