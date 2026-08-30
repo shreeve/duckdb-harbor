@@ -25,14 +25,28 @@ actions!(ducktable, [ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset]);
 /// About item opens the platform's standard dialog (window.prompt ->
 /// NSAlert) with the version and a GitHub link.
 fn app_menus() -> Vec<Menu> {
-    vec![Menu {
-        name: "DuckTable".into(),
-        items: vec![
-            MenuItem::action("About DuckTable", About),
-            MenuItem::separator(),
-            MenuItem::action("Quit DuckTable", Quit),
-        ],
-    }]
+    vec![
+        Menu {
+            name: "DuckTable".into(),
+            items: vec![
+                MenuItem::action("About DuckTable", About),
+                MenuItem::separator(),
+                MenuItem::action("Quit DuckTable", Quit),
+            ],
+        },
+        // macOS shows each item's key equivalent from the keymap, so this
+        // menu is also where the zoom shortcuts advertise themselves.
+        Menu {
+            name: "View".into(),
+            items: vec![
+                MenuItem::action("Zoom In", ZoomIn),
+                MenuItem::action("Zoom Out", ZoomOut),
+                MenuItem::action("Actual Size", ZoomReset),
+                MenuItem::separator(),
+                MenuItem::action("Toggle Inspector", ToggleInspector),
+            ],
+        },
+    ]
 }
 
 /// The About dialog: native, version-stamped, with a link out.
@@ -144,6 +158,12 @@ fn main() {
         });
         cx.on_action(|_: &ZoomReset, cx| {
             prefs::toggle(cx, |p| p.zoom = prefs::DEFAULT_ZOOM);
+        });
+        // Global fallback so the menu item validates and works; the
+        // view-scoped listener handles the keyboard path first and a
+        // handled action never reaches here (no double toggle).
+        cx.on_action(|_: &ToggleInspector, cx| {
+            prefs::toggle(cx, |p| p.inspector = !p.inspector);
         });
         // Global, not view-scoped: menu items must work regardless of
         // which pane holds focus. The prompt needs a window — but a menu
