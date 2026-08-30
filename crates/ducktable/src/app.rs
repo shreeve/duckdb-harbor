@@ -55,10 +55,12 @@ pub struct DuckTable {
     /// click racing the one connect fires) commit newest-wins instead of
     /// arbitrary order.
     refresh_seq: u64,
-    /// A config the loader refused, verbatim — shown in the sidebar, since
-    /// a GUI has no stderr and an unexplained empty list reads as "harbor
-    /// is broken".
-    pub(crate) config_warning: Option<String>,
+    /// The sidebar's out-loud line: a refused config, or a catalog
+    /// refresh that failed — a GUI has no stderr, and both would
+    /// otherwise fail silently (an unexplained empty list reads as
+    /// "harbor is broken"; a dead refresh click reads as "it worked").
+    /// The next fleet refresh rewrites it from the config's truth.
+    pub(crate) warning: Option<String>,
 }
 
 impl DuckTable {
@@ -74,7 +76,7 @@ impl DuckTable {
             berth_filter: None,
             select_seq: 0,
             refresh_seq: 0,
-            config_warning: None,
+            warning: None,
         };
         this.refresh(cx);
         this
@@ -203,12 +205,17 @@ impl DuckTable {
                 if state.attempt != fence {
                     return;
                 }
-                if let (Phase::Connected { catalog, .. }, Ok(new_catalog)) =
-                    (&mut state.phase, outcome)
-                {
-                    *catalog = new_catalog;
-                    cx.notify();
+                match outcome {
+                    Ok(new_catalog) => {
+                        if let Phase::Connected { catalog, .. } = &mut state.phase {
+                            *catalog = new_catalog;
+                        }
+                    }
+                    // A dead refresh click must not read as "nothing
+                    // changed, so nothing was wrong".
+                    Err(e) => state.warning = Some(format!("catalog refresh failed: {e}")),
                 }
+                cx.notify();
             })
             .ok();
         })
@@ -274,7 +281,7 @@ impl DuckTable {
                     return;
                 }
                 state.rows = rows;
-                state.config_warning = warning;
+                state.warning = warning;
                 cx.notify();
             })
             .ok();

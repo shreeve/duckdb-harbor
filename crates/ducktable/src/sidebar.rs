@@ -88,17 +88,11 @@ impl DuckTable {
                             })),
                     ),
             )
-            .when_some(self.berth_filter.clone(), |d, input| {
-                d.child(
-                    div()
-                        .px_2()
-                        .pb_1()
-                        .child(gpui_component::input::Input::new(&input).xsmall().cleanable(true)),
-                )
-            })
-            // A config the loader refused would otherwise blank this list
-            // silently — the one failure a GUI must say out loud.
-            .when_some(self.config_warning.clone(), |d, warning| {
+            .when_some(self.berth_filter.clone(), |d, input| d.child(filter_row(&input)))
+            // A config the loader refused or a refresh that failed would
+            // otherwise blank or freeze this list silently — the failures
+            // a GUI must say out loud.
+            .when_some(self.warning.clone(), |d, warning| {
                 d.child(
                     div()
                         .px_2()
@@ -108,76 +102,40 @@ impl DuckTable {
                         .child(warning),
                 )
             })
-            .children(self.rows.iter().filter(|row| {
-                match &berth_filter {
-                    Some(f) => row.name.to_lowercase().contains(f.as_str()),
-                    None => true,
-                }
-            }).map(|row| {
-                let name = clone_str(&row.name);
-                let selected = active.as_deref() == Some(row.name.as_str());
-                div()
-                    .id(SharedString::from(clone_str(&row.name)))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .h_flex()
-                    .gap_2()
-                    .items_center()
-                    .cursor_pointer()
-                    .when(selected, |d| d.bg(t.row_selected))
-                    .hover(|d| d.bg(t.row_hover))
-                    .child(Self::dot(row.state.level(), t))
-                    .child(
+            .when(
+                berth_filter.is_some()
+                    && !self.rows.iter().any(|row| matches(&row.name, &berth_filter)),
+                |d| d.child(empty_note(t, "No matching databases")),
+            )
+            .children(self.rows.iter().filter(|row| matches(&row.name, &berth_filter)).map(
+                |row| {
+                    let name = clone_str(&row.name);
+                    let selected = active.as_deref() == Some(row.name.as_str());
+                    list_row(SharedString::from(clone_str(&row.name)), selected, t)
+                        .px_2()
+                        .child(Self::dot(row.state.level(), t))
                         // Same grammar as the table rows below: name with
                         // its count hugging it, magnitude on the right.
                         // (The dot alone says stopped; "on demand" gave
                         // way to the size, known even for stopped files.)
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_flex()
-                            .gap_1()
-                            .items_center()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_sm()
-                                    .text_color(t.text)
-                                    .child(clone_str(&row.name)),
-                            )
-                            .when_some(row.tables, |d, n| {
-                                d.child(
-                                    div()
-                                        .flex_none()
-                                        .text_xs()
-                                        .text_color(t.muted)
-                                        .child(format!("({n})")),
-                                )
-                            }),
-                    )
-                    .when_some(row.size, |d, s| {
-                        d.child(
-                            div()
-                                .text_xs()
-                                .text_color(t.muted)
-                                .child(crate::util::human(s, "B")),
-                        )
-                    })
-                    .when_some(row.note.clone(), |d, note| {
-                        // reconcile's fix-it line ("… harbor forget x")
-                        // rides the row as a tooltip: the unhealthy dot
-                        // explains itself.
-                        d.tooltip(move |window, cx| {
-                            gpui_component::tooltip::Tooltip::new(clone_str(&note))
-                                .build(window, cx)
+                        .child(named_count(&row.name, row.tables, t))
+                        .when_some(row.size, |d, s| {
+                            d.child(dim(t, crate::util::human(s, "B")))
                         })
-                    })
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.connect(clone_str(&name), cx);
-                    }))
-            }))
+                        .when_some(row.note.clone(), |d, note| {
+                            // reconcile's fix-it line ("… harbor forget x")
+                            // rides the row as a tooltip: the unhealthy dot
+                            // explains itself.
+                            d.tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(clone_str(&note))
+                                    .build(window, cx)
+                            })
+                        })
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.connect(clone_str(&name), cx);
+                        }))
+                },
+            ))
             .child(self.catalog_tree(cx))
             .child(
                 div()
@@ -269,12 +227,12 @@ impl DuckTable {
                 ),
         );
         if let Some(input) = &self.table_filter {
-            tree = tree.child(
-                div()
-                    .px_2()
-                    .pb_1()
-                    .child(gpui_component::input::Input::new(input).xsmall().cleanable(true)),
-            );
+            tree = tree.child(filter_row(input));
+        }
+        if filter.is_some()
+            && !catalog.tables.iter().any(|table| matches(&table.name, &filter))
+        {
+            tree = tree.child(empty_note(t, "No matching tables"));
         }
         for schema in schemas {
             if many_schemas {
@@ -283,73 +241,38 @@ impl DuckTable {
                 );
             }
             for table in catalog.tables_in(schema) {
-                if let Some(f) = &filter {
-                    if !table.name.to_lowercase().contains(f.as_str()) {
-                        continue;
-                    }
+                if !matches(&table.name, &filter) {
+                    continue;
                 }
                 let key = (clone_str(schema), clone_str(&table.name));
                 let selected = self.selected_table.as_ref() == Some(&key);
                 tree = tree.child(
-                    div()
-                        .id(SharedString::from(format!("t-{schema}-{}", table.name)))
-                        // Text starts on the database names' axis: their
-                        // rows indent 8px pad + 8px dot + 8px gap = 24.
-                        .pl(px(24.))
-                        .pr_2()
-                        .py_1()
-                        .rounded_md()
-                        .h_flex()
-                        .gap_2()
-                        .items_center()
-                        .cursor_pointer()
-                        .when(selected, |d| d.bg(t.row_selected))
-                        .hover(|d| d.bg(t.row_hover))
-                        .child(
-                            // "users (35)" — the column count hugs the
-                            // name; a long name truncates but keeps its
-                            // count visible.
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .h_flex()
-                                .gap_1()
-                                .items_center()
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_sm()
-                                        .text_color(t.text)
-                                        .child(clone_str(&table.name)),
-                                )
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .text_xs()
-                                        .text_color(t.muted)
-                                        .child(format!("({})", table.columns.len())),
-                                ),
-                        )
-                        // Row count in compact SI form — rows are what a
-                        // scan of a database cares about; column counts
-                        // live in the footer status and Structure view.
-                        .when_some(table.estimated_rows, |d, n| {
-                            d.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(t.muted)
-                                    .child(crate::util::human(n, "")),
-                            )
-                        })
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            this.select_table(
-                                clone_str(&key.0),
-                                clone_str(&key.1),
-                                window,
-                                cx,
-                            );
-                        })),
+                    list_row(
+                        SharedString::from(format!("t-{schema}-{}", table.name)),
+                        selected,
+                        t,
+                    )
+                    // Text starts on the database names' axis: their
+                    // rows indent 8px pad + 8px dot + 8px gap = 24.
+                    .pl(px(24.))
+                    .pr_2()
+                    // "users (35)" — the column count hugs the name; a
+                    // long name truncates but keeps its count visible.
+                    .child(named_count(&table.name, Some(table.columns.len()), t))
+                    // Row count in compact SI form — rows are what a
+                    // scan of a database cares about; column counts
+                    // live in the footer status and Structure view.
+                    .when_some(table.estimated_rows, |d, n| {
+                        d.child(dim(t, crate::util::human(n, "")))
+                    })
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.select_table(
+                            clone_str(&key.0),
+                            clone_str(&key.1),
+                            window,
+                            cx,
+                        );
+                    })),
                 );
             }
         }
@@ -377,4 +300,59 @@ impl DuckTable {
         }
         tree
     }
+}
+
+/// The one filter test both sidebar lists apply, spelled once.
+fn matches(name: &str, filter: &Option<String>) -> bool {
+    match filter {
+        Some(f) => name.to_lowercase().contains(f.as_str()),
+        None => true,
+    }
+}
+
+/// A sidebar list row's chassis — hover, selection tint, click target.
+/// Callers add their inset and children.
+fn list_row(id: SharedString, selected: bool, t: Pal) -> Stateful<Div> {
+    div()
+        .id(id)
+        .py_1()
+        .rounded_md()
+        .h_flex()
+        .gap_2()
+        .items_center()
+        .cursor_pointer()
+        .when(selected, |d| d.bg(t.row_selected))
+        .hover(|d| d.bg(t.row_hover))
+}
+
+/// "name (n)" — the count hugs the name, so a long name truncates but
+/// keeps its count visible; the row's right side stays free for a
+/// magnitude.
+fn named_count(name: &str, count: Option<usize>, t: Pal) -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .h_flex()
+        .gap_1()
+        .items_center()
+        .child(div().min_w_0().truncate().text_sm().text_color(t.text).child(clone_str(name)))
+        .when_some(count, |d, n| {
+            d.child(div().flex_none().text_xs().text_color(t.muted).child(format!("({n})")))
+        })
+}
+
+/// A row's right-side magnitude (size on disk, row estimate), muted.
+fn dim(t: Pal, text: String) -> Div {
+    div().text_xs().text_color(t.muted).child(text)
+}
+
+/// The open filter's input row, shared by both lists.
+fn filter_row(input: &Entity<gpui_component::input::InputState>) -> Div {
+    div().px_2().pb_1().child(gpui_component::input::Input::new(input).xsmall().cleanable(true))
+}
+
+/// What a filter says when it filtered everything away — without this a
+/// too-narrow query just blanks the list.
+fn empty_note(t: Pal, text: &'static str) -> Div {
+    div().px_2().py_1().text_xs().text_color(t.muted).child(text)
 }

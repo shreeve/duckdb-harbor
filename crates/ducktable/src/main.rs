@@ -77,42 +77,29 @@ fn about(window: &mut Window, cx: &mut App) {
 /// renders as an invisible-but-clickable control.
 struct Assets;
 
+macro_rules! icon {
+    ($name:literal) => {
+        (concat!("icons/", $name, ".svg"), include_bytes!(concat!("../../../assets/icons/", $name, ".svg")) as &[u8])
+    };
+}
+
+const ICONS: [(&str, &[u8]); 11] = [
+    icon!("panel-right"),
+    icon!("search"),
+    icon!("refresh-cw"),
+    icon!("chevron-left"),
+    icon!("chevron-right"),
+    icon!("chevron-first"),
+    icon!("chevron-last"),
+    icon!("eye"),
+    icon!("check"),
+    icon!("copy"),
+    icon!("funnel"),
+];
+
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<std::borrow::Cow<'static, [u8]>>> {
-        Ok(match path {
-            "icons/panel-right.svg" => {
-                Some(include_bytes!("../../../assets/icons/panel-right.svg").into())
-            }
-            "icons/search.svg" => {
-                Some(include_bytes!("../../../assets/icons/search.svg").into())
-            }
-            "icons/refresh-cw.svg" => {
-                Some(include_bytes!("../../../assets/icons/refresh-cw.svg").into())
-            }
-            "icons/chevron-left.svg" => {
-                Some(include_bytes!("../../../assets/icons/chevron-left.svg").into())
-            }
-            "icons/chevron-right.svg" => {
-                Some(include_bytes!("../../../assets/icons/chevron-right.svg").into())
-            }
-            "icons/chevron-first.svg" => {
-                Some(include_bytes!("../../../assets/icons/chevron-first.svg").into())
-            }
-            "icons/chevron-last.svg" => {
-                Some(include_bytes!("../../../assets/icons/chevron-last.svg").into())
-            }
-            "icons/eye.svg" => Some(include_bytes!("../../../assets/icons/eye.svg").into()),
-            "icons/check.svg" => {
-                Some(include_bytes!("../../../assets/icons/check.svg").into())
-            }
-            "icons/copy.svg" => {
-                Some(include_bytes!("../../../assets/icons/copy.svg").into())
-            }
-            "icons/funnel.svg" => {
-                Some(include_bytes!("../../../assets/icons/funnel.svg").into())
-            }
-            _ => None,
-        })
+        Ok(ICONS.iter().find(|(p, _)| *p == path).map(|(_, bytes)| (*bytes).into()))
     }
 
     fn list(&self, _: &str) -> anyhow::Result<Vec<SharedString>> {
