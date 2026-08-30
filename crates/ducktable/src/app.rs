@@ -105,26 +105,27 @@ impl DuckTable {
         let page_size = crate::prefs::get(cx).page_size;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let (outcome, total, structure) = cx
-                .background_executor()
-                .spawn({
-                    let conn = conn.clone();
-                    let schema = clone_str(&schema);
-                    let name = clone_str(&name);
-                    async move {
-                        let page = crate::grid::first_page(&conn, &schema, &name, page_size);
-                        let (total, structure) = if page.is_ok() {
-                            (
-                                crate::grid::total_rows(&conn, &schema, &name),
-                                crate::structure::table_structure(&conn, &schema, &name),
-                            )
-                        } else {
-                            (None, None)
-                        };
-                        (page, total, structure)
-                    }
-                })
-                .await;
+            // Three independent queries (each on its own connection), so
+            // they run concurrently — click latency is the slowest one,
+            // not the sum. A failed page drops the other two unawaited.
+            let page_task = cx.background_executor().spawn({
+                let (conn, schema, name) = (conn.clone(), clone_str(&schema), clone_str(&name));
+                async move { crate::grid::first_page(&conn, &schema, &name, page_size) }
+            });
+            let total_task = cx.background_executor().spawn({
+                let (conn, schema, name) = (conn.clone(), clone_str(&schema), clone_str(&name));
+                async move { crate::grid::total_rows(&conn, &schema, &name) }
+            });
+            let struct_task = cx.background_executor().spawn({
+                let (conn, schema, name) = (conn.clone(), clone_str(&schema), clone_str(&name));
+                async move { crate::structure::table_structure(&conn, &schema, &name) }
+            });
+            let outcome = page_task.await;
+            let (total, structure) = if outcome.is_ok() {
+                (total_task.await, struct_task.await)
+            } else {
+                (None, None)
+            };
             this.update_in(cx, |state, window, cx| {
                 if state.select_seq != fence {
                     return;
