@@ -4,6 +4,19 @@ pub fn clone_str(s: &str) -> String {
     s.to_string()
 }
 
+/// An exact count with thousands separators: 1117569 -> "1,117,569".
+pub fn commas(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// A count in compact SI form: exact under 1000, then k/M/G/T with one
 /// decimal below 10 ("4.6M") and integers to 999 ("13k", "999k"); the
 /// tenth-rounded value rolls to the next unit at 999.5.

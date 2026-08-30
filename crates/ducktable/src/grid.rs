@@ -564,11 +564,15 @@ impl Render for Grid {
                 d.last_time_ms,
             )
         };
+        let commas = crate::util::commas;
         let rows_part = match total {
-            Some(n) if (count as u64) < n => format!("{count} of {n} rows"),
-            Some(n) => format!("{n} {}", if n == 1 { "row" } else { "rows" }),
+            Some(n) if (count as u64) < n => {
+                format!("{} of {} rows", commas(count as u64), commas(n))
+            }
+            Some(n) => format!("{} {}", commas(n), if n == 1 { "row" } else { "rows" }),
             None => format!(
-                "{count}{} {}",
+                "{}{} {}",
+                commas(count as u64),
                 if eof { "" } else { "+" },
                 if count == 1 && eof { "row" } else { "rows" }
             ),
