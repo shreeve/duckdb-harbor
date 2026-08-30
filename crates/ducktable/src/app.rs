@@ -62,10 +62,16 @@ impl DuckTable {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let conn = match &self.phase {
-            Phase::Connected { conn, .. } => conn.clone(),
+        let (conn, solo_schema) = match &self.phase {
+            Phase::Connected { conn, catalog, .. } => {
+                (conn.clone(), catalog.schemas().len() <= 1)
+            }
             _ => return,
         };
+        // "main.tests" earns its prefix only when there is another schema
+        // to distinguish it from.
+        let title =
+            if solo_schema { clone_str(&name) } else { format!("{schema}.{name}") };
         self.selected_table = Some((clone_str(&schema), clone_str(&name)));
         self.select_seq += 1;
         let fence = self.select_seq;
@@ -88,7 +94,7 @@ impl DuckTable {
                     return;
                 }
                 state.grid = Some(cx.new(|cx| {
-                    crate::grid::Grid::new(conn, &schema, &name, outcome, window, cx)
+                    crate::grid::Grid::new(conn, &schema, &name, title, outcome, window, cx)
                 }));
                 cx.notify();
             })

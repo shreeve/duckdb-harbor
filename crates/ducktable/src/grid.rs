@@ -67,6 +67,7 @@ impl Grid {
         conn: Conn,
         schema: &str,
         name: &str,
+        title: String,
         outcome: Result<harbor_client::QueryResult, String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -75,7 +76,7 @@ impl Grid {
         let mut delegate = GridDelegate {
             conn,
             source: format!("{}.{}", qident(schema), qident(name)),
-            title: format!("{schema}.{name}"),
+            title,
             cols: Vec::new(),
             schema_cols: Vec::new(),
             numeric: Vec::new(),
@@ -393,7 +394,10 @@ impl Render for Grid {
                 div()
                     .h_flex()
                     .h_8()
-                    .px_3()
+                    // Left inset matches the grid text (8px cell padding),
+                    // so the title sits flush over the first column.
+                    .pl_2()
+                    .pr_3()
                     .gap_3()
                     .flex_none()
                     .items_center()
