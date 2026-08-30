@@ -234,6 +234,20 @@ impl Grid {
                             Ok((result, total)) => {
                                 d.error = None;
                                 d.last_time_ms = result.time_ms;
+                                // An error-born grid (first page failed)
+                                // has no schema yet; adopt it from the
+                                // first fetch that succeeds, or the rows
+                                // land invisible and the gutter resize
+                                // below indexes an empty column list.
+                                if d.schema_cols.is_empty() {
+                                    d.numeric = result
+                                        .columns
+                                        .iter()
+                                        .map(|c| numeric(&c.duckdb_type.to_uppercase()))
+                                        .collect();
+                                    d.schema_cols = result.columns;
+                                    d.rebuild_cols();
+                                }
                                 d.rows = result.rows;
                                 d.page = page;
                                 if let Some(t) = total {

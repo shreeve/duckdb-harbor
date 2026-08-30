@@ -26,7 +26,7 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
   job.
 - **Berths are addressed by name.** Connection UX mirrors `pilot`: a name is
   resolved through Harbor config, spawn-on-demand aliases launch Harbor for a
-  local file, and tokens come from `~/.config/harbor/runtime/<name>.token`.
+  local file, and tokens come from `~/.local/state/harbor/runtime/<name>.token`.
   Harbor is MIT and first-party: DuckTable consumes the `wire` protocol crate
   and `harbor-common` (config, paths, berth state semantics) as git
   dependencies pinned by rev, with a `[patch]` for local iteration. The
