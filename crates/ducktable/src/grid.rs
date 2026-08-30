@@ -1,5 +1,7 @@
-//! The results grid: gpui-component's virtualized Table underneath (both
-//! axes verified by `examples/wide_probe.rs`), DuckTable's delegate on top.
+//! The results grid: gpui-component's virtualized Table underneath (its
+//! two-axis virtualization stress-checked by `examples/wide_probe.rs`, a
+//! plain-cell probe of the library — not of this delegate), DuckTable's
+//! delegate on top.
 //! This surface owns fetching (server-side pages via `POST /sql`), value
 //! presentation, and its header/status strips. Editing layers on later
 //! (`edits.rs`); display ships first.
@@ -13,7 +15,6 @@
 
 use crate::prefs;
 use crate::theme::{pal, ui_font, value_font};
-use crate::util::qident;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::table::{Column as TableColumn, Table, TableDelegate, TableState};
@@ -113,10 +114,16 @@ pub(crate) struct Grid {
 struct PageReq {
     page: usize,
     size: usize,
-    /// Some(new) = this fetch changes the WHERE filter and commits it
-    /// with the rows; None = keep the current filter.
-    filter: Option<Option<String>>,
+    filter: FilterChange,
     recount: bool,
+}
+
+/// What a fetch does to the WHERE filter.
+enum FilterChange {
+    /// Keep the current filter.
+    Keep,
+    /// Commit a new one with the rows (None clears it).
+    Set(Option<String>),
 }
 
 /// The delegate facts the footer renders (footer.rs), snapshotted by
@@ -144,6 +151,12 @@ pub(crate) struct GridDelegate {
     /// The result schema, kept so the column list can be rebuilt when the
     /// row-number preference flips.
     schema_cols: Vec<wire::Column>,
+    /// Display names, one per schema column, derived once at schema commit
+    /// — three surfaces (headers, popover, inspector) read them per frame.
+    names: Vec<SharedString>,
+    /// The gutter's absolute row numbers, derived once per page commit —
+    /// render_td must not format per cell per frame.
+    row_labels: Vec<SharedString>,
     numeric: Vec<bool>,
     /// Schema indices hidden via the Columns popover.
     hidden: std::collections::HashSet<usize>,
@@ -209,10 +222,12 @@ impl Grid {
         let gutter = p.row_numbers;
         let mut delegate = GridDelegate {
             conn,
-            source: format!("{}.{}", qident(schema), qident(name)),
+            source: crate::queries::source(schema, name),
             title,
             cols: Vec::new(),
             schema_cols: Vec::new(),
+            names: Vec::new(),
+            row_labels: Vec::new(),
             numeric: Vec::new(),
             hidden: std::collections::HashSet::new(),
             widths: std::collections::HashMap::new(),
@@ -231,19 +246,7 @@ impl Grid {
             last_time_ms: 0,
         };
         match outcome {
-            Ok(page) => {
-                delegate.last_time_ms = page.time_ms;
-                delegate.numeric = page
-                    .columns
-                    .iter()
-                    .map(|c| numeric(&c.duckdb_type.to_uppercase()))
-                    .collect();
-                delegate.schema_cols = page.columns;
-                delegate.rows = display_rows(page.rows);
-                // The first page sizes the columns to their content; from
-                // here on widths hold still (pages replace, fits don't).
-                delegate.fit_widths(p.zoom_factor());
-            }
+            Ok(page) => delegate.commit_schema(page, p.zoom_factor()),
             Err(message) => {
                 delegate.error = Some(message);
             }
@@ -346,7 +349,11 @@ impl Grid {
             gpui_component::input::InputState::new(window, cx)
                 .placeholder("Search columns\u{2026}")
         });
-        let ddl_input = structure.as_ref().and_then(|s| s.ddl.clone()).map(|ddl| {
+        let ddl = structure.as_ref().and_then(|s| s.ddl.clone());
+        let ddl_copy = ddl
+            .clone()
+            .map(|ddl| cx.new(|_| crate::copy_button::CopyButton::new("Copy DDL", ddl)));
+        let ddl_input = ddl.map(|ddl| {
             // Auto-grow mode with the height seeded AND capped to the line
             // count (one definition per line, so the count IS the height,
             // ceiling 24 with the rest reachable by scroll). This exact
@@ -362,9 +369,6 @@ impl Grid {
                     .rows(rows)
                     .default_value(ddl)
             })
-        });
-        let ddl_copy = structure.as_ref().and_then(|s| s.ddl.clone()).map(|ddl| {
-            cx.new(|_| crate::copy_button::CopyButton::new("Copy DDL", ddl))
         });
         cx.subscribe(&col_search, |_, _, _: &gpui_component::input::InputEvent, cx| {
             cx.notify();
@@ -396,13 +400,13 @@ impl Grid {
         let (conn, sql, count_sql) = {
             let d = self.table.read(cx).delegate();
             let filter = match &req.filter {
-                Some(new) => new.clone(),
-                None => d.filter.clone(),
+                FilterChange::Set(new) => new.clone(),
+                FilterChange::Keep => d.filter.clone(),
             };
             (
                 d.conn.clone(),
-                d.page_sql(req.page, req.size, &filter),
-                req.recount.then(|| d.count_sql(&filter)),
+                crate::queries::page_sql(&d.source, &filter, req.page, req.size),
+                req.recount.then(|| crate::queries::count_sql(&d.source, &filter)),
             )
         };
         let PageReq { page, size, filter, .. } = req;
@@ -415,7 +419,7 @@ impl Grid {
                     let total = count_sql.map(|c| {
                         harbor_client::query(&conn, &c)
                             .ok()
-                            .and_then(|r| r.rows.first()?.first()?.as_u64())
+                            .and_then(|r| crate::queries::count_of(&r))
                     });
                     Ok::<_, String>((result, total))
                 })
@@ -434,35 +438,25 @@ impl Grid {
                         match outcome {
                             Ok((result, total)) => {
                                 d.error = None;
-                                d.last_time_ms = result.time_ms;
-                                // An error-born grid (first page failed)
-                                // has no schema yet; adopt it from the
-                                // first fetch that succeeds, or the rows
-                                // land invisible and the gutter resize
-                                // below indexes an empty column list.
-                                let born = d.schema_cols.is_empty();
-                                if born {
-                                    d.numeric = result
-                                        .columns
-                                        .iter()
-                                        .map(|c| numeric(&c.duckdb_type.to_uppercase()))
-                                        .collect();
-                                    d.schema_cols = result.columns;
-                                }
-                                d.rows = display_rows(result.rows);
-                                if born {
-                                    // Its first real rows: give this grid
-                                    // the same content-fit a normal birth
-                                    // gets in Grid::new.
-                                    d.fit_widths(zoom);
-                                }
                                 d.page = page;
                                 d.page_size = size;
-                                if let Some(f) = filter {
+                                if let FilterChange::Set(f) = filter {
                                     d.filter = f;
                                 }
                                 if let Some(t) = total {
                                     d.total_rows = t;
+                                }
+                                if d.schema_cols.is_empty() {
+                                    // An error-born grid (first page
+                                    // failed) has no schema yet; adopt it
+                                    // from the first fetch that succeeds —
+                                    // the same birth Grid::new gives a
+                                    // healthy first page.
+                                    d.commit_schema(result, zoom);
+                                } else {
+                                    d.last_time_ms = result.time_ms;
+                                    d.rows = display_rows(result.rows);
+                                    d.relabel();
                                 }
                                 d.selected = None;
                                 d.active_cell = None;
@@ -485,7 +479,7 @@ impl Grid {
                             }
                         }
                         state.clear_selection(cx);
-                        if state.delegate().rows.len() > 0 {
+                        if !state.delegate().rows.is_empty() {
                             state.scroll_to_row(0, cx);
                         }
                     }
@@ -501,7 +495,7 @@ impl Grid {
     /// Navigate to a page at the current size and filter.
     fn fetch_page(&mut self, page: usize, cx: &mut Context<Self>) {
         let size = self.table.read(cx).delegate().page_size;
-        self.fetch(PageReq { page, size, filter: None, recount: false }, cx);
+        self.fetch(PageReq { page, size, filter: FilterChange::Keep, recount: false }, cx);
     }
 
     pub(crate) fn jump_first(&mut self, cx: &mut Context<Self>) {
@@ -551,7 +545,7 @@ impl Grid {
         let ix = prefs::PAGE_SIZES.iter().position(|s| *s == current).unwrap_or(0);
         let next = prefs::PAGE_SIZES[(ix + 1) % prefs::PAGE_SIZES.len()];
         prefs::toggle(cx, |p| p.page_size = next);
-        self.fetch(PageReq { page: 0, size: next, filter: None, recount: false }, cx);
+        self.fetch(PageReq { page: 0, size: next, filter: FilterChange::Keep, recount: false }, cx);
     }
 
     /// Open or close the raw-SQL filter strip. Closing clears an active
@@ -564,7 +558,7 @@ impl Grid {
             };
             if had_filter {
                 self.fetch(
-                    PageReq { page: 0, size, filter: Some(None), recount: true },
+                    PageReq { page: 0, size, filter: FilterChange::Set(None), recount: true },
                     cx,
                 );
             }
@@ -583,7 +577,7 @@ impl Grid {
                     PageReq {
                         page: 0,
                         size,
-                        filter: Some((!text.is_empty()).then_some(text)),
+                        filter: FilterChange::Set((!text.is_empty()).then_some(text)),
                         recount: true,
                     },
                     cx,
@@ -632,7 +626,6 @@ impl Grid {
         });
     }
 
-    /// Reset every hidden column (the popover's "Show all").
     /// The Sheets divider gesture, resolved geometrically: a double-click
     /// in the header row within 4px of a column's right boundary fits that
     /// column — or, with the corner's select-all armed, every column. The
@@ -694,6 +687,7 @@ impl Grid {
         cx.notify();
     }
 
+    /// Reset every hidden column (the popover's "Show all").
     pub(crate) fn show_all_columns(&mut self, cx: &mut Context<Self>) {
         self.remap_columns(cx, |d| {
             if d.hidden.is_empty() {
@@ -719,15 +713,12 @@ impl Grid {
     }
 
     /// (schema index, name, hidden) for the Columns popover.
-    pub(crate) fn column_list(&self, cx: &App) -> Vec<(usize, String, bool)> {
+    pub(crate) fn column_list(&self, cx: &App) -> Vec<(usize, SharedString, bool)> {
         let d = self.table.read(cx).delegate();
-        d.schema_cols
+        d.names
             .iter()
             .enumerate()
-            .map(|(i, c)| {
-                let name = c.name.clone().unwrap_or_else(|| format!("col{i}"));
-                (i, name, d.hidden.contains(&i))
-            })
+            .map(|(i, name)| (i, name.clone(), d.hidden.contains(&i)))
             .collect()
     }
 
@@ -765,21 +756,20 @@ impl Grid {
     }
 
     /// The selected row as (column, display value, is_null) pairs, for the
-    /// inspector's ROW section.
-    pub(crate) fn row_kv(&self, cx: &App) -> Option<Vec<(String, String, bool)>> {
-        let state = self.table.read(cx);
-        let d = state.delegate();
-        let row = d.rows.get(state.selected_row()?)?;
+    /// inspector's ROW section. SharedStrings all the way — this runs on
+    /// every notify with the inspector open, so it only bumps refcounts.
+    /// Reads the delegate's own selection mirror, the one source render_tr
+    /// tints from.
+    pub(crate) fn row_kv(&self, cx: &App) -> Option<Vec<(SharedString, SharedString, bool)>> {
+        let d = self.table.read(cx).delegate();
+        let row = d.rows.get(d.selected?)?;
         Some(
-            d.schema_cols
+            d.names
                 .iter()
                 .enumerate()
-                .map(|(i, c)| {
-                    let name = c.name.clone().unwrap_or_else(|| format!("col{i}"));
-                    match row.get(i) {
-                        None | Some(None) => (name, "NULL".to_string(), true),
-                        Some(Some(s)) => (name, s.to_string(), false),
-                    }
+                .map(|(i, name)| match row.get(i) {
+                    None | Some(None) => (name.clone(), SharedString::from("NULL"), true),
+                    Some(Some(s)) => (name.clone(), s.clone(), false),
                 })
                 .collect(),
         )
@@ -799,29 +789,36 @@ impl Grid {
 }
 
 impl GridDelegate {
-    /// The SELECT for one page under the current filter.
-    fn page_sql(&self, page: usize, size: usize, filter: &Option<String>) -> String {
-        format!(
-            "SELECT * FROM {}{} LIMIT {} OFFSET {}",
-            self.source,
-            Self::where_part(filter),
-            size,
-            page * size,
-        )
+    /// Adopt a page's schema and rows — the one birth, shared by Grid::new
+    /// and the first successful fetch of an error-born grid. The display
+    /// names are derived here, once: three surfaces (headers, popover,
+    /// inspector) read them per frame and must only bump SharedStrings.
+    fn commit_schema(&mut self, page: harbor_client::QueryResult, zoom: f32) {
+        self.last_time_ms = page.time_ms;
+        self.numeric =
+            page.columns.iter().map(|c| numeric(&c.duckdb_type.to_uppercase())).collect();
+        self.names = page
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| SharedString::from(c.name.clone().unwrap_or_else(|| format!("col{i}"))))
+            .collect();
+        self.schema_cols = page.columns;
+        self.rows = display_rows(page.rows);
+        self.relabel();
+        // The first page sizes the columns to their content; from here on
+        // widths hold still (pages replace, fits don't).
+        self.fit_widths(zoom);
     }
 
-    fn count_sql(&self, filter: &Option<String>) -> String {
-        format!("SELECT count(*) FROM {}{}", self.source, Self::where_part(filter))
-    }
-
-    // The filter text splices in verbatim BY DESIGN: the strip is a raw
-    // SQL surface and the berth is the user's own database — the author
-    // of the WHERE clause is the person it could affect.
-    fn where_part(filter: &Option<String>) -> String {
-        match filter {
-            Some(f) => format!(" WHERE {f}"),
-            None => String::new(),
-        }
+    /// The gutter's absolute row numbers, derived once per page commit —
+    /// page 2 starts at 5,001 and the label says so without a per-frame
+    /// format!.
+    fn relabel(&mut self) {
+        let base = self.page * self.page_size;
+        self.row_labels = (0..self.rows.len())
+            .map(|r| SharedString::from((base + r + 1).to_string()))
+            .collect();
     }
 
     /// Last page index under the current count, when known.
@@ -839,8 +836,6 @@ impl GridDelegate {
         }
     }
 
-    /// Rebuild the display columns from the schema minus the hidden set
-    /// (plus the gutter), refreshing the visible→schema map.
     /// Content-fit every visible column from the rows in hand, Sheets
     /// style. The value font is monospace, so a column's width is its
     /// longest cell's character count times the glyph advance — no text
@@ -892,10 +887,12 @@ impl GridDelegate {
         px((content.max(header) + 18.).clamp(60. * zoom, 460. * zoom))
     }
 
+    /// Rebuild the display columns from the schema minus the hidden set
+    /// (plus the gutter), refreshing the visible→schema map.
     fn rebuild_cols(&mut self) {
         self.visible =
             (0..self.schema_cols.len()).filter(|i| !self.hidden.contains(i)).collect();
-        self.cols = build_columns(&self.schema_cols, &self.visible, self.gutter);
+        self.cols = build_columns(&self.names, &self.visible, self.gutter);
         let g = self.gutter as usize;
         for (disp, schema_ix) in self.visible.iter().enumerate() {
             if let Some(&w) = self.widths.get(schema_ix) {
@@ -969,7 +966,7 @@ impl TableDelegate for GridDelegate {
                         .text_color(t.muted)
                         // Absolute position: page 2 starts at 5,001, and
                         // the number says so (plain digits, like Sheets).
-                        .child(format!("{}", self.page * self.page_size + row_ix + 1)),
+                        .child(self.row_labels.get(row_ix).cloned().unwrap_or_default()),
                 )
                 // The gutter's divider is firmer than the data grid lines
                 // (design.css `.grid td.num`), so it is its own strip.
@@ -1505,7 +1502,7 @@ fn display_rows(rows: Vec<Vec<Value>>) -> Vec<Vec<Option<SharedString>>> {
 }
 
 fn build_columns(
-    cols: &[wire::Column],
+    names: &[SharedString],
     visible: &[usize],
     with_gutter: bool,
 ) -> Vec<TableColumn> {
@@ -1521,14 +1518,13 @@ fn build_columns(
     gutter
         .into_iter()
         .chain(visible.iter().map(|&i| {
-            let c = &cols[i];
-            let name = c.name.clone().unwrap_or_else(|| format!("col{i}"));
-            let ty = c.duckdb_type.to_uppercase();
             // Left padding stays on the table's cell wrapper; the other
             // edges go to zero so render_td can reach them (its divider
-            // and text inset live there).
-            TableColumn::new(format!("c{i}"), name)
-                .width(px(width_for(&ty)))
+            // and text inset live there). The width is a placeholder:
+            // fit_widths sizes every column from its content before the
+            // first paint.
+            TableColumn::new(format!("c{i}"), names[i].clone())
+                .width(px(100.))
                 .paddings(Edges { left: px(8.), right: px(0.), top: px(0.), bottom: px(0.) })
         }))
         .collect()
@@ -1541,20 +1537,4 @@ fn numeric(ty: &str) -> bool {
         || ty.starts_with("DOUBLE")
         || ty.starts_with("FLOAT")
         || ty.starts_with("REAL")
-}
-
-fn width_for(ty: &str) -> f32 {
-    if ty == "BOOLEAN" {
-        80.
-    } else if ty == "UUID" {
-        290.
-    } else if ty.starts_with("TIMESTAMP") {
-        190.
-    } else if ty == "DATE" || ty.starts_with("TIME") {
-        110.
-    } else if numeric(ty) {
-        100.
-    } else {
-        200.
-    }
 }

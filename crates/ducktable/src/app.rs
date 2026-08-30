@@ -10,7 +10,6 @@ use gpui::*;
 use harbor_client::{fleet, Conn, State};
 use std::time::Duration;
 
-#[derive(Clone)]
 pub(crate) struct RowVm {
     pub(crate) name: String,
     pub(crate) state: State,
@@ -229,10 +228,9 @@ impl DuckTable {
         // The connected berth's catalog is already in hand; its row must
         // not pay a second connect + catalog download just for a count.
         let connected: Option<(String, usize)> = match &self.phase {
-            Phase::Connected { conn, catalog, .. } => Some((
-                clone_str(&conn.name),
-                catalog.schemas().iter().map(|s| catalog.tables_in(s).len()).sum(),
-            )),
+            Phase::Connected { conn, catalog, .. } => {
+                Some((clone_str(&conn.name), catalog.tables.len()))
+            }
             _ => None,
         };
         cx.spawn(async move |this, cx| {
@@ -260,12 +258,7 @@ impl DuckTable {
                                     // Lite: this sweep only counts tables,
                                     // so it never pays for columns or DDL.
                                     let cat = harbor_client::catalog_lite(&conn).ok()?;
-                                    Some(
-                                        cat.schemas()
-                                            .iter()
-                                            .map(|s| cat.tables_in(s).len())
-                                            .sum(),
-                                    )
+                                    Some(cat.tables.len())
                                 })
                                 .flatten(),
                         };

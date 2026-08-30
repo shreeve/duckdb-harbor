@@ -224,8 +224,7 @@ impl DuckTable {
             .map(|i| i.read(cx).value().to_string().to_lowercase())
             .filter(|s| !s.is_empty());
         let filter_open = self.table_filter.is_some();
-        let table_total: usize =
-            schemas.iter().map(|s| catalog.tables_in(s).len()).sum();
+        let table_total = catalog.tables.len();
         let mut tree = div().id("catalog").flex_1().min_h_0().overflow_y_scroll().v_flex().gap_px();
         tree = tree.child(
             div()

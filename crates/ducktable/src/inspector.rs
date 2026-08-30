@@ -84,7 +84,7 @@ fn section(t: Pal, label: &'static str) -> impl IntoElement {
         .child(label)
 }
 
-fn kv(t: Pal, z: f32, k: impl Into<SharedString>, v: String, is_null: bool) -> impl IntoElement {
+fn kv(t: Pal, z: f32, k: SharedString, v: SharedString, is_null: bool) -> impl IntoElement {
     div()
         .h_flex()
         .justify_between()
@@ -99,7 +99,7 @@ fn kv(t: Pal, z: f32, k: impl Into<SharedString>, v: String, is_null: bool) -> i
                 .truncate()
                 .text_size(px(12. * z))
                 .text_color(t.muted)
-                .child(k.into()),
+                .child(k),
         )
         .child(
             div()

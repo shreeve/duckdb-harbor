@@ -61,7 +61,7 @@ pub(crate) fn pretty_ddl(sql: &str) -> String {
     let (mut in_s, mut in_d) = (false, false);
     let mut defs: Vec<String> = Vec::new();
     let mut cur = String::new();
-    let mut rest = "";
+    let mut rest = None;
     for (i, ch) in tail.char_indices() {
         if in_s {
             if ch == '\'' {
@@ -91,7 +91,7 @@ pub(crate) fn pretty_ddl(sql: &str) -> String {
                 cur.push(ch);
             }
             ')' if depth == 0 => {
-                rest = tail[i..].trim();
+                rest = Some(tail[i..].trim());
                 break;
             }
             ')' => {
@@ -102,6 +102,11 @@ pub(crate) fn pretty_ddl(sql: &str) -> String {
             _ => cur.push(ch),
         }
     }
+    // No closing paren means this was never the definition list the scan
+    // assumed; hand back the original rather than half a reformat.
+    let Some(rest) = rest else {
+        return sql.to_string();
+    };
     if !cur.trim().is_empty() {
         defs.push(cur);
     }
@@ -295,6 +300,24 @@ fn cell(t: Pal, z: f32, text: &str, w: f32, muted: bool) -> impl IntoElement + u
         .child(text.to_string())
 }
 
+/// A small attribute badge: "PK" in the accent, "NOT NULL" muted.
+fn chip(t: Pal, z: f32, label: &'static str, accent: bool) -> impl IntoElement {
+    div()
+        .flex_none()
+        .px(px(5.))
+        .rounded(px(4.))
+        .text_size(px(10. * z))
+        .font_family(ui_font())
+        .map(|d| {
+            if accent {
+                d.bg(t.accent.opacity(0.15)).text_color(t.accent)
+            } else {
+                d.bg(t.grid_line.opacity(0.55)).text_color(t.muted)
+            }
+        })
+        .child(label)
+}
+
 #[cfg(test)]
 mod tests {
     use super::pretty_ddl;
@@ -334,21 +357,10 @@ mod tests {
         let out = pretty_ddl("CREATE TABLE t(a INTEGER, PRIMARY KEY (a));");
         assert!(out.contains("\n  PRIMARY KEY (a)\n"));
     }
-}
 
-fn chip(t: Pal, z: f32, label: &'static str, accent: bool) -> impl IntoElement {
-    div()
-        .flex_none()
-        .px(px(5.))
-        .rounded(px(4.))
-        .text_size(px(10. * z))
-        .font_family(ui_font())
-        .map(|d| {
-            if accent {
-                d.bg(t.accent.opacity(0.15)).text_color(t.accent)
-            } else {
-                d.bg(t.grid_line.opacity(0.55)).text_color(t.muted)
-            }
-        })
-        .child(label)
+    #[test]
+    fn ddl_without_a_closing_paren_passes_through_verbatim() {
+        let raw = "CREATE TABLE broken(a INTEGER, b VARCHAR";
+        assert_eq!(pretty_ddl(raw), raw);
+    }
 }
