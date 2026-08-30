@@ -16,6 +16,9 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::table::{Column as TableColumn, Table, TableDelegate, TableState};
 use gpui_component::tooltip::Tooltip;
+use gpui_component::resizable::{
+    h_resizable, resizable_panel, ResizablePanelEvent, ResizableState,
+};
 use gpui_component::{Sizable as _, Size, StyledExt as _};
 use harbor_client::Conn;
 use serde_json::Value;
@@ -49,6 +52,9 @@ pub(crate) struct Grid {
     view: ViewMode,
     /// Prefetched with the first page, so switching views is instant.
     structure: Option<crate::structure::TableStructure>,
+    /// The table/inspector divider (UI.md: divider positions persist —
+    /// the width saves at the end of each drag).
+    resize: Entity<ResizableState>,
 }
 
 pub(crate) struct GridDelegate {
@@ -126,7 +132,16 @@ impl Grid {
             }
         }
         let table = cx.new(|cx| TableState::new(delegate, window, cx));
-        Self { table, view: ViewMode::Data, structure }
+        let resize = cx.new(|_| ResizableState::default());
+        cx.subscribe(&resize, |_, state, _: &ResizablePanelEvent, cx| {
+            if let Some(width) = state.read(cx).sizes().get(1).copied() {
+                crate::prefs::save(cx, |p| {
+                    p.inspector_width = f32::from(width).clamp(180., 600.);
+                });
+            }
+        })
+        .detach();
+        Self { table, view: ViewMode::Data, structure, resize }
     }
 
     pub(crate) fn structure(&self) -> Option<&crate::structure::TableStructure> {
@@ -599,20 +614,33 @@ impl Render for Grid {
                 )
             })
             .child(match view {
-                ViewMode::Data => div()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .h_flex()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .child(Table::new(&self.table).bordered(false).with_size(GRID_SIZE)),
-                    )
-                    .when_some(inspector, |d, pane| d.child(pane))
-                    .into_any_element(),
+                ViewMode::Data => {
+                    let table_el =
+                        Table::new(&self.table).bordered(false).with_size(GRID_SIZE);
+                    let body = div().flex_1().min_h_0().w_full();
+                    match inspector {
+                        // With the inspector open, the two panes share a
+                        // draggable divider; the saved width seeds it.
+                        Some(pane) => body.child(
+                            h_resizable("data-split")
+                                .with_state(&self.resize)
+                                .child(
+                                    resizable_panel()
+                                        .child(div().size_full().child(table_el)),
+                                )
+                                .child(
+                                    resizable_panel()
+                                        .size(px(p.inspector_width))
+                                        .size_range(px(180.)..px(600.))
+                                        .child(pane),
+                                ),
+                        ),
+                        None => body.h_flex().child(
+                            div().flex_1().min_w_0().h_full().child(table_el),
+                        ),
+                    }
+                    .into_any_element()
+                }
                 ViewMode::Structure => div()
                     .flex_1()
                     .min_h_0()

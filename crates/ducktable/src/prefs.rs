@@ -14,11 +14,19 @@ pub struct Prefs {
     pub null_tags: bool,
     /// The inspector pane's open state (UI.md: persists per window).
     pub inspector: bool,
+    /// The inspector pane's width (UI.md: divider positions persist).
+    pub inspector_width: f32,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { row_numbers: true, right_align: false, null_tags: true, inspector: false }
+        Self {
+            row_numbers: true,
+            right_align: false,
+            null_tags: true,
+            inspector: false,
+            inspector_width: 290.,
+        }
     }
 }
 
@@ -40,6 +48,11 @@ pub fn init(cx: &mut App) {
         prefs.right_align = read("right_align", prefs.right_align);
         prefs.null_tags = read("null_tags", prefs.null_tags);
         prefs.inspector = read("inspector", prefs.inspector);
+        prefs.inspector_width = v
+            .get("inspector_width")
+            .and_then(Value::as_f64)
+            .map(|w| (w as f32).clamp(180., 600.))
+            .unwrap_or(prefs.inspector_width);
     }
     cx.set_global(prefs);
 }
@@ -50,6 +63,13 @@ pub fn get(cx: &App) -> Prefs {
 
 /// Flip one preference, persist, and repaint.
 pub fn toggle(cx: &mut App, change: impl FnOnce(&mut Prefs)) {
+    save(cx, change);
+    cx.refresh_windows();
+}
+
+/// Change and persist without a repaint — for values the UI already
+/// reflects, like a divider position at the end of a drag.
+pub fn save(cx: &mut App, change: impl FnOnce(&mut Prefs)) {
     let prefs = cx.global_mut::<Prefs>();
     change(prefs);
     let out = json!({
@@ -57,6 +77,7 @@ pub fn toggle(cx: &mut App, change: impl FnOnce(&mut Prefs)) {
         "right_align": prefs.right_align,
         "null_tags": prefs.null_tags,
         "inspector": prefs.inspector,
+        "inspector_width": prefs.inspector_width,
     });
     if let Some(p) = file() {
         if let Some(dir) = p.parent() {
@@ -64,5 +85,4 @@ pub fn toggle(cx: &mut App, change: impl FnOnce(&mut Prefs)) {
         }
         std::fs::write(p, out.to_string()).ok();
     }
-    cx.refresh_windows();
 }

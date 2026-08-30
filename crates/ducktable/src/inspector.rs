@@ -18,32 +18,25 @@ impl Grid {
     pub(crate) fn inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = pal(cx);
 
-        let mut pane = div()
+        // The width belongs to the resizable panel wrapping this pane
+        // (grid.rs), so the pane just fills it.
+        let mut list = div()
             .id("inspector")
             .v_flex()
-            // Wide enough that a full microsecond timestamp
-            // (26 mono chars) survives the key column and padding.
-            .w(px(290.))
-            .flex_none()
-            .h_full()
+            .size_full()
             .px_3()
             .py_2()
-            // Raised, like the proof's inspector pane — not another white
-            // panel against the white grid.
-            .bg(t.raised)
-            .border_l_1()
-            .border_color(t.border)
             .overflow_y_scroll()
             .child(section(t, "ROW"));
 
         match self.row_kv(cx) {
             Some(pairs) => {
                 for (k, v, is_null) in pairs {
-                    pane = pane.child(kv(t, k, v, is_null));
+                    list = list.child(kv(t, k, v, is_null));
                 }
             }
             None => {
-                pane = pane.child(
+                list = list.child(
                     div()
                         .pt_1()
                         .text_size(px(12.))
@@ -53,7 +46,30 @@ impl Grid {
             }
         }
 
-        pane
+        div()
+            .size_full()
+            .relative()
+            // Raised, like the proof's inspector pane — not another white
+            // panel against the white grid.
+            .bg(t.raised)
+            .border_l_1()
+            .border_color(t.border)
+            .child(list)
+            .child(
+                // The gripper: a small centered bar on the divider,
+                // signalling the edge drags. It sits OUTSIDE the scroll
+                // container so it never scrolls away; the actual drag
+                // target is the resizable panel's handle on this edge.
+                div()
+                    .absolute()
+                    .left(px(1.))
+                    .top(relative(0.5))
+                    .mt(px(-14.))
+                    .w(px(3.))
+                    .h(px(28.))
+                    .rounded(px(2.))
+                    .bg(t.border),
+            )
     }
 }
 
