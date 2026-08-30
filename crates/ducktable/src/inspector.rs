@@ -1,10 +1,12 @@
 //! The inspector: the grid's right panel (design/main-window.html, UI.md
 //! "Inspector"). It lives INSIDE the grid, below the header strip — the
 //! title/toggles row keeps the full width and nothing shifts when the
-//! panel opens. Read-only in this slice — SIZE, STATISTICS, and METADATA
-//! from the berth, and ROW showing the selected row's values vertically.
-//! The row editor arrives with the staged/live pipeline (edits.rs); it and
-//! the grid's inline editor will be one editing session with one owner.
+//! panel opens. It shows ROW-LEVEL data only: the selected row's values,
+//! vertically. Berth facts (versions, size) live on the identity card and
+//! row counts in the grid's status line — different data urgency levels
+//! never share this pane. Read-only in this slice; the row editor arrives
+//! with the staged/live pipeline (edits.rs) — it and the grid's inline
+//! editor will be one editing session with one owner.
 
 use crate::grid::Grid;
 use crate::theme::{pal, value_font, Pal};
@@ -12,22 +14,9 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::StyledExt as _;
 
-/// The berth facts the inspector shows. Fixed for a connection's lifetime,
-/// so they ride into the grid at construction instead of reaching back
-/// into the app's phase.
-pub(crate) struct BerthMeta {
-    pub(crate) berth: String,
-    pub(crate) duckdb: String,
-    pub(crate) harbor: String,
-    /// `PRAGMA database_size` (database_size, wal_size), as the server
-    /// prints them.
-    pub(crate) db_size: Option<(String, String)>,
-}
-
 impl Grid {
     pub(crate) fn inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = pal(cx);
-        let meta = self.meta();
 
         let mut pane = div()
             .id("inspector")
@@ -40,33 +29,9 @@ impl Grid {
             .bg(t.surface)
             .border_l_1()
             .border_color(t.border)
-            .overflow_y_scroll();
+            .overflow_y_scroll()
+            .child(section(t, "ROW"));
 
-        if let Some((data, wal)) = meta.db_size.clone() {
-            pane = pane
-                .child(section(t, "SIZE"))
-                .child(kv(t, "Data", data, false))
-                .child(kv(t, "WAL", wal, false));
-        }
-
-        let (loaded, total) = self.counts(cx);
-        pane = pane.child(section(t, "STATISTICS")).child(kv(
-            t,
-            "Rows",
-            match total {
-                Some(n) => format!("{n}"),
-                None => format!("{loaded}+"),
-            },
-            false,
-        ));
-
-        pane = pane
-            .child(section(t, "METADATA"))
-            .child(kv(t, "DuckDB", meta.duckdb.clone(), false))
-            .child(kv(t, "Harbor", meta.harbor.clone(), false))
-            .child(kv(t, "Berth", meta.berth.clone(), false));
-
-        pane = pane.child(section(t, "ROW"));
         match self.row_kv(cx) {
             Some(pairs) => {
                 for (k, v, is_null) in pairs {
@@ -90,7 +55,7 @@ impl Grid {
 
 fn section(t: Pal, label: &'static str) -> impl IntoElement {
     div()
-        .pt_3()
+        .pt_1()
         .pb_1()
         .text_size(px(10.5))
         .font_weight(FontWeight::BOLD)

@@ -236,10 +236,12 @@ diagrams.
 
 ## Inspector (right panel)
 
-Details only; no AI chat in v1. Sections mirror what a berth can
-answer: Size (data, index, total), Statistics (row count), Metadata
-(DuckDB version, Harbor version, berth name), and a Row section showing
-the selected row's values vertically. The row editor and the grid's
+Details only; no AI chat in v1. The inspector is ROW-LEVEL: the
+selected row's values shown vertically, and nothing else. Berth-level
+facts keep their own homes at their own urgency — versions, database
+path, and size on the berth identity card; row counts in the grid's
+status line. Mixing a row being edited with the database engine's
+version number puts two data urgency levels in one pane. The row editor and the grid's
 inline editor are one editing session with one owner: opening one
 closes the other, and both write through the same staged/live pipeline.
 If a refresh replaces the selected row, the inspector shows the new

@@ -3,6 +3,7 @@
 
 use crate::app::{DuckTable, Phase};
 use crate::theme::{pal, Pal};
+use gpui::prelude::FluentBuilder as _;
 use crate::util::clone_str;
 use gpui::*;
 use gpui_component::button::*;
@@ -76,7 +77,7 @@ impl DuckTable {
                         move |this, _, _, cx| this.connect(clone_str(&name), cx),
                     ))
                 }),
-            Phase::Connected { conn, info, .. } => div()
+            Phase::Connected { conn, info, db_size, .. } => div()
                 .v_flex()
                 .gap_1()
                 .items_start()
@@ -103,6 +104,13 @@ impl DuckTable {
                     "Database",
                     harbor_client::paths::shorten(std::path::Path::new(&info.database)),
                 ))
+                .when_some(db_size.clone(), |d, (data, wal)| {
+                    d.child(meta(
+                        t,
+                        "Size",
+                        if wal == "0 bytes" { data } else { format!("{data} (WAL {wal})") },
+                    ))
+                })
                 .child(meta(t, "Uptime", format!("{}s", info.uptime_ms / 1000)))
                 .child(meta(
                     t,

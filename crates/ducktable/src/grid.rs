@@ -37,7 +37,6 @@ fn gutter_width(rows: usize) -> f32 {
 
 pub(crate) struct Grid {
     table: Entity<TableState<GridDelegate>>,
-    meta: crate::inspector::BerthMeta,
 }
 
 pub(crate) struct GridDelegate {
@@ -73,7 +72,6 @@ impl Grid {
         title: String,
         outcome: Result<harbor_client::QueryResult, String>,
         total_rows: Option<u64>,
-        meta: crate::inspector::BerthMeta,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -115,11 +113,7 @@ impl Grid {
             }
         }
         let table = cx.new(|cx| TableState::new(delegate, window, cx));
-        Self { table, meta }
-    }
-
-    pub(crate) fn meta(&self) -> &crate::inspector::BerthMeta {
-        &self.meta
+        Self { table }
     }
 
     /// The selected row as (column, display value, is_null) pairs, for the
@@ -142,12 +136,6 @@ impl Grid {
                 })
                 .collect(),
         )
-    }
-
-    /// (rows loaded, exact total when known), for the inspector.
-    pub(crate) fn counts(&self, cx: &App) -> (usize, Option<u64>) {
-        let d = self.table.read(cx).delegate();
-        (d.rows.len(), d.total_rows)
     }
 
     /// Rebuild the column list after the row-number preference flips.
