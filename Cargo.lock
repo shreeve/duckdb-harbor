@@ -1435,6 +1435,8 @@ dependencies = [
  "anyhow",
  "gpui",
  "gpui-component",
+ "harbor-client",
+ "wire",
 ]
 
 [[package]]
@@ -2491,6 +2493,27 @@ dependencies = [
  "crunchy",
  "num-traits",
  "zerocopy",
+]
+
+[[package]]
+name = "harbor-client"
+version = "0.1.0"
+dependencies = [
+ "harbor-common",
+ "serde",
+ "serde_json",
+ "toml 1.1.4+spec-1.1.0",
+ "wire",
+]
+
+[[package]]
+name = "harbor-common"
+version = "0.15.0"
+source = "git+https://github.com/shreeve/duckdb-harbor?rev=5441d81#5441d810714f7e815a3901adc48d41e20686a0e8"
+dependencies = [
+ "libc",
+ "serde",
+ "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]
@@ -7216,6 +7239,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d129932f4644ac2396cb456385cbf9e63b5b30c6e8dc4820bdca4eb082037a5"
 dependencies = [
  "winapi",
+]
+
+[[package]]
+name = "wire"
+version = "0.15.0"
+source = "git+https://github.com/shreeve/duckdb-harbor?rev=5441d81#5441d810714f7e815a3901adc48d41e20686a0e8"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

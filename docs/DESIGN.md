@@ -27,9 +27,17 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
 - **Berths are addressed by name.** Connection UX mirrors `pilot`: a name is
   resolved through Harbor config, spawn-on-demand aliases launch Harbor for a
   local file, and tokens come from `~/.config/harbor/runtime/<name>.token`.
-  Harbor and pilot are MIT and first-party, so DuckTable reuses their client
-  code (the `wire` crate and pilot's config/http modules) rather than
-  reimplementing the protocol.
+  Harbor is MIT and first-party: DuckTable consumes the `wire` protocol crate
+  and `harbor-common` (config, paths, berth state semantics) as git
+  dependencies pinned by rev, with a `[patch]` for local iteration. The
+  HTTP layer (blocking client, NDJSON streaming, chunked decoding) lives in
+  DuckTable's own client crate until Harbor hoists it into `harbor-common`.
+- **A connected berth is kept alive and its lifetime is respected.** While a
+  window holds a connection, DuckTable pulses `GET /keepalive` so an
+  idle-exit berth does not retire under an open grid. The lifetime rule is
+  pilot's: if DuckTable summoned the berth (spawn-on-demand), closing the
+  window lets it retire; if it joined one already running, closing the
+  window changes nothing.
 - **UI stack**: GPUI (pinned crates.io release, currently 0.2.2) with
   gpui-component (0.5.1) supplying the virtualized Table and the code editor.
   Both are pre-1.0; every gpui-component widget is consumed through a thin
