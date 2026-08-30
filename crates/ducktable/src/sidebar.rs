@@ -40,7 +40,10 @@ impl DuckTable {
                     .text_xs()
                     .font_weight(FontWeight::BOLD)
                     .text_color(t.muted)
-                    .child("BERTHS"),
+                    // "Berth" is Harbor's word; the UI says what a user
+                    // sees. (Not "CONNECTIONS" — that reads as saved
+                    // connection configs, which this list is not.)
+                    .child("DATABASES"),
             )
             .children(self.rows.iter().map(|row| {
                 let name = clone_str(&row.name);
@@ -125,7 +128,7 @@ impl DuckTable {
                 .text_xs()
                 .font_weight(FontWeight::BOLD)
                 .text_color(t.muted)
-                .child("CATALOG"),
+                .child("TABLES"),
         );
         for schema in schemas {
             if many_schemas {
