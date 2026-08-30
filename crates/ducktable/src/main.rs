@@ -22,6 +22,12 @@ use gpui_component::{Root, StyledExt as _};
 
 actions!(ducktable, [ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset, FitColumns]);
 
+/// The one window's root view, for App-level action handlers that need
+/// to reach into it (menus fire at App level when focus skips the view).
+struct AppView(WeakEntity<DuckTable>);
+
+impl Global for AppView {}
+
 /// The macOS menu bar. The first menu becomes the application menu; the
 /// About item opens the platform's standard dialog (window.prompt ->
 /// NSAlert) with the version and a GitHub link.
@@ -160,21 +166,26 @@ fn main() {
         cx.on_action(|_: &ToggleInspector, cx| {
             prefs::toggle(cx, |p| p.inspector = !p.inspector);
         });
-        // FitColumns needs the window's grid, which a global cannot reach —
-        // this handler exists so the menu item validates, and if it ever
-        // actually fires (the window listener was somehow skipped) it
-        // re-dispatches into the active window, deferred out of the menu's
-        // window lease (the About lesson). A handled dispatch never returns
-        // here, so there is no loop.
+        // FitColumns needs the window's grid, which this handler reaches
+        // through the app-view handle — directly, never by re-dispatching
+        // into the window. A re-dispatch here once looped forever: with
+        // focus in a text input the window listener is off the dispatch
+        // path, so the action came straight back to this handler, which
+        // deferred it again, and Cmd-Shift-F pinned the main thread until
+        // force-quit. This handler both validates the menu item and does
+        // the work when the view-scoped listener was skipped (a handled
+        // dispatch never reaches here, so there is no double fit).
         cx.on_action(|_: &FitColumns, cx| {
-            if let Some(w) = cx.active_window() {
-                cx.defer(move |cx| {
-                    w.update(cx, |_, window, cx| {
-                        window.dispatch_action(Box::new(FitColumns), cx);
-                    })
-                    .ok();
+            let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) else {
+                return;
+            };
+            cx.defer(move |cx| {
+                view.update(cx, |this, cx| {
+                    if let Some(grid) = &this.grid {
+                        grid.update(cx, |grid, cx| grid.fit_columns(cx));
+                    }
                 });
-            }
+            });
         });
         // Global, not view-scoped: menu items must work regardless of
         // which pane holds focus. The prompt needs a window — but a menu
@@ -198,6 +209,9 @@ fn main() {
                 },
                 |window, cx| {
                     let view = cx.new(DuckTable::new);
+                    // The one window's view, reachable from App-level
+                    // action handlers (FitColumns above).
+                    cx.set_global(AppView(view.downgrade()));
                     cx.new(|cx| Root::new(view, window, cx))
                 },
             )?;
