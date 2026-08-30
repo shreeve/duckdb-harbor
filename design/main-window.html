@@ -13,13 +13,16 @@
 <div class="window">
   <div class="chrome">platform chrome</div>
   <div class="toolbar">
+    <button class="tog" id="tog-l" title="Hide sidebar (&#8984;0)">&#9776;</button>
     <span class="pill"><span class="dot on"></span> medlabs</span>
     <span class="crumb">memory &rsaquo; main &rsaquo; <b>Invoice</b></span>
     <span class="spacer"></span>
     <span class="timing">engine 1.2 ms</span>
+    <button class="tog" id="tog-r" title="Hide details (&#8984;&#8997;0)">&#11224;</button>
   </div>
   <div class="panes">
 
+    <div class="panewrap" id="wrap-l">
     <div class="sidebar">
       <div class="side-h"><span class="tw">&#9662;</span> BERTHS</div>
       <div class="row sel"><span class="dot on"></span><span class="n">medlabs</span></div>
@@ -42,6 +45,8 @@
       <div class="side-h"><span class="tw">&#9662;</span> NOTEBOOKS</div>
       <div class="row"><span class="n">revenue-deep-dive</span></div>
       <div class="row"><span class="n">cohort-scratch</span></div>
+    </div>
+    <div class="grabber gl" id="grab-l" title="Collapse sidebar">&#9664;</div>
     </div>
 
     <div class="content">
@@ -84,6 +89,8 @@
       </div>
     </div>
 
+    <div class="panewrap" id="wrap-r">
+    <div class="grabber gr" id="grab-r" title="Collapse details">&#9654;</div>
     <div class="inspector">
       <div class="insp-h">SIZE</div>
       <div class="kv"><span class="k">Data</span><span class="v">1.2 MB</span></div>
@@ -100,9 +107,26 @@
       <div class="kv"><span class="k">BillingAddress</span><span class="v" style="color: var(--accent)">Gr&eacute;trystraat 65</span></div>
       <div class="kv"><span class="k">BillingCity</span><span class="v">Brussels</span></div>
     </div>
+    </div>
 
   </div>
 </div>
+<script>
+function wire(wrapId, grabId, togId, openGlyph, closedGlyph) {
+  const wrap = document.getElementById(wrapId);
+  const grab = document.getElementById(grabId);
+  const tog = document.getElementById(togId);
+  const flip = () => {
+    const closed = wrap.classList.toggle("collapsed");
+    grab.innerHTML = closed ? closedGlyph : openGlyph;
+    tog.classList.toggle("off", closed);
+  };
+  grab.onclick = flip;
+  tog.onclick = flip;
+}
+wire("wrap-l", "grab-l", "tog-l", "&#9664;", "&#9654;");
+wire("wrap-r", "grab-r", "tog-r", "&#9654;", "&#9664;");
+</script>
 <p class="caption">Staged mode: the edited cell carries an accent bar and tint; the same value shows accented in the inspector's Row
 section; the status line counts staged changes. The berth pill echoes the sidebar's status dot. Platform chrome is a neutral strip.</p>
 

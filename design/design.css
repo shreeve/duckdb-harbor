@@ -213,3 +213,29 @@ body {
   border-radius: var(--radius-m); color: var(--text);
 }
 .err-inline pre { font: 10.5px var(--font-mono); color: var(--danger); margin-top: 5px; white-space: pre-wrap; }
+
+/* ---- pane collapse affordances ---- */
+.tog {
+  width: 26px; height: 22px; border-radius: var(--radius-s);
+  border: none; background: transparent; color: var(--muted);
+  font-size: 13px; cursor: pointer; display: inline-flex;
+  align-items: center; justify-content: center;
+}
+.tog:hover { background: var(--selection); color: var(--text); }
+.tog.off { color: var(--accent); background: var(--accent-soft); }
+.panewrap { position: relative; flex: none; display: flex; }
+.grabber {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  width: 14px; height: 46px; z-index: 3;
+  border: 1px solid var(--border); background: var(--surface);
+  color: var(--muted); font-size: 9px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.10);
+}
+.grabber:hover { color: var(--accent); border-color: var(--accent); }
+.grabber.gl { right: -7px; border-radius: 0 7px 7px 0; }
+.grabber.gr { left: -7px; border-radius: 7px 0 0 7px; }
+.panewrap.collapsed .sidebar, .panewrap.collapsed .inspector { display: none; }
+.panewrap.collapsed { width: 0; }
+.panewrap.collapsed .grabber.gl { right: -14px; }
+.panewrap.collapsed .grabber.gr { left: -14px; }
