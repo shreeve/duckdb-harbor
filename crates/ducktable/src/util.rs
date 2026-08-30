@@ -46,26 +46,6 @@ pub fn human_bytes(n: u64) -> String {
     unreachable!()
 }
 
-/// Bytes from a DuckDB pretty size ("175.0 MiB", "123 bytes"), so binary
-/// server strings can re-render in the app's decimal units.
-pub fn parse_pretty_size(s: &str) -> Option<u64> {
-    let mut parts = s.trim().split_whitespace();
-    let value: f64 = parts.next()?.parse().ok()?;
-    let scale = match parts.next().unwrap_or("bytes") {
-        "bytes" | "byte" | "B" => 1.,
-        "KiB" => 1024.,
-        "MiB" => 1024. * 1024.,
-        "GiB" => 1024. * 1024. * 1024.,
-        "TiB" => 1024f64.powi(4),
-        "KB" => 1e3,
-        "MB" => 1e6,
-        "GB" => 1e9,
-        "TB" => 1e12,
-        _ => return None,
-    };
-    Some((value * scale) as u64)
-}
-
 /// A count in compact SI form: exact under 1000, then k/M/G/T with one
 /// decimal below 10 ("4.6M") and integers to 999 ("13k", "999k"); the
 /// tenth-rounded value rolls to the next unit at 999.5.

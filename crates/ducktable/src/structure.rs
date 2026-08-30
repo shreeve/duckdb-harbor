@@ -5,19 +5,15 @@
 //! in this slice; the editor arrives with the staged/live pipeline
 //! (edits.rs).
 //!
-//! Introspection contract verified against a live berth
-//! (crates/harbor-client/examples/probe_struct.rs): `PRAGMA
-//! table_info('"schema"."table"')` returns cid, name, type,
-//! notnull (bool), dflt_value, pk (bool); `duckdb_tables()` carries the
-//! reconstructed CREATE TABLE in its `sql` column.
+//! Everything shown here is a projection of the `/catalog` document —
+//! columns, constraints, and (harbor 0.16+) the engine's own CREATE TABLE
+//! text — so opening the Structure view costs no query at all.
 
 use crate::grid::Grid;
 use crate::theme::{pal, ui_font, value_font, Pal};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::StyledExt as _;
-use harbor_client::Conn;
-use serde_json::Value;
 
 pub(crate) struct StructCol {
     pub(crate) name: String,
@@ -32,55 +28,22 @@ pub(crate) struct TableStructure {
     pub(crate) ddl: Option<String>,
 }
 
-/// Fetch a table's structure. Runs on the background thread alongside the
-/// first page (fetch first, commit over the old value), so switching to
-/// the Structure view later is instant.
-pub(crate) fn table_structure(
-    conn: &Conn,
-    schema: &str,
-    name: &str,
-) -> Option<TableStructure> {
-    let qualified =
-        format!("{}.{}", crate::util::qident(schema), crate::util::qident(name));
-    let sql = format!("PRAGMA table_info('{}')", qualified.replace('\'', "''"));
-    let info = harbor_client::query(conn, &sql).ok()?;
-    let pos = |key: &str| info.columns.iter().position(|c| c.name.as_deref() == Some(key));
-    let (name_ix, ty_ix, notnull_ix, dflt_ix, pk_ix) =
-        (pos("name")?, pos("type")?, pos("notnull")?, pos("dflt_value")?, pos("pk")?);
-    let text = |v: Option<&Value>| match v {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Null) | None => String::new(),
-        Some(other) => other.to_string(),
-    };
-    let cols = info
-        .rows
+/// A table's structure, read straight out of the catalog snapshot the
+/// connection already holds — no query, so the Structure view is as
+/// current as the sidebar and never a frame behind it.
+pub(crate) fn table_structure(table: &harbor_client::Table) -> TableStructure {
+    let cols = table
+        .columns
         .iter()
-        .map(|row| StructCol {
-            name: text(row.get(name_ix)),
-            ty: text(row.get(ty_ix)),
-            notnull: row.get(notnull_ix) == Some(&Value::Bool(true)),
-            dflt: match row.get(dflt_ix) {
-                Some(Value::Null) | None => None,
-                Some(v) => Some(text(Some(v))),
-            },
-            pk: row.get(pk_ix) == Some(&Value::Bool(true)),
+        .map(|c| StructCol {
+            name: c.name.clone(),
+            ty: c.duck_type.clone(),
+            notnull: c.not_null,
+            dflt: c.default.clone(),
+            pk: c.primary,
         })
         .collect();
-
-    let ddl_sql = format!(
-        "SELECT sql FROM duckdb_tables() WHERE schema_name = '{}' AND table_name = '{}'",
-        schema.replace('\'', "''"),
-        name.replace('\'', "''"),
-    );
-    let ddl = harbor_client::query(conn, &ddl_sql)
-        .ok()
-        .and_then(|r| r.rows.first()?.first().cloned())
-        .and_then(|v| match v {
-            Value::String(s) => Some(pretty_ddl(&s)),
-            _ => None,
-        });
-
-    Some(TableStructure { cols, ddl })
+    TableStructure { cols, ddl: table.ddl.as_deref().map(pretty_ddl) }
 }
 
 /// Reformat DuckDB's one-line CREATE TABLE into an indented definition:

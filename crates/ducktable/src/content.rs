@@ -77,7 +77,7 @@ impl DuckTable {
                         move |this, _, _, cx| this.connect(clone_str(&name), cx),
                     ))
                 }),
-            Phase::Connected { conn, info, db_size, .. } => div()
+            Phase::Connected { conn, info, catalog } => div()
                 .v_flex()
                 .gap_1()
                 .items_start()
@@ -104,15 +104,14 @@ impl DuckTable {
                     "Database",
                     harbor_client::paths::shorten(std::path::Path::new(&info.database)),
                 ))
-                .when_some(*db_size, |d, (data, wal)| {
+                .when_some(catalog.database_size_bytes, |d, data| {
                     let h = crate::util::human_bytes;
                     d.child(meta(
                         t,
                         "Size",
-                        if wal == 0 {
-                            h(data)
-                        } else {
-                            format!("{} (WAL {})", h(data), h(wal))
+                        match catalog.wal_size_bytes.unwrap_or(0) {
+                            0 => h(data),
+                            wal => format!("{} (WAL {})", h(data), h(wal)),
                         },
                     ))
                 })

@@ -20,6 +20,14 @@ pub struct Catalog {
     pub tables: Vec<Table>,
     #[serde(default)]
     pub sequences: Vec<Sequence>,
+    /// Exact bytes of the served file, statted by the server (harbor
+    /// 0.16+); None from an older Harbor or a berth serving no file.
+    #[serde(default)]
+    pub database_size_bytes: Option<u64>,
+    /// Exact bytes of the WAL beside it — 0 after a checkpoint, which is
+    /// an answer, not an absence.
+    #[serde(default)]
+    pub wal_size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -27,6 +35,13 @@ pub struct Catalog {
 pub struct Table {
     pub name: String,
     pub schema: String,
+    /// The engine's cardinality estimate (harbor 0.16+) — a sidebar
+    /// figure, not a COUNT(*).
+    #[serde(default)]
+    pub estimated_rows: Option<u64>,
+    /// The engine's own CREATE TABLE rendering (harbor 0.16+).
+    #[serde(default)]
+    pub ddl: Option<String>,
     #[serde(default)]
     pub columns: Vec<Column>,
     #[serde(default)]
@@ -104,10 +119,13 @@ mod tests {
         let doc = r#"{
             "harborVersion": "0.15.0",
             "duckdbVersion": "v2.0.0",
+            "databaseSizeBytes": 1310720,
+            "walSizeBytes": 0,
             "tables": [
-                {"name": "events", "schema": "main",
+                {"name": "events", "schema": "main", "estimatedRows": 42,
                  "columns": [{"name": "id", "type": "INTEGER", "notNull": true, "default": "nextval('id')", "primary": true}],
-                 "primaryKey": ["id"], "uniqueConstraints": [], "indexes": [], "foreignKeys": []},
+                 "primaryKey": ["id"], "uniqueConstraints": [], "indexes": [], "foreignKeys": [],
+                 "ddl": "CREATE TABLE events(id INTEGER PRIMARY KEY DEFAULT(nextval('id')));"},
                 {"name": "zeta", "schema": "audit", "columns": [], "primaryKey": []}
             ],
             "sequences": [{"name": "id", "start": 1}],
@@ -117,6 +135,13 @@ mod tests {
         assert_eq!(c.schemas(), vec!["main", "audit"]);
         assert_eq!(c.tables_in("main")[0].columns[0].duck_type, "INTEGER");
         assert!(c.tables_in("main")[0].columns[0].primary);
+        assert_eq!(c.tables_in("main")[0].estimated_rows, Some(42));
+        assert!(c.tables_in("main")[0].ddl.as_deref().unwrap().starts_with("CREATE TABLE"));
+        // The audit table came from an older Harbor with no enrichment:
+        // every new field is an absence, never an error.
+        assert_eq!(c.tables_in("audit")[0].estimated_rows, None);
+        assert_eq!(c.database_size_bytes, Some(1310720));
+        assert_eq!(c.wal_size_bytes, Some(0));
         assert_eq!(c.sequences[0].name, "id");
     }
 }

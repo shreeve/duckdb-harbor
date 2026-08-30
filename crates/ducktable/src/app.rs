@@ -28,13 +28,10 @@ pub(crate) enum Phase {
     Connected {
         conn: Conn,
         info: wire::InfoResponse,
+        /// The one snapshot everything schema-shaped renders from: tables,
+        /// columns, DDL, row estimates, and the file's size on disk all
+        /// arrive in this single document (harbor 0.16+).
         catalog: harbor_client::Catalog,
-        /// `PRAGMA database_size` figures for the identity card:
-        /// (data bytes, wal bytes).
-        db_size: Option<(u64, u64)>,
-        /// Per-table row counts for the sidebar, (schema, table) ->
-        /// estimated_size. Snapshot at connect, like the catalog.
-        row_counts: std::collections::HashMap<(String, String), u64>,
     },
     Failed { name: String, message: String },
 }
@@ -92,10 +89,16 @@ impl DuckTable {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (conn, solo_schema) = match &self.phase {
-            Phase::Connected { conn, catalog, .. } => {
-                (conn.clone(), catalog.schemas().len() <= 1)
-            }
+        let (conn, solo_schema, structure) = match &self.phase {
+            Phase::Connected { conn, catalog, .. } => (
+                conn.clone(),
+                catalog.schemas().len() <= 1,
+                catalog
+                    .tables
+                    .iter()
+                    .find(|t| t.schema == schema && t.name == name)
+                    .map(crate::structure::table_structure),
+            ),
             _ => return,
         };
         // "main.tests" earns its prefix only when there is another schema
@@ -108,9 +111,10 @@ impl DuckTable {
         let page_size = crate::prefs::get(cx).page_size;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            // Three independent queries (each on its own connection), so
-            // they run concurrently — click latency is the slowest one,
-            // not the sum. A failed page drops the other two unawaited.
+            // Two independent queries (each on its own connection), so they
+            // run concurrently — click latency is the slower one, not the
+            // sum. The structure came free out of the catalog snapshot. A
+            // failed page drops the count unawaited.
             let page_task = cx.background_executor().spawn({
                 let (conn, schema, name) = (conn.clone(), clone_str(&schema), clone_str(&name));
                 async move { crate::queries::first_page(&conn, &schema, &name, page_size) }
@@ -119,16 +123,8 @@ impl DuckTable {
                 let (conn, schema, name) = (conn.clone(), clone_str(&schema), clone_str(&name));
                 async move { crate::queries::total_rows(&conn, &schema, &name) }
             });
-            let struct_task = cx.background_executor().spawn({
-                let (conn, schema, name) = (conn.clone(), clone_str(&schema), clone_str(&name));
-                async move { crate::structure::table_structure(&conn, &schema, &name) }
-            });
             let outcome = page_task.await;
-            let (total, structure) = if outcome.is_ok() {
-                (total_task.await, struct_task.await)
-            } else {
-                (None, None)
-            };
+            let total = if outcome.is_ok() { total_task.await } else { None };
             this.update_in(cx, |state, window, cx| {
                 if state.select_seq != fence {
                     return;
@@ -191,10 +187,10 @@ impl DuckTable {
         cx.notify();
     }
 
-    /// Re-pull the catalog, row counts, and size for the live connection —
-    /// the sidebar's snapshot goes stale when something else writes to the
-    /// database. Fetch first; the old catalog stays until the new one
-    /// lands, and a failed refresh changes nothing.
+    /// Re-pull the catalog for the live connection — the sidebar's
+    /// snapshot goes stale when something else writes to the database.
+    /// Fetch first; the old catalog stays until the new one lands, and a
+    /// failed refresh changes nothing.
     pub(crate) fn refresh_catalog(&mut self, cx: &mut Context<Self>) {
         let conn = match &self.phase {
             Phase::Connected { conn, .. } => conn.clone(),
@@ -204,25 +200,16 @@ impl DuckTable {
         cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_executor()
-                .spawn(async move {
-                    let catalog = harbor_client::catalog(&conn)?;
-                    let db_size = crate::queries::database_size(&conn);
-                    let counts = crate::queries::table_counts(&conn).unwrap_or_default();
-                    Ok::<_, String>((catalog, db_size, counts))
-                })
+                .spawn(async move { harbor_client::catalog(&conn) })
                 .await;
             this.update(cx, |state, cx| {
                 if state.attempt != fence {
                     return;
                 }
-                if let (
-                    Phase::Connected { catalog, db_size, row_counts, .. },
-                    Ok((new_catalog, new_size, new_counts)),
-                ) = (&mut state.phase, outcome)
+                if let (Phase::Connected { catalog, .. }, Ok(new_catalog)) =
+                    (&mut state.phase, outcome)
                 {
                     *catalog = new_catalog;
-                    *db_size = new_size;
-                    *row_counts = new_counts;
                     cx.notify();
                 }
             })
@@ -318,9 +305,7 @@ impl DuckTable {
                     let conn = fleet::connect(&target)?;
                     let info = fleet::info(&conn)?;
                     let catalog = harbor_client::catalog(&conn)?;
-                    let db_size = crate::queries::database_size(&conn);
-                    let row_counts = crate::queries::table_counts(&conn).unwrap_or_default();
-                    Ok::<_, String>((conn, info, catalog, db_size, row_counts))
+                    Ok::<_, String>((conn, info, catalog))
                 })
                 .await;
             this.update(cx, |state, cx| {
@@ -332,9 +317,7 @@ impl DuckTable {
                 state.grid = None;
                 state.select_seq += 1;
                 state.phase = match outcome {
-                    Ok((conn, info, catalog, db_size, row_counts)) => {
-                        Phase::Connected { conn, info, catalog, db_size, row_counts }
-                    }
+                    Ok((conn, info, catalog)) => Phase::Connected { conn, info, catalog },
                     Err(message) => Phase::Failed { name: clone_str(&name), message },
                 };
                 if let Phase::Connected { .. } = state.phase {

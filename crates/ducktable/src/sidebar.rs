@@ -201,7 +201,7 @@ impl DuckTable {
 
     fn catalog_tree(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = pal(cx);
-        let Phase::Connected { catalog, row_counts, .. } = &self.phase else {
+        let Phase::Connected { catalog, .. } = &self.phase else {
             return div().id("catalog").flex_1();
         };
         let schemas = catalog.schemas();
@@ -322,7 +322,7 @@ impl DuckTable {
                         // Row count in compact SI form — rows are what a
                         // scan of a database cares about; column counts
                         // live in the footer status and Structure view.
-                        .when_some(row_counts.get(&key).copied(), |d, n| {
+                        .when_some(table.estimated_rows, |d, n| {
                             d.child(
                                 div()
                                     .text_xs()
