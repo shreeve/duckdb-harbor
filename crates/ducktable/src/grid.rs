@@ -39,6 +39,20 @@ const HEADER_TEXT: f32 = 11.5;
 const GUTTER_TEXT: f32 = 11.;
 const TAG_TEXT: f32 = 10.;
 
+/// A square hover-highlight icon tile — the chassis every header/footer
+/// glyph shares. Callers layer their own colors (state tints, disabled
+/// dimming) on top; a disabled tile skips the pointer and hover.
+fn icon_tile(id: &'static str, size: f32, enabled: bool, t: crate::theme::Pal) -> Stateful<Div> {
+    div()
+        .id(id)
+        .h_flex()
+        .items_center()
+        .justify_center()
+        .size(px(size))
+        .rounded(px(4.))
+        .when(enabled, move |d| d.cursor_pointer().hover(move |d| d.bg(t.row_hover)))
+}
+
 // 7 is Menlo's digit advance at GUTTER_TEXT (11px); 16 is the gutter's
 // horizontal padding. Both move if the value font or size does.
 fn gutter_width(max_row: u64) -> f32 {
@@ -1100,16 +1114,8 @@ impl Render for Grid {
                     .child(
                         // The inspector's panel glyph (Finder/Xcode
                         // convention), right of the lozenge.
-                        div()
-                            .id("toggle-inspector")
-                            .h_flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(22.))
-                            .rounded(px(4.))
-                            .cursor_pointer()
+                        icon_tile("toggle-inspector", 22., true, t)
                             .text_color(if p.inspector { t.accent } else { t.muted })
-                            .hover(|d| d.bg(t.row_hover))
                             .tooltip(|window, cx| {
                                 Tooltip::new("Show inspector (\u{2318}\u{2325}0)").build(window, cx)
                             })
@@ -1265,16 +1271,8 @@ impl Render for Grid {
                         // The filter toggle sits by the view switcher;
                         // accent when a filter is ACTIVE, not just open.
                         d.child(
-                            div()
-                                .id("toggle-filter")
+                            icon_tile("toggle-filter", 22., true, t)
                                 .ml_2()
-                                .h_flex()
-                                .items_center()
-                                .justify_center()
-                                .size(px(22.))
-                                .rounded(px(4.))
-                                .cursor_pointer()
-                                .hover(|d| d.bg(t.row_hover))
                                 .tooltip(|window, cx| {
                                     Tooltip::new("Filter (raw SQL WHERE)").build(window, cx)
                                 })
@@ -1499,21 +1497,11 @@ impl Render for Grid {
                                 let arrow = |id: &'static str,
                                              path: &'static str,
                                              enabled: bool| {
-                                    div()
-                                        .id(id)
-                                        .h_flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .size(px(20.))
-                                        .rounded(px(4.))
-                                        .map(|d| {
-                                            if enabled {
-                                                d.cursor_pointer()
-                                                    .text_color(t.text)
-                                                    .hover(|d| d.bg(t.row_hover))
-                                            } else {
-                                                d.text_color(t.muted.opacity(0.4))
-                                            }
+                                    icon_tile(id, 20., enabled, t)
+                                        .text_color(if enabled {
+                                            t.text
+                                        } else {
+                                            t.muted.opacity(0.4)
                                         })
                                         .child(
                                             gpui_component::Icon::empty().path(path).size_4(),
