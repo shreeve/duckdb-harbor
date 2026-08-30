@@ -18,7 +18,7 @@ harbor start ./sales.duckdb       → spawn a detached berth, bind the socket
 harbor show                       → reconcile config, sidecars and locks
 harbor stop sales                 → drain, CHECKPOINT, socket gone
 pilot sales                       → duckdb-CLI-class REPL over UDS or plain HTTP
-pilot ./ad-hoc.duckdb             → summon an ephemeral berth, connect
+pilot ./ad-hoc.duckdb             → start a temp database, connect
 ```
 
 The workspace has four first-party crates: **`harbor`** (bin + library),
@@ -118,27 +118,31 @@ drift is caught by cross-side protocol tests rather than by a shared Rust
 dependency. Dependency quarantine stays clean: reedline never enters the
 server tree, and justhttp never enters the client.
 
-## Pilot spawns the owner on demand (ephemeral berths)
+## A path summons a temp database; a name is a service
 
-`pilot ./sales.duckdb` gives the `duckdb sales.duckdb` muscle memory via the
-agent pattern (gpg-agent/emacsclient): resolve the target — name in
-`config.toml` → that entry; live berth name → registered endpoint; URL →
-connect when it is a path-free plain-HTTP origin; file path → connect to the
-live berth whose sidecar claims that path, else run
-`harbor start ... --idle-exit` from PATH (Pilot never links DuckDB), wait for
-its readiness result, then connect. This factors out DuckDB's single-writer
-lock pain: a second Pilot on the same file joins the same berth instead of
-reporting "database is locked".
+The semantics follow how the target is written. A **name** is a service: it
+starts when the operator says `harbor start` and stops when they say
+`harbor stop` — connecting to it never starts it, and a stopped name stays
+stopped (`pilot <name>` on a stopped entry answers with the `harbor start`
+hint rather than a berth). A **path** is a session: `pilot ./sales.duckdb`
+gives the `duckdb sales.duckdb` muscle memory via the agent pattern
+(gpg-agent/emacsclient) — connect to the live berth whose sidecar claims
+that file, else run `harbor start ... --idle-exit` from PATH (Pilot never
+links DuckDB), wait for readiness, connect. This factors out DuckDB's
+single-writer lock pain: a second Pilot on the same file joins the same
+berth instead of reporting "database is locked".
 
-Pilot-spawned berths run with `--idle-exit <dur>`: no active countable
+These temp databases run with `--idle-exit <dur>`: no active countable
 requests and no live sessions for the window → drain, CHECKPOINT, unlink,
-exit. Idle keep-alive TCP connections are not reference-counted. The
-lifecycle is robust against Pilot crashes and has no client refcount. A
-permanent berth is started explicitly with `harbor start`. An interactive
-Pilot sends cheap authenticated `/keepalive` activity pulses while it waits at
-the prompt; these hold no DuckDB connection and leave no server-side record,
-so exiting or crashing Pilot simply lets the same idle window resume. One-shot
-Pilot invocations do not pulse after their query.
+exit. `harbor show` marks them — `● running (temp 1m30s)` — so a berth that
+appears and leaves on its own always says so. Idle keep-alive TCP
+connections are not reference-counted. The lifecycle is robust against
+Pilot crashes and has no client refcount. An interactive Pilot sends cheap
+authenticated `/keepalive` activity pulses while it waits at the prompt —
+every third of the idle window, capped at 10s; these hold no DuckDB
+connection and leave no server-side record, so exiting or crashing Pilot
+simply lets the same idle window resume. One-shot Pilot invocations do not
+pulse after their query.
 
 ## One config, two readers: `~/.config/harbor/config.toml`
 
@@ -170,8 +174,9 @@ collisions: an explicit config entry shadows any live local berth of the same
 name (ssh_config precedent: explicit mapping beats ambient discovery). Pilot
 prints a notice when the local berth has a UDS socket; a same-name TCP sidecar
 is shadowed silently. `pilot medlabs` resolves `[connection.medlabs]` →
-path-free plain-HTTP `url` or `path` (spawn-on-demand alias with per-entry
-`idle-exit`), plus `[defaults]` for REPL prefs (mode, timer, maxrows,
+path-free plain-HTTP `url`, or `path` (joins the running berth; a stopped
+name stays stopped until `harbor start`), plus `[defaults]` for REPL prefs
+(mode, timer, maxrows,
 nullvalue, theme, appearance). Credentials can come from `--token`,
 `HARBOR_TOKEN`, inline config `token`, `token-file`, or `token-cmd`; URL
 userinfo is not parsed. Harbor creates `$HARBOR_HOME` as mode 0700 and minted

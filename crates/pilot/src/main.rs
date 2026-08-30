@@ -171,9 +171,9 @@ usage:
   pilot version                print this binary's version (also -V)
 
 target:
-  name                         a config.toml entry, else a live berth: its
+  name                         a config.toml entry, else a running database: its
                                socket or registered TCP port (+ <name>.token)
-  path/to.duckdb               join the owning berth, or summon one (idle-exit)
+  path/to.duckdb               join its server, or start a temp one (exits when idle)
   path/to.sock                 a harbor unix socket
   http://host:port             a harbor TCP listener
 
@@ -184,7 +184,7 @@ options:
 
 config: $HARBOR_HOME/config.toml ([defaults] mode/timer/maxrows/nullvalue,
 [connection.<name>] url|path + token-file|token-cmd). Remote TLS is Caddy's
-job; ssh is the human path to a remote berth.
+job; ssh is the human path to a remote host.
 ";
 
 /// Resolution order: config.toml name -> live berth name ->
@@ -241,7 +241,7 @@ fn resolve(
                 _ => false,
             };
             if !same {
-                eprintln!("pilot: config entry {target:?} shadows a live local berth of the same name");
+                eprintln!("pilot: config entry {target:?} shadows a running local database of the same name");
             }
         }
         let token = flag_token.or(env_token).or_else(|| config::resolve_token(entry));
@@ -249,19 +249,17 @@ fn resolve(
             return Ok(Conn { transport: url_transport(url)?, token });
         }
         if entry.path.is_some() {
-            // The entry, then [defaults], then who asked — the same ladder
-            // harbor climbs. Only the lifetime is resolved here, because only
-            // the lifetime depends on WHO asked: `harbor start` is an operator
-            // and would pin the berth up, while pilot is a client and its
-            // berths retire. Every other key is harbor's to apply.
-            let life = harbor_common::lifetime::resolve(
-                Default::default(),
-                entry.idle_exit.as_deref(),
-                cfg.defaults.idle_exit.as_deref(),
-                harbor_common::Summoner::Client,
-            )?;
-            let (transport, file_token) = ensure_named_berth(target, &home, life)?;
-            return Ok(Conn { transport, token: token.or(file_token) });
+            // A configured name is a service: it starts when the operator
+            // says so and a stopped one stays stopped — connecting to it must
+            // never start it. Only a *path* summons a temp database, because
+            // pointing at a file says "serve this for me now"; naming a
+            // service does not.
+            let Some(transport) = berth_transport(&home, target) else {
+                return Err(format!(
+                    "{target:?} is configured but not running — start it with: harbor start {target}"
+                ));
+            };
+            return Ok(Conn { transport, token: token.or_else(|| berth_token(&home, target)) });
         }
         return Err(format!("config entry {target:?} has neither url nor path"));
     }
@@ -289,7 +287,7 @@ fn resolve(
             token: flag_token.or(env_token),
         });
         #[cfg(windows)]
-        return Err("Unix socket targets are not supported on Windows; use a berth name or http://host:port".into());
+        return Err("Unix socket targets are not supported on Windows; use a database name or http://host:port".into());
     }
 
     let home = config::runtime_dir()?;
@@ -313,7 +311,7 @@ fn resolve(
             token: flag_token.or(env_token).or(file_token),
         });
     }
-    Err(format!("no live berth named {target:?}{}", fleet_hint(&home)))
+    Err(format!("nothing running named {target:?}{}", fleet_hint(&home)))
 }
 
 fn berth_sock(home: &std::path::Path, name: &str) -> PathBuf {
@@ -388,49 +386,6 @@ fn url_transport(url: &str) -> Result<Transport, String> {
     Err(format!("not a url: {url}"))
 }
 
-/// Join the berth a config entry names, or ask harbor to start it BY NAME.
-///
-/// By name, and that is the whole point. harbor owns how a configured berth
-/// starts — `sealed`, `unsigned`, `memory-limit`, `threads`, `workers`,
-/// `statement-timeout`, `init`, `port`, `create`, all of it — and
-/// `harbor start <name>` is the single call that applies the entry entire.
-/// Re-deriving a spawn from the entry's path meant pilot passed only the
-/// flags somebody had remembered to thread through, so `sealed = true` got an
-/// unsealed berth whenever a client happened to summon it first: one name,
-/// two security postures, decided by who got there first. It also named the
-/// berth after the database file rather than the section key, which is the
-/// exact failure `[connection.warehouse]` -> `inventory.duckdb` is documented
-/// to prevent — harbor is the only place that knows the name is the key.
-///
-/// The lifetime rides as a flag because it is the one thing harbor cannot
-/// know: the ladder's last rung is who asked, and from here the answer is
-/// always "a client".
-fn ensure_named_berth(
-    name: &str,
-    home: &std::path::Path,
-    life: harbor_common::lifetime::Lifetime,
-) -> Result<(Transport, Option<String>), String> {
-    if let Some(t) = berth_transport(home, name) {
-        return Ok((t, berth_token(home, name)));
-    }
-    let harbor = std::env::var("HARBOR_BIN").unwrap_or_else(|_| "harbor".to_string());
-    eprintln!("pilot: summoning the {name:?} berth (idle-exit {})", life.describe());
-    let status = std::process::Command::new(&harbor)
-        .args(["start", name])
-        .args(life.to_args())
-        // pilot is about to draw a prompt; harbor's fleet table is not pilot's
-        // output. Failures still speak — harbor writes those to stderr.
-        .stdout(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("cannot run {harbor:?} (is harbor installed?): {e}"))?;
-    if !status.success() {
-        return Err(format!("harbor start {name} failed"));
-    }
-    let transport = berth_transport(home, name)
-        .ok_or_else(|| format!("harbor start returned without registering berth {name:?}"))?;
-    Ok((transport, berth_token(home, name)))
-}
-
 /// Join the live berth that owns this file, or exec `harbor` to summon an
 /// ephemeral one (idle-exit reaps it). Returns socket + the
 /// berth's token, if readable.
@@ -468,7 +423,7 @@ fn ensure_berth(
         .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '-' })
         .collect();
     if name.is_empty() {
-        return Err(format!("cannot derive a berth name from {}", path.display()));
+        return Err(format!("cannot derive a database name from {}", path.display()));
     }
     // The sidecar scan above found no berth owning THIS file — so a live
     // berth under the derived name is serving a DIFFERENT database. Summoning
@@ -482,13 +437,13 @@ fn ensure_berth(
             .and_then(|j| j["db"].as_str().map(str::to_string))
             .unwrap_or_else(|| "another database".to_string());
         return Err(format!(
-            "berth {name:?} is live but serves {other}, not {} — stop it (`harbor forget {name}`) or serve this file under a different name (`harbor start {} --name <other>`)",
+            "{name:?} is running but serves {other}, not {} — stop it (`harbor forget {name}`) or serve this file under a different name (`harbor start {} --name <other>`)",
             canon.display(),
             canon.display()
         ));
     }
     let harbor = std::env::var("HARBOR_BIN").unwrap_or_else(|_| "harbor".to_string());
-    eprintln!("pilot: summoning a berth for {} (idle-exit {})", canon.display(), life.describe());
+    eprintln!("pilot: starting a temp database for {} (exits after {} idle)", canon.display(), life.describe());
     let mut cmd = std::process::Command::new(&harbor);
     cmd.args(["start"]).arg(&canon).args(["--name", &name]);
     // A Lifetime knows its own argv, so "never" reaches harbor as the absence
@@ -504,13 +459,13 @@ fn ensure_berth(
         return Err(format!("harbor start failed for {}", canon.display()));
     }
     let transport = berth_transport(&home, &name)
-        .ok_or_else(|| format!("harbor start returned without registering berth {name:?}"))?;
+        .ok_or_else(|| format!("harbor start returned without registering {name:?}"))?;
     Ok((transport, berth_token(&home, &name)))
 }
 
 fn fleet_hint(home: &std::path::Path) -> String {
     let names: Vec<String> = berth_entries(home).into_iter().map(|(n, _)| n).collect();
-    if names.is_empty() { String::new() } else { format!("; live berths: {}", names.join(", ")) }
+    if names.is_empty() { String::new() } else { format!("; running: {}", names.join(", ")) }
 }
 
 /// The dial reconcile needs for the one row a lock file cannot settle.
@@ -547,7 +502,7 @@ fn show_fleet(cfg: &config::FileConfig) -> ExitCode {
     let st = Style::stdout().with_choice(cfg.defaults.color.as_deref());
     if rows.is_empty() {
         println!("Nothing configured, nothing running.\n");
-        println!("  pilot <db.duckdb>   open a database — a berth starts itself");
+        println!("  pilot <db.duckdb>   open a database file — served on demand");
         return ExitCode::SUCCESS;
     }
     print!("{}", harbor_common::fleet::table(&rows).render(&st));
@@ -602,7 +557,7 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
                         Some(Duration::from_secs(2)),
                     );
                 } else {
-                    eprintln!("\npilot: second interrupt — leaving (the berth keeps cancelling)");
+                    eprintln!("\npilot: second interrupt — leaving (the server keeps cancelling)");
                     std::process::exit(130);
                 }
             }

@@ -48,8 +48,8 @@ fn main() -> ExitCode {
         "serve" => serve(rest),
         "start" => start(rest),
         "show" => show(rest),
-        "stop" => stop_berth(rest, false),
-        "forget" => stop_berth(rest, true),
+        "stop" => stop_database(rest, false),
+        "forget" => stop_database(rest, true),
         "doctor" => doctor_cmd(rest),
         "-h" | "--help" | "help" => {
             print!("{HELP}");
@@ -74,9 +74,9 @@ const HELP: &str = "\
 harbor — DuckDB wearing a server
 
 usage:
-  harbor show   [name]              the fleet, or one berth in detail
-  harbor start  <name|db.duckdb>    spawn a detached berth, wait until ready
-  harbor stop   <name>              SIGTERM the berth: drain, CHECKPOINT, exit
+  harbor show   [name]              the fleet, or one database in detail
+  harbor start  <name|db.duckdb>    start a database in the background, wait ready
+  harbor stop   <name>              drain, CHECKPOINT, and stop it
   harbor forget <name>              stop it and drop it (never the database)
   harbor doctor                     check the config for what nothing else sees
   harbor serve  <db.duckdb> [opts]  own a database, serve it (foreground)
@@ -84,7 +84,7 @@ usage:
 
 Bare `harbor` is `harbor show`.
 
-A bare word always names a configured berth, never a file — which is what
+A bare word always names a configured database, never a file — which is what
 stops `harbor start medlabs`, run from the wrong directory, from meaning the
 file ./medlabs. A path carries a / or ends in .duckdb.
 
@@ -92,7 +92,7 @@ serve/start options (a config entry may set any of these; a flag here wins):
   --create            allow a database file that does not exist yet (the
                       positional is a PATH; without this flag a missing
                       file is an error, never a fresh database)
-  --name <n>          berth name (default: db file stem)
+  --name <n>          the name to serve under (default: db file stem)
   --socket <path>     unix socket (Unix only; default there: $HARBOR_HOME/runtime/<name>.sock)
   --port <p>          listen on TCP 127.0.0.1:<p> instead of a unix socket
   --bind <addr>       TCP bind address (with --port; default 127.0.0.1)
@@ -102,14 +102,14 @@ serve/start options (a config entry may set any of these; a flag here wins):
   --memory-limit <s>  DuckDB memory_limit (default 2GB — fleet-safe)
   --threads <n>       DuckDB threads (default: DuckDB's own)
   --idle-exit <d>     drain, CHECKPOINT and exit after <d> (e.g. 90s, 10m) with
-                      no requests and no live sessions (ephemeral berths)
+                      no requests and no live sessions (a temp database)
   --init <sql>        run SQL at boot, before serving (repeatable) — the door
                       for extensions: --init 'LOAD <ext>'
   --unsigned          allow unsigned extensions (open-time only; needed to
                       LOAD a locally built, unsigned extension)
-  --sealed            lock the berth to SQL on its own database: no host file
+  --sealed            lock the server to SQL on its own database: no host file
                       access (read_csv/COPY), no community extensions. For a
-                      berth an untrusted caller can reach
+                      database an untrusted caller can reach
   --statement-timeout <d>  hard deadline ceiling per statement (e.g. 30s); a
                       request may ask for a shorter timeout, but not a longer one
   --max-temp-size <s>  cap spill-to-disk (e.g. 10GB; default: DuckDB's own)
@@ -192,7 +192,7 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
     // in front of real data once already. Creation is opt-in, loudly.
     if !o.db.exists() && !o.create {
         return Err(format!(
-            "database file not found: {} (the argument is a path, not a berth name; pass --create to make a new database here)",
+            "database file not found: {} (the argument is a path, not a configured name; pass --create to make a new database here)",
             o.db.display()
         ));
     }
@@ -267,11 +267,11 @@ fn claim_lock(path: &Path) -> Result<std::fs::File, String> {
                     }
                     // Unlinked or replaced under us: drop it and take the new one.
                     _ if Instant::now() < deadline => continue,
-                    _ => return Err(format!("berth lock {} keeps changing", path.display())),
+                    _ => return Err(format!("lock {} keeps changing", path.display())),
                 }
             }
             if Instant::now() >= deadline {
-                return Err(format!("berth lock {} is already claimed", path.display()));
+                return Err(format!("lock {} is already claimed", path.display()));
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -293,7 +293,7 @@ fn claim_lock(path: &Path) -> Result<std::fs::File, String> {
                     std::thread::sleep(Duration::from_millis(20))
                 }
                 Err(_) => {
-                    return Err(format!("berth lock {} is already claimed", path.display()));
+                    return Err(format!("lock {} is already claimed", path.display()));
                 }
             }
         }
@@ -339,7 +339,7 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
     // definition and safe to unlink. Never unlink without the lock.
     let lock_path = home.join(format!("{}.lock", o.name));
     let lock = claim_lock(&lock_path).map_err(|_| {
-        format!("berth {:?} is already claimed in {}", o.name, home.display())
+        format!("{:?} is already claimed in {}", o.name, home.display())
     })?;
     std::mem::forget(lock); // hold the flock until the process exits
 
@@ -461,6 +461,8 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         "harborVersion": VERSION,
         "duckdbVersion": duckdb_version,
         "startedAtMs": started_ms,
+        // `show` marks a temp database with its idle window; null = permanent.
+        "idleExitMs": o.idle_exit.map(|d| d.as_millis() as u64),
     });
     let json_path = home.join(format!("{}.json", o.name));
     let tmp = home.join(format!("{}.json.tmp", o.name));
@@ -469,9 +471,9 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         .map_err(|e| format!("registry json: {e}"))?;
 
     eprintln!(
-        "harbor {VERSION}: berth {:?} serving {} on {} (duckdb {}, memory_limit {})",
-        o.name,
+        "harbor {VERSION}: serving {} as {:?} on {} (duckdb {}, memory_limit {})",
         o.db.display(),
+        o.name,
         addr,
         duckdb_version,
         o.memory_limit
@@ -489,7 +491,7 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
             std::thread::sleep(tick);
             if harbor::idle_ms() >= idle.as_millis() as u64 && harbor::quiet() {
                 eprintln!(
-                    "harbor: idle {}s with no sessions — leaving the berth",
+                    "harbor: idle {}s with no sessions — exiting",
                     idle.as_secs()
                 );
                 let _ = harbor::stop();
@@ -508,7 +510,7 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
     // with no holder is harmless — but unlinking it while another claimant
     // has the old inode open lets a third claimant create a fresh inode and
     // flock it too: two winners, one database. Never unlink a lock file.
-    eprintln!("harbor: berth {:?} closed ({farewell})", o.name);
+    eprintln!("harbor: {:?} closed ({farewell})", o.name);
     Ok(())
 }
 
@@ -633,7 +635,7 @@ fn spawn_detached(rest: Vec<String>) -> Result<(), String> {
         // dead child's pid — which an orchestrator then records and signals.
         if let Ok(Some(status)) = child.try_wait() {
             return Err(format!(
-                "the berth did not start ({status}); a berth may already serve this name — \
+                "the database did not start ({status}); something may already serve this name — \
                  see harbor show, or {}",
                 log_path.display()
             ));
@@ -670,7 +672,7 @@ fn spawn_detached(rest: Vec<String>) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Err(format!("berth {:?} did not come up in 15s — see {}", o.name, log_path.display()))
+    Err(format!("{:?} did not come up in 15s — see {}", o.name, log_path.display()))
 }
 
 /// The dial of last resort, for the one row shape a lock file cannot settle.
@@ -818,7 +820,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
 /// not act on a guess that starts a server.
 fn unknown_berth(cfg: &harbor_common::config::FileConfig, name: &str) -> String {
     let known: Vec<&str> = cfg.berths().into_iter().map(|(n, _)| n).collect();
-    let mut msg = format!("no berth named {name:?} in your config");
+    let mut msg = format!("no database named {name:?} in your config");
     if let Some(near) = known.iter().find(|k| edit_distance(k, name) <= 2) {
         msg.push_str(&format!("\n        did you mean: {near}?"));
     }
@@ -826,7 +828,7 @@ fn unknown_berth(cfg: &harbor_common::config::FileConfig, name: &str) -> String 
         true => msg.push_str("\n        nothing is configured yet — harbor start <db.duckdb>"),
         false => msg.push_str(&format!("\n        configured: {}", known.join(", "))),
     }
-    msg.push_str("\n        (a bare word always names a berth; a path needs a / or .duckdb)");
+    msg.push_str("\n        (a bare word always names a configured database; a path needs a / or .duckdb)");
     msg
 }
 
@@ -897,7 +899,7 @@ fn entry_args(
 /// quietly become a file that is not there.
 fn start(rest: Vec<String>) -> Result<(), String> {
     let Some(first) = rest.first() else {
-        return Err("which berth? (try: harbor show)".into());
+        return Err("which database? (try: harbor show)".into());
     };
     if first.starts_with('-') || harbor_common::looks_like_path(first) {
         return spawn_detached(rest);
@@ -959,10 +961,10 @@ fn show_after_change(lead: bool) -> Result<(), String> {
 fn show(rest: Vec<String>) -> Result<(), String> {
     use harbor_common::ui::{Panel, Style};
     if let Some(flag) = rest.iter().find(|a| a.starts_with('-')) {
-        return Err(format!("harbor show takes a berth name, not {flag:?}"));
+        return Err(format!("harbor show takes a database name, not {flag:?}"));
     }
     if rest.len() > 1 {
-        return Err("harbor show takes at most one berth name".into());
+        return Err("harbor show takes at most one database name".into());
     }
     let cfg = load_config()?;
     // Read-only: never create or chmod anything just to list.
@@ -1015,7 +1017,7 @@ fn show(rest: Vec<String>) -> Result<(), String> {
     if rows.is_empty() {
         println!("Nothing configured, nothing running.\n");
         println!("  harbor start <db.duckdb>   remember a database and start it");
-        println!("  pilot <db.duckdb>          just open one — a berth starts itself");
+        println!("  pilot <db.duckdb>          just open one — served on demand");
         return Ok(());
     }
 
@@ -1057,8 +1059,8 @@ fn doctor_cmd(rest: Vec<String>) -> Result<(), String> {
     }
 }
 
-fn stop_berth(rest: Vec<String>, remove: bool) -> Result<(), String> {
-    let name = rest.first().ok_or("which berth? (try: harbor show)")?;
+fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
+    let name = rest.first().ok_or("which database? (try: harbor show)")?;
     let name = normalize(name)?;
     let home = harbor_home()?;
     let json_path = home.join(format!("{name}.json"));
@@ -1075,7 +1077,7 @@ fn stop_berth(rest: Vec<String>, remove: bool) -> Result<(), String> {
                 let pid = j["pid"].as_u64().map(|p| p.to_string()).unwrap_or_default();
                 if !remove {
                     return Err(format!(
-                        "berth {name:?} is not running (stale pid {pid}); nothing to signal. \
+                        "{name:?} is not running (stale pid {pid}); nothing to signal. \
                          Use `harbor forget {name}` to clear the registry entry."
                     ));
                 }
@@ -1089,7 +1091,7 @@ fn stop_berth(rest: Vec<String>, remove: bool) -> Result<(), String> {
                 while Instant::now() < deadline {
                     if unsafe { libc::kill(pid as i32, 0) } != 0 {
                         died = true;
-                        println!("berth {name:?} stopped (drained and checkpointed)");
+                        println!("{name:?} stopped (drained and checkpointed)");
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(100));
@@ -1101,7 +1103,7 @@ fn stop_berth(rest: Vec<String>, remove: bool) -> Result<(), String> {
                     // inode, flock it, and claim the same name — two berths,
                     // one database, the exact thing the mutex prevents.
                     return Err(format!(
-                        "berth {name:?} (pid {pid}) is still running 35s after SIGTERM — \
+                        "{name:?} (pid {pid}) is still running 35s after SIGTERM — \
                          nothing was removed. Escalate by hand if you mean it: kill -9 {pid}"
                     ));
                 }
@@ -1109,14 +1111,14 @@ fn stop_berth(rest: Vec<String>, remove: bool) -> Result<(), String> {
                 #[cfg(windows)]
                 {
                     let (bind, port) = registered_tcp(&home, &name)
-                        .ok_or_else(|| format!("berth {name:?} has no registered TCP address"))?;
+                        .ok_or_else(|| format!("{name:?} has no registered TCP address"))?;
                     let token = std::fs::read_to_string(home.join(format!("{name}.token")))
                         .ok()
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty());
                     if !shutdown_tcp(&bind, port, token.as_deref()) {
                         return Err(format!(
-                            "berth {name:?} (pid {pid}) refused the graceful shutdown request"
+                            "{name:?} (pid {pid}) refused the graceful shutdown request"
                         ));
                     }
                     let deadline = Instant::now() + Duration::from_secs(35);
@@ -1125,18 +1127,18 @@ fn stop_berth(rest: Vec<String>, remove: bool) -> Result<(), String> {
                     }
                     if !berth_dead(&lock_path) {
                         return Err(format!(
-                            "berth {name:?} (pid {pid}) is still running 35s after shutdown — \
+                            "{name:?} (pid {pid}) is still running 35s after shutdown — \
                              nothing was removed. Escalate with Task Manager if you mean it."
                         ));
                     }
-                    println!("berth {name:?} stopped (drained and checkpointed)");
+                    println!("{name:?} stopped (drained and checkpointed)");
                 }
             }
         }
     } else if sock.exists() {
-        return Err(format!("berth {name:?} has a socket but no registry json; kill it by pid"));
+        return Err(format!("{name:?} has a socket but no registry json; kill it by pid"));
     } else if !remove {
-        return Err(format!("no berth named {name:?}"));
+        return Err(format!("nothing named {name:?}"));
     }
 
     if remove {

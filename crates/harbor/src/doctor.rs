@@ -66,7 +66,7 @@ pub fn check_entries(cfg: &FileConfig) -> Vec<Finding> {
         let (title, fix) = match (c.path.is_some(), c.url.is_some()) {
             (true, true) => (
                 format!("[connection.{name}] sets both path and url"),
-                format!("keep one: path makes {name} a local berth, url makes it a remote"),
+                format!("keep one: path makes {name} local, url makes it remote"),
             ),
             _ => (
                 format!("[connection.{name}] sets neither path nor url"),

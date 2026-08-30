@@ -222,7 +222,7 @@ pub const DOT_COMMANDS: &[(&str, &str, &str)] = &[
     ("tables", "", "SHOW TABLES"),
     ("schema", "[t]", "CREATE statements, one table or all"),
     ("databases", "", "the live fleet"),
-    ("open", "<target>", "switch berth (name, path, url)"),
+    ("open", "<target>", "switch database (name, path, url)"),
     ("read", "<file.sql>", "run a script, statement by statement"),
     ("keymode", "vi|emacs", "keybindings (default emacs)"),
     ("theme", "[name]", "syntax colors: duck | mono | vivid"),
@@ -398,7 +398,7 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
         "quit" | "exit" | "q" => return DotResult::Quit,
         "open" => match parts.next() {
             Some(t) => return DotResult::Open(t.to_string()),
-            None => eprintln!("pilot: .open <berth|path|url>"),
+            None => eprintln!("pilot: .open <name|path|url>"),
         },
         "keymode" => match parts.next() {
             Some("vi") => return DotResult::Keymode(true),

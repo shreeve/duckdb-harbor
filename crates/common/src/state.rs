@@ -33,7 +33,7 @@ pub enum Level {
 pub enum State {
     /// Configured, running, and serving what the config says.
     Running,
-    /// Configured, not running. Opens on demand.
+    /// Configured, not running. Starts with `harbor start`.
     Stopped,
     /// Running, but the database or the options differ from the config now.
     Drifted,

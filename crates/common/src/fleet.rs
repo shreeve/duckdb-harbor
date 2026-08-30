@@ -96,6 +96,9 @@ fn now_ms() -> u64 {
 pub struct Row {
     pub name: String,
     pub state: State,
+    /// A temp database's idle window in ms — it exits on its own after this
+    /// much quiet. None = permanent: it runs until stopped.
+    pub idle_exit_ms: Option<u64>,
     pub pid: Option<u64>,
     pub uptime: Option<String>,
     pub db: String,
@@ -185,7 +188,7 @@ pub fn reconcile(cfg: &FileConfig, home: &Path, probe: &dyn Fn(&Addr) -> bool) -
             // A lock left by a clean exit is normal residue, not a mess.
             (Claim::Free, false, true) | (Claim::None, false, true) => State::Stopped,
             (Claim::Free, false, false) => {
-                note = Some(format!("left by a berth that is gone — harbor forget {name}"));
+                note = Some(format!("left by a database that is gone — harbor forget {name}"));
                 State::Stale
             }
             // Sidecar, no lock at all: the only row that has to be dialled.
@@ -207,6 +210,9 @@ pub fn reconcile(cfg: &FileConfig, home: &Path, probe: &dyn Fn(&Addr) -> bool) -
 
         rows.push(Row {
             state,
+            idle_exit_ms: side
+                .and_then(|j| j["idleExitMs"].as_u64())
+                .filter(|_| state.is_live()),
             pid: side.and_then(|j| j["pid"].as_u64()).filter(|_| state.is_live()),
             uptime: uptime.filter(|_| state.is_live()),
             db: match (live_db.is_empty(), want_db.is_empty()) {
@@ -230,9 +236,19 @@ pub fn table(rows: &[Row]) -> crate::ui::Table {
     use crate::ui::{Cell, Table};
     let mut t = Table::new(["NAME", "STATE", "PID", "UPTIME", "ADDRESS", "DATABASE"]);
     for r in rows {
+        // A temp database says so, and says when it will leave:
+        // `● running (temp 90s)`.
+        let state_cell = match r.idle_exit_ms {
+            Some(ms) => format!(
+                "{} (temp {})",
+                r.state.label(),
+                crate::lifetime::humanize(Duration::from_millis(ms))
+            ),
+            None => r.state.label(),
+        };
         t.row([
             Cell::new(&r.name),
-            Cell::new(r.state.label()).tone(r.state.level().into()),
+            Cell::new(state_cell).tone(r.state.level().into()),
             Cell::new(r.pid.map(|p| p.to_string()).unwrap_or("—".into())).right(),
             Cell::new(r.uptime.clone().unwrap_or("—".into())).right(),
             Cell::new(r.addr.as_ref().map(Addr::full).unwrap_or("—".into())),

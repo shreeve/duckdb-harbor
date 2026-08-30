@@ -269,9 +269,13 @@ harbor + pilot and the exact DuckDB shared library they were built against.
 Unix archives carry `bin/`, `lib/` and `install.sh`; Windows archives put
 `duckdb.dll` beside the two executables and run in place.
 
-`harbor serve` runs in the foreground. `harbor start <name|db.duckdb>` spawns a
-**detached** berth and returns once it answers `/ready` — a bare word names a
-berth in your config, a path names a file. `harbor show` (or bare `harbor`)
+`harbor serve` runs in the foreground. `harbor start <name|db.duckdb>` starts a
+database in the **background** and returns once it answers `/ready` — a bare
+word names an entry in your config, a path names a file. A configured name is
+a service: it starts and stops when you say so, and never on demand. A *path*
+handed to `pilot` is the on-demand form: it joins the running server for that
+file or starts a temp one that exits on its own after sitting idle
+(`harbor show` marks these: `● running (temp 1m30s)`). `harbor show` (or bare `harbor`)
 lists the fleet and `harbor show <name>` details one; `harbor stop <name>`
 drains and `CHECKPOINT`s; `harbor forget <name>` clears the registry, never the
 database file; `harbor doctor` checks the config for what nothing else has a
