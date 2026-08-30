@@ -1218,8 +1218,7 @@ impl Grid {
             let np = (pos as i32 + dc).clamp(0, d.visible.len() as i32 - 1) as usize;
             let nc = d.visible[np];
             d.active_cell = Some((nr, nc));
-            d.selected = Some(nr);
-            state.set_selected_row(nr, cx);
+            select_row(state, nr, cx);
             cx.notify();
         });
         cx.notify();
@@ -1253,6 +1252,11 @@ impl Grid {
             let d = state.delegate_mut();
             d.staged = staged;
             d.deleted = deleted;
+            // Dirtiness just changed under the selection: re-decide the
+            // wash (undoing a row's last edit gives its wash back).
+            if let Some(row) = state.delegate().selected {
+                select_row(state, row, cx);
+            }
             state.refresh(cx);
             cx.notify();
         });
@@ -1404,7 +1408,33 @@ impl Grid {
     }
 }
 
+/// Select a row the dirty-aware way. The delegate always records it —
+/// the ring and ⌘⌫ need a selected row — but the library's selection
+/// (the blue row wash) is only requested for clean rows: once a row
+/// carries staged changes, its amber or red owns the story, and two
+/// washes fighting on one row read as confusion, not state.
+fn select_row(
+    state: &mut TableState<GridDelegate>,
+    row: usize,
+    cx: &mut Context<TableState<GridDelegate>>,
+) {
+    state.delegate_mut().selected = Some(row);
+    if state.delegate().row_dirty(row) {
+        state.clear_selection(cx);
+        state.delegate_mut().selected = Some(row);
+        state.scroll_to_row(row, cx);
+    } else {
+        state.set_selected_row(row, cx);
+    }
+}
+
 impl GridDelegate {
+    /// A row carrying any staged change — the rows whose color already
+    /// tells a story, so the selection wash stays off them.
+    fn row_dirty(&self, row: usize) -> bool {
+        self.deleted.contains(&row) || self.staged.keys().any(|(r, _)| *r == row)
+    }
+
     /// Adopt a page's schema and rows — the one birth, shared by Grid::new
     /// and the first successful fetch of an error-born grid. The display
     /// names are derived here, once: three surfaces (headers, popover,
@@ -1579,6 +1609,8 @@ impl TableDelegate for GridDelegate {
         // Column 0 is the row-number gutter: raised, muted, and a firmer
         // divider than the data cells (design.css `.grid td.num`).
         if self.gutter && col_ix == 0 {
+            let row_deleted = self.deleted.contains(&row_ix);
+            let row_dirty = !row_deleted && self.staged.keys().any(|(r, _)| *r == row_ix);
             return div()
                 .h_flex()
                 .relative()
@@ -1590,13 +1622,18 @@ impl TableDelegate for GridDelegate {
                 // Select-all darkens the number rail a shade deeper than
                 // the cells, the way Sheets treats its row headers.
                 .when(self.all_selected, |d| d.bg(t.accent.opacity(0.16)))
+                // A dirty row's number wears the row's own story — amber
+                // for staged updates, red for a staged delete — so dirt
+                // stays findable even with its column scrolled off-screen.
+                .when(row_dirty, |d| d.bg(t.warn.opacity(0.18)))
+                .when(row_deleted, |d| d.bg(t.bad.opacity(0.10)))
                 .border_b_1()
                 .border_color(t.grid_line)
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |state, _, _, cx| {
                         state.delegate_mut().all_selected = false;
-                        state.set_selected_row(row_ix, cx);
+                        select_row(state, row_ix, cx);
                     }),
                 )
                 .child(
@@ -1645,9 +1682,14 @@ impl TableDelegate for GridDelegate {
                             .border_color(t.accent),
                     )
                     .child(
-                        div().w_full().px(px(2.)).child(
+                        div().w_full().child(
                             gpui_component::input::Input::new(&input)
                                 .appearance(false)
+                                // Zero the input's built-in left inset so
+                                // the caret sits exactly on the column's
+                                // text axis — editing must not nudge the
+                                // value sideways.
+                                .pl(px(0.))
                                 .text_size(px(CELL_TEXT * p.zoom_factor()))
                                 .font_family(value_font()),
                         ),
@@ -1696,8 +1738,9 @@ impl TableDelegate for GridDelegate {
                         .bg(t.accent.opacity(0.08)),
                 )
             })
-            // Staged-but-uncommitted: the soft accent wash that says
-            // "yours, not yet the database's" (docs/EDITING.md). Same
+            // Staged-but-uncommitted: a soft amber wash — "modified, not
+            // yet saved," the color that is neither the accent (where you
+            // are) nor the danger red (what you are destroying). Same
             // full-bleed layer trick as select-all, same reason.
             .when(is_staged && !is_deleted, |d| {
                 d.child(
@@ -1707,7 +1750,7 @@ impl TableDelegate for GridDelegate {
                         .bottom_0()
                         .left(px(-PANE_INSET))
                         .right_0()
-                        .bg(t.accent.opacity(0.14)),
+                        .bg(t.warn.opacity(0.16)),
                 )
             })
             // A staged DELETE ghosts the whole row: a danger wash here,
@@ -1746,7 +1789,7 @@ impl TableDelegate for GridDelegate {
                     let d = state.delegate_mut();
                     d.all_selected = false;
                     d.active_cell = Some((row_ix, data_col));
-                    state.set_selected_row(row_ix, cx);
+                    select_row(state, row_ix, cx);
                     cx.notify();
                 }),
             )
