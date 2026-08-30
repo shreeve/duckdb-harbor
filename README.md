@@ -44,8 +44,9 @@ fleet shutdown route:
 POST /sql                  run one statement, stream the result as NDJSON
                            (Accept: application/json for one document instead)
 GET  /ready                can this server answer a query? no credential required
-GET  /catalog              the whole schema — tables, keys, unique constraints,
-                           indexes, sequences — as one stable JSON document
+GET  /catalog              everything about the database in one stable JSON
+                           document — schema, sizes, row estimates, DDL
+                           (?style=lite for the cheap sketch)
 GET  /info                 berth identity — name, harbor + DuckDB versions, pid
 GET  /keepalive            keep an idle-exit berth alive while Pilot has a prompt
 DELETE /shutdown           authenticated drain, checkpoint, and stop
@@ -194,6 +195,31 @@ touching the same row do not queue, the second is refused the moment it writes.
 The answer is to run the transaction again, which is what `rip/db` does for
 you.
 
+## The whole database, one call
+
+`GET /catalog` answers what a client would otherwise ask in a dozen queries:
+every table with its columns, primary key, unique constraints, foreign keys,
+indexes and sequences — plus the engine's row estimate and its own
+`CREATE TABLE` rendering per table, and the database and WAL file sizes in
+exact bytes at the top:
+
+```json
+{"harborVersion":"0.18.0","duckdbVersion":"v2.0.0-alpha38195",
+ "databaseSizeBytes":12582912,"walSizeBytes":0,
+ "tables":[{"name":"orders","schema":"main","estimatedRows":300000,
+            "columns":[…],"primaryKey":["id"],
+            "ddl":"CREATE TABLE orders(id BIGINT PRIMARY KEY, …);"}, …],
+ …}
+```
+
+The document is stable — same database, same bytes — so clients can diff it.
+A fleet client that only wants to paint a sidebar asks
+`GET /catalog?style=lite` and gets the versions, the sizes, and
+`{name, schema, estimatedRows}` per table: what exists and how big, without
+how it is built, at a fraction of the bytes. An unknown style value is a loud
+`400`; unknown parameters pass, which is what lets an older harbor answer a
+newer client's ask with the full document instead of a 404.
+
 ## Get it running
 
 Two binaries: **`harbor`** (the server and fleet manager) and **`pilot`** (the
@@ -207,7 +233,7 @@ compatible library at runtime. A build needs a libduckdb to link against.
 $ make fetch-duckdb                       # libduckdb + duckdb CLI -> ~/.duckdb/cli/2.0.0/
 $ make harbor pilot                       # -> target/release/{harbor,pilot}
 $ harbor serve mydata.duckdb --token secret
-harbor 0.15.0: berth "mydata" serving mydata.duckdb on ~/.local/state/harbor/runtime/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
+harbor 0.18.0: berth "mydata" serving mydata.duckdb on ~/.local/state/harbor/runtime/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
 ```
 
 `make bootstrap` does the whole thing in one shot — fetch the engine into
@@ -235,7 +261,7 @@ with `sudo` in front of the whole command — the installer never escalates on
 its own. On Windows the binaries land in `%LOCALAPPDATA%\Programs\harbor\bin`,
 which the installer adds to your user `PATH`.
 
-Pin a version with `... | bash -s v0.15.0` (or `-Tag v0.15.0` on Windows). Each
+Pin a version with `... | bash -s v0.18.0` (or `-Tag v0.18.0` on Windows). Each
 [release](https://github.com/shreeve/duckdb-harbor/releases)
 ships one self-contained archive per
 platform (osx-arm64, linux-amd64, linux-arm64, windows-amd64, windows-arm64):
@@ -507,7 +533,7 @@ crates:
 - **`justhttp`** — Harbor's small synchronous HTTP/1.1 server over TCP and Unix
   sockets.
 
-Harbor currently implements its protocol shapes directly rather than depending
+Harbor implements its protocol shapes directly rather than depending
 on `wire`, so a wire change needs tests on both sides; drift is not a Rust
 compile error. Harbor links an external `libduckdb` rather than embedding one,
 so no DuckDB source tree is required — `make fetch-duckdb` fetches a libduckdb
@@ -517,7 +543,7 @@ bindings, so there is no bindgen and no headers to find.
 `make unit` runs the fast Rust tests and `make test` runs the full suite. The
 full suite expects `sample.duckdb`; create it with
 `test/scripts/fixture.sh sample.duckdb` when it is absent. CI performs that
-fixture step explicitly. The ten suites use independent oracles where answers
+fixture step explicitly. The eleven suites use independent oracles where answers
 need comparison — values read from the database file before the server takes
 the lock, and Python's own `datetime` and `base64` for fuzzed values. An oracle
 that shares an implementation with the thing it checks confirms only that the
@@ -525,11 +551,11 @@ code is self-consistent.
 
 ## Status
 
-Pre-production. harbor and pilot are two small binaries — no Harbor extension,
-launcher, or signing dance. Harbor is dynamically linked: the same build has
-served DuckDB 1.5.5 and a 2.0 development build by resolving the compatible
-`libduckdb` beside it. Deploy remote TCP behind Caddy, which owns TLS and edge
-request policy; Harbor independently owns SQL statement deadlines.
+Pre-production. harbor and pilot are two small binaries. Harbor is dynamically
+linked: the same build has served DuckDB 1.5.5 and a 2.0 development build by
+resolving the compatible `libduckdb` beside it. Deploy remote TCP behind
+Caddy, which owns TLS and edge request policy; Harbor independently owns SQL
+statement deadlines.
 
 ## License
 
