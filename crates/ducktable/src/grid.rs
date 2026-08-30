@@ -96,6 +96,9 @@ pub(crate) struct GridDelegate {
     numeric: Vec<bool>,
     /// Schema indices hidden via the Columns popover.
     hidden: std::collections::HashSet<usize>,
+    /// User drag-resizes, schema index → width, reapplied whenever the
+    /// column list rebuilds (toggles, refreshes).
+    widths: std::collections::HashMap<usize, Pixels>,
     /// Schema index for each data column currently displayed — the map
     /// render_td/th use, since col_ix stops matching schema order once
     /// anything is hidden.
@@ -154,6 +157,7 @@ impl Grid {
             schema_cols: Vec::new(),
             numeric: Vec::new(),
             hidden: std::collections::HashSet::new(),
+            widths: std::collections::HashMap::new(),
             visible: Vec::new(),
             gutter,
             total_rows,
@@ -183,21 +187,50 @@ impl Grid {
                 delegate.error = Some(message);
             }
         }
-        let table = cx.new(|cx| TableState::new(delegate, window, cx));
+        // Header dragging stays off until move_column permutes the
+        // visible map for real — the library default half-enables it
+        // (widths reorder, contents don't).
+        let table =
+            cx.new(|cx| TableState::new(delegate, window, cx).col_movable(false));
         cx.subscribe(&table, |_, table, event: &gpui_component::table::TableEvent, cx| {
-            if let gpui_component::table::TableEvent::SelectRow(ix) = event {
-                let ix = *ix;
-                table.update(cx, |state, cx| {
-                    let d = state.delegate_mut();
-                    d.selected = Some(ix);
-                    // Keyboard row moves carry the active-cell ring to the
-                    // same column of the new row (Sheets' arrow behavior).
-                    if let Some((_, col)) = d.active_cell {
-                        d.active_cell = Some((ix, col));
-                    }
+            match event {
+                gpui_component::table::TableEvent::SelectRow(ix) => {
+                    let ix = *ix;
+                    table.update(cx, |state, cx| {
+                        let d = state.delegate_mut();
+                        d.selected = Some(ix);
+                        // Keyboard row moves carry the active-cell ring to
+                        // the same column of the new row (Sheets' arrow
+                        // behavior).
+                        if let Some((_, col)) = d.active_cell {
+                            d.active_cell = Some((ix, col));
+                        }
+                        cx.notify();
+                    });
                     cx.notify();
-                });
-                cx.notify();
+                }
+                gpui_component::table::TableEvent::ColumnWidthsChanged(widths) => {
+                    // Mirror drag-resizes into the delegate, keyed by
+                    // schema column — otherwise any refresh rebuilds the
+                    // layout from the delegate's original widths and the
+                    // user's resize snaps back.
+                    let widths = widths.clone();
+                    table.update(cx, |state, _| {
+                        let d = state.delegate_mut();
+                        let g = d.gutter as usize;
+                        for (i, w) in widths.iter().enumerate() {
+                            if let Some(col) = d.cols.get_mut(i) {
+                                col.width = *w;
+                            }
+                            if i >= g {
+                                if let Some(&schema_ix) = d.visible.get(i - g) {
+                                    d.widths.insert(schema_ix, *w);
+                                }
+                            }
+                        }
+                    });
+                }
+                _ => {}
             }
         })
         .detach();
@@ -629,6 +662,12 @@ impl GridDelegate {
         self.visible =
             (0..self.schema_cols.len()).filter(|i| !self.hidden.contains(i)).collect();
         self.cols = build_columns(&self.schema_cols, &self.visible, self.gutter);
+        let g = self.gutter as usize;
+        for (disp, schema_ix) in self.visible.iter().enumerate() {
+            if let Some(&w) = self.widths.get(schema_ix) {
+                self.cols[disp + g].width = w;
+            }
+        }
         if self.gutter {
             let last = (self.page * self.page_size + self.rows.len()) as u64;
             self.cols[0].width = px(gutter_width(last));
