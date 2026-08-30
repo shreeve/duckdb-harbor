@@ -456,35 +456,19 @@ impl Render for Grid {
                 if count == 1 && eof { "row" } else { "rows" }
             ),
         };
-        // The footer status is mode-relevant: data facts for Data, schema
-        // facts for Structure.
+        // The footer status is mode-relevant, and "N columns" is ALWAYS
+        // the last element: it stays fixed at the right edge when the
+        // view switches, and the data-only facts simply disappear.
+        let columns_part = format!("{cols} {}", if cols == 1 { "column" } else { "columns" });
         let status = match view {
             ViewMode::Data => {
                 if loading && count == 0 {
                     "loading...".to_string()
                 } else {
-                    format!(
-                        "{rows_part} \u{00b7} {cols} {} \u{00b7} {ms} ms",
-                        if cols == 1 { "column" } else { "columns" },
-                    )
+                    format!("{ms} ms \u{00b7} {rows_part} \u{00b7} {columns_part}")
                 }
             }
-            ViewMode::Structure => match &self.structure {
-                Some(s) => {
-                    let n = s.cols.len();
-                    let keys = s.cols.iter().filter(|c| c.pk).count();
-                    let mut text =
-                        format!("{n} {}", if n == 1 { "column" } else { "columns" });
-                    if keys > 0 {
-                        text.push_str(&format!(
-                            " \u{00b7} {keys} key {}",
-                            if keys == 1 { "column" } else { "columns" }
-                        ));
-                    }
-                    text
-                }
-                None => String::new(),
-            },
+            ViewMode::Structure => columns_part,
         };
         div()
             .size_full()
