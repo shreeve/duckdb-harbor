@@ -90,6 +90,25 @@ pub fn runtime_dir() -> Result<PathBuf, String> {
     Ok(state_root()?.join("runtime"))
 }
 
+/// The registry files a berth owns under runtime/ — one spelling each,
+/// because a filename format string in three crates is how `.hold` becomes
+/// the eighth copy of the seventh typo.
+pub fn sock_file(runtime: &Path, name: &str) -> PathBuf {
+    runtime.join(format!("{name}.sock"))
+}
+pub fn sidecar_file(runtime: &Path, name: &str) -> PathBuf {
+    runtime.join(format!("{name}.json"))
+}
+pub fn token_file(runtime: &Path, name: &str) -> PathBuf {
+    runtime.join(format!("{name}.token"))
+}
+pub fn lock_file(runtime: &Path, name: &str) -> PathBuf {
+    runtime.join(format!("{name}.lock"))
+}
+pub fn log_file(runtime: &Path, name: &str) -> PathBuf {
+    runtime.join("log").join(format!("{name}.log"))
+}
+
 /// pilot's REPL history. State, not config, and not the fleet's business —
 /// it lived in `runtime/` for a while, where every sweep had to special-case
 /// it forever.

@@ -337,20 +337,20 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
     // The flock on <name>.lock is the real mutex: held for process life;
     // if we hold it and the socket file exists, the socket is stale by
     // definition and safe to unlink. Never unlink without the lock.
-    let lock_path = home.join(format!("{}.lock", o.name));
+    let lock_path = harbor_common::lock_file(&home, &o.name);
     let lock = claim_lock(&lock_path).map_err(|_| {
         format!("{:?} is already claimed in {}", o.name, home.display())
     })?;
     std::mem::forget(lock); // hold the flock until the process exits
 
-    let sock_path = o.socket.clone().unwrap_or_else(|| home.join(format!("{}.sock", o.name)));
+    let sock_path = o.socket.clone().unwrap_or_else(|| harbor_common::sock_file(&home, &o.name));
     if cfg!(unix) && o.port.is_none() && sock_path.exists() {
         std::fs::remove_file(&sock_path).map_err(|e| format!("stale socket: {e}"))?;
     }
 
     // Token: an existing <name>.token survives restarts (stable identity for
     // clients and Caddy); minted on first serve. `--token ''` = auth off.
-    let token_path = home.join(format!("{}.token", o.name));
+    let token_path = harbor_common::token_file(&home, &o.name);
     let token: Option<String> = match &o.token {
         Some(t) if t.is_empty() => None,
         Some(t) => Some(t.clone()),
@@ -464,8 +464,8 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         // `show` marks a temp database with its idle window; null = permanent.
         "idleExitMs": o.idle_exit.map(|d| d.as_millis() as u64),
     });
-    let json_path = home.join(format!("{}.json", o.name));
-    let tmp = home.join(format!("{}.json.tmp", o.name));
+    let json_path = harbor_common::sidecar_file(&home, &o.name);
+    let tmp = harbor_common::sidecar_file(&home, &o.name).with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(&info).unwrap())
         .and_then(|_| std::fs::rename(&tmp, &json_path))
         .map_err(|e| format!("registry json: {e}"))?;
@@ -565,9 +565,10 @@ fn duckdb_open(o: &Opts) -> Result<harbor::duckdb::Connection, String> {
 fn spawn_detached(rest: Vec<String>) -> Result<(), String> {
     let o = parse_opts(rest.clone())?;
     let home = harbor_home()?;
-    let log_dir = home.join("log");
-    std::fs::create_dir_all(&log_dir).map_err(|e| format!("log dir: {e}"))?;
-    let log_path = log_dir.join(format!("{}.log", o.name));
+    let log_path = harbor_common::log_file(&home, &o.name);
+    if let Some(dir) = log_path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("log dir: {e}"))?;
+    }
     // Append, never truncate: a berth may already be serving under this name
     // (this start is then the loser of a race, or a mistake), and File::create
     // would wipe the live process's history out from under it — the log an
@@ -626,7 +627,7 @@ fn spawn_detached(rest: Vec<String>) -> Result<(), String> {
     let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
 
     #[cfg(unix)]
-    let sock = o.socket.clone().unwrap_or_else(|| home.join(format!("{}.sock", o.name)));
+    let sock = o.socket.clone().unwrap_or_else(|| harbor_common::sock_file(&home, &o.name));
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         // The child dying is an answer, not a timeout: it lost the flock to a
@@ -659,10 +660,8 @@ fn spawn_detached(rest: Vec<String>) -> Result<(), String> {
             // serves — believe it, not the probe. A missing or mismatched
             // json means our child has not written it (keep polling) or never
             // will (the try_wait above reports that next lap).
-            let served_by = std::fs::read_to_string(home.join(format!("{}.json", o.name)))
-                .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .and_then(|j| j["pid"].as_u64());
+            let served_by =
+                harbor_common::fleet::Sidecar::read(&home, &o.name).and_then(|s| s.pid);
             if served_by == Some(u64::from(child.id())) {
                 // The receipt is the fleet. A one-line "ready on <socket>"
                 // restated the flags you just typed; the table answers the
@@ -687,10 +686,7 @@ fn probe(a: &harbor_common::fleet::Addr) -> bool {
 }
 
 fn ready_tcp(bind: &str, port: u16) -> bool {
-    let bind = match bind {
-        "0.0.0.0" | "::" => "127.0.0.1",
-        other => other,
-    };
+    let bind = harbor_common::fleet::dial_host(bind);
     let Ok(mut s) = std::net::TcpStream::connect((bind, port)) else { return false };
     let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
     probe_200(&mut s)
@@ -698,11 +694,8 @@ fn ready_tcp(bind: &str, port: u16) -> bool {
 
 #[cfg(windows)]
 fn registered_tcp(home: &Path, name: &str) -> Option<(String, u16)> {
-    let text = std::fs::read_to_string(home.join(format!("{name}.json"))).ok()?;
-    let j: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let port = u16::try_from(j["port"].as_u64()?).ok()?;
-    let bind = j["bind"].as_str().unwrap_or("127.0.0.1").to_string();
-    Some((bind, port))
+    let side = harbor_common::fleet::Sidecar::read(home, name)?;
+    Some((side.bind.unwrap_or_else(|| "127.0.0.1".into()), side.port?))
 }
 
 /// GET /ready over the socket — the only HTTP the fleet verbs speak.
@@ -1063,25 +1056,26 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
     let name = rest.first().ok_or("which database? (try: harbor show)")?;
     let name = normalize(name)?;
     let home = harbor_home()?;
-    let json_path = home.join(format!("{name}.json"));
-    let sock = home.join(format!("{name}.sock"));
-
-    let lock_path = home.join(format!("{name}.lock"));
-    if let Ok(s) = std::fs::read_to_string(&json_path) {
-        if let Ok(j) = serde_json::from_str::<serde_json::Value>(&s) {
+    let sock = harbor_common::sock_file(&home, &name);
+    let lock_path = harbor_common::lock_file(&home, &name);
+    if let Some(side) = harbor_common::fleet::Sidecar::read(&home, &name) {
             if berth_dead(&lock_path) {
                 // Proven dead: no process holds the flock, so the pid recorded
                 // in the json is stale and the OS may have recycled it to an
                 // unrelated process. Signalling it would be signalling a
                 // stranger — so don't. `forget` still cleans the registry below.
-                let pid = j["pid"].as_u64().map(|p| p.to_string()).unwrap_or_default();
                 if !remove {
-                    return Err(format!(
-                        "{name:?} is not running (stale pid {pid}); nothing to signal. \
-                         Use `harbor forget {name}` to clear the registry entry."
-                    ));
+                    // The asked-for state already holds, so this is success —
+                    // a berth at rest is not a stranger — but the corpse's
+                    // registry files remain and only forget clears them.
+                    let pid = side.pid.map(|p| p.to_string()).unwrap_or_default();
+                    println!(
+                        "{name:?} is not running (stale pid {pid}) — residue remains; \
+                         harbor forget {name} clears it"
+                    );
+                    return Ok(());
                 }
-            } else if let Some(pid) = j["pid"].as_u64() {
+            } else if let Some(pid) = side.pid {
                 #[cfg(unix)]
                 {
                 // SIGTERM is the contract: drain, CHECKPOINT, exit (core owns it).
@@ -1112,7 +1106,7 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
                 {
                     let (bind, port) = registered_tcp(&home, &name)
                         .ok_or_else(|| format!("{name:?} has no registered TCP address"))?;
-                    let token = std::fs::read_to_string(home.join(format!("{name}.token")))
+                    let token = std::fs::read_to_string(harbor_common::token_file(&home, &name))
                         .ok()
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty());
@@ -1134,7 +1128,6 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
                     println!("{name:?} stopped (drained and checkpointed)");
                 }
             }
-        }
     } else if sock.exists() {
         return Err(format!("{name:?} has a socket but no registry json; kill it by pid"));
     } else if !remove {
@@ -1160,15 +1153,19 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
         // a name that matched nothing at all, which made `forget` a verb that
         // lied about the one thing it does.
         let mut gone: Vec<&str> = Vec::new();
-        for f in ["sock", "json", "token"] {
-            if std::fs::remove_file(home.join(format!("{name}.{f}"))).is_ok() {
+        for (f, path) in [
+            ("sock", harbor_common::sock_file(&home, &name)),
+            ("json", harbor_common::sidecar_file(&home, &name)),
+            ("token", harbor_common::token_file(&home, &name)),
+        ] {
+            if std::fs::remove_file(path).is_ok() {
                 gone.push(f);
             }
         }
-        let _ = std::fs::remove_file(home.join("log").join(format!("{name}.log")));
+        let _ = std::fs::remove_file(harbor_common::log_file(&home, &name));
         // The lock is the last thing to go, and only while we hold it — see
         // unlink_lock_if_free. Nothing else in this file may unlink one.
-        if unlink_lock_if_free(&home.join(format!("{name}.lock"))) {
+        if unlink_lock_if_free(&harbor_common::lock_file(&home, &name)) {
             gone.push("lock");
         }
         match gone.is_empty() {

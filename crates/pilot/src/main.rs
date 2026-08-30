@@ -198,6 +198,12 @@ fn resolve(
 ) -> Result<Conn, String> {
     let env_token = std::env::var("HARBOR_TOKEN").ok();
 
+    let spelled_out = target.starts_with("http://")
+        || target.starts_with("https://")
+        || target.ends_with(".duckdb")
+        || target.ends_with(".sock")
+        || target.contains('/');
+
     // A bare name is a question only the config can answer, so a config that
     // could not be read must not be answered around. Falling through used to
     // mean: one typo anywhere in the file, the whole file discarded (it is
@@ -207,11 +213,6 @@ fn resolve(
     // prompt, different data, one warning line scrolled past. A spelled-out
     // target says what it means without the config's help; a name does not.
     if let Some(e) = cfg_err {
-        let spelled_out = target.starts_with("http://")
-            || target.starts_with("https://")
-            || target.ends_with(".duckdb")
-            || target.ends_with(".sock")
-            || target.contains('/');
         if !spelled_out {
             return Err(format!(
                 "{e}\n        so there is no way to know what {target:?} names. \
@@ -219,6 +220,17 @@ fn resolve(
             ));
         }
     }
+
+    // One name law for the whole fleet: harbor normalizes every name it
+    // mints, so pilot normalizes every name it looks up — `pilot MedLabs`
+    // and `harbor start MedLabs` must land on the same berth.
+    let normalized: String;
+    let target: &str = if spelled_out {
+        target
+    } else {
+        normalized = harbor_common::normalize(target)?;
+        &normalized
+    };
 
     // Explicit config entry shadows a same-named live berth (ssh_config rule).
     if let Some(entry) = cfg.connection.get(target) {
@@ -232,10 +244,8 @@ fn resolve(
                 let expanded = config::expand(p);
                 std::fs::canonicalize(&expanded).unwrap_or(expanded)
             });
-            let live_db = std::fs::read_to_string(home.join(format!("{target}.json")))
-                .ok()
-                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-                .and_then(|j| j["db"].as_str().map(PathBuf::from));
+            let live_db = harbor_common::fleet::Sidecar::read(&home, target)
+                .and_then(|s| s.db.map(PathBuf::from));
             let same = match (&entry_db, &live_db) {
                 (Some(a), Some(b)) => a == b,
                 _ => false,
@@ -315,11 +325,11 @@ fn resolve(
 }
 
 fn berth_sock(home: &std::path::Path, name: &str) -> PathBuf {
-    home.join(format!("{name}.sock"))
+    harbor_common::sock_file(home, name)
 }
 
 fn berth_token(home: &std::path::Path, name: &str) -> Option<String> {
-    let t = std::fs::read_to_string(home.join(format!("{name}.token"))).ok()?;
+    let t = std::fs::read_to_string(harbor_common::token_file(home, name)).ok()?;
     let t = t.trim().to_string();
     if t.is_empty() { None } else { Some(t) }
 }
@@ -327,13 +337,9 @@ fn berth_token(home: &std::path::Path, name: &str) -> Option<String> {
 /// The TCP address a --port berth registered in its sidecar json. Dials the
 /// bind address, or loopback when the berth bound every interface.
 fn berth_tcp(home: &std::path::Path, name: &str) -> Option<Transport> {
-    let text = std::fs::read_to_string(home.join(format!("{name}.json"))).ok()?;
-    let j: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let port = j["port"].as_u64()?;
-    let bind = match j["bind"].as_str() {
-        Some("0.0.0.0") | Some("::") | None => "127.0.0.1",
-        Some(b) => b,
-    };
+    let side = harbor_common::fleet::Sidecar::read(home, name)?;
+    let port = side.port?;
+    let bind = harbor_common::fleet::dial_host(side.bind.as_deref().unwrap_or("127.0.0.1"));
     Some(Transport::Tcp(format!("{bind}:{port}")))
 }
 
@@ -351,20 +357,14 @@ fn berth_transport(home: &std::path::Path, name: &str) -> Option<Transport> {
 /// Every berth the registry knows, with how to dial it — the same sidecar
 /// jsons `harbor show` reads, so socket and --port berths both appear.
 fn berth_entries(home: &std::path::Path) -> Vec<(String, Transport)> {
-    let mut v: Vec<(String, Transport)> = std::fs::read_dir(home)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|x| x == "json"))
-                .filter_map(|p| {
-                    let name = p.file_stem()?.to_string_lossy().into_owned();
-                    let t = berth_transport(home, &name)?;
-                    Some((name, t))
-                })
-                .collect()
+    let (sidecars, _) = harbor_common::fleet::scan_runtime(home);
+    sidecars
+        .into_keys()
+        .filter_map(|name| {
+            let t = berth_transport(home, &name)?;
+            Some((name, t))
         })
-        .unwrap_or_default();
-    v.sort_by(|a, b| a.0.cmp(&b.0));
-    v
+        .collect()
 }
 
 fn url_transport(url: &str) -> Result<Transport, String> {
@@ -424,44 +424,28 @@ fn ensure_berth(
     });
 
     // Already owned? The sidecar json says which berth claims this file.
-    if let Ok(rd) = std::fs::read_dir(&home) {
-        for e in rd.filter_map(|e| e.ok()) {
-            let p = e.path();
-            if p.extension().is_none_or(|x| x != "json") {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&p) else { continue };
-            let Ok(j) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
-            if j["db"].as_str() == Some(&canon.display().to_string())
-                && let Some(name) = j["name"].as_str()
-                && let Some(transport) = berth_transport(&home, name)
-            {
-                return Ok((transport, berth_token(&home, name)));
-            }
+    let (sidecars, _) = harbor_common::fleet::scan_runtime(&home);
+    for (name, side) in &sidecars {
+        if side.db.as_deref() == Some(&canon.display().to_string())
+            && let Some(transport) = berth_transport(&home, name)
+        {
+            return Ok((transport, berth_token(&home, name)));
         }
     }
 
     // Summon. Pilot never links DuckDB: the owner is the harbor binary.
-    let name: String = canon
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_lowercase())
-        .unwrap_or_default()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '-' })
-        .collect();
-    if name.is_empty() {
-        return Err(format!("cannot derive a database name from {}", path.display()));
-    }
+    // The name is minted by the same law harbor mints them with.
+    let stem = canon.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = harbor_common::normalize(&stem)
+        .map_err(|_| format!("cannot derive a database name from {}", path.display()))?;
     // The sidecar scan above found no berth owning THIS file — so a live
     // berth under the derived name is serving a DIFFERENT database. Summoning
     // would only collide on the name, and joining it would silently query the
     // wrong data. Name both files and the way out instead.
-    let sidecar = home.join(format!("{name}.json"));
-    if berth_sock(&home, &name).exists() || sidecar.exists() {
-        let other = std::fs::read_to_string(&sidecar)
-            .ok()
-            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-            .and_then(|j| j["db"].as_str().map(str::to_string))
+    if berth_sock(&home, &name).exists() || sidecars.contains_key(&name) {
+        let other = sidecars
+            .get(&name)
+            .and_then(|s| s.db.clone())
             .unwrap_or_else(|| "another database".to_string());
         return Err(format!(
             "{name:?} is running but serves {other}, not {} — stop it (`harbor forget {name}`) or serve this file under a different name (`harbor start {} --name <other>`)",

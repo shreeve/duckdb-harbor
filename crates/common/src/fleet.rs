@@ -28,14 +28,6 @@ pub enum Addr {
 }
 
 impl Addr {
-    pub fn read(j: &serde_json::Value) -> Option<Addr> {
-        if let Some(s) = j["socket"].as_str() {
-            return Some(Addr::Sock(PathBuf::from(s)));
-        }
-        let port = u16::try_from(j["port"].as_u64()?).ok()?;
-        Some(Addr::Tcp(j["bind"].as_str().unwrap_or("127.0.0.1").to_string(), port))
-    }
-
     /// Copy-pasteable, whole: exactly what another process needs to dial this
     /// berth. Both forms speak the same HTTP, so the TCP form is written as
     /// the URL it is rather than as a bare `host:port` you have to dress up.
@@ -44,6 +36,48 @@ impl Addr {
             Addr::Sock(p) => crate::paths::shorten(p),
             Addr::Tcp(host, port) => format!("http://{host}:{port}"),
         }
+    }
+}
+
+/// A berth bound to every interface is dialled at loopback.
+pub fn dial_host(bind: &str) -> &str {
+    match bind {
+        "0.0.0.0" | "::" => "127.0.0.1",
+        other => other,
+    }
+}
+
+/// A berth's registration, typed — the one reader for `<name>.json`.
+///
+/// Lenient on purpose: every field is optional and unknown bytes parse to an
+/// empty record, because "the registry says something is here" must survive a
+/// half-written or foreign sidecar — reconcile turns that into `Dead`, never
+/// into silence.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Sidecar {
+    pub name: Option<String>,
+    pub pid: Option<u64>,
+    pub db: Option<String>,
+    pub socket: Option<PathBuf>,
+    pub port: Option<u16>,
+    pub bind: Option<String>,
+    pub started_at_ms: Option<u64>,
+    pub idle_exit_ms: Option<u64>,
+}
+
+impl Sidecar {
+    pub fn read(runtime: &Path, name: &str) -> Option<Sidecar> {
+        let text = std::fs::read_to_string(crate::paths::sidecar_file(runtime, name)).ok()?;
+        Some(serde_json::from_str(&text).unwrap_or_default())
+    }
+
+    /// Where this berth answers, as registered.
+    pub fn addr(&self) -> Option<Addr> {
+        if let Some(s) = &self.socket {
+            return Some(Addr::Sock(s.clone()));
+        }
+        Some(Addr::Tcp(self.bind.clone().unwrap_or_else(|| "127.0.0.1".into()), self.port?))
     }
 }
 
@@ -107,8 +141,8 @@ pub struct Row {
 }
 
 /// Read the runtime directory once, for both sidecars and locks.
-pub fn scan_runtime(home: &Path) -> (BTreeMap<String, serde_json::Value>, BTreeSet<String>) {
-    let mut sidecars: BTreeMap<String, serde_json::Value> = Default::default();
+pub fn scan_runtime(home: &Path) -> (BTreeMap<String, Sidecar>, BTreeSet<String>) {
+    let mut sidecars: BTreeMap<String, Sidecar> = Default::default();
     let mut locks = BTreeSet::new();
     let Ok(rd) = std::fs::read_dir(home) else { return (sidecars, locks) };
     for p in rd.filter_map(|e| e.ok().map(|e| e.path())) {
@@ -117,7 +151,7 @@ pub fn scan_runtime(home: &Path) -> (BTreeMap<String, serde_json::Value>, BTreeS
             Some("json") => {
                 let v = std::fs::read_to_string(&p)
                     .ok()
-                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                    .and_then(|t| serde_json::from_str::<Sidecar>(&t).ok())
                     .unwrap_or_default();
                 sidecars.insert(stem, v);
             }
@@ -151,12 +185,12 @@ pub fn reconcile(cfg: &FileConfig, home: &Path, probe: &dyn Fn(&Addr) -> bool) -
     for name in names {
         let side = sidecars.get(&name);
         let conf = configured.get(name.as_str()).copied();
-        let claim = claim_state(&home.join(format!("{name}.lock")));
+        let claim = claim_state(&crate::paths::lock_file(home, &name));
 
-        let live_db = side.and_then(|j| j["db"].as_str()).unwrap_or("").to_string();
+        let live_db = side.and_then(|s| s.db.clone()).unwrap_or_default();
         let want_db =
             conf.and_then(|c| c.database()).map(|p| p.display().to_string()).unwrap_or_default();
-        let addr = side.and_then(Addr::read);
+        let addr = side.and_then(Sidecar::addr);
 
         let mut note = None;
         let state = match (claim, side.is_some(), conf.is_some()) {
@@ -204,16 +238,14 @@ pub fn reconcile(cfg: &FileConfig, home: &Path, probe: &dyn Fn(&Addr) -> bool) -
         };
 
         let uptime = side
-            .and_then(|j| j["startedAtMs"].as_u64())
+            .and_then(|s| s.started_at_ms)
             .and_then(|t| now_ms().checked_sub(t))
             .map(|ms| crate::lifetime::humanize(Duration::from_millis(ms)));
 
         rows.push(Row {
             state,
-            idle_exit_ms: side
-                .and_then(|j| j["idleExitMs"].as_u64())
-                .filter(|_| state.is_live()),
-            pid: side.and_then(|j| j["pid"].as_u64()).filter(|_| state.is_live()),
+            idle_exit_ms: side.and_then(|s| s.idle_exit_ms).filter(|_| state.is_live()),
+            pid: side.and_then(|s| s.pid).filter(|_| state.is_live()),
             uptime: uptime.filter(|_| state.is_live()),
             db: match (live_db.is_empty(), want_db.is_empty()) {
                 (false, _) => crate::paths::shorten(Path::new(&live_db)),

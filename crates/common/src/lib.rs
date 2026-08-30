@@ -27,8 +27,8 @@ pub mod state;
 pub mod ui;
 
 pub use paths::{
-    config_file, config_root, expand, history_file, looks_like_path, normalize,
-    runtime_dir, state_root,
+    config_file, config_root, expand, history_file, lock_file, log_file, looks_like_path,
+    normalize, runtime_dir, sidecar_file, sock_file, state_root, token_file,
 };
 pub use lifetime::{Lifetime, Summoner};
 pub use state::{Level, State};
