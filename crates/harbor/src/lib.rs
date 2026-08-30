@@ -43,10 +43,15 @@ use encode::*;
 
 // The HTTP side of harbor.
 //
-// Shape (deliberately small):
+// Shape (the data plane is deliberately small; the rest is bookkeeping):
 //
-//   POST /sql     run one statement, stream the NDJSON envelope back
-//   GET  /ready   can this server answer a query? no auth
+//   POST /sql          run one statement, stream the NDJSON envelope back
+//   GET  /ready        can this server answer a query? no auth
+//   GET  /info         who am I, serving what, since when
+//   GET  /catalog      schema document for completion and browsers
+//   GET  /sessions     who holds a lease right now
+//   POST /sessions …   session lifecycle (new/release), cancel by query id
+//   DELETE /shutdown   drain, CHECKPOINT, exit (the graceful stop)
 //
 // The envelope is the one thing that must not drift from the v1 harbor,
 // because it is the contract every client already speaks:
@@ -109,16 +114,15 @@ const MAX_JSON_RESPONSE: usize = 32 << 20;
 // ---------------------------------------------------------------------------
 // Process-wide state
 //
-// harbor lives inside DuckDB's process, so "the server" is a process
-// singleton: one listener, one worker pool.
+// harbor IS DuckDB's process, so "the server" is a process singleton: one
+// listener, one worker pool.
 //
-// The pool has to be built during extension load, and that is not a stylistic
-// choice. DuckDB hands an extension its database handle through a wrapper
-// owned by the loader's state (`extension_load.cpp`, `ExtensionAccess::
-// GetDatabase`), and that state is destroyed the moment loading finishes.
-// The connection objects made from it stay valid; the handle does not. So
-// every connection harbor will ever use is opened here, before the entrypoint
-// returns, and `harbor_serve` draws from what is already there.
+// The pool is built up front, in one place: `serve` opens the engine and
+// hands every connection harbor will ever use to `open_pool` before the
+// listener exists, and everything after draws from what is already there.
+// (The shape survives harbor's extension-era origin, where opening late was
+// impossible; it stays because a fixed pool makes concurrency arithmetic —
+// workers + leases — a boot-time fact instead of a runtime negotiation.)
 //
 // One connection per worker, because a DuckDB connection is Send but not
 // Sync — two threads may not share one.
@@ -130,7 +134,7 @@ const MAX_JSON_RESPONSE: usize = 32 << 20;
 ///
 /// The default covers the default six workers with ten left over for leases.
 /// `HARBOR_POOL_SIZE` moves it, and has to, because this is the one number
-/// that cannot be changed once the extension is loaded: a deployment that
+/// that cannot be changed once the pool is opened: a deployment that
 /// wants more concurrent transactions than ten has no other way to ask.
 const DEFAULT_POOL_SIZE: usize = 16;
 const MIN_POOL_SIZE: usize = 2;
@@ -245,9 +249,9 @@ struct SlotRun {
 /// What a cancel request should do, decided from bookkeeping alone.
 ///
 /// Split out from `SlotState` so the part that is easy to get wrong can be
-/// tested without a database: this crate builds against DuckDB's loadable
-/// extension API, so a `Connection` — and therefore an `InterruptHandle` —
-/// cannot exist under `cargo test` at all.
+/// tested without a database: this crate links libduckdb dynamically, so a
+/// bare `cargo test` (no DUCKDB_LIB on the linker path) cannot construct a
+/// `Connection` — and therefore an `InterruptHandle` — at all.
 #[derive(Debug, PartialEq, Eq)]
 enum Cancel {
     /// Interrupt the connection now.
@@ -952,8 +956,8 @@ struct Running {
     addr: String,
 }
 
-/// Open every connection harbor will need. Called once, from the extension
-/// entrypoint, and only there — see the note above on why later is too late.
+/// Open every connection harbor will need. Called once, by `serve` right
+/// after it opens the engine — see the note above on why the pool is fixed.
 pub fn open_pool(con: Connection) -> Result<(), String> {
     let mut pool = POOL.lock().unwrap();
 
@@ -1020,7 +1024,7 @@ pub fn start(
     // is a worse failure than not binding at all.
     let mut pool = POOL.lock().unwrap();
     if pool.is_empty() {
-        return Err("harbor: no database connections (extension not initialised)".to_string());
+        return Err("harbor: no database connections (the pool was never opened)".to_string());
     }
     // Say so rather than quietly serving with fewer. workers is capped by the
     // connection pool, which is fixed at load, so `workers := 32` gets what the
@@ -1065,8 +1069,8 @@ pub fn start(
         Listen::Unix(path) => path.display().to_string(),
     };
     *STARTED_AT.lock().unwrap() = Some(Instant::now());
-    // Reset the process-global accumulators for this instance. harbor_serve
-    // can follow a harbor_stop in the same process (the extension path), and
+    // Reset the process-global accumulators for this instance. One process
+    // may serve, stop, and serve again (tests do exactly this), and
     // a request abandoned by the bounded-join shutdown may decrement
     // INFLIGHT_REQUESTS late — so a fresh instance must not inherit a nonzero
     // count (which would wedge quiet()/--idle-exit) or a stale readiness
@@ -1580,12 +1584,12 @@ fn shed(req: Request) -> (bool, u16) {
 /// Identity document the embedding host sets before `start()`; GET /info
 /// serves it with `uptimeMs` spliced in. The host owns the static fields
 /// (name, database path, pid) because the core cannot know them.
-/// Unset — as in the retiring extension — /info answers 404, which is
-/// exactly the pre-fleet behavior clients use as a version probe.
+/// Unset, /info answers 404 — the pre-fleet behavior old clients still
+/// lean on as a version probe.
 static INFO: Mutex<Option<serde_json::Value>> = Mutex::new(None);
 static STARTED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 /// The last moment a countable request began or finished. `/ready` and
-/// `/info` do not count: a fleet `ls` probing liveness must not keep an
+/// `/info` do not count: a fleet `show` probing liveness must not keep an
 /// --idle-exit berth alive forever.
 static LAST_ACTIVITY: Mutex<Option<Instant>> = Mutex::new(None);
 /// Countable requests currently being served, statement and stream included.

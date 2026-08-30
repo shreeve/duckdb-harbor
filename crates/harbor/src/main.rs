@@ -479,7 +479,7 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         o.memory_limit
     );
 
-    // Ephemeral berths: no countable requests AND no live sessions for the
+    // Temp berths: no countable requests AND no live sessions for the
     // window → leave through the normal drain + CHECKPOINT door. Nothing
     // cleverer than this on purpose — no refcounts, no control sockets.
     if let Some(idle) = o.idle_exit {
@@ -744,7 +744,7 @@ fn shutdown_tcp(bind: &str, port: u16, token: Option<&str>) -> bool {
 
 /// Positive proof that a berth is gone: its `<name>.lock` exists and we can
 /// take the exclusive flock the live berth holds for its whole life (serve).
-/// Only a *definite* death suppresses a stop/rm signal — if the lock file is
+/// Only a *definite* death suppresses a stop/forget signal — if the lock file is
 /// missing or unreadable we return false and fall through to the old behaviour,
 /// so a live berth is never left unstoppable. Unlike `GET /ready` this needs no
 /// response from the berth, so a busy one is correctly seen as alive, not dead.
@@ -1073,7 +1073,7 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
                 // Proven dead: no process holds the flock, so the pid recorded
                 // in the json is stale and the OS may have recycled it to an
                 // unrelated process. Signalling it would be signalling a
-                // stranger — so don't. `rm` still cleans the registry below.
+                // stranger — so don't. `forget` still cleans the registry below.
                 let pid = j["pid"].as_u64().map(|p| p.to_string()).unwrap_or_default();
                 if !remove {
                     return Err(format!(

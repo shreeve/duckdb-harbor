@@ -17,14 +17,18 @@
 //! ```
 //!
 //! Harbor reads this file too, which is what makes `harbor start medlabs`
-//! mean anything. It is safe for it to: the deserializer below has no
-//! `token-cmd` field on the server's side of the fence, so the server cannot
-//! be made to shell out for a credential no matter what the file says.
+//! mean anything. It is safe for it to — but know where the fence really
+//! is: this ONE deserializer parses the token fields for both binaries;
+//! what keeps the server from shelling out for a credential is that
+//! `resolve_token` (the only `sh -c` path) lives in pilot and nothing in
+//! harbor calls it or reads these fields. Guard the call site, not the
+//! schema.
 //!
 //! Every berth key is the matching `harbor serve` flag with the dashes
-//! stripped, so `harbor serve --help` is the reference and there is no second
-//! dialect to learn. A key that is only ever passed as a flag would make the
-//! config decorative, so there aren't any.
+//! stripped, so there is no second dialect to learn. (The reverse is not
+//! quite total: `--name`, `--socket`, and `--token` are flag-only —
+//! identity and credentials are the operator's word at spawn time, not
+//! standing config.)
 
 use serde::Deserialize;
 use std::collections::HashMap;

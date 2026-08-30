@@ -6,7 +6,7 @@
 //! ~/.config/harbor/config.toml    desired state — you edit this
 //! ~/.local/state/harbor/          actual state — harbor writes this
 //!     runtime/   <name>.{json,sock,token,lock}
-//!     log/       <name>.log
+//!     runtime/log/<name>.log      the berth's server log
 //!     history    pilot's REPL history
 //! ```
 //!
@@ -90,10 +90,6 @@ pub fn runtime_dir() -> Result<PathBuf, String> {
     Ok(state_root()?.join("runtime"))
 }
 
-pub fn log_dir() -> Result<PathBuf, String> {
-    Ok(state_root()?.join("log"))
-}
-
 /// pilot's REPL history. State, not config, and not the fleet's business —
 /// it lived in `runtime/` for a while, where every sweep had to special-case
 /// it forever.
@@ -109,7 +105,7 @@ pub fn normalize(name: &str) -> Result<String, String> {
         .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '-' })
         .collect();
     if n.is_empty() || n.len() > 64 {
-        return Err(format!("bad berth name {name:?}"));
+        return Err(format!("bad database name {name:?}"));
     }
     Ok(n)
 }
