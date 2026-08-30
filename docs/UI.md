@@ -38,24 +38,6 @@ Three vertical panes. Sidebar and inspector collapse independently and
 auto-collapse when the window is too narrow to keep the content pane at
 least 480pt wide; divider positions persist. Minimum window 640x400.
 
-Rigidity is part of feeling native: every pane and card declares a real
-minimum size, and the window's minimum is derived from those minimums,
-never chosen as a free-standing number. Content pushes back instead of
-flowing; nothing ever mushes the way a web page does.
-
-The sizing rules, in order. A component class declares its size as a
-design decision; runtime content never drives layout (one long value
-must not inflate a card, and scanning instances for a max is only
-legitimate for closed, design-time-known sets like a label column).
-Siblings presented in the same slot share the slot's size, so swapping
-content never reflows the frame. Content then adapts within the bounds
-by its kind: a value ellipsizes on one line (recoverable in full via
-tooltip, inspector, or copy; paths prefer middle truncation), prose
-wraps, collections scroll (never a single long item), and a bounded
-container grows to a declared cap then hands off to scroll. When space
-truly runs out, the response is a deliberate state change (a pane
-collapses), not gradual squeezing.
-
 Collapsing is offered three redundant ways, all reaching the same
 state: toolbar toggle buttons at each end using the split-rectangle
 panel glyph (the Finder/Xcode convention; never a hamburger, which
@@ -67,6 +49,35 @@ double-clicking a divider toggles; and Cmd+0 (sidebar) / Cmd+Alt+0
 
 Keyboard shortcuts are written as Cmd here; on Linux and Windows every
 Cmd reads as Ctrl.
+
+## Sizing
+
+Rigidity is part of feeling native: content pushes back instead of
+flowing, and nothing ever mushes the way a web page does. Every surface
+answers "how big, and what happens when content overflows?" from these
+rules, in order:
+
+1. **A component class declares its size as a design decision.**
+   Runtime content never drives layout: one long value must not inflate
+   a card. Deriving a size from content is legitimate only for closed,
+   design-time-known sets (a label column sized to its longest label),
+   never for user data.
+2. **Siblings presented in the same slot share the slot's size**, so
+   swapping content never reflows the frame. The berth identity card is
+   the reference case: every berth presents in the same 440pt-minimum
+   card, so switching berths moves nothing.
+3. **Content adapts within the bounds, by its kind.** A value
+   ellipsizes on one line, with the full text recoverable somewhere
+   deliberate (tooltip, inspector, copy) and middle truncation
+   preferred for paths, whose filename is the payload. Prose meant to
+   be read in full (errors, empty states) wraps. Collections (lists,
+   trees, the grid, the editor) scroll; a single long item never
+   scrolls. A bounded container may grow with content to a declared
+   cap, then hand off to scroll.
+4. **The window minimum is the sum of the floors** along the widest
+   required chain, never a free-standing number. When space truly runs
+   out, the response is a deliberate state change (a pane collapses),
+   not gradual squeezing.
 
 ## Sidebar
 
