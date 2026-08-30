@@ -29,14 +29,36 @@ pub struct DuckTable {
     pub(crate) phase: Phase,
     pub(crate) attempt: u64,
     pub(crate) selected_table: Option<(String, String)>,
+    pub(crate) grid: Option<Entity<crate::grid::Grid>>,
 }
 
 impl DuckTable {
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
-        let mut this =
-            Self { rows: Vec::new(), phase: Phase::Idle, attempt: 0, selected_table: None };
+        let mut this = Self {
+            rows: Vec::new(),
+            phase: Phase::Idle,
+            attempt: 0,
+            selected_table: None,
+            grid: None,
+        };
         this.refresh(cx);
         this
+    }
+
+    pub(crate) fn select_table(
+        &mut self,
+        schema: String,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let conn = match &self.phase {
+            Phase::Connected { conn, .. } => conn.clone(),
+            _ => return,
+        };
+        self.selected_table = Some((clone_str(&schema), clone_str(&name)));
+        self.grid = Some(cx.new(|cx| crate::grid::Grid::new(conn, &schema, &name, window, cx)));
+        cx.notify();
     }
 
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -71,6 +93,7 @@ impl DuckTable {
         let fence = self.attempt;
         self.phase = Phase::Connecting { name: clone_str(&name) };
         self.selected_table = None;
+        self.grid = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let target = clone_str(&name);
@@ -106,6 +129,7 @@ impl DuckTable {
         self.attempt += 1;
         self.phase = Phase::Idle;
         self.selected_table = None;
+        self.grid = None;
         cx.notify();
     }
 

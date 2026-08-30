@@ -47,6 +47,16 @@ pub fn pal(cx: &App) -> Pal {
     }
 }
 
+/// The one owner of the value font: every control that shows a stored
+/// value uses this family (DESIGN.md: one font rule, one owner).
+pub fn value_font() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Menlo"
+    } else {
+        "monospace"
+    }
+}
+
 impl Pal {
     pub fn level(&self, level: Level) -> Hsla {
         match level {

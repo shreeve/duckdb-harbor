@@ -11,8 +11,10 @@
 pub mod catalog;
 pub mod fleet;
 pub mod http;
+pub mod query;
 pub mod tokens;
 
 pub use catalog::{catalog, Catalog};
 pub use fleet::{connect, info, keepalive, list, probe, state_of, BerthRow, Conn, Sidecar};
+pub use query::{query, QueryResult};
 pub use harbor_common::{paths, Level, State};

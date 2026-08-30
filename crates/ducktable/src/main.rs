@@ -4,6 +4,7 @@
 
 mod app;
 mod content;
+mod grid;
 mod sidebar;
 mod theme;
 mod util;

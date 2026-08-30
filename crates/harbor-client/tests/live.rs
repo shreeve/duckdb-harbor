@@ -36,3 +36,27 @@ fn a_live_berth_yields_identity() {
     assert_eq!(identity.name, row.name);
     assert!(harbor_client::keepalive(&conn));
 }
+
+#[test]
+#[ignore]
+fn a_live_berth_answers_sql() {
+    let live = fleet::list()
+        .into_iter()
+        .find(|r| r.transport.as_ref().map(fleet::probe).unwrap_or(false));
+    let Some(row) = live else {
+        println!("no live berth to test against; skipping");
+        return;
+    };
+    let conn = connect(&row.name).expect("connect");
+    let result = harbor_client::query(&conn, "SELECT 1 AS one, 'two' AS two, NULL AS three")
+        .expect("query");
+    println!(
+        "columns: {:?}",
+        result.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+    );
+    println!("rows: {:?} ({} in {} ms)", result.rows, result.row_count, result.time_ms);
+    assert_eq!(result.columns.len(), 3);
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], serde_json::json!(1));
+    assert_eq!(result.rows[0][2], serde_json::Value::Null);
+}

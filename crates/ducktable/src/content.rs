@@ -4,7 +4,6 @@
 use crate::app::{DuckTable, Phase};
 use crate::theme::{pal, Pal};
 use crate::util::clone_str;
-use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::*;
 use gpui_component::*;
@@ -13,6 +12,15 @@ use harbor_client::Level;
 impl DuckTable {
     pub(crate) fn content(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = pal(cx);
+        if let (Phase::Connected { .. }, Some(grid)) = (&self.phase, &self.grid) {
+            return div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .bg(t.surface)
+                .child(grid.clone())
+                .into_any_element();
+        }
         let body = match &self.phase {
             Phase::Idle => div()
                 .v_flex()
@@ -57,73 +65,6 @@ impl DuckTable {
                         move |this, _, _, cx| this.connect(clone_str(&name), cx),
                     ))
                 }),
-            Phase::Connected { catalog, .. }
-                if self.selected_table.as_ref().is_some_and(|(s, n)| {
-                    catalog.tables.iter().any(|t| &t.schema == s && &t.name == n)
-                }) =>
-            {
-                let (schema, name) = self.selected_table.clone().unwrap();
-                let table = catalog
-                    .tables
-                    .iter()
-                    .find(|t| t.schema == schema && t.name == name)
-                    .unwrap();
-                div()
-                    .v_flex()
-                    .gap_1()
-                    .items_start()
-                    .p_4()
-                    .min_w(px(440.))
-                    .max_w_full()
-                    .max_h_full()
-                    .overflow_hidden()
-                    .bg(t.surface)
-                    .border_1()
-                    .border_color(t.border)
-                    .rounded_lg()
-                    .child(
-                        div()
-                            .text_lg()
-                            .text_color(t.text)
-                            .child(format!("{schema}.{name}")),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(t.muted)
-                            .pb_2()
-                            .child(format!("{} columns", table.columns.len())),
-                    )
-                    .children(table.columns.iter().map(|c| {
-                        div()
-                            .h_flex()
-                            .gap_2()
-                            .w_full()
-                            .text_sm()
-                            .child(
-                                div()
-                                    .w_48()
-                                    .flex_none()
-                                    .truncate()
-                                    .text_color(t.text)
-                                    .child(clone_str(&c.name)),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(t.muted)
-                                    .child(clone_str(&c.duck_type)),
-                            )
-                            .when(c.primary, |d| {
-                                d.child(div().text_xs().text_color(t.accent).child("PK"))
-                            })
-                            .when(c.not_null && !c.primary, |d| {
-                                d.child(div().text_xs().text_color(t.muted).child("NOT NULL"))
-                            })
-                    }))
-            }
             Phase::Connected { conn, info, .. } => div()
                 .v_flex()
                 .gap_1()
@@ -168,6 +109,7 @@ impl DuckTable {
             .justify_center()
             .p_6()
             .child(body)
+            .into_any_element()
     }
 }
 

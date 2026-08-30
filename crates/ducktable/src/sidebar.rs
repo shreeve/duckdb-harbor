@@ -153,9 +153,13 @@ impl DuckTable {
                                 .text_color(t.muted)
                                 .child(format!("{}", table.columns.len())),
                         )
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.selected_table = Some((clone_str(&key.0), clone_str(&key.1)));
-                            cx.notify();
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.select_table(
+                                clone_str(&key.0),
+                                clone_str(&key.1),
+                                window,
+                                cx,
+                            );
                         })),
                 );
             }
