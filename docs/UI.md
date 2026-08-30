@@ -220,6 +220,23 @@ Every surface defines empty, loading, and failed:
 - Cmd+C: copy selection (grid: cells/rows, with-headers variant)
 - Cmd+F: filter bar; Esc walks: cancel edit > clear filter > close panel
 
+## Appearance and theming
+
+The look aims for modern macOS warmth, not editor-minimalism: an accent
+color that does real work (selection, focus ring, the LIVE indicator),
+soft hierarchy between panes, rounded controls, friendly empty states.
+Density is functional, not aesthetic: the data grid and editor stay
+compact and monospaced in every theme; the chrome around them carries
+the personality.
+
+Every color in the app resolves through semantic tokens (background,
+surface, accent, text, muted, success, warning, danger, grid lines,
+selection), never hardcoded values. Themes are token sets: light and
+dark ship first, plus about three more (e.g. a warm paper light, a
+midnight blue dark, a high-contrast). The accent is themeable
+independently. Value rendering (NULL tags, conflict cells, dirty-cell
+marks) uses tokens too, so every theme keeps the same meaning.
+
 ## Non-goals
 
 Charting, dashboards, AI chat, multi-engine drivers, iOS, collaborative
