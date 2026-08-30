@@ -65,6 +65,23 @@ pub(crate) struct Grid {
     /// The Columns popover's search box — persistent so the query
     /// survives re-renders while the popover is open.
     col_search: Entity<gpui_component::input::InputState>,
+    /// Fence for page fetches: a newer fetch supersedes an older one in
+    /// flight, whose outcome is then discarded instead of committing
+    /// stale rows.
+    fetch_seq: u64,
+}
+
+/// Everything a fetch commits along with its rows. The delegate is not
+/// touched until the data arrives — the footer, funnel, and gutter always
+/// describe the rows actually on screen, and a failed or superseded fetch
+/// leaves no half-applied state behind.
+struct PageReq {
+    page: usize,
+    size: usize,
+    /// Some(new) = this fetch changes the WHERE filter and commits it
+    /// with the rows; None = keep the current filter.
+    filter: Option<Option<String>>,
+    recount: bool,
 }
 
 pub(crate) struct GridDelegate {
@@ -197,20 +214,39 @@ impl Grid {
             cx.notify();
         })
         .detach();
-        Self { table, filter_input: None, view: ViewMode::Data, structure, resize, col_search }
+        Self {
+            table,
+            filter_input: None,
+            view: ViewMode::Data,
+            structure,
+            resize,
+            col_search,
+            fetch_seq: 0,
+        }
     }
 
     /// Fetch a page (and optionally a fresh count) in the background and
-    /// commit everything in one frame. The current page stays on screen
-    /// until then; an error keeps it and shows in the strip.
-    fn fetch(&mut self, page: usize, recount: bool, cx: &mut Context<Self>) {
+    /// commit everything — rows, page, size, filter — in one frame. The
+    /// current page stays on screen until then; an error keeps it and
+    /// shows in the strip. A newer fetch supersedes an older one in
+    /// flight (the fence below), so rapid clicks converge on the latest
+    /// request instead of dropping it.
+    fn fetch(&mut self, req: PageReq, cx: &mut Context<Self>) {
+        self.fetch_seq += 1;
+        let fence = self.fetch_seq;
         let (conn, sql, count_sql) = {
             let d = self.table.read(cx).delegate();
-            if d.loading {
-                return;
-            }
-            (d.conn.clone(), d.page_sql(page, d.page_size), recount.then(|| d.count_sql()))
+            let filter = match &req.filter {
+                Some(new) => new.clone(),
+                None => d.filter.clone(),
+            };
+            (
+                d.conn.clone(),
+                d.page_sql(req.page, req.size, &filter),
+                req.recount.then(|| d.count_sql(&filter)),
+            )
         };
+        let PageReq { page, size, filter, .. } = req;
         self.table.update(cx, |state, _| state.delegate_mut().loading = true);
         cx.spawn(async move |this, cx| {
             let outcome = cx
@@ -226,6 +262,11 @@ impl Grid {
                 })
                 .await;
             this.update(cx, |grid, cx| {
+                // Superseded by a newer fetch: this outcome is stale and
+                // commits nothing (the newer fetch owns the loading flag).
+                if grid.fetch_seq != fence {
+                    return;
+                }
                 grid.table.update(cx, |state, cx| {
                     let ok = {
                         let d = state.delegate_mut();
@@ -250,6 +291,10 @@ impl Grid {
                                 }
                                 d.rows = result.rows;
                                 d.page = page;
+                                d.page_size = size;
+                                if let Some(f) = filter {
+                                    d.filter = f;
+                                }
                                 if let Some(t) = total {
                                     d.total_rows = t;
                                 }
@@ -287,9 +332,15 @@ impl Grid {
         .detach();
     }
 
+    /// Navigate to a page at the current size and filter.
+    fn fetch_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        let size = self.table.read(cx).delegate().page_size;
+        self.fetch(PageReq { page, size, filter: None, recount: false }, cx);
+    }
+
     pub(crate) fn jump_first(&mut self, cx: &mut Context<Self>) {
         if self.table.read(cx).delegate().page > 0 {
-            self.fetch(0, false, cx);
+            self.fetch_page(0, cx);
         }
     }
 
@@ -302,7 +353,7 @@ impl Grid {
         };
         if let Some(last) = last {
             if page < last {
-                self.fetch(last, false, cx);
+                self.fetch_page(last, cx);
             }
         }
     }
@@ -310,7 +361,7 @@ impl Grid {
     pub(crate) fn prev_page(&mut self, cx: &mut Context<Self>) {
         let page = self.table.read(cx).delegate().page;
         if page > 0 {
-            self.fetch(page - 1, false, cx);
+            self.fetch_page(page - 1, cx);
         }
     }
 
@@ -325,29 +376,36 @@ impl Grid {
             (d.page, more)
         };
         if more {
-            self.fetch(page + 1, false, cx);
+            self.fetch_page(page + 1, cx);
         }
     }
 
     /// Cycle the page size through PAGE_SIZES (a global preference) and
-    /// refetch from page 1.
+    /// refetch from page 1. The pref cycles immediately (so rapid clicks
+    /// advance through the sizes), but the delegate's size commits with
+    /// the rows fetched at it — the footer never labels old rows with a
+    /// new size.
     pub(crate) fn cycle_page_size(&mut self, cx: &mut Context<Self>) {
-        let current = self.table.read(cx).delegate().page_size;
+        let current = prefs::get(cx).page_size;
         let ix = prefs::PAGE_SIZES.iter().position(|s| *s == current).unwrap_or(0);
         let next = prefs::PAGE_SIZES[(ix + 1) % prefs::PAGE_SIZES.len()];
         prefs::toggle(cx, |p| p.page_size = next);
-        self.table.update(cx, |state, _| state.delegate_mut().page_size = next);
-        self.fetch(0, false, cx);
+        self.fetch(PageReq { page: 0, size: next, filter: None, recount: false }, cx);
     }
 
     /// Open or close the raw-SQL filter strip. Closing clears an active
     /// filter (refetching unfiltered).
     pub(crate) fn toggle_filter_strip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.filter_input.take().is_some() {
-            let had_filter = self.table.read(cx).delegate().filter.is_some();
+            let (had_filter, size) = {
+                let d = self.table.read(cx).delegate();
+                (d.filter.is_some(), d.page_size)
+            };
             if had_filter {
-                self.table.update(cx, |state, _| state.delegate_mut().filter = None);
-                self.fetch(0, true, cx);
+                self.fetch(
+                    PageReq { page: 0, size, filter: Some(None), recount: true },
+                    cx,
+                );
             }
             cx.notify();
             return;
@@ -359,10 +417,16 @@ impl Grid {
         cx.subscribe(&input, |grid, input, event: &gpui_component::input::InputEvent, cx| {
             if matches!(event, gpui_component::input::InputEvent::PressEnter { .. }) {
                 let text = input.read(cx).value().trim().to_string();
-                grid.table.update(cx, |state, _| {
-                    state.delegate_mut().filter = (!text.is_empty()).then_some(text);
-                });
-                grid.fetch(0, true, cx);
+                let size = grid.table.read(cx).delegate().page_size;
+                grid.fetch(
+                    PageReq {
+                        page: 0,
+                        size,
+                        filter: Some((!text.is_empty()).then_some(text)),
+                        recount: true,
+                    },
+                    cx,
+                );
             }
         })
         .detach();
@@ -505,22 +569,25 @@ impl Grid {
 
 impl GridDelegate {
     /// The SELECT for one page under the current filter.
-    fn page_sql(&self, page: usize, size: usize) -> String {
+    fn page_sql(&self, page: usize, size: usize, filter: &Option<String>) -> String {
         format!(
             "SELECT * FROM {}{} LIMIT {} OFFSET {}",
             self.source,
-            self.where_part(),
+            Self::where_part(filter),
             size,
             page * size,
         )
     }
 
-    fn count_sql(&self) -> String {
-        format!("SELECT count(*) FROM {}{}", self.source, self.where_part())
+    fn count_sql(&self, filter: &Option<String>) -> String {
+        format!("SELECT count(*) FROM {}{}", self.source, Self::where_part(filter))
     }
 
-    fn where_part(&self) -> String {
-        match &self.filter {
+    // The filter text splices in verbatim BY DESIGN: the strip is a raw
+    // SQL surface and the berth is the user's own database — the author
+    // of the WHERE clause is the person it could affect.
+    fn where_part(filter: &Option<String>) -> String {
+        match filter {
             Some(f) => format!(" WHERE {f}"),
             None => String::new(),
         }
