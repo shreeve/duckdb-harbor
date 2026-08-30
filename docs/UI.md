@@ -237,6 +237,24 @@ midnight blue dark, a high-contrast). The accent is themeable
 independently. Value rendering (NULL tags, conflict cells, dirty-cell
 marks) uses tokens too, so every theme keeps the same meaning.
 
+## Platform fit
+
+One design, three thin platform layers; the theme and layout are
+identical everywhere, and the platform work is behavioral:
+
+- Window chrome: traffic lights inset on macOS; native caption
+  behaviors (snap layouts, min/max/close placement) on Windows; the
+  window manager's decoration preference on Linux. Mockups treat this
+  region as platform chrome, never drawing one platform's controls
+  into another's build.
+- Menus: native menu bar on macOS; in-window menus elsewhere.
+- Keymaps are per-platform defaults, not a blind Cmd-to-Ctrl swap, and
+  platform text-editing conventions are preserved.
+- Chrome text uses the platform UI font; the data and editor fonts are
+  ours everywhere.
+- File dialogs, clipboard, notifications, URL opening are native.
+- Light/dark follows the OS setting on all three platforms.
+
 ## Non-goals
 
 Charting, dashboards, AI chat, multi-engine drivers, iOS, collaborative
