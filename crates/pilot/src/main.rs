@@ -237,8 +237,15 @@ fn resolve(
 
     // Explicit config entry shadows a same-named live berth (ssh_config rule).
     if let Some(entry) = cfg.connection.get(target) {
+        // Both url and path is a question only the entry's author can
+        // answer; picking one silently is how you query the wrong database.
+        if entry.url.is_some() && entry.path.is_some() {
+            return Err(format!(
+                "config entry {target:?} has both url and path — keep the one you mean"
+            ));
+        }
         let home = config::runtime_dir()?;
-        if berth_sock(&home, target).exists() {
+        if let Some(side) = harbor_common::fleet::Sidecar::read(&home, target) {
             // Warn only when they actually diverge. When the entry's path IS
             // the database the live berth serves, following the config joins
             // that berth — nothing is shadowed, and warning here read as
@@ -247,8 +254,7 @@ fn resolve(
                 let expanded = config::expand(p);
                 std::fs::canonicalize(&expanded).unwrap_or(expanded)
             });
-            let live_db = harbor_common::fleet::Sidecar::read(&home, target)
-                .and_then(|s| s.db.map(PathBuf::from));
+            let live_db = side.db.map(PathBuf::from);
             let same = match (&entry_db, &live_db) {
                 (Some(a), Some(b)) => a == b,
                 _ => false,
@@ -321,31 +327,13 @@ fn resolve(
     }
 
     let home = config::runtime_dir()?;
-    #[cfg(unix)]
-    {
-        let sock = berth_sock(&home, target);
-        if sock.exists() {
-            let file_token = berth_token(&home, target);
-            return Ok(Conn {
-                transport: Transport::Unix(sock),
-                token: flag_token.or(env_token).or(file_token),
-            });
-        }
-    }
-    // A --port berth (and every Windows berth) registers its TCP address in
-    // the sidecar. The bare name works for both local transports.
-    if let Some(transport) = berth_tcp(&home, target) {
+    // Zero-config: an unconfigured bare name still joins a live local berth.
+    // The sidecar is the registry — socket and --port berths both answer here.
+    if let Some(transport) = berth_transport(&home, target) {
         let file_token = berth_token(&home, target);
-        return Ok(Conn {
-            transport,
-            token: flag_token.or(env_token).or(file_token),
-        });
+        return Ok(Conn { transport, token: flag_token.or(env_token).or(file_token) });
     }
     Err(format!("nothing running named {target:?}{}", fleet_hint(&home)))
-}
-
-fn berth_sock(home: &std::path::Path, name: &str) -> PathBuf {
-    harbor_common::sock_file(home, name)
 }
 
 fn berth_token(home: &std::path::Path, name: &str) -> Option<String> {
@@ -354,24 +342,20 @@ fn berth_token(home: &std::path::Path, name: &str) -> Option<String> {
     if t.is_empty() { None } else { Some(t) }
 }
 
-/// The TCP address a --port berth registered in its sidecar json. Dials the
-/// bind address, or loopback when the berth bound every interface.
-fn berth_tcp(home: &std::path::Path, name: &str) -> Option<Transport> {
-    let side = harbor_common::fleet::Sidecar::read(home, name)?;
-    let port = side.port?;
-    let bind = harbor_common::fleet::dial_host(side.bind.as_deref().unwrap_or("127.0.0.1"));
-    Some(Transport::Tcp(format!("{bind}:{port}")))
-}
-
+/// Where a live berth answers — read from its sidecar, never guessed from a
+/// path convention. Guessing is how a --socket berth used to be unreachable
+/// by name: it answers where it said it would, not where we'd have put it.
 fn berth_transport(home: &std::path::Path, name: &str) -> Option<Transport> {
-    #[cfg(unix)]
-    {
-        let sock = berth_sock(home, name);
-        if sock.exists() {
-            return Some(Transport::Unix(sock));
-        }
+    match harbor_common::fleet::Sidecar::read(home, name)?.addr()? {
+        #[cfg(unix)]
+        harbor_common::fleet::Addr::Sock(p) => Some(Transport::Unix(p)),
+        #[cfg(not(unix))]
+        harbor_common::fleet::Addr::Sock(_) => None,
+        harbor_common::fleet::Addr::Tcp(host, port) => Some(Transport::Tcp(format!(
+            "{}:{port}",
+            harbor_common::fleet::dial_host(&host)
+        ))),
     }
-    berth_tcp(home, name)
 }
 
 /// Every berth the registry knows, with how to dial it — the same sidecar
@@ -484,13 +468,13 @@ fn ensure_berth(
     // berth under the derived name is serving a DIFFERENT database. Summoning
     // would only collide on the name, and joining it would silently query the
     // wrong data. Name both files and the way out instead.
-    if berth_sock(&home, &name).exists() || sidecars.contains_key(&name) {
+    if sidecars.contains_key(&name) {
         let other = sidecars
             .get(&name)
             .and_then(|s| s.db.clone())
             .unwrap_or_else(|| "another database".to_string());
         return Err(format!(
-            "{name:?} is running but serves {other}, not {} — stop it (`harbor forget {name}`) or serve this file under a different name (`harbor start {} --name <other>`)",
+            "{name:?} is running but serves {other}, not {} — stop it (`harbor stop {name}`) or serve this file under a different name (`harbor start {} --name <other>`)",
             canon.display(),
             canon.display()
         ));

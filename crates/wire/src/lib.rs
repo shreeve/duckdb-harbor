@@ -263,8 +263,11 @@ pub struct OneShotResponse {
 
 /// GET /info — fleet-era berth identity. Absent (404 `not_found`) on
 /// pre-fleet servers; that absence is the version probe.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+///
+/// Lenient on read (`default`): a client usually wants one field of this,
+/// and a missing sibling must not turn the whole document unreadable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
 pub struct InfoResponse {
     pub protocol_version: u32,
     pub name: String,

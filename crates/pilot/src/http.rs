@@ -88,6 +88,15 @@ fn request_inner(
     let mut req = format!("{route} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
     req.push_str("Accept: application/x-ndjson\r\n");
     if let Some(t) = token {
+        // The token reaches here from argv, the environment, a token-file,
+        // or a token-cmd — one gate for all four. A control byte in a header
+        // is request splitting, so it is refused, never quoted around.
+        if t.bytes().any(|b| b.is_ascii_control()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "token contains control characters (newline?) — refusing to send it",
+            ));
+        }
         req.push_str(&format!("Authorization: Bearer {t}\r\n"));
     }
     if let Some(b) = body {
