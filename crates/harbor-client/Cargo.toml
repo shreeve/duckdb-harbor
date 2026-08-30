@@ -7,8 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-wire = { git = "https://github.com/shreeve/duckdb-harbor", rev = "5441d81" }
-harbor-common = { git = "https://github.com/shreeve/duckdb-harbor", rev = "5441d81", default-features = false }
+wire = { git = "https://github.com/shreeve/duckdb-harbor", rev = "82e331c" }
+harbor-common = { git = "https://github.com/shreeve/duckdb-harbor", rev = "82e331c", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

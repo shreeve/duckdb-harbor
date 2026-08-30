@@ -12,6 +12,7 @@
 use crate::http::{request, Transport};
 use crate::tokens;
 use harbor_common::config::{self, Connection};
+use harbor_common::fleet::Addr;
 use harbor_common::paths::runtime_dir;
 use harbor_common::State;
 use std::path::{Path, PathBuf};
@@ -21,8 +22,8 @@ use std::time::Duration;
 #[derive(Debug, Clone, Default)]
 pub struct Sidecar {
     pub db: Option<PathBuf>,
-    pub port: Option<u16>,
-    pub bind: Option<String>,
+    /// Where the berth actually answers, as the berth itself recorded it.
+    pub addr: Option<Addr>,
 }
 
 /// One row of the fleet view: a name, what the config says about it, and
@@ -72,30 +73,31 @@ fn berth_token(home: &Path, name: &str) -> Option<String> {
 fn read_sidecar(home: &Path, name: &str) -> Option<Sidecar> {
     let text = std::fs::read_to_string(home.join(format!("{name}.json"))).ok()?;
     let j: serde_json::Value = serde_json::from_str(&text).ok()?;
-    Some(Sidecar {
-        db: j["db"].as_str().map(PathBuf::from),
-        port: j["port"].as_u64().map(|p| p as u16),
-        bind: j["bind"].as_str().map(str::to_string),
-    })
+    Some(Sidecar { db: j["db"].as_str().map(PathBuf::from), addr: Addr::read(&j) })
 }
 
-/// How to dial a live local berth: the socket, else the TCP address its
-/// sidecar registered (loopback when it bound every interface).
-fn berth_transport(home: &Path, name: &str, sidecar: Option<&Sidecar>) -> Option<Transport> {
-    #[cfg(unix)]
-    {
-        let sock = berth_sock(home, name);
-        if sock.exists() {
-            return Some(Transport::Unix(sock));
+/// How to dial a live local berth: whatever its sidecar says it bound.
+///
+/// Read, not derived. This used to guess `<runtime>/<name>.sock` and fall
+/// back to the port — which is right only while the socket happens to sit at
+/// the path the name implies. A berth started with an explicit `--socket`
+/// answers somewhere else entirely, and the guess would then dial a path that
+/// is not there and report a live berth as Dead. The berth records where it
+/// actually bound; that is the answer.
+fn berth_transport(sidecar: Option<&Sidecar>) -> Option<Transport> {
+    match sidecar?.addr.as_ref()? {
+        #[cfg(unix)]
+        Addr::Sock(p) => p.exists().then(|| Transport::Unix(p.clone())),
+        #[cfg(not(unix))]
+        Addr::Sock(_) => None,
+        Addr::Tcp(host, port) => {
+            let bind = match host.as_str() {
+                "0.0.0.0" | "::" => "127.0.0.1",
+                other => other,
+            };
+            Some(Transport::Tcp(format!("{bind}:{port}")))
         }
     }
-    let sc = sidecar?;
-    let port = sc.port?;
-    let bind = match sc.bind.as_deref() {
-        Some("0.0.0.0") | Some("::") | None => "127.0.0.1",
-        Some(b) => b,
-    };
-    Some(Transport::Tcp(format!("{bind}:{port}")))
 }
 
 /// Every berth the config or the runtime dir knows, sorted by name. A
@@ -127,8 +129,7 @@ pub fn list() -> Vec<BerthRow> {
         .into_iter()
         .map(|name| {
             let sidecar = home.as_deref().and_then(|h| read_sidecar(h, &name));
-            let transport =
-                home.as_deref().and_then(|h| berth_transport(h, &name, sidecar.as_ref()));
+            let transport = berth_transport(sidecar.as_ref());
             BerthRow {
                 configured: cfg.get(&name).cloned(),
                 sidecar,
@@ -215,7 +216,7 @@ pub fn connect(name: &str) -> Result<Conn, String> {
 
     let home = runtime_dir()?;
     let sidecar = read_sidecar(&home, name);
-    if let Some(transport) = berth_transport(&home, name, sidecar.as_ref()) {
+    if let Some(transport) = berth_transport(sidecar.as_ref()) {
         return Ok(Conn {
             name: name.to_string(),
             transport,
@@ -248,7 +249,7 @@ fn ensure_berth(
             if j["db"].as_str() == Some(&canon.display().to_string()) {
                 if let Some(name) = j["name"].as_str() {
                     let sc = read_sidecar(&home, name);
-                    if let Some(t) = berth_transport(&home, name, sc.as_ref()) {
+                    if let Some(t) = berth_transport(sc.as_ref()) {
                         return Ok((t, berth_token(&home, name), false));
                     }
                 }
@@ -281,7 +282,7 @@ fn ensure_berth(
         return Err(format!("harbor start failed for {}", canon.display()));
     }
     let sc = read_sidecar(&home, &name);
-    let transport = berth_transport(&home, &name, sc.as_ref())
+    let transport = berth_transport(sc.as_ref())
         .ok_or_else(|| format!("harbor start returned without registering {name:?}"))?;
     Ok((transport, berth_token(&home, &name), true))
 }
