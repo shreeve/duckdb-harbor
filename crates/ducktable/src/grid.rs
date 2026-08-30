@@ -262,6 +262,26 @@ impl Grid {
         .detach();
     }
 
+    pub(crate) fn jump_first(&mut self, cx: &mut Context<Self>) {
+        if self.table.read(cx).delegate().page > 0 {
+            self.fetch(0, false, cx);
+        }
+    }
+
+    /// Jump to the last page — only reachable once the total is known,
+    /// because the offset comes from it.
+    pub(crate) fn jump_last(&mut self, cx: &mut Context<Self>) {
+        let (page, last) = {
+            let d = self.table.read(cx).delegate();
+            (d.page, d.last_page())
+        };
+        if let Some(last) = last {
+            if page < last {
+                self.fetch(last, false, cx);
+            }
+        }
+    }
+
     pub(crate) fn prev_page(&mut self, cx: &mut Context<Self>) {
         let page = self.table.read(cx).delegate().page;
         if page > 0 {
@@ -743,12 +763,13 @@ impl Render for Grid {
         let inspector = (p.inspector && self.view == ViewMode::Data)
             .then(|| self.inspector(cx).into_any_element());
         let view = self.view;
-        let (title, count, total, cols, page, size, filter_active, loading, error, ms) = {
+        let (title, count, total, last_pg, cols, page, size, filter_active, loading, error, ms) = {
             let d = self.table.read(cx).delegate();
             (
                 d.title.clone(),
                 d.rows.len(),
                 d.total_rows,
+                d.last_page(),
                 d.cols.len().saturating_sub(d.gutter as usize),
                 d.page,
                 d.page_size,
@@ -781,6 +802,7 @@ impl Render for Grid {
             // Unknown total: a full page suggests there may be more.
             None => count == size,
         };
+        let can_last = matches!(last_pg, Some(lp) if page < lp);
         let filter_open = self.filter_input.is_some();
         // The footer status is mode-relevant, and "N columns" is ALWAYS
         // the last element: it stays fixed at the right edge when the
@@ -788,20 +810,22 @@ impl Render for Grid {
         // columns text is its OWN node — as a suffix of one longer string
         // its glyphs land a subpixel differently and the switch shows a
         // 1px shift.
+        //
+        // Ordering rule for a jitter-free footer: in a right-justified
+        // cluster an element only moves when something to its RIGHT
+        // changes width, so the per-page variables (ms, row range) sit
+        // leftmost and everything right of them — pager glyphs, "N per",
+        // columns — is fixed. Page flips never move the arrows.
         let columns_part = format!("{cols} {}", if cols == 1 { "column" } else { "columns" });
-        let (status_prefix, status_columns) = match view {
-            ViewMode::Data => {
-                if loading && count == 0 {
-                    (Some("loading...".to_string()), None)
-                } else {
-                    (
-                        Some(format!("{ms} ms \u{00b7} {rows_part} \u{00b7}")),
-                        Some(columns_part),
-                    )
-                }
-            }
-            ViewMode::Structure => (None, Some(columns_part)),
+        let loading_empty = loading && count == 0;
+        let pager_visible = view == ViewMode::Data && !loading_empty;
+        let status_prefix = match view {
+            ViewMode::Data if loading_empty => Some("loading...".to_string()),
+            ViewMode::Data => Some(format!("{ms} ms \u{00b7} {rows_part}")),
+            ViewMode::Structure => None,
         };
+        let status_columns =
+            (view == ViewMode::Structure || pager_visible).then_some(columns_part);
         div()
             .size_full()
             .min_w_0()
@@ -1123,69 +1147,118 @@ impl Render for Grid {
                         )
                     })
                     .child(div().flex_1())
-                    .when(view == ViewMode::Data, |d| {
-                        // Pager: size, then prev/next. Status stays the
-                        // rightmost element (columns-last anchor).
-                        let arrow = |id: &'static str,
-                                     icon: gpui_component::IconName,
-                                     enabled: bool| {
-                            div()
-                                .id(id)
-                                .h_flex()
-                                .items_center()
-                                .justify_center()
-                                .size(px(20.))
-                                .rounded(px(4.))
-                                .map(|d| {
-                                    if enabled {
-                                        d.cursor_pointer()
-                                            .text_color(t.text)
-                                            .hover(|d| d.bg(t.row_hover))
-                                    } else {
-                                        d.text_color(t.muted.opacity(0.4))
-                                    }
-                                })
-                                .child(gpui_component::Icon::new(icon).size_4())
-                        };
-                        d.child(
-                            div()
-                                .id("page-size")
-                                .px_2()
-                                .h(px(20.))
-                                .h_flex()
-                                .items_center()
-                                .rounded(px(4.))
-                                .cursor_pointer()
-                                .text_xs()
-                                .text_color(t.muted)
-                                .hover(|d| d.bg(t.row_hover))
-                                .tooltip(|window, cx| {
-                                    Tooltip::new("Rows per page \u{2014} click to change")
-                                        .build(window, cx)
-                                })
-                                .child(commas(size as u64))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.cycle_page_size(cx);
-                                })),
-                        )
-                        .child(
-                            arrow("page-prev", gpui_component::IconName::ChevronLeft, can_prev)
-                                .on_click(cx.listener(|this, _, _, cx| this.prev_page(cx))),
-                        )
-                        .child(
-                            arrow("page-next", gpui_component::IconName::ChevronRight, can_next)
-                                .on_click(cx.listener(|this, _, _, cx| this.next_page(cx))),
-                        )
-                    })
                     .child(
+                        // One right-anchored line: ms · range · pager ·
+                        // columns (see the ordering rule above).
                         div()
                             .ml_2()
                             .h_flex()
                             .flex_none()
-                            .gap_1()
+                            .items_center()
+                            .gap_2()
                             .text_xs()
                             .text_color(t.muted)
                             .when_some(status_prefix, |d, s| d.child(div().child(s)))
+                            .when(pager_visible, |d| {
+                                let arrow = |id: &'static str,
+                                             path: &'static str,
+                                             enabled: bool| {
+                                    div()
+                                        .id(id)
+                                        .h_flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .size(px(20.))
+                                        .rounded(px(4.))
+                                        .map(|d| {
+                                            if enabled {
+                                                d.cursor_pointer()
+                                                    .text_color(t.text)
+                                                    .hover(|d| d.bg(t.row_hover))
+                                            } else {
+                                                d.text_color(t.muted.opacity(0.4))
+                                            }
+                                        })
+                                        .child(
+                                            gpui_component::Icon::empty().path(path).size_4(),
+                                        )
+                                };
+                                d.child(div().child("\u{00b7}"))
+                                    .child(
+                                        div()
+                                            .h_flex()
+                                            .items_center()
+                                            .gap_0p5()
+                                            .child(
+                                                arrow(
+                                                    "page-first",
+                                                    "icons/chevron-first.svg",
+                                                    can_prev,
+                                                )
+                                                .on_click(cx.listener(
+                                                    |this, _, _, cx| this.jump_first(cx),
+                                                )),
+                                            )
+                                            .child(
+                                                arrow(
+                                                    "page-prev",
+                                                    "icons/chevron-left.svg",
+                                                    can_prev,
+                                                )
+                                                .on_click(cx.listener(
+                                                    |this, _, _, cx| this.prev_page(cx),
+                                                )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("page-size")
+                                                    .px_1()
+                                                    .h(px(20.))
+                                                    .h_flex()
+                                                    .items_center()
+                                                    .rounded(px(4.))
+                                                    .cursor_pointer()
+                                                    .hover(|d| d.bg(t.row_hover))
+                                                    .tooltip(|window, cx| {
+                                                        Tooltip::new(
+                                                            "Rows per page \u{2014} \
+                                                             click to change",
+                                                        )
+                                                        .build(window, cx)
+                                                    })
+                                                    .child(format!(
+                                                        "{} per",
+                                                        commas(size as u64)
+                                                    ))
+                                                    .on_click(cx.listener(
+                                                        |this, _, _, cx| {
+                                                            this.cycle_page_size(cx);
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                arrow(
+                                                    "page-next",
+                                                    "icons/chevron-right.svg",
+                                                    can_next,
+                                                )
+                                                .on_click(cx.listener(
+                                                    |this, _, _, cx| this.next_page(cx),
+                                                )),
+                                            )
+                                            .child(
+                                                arrow(
+                                                    "page-last",
+                                                    "icons/chevron-last.svg",
+                                                    can_last,
+                                                )
+                                                .on_click(cx.listener(
+                                                    |this, _, _, cx| this.jump_last(cx),
+                                                )),
+                                            ),
+                                    )
+                                    .child(div().child("\u{00b7}"))
+                            })
                             .when_some(status_columns, |d, s| d.child(div().child(s))),
                     ),
             )

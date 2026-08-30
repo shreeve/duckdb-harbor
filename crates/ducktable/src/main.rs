@@ -42,6 +42,12 @@ impl AssetSource for Assets {
             "icons/chevron-right.svg" => {
                 Some(include_bytes!("../../../assets/icons/chevron-right.svg").into())
             }
+            "icons/chevron-first.svg" => {
+                Some(include_bytes!("../../../assets/icons/chevron-first.svg").into())
+            }
+            "icons/chevron-last.svg" => {
+                Some(include_bytes!("../../../assets/icons/chevron-last.svg").into())
+            }
             "icons/eye.svg" => Some(include_bytes!("../../../assets/icons/eye.svg").into()),
             "icons/funnel.svg" => {
                 Some(include_bytes!("../../../assets/icons/funnel.svg").into())

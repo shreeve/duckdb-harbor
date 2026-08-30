@@ -20,8 +20,9 @@ pub struct Prefs {
     pub page_size: usize,
 }
 
-/// The page sizes the footer control cycles through.
-pub const PAGE_SIZES: [usize; 4] = [500, 1_000, 5_000, 10_000];
+/// The page sizes the footer control cycles through: one decade apart, so
+/// each step is a different kind of read (skim / work / bulk-scan).
+pub const PAGE_SIZES: [usize; 3] = [500, 5_000, 50_000];
 
 impl Default for Prefs {
     fn default() -> Self {
@@ -31,7 +32,7 @@ impl Default for Prefs {
             null_tags: true,
             inspector: false,
             inspector_width: 290.,
-            page_size: 5_000,
+            page_size: 500,
         }
     }
 }
