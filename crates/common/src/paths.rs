@@ -66,7 +66,7 @@ pub fn config_file() -> Result<PathBuf, String> {
     Ok(config_root()?.join("config.toml"))
 }
 
-/// Holds `runtime/`, `log/` and `history` — everything harbor writes.
+/// Holds `runtime/` and `history` — everything harbor writes.
 pub fn state_root() -> Result<PathBuf, String> {
     if let Some(h) = harbor_home() {
         return Ok(h);
@@ -104,6 +104,11 @@ pub fn token_file(runtime: &Path, name: &str) -> PathBuf {
 }
 pub fn lock_file(runtime: &Path, name: &str) -> PathBuf {
     runtime.join(format!("{name}.lock"))
+}
+/// The operator's stop, made durable: while this exists, no client may
+/// raise the name — `harbor start` lifts it, `harbor forget` sweeps it.
+pub fn hold_file(runtime: &Path, name: &str) -> PathBuf {
+    runtime.join(format!("{name}.hold"))
 }
 pub fn log_file(runtime: &Path, name: &str) -> PathBuf {
     runtime.join("log").join(format!("{name}.log"))

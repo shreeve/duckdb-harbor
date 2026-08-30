@@ -76,7 +76,8 @@ harbor — DuckDB wearing a server
 usage:
   harbor show   [name]              the fleet, or one database in detail
   harbor start  <name|db.duckdb>    start a database in the background, wait ready
-  harbor stop   <name>              drain, CHECKPOINT, and stop it
+  harbor stop   <name>              drain, CHECKPOINT, and hold it stopped
+                                    (a held name will not autostart; start lifts the hold)
   harbor forget <name>              stop it and drop it (never the database)
   harbor doctor                     check the config for what nothing else sees
   harbor serve  <db.duckdb> [opts]  own a database, serve it (foreground)
@@ -914,6 +915,9 @@ fn start(rest: Vec<String>) -> Result<(), String> {
     // error. `start` names an end state, and a second `start` in a shell you
     // forgot you had should read the same as the first.
     let home = harbor_common::runtime_dir()?;
+    // start means "desired state: running", which by definition lifts the
+    // operator's hold — the one word that outranks a client's autostart.
+    let _ = std::fs::remove_file(harbor_common::hold_file(&home, &name));
     if harbor_common::fleet::reconcile(&cfg, &home, &probe).iter().any(|r| {
         r.name == name && r.state == harbor_common::State::Running
     }) && rest.len() == 1
@@ -1056,6 +1060,16 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
     let home = harbor_home()?;
     let sock = harbor_common::sock_file(&home, &name);
     let lock_path = harbor_common::lock_file(&home, &name);
+
+    // stop is a hold: the name stays down against every client's autostart
+    // until `harbor start` says otherwise. Written before the signal because
+    // the operator's word holds even while the drain runs long — and only
+    // for configured names, since nothing autostarts anything else.
+    if !remove
+        && load_config().ok().and_then(|c| c.get(&name).map(|e| e.is_berth())).unwrap_or(false)
+    {
+        let _ = write_private(&harbor_common::hold_file(&home, &name), "");
+    }
     if let Some(side) = harbor_common::fleet::Sidecar::read(&home, &name) {
             if berth_dead(&lock_path) {
                 // Proven dead: no process holds the flock, so the pid recorded
@@ -1155,6 +1169,7 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
             ("sock", harbor_common::sock_file(&home, &name)),
             ("json", harbor_common::sidecar_file(&home, &name)),
             ("token", harbor_common::token_file(&home, &name)),
+            ("hold", harbor_common::hold_file(&home, &name)),
         ] {
             if std::fs::remove_file(path).is_ok() {
                 gone.push(f);

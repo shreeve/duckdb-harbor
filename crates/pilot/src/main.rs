@@ -171,9 +171,10 @@ usage:
   pilot version                print this binary's version (also -V)
 
 target:
-  name                         a config.toml entry, else a running database: its
-                               socket or registered TCP port (+ <name>.token)
-  path/to.duckdb               join its server, or start a temp one (exits when idle)
+  name                         a service — starts on use, runs until harbor stop
+                               (a stopped-by-hand name stays down until harbor start)
+  path/to.duckdb               a session — join its server, or start a temp one
+                               (opens or creates the file; exits when idle)
   path/to.sock                 a harbor unix socket
   http://host:port             a harbor TCP listener
 
@@ -259,15 +260,28 @@ fn resolve(
             return Ok(Conn { transport: url_transport(url)?, token });
         }
         if entry.path.is_some() {
-            // A configured name is a service: it starts when the operator
-            // says so and a stopped one stays stopped — connecting to it must
-            // never start it. Only a *path* summons a temp database, because
-            // pointing at a file says "serve this for me now"; naming a
-            // service does not.
-            let Some(transport) = berth_transport(&home, target) else {
-                return Err(format!(
-                    "{target:?} is configured but not running — start it with: harbor start {target}"
-                ));
+            // A name is a service: it starts on use and runs until you say
+            // stop. The one word that outranks a client is the operator's —
+            // after `harbor stop`, the hold keeps the name down until
+            // `harbor start` lifts it. Pilot decides nothing here: it only
+            // realizes desired state through harbor's own verb.
+            let transport = match berth_transport(&home, target) {
+                Some(t) => t,
+                None => {
+                    if harbor_common::hold_file(&home, target).exists() {
+                        return Err(format!(
+                            "{target:?} is stopped by hand — harbor start {target} brings it back"
+                        ));
+                    }
+                    exec_harbor_start(&[std::ffi::OsString::from(target)])
+                        .map_err(|e| format!("cannot start {target:?}: {e}"))?;
+                    berth_transport(&home, target).ok_or_else(|| {
+                        format!(
+                            "harbor started {target:?} but it never registered — \
+                             see harbor show {target}"
+                        )
+                    })?
+                }
             };
             return Ok(Conn { transport, token: token.or_else(|| berth_token(&home, target)) });
         }
@@ -356,7 +370,7 @@ fn berth_transport(home: &std::path::Path, name: &str) -> Option<Transport> {
 /// Every berth the registry knows, with how to dial it — the same sidecar
 /// jsons `harbor show` reads, so socket and --port berths both appear.
 fn berth_entries(home: &std::path::Path) -> Vec<(String, Transport)> {
-    let (sidecars, _) = harbor_common::fleet::scan_runtime(home);
+    let (sidecars, _, _) = harbor_common::fleet::scan_runtime(home);
     sidecars
         .into_keys()
         .filter_map(|name| {
@@ -423,7 +437,7 @@ fn ensure_berth(
     });
 
     // Already owned? The sidecar json says which berth claims this file.
-    let (sidecars, _) = harbor_common::fleet::scan_runtime(&home);
+    let (sidecars, _, _) = harbor_common::fleet::scan_runtime(&home);
     for (name, side) in &sidecars {
         if side.db.as_deref() == Some(&canon.display().to_string())
             && let Some(transport) = berth_transport(&home, name)
@@ -452,32 +466,42 @@ fn ensure_berth(
             canon.display()
         ));
     }
-    let harbor = std::env::var("HARBOR_BIN").unwrap_or_else(|_| "harbor".to_string());
-    // No announcement: the operator asked for this database and gets a
-    // prompt, not a narration. `harbor show` carries the lifetime story.
-    let mut cmd = std::process::Command::new(&harbor);
-    cmd.args(["start"]).arg(&canon).args(["--name", &name]);
+    let mut args: Vec<std::ffi::OsString> = vec![canon.clone().into()];
+    args.push("--name".into());
+    args.push(name.clone().into());
     // A typed path is the duckdb-cli contract: open it, existing or not.
     // A configured NAME over a missing file still blocks — that guard
     // protects names clients trust; a path names only itself.
     if !canon.exists() {
-        cmd.arg("--create");
+        args.push("--create".into());
     }
     // A Lifetime knows its own argv, so "never" reaches harbor as the absence
     // of --idle-exit rather than as a duration string harbor cannot parse.
-    cmd.args(life.to_args());
-    let status = cmd
-        // pilot is about to draw a prompt; harbor's fleet table is not pilot's
-        // output. Failures still speak — harbor writes those to stderr.
-        .stdout(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("cannot run {harbor:?} (is harbor installed?): {e}"))?;
-    if !status.success() {
-        return Err(format!("harbor start failed for {}", canon.display()));
-    }
+    args.extend(life.to_args().into_iter().map(std::ffi::OsString::from));
+    exec_harbor_start(&args).map_err(|e| format!("cannot start {}: {e}", canon.display()))?;
     let transport = berth_transport(&home, &name)
         .ok_or_else(|| format!("harbor start returned without registering {name:?}"))?;
     Ok((transport, berth_token(&home, &name)))
+}
+
+/// Pilot's only fleet-touching act is connecting, so anything it starts is
+/// started through harbor's own verb — one summon path, owned by the binary
+/// that owns the rules. No announcement on success: the operator asked for a
+/// database and gets a prompt, not a narration.
+fn exec_harbor_start(args: &[std::ffi::OsString]) -> Result<(), String> {
+    let harbor = std::env::var("HARBOR_BIN").unwrap_or_else(|_| "harbor".to_string());
+    let status = std::process::Command::new(&harbor)
+        .arg("start")
+        .args(args)
+        // pilot is about to draw a prompt; harbor's fleet table is not
+        // pilot's output. Failures still speak — harbor writes to stderr.
+        .stdout(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("cannot run {harbor:?} (is harbor installed?): {e}"))?;
+    match status.success() {
+        true => Ok(()),
+        false => Err("harbor start failed".into()),
+    }
 }
 
 fn fleet_hint(home: &std::path::Path) -> String {

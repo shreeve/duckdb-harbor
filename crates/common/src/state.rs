@@ -33,8 +33,11 @@ pub enum Level {
 pub enum State {
     /// Configured, running, and serving what the config says.
     Running,
-    /// Configured, not running. Starts with `harbor start`.
+    /// Configured, not running. Starts on use, or with `harbor start`.
     Stopped,
+    /// Configured, stopped by the operator's own word — `harbor stop` holds
+    /// it down against every client until `harbor start` lifts the hold.
+    Held,
     /// Running, but the database or the options differ from the config now.
     Drifted,
     /// Running, with nothing in the config about it — summoned by a client,
@@ -51,6 +54,7 @@ impl State {
         match self {
             State::Running => "running",
             State::Stopped => "stopped",
+            State::Held => "held",
             State::Drifted => "drifted",
             State::Unmanaged => "unmanaged",
             State::Dead => "dead",
@@ -62,6 +66,7 @@ impl State {
         match self {
             State::Running => "●",
             State::Stopped => "○",
+            State::Held => "○",
             State::Drifted => "◆",
             State::Unmanaged => "◍",
             State::Dead => "✕",
@@ -72,7 +77,7 @@ impl State {
     pub fn level(self) -> Level {
         match self {
             State::Running => Level::Good,
-            State::Stopped | State::Stale => Level::Idle,
+            State::Stopped | State::Held | State::Stale => Level::Idle,
             State::Drifted | State::Unmanaged => Level::Warn,
             State::Dead => Level::Bad,
         }
@@ -93,7 +98,7 @@ impl State {
     /// because it is acted on in bulk, not one at a time.
     pub fn rank(self) -> u8 {
         match self {
-            State::Running | State::Drifted | State::Stopped => 0,
+            State::Running | State::Drifted | State::Stopped | State::Held => 0,
             State::Unmanaged => 1,
             State::Dead => 2,
             State::Stale => 3,
@@ -115,7 +120,7 @@ mod tests {
     #[test]
     fn the_word_survives_without_color() {
         // A reader with color off, or in a pipe, still gets the state.
-        for s in [State::Running, State::Stopped, State::Drifted, State::Dead, State::Stale] {
+        for s in [State::Running, State::Stopped, State::Held, State::Drifted, State::Dead, State::Stale] {
             assert!(!s.word().is_empty() && !s.glyph().is_empty());
             assert!(s.label().contains(s.word()));
         }

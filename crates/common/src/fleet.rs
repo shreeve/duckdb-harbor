@@ -140,11 +140,12 @@ pub struct Row {
     pub note: Option<String>,
 }
 
-/// Read the runtime directory once, for both sidecars and locks.
-pub fn scan_runtime(home: &Path) -> (BTreeMap<String, Sidecar>, BTreeSet<String>) {
+/// Read the runtime directory once: sidecars, locks, and holds.
+pub fn scan_runtime(home: &Path) -> (BTreeMap<String, Sidecar>, BTreeSet<String>, BTreeSet<String>) {
     let mut sidecars: BTreeMap<String, Sidecar> = Default::default();
     let mut locks = BTreeSet::new();
-    let Ok(rd) = std::fs::read_dir(home) else { return (sidecars, locks) };
+    let mut holds = BTreeSet::new();
+    let Ok(rd) = std::fs::read_dir(home) else { return (sidecars, locks, holds) };
     for p in rd.filter_map(|e| e.ok().map(|e| e.path())) {
         let Some(stem) = p.file_stem().map(|x| x.to_string_lossy().into_owned()) else { continue };
         match p.extension().and_then(|x| x.to_str()) {
@@ -158,10 +159,13 @@ pub fn scan_runtime(home: &Path) -> (BTreeMap<String, Sidecar>, BTreeSet<String>
             Some("lock") => {
                 locks.insert(stem);
             }
+            Some("hold") => {
+                holds.insert(stem);
+            }
             _ => {}
         }
     }
-    (sidecars, locks)
+    (sidecars, locks, holds)
 }
 
 /// Reconcile desired (config) against actual (runtime) into one row per name.
@@ -173,13 +177,14 @@ pub fn scan_runtime(home: &Path) -> (BTreeMap<String, Sidecar>, BTreeSet<String>
 /// lock file at all — which is why it is a parameter: common has no HTTP client
 /// and should not grow one to answer a question it almost never asks.
 pub fn reconcile(cfg: &FileConfig, home: &Path, probe: &dyn Fn(&Addr) -> bool) -> Vec<Row> {
-    let (sidecars, locks) = scan_runtime(home);
+    let (sidecars, locks, holds) = scan_runtime(home);
     let configured: BTreeMap<&str, &Connection> = cfg.berths().into_iter().collect();
 
     let mut names: BTreeSet<String> = Default::default();
     names.extend(configured.keys().map(|k| k.to_string()));
     names.extend(sidecars.keys().cloned());
     names.extend(locks.iter().cloned());
+    names.extend(holds.iter().cloned());
 
     let mut rows: Vec<Row> = Vec::new();
     for name in names {
@@ -219,8 +224,15 @@ pub fn reconcile(cfg: &FileConfig, home: &Path, probe: &dyn Fn(&Addr) -> bool) -
                 ));
                 State::Dead
             }
-            // A lock left by a clean exit is normal residue, not a mess.
-            (Claim::Free, false, true) | (Claim::None, false, true) => State::Stopped,
+            // A lock left by a clean exit is normal residue, not a mess. A
+            // hold is the operator's stop, standing: only start lifts it.
+            (Claim::Free, false, true) | (Claim::None, false, true) => match holds.contains(&name) {
+                true => {
+                    note = Some(format!("stopped by hand — harbor start {name} brings it back"));
+                    State::Held
+                }
+                false => State::Stopped,
+            },
             (Claim::Free, false, false) => {
                 note = Some(format!("left by a database that is gone — harbor forget {name}"));
                 State::Stale
@@ -234,7 +246,13 @@ pub fn reconcile(cfg: &FileConfig, home: &Path, probe: &dyn Fn(&Addr) -> bool) -
                     State::Dead
                 }
             },
-            (Claim::None, false, false) => continue,
+            (Claim::None, false, false) => match holds.contains(&name) {
+                true => {
+                    note = Some(format!("held but no longer configured — harbor forget {name}"));
+                    State::Stale
+                }
+                false => continue,
+            },
         };
 
         let uptime = side
