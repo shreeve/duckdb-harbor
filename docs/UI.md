@@ -38,6 +38,13 @@ Three vertical panes. Sidebar and inspector collapse independently and
 auto-collapse when the window is too narrow to keep the content pane at
 least 480pt wide; divider positions persist. Minimum window 640x400.
 
+Rigidity is part of feeling native: every pane and card declares a real
+minimum size, and the window's minimum is derived from those minimums,
+never chosen as a free-standing number. Content pushes back instead of
+flowing; nothing ever mushes the way a web page does. When space runs
+out, the response is a deliberate state change (a pane collapses, a
+value truncates with an ellipsis), not gradual squeezing.
+
 Collapsing is offered three redundant ways, all reaching the same
 state: toolbar toggle buttons at each end using the split-rectangle
 panel glyph (the Finder/Xcode convention; never a hamburger, which
