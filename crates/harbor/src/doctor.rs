@@ -14,7 +14,7 @@
 //!
 //! Every finding names the fix. A finding with no fix is a complaint.
 
-use harbor_common::config::{Connection, FileConfig, Kind};
+use harbor_common::config::FileConfig;
 use harbor_common::paths::shorten;
 use harbor_common::ui::Tone;
 use std::collections::HashMap;
@@ -26,8 +26,6 @@ pub enum Severity {
     Error,
     /// Works today, will surprise someone.
     Warn,
-    /// Worth knowing.
-    Note,
 }
 
 impl Severity {
@@ -35,14 +33,12 @@ impl Severity {
         match self {
             Severity::Error => Tone::Red,
             Severity::Warn => Tone::Yellow,
-            Severity::Note => Tone::Dim,
         }
     }
     pub fn glyph(self) -> &'static str {
         match self {
             Severity::Error => "✕",
             Severity::Warn => "▲",
-            Severity::Note => "·",
         }
     }
 }
@@ -228,18 +224,10 @@ pub fn examine(cfg: &FileConfig) -> Vec<Finding> {
     out
 }
 
-/// Non-zero when anything needs a human, so `harbor doctor` works in a
-/// health check. Notes alone are not a failure.
+/// Non-zero when anything needs a human, so `harbor doctor` works in a health
+/// check.
 pub fn exit_code(findings: &[Finding]) -> u8 {
-    match findings.iter().any(|f| f.severity <= Severity::Warn) {
-        true => 1,
-        false => 0,
-    }
-}
-
-/// Handy for callers that want the connection back out of a finding.
-pub fn berth_of<'a>(cfg: &'a FileConfig, name: &str) -> Option<&'a Connection> {
-    cfg.get(name).filter(|c| c.kind() == Kind::Berth)
+    u8::from(!findings.is_empty())
 }
 
 #[cfg(test)]

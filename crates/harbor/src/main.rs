@@ -1,14 +1,16 @@
 //! harbor — DuckDB wearing a server.
 //!
 //! One binary, two jobs (PLAN.md D8): `serve` embeds DuckDB and owns one
-//! database file; the fleet verbs (`add`, `ls`, `stop`, `rm`) manage the
-//! berths of ~/.config/harbor/runtime from outside, linking no engine code paths at all.
+//! database file; the fleet verbs (`start`, `show`, `stop`, `forget`, `doctor`)
+//! manage the berths of ~/.local/state/harbor/runtime from outside, linking no
+//! engine code paths at all.
 //!
-//!   harbor serve db.duckdb [--name n] [--socket p | --port p] [--token t]
-//!   harbor add   db.duckdb [--name n]        spawn a detached berth, wait ready
-//!   harbor ls                                the live fleet
-//!   harbor stop  <name>                      SIGTERM → drain, CHECKPOINT
-//!   harbor rm    <name>                      stop + clear registry (never the db)
+//!   harbor serve  db.duckdb [--name n] [--socket p | --port p] [--token t]
+//!   harbor start  <name|db.duckdb>           spawn a detached berth, wait ready
+//!   harbor show   [name]                     the fleet, or one berth in detail
+//!   harbor stop   <name>                     SIGTERM → drain, CHECKPOINT
+//!   harbor forget <name>                     stop + clear registry (never the db)
+//!   harbor doctor                            what nothing else has a moment to see
 //!   harbor version                           print this binary's version
 //!
 //! The registry is the filesystem (D3): <name>.sock is the registration,
@@ -37,17 +39,18 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (cmd, rest) = match args.split_first() {
         Some((c, r)) => (c.as_str(), r.to_vec()),
-        None => {
-            print!("{HELP}");
-            return ExitCode::SUCCESS;
-        }
+        // Bare `harbor` shows the fleet — systemctl's precedent, and the job
+        // this binary does: the client connects you, the manager reports to
+        // you. `harbor help` is still the route to the verb list.
+        None => ("show", Vec::new()),
     };
     let result = match cmd {
         "serve" => serve(rest),
-        "add" => add(rest),
-        "ls" => ls(),
+        "start" => start(rest),
+        "show" => show(rest),
         "stop" => stop_berth(rest, false),
-        "rm" => stop_berth(rest, true),
+        "forget" => stop_berth(rest, true),
+        "doctor" => doctor_cmd(rest),
         "-h" | "--help" | "help" => {
             print!("{HELP}");
             Ok(())
@@ -71,14 +74,21 @@ const HELP: &str = "\
 harbor — DuckDB wearing a server
 
 usage:
-  harbor serve <db.duckdb> [opts]   own a database, serve it (foreground)
-  harbor add   <db.duckdb> [opts]   spawn a detached berth, wait until ready
-  harbor ls                         list berths in the harbor
-  harbor stop  <name>               SIGTERM the berth: drain, CHECKPOINT, exit
-  harbor rm    <name>               stop + remove registry entries (never the db)
+  harbor show   [name]              the fleet, or one berth in detail
+  harbor start  <name|db.duckdb>    spawn a detached berth, wait until ready
+  harbor stop   <name>              SIGTERM the berth: drain, CHECKPOINT, exit
+  harbor forget <name>              stop it and drop it (never the database)
+  harbor doctor                     check the config for what nothing else sees
+  harbor serve  <db.duckdb> [opts]  own a database, serve it (foreground)
   harbor version                    print this binary's version (also -V)
 
-serve/add options:
+Bare `harbor` is `harbor show`.
+
+A bare word always names a configured berth, never a file — which is what
+stops `harbor start medlabs`, run from the wrong directory, from meaning the
+file ./medlabs. A path carries a / or ends in .duckdb.
+
+serve/start options (a config entry may set any of these; a flag here wins):
   --create            allow a database file that does not exist yet (the
                       positional is a PATH; without this flag a missing
                       file is an error, never a fresh database)
@@ -176,7 +186,7 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
         }
     }
     o.db = db.ok_or("no database file given")?;
-    // The positional is a PATH — `harbor add medlabs` from ~/x names the
+    // The positional is a PATH — `harbor start medlabs` from ~/x names the
     // file ~/x/medlabs, and silently creating a fresh database there (then
     // serving it under the very name clients trust) put an empty impostor
     // in front of real data once already. Creation is opt-in, loudly.
@@ -226,26 +236,93 @@ fn harbor_home() -> Result<PathBuf, String> {
 /// Claim a berth name for this process's lifetime. Unix uses flock so the
 /// inode can remain forever; Windows opens the file with no sharing, which is
 /// the native equivalent and releases automatically when the process exits.
+///
+/// Two properties beyond taking the lock, both needed now that other verbs
+/// touch these files routinely:
+///
+/// **It retries briefly.** `harbor show` flocks every lock file to test it and
+/// `forget` takes one to unlink it, each for microseconds. Without a retry,
+/// a `start` that lands in one of those windows fails with "already claimed"
+/// about a berth nobody is running.
+///
+/// **It revalidates the inode.** `forget` can unlink a lock file, so the path
+/// this opened may no longer be the path this holds. If they differ, another
+/// claimant could take the fresh inode and win the same name — two servers,
+/// one database. Comparing dev+ino after the lock is the dpkg/apt protocol,
+/// and it is what makes unlinking a lock safe at all.
 fn claim_lock(path: &Path) -> Result<std::fs::File, String> {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
-        let lock = std::fs::File::create(path).map_err(|e| format!("lock: {e}"))?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(format!("berth lock {} is already claimed", path.display()));
+        use std::os::unix::fs::MetadataExt;
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let lock = std::fs::File::create(path).map_err(|e| format!("lock: {e}"))?;
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                // Held. Is it still the file at this path?
+                let held = lock.metadata().map_err(|e| e.to_string())?;
+                match std::fs::metadata(path) {
+                    Ok(now) if now.dev() == held.dev() && now.ino() == held.ino() => {
+                        return Ok(lock);
+                    }
+                    // Unlinked or replaced under us: drop it and take the new one.
+                    _ if Instant::now() < deadline => continue,
+                    _ => return Err(format!("berth lock {} keeps changing", path.display())),
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("berth lock {} is already claimed", path.display()));
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
-        Ok(lock)
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .share_mode(0)
-            .open(path)
-            .map_err(|_| format!("berth lock {} is already claimed", path.display()))
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .share_mode(0)
+                .open(path)
+            {
+                Ok(f) => return Ok(f),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(_) => {
+                    return Err(format!("berth lock {} is already claimed", path.display()));
+                }
+            }
+        }
+    }
+}
+
+/// Unlink a lock file, but only while holding it.
+///
+/// The rule everywhere else in this file is *never unlink a lock*, because
+/// unlinking one another claimant has open lets a third create a fresh inode
+/// and flock that: two winners, one database. Holding the lock across the
+/// unlink is what suspends that rule safely — a concurrent `serve` either
+/// loses the flock and waits, or wins after the unlink and revalidates onto
+/// the new inode. Returns whether anything was removed.
+fn unlink_lock_if_free(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let Ok(f) = std::fs::OpenOptions::new().read(true).open(path) else { return false };
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return false; // someone is serving under this name
+        }
+        let removed = std::fs::remove_file(path).is_ok();
+        drop(f);
+        removed
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::remove_file(path).is_ok()
     }
 }
 
@@ -358,7 +435,7 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
     }
 
     // One identity, two consumers: GET /info (auth, live uptime spliced in by
-    // the core) and the <name>.json sidecar `harbor ls` reads without dialing.
+    // the core) and the <name>.json sidecar `harbor show` reads without dialing.
     let db_abs = std::fs::canonicalize(&o.db).unwrap_or(o.db.clone()).display().to_string();
     harbor::set_info(serde_json::json!({
         "protocolVersion": 1,
@@ -484,14 +561,14 @@ fn duckdb_open(o: &Opts) -> Result<harbor::duckdb::Connection, String> {
 // Fleet verbs — filesystem + probes, no engine
 // ---------------------------------------------------------------------------
 
-fn add(rest: Vec<String>) -> Result<(), String> {
+fn spawn_detached(rest: Vec<String>) -> Result<(), String> {
     let o = parse_opts(rest.clone())?;
     let home = harbor_home()?;
     let log_dir = home.join("log");
     std::fs::create_dir_all(&log_dir).map_err(|e| format!("log dir: {e}"))?;
     let log_path = log_dir.join(format!("{}.log", o.name));
     // Append, never truncate: a berth may already be serving under this name
-    // (this add is then the loser of a race, or a mistake), and File::create
+    // (this start is then the loser of a race, or a mistake), and File::create
     // would wipe the live process's history out from under it — the log an
     // operator needs most at exactly the moment it went missing.
     let log = std::fs::OpenOptions::new()
@@ -539,7 +616,7 @@ fn add(rest: Vec<String>) -> Result<(), String> {
         use std::os::windows::process::CommandExt;
         use std::process::Stdio;
         // CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS: the child owns no
-        // console and survives the short-lived `harbor add` launcher.
+        // console and survives the short-lived `harbor start` launcher.
         cmd.stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
             .stderr(Stdio::from(log))
@@ -553,12 +630,12 @@ fn add(rest: Vec<String>) -> Result<(), String> {
     while Instant::now() < deadline {
         // The child dying is an answer, not a timeout: it lost the flock to a
         // berth already serving, or failed outright. Without this check the
-        // existing berth answers /ready and this add reports success with the
+        // existing berth answers /ready and this start reports success with the
         // dead child's pid — which an orchestrator then records and signals.
         if let Ok(Some(status)) = child.try_wait() {
             return Err(format!(
                 "the berth did not start ({status}); a berth may already serve this name — \
-                 see harbor ls, or {}",
+                 see harbor show, or {}",
                 log_path.display()
             ));
         }
@@ -698,57 +775,454 @@ fn probe_200(s: &mut (impl Read + Write)) -> bool {
     }
 }
 
-fn ls() -> Result<(), String> {
-    let home = harbor_home()?;
-    // Keyed off the sidecar json — the file that exists precisely so ls can
-    // read identity without dialing — because a --port berth has no socket
-    // and was invisible when this listed *.sock.
-    let mut jsons: Vec<PathBuf> = std::fs::read_dir(&home)
-        .map_err(|e| e.to_string())?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "json"))
-        .collect();
-    jsons.sort();
-    if jsons.is_empty() {
-        println!("no berths in {} (harbor add <db.duckdb>)", home.display());
+/// The config, or a clear reason why not.
+///
+/// `load_or_empty` is wrong for the fleet verbs: a refused or invalid config
+/// returns *empty*, which would silently reclassify every configured berth as
+/// unmanaged and make every stopped one vanish. A confidently wrong table is
+/// worse than an error.
+fn load_config() -> Result<harbor_common::config::FileConfig, String> {
+    match harbor_common::config::load() {
+        Ok(c) => Ok(c),
+        Err(harbor_common::config::Error::Missing(_)) => Ok(Default::default()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Levenshtein — just enough for "did you mean".
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Unknown name: say what exists, and guess only when the guess is close.
+///
+/// Deliberately never *runs* the guess the way git's help.autocorrect can. Do
+/// not act on a guess that starts a server.
+fn unknown_berth(cfg: &harbor_common::config::FileConfig, name: &str) -> String {
+    let known: Vec<&str> = cfg.berths().into_iter().map(|(n, _)| n).collect();
+    let mut msg = format!("no berth named {name:?} in your config");
+    if let Some(near) = known.iter().find(|k| edit_distance(k, name) <= 2) {
+        msg.push_str(&format!("\n        did you mean: {near}?"));
+    }
+    match known.is_empty() {
+        true => msg.push_str("\n        nothing is configured yet — harbor start <db.duckdb>"),
+        false => msg.push_str(&format!("\n        configured: {}", known.join(", "))),
+    }
+    msg.push_str("\n        (a bare word always names a berth; a path needs a / or .duckdb)");
+    msg
+}
+
+/// A config entry, rendered as `serve` flags.
+///
+/// Config is translated into argv rather than read twice, so `serve` stays
+/// flag-complete: a systemd unit, a container, and the test harness never need
+/// a config file at all.
+fn entry_args(
+    c: &harbor_common::config::Connection,
+    d: &harbor_common::config::Defaults,
+) -> Result<Vec<String>, String> {
+    let mut v: Vec<String> = Vec::new();
+    // A human typing `harbor start` asked for a server, so absent means
+    // persistent — but an entry naming its own idle-exit wins over that.
+    let life = harbor_common::lifetime::resolve(
+        Default::default(),
+        c.idle_exit.as_deref(),
+        d.idle_exit.as_deref(),
+        harbor_common::Summoner::Operator,
+    )?;
+    v.extend(life.to_args());
+
+    let (threads, workers, port) = (
+        c.threads.or(d.threads).map(|n| n.to_string()),
+        c.workers.or(d.workers).map(|n| n.to_string()),
+        c.port.map(|n| n.to_string()),
+    );
+    let pairs: [(&str, Option<&str>); 7] = [
+        ("memory-limit", c.memory_limit.as_deref().or(d.memory_limit.as_deref())),
+        ("statement-timeout", c.statement_timeout.as_deref()),
+        ("max-temp-size", c.max_temp_size.as_deref()),
+        ("bind", c.bind.as_deref()),
+        ("threads", threads.as_deref()),
+        ("workers", workers.as_deref()),
+        ("port", port.as_deref()),
+    ];
+    for (flag, val) in pairs {
+        if let Some(x) = val {
+            v.push(format!("--{flag}"));
+            v.push(x.to_string());
+        }
+    }
+    for sql in c.init.iter().flatten() {
+        v.push("--init".into());
+        v.push(sql.clone());
+    }
+    for (on, flag) in [
+        (c.sealed, "--sealed"),
+        (c.unsigned, "--unsigned"),
+        (c.create, "--create"),
+        (c.log, "--log"),
+    ] {
+        if on == Some(true) {
+            v.push(flag.into());
+        }
+    }
+    Ok(v)
+}
+
+/// `harbor start <name|db.duckdb>` — spawn a detached berth and wait for it.
+///
+/// **A bare word is a configured berth, never a path.** Reading a bare word as
+/// a path is how `medlabs`, typed from the wrong directory, once meant the file
+/// ./medlabs — created empty under --create, then served as an empty impostor
+/// under the name clients trusted. Resolving it as a name closes that class: it
+/// either matches something configured or it is an error, and it can never
+/// quietly become a file that is not there.
+fn start(rest: Vec<String>) -> Result<(), String> {
+    let Some(first) = rest.first() else {
+        return Err("which berth? (try: harbor show)".into());
+    };
+    if first.starts_with('-') || harbor_common::looks_like_path(first) {
+        return spawn_detached(rest);
+    }
+    let name = harbor_common::normalize(first)?;
+    let cfg = load_config()?;
+    let entry =
+        cfg.get(&name).filter(|c| c.is_berth()).ok_or_else(|| unknown_berth(&cfg, &name))?;
+    let db = entry.database().expect("is_berth implies a path");
+    if !db.exists() && entry.create != Some(true) {
+        return Err(format!(
+            "{name} is configured, but its database is not there\n          \
+             config    {}\n          database  {}  (missing)\n        \
+             Fix the path in [connection.{name}], or set create = true there",
+            harbor_common::paths::shorten(&harbor_common::config_file()?),
+            harbor_common::paths::shorten(&db)
+        ));
+    }
+    // Config first, then whatever was typed: parse_opts keeps the last
+    // assignment, so an explicit flag wins over the file.
+    let mut args = vec![db.display().to_string(), "--name".to_string(), name];
+    args.extend(entry_args(entry, &cfg.defaults)?);
+    args.extend(rest[1..].iter().cloned());
+    spawn_detached(args)
+}
+
+/// How a berth's lock file reads — the cheapest liveness answer there is.
+///
+/// `berth_dead` collapses this to a bool, which is right for `stop`/`forget`
+/// (where "no evidence" must never be read as "safe to signal") but loses the
+/// bit `show` needs: a lock file that exists and is unheld is the *normal
+/// residue of a clean exit*, and must not be confused with no lock at all.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Claim {
+    /// No lock file. Nothing has ever claimed this name, or state was swept.
+    None,
+    /// Someone holds it. The berth is alive — proven, without dialling it.
+    Held,
+    /// The file is there and nobody holds it. Provably not running.
+    Free,
+}
+
+fn claim_state(lock: &Path) -> Claim {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let Ok(f) = std::fs::OpenOptions::new().read(true).open(lock) else {
+            return Claim::None;
+        };
+        // Taking it proves nobody else has it; dropping f releases immediately.
+        let free = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        match free {
+            true => Claim::Free,
+            false => Claim::Held,
+        }
+    }
+    #[cfg(windows)]
+    {
+        match std::fs::OpenOptions::new().read(true).write(true).share_mode(0).open(lock) {
+            Ok(_) => Claim::Free,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Claim::None,
+            Err(_) => Claim::Held,
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// One berth, from every source that knows anything about it.
+struct Row {
+    name: String,
+    state: harbor_common::State,
+    pid: Option<u64>,
+    uptime: Option<String>,
+    db: String,
+    note: Option<String>,
+}
+
+/// Read the runtime directory once, for both sidecars and locks.
+fn scan_runtime(
+    home: &Path,
+) -> (
+    std::collections::BTreeMap<String, serde_json::Value>,
+    std::collections::BTreeSet<String>,
+) {
+    let mut sidecars: std::collections::BTreeMap<String, serde_json::Value> = Default::default();
+    let mut locks = std::collections::BTreeSet::new();
+    let Ok(rd) = std::fs::read_dir(home) else { return (sidecars, locks) };
+    for p in rd.filter_map(|e| e.ok().map(|e| e.path())) {
+        let Some(stem) = p.file_stem().map(|x| x.to_string_lossy().into_owned()) else { continue };
+        match p.extension().and_then(|x| x.to_str()) {
+            Some("json") => {
+                let v = std::fs::read_to_string(&p)
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                    .unwrap_or_default();
+                sidecars.insert(stem, v);
+            }
+            Some("lock") => {
+                locks.insert(stem);
+            }
+            _ => {}
+        }
+    }
+    (sidecars, locks)
+}
+
+/// Reconcile desired (config) against actual (runtime) into one row per name.
+///
+/// The flock answers liveness for every row but one, so this makes no network
+/// call in the common case: N cheap local opens instead of N round trips, each
+/// of which could otherwise cost a 2s read timeout.
+///
+/// Drift is a string comparison, never a `canonicalize`. A configured database
+/// on a disconnected mount must not turn an instant command into a hang —
+/// `harbor doctor` is the verb that is allowed to touch the disk.
+fn reconcile(cfg: &harbor_common::config::FileConfig, home: &Path) -> Vec<Row> {
+    use harbor_common::State;
+    let (sidecars, locks) = scan_runtime(home);
+    let configured: std::collections::BTreeMap<&str, &harbor_common::config::Connection> =
+        cfg.berths().into_iter().collect();
+
+    let mut names: std::collections::BTreeSet<String> = Default::default();
+    names.extend(configured.keys().map(|k| k.to_string()));
+    names.extend(sidecars.keys().cloned());
+    names.extend(locks.iter().cloned());
+
+    let mut rows: Vec<Row> = Vec::new();
+    for name in names {
+        let side = sidecars.get(&name);
+        let conf = configured.get(name.as_str()).copied();
+        let claim = claim_state(&home.join(format!("{name}.lock")));
+
+        let live_db = side.and_then(|j| j["db"].as_str()).unwrap_or("").to_string();
+        let want_db = conf
+            .and_then(|c| c.database())
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+
+        let mut note = None;
+        let state = match (claim, side.is_some(), conf.is_some()) {
+            (Claim::Held, true, true) if live_db == want_db => State::Running,
+            (Claim::Held, true, true) => {
+                note = Some(format!(
+                    "config now says {} — harbor stop {name} && harbor start {name}",
+                    harbor_common::paths::shorten(Path::new(&want_db))
+                ));
+                State::Drifted
+            }
+            (Claim::Held, true, false) => {
+                note = Some("not in your config — a client summoned it, or it was started by hand".into());
+                State::Unmanaged
+            }
+            // Alive with no registration: mid-boot, or a forget ran under it.
+            (Claim::Held, false, _) => {
+                note = Some("running but unregistered — starting up, or its sidecar was removed".into());
+                State::Unmanaged
+            }
+            (Claim::Free, true, _) => {
+                note = Some(format!("registry says it is running and the lock says otherwise — harbor forget {name}"));
+                State::Dead
+            }
+            // A lock left by a clean exit is normal residue, not a mess.
+            (Claim::Free, false, true) | (Claim::None, false, true) => State::Stopped,
+            (Claim::Free, false, false) => {
+                note = Some(format!("left by a berth that is gone — harbor forget {name}"));
+                State::Stale
+            }
+            // Sidecar, no lock at all: the only row that has to be dialled.
+            (Claim::None, true, _) => {
+                let alive = match (side.and_then(|j| j["socket"].as_str()), side.and_then(|j| j["port"].as_u64())) {
+                    (Some(sock), _) => ready(Path::new(sock)),
+                    (None, Some(port)) => ready_tcp("127.0.0.1", port as u16),
+                    _ => false,
+                };
+                match alive {
+                    true if conf.is_some() && live_db == want_db => State::Running,
+                    true => State::Unmanaged,
+                    false => {
+                        note = Some(format!("no lock and no answer — harbor forget {name}"));
+                        State::Dead
+                    }
+                }
+            }
+            (Claim::None, false, false) => continue,
+        };
+
+        let uptime = side
+            .and_then(|j| j["startedAtMs"].as_u64())
+            .and_then(|t| now_ms().checked_sub(t))
+            .map(|ms| harbor_common::lifetime::humanize(Duration::from_millis(ms)));
+
+        rows.push(Row {
+            state,
+            pid: side.and_then(|j| j["pid"].as_u64()).filter(|_| state.is_live()),
+            uptime: uptime.filter(|_| state.is_live()),
+            db: match (live_db.is_empty(), want_db.is_empty()) {
+                (false, _) => harbor_common::paths::shorten(Path::new(&live_db)),
+                (true, false) => harbor_common::paths::shorten(Path::new(&want_db)),
+                _ => "—".into(),
+            },
+            note,
+            name,
+        });
+    }
+    rows.sort_by(|a, b| (a.state.rank(), &a.name).cmp(&(b.state.rank(), &b.name)));
+    rows
+}
+
+/// `harbor show [name]` — the fleet, or one berth in detail.
+fn show(rest: Vec<String>) -> Result<(), String> {
+    use harbor_common::ui::{Cell, Panel, Style, Table};
+    if let Some(flag) = rest.iter().find(|a| a.starts_with('-')) {
+        return Err(format!("harbor show takes a berth name, not {flag:?}"));
+    }
+    if rest.len() > 1 {
+        return Err("harbor show takes at most one berth name".into());
+    }
+    let cfg = load_config()?;
+    // Read-only: never create or chmod anything just to list.
+    let home = harbor_common::runtime_dir()?;
+    let rows = reconcile(&cfg, &home);
+    let st = Style::stdout().with_choice(cfg.defaults.color.as_deref());
+
+    if let Some(want) = rest.first() {
+        let name = harbor_common::normalize(want)?;
+        let row = rows
+            .iter()
+            .find(|r| r.name == name)
+            .ok_or_else(|| unknown_berth(&cfg, &name))?;
+        let mut p = Panel::new(&row.name)
+            .badge(
+                match &row.uptime {
+                    Some(u) => format!("{} · {u}", row.state.label()),
+                    None => row.state.label(),
+                },
+                row.state.level().into(),
+            )
+            .field("database", &row.db);
+        if let Some(c) = cfg.get(&name) {
+            let life = harbor_common::lifetime::resolve(
+                Default::default(),
+                c.idle_exit.as_deref(),
+                cfg.defaults.idle_exit.as_deref(),
+                harbor_common::Summoner::Operator,
+            )?;
+            p = p.field("idle-exit", life.describe());
+            p = p.field(
+                "config",
+                format!(
+                    "{}  [connection.{name}]",
+                    harbor_common::paths::shorten(&harbor_common::config_file()?)
+                ),
+            );
+        }
+        if row.state.is_live() {
+            p = p.field("address", harbor_common::paths::shorten(&home.join(format!("{name}.sock"))));
+        }
+        if let Some(n) = &row.note {
+            p = p.field_toned("note", n, row.state.level().into());
+        }
+        print!("{}", p.footer(row.pid.map(|x| format!("pid {x}")).unwrap_or_default()).render(&st));
         return Ok(());
     }
-    println!("{:<20} {:<8} {:<8} {:<24} {:<22} DB", "BERTH", "STATE", "PID", "DUCKDB", "ADDRESS");
-    for path in jsons {
-        let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-        let j = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .unwrap_or_default();
-        let state = match (j["socket"].as_str(), j["port"].as_u64()) {
-            (Some(sock), _) if ready(Path::new(sock)) => "ready",
-            (None, Some(port)) if ready_tcp("127.0.0.1", port as u16) => "ready",
-            _ => "dead",
-        };
-        // How to dial it — the answer "ready" begs for. Socket berths show the
-        // path (~-shortened), TCP berths bind:port; pilot accepts either form.
-        let addr = match (j["socket"].as_str(), j["port"].as_u64()) {
-            (Some(sock), _) => tilde(sock),
-            (None, Some(port)) => format!("{}:{port}", j["bind"].as_str().unwrap_or("127.0.0.1")),
-            _ => "-".to_string(),
-        };
-        let pid = j["pid"].as_u64().map(|p| p.to_string()).unwrap_or_default();
-        let duck = j["duckdbVersion"].as_str().unwrap_or("-").to_string();
-        let db = j["db"].as_str().unwrap_or("-").to_string();
-        println!("{name:<20} {state:<8} {pid:<8} {duck:<24} {addr:<22} {db}");
+
+    if rows.is_empty() {
+        println!("Nothing configured, nothing running.\n");
+        println!("  harbor start <db.duckdb>   remember a database and start it");
+        println!("  pilot <db.duckdb>          just open one — a berth starts itself");
+        return Ok(());
+    }
+
+    let mut t = Table::new(["NAME", "STATE", "PID", "UPTIME", "DATABASE"]);
+    for r in &rows {
+        t.row([
+            Cell::new(&r.name),
+            Cell::new(r.state.label()).tone(r.state.level().into()),
+            Cell::new(r.pid.map(|p| p.to_string()).unwrap_or("—".into())).right(),
+            Cell::new(r.uptime.clone().unwrap_or("—".into())).right(),
+            Cell::new(&r.db),
+        ]);
+        if let Some(n) = &r.note {
+            t.note(r.state.level().into(), n);
+        }
+    }
+    print!("{}", t.render(&st));
+
+    if st.boxed {
+        let mut tally: std::collections::BTreeMap<&str, usize> = Default::default();
+        for r in &rows {
+            *tally.entry(r.state.word()).or_default() += 1;
+        }
+        let parts: Vec<String> = tally.iter().map(|(w, n)| format!("{n} {w}")).collect();
+        println!("\n  {}", parts.join(", "));
+        // The free checks only — an entry on a dead mount must not make this hang.
+        if let Some((sev, line)) = doctor::summary(&doctor::quick(&cfg)) {
+            println!("  {}", st.paint(sev.tone(), &line));
+        }
     }
     Ok(())
 }
 
-fn tilde(path: &str) -> String {
-    match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-        Ok(h) if path.starts_with(&h) => format!("~{}", &path[h.len()..]),
-        _ => path.to_string(),
+/// `harbor doctor` — the checks nothing else has a moment to make.
+fn doctor_cmd(rest: Vec<String>) -> Result<(), String> {
+    use harbor_common::ui::{Style, Tone};
+    if !rest.is_empty() {
+        return Err("harbor doctor takes no arguments".into());
+    }
+    let cfg = load_config()?;
+    let st = Style::stdout().with_choice(cfg.defaults.color.as_deref());
+    let findings = doctor::examine(&cfg);
+    if findings.is_empty() {
+        println!("{}", st.paint(Tone::Green, "✓ nothing to fix"));
+        return Ok(());
+    }
+    for f in &findings {
+        println!("{} {}", st.paint(f.severity.tone(), f.severity.glyph()), f.title);
+        for d in &f.detail {
+            println!("    {}", st.paint(Tone::Dim, d));
+        }
+        println!("    {}\n", st.paint(Tone::Cyan, &f.fix));
+    }
+    match doctor::exit_code(&findings) {
+        0 => Ok(()),
+        _ => Err(format!("{} problem(s) — see above", findings.len())),
     }
 }
 
 fn stop_berth(rest: Vec<String>, remove: bool) -> Result<(), String> {
-    let name = rest.first().ok_or("which berth? (harbor ls)")?;
+    let name = rest.first().ok_or("which berth? (try: harbor show)")?;
     let name = normalize(name)?;
     let home = harbor_home()?;
     let json_path = home.join(format!("{name}.json"));
@@ -766,7 +1240,7 @@ fn stop_berth(rest: Vec<String>, remove: bool) -> Result<(), String> {
                 if !remove {
                     return Err(format!(
                         "berth {name:?} is not running (stale pid {pid}); nothing to signal. \
-                         Use `harbor rm {name}` to clear the registry entry."
+                         Use `harbor forget {name}` to clear the registry entry."
                     ));
                 }
             } else if let Some(pid) = j["pid"].as_u64() {
@@ -832,10 +1306,28 @@ fn stop_berth(rest: Vec<String>, remove: bool) -> Result<(), String> {
     if remove {
         // The lock file stays (see serve): a stale one with no holder is
         // harmless, and unlinking one is never safe.
+        // Say what was actually removed. The old wording claimed success for
+        // a name that matched nothing at all, which made `forget` a verb that
+        // lied about the one thing it does.
+        let mut gone: Vec<&str> = Vec::new();
         for f in ["sock", "json", "token"] {
-            let _ = std::fs::remove_file(home.join(format!("{name}.{f}")));
+            if std::fs::remove_file(home.join(format!("{name}.{f}"))).is_ok() {
+                gone.push(f);
+            }
         }
-        println!("berth {name:?} removed from the registry (database file untouched)");
+        let _ = std::fs::remove_file(home.join("log").join(format!("{name}.log")));
+        // The lock is the last thing to go, and only while we hold it — see
+        // unlink_lock_if_free. Nothing else in this file may unlink one.
+        if unlink_lock_if_free(&home.join(format!("{name}.lock"))) {
+            gone.push("lock");
+        }
+        match gone.is_empty() {
+            true => println!("nothing to forget: {name:?} left no state behind"),
+            false => println!(
+                "forgot {name:?} — removed its {} (the database file was not touched)",
+                gone.join(", ")
+            ),
+        }
     }
     Ok(())
 }

@@ -57,4 +57,4 @@ case ":${PATH:-}:" in
 esac
 
 echo
-echo "try: harbor add mydata.duckdb --create && pilot mydata"
+echo "try: harbor start mydata.duckdb --create && pilot mydata"

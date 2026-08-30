@@ -103,4 +103,4 @@ if (($userPath -split ';') -notcontains $bin) {
 }
 
 Write-Host ""
-Write-Host "try: harbor add mydata.duckdb --create ; pilot mydata"
+Write-Host "try: harbor start mydata.duckdb --create ; pilot mydata"

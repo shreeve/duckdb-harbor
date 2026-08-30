@@ -52,6 +52,12 @@ off=$(tput sgr0 2>/dev/null || true)
 
 declare -a failed=() skipped=() passed=()
 work=$(mktemp -d "${TMPDIR:-/tmp}/harbor-check.XXXXXX")
+# Every berth this suite starts registers under $HARBOR_HOME. Without this the
+# sockets, tokens and lock files land in the operator's real runtime directory,
+# and each run leaves a fistful of dead names behind — invisible before
+# `harbor show` learned to report them, and noise in the fleet view now.
+export HARBOR_HOME="$work/harbor-home"
+mkdir -p "$HARBOR_HOME"
 server_pid=""
 cleanup() {
   [[ -n "$server_pid" ]] && kill -TERM "$server_pid" 2>/dev/null

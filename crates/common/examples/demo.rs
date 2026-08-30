@@ -8,12 +8,12 @@ fn main() {
     let rows: &[(&str, State, &str, &str, &str, Option<&str>)] = &[
         ("labs", State::Running, "83582", "4m", "~/Data/Code/invoices/data/labs.duckdb", None),
         ("medlabs", State::Drifted, "12699", "1h12m", "~/Data/Code/medlabs/api/db/medlabs.duckdb",
-         Some("config now says medlabs-v2.duckdb — harbor restart medlabs")),
+         Some("config now says medlabs-v2.duckdb — harbor stop medlabs && harbor start medlabs")),
         ("sales", State::Stopped, "—", "—", "~/Data/sales.duckdb", None),
         ("scratch", State::Unmanaged, "90551", "2m", "~/Data/scratch.duckdb",
          Some("not in config — summoned by pilot; retires 90s after the last use")),
         ("probe2", State::Stale, "—", "—", "—",
-         Some("runtime/probe2.lock, held by nobody — harbor prune")),
+         Some("runtime/probe2.lock, held by nobody — harbor forget probe2")),
     ];
     for (name, state, pid, up, db, note) in rows {
         t.row([

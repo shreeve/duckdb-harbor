@@ -244,10 +244,13 @@ harbor + pilot and the exact DuckDB shared library they were built against.
 Unix archives carry `bin/`, `lib/` and `install.sh`; Windows archives put
 `duckdb.dll` beside the two executables and run in place.
 
-`harbor serve` runs in the foreground. `harbor add mydata.duckdb` spawns a
-**detached** berth and returns once it answers `/ready`; `harbor ls` lists the
-fleet, `harbor stop <name>` drains and `CHECKPOINT`s, `harbor rm <name>` clears
-the registry (never the database file). With no `--token`, a per-berth token is
+`harbor serve` runs in the foreground. `harbor start <name|db.duckdb>` spawns a
+**detached** berth and returns once it answers `/ready` — a bare word names a
+berth in your config, a path names a file. `harbor show` (or bare `harbor`)
+lists the fleet and `harbor show <name>` details one; `harbor stop <name>`
+drains and `CHECKPOINT`s; `harbor forget <name>` clears the registry, never the
+database file; `harbor doctor` checks the config for what nothing else has a
+moment to notice. With no `--token`, a per-berth token is
 minted and written to `~/.local/state/harbor/runtime/<name>.token`.
 
 Exits are clean: `SIGTERM` / `Ctrl-C` drain in-flight requests and `CHECKPOINT`
