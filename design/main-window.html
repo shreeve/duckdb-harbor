@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>DuckTable — main window</title>
+<link rel="stylesheet" href="tokens.css"><link rel="stylesheet" href="design.css">
+<script src="theme.js"></script>
+</head><body>
+
+<div class="page-head">
+  <h1>Main window</h1><span class="sub">table tab, staged mode, one dirty cell</span>
+  <span class="spacer"></span><a href="index.html">&larr; all screens</a>
+</div>
+
+<div class="window">
+  <div class="chrome">platform chrome</div>
+  <div class="toolbar">
+    <span class="pill"><span class="dot on"></span> medlabs</span>
+    <span class="crumb">memory &rsaquo; main &rsaquo; <b>Invoice</b></span>
+    <span class="spacer"></span>
+    <span class="timing">engine 1.2 ms</span>
+  </div>
+  <div class="panes">
+
+    <div class="sidebar">
+      <div class="side-h"><span class="tw">&#9662;</span> BERTHS</div>
+      <div class="row sel"><span class="dot on"></span><span class="n">medlabs</span></div>
+      <div class="row"><span class="dot run"></span><span class="n">scratch</span><span class="meta">spawn</span></div>
+      <div class="row"><span class="dot off"></span><span class="n">archive</span></div>
+      <div class="filter">&#8981; filter</div>
+      <div class="side-h"><span class="tw">&#9662;</span> CATALOG</div>
+      <div class="tree">
+        <div class="row hdr">&#9662; memory / main</div>
+        <div class="row l2 hdr">Tables</div>
+        <div class="row l2 sel"><span class="n">Invoice</span><span class="meta">412</span></div>
+        <div class="row l2"><span class="n">InvoiceLine</span><span class="meta">2.2k</span></div>
+        <div class="row l2"><span class="n">Track</span><span class="meta">3.5k</span></div>
+        <div class="row l2 hdr">Views</div>
+        <div class="row l2"><span class="n">v_monthly_rev</span></div>
+        <div class="row l2 hdr">Macros</div>
+        <div class="row l2"><span class="n">pct(x, y)</span></div>
+        <div class="row hdr">&#9656; chinook_pg <span class="meta">attached</span></div>
+      </div>
+      <div class="side-h"><span class="tw">&#9662;</span> NOTEBOOKS</div>
+      <div class="row"><span class="n">revenue-deep-dive</span></div>
+      <div class="row"><span class="n">cohort-scratch</span></div>
+    </div>
+
+    <div class="content">
+      <div class="tabs">
+        <span class="tab act">Invoice <span class="x">&times;</span></span>
+        <span class="tab"><span class="dirty"></span> query 1 <span class="x">&times;</span></span>
+        <span class="tab plus">+</span>
+      </div>
+      <div class="grid">
+        <table>
+          <tr><th class="num">#</th><th>InvoiceId <span class="arr">&#9650;</span></th><th>CustomerId</th><th>InvoiceDate</th><th>BillingAddress</th><th>BillingCity</th><th>Total</th></tr>
+          <tr><td class="num">1</td><td>1</td><td>2 <span class="fk">&rarr;</span></td><td>2021-01-01 00:00:00</td><td>Theodor-Heuss-Stra&szlig;e 34</td><td>Stuttgart</td><td>1.98</td></tr>
+          <tr><td class="num">2</td><td>2</td><td>4 <span class="fk">&rarr;</span></td><td>2021-01-02 00:00:00</td><td>Ullev&aring;lsveien 14</td><td>Oslo</td><td>3.96</td></tr>
+          <tr class="sel"><td class="num">3</td><td>3</td><td>8 <span class="fk">&rarr;</span></td><td>2021-01-03 00:00:00</td><td class="dirty">Gr&eacute;trystraat 65</td><td>Brussels</td><td>5.94</td></tr>
+          <tr><td class="num">4</td><td>4</td><td>14 <span class="fk">&rarr;</span></td><td>2021-01-06 00:00:00</td><td>8210 111 ST NW</td><td>Edmonton</td><td>8.91</td></tr>
+          <tr><td class="num">5</td><td>5</td><td>23 <span class="fk">&rarr;</span></td><td>2021-01-11 00:00:00</td><td>69 Salem Street</td><td>Boston</td><td>13.86</td></tr>
+          <tr><td class="num">6</td><td>6</td><td>37 <span class="fk">&rarr;</span></td><td>2021-01-19 00:00:00</td><td><span class="null">NULL</span></td><td>Frankfurt</td><td>0.99</td></tr>
+          <tr><td class="num">7</td><td>7</td><td>38 <span class="fk">&rarr;</span></td><td>2021-02-01 00:00:00</td><td>Barbarossastra&szlig;e 19</td><td>Berlin</td><td>1.98</td></tr>
+          <tr><td class="num">8</td><td>8</td><td>40 <span class="fk">&rarr;</span></td><td>2021-02-01 00:00:00</td><td>8, Rue Hanovre</td><td>Paris</td><td>1.98</td></tr>
+          <tr><td class="num">9</td><td>9</td><td>42 <span class="fk">&rarr;</span></td><td>2021-02-02 00:00:00</td><td>9, Place Louis Barthou</td><td>Bordeaux</td><td>3.96</td></tr>
+          <tr><td class="num">10</td><td>10</td><td>46 <span class="fk">&rarr;</span></td><td>2021-02-03 00:00:00</td><td>3 Chatham Street</td><td>Dublin</td><td>5.94</td></tr>
+          <tr><td class="num">11</td><td>11</td><td>52 <span class="fk">&rarr;</span></td><td>2021-02-06 00:00:00</td><td>202 Hoxton Street</td><td>London</td><td>8.91</td></tr>
+          <tr><td class="num">12</td><td>12</td><td>2 <span class="fk">&rarr;</span></td><td>2021-02-11 00:00:00</td><td>Theodor-Heuss-Stra&szlig;e 34</td><td>Stuttgart</td><td>13.86</td></tr>
+        </table>
+      </div>
+      <div class="bbar">
+        <span class="seg"><span class="on">Data</span><span>Structure</span><span>JSON</span></span>
+        <span class="ghost">columns</span><span class="ghost">filters</span>
+        <span class="spacer"></span>
+        <span class="seg"><span class="on">staged</span><span>live</span></span>
+        <span class="ghost">1,000 &#9662;</span>
+        <span class="ghost">&lsaquo; 1 / 1 &rsaquo;</span>
+      </div>
+      <div class="statusbar">
+        <span class="dot on"></span> medlabs
+        <span>128 of 412 rows</span>
+        <span>engine 1.2 ms</span>
+        <span class="spacer" style="flex:1"></span>
+        <span>1 staged change &middot; &#8984;S to commit</span>
+      </div>
+    </div>
+
+    <div class="inspector">
+      <div class="insp-h">SIZE</div>
+      <div class="kv"><span class="k">Data</span><span class="v">1.2 MB</span></div>
+      <div class="kv"><span class="k">Index</span><span class="v">248 KB</span></div>
+      <div class="insp-h">STATISTICS</div>
+      <div class="kv"><span class="k">Rows</span><span class="v">412</span></div>
+      <div class="insp-h">METADATA</div>
+      <div class="kv"><span class="k">DuckDB</span><span class="v">2.0.0</span></div>
+      <div class="kv"><span class="k">Harbor</span><span class="v">0.15.0</span></div>
+      <div class="kv"><span class="k">Berth</span><span class="v">medlabs</span></div>
+      <div class="insp-h">ROW</div>
+      <div class="kv"><span class="k">InvoiceId</span><span class="v">3</span></div>
+      <div class="kv"><span class="k">CustomerId</span><span class="v">8</span></div>
+      <div class="kv"><span class="k">BillingAddress</span><span class="v" style="color: var(--accent)">Gr&eacute;trystraat 65</span></div>
+      <div class="kv"><span class="k">BillingCity</span><span class="v">Brussels</span></div>
+    </div>
+
+  </div>
+</div>
+<p class="caption">Staged mode: the edited cell carries an accent bar and tint; the same value shows accented in the inspector's Row
+section; the status line counts staged changes. The berth pill echoes the sidebar's status dot. Platform chrome is a neutral strip.</p>
+
+</body></html>

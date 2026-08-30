@@ -1,0 +1,120 @@
+/* DuckTable semantic tokens. One vocabulary, five themes.
+   These names map 1:1 to the gpui-component theme JSON we ship. */
+
+:root {
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI", Cantarell, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, monospace;
+  --radius-s: 5px;
+  --radius-m: 8px;
+  --radius-l: 12px;
+}
+
+:root, [data-theme="light"] {
+  --bg: #eceef1;            /* window backdrop / sidebar */
+  --surface: #ffffff;       /* content panes */
+  --surface-raised: #f7f8fa;/* toolbars, headers, bottom bars */
+  --text: #1d1d1f;
+  --muted: #71717a;
+  --accent: #007aff;
+  --on-accent: #ffffff;
+  --accent-soft: rgba(0, 122, 255, 0.12);
+  --success: #28a745;
+  --warning: #b58a00;
+  --danger: #d93025;
+  --danger-soft: rgba(217, 48, 37, 0.10);
+  --success-soft: rgba(40, 167, 69, 0.12);
+  --warning-soft: rgba(181, 138, 0, 0.12);
+  --grid-line: #e7e8ec;
+  --border: #d9dbe1;
+  --selection: rgba(0, 122, 255, 0.10);
+  --selection-strong: rgba(0, 122, 255, 0.22);
+  --shadow: 0 10px 32px rgba(20, 24, 34, 0.14);
+}
+
+[data-theme="dark"] {
+  --bg: #1c1c1f;
+  --surface: #252529;
+  --surface-raised: #2c2c31;
+  --text: #f2f2f4;
+  --muted: #9a9aa3;
+  --accent: #0a84ff;
+  --on-accent: #ffffff;
+  --accent-soft: rgba(10, 132, 255, 0.20);
+  --success: #32d074;
+  --warning: #ffd60a;
+  --danger: #ff6459;
+  --danger-soft: rgba(255, 100, 89, 0.16);
+  --success-soft: rgba(50, 208, 116, 0.16);
+  --warning-soft: rgba(255, 214, 10, 0.14);
+  --grid-line: #38383e;
+  --border: #414149;
+  --selection: rgba(10, 132, 255, 0.18);
+  --selection-strong: rgba(10, 132, 255, 0.34);
+  --shadow: 0 12px 36px rgba(0, 0, 0, 0.55);
+}
+
+[data-theme="paper"] {
+  --bg: #efe8da;
+  --surface: #faf6ec;
+  --surface-raised: #f3edde;
+  --text: #3c342a;
+  --muted: #8b8172;
+  --accent: #c2540a;
+  --on-accent: #fff8ef;
+  --accent-soft: rgba(194, 84, 10, 0.13);
+  --success: #4f7d3a;
+  --warning: #9a7b00;
+  --danger: #b3362a;
+  --danger-soft: rgba(179, 54, 42, 0.11);
+  --success-soft: rgba(79, 125, 58, 0.13);
+  --warning-soft: rgba(154, 123, 0, 0.13);
+  --grid-line: #e5dcc8;
+  --border: #d6ccb4;
+  --selection: rgba(194, 84, 10, 0.10);
+  --selection-strong: rgba(194, 84, 10, 0.24);
+  --shadow: 0 10px 30px rgba(80, 65, 40, 0.18);
+}
+
+[data-theme="midnight"] {
+  --bg: #0c1220;
+  --surface: #121a2b;
+  --surface-raised: #182236;
+  --text: #dbe4f5;
+  --muted: #7e8ca8;
+  --accent: #5aa2ff;
+  --on-accent: #06101f;
+  --accent-soft: rgba(90, 162, 255, 0.18);
+  --success: #46d493;
+  --warning: #f5c542;
+  --danger: #ff7369;
+  --danger-soft: rgba(255, 115, 105, 0.15);
+  --success-soft: rgba(70, 212, 147, 0.15);
+  --warning-soft: rgba(245, 197, 66, 0.13);
+  --grid-line: #1f2b44;
+  --border: #2a3852;
+  --selection: rgba(90, 162, 255, 0.16);
+  --selection-strong: rgba(90, 162, 255, 0.32);
+  --shadow: 0 14px 40px rgba(0, 0, 0, 0.6);
+}
+
+[data-theme="contrast"] {
+  --bg: #ffffff;
+  --surface: #ffffff;
+  --surface-raised: #f2f2f2;
+  --text: #000000;
+  --muted: #3d3d3d;
+  --accent: #0000d6;
+  --on-accent: #ffffff;
+  --accent-soft: rgba(0, 0, 214, 0.14);
+  --success: #006b21;
+  --warning: #7a5d00;
+  --danger: #c40000;
+  --danger-soft: rgba(196, 0, 0, 0.12);
+  --success-soft: rgba(0, 107, 33, 0.14);
+  --warning-soft: rgba(122, 93, 0, 0.14);
+  --grid-line: #9a9a9a;
+  --border: #000000;
+  --selection: rgba(0, 0, 214, 0.12);
+  --selection-strong: rgba(0, 0, 214, 0.28);
+  --shadow: 0 8px 24px rgba(0, 0, 0, 0.30);
+}
