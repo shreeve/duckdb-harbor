@@ -634,14 +634,15 @@ impl Render for Grid {
                         // to the rounded corners, so instead of clipped
                         // square segments the active one is an inset
                         // rounded pill (the macOS segmented-control shape).
-                        // Concentric radii (track = pill + inset) keep the
-                        // pill's corners parallel to the track's — the
-                        // segmented-control look.
+                        // design.css `.seg`: the active fill runs flush to
+                        // the track's edges. gpui does not clip child
+                        // backgrounds to the track's radius, so each end
+                        // segment carries its own matching outer corners
+                        // (nested radius = track radius - border).
                         div()
                             .h_flex()
                             .flex_none()
-                            .p(px(2.))
-                            .rounded(px(7.))
+                            .rounded(px(8.))
                             .bg(t.surface)
                             .border_1()
                             .border_color(t.border)
@@ -649,6 +650,7 @@ impl Render for Grid {
                                 "view-data",
                                 "Data",
                                 view == ViewMode::Data,
+                                (true, false),
                                 t,
                                 cx.listener(|this, _, _, cx| {
                                     this.view = ViewMode::Data;
@@ -659,6 +661,7 @@ impl Render for Grid {
                                 "view-structure",
                                 "Structure",
                                 view == ViewMode::Structure,
+                                (false, true),
                                 t,
                                 cx.listener(|this, _, _, cx| {
                                     this.view = ViewMode::Structure;
@@ -689,14 +692,17 @@ fn seg_tile(
     id: &'static str,
     label: &'static str,
     on: bool,
+    (first, last): (bool, bool),
     t: crate::theme::Pal,
     handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
+    let r = px(7.);
     div()
         .id(id)
-        .px(px(12.))
-        .py(px(4.))
-        .rounded(px(5.))
+        .px(px(11.))
+        .py(px(3.))
+        .when(first, |d| d.rounded_tl(r).rounded_bl(r))
+        .when(last, |d| d.rounded_tr(r).rounded_br(r))
         .cursor_pointer()
         .text_size(px(12.))
         .map(|d| {
