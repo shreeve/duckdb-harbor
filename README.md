@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/shreeve/ducktable/raw/main/assets/AppIcon.iconset/icon_512x512.png" alt="DuckTable" width="180">
+  <img src="https://github.com/shreeve/ducktable/raw/main/social-ducktable.png" alt="DuckTable" width="600">
 </p>
 
 # DuckTable
