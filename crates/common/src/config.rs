@@ -204,7 +204,27 @@ impl std::fmt::Display for Error {
 /// Schema-check a candidate config text — the gate a writer runs BEFORE the
 /// bytes land, so an edit can never leave behind a file `load` will refuse.
 pub fn parse(text: &str) -> Result<FileConfig, String> {
-    toml::from_str(text).map_err(|e| e.to_string())
+    toml::from_str(text).map_err(|e| e.to_string()).and_then(normalize_keys)
+}
+
+/// The name law, applied at the door: a section key is the operator's
+/// spelling, but every lookup and every registry file speaks the normalized
+/// form — so the map is keyed by it, and `[connection.MedLabs]` answers
+/// `harbor start medlabs` instead of being unreachable prose. Two spellings
+/// that collapse to one name are refused whole: they would silently shadow
+/// each other, and which one wins is a question only the author can answer.
+fn normalize_keys(mut cfg: FileConfig) -> Result<FileConfig, String> {
+    let mut out = HashMap::new();
+    for (key, conn) in std::mem::take(&mut cfg.connection) {
+        let name = crate::paths::normalize(&key)?;
+        if out.insert(name.clone(), conn).is_some() {
+            return Err(format!(
+                "[connection.{key}] collides with another entry — both normalize to {name:?}"
+            ));
+        }
+    }
+    cfg.connection = out;
+    Ok(cfg)
 }
 
 /// Read and parse the config, or say precisely why not.
@@ -224,7 +244,9 @@ pub fn load() -> Result<FileConfig, Error> {
             return Err(Error::Refused { file: file.clone(), offender: p.clone() });
         }
     }
-    toml::from_str(&text).map_err(|e| Error::Invalid { file, why: e.to_string() })
+    let cfg: FileConfig = toml::from_str(&text)
+        .map_err(|e| Error::Invalid { file: file.clone(), why: e.to_string() })?;
+    normalize_keys(cfg).map_err(|why| Error::Invalid { file, why })
 }
 
 #[cfg(test)]

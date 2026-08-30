@@ -995,6 +995,9 @@ fn show(rest: Vec<String>) -> Result<(), String> {
     let st = Style::stdout().with_choice(cfg.defaults.color.as_deref());
 
     if let Some(want) = rest.first() {
+        if harbor_common::looks_like_path(want) {
+            return Err("show takes a database name, not a path — bare harbor lists them".into());
+        }
         let name = harbor_common::normalize(want)?;
         let row = rows
             .iter()
@@ -1192,6 +1195,9 @@ fn add_cmd(rest: Vec<String>) -> Result<(), String> {
 /// instead of the unix socket, not alongside it — and `off` moves it back.
 fn expose_cmd(rest: Vec<String>) -> Result<(), String> {
     let name = rest.first().ok_or("expose which database? (harbor expose <name> <port|off>)")?;
+    if harbor_common::looks_like_path(name) {
+        return Err("expose takes a database name, not a path — harbor show lists them".into());
+    }
     let name = normalize(name)?;
     if rest.len() > 2 {
         return Err("expose takes a name and a port (or off)".into());
@@ -1256,8 +1262,15 @@ fn reapply(name: &str) -> Result<(), String> {
 }
 
 fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
-    let name = rest.first().ok_or("which database? (try: harbor show)")?;
-    let name = normalize(name)?;
+    let verb = if remove { "forget" } else { "stop" };
+    let raw = rest.first().ok_or("which database? (try: harbor show)")?;
+    // These verbs act on names. Normalizing a typed path would mint a
+    // nonsense name ("./x.duckdb" → "--x-duckdb") and then blame the user
+    // for a bare word they never typed.
+    if harbor_common::looks_like_path(raw) {
+        return Err(format!("{verb} takes a database name, not a path — harbor show lists them"));
+    }
+    let name = normalize(raw)?;
     let home = harbor_home()?;
     let sock = harbor_common::sock_file(&home, &name);
     let lock_path = harbor_common::lock_file(&home, &name);
@@ -1268,6 +1281,18 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
     // for configured names, since nothing autostarts anything else. Lenient
     // on the config read: a broken config must not make a berth unstoppable.
     let cfg = load_config().ok();
+    // forget is a fleet verb, and a remote entry is not a berth: it has no
+    // registry files here, and its token-cmd is operator prose no verb may
+    // eat. Removing one is an edit made in the file, on purpose.
+    if remove
+        && let Some(k) = cfg.as_ref().and_then(|c| c.get(&name).map(|e| e.kind()))
+        && k != harbor_common::config::Kind::Berth
+    {
+        return Err(format!(
+            "{name:?} is not a berth — its [connection.{name}] entry is yours to remove, in {}",
+            harbor_common::paths::shorten(&harbor_common::config_file()?)
+        ));
+    }
     let held = !remove
         && cfg.as_ref().and_then(|c| c.get(&name).map(|e| e.is_berth())).unwrap_or(false);
     if held {

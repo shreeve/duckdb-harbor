@@ -11,7 +11,7 @@
 //! leave behind a file `load` will refuse, because a refused config takes
 //! every bare name down with it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use harbor_common::perms;
 
@@ -31,20 +31,44 @@ fn open_document() -> Result<(PathBuf, toml_edit::DocumentMut), String> {
     Ok((file, doc))
 }
 
-/// Schema-check, then write. The check runs on the exact bytes about to
-/// land. Creating the config root here is the deliberate exception to
-/// serve's "a server should not conjure a config directory": an edit is the
-/// operator writing desired state, and desired state needs somewhere to live.
-fn commit(file: &PathBuf, doc: &toml_edit::DocumentMut) -> Result<(), String> {
+/// Schema-check, then write — atomically. The check runs on the exact bytes
+/// about to land, and they land by tmp + rename: the operator's hand-written
+/// prose is the one file a torn write may not eat, because a truncated
+/// config takes every bare name down with it. Creating the config root here
+/// is the deliberate exception to serve's "a server should not conjure a
+/// config directory": an edit is the operator writing desired state, and
+/// desired state needs somewhere to live — but a root writable by others
+/// refuses the edit, same trust gate as the reads.
+fn commit(file: &Path, doc: &toml_edit::DocumentMut) -> Result<(), String> {
     let text = doc.to_string();
     harbor_common::config::parse(&text)
         .map_err(|e| format!("refusing an edit the config schema rejects: {e}"))?;
     let root = harbor_common::config_root()?;
     if !root.exists() {
         perms::create_dir_private(&root).map_err(|e| format!("{}: {e}", root.display()))?;
+    } else if perms::exposed(&root) {
+        return Err(format!(
+            "{} is writable by others or not yours (chmod go-w it) — refusing to edit",
+            root.display()
+        ));
     }
-    perms::write_private(file, &text).map_err(|e| format!("{}: {e}", file.display()))?;
+    let tmp = file.with_extension("toml.tmp");
+    perms::write_private(&tmp, &text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, file).map_err(|e| format!("{}: {e}", file.display()))?;
     Ok(())
+}
+
+/// The document key that answers to this name: exact first, else the
+/// operator's own spelling that normalizes to it — so `forget medlabs`
+/// finds a hand-written `[connection.MedLabs]` instead of missing it.
+fn doc_key(t: &toml_edit::Table, name: &str) -> Option<String> {
+    if t.contains_key(name) {
+        return Some(name.to_string());
+    }
+    t.iter()
+        .map(|(k, _)| k)
+        .find(|k| harbor_common::normalize(k).is_ok_and(|n| n == name))
+        .map(str::to_string)
 }
 
 /// `[connection.<name>] path = "<db>"` — the promotion. Refuses to touch an
@@ -55,9 +79,9 @@ pub fn add_entry(name: &str, db: &str) -> Result<PathBuf, String> {
     let connections = doc["connection"].or_insert(toml_edit::Item::Table(Default::default()));
     if let Some(t) = connections.as_table_mut() {
         t.set_implicit(true);
-        if t.contains_key(name) {
+        if let Some(key) = doc_key(t, name) {
             return Err(format!(
-                "[connection.{name}] already exists in {} — edit it there",
+                "[connection.{key}] already exists in {} — edit it there",
                 file.display()
             ));
         }
@@ -77,7 +101,10 @@ pub fn remove_entry(name: &str) -> Result<bool, String> {
     let removed = doc
         .get_mut("connection")
         .and_then(toml_edit::Item::as_table_mut)
-        .map(|t| t.remove(name).is_some())
+        .map(|t| match doc_key(t, name) {
+            Some(key) => t.remove(&key).is_some(),
+            None => false,
+        })
         .unwrap_or(false);
     if removed {
         commit(&file, &doc)?;
@@ -95,7 +122,10 @@ pub fn set_entry_key(
     let entry = doc
         .get_mut("connection")
         .and_then(toml_edit::Item::as_table_mut)
-        .and_then(|t| t.get_mut(name))
+        .and_then(|t| {
+            let key = doc_key(t, name)?;
+            t.get_mut(&key)
+        })
         .and_then(toml_edit::Item::as_table_mut)
         .ok_or_else(|| format!("no [connection.{name}] in {}", file.display()))?;
     match value {
