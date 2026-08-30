@@ -8,6 +8,7 @@ mod grid;
 mod inspector;
 mod prefs;
 mod sidebar;
+mod structure;
 mod theme;
 mod util;
 

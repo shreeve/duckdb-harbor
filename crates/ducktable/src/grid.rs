@@ -35,8 +35,20 @@ fn gutter_width(rows: usize) -> f32 {
     (16. + digits * 7.).max(34.)
 }
 
+/// Which view of the table the footer has selected. Data and Structure
+/// are exclusive by design: a schema change reshapes the data view, so
+/// the two never render side by side.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum ViewMode {
+    Data,
+    Structure,
+}
+
 pub(crate) struct Grid {
     table: Entity<TableState<GridDelegate>>,
+    view: ViewMode,
+    /// Prefetched with the first page, so switching views is instant.
+    structure: Option<crate::structure::TableStructure>,
 }
 
 pub(crate) struct GridDelegate {
@@ -72,6 +84,7 @@ impl Grid {
         title: String,
         outcome: Result<harbor_client::QueryResult, String>,
         total_rows: Option<u64>,
+        structure: Option<crate::structure::TableStructure>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -113,7 +126,11 @@ impl Grid {
             }
         }
         let table = cx.new(|cx| TableState::new(delegate, window, cx));
-        Self { table }
+        Self { table, view: ViewMode::Data, structure }
+    }
+
+    pub(crate) fn structure(&self) -> Option<&crate::structure::TableStructure> {
+        self.structure.as_ref()
     }
 
     /// The selected row as (column, display value, is_null) pairs, for the
@@ -413,8 +430,10 @@ impl Render for Grid {
         let p = prefs::get(cx);
         // The inspector slots in BESIDE the table, below the header strip —
         // the title/toggle row keeps the full width, so opening the panel
-        // never shifts it.
-        let inspector = p.inspector.then(|| self.inspector(cx).into_any_element());
+        // never shifts it. It is row-level, so it only accompanies Data.
+        let inspector = (p.inspector && self.view == ViewMode::Data)
+            .then(|| self.inspector(cx).into_any_element());
+        let view = self.view;
         let (title, count, total, cols, eof, loading, error, ms) = {
             let d = self.table.read(cx).delegate();
             (
@@ -563,8 +582,8 @@ impl Render for Grid {
                         .child(message),
                 )
             })
-            .child(
-                div()
+            .child(match view {
+                ViewMode::Data => div()
                     .flex_1()
                     .min_h_0()
                     .w_full()
@@ -576,9 +595,94 @@ impl Render for Grid {
                             .h_full()
                             .child(Table::new(&self.table).bordered(false).with_size(GRID_SIZE)),
                     )
-                    .when_some(inspector, |d, pane| d.child(pane)),
+                    .when_some(inspector, |d, pane| d.child(pane))
+                    .into_any_element(),
+                ViewMode::Structure => div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(self.structure_view(cx))
+                    .into_any_element(),
+            })
+            .child(
+                // The footer (UI.md "Bottom bar"): per-table controls, a
+                // different scope from the header's global display prefs.
+                // The view switcher lives here; columns/filters/paging
+                // join it in later slices.
+                div()
+                    .h_flex()
+                    .h(px(28.))
+                    .flex_none()
+                    .items_center()
+                    .pl_2()
+                    .pr_3()
+                    .border_t_1()
+                    .border_color(t.border)
+                    .child(
+                        div()
+                            .h_flex()
+                            .flex_none()
+                            .gap(px(2.))
+                            .p(px(2.))
+                            .rounded(px(6.))
+                            .bg(t.raised)
+                            .border_1()
+                            .border_color(t.grid_line)
+                            .child(seg_tile(
+                                "view-data",
+                                "Data",
+                                view == ViewMode::Data,
+                                t,
+                                cx.listener(|this, _, _, cx| {
+                                    this.view = ViewMode::Data;
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(seg_tile(
+                                "view-structure",
+                                "Structure",
+                                view == ViewMode::Structure,
+                                t,
+                                cx.listener(|this, _, _, cx| {
+                                    this.view = ViewMode::Structure;
+                                    cx.notify();
+                                }),
+                            )),
+                    ),
             )
     }
+}
+
+/// One segment in the footer's view switcher: same recessed-track visual
+/// language as the display toggles, but text-labeled and exactly one
+/// segment active.
+fn seg_tile(
+    id: &'static str,
+    label: &'static str,
+    on: bool,
+    t: crate::theme::Pal,
+    handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .h_flex()
+        .items_center()
+        .justify_center()
+        .px_2()
+        .h(px(18.))
+        .rounded(px(4.))
+        .cursor_pointer()
+        .text_size(px(11.))
+        .map(|d| {
+            if on {
+                d.bg(t.accent.opacity(0.15)).text_color(t.accent)
+            } else {
+                d.text_color(t.muted)
+            }
+        })
+        .hover(move |d| if on { d } else { d.bg(t.row_hover) })
+        .on_click(move |e, window, cx| handler(e, window, cx))
+        .child(label)
 }
 
 /// One tile in the display-toggle track: flat glyph when off, accent-tinted
