@@ -45,6 +45,24 @@ sys.path.insert(0, __file__.rsplit("/", 1)[0])
 import corpus  # noqa: E402
 
 
+# Every berth a test starts registers under $HARBOR_HOME. Run through the
+# suite, check.sh sets it; run directly — which the usage line above invites —
+# nothing did, so sockets, tokens and lock files landed in the operator's real
+# runtime directory and each run left a dead name behind. `setdefault` keeps
+# the harness in charge when there is one.
+#
+# Short, and under /tmp deliberately: a macOS unix socket path must fit in
+# SUN_LEN (104 bytes), and the per-user $TMPDIR alone is most of that.
+def _isolate_fleet():
+    import tempfile
+    if not os.environ.get("HARBOR_HOME"):
+        os.environ["HARBOR_HOME"] = tempfile.mkdtemp(prefix="hb-", dir="/tmp")
+
+
+_isolate_fleet()
+
+
+
 SKIPPED = 77
 
 # Variants that cannot appear as a result column, or cannot be produced here.
