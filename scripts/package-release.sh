@@ -9,13 +9,13 @@
 # in place;
 # install.sh copies the Unix pieces into their homes.
 #
-#   TAG=v0.15.0 PLAT=osx-arm64 scripts/package-release.sh
+#   TAG=v0.18.0 PLAT=osx-arm64 scripts/package-release.sh
 #
 # Produces $OUT/harbor-$TAG-$PLAT.tar.gz (OUT defaults to dist/).
 
 set -euo pipefail
 
-TAG=${TAG:?package-release: set TAG (e.g. v0.11.0)}
+TAG=${TAG:?package-release: set TAG (e.g. v0.18.0)}
 PLAT=${PLAT:?package-release: set PLAT (osx-arm64 | linux-amd64 | linux-arm64 | windows-amd64 | windows-arm64)}
 DUCKDB_LIB=${DUCKDB_LIB:-$HOME/.duckdb/cli/2.0.0}
 OUT=${OUT:-dist}

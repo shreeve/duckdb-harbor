@@ -6,7 +6,7 @@ install.ps1 — install harbor + pilot with one command (Windows):
 
 Pin a version:
 
-    & ([scriptblock]::Create((irm .../install.ps1))) -Tag v0.15.0
+    & ([scriptblock]::Create((irm .../install.ps1))) -Tag v0.18.0
 
 Downloads the release zip for this architecture, verifies its SHA-256 against
 the published checksums, and installs into %LOCALAPPDATA%\Programs\harbor —
