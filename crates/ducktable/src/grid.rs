@@ -2602,6 +2602,38 @@ impl Render for Grid {
         // ViewMode switch below is the HOST grid's concern; an embedded
         // grid is always its table.
         if self.embedded {
+            // The inspector rides query results exactly as it rides the
+            // Data grid — row_kv is delegate data, and a result row is
+            // as inspectable as a table row. The Query gate keeps the
+            // Structure view's embedded columns-grid out of it.
+            let inspector = (p.inspector && p.view == ViewMode::Query)
+                .then(|| self.inspector(cx).into_any_element());
+            let body = {
+                let table_el = self.table_body(cx);
+                let body = div().flex_1().min_h_0().w_full();
+                match inspector {
+                    Some(pane) => body.child(
+                        h_resizable("query-split")
+                            .with_state(&self.resize)
+                            .child(
+                                resizable_panel()
+                                    .child(div().size_full().child(table_el)),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .size(px(p.inspector_width))
+                                    .size_range(
+                                        px(prefs::INSPECTOR_MIN)
+                                            ..px(prefs::INSPECTOR_MAX),
+                                    )
+                                    .child(pane),
+                            ),
+                    ),
+                    None => body.h_flex().child(
+                        div().flex_1().min_w_0().h_full().child(table_el),
+                    ),
+                }
+            };
             return div()
                 .size_full()
                 .min_w_0()
@@ -2623,16 +2655,14 @@ impl Render for Grid {
                             .child(message),
                     )
                 })
-                .child(
-                    div().flex_1().min_h_0().w_full().h_flex().child(
-                        div().flex_1().min_w_0().h_full().child(self.table_body(cx)),
-                    ),
-                )
+                .child(body)
                 .into_any_element();
         }
         // The inspector slots in BESIDE the table, below the header strip —
         // the title/toggle row keeps the full width, so opening the panel
-        // never shifts it. It is row-level, so it only accompanies Data.
+        // never shifts it. It is row-level: here it accompanies Data; in
+        // the Query view the EMBEDDED results grid carries its own
+        // (the branch above).
         let inspector = (p.inspector && p.view == ViewMode::Data)
             .then(|| self.inspector(cx).into_any_element());
         div()
@@ -2728,7 +2758,7 @@ impl Render for Grid {
                                 }),
                             )),
                     ))
-                    .when(view == ViewMode::Data, |d| d.child(
+                    .when(matches!(view, ViewMode::Data | ViewMode::Query), |d| d.child(
                         // The inspector's panel glyph (Finder/Xcode
                         // convention), right of the lozenge.
                         icon_tile("toggle-inspector", 22., true, t)
