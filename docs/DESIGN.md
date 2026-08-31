@@ -70,6 +70,38 @@ Client architecture:
   synchronously and fences the in-flight attempt with a token; a late
   completion discards itself instead of clobbering newer state.
 
+Motion and feel — the reusable techniques, each minted once, named, and
+meant to be reached for anywhere (the umbrella law is EDITING.md's
+"content snaps, chrome fades"):
+
+- **Atomic swap, single writer.** When two visuals must move together
+  (selection ring + row wash), one code path mutates both in one frame;
+  nobody else writes. Where a library binding would be a second writer, a
+  keystroke interceptor runs first and does the whole job (grid.rs).
+- **Interceptor before bindings.** gpui dispatches interceptors, then
+  bindings, then listeners; a consumed keystroke skips the rest. The tool
+  for "this key must NOT do what the widget thinks" — the grid's arrows,
+  the query editor's ⌘Enter (query.rs).
+- **Generation fence.** Every async producer carries the sequence number
+  it was born with; a result may only land if it still matches. Connects,
+  table selects, query runs, copy-flash timers — anything late discards
+  itself (app.rs, query.rs, copy_button.rs).
+- **Three-phase feedback.** For work that is usually fast: change nothing
+  for the first beat (~300ms) and swap atomically if it finishes; only a
+  slow run earns ticking progress and a faded (never blanked) prior
+  state; completion is always one atomic swap (query.rs runs).
+- **Ghost width lock.** When a state change alters text weight or
+  content, an invisible ghost at the widest variant owns the layout and
+  the visible label overlays it — state can never resize chrome
+  (chrome.rs seg_tile).
+- **Always-present chrome.** Separators and slots never appear or
+  disappear — they occupy their pixels in every state and change only
+  color/alpha, so nothing can shift (chrome.rs seg_sep).
+- **Crossfade.** Two elements stacked on one clock, opposite opacity
+  directions, played inside a state window its own timer closes — an
+  instant vanish beside a fade-in reads as a glitch (chrome.rs
+  crossfade; first user: the copy tile's check → copy revert).
+
 DuckDB facts (measured):
 
 - EXPLAIN returns two columns (`explain_key`, `explain_value`); the box art is
