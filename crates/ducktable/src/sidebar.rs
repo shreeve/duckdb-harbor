@@ -120,7 +120,7 @@ impl DuckTable {
                         // way to the size, known even for stopped files.)
                         .child(named_count(&row.name, row.tables, t))
                         .when_some(row.size, |d, s| {
-                            d.child(dim(t, crate::util::human(s, "B")))
+                            d.child(dim(t, crate::util::human(s as f64, "B")))
                         })
                         .when_some(row.note.clone(), |d, note| {
                             // reconcile's fix-it line ("… harbor forget x")
@@ -263,7 +263,7 @@ impl DuckTable {
                     // scan of a database cares about; column counts
                     // live in the footer status and Structure view.
                     .when_some(table.estimated_rows, |d, n| {
-                        d.child(dim(t, crate::util::human(n, "")))
+                        d.child(dim(t, crate::util::human(n as f64, "")))
                     })
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.select_table(

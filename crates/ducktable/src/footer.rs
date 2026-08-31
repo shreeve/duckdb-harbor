@@ -120,7 +120,11 @@ impl Grid {
             format!("{} {}", f.cols, if f.cols == 1 { "column" } else { "columns" })
         });
         let verdict = facts.as_ref().map(|f| {
-            format!("{} ms \u{00b7} {}", f.ms, rows_part.clone().unwrap_or_default())
+            format!(
+                "{} \u{00b7} {}",
+                crate::util::human(f.ms as f64 / 1000., "s"),
+                rows_part.clone().unwrap_or_default()
+            )
         });
         let loading_empty = view == ViewMode::Data
             && facts.as_ref().is_some_and(|f| f.loading && f.count == 0);
