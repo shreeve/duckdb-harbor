@@ -220,10 +220,10 @@ impl DuckTable {
 
     /// Open (focused) or close the sidebar's table filter.
     /// ⌥←/⌥→: the previous/next table, walking the sidebar's own order
-    /// and filter (sidebar.rs visible_tables). Clamped at the ends like
-    /// the ⌥↑/↓ page keys — data navigation hits walls; only the view
-    /// switcher was ever a carousel, and ⌘1/⌘2/⌘3 address it now. With
-    /// nothing selected yet, either arrow lands on the nearest end.
+    /// and filter (sidebar.rs visible_tables) — with rollover, so the
+    /// tables read as a ring you can circle rather than a hall that
+    /// dead-ends (Steve's ruling). With nothing selected yet, either
+    /// arrow lands on the nearest end.
     pub(crate) fn step_table(
         &mut self,
         delta: i32,
@@ -239,7 +239,7 @@ impl DuckTable {
             .as_ref()
             .and_then(|sel| list.iter().position(|k| k == sel));
         let next = match ix {
-            Some(i) => (i as i32 + delta).clamp(0, list.len() as i32 - 1) as usize,
+            Some(i) => (i as i32 + delta).rem_euclid(list.len() as i32) as usize,
             None => {
                 if delta >= 0 {
                     0
@@ -249,7 +249,7 @@ impl DuckTable {
             }
         };
         if Some(&list[next]) == self.selected_table.as_ref() {
-            return; // already at the wall
+            return; // a one-table ring goes nowhere
         }
         let (schema, name) = list[next].clone();
         self.select_table(schema, name, window, cx);

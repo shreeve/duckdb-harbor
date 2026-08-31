@@ -36,10 +36,14 @@ use serde_json::Value;
 // silently stitch separately-queried chunks together.
 
 // 7 is Menlo's digit advance at GUTTER_TEXT (11px); 16 is the gutter's
-// horizontal padding. Both move if the value font or size does.
+// horizontal padding. Both move if the value font or size does. The
+// floor is TWO digits — room for "99" — so the gutter starts identical
+// across Structure, Data, and Query and widens only when the content
+// actually holds bigger row numbers (a 45,000th row earns five digits;
+// a five-row table never pays for them).
 fn gutter_width(max_row: u64) -> f32 {
-    let digits = max_row.max(1).ilog10() as f32 + 1.;
-    (16. + digits * 7.).max(34.)
+    let digits = (max_row.max(1).ilog10() as f32 + 1.).max(2.);
+    16. + digits * 7.
 }
 
 pub(crate) struct Grid {
@@ -140,6 +144,7 @@ pub(crate) struct Grid {
     /// The table wrapper's window bounds, recorded by a canvas each frame
     /// so `divider_double_click` can hit-test header dividers.
     table_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
+
 }
 
 /// Everything a fetch commits along with its rows. The delegate is not
@@ -544,6 +549,14 @@ impl Grid {
             cx.notify();
         })
         .detach();
+        // The DDL editor re-wraps when it learns its real width — first
+        // paint, pane resize, zoom — and notifies ITSELF. The card's
+        // height is OUR render's math (wrapped_line_count), so observe
+        // the editor: the card resizes in the very next frame instead
+        // of waiting for an incidental repaint (the first-display chop).
+        if let Some(input) = &ddl_input {
+            cx.observe(input, |_, _, cx| cx.notify()).detach();
+        }
         let structure_grid = structure
             .as_ref()
             .map(|s| crate::structure::columns_grid(conn.clone(), s, window, cx));
@@ -2676,6 +2689,21 @@ impl Render for Grid {
                 div()
                     .h_flex()
                     .h_8()
+                    .relative()
+                    // The strip spans the pane in every view: its canvas
+                    // records the width the Structure view needs BEFORE
+                    // the DDL's first paint (see pane_width).
+                    .child(
+                        div().absolute().inset_0().child(
+                            canvas(
+                                move |b, _, _| {
+                                    crate::structure::record_pane_width(b.size.width)
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .size_full(),
+                        ),
+                    )
                     // Left inset matches the grid text (PANE_INSET cell
                     // padding), so the title sits flush over the first
                     // column.
@@ -2764,7 +2792,7 @@ impl Render for Grid {
                         icon_tile("toggle-inspector", 22., true, t)
                             .text_color(if p.inspector { t.accent } else { t.muted })
                             .tooltip(|window, cx| {
-                                Tooltip::new("Show inspector (\u{2318}\u{2325}0)").build(window, cx)
+                                Tooltip::new("Show inspector (\u{2318}I)").build(window, cx)
                             })
                             .on_click(cx.listener(|_, _, _, cx| {
                                 prefs::toggle(cx, |p| p.inspector = !p.inspector);

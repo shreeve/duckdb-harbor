@@ -531,12 +531,11 @@ impl TextElement {
         window: &mut Window,
     ) -> (Pixels, usize) {
         let total_lines = text.lines_len();
-        let line_number_len = match total_lines {
-            0..=9999 => 5,
-            10000..=99999 => 6,
-            100000..=999999 => 7,
-            _ => 8,
-        };
+        // DuckTable patch: two digits by default — the gutter fits "99"
+        // and widens only when the text actually holds more lines,
+        // matching the data grids' row-number gutter instead of
+        // reserving five digits for a six-line scratchpad.
+        let line_number_len = (total_lines.max(1).ilog10() as usize + 1).max(2);
 
         let line_number_width = if state.mode.line_number() {
             let empty_line_number = window.text_system().shape_line(
@@ -1132,11 +1131,17 @@ impl Element for TextElement {
             (total_wrapped_lines as f32 * line_height + empty_bottom_height + ghost_lines_height)
                 .max(bounds.size.height),
         );
-        // DuckTable patch: a DISABLED editor never scrolls itself — it
-        // has no scroll range at all. The host sizes it to content;
-        // padding-arithmetic residue must not leave a few pixels of
-        // wiggle.
-        let scroll_size = if state.disabled { bounds.size } else { scroll_size };
+        // DuckTable patch: a DISABLED editor has no ARTIFICIAL vertical
+        // overflow — the height is its content's (no scroll-past-end,
+        // no padding-arithmetic residue), so when the host sizes it to
+        // fit there is simply NOTHING to scroll vertically. Horizontal
+        // overflow is genuine content (long lines) and keeps its
+        // scroll.
+        let scroll_size = if state.disabled {
+            gpui::size(scroll_size.width, bounds.size.height)
+        } else {
+            scroll_size
+        };
 
         // `position_for_index` for example
         //

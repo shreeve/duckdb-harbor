@@ -34,8 +34,8 @@ actions!(
 /// App-level, like the view keys, so it works from any view; text
 /// inputs stay safe — their own alt-arrow bindings (word jump) sit
 /// deeper in the context stack and win while typing. The ⌥-arrow
-/// grammar: ↑/↓ pages within a table, ←/→ moves between tables; views
-/// are ⌘1/⌘2/⌘3's job.
+/// grammar: ↑/↓ pages within a table, ←/→ circles the tables (with
+/// rollover); views are ⌘1/⌘2/⌘3's job.
 fn step_table(delta: i32, cx: &mut App) {
     let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) else {
         return;
@@ -250,7 +250,7 @@ fn main() {
         theme::init(cx);
         prefs::init(cx);
         cx.bind_keys([
-            KeyBinding::new("cmd-alt-0", ToggleInspector, None),
+            KeyBinding::new("cmd-i", ToggleInspector, None),
             KeyBinding::new("cmd-q", Quit, None),
             // Cmd-Plus arrives as cmd-= (unshifted) or cmd-shift-= — bind
             // both, the way browsers treat the pair.
