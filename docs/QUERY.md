@@ -178,12 +178,22 @@ the user's statement parenthesized — "a Data window with a custom
 query preceding it." `page_sql` emits `SELECT * FROM (statement)
 LIMIT … OFFSET …` for the SELECT-shaped family (select / with / from /
 values / table); the footer's pager, size cycling, and jump-to-last
-all just work. The bare first run still materializes once — which is
-how the exact total is known for free — and the grid keeps page 0 of
-it. Unwrappable statements (PRAGMA, SHOW …) keep their whole result as
-one inert page, pager hidden. *Wire seam still flagged:* capping the
-FIRST run wants Harbor cooperation (cap-and-report); until then one
-full materialization per send.
+all just work.
+
+A send is at most the two queries the Data view gives a table — and
+usually just ONE (the probe-row ruling, 2026-08-31, retiring the
+flagged wire seam without Harbor's help): page 0 fetches with LIMIT
+size+1, and a result that fits the page IS its own exact count. Only
+the extra row's arrival proves there is more; only then does
+`count(*)` fire for the exact total — `from members limit 520000`
+ships 5,000 rows and one count, while the everyday small query pays a
+single execution. The page query doubles as the wrap probe: if it
+fails — not actually SELECT-shaped, or a syntax error — the statement
+runs bare, so error verdicts always quote the user's own SQL, never
+the wrapper's, and the `wrappable()` heuristic is self-correcting.
+Unwrappable statements keep their whole result as one inert page,
+pager hidden. The named costs: a big result executes its plan twice,
+and deep OFFSET pages re-skip rows — table paging's own physics.
 
 **Chrome taxonomy** (ruled 2026-08-31): display preferences are
 GLOBAL and set once — row numbers, NULL tags, right-alignment are
