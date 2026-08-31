@@ -432,9 +432,15 @@ impl Scrollbar {
             _ => (THUMB_ACTIVE_WIDTH, THUMB_ACTIVE_INSET, THUMB_ACTIVE_RADIUS),
         };
 
+        // DuckTable patch: a scroll in progress shows ONLY the floating
+        // thumb, never an opaque track — the track quad spanned the
+        // whole gutter and blotted out content beneath it until the
+        // fade-out finished. Native macOS overlay scrollbars work this
+        // way: the track appears on hover or drag (those styles keep
+        // theirs), not while content merely moves.
         (
             cx.theme().scrollbar_thumb,
-            cx.theme().scrollbar,
+            gpui::transparent_black(),
             gpui::transparent_black(),
             width,
             inset,
