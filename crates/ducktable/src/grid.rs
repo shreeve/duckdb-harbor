@@ -36,10 +36,14 @@ use serde_json::Value;
 // silently stitch separately-queried chunks together.
 
 // 7 is Menlo's digit advance at GUTTER_TEXT (11px); 16 is the gutter's
-// horizontal padding. Both move if the value font or size does.
+// horizontal padding. Both move if the value font or size does. The
+// floor is TWO digits — room for "99" — so the gutter starts identical
+// across Structure, Data, and Query and widens only when the content
+// actually holds bigger row numbers (a 45,000th row earns five digits;
+// a five-row table never pays for them).
 fn gutter_width(max_row: u64) -> f32 {
-    let digits = max_row.max(1).ilog10() as f32 + 1.;
-    (16. + digits * 7.).max(34.)
+    let digits = (max_row.max(1).ilog10() as f32 + 1.).max(2.);
+    16. + digits * 7.
 }
 
 pub(crate) struct Grid {
