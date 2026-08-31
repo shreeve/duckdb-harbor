@@ -50,7 +50,10 @@ pub(crate) struct Grid {
     pub(crate) conn: Conn,
     /// The berth's Query view, injected by the app (berth-scoped, so it
     /// outlives this table's grid); rendered by the Query segment.
-    pub(crate) query_view: Option<AnyView>,
+    pub(crate) query_view: Option<Entity<crate::query::QueryView>>,
+    /// Repaints the footer's status line as the query view's run state
+    /// ticks and settles; replaced whole when a berth swaps views in.
+    pub(crate) query_obs: Option<Subscription>,
     /// Quoted `"schema"."table"` this grid pages from.
     source: String,
     title: String,
@@ -472,6 +475,7 @@ impl Grid {
             table,
             conn,
             query_view: None,
+            query_obs: None,
             source,
             title,
             page: 0,

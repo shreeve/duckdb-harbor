@@ -66,15 +66,30 @@ impl Grid {
             format!("{} {}", cols, if cols == 1 { "column" } else { "columns" });
         let loading_empty = loading && count == 0;
         let pager_visible = view == ViewMode::Data && !loading_empty;
+        // The Query view's stats live HERE, same widgets and ordering as
+        // Data's — not in a mid-pane strip (docs/QUERY.md: the status
+        // line follows the anti-jump ordering).
+        let (query_prefix, query_columns) = if view == ViewMode::Query {
+            self.query_view
+                .as_ref()
+                .map(|q| q.read(cx).status_parts())
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
         let status_prefix = match view {
             ViewMode::Data if loading_empty => Some("loading...".to_string()),
             ViewMode::Data => {
                 Some(format!("{} ms \u{00b7} {rows_part}", self.last_time_ms))
             }
-            ViewMode::Structure | ViewMode::Query => None,
+            ViewMode::Query => query_prefix,
+            ViewMode::Structure => None,
         };
-        let status_columns =
-            (view == ViewMode::Structure || pager_visible).then_some(columns_part);
+        let status_columns = if view == ViewMode::Query {
+            query_columns
+        } else {
+            (view == ViewMode::Structure || pager_visible).then_some(columns_part)
+        };
         div()
             .h_flex()
             .h(px(38.))

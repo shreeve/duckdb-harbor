@@ -19,8 +19,12 @@ pub(crate) struct QueryView {
     berth: String,
     pub(crate) editor: Entity<InputState>,
     results: Option<Entity<TableState<ResultsDelegate>>>,
-    /// The verdict strip: engine time and row counts, or the error.
-    status: Option<SharedString>,
+    /// The last completed run's verdict, footer-rendered: (ms, rows,
+    /// cols); cols == 0 is a resultless statement's "ok".
+    stats: Option<(u64, u64, usize)>,
+    /// A transient footer note ("nothing to run"), cleared by the next
+    /// verdict.
+    note: Option<SharedString>,
     error: Option<SharedString>,
     running: bool,
     /// Run generation: a stale result can never replace a newer one.
@@ -61,6 +65,7 @@ impl QueryView {
         // ⌘Enter arrives as the input's secondary-enter — the send key.
         // Plain Enter stays a newline (the editor's own default).
         let subscription = cx.subscribe_in(&editor, window, Self::on_editor_event);
+        prune_history(berth);
         // The editor's Enter handler ALWAYS inserts a newline in
         // multi-line mode, secondary included, before emitting its
         // event. Interceptors run before binding dispatch, so this one
@@ -88,7 +93,8 @@ impl QueryView {
             berth: berth.to_string(),
             editor,
             results: None,
-            status: None,
+            stats: None,
+            note: None,
             error: None,
             running: false,
             generation: 0,
@@ -138,14 +144,14 @@ impl QueryView {
     /// the gaps between statements the one above owns the caret.
     pub(crate) fn run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.running {
-            self.status = Some("already running\u{2026}".into());
+            self.note = Some("already running\u{2026}".into());
             cx.notify();
             return;
         }
         let text = self.editor.read(cx).value().to_string();
         let caret = self.editor.read(cx).cursor();
         let Some(sql) = statement_at(&text, caret) else {
-            self.status = Some("nothing to run".into());
+            self.note = Some("nothing to run".into());
             cx.notify();
             return;
         };
@@ -186,6 +192,7 @@ impl QueryView {
         })
         .detach();
         cx.spawn_in(window, async move |this, cx| {
+            let sql_logged = sql.clone();
             let outcome = cx
                 .background_executor()
                 .spawn(async move { harbor_client::query(&conn, &sql) })
@@ -201,20 +208,17 @@ impl QueryView {
                 this.show_running = false;
                 this.run_started = None;
                 this.error = None;
+                this.note = None;
+                append_history(&this.berth, &sql_logged, &outcome);
                 match outcome {
                     Ok(result) => {
                         let rows = result.row_count;
                         let ms = result.time_ms;
                         let cols = result.columns.len();
+                        this.stats = Some((ms, rows, cols));
                         if cols == 0 {
                             this.results = None;
-                            this.status =
-                                Some(format!("ok \u{00b7} {ms} ms").into());
                         } else {
-                            this.status = Some(
-                                format!("{ms} ms \u{00b7} {rows} rows \u{00b7} {cols} columns")
-                                    .into(),
-                            );
                             let delegate = ResultsDelegate::new(result);
                             this.results = Some(cx.new(|cx| {
                                 TableState::new(delegate, window, cx)
@@ -224,7 +228,7 @@ impl QueryView {
                     }
                     Err(message) => {
                         this.error = Some(SharedString::from(message));
-                        this.status = None;
+                        this.stats = None;
                     }
                 }
                 cx.notify();
@@ -232,6 +236,32 @@ impl QueryView {
             .ok();
         })
         .detach();
+    }
+
+    /// The footer's status parts, in the Data view's exact voice and
+    /// ordering (docs/QUERY.md): ticking while a slow run holds the
+    /// floor, then the verdict — ms and rows leftmost, columns its own
+    /// node (the anti-jump rule).
+    pub(crate) fn status_parts(&self) -> (Option<String>, Option<String>) {
+        if self.show_running {
+            if let Some(t) = self.run_started {
+                return (
+                    Some(format!("running\u{2026} {} ms", t.elapsed().as_millis())),
+                    None,
+                );
+            }
+        }
+        if let Some(note) = &self.note {
+            return (Some(note.to_string()), None);
+        }
+        match self.stats {
+            Some((ms, _, 0)) => (Some(format!("ok \u{00b7} {ms} ms")), None),
+            Some((ms, rows, cols)) => (
+                Some(format!("{ms} ms \u{00b7} {} rows", crate::util::commas(rows))),
+                Some(format!("{cols} {}", if cols == 1 { "column" } else { "columns" })),
+            ),
+            None => (None, None),
+        }
     }
 
     pub(crate) fn request_focus(&mut self, cx: &mut Context<Self>) {
@@ -293,34 +323,9 @@ impl Render for QueryView {
                         .child(message),
                 )
             })
-            .when_some(
-                // Phase 2's ticking line replaces the last verdict while
-                // it shows; otherwise the verdict stands until the next
-                // one atomically replaces it.
-                if self.show_running {
-                    self.run_started.map(|t| {
-                        SharedString::from(format!(
-                            "running\u{2026} {} ms",
-                            t.elapsed().as_millis()
-                        ))
-                    })
-                } else {
-                    self.status.clone()
-                },
-                |d, status| {
-                    d.child(
-                        div()
-                            .flex_none()
-                            .px_3()
-                            .py_1()
-                            .border_t_1()
-                            .border_color(t.border)
-                            .text_xs()
-                            .text_color(t.muted)
-                            .child(status),
-                    )
-                },
-            )
+            // The run's verdict lives in the FOOTER's status line, the
+            // same widgets and ordering as the Data view — no mid-pane
+            // strip (Steve's unification ruling, 2026-08-31).
             .when_some(self.results.clone(), |d, table| {
                 // The results pane: a snapshot that snaps (law 5). While
                 // a slow run holds the floor, the prior snapshot fades —
@@ -540,6 +545,59 @@ fn scratch_path(berth: &str) -> Option<std::path::PathBuf> {
 
 fn load_scratch(berth: &str) -> Option<String> {
     std::fs::read_to_string(scratch_path(berth)?).ok()
+}
+
+fn history_path(berth: &str) -> Option<std::path::PathBuf> {
+    let dir = scratch_path(berth)?;
+    let name = dir.file_stem()?.to_string_lossy().to_string();
+    Some(dir.parent()?.parent()?.join("history").join(format!("{name}.ndjson")))
+}
+
+/// One line per run, appended on completion (docs/QUERY.md: capture
+/// before UI — history never captured is unrecoverable). NDJSON, not a
+/// shell-style flat file: SQL is multi-line, and a run's verdict —
+/// duration, rows, error — is what makes history a log of what
+/// happened rather than a pile of text. The v2 recall popover reads
+/// this; until then it is grep-food.
+fn append_history(
+    berth: &str,
+    sql: &str,
+    outcome: &Result<harbor_client::QueryResult, String>,
+) {
+    let Some(path) = history_path(berth) else { return };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let entry = match outcome {
+        Ok(r) => serde_json::json!({
+            "ts": ts, "sql": sql, "ok": true, "ms": r.time_ms, "rows": r.row_count,
+        }),
+        Err(message) => serde_json::json!({
+            "ts": ts, "sql": sql, "ok": false, "error": message,
+        }),
+    };
+    use std::io::Write as _;
+    if let Ok(mut f) =
+        std::fs::OpenOptions::new().create(true).append(true).open(&path)
+    {
+        writeln!(f, "{entry}").ok();
+    }
+}
+
+/// The 10k-entry cap, enforced once per session at view birth — cheap,
+/// bounded, and never on the run path.
+fn prune_history(berth: &str) {
+    let Some(path) = history_path(berth) else { return };
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() > 10_000 {
+        let keep = &lines[lines.len() - 10_000..];
+        std::fs::write(&path, format!("{}\n", keep.join("\n"))).ok();
+    }
 }
 
 #[cfg(test)]

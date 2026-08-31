@@ -186,8 +186,12 @@ impl DuckTable {
                         crate::query::QueryView::new(qconn, &berth, window, cx)
                     }));
                 }
-                grid.update(cx, |g, _| {
-                    g.query_view = state.query.clone().map(|q| q.into());
+                grid.update(cx, |g, cx| {
+                    g.query_view = state.query.clone();
+                    g.query_obs = g
+                        .query_view
+                        .as_ref()
+                        .map(|q| cx.observe(q, |_, _, cx| cx.notify()));
                 });
                 state.grid = Some(grid);
                 cx.notify();
