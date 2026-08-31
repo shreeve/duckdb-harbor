@@ -340,7 +340,16 @@ def run_all(h, leases, proc, db, port):
     while time.time() < deadline and h.sessions()["sessions"]:
         time.sleep(0.25)
     eq("the abandoned lease is reclaimed", 0, len(h.sessions()["sessions"]))
+    # Two waits, because these are two events. `lease_release` drops the lease
+    # from `live` under the registry lock, rolls back OUTSIDE it, and only then
+    # takes the lock again to push the connection onto `free` — `inflight`
+    # exists to count exactly that gap. So an empty session list does not mean
+    # the connection has landed, and asserting `free` on the strength of it
+    # reddens this suite at random. Wait for the second event too.
+    while time.time() < deadline and h.connections()["free"] != leases:
+        time.sleep(0.05)
     eq("its connection is back in the pool", leases, h.connections()["free"])
+    eq("with nothing left in flight", 0, h.connections()["inflight"])
     eq("and its transaction was rolled back", 0, h.value("SELECT n FROM t WHERE id=3"))
     eq("the accounting still balances", True, h.connections()["balanced"])
 
