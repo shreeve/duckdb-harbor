@@ -86,6 +86,10 @@ pub(crate) struct Grid {
     /// the scrolling frame shows a stale header. Render consumes this
     /// by scheduling one more frame, where the header catches up.
     header_chase: bool,
+    /// The keystroke interceptor that keeps the table's built-in
+    /// arrow/escape bindings out of navigation (see Grid::new) — held so
+    /// it unregisters when this grid drops.
+    _intercept: Subscription,
     /// The filter strip's input; Some = the strip is open.
     pub(crate) filter_input: Option<Entity<gpui_component::input::InputState>>,
     /// Prefetched with the first page, so switching views is instant.
@@ -296,6 +300,45 @@ impl Grid {
         // (widths reorder, contents don't).
         let table =
             cx.new(|cx| TableState::new(delegate, window, cx).col_movable(false));
+        // The table binds plain up/down/left/right/escape to its own
+        // selection actions, and gpui dispatches BINDINGS before raw key
+        // listeners — so the wash moved by the table's action and the
+        // ring moved by our listener-fed mirror arrived as two writes,
+        // a perceptible lump-lump. This interceptor runs before binding
+        // dispatch, and a stopped event skips bindings AND listeners
+        // both — so for the five keys we own, in navigation, with our
+        // table focused, it performs the move itself: ring and wash in
+        // ONE mutation, nobody else consulted. Single writer, atomic
+        // paint.
+        let weak = cx.entity().downgrade();
+        let intercept = cx.intercept_keystrokes(move |ev, window, cx| {
+            let ks = &ev.keystroke;
+            if ks.modifiers != Modifiers::default() {
+                return; // modified chords stay on the normal paths
+            }
+            if !matches!(ks.key.as_str(), "up" | "down" | "left" | "right" | "escape") {
+                return;
+            }
+            let Some(grid) = weak.upgrade() else { return };
+            {
+                let g = grid.read(cx);
+                if g.editor.is_some() {
+                    return; // the open editor's own keys keep their meanings
+                }
+                if !g.table.focus_handle(cx).contains_focused(window, cx) {
+                    return;
+                }
+            }
+            let key = ks.key.clone();
+            grid.update(cx, |g, cx| match key.as_str() {
+                "up" => g.move_ring(-1, 0, cx),
+                "down" => g.move_ring(1, 0, cx),
+                "left" => g.move_ring(0, -1, cx),
+                "right" => g.move_ring(0, 1, cx),
+                _ => g.clear_ring(cx),
+            });
+            cx.stop_propagation();
+        });
         cx.subscribe(&table, |_, table, event: &gpui_component::table::TableEvent, cx| {
             match event {
                 gpui_component::table::TableEvent::SelectRow(ix) => {
@@ -433,6 +476,7 @@ impl Grid {
             needs_focus: false,
             ring_keep: None,
             header_chase: false,
+            _intercept: intercept,
             filter_input: None,
             structure,
             resize,
@@ -1077,15 +1121,7 @@ impl Grid {
                 cx.stop_propagation();
             }
             "escape" => {
-                // Esc while navigating clears the selection — the same
-                // panic key, the same "nothing happened" result.
-                self.table.update(cx, |state, cx| {
-                    let d = state.delegate_mut();
-                    d.active_cell = None;
-                    d.tab_anchor = None;
-                    state.clear_selection(cx);
-                    cx.notify();
-                });
+                self.clear_ring(cx);
                 cx.stop_propagation();
             }
             _ => {
@@ -1367,6 +1403,19 @@ impl Grid {
         self.ring_keep = self.table.read(cx).delegate().active_cell;
         let page = if delta < 0 { self.page - 1 } else { self.page + 1 };
         self.fetch_page(page, cx);
+    }
+
+    /// Esc while navigating: clear the ring, the selection, and any Tab
+    /// run — the same panic key, the same "nothing happened" result.
+    fn clear_ring(&mut self, cx: &mut Context<Self>) {
+        self.table.update(cx, |state, cx| {
+            let d = state.delegate_mut();
+            d.active_cell = None;
+            d.tab_anchor = None;
+            state.clear_selection(cx);
+            cx.notify();
+        });
+        cx.notify();
     }
 
     /// Tab / ⇧Tab: move along the row, remembering where the run began
