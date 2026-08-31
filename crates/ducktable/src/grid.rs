@@ -1172,6 +1172,25 @@ impl Grid {
     /// the cell the first click just made active (the delegate's own
     /// mouse-down runs before this bubbling listener).
     fn on_body_click(&mut self, e: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Click-away confirms — the universal grid contract (Sheets,
+        // Excel, AG Grid: focus moving to another cell commits the
+        // edit). The clicked cell's own mouse-down has already moved
+        // active_cell by the time this bubbles, so "editing != active"
+        // is precisely "the click landed elsewhere"; a click inside the
+        // open editor moves nothing and stays an editor click. Confirm
+        // stages the value and hands focus back to the table, so the
+        // next keystroke types into the newly ringed cell. (A value
+        // that fails validation keeps its editor and its reason — Esc
+        // remains the way out of a bad value.)
+        if self.editor.is_some() {
+            let (editing, active) = {
+                let d = self.table.read(cx).delegate();
+                (d.editing, d.active_cell)
+            };
+            if editing != active {
+                self.confirm_and_move(0, 0, false, cx);
+            }
+        }
         if e.click_count != 2 || self.editor.is_some() {
             return;
         }

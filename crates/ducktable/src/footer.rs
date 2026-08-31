@@ -147,7 +147,9 @@ impl Grid {
                 )
             })
             .when(view == ViewMode::Data, |d| {
-                d.child(self.columns_popover(cx))
+                // A breath between the funnel and the eye — the tiles
+                // read as separate controls, not a fused cluster.
+                d.child(div().ml_1().child(self.columns_popover(cx)))
             })
             // The staging story, told where the eye rests between edits:
             // the verb-split count while changes wait, "committing…"
