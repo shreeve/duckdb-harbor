@@ -105,7 +105,7 @@ impl DuckTable {
                     harbor_client::paths::shorten(std::path::Path::new(&info.database)),
                 ))
                 .when_some(catalog.database_size_bytes, |d, data| {
-                    let h = |n| crate::util::human(n, "B");
+                    let h = |n: u64| crate::util::human(n as f64, "B");
                     d.child(meta(
                         t,
                         "Size",
@@ -115,7 +115,11 @@ impl DuckTable {
                         },
                     ))
                 })
-                .child(meta(t, "Uptime", format!("{}s", info.uptime_ms / 1000)))
+                .child(meta(
+                    t,
+                    "Uptime",
+                    crate::util::human(info.uptime_ms as f64 / 1000., "s"),
+                ))
                 .child(meta(
                     t,
                     "Lifetime",

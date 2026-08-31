@@ -282,15 +282,16 @@ impl QueryView {
         if self.show_running {
             if let Some(t) = self.run_started {
                 return Some(format!(
-                    "running\u{2026} {} ms",
-                    t.elapsed().as_millis()
+                    "running\u{2026} {}",
+                    crate::util::human(t.elapsed().as_secs_f64(), "s")
                 ));
             }
         }
         if let Some(note) = &self.note {
             return Some(note.to_string());
         }
-        self.ok_ms.map(|ms| format!("ok \u{00b7} {ms} ms"))
+        self.ok_ms
+            .map(|ms| format!("ok \u{00b7} {}", crate::util::human(ms as f64 / 1000., "s")))
     }
 
     /// The embedded results grid, for the footer's stats and pager.
