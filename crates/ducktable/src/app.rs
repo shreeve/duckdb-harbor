@@ -61,6 +61,9 @@ pub struct DuckTable {
     /// "harbor is broken"; a dead refresh click reads as "it worked").
     /// The next fleet refresh rewrites it from the config's truth.
     pub(crate) warning: Option<String>,
+    /// The berth's one Query scratchpad (docs/QUERY.md law 1): owned
+    /// here so table switches never touch it; rebuilt per berth.
+    pub(crate) query: Option<Entity<crate::query::QueryView>>,
     /// Staged edits parked while their table is off-screen (Law 4 in
     /// docs/EDITING.md: staged changes belong to the table, not the
     /// view). Keyed by source; handed back when the table's grid is
@@ -82,6 +85,7 @@ impl DuckTable {
             select_seq: 0,
             refresh_seq: 0,
             warning: None,
+            query: None,
             staged: std::collections::HashMap::new(),
         };
         this.refresh(cx);
@@ -170,6 +174,25 @@ impl DuckTable {
                 if let Some(stash) = state.staged.remove(&source) {
                     grid.update(cx, |g, cx| g.adopt_edits(stash, cx));
                 }
+                // The berth's scratchpad rides along: created once per
+                // berth, injected into every grid it outlives.
+                let berth = match &state.phase {
+                    Phase::Connected { info, .. } => clone_str(&info.name),
+                    _ => String::new(),
+                };
+                if !state.query.as_ref().is_some_and(|q| q.read(cx).is_for(&berth)) {
+                    let qconn = grid.read(cx).conn.clone();
+                    state.query = Some(cx.new(|cx| {
+                        crate::query::QueryView::new(qconn, &berth, window, cx)
+                    }));
+                }
+                grid.update(cx, |g, cx| {
+                    g.query_view = state.query.clone();
+                    g.query_obs = g
+                        .query_view
+                        .as_ref()
+                        .map(|q| cx.observe(q, |_, _, cx| cx.notify()));
+                });
                 state.grid = Some(grid);
                 cx.notify();
             })
@@ -343,6 +366,7 @@ impl DuckTable {
                 state.connecting = None;
                 state.selected_table = None;
                 state.grid = None;
+                state.query = None;
                 state.staged.clear();
                 state.select_seq += 1;
                 state.phase = match outcome {
@@ -388,5 +412,15 @@ impl DuckTable {
             }
         })
         .detach();
+    }
+}
+
+impl DuckTable {
+    /// The carousel landed on Query: hand focus to the editor (the
+    /// symmetry of landing on Data focusing the grid).
+    pub(crate) fn focus_query(&self, cx: &mut gpui::App) {
+        if let Some(q) = &self.query {
+            q.update(cx, |q, cx| q.request_focus(cx));
+        }
     }
 }

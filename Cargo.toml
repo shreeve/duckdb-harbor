@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ducktable", "crates/harbor-client"]
+members = ["crates/ducktable", "crates/duckdb-lang", "crates/harbor-client"]
 
 [workspace.package]
 version = "0.7.0"
