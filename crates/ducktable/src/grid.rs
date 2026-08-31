@@ -1047,19 +1047,22 @@ impl Grid {
                 self.stage_clear(row, col, cx);
                 cx.stop_propagation();
             }
-            "up" if !m.shift => {
+            "up" if !m.shift && !m.alt => {
                 self.move_ring(-1, 0, cx);
                 cx.stop_propagation();
             }
-            "down" if !m.shift => {
+            "down" if !m.shift && !m.alt => {
                 self.move_ring(1, 0, cx);
                 cx.stop_propagation();
             }
-            "left" if !m.shift => {
+            // ⌥←/⌥→ are inert, matching Sheets (its laptop variant uses
+            // them for sheet switching — grid-tab switching's seat here,
+            // once multiple grids exist).
+            "left" if !m.shift && !m.alt => {
                 self.move_ring(0, -1, cx);
                 cx.stop_propagation();
             }
-            "right" if !m.shift => {
+            "right" if !m.shift && !m.alt => {
                 self.move_ring(0, 1, cx);
                 cx.stop_propagation();
             }
