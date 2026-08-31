@@ -25,27 +25,34 @@ use gpui_component::{Root, StyledExt as _};
 actions!(
     ducktable,
     [
-        ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset, FitColumns, ViewPrev,
-        ViewNext, View1, View2, View3, ToggleFullScreen
+        ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset, FitColumns, TablePrev,
+        TableNext, View1, View2, View3, ToggleFullScreen
     ]
 );
 
-/// ⌥←/⌥→: walk the footer's view switcher with rollover — a carousel,
-/// not a wall. App-level, unlike the grid's keymap, because it must
-/// keep working in Structure mode, where the table (and the focus that
-/// feeds the grid's listeners) isn't even rendered. Text inputs stay
-/// safe: their own alt-arrow bindings (word jump) sit deeper in the
-/// context stack and win while typing.
-fn step_view(dir: i32, cx: &mut App) {
-    let modes = view_order();
-    let cur = prefs::get(cx).view;
-    let ix = modes.iter().position(|v| *v == cur).unwrap_or(0) as i32;
-    go_view(modes[(ix + dir).rem_euclid(modes.len() as i32) as usize], cx);
+/// ⌥←/⌥→: the previous/next table in the sidebar (App::step_table).
+/// App-level, like the view keys, so it works from any view; text
+/// inputs stay safe — their own alt-arrow bindings (word jump) sit
+/// deeper in the context stack and win while typing. The ⌥-arrow
+/// grammar: ↑/↓ pages within a table, ←/→ moves between tables; views
+/// are ⌘1/⌘2/⌘3's job.
+fn step_table(delta: i32, cx: &mut App) {
+    let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) else {
+        return;
+    };
+    cx.defer(move |cx| {
+        if let Some(w) = cx.active_window() {
+            w.update(cx, |_, window, cx| {
+                view.update(cx, |this, cx| this.step_table(delta, window, cx));
+            })
+            .ok();
+        }
+    });
 }
 
-/// The switcher's one ordering — the footer renders it, the carousel
-/// walks it, and ⌘1/⌘2/⌘3 address it (Finder's ⌘1–4 idiom; these keys
-/// migrate to the tab strip when tabs ship, the ⌥↑/↓ pattern).
+/// The switcher's one ordering — the footer renders it and ⌘1/⌘2/⌘3
+/// address it (Finder's ⌘1–4 idiom; these keys migrate to the tab
+/// strip when tabs ship, the ⌥↑/↓ pattern).
 fn view_order() -> [prefs::ViewMode; 3] {
     use prefs::ViewMode;
     [ViewMode::Structure, ViewMode::Data, ViewMode::Query]
@@ -100,14 +107,14 @@ fn app_menus() -> Vec<Menu> {
         Menu {
             name: "View".into(),
             items: vec![
-                // The carousel advertises itself here: macOS renders the
-                // ⌥←/⌥→ key equivalents from the keymap bindings.
+                // macOS renders the ⌘1/⌘2/⌘3 and ⌥←/⌥→ key
+                // equivalents from the keymap bindings.
                 MenuItem::action("Structure", View1),
                 MenuItem::action("Data", View2),
                 MenuItem::action("Query", View3),
                 MenuItem::separator(),
-                MenuItem::action("Previous View", ViewPrev),
-                MenuItem::action("Next View", ViewNext),
+                MenuItem::action("Previous Table", TablePrev),
+                MenuItem::action("Next Table", TableNext),
                 MenuItem::separator(),
                 MenuItem::action("Zoom In", ZoomIn),
                 MenuItem::action("Zoom Out", ZoomOut),
@@ -252,15 +259,15 @@ fn main() {
             KeyBinding::new("cmd--", ZoomOut, None),
             KeyBinding::new("cmd-0", ZoomReset, None),
             KeyBinding::new("cmd-shift-f", FitColumns, None),
-            KeyBinding::new("alt-left", ViewPrev, None),
-            KeyBinding::new("alt-right", ViewNext, None),
+            KeyBinding::new("alt-left", TablePrev, None),
+            KeyBinding::new("alt-right", TableNext, None),
             KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
             KeyBinding::new("cmd-1", View1, None),
             KeyBinding::new("cmd-2", View2, None),
             KeyBinding::new("cmd-3", View3, None),
         ]);
-        cx.on_action(|_: &ViewPrev, cx| step_view(-1, cx));
-        cx.on_action(|_: &ViewNext, cx| step_view(1, cx));
+        cx.on_action(|_: &TablePrev, cx| step_table(-1, cx));
+        cx.on_action(|_: &TableNext, cx| step_table(1, cx));
         cx.on_action(|_: &ToggleFullScreen, cx| {
             cx.defer(|cx| {
                 if let Some(w) = cx.active_window() {
