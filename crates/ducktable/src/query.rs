@@ -6,7 +6,7 @@
 //! v1 scaffold scope: marked-statement runs (no selection runs yet), a
 //! single result per run, client-side truncation at the page size.
 
-use crate::theme::{pal, value_font};
+use crate::theme::{pal, value_font, CELL_TEXT, HEADER_TEXT};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -25,9 +25,20 @@ pub(crate) struct QueryView {
     running: bool,
     /// Run generation: a stale result can never replace a newer one.
     generation: u64,
+    /// When the in-flight run began — the elapsed clock's zero.
+    run_started: Option<std::time::Instant>,
+    /// True only after a run has held the floor for 300ms: fast queries
+    /// swap atomically with no intermediate state at all; slow ones earn
+    /// a ticking "running" line and faded prior results (Steve's
+    /// three-phase ruling, 2026-08-31).
+    show_running: bool,
     /// Set by the carousel landing here; consumed by the next render.
     needs_focus: bool,
     _subscription: Subscription,
+    /// Keystroke interceptor for ⌘Enter: it must run BEFORE the input's
+    /// own binding, which would insert a newline first (send means send,
+    /// not send-and-type).
+    _intercept: Subscription,
 }
 
 impl QueryView {
@@ -50,6 +61,28 @@ impl QueryView {
         // ⌘Enter arrives as the input's secondary-enter — the send key.
         // Plain Enter stays a newline (the editor's own default).
         let subscription = cx.subscribe_in(&editor, window, Self::on_editor_event);
+        // The editor's Enter handler ALWAYS inserts a newline in
+        // multi-line mode, secondary included, before emitting its
+        // event. Interceptors run before binding dispatch, so this one
+        // owns ⌘Enter outright while the editor is focused: run the
+        // statement, stop the keystroke, buffer untouched. The
+        // PressEnter subscription above stays as the backstop for any
+        // path this guard doesn't cover.
+        let weak = cx.entity().downgrade();
+        let intercept = cx.intercept_keystrokes(move |ev, window, cx| {
+            let m = &ev.keystroke.modifiers;
+            if !(m.platform && !m.shift && !m.alt && !m.control)
+                || ev.keystroke.key != "enter"
+            {
+                return;
+            }
+            let Some(view) = weak.upgrade() else { return };
+            if !view.read(cx).editor.read(cx).focus_handle(cx).is_focused(window) {
+                return;
+            }
+            view.update(cx, |view, cx| view.run(window, cx));
+            cx.stop_propagation();
+        });
         Self {
             conn,
             berth: berth.to_string(),
@@ -59,8 +92,11 @@ impl QueryView {
             error: None,
             running: false,
             generation: 0,
+            run_started: None,
+            show_running: false,
             needs_focus: false,
             _subscription: subscription,
+            _intercept: intercept,
         }
     }
 
@@ -114,12 +150,41 @@ impl QueryView {
             return;
         };
         self.running = true;
-        self.error = None;
-        self.status = Some("running\u{2026}".into());
         self.generation += 1;
         let generation = self.generation;
         let conn = self.conn.clone();
-        cx.notify();
+        self.run_started = Some(std::time::Instant::now());
+        // Phase 1: NOTHING on screen changes yet. A fast query (the
+        // common case) replaces status and results in one frame when it
+        // lands; only a run still going at 300ms earns visible chrome.
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(300))
+                .await;
+            // Phase 2: still running -> show the ticking line and fade
+            // the prior results; tick ~100ms so the elapsed count moves.
+            loop {
+                let live = this
+                    .update(cx, |this, cx| {
+                        let live = this.running && this.generation == generation;
+                        if live && !this.show_running {
+                            this.show_running = true;
+                        }
+                        if live {
+                            cx.notify();
+                        }
+                        live
+                    })
+                    .unwrap_or(false);
+                if !live {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(100))
+                    .await;
+            }
+        })
+        .detach();
         cx.spawn_in(window, async move |this, cx| {
             let outcome = cx
                 .background_executor()
@@ -130,7 +195,12 @@ impl QueryView {
                 if generation != this.generation {
                     return;
                 }
+                // Phase 3: one atomic swap — verdict line and results
+                // land together, the fade lifts, nothing intermediate.
                 this.running = false;
+                this.show_running = false;
+                this.run_started = None;
+                this.error = None;
                 match outcome {
                     Ok(result) => {
                         let rows = result.row_count;
@@ -187,8 +257,26 @@ impl Render for QueryView {
                     .flex_1()
                     .min_h_0()
                     .w_full()
+                    // The pane's one shared inset (theme::PANE_INSET), the
+                    // same 12px the grid text and title strip align to.
+                    // Horizontally the Input adds its own 8px (input_px,
+                    // kept even with appearance off), so the wrapper
+                    // supplies only the difference — 12 total, not 20.
+                    .py(px(crate::theme::PANE_INSET))
+                    .px(px(crate::theme::PANE_INSET - 8.))
                     .font_family(value_font())
-                    .child(Input::new(&self.editor).h_full()),
+                    // The same zoom ladder as the Data grid (Cmd-= / -),
+                    // set ON the input: Input applies its own size-class
+                    // text_sm before refining with caller styles, so a
+                    // wrapper cascade never reaches the editor text.
+                    .child(
+                        Input::new(&self.editor)
+                            .h_full()
+                            // No border, no focus ring: the pane inset is
+                            // the frame; the editor is just text.
+                            .appearance(false)
+                            .text_size(px(CELL_TEXT * crate::prefs::get(cx).zoom_factor())),
+                    ),
             )
             .when_some(self.error.clone(), |d, message| {
                 // The engine's verdict, verbatim (docs/QUERY.md law 4).
@@ -205,23 +293,47 @@ impl Render for QueryView {
                         .child(message),
                 )
             })
-            .when_some(self.status.clone(), |d, status| {
+            .when_some(
+                // Phase 2's ticking line replaces the last verdict while
+                // it shows; otherwise the verdict stands until the next
+                // one atomically replaces it.
+                if self.show_running {
+                    self.run_started.map(|t| {
+                        SharedString::from(format!(
+                            "running\u{2026} {} ms",
+                            t.elapsed().as_millis()
+                        ))
+                    })
+                } else {
+                    self.status.clone()
+                },
+                |d, status| {
+                    d.child(
+                        div()
+                            .flex_none()
+                            .px_3()
+                            .py_1()
+                            .border_t_1()
+                            .border_color(t.border)
+                            .text_xs()
+                            .text_color(t.muted)
+                            .child(status),
+                    )
+                },
+            )
+            .when_some(self.results.clone(), |d, table| {
+                // The results pane: a snapshot that snaps (law 5). While
+                // a slow run holds the floor, the prior snapshot fades —
+                // visibly stale, never blanked.
                 d.child(
                     div()
-                        .flex_none()
-                        .px_3()
-                        .py_1()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
                         .border_t_1()
                         .border_color(t.border)
-                        .text_xs()
-                        .text_color(t.muted)
-                        .child(status),
-                )
-            })
-            .when_some(self.results.clone(), |d, table| {
-                // The results pane: a snapshot that snaps (law 5).
-                d.child(
-                    div().flex_1().min_h_0().w_full().border_t_1().border_color(t.border).child(
+                        .when(self.show_running, |d| d.opacity(0.45))
+                        .child(
                         Table::new(&table)
                             .bordered(false)
                             .with_size(crate::prefs::get(cx).table_size()),
@@ -292,8 +404,15 @@ impl TableDelegate for ResultsDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let t = pal(cx);
+        let p = crate::prefs::get(cx);
         let cell = self.rows.get(row_ix).and_then(|r| r.get(col_ix)).cloned().flatten();
-        let base = div().px_2().text_sm().font_family(value_font());
+        let base = div()
+            .h_flex()
+            .items_center()
+            .h(p.table_size().table_row_height())
+            .px_2()
+            .text_size(px(CELL_TEXT * p.zoom_factor()))
+            .font_family(value_font());
         match cell {
             Some(text) => base.text_color(t.text).child(text),
             None => base.text_color(t.muted).child("NULL"),
@@ -307,9 +426,10 @@ impl TableDelegate for ResultsDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let t = pal(cx);
+        let p = crate::prefs::get(cx);
         div()
             .px_2()
-            .text_sm()
+            .text_size(px(HEADER_TEXT * p.zoom_factor()))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(t.text)
             .child(self.cols[col_ix].name.clone())

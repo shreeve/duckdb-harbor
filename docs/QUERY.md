@@ -63,7 +63,14 @@ past minimum snaps closed, double-click toggles). Before the first run
 the results pane sits collapsed to its one-line status strip — a
 deliberate state, not a squeezed grid — and the first run opens it to
 the persisted split. The editor is gpui-component's `code_editor` with
-line numbers and tree-sitter-duckdb highlighting, in the value font.
+line numbers and tree-sitter-duckdb highlighting, in the value font —
+borderless (the pane's 12px inset is the frame; focus is the caret),
+and sized by the same zoom ladder as every data surface: the editor,
+the results, and the Data grid share one text size per zoom step, never
+per-pane fonts (ruled 2026-08-31). Each app theme carries a matching
+highlight theme in ducktable.json — syntax colors drawn from the
+theme's own families (keyword=primary, string=success, number=warning,
+comment=muted italic).
 
 The footer keeps the switcher on the left. The Data view's controls
 (filter strip, Columns popover) are **absent, not disabled**. The
@@ -146,6 +153,13 @@ chrome for the uncommon case only.
 render a one-line acknowledgment card in place of the grid:
 `ok · 3 rows affected · 2 ms` — never an empty grid pretending to be
 data.
+
+**Run feedback is three-phase** (ruled 2026-08-31): for the first
+300ms of a run, nothing on screen changes — a fast query's verdict and
+results land together in one atomic frame. A run still going at 300ms
+earns a ticking `running… N ms` line and the prior results fade to
+~45%, visibly stale but never blanked. Completion is always one atomic
+swap. Law 5's commit-flicker discipline, applied to queries.
 
 **Errors** land as a danger-colored message strip at the top of the
 results pane: the engine's message verbatim, copyable, with statement
