@@ -113,3 +113,37 @@ fn a_session_carries_a_transaction_with_bound_params() {
     harbor_client::session_release(&conn, &sid);
     println!("session {sid}: transaction, params, counts — all as the spec assumes");
 }
+
+#[test]
+#[ignore]
+fn keyless_base_tables_expose_rowid() {
+    let Some(row) = connectable() else {
+        println!("no berth to test against; skipping");
+        return;
+    };
+    let conn = connect(&row.name).expect("connect");
+    // Find any base table, then probe the rowid pseudocolumn through
+    // the same wire the grid would use.
+    let tables = harbor_client::query(
+        &conn,
+        "SELECT schema_name, table_name FROM duckdb_tables() LIMIT 1",
+    )
+    .expect("duckdb_tables");
+    let Some(t) = tables.rows.first() else {
+        println!("no base tables; skipping");
+        return;
+    };
+    let (schema, name) = (t[0].as_str().unwrap(), t[1].as_str().unwrap());
+    let sql = format!("SELECT rowid, * FROM \"{schema}\".\"{name}\" LIMIT 3");
+    let result = harbor_client::query(&conn, &sql).expect("rowid probe");
+    println!("rowid probe on {schema}.{name}:");
+    println!("  columns: {:?}", result.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>());
+    for r in &result.rows {
+        println!("  {:?}", r.first());
+    }
+    assert!(result.columns.first().and_then(|c| c.name.as_deref()) == Some("rowid"));
+    // And the shape an UPDATE would use: quoted pseudocolumn in WHERE.
+    let sql = format!("SELECT count(*) FROM \"{schema}\".\"{name}\" WHERE \"rowid\" = 0");
+    let count = harbor_client::query(&conn, &sql).expect("quoted rowid in WHERE");
+    println!("  quoted-WHERE count row: {:?}", count.rows.first());
+}

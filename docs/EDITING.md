@@ -63,7 +63,7 @@ combination has a deliberate answer:
 | F2 | opens the kept-value editor (the third door, with Enter and double-click — and the one that works mid-Tab-run) |
 | PageUp / PageDown | one screenful up / down within the loaded page (Sheets' meaning), a row of overlap, clamped at the page edge |
 | ⌥↑ / ⌥↓ | previous / next DATABASE page (the pager) — the ring keeps its seat (same column, row clamped); when multiple grid tabs exist someday, these migrate to tab switching (Sheets' worksheet keys) |
-| ⌥← / ⌥→ | step the view switcher's segments left / right (Data / Structure today, clamped like the control it drives) |
+| ⌥← / ⌥→ | step the view switcher's segments left / right, rolling over at the ends (Data / Structure today; a carousel, ready for more segments) |
 | ⌘⇧⌫ | discard all staged changes (TablePlus's chord; every discard stays undoable) |
 | ⇧ + arrows | deliberately inert — range selection's seat, reserved until ranges ship; a ring that moved when you expected a range to grow would lie |
 | ⌃ + arrows | never bound — macOS owns them (Mission Control, Spaces) |
@@ -124,11 +124,21 @@ not change, and printable exotica (AltGr, IME) already land on rung 6.
 
 ## Identity and capability
 
-- Editing requires a primary key. The UPDATE/DELETE WHERE binds the
-  **original fetched values** of the key columns; a table without a
-  primary key is read-only, with the reason stated, never a mystery.
-  (Panel ruling: every clever keyless workaround converts a visible
-  refusal into an invisible lottery.)
+- Editing binds a row identity in the WHERE clause: the **original
+  fetched values** of the primary-key columns when the catalog has a
+  key — and DuckDB's implicit **rowid** when it doesn't. Every base
+  table has a rowid, so keyless tables edit like any other: pages fetch
+  `rowid, *`, the column stays hidden from every surface, and only the
+  WHERE clauses see it. This beats the all-columns-WHERE fallback other
+  tools use — duplicate rows each keep their own rowid (all-columns
+  matching refuses to edit either copy), and NULL comparison never
+  enters the picture. The physical-id caveat: a vacuum after heavy
+  deletes can renumber rows; the affected-exactly-one check at commit
+  is the backstop, and the fetch-to-⌘S window is seconds. (The original
+  panel ruling — keyless means read-only — predates noticing the engine
+  hands us an identity for free; Steve overruled it with rowid in
+  hand. A read-only fallback remains for anything without one, views
+  someday.)
 - Primary-key cells are editable like any other — the WHERE holds the
   original, so `SET id = 7 WHERE id = 5` is just an update.
 - Statements are parameterized (`?` + bound params), never assembled

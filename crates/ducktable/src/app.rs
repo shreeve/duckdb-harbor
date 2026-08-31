@@ -127,9 +127,14 @@ impl DuckTable {
             // run concurrently — click latency is the slower one, not the
             // sum. The structure came free out of the catalog snapshot. A
             // failed page drops the count unawaited.
+            // Keyless tables fetch DuckDB's implicit rowid as their
+            // editing identity — the same predicate Grid::new applies.
+            let rowid = structure
+                .as_ref()
+                .is_some_and(|s| !s.cols.iter().any(|c| c.pk));
             let page_task = cx.background_executor().spawn({
                 let (conn, schema, name) = (conn.clone(), clone_str(&schema), clone_str(&name));
-                async move { crate::queries::first_page(&conn, &schema, &name, page_size) }
+                async move { crate::queries::first_page(&conn, &schema, &name, rowid, page_size) }
             });
             let total_task = cx.background_executor().spawn({
                 let (conn, schema, name) = (conn.clone(), clone_str(&schema), clone_str(&name));

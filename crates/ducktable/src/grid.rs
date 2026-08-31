@@ -67,6 +67,9 @@ pub(crate) struct Grid {
     /// The open cell editor, if any. Provisional input lives here; it
     /// becomes a staged change only on confirm.
     editor: Option<CellEditor>,
+    /// The identity is DuckDB's implicit rowid (no catalog key): pages
+    /// fetch `rowid, *` and the delegate hides schema column 0.
+    rowid: bool,
     /// Primary-key column names from the catalog — kept so an error-born
     /// grid can build its Edits when its first schema finally lands.
     pk_cols: Vec<String>,
@@ -186,6 +189,9 @@ pub(crate) struct GridDelegate {
     numeric: Vec<bool>,
     /// Schema indices hidden via the Columns popover.
     hidden: std::collections::HashSet<usize>,
+    /// Schema column 0 is the hidden rowid identity — plumbing, not
+    /// data: excluded from display, the popover, and every fit.
+    identity: bool,
     /// User drag-resizes, schema index → width, reapplied whenever the
     /// column list rebuilds (toggles, refreshes).
     widths: std::collections::HashMap<usize, Pixels>,
@@ -239,11 +245,16 @@ impl Grid {
         let p = prefs::get(cx);
         let gutter = p.row_numbers;
         // Editability follows capability (docs/EDITING.md): a primary key
-        // from the catalog, or the grid is read-only with the reason shown.
+        // from the catalog when there is one — and DuckDB's implicit
+        // rowid when there isn't. Every base table has a rowid, so a
+        // keyless table edits like any other: pages fetch `rowid, *`,
+        // the column stays hidden, and only the WHERE clauses see it.
         let pk_cols: Vec<String> = structure
             .as_ref()
             .map(|s| s.cols.iter().filter(|c| c.pk).map(|c| c.name.clone()).collect())
             .unwrap_or_default();
+        let rowid = structure.is_some() && pk_cols.is_empty();
+        let pk_cols = if rowid { vec!["rowid".to_string()] } else { pk_cols };
         let mut delegate = GridDelegate {
             cols: Vec::new(),
             schema_cols: Vec::new(),
@@ -260,6 +271,7 @@ impl Grid {
             editor_input: None,
             numeric: Vec::new(),
             hidden: std::collections::HashSet::new(),
+            identity: rowid,
             widths: std::collections::HashMap::new(),
             visible: Vec::new(),
             gutter,
@@ -470,6 +482,7 @@ impl Grid {
             last_time_ms,
             edits,
             editor: None,
+            rowid,
             pk_cols,
             not_null,
             committing: false,
@@ -502,7 +515,8 @@ impl Grid {
             FilterChange::Keep => self.filter.clone(),
         };
         let conn = self.conn.clone();
-        let sql = crate::queries::page_sql(&self.source, &filter, req.page, req.size);
+        let sql =
+            crate::queries::page_sql(&self.source, self.rowid, &filter, req.page, req.size);
         let count_sql = req.recount.then(|| crate::queries::count_sql(&self.source, &filter));
         let PageReq { page, size, filter, .. } = req;
         self.table.update(cx, |state, _| state.delegate_mut().loading = true);
@@ -867,6 +881,7 @@ impl Grid {
         d.names
             .iter()
             .enumerate()
+            .skip(d.identity as usize)
             .map(|(i, name)| (i, name.clone(), d.hidden.contains(&i)))
             .collect()
     }
@@ -895,6 +910,7 @@ impl Grid {
             d.names
                 .iter()
                 .enumerate()
+                .skip(d.identity as usize)
                 .map(|(i, name)| match row.get(i) {
                     None | Some(None) => (name.clone(), SharedString::from("NULL"), true),
                     Some(Some(s)) => (name.clone(), s.clone(), false),
@@ -998,27 +1014,9 @@ impl Grid {
             cx.stop_propagation();
             return;
         }
-        // ⌥←/⌥→ walk the view switcher — the Data/Structure segments
-        // today, every segment that joins them later. Clamped like the
-        // physical control it drives; needs no cell, just the pane.
-        if m.alt && !m.platform && !m.control && !m.shift {
-            let dir = match ks.key.as_str() {
-                "left" => -1i32,
-                "right" => 1,
-                _ => 0,
-            };
-            if dir != 0 {
-                let modes = [ViewMode::Data, ViewMode::Structure];
-                let cur = prefs::get(cx).view;
-                let ix = modes.iter().position(|v| *v == cur).unwrap_or(0) as i32;
-                let next = modes[(ix + dir).clamp(0, modes.len() as i32 - 1) as usize];
-                if next != cur {
-                    prefs::toggle(cx, |p| p.view = next);
-                }
-                cx.stop_propagation();
-                return;
-            }
-        }
+        // (⌥←/⌥→, the view-switcher carousel, live at App level in
+        // main.rs — they must keep working in Structure mode, where
+        // this listener's focus source doesn't exist.)
         // The modified-arrow grammar (docs/EDITING.md "Navigation"), all
         // of it needing a cell to move. JUMP rides the ring's own clamp:
         // an impossible distance lands exactly on the edge.
@@ -1441,6 +1439,14 @@ impl Grid {
         self.ring_keep = self.table.read(cx).delegate().active_cell;
         let page = if delta < 0 { self.page - 1 } else { self.page + 1 };
         self.fetch_page(page, cx);
+    }
+
+    /// Ask for table focus on the next frame (render consumes the flag,
+    /// where a &mut Window exists) — the view switcher calls this when
+    /// landing back on Data.
+    pub(crate) fn request_focus(&mut self, cx: &mut Context<Self>) {
+        self.needs_focus = true;
+        cx.notify();
     }
 
     /// Esc while navigating: clear the ring, the selection, and any Tab
@@ -1872,8 +1878,9 @@ impl GridDelegate {
     /// Rebuild the display columns from the schema minus the hidden set
     /// (plus the gutter), refreshing the visible→schema map.
     fn rebuild_cols(&mut self) {
-        self.visible =
-            (0..self.schema_cols.len()).filter(|i| !self.hidden.contains(i)).collect();
+        self.visible = (self.identity as usize..self.schema_cols.len())
+            .filter(|i| !self.hidden.contains(i))
+            .collect();
         self.cols = build_columns(&self.names, &self.visible, self.gutter);
         let g = self.gutter as usize;
         for (disp, schema_ix) in self.visible.iter().enumerate() {
