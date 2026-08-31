@@ -141,3 +141,32 @@ pub(crate) fn seg_tile(
 pub(crate) fn seg_sep(t: Pal) -> Div {
     div().w(px(1.)).h_full().flex_none().bg(t.border)
 }
+
+/// Crossfade: two elements stacked on ONE clock, opposite directions —
+/// the outgoing breathes out exactly as the incoming breathes in. An
+/// instant vanish beside a fade-in reads as a glitch; this is the
+/// reusable cure (first used by the copy tile's check -> copy revert).
+///
+/// The caller renders this during a crossfade WINDOW (a state its own
+/// timer closes a hair after `ms`), keys it with a sequence number so
+/// each playback runs once, and must SIZE the returned container — the
+/// children are absolute, so it has no intrinsic size of its own.
+pub(crate) fn crossfade<A, B>(name: &'static str, seq: u64, ms: u64, out: A, in_: B) -> Div
+where
+    A: Element + Styled,
+    B: Element + Styled,
+{
+    let dur = std::time::Duration::from_millis(ms);
+    div()
+        .relative()
+        .child(div().absolute().inset_0().child(out.with_animation(
+            ElementId::from((name, seq << 1)),
+            Animation::new(dur),
+            |el, delta| el.opacity(1.0 - delta),
+        )))
+        .child(div().absolute().inset_0().child(in_.with_animation(
+            ElementId::from((name, (seq << 1) | 1)),
+            Animation::new(dur),
+            |el, delta| el.opacity(delta),
+        )))
+}
