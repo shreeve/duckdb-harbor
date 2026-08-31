@@ -935,7 +935,12 @@ impl InputState {
             return;
         }
         if let Some(offset) = self.vertical_target(-1) {
-            self.select_to(offset, cx);
+            // On the first line there is no row above — the target
+            // lands back on the caret's own row. Extend to buffer
+            // start instead, like macOS.
+            let same_row = self.text_wrapper.offset_to_display_point(offset).row
+                == self.text_wrapper.offset_to_display_point(self.cursor()).row;
+            self.select_to(if same_row { 0 } else { offset }, cx);
         }
     }
 
@@ -945,7 +950,11 @@ impl InputState {
             return;
         }
         if let Some(offset) = self.vertical_target(1) {
-            self.select_to(offset, cx);
+            // On the last line there is no row below: extend to buffer
+            // end, like macOS.
+            let same_row = self.text_wrapper.offset_to_display_point(offset).row
+                == self.text_wrapper.offset_to_display_point(self.cursor()).row;
+            self.select_to(if same_row { self.text.len() } else { offset }, cx);
         }
     }
 

@@ -105,10 +105,14 @@ downward. The mark moves with the caret same-frame (content snaps).
 
 **Splitting** — *amendment to UI.md's "statements split server-side"*:
 the client splits, because the wire shape already forces one exec call
-per statement, and the tree-sitter grammar is derived from the engine's
-own PEG grammar, so the split is the engine's split. A quote/comment/
-dollar-aware token splitter backstops the tree when it is mid-keystroke
-soup. The engine remains the sole judge of validity.
+per statement, and one boundary exists (the semicolon ruling,
+2026-08-31): a top-level `;` — quote/comment/dollar-aware, exactly
+where the engine's own parser would cut. The tree plays no role in
+spans. Blank lines never divide: FROM-first syntax makes every keyword
+heuristic lie eventually, and a wrong split can leave a runnable
+prefix. The terminator belongs to its statement — the `;` closes its
+band — and the payload sheds it, along with any same-line trailing
+comment. The engine remains the sole judge of validity.
 
 **Sessions:** the Query view opens one Harbor session lazily at first
 run and holds it while the berth stays connected — every run shares it,
@@ -400,7 +404,7 @@ method is SQL over the wire, never on the render path).
   engine positions mapped through statement span bases. Bind-level
   checks via EXPLAIN are later and opt-in.
 - **Statement splitter:** lexer-aware top-level `;`, quote/comment/
-  dollar-safe — the tree's backstop and the runner's unit of send.
+  dollar-safe — the sole span authority and the runner's unit of send.
 
 ### `crates/ducktable/src/query/` — the room
 

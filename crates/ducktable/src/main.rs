@@ -118,9 +118,10 @@ fn app_menus() -> Vec<Menu> {
                 MenuItem::action("Next Table", TableNext),
                 MenuItem::separator(),
                 // The header strip's toggles, together and in its own
-                // order: the lozenge's three (⌥7/⌥8/⌥9 — ⌘'s digits
-                // stay reserved for views), then the inspector glyph
-                // beside them.
+                // order: the lozenge's three (⌥7/8/9 and ⌘7/8/9 both
+                // fire; the menu shows one form — macOS allows a menu
+                // item a single key equivalent), then the inspector
+                // glyph beside them.
                 MenuItem::action("Row Numbers", ToggleRowNumbers),
                 MenuItem::action("Right-Align Numbers", ToggleRightAlign),
                 MenuItem::action("NULL Tags", ToggleNullTags),
@@ -240,6 +241,10 @@ impl Render for DuckTable {
 /// neighbors. This AppKit default, registered before the menu is built,
 /// turns the injection off; the green traffic light still fullscreens.
 #[cfg(target_os = "macos")]
+// The objc crate's macros probe cfg(cargo-clippy), which rustc now
+// flags; the allow keeps OUR build warning-clean without touching the
+// vendored macro.
+#[allow(unexpected_cfgs)]
 fn suppress_fullscreen_menu_item() {
     use objc::runtime::{Object, NO};
     use objc::{class, msg_send, sel, sel_impl};
@@ -294,10 +299,12 @@ fn main() {
             KeyBinding::new("cmd-1", View1, None),
             KeyBinding::new("cmd-2", View2, None),
             KeyBinding::new("cmd-3", View3, None),
-            // Twin shortcuts: ⌥ digits (text-input safe) and ⌘ digits
-            // (muscle memory beside ⌘1/2/3) both fire the toggles. The
-            // menu can only advertise one — macOS gives a menu item a
-            // single key equivalent — so it shows the ⌘ form.
+            // Twin shortcuts: ⌥ digits and ⌘ digits (muscle memory
+            // beside ⌘1/2/3) both fire the toggles. The menu can only
+            // advertise one — macOS gives a menu item a single key
+            // equivalent — so it shows the ⌘ form. Known trade: on
+            // layouts that TYPE with Option (German ⌥7 = |), the ⌥
+            // bindings shadow those characters in text inputs.
             KeyBinding::new("alt-7", ToggleRowNumbers, None),
             KeyBinding::new("alt-8", ToggleRightAlign, None),
             KeyBinding::new("alt-9", ToggleNullTags, None),
