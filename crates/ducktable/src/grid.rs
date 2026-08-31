@@ -2206,11 +2206,16 @@ impl Render for Grid {
         }
         // The header chase: this frame's body paint will apply the
         // pending horizontal scroll AFTER the header has painted, so
-        // ask for one more frame — where the header reads the applied
-        // offset and catches up. One frame, one flag, no loop.
+        // the scrolling frame shows a stale header. A notify placed NOW
+        // would be swallowed — the table renders later this same frame
+        // and clears its dirty mark — so the request rides on_next_frame,
+        // past this frame's paint. One frame, one flag, no loop.
         if self.header_chase {
             self.header_chase = false;
-            self.table.update(cx, |_, cx| cx.notify());
+            let table = self.table.clone();
+            window.on_next_frame(move |_, cx| {
+                table.update(cx, |_, cx| cx.notify());
+            });
         }
         // An editor whose column just got hidden would be invisible but
         // still focused — cancel it (lossless, like any Esc).
