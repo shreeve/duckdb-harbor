@@ -12,6 +12,7 @@ mod grid;
 mod inspector;
 mod prefs;
 mod queries;
+mod query;
 mod sidebar;
 mod structure;
 mod theme;
@@ -34,19 +35,25 @@ actions!(
 /// context stack and win while typing.
 fn step_view(dir: i32, cx: &mut App) {
     use prefs::ViewMode;
-    let modes = [ViewMode::Data, ViewMode::Structure];
+    let modes = [ViewMode::Data, ViewMode::Structure, ViewMode::Query];
     let cur = prefs::get(cx).view;
     let ix = modes.iter().position(|v| *v == cur).unwrap_or(0) as i32;
     let next = modes[(ix + dir).rem_euclid(modes.len() as i32) as usize];
     prefs::toggle(cx, |p| p.view = next);
-    // Landing on Data hands focus back to the table, so the arrows and
-    // the editing keys work without a click.
-    if next == ViewMode::Data {
+    // Landing on Data hands focus back to the table; landing on Query
+    // hands it to the editor — the same symmetry (docs/QUERY.md).
+    if matches!(next, ViewMode::Data | ViewMode::Query) {
         if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
             cx.defer(move |cx| {
                 view.update(cx, |this, cx| {
-                    if let Some(grid) = &this.grid {
-                        grid.update(cx, |grid, cx| grid.request_focus(cx));
+                    match next {
+                        ViewMode::Data => {
+                            if let Some(grid) = &this.grid {
+                                grid.update(cx, |grid, cx| grid.request_focus(cx));
+                            }
+                        }
+                        ViewMode::Query => this.focus_query(cx),
+                        ViewMode::Structure => {}
                     }
                 });
             });
@@ -169,6 +176,19 @@ fn main() {
 
     app.run(move |cx| {
         gpui_component::init(cx);
+        // The DuckDB grammar (crates/duckdb-lang), registered before any
+        // editor renders: the Query view asks for language "duckdb".
+        gpui_component::highlighter::LanguageRegistry::singleton().register(
+            "duckdb",
+            &gpui_component::highlighter::LanguageConfig::new(
+                "duckdb",
+                duckdb_lang::LANGUAGE.into(),
+                vec![],
+                duckdb_lang::HIGHLIGHTS,
+                duckdb_lang::INJECTIONS,
+                duckdb_lang::LOCALS,
+            ),
+        );
         theme::init(cx);
         prefs::init(cx);
         cx.bind_keys([

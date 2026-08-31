@@ -71,7 +71,7 @@ impl Grid {
             ViewMode::Data => {
                 Some(format!("{} ms \u{00b7} {rows_part}", self.last_time_ms))
             }
-            ViewMode::Structure => None,
+            ViewMode::Structure | ViewMode::Query => None,
         };
         let status_columns =
             (view == ViewMode::Structure || pager_visible).then_some(columns_part);
@@ -115,10 +115,20 @@ impl Grid {
                         "view-structure",
                         "Structure",
                         view == ViewMode::Structure,
-                        (false, true),
+                        (false, false),
                         t,
                         cx.listener(|_, _, _, cx| {
                             crate::prefs::toggle(cx, |p| p.view = ViewMode::Structure);
+                        }),
+                    ))
+                    .child(seg_tile(
+                        "view-query",
+                        "Query",
+                        view == ViewMode::Query,
+                        (false, true),
+                        t,
+                        cx.listener(|_, _, _, cx| {
+                            crate::prefs::toggle(cx, |p| p.view = ViewMode::Query);
                         }),
                     )),
             )

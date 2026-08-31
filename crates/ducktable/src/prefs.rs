@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 pub enum ViewMode {
     Data,
     Structure,
+    Query,
 }
 
 #[derive(Clone, Copy)]
@@ -100,8 +101,10 @@ pub fn init(cx: &mut App) {
         prefs.row_numbers = read("row_numbers", prefs.row_numbers);
         prefs.right_align = read("right_align", prefs.right_align);
         prefs.null_tags = read("null_tags", prefs.null_tags);
-        if v.get("view").and_then(Value::as_str) == Some("structure") {
-            prefs.view = ViewMode::Structure;
+        match v.get("view").and_then(Value::as_str) {
+            Some("structure") => prefs.view = ViewMode::Structure,
+            Some("query") => prefs.view = ViewMode::Query,
+            _ => {}
         }
         prefs.inspector = read("inspector", prefs.inspector);
         prefs.inspector_width = v
@@ -144,7 +147,11 @@ pub fn save(cx: &mut App, change: impl FnOnce(&mut Prefs)) {
         "row_numbers": prefs.row_numbers,
         "right_align": prefs.right_align,
         "null_tags": prefs.null_tags,
-        "view": if prefs.view == ViewMode::Structure { "structure" } else { "data" },
+        "view": match prefs.view {
+            ViewMode::Data => "data",
+            ViewMode::Structure => "structure",
+            ViewMode::Query => "query",
+        },
         "inspector": prefs.inspector,
         "inspector_width": prefs.inspector_width,
         "page_size": prefs.page_size,

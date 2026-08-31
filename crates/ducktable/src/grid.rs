@@ -47,7 +47,10 @@ pub(crate) struct Grid {
     // satellite `impl Grid` files (footer.rs); nothing outside those
     // renders should touch them.
     pub(crate) table: Entity<TableState<GridDelegate>>,
-    conn: Conn,
+    pub(crate) conn: Conn,
+    /// The berth's Query view, injected by the app (berth-scoped, so it
+    /// outlives this table's grid); rendered by the Query segment.
+    pub(crate) query_view: Option<AnyView>,
     /// Quoted `"schema"."table"` this grid pages from.
     source: String,
     title: String,
@@ -472,6 +475,7 @@ impl Grid {
         Self {
             table,
             conn,
+            query_view: None,
             source,
             title,
             page: 0,
@@ -2624,6 +2628,20 @@ impl Render for Grid {
                     .w_full()
                     .child(self.structure_view(cx))
                     .into_any_element(),
+                ViewMode::Query => {
+                    let body = div().flex_1().min_h_0().w_full();
+                    match self.query_view.clone() {
+                        Some(view) => body.child(view),
+                        None => body
+                            .v_flex()
+                            .items_center()
+                            .justify_center()
+                            .child(div().text_sm().text_color(t.muted).child(
+                                "Select a table once to open the query scratchpad.",
+                            )),
+                    }
+                    .into_any_element()
+                }
             })
             .child(self.footer(cx))
     }

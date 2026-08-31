@@ -1442,6 +1442,7 @@ name = "ducktable"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "duckdb-lang",
  "gpui",
  "gpui-component",
  "harbor-client",

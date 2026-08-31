@@ -1,0 +1,449 @@
+//! The Query view (docs/QUERY.md): a berth-scoped SQL scratchpad above
+//! a read-only results pane. The editor is gpui-component's code editor
+//! with tree-sitter-duckdb highlighting; ⌘Enter sends the statement
+//! under the caret; the scratch autosaves and survives restarts.
+//!
+//! v1 scaffold scope: marked-statement runs (no selection runs yet), a
+//! single result per run, client-side truncation at the page size.
+
+use crate::theme::{pal, value_font};
+use gpui::prelude::FluentBuilder as _;
+use gpui::*;
+use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::table::{Column as TableColumn, Table, TableDelegate, TableState};
+use gpui_component::{Sizable as _, StyledExt as _};
+use harbor_client::Conn;
+
+pub(crate) struct QueryView {
+    conn: Conn,
+    berth: String,
+    pub(crate) editor: Entity<InputState>,
+    results: Option<Entity<TableState<ResultsDelegate>>>,
+    /// The verdict strip: engine time and row counts, or the error.
+    status: Option<SharedString>,
+    error: Option<SharedString>,
+    running: bool,
+    /// Run generation: a stale result can never replace a newer one.
+    generation: u64,
+    /// Set by the carousel landing here; consumed by the next render.
+    needs_focus: bool,
+    _subscription: Subscription,
+}
+
+impl QueryView {
+    pub(crate) fn new(
+        conn: Conn,
+        berth: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut state = InputState::new(window, cx)
+                .code_editor("duckdb")
+                .line_number(true)
+                .placeholder("Type SQL. \u{2318}Enter runs the statement under the caret.");
+            if let Some(text) = load_scratch(berth) {
+                state = state.default_value(text);
+            }
+            state
+        });
+        // ⌘Enter arrives as the input's secondary-enter — the send key.
+        // Plain Enter stays a newline (the editor's own default).
+        let subscription = cx.subscribe_in(&editor, window, Self::on_editor_event);
+        Self {
+            conn,
+            berth: berth.to_string(),
+            editor,
+            results: None,
+            status: None,
+            error: None,
+            running: false,
+            generation: 0,
+            needs_focus: false,
+            _subscription: subscription,
+        }
+    }
+
+    /// True when this view already speaks for `berth` — table switches
+    /// keep the scratchpad, reconnects rebuild it (docs/QUERY.md law 1).
+    pub(crate) fn is_for(&self, berth: &str) -> bool {
+        self.berth == berth
+    }
+
+    fn on_editor_event(
+        &mut self,
+        _: &Entity<InputState>,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            InputEvent::PressEnter { secondary: true } => self.run(window, cx),
+            InputEvent::Change { .. } => {
+                // Autosave rides the change event; a debounce can come
+                // later — scratch writes are tiny.
+                self.save_scratch(cx);
+            }
+            _ => {}
+        }
+    }
+
+    fn save_scratch(&self, cx: &App) {
+        let text = self.editor.read(cx).value().to_string();
+        if let Some(path) = scratch_path(&self.berth) {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).ok();
+            }
+            std::fs::write(path, text).ok();
+        }
+    }
+
+    /// ⌘Enter: send the statement under the caret (docs/QUERY.md). In
+    /// the gaps between statements the one above owns the caret.
+    pub(crate) fn run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.running {
+            self.status = Some("already running\u{2026}".into());
+            cx.notify();
+            return;
+        }
+        let text = self.editor.read(cx).value().to_string();
+        let caret = self.editor.read(cx).cursor();
+        let Some(sql) = statement_at(&text, caret) else {
+            self.status = Some("nothing to run".into());
+            cx.notify();
+            return;
+        };
+        self.running = true;
+        self.error = None;
+        self.status = Some("running\u{2026}".into());
+        self.generation += 1;
+        let generation = self.generation;
+        let conn = self.conn.clone();
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { harbor_client::query(&conn, &sql) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                // Fenced: only the newest run may land (docs/QUERY.md).
+                if generation != this.generation {
+                    return;
+                }
+                this.running = false;
+                match outcome {
+                    Ok(result) => {
+                        let rows = result.row_count;
+                        let ms = result.time_ms;
+                        let cols = result.columns.len();
+                        if cols == 0 {
+                            this.results = None;
+                            this.status =
+                                Some(format!("ok \u{00b7} {ms} ms").into());
+                        } else {
+                            this.status = Some(
+                                format!("{ms} ms \u{00b7} {rows} rows \u{00b7} {cols} columns")
+                                    .into(),
+                            );
+                            let delegate = ResultsDelegate::new(result);
+                            this.results = Some(cx.new(|cx| {
+                                TableState::new(delegate, window, cx)
+                                    .col_movable(false)
+                            }));
+                        }
+                    }
+                    Err(message) => {
+                        this.error = Some(SharedString::from(message));
+                        this.status = None;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(crate) fn request_focus(&mut self, cx: &mut Context<Self>) {
+        self.needs_focus = true;
+        cx.notify();
+    }
+}
+
+impl Render for QueryView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = pal(cx);
+        if self.needs_focus {
+            self.needs_focus = false;
+            self.editor.read(cx).focus_handle(cx).focus(window);
+        }
+        div()
+            .size_full()
+            .min_h_0()
+            .v_flex()
+            .child(
+                // The editor pane: the scratchpad, in the value font.
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .font_family(value_font())
+                    .child(Input::new(&self.editor).h_full()),
+            )
+            .when_some(self.error.clone(), |d, message| {
+                // The engine's verdict, verbatim (docs/QUERY.md law 4).
+                d.child(
+                    div()
+                        .flex_none()
+                        .px_3()
+                        .py_2()
+                        .border_t_1()
+                        .border_color(t.border)
+                        .text_xs()
+                        .font_family(value_font())
+                        .text_color(t.bad)
+                        .child(message),
+                )
+            })
+            .when_some(self.status.clone(), |d, status| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .px_3()
+                        .py_1()
+                        .border_t_1()
+                        .border_color(t.border)
+                        .text_xs()
+                        .text_color(t.muted)
+                        .child(status),
+                )
+            })
+            .when_some(self.results.clone(), |d, table| {
+                // The results pane: a snapshot that snaps (law 5).
+                d.child(
+                    div().flex_1().min_h_0().w_full().border_t_1().border_color(t.border).child(
+                        Table::new(&table)
+                            .bordered(false)
+                            .with_size(crate::prefs::get(cx).table_size()),
+                    ),
+                )
+            })
+    }
+}
+
+// ============================ results table ===========================
+
+/// A read-only results surface: names and display-ready texts, nothing
+/// else. Editing powers stay with the Data grid's identity gate.
+pub(crate) struct ResultsDelegate {
+    cols: Vec<TableColumn>,
+    rows: Vec<Vec<Option<SharedString>>>,
+}
+
+impl ResultsDelegate {
+    fn new(result: harbor_client::QueryResult) -> Self {
+        let cols = result
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                TableColumn::new(
+                    format!("c{i}"),
+                    SharedString::from(c.name.clone().unwrap_or_default()),
+                )
+                .width(px(140.))
+            })
+            .collect();
+        let rows = result
+            .rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|v| match v {
+                        serde_json::Value::Null => None,
+                        serde_json::Value::String(s) => Some(SharedString::from(s)),
+                        other => Some(SharedString::from(other.to_string())),
+                    })
+                    .collect()
+            })
+            .collect();
+        Self { cols, rows }
+    }
+}
+
+impl TableDelegate for ResultsDelegate {
+    fn columns_count(&self, _: &App) -> usize {
+        self.cols.len()
+    }
+
+    fn rows_count(&self, _: &App) -> usize {
+        self.rows.len()
+    }
+
+    fn column(&self, col_ix: usize, _: &App) -> &TableColumn {
+        &self.cols[col_ix]
+    }
+
+    fn render_td(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let t = pal(cx);
+        let cell = self.rows.get(row_ix).and_then(|r| r.get(col_ix)).cloned().flatten();
+        let base = div().px_2().text_sm().font_family(value_font());
+        match cell {
+            Some(text) => base.text_color(t.text).child(text),
+            None => base.text_color(t.muted).child("NULL"),
+        }
+    }
+
+    fn render_th(
+        &mut self,
+        col_ix: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let t = pal(cx);
+        div()
+            .px_2()
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(t.text)
+            .child(self.cols[col_ix].name.clone())
+    }
+}
+
+// =========================== statement spans ==========================
+
+/// The statement owning `caret`: spans split on top-level semicolons,
+/// aware of quotes, dollar-quotes, and both comment forms. In the gap
+/// after a statement the one ABOVE owns the caret (docs/QUERY.md).
+fn statement_at(text: &str, caret: usize) -> Option<String> {
+    let spans = split_statements(text);
+    let caret = caret.min(text.len());
+    // The last statement that begins at or before the caret — so the
+    // gap after a statement still belongs to it. Before the first
+    // statement, the caret looks down.
+    let pick = spans.iter().rposition(|s| s.start <= caret).unwrap_or(0);
+    let sql = text[spans.get(pick)?.clone()].trim();
+    (!sql.is_empty()).then(|| sql.to_string())
+}
+
+/// Byte ranges of `;`-separated statements, each excluding its
+/// terminator. A tiny lexer, not a parser: it only needs to know what a
+/// semicolon does NOT end — strings, quoted identifiers, comments, and
+/// $$ bodies.
+fn split_statements(text: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        // '' and "" are escapes, not terminators.
+                        if bytes.get(i + 1) == Some(&quote) {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'$' if bytes.get(i + 1) == Some(&b'$') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'$' && bytes[i + 1] == b'$') {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b';' => {
+                spans.push(start..i);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if start < bytes.len() {
+        spans.push(start..bytes.len());
+    }
+    // Shrink each span to its trimmed content: the whitespace between
+    // statements must not belong to the NEXT one (the gap rule above).
+    spans
+        .into_iter()
+        .filter_map(|s| {
+            let raw = &text[s.clone()];
+            let lead = raw.len() - raw.trim_start().len();
+            let tail = raw.len() - raw.trim_end().len();
+            let (a, b) = (s.start + lead, s.end - tail);
+            (a < b).then_some(a..b)
+        })
+        .collect()
+}
+
+fn scratch_path(berth: &str) -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let safe: String = berth
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    Some(
+        std::path::Path::new(&home)
+            .join(".config")
+            .join("ducktable")
+            .join("scratch")
+            .join(format!("{safe}.sql")),
+    )
+}
+
+fn load_scratch(berth: &str) -> Option<String> {
+    std::fs::read_to_string(scratch_path(berth)?).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    // NOT `use super::*`: the render imports glob in gpui's `test`
+    // attribute macro, which would shadow the built-in #[test] and
+    // expand itself forever.
+    use super::{split_statements, statement_at};
+
+    #[test]
+    fn splits_respect_quotes_and_comments() {
+        let text = "SELECT 'a;b'; -- c;\nSELECT 2; /* ; */ SELECT 3";
+        let spans = split_statements(text);
+        let got: Vec<&str> = spans.iter().map(|s| text[s.clone()].trim()).collect();
+        assert_eq!(got, ["SELECT 'a;b'", "-- c;\nSELECT 2", "/* ; */ SELECT 3"]);
+    }
+
+    #[test]
+    fn caret_in_gap_belongs_to_statement_above() {
+        let text = "SELECT 1;\n\nSELECT 2";
+        // Caret just after the first semicolon, in the blank line.
+        assert_eq!(statement_at(text, 10).as_deref(), Some("SELECT 1"));
+        assert_eq!(statement_at(text, text.len()).as_deref(), Some("SELECT 2"));
+        // Before anything: looks down.
+        assert_eq!(statement_at("  SELECT 9", 0).as_deref(), Some("SELECT 9"));
+    }
+}

@@ -11,5 +11,6 @@ gpui.workspace = true
 gpui-component.workspace = true
 anyhow.workspace = true
 harbor-client = { path = "../harbor-client" }
+duckdb-lang = { path = "../duckdb-lang" }
 wire = { git = "https://github.com/shreeve/duckdb-harbor", rev = "8418541" }
 serde_json = "1"
