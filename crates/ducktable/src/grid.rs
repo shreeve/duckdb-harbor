@@ -1703,13 +1703,36 @@ impl Grid {
                 grid.committing = false;
                 match outcome {
                     Ok(_) => {
+                        // The values on screen ARE the committed truth —
+                        // fold them into the display rows before the
+                        // staged layer clears, so nothing reverts while
+                        // the refetch is in flight. All the eye sees is
+                        // the amber leaving. Deleted rows keep their
+                        // ghosts until the refetch removes them for
+                        // real (a ghost that briefly looked alive again
+                        // would be its own artifact).
+                        grid.table.update(cx, |state, cx| {
+                            let d = state.delegate_mut();
+                            let staged: Vec<_> = d.staged.drain().collect();
+                            for ((row, col), text) in staged {
+                                if let Some(cell) =
+                                    d.rows.get_mut(row).and_then(|r| r.get_mut(col))
+                                {
+                                    *cell = text;
+                                }
+                            }
+                            state.refresh(cx);
+                            cx.notify();
+                        });
                         if let Some(e) = &mut grid.edits {
                             e.clear();
                         }
-                        grid.sync_staged(cx);
-                        // Fetch-first: the page refetches so every row
-                        // shows the database's truth — defaults filled,
-                        // triggers applied.
+                        // No sync_staged here: it would also clear the
+                        // delete ghosts. The refetch's own sync does.
+                        // Fetch-first still holds: the page refetches so
+                        // every row shows the database's truth —
+                        // defaults filled, triggers applied — landing
+                        // over pixels that already match it.
                         let page = grid.page;
                         grid.fetch_page_now(page, cx);
                     }
