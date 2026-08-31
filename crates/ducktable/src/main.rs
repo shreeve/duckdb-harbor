@@ -24,7 +24,10 @@ use gpui_component::{Root, StyledExt as _};
 
 actions!(
     ducktable,
-    [ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset, FitColumns, ViewPrev, ViewNext]
+    [
+        ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset, FitColumns, ViewPrev,
+        ViewNext, View1, View2, View3, ToggleFullScreen
+    ]
 );
 
 /// ⌥←/⌥→: walk the footer's view switcher with rollover — a carousel,
@@ -34,11 +37,23 @@ actions!(
 /// safe: their own alt-arrow bindings (word jump) sit deeper in the
 /// context stack and win while typing.
 fn step_view(dir: i32, cx: &mut App) {
-    use prefs::ViewMode;
-    let modes = [ViewMode::Data, ViewMode::Structure, ViewMode::Query];
+    let modes = view_order();
     let cur = prefs::get(cx).view;
     let ix = modes.iter().position(|v| *v == cur).unwrap_or(0) as i32;
-    let next = modes[(ix + dir).rem_euclid(modes.len() as i32) as usize];
+    go_view(modes[(ix + dir).rem_euclid(modes.len() as i32) as usize], cx);
+}
+
+/// The switcher's one ordering — the footer renders it, the carousel
+/// walks it, and ⌘1/⌘2/⌘3 address it (Finder's ⌘1–4 idiom; these keys
+/// migrate to the tab strip when tabs ship, the ⌥↑/↓ pattern).
+fn view_order() -> [prefs::ViewMode; 3] {
+    use prefs::ViewMode;
+    [ViewMode::Structure, ViewMode::Data, ViewMode::Query]
+}
+
+/// Land on a view: select it and hand focus to its surface.
+fn go_view(next: prefs::ViewMode, cx: &mut App) {
+    use prefs::ViewMode;
     prefs::toggle(cx, |p| p.view = next);
     // Landing on Data hands focus back to the table; landing on Query
     // hands it to the editor — the same symmetry (docs/QUERY.md).
@@ -85,12 +100,25 @@ fn app_menus() -> Vec<Menu> {
         Menu {
             name: "View".into(),
             items: vec![
+                // The carousel advertises itself here: macOS renders the
+                // ⌥←/⌥→ key equivalents from the keymap bindings.
+                MenuItem::action("Structure", View1),
+                MenuItem::action("Data", View2),
+                MenuItem::action("Query", View3),
+                MenuItem::separator(),
+                MenuItem::action("Previous View", ViewPrev),
+                MenuItem::action("Next View", ViewNext),
+                MenuItem::separator(),
                 MenuItem::action("Zoom In", ZoomIn),
                 MenuItem::action("Zoom Out", ZoomOut),
                 MenuItem::action("Actual Size", ZoomReset),
                 MenuItem::separator(),
                 MenuItem::action("Fit Column Widths", FitColumns),
                 MenuItem::action("Toggle Inspector", ToggleInspector),
+                MenuItem::separator(),
+                // Ours, not AppKit's injected one (suppressed above for
+                // its icon and forced indent) — plain text, same slot.
+                MenuItem::action("Toggle Full Screen", ToggleFullScreen),
             ],
         },
     ]
@@ -171,7 +199,30 @@ impl Render for DuckTable {
     }
 }
 
+/// macOS auto-appends "Enter Full Screen" (icon and all) to any menu
+/// named View, which also forces an icon column that indents its
+/// neighbors. This AppKit default, registered before the menu is built,
+/// turns the injection off; the green traffic light still fullscreens.
+#[cfg(target_os = "macos")]
+fn suppress_fullscreen_menu_item() {
+    use objc::runtime::{Object, NO};
+    use objc::{class, msg_send, sel, sel_impl};
+    unsafe {
+        let key: *mut Object = msg_send![
+            class!(NSString),
+            stringWithUTF8String: c"NSFullScreenMenuItemEverywhere".as_ptr()
+        ];
+        let no: *mut Object = msg_send![class!(NSNumber), numberWithBool: NO];
+        let dict: *mut Object =
+            msg_send![class!(NSDictionary), dictionaryWithObject: no forKey: key];
+        let defaults: *mut Object = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let _: () = msg_send![defaults, registerDefaults: dict];
+    }
+}
+
 fn main() {
+    #[cfg(target_os = "macos")]
+    suppress_fullscreen_menu_item();
     let app = Application::new().with_assets(Assets);
 
     app.run(move |cx| {
@@ -203,9 +254,23 @@ fn main() {
             KeyBinding::new("cmd-shift-f", FitColumns, None),
             KeyBinding::new("alt-left", ViewPrev, None),
             KeyBinding::new("alt-right", ViewNext, None),
+            KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
+            KeyBinding::new("cmd-1", View1, None),
+            KeyBinding::new("cmd-2", View2, None),
+            KeyBinding::new("cmd-3", View3, None),
         ]);
         cx.on_action(|_: &ViewPrev, cx| step_view(-1, cx));
         cx.on_action(|_: &ViewNext, cx| step_view(1, cx));
+        cx.on_action(|_: &ToggleFullScreen, cx| {
+            cx.defer(|cx| {
+                if let Some(w) = cx.active_window() {
+                    w.update(cx, |_, window, _| window.toggle_fullscreen()).ok();
+                }
+            });
+        });
+        cx.on_action(|_: &View1, cx| go_view(view_order()[0], cx));
+        cx.on_action(|_: &View2, cx| go_view(view_order()[1], cx));
+        cx.on_action(|_: &View3, cx| go_view(view_order()[2], cx));
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(|_: &ZoomIn, cx| {
             prefs::toggle(cx, |p| p.zoom = (p.zoom + 1).min(prefs::ZOOMS.len() - 1));

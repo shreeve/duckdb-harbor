@@ -44,11 +44,15 @@ disagree, the two amendments are flagged inline.
 
 ## The window
 
-Query joins `ViewMode` as the third segment: **Data | Structure |
-Query**. The ⌥←/⌥→ carousel rolls through all three; landing on Query
-focuses the editor, the exact symmetry of landing on Data focusing the
-grid. ⌘1–9 stay reserved for the roadmap tab strip; segments never
-take them.
+Query joins `ViewMode` as the third segment — the order is
+**Structure | Data | Query** (ruled 2026-08-31): what the table is,
+what it holds, what you ask — Sequel Pro's arc, with Data, the default
+and hub, seated center so both neighbors are one ⌥-arrow away. The
+⌥←/⌥→ carousel rolls through all three; landing on Query focuses the
+editor, the exact symmetry of landing on Data focusing the grid.
+⌘1/⌘2/⌘3 address the segments directly (Finder's idiom) — held on
+loan: when the roadmap tab strip ships, the number keys migrate to
+tabs, the same pattern ⌥↑/↓ follows.
 
 The view is **berth-scoped**. Whichever table you arrived from, Query
 shows the berth's one scratchpad; switching tables never touches it,

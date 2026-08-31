@@ -102,24 +102,27 @@ impl Grid {
                     .border_1()
                     .border_color(t.border)
                     .child(seg_tile(
-                        "view-data",
-                        "Data",
-                        view == ViewMode::Data,
-                        (true, false),
-                        t,
-                        cx.listener(|_, _, _, cx| {
-                            crate::prefs::toggle(cx, |p| p.view = ViewMode::Data);
-                        }),
-                    ))
-                    .child(seg_sep(t))
-                    .child(seg_tile(
                         "view-structure",
                         "Structure",
                         view == ViewMode::Structure,
-                        (false, false),
+                        (true, false),
                         t,
                         cx.listener(|_, _, _, cx| {
                             crate::prefs::toggle(cx, |p| p.view = ViewMode::Structure);
+                        }),
+                    ))
+                    .child(seg_sep(t))
+                    // Structure, Data, Query — what it is, what it holds,
+                    // what you ask (Sequel Pro's arc). Data, the default
+                    // and hub, sits center: one ⌥-arrow from each side.
+                    .child(seg_tile(
+                        "view-data",
+                        "Data",
+                        view == ViewMode::Data,
+                        (false, false),
+                        t,
+                        cx.listener(|_, _, _, cx| {
+                            crate::prefs::toggle(cx, |p| p.view = ViewMode::Data);
                         }),
                     ))
                     .child(seg_sep(t))
