@@ -124,7 +124,12 @@ pub(crate) struct Grid {
     pub(crate) col_search: Entity<gpui_component::input::InputState>,
     /// The Structure view's DDL block: a DISABLED multi-line Input, so
     /// the text is natively selectable (mouse drag, Cmd+C) while every
-    /// mutation stays gated off. None when the table has no DDL.
+    /// mutation stays gated off. None when the table has no DDL. It
+    /// holds perfectly still because the vendored gpui-component rules
+    /// that a disabled editor never scrolls itself (vendor/, Cargo.toml
+    /// [patch]); a first-party StyledText replacement was tried and
+    /// rolled back — it lost the editor's font metrics, no-wrap layout,
+    /// and native selection.
     pub(crate) ddl_input: Option<Entity<gpui_component::input::InputState>>,
     /// The DDL block's copy tile, a self-confirming widget (copy_button.rs).
     pub(crate) ddl_copy: Option<Entity<crate::copy_button::CopyButton>>,
@@ -526,9 +531,8 @@ impl Grid {
         let ddl_input = ddl.map(|ddl| {
             // A code editor (language "duckdb"), so the DDL wears the
             // same tree-sitter highlighting as the Query view — but
-            // numberless, and with its height pinned at render time from
-            // the line count (structure.rs). The old AutoGrow spelling
-            // measured a frame late and flapped; a pinned height cannot.
+            // numberless, with its height pinned at render time
+            // (structure.rs).
             cx.new(|cx| {
                 gpui_component::input::InputState::new(window, cx)
                     .code_editor("duckdb")
