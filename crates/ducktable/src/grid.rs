@@ -81,6 +81,11 @@ pub(crate) struct Grid {
     /// The ring's seat across a keyboard page flip (page_step): the
     /// fetch that lands consumes it, row clamped to the new page.
     ring_keep: Option<(usize, usize)>,
+    /// A horizontal scroll was requested: the table applies it while
+    /// painting its BODY, after the header row has already painted, so
+    /// the scrolling frame shows a stale header. Render consumes this
+    /// by scheduling one more frame, where the header catches up.
+    header_chase: bool,
     /// The filter strip's input; Some = the strip is open.
     pub(crate) filter_input: Option<Entity<gpui_component::input::InputState>>,
     /// Prefetched with the first page, so switching views is instant.
@@ -427,6 +432,7 @@ impl Grid {
             committing: false,
             needs_focus: false,
             ring_keep: None,
+            header_chase: false,
             filter_input: None,
             structure,
             resize,
@@ -1404,6 +1410,7 @@ impl Grid {
             state.scroll_to_col(np + gutter, cx);
             cx.notify();
         });
+        self.header_chase = true;
         cx.notify();
     }
 
@@ -1434,6 +1441,9 @@ impl Grid {
             }
             cx.notify();
         });
+        if dc != 0 {
+            self.header_chase = true;
+        }
         cx.notify();
     }
 
@@ -2193,6 +2203,14 @@ impl Render for Grid {
         if self.needs_focus {
             self.needs_focus = false;
             window.focus(&self.table.focus_handle(cx));
+        }
+        // The header chase: this frame's body paint will apply the
+        // pending horizontal scroll AFTER the header has painted, so
+        // ask for one more frame — where the header reads the applied
+        // offset and catches up. One frame, one flag, no loop.
+        if self.header_chase {
+            self.header_chase = false;
+            self.table.update(cx, |_, cx| cx.notify());
         }
         // An editor whose column just got hidden would be invisible but
         // still focused — cancel it (lossless, like any Esc).
