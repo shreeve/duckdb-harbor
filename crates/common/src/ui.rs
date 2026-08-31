@@ -135,24 +135,6 @@ fn pad(s: &str, to: usize, right: bool) -> String {
     }
 }
 
-/// Shorten to fit, with an ellipsis, measured in cells.
-fn elide(s: &str, max: usize) -> String {
-    if cells(s) <= max || max == 0 {
-        return s.to_string();
-    }
-    let mut out = String::new();
-    let mut w = 0;
-    for c in s.chars() {
-        let cw = UnicodeWidthStr::width(c.to_string().as_str());
-        if w + cw > max.saturating_sub(1) {
-            break;
-        }
-        out.push(c);
-        w += cw;
-    }
-    out.push('…');
-    out
-}
 
 // ---------------------------------------------------------------------------
 // box drawing
@@ -293,8 +275,6 @@ impl Table {
             let mid: Vec<String> = (0..w.len()).map(seg).collect();
             format!("{l}{}{r}", mid.join(m))
         };
-        // Everything between the outer bars, for a note that spans the table.
-        let inner: usize = w.iter().map(|x| x + 2).sum::<usize>() + w.len().saturating_sub(1);
 
         let mut out = String::new();
         out.push_str(&rule(c.tl, c.tm, c.tr));
@@ -323,23 +303,40 @@ impl Table {
                     None => " ".repeat(w[i] + 2),
                 })
                 .collect();
-            out.push_str(&format!("{}{}{}\n", c.v, cs.join(c.v), c.v));
+            out.push_str(&format!("{}{}{}", c.v, cs.join(c.v), c.v));
 
-            for (_, tone, text) in self.notes.iter().filter(|(a, _, _)| *a == ri) {
-                let body = elide(&format!("  ! {text}"), inner);
-                out.push_str(&format!(
-                    "{}{}{}\n",
-                    c.v,
-                    st.paint(*tone, &pad(&body, inner, false)),
-                    c.v
-                ));
+            // A footnote marker hangs OUTSIDE the right edge, so the grid is
+            // never interrupted: a note drawn as a full-width row inside the
+            // box broke every column rule beneath it. The note itself prints
+            // below the table under the same superscript.
+            let marks: Vec<String> = self
+                .notes
+                .iter()
+                .enumerate()
+                .filter(|(_, (at, _, _))| *at == ri)
+                .map(|(k, (_, tone, _))| st.paint(*tone, &superscript(k + 1)))
+                .collect();
+            if !marks.is_empty() {
+                out.push(' ');
+                out.push_str(&marks.join(" "));
             }
+            out.push('\n');
         }
 
         out.push_str(&rule(c.bl, c.bm, c.br));
         out.push('\n');
+        for (k, (_, tone, text)) in self.notes.iter().enumerate() {
+            out.push_str(&st.paint(*tone, &format!("{} {text}", superscript(k + 1))));
+            out.push('\n');
+        }
         out
     }
+}
+
+/// 1 → "¹", 12 → "¹²" — the footnote marks beside a table's right edge.
+fn superscript(n: usize) -> String {
+    const DIGITS: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
+    n.to_string().chars().map(|d| DIGITS[d as usize - '0' as usize]).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -469,14 +466,43 @@ mod tests {
     }
 
     #[test]
-    fn every_line_of_a_table_is_the_same_width() {
+    fn every_line_of_the_box_is_the_same_width() {
         let mut t = Table::new(["NAME", "DATABASE"]);
         t.row([Cell::new("medlabs"), Cell::new("~/Data/medlabs.duckdb")]);
         t.note(Tone::Yellow, "no setup file");
         t.row([Cell::new("x"), Cell::new("~/y.duckdb")]);
         let out = t.render(&boxed());
-        let widths: Vec<usize> = out.lines().map(cells).collect();
+        // The box: lines that start with a border glyph, measured to the
+        // closing glyph. A footnote marker hangs outside the right edge and
+        // does not count against the grid.
+        let widths: Vec<usize> = out
+            .lines()
+            .filter(|l| l.starts_with(['╭', '│', '├', '╰']))
+            .map(|l| {
+                let end = l.rfind(['╮', '│', '┤', '╯']).unwrap();
+                cells(&l[..end + 3]) // the border glyphs are 3 bytes each
+            })
+            .collect();
+        assert_eq!(widths.len(), 6, "box lines went missing:\n{out}");
         assert!(widths.windows(2).all(|w| w[0] == w[1]), "ragged: {widths:?}\n{out}");
+    }
+
+    #[test]
+    fn a_note_is_a_footnote_not_a_row() {
+        let mut t = Table::new(["NAME", "STATE"]);
+        t.row([Cell::new("medlabs"), Cell::new("unmanaged")]);
+        t.note(Tone::Yellow, "not in your config");
+        t.row([Cell::new("labs"), Cell::new("stopped")]);
+        t.note(Tone::Yellow, "left by a database that is gone");
+        let out = t.render(&boxed());
+        // The marker sits after the row's right edge; the text sits below the
+        // box under the same superscript, so the grid is never interrupted.
+        assert!(out.lines().any(|l| l.ends_with("│ ¹")), "no marker:\n{out}");
+        assert!(out.lines().any(|l| l.ends_with("│ ²")), "no second marker:\n{out}");
+        let bottom = out.lines().position(|l| l.starts_with('╰')).unwrap();
+        let below: Vec<&str> = out.lines().skip(bottom + 1).collect();
+        assert_eq!(below, ["¹ not in your config", "² left by a database that is gone"], "{out}");
+        assert!(!out.contains('!'), "the old inline note style survived:\n{out}");
     }
 
     #[test]
@@ -521,9 +547,4 @@ mod tests {
         assert!(out.starts_with('╭') && out.trim_end().ends_with('╯'));
     }
 
-    #[test]
-    fn elide_measures_cells() {
-        assert_eq!(elide("abcdef", 4), "abc…");
-        assert_eq!(elide("abc", 10), "abc");
-    }
 }
