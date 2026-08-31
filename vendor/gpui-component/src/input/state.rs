@@ -784,6 +784,30 @@ impl InputState {
     }
 
     /// Return the value of the input field.
+    /// DuckTable patch: seed the wrapper's font AND wrap width BEFORE
+    /// first paint, so a host that sizes the editor from
+    /// wrapped_line_count() is correct on its very first frame (no
+    /// chopped flash). Both setters no-op when unchanged; layout stays
+    /// the source of truth afterward (element layout sets the font,
+    /// set_input_bounds the width).
+    pub fn prewrap(
+        &mut self,
+        font: gpui::Font,
+        font_size: Pixels,
+        width: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        self.text_wrapper.set_font(font, font_size, cx);
+        self.text_wrapper.set_wrap_width(Some(width), cx);
+    }
+
+    /// DuckTable patch: the SOFT-WRAPPED line count — for hosts that
+    /// size a read-only editor to exactly its content (the Structure
+    /// view's DDL card), where raw line count undercounts wrapped rows.
+    pub fn wrapped_line_count(&self) -> usize {
+        self.text_wrapper.len()
+    }
+
     pub fn value(&self) -> SharedString {
         SharedString::new(self.text.to_string())
     }

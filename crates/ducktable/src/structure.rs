@@ -161,6 +161,20 @@ fn top_level_open(sql: &str) -> Option<usize> {
     None
 }
 
+/// The pane width, recorded by the title strip's canvas every frame in
+/// every view — APP-STATIC, not per-grid, so it survives the grid swap
+/// a table switch performs and the DDL's first frame always knows its
+/// width. One window, one pane, one cell.
+static PANE_WIDTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn record_pane_width(w: Pixels) {
+    PANE_WIDTH.store(f32::from(w).to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn pane_width() -> f32 {
+    f32::from_bits(PANE_WIDTH.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// The columns table AS a grid: the table's own schema synthesized
 /// into a result and handed to the real Grid — one grid, many sources,
 /// applied to the catalog itself. Embedded, unpageable, read-only by
@@ -278,8 +292,55 @@ impl Grid {
             // editor never scrolls itself" patch (no scroll-past-end
             // room, no cursor-track nudges — see vendor/, Cargo.toml
             // [patch]). The wheel falls through to the pane naturally.
-            let rows = state.read(cx).value().lines().count().max(2);
             let line_h = 20. * z;
+            // Shrink-wrapped: the card is as wide as its longest line
+            // (7/11 is Menlo's advance-to-size ratio, the constant the
+            // gutter already trusts) and only ever stretches to the
+            // pane's width, where long lines soft-wrap.
+            let max_chars = state
+                .read(cx)
+                .value()
+                .lines()
+                .map(|l| l.chars().count())
+                .max()
+                .unwrap_or(0)
+                .max(8);
+            let mut card_w = max_chars as f32 * (CELL_TEXT * z * 7. / 11.) + 28.;
+            // Cap at the pane width recorded LAST frame (the title
+            // strip's canvas — present in every view, so it is already
+            // known before the Structure view's first paint), and seed
+            // the editor's wrap width with the exact value its layout
+            // will derive: card − borders(2) − input_px(16) −
+            // RIGHT_MARGIN(10). The wrapper re-wraps synchronously, so
+            // the row count read below is FIRST-FRAME correct — drawn
+            // right, not repainted right (Steve's ruling). A cold start
+            // straight into Structure has no recorded width yet and
+            // settles via the editor observer instead.
+            let avail = pane_width() - PANE_INSET - 12.;
+            if avail > 60. {
+                card_w = card_w.min(avail);
+                // Font AND width: the wrapper is born with the app's
+                // default font at rem size, and only learns the card's
+                // real metrics (Menlo at CELL_TEXT × zoom) during
+                // layout — a width-only seed wraps at the wrong
+                // boundaries and still flickers.
+                state.update(cx, |s, cx| {
+                    s.prewrap(
+                        font(value_font()),
+                        px(CELL_TEXT * z),
+                        px(card_w - 28.),
+                        cx,
+                    );
+                });
+            }
+            // WRAPPED rows, from the editor's own wrapper (a vendored
+            // accessor): the card's height must count soft-wrapped rows
+            // — everything visible, nothing to scroll.
+            let rows = state
+                .read(cx)
+                .wrapped_line_count()
+                .max(state.read(cx).value().lines().count())
+                .max(2);
             // The frame is OURS, from the app palette — the component's
             // own border/fill are stock colors that ignore the theme
             // (Paper's DDL wore a blue box). appearance(false) strips
@@ -293,6 +354,8 @@ impl Grid {
                     .bg(t.raised)
                     .py_1()
                     .mb_2()
+                    .w(px(card_w))
+                    .max_w_full()
                     .child(
                         gpui_component::input::Input::new(state)
                             .disabled(true)

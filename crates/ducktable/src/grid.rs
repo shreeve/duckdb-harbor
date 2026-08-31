@@ -140,6 +140,7 @@ pub(crate) struct Grid {
     /// The table wrapper's window bounds, recorded by a canvas each frame
     /// so `divider_double_click` can hit-test header dividers.
     table_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
+
 }
 
 /// Everything a fetch commits along with its rows. The delegate is not
@@ -544,6 +545,14 @@ impl Grid {
             cx.notify();
         })
         .detach();
+        // The DDL editor re-wraps when it learns its real width — first
+        // paint, pane resize, zoom — and notifies ITSELF. The card's
+        // height is OUR render's math (wrapped_line_count), so observe
+        // the editor: the card resizes in the very next frame instead
+        // of waiting for an incidental repaint (the first-display chop).
+        if let Some(input) = &ddl_input {
+            cx.observe(input, |_, _, cx| cx.notify()).detach();
+        }
         let structure_grid = structure
             .as_ref()
             .map(|s| crate::structure::columns_grid(conn.clone(), s, window, cx));
@@ -2676,6 +2685,21 @@ impl Render for Grid {
                 div()
                     .h_flex()
                     .h_8()
+                    .relative()
+                    // The strip spans the pane in every view: its canvas
+                    // records the width the Structure view needs BEFORE
+                    // the DDL's first paint (see pane_width).
+                    .child(
+                        div().absolute().inset_0().child(
+                            canvas(
+                                move |b, _, _| {
+                                    crate::structure::record_pane_width(b.size.width)
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .size_full(),
+                        ),
+                    )
                     // Left inset matches the grid text (PANE_INSET cell
                     // padding), so the title sits flush over the first
                     // column.

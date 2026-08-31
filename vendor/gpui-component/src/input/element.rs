@@ -1132,11 +1132,17 @@ impl Element for TextElement {
             (total_wrapped_lines as f32 * line_height + empty_bottom_height + ghost_lines_height)
                 .max(bounds.size.height),
         );
-        // DuckTable patch: a DISABLED editor never scrolls itself — it
-        // has no scroll range at all. The host sizes it to content;
-        // padding-arithmetic residue must not leave a few pixels of
-        // wiggle.
-        let scroll_size = if state.disabled { bounds.size } else { scroll_size };
+        // DuckTable patch: a DISABLED editor has no ARTIFICIAL vertical
+        // overflow — the height is its content's (no scroll-past-end,
+        // no padding-arithmetic residue), so when the host sizes it to
+        // fit there is simply NOTHING to scroll vertically. Horizontal
+        // overflow is genuine content (long lines) and keeps its
+        // scroll.
+        let scroll_size = if state.disabled {
+            gpui::size(scroll_size.width, bounds.size.height)
+        } else {
+            scroll_size
+        };
 
         // `position_for_index` for example
         //
