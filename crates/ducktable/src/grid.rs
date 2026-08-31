@@ -1395,8 +1395,13 @@ impl Grid {
             }
             let nr = (r as i32 + dr).clamp(0, d.rows.len() as i32 - 1) as usize;
             let nc = if d.visible.contains(&col) { col } else { d.visible[0] };
+            let np = d.visible.iter().position(|&v| v == nc).unwrap_or(0);
+            let gutter = d.gutter as usize;
             d.active_cell = Some((nr, nc));
             select_row(state, nr, cx);
+            // The carriage return crosses most of the row — bring the
+            // anchor column back into view with it.
+            state.scroll_to_col(np + gutter, cx);
             cx.notify();
         });
         cx.notify();
@@ -1417,8 +1422,16 @@ impl Grid {
             let pos = d.visible.iter().position(|&v| v == c).unwrap_or(0);
             let np = (pos as i32 + dc).clamp(0, d.visible.len() as i32 - 1) as usize;
             let nc = d.visible[np];
+            let gutter = d.gutter as usize;
             d.active_cell = Some((nr, nc));
             select_row(state, nr, cx);
+            if dc != 0 {
+                // The viewport follows the ring sideways too — minimal
+                // scroll, so a jump to the far edge lands the cell at
+                // the visible edge and a one-step move only scrolls
+                // when crossing it (select_row covers the vertical).
+                state.scroll_to_col(np + gutter, cx);
+            }
             cx.notify();
         });
         cx.notify();
