@@ -1371,6 +1371,16 @@ impl InputState {
         direction: Option<MoveDirection>,
         cx: &mut Context<Self>,
     ) {
+        // DuckTable patch: a DISABLED editor never scrolls itself — not
+        // even to chase the cursor. A click near the last line computes
+        // a cursor overhang of a few pixels (content is exactly rows ×
+        // line height; the inner viewport is that minus padding) and
+        // would nudge the content up via deferred_scroll_offset, which
+        // layout applies RAW, bypassing every clamp. Selection still
+        // works; there is simply nowhere to scroll to.
+        if self.disabled {
+            return;
+        }
         let Some(last_layout) = self.last_layout.as_ref() else {
             return;
         };

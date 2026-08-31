@@ -269,7 +269,9 @@ impl Grid {
                 div()
                     .h_flex()
                     .items_center()
-                    .pt_4()
+                    // 12px above matches PANE_INSET on the left: the DDL
+                    // section gets the same breathing room on both axes.
+                    .pt_3()
                     .pb_1()
                     .gap_1()
                     .child(
