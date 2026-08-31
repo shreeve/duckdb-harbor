@@ -289,7 +289,21 @@ impl TextElement {
             let line_cursor_end =
                 line.position_for_index(end_ix.saturating_sub(prev_lines_offset), line_height);
 
-            if line_cursor_start.is_some() || line_cursor_end.is_some() {
+            // DuckTable patch: a line the selection merely ENDS ON —
+            // at its very first character, contributing nothing —
+            // paints nothing. Upstream gave it the 6px empty-line
+            // stub, a phantom mark that read as "this line is
+            // selected" when it wasn't.
+            let ends_at_line_start =
+                start_ix < prev_lines_offset && end_ix <= prev_lines_offset;
+            // DuckTable patch: a selection that runs past this line's
+            // end includes its NEWLINE — shown as a small tail after
+            // the last glyph, the way every macOS text view draws it.
+            let includes_newline = end_ix > prev_lines_offset + line.len();
+
+            if (line_cursor_start.is_some() || line_cursor_end.is_some())
+                && !ends_at_line_start
+            {
                 let start = line_cursor_start
                     .unwrap_or_else(|| line.position_for_index(0, line_height).unwrap());
 
@@ -303,6 +317,13 @@ impl TextElement {
                 let mut end_x = end.x;
                 if wrapped_lines > 0 {
                     end_x = line_wrap_width;
+                }
+
+                // The newline tail (only the last visual row of an
+                // unwrapped line carries it; wrapped rows get theirs
+                // below).
+                if includes_newline && wrapped_lines == 0 {
+                    end_x += px(6.);
                 }
 
                 // Ensure at least 6px width for the selection for empty lines.
@@ -321,6 +342,10 @@ impl TextElement {
                     let mut end = point(end.x, end.y + i as f32 * line_height);
                     if i < wrapped_lines {
                         end.x = line_size.width;
+                    } else if includes_newline {
+                        // DuckTable patch: the newline tail on the
+                        // last visual row of a wrapped line.
+                        end.x += px(6.);
                     }
 
                     line_corners.push(Corners {
@@ -538,21 +563,35 @@ impl TextElement {
         let line_number_len = (total_lines.max(1).ilog10() as usize + 1).max(2);
 
         let line_number_width = if state.mode.line_number() {
-            let empty_line_number = window.text_system().shape_line(
-                "+".repeat(line_number_len).into(),
-                font_size,
-                &[TextRun {
-                    len: line_number_len,
-                    font: style.font(),
-                    color: gpui::black(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                }],
-                None,
-            );
+            // DuckTable patch: a host-imposed gutter takes its exact
+            // width verbatim (plus the text gap) — alignment with an
+            // external rail beats the shaped-digits heuristic.
+            if let Some(gs) = &state.gutter_style {
+                gs.width + gs.text_gap
+            } else {
+                let empty_line_number = window.text_system().shape_line(
+                    "+".repeat(line_number_len).into(),
+                    font_size,
+                    &[TextRun {
+                        len: line_number_len,
+                        font: style.font(),
+                        color: gpui::black(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                );
 
-            empty_line_number.width + px(6.) + LINE_NUMBER_RIGHT_MARGIN
+                empty_line_number.width + px(6.) + LINE_NUMBER_RIGHT_MARGIN
+            }
+        } else if let Some(gs) = &state.gutter_style {
+            // DuckTable patch: rail hidden (⌥7 off) — the host's text
+            // gap stays as the pane's left inset, matching the grids'
+            // cell padding when THEIR rail is off. Reserved here, not
+            // as wrapper padding, so the pane's top boundary line
+            // still spans the full width.
+            gs.text_gap
         } else {
             px(0.)
         };
@@ -1204,23 +1243,47 @@ impl Element for TextElement {
                 strikethrough: None,
             }];
 
+            // DuckTable patch: host-imposed number size and per-row
+            // labels (send-mark restart numbering) when present.
+            let num_size = state
+                .gutter_style
+                .as_ref()
+                .map(|gs| gs.text_size)
+                .unwrap_or(text_size);
+            let labels = state.line_labels.clone();
+
             // build line numbers
             for (ix, line) in last_layout.lines.iter().enumerate() {
                 let ix = last_layout.visible_range.start + ix;
-                let line_no = format!("{:>width$}", ix + 1, width = line_number_len).into();
-
-                let runs = if current_row == Some(ix) {
-                    &current_line_runs
-                } else {
-                    &other_line_runs
-                };
+                let label = labels
+                    .as_ref()
+                    .and_then(|l| l.get(ix).copied())
+                    .unwrap_or(ix as u32 + 1);
 
                 let mut sub_lines: SmallVec<[ShapedLine; 1]> = SmallVec::new();
-                sub_lines.push(
-                    window
-                        .text_system()
-                        .shape_line(line_no, text_size, &runs, None),
-                );
+                // A zero label is a silent row — the blank space
+                // between statements carries no number at all.
+                if label == 0 {
+                    sub_lines.push(ShapedLine::default());
+                } else {
+                    let line_no: SharedString =
+                        format!("{:>width$}", label, width = line_number_len).into();
+                    let runs_len = line_no.len();
+
+                    let runs = if current_row == Some(ix) {
+                        &current_line_runs
+                    } else {
+                        &other_line_runs
+                    };
+                    let mut runs = runs.clone();
+                    runs[0].len = runs_len;
+
+                    sub_lines.push(
+                        window
+                            .text_system()
+                            .shape_line(line_no, num_size, &runs, None),
+                    );
+                }
                 for _ in 0..line.wrapped_lines.len().saturating_sub(1) {
                     sub_lines.push(ShapedLine::default());
                 }
@@ -1439,6 +1502,37 @@ impl Element for TextElement {
                 cx.theme().editor_background(),
             ));
 
+            // DuckTable patch: the host's send mark, rail style, and
+            // row labels, read once for the loop below.
+            let send_mark = self.state.read(cx).send_mark.clone();
+            let gutter = self.state.read(cx).gutter_style.clone();
+            let row_labels = self.state.read(cx).line_labels.clone();
+            // DuckTable patch: the rows that close a `;`-terminated
+            // statement — the only rows that earn a closing hairline.
+            let end_rows = self.state.read(cx).gutter_end_rows.clone();
+
+            // DuckTable patch: the rail base — raised fill and its firm
+            // right edge — runs the FULL height of the pane (Steve's
+            // ruling), structure even past the last line. Per-row
+            // dressing (separators, hairlines) layers on inside the
+            // loop.
+            if let Some(gs) = &gutter {
+                let rp = point(
+                    input_bounds.origin.x + gs.left_inset,
+                    input_bounds.origin.y,
+                );
+                let rw = gs.width - gs.left_inset;
+                let rh = input_bounds.size.height + prepaint.ghost_lines_height;
+                window.paint_quad(fill(Bounds::new(rp, size(rw, rh)), gs.background));
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(rp.x + rw - px(1.), rp.y),
+                        size(px(1.), rh),
+                    ),
+                    gs.border,
+                ));
+            }
+
             // Each item is the normal lines.
             for (ix, lines) in line_numbers.iter().enumerate() {
                 let row = visible_range.start + ix;
@@ -1447,8 +1541,95 @@ impl Element for TextElement {
                 let is_active = prepaint.current_row == Some(row);
 
                 let height = line_height * lines.len() as f32;
-                // paint active line number background
-                if is_active {
+                // DuckTable patch: per-row rail dressing. EVERY row of
+                // the buffer — numbered or silent — ends in exactly ONE
+                // 1px line: the grids' subtle separator under its
+                // number cell, unless the NEXT row begins a statement,
+                // in which case this row's separator IS the statement
+                // hairline — full width, firmer — so a boundary can
+                // never stack two lines. The buffer's very first row
+                // additionally opens with the one top hairline (the
+                // header band above draws no border of its own).
+                if let Some(gs) = &gutter {
+                    // With host labels, a row past the buffer is
+                    // silent (0) — so a statement ending on the last
+                    // line still closes its block; without labels the
+                    // continuous default applies.
+                    let label = match &row_labels {
+                        Some(l) => l.get(row).copied().unwrap_or(0),
+                        None => row as u32 + 1,
+                    };
+                    let next_label = match &row_labels {
+                        Some(l) => l.get(row + 1).copied().unwrap_or(0),
+                        None => row as u32 + 2,
+                    };
+                    let rp = point(p.x + gs.left_inset, p.y);
+                    let rw = gs.width - gs.left_inset;
+                    let full_w = input_bounds.size.width - gs.left_inset;
+                    // DuckTable patch: the send mark dims the marked
+                    // statement's rail cells to the host's color (the
+                    // header band's own) — the mark is a place, not a
+                    // sticker; separators and numbers paint on top.
+                    // The rail's right-border COLUMN is sacred: only
+                    // the border itself and the border-colored
+                    // statement hairlines may touch it, so the mark
+                    // stops one pixel short.
+                    if let Some((mark, color)) = &send_mark {
+                        if mark.contains(&row) {
+                            window.paint_quad(fill(
+                                Bounds::new(rp, size(rw - px(1.), height)),
+                                *color,
+                            ));
+                        }
+                    }
+                    // ONE line per row boundary, style decided here:
+                    // a statement hairline (full-width, border color)
+                    // when the row above ENDS a statement or the row
+                    // below BEGINS one — the same boundary for
+                    // adjacent statements, so lines can never stack —
+                    // else the subtle rail-only separator.
+                    // Only a `;` closes a band: with host end-rows, a
+                    // statement's closing hairline draws exactly on
+                    // the rows the host marked terminated; without
+                    // them, the label arithmetic decides.
+                    let ends = match &end_rows {
+                        Some(e) => e.contains(&(row as u32)),
+                        None => label > 0 && next_label != label + 1,
+                    };
+                    let begins_next = next_label == 1;
+                    if ends || begins_next {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(rp.x, rp.y + height - px(1.)),
+                                size(full_w, px(1.)),
+                            ),
+                            gs.border,
+                        ));
+                    } else if label == 0 && next_label == 0 {
+                        // Between two blank rows the rail stays silent
+                        // — a gap is one quiet block, not a ruler of
+                        // empty cells (Steve's ruling).
+                    } else {
+                        // One pixel short of the right border, so the
+                        // vertical line stays unbroken (no wrong-color
+                        // dot at the junction).
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(rp.x, rp.y + height - px(1.)),
+                                size(rw - px(1.), px(1.)),
+                            ),
+                            gs.row_line,
+                        ));
+                    }
+                    // No row-0 top hairline: the pane's top boundary
+                    // is painted once at the viewport's fixed top,
+                    // after the row loop — see below.
+                }
+                // paint active line number background — unless a host
+                // rail owns the gutter's paint (DuckTable patch): its
+                // cells stay uniform, the send mark being the only
+                // tint.
+                if is_active && gutter.is_none() {
                     if let Some(bg_color) = active_line_color {
                         window.paint_quad(fill(
                             Bounds::new(p, size(prepaint.last_layout.line_number_width, height)),
@@ -1458,6 +1639,16 @@ impl Element for TextElement {
                 }
 
                 for line in lines {
+                    // DuckTable patch: a host-imposed gutter right-
+                    // aligns its numbers to width − right_inset, the
+                    // way the data grids set their row rail.
+                    let p = match gutter.as_ref() {
+                        Some(gs) => point(
+                            p.x + (gs.width - gs.right_inset - line.width).max(px(0.)),
+                            p.y,
+                        ),
+                        None => p,
+                    };
                     _ = line.paint(p, line_height, window, cx);
                     offset_y += line_height;
                 }
@@ -1467,6 +1658,26 @@ impl Element for TextElement {
                     offset_y += prepaint.ghost_lines_height;
                 }
             }
+        }
+
+        // DuckTable patch: the pane's top boundary — the header band's
+        // bottom edge — painted at the viewport's FIXED top, after the
+        // rows, so scrolling slides text under the line instead of
+        // carrying it away. At scroll-top these are the exact device
+        // pixels the first row's opening hairline would claim, so it
+        // is one line, never two. OUTSIDE the line-number block: the
+        // band's edge survives the rail being hidden (⌥7 off).
+        if let Some(gs) = self.state.read(cx).gutter_style.clone() {
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(
+                        input_bounds.origin.x + gs.left_inset,
+                        input_bounds.origin.y,
+                    ),
+                    size(input_bounds.size.width - gs.left_inset, px(1.)),
+                ),
+                gs.border,
+            ));
         }
 
         self.state.update(cx, |state, cx| {

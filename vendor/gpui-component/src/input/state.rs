@@ -258,6 +258,33 @@ impl LastLayout {
 }
 
 /// InputState to keep editing state of the [`super::Input`].
+/// DuckTable patch: exact gutter geometry a host can impose so the
+/// editor's line numbers align with an external grid's row rail.
+#[derive(Clone, PartialEq)]
+pub struct GutterStyle {
+    /// Total gutter width (line numbers + insets).
+    pub width: Pixels,
+    /// Where the rail visually begins, from the input's content
+    /// origin — lets a host that walks back the input's own padding
+    /// (negative margin) re-anchor the send-mark bar to its pane edge.
+    pub left_inset: Pixels,
+    /// The numbers' inset from the gutter's right edge.
+    pub right_inset: Pixels,
+    /// The numbers' text size.
+    pub text_size: Pixels,
+    /// Breathing room between the rail's right edge and the text —
+    /// widens the layout's gutter reservation without widening the
+    /// painted rail.
+    pub text_gap: Pixels,
+    /// The rail's fill, painted per numbered row — the raised strip
+    /// the data grids give their row numbers.
+    pub background: gpui::Hsla,
+    /// The 1px separator under each numbered row.
+    pub row_line: gpui::Hsla,
+    /// The 1px strip on the rail's right edge.
+    pub border: gpui::Hsla,
+}
+
 pub struct InputState {
     pub(super) focus_handle: FocusHandle,
     pub(super) mode: InputMode,
@@ -294,6 +321,28 @@ pub struct InputState {
     pub(super) pattern: Option<regex::Regex>,
     pub(super) validate: Option<Box<dyn Fn(&str, &mut Context<Self>) -> bool + 'static>>,
     pub(crate) scroll_handle: ScrollHandle,
+    /// DuckTable patch: the send mark — a range of buffer rows the
+    /// host flags in the line-number gutter, and the accent color to
+    /// flag them with. Painted as a hairline bar at the gutter's left
+    /// edge (see element.rs). The host owns the meaning; here it is
+    /// only rows and a color.
+    pub send_mark: Option<(std::ops::Range<usize>, gpui::Hsla)>,
+    /// DuckTable patch: host-styled gutter — exact total width, the
+    /// numbers' inset from its right edge, and their text size — so an
+    /// editor's line numbers can sit pixel-for-pixel on a sibling
+    /// grid's row-number rail.
+    pub gutter_style: Option<GutterStyle>,
+    /// DuckTable patch: per-row line-number labels (row index →
+    /// label). The host renumbers however it likes — e.g. restarting
+    /// at 1 for each statement, matching the engine's own LINE n
+    /// diagnostics. Rows beyond the Vec fall back to index + 1.
+    pub line_labels: Option<std::rc::Rc<Vec<u32>>>,
+    /// DuckTable patch: the rows that CLOSE a finished statement — its
+    /// last row, listed only when a `;` terminated it. Only these rows
+    /// draw the band's closing hairline; an unterminated statement
+    /// stays open (no line claiming "done" under a mid-air thought),
+    /// and the line appears the moment the `;` does.
+    pub gutter_end_rows: Option<std::rc::Rc<Vec<u32>>>,
     /// The deferred scroll offset to apply on next layout.
     pub(crate) deferred_scroll_offset: Option<Point<Pixels>>,
     /// The size of the scrollable content.
@@ -393,6 +442,10 @@ impl InputState {
             last_selected_range: None,
             last_cursor: None,
             scroll_handle: ScrollHandle::new(),
+            send_mark: None,
+            gutter_style: None,
+            line_labels: None,
+            gutter_end_rows: None,
             scroll_size: gpui::size(px(0.), px(0.)),
             deferred_scroll_offset: None,
             preferred_column: None,
@@ -476,6 +529,18 @@ impl InputState {
             *l = line_number;
         }
         self
+    }
+
+    /// DuckTable patch: set_line_number without a Window — observers
+    /// carry none, and the Window above is unused anyway. Guarded, so
+    /// re-asserting the current state costs nothing.
+    pub fn set_line_number_visible(&mut self, on: bool, cx: &mut Context<Self>) {
+        if let InputMode::CodeEditor { line_number: l, .. } = &mut self.mode {
+            if *l != on {
+                *l = on;
+                cx.notify();
+            }
+        }
     }
 
     /// Set line number, only for [`InputMode::CodeEditor`] mode.
@@ -861,20 +926,27 @@ impl InputState {
         self.select_to(self.next_boundary(self.cursor()), cx);
     }
 
+    /// DuckTable patch: shift-up extends the selection to the SAME
+    /// column of the line above, like every macOS text view — upstream
+    /// jumped to just before the previous newline, selecting a phantom
+    /// tail regardless of where the caret stood.
     pub(super) fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
         if self.mode.is_single_line() {
             return;
         }
-        let offset = self.start_of_line().saturating_sub(1);
-        self.select_to(self.previous_boundary(offset), cx);
+        if let Some(offset) = self.vertical_target(-1) {
+            self.select_to(offset, cx);
+        }
     }
 
+    /// DuckTable patch: the column-preserving mirror of select_up.
     pub(super) fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
         if self.mode.is_single_line() {
             return;
         }
-        let offset = (self.end_of_line() + 1).min(self.text.len());
-        self.select_to(self.next_boundary(offset), cx);
+        if let Some(offset) = self.vertical_target(1) {
+            self.select_to(offset, cx);
+        }
     }
 
     pub(super) fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
