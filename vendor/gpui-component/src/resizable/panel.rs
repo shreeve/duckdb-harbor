@@ -196,6 +196,10 @@ pub struct ResizablePanel {
     size_range: Range<Pixels>,
     children: Vec<AnyElement>,
     visible: bool,
+    /// DuckTable patch: a fixed panel keeps its pixel size when the
+    /// CONTAINER resizes (only user drags change it) — see
+    /// `adjust_to_container_size`.
+    fixed: bool,
 }
 
 impl ResizablePanel {
@@ -209,7 +213,17 @@ impl ResizablePanel {
             axis: Axis::Horizontal,
             children: vec![],
             visible: true,
+            fixed: false,
         }
+    }
+
+    /// DuckTable patch: mark this panel as furniture — a sidebar, an
+    /// inspector — whose width the user sets by dragging and NOTHING
+    /// else changes. Container resizes hand their delta entirely to
+    /// the flexible panels.
+    pub fn fixed(mut self) -> Self {
+        self.fixed = true;
+        self
     }
 
     /// Set the visibility of the panel, default is true.
@@ -258,7 +272,19 @@ impl RenderOnce for ResizablePanel {
         div()
             .id(("resizable-panel", self.panel_ix))
             .flex()
-            .flex_grow()
+            // DuckTable patch: a fixed panel opts out of flex growth
+            // entirely — its basis IS its size, so the first frame of
+            // a container resize is already right. (With flex_grow the
+            // sidebar stretched in the flex pass, then the state's
+            // correction slammed it back a frame later: a visible
+            // wiggle on every resize tick.)
+            .map(|this| {
+                if self.fixed {
+                    this.flex_none()
+                } else {
+                    this.flex_grow()
+                }
+            })
             .size_full()
             .relative()
             .when(self.axis.is_vertical(), |this| {
@@ -290,7 +316,13 @@ impl RenderOnce for ResizablePanel {
                         let state = state.clone();
                         move |bounds, _, cx| {
                             state.update(cx, |state, cx| {
-                                state.update_panel_size(self.panel_ix, bounds, self.size_range, cx)
+                                state.update_panel_size(
+                                    self.panel_ix,
+                                    bounds,
+                                    self.size_range,
+                                    self.fixed,
+                                    cx,
+                                )
                             })
                         }
                     },

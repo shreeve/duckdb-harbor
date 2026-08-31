@@ -212,6 +212,10 @@ impl Render for DuckTable {
                         gpui_component::resizable::resizable_panel()
                             .size(px(prefs::get(cx).sidebar_width))
                             .size_range(px(prefs::SIDEBAR_MIN)..px(prefs::SIDEBAR_MAX))
+                            // Furniture: only the user's drag changes
+                            // this width — a window resize gives all
+                            // its delta to the content.
+                            .fixed()
                             .child(self.sidebar(cx)),
                     )
                     .child(

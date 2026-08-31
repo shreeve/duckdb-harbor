@@ -2687,6 +2687,9 @@ impl Render for Grid {
                                         px(prefs::INSPECTOR_MIN)
                                             ..px(prefs::INSPECTOR_MAX),
                                     )
+                                    // Furniture, like the sidebar: only
+                                    // a drag changes this width.
+                                    .fixed()
                                     .child(pane),
                             ),
                     ),
@@ -2919,6 +2922,8 @@ impl Render for Grid {
                                         .size_range(
                                             px(prefs::INSPECTOR_MIN)..px(prefs::INSPECTOR_MAX),
                                         )
+                                        // Furniture, like the sidebar.
+                                        .fixed()
                                         .child(pane),
                                 ),
                         ),

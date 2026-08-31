@@ -126,8 +126,10 @@ impl ResizableState {
         panel_ix: usize,
         bounds: Bounds<Pixels>,
         size_range: Range<Pixels>,
+        fixed: bool,
         cx: &mut Context<Self>,
     ) {
+        self.panels[panel_ix].fixed = fixed;
         let size = bounds.size.along(self.axis);
         // This check is only necessary to stop the very first panel from resizing on its own
         // it needs to be passed when the panel is freshly created so we get the initial size,
@@ -271,12 +273,38 @@ impl ResizableState {
         }
 
         let container_size = self.container_size();
-        let total_size = px(self.sizes.iter().map(|s| s.as_f32()).sum::<f32>());
+        // DuckTable patch: fixed panels (furniture — sidebars,
+        // inspectors) keep their pixel size when the container
+        // resizes; only the flexible panels share the delta,
+        // proportionally among themselves. Resizing the window must
+        // never quietly reshape what the user sized by hand.
+        let fixed_size = px(self
+            .panels
+            .iter()
+            .zip(&self.sizes)
+            .filter(|(p, _)| p.fixed)
+            .map(|(_, s)| s.as_f32())
+            .sum::<f32>());
+        let flex_size = px(self
+            .panels
+            .iter()
+            .zip(&self.sizes)
+            .filter(|(p, _)| !p.fixed)
+            .map(|(_, s)| s.as_f32())
+            .sum::<f32>());
+        if flex_size.is_zero() {
+            return;
+        }
+        let available = container_size - fixed_size;
 
         for i in 0..self.panels.len() {
+            if self.panels[i].fixed {
+                self.panels[i].size = Some(self.sizes[i]);
+                continue;
+            }
             let size = self.sizes[i];
-            let ratio = size / total_size;
-            let new_size = container_size * ratio;
+            let ratio = size / flex_size;
+            let new_size = available * ratio;
 
             self.sizes[i] = new_size;
             self.panels[i].size = Some(new_size);
@@ -292,4 +320,6 @@ pub(crate) struct ResizablePanelState {
     pub size: Option<Pixels>,
     pub size_range: Range<Pixels>,
     bounds: Bounds<Pixels>,
+    /// DuckTable patch: furniture flag — see [`ResizablePanel::fixed`].
+    pub(crate) fixed: bool,
 }
