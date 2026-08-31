@@ -250,7 +250,7 @@ fn main() {
         theme::init(cx);
         prefs::init(cx);
         cx.bind_keys([
-            KeyBinding::new("cmd-alt-0", ToggleInspector, None),
+            KeyBinding::new("cmd-i", ToggleInspector, None),
             KeyBinding::new("cmd-q", Quit, None),
             // Cmd-Plus arrives as cmd-= (unshifted) or cmd-shift-= — bind
             // both, the way browsers treat the pair.

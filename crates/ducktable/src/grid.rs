@@ -2788,7 +2788,7 @@ impl Render for Grid {
                         icon_tile("toggle-inspector", 22., true, t)
                             .text_color(if p.inspector { t.accent } else { t.muted })
                             .tooltip(|window, cx| {
-                                Tooltip::new("Show inspector (\u{2318}\u{2325}0)").build(window, cx)
+                                Tooltip::new("Show inspector (\u{2318}I)").build(window, cx)
                             })
                             .on_click(cx.listener(|_, _, _, cx| {
                                 prefs::toggle(cx, |p| p.inspector = !p.inspector);
