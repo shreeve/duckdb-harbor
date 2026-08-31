@@ -28,10 +28,10 @@ impl DuckTable {
             (None, Phase::Connected { conn, .. }) => Some(clone_str(&conn.name)),
             _ => None,
         };
+        // Width belongs to the resizable panel around this (main.rs
+        // "root-split"); the sidebar just fills what it's granted.
         div()
-            .w_56()
-            .flex_none()
-            .h_full()
+            .size_full()
             .bg(t.bg_sidebar)
             .border_r_1()
             .border_color(t.border)

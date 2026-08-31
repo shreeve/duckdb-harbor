@@ -33,6 +33,12 @@ pub struct Prefs {
     pub page_size: usize,
     /// Index into [`ZOOMS`].
     pub zoom: usize,
+    /// The sidebar's width (UI.md: divider positions persist).
+    pub sidebar_width: f32,
+    /// The window's last windowed frame (x, y, w, h) — None until the
+    /// first resize or move, so a fresh install takes the platform's
+    /// default placement.
+    pub win: Option<(f32, f32, f32, f32)>,
 }
 
 impl Prefs {
@@ -69,6 +75,12 @@ pub const DEFAULT_ZOOM: usize = 2;
 pub const INSPECTOR_MIN: f32 = 180.;
 pub const INSPECTOR_MAX: f32 = 600.;
 
+/// Sidebar width bounds — same double duty. The floor is the sidebar's
+/// classic fixed width (Steve's ruling: today's size is the minimum;
+/// the divider only ever grants more room).
+pub const SIDEBAR_MIN: f32 = 224.;
+pub const SIDEBAR_MAX: f32 = 480.;
+
 impl Default for Prefs {
     fn default() -> Self {
         Self {
@@ -80,6 +92,8 @@ impl Default for Prefs {
             inspector_width: 290.,
             page_size: 500,
             zoom: DEFAULT_ZOOM,
+            sidebar_width: 224.,
+            win: None,
         }
     }
 }
@@ -124,6 +138,23 @@ pub fn init(cx: &mut App) {
             .map(|n| n as usize)
             .filter(|n| *n < ZOOMS.len())
             .unwrap_or(prefs.zoom);
+        prefs.sidebar_width = v
+            .get("sidebar_width")
+            .and_then(Value::as_f64)
+            .map(|w| (w as f32).clamp(SIDEBAR_MIN, SIDEBAR_MAX))
+            .unwrap_or(prefs.sidebar_width);
+        // The window frame: four finite numbers with a plausible size,
+        // or the platform default. (A frame saved on a display that no
+        // longer exists still restores — macOS pulls windows on-screen.)
+        prefs.win = v.get("window").and_then(Value::as_array).and_then(|a| {
+            let n = |i: usize| a.get(i).and_then(Value::as_f64).map(|f| f as f32);
+            match (n(0), n(1), n(2), n(3)) {
+                (Some(x), Some(y), Some(w), Some(h)) if w >= 400. && h >= 300. => {
+                    Some((x, y, w, h))
+                }
+                _ => None,
+            }
+        });
     }
     cx.set_global(prefs);
 }
@@ -156,6 +187,8 @@ pub fn save(cx: &mut App, change: impl FnOnce(&mut Prefs)) {
         "inspector_width": prefs.inspector_width,
         "page_size": prefs.page_size,
         "zoom": prefs.zoom,
+        "sidebar_width": prefs.sidebar_width,
+        "window": prefs.win.map(|(x, y, w, h)| vec![x, y, w, h]),
     });
     if let Some(p) = file() {
         if let Some(dir) = p.parent() {

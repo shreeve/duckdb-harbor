@@ -69,10 +69,27 @@ pub struct DuckTable {
     /// view). Keyed by source; handed back when the table's grid is
     /// rebuilt, cleared on disconnect (a new berth is a new world).
     staged: std::collections::HashMap<String, crate::edits::Edits>,
+    /// The sidebar/content divider (UI.md: divider positions persist —
+    /// the width saves at the end of each drag).
+    pub(crate) sidebar_resize: Entity<gpui_component::resizable::ResizableState>,
 }
 
 impl DuckTable {
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
+        let sidebar_resize =
+            cx.new(|_| gpui_component::resizable::ResizableState::default());
+        cx.subscribe(
+            &sidebar_resize,
+            |_, state, _: &gpui_component::resizable::ResizablePanelEvent, cx| {
+                if let Some(width) = state.read(cx).sizes().first().copied() {
+                    crate::prefs::save(cx, |p| {
+                        p.sidebar_width = f32::from(width)
+                            .clamp(crate::prefs::SIDEBAR_MIN, crate::prefs::SIDEBAR_MAX);
+                    });
+                }
+            },
+        )
+        .detach();
         let mut this = Self {
             rows: Vec::new(),
             phase: Phase::Idle,
@@ -87,6 +104,7 @@ impl DuckTable {
             warning: None,
             query: None,
             staged: std::collections::HashMap::new(),
+            sidebar_resize,
         };
         this.refresh(cx);
         this

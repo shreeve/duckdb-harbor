@@ -201,8 +201,24 @@ impl Render for DuckTable {
                     grid.update(cx, |grid, cx| grid.fit_columns(cx));
                 }
             }))
-            .child(self.sidebar(cx))
-            .child(self.content(cx))
+            // The sidebar/content divider drags rightward from the
+            // classic fixed width — today's size is the floor, the
+            // divider only grants more room — and persists like the
+            // inspector's does.
+            .child(
+                gpui_component::resizable::h_resizable("root-split")
+                    .with_state(&self.sidebar_resize)
+                    .child(
+                        gpui_component::resizable::resizable_panel()
+                            .size(px(prefs::get(cx).sidebar_width))
+                            .size_range(px(prefs::SIDEBAR_MIN)..px(prefs::SIDEBAR_MAX))
+                            .child(self.sidebar(cx)),
+                    )
+                    .child(
+                        gpui_component::resizable::resizable_panel()
+                            .child(self.content(cx)),
+                    ),
+            )
     }
 }
 
@@ -329,10 +345,20 @@ fn main() {
         });
         cx.set_menus(app_menus());
 
+        // The window opens where it last stood — the frame saved on
+        // every move and resize below. A fresh install has no frame
+        // and takes the platform default.
+        let remembered = prefs::get(cx).win.map(|(x, y, w, h)| {
+            WindowBounds::Windowed(Bounds::new(
+                point(px(x), px(y)),
+                size(px(w), px(h)),
+            ))
+        });
         cx.spawn(async move |cx| {
             cx.open_window(
                 WindowOptions {
                     window_min_size: Some(size(px(720.), px(420.))),
+                    window_bounds: remembered,
                     ..Default::default()
                 },
                 |window, cx| {
@@ -340,6 +366,31 @@ fn main() {
                     // The one window's view, reachable from App-level
                     // action handlers (FitColumns above).
                     cx.set_global(AppView(view.downgrade()));
+                    view.update(cx, |_, cx| {
+                        // Fires on move and resize both; fullscreen
+                        // frames are the display's, not the user's, so
+                        // they don't overwrite the remembered one. The
+                        // SIZE saved is the content's (viewport), not
+                        // the outer frame's: macOS restores through
+                        // initWithContentRect, so an outer-frame size
+                        // would regrow by one titlebar every launch.
+                        cx.observe_window_bounds(window, |_, window, cx| {
+                            if window.is_fullscreen() {
+                                return;
+                            }
+                            let origin = window.bounds().origin;
+                            let content = window.viewport_size();
+                            prefs::save(cx, |p| {
+                                p.win = Some((
+                                    f32::from(origin.x),
+                                    f32::from(origin.y),
+                                    f32::from(content.width),
+                                    f32::from(content.height),
+                                ));
+                            });
+                        })
+                        .detach();
+                    });
                     cx.new(|cx| Root::new(view, window, cx))
                 },
             )?;
