@@ -69,6 +69,17 @@ Client architecture:
 - **A cancelled connect is not a failed connect.** Cancel updates the UI
   synchronously and fences the in-flight attempt with a token; a late
   completion discards itself instead of clobbering newer state.
+- **One grid, many sources.** Anything that shows rows IS the Grid — the
+  Data view pages a table, the Query view's results pane pages the user's
+  statement as a parenthesized subquery. A second "simpler" results table
+  is two owners of the same pixels (see rule three). Editability follows
+  capability: no catalog structure means no key, no key means no Edits —
+  read-only by construction, never by a parallel widget.
+- **Preferences are global; stats are per-grid.** Row numbers, NULL tags,
+  and alignment describe the reader and are set in exactly one place —
+  every grid honors them, self-healing on its next paint. Row counts,
+  timings, and page position describe one grid's contents and live on
+  that grid; the view's chrome merely displays the active grid's facts.
 
 Motion and feel — the reusable techniques, each minted once, named, and
 meant to be reached for anywhere (the umbrella law is EDITING.md's

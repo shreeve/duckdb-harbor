@@ -11,6 +11,20 @@ pub(crate) fn source(schema: &str, name: &str) -> String {
     format!("{}.{}", qident(schema), qident(name))
 }
 
+/// A query's FROM target: the user's statement, parenthesized. The Query
+/// view's results grid is "a Data window with a custom query preceding
+/// it" — the same page_sql machinery pages any SELECT-shaped statement
+/// by treating it as a subquery: `SELECT * FROM (statement) LIMIT …`.
+///
+/// The closing paren sits on its OWN LINE: a statement ending in a line
+/// comment would otherwise swallow the paren and everything page_sql
+/// appends after it. (No `;` stripping — the statement splitter never
+/// includes a top-level terminator, so any trailing semicolon here is
+/// inside a comment and must be left alone.)
+pub(crate) fn query_source(sql: &str) -> String {
+    format!("(\n{}\n)", sql.trim())
+}
+
 /// The SELECT for one page of `source` under an optional filter. The
 /// filter text splices in verbatim BY DESIGN: the strip is a raw SQL
 /// surface and the berth is the user's own database — the author of the
@@ -65,4 +79,20 @@ pub(crate) fn first_page(
 /// The table's exact row count, for the status line.
 pub(crate) fn total_rows(conn: &Conn, schema: &str, name: &str) -> Option<u64> {
     count_of(&harbor_client::query(conn, &count_sql(&source(schema, name), &None)).ok()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{page_sql, query_source};
+
+    #[test]
+    fn trailing_line_comment_cannot_eat_the_paging_clause() {
+        // The regression: a statement ending in a comment swallowed the
+        // closing paren and the LIMIT/OFFSET page_sql appends.
+        let src = query_source("from members\n-- where first_name ilike '%s%';");
+        let sql = page_sql(&src, false, &None, 1, 5000);
+        assert!(sql.ends_with(") LIMIT 5000 OFFSET 5000"), "{sql}");
+        // And the comment's own semicolon stays: it is comment text.
+        assert!(sql.contains("'%s%';"), "{sql}");
+    }
 }

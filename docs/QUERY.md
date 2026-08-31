@@ -172,13 +172,28 @@ failed statement's gutter bar turns danger until the statement is
 edited. (Squiggles at the span join in v2 as idle-parse diagnostics;
 the strip is the load-bearing surface.)
 
-**Truncation:** the client never materializes an unbounded result. A
-run fetches up to the active page size (500 / 5,000 / 50,000 via the
-existing pager glyphs); a capped result reads `first 500 rows` —
-honest about the unknown total. True paging of arbitrary results needs
-a server cursor and is v2. *Wire seam flagged:* the row cap wants
-Harbor cooperation (cap-and-report); until then the client truncates
-the decoded stream and cancels the remainder.
+**Paging** (ruled 2026-08-31, ahead of the v2 forecast): a query
+result pages like a table, because the grid's FROM target is simply
+the user's statement parenthesized — "a Data window with a custom
+query preceding it." `page_sql` emits `SELECT * FROM (statement)
+LIMIT … OFFSET …` for the SELECT-shaped family (select / with / from /
+values / table); the footer's pager, size cycling, and jump-to-last
+all just work. The bare first run still materializes once — which is
+how the exact total is known for free — and the grid keeps page 0 of
+it. Unwrappable statements (PRAGMA, SHOW …) keep their whole result as
+one inert page, pager hidden. *Wire seam still flagged:* capping the
+FIRST run wants Harbor cooperation (cap-and-report); until then one
+full materialization per send.
+
+**Chrome taxonomy** (ruled 2026-08-31): display preferences are
+GLOBAL and set once — row numbers, NULL tags, right-alignment are
+about the reader, not the data, so the title strip's one lozenge
+governs every grid and each grid self-heals to it on its next paint.
+Stats and paging are PER-GRID state — facts about one grid's contents
+— owned by that grid and *displayed* by the current view's chrome:
+one grid per view today, so the app footer reads the active grid
+(`FooterFacts`); if multi-result grids ever ship, each grid's stats
+travel with it into a per-grid strip, and nothing re-architects.
 
 ## The editor
 
