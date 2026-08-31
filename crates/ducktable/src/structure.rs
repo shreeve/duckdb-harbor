@@ -10,8 +10,7 @@
 //! text — so opening the Structure view costs no query at all.
 
 use crate::grid::Grid;
-use crate::theme::{pal, ui_font, value_font, Pal, CELL_TEXT, HEADER_TEXT, PANE_INSET, TAG_TEXT};
-use gpui::prelude::FluentBuilder as _;
+use crate::theme::{pal, value_font, CELL_TEXT, PANE_INSET};
 use gpui::*;
 use gpui_component::StyledExt as _;
 
@@ -162,71 +161,97 @@ fn top_level_open(sql: &str) -> Option<usize> {
     None
 }
 
-const ROW_H: f32 = 26.;
-const NAME_W: f32 = 220.;
-const TYPE_W: f32 = 180.;
-const ATTR_W: f32 = 130.;
+/// The columns table AS a grid: the table's own schema synthesized
+/// into a result and handed to the real Grid — one grid, many sources,
+/// applied to the catalog itself. Embedded, unpageable, read-only by
+/// construction; the attributes column renders its tags as pills
+/// (grid.rs pill_cols). Costs no query: the catalog snapshot is
+/// already in hand.
+pub(crate) fn columns_grid(
+    conn: harbor_client::Conn,
+    s: &TableStructure,
+    window: &mut Window,
+    cx: &mut Context<Grid>,
+) -> Entity<Grid> {
+    let columns = ["column", "type", "attributes", "default"]
+        .iter()
+        .map(|n| wire::Column {
+            name: Some((*n).to_string()),
+            duckdb_type: "VARCHAR".to_string(),
+            lossless: true,
+            ..Default::default()
+        })
+        .collect();
+    let rows: Vec<Vec<serde_json::Value>> = s
+        .cols
+        .iter()
+        .map(|c| {
+            let attrs = match (c.pk, c.notnull) {
+                (true, true) => "PK \u{00b7} NOT NULL",
+                (true, false) => "PK",
+                (false, true) => "NOT NULL",
+                (false, false) => "",
+            };
+            vec![
+                c.name.clone().into(),
+                c.ty.clone().into(),
+                attrs.into(),
+                c.dflt.clone().unwrap_or_default().into(),
+            ]
+        })
+        .collect();
+    let n = rows.len();
+    let result = harbor_client::QueryResult {
+        columns,
+        rows,
+        row_count: n as u64,
+        time_ms: 0,
+    };
+    let grid = cx.new(|cx| {
+        Grid::new_query(
+            conn,
+            "structure",
+            Ok(result),
+            Some(n as u64),
+            n.max(1),
+            false,
+            window,
+            cx,
+        )
+    });
+    grid.update(cx, |g, cx| {
+        g.mark_pill_column(2, cx);
+        // Sized to content, like the old fixed-width table — but
+        // resizable and fittable now, because it is a real grid.
+        g.fit_columns(cx);
+    });
+    grid
+}
 
 impl Grid {
     pub(crate) fn structure_view(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let t = pal(cx);
         let z = crate::prefs::get(cx).zoom_factor();
-        let mut pane = div()
-            .id("structure")
-            .v_flex()
-            .size_full()
-            // Left inset matches the title strip and the data grid's
-            // first column (PANE_INSET), so switching views never shifts
-            // the leftmost text.
-            .pl(px(PANE_INSET))
-            .pr_3()
-            .py_2()
-            .overflow_y_scroll();
-        let Some(s) = self.structure() else {
-            return pane.child(
+        let mut pane = div().id("structure").v_flex().size_full().overflow_y_scroll();
+        let Some(grid) = self.structure_grid.clone() else {
+            return pane.pl(px(PANE_INSET)).py_2().child(
                 div().text_sm().text_color(t.muted).child("Structure unavailable"),
             );
         };
-
-        pane = pane.child(header_row(t, z));
-        for c in &s.cols {
-            pane = pane.child(
-                div()
-                    .h_flex()
-                    .h(px(ROW_H * z))
-                    .flex_none()
-                    .items_center()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(t.grid_line)
-                    .child(cell(t, z, &c.name, NAME_W, false))
-                    .child(cell(t, z, &c.ty, TYPE_W, true))
-                    .child(
-                        div()
-                            .h_flex()
-                            .w(px(ATTR_W * z))
-                            .flex_none()
-                            .gap_1()
-                            .when(c.pk, |d| d.child(chip(t, z, "PK", true)))
-                            .when(c.notnull, |d| d.child(chip(t, z, "NOT NULL", false))),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(CELL_TEXT * z))
-                            .font_family(value_font())
-                            .text_color(t.muted)
-                            .child(c.dflt.clone().unwrap_or_default()),
-                    ),
-            );
-        }
+        // The columns grid, capped at ~20 rows (it scrolls internally
+        // for the rest), so the DDL below is always reachable without
+        // walking past 50 fields (Steve's ruling, 2026-08-31). +1 for
+        // the header row, +2 for the borders.
+        let n = self.structure().map(|s| s.cols.len()).unwrap_or(0);
+        let row_h = f32::from(crate::prefs::get(cx).table_size().table_row_height());
+        let cap = row_h * (n.min(20) + 1) as f32 + 2.;
+        pane = pane.child(div().flex_none().w_full().h(px(cap)).child(grid));
 
         // ddl and ddl_input come from the same source in Grid::new, so
         // they are Some together.
         if let (Some(state), Some(copy)) = (&self.ddl_input, &self.ddl_copy) {
-            pane = pane.child(
+            let mut ddl = div().v_flex().flex_none().pl(px(PANE_INSET)).pr_3();
+            ddl = ddl.child(
                 div()
                     .h_flex()
                     .items_center()
@@ -249,24 +274,25 @@ impl Grid {
             // text, which gpui divs cannot give. Styles go ON the Input:
             // it overrides the inherited text size (input_text_size),
             // and only its own refinement, which applies last, beats
-            // that. Same 12px value font as the columns table above.
-            // Height is pinned from the line count (one definition per
-            // line; 1.25rem per line + the input's vertical padding),
-            // ceiling 24 rows with the rest reachable by scroll — the
-            // code editor has no auto-grow, and pinning cannot flap.
+            // that. Same 12px value font as the grid above. Height is
+            // pinned from the line count (one definition per line; 20px
+            // per line + the input's vertical padding), ceiling 24 rows
+            // with the rest reachable by scroll — the code editor has
+            // no auto-grow, and pinning cannot flap.
             let rows = state.read(cx).value().lines().count().clamp(2, 24);
             // The frame is OURS, from the app palette — the component's
             // own border/fill are stock colors that ignore the theme
             // (Paper's DDL wore a blue box). appearance(false) strips
             // them; the wrapper draws the card in t.raised/t.border,
             // correct in every theme by construction.
-            pane = pane.child(
+            ddl = ddl.child(
                 div()
                     .rounded(px(6.))
                     .border_1()
                     .border_color(t.border)
                     .bg(t.raised)
                     .py_1()
+                    .mb_2()
                     .child(
                         gpui_component::input::Input::new(state)
                             .disabled(true)
@@ -276,70 +302,11 @@ impl Grid {
                             .font_family(value_font()),
                     ),
             );
+            pane = pane.child(ddl);
         }
 
         pane
     }
-}
-
-fn header_row(t: Pal, z: f32) -> impl IntoElement {
-    let th = move |label: &'static str, w: f32| {
-        div()
-            .w(px(w * z))
-            .flex_none()
-            .text_size(px(HEADER_TEXT * z))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(t.text)
-            .child(label)
-    };
-    div()
-        .h_flex()
-        .h(px(ROW_H * z))
-        .flex_none()
-        .items_center()
-        .gap_2()
-        .border_b_1()
-        .border_color(t.border)
-        .child(th("column", NAME_W))
-        .child(th("type", TYPE_W))
-        .child(th("attributes", ATTR_W))
-        .child(
-            div()
-                .flex_1()
-                .text_size(px(HEADER_TEXT * z))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(t.text)
-                .child("default"),
-        )
-}
-
-fn cell(t: Pal, z: f32, text: &str, w: f32, muted: bool) -> impl IntoElement + use<> {
-    div()
-        .w(px(w * z))
-        .flex_none()
-        .truncate()
-        .text_size(px(CELL_TEXT * z))
-        .font_family(value_font())
-        .text_color(if muted { t.muted } else { t.text })
-        .child(text.to_string())
-}
-
-/// A small attribute badge: "PK" in the accent, "NOT NULL" muted.
-fn chip(t: Pal, z: f32, label: &'static str, accent: bool) -> impl IntoElement {
-    div()
-        .flex_none()
-        .px(px(5.))
-        .rounded(px(4.))
-        .text_size(px(TAG_TEXT * z))
-        .font_family(ui_font())
-        .map(|d| {
-            if accent {
-                d.bg(t.accent.opacity(0.15)).text_color(t.accent)
-            } else {
-                d.bg(t.grid_line.opacity(0.55)).text_color(t.muted)
-            }
-        })
-        .child(label)
 }
 
 #[cfg(test)]

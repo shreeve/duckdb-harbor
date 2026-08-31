@@ -112,6 +112,10 @@ pub(crate) struct Grid {
     pub(crate) filter_input: Option<Entity<gpui_component::input::InputState>>,
     /// Prefetched with the first page, so switching views is instant.
     structure: Option<crate::structure::TableStructure>,
+    /// The Structure view's columns-as-a-grid (structure.rs): the
+    /// table's own schema in an embedded, read-only Grid — one grid,
+    /// many sources, applied to the catalog itself.
+    pub(crate) structure_grid: Option<Entity<Grid>>,
     /// The table/inspector divider (UI.md: divider positions persist —
     /// the width saves at the end of each drag).
     resize: Entity<ResizableState>,
@@ -204,6 +208,11 @@ pub(crate) struct GridDelegate {
     numeric: Vec<bool>,
     /// Schema indices hidden via the Columns popover.
     hidden: std::collections::HashSet<usize>,
+    /// Schema indices whose cell text renders as PILLS — " · "-joined
+    /// tags in the NULL tag's own chassis (the Structure grid's
+    /// attributes column). The grid's one badge vocabulary, extended,
+    /// not forked.
+    pill_cols: std::collections::HashSet<usize>,
     /// Schema column 0 is the hidden rowid identity — plumbing, not
     /// data: excluded from display, the popover, and every fit.
     identity: bool,
@@ -337,6 +346,7 @@ impl Grid {
             editor_input: None,
             numeric: Vec::new(),
             hidden: std::collections::HashSet::new(),
+            pill_cols: std::collections::HashSet::new(),
             identity: rowid,
             widths: std::collections::HashMap::new(),
             visible: Vec::new(),
@@ -530,6 +540,9 @@ impl Grid {
             cx.notify();
         })
         .detach();
+        let structure_grid = structure
+            .as_ref()
+            .map(|s| crate::structure::columns_grid(conn.clone(), s, window, cx));
         Self {
             table,
             conn,
@@ -557,6 +570,7 @@ impl Grid {
             _intercept: intercept,
             filter_input: None,
             structure,
+            structure_grid,
             resize,
             col_search,
             ddl_input,
@@ -777,6 +791,13 @@ impl Grid {
         let next = prefs::PAGE_SIZES[(ix + 1) % prefs::PAGE_SIZES.len()];
         prefs::toggle(cx, |p| p.page_size = next);
         self.fetch(PageReq { page: 0, size: next, filter: FilterChange::Keep, recount: false }, cx);
+    }
+
+    /// Mark a schema column as pill-rendered (see GridDelegate::pill_cols).
+    pub(crate) fn mark_pill_column(&mut self, schema_ix: usize, cx: &mut Context<Self>) {
+        self.table.update(cx, |state, _| {
+            state.delegate_mut().pill_cols.insert(schema_ix);
+        });
     }
 
     /// The grid the footer's stats and pager describe when the Query
@@ -2299,6 +2320,34 @@ impl TableDelegate for GridDelegate {
                     .into_any_element()
             }
             Some(Some(text)) => {
+                if self.pill_cols.contains(&data_col) {
+                    // " · "-joined tags as pills; PK wears the accent,
+                    // the rest the NULL tag's muted chassis.
+                    let mut row = cell.h_flex().gap_1();
+                    for tag in text.split(" \u{00b7} ").filter(|s| !s.is_empty()) {
+                        let accent = tag == "PK";
+                        row = row.child(
+                            div()
+                                .flex_none()
+                                .px(px(5.))
+                                .rounded(px(4.))
+                                .bg(if accent {
+                                    t.accent.opacity(0.15)
+                                } else {
+                                    t.grid_line.opacity(0.55)
+                                })
+                                .text_size(px(TAG_TEXT * p.zoom_factor()))
+                                .font_family(ui_font())
+                                .text_color(if accent {
+                                    t.accent
+                                } else {
+                                    t.muted.opacity(0.85)
+                                })
+                                .child(tag.to_string()),
+                        );
+                    }
+                    return row.into_any_element();
+                }
                 let text = text.clone();
                 cell.child(
                     div()
