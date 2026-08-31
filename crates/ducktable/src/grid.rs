@@ -2549,6 +2549,9 @@ fn build_columns(
             .resizable(false)
             .movable(false)
             .selectable(false)
+            // Sheets' row headers never leave: the gutter pins to the
+            // left while the data columns scroll beneath it.
+            .fixed_left()
     });
     gutter
         .into_iter()
