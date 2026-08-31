@@ -395,12 +395,18 @@ impl SyntaxHighlighter {
                 let node_range: Range<usize> = node.start_byte()..node.end_byte();
                 let highlight_name = SharedString::from(highlight_name.to_string());
 
-                // Merge near range and same highlight name
+                // Merge ADJACENT ranges with the same highlight name.
+                // DuckTable patch: adjacent means touching (==), not
+                // merely ordered (<=) — the old test fused two distant
+                // same-named captures and painted everything BETWEEN
+                // them too (`where … ilike` swallowed the column name
+                // separating the keywords; comma…comma swallowed the
+                // select list).
                 let last_item = highlights.last();
                 let last_range = last_item.map(|item| &item.range).unwrap_or(&(0..0));
                 let last_highlight_name = last_item.map(|item| item.name.clone());
 
-                if last_range.end <= node_range.start
+                if last_range.end == node_range.start
                     && last_highlight_name.as_ref() == Some(&highlight_name)
                 {
                     highlights.push(HighlightItem::new(
