@@ -19,7 +19,7 @@ resolver = "2"
 # archive would have shipped a `pilot --version` that disagreed with its own
 # filename. Inheriting removes the chance to forget one.
 [workspace.package]
-version = "0.19.0"
+version = "0.19.1"
 
 [profile.release]
 lto = true
