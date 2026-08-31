@@ -4,7 +4,7 @@
 //! as `inspector.rs` and `structure.rs` — per-table controls, a
 //! different scope from the header strip's global display prefs.
 
-use crate::chrome::{icon_tile, seg_tile};
+use crate::chrome::{icon_tile, seg_sep, seg_tile};
 use crate::grid::Grid;
 use crate::prefs::ViewMode;
 use crate::theme::{pal, PANE_INSET};
@@ -111,6 +111,7 @@ impl Grid {
                             crate::prefs::toggle(cx, |p| p.view = ViewMode::Data);
                         }),
                     ))
+                    .child(seg_sep(t))
                     .child(seg_tile(
                         "view-structure",
                         "Structure",
@@ -121,6 +122,7 @@ impl Grid {
                             crate::prefs::toggle(cx, |p| p.view = ViewMode::Structure);
                         }),
                     ))
+                    .child(seg_sep(t))
                     .child(seg_tile(
                         "view-query",
                         "Query",

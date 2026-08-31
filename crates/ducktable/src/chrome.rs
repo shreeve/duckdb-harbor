@@ -83,6 +83,7 @@ pub(crate) fn seg_tile(
     handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
     let r = px(7.);
+    let active_weight = FontWeight(560.);
     div()
         .id(id)
         .px(px(11.))
@@ -93,11 +94,50 @@ pub(crate) fn seg_tile(
         .text_size(px(12.))
         .map(|d| {
             if on {
-                d.bg(t.accent).text_color(t.on_accent).font_weight(FontWeight(560.))
+                d.bg(t.accent)
             } else {
-                d.text_color(t.muted).hover(|d| d.bg(t.row_hover))
+                d.hover(|d| d.bg(t.row_hover))
             }
         })
         .on_click(move |e, window, cx| handler(e, window, cx))
-        .child(label)
+        // Constant width in every state: an invisible ghost of the label
+        // at the ACTIVE weight owns the layout, and the visible label
+        // sits on top of it. Bold-on-select can then never widen the
+        // segment, so the track never shifts (the footer's no-jitter
+        // rule, applied to the switcher itself).
+        .child(
+            div()
+                .relative()
+                .child(
+                    div()
+                        .font_weight(active_weight)
+                        .text_color(gpui::transparent_black())
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .map(|d| {
+                            if on {
+                                d.text_color(t.on_accent).font_weight(active_weight)
+                            } else {
+                                d.text_color(t.muted)
+                            }
+                        })
+                        .child(label),
+                ),
+        )
+}
+
+/// The hairline between segments: always present, full height, the same
+/// 1px and color as the track's outer border — the interior lines speak
+/// the exact grammar the outer frame already does where it meets the
+/// fill. Nothing about it ever changes state, so nothing can flicker;
+/// only the accent fill moves when the selection does.
+pub(crate) fn seg_sep(t: Pal) -> Div {
+    div().w(px(1.)).h_full().flex_none().bg(t.border)
 }
