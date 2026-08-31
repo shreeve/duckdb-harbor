@@ -6,22 +6,27 @@
 //! v1 scaffold scope: marked-statement runs (no selection runs yet), a
 //! single result per run, client-side truncation at the page size.
 
-use crate::theme::{pal, value_font, CELL_TEXT, HEADER_TEXT};
+use crate::theme::{pal, value_font, CELL_TEXT};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::table::{Column as TableColumn, Table, TableDelegate, TableState};
-use gpui_component::{Sizable as _, StyledExt as _};
+use gpui_component::StyledExt as _;
 use harbor_client::Conn;
 
 pub(crate) struct QueryView {
     conn: Conn,
     berth: String,
     pub(crate) editor: Entity<InputState>,
-    results: Option<Entity<TableState<ResultsDelegate>>>,
-    /// The last completed run's verdict, footer-rendered: (ms, rows,
-    /// cols); cols == 0 is a resultless statement's "ok".
-    stats: Option<(u64, u64, usize)>,
+    /// The results pane: a REAL Grid, embedded — "a Data window with a
+    /// custom query preceding it". It pages, selects, and honors the
+    /// display toggles exactly like the Data view, and it is read-only
+    /// by construction (no catalog structure, no key, no Edits).
+    results: Option<Entity<crate::grid::Grid>>,
+    /// Bubbles the results grid's repaints (page flips, ticking loads)
+    /// up to the app footer, which reads that grid through us.
+    results_obs: Option<Subscription>,
+    /// A resultless statement's verdict: the engine said ok in N ms.
+    ok_ms: Option<u64>,
     /// A transient footer note ("nothing to run"), cleared by the next
     /// verdict.
     note: Option<SharedString>,
@@ -93,7 +98,8 @@ impl QueryView {
             berth: berth.to_string(),
             editor,
             results: None,
-            stats: None,
+            results_obs: None,
+            ok_ms: None,
             note: None,
             error: None,
             running: false,
@@ -211,24 +217,53 @@ impl QueryView {
                 this.note = None;
                 append_history(&this.berth, &sql_logged, &outcome);
                 match outcome {
-                    Ok(result) => {
-                        let rows = result.row_count;
+                    Ok(mut result) => {
                         let ms = result.time_ms;
-                        let cols = result.columns.len();
-                        this.stats = Some((ms, rows, cols));
-                        if cols == 0 {
+                        if result.columns.is_empty() {
                             this.results = None;
+                            this.results_obs = None;
+                            this.ok_ms = Some(ms);
                         } else {
-                            let delegate = ResultsDelegate::new(result);
-                            this.results = Some(cx.new(|cx| {
-                                TableState::new(delegate, window, cx)
-                                    .col_movable(false)
-                            }));
+                            this.ok_ms = None;
+                            // The bare run fetched everything, so the
+                            // exact total is free; the grid keeps page 0
+                            // and pages the rest as `SELECT * FROM
+                            // (statement) LIMIT … OFFSET …` when the
+                            // statement is SELECT-shaped. Unwrappable
+                            // statements (PRAGMA, SHOW …) keep their
+                            // whole result as one inert page.
+                            let total = result.rows.len() as u64;
+                            let pageable = wrappable(&sql_logged);
+                            let page_size = if pageable {
+                                let size = crate::prefs::get(cx).page_size;
+                                result.rows.truncate(size);
+                                size
+                            } else {
+                                result.rows.len().max(1)
+                            };
+                            let conn = this.conn.clone();
+                            let grid = cx.new(|cx| {
+                                crate::grid::Grid::new_query(
+                                    conn,
+                                    &sql_logged,
+                                    Ok(result),
+                                    Some(total),
+                                    page_size,
+                                    pageable,
+                                    window,
+                                    cx,
+                                )
+                            });
+                            this.results_obs =
+                                Some(cx.observe(&grid, |_, _, cx| cx.notify()));
+                            this.results = Some(grid);
                         }
                     }
                     Err(message) => {
                         this.error = Some(SharedString::from(message));
-                        this.stats = None;
+                        this.results = None;
+                        this.results_obs = None;
+                        this.ok_ms = None;
                     }
                 }
                 cx.notify();
@@ -238,30 +273,29 @@ impl QueryView {
         .detach();
     }
 
-    /// The footer's status parts, in the Data view's exact voice and
-    /// ordering (docs/QUERY.md): ticking while a slow run holds the
-    /// floor, then the verdict — ms and rows leftmost, columns its own
-    /// node (the anti-jump rule).
-    pub(crate) fn status_parts(&self) -> (Option<String>, Option<String>) {
+    /// The footer's transient voice, which outranks the results grid's
+    /// stats while it has something to say: the ticking elapsed line of
+    /// a slow run, a note ("nothing to run"), or a resultless
+    /// statement's "ok". The grid stats themselves come straight from
+    /// the results grid — the footer reads it through results_grid().
+    pub(crate) fn status_override(&self) -> Option<String> {
         if self.show_running {
             if let Some(t) = self.run_started {
-                return (
-                    Some(format!("running\u{2026} {} ms", t.elapsed().as_millis())),
-                    None,
-                );
+                return Some(format!(
+                    "running\u{2026} {} ms",
+                    t.elapsed().as_millis()
+                ));
             }
         }
         if let Some(note) = &self.note {
-            return (Some(note.to_string()), None);
+            return Some(note.to_string());
         }
-        match self.stats {
-            Some((ms, _, 0)) => (Some(format!("ok \u{00b7} {ms} ms")), None),
-            Some((ms, rows, cols)) => (
-                Some(format!("{ms} ms \u{00b7} {} rows", crate::util::commas(rows))),
-                Some(format!("{cols} {}", if cols == 1 { "column" } else { "columns" })),
-            ),
-            None => (None, None),
-        }
+        self.ok_ms.map(|ms| format!("ok \u{00b7} {ms} ms"))
+    }
+
+    /// The embedded results grid, for the footer's stats and pager.
+    pub(crate) fn results_grid(&self) -> Option<Entity<crate::grid::Grid>> {
+        self.results.clone()
     }
 
     pub(crate) fn request_focus(&mut self, cx: &mut Context<Self>) {
@@ -326,7 +360,7 @@ impl Render for QueryView {
             // The run's verdict lives in the FOOTER's status line, the
             // same widgets and ordering as the Data view — no mid-pane
             // strip (Steve's unification ruling, 2026-08-31).
-            .when_some(self.results.clone(), |d, table| {
+            .when_some(self.results.clone(), |d, grid| {
                 // The results pane: a snapshot that snaps (law 5). While
                 // a slow run holds the floor, the prior snapshot fades —
                 // visibly stale, never blanked.
@@ -338,107 +372,29 @@ impl Render for QueryView {
                         .border_t_1()
                         .border_color(t.border)
                         .when(self.show_running, |d| d.opacity(0.45))
-                        .child(
-                        Table::new(&table)
-                            .bordered(false)
-                            .with_size(crate::prefs::get(cx).table_size()),
-                    ),
+                        .child(grid),
                 )
             })
     }
 }
 
-// ============================ results table ===========================
-
-/// A read-only results surface: names and display-ready texts, nothing
-/// else. Editing powers stay with the Data grid's identity gate.
-pub(crate) struct ResultsDelegate {
-    cols: Vec<TableColumn>,
-    rows: Vec<Vec<Option<SharedString>>>,
-}
-
-impl ResultsDelegate {
-    fn new(result: harbor_client::QueryResult) -> Self {
-        let cols = result
-            .columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                TableColumn::new(
-                    format!("c{i}"),
-                    SharedString::from(c.name.clone().unwrap_or_default()),
-                )
-                .width(px(140.))
-            })
-            .collect();
-        let rows = result
-            .rows
-            .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .map(|v| match v {
-                        serde_json::Value::Null => None,
-                        serde_json::Value::String(s) => Some(SharedString::from(s)),
-                        other => Some(SharedString::from(other.to_string())),
-                    })
-                    .collect()
-            })
-            .collect();
-        Self { cols, rows }
+/// Statements the results grid can page by wrapping in a subquery —
+/// DuckDB accepts `SELECT * FROM (statement) LIMIT …` for the
+/// SELECT-shaped family. Anything else stays a single inert page.
+fn wrappable(sql: &str) -> bool {
+    let mut s = sql.trim_start();
+    while let Some(rest) = s.strip_prefix("--") {
+        s = rest.split_once('\n').map(|(_, r)| r).unwrap_or("").trim_start();
     }
-}
-
-impl TableDelegate for ResultsDelegate {
-    fn columns_count(&self, _: &App) -> usize {
-        self.cols.len()
+    if s.starts_with('(') {
+        return true;
     }
-
-    fn rows_count(&self, _: &App) -> usize {
-        self.rows.len()
-    }
-
-    fn column(&self, col_ix: usize, _: &App) -> &TableColumn {
-        &self.cols[col_ix]
-    }
-
-    fn render_td(
-        &mut self,
-        row_ix: usize,
-        col_ix: usize,
-        _: &mut Window,
-        cx: &mut Context<TableState<Self>>,
-    ) -> impl IntoElement {
-        let t = pal(cx);
-        let p = crate::prefs::get(cx);
-        let cell = self.rows.get(row_ix).and_then(|r| r.get(col_ix)).cloned().flatten();
-        let base = div()
-            .h_flex()
-            .items_center()
-            .h(p.table_size().table_row_height())
-            .px_2()
-            .text_size(px(CELL_TEXT * p.zoom_factor()))
-            .font_family(value_font());
-        match cell {
-            Some(text) => base.text_color(t.text).child(text),
-            None => base.text_color(t.muted).child("NULL"),
-        }
-    }
-
-    fn render_th(
-        &mut self,
-        col_ix: usize,
-        _: &mut Window,
-        cx: &mut Context<TableState<Self>>,
-    ) -> impl IntoElement {
-        let t = pal(cx);
-        let p = crate::prefs::get(cx);
-        div()
-            .px_2()
-            .text_size(px(HEADER_TEXT * p.zoom_factor()))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(t.text)
-            .child(self.cols[col_ix].name.clone())
-    }
+    let word: String =
+        s.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "select" | "with" | "from" | "values" | "table"
+    )
 }
 
 // =========================== statement spans ==========================

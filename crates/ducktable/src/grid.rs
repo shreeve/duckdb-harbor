@@ -54,7 +54,16 @@ pub(crate) struct Grid {
     /// Repaints the footer's status line as the query view's run state
     /// ticks and settles; replaced whole when a berth swaps views in.
     pub(crate) query_obs: Option<Subscription>,
-    /// Quoted `"schema"."table"` this grid pages from.
+    /// This grid is someone else's results pane (the Query view): it
+    /// renders body only — no title strip, no filter, no footer. The
+    /// host owns the chrome; the app footer reads THIS grid through it.
+    embedded: bool,
+    /// Whether page fetches make sense for this source: true for tables
+    /// and SELECT-shaped queries (pageable as a wrapped subquery), false
+    /// for a statement whose entire result already sits on page 0.
+    pub(crate) pageable: bool,
+    /// The FROM target this grid pages: a quoted `"schema"."table"`, or
+    /// a parenthesized user statement (queries::query_source).
     source: String,
     title: String,
     /// Current page (0-based) and the size its rows were fetched with.
@@ -248,6 +257,57 @@ impl Grid {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let source = crate::queries::source(schema, name);
+        Self::build(
+            conn, source, title, outcome, total_rows, page_size, structure, false,
+            true, window, cx,
+        )
+    }
+
+    /// A results grid for the Query view: the user's statement IS the
+    /// source — "a Data window with a custom query preceding it" — and
+    /// the same machinery pages `SELECT * FROM (statement)`. No catalog
+    /// structure, so no key, so no Edits: read-only by construction,
+    /// not by gate.
+    pub(crate) fn new_query(
+        conn: Conn,
+        sql: &str,
+        outcome: Result<harbor_client::QueryResult, String>,
+        total_rows: Option<u64>,
+        page_size: usize,
+        pageable: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(
+            conn,
+            crate::queries::query_source(sql),
+            String::new(),
+            outcome,
+            total_rows,
+            page_size,
+            None,
+            true,
+            pageable,
+            window,
+            cx,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        conn: Conn,
+        source: String,
+        title: String,
+        outcome: Result<harbor_client::QueryResult, String>,
+        total_rows: Option<u64>,
+        page_size: usize,
+        structure: Option<crate::structure::TableStructure>,
+        embedded: bool,
+        pageable: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let p = prefs::get(cx);
         let gutter = p.row_numbers;
         // Editability follows capability (docs/EDITING.md): a primary key
@@ -295,7 +355,6 @@ impl Grid {
             }
             Err(message) => (Some(message), 0),
         };
-        let source = crate::queries::source(schema, name);
         let edits = (!delegate.pk_ix.is_empty()).then(|| {
             Edits::new(
                 source.clone(),
@@ -476,6 +535,8 @@ impl Grid {
             conn,
             query_view: None,
             query_obs: None,
+            embedded,
+            pageable,
             source,
             title,
             page: 0,
@@ -716,6 +777,29 @@ impl Grid {
         let next = prefs::PAGE_SIZES[(ix + 1) % prefs::PAGE_SIZES.len()];
         prefs::toggle(cx, |p| p.page_size = next);
         self.fetch(PageReq { page: 0, size: next, filter: FilterChange::Keep, recount: false }, cx);
+    }
+
+    /// The grid the footer's stats and pager describe when the Query
+    /// view is up: the query view's embedded results grid.
+    pub(crate) fn query_results_grid(&self, cx: &App) -> Option<Entity<Grid>> {
+        self.query_view.as_ref().and_then(|q| q.read(cx).results_grid())
+    }
+
+    /// Route a pager action to the grid it belongs to: this one (Data),
+    /// or the Query view's results grid. Both are Grids — the whole
+    /// point of the unification — so one closure fits either.
+    pub(crate) fn pager_dispatch(
+        &mut self,
+        cx: &mut Context<Self>,
+        act: impl FnOnce(&mut Grid, &mut Context<Grid>),
+    ) {
+        if prefs::get(cx).view == ViewMode::Query {
+            if let Some(grid) = self.query_results_grid(cx) {
+                grid.update(cx, act);
+            }
+            return;
+        }
+        act(self, cx)
     }
 
     /// Open or close the raw-SQL filter strip. Closing clears an active
@@ -2356,10 +2440,71 @@ impl TableDelegate for GridDelegate {
     }
 }
 
+impl Grid {
+    /// The table element itself — the virtualized Table plus the
+    /// header-row hit-test canvas — shared by the Data arm and the
+    /// embedded (query-results) render.
+    fn table_body(&mut self, cx: &mut Context<Self>) -> Div {
+        // The table sits in a wrapper we own, whose bounds a canvas
+        // records each frame: double-clicks anywhere in the header row
+        // hit-test against the column boundaries geometrically (widths +
+        // horizontal scroll), so the fit gesture works ON the divider
+        // line itself — the 2px the library's drag handle occludes
+        // included, because ancestors still hear what it doesn't consume.
+        let bounds_store = self.table_bounds.clone();
+        let header_h = prefs::get(cx).table_size().table_row_height();
+        div()
+            .relative()
+            .size_full()
+            // Bubble-phase: the cell's own mouse-down (first click of the
+            // pair) has already set active_cell, so a double-click opens
+            // the editor right there.
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_body_click))
+            .child(
+                Table::new(&self.table)
+                    .bordered(false)
+                    .with_size(prefs::get(cx).table_size()),
+            )
+            // Painted AFTER the table, so nothing the table occludes
+            // (drag handles, scroll containers) can eclipse it — while,
+            // carrying no occlusion of its own, everything beneath still
+            // hears its events (dragging on the line keeps working). The
+            // canvas rides INSIDE the strip: the strip's own bounds are
+            // the header-row frame the hit-test needs.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(header_h)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(Self::divider_double_click),
+                    )
+                    .child(
+                        canvas(move |b, _, _| bounds_store.set(b), |_, _, _, _| {})
+                            .size_full(),
+                    ),
+            )
+    }
+}
+
 impl Render for Grid {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = pal(cx);
         let p = prefs::get(cx);
+        // Self-healing gutter: display prefs are global and set once (the
+        // strip's `#` tile), but EVERY grid honors them — a grid whose
+        // columns predate the flip (the embedded results grid, say)
+        // rebuilds itself on its next paint.
+        let stale_gutter = {
+            let d = self.table.read(cx).delegate();
+            !d.schema_cols.is_empty() && d.gutter != p.row_numbers
+        };
+        if stale_gutter {
+            self.sync_columns(cx);
+        }
         // A closed editor hands focus back to the table here — render is
         // where a &mut Window exists (the InputEvent subscription has
         // none), so the flag set at close time is consumed one frame on.
@@ -2387,14 +2532,48 @@ impl Render for Grid {
                 self.cancel_edit(cx);
             }
         }
+        let view = p.view;
+        let title = self.title.clone();
+        let error = self.error.clone();
+        // Embedded (the Query view's results pane): body only. The host
+        // owns the chrome — its editor above, the app footer below,
+        // which reads this grid's stats and pager state through it. The
+        // ViewMode switch below is the HOST grid's concern; an embedded
+        // grid is always its table.
+        if self.embedded {
+            return div()
+                .size_full()
+                .min_w_0()
+                .v_flex()
+                // The editing keymap is inert without Edits, but the
+                // navigation keys (page-step, ring moves' Escape) ride
+                // the same handler.
+                .on_key_down(cx.listener(Self::on_key))
+                .when_some(error, |d, message| {
+                    // A page-flip fetch that failed: the verdict shows
+                    // here, the prior page stays.
+                    d.child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(t.bad)
+                            .child(message),
+                    )
+                })
+                .child(
+                    div().flex_1().min_h_0().w_full().h_flex().child(
+                        div().flex_1().min_w_0().h_full().child(self.table_body(cx)),
+                    ),
+                )
+                .into_any_element();
+        }
         // The inspector slots in BESIDE the table, below the header strip —
         // the title/toggle row keeps the full width, so opening the panel
         // never shifts it. It is row-level, so it only accompanies Data.
         let inspector = (p.inspector && p.view == ViewMode::Data)
             .then(|| self.inspector(cx).into_any_element());
-        let view = p.view;
-        let title = self.title.clone();
-        let error = self.error.clone();
         div()
             .size_full()
             .min_w_0()
@@ -2431,9 +2610,12 @@ impl Render for Grid {
                             .truncate()
                             .child(title),
                     )
-                    // The display toggles and inspector glyph are data
-                    // concepts; the Structure view drops them.
-                    .when(view == ViewMode::Data, |d| d.child(
+                    // The display toggles ride every view that shows
+                    // rows — Data and Query alike (prefs are global, set
+                    // once, honored by every grid); the Structure view
+                    // drops them. The inspector glyph stays Data-only:
+                    // its panel is row-level.
+                    .when(matches!(view, ViewMode::Data | ViewMode::Query), |d| d.child(
                         // Recessed track, macOS-toolbar style: a subtle
                         // inset container; flat icon tiles with a 2px gap
                         // (edges never touch); the ON state is an
@@ -2456,9 +2638,12 @@ impl Render for Grid {
                                 "Show row numbers",
                                 p.row_numbers,
                                 t,
-                                cx.listener(|this, _, _, cx| {
+                                cx.listener(|_, _, _, cx| {
+                                    // No explicit sync: the toggle
+                                    // refreshes every window and each
+                                    // grid self-heals its gutter at the
+                                    // top of its own render.
                                     prefs::toggle(cx, |p| p.row_numbers = !p.row_numbers);
-                                    this.sync_columns(cx);
                                 }),
                             ))
                             .child(toggle_tile(
@@ -2481,8 +2666,8 @@ impl Render for Grid {
                                     prefs::toggle(cx, |p| p.null_tags = !p.null_tags);
                                 }),
                             )),
-                    )
-                    .child(
+                    ))
+                    .when(view == ViewMode::Data, |d| d.child(
                         // The inspector's panel glyph (Finder/Xcode
                         // convention), right of the lozenge.
                         icon_tile("toggle-inspector", 22., true, t)
@@ -2549,53 +2734,7 @@ impl Render for Grid {
             })
             .child(match view {
                 ViewMode::Data => {
-                    // The table sits in a wrapper we own, whose bounds a
-                    // canvas records each frame: double-clicks anywhere in
-                    // the header row hit-test against the column boundaries
-                    // geometrically (widths + horizontal scroll), so the
-                    // fit gesture works ON the divider line itself — the
-                    // 2px the library's drag handle occludes included,
-                    // because ancestors still hear what it doesn't consume.
-                    let bounds_store = self.table_bounds.clone();
-                    let header_h = prefs::get(cx).table_size().table_row_height();
-                    let table_el = div()
-                        .relative()
-                        .size_full()
-                        // Bubble-phase: the cell's own mouse-down (first
-                        // click of the pair) has already set active_cell,
-                        // so a double-click opens the editor right there.
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(Self::on_body_click),
-                        )
-                        .child(
-                            Table::new(&self.table)
-                                .bordered(false)
-                                .with_size(prefs::get(cx).table_size()),
-                        )
-                        // Painted AFTER the table, so nothing the table
-                        // occludes (drag handles, scroll containers) can
-                        // eclipse it — while, carrying no occlusion of its
-                        // own, everything beneath still hears its events
-                        // (dragging on the line keeps working). The canvas
-                        // rides INSIDE the strip: the strip's own bounds
-                        // are the header-row frame the hit-test needs.
-                        .child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .right_0()
-                                .h(header_h)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(Self::divider_double_click),
-                                )
-                                .child(
-                                    canvas(move |b, _, _| bounds_store.set(b), |_, _, _, _| {})
-                                        .size_full(),
-                                ),
-                        );
+                    let table_el = self.table_body(cx);
                     let body = div().flex_1().min_h_0().w_full();
                     match inspector {
                         // With the inspector open, the two panes share a
@@ -2644,6 +2783,7 @@ impl Render for Grid {
                 }
             })
             .child(self.footer(cx))
+            .into_any_element()
     }
 }
 

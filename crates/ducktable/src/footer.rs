@@ -24,32 +24,86 @@ fn vtext(v: &serde_json::Value) -> String {
     }
 }
 
+/// What the footer's right-anchored cluster renders from — computed off
+/// whichever grid the current view shows: the Data view's own, or the
+/// Query view's embedded results grid. Both are Grids; the footer does
+/// not care which.
+pub(crate) struct FooterFacts {
+    pub(crate) ms: u64,
+    pub(crate) count: usize,
+    pub(crate) cols: usize,
+    pub(crate) loading: bool,
+    pub(crate) page: usize,
+    pub(crate) page_size: usize,
+    pub(crate) total: Option<u64>,
+    pub(crate) can_prev: bool,
+    pub(crate) can_next: bool,
+    pub(crate) can_last: bool,
+    pub(crate) pageable: bool,
+}
+
 impl Grid {
+    pub(crate) fn footer_facts(&self, cx: &App) -> FooterFacts {
+        let (count, cols, loading) = self.table_facts(cx);
+        FooterFacts {
+            ms: self.last_time_ms,
+            count,
+            cols,
+            loading,
+            page: self.page,
+            page_size: self.page_size,
+            total: self.total_rows,
+            can_prev: self.page > 0,
+            can_next: self.has_next(cx),
+            can_last: matches!(self.last_page(), Some(lp) if self.page < lp),
+            pageable: self.pageable,
+        }
+    }
+
     pub(crate) fn footer(&self, cx: &mut Context<Self>) -> Div {
         let t = pal(cx);
         let view = crate::prefs::get(cx).view;
-        let (count, cols, loading) = self.table_facts(cx);
-        let can_prev = self.page > 0;
-        let can_next = self.has_next(cx);
-        let can_last = matches!(self.last_page(), Some(lp) if self.page < lp);
+        // The grid this footer describes. The Query view may have none
+        // yet (no run, or a resultless statement) — then only the query
+        // view's own status override speaks.
+        let qgrid = (view == ViewMode::Query)
+            .then(|| self.query_results_grid(cx))
+            .flatten();
+        let facts = match (view, &qgrid) {
+            (ViewMode::Query, Some(g)) => Some(g.read(cx).footer_facts(cx)),
+            (ViewMode::Query, None) => None,
+            _ => Some(self.footer_facts(cx)),
+        };
+        // The Query view's transient voice — ticking "running…", a
+        // note, or a resultless statement's "ok · N ms" — outranks the
+        // grid stats while it has something to say.
+        let qoverride = (view == ViewMode::Query)
+            .then(|| {
+                self.query_view.as_ref().and_then(|q| q.read(cx).status_override())
+            })
+            .flatten();
         let filter_open = self.filter_input.is_some();
-        let base = self.page * self.page_size;
-        let (first, last) = (base + 1, base + count);
-        let rows_part = if count == 0 {
-            "0 rows".to_string()
-        } else {
-            match self.total_rows {
-                Some(t) => format!(
-                    "{}\u{2013}{} of {} rows",
-                    commas(first as u64),
-                    commas(last as u64),
-                    commas(t)
-                ),
-                None => {
-                    format!("{}\u{2013}{} rows", commas(first as u64), commas(last as u64))
+        let rows_part = facts.as_ref().map(|f| {
+            let base = f.page * f.page_size;
+            let (first, last) = (base + 1, base + f.count);
+            if f.count == 0 {
+                "0 rows".to_string()
+            } else {
+                match f.total {
+                    Some(t) => format!(
+                        "{}\u{2013}{} of {} rows",
+                        commas(first as u64),
+                        commas(last as u64),
+                        commas(t)
+                    ),
+                    None => format!(
+                        "{}\u{2013}{} rows",
+                        commas(first as u64),
+                        commas(last as u64)
+                    ),
                 }
             }
-        };
+        });
         // Ordering rule for a jitter-free footer: in a right-justified
         // cluster an element only moves when something to its RIGHT
         // changes width. The pager — the only interactive element — is
@@ -62,34 +116,41 @@ impl Grid {
         // The columns text is its OWN node — as a suffix of one longer
         // string its glyphs land a subpixel differently and the view
         // switch shows a 1px shift.
-        let columns_part =
-            format!("{} {}", cols, if cols == 1 { "column" } else { "columns" });
-        let loading_empty = loading && count == 0;
-        let pager_visible = view == ViewMode::Data && !loading_empty;
-        // The Query view's stats live HERE, same widgets and ordering as
-        // Data's — not in a mid-pane strip (docs/QUERY.md: the status
-        // line follows the anti-jump ordering).
-        let (query_prefix, query_columns) = if view == ViewMode::Query {
-            self.query_view
-                .as_ref()
-                .map(|q| q.read(cx).status_parts())
-                .unwrap_or((None, None))
-        } else {
-            (None, None)
+        let columns_part = facts.as_ref().map(|f| {
+            format!("{} {}", f.cols, if f.cols == 1 { "column" } else { "columns" })
+        });
+        let verdict = facts.as_ref().map(|f| {
+            format!("{} ms \u{00b7} {}", f.ms, rows_part.clone().unwrap_or_default())
+        });
+        let loading_empty = view == ViewMode::Data
+            && facts.as_ref().is_some_and(|f| f.loading && f.count == 0);
+        let pager_visible = match view {
+            ViewMode::Data => !loading_empty,
+            // The pager holds its ground even while a run's ticking
+            // override speaks (always-present chrome); it only stays
+            // home for unpageable statements and empty scratchpads.
+            ViewMode::Query => facts.as_ref().is_some_and(|f| f.pageable),
+            ViewMode::Structure => false,
         };
         let status_prefix = match view {
             ViewMode::Data if loading_empty => Some("loading...".to_string()),
-            ViewMode::Data => {
-                Some(format!("{} ms \u{00b7} {rows_part}", self.last_time_ms))
-            }
-            ViewMode::Query => query_prefix,
+            ViewMode::Data => verdict,
+            ViewMode::Query => qoverride.clone().or(verdict),
             ViewMode::Structure => None,
         };
-        let status_columns = if view == ViewMode::Query {
-            query_columns
-        } else {
-            (view == ViewMode::Structure || pager_visible).then_some(columns_part)
+        // Structure lists its columns with no prefix beside them; while
+        // the query override speaks, the grid's column count stays quiet.
+        let status_columns = match view {
+            ViewMode::Structure => columns_part,
+            ViewMode::Data if pager_visible => columns_part,
+            ViewMode::Query if qoverride.is_none() => columns_part,
+            _ => None,
         };
+        let (can_prev, can_next, can_last, per) = facts
+            .as_ref()
+            .map(|f| (f.can_prev, f.can_next, f.can_last, f.page_size))
+            .unwrap_or((false, false, false, 0));
+        let dotted = status_prefix.is_some();
         div()
             .h_flex()
             .h(px(38.))
@@ -225,7 +286,7 @@ impl Grid {
                     .text_color(t.muted)
                     .when_some(status_prefix, |d, text| d.child(div().child(text)))
                     .when_some(status_columns, |d, text| {
-                        d.when(view == ViewMode::Data, |d| d.child(div().child("\u{00b7}")))
+                        d.when(dotted, |d| d.child(div().child("\u{00b7}")))
                             .child(div().child(text))
                     })
                     .when(pager_visible, |d| {
@@ -253,7 +314,7 @@ impl Grid {
                                             can_prev,
                                         )
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.jump_first(cx)
+                                            this.pager_dispatch(cx, |g, cx| g.jump_first(cx))
                                         })),
                                     )
                                     .child(
@@ -263,7 +324,7 @@ impl Grid {
                                             can_prev,
                                         )
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.prev_page(cx)
+                                            this.pager_dispatch(cx, |g, cx| g.prev_page(cx))
                                         })),
                                     )
                                     .child(
@@ -283,9 +344,11 @@ impl Grid {
                                                 )
                                                 .build(window, cx)
                                             })
-                                            .child(format!("{} per", commas(self.page_size as u64)))
+                                            .child(format!("{} per", commas(per as u64)))
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.cycle_page_size(cx);
+                                                this.pager_dispatch(cx, |g, cx| {
+                                                    g.cycle_page_size(cx)
+                                                });
                                             })),
                                     )
                                     .child(
@@ -295,7 +358,7 @@ impl Grid {
                                             can_next,
                                         )
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.next_page(cx)
+                                            this.pager_dispatch(cx, |g, cx| g.next_page(cx))
                                         })),
                                     )
                                     .child(
@@ -305,7 +368,7 @@ impl Grid {
                                             can_last,
                                         )
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.jump_last(cx)
+                                            this.pager_dispatch(cx, |g, cx| g.jump_last(cx))
                                         })),
                                     ),
                             )
