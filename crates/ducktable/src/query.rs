@@ -197,11 +197,52 @@ impl QueryView {
             }
         })
         .detach();
+        // Read on the UI thread; the fetch commits the size it ran with.
+        let size = crate::prefs::get(cx).page_size;
         cx.spawn_in(window, async move |this, cx| {
             let sql_logged = sql.clone();
-            let outcome = cx
+            // A send is at most the two queries the Data view gives a
+            // table — and usually just ONE (Steve's probe-row ruling,
+            // 2026-08-31): fetch page 0 of the wrapped statement with
+            // LIMIT size+1. A result that fits the page IS its own
+            // exact count — no second query. Only the extra row's
+            // arrival proves there is more, and only then does
+            // count(*) fire for the exact total. The page query
+            // doubles as the wrap probe: if it fails (not actually
+            // SELECT-shaped, or a syntax error), the statement runs
+            // bare, so error verdicts always quote the user's own
+            // SQL, never the wrapper's.
+            let (outcome, total, paged) = cx
                 .background_executor()
-                .spawn(async move { harbor_client::query(&conn, &sql) })
+                .spawn(async move {
+                    if wrappable(&sql) {
+                        let src = crate::queries::query_source(&sql);
+                        let probe = harbor_client::query(
+                            &conn,
+                            &crate::queries::page_sql(&src, false, &None, 0, size + 1),
+                        );
+                        if let Ok(mut result) = probe {
+                            if result.rows.len() <= size {
+                                let total = result.rows.len() as u64;
+                                return (Ok(result), Some(total), true);
+                            }
+                            result.rows.truncate(size);
+                            result.row_count = size as u64;
+                            // A failed count leaves the total unknown;
+                            // the grid's full-page heuristic still
+                            // paces has_next, and the footer reads
+                            // "1–5,000 rows" — honest, not wrong.
+                            let total = harbor_client::query(
+                                &conn,
+                                &crate::queries::count_sql(&src, &None),
+                            )
+                            .ok()
+                            .and_then(|r| crate::queries::count_of(&r));
+                            return (Ok(result), total, true);
+                        }
+                    }
+                    (harbor_client::query(&conn, &sql), None, false)
+                })
                 .await;
             this.update_in(cx, |this, window, cx| {
                 // Fenced: only the newest run may land (docs/QUERY.md).
@@ -215,9 +256,9 @@ impl QueryView {
                 this.run_started = None;
                 this.error = None;
                 this.note = None;
-                append_history(&this.berth, &sql_logged, &outcome);
+                append_history(&this.berth, &sql_logged, &outcome, total);
                 match outcome {
-                    Ok(mut result) => {
+                    Ok(result) => {
                         let ms = result.time_ms;
                         if result.columns.is_empty() {
                             this.results = None;
@@ -225,21 +266,19 @@ impl QueryView {
                             this.ok_ms = Some(ms);
                         } else {
                             this.ok_ms = None;
-                            // The bare run fetched everything, so the
-                            // exact total is free; the grid keeps page 0
-                            // and pages the rest as `SELECT * FROM
-                            // (statement) LIMIT … OFFSET …` when the
-                            // statement is SELECT-shaped. Unwrappable
-                            // statements (PRAGMA, SHOW …) keep their
-                            // whole result as one inert page.
-                            let total = result.rows.len() as u64;
-                            let pageable = wrappable(&sql_logged);
-                            let page_size = if pageable {
-                                let size = crate::prefs::get(cx).page_size;
-                                result.rows.truncate(size);
-                                size
+                            // A paged run holds page 0 of a paged grid
+                            // (total exact, or unknown if the count
+                            // failed); a bare run (unwrappable, or the
+                            // wrap probe failed) holds its entire
+                            // result as one inert page whose total is
+                            // its own length.
+                            let (grid_total, page_size) = if paged {
+                                (total, size)
                             } else {
-                                result.rows.len().max(1)
+                                (
+                                    Some(result.rows.len() as u64),
+                                    result.rows.len().max(1),
+                                )
                             };
                             let conn = this.conn.clone();
                             let grid = cx.new(|cx| {
@@ -247,9 +286,9 @@ impl QueryView {
                                     conn,
                                     &sql_logged,
                                     Ok(result),
-                                    Some(total),
+                                    grid_total,
                                     page_size,
-                                    pageable,
+                                    paged,
                                     window,
                                     cx,
                                 )
@@ -520,6 +559,9 @@ fn append_history(
     berth: &str,
     sql: &str,
     outcome: &Result<harbor_client::QueryResult, String>,
+    // A counted run's exact total — history should say the query
+    // MATCHED 520k rows, not that page 0 held 5,000 of them.
+    total: Option<u64>,
 ) {
     let Some(path) = history_path(berth) else { return };
     if let Some(dir) = path.parent() {
@@ -531,7 +573,8 @@ fn append_history(
         .unwrap_or(0);
     let entry = match outcome {
         Ok(r) => serde_json::json!({
-            "ts": ts, "sql": sql, "ok": true, "ms": r.time_ms, "rows": r.row_count,
+            "ts": ts, "sql": sql, "ok": true, "ms": r.time_ms,
+            "rows": total.unwrap_or(r.row_count),
         }),
         Err(message) => serde_json::json!({
             "ts": ts, "sql": sql, "ok": false, "error": message,
