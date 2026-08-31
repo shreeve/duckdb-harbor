@@ -13,6 +13,34 @@ asks you for a path. You connect to a berth by name; Harbor owns the engine,
 the files, and the versioning. Local files work through Harbor's
 spawn-on-demand aliases, the same way `pilot` opens them.
 
+## Screenshots
+
+One window, three views — and three of the built-in themes. Click any
+shot for full resolution.
+
+**Structure** — every column with its type, attributes, and defaults,
+and the table's DDL below, drawn as the engine would write it. *(Duck
+Light theme.)*
+
+[![Structure view](https://raw.githubusercontent.com/shreeve/ducktable/main/docs/shots/01-structure.png)](https://raw.githubusercontent.com/shreeve/ducktable/main/docs/shots/01-structure.png)
+
+**Data** — 27k rows paged 5,000 at a time in 28ms, with row numbers,
+right-aligned numerics, and NULL tags each one keystroke away. *(Paper
+theme.)*
+
+[![Data view](https://raw.githubusercontent.com/shreeve/ducktable/main/docs/shots/02-data.png)](https://raw.githubusercontent.com/shreeve/ducktable/main/docs/shots/02-data.png)
+
+**Query** — a SQL scratchpad above live results. Statements wear bands
+in the gutter, line numbers restart per statement to match the engine's
+own `LINE n` diagnostics, and ⌘Enter sends the statement under the
+caret. *(Midnight theme.)*
+
+[![Query view](https://raw.githubusercontent.com/shreeve/ducktable/main/docs/shots/03-query.png)](https://raw.githubusercontent.com/shreeve/ducktable/main/docs/shots/03-query.png)
+
+*(GitHub won't run scripts in a README, so the real slideshow lives at
+[`docs/shots/index.html`](docs/shots/index.html) — open it locally for
+arrow-key navigation, Escape to leave.)*
+
 ## Install
 
 ```console

@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<!-- The DuckTable screenshot carousel: three shots, three themes, zero
+     dependencies. ← / → (or click the edges) to move, Escape to leave.
+     Works from a local checkout (open this file) and from any static
+     host — the images load relative to it. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DuckTable — Screenshots</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0; height: 100%; background: #14161c; color: #d8d4c8;
+    font: 14px/1.4 -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif;
+    overflow: hidden; user-select: none;
+  }
+  .stage {
+    position: fixed; inset: 0; display: flex;
+    align-items: center; justify-content: center;
+  }
+  .stage img {
+    max-width: calc(100vw - 120px); max-height: calc(100vh - 96px);
+    border-radius: 10px; box-shadow: 0 24px 80px rgba(0,0,0,.55);
+    opacity: 0; transition: opacity .18s ease;
+  }
+  .stage img.on { opacity: 1; }
+  .zone {
+    position: fixed; top: 0; bottom: 0; width: 25%;
+    display: flex; align-items: center; border: 0; background: none;
+    color: #d8d4c8; opacity: 0; transition: opacity .15s ease; cursor: pointer;
+  }
+  .zone:hover { opacity: .8; }
+  .zone svg { width: 40px; height: 40px; }
+  .zone.prev { left: 0;  justify-content: flex-start; padding-left: 16px; }
+  .zone.next { right: 0; justify-content: flex-end;   padding-right: 16px; }
+  .caption {
+    position: fixed; left: 0; right: 0; bottom: 18px; text-align: center;
+    pointer-events: none; text-shadow: 0 1px 3px rgba(0,0,0,.6);
+  }
+  .caption b { color: #fff; font-weight: 600; }
+  .caption .dots { letter-spacing: 6px; margin-top: 4px; color: #6d7280; }
+  .caption .dots .here { color: #fff; }
+</style>
+</head>
+<body>
+  <div class="stage"><img id="shot" alt=""></div>
+  <button class="zone prev" aria-label="Previous">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
+  </button>
+  <button class="zone next" aria-label="Next">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6l6 6-6 6"/></svg>
+  </button>
+  <div class="caption">
+    <div id="label"></div>
+    <div class="dots" id="dots"></div>
+  </div>
+<script>
+  const shots = [
+    ["01-structure.png", "<b>Structure</b> — columns, attributes, defaults, and the DDL (Duck Light)"],
+    ["02-data.png",      "<b>Data</b> — 27k rows, paged and instant (Paper)"],
+    ["03-query.png",     "<b>Query</b> — the scratchpad, statement bands, live results (Midnight)"],
+  ];
+  const img = document.getElementById("shot");
+  const label = document.getElementById("label");
+  const dots = document.getElementById("dots");
+  let at = 0;
+  function show(n) {
+    at = (n + shots.length) % shots.length;
+    img.classList.remove("on");
+    const [src, cap] = shots[at];
+    const next = new Image();
+    next.onload = () => { img.src = src; img.classList.add("on"); };
+    next.src = src;
+    label.innerHTML = cap;
+    dots.innerHTML = shots
+      .map((_, i) => `<span class="${i === at ? "here" : ""}">●</span>`)
+      .join("");
+  }
+  document.querySelector(".prev").onclick = () => show(at - 1);
+  document.querySelector(".next").onclick = () => show(at + 1);
+  addEventListener("keydown", (e) => {
+    if (e.key === "ArrowLeft") show(at - 1);
+    else if (e.key === "ArrowRight" || e.key === " ") show(at + 1);
+    else if (e.key === "Escape") history.length > 1 ? history.back() : window.close();
+  });
+  show(0);
+</script>
+</body>
+</html>
