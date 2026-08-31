@@ -193,6 +193,12 @@ impl DuckTable {
                         .as_ref()
                         .map(|q| cx.observe(q, |_, _, cx| cx.notify()));
                 });
+                // A fresh grid hears the keyboard at once: landing on a
+                // table and pressing ↓ must navigate, not vanish into
+                // the sidebar. Data only — Query keeps its editor.
+                if crate::prefs::get(cx).view == crate::prefs::ViewMode::Data {
+                    grid.update(cx, |g, cx| g.request_focus(cx));
+                }
                 state.grid = Some(grid);
                 cx.notify();
             })

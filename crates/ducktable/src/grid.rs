@@ -427,12 +427,23 @@ impl Grid {
                 }
             }
             let key = ks.key.clone();
-            grid.update(cx, |g, cx| match key.as_str() {
-                "up" => g.move_ring(-1, 0, cx),
-                "down" => g.move_ring(1, 0, cx),
-                "left" => g.move_ring(0, -1, cx),
-                "right" => g.move_ring(0, 1, cx),
-                _ => g.clear_ring(cx),
+            grid.update(cx, |g, cx| {
+                // A bare arrow with no ring yet just takes the top-left
+                // seat (Steve's ruling): the first press shows you where
+                // you are, the next one moves. seed_ring says whether it
+                // placed the ring; a placed ring consumes the press.
+                let seeded =
+                    key != "escape" && g.seed_ring(cx);
+                if seeded {
+                    return;
+                }
+                match key.as_str() {
+                    "up" => g.move_ring(-1, 0, cx),
+                    "down" => g.move_ring(1, 0, cx),
+                    "left" => g.move_ring(0, -1, cx),
+                    "right" => g.move_ring(0, 1, cx),
+                    _ => g.clear_ring(cx),
+                }
             });
             cx.stop_propagation();
         });
@@ -1158,8 +1169,25 @@ impl Grid {
         // (⌥←/⌥→, the view-switcher carousel, live at App level in
         // main.rs — they must keep working in Structure mode, where
         // this listener's focus source doesn't exist.)
+        // A navigation chord with no ring on the page yet: assume the
+        // journey starts at the top-left cell — Sheets' A1 assumption —
+        // and let the chord mean what it means from there (⌘↓ reaches
+        // the last row in one press, ⌥↓ flips the page). Bare arrows
+        // never arrive here — the interceptor in Grid::build owns them,
+        // where a first press just takes the seat. Navigation only:
+        // keys that edit (Enter, ⌫, typing) still require a
+        // deliberately chosen cell, and ⇧ combos stay inert with range
+        // selection reserved.
+        let nav_key = matches!(
+            ks.key.as_str(),
+            "up" | "down" | "left" | "right" | "home" | "end" | "pageup" | "pagedown"
+        );
+        if nav_key && !m.shift && !m.control {
+            self.seed_ring(cx);
+        }
         // The modified-arrow grammar (docs/EDITING.md "Navigation"), all
-        // of it needing a cell to move. JUMP rides the ring's own clamp:
+        // of it needing a cell to move — which the seed above guarantees
+        // a navigation key always has. JUMP rides the ring's own clamp:
         // an impossible distance lands exactly on the edge.
         const JUMP: i32 = 1_000_000;
         if self.table.read(cx).delegate().active_cell.is_some() {
@@ -1673,6 +1701,26 @@ impl Grid {
         });
         self.header_chase = true;
         cx.notify();
+    }
+
+    /// The A1 assumption (Steve's ruling): a navigation gesture with no
+    /// ring on the page yet starts at the top-left cell. Returns whether
+    /// it placed the ring — a bare arrow's first press consumes itself
+    /// on that placement (the interceptor checks), while chords apply
+    /// their motion from the fresh seat (⌘↓ still reaches the last row
+    /// in one press). An empty page seats nobody.
+    fn seed_ring(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut seeded = false;
+        self.table.update(cx, |state, cx| {
+            let d = state.delegate_mut();
+            if d.active_cell.is_none() && !d.rows.is_empty() && !d.visible.is_empty() {
+                d.active_cell = Some((0, d.visible[0]));
+                seeded = true;
+                select_row(state, 0, cx);
+                cx.notify();
+            }
+        });
+        seeded
     }
 
     /// Move the active-cell ring. Columns move along the VISIBLE order,
