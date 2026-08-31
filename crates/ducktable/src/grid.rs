@@ -452,19 +452,15 @@ impl Grid {
             .clone()
             .map(|ddl| cx.new(|_| crate::copy_button::CopyButton::new("Copy DDL", ddl)));
         let ddl_input = ddl.map(|ddl| {
-            // Auto-grow mode with the height seeded AND capped to the line
-            // count (one definition per line, so the count IS the height,
-            // ceiling 24 with the rest reachable by scroll). This exact
-            // spelling is load-bearing: unseeded auto-grow applies its
-            // measured height a frame late (the DDL flapped between two
-            // rows and full size with mouse activity), and the plainer
-            // `.multi_line(true).rows(n)` renders ONE row in this crate
-            // version. Verified working as written; change with proof.
-            let rows = ddl.lines().count().clamp(2, 24);
+            // A code editor (language "duckdb"), so the DDL wears the
+            // same tree-sitter highlighting as the Query view — but
+            // numberless, and with its height pinned at render time from
+            // the line count (structure.rs). The old AutoGrow spelling
+            // measured a frame late and flapped; a pinned height cannot.
             cx.new(|cx| {
                 gpui_component::input::InputState::new(window, cx)
-                    .auto_grow(2, 24)
-                    .rows(rows)
+                    .code_editor("duckdb")
+                    .line_number(false)
                     .default_value(ddl)
             })
         });

@@ -250,11 +250,31 @@ impl Grid {
             // it overrides the inherited text size (input_text_size),
             // and only its own refinement, which applies last, beats
             // that. Same 12px value font as the columns table above.
+            // Height is pinned from the line count (one definition per
+            // line; 1.25rem per line + the input's vertical padding),
+            // ceiling 24 rows with the rest reachable by scroll — the
+            // code editor has no auto-grow, and pinning cannot flap.
+            let rows = state.read(cx).value().lines().count().clamp(2, 24);
+            // The frame is OURS, from the app palette — the component's
+            // own border/fill are stock colors that ignore the theme
+            // (Paper's DDL wore a blue box). appearance(false) strips
+            // them; the wrapper draws the card in t.raised/t.border,
+            // correct in every theme by construction.
             pane = pane.child(
-                gpui_component::input::Input::new(state)
-                    .disabled(true)
-                    .text_size(px(CELL_TEXT * z))
-                    .font_family(value_font()),
+                div()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(t.border)
+                    .bg(t.raised)
+                    .py_1()
+                    .child(
+                        gpui_component::input::Input::new(state)
+                            .disabled(true)
+                            .appearance(false)
+                            .h(px(rows as f32 * 20. + 14.))
+                            .text_size(px(CELL_TEXT * z))
+                            .font_family(value_font()),
+                    ),
             );
         }
 
