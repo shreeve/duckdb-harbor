@@ -32,7 +32,7 @@ One meaning per key. No contextual double-agents.
 |---|---|---|
 | typing | opens the editor **replacing** the value, seeded with the keystroke | inserts text |
 | Enter | opens the editor **keeping** the value, caret at end — but during a Tab run, sweeps to the run's anchor column one row down (the carriage return) | confirms the cell, ring moves down — or sweeps, if a Tab run is going |
-| ⇧Enter | (same as Enter, sweeping/moving up) | confirms, ring moves up (or sweeps up) |
+| ⇧Enter | (same as Enter, sweeping/moving up) | inserts a line break — the chat-composer convention (Slack, every message box); confirm-and-move-up retired in its favor |
 | Tab / ⇧Tab | moves the ring right / left, arming the typewriter anchor | confirms, ring moves right / left, anchor kept |
 | arrows | move the ring | *replace entry:* confirm + move the ring · *kept-value entry:* move the caret |
 | double-click | opens the editor keeping the value, caret at the click | — |
@@ -41,8 +41,9 @@ One meaning per key. No contextual double-agents.
 | ⌃⇧N | stages NULL explicitly, any type | — |
 | ⌘⌫ | stages a row DELETE (ghost strikethrough; reversible until commit) | — |
 | ⌘Z / ⌘⇧Z | un-stages / re-stages the most recent change | text undo / redo |
-| ⌘S | commits all staged changes — one transaction, all or nothing | confirms the cell, then commits |
-| ⌥Enter | — | newline (⌘Enter also, per Sheets muscle memory — ⌘Enter never commits) |
+| ⌘S | commits all staged changes — one transaction, all or nothing | confirms the cell, then commits (⌘Enter is its equal) |
+| ⌥Enter | — | newline (the Sheets-hand twin of ⇧Enter) |
+| ⌘Enter | commits all staged changes | confirms the cell, then commits — "send it," the AI-composer universal (Steve's ruling, 2026: the world's ⌘Enter now means send, and ⇧Enter means newline; the older Sheets ⌘Enter-newline reflex keeps ⌥Enter) |
 
 The replace-vs-kept-value arrow split is Sheets' own physics, unnamed:
 the entry gesture *is* the state, your finger chose it a second ago. No

@@ -944,9 +944,22 @@ impl Grid {
             }
             match ks.key.as_str() {
                 "escape" => self.cancel_edit(cx),
-                "enter" if m.platform || m.alt => return, // newline — the input's
+                // The newline family (Steve's ruling): ⇧Enter first —
+                // the chat-composer convention every hand knows — with
+                // ⌥Enter as the Sheets twin. They belong to the text.
+                // (Visibly inert until the multi-line editor arrives —
+                // reserved is not dead.)
+                "enter" if m.shift || m.alt => return,
+                "enter" if m.platform => {
+                    // ⌘Enter — "send it" (normally consumed by the input
+                    // and routed via PressEnter{secondary}; this arm is
+                    // the backstop).
+                    if self.confirm_and_move(0, 0, false, cx) {
+                        self.commit(cx);
+                    }
+                }
                 "enter" => {
-                    self.confirm_and_move(if m.shift { -1 } else { 1 }, 0, false, cx);
+                    self.confirm_and_move(1, 0, false, cx);
                 }
                 "tab" => {
                     self.confirm_and_move(0, if m.shift { -1 } else { 1 }, true, cx);
@@ -980,7 +993,9 @@ impl Grid {
         if !self.table.focus_handle(cx).contains_focused(window, cx) {
             return;
         }
-        if m.platform && !m.shift && ks.key == "s" {
+        // ⌘S and ⌘Enter both mean "send it" — the file-save reflex and
+        // the AI-composer reflex arrive at the same transaction.
+        if m.platform && !m.shift && (ks.key == "s" || ks.key == "enter") {
             self.commit(cx);
             cx.stop_propagation();
             return;
@@ -1216,8 +1231,16 @@ impl Grid {
         // subscription is the belt to on_key's suspenders. Idempotent:
         // whoever runs first takes the editor.
         cx.subscribe(&input, |grid, _, ev: &gpui_component::input::InputEvent, cx| {
-            if matches!(ev, gpui_component::input::InputEvent::PressEnter { .. }) {
-                grid.confirm_and_move(1, 0, false, cx);
+            if let gpui_component::input::InputEvent::PressEnter { secondary } = ev {
+                if *secondary {
+                    // ⌘Enter — "send it", the AI-era universal: confirm
+                    // this cell, then commit everything staged.
+                    if grid.confirm_and_move(0, 0, false, cx) {
+                        grid.commit(cx);
+                    }
+                } else {
+                    grid.confirm_and_move(1, 0, false, cx);
+                }
             }
         })
         .detach();
