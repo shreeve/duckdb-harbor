@@ -247,7 +247,7 @@ impl Grid {
         let cap = row_h * (n.min(20) + 1) as f32 + 2.;
         pane = pane.child(div().flex_none().w_full().h(px(cap)).child(grid));
 
-        // ddl and ddl_input come from the same source in Grid::new, so
+        // ddl and ddl_input come from the same source in Grid::build, so
         // they are Some together.
         if let (Some(state), Some(copy)) = (&self.ddl_input, &self.ddl_copy) {
             let mut ddl = div().v_flex().flex_none().pl(px(PANE_INSET)).pr_3();
@@ -271,15 +271,15 @@ impl Grid {
             );
             // A disabled Input keeps native text selection (drag, Cmd+C)
             // while gating off every mutation — read-only selectable
-            // text, which gpui divs cannot give. Styles go ON the Input:
-            // it overrides the inherited text size (input_text_size),
-            // and only its own refinement, which applies last, beats
-            // that. Same 12px value font as the grid above. Height is
-            // pinned from the line count (one definition per line; 20px
-            // per line + the input's vertical padding), ceiling 24 rows
-            // with the rest reachable by scroll — the code editor has
-            // no auto-grow, and pinning cannot flap.
-            let rows = state.read(cx).value().lines().count().clamp(2, 24);
+            // text, which gpui divs cannot give. The card sits EXACTLY
+            // content-sized and cannot scroll: line height is pinned ON
+            // the input so rows × line height IS the content height,
+            // and the vendored gpui-component carries the "a disabled
+            // editor never scrolls itself" patch (no scroll-past-end
+            // room, no cursor-track nudges — see vendor/, Cargo.toml
+            // [patch]). The wheel falls through to the pane naturally.
+            let rows = state.read(cx).value().lines().count().max(2);
+            let line_h = 20. * z;
             // The frame is OURS, from the app palette — the component's
             // own border/fill are stock colors that ignore the theme
             // (Paper's DDL wore a blue box). appearance(false) strips
@@ -297,8 +297,9 @@ impl Grid {
                         gpui_component::input::Input::new(state)
                             .disabled(true)
                             .appearance(false)
-                            .h(px(rows as f32 * 20. + 14.))
+                            .h(px(rows as f32 * line_h + 14.))
                             .text_size(px(CELL_TEXT * z))
+                            .line_height(px(line_h))
                             .font_family(value_font()),
                     ),
             );

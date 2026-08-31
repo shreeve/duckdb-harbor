@@ -302,6 +302,31 @@ impl DuckTable {
     }
 }
 
+impl crate::app::DuckTable {
+    /// The sidebar's table list, in the exact order and under the exact
+    /// filter the tree renders — ⌥←/⌥→ (App::step_table) walks THIS
+    /// list, so arrow order always agrees with what the eye sees.
+    pub(crate) fn visible_tables(&self, cx: &App) -> Vec<(String, String)> {
+        let crate::app::Phase::Connected { catalog, .. } = &self.phase else {
+            return Vec::new();
+        };
+        let filter = self
+            .table_filter
+            .as_ref()
+            .map(|i| i.read(cx).value().to_string().to_lowercase())
+            .filter(|s| !s.is_empty());
+        let mut out = Vec::new();
+        for schema in catalog.schemas() {
+            for table in catalog.tables_in(schema) {
+                if matches(&table.name, &filter) {
+                    out.push((schema.to_string(), table.name.clone()));
+                }
+            }
+        }
+        out
+    }
+}
+
 /// The one filter test both sidebar lists apply, spelled once.
 fn matches(name: &str, filter: &Option<String>) -> bool {
     match filter {
