@@ -2533,7 +2533,15 @@ impl Render for Grid {
             }
         }
         let view = p.view;
-        let title = self.title.clone();
+        // The title band names what fills the pane. Structure and Data
+        // are about the selected table, so they wear its name; Query is
+        // about whatever you ask — the berth-scoped scratchpad — so it
+        // wears its own (the sidebar selection would be a lie there).
+        let title = if view == ViewMode::Query {
+            "Query".to_string()
+        } else {
+            self.title.clone()
+        };
         let error = self.error.clone();
         // Embedded (the Query view's results pane): body only. The host
         // owns the chrome — its editor above, the app footer below,
