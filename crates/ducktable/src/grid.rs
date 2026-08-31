@@ -998,6 +998,27 @@ impl Grid {
             cx.stop_propagation();
             return;
         }
+        // ⌥←/⌥→ walk the view switcher — the Data/Structure segments
+        // today, every segment that joins them later. Clamped like the
+        // physical control it drives; needs no cell, just the pane.
+        if m.alt && !m.platform && !m.control && !m.shift {
+            let dir = match ks.key.as_str() {
+                "left" => -1i32,
+                "right" => 1,
+                _ => 0,
+            };
+            if dir != 0 {
+                let modes = [ViewMode::Data, ViewMode::Structure];
+                let cur = prefs::get(cx).view;
+                let ix = modes.iter().position(|v| *v == cur).unwrap_or(0) as i32;
+                let next = modes[(ix + dir).clamp(0, modes.len() as i32 - 1) as usize];
+                if next != cur {
+                    prefs::toggle(cx, |p| p.view = next);
+                }
+                cx.stop_propagation();
+                return;
+            }
+        }
         // The modified-arrow grammar (docs/EDITING.md "Navigation"), all
         // of it needing a cell to move. JUMP rides the ring's own clamp:
         // an impossible distance lands exactly on the edge.
@@ -1049,12 +1070,12 @@ impl Grid {
                     return;
                 }
                 "pageup" => {
-                    self.page_step(-1, cx);
+                    self.page_screen(-1, cx);
                     cx.stop_propagation();
                     return;
                 }
                 "pagedown" => {
-                    self.page_step(1, cx);
+                    self.page_screen(1, cx);
                     cx.stop_propagation();
                     return;
                 }
@@ -1105,9 +1126,6 @@ impl Grid {
                 self.move_ring(1, 0, cx);
                 cx.stop_propagation();
             }
-            // ⌥←/⌥→ are inert, matching Sheets (its laptop variant uses
-            // them for sheet switching — grid-tab switching's seat here,
-            // once multiple grids exist).
             "left" if !m.shift && !m.alt => {
                 self.move_ring(0, -1, cx);
                 cx.stop_propagation();
@@ -1392,9 +1410,29 @@ impl Grid {
         }
     }
 
-    /// PageUp/PageDown (and ⌥↑/⌥↓) from the keyboard: flip the page and
-    /// let the ring keep its seat — same column, same row position
-    /// (clamped), new rows. A flip that cannot happen is a quiet no-op.
+    /// PageUp/PageDown: one screenful within the loaded page — Sheets'
+    /// own meaning for these keys — with a row of overlap for context.
+    /// The ring rides; move_ring's clamp stops it at the page's edge
+    /// (crossing database pages is ⌥↑/⌥↓'s job, deliberately distinct).
+    fn page_screen(&mut self, dir: i32, cx: &mut Context<Self>) {
+        let viewport = self
+            .table
+            .read(cx)
+            .vertical_scroll_handle
+            .0
+            .borrow()
+            .base_handle
+            .bounds()
+            .size
+            .height;
+        let row_h = prefs::get(cx).table_size().table_row_height();
+        let rows = ((viewport / row_h).floor() as i32 - 1).max(1);
+        self.move_ring(dir * rows, 0, cx);
+    }
+
+    /// ⌥↑/⌥↓ from the keyboard: flip the database page and let the ring
+    /// keep its seat — same column, same row position (clamped), new
+    /// rows. A flip that cannot happen is a quiet no-op.
     fn page_step(&mut self, delta: i32, cx: &mut Context<Self>) {
         let can = if delta < 0 { self.page > 0 } else { self.has_next(cx) };
         if !can {

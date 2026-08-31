@@ -61,9 +61,9 @@ combination has a deliberate answer:
 | Home / End | first / last visible column |
 | ⌘Home / ⌘End | first / last cell of the page (Sheets' A1 / end-of-data, page-scoped) |
 | F2 | opens the kept-value editor (the third door, with Enter and double-click — and the one that works mid-Tab-run) |
-| PageUp / PageDown | previous / next page — the ring keeps its seat (same column, row clamped) |
-| ⌥↑ / ⌥↓ | previous / next page (same as the Page keys, reachable without Fn) — when multiple grid tabs exist someday, these migrate to tab switching (Sheets' worksheet keys) and paging keeps the Page keys |
-| ⌥← / ⌥→ | inert — Sheets' laptop sheet-switching keys, reserved with their vertical siblings |
+| PageUp / PageDown | one screenful up / down within the loaded page (Sheets' meaning), a row of overlap, clamped at the page edge |
+| ⌥↑ / ⌥↓ | previous / next DATABASE page (the pager) — the ring keeps its seat (same column, row clamped); when multiple grid tabs exist someday, these migrate to tab switching (Sheets' worksheet keys) |
+| ⌥← / ⌥→ | step the view switcher's segments left / right (Data / Structure today, clamped like the control it drives) |
 | ⌘⇧⌫ | discard all staged changes (TablePlus's chord; every discard stays undoable) |
 | ⇧ + arrows | deliberately inert — range selection's seat, reserved until ranges ship; a ring that moved when you expected a range to grow would lie |
 | ⌃ + arrows | never bound — macOS owns them (Mission Control, Spaces) |
