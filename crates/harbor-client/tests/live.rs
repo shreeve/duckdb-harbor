@@ -67,3 +67,83 @@ fn a_live_berth_answers_sql() {
     assert_eq!(result.rows[0][0], serde_json::json!(1));
     assert_eq!(result.rows[0][2], serde_json::Value::Null);
 }
+
+/// The exact wire sequence the GUI's ⌘S performs (docs/EDITING.md):
+/// a session pins one connection, BEGIN..COMMIT spans requests on it,
+/// parameters bind instead of concatenating, and UPDATE answers with a
+/// count row — the affected-exactly-one verification reads that cell.
+#[test]
+#[ignore]
+fn a_session_carries_a_transaction_with_bound_params() {
+    use serde_json::json;
+    let Some(row) = connectable() else {
+        println!("no berth to test against; skipping");
+        return;
+    };
+    let conn = connect(&row.name).expect("connect");
+    let sid = harbor_client::session_new(&conn).expect("session");
+    let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
+        harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
+    };
+    // A TEMP table lives on the pinned connection and dies with it —
+    // the probe never touches the database's real schema.
+    run("CREATE TEMP TABLE _dt_edit_probe(id INTEGER PRIMARY KEY, name VARCHAR)", None);
+    run("INSERT INTO _dt_edit_probe VALUES (?, ?), (?, ?)",
+        Some(vec![json!(1), json!("a"), json!(2), json!("b")]));
+    // The staged-update shape: SET by param, WHERE binds the ORIGINAL key.
+    run("BEGIN", None);
+    let hit = run("UPDATE _dt_edit_probe SET \"name\" = ? WHERE \"id\" = ?",
+        Some(vec![json!("z"), json!(1)]));
+    println!("update answered: {:?}", hit.rows);
+    assert_eq!(hit.rows[0][0].as_u64(), Some(1), "one row, exactly");
+    // A WHERE that no longer matches answers 0 — the signal the commit
+    // guard turns into a full rollback.
+    let miss = run("UPDATE _dt_edit_probe SET \"name\" = ? WHERE \"id\" = ?",
+        Some(vec![json!("q"), json!(99)]));
+    assert_eq!(miss.rows[0][0].as_u64(), Some(0), "a vanished row answers 0");
+    run("COMMIT", None);
+    let after = run("SELECT name FROM _dt_edit_probe ORDER BY id", None);
+    assert_eq!(after.rows[0][0], json!("z"));
+    // And the rollback leg: BEGIN, change, ROLLBACK — nothing landed.
+    run("BEGIN", None);
+    run("UPDATE _dt_edit_probe SET name = ? WHERE id = ?", Some(vec![json!("gone"), json!(2)]));
+    run("ROLLBACK", None);
+    let intact = run("SELECT name FROM _dt_edit_probe WHERE id = 2", None);
+    assert_eq!(intact.rows[0][0], json!("b"), "rollback left the row untouched");
+    harbor_client::session_release(&conn, &sid);
+    println!("session {sid}: transaction, params, counts — all as the spec assumes");
+}
+
+#[test]
+#[ignore]
+fn keyless_base_tables_expose_rowid() {
+    let Some(row) = connectable() else {
+        println!("no berth to test against; skipping");
+        return;
+    };
+    let conn = connect(&row.name).expect("connect");
+    // Find any base table, then probe the rowid pseudocolumn through
+    // the same wire the grid would use.
+    let tables = harbor_client::query(
+        &conn,
+        "SELECT schema_name, table_name FROM duckdb_tables() LIMIT 1",
+    )
+    .expect("duckdb_tables");
+    let Some(t) = tables.rows.first() else {
+        println!("no base tables; skipping");
+        return;
+    };
+    let (schema, name) = (t[0].as_str().unwrap(), t[1].as_str().unwrap());
+    let sql = format!("SELECT rowid, * FROM \"{schema}\".\"{name}\" LIMIT 3");
+    let result = harbor_client::query(&conn, &sql).expect("rowid probe");
+    println!("rowid probe on {schema}.{name}:");
+    println!("  columns: {:?}", result.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>());
+    for r in &result.rows {
+        println!("  {:?}", r.first());
+    }
+    assert!(result.columns.first().and_then(|c| c.name.as_deref()) == Some("rowid"));
+    // And the shape an UPDATE would use: quoted pseudocolumn in WHERE.
+    let sql = format!("SELECT count(*) FROM \"{schema}\".\"{name}\" WHERE \"rowid\" = 0");
+    let count = harbor_client::query(&conn, &sql).expect("quoted rowid in WHERE");
+    println!("  quoted-WHERE count row: {:?}", count.rows.first());
+}

@@ -6,6 +6,7 @@ mod app;
 mod chrome;
 mod content;
 mod copy_button;
+mod edits;
 mod footer;
 mod grid;
 mod inspector;
@@ -20,7 +21,38 @@ use app::DuckTable;
 use gpui::*;
 use gpui_component::{Root, StyledExt as _};
 
-actions!(ducktable, [ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset, FitColumns]);
+actions!(
+    ducktable,
+    [ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset, FitColumns, ViewPrev, ViewNext]
+);
+
+/// ⌥←/⌥→: walk the footer's view switcher with rollover — a carousel,
+/// not a wall. App-level, unlike the grid's keymap, because it must
+/// keep working in Structure mode, where the table (and the focus that
+/// feeds the grid's listeners) isn't even rendered. Text inputs stay
+/// safe: their own alt-arrow bindings (word jump) sit deeper in the
+/// context stack and win while typing.
+fn step_view(dir: i32, cx: &mut App) {
+    use prefs::ViewMode;
+    let modes = [ViewMode::Data, ViewMode::Structure];
+    let cur = prefs::get(cx).view;
+    let ix = modes.iter().position(|v| *v == cur).unwrap_or(0) as i32;
+    let next = modes[(ix + dir).rem_euclid(modes.len() as i32) as usize];
+    prefs::toggle(cx, |p| p.view = next);
+    // Landing on Data hands focus back to the table, so the arrows and
+    // the editing keys work without a click.
+    if next == ViewMode::Data {
+        if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
+            cx.defer(move |cx| {
+                view.update(cx, |this, cx| {
+                    if let Some(grid) = &this.grid {
+                        grid.update(cx, |grid, cx| grid.request_focus(cx));
+                    }
+                });
+            });
+        }
+    }
+}
 
 /// The one window's root view, for App-level action handlers that need
 /// to reach into it (menus fire at App level when focus skips the view).
@@ -149,7 +181,11 @@ fn main() {
             KeyBinding::new("cmd--", ZoomOut, None),
             KeyBinding::new("cmd-0", ZoomReset, None),
             KeyBinding::new("cmd-shift-f", FitColumns, None),
+            KeyBinding::new("alt-left", ViewPrev, None),
+            KeyBinding::new("alt-right", ViewNext, None),
         ]);
+        cx.on_action(|_: &ViewPrev, cx| step_view(-1, cx));
+        cx.on_action(|_: &ViewNext, cx| step_view(1, cx));
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(|_: &ZoomIn, cx| {
             prefs::toggle(cx, |p| p.zoom = (p.zoom + 1).min(prefs::ZOOMS.len() - 1));

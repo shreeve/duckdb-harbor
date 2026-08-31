@@ -14,6 +14,7 @@
 //! indices.
 
 use crate::chrome::{icon_tile, toggle_tile};
+use crate::edits::{self, Edits};
 use crate::prefs::{self, ViewMode};
 use crate::theme::{
     pal, ui_font, value_font, CELL_TEXT, GUTTER_TEXT, HEADER_TEXT, PANE_INSET, TAG_TEXT,
@@ -60,6 +61,38 @@ pub(crate) struct Grid {
     pub(crate) total_rows: Option<u64>,
     error: Option<String>,
     pub(crate) last_time_ms: u64,
+    /// The staging layer (docs/EDITING.md), present only when the table
+    /// is editable — it has a primary key. None = read-only.
+    pub(crate) edits: Option<Edits>,
+    /// The open cell editor, if any. Provisional input lives here; it
+    /// becomes a staged change only on confirm.
+    editor: Option<CellEditor>,
+    /// The identity is DuckDB's implicit rowid (no catalog key): pages
+    /// fetch `rowid, *` and the delegate hides schema column 0.
+    rowid: bool,
+    /// Primary-key column names from the catalog — kept so an error-born
+    /// grid can build its Edits when its first schema finally lands.
+    pk_cols: Vec<String>,
+    /// NOT NULL per schema column (from the catalog, by name) — staging
+    /// NULL into one refuses at the fingers, not at the server.
+    not_null: Vec<bool>,
+    /// A commit is in flight; ⌘S is a no-op until it resolves.
+    pub(crate) committing: bool,
+    /// Focus should return to the table on the next frame — set by paths
+    /// that lack a Window (subscriptions), consumed by render.
+    needs_focus: bool,
+    /// The ring's seat across a keyboard page flip (page_step): the
+    /// fetch that lands consumes it, row clamped to the new page.
+    ring_keep: Option<(usize, usize)>,
+    /// A horizontal scroll was requested: the table applies it while
+    /// painting its BODY, after the header row has already painted, so
+    /// the scrolling frame shows a stale header. Render consumes this
+    /// by scheduling one more frame, where the header catches up.
+    header_chase: bool,
+    /// The keystroke interceptor that keeps the table's built-in
+    /// arrow/escape bindings out of navigation (see Grid::new) — held so
+    /// it unregisters when this grid drops.
+    _intercept: Subscription,
     /// The filter strip's input; Some = the strip is open.
     pub(crate) filter_input: Option<Entity<gpui_component::input::InputState>>,
     /// Prefetched with the first page, so switching views is instant.
@@ -96,6 +129,17 @@ struct PageReq {
     recount: bool,
 }
 
+/// One open cell editor. Entry gesture decides arrow physics (docs/
+/// EDITING.md): replace entry (typed) — arrows confirm and move the
+/// ring; kept-value entry (Enter/double-click) — arrows move the caret.
+struct CellEditor {
+    row: usize,
+    /// Schema column index.
+    col: usize,
+    input: Entity<gpui_component::input::InputState>,
+    replace: bool,
+}
+
 /// What a fetch does to the WHERE filter.
 enum FilterChange {
     /// Keep the current filter.
@@ -121,9 +165,33 @@ pub(crate) struct GridDelegate {
     /// The page's first absolute row (page × size), committed with its
     /// labels — gutter sizing derives from it when the columns rebuild.
     base: usize,
+    /// Schema column indices of the primary-key columns; empty when the
+    /// table has no key (and is therefore read-only).
+    pk_ix: Vec<usize>,
+    /// Each row's identity: the key columns' RAW fetched values, captured
+    /// before display conversion — the WHERE clause binds these.
+    identities: Vec<Vec<Value>>,
+    /// Identity key -> row index on this page, for projecting staged
+    /// changes onto the view.
+    row_of: std::collections::HashMap<String, usize>,
+    /// Projection of the staged layer onto this page: (row, schema col)
+    /// -> staged display text (None = staged NULL).
+    staged: std::collections::HashMap<(usize, usize), Option<SharedString>>,
+    /// Rows staged for DELETE — ghosted with strikethrough until commit.
+    deleted: std::collections::HashSet<usize>,
+    /// The cell whose editor is open, and the editor to render there.
+    editing: Option<(usize, usize)>,
+    /// The column where the current Tab run began — Sheets' typewriter
+    /// anchor. Enter during a run sweeps back to it, one row on; any
+    /// arrow, click, or Esc ends the run.
+    tab_anchor: Option<usize>,
+    editor_input: Option<Entity<gpui_component::input::InputState>>,
     numeric: Vec<bool>,
     /// Schema indices hidden via the Columns popover.
     hidden: std::collections::HashSet<usize>,
+    /// Schema column 0 is the hidden rowid identity — plumbing, not
+    /// data: excluded from display, the popover, and every fit.
+    identity: bool,
     /// User drag-resizes, schema index → width, reapplied whenever the
     /// column list rebuilds (toggles, refreshes).
     widths: std::collections::HashMap<usize, Pixels>,
@@ -176,14 +244,34 @@ impl Grid {
     ) -> Self {
         let p = prefs::get(cx);
         let gutter = p.row_numbers;
+        // Editability follows capability (docs/EDITING.md): a primary key
+        // from the catalog when there is one — and DuckDB's implicit
+        // rowid when there isn't. Every base table has a rowid, so a
+        // keyless table edits like any other: pages fetch `rowid, *`,
+        // the column stays hidden, and only the WHERE clauses see it.
+        let pk_cols: Vec<String> = structure
+            .as_ref()
+            .map(|s| s.cols.iter().filter(|c| c.pk).map(|c| c.name.clone()).collect())
+            .unwrap_or_default();
+        let rowid = structure.is_some() && pk_cols.is_empty();
+        let pk_cols = if rowid { vec!["rowid".to_string()] } else { pk_cols };
         let mut delegate = GridDelegate {
             cols: Vec::new(),
             schema_cols: Vec::new(),
             names: Vec::new(),
             row_labels: Vec::new(),
             base: 0,
+            pk_ix: Vec::new(),
+            identities: Vec::new(),
+            row_of: std::collections::HashMap::new(),
+            staged: std::collections::HashMap::new(),
+            deleted: std::collections::HashSet::new(),
+            editing: None,
+            tab_anchor: None,
+            editor_input: None,
             numeric: Vec::new(),
             hidden: std::collections::HashSet::new(),
+            identity: rowid,
             widths: std::collections::HashMap::new(),
             visible: Vec::new(),
             gutter,
@@ -196,16 +284,73 @@ impl Grid {
         let (error, last_time_ms) = match outcome {
             Ok(page) => {
                 let ms = page.time_ms;
-                delegate.commit_schema(page, 0, p.zoom_factor());
+                delegate.commit_schema(page, 0, p.zoom_factor(), &pk_cols);
                 (None, ms)
             }
             Err(message) => (Some(message), 0),
         };
+        let source = crate::queries::source(schema, name);
+        let edits = (!delegate.pk_ix.is_empty()).then(|| {
+            Edits::new(
+                source.clone(),
+                pk_cols.clone(),
+                delegate.names.iter().map(|n| n.to_string()).collect(),
+            )
+        });
+        let not_null = delegate
+            .names
+            .iter()
+            .map(|n| {
+                structure
+                    .as_ref()
+                    .and_then(|s| s.cols.iter().find(|c| c.name == n.as_ref()))
+                    .is_some_and(|c| c.notnull)
+            })
+            .collect();
         // Header dragging stays off until move_column permutes the
         // visible map for real — the library default half-enables it
         // (widths reorder, contents don't).
         let table =
             cx.new(|cx| TableState::new(delegate, window, cx).col_movable(false));
+        // The table binds plain up/down/left/right/escape to its own
+        // selection actions, and gpui dispatches BINDINGS before raw key
+        // listeners — so the wash moved by the table's action and the
+        // ring moved by our listener-fed mirror arrived as two writes,
+        // a perceptible lump-lump. This interceptor runs before binding
+        // dispatch, and a stopped event skips bindings AND listeners
+        // both — so for the five keys we own, in navigation, with our
+        // table focused, it performs the move itself: ring and wash in
+        // ONE mutation, nobody else consulted. Single writer, atomic
+        // paint.
+        let weak = cx.entity().downgrade();
+        let intercept = cx.intercept_keystrokes(move |ev, window, cx| {
+            let ks = &ev.keystroke;
+            if ks.modifiers != Modifiers::default() {
+                return; // modified chords stay on the normal paths
+            }
+            if !matches!(ks.key.as_str(), "up" | "down" | "left" | "right" | "escape") {
+                return;
+            }
+            let Some(grid) = weak.upgrade() else { return };
+            {
+                let g = grid.read(cx);
+                if g.editor.is_some() {
+                    return; // the open editor's own keys keep their meanings
+                }
+                if !g.table.focus_handle(cx).contains_focused(window, cx) {
+                    return;
+                }
+            }
+            let key = ks.key.clone();
+            grid.update(cx, |g, cx| match key.as_str() {
+                "up" => g.move_ring(-1, 0, cx),
+                "down" => g.move_ring(1, 0, cx),
+                "left" => g.move_ring(0, -1, cx),
+                "right" => g.move_ring(0, 1, cx),
+                _ => g.clear_ring(cx),
+            });
+            cx.stop_propagation();
+        });
         cx.subscribe(&table, |_, table, event: &gpui_component::table::TableEvent, cx| {
             match event {
                 gpui_component::table::TableEvent::SelectRow(ix) => {
@@ -327,7 +472,7 @@ impl Grid {
         Self {
             table,
             conn,
-            source: crate::queries::source(schema, name),
+            source,
             title,
             page: 0,
             page_size,
@@ -335,6 +480,16 @@ impl Grid {
             total_rows,
             error,
             last_time_ms,
+            edits,
+            editor: None,
+            rowid,
+            pk_cols,
+            not_null,
+            committing: false,
+            needs_focus: false,
+            ring_keep: None,
+            header_chase: false,
+            _intercept: intercept,
             filter_input: None,
             structure,
             resize,
@@ -360,7 +515,8 @@ impl Grid {
             FilterChange::Keep => self.filter.clone(),
         };
         let conn = self.conn.clone();
-        let sql = crate::queries::page_sql(&self.source, &filter, req.page, req.size);
+        let sql =
+            crate::queries::page_sql(&self.source, self.rowid, &filter, req.page, req.size);
         let count_sql = req.recount.then(|| crate::queries::count_sql(&self.source, &filter));
         let PageReq { page, size, filter, .. } = req;
         self.table.update(cx, |state, _| state.delegate_mut().loading = true);
@@ -395,6 +551,9 @@ impl Grid {
                             grid.total_rows = t;
                         }
                         grid.last_time_ms = result.time_ms;
+                        // New rows displace old indexes; an editor left
+                        // open would be typing into a stranger's cell.
+                        grid.editor = None;
                         Some(result)
                     }
                     Err(message) => {
@@ -404,6 +563,10 @@ impl Grid {
                 };
                 let base = page * size;
                 let zoom = prefs::get(cx).zoom_factor();
+                let pk_cols = grid.pk_cols.clone();
+                // Taken unconditionally: a failed flip must not park a
+                // stale seat for some later, unrelated fetch to restore.
+                let ring_keep = grid.ring_keep.take();
                 grid.table.update(cx, |state, cx| {
                     state.delegate_mut().loading = false;
                     if let Some(result) = result {
@@ -415,13 +578,15 @@ impl Grid {
                                 // first fetch that succeeds — the same
                                 // birth Grid::new gives a healthy first
                                 // page.
-                                d.commit_schema(result, base, zoom);
+                                d.commit_schema(result, base, zoom, &pk_cols);
                             } else {
-                                d.rows = display_rows(result.rows);
-                                d.relabel(base);
+                                d.adopt_rows(result.rows, base);
                             }
                             d.selected = None;
                             d.active_cell = None;
+                            d.editing = None;
+                            d.editor_input = None;
+                            d.tab_anchor = None;
                         }
                         let d = state.delegate();
                         if d.gutter {
@@ -439,6 +604,47 @@ impl Grid {
                     }
                     cx.notify();
                 });
+                // A keyboard page flip keeps the ring seated: same
+                // column (if still visible), same row clamped to the new
+                // page's rows.
+                if let (Some((r, c)), true) = (ring_keep, grid.error.is_none()) {
+                    grid.table.update(cx, |state, cx| {
+                        let d = state.delegate_mut();
+                        if d.rows.is_empty() {
+                            return;
+                        }
+                        let row = r.min(d.rows.len() - 1);
+                        let col = if d.visible.contains(&c) {
+                            c
+                        } else {
+                            d.visible.first().copied().unwrap_or(0)
+                        };
+                        d.active_cell = Some((row, col));
+                        select_row(state, row, cx);
+                        cx.notify();
+                    });
+                }
+                // An error-born grid earns its staging layer the moment
+                // a schema lands and turns out fully keyed.
+                if grid.edits.is_none() && !grid.pk_cols.is_empty() {
+                    let (keyed, names) = {
+                        let d = grid.table.read(cx).delegate();
+                        (
+                            !d.pk_ix.is_empty(),
+                            d.names.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+                        )
+                    };
+                    if keyed {
+                        grid.edits = Some(Edits::new(
+                            grid.source.clone(),
+                            grid.pk_cols.clone(),
+                            names,
+                        ));
+                    }
+                }
+                // Staged changes are identity-keyed; the new page gets
+                // them projected wherever (and whether) its rows match.
+                grid.sync_staged(cx);
                 cx.notify();
             })
             .ok();
@@ -675,6 +881,7 @@ impl Grid {
         d.names
             .iter()
             .enumerate()
+            .skip(d.identity as usize)
             .map(|(i, name)| (i, name.clone(), d.hidden.contains(&i)))
             .collect()
     }
@@ -703,12 +910,870 @@ impl Grid {
             d.names
                 .iter()
                 .enumerate()
+                .skip(d.identity as usize)
                 .map(|(i, name)| match row.get(i) {
                     None | Some(None) => (name.clone(), SharedString::from("NULL"), true),
                     Some(Some(s)) => (name.clone(), s.clone(), false),
                 })
                 .collect(),
         )
+    }
+
+    // ------------------------------------------------------------------
+    // Editing (docs/EDITING.md). One meaning per key; Esc is lossless;
+    // nothing writes until ⌘S.
+    // ------------------------------------------------------------------
+
+    /// The grid's whole keymap, focus-scoped by construction: this
+    /// listener sits on the grid wrapper, so it hears keys only when
+    /// focus is inside — the table or an open cell editor.
+    fn on_key(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &e.keystroke;
+        let m = ks.modifiers;
+        if self.editor.is_some() {
+            // Focus decides whose grammar a key speaks. The WHERE strip
+            // and the popovers live inside this pane too; their
+            // keystrokes bubble through here and are not ours.
+            let (focused, replace) = self
+                .editor
+                .as_ref()
+                .map(|ed| (ed.input.focus_handle(cx).is_focused(window), ed.replace))
+                .unwrap_or((false, false));
+            if !focused {
+                return;
+            }
+            match ks.key.as_str() {
+                "escape" => self.cancel_edit(cx),
+                // The newline family (Steve's ruling): ⇧Enter first —
+                // the chat-composer convention every hand knows — with
+                // ⌥Enter as the Sheets twin. They belong to the text.
+                // (Visibly inert until the multi-line editor arrives —
+                // reserved is not dead.)
+                "enter" if m.shift || m.alt => return,
+                "enter" if m.platform => {
+                    // ⌘Enter — "send it" (normally consumed by the input
+                    // and routed via PressEnter{secondary}; this arm is
+                    // the backstop).
+                    if self.confirm_and_move(0, 0, false, cx) {
+                        self.commit(cx);
+                    }
+                }
+                "enter" => {
+                    self.confirm_and_move(1, 0, false, cx);
+                }
+                "tab" => {
+                    self.confirm_and_move(0, if m.shift { -1 } else { 1 }, true, cx);
+                }
+                "up" if replace => {
+                    self.confirm_and_move(-1, 0, false, cx);
+                }
+                "down" if replace => {
+                    self.confirm_and_move(1, 0, false, cx);
+                }
+                "left" if replace => {
+                    self.confirm_and_move(0, -1, false, cx);
+                }
+                "right" if replace => {
+                    self.confirm_and_move(0, 1, false, cx);
+                }
+                "s" if m.platform => {
+                    // "I'm done, make it real": confirm in place, commit.
+                    if self.confirm_and_move(0, 0, false, cx) {
+                        self.commit(cx);
+                    }
+                }
+                _ => return,
+            }
+            cx.stop_propagation();
+            return;
+        }
+        // Navigating — but only when the table itself holds focus. A key
+        // typed into the WHERE input (or any other input in the pane)
+        // must mean what that input says it means.
+        if !self.table.focus_handle(cx).contains_focused(window, cx) {
+            return;
+        }
+        // ⌘S and ⌘Enter both mean "send it" — the file-save reflex and
+        // the AI-composer reflex arrive at the same transaction.
+        if m.platform && !m.shift && (ks.key == "s" || ks.key == "enter") {
+            self.commit(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if m.platform && ks.key == "z" {
+            let did = match &mut self.edits {
+                Some(e) if m.shift => e.redo(),
+                Some(e) => e.undo(),
+                None => false,
+            };
+            if did {
+                self.sync_staged(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if m.platform && m.shift && ks.key == "backspace" {
+            // ⌘⇧⌫, TablePlus's own chord: discard everything staged —
+            // each discard is an undo entry, so even this is reversible.
+            self.discard_all(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if m.platform && ks.key == "backspace" {
+            self.stage_delete_row(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if m.control && m.shift && ks.key == "n" {
+            self.stage_null(cx);
+            cx.stop_propagation();
+            return;
+        }
+        // (⌥←/⌥→, the view-switcher carousel, live at App level in
+        // main.rs — they must keep working in Structure mode, where
+        // this listener's focus source doesn't exist.)
+        // The modified-arrow grammar (docs/EDITING.md "Navigation"), all
+        // of it needing a cell to move. JUMP rides the ring's own clamp:
+        // an impossible distance lands exactly on the edge.
+        const JUMP: i32 = 1_000_000;
+        if self.table.read(cx).delegate().active_cell.is_some() {
+            // ⌘-arrows jump to the edges of the page — Sheets muscle
+            // memory, scoped the way fit is: to what you're looking at.
+            // (⌘⇧-arrows stay inert with the other ⇧ combos: extending a
+            // selection to the edge is range territory, reserved.)
+            if m.platform && !m.alt && !m.control && !m.shift {
+                let (dr, dc) = match ks.key.as_str() {
+                    "up" => (-JUMP, 0),
+                    "down" => (JUMP, 0),
+                    "left" => (0, -JUMP),
+                    "right" => (0, JUMP),
+                    _ => (0, 0),
+                };
+                if (dr, dc) != (0, 0) {
+                    self.move_ring(dr, dc, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+            }
+            // Fn-arrows: Home/End are the column edges; the Page keys
+            // drive the pager, the ring keeping its seat across the flip.
+            // ⌥↑/⌥↓ alias the Page keys — reachable without Fn.
+            match ks.key.as_str() {
+                // Home/End take the row's edges; with ⌘ they take the
+                // page's corners (Sheets' ⌘Home = A1, ⌘End = end of
+                // data, scoped to the page like every other jump).
+                "home" => {
+                    self.move_ring(if m.platform { -JUMP } else { 0 }, -JUMP, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "end" => {
+                    self.move_ring(if m.platform { JUMP } else { 0 }, JUMP, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                // F2, the third door into the kept-value editor (Sheets
+                // and every clone bind it) — and the one that works
+                // mid-Tab-run, where Enter means carriage return.
+                "f2" => {
+                    if let Some((row, col)) = self.table.read(cx).delegate().active_cell {
+                        self.open_editor(row, col, None, window, cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                "pageup" => {
+                    self.page_screen(-1, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "pagedown" => {
+                    self.page_screen(1, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "up" if m.alt && !m.platform && !m.control => {
+                    self.page_step(-1, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "down" if m.alt && !m.platform && !m.control => {
+                    self.page_step(1, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if m.platform || m.control || m.function {
+            return; // chords we don't own keep their meanings
+        }
+        let Some((row, col)) = self.table.read(cx).delegate().active_cell else {
+            return;
+        };
+        // ⇧-arrows are deliberately inert: they are range selection's
+        // seat (deferred), and a ring that moves when you expected a
+        // range to grow would lie. A dead key teaches honestly.
+        match ks.key.as_str() {
+            "enter" => {
+                // Sheets' split personality, faithfully: Enter normally
+                // opens the editor keeping the value — but during a Tab
+                // run it is a carriage return, sweeping to the run's
+                // anchor column one row on, no editor.
+                let anchor = self.table.read(cx).delegate().tab_anchor;
+                match anchor {
+                    Some(a) => self.sweep(if m.shift { -1 } else { 1 }, a, cx),
+                    None => self.open_editor(row, col, None, window, cx),
+                }
+                cx.stop_propagation();
+            }
+            "backspace" | "delete" => {
+                self.stage_clear(row, col, cx);
+                cx.stop_propagation();
+            }
+            "up" if !m.shift && !m.alt => {
+                self.move_ring(-1, 0, cx);
+                cx.stop_propagation();
+            }
+            "down" if !m.shift && !m.alt => {
+                self.move_ring(1, 0, cx);
+                cx.stop_propagation();
+            }
+            "left" if !m.shift && !m.alt => {
+                self.move_ring(0, -1, cx);
+                cx.stop_propagation();
+            }
+            "right" if !m.shift && !m.alt => {
+                self.move_ring(0, 1, cx);
+                cx.stop_propagation();
+            }
+            "tab" => {
+                self.tab_move(if m.shift { -1 } else { 1 }, cx);
+                cx.stop_propagation();
+            }
+            "escape" => {
+                self.clear_ring(cx);
+                cx.stop_propagation();
+            }
+            _ => {
+                // The typing contract: a printable character opens the
+                // editor seeded with itself — replace entry.
+                if let Some(ch) = &ks.key_char {
+                    if !ch.chars().all(char::is_control) && self.edits.is_some() {
+                        self.open_editor(row, col, Some(ch.clone()), window, cx);
+                        cx.stop_propagation();
+                    }
+                }
+            }
+        }
+    }
+
+    /// A double-click in the table body opens the kept-value editor on
+    /// the cell the first click just made active (the delegate's own
+    /// mouse-down runs before this bubbling listener).
+    fn on_body_click(&mut self, e: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Click-away confirms — the universal grid contract (Sheets,
+        // Excel, AG Grid: focus moving to another cell commits the
+        // edit). The clicked cell's own mouse-down has already moved
+        // active_cell by the time this bubbles, so "editing != active"
+        // is precisely "the click landed elsewhere"; a click inside the
+        // open editor moves nothing and stays an editor click. Confirm
+        // stages the value and hands focus back to the table, so the
+        // next keystroke types into the newly ringed cell. (A value
+        // that fails validation keeps its editor and its reason — Esc
+        // remains the way out of a bad value.)
+        if self.editor.is_some() {
+            let (editing, active) = {
+                let d = self.table.read(cx).delegate();
+                (d.editing, d.active_cell)
+            };
+            if editing != active {
+                self.confirm_and_move(0, 0, false, cx);
+            }
+        }
+        if e.click_count != 2 || self.editor.is_some() {
+            return;
+        }
+        // The header row is the fit gesture's turf (divider_double_click)
+        // — its recorded frame excludes body double-clicks from opening
+        // an editor and vice versa.
+        if self.table_bounds.get().contains(&e.position) {
+            return;
+        }
+        if let Some((row, col)) = self.table.read(cx).delegate().active_cell {
+            self.open_editor(row, col, None, window, cx);
+        }
+    }
+
+    /// Open the cell editor. `seed` = replace entry (the typed
+    /// character); None = kept-value entry (Enter / double-click).
+    fn open_editor(
+        &mut self,
+        row: usize,
+        col: usize,
+        seed: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.edits.is_none() || self.committing {
+            return; // read-only says why in the footer, not with a beep
+        }
+        let (original, deleted) = {
+            let d = self.table.read(cx).delegate();
+            if row >= d.rows.len() {
+                return;
+            }
+            let base = d.rows[row].get(col).cloned().flatten();
+            let staged = d.staged.get(&(row, col)).cloned();
+            (staged.unwrap_or(base), d.deleted.contains(&row))
+        };
+        if deleted {
+            return; // you cannot edit a ghost; revert the delete first (⌘Z)
+        }
+        let replace = seed.is_some();
+        let text = seed
+            .unwrap_or_else(|| original.as_ref().map(|s| s.to_string()).unwrap_or_default());
+        let input = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx).default_value(text)
+        });
+        input.update(cx, |state, cx| {
+            // Caret at the end (set_cursor_position also focuses):
+            // replace entry keeps typing past its seed; kept-value entry
+            // lands where Sheets puts it. The column clamps to the line.
+            state.set_cursor_position(
+                gpui_component::input::Position::new(0, u32::MAX),
+                window,
+                cx,
+            );
+        });
+        // Enter may be consumed by the input before it bubbles; the event
+        // subscription is the belt to on_key's suspenders. Idempotent:
+        // whoever runs first takes the editor.
+        cx.subscribe(&input, |grid, _, ev: &gpui_component::input::InputEvent, cx| {
+            if let gpui_component::input::InputEvent::PressEnter { secondary } = ev {
+                if *secondary {
+                    // ⌘Enter — "send it", the AI-era universal: confirm
+                    // this cell, then commit everything staged.
+                    if grid.confirm_and_move(0, 0, false, cx) {
+                        grid.commit(cx);
+                    }
+                } else {
+                    grid.confirm_and_move(1, 0, false, cx);
+                }
+            }
+        })
+        .detach();
+        self.editor = Some(CellEditor { row, col, input: input.clone(), replace });
+        self.table.update(cx, |state, cx| {
+            let d = state.delegate_mut();
+            d.editing = Some((row, col));
+            d.editor_input = Some(input);
+            state.refresh(cx);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Esc: the in-progress text never happened; what was there before —
+    /// staged value or fetched value — is still there. Ring stays put.
+    fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        self.editor = None;
+        self.close_editor_cell(cx);
+    }
+
+    fn close_editor_cell(&mut self, cx: &mut Context<Self>) {
+        self.table.update(cx, |state, cx| {
+            let d = state.delegate_mut();
+            d.editing = None;
+            d.editor_input = None;
+            state.refresh(cx);
+            cx.notify();
+        });
+        self.needs_focus = true;
+        cx.notify();
+    }
+
+    /// Confirm the open editor: validate, stage (auto-clean if equal to
+    /// the fetched original), close, move the ring. `via_tab` keeps the
+    /// Tab run's anchor alive; a vertical confirm during a run sweeps
+    /// back to the anchor column (Sheets' carriage return). Returns
+    /// false when validation refused — the editor stays open with the
+    /// reason.
+    fn confirm_and_move(
+        &mut self,
+        dr: i32,
+        dc: i32,
+        via_tab: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(ed) = self.editor.take() else { return true };
+        let text = ed.input.read(cx).value().to_string();
+        let (ty, fetched, identity) = {
+            let d = self.table.read(cx).delegate();
+            (
+                d.schema_cols.get(ed.col).map(|c| c.duckdb_type.clone()).unwrap_or_default(),
+                d.rows.get(ed.row).and_then(|r| r.get(ed.col)).cloned().flatten(),
+                d.identities.get(ed.row).cloned(),
+            )
+        };
+        let staged = if text.is_empty() {
+            if fetched.is_none() {
+                // NULL in, nothing typed, NULL out: confirming an empty
+                // editor over NULL is a no-op (stage_cell auto-cleans),
+                // not a NULL→'' edit.
+                Some((None, Value::Null))
+            } else if edits::is_text_type(&ty) {
+                // An emptied editor: '' for text (the one honest way to
+                // enter it), NULL for everything else — docs/EDITING.md.
+                Some((Some(SharedString::from("")), Value::String(String::new())))
+            } else {
+                None // NULL path, checked below
+            }
+        } else {
+            match edits::parse_value(&text, &ty) {
+                Ok(Value::Null) => None,
+                Ok(v) => Some((Some(SharedString::from(text.clone())), v)),
+                Err(msg) => {
+                    // Validation informs, never imprisons: the editor
+                    // stays open with the reason; Esc still works.
+                    self.error = Some(msg);
+                    self.editor = Some(ed);
+                    cx.notify();
+                    return false;
+                }
+            }
+        };
+        let (staged_text, value) = match staged {
+            Some(pair) => pair,
+            None => {
+                if !self.stageable_null(ed.col, cx) {
+                    self.editor = Some(ed);
+                    return false;
+                }
+                (None, Value::Null)
+            }
+        };
+        if let (Some(edits), Some(identity)) = (&mut self.edits, identity) {
+            self.error = None;
+            edits.stage_cell(identity, ed.col, fetched, staged_text, value);
+        }
+        self.close_editor_cell(cx);
+        self.sync_staged(cx);
+        if via_tab && dc != 0 {
+            self.tab_move(dc, cx);
+        } else if dr != 0 && dc == 0 {
+            let anchor = self.table.read(cx).delegate().tab_anchor;
+            match anchor {
+                Some(col) => self.sweep(dr, col, cx),
+                None => self.move_ring(dr, 0, cx),
+            }
+        } else if dr != 0 || dc != 0 {
+            self.move_ring(dr, dc, cx);
+        }
+        true
+    }
+
+    /// NOT NULL columns refuse a staged NULL at the fingers, with the
+    /// reason where the eyes are.
+    fn stageable_null(&mut self, col: usize, cx: &mut Context<Self>) -> bool {
+        if self.not_null.get(col).copied().unwrap_or(false) {
+            let name = self.table.read(cx).delegate().names[col].clone();
+            self.error = Some(format!("{name} is NOT NULL — edit the value instead"));
+            cx.notify();
+            return false;
+        }
+        true
+    }
+
+    /// Delete on a cell: clear it, type-honestly — '' for text columns,
+    /// NULL for everything else. Never touches the row.
+    fn stage_clear(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
+        let (ty, fetched, identity, deleted) = {
+            let d = self.table.read(cx).delegate();
+            (
+                d.schema_cols.get(col).map(|c| c.duckdb_type.clone()).unwrap_or_default(),
+                d.rows.get(row).and_then(|r| r.get(col)).cloned().flatten(),
+                d.identities.get(row).cloned(),
+                d.deleted.contains(&row),
+            )
+        };
+        if deleted {
+            return;
+        }
+        let (text, value) = if edits::is_text_type(&ty) {
+            (Some(SharedString::from("")), Value::String(String::new()))
+        } else {
+            if !self.stageable_null(col, cx) {
+                return;
+            }
+            (None, Value::Null)
+        };
+        if let (Some(edits), Some(identity)) = (&mut self.edits, identity) {
+            self.error = None;
+            edits.stage_cell(identity, col, fetched, text, value);
+            self.sync_staged(cx);
+        }
+    }
+
+    /// ⌃⇧N: SQL NULL, deliberately, any column type.
+    fn stage_null(&mut self, cx: &mut Context<Self>) {
+        let Some((row, col)) = self.table.read(cx).delegate().active_cell else { return };
+        let (fetched, identity) = {
+            let d = self.table.read(cx).delegate();
+            (
+                d.rows.get(row).and_then(|r| r.get(col)).cloned().flatten(),
+                d.identities.get(row).cloned(),
+            )
+        };
+        if !self.stageable_null(col, cx) {
+            return;
+        }
+        if let (Some(edits), Some(identity)) = (&mut self.edits, identity) {
+            edits.stage_cell(identity, col, fetched, None, Value::Null);
+            self.sync_staged(cx);
+        }
+    }
+
+    /// ⌘⌫: stage the selected row's DELETE — visible, ghosted,
+    /// reversible until commit. No dialog, ever: reversibility replaces
+    /// confirmation.
+    fn stage_delete_row(&mut self, cx: &mut Context<Self>) {
+        let identity = {
+            let d = self.table.read(cx).delegate();
+            d.selected
+                .or(d.active_cell.map(|(r, _)| r))
+                .and_then(|r| d.identities.get(r).cloned())
+        };
+        if let (Some(edits), Some(identity)) = (&mut self.edits, identity) {
+            edits.stage_delete(identity);
+            self.sync_staged(cx);
+        }
+    }
+
+    /// PageUp/PageDown: one screenful within the loaded page — Sheets'
+    /// own meaning for these keys — with a row of overlap for context.
+    /// The ring rides; move_ring's clamp stops it at the page's edge
+    /// (crossing database pages is ⌥↑/⌥↓'s job, deliberately distinct).
+    fn page_screen(&mut self, dir: i32, cx: &mut Context<Self>) {
+        let viewport = self
+            .table
+            .read(cx)
+            .vertical_scroll_handle
+            .0
+            .borrow()
+            .base_handle
+            .bounds()
+            .size
+            .height;
+        let row_h = prefs::get(cx).table_size().table_row_height();
+        let rows = ((viewport / row_h).floor() as i32 - 1).max(1);
+        self.move_ring(dir * rows, 0, cx);
+    }
+
+    /// ⌥↑/⌥↓ from the keyboard: flip the database page and let the ring
+    /// keep its seat — same column, same row position (clamped), new
+    /// rows. A flip that cannot happen is a quiet no-op.
+    fn page_step(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let can = if delta < 0 { self.page > 0 } else { self.has_next(cx) };
+        if !can {
+            return;
+        }
+        self.ring_keep = self.table.read(cx).delegate().active_cell;
+        let page = if delta < 0 { self.page - 1 } else { self.page + 1 };
+        self.fetch_page(page, cx);
+    }
+
+    /// Ask for table focus on the next frame (render consumes the flag,
+    /// where a &mut Window exists) — the view switcher calls this when
+    /// landing back on Data.
+    pub(crate) fn request_focus(&mut self, cx: &mut Context<Self>) {
+        self.needs_focus = true;
+        cx.notify();
+    }
+
+    /// Esc while navigating: clear the ring, the selection, and any Tab
+    /// run — the same panic key, the same "nothing happened" result.
+    fn clear_ring(&mut self, cx: &mut Context<Self>) {
+        self.table.update(cx, |state, cx| {
+            let d = state.delegate_mut();
+            d.active_cell = None;
+            d.tab_anchor = None;
+            state.clear_selection(cx);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Tab / ⇧Tab: move along the row, remembering where the run began
+    /// (Sheets' typewriter anchor) so Enter can sweep back to it.
+    fn tab_move(&mut self, dc: i32, cx: &mut Context<Self>) {
+        let (col, had) = {
+            let d = self.table.read(cx).delegate();
+            (d.active_cell.map(|(_, c)| c), d.tab_anchor)
+        };
+        self.move_ring(0, dc, cx);
+        if let Some(col) = col {
+            // move_ring ends runs; a Tab re-arms, keeping the original
+            // anchor if the run was already going. Only a FORWARD Tab
+            // starts a run (the Excel/Univer reference rule): ⇧Tab
+            // retreats within one but never begins one.
+            self.table.update(cx, |state, _| {
+                state.delegate_mut().tab_anchor = had.or((dc > 0).then_some(col));
+            });
+        }
+    }
+
+    /// The carriage return: Enter after a Tab run goes back to the run's
+    /// anchor column, one row on — the typewriter physics that makes
+    /// entering a row of data feel effortless in Sheets.
+    fn sweep(&mut self, dr: i32, col: usize, cx: &mut Context<Self>) {
+        self.table.update(cx, |state, cx| {
+            let d = state.delegate_mut();
+            d.tab_anchor = None;
+            let Some((r, _)) = d.active_cell else { return };
+            if d.rows.is_empty() || d.visible.is_empty() {
+                return;
+            }
+            let nr = (r as i32 + dr).clamp(0, d.rows.len() as i32 - 1) as usize;
+            let nc = if d.visible.contains(&col) { col } else { d.visible[0] };
+            let np = d.visible.iter().position(|&v| v == nc).unwrap_or(0);
+            let gutter = d.gutter as usize;
+            d.active_cell = Some((nr, nc));
+            select_row(state, nr, cx);
+            // The carriage return crosses most of the row — bring the
+            // anchor column back into view with it.
+            state.scroll_to_col(np + gutter, cx);
+            cx.notify();
+        });
+        self.header_chase = true;
+        cx.notify();
+    }
+
+    /// Move the active-cell ring. Columns move along the VISIBLE order,
+    /// so hidden columns don't swallow a keystroke. Any ring move ends a
+    /// Tab run (tab_move re-arms after calling this).
+    fn move_ring(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) {
+        self.table.update(cx, |state, cx| {
+            let d = state.delegate_mut();
+            d.tab_anchor = None;
+            let Some((r, c)) = d.active_cell else { return };
+            if d.rows.is_empty() || d.visible.is_empty() {
+                return;
+            }
+            let nr = (r as i32 + dr).clamp(0, d.rows.len() as i32 - 1) as usize;
+            let pos = d.visible.iter().position(|&v| v == c).unwrap_or(0);
+            let np = (pos as i32 + dc).clamp(0, d.visible.len() as i32 - 1) as usize;
+            let nc = d.visible[np];
+            let gutter = d.gutter as usize;
+            d.active_cell = Some((nr, nc));
+            select_row(state, nr, cx);
+            if dc != 0 {
+                // The viewport follows the ring sideways too — minimal
+                // scroll, so a jump to the far edge lands the cell at
+                // the visible edge and a one-step move only scrolls
+                // when crossing it (select_row covers the vertical).
+                state.scroll_to_col(np + gutter, cx);
+            }
+            cx.notify();
+        });
+        if dc != 0 {
+            self.header_chase = true;
+        }
+        cx.notify();
+    }
+
+    /// Project the staged layer onto the current page: identity-keyed
+    /// changes land wherever (and whether) their rows appear.
+    fn sync_staged(&mut self, cx: &mut Context<Self>) {
+        let (staged, deleted) = {
+            let d = self.table.read(cx).delegate();
+            let mut staged = std::collections::HashMap::new();
+            let mut deleted = std::collections::HashSet::new();
+            if let Some(e) = &self.edits {
+                for (key, _, change) in e.entries() {
+                    let Some(&row) = d.row_of.get(key) else { continue };
+                    match change {
+                        edits::RowChange::Delete => {
+                            deleted.insert(row);
+                        }
+                        edits::RowChange::Update(cells) => {
+                            for (col, cell) in cells {
+                                staged.insert((row, *col), cell.text.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            (staged, deleted)
+        };
+        self.table.update(cx, |state, cx| {
+            let d = state.delegate_mut();
+            d.staged = staged;
+            d.deleted = deleted;
+            // Dirtiness just changed under the selection: re-decide the
+            // wash (undoing a row's last edit gives its wash back).
+            if let Some(row) = state.delegate().selected {
+                select_row(state, row, cx);
+            }
+            state.refresh(cx);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Surrender the staged layer when this grid is being replaced —
+    /// only if there is actually something staged to carry.
+    pub(crate) fn take_edits(&mut self) -> Option<Edits> {
+        let e = self.edits.take()?;
+        let (updates, deletes) = e.counts();
+        if updates + deletes == 0 {
+            self.edits = Some(e);
+            return None;
+        }
+        Some(e)
+    }
+
+    /// Receive a stashed staging set from a previous visit to this
+    /// table. Adopted only when the table still has the same identity
+    /// and columns — a changed schema orphans the stash rather than
+    /// mis-keying it.
+    pub(crate) fn adopt_edits(&mut self, stash: Edits, cx: &mut Context<Self>) {
+        if self.edits.as_ref().is_some_and(|mine| mine.same_shape(&stash)) {
+            self.edits = Some(stash);
+            self.sync_staged(cx);
+        }
+    }
+
+    /// Discard one staged row change (the review popover's per-entry ✕).
+    /// Itself undoable — nothing is more than one ⌘Z from recovery.
+    pub(crate) fn discard_change(&mut self, key: &str, cx: &mut Context<Self>) {
+        if let Some(e) = &mut self.edits {
+            e.discard(key);
+        }
+        self.sync_staged(cx);
+    }
+
+    /// Discard everything staged — as individual discards, so each one
+    /// stays on the undo stack.
+    pub(crate) fn discard_all(&mut self, cx: &mut Context<Self>) {
+        if let Some(e) = &mut self.edits {
+            let keys: Vec<String> =
+                e.entries().iter().map(|(k, _, _)| k.to_string()).collect();
+            for key in keys {
+                e.discard(&key);
+            }
+        }
+        self.sync_staged(cx);
+    }
+
+    /// ⌘S: everything staged, one transaction, all or nothing. A Harbor
+    /// session pins the connection so BEGIN..COMMIT outlives one request;
+    /// every statement must affect exactly one row or the whole thing
+    /// rolls back — and the release itself rolls back on any failure.
+    pub(crate) fn commit(&mut self, cx: &mut Context<Self>) {
+        if self.committing {
+            return;
+        }
+        let Some(edits) = &self.edits else { return };
+        let stmts = edits.statements();
+        if stmts.is_empty() {
+            return;
+        }
+        self.committing = true;
+        self.error = None;
+        cx.notify();
+        let conn = self.conn.clone();
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    let sid = harbor_client::session_new(&conn)?;
+                    let run = || -> Result<usize, String> {
+                        harbor_client::exec(&conn, "BEGIN", None, Some(&sid))?;
+                        for (sql, params) in &stmts {
+                            let r = harbor_client::exec(
+                                &conn,
+                                sql,
+                                Some(params.clone()),
+                                Some(&sid),
+                            )?;
+                            // The engine answers UPDATE/DELETE with one
+                            // count row; anything but exactly 1 means the
+                            // row is not what we fetched. Nothing lands.
+                            let affected = crate::queries::count_of(&r).unwrap_or(0);
+                            if affected != 1 {
+                                return Err(format!(
+                                    "a row changed since you read it \
+                                     ({affected} rows matched) — refresh and retry"
+                                ));
+                            }
+                        }
+                        harbor_client::exec(&conn, "COMMIT", None, Some(&sid))?;
+                        Ok(stmts.len())
+                    };
+                    let result = run();
+                    // Releasing the session rolls back anything uncommitted,
+                    // so a failed run can never half-land.
+                    harbor_client::session_release(&conn, &sid);
+                    result
+                })
+                .await;
+            this.update(cx, |grid, cx| {
+                grid.committing = false;
+                match outcome {
+                    Ok(_) => {
+                        // The values on screen ARE the committed truth —
+                        // fold them into the display rows before the
+                        // staged layer clears, so nothing reverts while
+                        // the refetch is in flight. All the eye sees is
+                        // the amber leaving. Deleted rows keep their
+                        // ghosts until the refetch removes them for
+                        // real (a ghost that briefly looked alive again
+                        // would be its own artifact).
+                        grid.table.update(cx, |state, cx| {
+                            let d = state.delegate_mut();
+                            let staged: Vec<_> = d.staged.drain().collect();
+                            for ((row, col), text) in staged {
+                                if let Some(cell) =
+                                    d.rows.get_mut(row).and_then(|r| r.get_mut(col))
+                                {
+                                    *cell = text;
+                                }
+                            }
+                            state.refresh(cx);
+                            cx.notify();
+                        });
+                        if let Some(e) = &mut grid.edits {
+                            e.clear();
+                        }
+                        // No sync_staged here: it would also clear the
+                        // delete ghosts. The refetch's own sync does.
+                        // Fetch-first still holds: the page refetches so
+                        // every row shows the database's truth —
+                        // defaults filled, triggers applied — landing
+                        // over pixels that already match it.
+                        let page = grid.page;
+                        grid.fetch_page_now(page, cx);
+                    }
+                    Err(message) => {
+                        grid.error = Some(format!("{message} · edits kept"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// A refetch of the same page (post-commit) — unlike fetch_page this
+    /// never skips on "already there".
+    fn fetch_page_now(&mut self, page: usize, cx: &mut Context<Self>) {
+        let size = self.page_size;
+        self.fetch(
+            PageReq { page, size, filter: FilterChange::Keep, recount: true },
+            cx,
+        );
     }
 
     /// Rebuild the column list after the row-number preference flips.
@@ -724,12 +1789,44 @@ impl Grid {
     }
 }
 
+/// Select a row the dirty-aware way. The delegate always records it —
+/// the ring and ⌘⌫ need a selected row — but the library's selection
+/// (the blue row wash) is only requested for clean rows: once a row
+/// carries staged changes, its amber or red owns the story, and two
+/// washes fighting on one row read as confusion, not state.
+fn select_row(
+    state: &mut TableState<GridDelegate>,
+    row: usize,
+    cx: &mut Context<TableState<GridDelegate>>,
+) {
+    state.delegate_mut().selected = Some(row);
+    if state.delegate().row_dirty(row) {
+        state.clear_selection(cx);
+        state.delegate_mut().selected = Some(row);
+        state.scroll_to_row(row, cx);
+    } else {
+        state.set_selected_row(row, cx);
+    }
+}
+
 impl GridDelegate {
+    /// A row carrying any staged change — the rows whose color already
+    /// tells a story, so the selection wash stays off them.
+    fn row_dirty(&self, row: usize) -> bool {
+        self.deleted.contains(&row) || self.staged.keys().any(|(r, _)| *r == row)
+    }
+
     /// Adopt a page's schema and rows — the one birth, shared by Grid::new
     /// and the first successful fetch of an error-born grid. The display
     /// names are derived here, once: three surfaces (headers, popover,
     /// inspector) read them per frame and must only bump SharedStrings.
-    fn commit_schema(&mut self, page: harbor_client::QueryResult, base: usize, zoom: f32) {
+    fn commit_schema(
+        &mut self,
+        page: harbor_client::QueryResult,
+        base: usize,
+        zoom: f32,
+        pk_cols: &[String],
+    ) {
         self.numeric =
             page.columns.iter().map(|c| numeric(&c.duckdb_type.to_uppercase())).collect();
         self.names = page
@@ -738,12 +1835,47 @@ impl GridDelegate {
             .enumerate()
             .map(|(i, c)| SharedString::from(c.name.clone().unwrap_or_else(|| format!("col{i}"))))
             .collect();
+        self.pk_ix = pk_cols
+            .iter()
+            .filter_map(|k| self.names.iter().position(|n| n.as_ref() == k))
+            .collect();
+        // Identity requires the WHOLE key: a partial match would target
+        // the wrong rows, so a key column missing from the result set
+        // (impossible for SELECT *, but honesty is cheap) disables it.
+        if self.pk_ix.len() != pk_cols.len() {
+            self.pk_ix.clear();
+        }
         self.schema_cols = page.columns;
-        self.rows = display_rows(page.rows);
-        self.relabel(base);
+        self.adopt_rows(page.rows, base);
         // The first page sizes the columns to their content; from here on
         // widths hold still (pages replace, fits don't).
         self.fit_widths(zoom);
+    }
+
+    /// Take a page's rows: capture each row's identity (the key columns'
+    /// raw values) before display conversion, then derive the render-side
+    /// strings and labels. The one door rows enter the delegate through.
+    fn adopt_rows(&mut self, rows: Vec<Vec<Value>>, base: usize) {
+        self.identities = if self.pk_ix.is_empty() {
+            Vec::new()
+        } else {
+            rows.iter()
+                .map(|r| {
+                    self.pk_ix
+                        .iter()
+                        .map(|&i| r.get(i).cloned().unwrap_or(Value::Null))
+                        .collect()
+                })
+                .collect()
+        };
+        self.row_of = self
+            .identities
+            .iter()
+            .enumerate()
+            .map(|(ix, id)| (edits::key_of(id), ix))
+            .collect();
+        self.rows = display_rows(rows);
+        self.relabel(base);
     }
 
     /// The gutter's absolute row numbers, derived once per page commit —
@@ -811,8 +1943,9 @@ impl GridDelegate {
     /// Rebuild the display columns from the schema minus the hidden set
     /// (plus the gutter), refreshing the visible→schema map.
     fn rebuild_cols(&mut self) {
-        self.visible =
-            (0..self.schema_cols.len()).filter(|i| !self.hidden.contains(i)).collect();
+        self.visible = (self.identity as usize..self.schema_cols.len())
+            .filter(|i| !self.hidden.contains(i))
+            .collect();
         self.cols = build_columns(&self.names, &self.visible, self.gutter);
         let g = self.gutter as usize;
         for (disp, schema_ix) in self.visible.iter().enumerate() {
@@ -858,6 +1991,8 @@ impl TableDelegate for GridDelegate {
         // Column 0 is the row-number gutter: raised, muted, and a firmer
         // divider than the data cells (design.css `.grid td.num`).
         if self.gutter && col_ix == 0 {
+            let row_deleted = self.deleted.contains(&row_ix);
+            let row_dirty = !row_deleted && self.staged.keys().any(|(r, _)| *r == row_ix);
             return div()
                 .h_flex()
                 .relative()
@@ -869,13 +2004,18 @@ impl TableDelegate for GridDelegate {
                 // Select-all darkens the number rail a shade deeper than
                 // the cells, the way Sheets treats its row headers.
                 .when(self.all_selected, |d| d.bg(t.accent.opacity(0.16)))
+                // A dirty row's number wears the row's own story — amber
+                // for staged updates, red for a staged delete — so dirt
+                // stays findable even with its column scrolled off-screen.
+                .when(row_dirty, |d| d.bg(t.warn.opacity(0.18)))
+                .when(row_deleted, |d| d.bg(t.bad.opacity(0.10)))
                 .border_b_1()
                 .border_color(t.grid_line)
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |state, _, _, cx| {
                         state.delegate_mut().all_selected = false;
-                        state.set_selected_row(row_ix, cx);
+                        select_row(state, row_ix, cx);
                     }),
                 )
                 .child(
@@ -898,8 +2038,58 @@ impl TableDelegate for GridDelegate {
         let Some(data_col) = self.visible.get(col_ix - self.gutter as usize).copied() else {
             return div().into_any_element();
         };
+        // An open editor replaces the cell's content outright — the
+        // editor surface IS the state (no tint underneath). It wears the
+        // active-cell ring so the eye never has to relocate.
+        if self.editing == Some((row_ix, data_col)) {
+            if let Some(input) = self.editor_input.clone() {
+                return div()
+                    .h_flex()
+                    .relative()
+                    .w_full()
+                    .h(row_h)
+                    .items_center()
+                    .border_r_1()
+                    .border_b_1()
+                    .border_color(t.grid_line)
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(-PANE_INSET))
+                            .right_0()
+                            .top_0()
+                            .bottom_0()
+                            .bg(t.surface)
+                            .border_2()
+                            .border_color(t.accent),
+                    )
+                    .child(
+                        div().w_full().child(
+                            gpui_component::input::Input::new(&input)
+                                .appearance(false)
+                                // Zero the input's built-in left inset so
+                                // the caret sits exactly on the column's
+                                // text axis — editing must not nudge the
+                                // value sideways.
+                                .pl(px(0.))
+                                .text_size(px(CELL_TEXT * p.zoom_factor()))
+                                .font_family(value_font()),
+                        ),
+                    )
+                    .into_any_element();
+            }
+        }
         let right = p.right_align && self.numeric.get(data_col).copied().unwrap_or(false);
-        let value = self.rows.get(row_ix).and_then(|r| r.get(data_col));
+        // The staged layer overrides the fetched value: a confirmed edit
+        // shows its new text (or NULL) under a soft accent tint until ⌘S
+        // makes it the database's truth.
+        let staged = self.staged.get(&(row_ix, data_col)).cloned();
+        let is_staged = staged.is_some();
+        let value = match staged {
+            Some(v) => Some(v),
+            None => self.rows.get(row_ix).and_then(|r| r.get(data_col)).cloned(),
+        };
+        let is_deleted = self.deleted.contains(&row_ix);
         // The column paddings are zeroed (build_columns), so this div owns
         // the cell: full height, the vertical divider on its right edge,
         // and its own text inset.
@@ -930,6 +2120,34 @@ impl TableDelegate for GridDelegate {
                         .bg(t.accent.opacity(0.08)),
                 )
             })
+            // Staged-but-uncommitted: a soft amber wash — "modified, not
+            // yet saved," the color that is neither the accent (where you
+            // are) nor the danger red (what you are destroying). Same
+            // full-bleed layer trick as select-all, same reason.
+            .when(is_staged && !is_deleted, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(-PANE_INSET))
+                        .right_0()
+                        .bg(t.warn.opacity(0.16)),
+                )
+            })
+            // A staged DELETE ghosts the whole row: a danger wash here,
+            // strikethrough on the text below. Reversible until commit.
+            .when(is_deleted, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(-PANE_INSET))
+                        .right_0()
+                        .bg(t.bad.opacity(0.07)),
+                )
+            })
             // The cell starts PANE_INSET in (wrapper padding), so its
             // bottom border leaves a notch there. Every row but the LAST
             // hides it under the tr's full-width border, which the Table
@@ -953,7 +2171,8 @@ impl TableDelegate for GridDelegate {
                     let d = state.delegate_mut();
                     d.all_selected = false;
                     d.active_cell = Some((row_ix, data_col));
-                    state.set_selected_row(row_ix, cx);
+                    d.tab_anchor = None;
+                    select_row(state, row_ix, cx);
                     cx.notify();
                 }),
             )
@@ -999,7 +2218,8 @@ impl TableDelegate for GridDelegate {
                         .truncate()
                         .text_size(px(CELL_TEXT * p.zoom_factor()))
                         .font_family(value_font())
-                        .text_color(t.text)
+                        .text_color(if is_deleted { t.muted } else { t.text })
+                        .when(is_deleted, |d| d.line_through())
                         .when(right, |d| d.text_right())
                         .child(text),
                 )
@@ -1133,9 +2353,36 @@ impl TableDelegate for GridDelegate {
 }
 
 impl Render for Grid {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = pal(cx);
         let p = prefs::get(cx);
+        // A closed editor hands focus back to the table here — render is
+        // where a &mut Window exists (the InputEvent subscription has
+        // none), so the flag set at close time is consumed one frame on.
+        if self.needs_focus {
+            self.needs_focus = false;
+            window.focus(&self.table.focus_handle(cx));
+        }
+        // The header chase: this frame's body paint will apply the
+        // pending horizontal scroll AFTER the header has painted, so
+        // the scrolling frame shows a stale header. A notify placed NOW
+        // would be swallowed — the table renders later this same frame
+        // and clears its dirty mark — so the request rides on_next_frame,
+        // past this frame's paint. One frame, one flag, no loop.
+        if self.header_chase {
+            self.header_chase = false;
+            let table = self.table.clone();
+            window.on_next_frame(move |_, cx| {
+                table.update(cx, |_, cx| cx.notify());
+            });
+        }
+        // An editor whose column just got hidden would be invisible but
+        // still focused — cancel it (lossless, like any Esc).
+        if let Some(ed) = &self.editor {
+            if !self.table.read(cx).delegate().visible.contains(&ed.col) {
+                self.cancel_edit(cx);
+            }
+        }
         // The inspector slots in BESIDE the table, below the header strip —
         // the title/toggle row keeps the full width, so opening the panel
         // never shifts it. It is row-level, so it only accompanies Data.
@@ -1148,6 +2395,9 @@ impl Render for Grid {
             .size_full()
             .min_w_0()
             .v_flex()
+            // The whole editing keymap rides the pane, on the bubble path
+            // from wherever focus is — the table or an open cell editor.
+            .on_key_down(cx.listener(Self::on_key))
             .child(
                 div()
                     .h_flex()
@@ -1307,6 +2557,13 @@ impl Render for Grid {
                     let table_el = div()
                         .relative()
                         .size_full()
+                        // Bubble-phase: the cell's own mouse-down (first
+                        // click of the pair) has already set active_cell,
+                        // so a double-click opens the editor right there.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(Self::on_body_click),
+                        )
                         .child(
                             Table::new(&self.table)
                                 .bordered(false)
@@ -1402,6 +2659,9 @@ fn build_columns(
             .resizable(false)
             .movable(false)
             .selectable(false)
+            // Sheets' row headers never leave: the gutter pins to the
+            // left while the data columns scroll beneath it.
+            .fixed_left()
     });
     gutter
         .into_iter()

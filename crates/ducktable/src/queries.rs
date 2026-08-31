@@ -15,8 +15,23 @@ pub(crate) fn source(schema: &str, name: &str) -> String {
 /// filter text splices in verbatim BY DESIGN: the strip is a raw SQL
 /// surface and the berth is the user's own database — the author of the
 /// WHERE clause is the person it could affect.
-pub(crate) fn page_sql(source: &str, filter: &Option<String>, page: usize, size: usize) -> String {
-    format!("SELECT * FROM {source}{} LIMIT {size} OFFSET {}", where_part(filter), page * size)
+///
+/// `rowid` prepends DuckDB's implicit row identifier — the editing
+/// identity for tables without a primary key (docs/EDITING.md). The
+/// grid hides that column; only the WHERE clauses ever see it.
+pub(crate) fn page_sql(
+    source: &str,
+    rowid: bool,
+    filter: &Option<String>,
+    page: usize,
+    size: usize,
+) -> String {
+    let cols = if rowid { "rowid, *" } else { "*" };
+    format!(
+        "SELECT {cols} FROM {source}{} LIMIT {size} OFFSET {}",
+        where_part(filter),
+        page * size
+    )
 }
 
 pub(crate) fn count_sql(source: &str, filter: &Option<String>) -> String {
@@ -41,9 +56,10 @@ pub(crate) fn first_page(
     conn: &Conn,
     schema: &str,
     name: &str,
+    rowid: bool,
     limit: usize,
 ) -> Result<harbor_client::QueryResult, String> {
-    harbor_client::query(conn, &page_sql(&source(schema, name), &None, 0, limit))
+    harbor_client::query(conn, &page_sql(&source(schema, name), rowid, &None, 0, limit))
 }
 
 /// The table's exact row count, for the status line.
