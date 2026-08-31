@@ -538,7 +538,7 @@ fn probe(a: &harbor_common::fleet::Addr) -> bool {
 /// of the time. Stopped berths belong here too — pilot summons one on demand,
 /// so "not running" is not "not openable".
 fn show_fleet(cfg: &config::FileConfig) -> ExitCode {
-    use harbor_common::ui::Style;
+    use harbor_common::ui::{Style, Tone};
     let home = match config::runtime_dir() {
         Ok(h) => h,
         Err(e) => {
@@ -550,13 +550,27 @@ fn show_fleet(cfg: &config::FileConfig) -> ExitCode {
     let st = Style::stdout().with_choice(cfg.defaults.color.as_deref());
     if rows.is_empty() {
         println!("Nothing configured, nothing running.\n");
-        println!("  pilot <db.duckdb>   open a database file — served on demand");
+        println!(
+            "  {} {}",
+            st.paint(Tone::Green, "pilot <db.duckdb>"),
+            st.paint(Tone::Dim, "open a database file — served on demand")
+        );
         return ExitCode::SUCCESS;
     }
     print!("{}", harbor_common::fleet::table(&rows).render(&st));
     if st.boxed {
-        println!("\n  {}", harbor_common::fleet::tally(&rows));
-        println!("  pilot <name> to open one");
+        // One line, not two: the count and the invitation are the same
+        // thought — here is the fleet, here is how you open one of it — and
+        // the arrow carries that so the eye does not have to travel down to
+        // find out there was more. Dim arrow, lit command: the only part
+        // worth typing is the only part that is bright.
+        println!(
+            "\n  {} {} {} {}",
+            harbor_common::fleet::tally(&rows),
+            st.paint(Tone::Dim, "➜"),
+            st.paint(Tone::Green, "pilot <name>"),
+            st.paint(Tone::Dim, "to open one")
+        );
     }
     ExitCode::SUCCESS
 }
