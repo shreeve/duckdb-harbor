@@ -26,7 +26,8 @@ actions!(
     ducktable,
     [
         ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset, FitColumns, TablePrev,
-        TableNext, View1, View2, View3, ToggleFullScreen
+        TableNext, View1, View2, View3, ToggleFullScreen, ToggleRowNumbers, ToggleRightAlign,
+        ToggleNullTags
     ]
 );
 
@@ -116,12 +117,20 @@ fn app_menus() -> Vec<Menu> {
                 MenuItem::action("Previous Table", TablePrev),
                 MenuItem::action("Next Table", TableNext),
                 MenuItem::separator(),
+                // The header strip's toggles, together and in its own
+                // order: the lozenge's three (⌥7/⌥8/⌥9 — ⌘'s digits
+                // stay reserved for views), then the inspector glyph
+                // beside them.
+                MenuItem::action("Row Numbers", ToggleRowNumbers),
+                MenuItem::action("Right-Align Numbers", ToggleRightAlign),
+                MenuItem::action("NULL Tags", ToggleNullTags),
+                MenuItem::action("Toggle Inspector", ToggleInspector),
+                MenuItem::separator(),
                 MenuItem::action("Zoom In", ZoomIn),
                 MenuItem::action("Zoom Out", ZoomOut),
                 MenuItem::action("Actual Size", ZoomReset),
                 MenuItem::separator(),
                 MenuItem::action("Fit Column Widths", FitColumns),
-                MenuItem::action("Toggle Inspector", ToggleInspector),
                 MenuItem::separator(),
                 // Ours, not AppKit's injected one (suppressed above for
                 // its icon and forced indent) — plain text, same slot.
@@ -285,6 +294,16 @@ fn main() {
             KeyBinding::new("cmd-1", View1, None),
             KeyBinding::new("cmd-2", View2, None),
             KeyBinding::new("cmd-3", View3, None),
+            // Twin shortcuts: ⌥ digits (text-input safe) and ⌘ digits
+            // (muscle memory beside ⌘1/2/3) both fire the toggles. The
+            // menu can only advertise one — macOS gives a menu item a
+            // single key equivalent — so it shows the ⌘ form.
+            KeyBinding::new("alt-7", ToggleRowNumbers, None),
+            KeyBinding::new("alt-8", ToggleRightAlign, None),
+            KeyBinding::new("alt-9", ToggleNullTags, None),
+            KeyBinding::new("cmd-7", ToggleRowNumbers, None),
+            KeyBinding::new("cmd-8", ToggleRightAlign, None),
+            KeyBinding::new("cmd-9", ToggleNullTags, None),
         ]);
         cx.on_action(|_: &TablePrev, cx| step_table(-1, cx));
         cx.on_action(|_: &TableNext, cx| step_table(1, cx));
@@ -313,6 +332,18 @@ fn main() {
         // handled action never reaches here (no double toggle).
         cx.on_action(|_: &ToggleInspector, cx| {
             prefs::toggle(cx, |p| p.inspector = !p.inspector);
+        });
+        // The lozenge's display toggles (⌘7/⌘8/⌘9): global prefs, so
+        // the keyboard path is exactly the click path — every grid
+        // self-heals from prefs at the top of its own render.
+        cx.on_action(|_: &ToggleRowNumbers, cx| {
+            prefs::toggle(cx, |p| p.row_numbers = !p.row_numbers);
+        });
+        cx.on_action(|_: &ToggleRightAlign, cx| {
+            prefs::toggle(cx, |p| p.right_align = !p.right_align);
+        });
+        cx.on_action(|_: &ToggleNullTags, cx| {
+            prefs::toggle(cx, |p| p.null_tags = !p.null_tags);
         });
         // FitColumns needs the window's grid, which this handler reaches
         // through the app-view handle — directly, never by re-dispatching

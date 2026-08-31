@@ -90,6 +90,38 @@ impl DuckTable {
             },
         )
         .detach();
+        // Escape in a sidebar filter, macOS filter-field style: text
+        // present -> first press clears it (retype without losing the
+        // box); empty -> the press dismisses the filter. One
+        // interceptor outlives every toggled filter instance.
+        let weak = cx.entity().downgrade();
+        cx.intercept_keystrokes(move |ev, window, cx| {
+            if ev.keystroke.key != "escape" {
+                return;
+            }
+            let Some(app) = weak.upgrade() else { return };
+            let filters =
+                [app.read(cx).table_filter.clone(), app.read(cx).berth_filter.clone()];
+            for input in filters.into_iter().flatten() {
+                if !input.read(cx).focus_handle(cx).is_focused(window) {
+                    continue;
+                }
+                if input.read(cx).value().is_empty() {
+                    app.update(cx, |app, cx| {
+                        if app.table_filter.as_ref() == Some(&input) {
+                            app.toggle_table_filter(window, cx);
+                        } else {
+                            app.toggle_berth_filter(window, cx);
+                        }
+                    });
+                } else {
+                    input.update(cx, |state, cx| state.set_value("", window, cx));
+                }
+                cx.stop_propagation();
+                return;
+            }
+        })
+        .detach();
         let mut this = Self {
             rows: Vec::new(),
             phase: Phase::Idle,

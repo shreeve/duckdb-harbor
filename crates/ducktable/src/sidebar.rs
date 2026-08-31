@@ -30,11 +30,12 @@ impl DuckTable {
         };
         // Width belongs to the resizable panel around this (main.rs
         // "root-split"); the sidebar just fills what it's granted.
+        // No border of its own: the resize handle's 1px line IS the
+        // divider (it also glows while dragging) — with both, the seam
+        // read as 2px.
         div()
             .size_full()
             .bg(t.bg_sidebar)
-            .border_r_1()
-            .border_color(t.border)
             .px_2()
             .pt_2()
             .v_flex()

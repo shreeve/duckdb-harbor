@@ -41,7 +41,7 @@ use serde_json::Value;
 // across Structure, Data, and Query and widens only when the content
 // actually holds bigger row numbers (a 45,000th row earns five digits;
 // a five-row table never pays for them).
-fn gutter_width(max_row: u64) -> f32 {
+pub(crate) fn gutter_width(max_row: u64) -> f32 {
     let digits = (max_row.max(1).ilog10() as f32 + 1.).max(2.);
     16. + digits * 7.
 }
@@ -114,6 +114,9 @@ pub(crate) struct Grid {
     _intercept: Subscription,
     /// The filter strip's input; Some = the strip is open.
     pub(crate) filter_input: Option<Entity<gpui_component::input::InputState>>,
+    /// Escape interceptor for the open filter strip (clear, then
+    /// dismiss) — dropped with the strip so closed strips cost nothing.
+    filter_esc: Option<Subscription>,
     /// Prefetched with the first page, so switching views is instant.
     structure: Option<crate::structure::TableStructure>,
     /// The Structure view's columns-as-a-grid (structure.rs): the
@@ -257,6 +260,32 @@ pub(crate) struct GridDelegate {
 }
 
 impl Grid {
+    /// Last absolute row number currently painted by this grid. The
+    /// Query view uses this exact value when synchronizing its top and
+    /// bottom row-number rails.
+    pub(crate) fn last_visible_row(&self, cx: &App) -> u64 {
+        let d = self.table.read(cx).delegate();
+        if d.gutter {
+            (d.base + d.rows.len()) as u64
+        } else {
+            0
+        }
+    }
+
+    /// Give this grid the shared Query-pane gutter width. This is an
+    /// exact assignment, not a grow-only floor: when a later result has
+    /// fewer digits, the editor and result grid shrink together.
+    pub(crate) fn set_gutter_max(&mut self, max_row: u64, cx: &mut Context<Self>) {
+        let want = px(gutter_width(max_row));
+        self.table.update(cx, |state, cx| {
+            let d = state.delegate_mut();
+            if d.gutter && d.cols.first().is_some_and(|col| col.width != want) {
+                d.cols[0].width = want;
+                state.refresh(cx);
+            }
+        });
+    }
+
     /// Build a grid from an already-fetched first page. The caller fetches
     /// BEFORE constructing (DESIGN.md: fetch first, commit over the old
     /// value), so the swap from the previous grid is one complete frame —
@@ -597,6 +626,7 @@ impl Grid {
             header_chase: false,
             _intercept: intercept,
             filter_input: None,
+            filter_esc: None,
             structure,
             structure_grid,
             resize,
@@ -855,6 +885,7 @@ impl Grid {
     /// filter (refetching unfiltered).
     pub(crate) fn toggle_filter_strip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.filter_input.take().is_some() {
+            self.filter_esc = None;
             if self.filter.is_some() {
                 let size = self.page_size;
                 self.fetch(
@@ -886,6 +917,44 @@ impl Grid {
         })
         .detach();
         input.update(cx, |state, cx| state.focus(window, cx));
+        // Escape, the sidebar filters' grammar: text present -> clear
+        // it (and drop an APPLIED filter with it, so an empty box
+        // never sits over secretly-filtered rows); empty -> dismiss
+        // the strip.
+        let weak = cx.entity().downgrade();
+        let weak_input = input.downgrade();
+        self.filter_esc = Some(cx.intercept_keystrokes(move |ev, window, cx| {
+            if ev.keystroke.key != "escape" {
+                return;
+            }
+            let (Some(grid), Some(input)) = (weak.upgrade(), weak_input.upgrade())
+            else {
+                return;
+            };
+            if !input.read(cx).focus_handle(cx).is_focused(window) {
+                return;
+            }
+            if input.read(cx).value().is_empty() {
+                grid.update(cx, |grid, cx| grid.toggle_filter_strip(window, cx));
+            } else {
+                input.update(cx, |state, cx| state.set_value("", window, cx));
+                grid.update(cx, |grid, cx| {
+                    if grid.filter.is_some() {
+                        let size = grid.page_size;
+                        grid.fetch(
+                            PageReq {
+                                page: 0,
+                                size,
+                                filter: FilterChange::Set(None),
+                                recount: true,
+                            },
+                            cx,
+                        );
+                    }
+                });
+            }
+            cx.stop_propagation();
+        }));
         self.filter_input = Some(input);
         cx.notify();
     }
@@ -2805,7 +2874,7 @@ impl Render for Grid {
                             .child(toggle_tile(
                                 "toggle-rows",
                                 "#",
-                                "Show row numbers",
+                                "Show row numbers (\u{2318}7 or \u{2325}7)",
                                 p.row_numbers,
                                 t,
                                 cx.listener(|_, _, _, cx| {
@@ -2819,7 +2888,7 @@ impl Render for Grid {
                             .child(toggle_tile(
                                 "toggle-align",
                                 "\u{21e5}",
-                                "Right-align numeric columns",
+                                "Right-align numeric columns (\u{2318}8 or \u{2325}8)",
                                 p.right_align,
                                 t,
                                 cx.listener(|_, _, _, cx| {
@@ -2829,7 +2898,7 @@ impl Render for Grid {
                             .child(toggle_tile(
                                 "toggle-nulls",
                                 "\u{2205}",
-                                "Show NULL tags",
+                                "Show NULL tags (\u{2318}9 or \u{2325}9)",
                                 p.null_tags,
                                 t,
                                 cx.listener(|_, _, _, cx| {
