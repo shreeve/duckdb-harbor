@@ -29,6 +29,10 @@ pub struct Prefs {
     pub inspector: bool,
     /// The inspector pane's width (UI.md: divider positions persist).
     pub inspector_width: f32,
+    /// The sidebar's table ordering. Plain sort puts `order_items` above
+    /// `orders` (`_` < `s` bytewise); family sort collates `_` after the
+    /// alphabet, so a base table leads and its compound children follow.
+    pub family_sort: bool,
     /// Rows per page in the data grid.
     pub page_size: usize,
     /// Index into [`ZOOMS`].
@@ -98,6 +102,7 @@ impl Default for Prefs {
             view: ViewMode::Data,
             inspector: false,
             inspector_width: 290.,
+            family_sort: false,
             page_size: 500,
             zoom: DEFAULT_ZOOM,
             sidebar_width: 224.,
@@ -130,6 +135,7 @@ pub fn init(cx: &mut App) {
             _ => {}
         }
         prefs.inspector = read("inspector", prefs.inspector);
+        prefs.family_sort = read("family_sort", prefs.family_sort);
         prefs.inspector_width = v
             .get("inspector_width")
             .and_then(Value::as_f64)
@@ -199,6 +205,7 @@ pub fn save(cx: &mut App, change: impl FnOnce(&mut Prefs)) {
         },
         "inspector": prefs.inspector,
         "inspector_width": prefs.inspector_width,
+        "family_sort": prefs.family_sort,
         "page_size": prefs.page_size,
         "zoom": prefs.zoom,
         "sidebar_width": prefs.sidebar_width,

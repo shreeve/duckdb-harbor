@@ -106,6 +106,10 @@ impl DuckTable {
                                     )
                                     .size_3p5(),
                                 )
+                                .tooltip(move |window, cx| {
+                                    gpui_component::tooltip::Tooltip::new("Filter databases")
+                                        .build(window, cx)
+                                })
                                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                     this.toggle_berth_filter(window, cx);
                                 })),
@@ -119,6 +123,10 @@ impl DuckTable {
                                     .size_3p5()
                                     .text_color(t.muted),
                             )
+                            .tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new("Refresh databases")
+                                    .build(window, cx)
+                            })
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.refresh(cx);
                             })),
@@ -209,6 +217,7 @@ impl DuckTable {
 
     fn catalog_tree(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = pal(cx);
+        let family_sort = crate::prefs::get(cx).family_sort;
         let Phase::Connected { catalog, .. } = &self.phase else {
             return div().id("catalog").flex_1();
         };
@@ -239,6 +248,22 @@ impl DuckTable {
                         .text_color(t.muted)
                         .child("TABLES"),
                 )
+                // Family sort: base tables ahead of their compound
+                // children (`orders` above `order_items`) — see
+                // family_cmp. Accent-lit while on, like the filter.
+                .child(
+                    head_glyph("family-sort", family_sort, t)
+                        .child(svg().path("icons/shapes.svg").size_3p5().text_color(
+                            if family_sort { t.accent } else { t.muted },
+                        ))
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new("Sort objects")
+                                .build(window, cx)
+                        })
+                        .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                            crate::prefs::toggle(cx, |p| p.family_sort = !p.family_sort);
+                        })),
+                )
                 // A filter earns its glyph past 10 items (and stays
                 // while open, so it can always be closed).
                 .when(filter_open || table_total > 10, |d| {
@@ -248,6 +273,10 @@ impl DuckTable {
                                 gpui_component::Icon::new(gpui_component::IconName::Search)
                                     .size_3p5(),
                             )
+                            .tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new("Filter tables")
+                                    .build(window, cx)
+                            })
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.toggle_table_filter(window, cx);
                             })),
@@ -258,6 +287,10 @@ impl DuckTable {
                         // A raw svg() does NOT inherit text color (Icon
                         // sets it explicitly); without this it's invisible.
                         .child(svg().path("icons/refresh-cw.svg").size_3p5().text_color(t.muted))
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new("Refresh tables")
+                                .build(window, cx)
+                        })
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                             this.refresh_catalog(cx);
                         })),
@@ -277,7 +310,7 @@ impl DuckTable {
                     div().px_2().py_1().text_xs().text_color(t.muted).child(clone_str(schema)),
                 );
             }
-            for table in catalog.tables_in(schema) {
+            for table in tables_in_order(catalog, schema, family_sort) {
                 if !matches(&table.name, &filter) {
                     continue;
                 }
@@ -352,9 +385,10 @@ impl crate::app::DuckTable {
             .as_ref()
             .map(|i| i.read(cx).value().to_string().to_lowercase())
             .filter(|s| !s.is_empty());
+        let family_sort = crate::prefs::get(cx).family_sort;
         let mut out = Vec::new();
         for schema in catalog.schemas() {
-            for table in catalog.tables_in(schema) {
+            for table in tables_in_order(catalog, schema, family_sort) {
                 if matches(&table.name, &filter) {
                     out.push((schema.to_string(), table.name.clone()));
                 }
@@ -362,6 +396,33 @@ impl crate::app::DuckTable {
         }
         out
     }
+}
+
+/// The catalog's tables for one schema, in the sidebar's chosen order.
+/// Both renderers of that order (the tree and visible_tables) come
+/// through here, so the keyboard can never disagree with the eye.
+fn tables_in_order<'a>(
+    catalog: &'a harbor_client::Catalog,
+    schema: &str,
+    family_sort: bool,
+) -> Vec<&'a harbor_client::catalog::Table> {
+    let mut tables = catalog.tables_in(schema);
+    if family_sort {
+        tables.sort_by(|a, b| family_cmp(&a.name, &b.name));
+    }
+    tables
+}
+
+/// Family collation: `_` sorts after the alphabet instead of before it,
+/// so a base table leads its compound children — `orders` above
+/// `order_items`, `partners` above `partner_emails` — which plain
+/// bytewise order inverts (`_` = 0x5F < any lowercase letter). No
+/// pluralization smarts: making the separator heavy is the whole rule.
+fn family_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    fn key(s: &str) -> impl Iterator<Item = u8> + '_ {
+        s.bytes().map(|c| if c == b'_' { 0xFF } else { c })
+    }
+    key(a).cmp(key(b))
 }
 
 /// The one filter test both sidebar lists apply, spelled once.

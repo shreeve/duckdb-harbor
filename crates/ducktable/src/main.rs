@@ -183,7 +183,8 @@ macro_rules! icon {
     };
 }
 
-const ICONS: [(&str, &[u8]); 11] = [
+const ICONS: [(&str, &[u8]); 12] = [
+    icon!("shapes"),
     icon!("panel-right"),
     icon!("search"),
     icon!("refresh-cw"),
