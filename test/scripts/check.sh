@@ -6,14 +6,10 @@
 #   make test SUITES="spec fuzz" just those
 #
 # Invoked by the `test` target in the Makefile; run it directly if you want
-# the arguments. The ordering is deliberate — unit tests take seconds and catch
-# the compile-level mistakes, the HTTP suites take a minute, and resilience
-# takes several because it kills and restarts the server repeatedly. A failure
-# early means not paying for the rest.
-#
-# The differential suite needs the v1 harbor built alongside; when it is not
-# there it skips rather than fails, because the reference implementation is not
-# a build dependency of this one.
+# the arguments. The ordering is deliberate — unit tests take seconds and
+# catch the compile-level mistakes, the HTTP suites take a minute, and the
+# server-lifecycle suites take several because they kill and restart servers
+# repeatedly. A failure early means not paying for the rest.
 
 set -uo pipefail
 

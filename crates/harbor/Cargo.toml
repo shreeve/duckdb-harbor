@@ -26,13 +26,12 @@ signal-hook = { version = "0.4", default-features = false }
 # already in reedline's tree: terminal-cell widths for duckbox alignment
 unicode-width = "0.2"
 getrandom = "0.2"
-# Negotiated wire compression (Accept-Encoding). Two codings, two
-# audiences: zstd is the IANA-registered one browsers and `curl
-# --compressed` speak natively; lz4 frames decode at ~5GB/s for native
-# clients that ask for them (and `curl | lz4 -d` round-trips). lz4_flex is
-# pure Rust; zstd binds libzstd (no pure-Rust encoder exists), the one C
-# dependency in the binary.
-lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame", "safe-encode", "safe-decode"] }
+# Negotiated wire compression (Accept-Encoding: zstd) — the
+# IANA-registered coding browsers, newer curl, and Node/Bun speak
+# natively. Measured within 10% of lz4's wall in lz4's best case and free
+# when the query does any real work, at 2-24x the density — so zstd is
+# the only coding harbor offers. Binds libzstd (no pure-Rust encoder
+# exists), the one C dependency in the binary.
 zstd = "0.13"
 libc = "0.2"
 

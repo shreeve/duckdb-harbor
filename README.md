@@ -118,15 +118,14 @@ The one thing one-shot does better: since nothing has been sent when the last
 row lands, a failure is still a real status code. The same query that streams a
 `200` with an `{"type":"error"}` line at the end answers `400` in this shape.
 
-The stream compresses on request — `Accept-Encoding: zstd` (the standard
-coding browsers and newer curl offer on their own) or `Accept-Encoding:
-lz4` (frames that decode at several GB/s, for native clients that want the
-absolute floor). Either one wraps the identical NDJSON bytes; a 5M-row
-integer result measures 161MB plain, 25MB as lz4, 1.1MB as zstd. The
-client's listed order wins when it offers both, anything else — gzip
+The stream compresses on request — `Accept-Encoding: zstd`, the standard
+coding browsers, newer curl, and Node/Bun offer on their own. The wrapped
+bytes are the identical NDJSON: a 5M-row integer result measures 161MB
+plain and 1.1MB as zstd, and when the query does any real work the
+compression rides the writer thread for free. Anything else — gzip
 included, its encoder would throttle the stream — gets identity, and
-`curl -H 'Accept-Encoding: lz4' ... | lz4 -d` (or `zstd -d`) recovers the
-stream byte-for-byte.
+`curl -H 'Accept-Encoding: zstd' ... | zstd -d` recovers the stream
+byte-for-byte.
 
 `/ready` normally runs `SELECT 1` through an ordinary executor and answers `200
 {"status":"ready"}` or `503`. Under sustained worker saturation, the dedicated
@@ -353,7 +352,9 @@ DATABASE            PID    CLIENTS  UPTIME  ADDRESS
 
 A socket nothing answers on is a leftover from a `kill -9`, and the list
 unlinks it. There is nothing else to clean up, because nothing else is
-written.
+written. Set `HARBOR_HOME` (absolute path) to collapse everything harbor
+writes — sockets and state alike — into that one directory instead; the
+test suites use it to keep their servers out of the real fleet view.
 
 ### Sockets, TCP, and tokens
 

@@ -5,10 +5,9 @@
 //! (logical_type introspection), then every chunk is walked through borrowed
 //! vector views: no per-row value materialization, no arrow arrays, no
 //! decoder panics. The pure formatters — dates, decimals, BIGNUM, BIT, UUID,
-//! base64, the JSON-safe integer rule — are shared with src/encode.rs; when
-//! the flip retires that file, they move here.
-//!
-//! This module deliberately imports nothing from duckdb-rs.
+//! base64, the JSON-safe integer rule — live in src/encode.rs, which the
+//! flip kept as the engine-free formatter home; this module owns everything
+//! that touches a vector view.
 
 use super::ffi;
 use super::{Error, str_view};
@@ -18,24 +17,6 @@ use crate::encode::{
     push_time, push_u128_raw, push_u64_raw, push_uuid, quote_identifier, split_time,
     varint_to_decimal,
 };
-
-/// One fallible v2 call inside a `Result<_, Error>` function.
-macro_rules! call {
-    ($api:expr, $f:ident($($a:expr),*)) => {{
-        let api = $api;
-        let f = api.$f.ok_or_else(|| Error {
-            code: ffi::ERROR_API,
-            message: concat!("engine lacks duckdb_v2_", stringify!($f)).to_string(),
-        })?;
-        let mut err: ffi::error_info_handle = std::ptr::null_mut();
-        // Some call sites already sit inside an unsafe block.
-        #[allow(unused_unsafe)]
-        let code = unsafe { f($($a,)* &mut err) };
-        if code != ffi::ERROR_NONE {
-            return Err(Error::take(api, code, err));
-        }
-    }};
-}
 
 // ---------------------------------------------------------------------------
 // The type tree: everything the encoders consult, read once per result.
@@ -748,17 +729,7 @@ fn emit(
             // rendering, exactly what the schema's "varchar-cast" promises.
             // (v1 emitted base64 of storage bytes under the same lossless:false
             // label — a payload nothing could decode; text is strictly better.)
-            LOGICAL_TYPE_ID_GEOMETRY => {
-                let mut value: ffi::value_handle = std::ptr::null_mut();
-                call!(api, vector_get_value(r.vector, row as ffi::idx_t, &mut value));
-                let text = value_text(api, value);
-                destroy_value(api, &mut value);
-                match text {
-                    Some(s) => push_json_string(out, &s),
-                    None => out.push_str("null"),
-                }
-            }
-            LOGICAL_TYPE_ID_VARIANT => {
+            LOGICAL_TYPE_ID_GEOMETRY | LOGICAL_TYPE_ID_VARIANT => {
                 let mut value: ffi::value_handle = std::ptr::null_mut();
                 call!(api, vector_get_value(r.vector, row as ffi::idx_t, &mut value));
                 let text = value_text(api, value);

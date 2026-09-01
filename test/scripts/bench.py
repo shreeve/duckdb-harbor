@@ -167,8 +167,10 @@ def main():
             if not s.ready():
                 sys.exit(f"bench: {b} did not come up — see {s.log.name}")
 
-        # results[shape][binary] = list of (wall, timeMs)
-        results = {name: {s.binary: [] for s in servers} for name, _ in shapes}
+        # results[shape][server] = list of (wall, timeMs), keyed by the
+        # Server object itself so two paths to the same binary (or the same
+        # path given twice) keep separate columns.
+        results = {name: {s: [] for s in servers} for name, _ in shapes}
 
         # One unrecorded warmup pass: first-touch costs (page cache, JIT'd
         # anything, the connection handshake) belong to nobody's column.
@@ -182,7 +184,7 @@ def main():
             order = servers[r % len(servers):] + servers[:r % len(servers)]
             for name, query in shapes:
                 for s in order:
-                    results[name][s.binary].append(s.sql(query))
+                    results[name][s].append(s.sql(query))
             print(f"round {r + 1}/{args.rounds} done", file=sys.stderr)
 
         width = max(len(os.path.basename(b)) for b in binaries)
@@ -192,7 +194,7 @@ def main():
         for name, _ in shapes:
             base_median = None
             for s in servers:
-                samples = results[name][s.binary]
+                samples = results[name][s]
                 server_ms = sorted(t for _, t in samples)
                 wall_ms = sorted(w * 1000 for w, _ in samples)
                 median = statistics.median(server_ms)

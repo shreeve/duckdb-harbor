@@ -3,13 +3,31 @@
 //! ffi.rs is generated from DuckDB's api_spec/v2 YAML (scripts/gen-v2-ffi.rb):
 //! the whole surface as one dlsym-filled function table. This module is the
 //! hand-written rim: find the library, load it once, and give errors and
-//! string views a Rust shape. It carries its own candidate search because it
-//! is the successor to the v1 loader in src/engine.rs, not a client of it —
-//! when 0.21 flips, that file and the duckdb-rs dependency behind it go away.
+//! string views a Rust shape. The candidate search here replaced the v1-era
+//! loader (src/engine.rs) when 0.21's flip retired it along with duckdb-rs.
 //!
 //! Unix opens with RTLD_NOW | RTLD_GLOBAL. GLOBAL is load-bearing: DuckDB's
 //! own extension loading expects engine symbols resolvable from the global
 //! namespace.
+
+/// One fallible v2 call inside a `Result<_, Error>` function. Defined
+/// before the modules so both conn and encode see it.
+macro_rules! call {
+    ($api:expr, $f:ident($($a:expr),*)) => {{
+        let api = $api;
+        let f = api.$f.ok_or_else(|| Error {
+            code: ffi::ERROR_API,
+            message: concat!("engine lacks duckdb_v2_", stringify!($f)).to_string(),
+        })?;
+        let mut err: ffi::error_info_handle = std::ptr::null_mut();
+        // Some call sites already sit inside an unsafe block.
+        #[allow(unused_unsafe)]
+        let code = unsafe { f($($a,)* &mut err) };
+        if code != ffi::ERROR_NONE {
+            return Err(Error::take(api, code, err));
+        }
+    }};
+}
 
 pub mod conn;
 pub mod encode;

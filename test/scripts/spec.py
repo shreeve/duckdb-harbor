@@ -4,10 +4,10 @@ spec.py — assert the encoding harbor produces, spelled out.
 
     test/scripts/spec.py --port 9499 --token T
 
-The differential runner proves this harbor and the v1 harbor agree. This one
-proves the agreed answer is the right one. Two implementations that share a
-misreading of SPEC §5.4 would sail through the differential and fail here, and
-that is the whole reason it exists.
+This suite proves the answer on the wire is the right one, straight from
+SPEC. An implementation that misreads SPEC §5.4 agrees with itself
+perfectly; only expectations written from the spec catch it, and that is
+the whole reason this file exists.
 
 Every expectation below is written out by hand from the SQL literal, not
 captured from a run. Capturing output and calling it an expectation only

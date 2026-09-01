@@ -24,23 +24,6 @@ use std::thread;
 use super::encode::{Type, result_columns};
 use super::{Engine, Error, ffi};
 
-/// One fallible v2 call inside a `Result<_, Error>` function.
-macro_rules! call {
-    ($api:expr, $f:ident($($a:expr),*)) => {{
-        let api = $api;
-        let f = api.$f.ok_or_else(|| Error {
-            code: ffi::ERROR_API,
-            message: concat!("engine lacks duckdb_v2_", stringify!($f)).to_string(),
-        })?;
-        let mut err: ffi::error_info_handle = std::ptr::null_mut();
-        #[allow(unused_unsafe)]
-        let code = unsafe { f($($a,)* &mut err) };
-        if code != ffi::ERROR_NONE {
-            return Err(Error::take(api, code, err));
-        }
-    }};
-}
-
 fn str_of(s: &str) -> ffi::str_t {
     ffi::str_t { ptr: s.as_ptr() as *const _, len: s.len() as ffi::idx_t }
 }
@@ -194,9 +177,10 @@ impl Conn {
         let stmts = self.statements(sql)?;
         let mut out = Vec::new();
         for stmt in stmts.iter() {
-            let mut stream = self.execute(stmt, &[])?;
-            let columns = std::mem::take(&mut stream.columns);
-            while let Some(chunk) = stream.next_chunk()? {
+            // In place, no fetch thread: boot-time helpers read a handful
+            // of rows and should not depend on spawn succeeding.
+            let (mut fetcher, columns) = self.open_result(stmt, &[])?;
+            while let Some(chunk) = fetcher.next_chunk()? {
                 let readers = chunk.readers(columns.len().min(1))?;
                 if let (Some(reader), Some((_, ty))) = (readers.first(), columns.first()) {
                     for row in 0..chunk.rows {
@@ -284,8 +268,11 @@ impl Conn {
         Ok(entry.stmts.clone())
     }
 
-    /// Execute one parsed statement. The statement is borrowed, not consumed.
-    pub fn execute(&self, stmt: &Stmt, params: &[Param]) -> Result<Stream, Error> {
+    /// Execute one parsed statement into a live result: the Fetcher that
+    /// owns it plus its prepare-time columns. The shared front half of
+    /// `execute` (which pipelines it) and `drain` (which consumes it in
+    /// place).
+    fn open_result(&self, stmt: &Stmt, params: &[Param]) -> Result<(Fetcher, Vec<(String, Type)>), Error> {
         let api = &self.eng.api;
 
         // Params go in as owned values, positional ($1 = element 0).
@@ -322,19 +309,16 @@ impl Conn {
         }
         executed?;
 
-        let columns = match result_columns(api, result) {
-            Ok(c) => c,
-            Err(e) => {
-                if let Some(f) = api.result_destroy {
-                    unsafe { f(&mut result) };
-                }
-                return Err(e);
-            }
-        };
-
-        // Hand the result to its fetch thread; from here the Fetcher owns
-        // it (destroying it on every exit path, including a failed spawn).
+        // From here the Fetcher owns the result and destroys it on drop.
         let fetcher = Fetcher { eng: self.eng, result };
+        let columns = result_columns(api, result)?;
+        Ok((fetcher, columns))
+    }
+
+    /// Execute one parsed statement as a pipelined stream. The statement is
+    /// borrowed, not consumed.
+    pub fn execute(&self, stmt: &Stmt, params: &[Param]) -> Result<Stream, Error> {
+        let (fetcher, columns) = self.open_result(stmt, params)?;
         let (tx, rx) = mpsc::sync_channel(PREFETCH);
         let join = thread::Builder::new()
             .name("harbor-fetch".into())
@@ -348,16 +332,27 @@ impl Conn {
             rx: Some(rx),
             join: Some(join),
             interrupt: Interrupt { eng: self.eng, conn: self.interrupt.clone() },
-            done: false,
         })
+    }
+
+    /// Execute one parsed statement and consume it in place, no thread. For
+    /// results nobody reads — front statements, resets, side effects — the
+    /// pipeline is pure overhead: a spawn and a join to stream chunks that
+    /// will be discarded.
+    pub fn drain(&self, stmt: &Stmt) -> Result<(), Error> {
+        let (mut fetcher, _) = self.open_result(stmt, &[])?;
+        while fetcher.next_chunk()?.is_some() {}
+        Ok(())
     }
 
     /// Parse and run a whole SQL string, draining every result. The
     /// counterpart of duckdb-rs execute_batch: SETs, ROLLBACK, CHECKPOINT.
+    /// Goes through the statement cache: the per-job ROLLBACK reset runs
+    /// this constantly with identical text.
     pub fn execute_batch(&mut self, sql: &str) -> Result<(), Error> {
-        for stmt in self.parse(sql)? {
-            let mut stream = self.execute(&stmt, &[])?;
-            while stream.next_chunk()?.is_some() {}
+        let stmts = self.statements(sql)?;
+        for stmt in stmts.iter() {
+            self.drain(stmt)?;
         }
         Ok(())
     }
@@ -422,9 +417,10 @@ pub struct Stream {
     /// The result's columns. Public so a caller can `mem::take` them and
     /// keep them across the mutable borrows the chunk loop needs.
     pub columns: Vec<(String, Type)>,
-    /// Taken (closed) on drop, so the fetch thread's next send fails and
-    /// it stops fetching.
-    rx: Option<mpsc::Receiver<Result<Chunk, Error>>>,
+    /// Taken on the stream's terminal message (end or error) and on drop —
+    /// dropping the receiver is what makes the fetch thread's next send
+    /// fail and stop fetching.
+    rx: Option<mpsc::Receiver<Result<Option<Chunk>, Error>>>,
     join: Option<thread::JoinHandle<()>>,
     /// Fired on drop when the fetch thread is still mid-query: an
     /// abandoned stream must not leave the fetch thread blocked inside the
@@ -432,30 +428,43 @@ pub struct Stream {
     /// statements. The engine clears the flag at the next query's start
     /// (ClientContext::InitialCleanup), so a stray interrupt cannot poison
     /// the statement after this one.
+    ///
+    /// A Stream must not outlive its Conn: Conn::drop nulls the interrupt
+    /// slot, after which an abandoned stream's join waits for the query's
+    /// natural end, uninterruptible. Every current caller scopes streams
+    /// inside the connection; keep it that way.
     interrupt: Interrupt,
-    done: bool,
 }
 
 impl Stream {
     /// The next chunk, or None at end-of-stream. An interrupted query
     /// surfaces here as ERROR_RUNTIME_INTERRUPT.
+    ///
+    /// End-of-stream is an explicit message, not the channel closing: a
+    /// fetch thread that dies without saying goodbye — a panic, above all —
+    /// must surface as an error, never as a clean end. The alternative is
+    /// the worst failure a result stream can have: a truncated result
+    /// wearing a well-formed end record.
     pub fn next_chunk(&mut self) -> Result<Option<Chunk>, Error> {
-        if self.done {
-            return Ok(None);
-        }
         let Some(rx) = self.rx.as_ref() else {
             return Ok(None);
         };
         match rx.recv() {
-            Ok(Ok(chunk)) => Ok(Some(chunk)),
+            Ok(Ok(Some(chunk))) => Ok(Some(chunk)),
+            Ok(Ok(None)) => {
+                self.rx = None;
+                Ok(None)
+            }
             Ok(Err(e)) => {
-                self.done = true;
+                self.rx = None;
                 Err(e)
             }
-            // Sender gone with no error sent: the stream ended.
             Err(mpsc::RecvError) => {
-                self.done = true;
-                Ok(None)
+                self.rx = None;
+                Err(Error {
+                    code: ffi::ERROR_API,
+                    message: "the fetch thread died mid-stream".to_string(),
+                })
             }
         }
     }
@@ -491,21 +500,33 @@ struct Fetcher {
 unsafe impl Send for Fetcher {}
 
 impl Fetcher {
-    /// Fetch until end, error, or the consumer hangs up.
-    fn run(mut self, tx: mpsc::SyncSender<Result<Chunk, Error>>) {
-        loop {
-            match self.next_chunk() {
-                Ok(Some(chunk)) => {
-                    if tx.send(Ok(chunk)).is_err() {
-                        break;
+    /// Fetch until end, error, or the consumer hangs up. Every terminal —
+    /// end-of-stream, error, even a panic out of the FFI — is an explicit
+    /// message, so the consumer can tell a finished stream from a dead
+    /// thread (see Stream::next_chunk).
+    fn run(self, tx: mpsc::SyncSender<Result<Option<Chunk>, Error>>) {
+        let mut this = std::panic::AssertUnwindSafe(self);
+        let outcome = std::panic::catch_unwind(move || {
+            loop {
+                match this.next_chunk() {
+                    Ok(Some(chunk)) => {
+                        if tx.send(Ok(Some(chunk))).is_err() {
+                            return;
+                        }
+                    }
+                    terminal => {
+                        let _ = tx.send(terminal);
+                        return;
                     }
                 }
-                Ok(None) => break,
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                    break;
-                }
             }
+            // `this` (and the tx clone it captured) drop here: the result
+            // is destroyed before the thread exits, on unwind included.
+        });
+        if outcome.is_err() {
+            // The channel went down with the panic; the consumer reads the
+            // RecvError as "fetch thread died". Nothing more to say here —
+            // the unwind already printed its own message.
         }
     }
 
