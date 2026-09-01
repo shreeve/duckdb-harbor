@@ -138,11 +138,11 @@ not the 3–5× that "text is bloated" intuition suggests. Harbor sends the sche
 once and then positional rows (`{"type":"row","values":[...]}`) with no repeated
 keys, which removes most of JSON's structural overhead.
 
-**Quack is roughly 2× faster, and the true gap is somewhat wider than shown.**
-The comparison favors Harbor: `curl` wrote bytes to a file without parsing JSON,
-while the DuckDB client materialized a full temp table and paid process startup.
-Harbor is nonetheless already within 2–3× of a native binary protocol, before
-any encoder optimization.
+**Quack was roughly 2× faster against the encoder measured here, and the true
+gap was somewhat wider than shown.** The comparison favors Harbor: `curl` wrote
+bytes to a file without parsing JSON, while the DuckDB client materialized a
+full temp table and paid process startup. That was Harbor within 2–3× of a
+native binary protocol, before any encoder optimization.
 
 **Compression inverts the bandwidth argument.** Quack ships uncompressed. With
 `Content-Encoding: zstd` at level 1, Harbor moves **13× less data than Quack**.
@@ -151,11 +151,16 @@ Stated with the caveat it deserves: this synthetic data (sequential integers,
 production data — which still puts NDJSON ahead of uncompressed binary on any
 real network.
 
-Harbor has headroom it has not spent. `emit_value` in
-[`crates/harbor/src/encode.rs`](crates/harbor/src/encode.rs) still allocates a
-`String` per numeric cell via `to_string()`, and the row loop converts each
-borrowed `ValueRef` into an owned `Value`. Replacing those with `itoa`/`ryu`
-and direct `ValueRef` emission is mechanical work worth a further multiple.
+That headroom has since been spent. The encoder now writes digits directly into
+the output buffer with no per-cell allocation, and fetch and encode run
+pipelined on separate threads. Re-measured on the same machine and shape
+(current tree, DuckDB `v2.0.0-dev83323`): the million rows arrive in
+**~0.06 s** wall, best of three — a 3.5× improvement that lands at Quack's
+recorded figure, with the caveat that the two client paths still differ as
+described in the appendix. The `not measured` cell is also settled: with
+`Content-Encoding: zstd` the wall time is indistinguishable from identity,
+because compression rides the writer thread while the engine produces the next
+chunk. The wall-time gap in the table was the old encoder, not the protocol.
 
 ## The real comparison
 
@@ -189,9 +194,11 @@ remote SQL execution rather than transparent federation. Harbor should not try
 to imitate this.
 
 **Bulk binary transport.** For very large typed results moving between DuckDB
-instances, native chunk transfer wins on CPU and will keep winning. Measured
-above: ~2× on wall time, and no amount of JSON engineering closes it at
-100M-row scale.
+instances, native chunk transfer skips text encoding and parsing entirely, and
+that CPU advantage compounds at 100M-row scale. Harbor's encoder rewrite closed
+the measured wall-time gap at 1M rows, but the client must still parse JSON that
+a native client never produces — compression changed the bandwidth story, not
+the compute one.
 
 **Full type fidelity by construction.** Harbor spends real effort on lossless
 JSON encoding for decimals, nested types and oversized integers. Quack gets it

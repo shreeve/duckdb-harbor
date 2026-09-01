@@ -35,7 +35,7 @@ crate, so protocol changes require tests on both sides.
 ## One binary, engine on demand (~2.2MB until asked to serve)
 
 Nothing links `libduckdb`. The generated bindings route every DuckDB C call
-through null-initialized function pointers, and `engine.rs` fills them by
+through null-initialized function pointers, and `engine/mod.rs` fills them by
 `dlopen` — but only on the code paths that open a database. Consequences,
 each load-bearing:
 
