@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>DuckTable — design mockups</title>
+<link rel="stylesheet" href="tokens.css"><link rel="stylesheet" href="design.css">
+<script src="theme.js"></script>
+<style>
+  .cards { max-width: 900px; margin: 0 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .card {
+    display: block; background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-l); padding: 18px 20px; text-decoration: none; color: var(--text);
+  }
+  .card:hover { border-color: var(--accent); }
+  .card h2 { font-size: 14px; font-weight: 650; margin-bottom: 5px; }
+  .card p { color: var(--muted); font-size: 12.5px; }
+  .note { max-width: 900px; margin: 26px auto 0; color: var(--muted); font-size: 12.5px; }
+  .note code { font: 11.5px var(--font-mono); background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; }
+</style>
+</head><body>
+
+<div class="page-head">
+  <h1>DuckTable design</h1><span class="sub">token-driven mockups &mdash; switch the theme, every screen follows</span>
+  <span class="spacer"></span>
+</div>
+
+<div class="cards">
+  <a class="card" href="main-window.html"><h2>Main window</h2>
+    <p>Three panes: berths + catalog + notebooks sidebar, tab strip, data grid with a staged edit, Details inspector, status line.</p></a>
+  <a class="card" href="editing.html"><h2>Editing</h2>
+    <p>Three LIVE-mode indicator variants, the conflict cell with its resolution popover, and the staged change list.</p></a>
+  <a class="card" href="states.html"><h2>States</h2>
+    <p>Harbor unreachable, no berths yet, and a berth start failure inline in the sidebar with stderr.</p></a>
+  <a class="card" href="notebook.html"><h2>Notebook</h2>
+    <p>Stacked independent query panes: expanded, query-collapsed, and fully collapsed, with the "+" adder between panes.</p></a>
+</div>
+
+<p class="note">Every color on every screen resolves through the semantic tokens in <code>tokens.css</code>:
+five themes (light, dark, paper, midnight, contrast) are five token blocks, nothing else changes.
+The same vocabulary becomes gpui-component theme JSON in the build. The theme picker at top right persists across pages.</p>
+
+</body></html>

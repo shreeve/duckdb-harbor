@@ -1,0 +1,16 @@
+[package]
+name = "harbor-client"
+description = "DuckTable's Harbor client: transports, probes, and the NDJSON stream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wire = { path = "../../../harbor/crates/wire" }
+harbor-common = { path = "../../../harbor/crates/common", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+toml = "1"

@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>DuckTable — editing: LIVE, conflicts, staged</title>
+<link rel="stylesheet" href="tokens.css"><link rel="stylesheet" href="design.css">
+<script src="theme.js"></script>
+<style>
+  .mini { max-width: 720px; margin: 0 auto 8px; }
+  .vh { max-width: 720px; margin: 30px auto 8px; font-size: 13px; font-weight: 650; }
+  .vh small { color: var(--muted); font-weight: 400; margin-left: 8px; }
+  .live-edge { box-shadow: inset 0 2px 0 var(--accent); }
+  .conflict {
+    background: var(--warning-soft);
+    box-shadow: inset 3px 0 0 var(--warning);
+  }
+  .confl-pop {
+    position: relative; margin: 8px 0 4px 120px; width: 340px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-m); box-shadow: var(--shadow);
+    padding: 10px 12px; font-size: 12px;
+  }
+  .confl-pop .r { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-family: var(--font-mono); font-size: 12px; }
+  .confl-pop .tag { font: 600 10px var(--font-ui); letter-spacing: 0.5px; border-radius: 4px; padding: 1px 6px; }
+  .confl-pop .mine { background: var(--accent-soft); color: var(--accent); }
+  .confl-pop .theirs { background: var(--warning-soft); color: var(--warning); }
+  .confl-pop .acts { display: flex; gap: 8px; margin-top: 8px; }
+  .chg { padding: 0; }
+  .chg .li {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 12px; border-bottom: 1px solid var(--grid-line);
+    font: 11.5px var(--font-mono);
+  }
+  .chg .li .op { font: 700 9.5px var(--font-ui); letter-spacing: 0.6px; border-radius: 4px; padding: 2px 6px; width: 52px; text-align: center; }
+  .op.u { background: var(--accent-soft); color: var(--accent); }
+  .op.i { background: var(--success-soft); color: var(--success); }
+  .op.d { background: var(--danger-soft); color: var(--danger); }
+  .chg .li .sql { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chg .li .param { color: var(--muted); }
+  .chg .foot { display: flex; align-items: center; gap: 10px; padding: 9px 12px; }
+</style>
+</head><body>
+
+<div class="page-head">
+  <h1>Editing</h1><span class="sub">LIVE indicator variants &middot; conflict cell &middot; staged change list</span>
+  <span class="spacer"></span><a href="index.html">&larr; all screens</a>
+</div>
+
+<div class="vh">LIVE indicator &mdash; variant A <small>badge in the bottom bar + tinted status line (recommended)</small></div>
+<div class="window mini">
+  <div class="bbar">
+    <span class="seg"><span class="on">Data</span><span>Structure</span><span>JSON</span></span>
+    <span class="spacer"></span>
+    <span class="badge-live"><span class="pulse"></span>LIVE</span>
+    <span class="ghost">&lsaquo; 1 / 1 &rsaquo;</span>
+  </div>
+  <div class="statusbar" style="background: var(--accent-soft)">
+    <span class="dot on"></span> medlabs <span>every edit writes immediately &middot; &#8984;Z undoes</span>
+    <span class="spacer" style="flex:1"></span><span style="color: var(--accent); font-weight: 650">LIVE</span>
+  </div>
+</div>
+
+<div class="vh">LIVE indicator &mdash; variant B <small>accent edge across the top of the grid</small></div>
+<div class="window mini">
+  <div class="grid live-edge">
+    <table>
+      <tr><th class="num">#</th><th>InvoiceId</th><th>BillingCity</th><th>Total</th></tr>
+      <tr><td class="num">1</td><td>1</td><td>Stuttgart</td><td>1.98</td></tr>
+      <tr><td class="num">2</td><td>2</td><td>Oslo</td><td>3.96</td></tr>
+    </table>
+  </div>
+  <div class="bbar"><span class="spacer"></span><span class="badge-live"><span class="pulse"></span>LIVE</span></div>
+</div>
+
+<div class="vh">LIVE indicator &mdash; variant C <small>mode segment itself carries the badge, nothing else changes</small></div>
+<div class="window mini">
+  <div class="bbar">
+    <span class="seg"><span>staged</span><span class="on">&#9679; live</span></span>
+    <span class="ghost">writes are immediate</span>
+    <span class="spacer"></span>
+    <span class="ghost">&lsaquo; 1 / 1 &rsaquo;</span>
+  </div>
+</div>
+
+<div class="vh">Conflict cell <small>a LIVE write affected zero rows: someone else changed it first</small></div>
+<div class="window mini">
+  <div class="grid">
+    <table>
+      <tr><th class="num">#</th><th>InvoiceId</th><th>BillingAddress</th><th>BillingCity</th></tr>
+      <tr><td class="num">3</td><td>3</td><td class="conflict">Gr&eacute;trystraat 65 &#9888;</td><td>Brussels</td></tr>
+    </table>
+  </div>
+  <div class="confl-pop">
+    <div style="font-weight:650; margin-bottom:4px">Changed by someone else</div>
+    <div class="r"><span class="tag mine">YOURS</span> Gr&eacute;trystraat 65</div>
+    <div class="r"><span class="tag theirs">SERVER</span> Gr&eacute;trystraat 63b</div>
+    <div class="acts">
+      <button class="btn primary">Keep server value</button>
+      <button class="btn">Retry my edit</button>
+    </div>
+  </div>
+  <p class="caption" style="margin: 8px 12px 14px">The cell takes the server's value and shows the warning tint until resolved;
+  nothing is overwritten blind. "Retry my edit" issues a fresh conditional UPDATE against the new server value.</p>
+</div>
+
+<div class="vh">Staged change list <small>&#8984;S commits all-or-nothing; statements are parameterized</small></div>
+<div class="window mini chg">
+  <div class="li"><span class="op u">UPDATE</span><span class="sql">Invoice SET BillingAddress = ? WHERE InvoiceId = ?</span><span class="param">['Gr&eacute;trystraat 65', 3]</span></div>
+  <div class="li"><span class="op u">UPDATE</span><span class="sql">Invoice SET Total = ? WHERE InvoiceId = ?</span><span class="param">[6.02, 3]</span></div>
+  <div class="li"><span class="op i">INSERT</span><span class="sql">Invoice (CustomerId, InvoiceDate, Total) VALUES (?, ?, ?)</span><span class="param">[12, '2021-03-01', 0.99]</span></div>
+  <div class="li"><span class="op d">DELETE</span><span class="sql">Invoice WHERE InvoiceId = ?</span><span class="param">[11]</span></div>
+  <div class="foot">
+    <span class="ghost" style="color: var(--muted)">4 changes &middot; one transaction, all or nothing</span>
+    <span class="spacer" style="flex:1"></span>
+    <button class="btn danger">Discard all</button>
+    <button class="btn primary">Commit (&#8984;S)</button>
+  </div>
+</div>
+
+</body></html>
