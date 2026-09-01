@@ -35,7 +35,7 @@ The library is DuckDB — all of it, one dynamic library, vanilla, compiled and
 shipped by the DuckDB team. We never patch it, fork it, or wrap it in
 bindings. Version hop = swap the file.
 
-The binary is harbor: one 1.7MB executable that is both sides of the
+The binary is harbor: one 2.2MB executable that is both sides of the
 conversation. As a server it loads libduckdb and serves your database over
 HTTP, on a Unix socket or TCP. As a client it connects to any harbor and
 gives you a modern shell — syntax highlighting, completion, history — in
@@ -117,6 +117,16 @@ naming NDJSON as the remedy. Streaming has no such limit.
 The one thing one-shot does better: since nothing has been sent when the last
 row lands, a failure is still a real status code. The same query that streams a
 `200` with an `{"type":"error"}` line at the end answers `400` in this shape.
+
+The stream compresses on request — `Accept-Encoding: zstd` (the standard
+coding browsers and newer curl offer on their own) or `Accept-Encoding:
+lz4` (frames that decode at several GB/s, for native clients that want the
+absolute floor). Either one wraps the identical NDJSON bytes; a 5M-row
+integer result measures 161MB plain, 25MB as lz4, 1.1MB as zstd. The
+client's listed order wins when it offers both, anything else — gzip
+included, its encoder would throttle the stream — gets identity, and
+`curl -H 'Accept-Encoding: lz4' ... | lz4 -d` (or `zstd -d`) recovers the
+stream byte-for-byte.
 
 `/ready` normally runs `SELECT 1` through an ordinary executor and answers `200
 {"status":"ready"}` or `503`. Under sustained worker saturation, the dedicated
@@ -264,7 +274,7 @@ newer client's ask with the full document instead of a 404.
 
 One binary, and nothing to configure. The client half never touches DuckDB —
 the engine (`libduckdb`) loads on demand, only when this process is the one
-serving a file, so the same 1.7MB `harbor` is a pure protocol client on
+serving a file, so the same 2.2MB `harbor` is a pure protocol client on
 machines that never host a database. `make fetch-duckdb` pulls DuckDB's
 official v2 nightly into `~/.duckdb/cli/2.0.0/`, one of the places harbor
 looks at runtime; then:

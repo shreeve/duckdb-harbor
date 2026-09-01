@@ -3315,10 +3315,26 @@ fn run_sql(
             }
             // data_length: None makes justhttp chunk the body and keep the
             // connection alive.
-            let headers = vec![
+            let mut headers = vec![
                 Header::from_bytes(&b"Content-Type"[..], &b"application/x-ndjson"[..]).unwrap(),
                 Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..]).unwrap(),
             ];
+            if let Some(coding) = negotiated_coding(&req) {
+                if let Ok(reader) = CodedReader::new(body_rx, coding) {
+                    headers.push(
+                        Header::from_bytes(&b"Content-Encoding"[..], coding.header_value())
+                            .unwrap(),
+                    );
+                    let _ = req.respond(Response::new(200.into(), headers, reader, None));
+                    return (true, 200);
+                }
+                // Encoder setup failed (it does not, short of OOM): the
+                // channel was consumed constructing it, so this request is
+                // already lost either way — fall through is impossible,
+                // answer plainly.
+                let _ = req.respond(error_response(500, "internal", "could not start encoder"));
+                return (true, 500);
+            }
             let _ = req.respond(Response::new(200.into(), headers, ChannelReader::new(body_rx), None));
             (true, 200)
         }
@@ -3979,6 +3995,150 @@ impl Read for ChannelReader {
     }
 }
 
+/// The wire codings harbor can wrap a stream in. Two, for two audiences:
+/// zstd is the IANA-registered coding browsers and `curl --compressed`
+/// speak without being told; lz4 decodes several times faster for native
+/// clients that ask for it by name. Anything else is identity — gzip in
+/// particular is refused by omission, because its encode speed would
+/// throttle the stream it wraps.
+#[derive(Clone, Copy, PartialEq)]
+enum Coding {
+    Lz4,
+    Zstd,
+}
+
+impl Coding {
+    fn header_value(self) -> &'static [u8] {
+        match self {
+            Coding::Lz4 => b"lz4",
+            Coding::Zstd => b"zstd",
+        }
+    }
+}
+
+/// The first coding the client offers that harbor speaks, scanning
+/// Accept-Encoding tokens in the client's own order — the client knows its
+/// decode strengths better than we do. A `;q=0` token is an exclusion,
+/// per the RFC; other q-values are taken as listing order.
+fn negotiated_coding(req: &Request) -> Option<Coding> {
+    for h in req.headers().iter().filter(|h| h.field.equiv("Accept-Encoding")) {
+        for token in h.value.as_str().split(',') {
+            let mut parts = token.split(';');
+            let name = parts.next().unwrap_or("").trim();
+            let excluded = parts.any(|p| p.trim().eq_ignore_ascii_case("q=0"));
+            if excluded {
+                continue;
+            }
+            if name.eq_ignore_ascii_case("zstd") {
+                return Some(Coding::Zstd);
+            }
+            if name.eq_ignore_ascii_case("lz4") {
+                return Some(Coding::Lz4);
+            }
+        }
+    }
+    None
+}
+
+/// The body channel as one compressed frame — the `Content-Encoding` path.
+///
+/// Each chunk the executor sends is written into the frame and flushed, so
+/// the stream's latency profile is the uncompressed one: the executor
+/// already batches to FLUSH_AT (64KB), and the channel closing finishes
+/// the frame. Standard frame formats both ways, so `curl | lz4 -d` and
+/// `curl --compressed` (zstd) recover the NDJSON byte-for-byte.
+///
+/// The encoder writes into a shared in-process buffer (single-threaded:
+/// justhttp drives this Read from one writer thread) that read() drains.
+struct CodedReader {
+    rx: mpsc::Receiver<Vec<u8>>,
+    enc: Option<FrameEnc>,
+    buf: SharedBuf,
+    pos: usize,
+}
+
+enum FrameEnc {
+    Lz4(lz4_flex::frame::FrameEncoder<SharedBuf>),
+    Zstd(zstd::stream::Encoder<'static, SharedBuf>),
+}
+
+impl FrameEnc {
+    fn write_and_flush(&mut self, data: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        match self {
+            FrameEnc::Lz4(e) => {
+                e.write_all(data)?;
+                e.flush()
+            }
+            FrameEnc::Zstd(e) => {
+                e.write_all(data)?;
+                e.flush()
+            }
+        }
+    }
+
+    /// End the frame: last block plus footer land in the shared buffer.
+    fn finish(self) -> std::io::Result<()> {
+        match self {
+            FrameEnc::Lz4(e) => e.finish().map(drop).map_err(std::io::Error::other),
+            FrameEnc::Zstd(e) => e.finish().map(drop),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct SharedBuf(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+impl std::io::Write for SharedBuf {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl CodedReader {
+    fn new(rx: mpsc::Receiver<Vec<u8>>, coding: Coding) -> std::io::Result<Self> {
+        let buf = SharedBuf::default();
+        let enc = match coding {
+            Coding::Lz4 => FrameEnc::Lz4(lz4_flex::frame::FrameEncoder::new(buf.clone())),
+            // Level 1: the fast end. The stream is envelope-heavy NDJSON,
+            // which crushes at any level; what matters is staying off the
+            // encode critical path.
+            Coding::Zstd => FrameEnc::Zstd(zstd::stream::Encoder::new(buf.clone(), 1)?),
+        };
+        Ok(Self { rx, enc: Some(enc), buf, pos: 0 })
+    }
+}
+
+impl Read for CodedReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            {
+                let held = self.buf.0.borrow();
+                if self.pos < held.len() {
+                    let n = (held.len() - self.pos).min(out.len());
+                    out[..n].copy_from_slice(&held[self.pos..self.pos + n]);
+                    drop(held);
+                    self.pos += n;
+                    return Ok(n);
+                }
+            }
+            self.buf.0.borrow_mut().clear();
+            self.pos = 0;
+            let Some(enc) = self.enc.as_mut() else {
+                return Ok(0);
+            };
+            match self.rx.recv() {
+                Ok(chunk) => enc.write_and_flush(&chunk)?,
+                Err(_) => self.enc.take().expect("checked above").finish()?,
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Responses
 //
@@ -4449,6 +4609,56 @@ mod tests {
         ];
         for (m, p) in &non_routes {
             assert!(!route_exists(m, p), "should NOT be a route: {m:?} {p}");
+        }
+    }
+
+    #[test]
+    fn coded_readers_round_trip_the_stream() {
+        use std::io::Read;
+        // Chunks shaped like the executor's sends: several FLUSH_AT-sized
+        // bodies (crossing the frame's 64KB block boundary), then a small
+        // tail, then the channel closes.
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        let row = br#"{"type":"row","values":[123456789,"abc\n\"quoted\""]}"#;
+        let mut big = Vec::new();
+        while big.len() < 70 << 10 {
+            big.extend_from_slice(row);
+            big.push(b'\n');
+        }
+        chunks.push(big.clone());
+        chunks.push(big);
+        chunks.push(b"{\"type\":\"end\",\"rowCount\":2,\"timeMs\":1}\n".to_vec());
+        let expected: Vec<u8> = chunks.iter().flatten().copied().collect();
+
+        for coding in [super::Coding::Lz4, super::Coding::Zstd] {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(chunks.len());
+            for c in &chunks {
+                tx.send(c.clone()).unwrap();
+            }
+            drop(tx);
+
+            let mut compressed = Vec::new();
+            super::CodedReader::new(rx, coding)
+                .unwrap()
+                .read_to_end(&mut compressed)
+                .unwrap();
+            assert!(compressed.len() < expected.len() / 3, "row envelopes should crush");
+
+            let mut recovered = Vec::new();
+            match coding {
+                super::Coding::Lz4 => {
+                    lz4_flex::frame::FrameDecoder::new(&compressed[..])
+                        .read_to_end(&mut recovered)
+                        .unwrap();
+                }
+                super::Coding::Zstd => {
+                    zstd::stream::Decoder::new(&compressed[..])
+                        .unwrap()
+                        .read_to_end(&mut recovered)
+                        .unwrap();
+                }
+            }
+            assert_eq!(recovered, expected);
         }
     }
 }
