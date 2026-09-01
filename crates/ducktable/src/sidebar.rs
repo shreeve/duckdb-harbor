@@ -8,7 +8,7 @@ use crate::SetTheme;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
-use gpui_component::menu::{DropdownMenu as _, PopupMenu};
+use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::*;
 use harbor_client::Level;
 
@@ -20,7 +20,7 @@ fn theme_menu(menu: PopupMenu, _: &mut Window, cx: &mut Context<PopupMenu>) -> P
     let current = crate::theme::current_index(cx);
     let mut menu = menu;
     let mut first = true;
-    for (dark, heading) in [(false, "Light"), (true, "Dark")] {
+    for (dark, heading) in [(false, "LIGHT"), (true, "DARK")] {
         let group = themes.iter().enumerate().filter(|(_, (_, d))| *d == dark);
         for (n, (ix, (name, _))) in group.enumerate() {
             if n == 0 {
@@ -28,7 +28,15 @@ fn theme_menu(menu: PopupMenu, _: &mut Window, cx: &mut Context<PopupMenu>) -> P
                     menu = menu.separator();
                 }
                 first = false;
-                menu = menu.label(heading);
+                // BOLD CAPS a step smaller than the items: some themes'
+                // muted color sits too close to the item color for a
+                // plain label to read as a section header.
+                menu = menu.item(
+                    PopupMenuItem::element(move |_, _| {
+                        div().text_xs().font_bold().child(heading)
+                    })
+                    .disabled(true),
+                );
             }
             menu = menu.menu_with_check(name.clone(), ix == current, Box::new(SetTheme { ix }));
         }
