@@ -246,24 +246,20 @@ impl Grid {
     pub(crate) fn structure_view(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let t = pal(cx);
         let z = crate::prefs::get(cx).zoom_factor();
-        let mut pane = div().id("structure").v_flex().size_full().overflow_y_scroll();
+        let pane = div().id("structure").v_flex().size_full();
         let Some(grid) = self.structure_grid.clone() else {
             return pane.pl(px(PANE_INSET)).py_2().child(
                 div().text_sm().text_color(t.muted).child("Structure unavailable"),
             );
         };
-        // The columns grid, capped at ~20 rows (it scrolls internally
-        // for the rest), so the DDL below is always reachable without
-        // walking past 50 fields (Steve's ruling, 2026-08-31). +1 for
-        // the header row, +2 for the borders.
         let n = self.structure().map(|s| s.cols.len()).unwrap_or(0);
         let row_h = f32::from(crate::prefs::get(cx).table_size().table_row_height());
-        let cap = row_h * (n.min(20) + 1) as f32 + 2.;
-        pane = pane.child(div().flex_none().w_full().h(px(cap)).child(grid));
+        // The grid's full content height: rows + header + borders.
+        let content_h = row_h * (n + 1) as f32 + 2.;
 
         // ddl and ddl_input come from the same source in Grid::build, so
         // they are Some together.
-        if let (Some(state), Some(copy)) = (&self.ddl_input, &self.ddl_copy) {
+        let ddl_section = if let (Some(state), Some(copy)) = (&self.ddl_input, &self.ddl_copy) {
             let mut ddl = div().v_flex().flex_none().pl(px(PANE_INSET)).pr_3();
             ddl = ddl.child(
                 div()
@@ -368,10 +364,61 @@ impl Grid {
                             .font_family(value_font()),
                     ),
             );
-            pane = pane.child(ddl);
-        }
+            Some(ddl)
+        } else {
+            None
+        };
 
-        pane
+        if let (Some(ddl), Some(split)) = (ddl_section, &self.structure_split) {
+            // Two panes, one divider — the user's, like the Query
+            // view's editor/results split: draggable, persisted, the
+            // handle's own line marking where the columns end and the
+            // DDL begins. The columns grid scrolls internally above it;
+            // the DDL scrolls below it.
+            let pref = crate::prefs::get(cx).structure_split;
+            // Auto (never dragged): the classic ~20-row cap (Steve's
+            // ruling, 2026-08-31), landing mid-row when clipped so a
+            // half-visible row 21 says "cut, not end".
+            let auto = if n > 20 { row_h * 21.5 + 2. } else { content_h };
+            let want = if pref > 0. { pref } else { auto };
+            // Never taller than the grid's content — a small table
+            // stays shrink-wrapped, its DDL right below — and never
+            // squashed past the floor content itself allows.
+            let lo = crate::prefs::STRUCTURE_SPLIT_MIN.min(content_h);
+            let h = want.min(content_h).max(lo);
+            pane.child(
+                gpui_component::resizable::v_resizable("structure-split")
+                    .with_state(split)
+                    .child(
+                        gpui_component::resizable::resizable_panel()
+                            .size(px(h))
+                            .size_range(px(lo)..px(crate::prefs::STRUCTURE_SPLIT_MAX))
+                            // Furniture: only the user's drag moves the
+                            // divider — a window resize gives its delta
+                            // to the DDL.
+                            .fixed()
+                            .child(div().size_full().min_h_0().child(grid)),
+                    )
+                    .child(
+                        gpui_component::resizable::resizable_panel().child(
+                            div()
+                                .id("structure-ddl")
+                                .size_full()
+                                .min_h_0()
+                                .v_flex()
+                                .overflow_y_scroll()
+                                .child(ddl),
+                        ),
+                    ),
+            )
+        } else {
+            // No DDL, so no divider: the grid alone, capped at ~20 rows
+            // (it scrolls internally for the rest), the pane scrolling
+            // as one. +1 for the header row, +2 for the borders.
+            let cap = row_h * (n.min(20) + 1) as f32 + 2.;
+            pane.overflow_y_scroll()
+                .child(div().flex_none().w_full().h(px(cap)).child(grid))
+        }
     }
 }
 

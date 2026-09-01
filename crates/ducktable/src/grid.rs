@@ -123,6 +123,10 @@ pub(crate) struct Grid {
     /// table's own schema in an embedded, read-only Grid — one grid,
     /// many sources, applied to the catalog itself.
     pub(crate) structure_grid: Option<Entity<Grid>>,
+    /// The Structure view's columns/DDL divider (UI.md: divider
+    /// positions persist). None when there is no DDL below the columns
+    /// — one pane needs no divider.
+    pub(crate) structure_split: Option<Entity<ResizableState>>,
     /// The table/inspector divider (UI.md: divider positions persist —
     /// the width saves at the end of each drag).
     resize: Entity<ResizableState>,
@@ -600,6 +604,24 @@ impl Grid {
         let structure_grid = structure
             .as_ref()
             .map(|s| crate::structure::columns_grid(conn.clone(), s, window, cx));
+        // The columns/DDL divider persists like every other divider
+        // (sidebar, inspector, query): only the user's drag writes it.
+        let structure_split = (structure_grid.is_some() && ddl_input.is_some()).then(|| {
+            let state = cx.new(|_| ResizableState::default());
+            cx.subscribe(
+                &state,
+                |_, state, _: &gpui_component::resizable::ResizablePanelEvent, cx| {
+                    if let Some(h) = state.read(cx).sizes().first().copied() {
+                        crate::prefs::save(cx, |p| {
+                            p.structure_split = f32::from(h)
+                                .clamp(prefs::STRUCTURE_SPLIT_MIN, prefs::STRUCTURE_SPLIT_MAX);
+                        });
+                    }
+                },
+            )
+            .detach();
+            state
+        });
         Self {
             table,
             conn,
@@ -629,6 +651,7 @@ impl Grid {
             filter_esc: None,
             structure,
             structure_grid,
+            structure_split,
             resize,
             col_search,
             ddl_input,

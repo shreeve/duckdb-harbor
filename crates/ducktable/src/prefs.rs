@@ -42,6 +42,10 @@ pub struct Prefs {
     /// The Query pane's editor height — the editor/results divider
     /// position (docs/QUERY.md: the split persists).
     pub query_split: f32,
+    /// The Structure pane's columns-grid height — the columns/DDL
+    /// divider position. 0 means auto: content-sized up to the ~20-row
+    /// cap, until the user's first drag.
+    pub structure_split: f32,
     /// The window's last windowed frame (x, y, w, h) — None until the
     /// first resize or move, so a fresh install takes the platform's
     /// default placement.
@@ -93,6 +97,12 @@ pub const SIDEBAR_MAX: f32 = 480.;
 pub const QUERY_SPLIT_MIN: f32 = 72.;
 pub const QUERY_SPLIT_MAX: f32 = 2000.;
 
+/// Structure columns-pane height bounds — the same law as the query
+/// split: never squashed below a few rows, never allowed to push the
+/// DDL out of reach entirely.
+pub const STRUCTURE_SPLIT_MIN: f32 = 72.;
+pub const STRUCTURE_SPLIT_MAX: f32 = 2000.;
+
 impl Default for Prefs {
     fn default() -> Self {
         Self {
@@ -107,6 +117,7 @@ impl Default for Prefs {
             zoom: DEFAULT_ZOOM,
             sidebar_width: 224.,
             query_split: 240.,
+            structure_split: 0.,
             win: None,
         }
     }
@@ -163,6 +174,14 @@ pub fn init(cx: &mut App) {
             .and_then(Value::as_f64)
             .map(|h| (h as f32).clamp(QUERY_SPLIT_MIN, QUERY_SPLIT_MAX))
             .unwrap_or(prefs.query_split);
+        // 0 (or absent) stays 0: auto survives every save that isn't a
+        // drag of this divider.
+        prefs.structure_split = v
+            .get("structure_split")
+            .and_then(Value::as_f64)
+            .filter(|h| *h > 0.)
+            .map(|h| (h as f32).clamp(STRUCTURE_SPLIT_MIN, STRUCTURE_SPLIT_MAX))
+            .unwrap_or(prefs.structure_split);
         // The window frame: four finite numbers with a plausible size,
         // or the platform default. (A frame saved on a display that no
         // longer exists still restores — macOS pulls windows on-screen.)
@@ -210,6 +229,7 @@ pub fn save(cx: &mut App, change: impl FnOnce(&mut Prefs)) {
         "zoom": prefs.zoom,
         "sidebar_width": prefs.sidebar_width,
         "query_split": prefs.query_split,
+        "structure_split": prefs.structure_split,
         "window": prefs.win.map(|(x, y, w, h)| vec![x, y, w, h]),
     });
     if let Some(p) = file() {
