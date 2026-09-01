@@ -45,8 +45,9 @@ each load-bearing:
   searched.
 - **The engine swaps by file.** `HARBOR_LIBDUCKDB`, then `../lib` beside the
   binary (the release-archive layout), `~/.local/lib`, and `~/.duckdb/cli/*`
-  — DuckDB's own world, disposable and refetchable. One build has served
-  1.5.5 and 2.0-dev engines; the engine pin *is* the dylib.
+  — DuckDB's own world, disposable and refetchable. Harbor binds the v2 C
+  API, so DuckDB 2.0 is the engine floor; one build has served every 2.0
+  nightly it has met, and the engine pin *is* the dylib.
 - **Building needs nothing.** No DuckDB source tree, library, or header —
   the crate ships pregenerated bindings, so `cargo build` works on a bare
   machine and CI needs the engine only to run the suite.
@@ -174,11 +175,13 @@ daily — `libduckdb` (+ headers) and the `duckdb` CLI. That is the whole
 engine harbor needs, from upstream, so there is nothing to build and nothing
 to fork. `make fetch-duckdb` pulls it into `~/.duckdb/cli/2.0.0/`; CI fetches
 the same nightly via `.github/actions/duckdb`. Verified: one harbor build
-loads and runs clean against multiple alphas and against upstream stable
-`v1.5.5` — tested compatibility for Harbor's exercised C-API surface, not a
-claim about every past or future ABI. (The v2 nightlies parse SQL ~2× slower
-than 1.5.5 — the new PEG parser; execution is at parity. See the README's
-Performance section.)
+loads and runs clean against multiple 2.0 alphas — tested compatibility for
+Harbor's exercised C-API surface, not a claim about every future ABI. The
+floor is DuckDB 2.0 by construction: harbor binds the v2 C API, whose symbols
+older engines do not export. Database files are a different matter — a file
+created by a 1.5-era DuckDB opens as-is, because 2.0's storage layer reads
+it. (The v2 nightlies parse SQL ~2× slower than 1.5.5 — the new PEG parser;
+execution is at parity. See the README's Performance section.)
 
 **Harbor ships no extension.** A release archive carries harbor and the exact
 libduckdb it was tested against — nothing else. The extension door is the

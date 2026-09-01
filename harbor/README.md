@@ -595,10 +595,12 @@ works the same everywhere.
 **The engine is the loaded `libduckdb`, not the binary.** Nothing is linked:
 harbor loads the engine on demand (`HARBOR_LIBDUCKDB`, then `../lib` beside
 the binary, `~/.local/lib`, and `~/.duckdb/cli/*` — DuckDB's own world,
-disposable and refetchable). The same build has been verified against DuckDB
-1.5.5 and 2.0 development builds. Treat that as tested compatibility, not a
-promise that an arbitrary past or future DuckDB ABI will work — and point it
-at a library whose storage format matches the database file. A machine with
+disposable and refetchable). Harbor binds DuckDB's v2 C API, so DuckDB 2.0
+is the engine floor; the same build has been verified against the 2.0
+development line as it moves. Treat that as tested compatibility, not a
+promise that an arbitrary future DuckDB ABI will work. Your database files
+need no such care: a file created by a 1.5-era DuckDB opens as-is, because
+2.0's storage layer reads it. A machine with
 no engine at all still runs the client half; only serving needs the library,
 and the error says exactly where it looked.
 
@@ -634,9 +636,10 @@ code is self-consistent.
 
 ## Status
 
-Pre-production. One small binary. Nothing is linked: the same build has served
-DuckDB 1.5.5 and 2.0 development builds by loading the compatible `libduckdb`
-at runtime. Deploy remote TCP behind Caddy, which owns TLS and edge request
+Pre-production. One small binary. Nothing is linked: harbor loads a DuckDB
+2.0+ `libduckdb` at runtime — the v2 C API is the floor — and database files
+from 1.5-era DuckDBs open as-is. Deploy remote TCP behind Caddy, which owns
+TLS and edge request
 policy; Harbor independently owns SQL statement deadlines.
 
 ## License
