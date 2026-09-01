@@ -28,6 +28,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod config_edit;
 mod doctor;
+mod engine;
+mod engine_fill;
 
 // Paths, names, permissions and durations live in harbor-common so pilot and
 // ducktable cannot drift from them. What stays here is what only a server
@@ -538,6 +540,10 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
 
 fn duckdb_open(o: &Opts) -> Result<harbor::duckdb::Connection, String> {
     use harbor::duckdb::{Config, Connection};
+    // The engine loads here, on demand — the binary itself has no
+    // load-time libduckdb dependency, so invocations that never open a
+    // database run on machines without the library.
+    engine::ensure_loaded()?;
     // These four settings can only be chosen when the connection is opened,
     // not with a later SET, so they must reach the Connection here:
     //   --unsigned  allow_unsigned_extensions — the one door for loading a
