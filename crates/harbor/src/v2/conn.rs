@@ -413,9 +413,19 @@ impl Stream {
     /// the budget is heavy-shaped (or genuinely stalled) and the blocking
     /// fetch takes over for this chunk, buying back parallelism at the
     /// cost of a nap that is noise at that scale.
+    ///
+    /// The nap has only been observed on macOS, where dodging it is a
+    /// 2.5-6x win on streaming shapes. On Linux (22-core, same engine
+    /// pin) the blocking fetch streams 5M rows in ~0.15s — no nap to
+    /// dodge — and stepping showed no measurable benefit. So step-first
+    /// is macOS-only; everywhere else takes the engine's own fetch, the
+    /// canonical path. Re-measure both platforms at v2.0.0 GA.
     pub fn next_chunk(&mut self) -> Result<Option<Chunk>, Error> {
         const STEP_BUDGET: u32 = 32;
         let api = &self.eng.api;
+        if !cfg!(target_os = "macos") {
+            return self.next_chunk_blocking();
+        }
         let Some(step) = api.result_step else {
             return self.next_chunk_blocking();
         };
