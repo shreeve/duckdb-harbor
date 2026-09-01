@@ -21,6 +21,35 @@ pub enum Transport {
     Tcp(String), // host:port
 }
 
+/// The mooring: one silent connection, held open for the session.
+///
+/// A spawned server's lifetime is its client count, so what keeps it ashore
+/// while a human thinks between statements is not a heartbeat but presence —
+/// this stream, connected and quiet. justhttp counts a connection from accept,
+/// and an idle one waits through its read ticks forever, so holding the fd is
+/// the whole protocol. Dropping the Anchor is the goodbye.
+pub struct Anchor(#[allow(dead_code)] AnchorStream);
+
+// The streams are held, never read: their existence is the message.
+enum AnchorStream {
+    #[cfg(unix)]
+    Unix(#[allow(dead_code)] UnixStream),
+    Tcp(#[allow(dead_code)] TcpStream),
+}
+
+/// Open the anchor, or nothing — a server that refuses one (gone between
+/// resolve and here) will refuse the first statement too, which is where
+/// the error belongs.
+pub fn hold(transport: &Transport) -> Option<Anchor> {
+    match transport {
+        #[cfg(unix)]
+        Transport::Unix(p) => UnixStream::connect(p).ok().map(|s| Anchor(AnchorStream::Unix(s))),
+        Transport::Tcp(addr) => {
+            TcpStream::connect(addr).ok().map(|s| Anchor(AnchorStream::Tcp(s)))
+        }
+    }
+}
+
 pub struct Response {
     pub status: u16,
     pub body: Box<dyn BufRead>,

@@ -4062,16 +4062,6 @@ fn error_response(status: u16, code: &'static str, message: &str) -> Response<st
 
 // ---------------------------------------------------------------------------
 
-/// Bytes of entropy, for a token nobody has to invent. Not a hot path, so the
-/// cost of `getrandom` per call is irrelevant.
-pub fn random_token() -> String {
-    use rand::RngCore;
-    let mut bytes = [0u8; 24];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-
 #[cfg(test)]
 mod tests {
     use super::Method;

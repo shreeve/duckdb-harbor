@@ -7,7 +7,7 @@
 # `cargo test -p justhttp`.
 [workspace]
 members = ["crates/*"]
-default-members = ["crates/wire", "crates/pilot", "crates/harbor"]
+default-members = ["crates/wire", "crates/harbor"]
 # Vendored crates are patch sources, not members — excluded so their own
 # test suites can run in place (cd vendor/<crate> && cargo test).
 exclude = ["vendor/reedline"]

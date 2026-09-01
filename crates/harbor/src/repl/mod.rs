@@ -1,21 +1,19 @@
-//! The Harbor client — the REPL formerly shipped as the separate
-//! `pilot` binary, now a module of the one crate (`pilot` remains as a
-//! shim over cli_main).
+//! The client half of the one binary — the REPL, the one-shot runner, and
+//! the list.
 //!
-//! Zero-config local: a bare name resolves to ~/.local/state/harbor/runtime/<name>.sock —
-//! or, for a --port berth, the TCP address its sidecar json registered — plus
-//! its token file; config.toml is purely additive (remotes, aliases, taste).
+//! Zero config, zero registry. A target is a database file, a socket, or a
+//! plain-HTTP url; nothing else. A file with no server behind it gets one
+//! spawned on the spot — detached, refcounted, gone when its last client
+//! leaves — so `harbor data.duckdb` always just opens the database, exactly
+//! like the duckdb shell, except everyone else can be in it too.
+//!
+//!   harbor <db.duckdb>              the REPL (or stdin/-c on a pipe)
+//!   harbor <path/to.sock>           a harbor unix socket
+//!   harbor http://host:port         a harbor TCP listener
+//!
 //! TLS is Caddy's job — the client speaks plain HTTP over UDS/TCP.
-//!
-//!   pilot                          list live berths
-//!   pilot <target>                 the REPL
-//!   pilot <target> -c "SQL"        run one statement
-//!   echo "SQL" | pilot <target>    same, from stdin
-//!
-//! <target> = config entry | berth name | file.duckdb | socket | http://host:port
 
 mod complete;
-mod config;
 mod render;
 mod highlight;
 mod http;
@@ -24,17 +22,18 @@ mod repl;
 mod scan;
 mod theme;
 
+pub use http::Transport;
+
 use wire::{Event, SqlRequest, endpoint};
 use render::{Mode, RenderOpts, Renderer};
-use http::Transport;
 use std::io::{BufRead, IsTerminal, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// Set by SIGINT while a statement streams (registered in repl::run);
+/// Set by SIGINT while a statement streams (registered in cli_main/helm);
 /// checked at every read tick. Cleared before each statement.
 static CANCEL: LazyLock<std::sync::Arc<AtomicBool>> =
     LazyLock::new(|| std::sync::Arc::new(AtomicBool::new(false)));
@@ -55,8 +54,8 @@ enum Outcome {
     Failed,
 }
 
-/// The client's whole CLI. `pilot` (the shim binary) and `harbor repl`
-/// both land here; the caller hands over its remaining arguments.
+/// The client's whole CLI: everything except bare `harbor` (the list, which
+/// main dispatches straight to list_main) and `<db> serve` (the server).
 pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
     // Ctrl-C cancels the running statement (via its queryId), it does not
     // kill the client. At the REPL prompt reedline runs raw mode, so SIGINT
@@ -89,32 +88,25 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
                 print!("{HELP}");
                 return ExitCode::SUCCESS;
             }
-            "-V" | "--version" | "version" => {
-                println!("pilot {}", env!("CARGO_PKG_VERSION"));
-                return ExitCode::SUCCESS;
-            }
-            _ if target.is_none() => target = Some(a),
+            _ if target.is_none() && !a.starts_with('-') => target = Some(a),
             _ => return fail(&format!("unexpected argument: {a}")),
         }
     }
 
-    // Once; resolve and the render defaults share it.
-    let (cfg, cfg_err) = config::load();
-
-    // Bare `pilot` opens what the config says to open, and otherwise shows what
-    // there is to open. It deliberately does not pick "the only berth" when
-    // there happens to be one — that would make adding a second database
-    // silently change what a bare command does.
-    let Some(target) = target.or_else(|| cfg.defaults.connection.clone()) else {
-        return show_fleet(&cfg);
+    let Some(target) = target else {
+        return fail("which database? (harbor <db.duckdb> — or bare harbor to see what's running)");
     };
-    let conn = match resolve(&cfg, &target, token, cfg_err.as_ref()) {
+    let conn = match resolve(&target, token) {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
+    // The mooring, held for the life of this invocation: a spawned server
+    // lives while anyone is connected, and between statements — a human
+    // thinking at the prompt, a script paused mid-pipe — this silent open
+    // connection is the "anyone".
+    let anchor = http::hold(&conn.transport);
 
-    // config [defaults], then the flags on top — for the REPL and one-shots.
-    let mut opts = RenderOpts::with_defaults(&cfg.defaults);
+    let mut opts = RenderOpts::default();
     if json {
         opts.mode = Mode::JsonLines;
     }
@@ -133,8 +125,8 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
                 // Resolve the highlight theme now, while we own the tty: the
                 // "auto" appearance queries the terminal (OSC 11), which needs
                 // an interactive stdin/stdout and must run before reedline does.
-                theme::init(cfg.defaults.theme.as_deref(), cfg.defaults.appearance.as_deref());
-                return repl::run(&conn, &prompt_name(&target), opts);
+                theme::init(None, None);
+                return repl::run(&conn, &prompt_name(&target), opts, anchor);
             }
             let mut s = String::new();
             if std::io::stdin().read_to_string(&mut s).is_err() || s.trim().is_empty() {
@@ -157,6 +149,7 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
             break;
         }
     }
+    drop(anchor);
     match last {
         Outcome::Done => ExitCode::SUCCESS,
         Outcome::Cancelled => ExitCode::from(130), // the shell convention for SIGINT
@@ -165,208 +158,159 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
 }
 
 const HELP: &str = "\
-pilot — the Harbor client
+harbor — a DuckDB database, served
 
 usage:
-  pilot                        open [defaults] connection, else show the fleet
-  pilot <target>               interactive REPL (highlighting, Tab completion)
-  pilot <target> -c \"SQL\"      run one statement
-  echo \"SQL\" | pilot <target>  same, from stdin
-  pilot version                print this binary's version (also -V)
-
-target:
-  name                         a service — starts on use, runs until harbor stop
-                               (a stopped-by-hand name stays down until harbor start)
-  path/to.duckdb               a session — join its server, or start a temp one
-                               (opens or creates the file; exits when idle.
-                                a slash or a dot marks a path; a name has neither)
-  path/to.sock                 a harbor unix socket
-  http://host:port             a harbor TCP listener
+  harbor                       what's running
+  harbor <db.duckdb>           open a database: the REPL on a terminal, or
+                               SQL from -c \"...\" / stdin on a pipe. No server
+                               behind the file yet? One is spawned for it —
+                               it lives while anyone is connected.
+  harbor <path/to.sock>        a harbor unix socket
+  harbor http://host:port      a harbor TCP listener
+  harbor <db.duckdb> serve     serve it yourself — the server is yours, and
+                               lives until you leave (harbor <db> serve -h)
 
 options:
-  --token <t>                  bearer token (else HARBOR_TOKEN, else <name>.token)
+  -c \"SQL\"                     run statements and exit (stdin works too)
+  --token <t>                  bearer token for a TCP server (else $HARBOR_TOKEN)
   --mode <m>                   duckbox, duckboxy, markdown, csv, json, jsonlines, line, list, trash
   --json                       shorthand for --mode jsonlines
 
-config: $HARBOR_HOME/config.toml ([defaults] mode/timer/maxrows/nullvalue,
-[connection.<name>] url|path + token-file|token-cmd). Remote TLS is Caddy's
-job; ssh is the human path to a remote host.
+Remote TLS is Caddy's job; ssh is the human path to a remote host.
 ";
 
-/// Resolution order: config.toml name -> live berth name ->
-/// plain-HTTP url -> .duckdb path (join-or-spawn) -> socket path. Zero-config
-/// local always works; the config is purely additive.
-fn resolve(
-    cfg: &config::FileConfig,
-    target: &str,
-    flag_token: Option<String>,
-    cfg_err: Option<&harbor_common::config::Error>,
-) -> Result<Conn, String> {
-    let env_token = std::env::var("HARBOR_TOKEN").ok();
-
-    // One classifier for the whole fleet: a name never contains a dot or a
-    // slash, so an argument carrying one is a path — and a url says so
-    // outright. The same law harbor consults, from the same crate.
-    let spelled_out = target.starts_with("http://")
-        || target.starts_with("https://")
-        || harbor_common::looks_like_path(target);
-
-    // A bare name is a question only the config can answer, so a config that
-    // could not be read must not be answered around. Falling through used to
-    // mean: one typo anywhere in the file, the whole file discarded (it is
-    // deny_unknown_fields, so a single bad key takes all of it), and then
-    // `pilot medlabs` — which the file may well have defined as a remote —
-    // silently joins the LOCAL berth that happens to share the name. Same
-    // prompt, different data, one warning line scrolled past. A spelled-out
-    // target says what it means without the config's help; a name does not.
-    if let Some(e) = cfg_err
-        && !spelled_out
-    {
-        return Err(format!(
-            "{e}\n        so there is no way to know what {target:?} names. \
-             Fix the config, or say what you mean: a path, or http://host:port"
-        ));
-    }
-
-    // One name law for the whole fleet: harbor normalizes every name it
-    // mints, so pilot normalizes every name it looks up — `pilot MedLabs`
-    // and `harbor start MedLabs` must land on the same berth.
-    let normalized: String;
-    let target: &str = if spelled_out {
-        target
-    } else {
-        normalized = harbor_common::normalize(target)?;
-        &normalized
-    };
-
-    // Explicit config entry shadows a same-named live berth (ssh_config rule).
-    if let Some(entry) = cfg.connection.get(target) {
-        // Both url and path is a question only the entry's author can
-        // answer; picking one silently is how you query the wrong database.
-        if entry.url.is_some() && entry.path.is_some() {
-            return Err(format!(
-                "config entry {target:?} has both url and path — keep the one you mean"
-            ));
-        }
-        let home = config::runtime_dir()?;
-        if let Some(side) = harbor_common::fleet::Sidecar::read(&home, target) {
-            // Warn only when they actually diverge. When the entry's path IS
-            // the database the live berth serves, following the config joins
-            // that berth — nothing is shadowed, and warning here read as
-            // "pilot is about to force a second load" to more than one user.
-            let entry_db = entry.path.as_deref().map(|p| {
-                let expanded = config::expand(p);
-                std::fs::canonicalize(&expanded).unwrap_or(expanded)
-            });
-            let live_db = side.db.map(PathBuf::from);
-            let same = match (&entry_db, &live_db) {
-                (Some(a), Some(b)) => a == b,
-                _ => false,
-            };
-            if !same {
-                eprintln!("pilot: config entry {target:?} shadows a running local database of the same name");
-            }
-        }
-        let token = flag_token.or(env_token).or_else(|| config::resolve_token(entry));
-        if let Some(url) = &entry.url {
-            return Ok(Conn { transport: url_transport(url)?, token });
-        }
-        if entry.path.is_some() {
-            // A name is a service: it starts on use and runs until you say
-            // stop. The one word that outranks a client is the operator's —
-            // after `harbor stop`, the hold keeps the name down until
-            // `harbor start` lifts it. Pilot decides nothing here: it only
-            // realizes desired state through harbor's own verb.
-            let transport = match berth_transport(&home, target) {
-                Some(t) => t,
-                None => {
-                    if harbor_common::hold_file(&home, target).exists() {
-                        return Err(format!(
-                            "{target:?} is stopped by hand — harbor start {target} brings it back"
-                        ));
-                    }
-                    exec_harbor_start(&[std::ffi::OsString::from(target)])
-                        .map_err(|e| format!("cannot start {target:?}: {e}"))?;
-                    berth_transport(&home, target).ok_or_else(|| {
-                        format!(
-                            "harbor started {target:?} but it never registered — \
-                             see harbor show {target}"
-                        )
-                    })?
-                }
-            };
-            return Ok(Conn { transport, token: token.or_else(|| berth_token(&home, target)) });
-        }
-        return Err(format!("config entry {target:?} has neither url nor path"));
-    }
+/// A target is spelled out or it is refused: a plain-HTTP url, a socket, or
+/// a database file (a path carries a slash or a dot; there are no names).
+fn resolve(target: &str, flag_token: Option<String>) -> Result<Conn, String> {
+    let token = flag_token.or_else(|| std::env::var("HARBOR_TOKEN").ok());
 
     if target.starts_with("http://") || target.starts_with("https://") {
-        return Ok(Conn { transport: url_transport(target)?, token: flag_token.or(env_token) });
+        return Ok(Conn { transport: url_transport(target)?, token });
     }
-    if harbor_common::looks_like_path(target) {
-        let p = config::expand(target);
-        // The filesystem says which kind of path this is: a live socket is
-        // dialled, and everything else is a database file to open. `.sock`
-        // still reads as a socket when the file is not there yet, so a
-        // mistyped socket path fails as a socket, loudly, instead of
-        // quietly becoming a fresh database.
-        if is_socket(&p) || target.ends_with(".sock") {
-            #[cfg(unix)]
-            return Ok(Conn {
-                transport: Transport::Unix(p),
-                token: flag_token.or(env_token),
-            });
-            #[cfg(windows)]
-            return Err("Unix socket targets are not supported on Windows; use a database name or http://host:port".into());
-        }
-        // Summon the owner. A second pilot on the same file joins the same
-        // berth instead of "database is locked".
-        let life = harbor_common::lifetime::resolve(
-            None,
-            cfg.defaults.temp_idle_exit.as_deref(),
-            harbor_common::Summoner::Client,
-        )?;
-        let (transport, file_token) = ensure_berth(&p, life)?;
-        return Ok(Conn { transport, token: flag_token.or(env_token).or(file_token) });
+    if !harbor_common::looks_like_path(target) {
+        return Err(format!(
+            "{target:?} is not a database file (a path carries a / or a dot) — \
+             harbor takes a file, a .sock, or http://host:port"
+        ));
     }
-
-    let home = config::runtime_dir()?;
-    // Zero-config: an unconfigured bare name still joins a live local berth.
-    // The sidecar is the registry — socket and --port berths both answer here.
-    if let Some(transport) = berth_transport(&home, target) {
-        let file_token = berth_token(&home, target);
-        return Ok(Conn { transport, token: flag_token.or(env_token).or(file_token) });
-    }
-    Err(format!("nothing running named {target:?}{}", fleet_hint(&home)))
-}
-
-fn berth_token(home: &std::path::Path, name: &str) -> Option<String> {
-    let t = std::fs::read_to_string(harbor_common::token_file(home, name)).ok()?;
-    let t = t.trim().to_string();
-    if t.is_empty() { None } else { Some(t) }
-}
-
-/// Where a live berth answers — read from its sidecar, never guessed from a
-/// path convention. Guessing is how a --socket berth used to be unreachable
-/// by name: it answers where it said it would, not where we'd have put it.
-fn berth_transport(home: &std::path::Path, name: &str) -> Option<Transport> {
-    match harbor_common::fleet::Sidecar::read(home, name)?.addr()? {
+    let p = harbor_common::paths::expand(target);
+    // The filesystem says which kind of path this is: a live socket is
+    // dialled, and everything else is a database file to open. `.sock`
+    // still reads as a socket when the file is not there yet, so a
+    // mistyped socket path fails as a socket, loudly, instead of
+    // quietly becoming a fresh database.
+    if is_socket(&p) || target.ends_with(".sock") {
         #[cfg(unix)]
-        harbor_common::fleet::Addr::Sock(p) => Some(Transport::Unix(p)),
-        #[cfg(not(unix))]
-        harbor_common::fleet::Addr::Sock(_) => None,
-        harbor_common::fleet::Addr::Tcp(host, port) => Some(Transport::Tcp(format!(
-            "{}:{port}",
-            harbor_common::fleet::dial_host(&host)
-        ))),
+        return Ok(Conn { transport: Transport::Unix(p), token });
+        #[cfg(windows)]
+        return Err("Unix socket targets are not supported on Windows; use http://host:port".into());
+    }
+    Ok(Conn { transport: ensure_server(&p)?, token })
+}
+
+/// Join the server that owns this file, or spawn one — this same binary,
+/// detached, `--ephemeral`: it lives while anyone is connected and takes its
+/// socket with it when the last client leaves. The socket is identity, not
+/// registry: derived from the file's canonical path, so every spelling of the
+/// same file lands on the same server and no scan or sidecar is needed.
+fn ensure_server(path: &Path) -> Result<Transport, String> {
+    #[cfg(windows)]
+    {
+        let _ = path;
+        return Err(
+            "spawn-on-use needs unix sockets; on Windows run `harbor <db> serve --port <p> --token <t>` \
+             and connect to http://127.0.0.1:<p>"
+                .into(),
+        );
+    }
+    #[cfg(unix)]
+    {
+        let runtime = harbor_common::runtime_dir()?;
+        let canon = harbor_common::paths::canonical_db(path)?;
+        let sock = harbor_common::socket_for(&runtime, &canon)?;
+        let transport = Transport::Unix(sock.clone());
+        if ready(&transport) {
+            return Ok(transport);
+        }
+
+        // Spawn. Same binary, no PATH lookup, no environment contract —
+        // current_exe is the whole story. Detached (own process group, no
+        // tty), stderr to a log beside the socket so a failure has a face.
+        harbor_common::perms::ensure_private_dir(&runtime)?;
+        let log_path = sock.with_extension("log");
+        let log = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&log_path)
+            .map_err(|e| format!("log file: {e}"))?;
+        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg(&canon).arg("serve").arg("--ephemeral");
+        // A typed path is the duckdb-cli contract: open it, existing or not.
+        if !canon.exists() {
+            cmd.arg("--create");
+        }
+        {
+            use std::os::unix::process::CommandExt;
+            use std::process::Stdio;
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
+                .stderr(Stdio::from(log))
+                .process_group(0); // detached from our tty/session
+        }
+        let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if ready(&transport) {
+                return Ok(transport);
+            }
+            // The child dying is an answer, not a timeout — but it can be the
+            // GOOD answer: two clients raced, ours lost the database lock to
+            // the winner, and the winner's socket (same derived path) serves
+            // us fine. Only a dead child AND no listener is a failure.
+            if let Ok(Some(status)) = child.try_wait() {
+                if ready(&transport) {
+                    return Ok(transport);
+                }
+                return Err(format!(
+                    "the server did not start ({status}) — {}",
+                    log_tail(&log_path)
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Err(format!("{} did not come up in 15s — {}", canon.display(), log_tail(&log_path)))
     }
 }
 
-/// Every berth the registry knows, with how to dial it — the same sidecar
-/// jsons `harbor show` reads, so socket and --port berths both appear.
-fn berth_names(home: &std::path::Path) -> Vec<String> {
-    let (sidecars, _, _) = harbor_common::fleet::scan_runtime(home);
-    sidecars.into_keys().collect()
+/// The last few log lines, inlined — the operator should not have to go
+/// find the file to learn why their prompt never appeared.
+fn log_tail(log_path: &Path) -> String {
+    match std::fs::read_to_string(log_path) {
+        Ok(s) if !s.trim().is_empty() => {
+            let tail: Vec<&str> = s.lines().rev().take(3).collect();
+            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            format!("its log says:\n        {}", tail.join("\n        "))
+        }
+        _ => format!("see {}", log_path.display()),
+    }
+}
+
+/// Is a harbor answering on this socket right now? serve's pre-flight, for
+/// a friendlier refusal than the database lock error.
+#[cfg(unix)]
+pub fn sock_ready(sock: &Path) -> bool {
+    ready(&Transport::Unix(sock.to_path_buf()))
+}
+
+/// GET /ready, 200 or bust. Unauthenticated by design, so no token needed.
+fn ready(transport: &Transport) -> bool {
+    matches!(
+        http::request(transport, &endpoint::READY, None, None, Some(Duration::from_secs(2))),
+        Ok(r) if r.status == 200
+    )
 }
 
 fn url_transport(url: &str) -> Result<Transport, String> {
@@ -380,7 +324,7 @@ fn url_transport(url: &str) -> Result<Transport, String> {
     }
     if url.starts_with("https://") {
         return Err(
-            "TLS is Caddy's job, not pilot's: pilot stays TLS-free by design. \
+            "TLS is Caddy's job, not harbor's: the client stays TLS-free by design. \
              Use http:// on a trusted network, or ssh to the host and use the socket"
                 .into(),
         );
@@ -388,15 +332,14 @@ fn url_transport(url: &str) -> Result<Transport, String> {
     Err(format!("not a url: {url}"))
 }
 
-/// The short name a prompt wears: a berth name stays itself, a path or
-/// socket shows its stem, a url drops its scheme. The prompt orients; the
-/// full target is one `harbor show` away.
+/// The short name a prompt wears: a path or socket shows its stem, a url
+/// drops its scheme. The prompt orients; the full target is in the list.
 pub fn prompt_name(target: &str) -> String {
     if let Some(rest) = target.split_once("://").map(|(_, r)| r) {
         return rest.trim_end_matches('/').to_string();
     }
     if harbor_common::looks_like_path(target)
-        && let Some(stem) = std::path::Path::new(target).file_stem()
+        && let Some(stem) = Path::new(target).file_stem()
     {
         return stem.to_string_lossy().into_owned();
     }
@@ -404,7 +347,7 @@ pub fn prompt_name(target: &str) -> String {
 }
 
 /// Does this path exist as a unix socket right now?
-fn is_socket(p: &std::path::Path) -> bool {
+fn is_socket(p: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileTypeExt;
@@ -417,172 +360,133 @@ fn is_socket(p: &std::path::Path) -> bool {
     }
 }
 
-/// Join the live berth that owns this file, or exec `harbor` to summon an
-/// ephemeral one (idle-exit reaps it). Returns socket + the
-/// berth's token, if readable.
-fn ensure_berth(
-    path: &std::path::Path,
-    life: harbor_common::lifetime::Lifetime,
-) -> Result<(Transport, Option<String>), String> {
-    let home = config::runtime_dir()?;
-    // A file being created has no inode to canonicalize yet — resolve its
-    // parent instead, so the sidecar still records one absolute truth per
-    // file and a later pilot from another cwd joins instead of colliding.
-    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| {
-        let parent = match path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => std::path::Path::new("."),
+// ---------------------------------------------------------------------------
+// The list — bare `harbor`
+// ---------------------------------------------------------------------------
+
+/// One live server, as its own /info tells it.
+struct ListRow {
+    database: String,
+    pid: String,
+    clients: String,
+    uptime: String,
+    address: String,
+}
+
+/// Bare `harbor`: what's running, straight from the filesystem and the
+/// servers themselves. Readdir the runtime dir for sockets, ask each for
+/// /info, and unlink the ones nothing answers on — the registry IS the
+/// listening socket, so a stale file is litter, not state.
+pub fn list_main() -> ExitCode {
+    match list() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(&e),
+    }
+}
+
+fn list() -> Result<(), String> {
+    let runtime = harbor_common::runtime_dir()?;
+    let mut socks: Vec<PathBuf> = match std::fs::read_dir(&runtime) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "sock"))
+            .collect(),
+        Err(_) => Vec::new(), // no runtime dir yet: nothing has ever served
+    };
+    socks.sort();
+
+    let mut rows: Vec<ListRow> = Vec::new();
+    for sock in socks {
+        let transport = {
+            #[cfg(unix)]
+            {
+                Transport::Unix(sock.clone())
+            }
+            #[cfg(windows)]
+            {
+                continue;
+            }
         };
-        match std::fs::canonicalize(parent) {
-            Ok(p) => p.join(path.file_name().unwrap_or_default()),
-            Err(_) => path.to_path_buf(),
+        let shown = harbor_common::paths::shorten(&sock);
+        match http::request(&transport, &endpoint::INFO, None, None, Some(Duration::from_secs(2))) {
+            Ok(r) if r.status == 200 => {
+                let v: serde_json::Value =
+                    serde_json::from_str(r.body_string().unwrap_or_default().trim())
+                        .unwrap_or_default();
+                let ms = v["uptimeMs"].as_u64().unwrap_or(0);
+                rows.push(ListRow {
+                    database: v["database"]
+                        .as_str()
+                        .map(|d| harbor_common::paths::shorten(Path::new(d)))
+                        .unwrap_or_else(|| "?".into()),
+                    pid: v["pid"].as_u64().map_or_else(|| "?".into(), |p| p.to_string()),
+                    clients: v["clients"].as_u64().map_or_else(|| "?".into(), |c| c.to_string()),
+                    uptime: harbor_common::lifetime::humanize(Duration::from_millis(ms)),
+                    address: shown,
+                });
+            }
+            // It answered, just not with an open /info (an older, token'd
+            // server, say). Alive is alive — show the row, claim nothing.
+            Ok(_) => rows.push(ListRow {
+                database: "?".into(),
+                pid: "?".into(),
+                clients: "?".into(),
+                uptime: "?".into(),
+                address: shown,
+            }),
+            // Refused means nothing listens: a leftover from a kill -9 or a
+            // crash. Anything else (a transient error, a permission oddity)
+            // proves nothing, and an unlink on "proves nothing" is how a live
+            // server loses its front door.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                let _ = std::fs::remove_file(&sock);
+            }
+            Err(_) => {}
         }
-    });
-
-    // Already owned? The sidecar json says which berth claims this file.
-    let (sidecars, _, _) = harbor_common::fleet::scan_runtime(&home);
-    for (name, side) in &sidecars {
-        if side.db.as_deref() == Some(&canon.display().to_string())
-            && let Some(transport) = berth_transport(&home, name)
-        {
-            return Ok((transport, berth_token(&home, name)));
-        }
     }
 
-    // Summon. Pilot never links DuckDB: the owner is the harbor binary.
-    // The name is minted by the same law harbor mints them with.
-    let stem = canon.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let name = harbor_common::normalize(&stem)
-        .map_err(|_| format!("cannot derive a database name from {}", path.display()))?;
-    // The operator's stop outranks a typed path exactly as it outranks a
-    // typed name: whichever spelling would raise this berth, the hold
-    // refuses it, and only harbor's own verb lifts it.
-    if harbor_common::hold_file(&home, &name).exists() {
-        return Err(format!(
-            "{name:?} is stopped by hand — harbor start {name} brings it back"
-        ));
-    }
-    // The sidecar scan above found no berth owning THIS file — so a live
-    // berth under the derived name is serving a DIFFERENT database. Summoning
-    // would only collide on the name, and joining it would silently query the
-    // wrong data. Name both files and the way out instead.
-    if sidecars.contains_key(&name) {
-        let other = sidecars
-            .get(&name)
-            .and_then(|s| s.db.clone())
-            .unwrap_or_else(|| "another database".to_string());
-        return Err(format!(
-            "{name:?} is running but serves {other}, not {} — stop it (`harbor stop {name}`) or serve this file under a different name (`harbor start {} --name <other>`)",
-            canon.display(),
-            canon.display()
-        ));
-    }
-    let mut args: Vec<std::ffi::OsString> = vec![canon.clone().into()];
-    args.push("--name".into());
-    args.push(name.clone().into());
-    // A typed path is the duckdb-cli contract: open it, existing or not.
-    // A configured NAME over a missing file still blocks — that guard
-    // protects names clients trust; a path names only itself.
-    if !canon.exists() {
-        args.push("--create".into());
-    }
-    // Idle-exit is gone (0.20): a spawned server's lifetime is no longer a
-    // clock's business. The Lifetime is still resolved above so a bad
-    // config duration fails loudly here rather than never.
-    let _ = life;
-    exec_harbor_start(&args).map_err(|e| format!("cannot start {}: {e}", canon.display()))?;
-    let transport = berth_transport(&home, &name)
-        .ok_or_else(|| format!("harbor start returned without registering {name:?}"))?;
-    Ok((transport, berth_token(&home, &name)))
-}
-
-/// Pilot's only fleet-touching act is connecting, so anything it starts is
-/// started through harbor's own verb — one summon path, owned by the binary
-/// that owns the rules. No announcement on success: the operator asked for a
-/// database and gets a prompt, not a narration.
-fn exec_harbor_start(args: &[std::ffi::OsString]) -> Result<(), String> {
-    let harbor = std::env::var("HARBOR_BIN").unwrap_or_else(|_| "harbor".to_string());
-    let status = std::process::Command::new(&harbor)
-        .arg("start")
-        .args(args)
-        // pilot is about to draw a prompt; harbor's fleet table is not
-        // pilot's output. Failures still speak — harbor writes to stderr.
-        .stdout(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("cannot run {harbor:?} (is harbor installed?): {e}"))?;
-    match status.success() {
-        true => Ok(()),
-        false => Err("harbor start failed".into()),
-    }
-}
-
-fn fleet_hint(home: &std::path::Path) -> String {
-    let names = berth_names(home);
-    if names.is_empty() { String::new() } else { format!("; running: {}", names.join(", ")) }
-}
-
-/// The dial reconcile needs for the one row a lock file cannot settle.
-/// `/ready` is unauthenticated by design, so this needs no token.
-fn probe(a: &harbor_common::fleet::Addr) -> bool {
-    let transport = match a {
-        #[cfg(unix)]
-        harbor_common::fleet::Addr::Sock(p) => Transport::Unix(p.clone()),
-        #[cfg(not(unix))]
-        harbor_common::fleet::Addr::Sock(_) => return false,
-        harbor_common::fleet::Addr::Tcp(host, port) => Transport::Tcp(format!("{host}:{port}")),
-    };
-    matches!(
-        http::request(&transport, &endpoint::READY, None, None, Some(Duration::from_secs(2))),
-        Ok(r) if r.status == 200
-    )
-}
-
-/// Bare `pilot` with no default connection: the same fleet `harbor` draws.
-///
-/// The same table from the same reconcile, not a second one that agrees most
-/// of the time. Stopped berths belong here too — pilot summons one on demand,
-/// so "not running" is not "not openable".
-fn show_fleet(cfg: &config::FileConfig) -> ExitCode {
-    use harbor_common::ui::{Style, Tone};
-    let home = match config::runtime_dir() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("pilot: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let rows = harbor_common::fleet::reconcile(cfg, &home, &probe);
-    let st = Style::stdout().with_choice(cfg.defaults.color.as_deref());
     if rows.is_empty() {
-        println!("Nothing configured, nothing running.\n");
-        println!(
-            "  {} {}",
-            st.paint(Tone::Green, "pilot <db.duckdb>"),
-            st.paint(Tone::Dim, "open a database file — served on demand")
-        );
-        return ExitCode::SUCCESS;
+        println!("Nothing running.\n");
+        println!("  harbor <db.duckdb>   open a database — served while anyone is connected");
+        return Ok(());
     }
-    print!("{}", harbor_common::fleet::table(&rows).render(&st));
-    if st.boxed {
-        // One line, not two: the count and the invitation are the same
-        // thought — here is the fleet, here is how you open one of it — and
-        // the arrow carries that so the eye does not have to travel down to
-        // find out there was more. Dim arrow, lit command: the only part
-        // worth typing is the only part that is bright.
+
+    let head =
+        ListRow { database: "DATABASE".into(), pid: "PID".into(), clients: "CLIENTS".into(), uptime: "UPTIME".into(), address: "ADDRESS".into() };
+    let w = |f: fn(&ListRow) -> &str| {
+        std::iter::once(&head).chain(rows.iter()).map(|r| f(r).len()).max().unwrap_or(0)
+    };
+    let (wd, wp, wc, wu) =
+        (w(|r| &r.database), w(|r| &r.pid), w(|r| &r.clients), w(|r| &r.uptime));
+    for r in std::iter::once(&head).chain(rows.iter()) {
         println!(
-            "\n  {} {} {} {}",
-            harbor_common::fleet::tally(&rows),
-            st.paint(Tone::Dim, "➜"),
-            st.paint(Tone::Green, "pilot <name>"),
-            st.paint(Tone::Dim, "to open one")
+            "{:<wd$}  {:>wp$}  {:>wc$}  {:>wu$}  {}",
+            r.database, r.pid, r.clients, r.uptime, r.address
         );
     }
-    ExitCode::SUCCESS
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The helm — `harbor <db> serve` on a terminal
+// ---------------------------------------------------------------------------
+
+/// The prompt a foreground server wears: the same REPL, dialled at the
+/// server's own front door, so what the operator types is what any client
+/// would get. Returning ends the server — the caller stops and waits — which
+/// is the serve doctrine: the server is yours, it lives until you leave.
+pub fn helm(transport: Transport, token: Option<String>, name: &str) {
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, CANCEL.clone());
+    theme::init(None, None);
+    let conn = Conn { transport, token };
+    // No anchor: an owned server's lifetime is the operator's presence at
+    // this prompt, not its client count.
+    let _ = repl::run(&conn, name, RenderOpts::default(), None);
 }
 
 fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
     let wall = std::time::Instant::now();
-    let qid = format!("pilot-{}-{}", std::process::id(), QUERY_SEQ.fetch_add(1, Ordering::Relaxed));
+    let qid = format!("cli-{}-{}", std::process::id(), QUERY_SEQ.fetch_add(1, Ordering::Relaxed));
     // A Ctrl-C that landed between statements (say, while the pager showed
     // the last result) aborts before this one starts — never silently clear.
     if CANCEL.swap(false, Ordering::Relaxed) {
@@ -597,7 +501,7 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
     .expect("request serializes");
     // Runs on every 250ms socket tick: paints the spinner, and turns a
     // Ctrl-C into a DELETE on the query. A second Ctrl-C while the first
-    // cancel is pending means the berth is not honoring it — exit outright.
+    // cancel is pending means the server is not honoring it — exit outright.
     let on_tick = {
         let fired = AtomicBool::new(false);
         let spun = AtomicU64::new(0);
@@ -624,7 +528,7 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
                         Some(Duration::from_secs(2)),
                     );
                 } else {
-                    eprintln!("\npilot: second interrupt — leaving (the server keeps cancelling)");
+                    eprintln!("\nharbor: second interrupt — leaving (the server keeps cancelling)");
                     std::process::exit(130);
                 }
             }
@@ -705,8 +609,8 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
             Event::Row { values } => {
                 renderer.row(values);
                 if let Some(kind) = renderer.failed() {
-                    // Stop reading; dropping the connection tells the berth.
-                    // A closed pipe (`pilot … | head`) is the Unix goodbye,
+                    // Stop reading; dropping the connection tells the server.
+                    // A closed pipe (`harbor … | head`) is the Unix goodbye,
                     // not an error; anything else gets reported.
                     return if kind == std::io::ErrorKind::BrokenPipe {
                         Outcome::Done
@@ -770,11 +674,11 @@ fn clear_spinner() {
 
 fn err(msg: &str) -> Outcome {
     clear_spinner();
-    eprintln!("pilot: {msg}");
+    eprintln!("harbor: {msg}");
     Outcome::Failed
 }
 
 fn fail(msg: &str) -> ExitCode {
-    eprintln!("pilot: {msg}");
+    eprintln!("harbor: {msg}");
     ExitCode::FAILURE
 }

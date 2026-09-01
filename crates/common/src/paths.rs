@@ -116,9 +116,28 @@ pub fn socket_for(runtime: &Path, db: &Path) -> Result<PathBuf, String> {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "db".into());
-    // Keep well under sun_path even with a deep runtime dir.
-    let base: String = base.chars().take(40).collect();
-    Ok(runtime.join(format!("{base}-{h:08x}.sock", h = h as u32)))
+    // The basename is readability, so it is what yields: the whole path must
+    // fit sun_path (104 bytes with NUL on macOS — 103 is the universal
+    // budget), and the runtime dir eats what it eats ($TMPDIR sandboxes run
+    // deep). The hash carries the identity either way. Truncation is by
+    // BYTES, on char boundaries — a multi-byte name must not overshoot.
+    let dir = runtime.as_os_str().len();
+    let budget = 103usize.saturating_sub(dir + 1 + 1 + 8 + 5); // '/', '-', hash8, ".sock"
+    if budget == 0 {
+        return Err(format!(
+            "runtime dir is too deep for a unix socket ({}): shorten $HARBOR_HOME",
+            runtime.display()
+        ));
+    }
+    let mut cut = base.len().min(40);
+    while cut < base.len() && !base.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut cut = cut.min(budget);
+    while !base.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Ok(runtime.join(format!("{}-{h:08x}.sock", &base[..cut], h = h as u32)))
 }
 
 /// The canonical identity of a database path: symlinks resolved and
@@ -253,6 +272,23 @@ mod tests {
         assert!(looks_like_path("sub/dir"));
         assert!(looks_like_path("."));
         assert!(looks_like_path(".."));
+    }
+
+    #[test]
+    fn the_socket_fits_sun_path_even_in_a_deep_runtime_dir() {
+        // macOS $TMPDIR sandboxes produce runtime dirs ~80 bytes deep; the
+        // basename is what yields, the hash stays whole. (The db must exist —
+        // socket_for canonicalizes it.)
+        let db = std::env::temp_dir().join(format!("sunlen-{}.duckdb", std::process::id()));
+        std::fs::write(&db, b"").unwrap();
+        let deep = PathBuf::from(format!("/{}runtime", "sandbox/".repeat(9)));
+        let sock = socket_for(&deep, &db).unwrap();
+        assert!(sock.as_os_str().len() <= 103, "{} bytes: {}", sock.as_os_str().len(), sock.display());
+        assert!(sock.extension().is_some_and(|e| e == "sock"));
+        // Too deep to fit anything is an error with a name, not a bad bind.
+        let hopeless = PathBuf::from(format!("/{}", "x/".repeat(60)));
+        assert!(socket_for(&hopeless, &db).is_err());
+        let _ = std::fs::remove_file(&db);
     }
 
     #[test]

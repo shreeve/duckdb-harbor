@@ -2,7 +2,7 @@
 <#
 install.ps1 — install this harbor release from the extracted archive.
 
-    bin\harbor.exe, bin\pilot.exe, bin\duckdb.dll
+    bin\harbor.exe, bin\duckdb.dll
         -> %LOCALAPPDATA%\Programs\harbor\bin   (override: -InstallDir)
 
 Into your own profile, so nothing here needs Administrator. duckdb.dll sits
@@ -26,10 +26,10 @@ New-Item -ItemType Directory -Path $bin -Force | Out-Null
 foreach ($f in Get-ChildItem $src -File) {
   $dest = Join-Path $bin $f.Name
   try { Copy-Item $f.FullName $dest -Force }
-  catch { Write-Error "install: cannot replace $dest — stop any running berths first (harbor stop <name>), then re-run"; exit 1 }
+  catch { Write-Error "install: cannot replace $dest — stop any running harbor servers first, then re-run"; exit 1 }
 }
 
-Write-Host "installed: harbor + pilot -> $bin"
+Write-Host "installed: harbor -> $bin"
 
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 if (($userPath -split ';') -notcontains $bin) {

@@ -10,9 +10,6 @@ use reedline::{
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
 };
 use std::borrow::Cow;
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::repl::complete::SqlCompleter;
 use crate::repl::render::{Mode, RenderOpts};
@@ -194,7 +191,7 @@ fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
         Box::new(Emacs::new(kb))
     };
     let menu = ColumnarMenu::default().with_name("completion_menu");
-    let history = crate::repl::config::history_file();
+    let history = harbor_common::history_file().ok();
     Reedline::create()
         .with_validator(Box::new(SqlValidator))
         .with_highlighter(Box::new(crate::repl::highlight::SqlHighlighter))
@@ -212,7 +209,7 @@ fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
                 match history.map(|p| FileBackedHistory::with_file(1000, p)) {
                     Some(Ok(h)) => Box::new(h),
                     _ => {
-                        eprintln!("pilot: history file unavailable; using in-memory history");
+                        eprintln!("harbor: history file unavailable; using in-memory history");
                         Box::new(FileBackedHistory::default())
                     }
                 };
@@ -220,7 +217,12 @@ fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
         })
 }
 
-pub fn run(conn: &Conn, name: &str, mut opts: RenderOpts) -> std::process::ExitCode {
+pub fn run(
+    conn: &Conn,
+    name: &str,
+    mut opts: RenderOpts,
+    mut _anchor: Option<crate::repl::http::Anchor>,
+) -> std::process::ExitCode {
     let mut conn = conn.clone();
     let mut vi = false;
     // One completer for the session: its catalog cache loads lazily on the
@@ -243,24 +245,26 @@ pub fn run(conn: &Conn, name: &str, mut opts: RenderOpts) -> std::process::ExitC
                         DotResult::Quit => return std::process::ExitCode::SUCCESS,
                         DotResult::Handled => continue,
                         DotResult::Open(target) => {
-                            // A fresh config read on purpose: .open should
-                            // see entries added since the session began.
-                            let (cfg, cfg_err) = crate::repl::config::load();
-                            match crate::repl::resolve(&cfg, &target, None, cfg_err.as_ref()) {
+                            match crate::repl::resolve(&target, None) {
                                 Ok(c) => {
+                                    // Moor at the new server before letting
+                                    // the old mooring go: the switch must
+                                    // never be the moment both lifetimes hit
+                                    // zero clients.
+                                    _anchor = crate::repl::http::hold(&c.transport);
                                     conn = c;
                                     completer.reconnect(conn.clone());
                                     // The prompt changing name announces the switch.
                                     prompt = BerthPrompt { name: crate::repl::prompt_name(&target) };
                                 }
-                                Err(e) => eprintln!("pilot: {e}"),
+                                Err(e) => eprintln!("harbor: {e}"),
                             }
                             continue;
                         }
                         DotResult::Keymode(v) => {
                             vi = v;
                             line_editor = make_editor(&completer, vi);
-                            eprintln!("pilot: {} keybindings", if vi { "vi" } else { "emacs" });
+                            eprintln!("harbor: {} keybindings", if vi { "vi" } else { "emacs" });
                             continue;
                         }
                     }
@@ -288,7 +292,7 @@ pub fn run(conn: &Conn, name: &str, mut opts: RenderOpts) -> std::process::ExitC
             Ok(Signal::CtrlD) => return std::process::ExitCode::SUCCESS,
             Ok(_) => continue, // other signals (resize, etc.): nothing to do
             Err(e) => {
-                eprintln!("pilot: editor error: {e}");
+                eprintln!("harbor: editor error: {e}");
                 return std::process::ExitCode::FAILURE;
             }
         }
@@ -310,21 +314,21 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
         "quit" | "exit" | "q" => return DotResult::Quit,
         "open" => match parts.next() {
             Some(t) => return DotResult::Open(t.to_string()),
-            None => eprintln!("pilot: .open <name|path|url>"),
+            None => eprintln!("harbor: .open <name|path|url>"),
         },
         "keymode" => match parts.next() {
             Some("vi") => return DotResult::Keymode(true),
             Some("emacs") => return DotResult::Keymode(false),
-            _ => eprintln!("pilot: .keymode vi|emacs"),
+            _ => eprintln!("harbor: .keymode vi|emacs"),
         },
         "theme" => match parts.next() {
             None => {
                 let (name, _) = crate::repl::theme::describe();
                 println!("theme: {name} ({})", crate::repl::theme::NAMES.join(" "));
             }
-            Some(name) if crate::repl::theme::set_theme(name) => eprintln!("pilot: theme {name}"),
+            Some(name) if crate::repl::theme::set_theme(name) => eprintln!("harbor: theme {name}"),
             Some(name) => {
-                eprintln!("pilot: unknown theme {name:?} ({})", crate::repl::theme::NAMES.join(" "))
+                eprintln!("harbor: unknown theme {name:?} ({})", crate::repl::theme::NAMES.join(" "))
             }
         },
         "appearance" => {
@@ -337,11 +341,11 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
                 Some("light") => crate::repl::theme::set_appearance(Light),
                 Some("dark") => crate::repl::theme::set_appearance(Dark),
                 Some("auto") => crate::repl::theme::set_appearance(crate::repl::theme::detect_appearance()),
-                Some(other) => eprintln!("pilot: .appearance auto|light|dark (got {other:?})"),
+                Some(other) => eprintln!("harbor: .appearance auto|light|dark (got {other:?})"),
             }
         }
         "read" => match parts.next() {
-            Some(f) => match std::fs::read_to_string(crate::repl::config::expand(f)) {
+            Some(f) => match std::fs::read_to_string(harbor_common::paths::expand(f)) {
                 Ok(text) => {
                     for stmt in split_statements(&text) {
                         if run_sql(conn, &stmt, opts) != Outcome::Done {
@@ -349,20 +353,20 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
                         }
                     }
                 }
-                Err(e) => eprintln!("pilot: .read {f}: {e}"),
+                Err(e) => eprintln!("harbor: .read {f}: {e}"),
             },
-            None => eprintln!("pilot: .read <file.sql>"),
+            None => eprintln!("harbor: .read <file.sql>"),
         },
         "databases" | "db" => {
-            // Reloaded, not captured at startup: an edit made in another window
-            // is exactly what someone typing `.databases` wants to see.
-            let _ = crate::repl::show_fleet(&crate::repl::config::load().0);
+            // The same list bare `harbor` prints — one reconcile, not a
+            // second one that agrees most of the time.
+            let _ = crate::repl::list_main();
         }
         "mode" => match parts.next() {
             None => println!("mode: {} (duckbox duckboxy markdown csv json jsonlines line list trash)", opts.mode.name()),
             Some(m) => match Mode::parse(m) {
                 Some(m) => opts.mode = m,
-                None => eprintln!("pilot: unknown mode {m:?}"),
+                None => eprintln!("harbor: unknown mode {m:?}"),
             },
         },
         "maxrows" => match parts.next().and_then(|n| n.parse::<usize>().ok()) {
@@ -398,7 +402,7 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
             println!("  statements end with ;   Ctrl-C clears the line");
         }
         other => {
-            eprintln!("pilot: no such command .{other} (.help lists them)");
+            eprintln!("harbor: no such command .{other} (.help lists them)");
         }
     }
     DotResult::Handled

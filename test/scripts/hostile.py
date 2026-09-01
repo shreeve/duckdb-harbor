@@ -105,9 +105,9 @@ def start_server(db, port):
         [
             *os.environ.get(
                 "HARBOR_LAUNCHER",
-                os.path.join(HERE, "target", "release", "harbor") + " serve",
+                os.path.join(HERE, "target", "release", "harbor"),
             ).split(),
-            db, "--create",
+            db, "serve", "--create",
             "--port", str(port), "--token", TOKEN, "--workers", str(WORKERS),
         ],
         stdout=log, stderr=log, stdin=subprocess.DEVNULL,

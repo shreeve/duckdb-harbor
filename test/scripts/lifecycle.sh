@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+#
+# lifecycle.sh — the two lifetimes, end to end, through the real binary.
+#
+#   test/scripts/lifecycle.sh
+#
+# The law under test is the product's one breath: bare — the server is
+# everyone's, it lives while anyone is connected; serve — the server is
+# yours, it lives until you leave. Everything here is behavior no unit test
+# can see: spawn-on-use across processes, two clients landing on one server,
+# an idle connection as a mooring, the last departure sweeping the socket,
+# and a served server ignoring the refcount entirely.
+
+set -uo pipefail
+
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+harbor=${LIFECYCLE_HARBOR:-$here/target/release/harbor}
+[[ -x $harbor ]] || { echo "lifecycle: build first (make harbor)" >&2; exit 77; }
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/harbor-lifecycle.XXXXXX")
+export HARBOR_HOME="$work"
+# Short windows so departure is waitable. Test-only overrides, not API: the
+# shipped constants are 30s grace / 3s linger.
+export HARBOR_STARTUP_GRACE_MS=5000
+export HARBOR_LINGER_MS=1500
+cleanup() {
+  pkill -f "serve.*$work" 2>/dev/null
+  rm -rf "$work"
+}
+trap cleanup EXIT
+
+fails=0
+ok() { printf '  ✓ %s\n' "$1"; }
+bad() {
+  printf '  ✗ %s\n' "$1"
+  fails=$((fails + 1))
+}
+check() { # check <description> <expected-exit> <required-substring> <cmd...>
+  local desc=$1 want=$2 pat=$3 out status=0
+  shift 3
+  out=$("$@" 2>&1) || status=$?
+  if [[ $status -ne $want ]]; then
+    bad "$desc (exit $status, wanted $want): $out"
+    return
+  fi
+  if [[ -n $pat && $out != *"$pat"* ]]; then
+    bad "$desc (missing \"$pat\"): $out"
+    return
+  fi
+  ok "$desc"
+}
+# The one socket the database file derives to, live right now or "".
+live_sock() { ls "$work"/runtime/*.sock 2>/dev/null | head -1; }
+server_pid() { # via /info over the socket — the registry IS the server
+  local sock; sock=$(live_sock)
+  [[ -n $sock ]] || { echo ""; return; }
+  curl -s --max-time 2 --unix-socket "$sock" http://harbor/info \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("pid",""))' 2>/dev/null
+}
+wait_gone() { # poll until no socket answers (the departure), bounded
+  for _ in $(seq 1 60); do
+    [[ -z $(live_sock) ]] && return 0
+    sleep 0.2
+  done
+  return 1
+}
+
+echo "— spawn on use"
+check "a file target spawns a server and answers" 0 "42" \
+  "$harbor" "$work/x.duckdb" --mode csv -c "SELECT 42 AS answer"
+pid1=$(server_pid)
+[[ -n $pid1 ]] && ok "the server registered itself (its socket answers /info)" \
+               || bad "no server answering after spawn"
+check "a second client joins, not spawns" 0 "42" \
+  "$harbor" "$work/x.duckdb" --mode csv -c "SELECT 42 AS answer"
+pid2=$(server_pid)
+[[ -n $pid1 && $pid1 == "$pid2" ]] && ok "same server both times (pid $pid1)" \
+                                   || bad "the second client raised a second server ($pid1 vs $pid2)"
+check "the list shows the database" 0 "x.duckdb" "$harbor"
+check "a bare word is refused, never served" 1 "not a database file" \
+  "$harbor" nosuchname -c "SELECT 1"
+if [[ -f $work/nosuchname ]]; then bad "a bare word conjured a file"; else ok "no file conjured for a bare word"; fi
+
+echo "— the server is everyone's: it lives while anyone is connected"
+sock=$(live_sock)
+# A silent open connection, well past the linger AND past justhttp's 5s read
+# timeout — presence is the mooring, no heartbeat, no traffic.
+python3 - "$sock" <<'PY' &
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+time.sleep(7)
+s.close()
+PY
+holder=$!
+sleep 6
+if [[ -n $(live_sock) ]]; then ok "an idle connection holds the server (6s > 1s linger)"; else bad "the server left while a client was still connected"; fi
+wait "$holder"
+if wait_gone; then ok "the last departure ends the server"; else bad "the server outlived its last client"; fi
+if [[ ! -e $sock ]]; then ok "it swept its socket on the way out"; else bad "departure left the socket behind"; fi
+if [[ -f $work/x.duckdb && ! -e $work/x.duckdb.wal ]]; then
+  ok "the database stays ashore, checkpointed (no wal)"
+else
+  bad "departure left the database missing or with a wal"
+fi
+
+echo "— serve: the server is yours, it lives until you leave"
+"$harbor" "$work/x.duckdb" serve >"$work/serve.log" 2>&1 &
+srv=$!
+up=0
+for _ in $(seq 1 50); do [[ -n $(live_sock) ]] && { up=1; break; }; sleep 0.1; done
+(( up )) && ok "serve came up" || bad "serve never came up: $(cat "$work/serve.log")"
+check "a client joins the served database" 0 "7" \
+  "$harbor" "$work/x.duckdb" --mode csv -c "SELECT 7 AS seven"
+# Well past the linger an ephemeral server would have left on. A serve
+# lifetime has no clock at all — only SIGTERM (or .quit at the helm) ends it.
+sleep 2
+kill -0 "$srv" 2>/dev/null && ok "no refcount: it survives its clients leaving" \
+                           || bad "a served server left on the refcount"
+check "a second serve on the same file is refused" 1 "already being served" \
+  "$harbor" "$work/x.duckdb" serve
+kill -TERM "$srv"
+wait "$srv" 2>/dev/null
+if [[ -z $(live_sock) && ! -e $work/x.duckdb.wal ]]; then
+  ok "SIGTERM departs clean: socket swept, database checkpointed"
+else
+  bad "SIGTERM left residue (socket or wal)"
+fi
+
+echo "— the doors are guarded"
+check "--port without --token is refused" 1 "mandatory" \
+  "$harbor" "$work/x.duckdb" serve --port 9499
+check "--token on a unix socket is refused" 1 "no meaning" \
+  "$harbor" "$work/x.duckdb" serve --token abc
+check "a missing file without --create is an error, not a database" 1 "not found" \
+  "$harbor" "$work/absent.duckdb" serve
+check "verb-first is redirected, not parsed" 1 "database comes first" \
+  "$harbor" serve "$work/x.duckdb"
+
+echo "— the list is the truth, and sweeps what is not"
+python3 - "$work/runtime/dead-cafe0000.sock" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])  # bound then abandoned: the kill -9 leftover shape
+s.close()
+PY
+check "nothing running says so" 0 "Nothing running" "$harbor"
+if [[ ! -e $work/runtime/dead-cafe0000.sock ]]; then
+  ok "a stale socket is unlinked by the list"
+else
+  bad "the stale socket survived the list"
+fi
+
+echo
+if ((fails)); then
+  echo "lifecycle: $fails failing"
+  exit 1
+fi
+echo "lifecycle: all green"
