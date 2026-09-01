@@ -397,25 +397,29 @@ impl Stream {
     /// The next chunk, or None at end-of-stream. An interrupted query
     /// surfaces here as ERROR_RUNTIME_INTERRUPT.
     ///
-    /// Driven through result_step rather than result_fetch_chunk. The
-    /// blocking fetch parks in the engine's Executor::WaitForTask whenever
-    /// the stream buffer is momentarily empty — a bounded condition wait
-    /// (20ms) that is only signalled on task reschedule, not on
-    /// chunk-became-ready. A consumer that encodes faster than the engine
-    /// produces hits that nap once per chunk and a cheap query spends more
-    /// wall time asleep than working. Stepping keeps the loop in our hands:
-    /// each step runs engine work on this thread when there is any, and a
-    /// short yield spin bridges the sub-millisecond gaps while a background
-    /// pipeline finishes the next chunk. Only when the gap outlives the
-    /// spin — a genuinely slow producer — does it fall back to the engine's
-    /// own bounded wait, so nothing busy-loops on a long-running query.
+    /// Driven through result_step first, falling back to
+    /// result_fetch_chunk. The blocking fetch parks in the engine's
+    /// Executor::WaitForTask whenever the stream buffer is momentarily
+    /// empty — a bounded condition wait (20ms) that is only signalled on
+    /// task reschedule, not on chunk-became-ready. A consumer that encodes
+    /// faster than the engine produces hits that nap once per chunk and a
+    /// cheap query spends more wall time asleep than working. Stepping
+    /// dodges the nap — but each step runs its bounded unit of engine work
+    /// on THIS thread only, so a compute-heavy pipeline driven entirely by
+    /// steps executes serially: a wide aggregation measured 17x slower
+    /// than the blocking fetch, which engages the full worker pool. Hence
+    /// the budget: a cheap producer hands back its chunk within a few
+    /// steps and stays on the nap-free path; a query still chunkless after
+    /// the budget is heavy-shaped (or genuinely stalled) and the blocking
+    /// fetch takes over for this chunk, buying back parallelism at the
+    /// cost of a nap that is noise at that scale.
     pub fn next_chunk(&mut self) -> Result<Option<Chunk>, Error> {
+        const STEP_BUDGET: u32 = 32;
         let api = &self.eng.api;
-        let (Some(step), Some(wait)) = (api.result_step, api.result_wait) else {
+        let Some(step) = api.result_step else {
             return self.next_chunk_blocking();
         };
-        let mut yields = 0u32;
-        loop {
+        for _ in 0..STEP_BUDGET {
             let mut chunk: ffi::data_chunk_handle = std::ptr::null_mut();
             let mut status: ffi::RESULT_STEP_STATUS = ffi::RESULT_STEP_STATUS_WAITING;
             let mut err: ffi::error_info_handle = std::ptr::null_mut();
@@ -435,24 +439,15 @@ impl Stream {
                         message: "INTERRUPT Error: Interrupted!".to_string(),
                     });
                 }
-                _ => {
-                    if yields < 64 {
-                        yields += 1;
-                        std::thread::yield_now();
-                    } else {
-                        let mut err: ffi::error_info_handle = std::ptr::null_mut();
-                        let code = unsafe { wait(self.result, &mut err) };
-                        if code != ffi::ERROR_NONE {
-                            return Err(Error::take(api, code, err));
-                        }
-                    }
-                }
+                _ => std::thread::yield_now(),
             }
         }
+        self.next_chunk_blocking()
     }
 
-    /// The engine's own blocking fetch, for a build whose v2 surface lacks
-    /// step/wait.
+    /// The engine's own blocking fetch: full worker-pool parallelism, at
+    /// the cost of the WaitForTask nap. The heavy-shape half of
+    /// next_chunk, and the whole path for a build without result_step.
     fn next_chunk_blocking(&mut self) -> Result<Option<Chunk>, Error> {
         let api = &self.eng.api;
         let mut chunk: ffi::data_chunk_handle = std::ptr::null_mut();
