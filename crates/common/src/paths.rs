@@ -96,6 +96,49 @@ pub fn runtime_dir() -> Result<PathBuf, String> {
 pub fn sock_file(runtime: &Path, name: &str) -> PathBuf {
     runtime.join(format!("{name}.sock"))
 }
+/// The one true socket for a database file — identity derived, never
+/// registered. The canonical path (symlinks resolved, absolutized; for a
+/// file that does not exist yet, its parent canonicalized) is hashed so
+/// every spelling of the same file lands on the same server, and two
+/// `data.duckdb` in different directories never fight over one socket.
+/// The basename keeps `ls` readable; the hash carries uniqueness; the
+/// full path cannot be the name because sun_path is ~104 bytes on macOS.
+/// FNV-1a, hand-rolled, because the name must be STABLE across releases
+/// — a 0.20.1 must find a 0.20.0's socket — and std's hasher is not.
+pub fn socket_for(runtime: &Path, db: &Path) -> Result<PathBuf, String> {
+    let canon = canonical_db(db)?;
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in canon.to_string_lossy().as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let base = canon
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "db".into());
+    // Keep well under sun_path even with a deep runtime dir.
+    let base: String = base.chars().take(40).collect();
+    Ok(runtime.join(format!("{base}-{h:08x}.sock", h = h as u32)))
+}
+
+/// The canonical identity of a database path: symlinks resolved and
+/// absolutized. A not-yet-created file (--create) canonicalizes its
+/// parent and keeps its own name.
+pub fn canonical_db(db: &Path) -> Result<PathBuf, String> {
+    if let Ok(c) = db.canonicalize() {
+        return Ok(c);
+    }
+    let parent = match db.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let name = db.file_name().ok_or_else(|| format!("not a file path: {}", db.display()))?;
+    let parent = parent
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", parent.display()))?;
+    Ok(parent.join(name))
+}
+
 pub fn sidecar_file(runtime: &Path, name: &str) -> PathBuf {
     runtime.join(format!("{name}.json"))
 }
