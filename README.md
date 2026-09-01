@@ -37,10 +37,6 @@ caret. *(Midnight theme.)*
 
 [![Query view](https://raw.githubusercontent.com/shreeve/ducktable/main/docs/shots/03-query.png)](https://raw.githubusercontent.com/shreeve/ducktable/main/docs/shots/03-query.png)
 
-*(GitHub won't run scripts in a README, so the real slideshow lives at
-[`docs/shots/index.html`](docs/shots/index.html) — open it locally for
-arrow-key navigation, Escape to leave.)*
-
 ## Install
 
 ```console
