@@ -32,7 +32,7 @@ crate, so protocol changes require tests on both sides.
 
 ---
 
-## One binary, engine on demand (~2.7MB until asked to serve)
+## One binary, engine on demand (~1.7MB until asked to serve)
 
 Nothing links `libduckdb`. The generated bindings route every DuckDB C call
 through null-initialized function pointers, and `engine.rs` fills them by

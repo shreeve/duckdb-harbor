@@ -35,7 +35,7 @@ The library is DuckDB — all of it, one dynamic library, vanilla, compiled and
 shipped by the DuckDB team. We never patch it, fork it, or wrap it in
 bindings. Version hop = swap the file.
 
-The binary is harbor: one executable under 2MB that is both sides of the
+The binary is harbor: one 1.7MB executable that is both sides of the
 conversation. As a server it loads libduckdb and serves your database over
 HTTP, on a Unix socket or TCP. As a client it connects to any harbor and
 gives you a modern shell — syntax highlighting, completion, history — in
@@ -264,7 +264,7 @@ newer client's ask with the full document instead of a 404.
 
 One binary, and nothing to configure. The client half never touches DuckDB —
 the engine (`libduckdb`) loads on demand, only when this process is the one
-serving a file, so the same 2.7MB `harbor` is a pure protocol client on
+serving a file, so the same 1.7MB `harbor` is a pure protocol client on
 machines that never host a database. `make fetch-duckdb` pulls DuckDB's
 official v2 nightly into `~/.duckdb/cli/2.0.0/`, one of the places harbor
 looks at runtime; then:
