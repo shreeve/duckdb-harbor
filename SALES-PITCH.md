@@ -1,180 +1,291 @@
-# Harbor vs. Quack: The Sales Pitch
+# Harbor vs. Quack
 
-Yes—after reading the current Harbor code and DuckDB's announcement, I think **Harbor + Pilot + DuckTable stacks up extremely nicely**.
+> **This document is evidence, not positioning.** Every protocol claim below was
+> verified against a running Quack server with a man-in-the-middle proxy on the
+> wire, and every performance number was measured, not estimated. Versions,
+> method and reproduction steps are in [Appendix: how this was tested](#appendix-how-this-was-tested).
+> Where a claim rests on reading source rather than observing bytes, it says so.
 
-The important distinction is:
-
-> Quack makes one DuckDB talk beautifully to another DuckDB.
-> Harbor makes DuckDB accessible to practically anything.
-
-That is a genuinely valuable difference.
-
-## One important correction
-
-Quack also travels over HTTP. DuckDB explicitly describes it as an HTTP-based protocol with no custom network transport to operate.
-
-But its HTTP bodies use `application/duckdb`, encoded with DuckDB's internal binary serialization. So the transport is standard HTTP, but the **application protocol is DuckDB-specific**. A non-DuckDB client must implement that serialization, its handshake, fetching behavior, error model, session semantics, and future protocol changes. [DuckDB's Quack documentation](https://duckdb.org/docs/current/quack/overview)
-
-Harbor uses ordinary HTTP plus ordinary JSON/NDJSON:
-
-```http
-POST /sql
-
-{"sql":"SELECT * FROM orders"}
-```
-
-```json
-{"type":"schema","columns":[...]}
-{"type":"row","values":[...]}
-{"type":"end","rowCount":42,"timeMs":3}
-```
-
-That distinction is enormous for application development.
-
-## The real comparison
-
-| Area              | Harbor                                           | Quack + `CONNECT`                            |
-| ----------------- | ------------------------------------------------ | -------------------------------------------- |
-| Primary client    | Any HTTP-capable program                         | Another DuckDB                               |
-| Payload           | JSON/NDJSON                                      | DuckDB binary serialization                  |
-| Client dependency | HTTP + JSON parser                               | DuckDB/Quack client implementation           |
-| Browser use       | Natural with `fetch()`                           | Specialized client/Wasm integration          |
-| Shell use         | `curl` works                                     | DuckDB client required                       |
-| Language support  | Effectively universal                            | Bindings or custom protocol implementation   |
-| Remote catalog    | SQL endpoint and `/catalog`                      | Native `ATTACH`/`CONNECT` catalog            |
-| Type fidelity     | Carefully encoded JSON with type metadata        | Native, fully lossless DuckDB representation |
-| Result efficiency | Excellent for app-sized and streaming results    | Better for huge typed analytical transfers   |
-| Operations        | Fleet, readiness, shutdown, cancellation, leases | Native DuckDB server/session model           |
-| Human client      | Pilot                                            | DuckDB CLI with Quack                        |
-| UI                | DuckTable, the native desktop client             | Not the core Quack proposition               |
-
-## Harbor's strongest advantage
-
-Harbor draws the system boundary at exactly the right place:
-
-```mermaid
-flowchart TD
-    A["Web apps, Rip, workers, scripts"] -->|"HTTP + JSON"| H["Harbor"]
-    P["Pilot"] -->|"HTTP + NDJSON"| H
-    H --> D["One owned DuckDB process"]
-    U["DuckTable"] -->|"HTTP + JSON"| H
-```
-
-The application does not care:
-
-* which DuckDB client library exists for its language;
-* whether that library matches the server version;
-* how to compile or distribute `libduckdb`;
-* how DuckDB serializes vectors internally;
-* how to implement Quack;
-* whether it is running in JavaScript, Rip, Python, a shell script, or something new.
-
-It just sends SQL and reads JSON.
-
-That is especially powerful for your MedLabs/Rip architecture. Your workers already speak HTTP. Harbor lets them remain ordinary stateless application processes while one carefully controlled process owns the database.
-
-Quack would require putting DuckDB—or a credible Quack implementation—on the client side. That is exactly the coupling you are trying to avoid.
-
-## Harbor is considerably more than "DuckDB behind an endpoint"
-
-The code has the hard operational pieces that simplistic SQL-over-HTTP wrappers usually ignore:
-
-* bounded query concurrency;
-* streamed results without materializing the complete result;
-* lossless metadata for decimals, nested types and oversized integers;
-* prepared-statement caching;
-* pinned transactional sessions;
-* separate worker and session connection capacity;
-* client-named query cancellation;
-* statement deadlines;
-* abandoned-session reclamation;
-* readiness that tests the database rather than merely the process;
-* graceful drain, checkpoint and shutdown;
-* per-database process isolation;
-* Unix sockets locally and Caddy at the remote edge;
-* sealed mode, memory limits, spill limits and token authentication;
-* fleet discovery without introducing a supervising daemon.
-
-The protocol is also deliberately small and versioned. [`wire/src/lib.rs`](https://github.com/shreeve/duckdb-harbor/blob/main/crates/wire/src/lib.rs) shows that clients only need a few request types and four streaming events: `schema`, `row`, `end`, and `error`.
-
-That is a very good protocol.
-
-## Pilot makes the architecture feel complete
-
-Pilot is not merely a demo client. It makes Harbor comfortable for humans:
-
-* DuckDB-style interactive experience;
-* syntax highlighting and completion;
-* named berths;
-* database-path join-or-spawn behavior;
-* no DuckDB engine linked into the client;
-* version independence across a mixed fleet;
-* streaming rendering;
-* real Ctrl-C cancellation through Harbor.
-
-The last point is particularly good. Pilot generates a query ID, streams the response, and converts Ctrl-C into `DELETE /sql/queries/<id>`. That is thoughtful client/server behavior, not a superficial CLI wrapper. [`pilot/src/main.rs`](https://github.com/shreeve/duckdb-harbor/blob/main/crates/pilot/src/main.rs)
-
-And the vendored Reedline fixes demonstrate that you have worked through the irritating details that determine whether a REPL actually feels polished.
-
-## The package is coherent
-
-* **Harbor:** programmatic and operational interface;
-* **Pilot:** excellent terminal interface;
-* **DuckTable:** native desktop interface;
-* **DuckDB 2.0:** the engine.
-
-That is a coherent database product rather than merely a server experiment.
-
-The version-matching approach is especially defensible: Harbor, Pilot, and `libduckdb` all derive from the same nightly and ship in one archive. You are not pretending DuckDB's current extension ABI problem does not exist—anything an operator chooses to `LOAD` must match the linked engine, and Harbor makes that engine explicit.
-
-## Where Quack is honestly better
-
-Quack has several capabilities Harbor should not try to imitate.
-
-### Native remote catalog semantics
-
-With Quack:
-
-```sql
-ATTACH 'quack:server.example.com' AS qk (...);
-CONNECT qk;
-SELECT * FROM events;
-```
-
-The remote database behaves like DuckDB inside DuckDB. DuckDB 2.0 can route whole queries to it and use its remote pushdown optimizer. That is beautiful for federation, analytical composition and DuckDB-to-DuckDB workflows. [DuckDB 2.0 preview](https://duckdb.org/2026/08/17/duckdb-20-highlights)
-
-Harbor intentionally offers remote SQL execution, not transparent catalog federation.
-
-### Binary analytical result transport
-
-Quack preserves DuckDB's full type system without converting through JSON and can transfer native chunks efficiently. For gigantic analytical results moving between DuckDB instances, Quack should win.
-
-Harbor's schema metadata and careful value encoding make JSON safe, but it is still JSON. It will use more bandwidth and CPU for huge results.
-
-### Upstream integration
-
-Quack is becoming a stable, first-party part of DuckDB 2.0. `CONNECT` and the remote optimizer will naturally receive upstream investment and ecosystem support.
-
-That matters—but it does not erase Harbor's market. It clarifies it.
-
-## My conclusion
-
-Your statement is basically right, with one refinement:
-
-> Harbor's advantage is not that Quack fails to use HTTP. Quack does use HTTP. Harbor's advantage is that it uses the **universal HTTP application model**—JSON requests and streaming NDJSON responses—while Quack carries a specialized DuckDB binary protocol over HTTP.
-
-That makes the positioning very clean:
+The one-line distinction:
 
 > **Quack connects databases. Harbor connects applications.**
 
-Or, using the excellent language already in your README:
+Quack is a well-engineered protocol and it is faster than Harbor at moving bulk
+result sets. Neither of those facts is in dispute here, and this document does
+not argue otherwise. What it argues is that the two systems answer different
+questions, and that the axis Harbor is usually defended on — text versus
+binary — is the wrong one.
 
-> **Many clients, one DuckDB, over plain HTTP.**
+## What Quack actually is, on the wire
 
-I would not pitch Harbor as "better Quack." That invites a binary-protocol performance comparison in Quack's strongest territory.
+Quack is a **stateful session protocol that uses HTTP as a transport**. That is
+a sharper and more useful description than "a binary protocol," and it is the
+root of every practical difference below.
 
-I would pitch it as the missing application-facing counterpart:
+Observed, not inferred:
 
-> DuckDB 2.0 gives DuckDB a native server protocol. Harbor gives every language, browser, worker, script, and application an immediately usable DuckDB service—with no driver and no protocol implementation.
+* One endpoint, `POST /quack`, default port 9494.
+* Requests are `Content-Type: application/octet-stream`. Responses are
+  `Content-Type: application/vnd.duckdb`. The asymmetry is real; DuckDB's own
+  documentation says `application/duckdb`, which matches neither.
+* Bodies are DuckDB's internal `BinarySerializer` format — field-id tagged,
+  the same machinery used for its on-disk structures.
+* Every message carries `MessageHeader { type, connection_id, client_query_id }`.
+* `Access-Control-Allow-Origin: *`, with a source comment conceding this is
+  "very liberal."
 
-And yes: **Harbor + Pilot + DuckTable is an unusually complete and genuinely compelling package.** Quack does not obsolete it. DuckDB declaring "this is the year of DuckDB as a server" actually validates Harbor's premise—and greatly increases the number of people who will understand why Harbor exists.
+The message set is small and explicitly connection-oriented
+([`src/include/quack_message.hpp`](https://github.com/duckdb/duckdb-quack/blob/main/src/include/quack_message.hpp),
+[`quack_message.json`](https://github.com/duckdb/duckdb-quack/blob/main/src/include/quack_message.json)):
+`CONNECTION_REQUEST/RESPONSE`, `PREPARE_REQUEST/RESPONSE`,
+`FETCH_REQUEST/RESPONSE`, `SEND_DATA_REQUEST/RESPONSE`, `CANCEL_REQUEST`,
+`HEARTBEAT_REQUEST`, `ACKNOWLEDGEMENT`, `DISCONNECT`, `SUCCESS_RESPONSE`,
+`ERROR_RESPONSE`. Tags 5, 6 and 13 are already retired — the protocol has
+history.
+
+It is more sophisticated than a request/response wrapper:
+
+* **Single round trip for small results.** `PREPARE_RESPONSE` carries the first
+  chunks inline via an `inline_rows` hint, so a small query needs no `FETCH`.
+* **Windowed fetch.** `FETCH_REQUEST { uuid, batch_index, ack_index }` is a
+  sliding window, not a naive pull loop.
+* **Credit-based ingest.** `SEND_DATA_RESPONSE` returns an `accept_budget` the
+  client must respect — real backpressure on bulk insert.
+* **Client-generated query ids.** `PREPARE_REQUEST` carries a `hugeint_t`
+  `query_uuid`, so `CANCEL_REQUEST` needs no prior server round trip.
+* **Lease-based liveness.** The client proposes `heartbeat_timeout_seconds`;
+  expiry actively aborts running statements.
+
+Credit where due: that is a careful design.
+
+## The three findings that matter
+
+These are the differences that will not be closed by a patch release, because
+they follow from the protocol's shape rather than its maturity.
+
+### 1. Authorization is invisible to the edge
+
+The token travels as `auth_string` **inside the body** of `CONNECTION_REQUEST`.
+The server evaluates it as SQL through a pluggable setting —
+`SELECT <quack_authentication_function>(session_id, auth_string, token)`,
+default `quack_check_token`
+([`src/quack_server.cpp:579`](https://github.com/duckdb/duckdb-quack/blob/main/src/quack_server.cpp)).
+That extensibility is a genuine feature: per-user auth in SQL is a nice idea.
+
+But the observed consequence is severe. **One client query produced five
+`POST /quack` requests, and only the first carried the token.** The other four
+were authenticated solely by an opaque `connection_id`
+(`BAA0972AC8F986746A3E24913096E7AF`) buried in a binary body.
+
+To a reverse proxy, load balancer, API gateway or WAF, those five requests are
+indistinguishable, and four of them contain no credential at all. Authorization
+state lives in server memory. Caddy cannot gate this. Harbor's
+`Authorization: Bearer` header is checked by anything that speaks HTTP.
+
+### 2. Failures return HTTP 200
+
+Verified against a live server with a deliberately wrong token:
+
+```
+HTTP/1.1 200 OK
+Content-Type: application/vnd.duckdb
+Access-Control-Allow-Origin: *
+```
+
+…with `Authentication failed` as a bare string in the body. `ErrorResponse`
+carries a single `string` from `error.RawMessage()` — no code, no class, no
+retryable flag — and the POST handler never sets a status
+([`src/quack_http_server.cpp:225`](https://github.com/duckdb/duckdb-quack/blob/main/src/quack_http_server.cpp)).
+
+Harbor, same query, same minute: `HTTP/1.1 401 Unauthorized`.
+
+This is not a tidiness complaint. Nothing above the codec can tell success from
+failure: not a proxy, not a metrics sidecar, not `fail2ban`. **A brute-force
+attempt against a Quack server appears in access logs as a run of successful
+requests.**
+
+### 3. Nobody owns the file
+
+`quack_serve()` is a function called inside an already-running DuckDB. The
+protocol says nothing about which process owns the database file, who starts it,
+what happens when it dies, or who holds DuckDB's single-writer lock.
+
+That gap is the whole of Harbor. It showed up unprompted during testing: a
+second writer was refused while Harbor held the file —
+
+```
+IO Error: Could not set lock on file "bench.duckdb":
+Conflicting lock is held in /Users/shreeve/.local/bin/harbor (PID 28438)
+```
+
+— which is the product stated in one error message.
+
+## Measured performance
+
+1,000,000 rows × 3 columns (`BIGINT`, `DECIMAL`, `VARCHAR`), same data, same
+machine, localhost, warm:
+
+| | Quack | Harbor NDJSON | Harbor + zstd-1 |
+| --- | ---: | ---: | ---: |
+| Wire bytes | 34,935,381 | 57,037,316 | **2,698,430** |
+| Relative to Quack | 1.00× | 1.63× | **0.077× (13× smaller)** |
+| Wall time (best of 3) | 0.09 s | 0.21 s | not measured |
+
+Three honest readings of that table:
+
+**NDJSON costs only 1.63× the bytes of DuckDB's native binary format** —
+not the 3–5× that "text is bloated" intuition suggests. Harbor sends the schema
+once and then positional rows (`{"type":"row","values":[...]}`) with no repeated
+keys, which removes most of JSON's structural overhead.
+
+**Quack is roughly 2× faster, and the true gap is somewhat wider than shown.**
+The comparison favors Harbor: `curl` wrote bytes to a file without parsing JSON,
+while the DuckDB client materialized a full temp table and paid process startup.
+Harbor is nonetheless already within 2–3× of a native binary protocol, before
+any encoder optimization.
+
+**Compression inverts the bandwidth argument.** Quack ships uncompressed. With
+`Content-Encoding: zstd` at level 1, Harbor moves **13× less data than Quack**.
+Stated with the caveat it deserves: this synthetic data (sequential integers,
+`row-N` labels) is unusually compressible, and 3–6× is the realistic range on
+production data — which still puts NDJSON ahead of uncompressed binary on any
+real network.
+
+Harbor has headroom it has not spent. `emit_value` in
+[`crates/harbor/src/encode.rs`](crates/harbor/src/encode.rs) still allocates a
+`String` per numeric cell via `to_string()`, and the row loop converts each
+borrowed `ValueRef` into an owned `Value`. Replacing those with `itoa`/`ryu`
+and direct `ValueRef` emission is mechanical work worth a further multiple.
+
+## The real comparison
+
+| Area | Harbor | Quack + `CONNECT` |
+| --- | --- | --- |
+| Protocol shape | Stateless request/response; sessions opt-in | Stateful connection with heartbeat lease |
+| Primary client | Any HTTP-capable program | Another DuckDB |
+| Payload | JSON / NDJSON | `application/vnd.duckdb` binary |
+| Client dependency | HTTP + JSON parser | DuckDB, or a Quack implementation |
+| Auth visible to proxy | Yes — `Authorization: Bearer` | No — in-body, first request only |
+| Failure visible to proxy | Yes — real status codes | No — HTTP 200 |
+| Browser use | Natural with `fetch()` | Wasm or a hand-written JS codec |
+| Shell use | `curl` works | DuckDB client required |
+| Bulk transfer | 1.63× bytes; 13× smaller compressed | Fastest uncompressed |
+| Remote catalog | SQL endpoint and `/catalog` | Native `ATTACH`/`CONNECT` with pushdown |
+| Type fidelity | JSON with explicit type metadata | Native, fully lossless |
+| Process ownership | The entire point | Out of scope |
+| Human client | Pilot | DuckDB CLI |
+| Desktop UI | DuckTable | Not the proposition |
+
+## Where Quack is better
+
+This section is not a courtesy. A pitch that concedes nothing invites a reader
+to disprove one claim and discard the rest.
+
+**Native catalog federation.** `ATTACH 'quack:host'` then `CONNECT` makes a
+remote database behave like DuckDB inside DuckDB, and DuckDB 2.0 routes whole
+queries to it through a remote pushdown optimizer. For DuckDB-to-DuckDB
+federation and analytical composition this is excellent, and Harbor offers
+remote SQL execution rather than transparent federation. Harbor should not try
+to imitate this.
+
+**Bulk binary transport.** For very large typed results moving between DuckDB
+instances, native chunk transfer wins on CPU and will keep winning. Measured
+above: ~2× on wall time, and no amount of JSON engineering closes it at
+100M-row scale.
+
+**Full type fidelity by construction.** Harbor spends real effort on lossless
+JSON encoding for decimals, nested types and oversized integers. Quack gets it
+for free.
+
+**First-party momentum.** Quack graduates to stable in DuckDB 2.0. `CONNECT`
+and the remote optimizer will receive upstream investment that Harbor will not.
+This is the item to take most seriously — not because the protocol competes with
+Harbor, but because a first-party server with a lifecycle story eventually
+might.
+
+Two caveats in Quack's favor, stated plainly: DuckDB documents Quack as **beta**
+and expects breaking changes, and the shipped build negotiates **protocol
+version 1** while the source tree is already at `QUACK_VERSION = 3`. The
+HTTP-200-on-error behavior in particular could be fixed at any time. The
+in-body auth and the absent lifecycle are architectural and will not be.
+
+## What Harbor is actually for
+
+The application does not need to know which DuckDB client library exists for its
+language, whether that library matches the server version, how to distribute
+`libduckdb`, how DuckDB serializes vectors, or how to implement Quack. It sends
+SQL and reads JSON.
+
+Underneath that, Harbor is a supervisor, and that is the part nobody else ships:
+bounded query concurrency; streamed results without materializing; prepared
+statement caching; pinned transactional sessions with separate worker and
+session capacity; client-named cancellation; statement deadlines;
+abandoned-session reclamation; readiness that tests the database rather than the
+process; graceful drain, checkpoint and shutdown; per-database process
+isolation; Unix sockets locally and Caddy at the edge; sealed mode, memory and
+spill limits; and fleet discovery with no supervising daemon.
+
+The client protocol stays small and versioned —
+[`crates/wire/src/lib.rs`](crates/wire/src/lib.rs) defines a handful of request
+types and four streaming events: `schema`, `row`, `end`, `error`.
+
+Pilot completes it for humans: DuckDB-style REPL, highlighting and completion,
+named berths, join-or-spawn on a database path, no engine linked into the
+client, and real Ctrl-C cancellation translated into
+`DELETE /sql/queries/<id>`. DuckTable is the native desktop face on the same
+fleet.
+
+## Conclusion
+
+Quack is not a weaker Harbor and Harbor is not a weaker Quack. Quack turns
+DuckDB into a database other DuckDBs can use. Harbor turns a DuckDB file into a
+service that anything can use, and takes responsibility for the process that
+owns it.
+
+The strongest form of the argument is not "JSON versus binary" — that is
+Quack's ground and it wins there on CPU. It is:
+
+> Quack is a session protocol wearing HTTP. Harbor is an HTTP service.
+>
+> Everything follows from that: whether your proxy can authorize a request,
+> whether your monitoring can see a failure, whether a browser can talk to it,
+> and whether anything owns the file when the client goes away.
+
+Or, in the README's own words: **many clients, one DuckDB, over plain HTTP.**
+
+DuckDB declaring this the year of DuckDB-as-a-server does not obsolete Harbor.
+It vastly increases the number of people who will understand why it exists.
+
+---
+
+## Appendix: how this was tested
+
+**Date:** 2026-09-01. **Platform:** macOS, arm64.
+
+| Component | Version |
+| --- | --- |
+| DuckDB CLI | `v2.0.0-alpha38195` (Cyanoptera, `8cbdaba6ac`) |
+| `quack` extension | `b2f2d10`, installed from `core` |
+| Harbor / Pilot | `0.19.2` |
+
+**Method.** A Quack server was started with
+`CALL quack_serve('quack:localhost:9494', token => '…')`. A Python TCP proxy sat
+between client and server, logging raw bytes in both directions; the DuckDB
+client connected through it with `ATTACH 'quack:127.0.0.1:9493'`. All headers,
+status codes, request counts and token positions quoted above are from those
+captures. Harbor was run as `harbor serve bench.duckdb --port 9495 --token …`
+and driven with `curl`.
+
+**Wire bytes** were counted by the proxy for Quack (server→client, 34,935,381)
+and as the response body size for Harbor (57,037,316). Compressed sizes are
+`zstd -1` (2,698,430) and `gzip -1` (8,588,385) over Harbor's exact response
+bytes.
+
+**Timings** are best-of-three wall clock. They are *not* strictly comparable:
+Harbor's figure is `curl` writing the response to a file with no JSON parsing,
+while Quack's is a DuckDB client materializing the result into a temp table,
+including process startup. The comparison therefore understates Quack's CPU
+advantage, and is reported that way deliberately.
+
+**Reproducing it** requires only the versions above; no code in this repository
+was modified for these measurements.
