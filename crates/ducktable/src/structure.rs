@@ -12,6 +12,7 @@
 use crate::grid::Grid;
 use crate::theme::{pal, value_font, CELL_TEXT, PANE_INSET};
 use gpui::*;
+use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::StyledExt as _;
 
 pub(crate) struct StructCol {
@@ -383,9 +384,13 @@ impl Grid {
             let want = if pref > 0. { pref } else { auto };
             // Never taller than the grid's content — a small table
             // stays shrink-wrapped, its DDL right below — and never
-            // squashed past the floor content itself allows.
-            let lo = crate::prefs::STRUCTURE_SPLIT_MIN.min(content_h);
-            let h = want.min(content_h).max(lo);
+            // squashed past the floor content itself allows. Minus 1:
+            // the pane ends one px short of the content, putting the
+            // grid's final border in the px its own edge clip eats
+            // (grid.rs table_body), so the handle's line stands alone
+            // at every drag height.
+            let lo = crate::prefs::STRUCTURE_SPLIT_MIN.min(content_h - 1.);
+            let h = want.min(content_h - 1.).max(lo);
             pane.child(
                 gpui_component::resizable::v_resizable("structure-split")
                     .with_state(split)
@@ -401,12 +406,15 @@ impl Grid {
                     )
                     .child(
                         gpui_component::resizable::resizable_panel().child(
+                            // overflow_y_scrollbar, not overflow_y_scroll:
+                            // the pane wears the scrollbar the bare
+                            // gpui scroll never draws.
                             div()
                                 .id("structure-ddl")
                                 .size_full()
                                 .min_h_0()
                                 .v_flex()
-                                .overflow_y_scroll()
+                                .overflow_y_scrollbar()
                                 .child(ddl),
                         ),
                     ),

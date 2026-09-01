@@ -2662,14 +2662,31 @@ impl Grid {
         div()
             .relative()
             .size_full()
+            // The last grid line is the boundary's problem, not ours:
+            // whatever sits below a grid's bottom edge (the footer's
+            // border_t, the Structure divider's handle) draws its own
+            // 1px line, so a flush table bottom would stack on it — 2px
+            // under the columns, 1px past the table's right edge. The
+            // table hangs one px below this clip instead: a bottom edge
+            // AT the clip sheds its border into the hidden px, while a
+            // short table ending mid-pane keeps its closing border.
+            .overflow_hidden()
             // Bubble-phase: the cell's own mouse-down (first click of the
             // pair) has already set active_cell, so a double-click opens
             // the editor right there.
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_body_click))
             .child(
-                Table::new(&self.table)
-                    .bordered(false)
-                    .with_size(prefs::get(cx).table_size()),
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom(px(-1.))
+                    .child(
+                        Table::new(&self.table)
+                            .bordered(false)
+                            .with_size(prefs::get(cx).table_size()),
+                    ),
             )
             // Painted AFTER the table, so nothing the table occludes
             // (drag handles, scroll containers) can eclipse it — while,
