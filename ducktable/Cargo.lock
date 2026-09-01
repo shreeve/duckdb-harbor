@@ -1448,7 +1448,7 @@ dependencies = [
  "harbor-client",
  "objc",
  "serde_json",
- "wire 0.19.0",
+ "wire",
 ]
 
 [[package]]
@@ -2513,7 +2513,7 @@ dependencies = [
  "serde",
  "serde_json",
  "toml 1.1.4+spec-1.1.0",
- "wire 0.20.0",
+ "wire",
 ]
 
 [[package]]
@@ -7249,15 +7249,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d129932f4644ac2396cb456385cbf9e63b5b30c6e8dc4820bdca4eb082037a5"
 dependencies = [
  "winapi",
-]
-
-[[package]]
-name = "wire"
-version = "0.19.0"
-source = "git+https://github.com/shreeve/duckdb-harbor?rev=8418541#8418541d5df12ec14e2540c5604d8b57f5923baf"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
