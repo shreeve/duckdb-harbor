@@ -7,9 +7,9 @@
 > **Many clients, one DuckDB, over plain HTTP. `POST` a statement, read NDJSON
 > back.**
 
-DuckDB is embedded: one process opens the file, and that process holds an
-exclusive lock. So "let my app talk to my DuckDB" normally means picking a
-language binding and living inside that one process, forever.
+Only one process can access a DuckDB file at a time. Harbor fixes that: it
+runs a small server in front of each file so all your apps can share it, and
+handles starting, stopping, and listing those servers for you.
 
 DuckDB Harbor is `harbor`, a small Rust binary that opens a DuckDB database and
 serves it over HTTP. Point it at a file and that one process becomes a server:

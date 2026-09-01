@@ -1,5 +1,10 @@
 # DuckDB Harbor — the product
 
+Only one process can access a DuckDB file at a time. Harbor fixes that: it
+runs a small server in front of each file so all your apps can share it, and
+handles starting, stopping, and listing those servers by name. A **berth** is
+one of those servers.
+
 DuckDB Harbor ships two Rust binaries: `harbor` owns DuckDB databases and their
 HTTP/UDS fleet lifecycle; `pilot` is the engine-free client. This document is
 the architecture — what the product is and why it is shaped this way. For
