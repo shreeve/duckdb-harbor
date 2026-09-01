@@ -39,6 +39,10 @@ use encode::*;
 /// one version; the server half above never calls into it.
 pub mod repl;
 
+// 0.21 groundwork: the v2 C API engine, generated from DuckDB's api_spec.
+// Coexists with the v1 path (duckdb-rs + src/engine.rs) until the flip.
+pub mod v2;
+
 // ==========================================================================
 //
 // The HTTP server
