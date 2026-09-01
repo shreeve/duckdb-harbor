@@ -1,18 +1,23 @@
-<p align="center">
-  <img src="https://github.com/shreeve/duckdb-harbor/raw/main/duckdb-harbor-social.png" alt="DuckDB Harbor" width="600">
-</p>
+# DuckDB Harbor
 
-# duckdb-harbor
+Only one process can open a DuckDB file at a time. This repository ships the
+two programs that fix that, together because they are built together:
 
-> **Many clients, one DuckDB, over plain HTTP. `POST` a statement, read NDJSON
-> back.**
+- **[`harbor/`](harbor/)** — a small server that puts a DuckDB file behind
+  plain HTTP so all your apps can share it, and a DuckDB-style shell in the
+  same 2MB binary. Many clients, one DuckDB. Start with
+  [harbor/README.md](harbor/README.md).
+- **[`ducktable/`](ducktable/)** — the native macOS desktop face for those
+  servers: a fast, minimal table client built on GPUI. Start with
+  [ducktable/README.md](ducktable/README.md).
 
-Only one process can access a DuckDB file at a time. Harbor fixes that: it
-puts a small server in front of the file so all your apps can share it — and
-it feels exactly like the duckdb shell, except a database can also serve.
+Each directory is its own Cargo workspace with its own version and releases;
+DuckTable's client crates build Harbor's protocol crates from source, so the
+wire contract is checked on both sides of every commit.
 
-DuckDB Harbor is `harbor`, one small Rust binary with one grammar:
+Install harbor:
 
+<<<<<<<< HEAD:harbor/README.md
 ```console
 $ harbor                       # what's running
 $ harbor mydata.duckdb         # open it — REPL, or -c "SQL", or stdin
@@ -296,12 +301,13 @@ and installs `harbor` into `~/.local/bin` with `libduckdb` in `~/.local/lib`
 
 ```bash
 # macOS and Linux
+========
+```sh
+>>>>>>>> main:README.md
 curl -fsSL https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.sh | bash
-
-# Windows
-irm https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.ps1 | iex
 ```
 
+<<<<<<<< HEAD:harbor/README.md
 Nothing there asks for root. `~/.local/bin` is where the XDG base directory
 spec puts user executables; Debian and Fedora already have it on `PATH`, macOS
 does not, and the installer says so rather than putting binaries somewhere you
@@ -644,4 +650,6 @@ policy; Harbor independently owns SQL statement deadlines.
 
 ## License
 
+========
+>>>>>>>> main:README.md
 MIT.

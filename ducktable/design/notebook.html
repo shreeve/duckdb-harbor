@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>DuckTable — notebook</title>
+<link rel="stylesheet" href="tokens.css"><link rel="stylesheet" href="design.css">
+<script src="theme.js"></script>
+<style>
+  .pane {
+    margin: 12px 14px; border: 1px solid var(--border);
+    border-radius: var(--radius-m); overflow: hidden; background: var(--surface);
+  }
+  .pane-h {
+    display: flex; align-items: center; gap: 9px;
+    padding: 6px 11px; background: var(--surface-raised);
+    border-bottom: 1px solid var(--border); font-size: 12px;
+  }
+  .pane-h .tw { color: var(--muted); font-size: 9px; }
+  .pane-h .t { font-weight: 600; }
+  .pane-h .meta { color: var(--muted); font-size: 11px; }
+  .pane-h .run { margin-left: auto; color: var(--accent); font-size: 12px; }
+  .pane.closed .pane-h { border-bottom: none; }
+  .adder {
+    display: flex; align-items: center; gap: 10px; margin: 2px 14px;
+    color: var(--muted); font-size: 11px;
+  }
+  .adder hr { flex: 1; border: none; border-top: 1px dashed var(--border); }
+  .adder .plus {
+    width: 20px; height: 20px; border-radius: 50%; border: 1px solid var(--border);
+    background: var(--surface); color: var(--accent);
+    display: inline-flex; align-items: center; justify-content: center; font-size: 13px;
+  }
+</style>
+</head><body>
+
+<div class="page-head">
+  <h1>Notebook</h1><span class="sub">stacked independent query panes, one shared berth session</span>
+  <span class="spacer"></span><a href="index.html">&larr; all screens</a>
+</div>
+
+<div class="window">
+  <div class="chrome">platform chrome</div>
+  <div class="tabs">
+    <span class="tab">Invoice <span class="x">&times;</span></span>
+    <span class="tab act">revenue-deep-dive <span class="x">&times;</span></span>
+    <span class="tab plus">+</span>
+  </div>
+
+  <div style="padding: 4px 0 14px; background: var(--bg)">
+
+    <div class="pane">
+      <div class="pane-h"><span class="tw">&#9662;</span><span class="t">base table</span><span class="meta">412 rows &middot; 1.1 ms</span><span class="run">&#9654; run</span></div>
+      <div class="editor"><span class="kw">CREATE TEMP TABLE</span> rev <span class="kw">AS</span>
+<span class="kw">SELECT</span> BillingCity <span class="kw">AS</span> city, sum(Total) <span class="kw">AS</span> total
+<span class="kw">FROM</span> Invoice <span class="kw">GROUP BY</span> 1;</div>
+      <div class="grid">
+        <table>
+          <tr><th class="num">#</th><th>city</th><th>total</th></tr>
+          <tr><td class="num">1</td><td>Stuttgart</td><td>15.84</td></tr>
+          <tr><td class="num">2</td><td>Oslo</td><td>3.96</td></tr>
+          <tr><td class="num">3</td><td>Brussels</td><td>5.94</td></tr>
+        </table>
+      </div>
+    </div>
+
+    <div class="adder"><hr><span class="plus">+</span><hr></div>
+
+    <div class="pane">
+      <div class="pane-h"><span class="tw">&#9656;</span><span class="t">top cities</span>
+        <span class="meta" style="font-family: var(--font-mono)">SELECT * FROM rev ORDER BY total DESC LIMIT 10</span>
+        <span class="run">&#9654; run</span></div>
+      <div class="grid">
+        <table>
+          <tr><th class="num">#</th><th>city</th><th>total</th></tr>
+          <tr><td class="num">1</td><td>Stuttgart</td><td>15.84</td></tr>
+          <tr><td class="num">2</td><td>Boston</td><td>13.86</td></tr>
+        </table>
+      </div>
+    </div>
+
+    <div class="adder"><hr><span class="plus">+</span><hr></div>
+
+    <div class="pane closed">
+      <div class="pane-h"><span class="tw">&#9656;</span><span class="t">outliers</span><span class="meta">collapsed &middot; last run 2.4 ms</span><span class="run">&#9654; run</span></div>
+    </div>
+
+  </div>
+
+  <div class="statusbar">
+    <span class="dot on"></span> medlabs
+    <span>one session &middot; temp tables shared across panes</span>
+    <span class="spacer" style="flex:1"></span>
+    <span>run all &#8984;&#8679;&#9166;</span>
+  </div>
+</div>
+
+<p class="caption">Pane 1 expanded (query + grid). Pane 2's query is collapsed to a single title line above its grid.
+Pane 3 fully collapsed. The "+" between panes inserts a new one at that position. A pane may later gain a chart as a
+third collapsible view without changing this model. Notebooks are ordinary tabs; the documents live in the sidebar's
+Notebooks section.</p>
+
+</body></html>
