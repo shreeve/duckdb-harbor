@@ -11,6 +11,7 @@
 //! own extension loading expects engine symbols resolvable from the global
 //! namespace.
 
+pub mod conn;
 pub mod encode;
 pub mod ffi;
 
