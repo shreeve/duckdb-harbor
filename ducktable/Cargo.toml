@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/ducktable", "crates/duckdb-lang", "crates/harbor-client"]
+
+[workspace.package]
+version = "0.9.3"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/shreeve/ducktable"
+
+[workspace.dependencies]
+gpui = "0.2.2"
+gpui-component = "0.5.1"
+anyhow = "1"
+
+[profile.dev]
+debug = "limited"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+# The one seam where a pinned widget fights us: vendor/gpui-component is
+# the crates.io 0.5.1 source with a surgical patch — a DISABLED editor
+# never scrolls itself (no scroll-past-end room, no cursor-track
+# nudges), which is what lets the Structure view's DDL card sit
+# content-sized and perfectly still. Each patch site is marked
+# "DuckTable patch:". Upgrading the pin means re-carrying those marks.
+[patch.crates-io]
+gpui-component = { path = "vendor/gpui-component" }
