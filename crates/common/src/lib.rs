@@ -17,7 +17,9 @@
 //! stylesheet. Nothing in this crate decides that a running berth is
 //! `#22c55e`.
 
+#[cfg(feature = "fleet")]
 pub mod config;
+#[cfg(feature = "fleet")]
 pub mod fleet;
 pub mod lifetime;
 pub mod paths;

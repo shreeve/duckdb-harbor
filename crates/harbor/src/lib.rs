@@ -577,9 +577,9 @@ const REAP_INTERVAL: Duration = Duration::from_millis(500);
 /// token admits every caller — so this is about never colliding and never
 /// reusing, not about resisting an attacker who already has the token.
 fn new_lease_id() -> String {
-    use rand::RngCore;
     let mut bytes = [0u8; 18];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    // Best-effort never happens in practice; the id only has to not collide.
+    let _ = getrandom::getrandom(&mut bytes);
     let mut out = String::with_capacity(36);
     for b in bytes {
         out.push_str(&format!("{b:02x}"));

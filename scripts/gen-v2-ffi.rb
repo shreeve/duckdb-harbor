@@ -212,7 +212,11 @@ end
 all_fns = [] # [name, sig]
 out << "// --- the function table ----------------------------------------------------\n\n"
 out << "/// Every v2 entry point, resolved by name from the loaded engine. A field is\n"
-out << "/// `None` when the engine predates that symbol; callers unwrap with context.\npub struct Api {\n"
+out << "/// `None` when the engine predates that symbol; callers unwrap with context.\n"
+out << "///\n"
+out << "/// repr(C) is load-bearing: `fill` writes the table as consecutive\n"
+out << "/// pointer-sized slots in declaration order, matching `SYMBOL_NAMES`.\n"
+out << "#[repr(C)]\npub struct Api {\n"
 modules.each do |mod_name, fns|
   out << "    // -- #{mod_name}\n"
   fns.each do |name, fn|
@@ -225,28 +229,31 @@ modules.each do |mod_name, fns|
 end
 out << "}\n\n"
 
+out << "/// The exported C symbol names, in `Api` field (declaration) order.\n"
+out << "const SYMBOL_NAMES: [&[u8]; #{all_fns.size}] = [\n"
+all_fns.each { |name| out << "    b\"#{PREFIX}#{name}\\0\",\n" }
+out << "];\n\n"
 out << <<~RS
   impl Api {
       /// Resolve every symbol from `lib`. Missing ones stay `None`; the count
       /// of hits comes back so the loader can tell "no v2 API" from "older v2".
+      ///
+      /// Data-driven on purpose: one loop over SYMBOL_NAMES instead of #{all_fns.size}
+      /// inlined lookups — the straight-line version was the largest symbol in
+      /// the whole binary. Sound because Api is repr(C) and every field is an
+      /// `Option` of an `extern "C" fn` pointer: #{all_fns.size} consecutive slots, each
+      /// pointer-sized with the null niche, in exactly SYMBOL_NAMES order.
       pub unsafe fn fill(lib: &Library) -> (Api, usize) {
+          // All-zero bytes is `None` for every `Option<extern "C" fn>` field.
+          let mut api: Api = unsafe { std::mem::zeroed() };
+          let slots = &mut api as *mut Api as *mut Option<unsafe extern "C" fn()>;
           let mut n = 0usize;
-          macro_rules! sym {
-              ($name:literal) => {
-                  match unsafe { lib.get::<unsafe extern "C" fn()>($name) } {
-                      Ok(s) => {
-                          n += 1;
-                          Some(unsafe { std::mem::transmute(*s) })
-                      }
-                      Err(_) => None,
-                  }
-              };
+          for (i, name) in SYMBOL_NAMES.iter().enumerate() {
+              if let Ok(s) = unsafe { lib.get::<unsafe extern "C" fn()>(name) } {
+                  unsafe { *slots.add(i) = Some(*s) };
+                  n += 1;
+              }
           }
-          let api = Api {
-RS
-all_fns.each { |name| out << "            #{name}: sym!(b\"#{PREFIX}#{name}\\0\"),\n" }
-out << <<~RS
-          };
           (api, n)
       }
   }
