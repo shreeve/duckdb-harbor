@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>DuckTable — states</title>
+<link rel="stylesheet" href="tokens.css"><link rel="stylesheet" href="design.css">
+<script src="theme.js"></script>
+<style>
+  .vh { max-width: 900px; margin: 30px auto 8px; font-size: 13px; font-weight: 650; }
+  .vh small { color: var(--muted); font-weight: 400; margin-left: 8px; }
+  .mini { max-width: 900px; margin: 0 auto; }
+  .side-demo { width: 260px; padding: 10px 8px; }
+</style>
+</head><body>
+
+<div class="page-head">
+  <h1>States</h1><span class="sub">error and empty states are designed, never blank</span>
+  <span class="spacer"></span><a href="index.html">&larr; all screens</a>
+</div>
+
+<div class="vh">Harbor unreachable <small>full-window state with the reason and the path forward</small></div>
+<div class="window mini">
+  <div class="chrome">platform chrome</div>
+  <div class="state-card">
+    <div class="ic">&#9875;</div>
+    <h2>Can't reach Harbor</h2>
+    <p>Nothing is listening at <code>127.0.0.1:4204</code>.<br>
+       Start it with <code>harbor serve</code>, or check <code>~/.config/harbor/config.toml</code>.</p>
+    <button class="btn primary">Retry</button>
+    <button class="btn">Copy details</button>
+  </div>
+</div>
+
+<div class="vh">No berths configured <small>empty state teaches the term in passing</small></div>
+<div class="window mini">
+  <div class="chrome">platform chrome</div>
+  <div class="state-card">
+    <div class="ic">&#9973;</div>
+    <h2>No berths yet</h2>
+    <p>A berth is a named database Harbor manages.<br>
+       Add one to <code>~/.config/harbor/config.toml</code> and it appears here.</p>
+    <button class="btn">Open Harbor docs</button>
+  </div>
+</div>
+
+<div class="vh">Berth start failure <small>inline in the sidebar row, stderr excerpt, copyable</small></div>
+<div class="window mini" style="display:flex">
+  <div class="sidebar side-demo">
+    <div class="side-h">BERTHS</div>
+    <div class="row"><span class="dot on"></span><span class="n">medlabs</span></div>
+    <div class="row sel"><span class="dot off" style="background: var(--danger); opacity: 1"></span><span class="n">scratch</span><span class="meta">failed</span></div>
+    <div class="err-inline">
+      Couldn't start <b>scratch</b>
+      <pre>IO Error: could not open
+"~/Data/scratch.duckdb": file is
+locked by PID 4188</pre>
+      <button class="btn" style="margin-top:6px">Retry</button>
+      <button class="btn">Copy</button>
+    </div>
+    <div class="row"><span class="dot off"></span><span class="n">archive</span></div>
+  </div>
+  <div style="flex:1; display:flex; align-items:center; justify-content:center; color: var(--muted); font-size: 12.5px; min-height: 280px">
+    connection lost mid-session keeps tabs and data, marked stale &mdash; never a blank pane
+  </div>
+</div>
+
+</body></html>
