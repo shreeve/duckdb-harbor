@@ -113,7 +113,7 @@ def spec_source():
     a result column.
     """
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    path = os.path.join(root, "crates", "harbor", "src", "v2", "ffi.rs")
+    path = os.path.join(root, "crates", "harbor", "src", "engine", "ffi.rs")
     return (path, None) if os.path.exists(path) else (None, None)
 
 
