@@ -256,7 +256,11 @@ impl Grid {
         let n = self.structure().map(|s| s.cols.len()).unwrap_or(0);
         let row_h = f32::from(crate::prefs::get(cx).table_size().table_row_height());
         // The grid's full content height: rows + header + borders.
-        let content_h = row_h * (n + 1) as f32 + 2.;
+        // Exact: header + rows, borders inside their row heights (the
+        // hairline consolidation). Anything added here floats the
+        // divider handle BELOW the grid's bottom line instead of
+        // letting it stand in for it.
+        let content_h = row_h * (n + 1) as f32;
 
         // ddl and ddl_input come from the same source in Grid::build, so
         // they are Some together.
@@ -380,7 +384,7 @@ impl Grid {
             // Auto (never dragged): the classic ~20-row cap (Steve's
             // ruling, 2026-08-31), landing mid-row when clipped so a
             // half-visible row 21 says "cut, not end".
-            let auto = if n > 20 { row_h * 21.5 + 2. } else { content_h };
+            let auto = if n > 20 { row_h * 21.5 } else { content_h };
             let want = if pref > 0. { pref } else { auto };
             // Never taller than the grid's content — a small table
             // stays shrink-wrapped, its DDL right below — and never
