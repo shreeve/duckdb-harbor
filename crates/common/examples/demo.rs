@@ -15,7 +15,7 @@ fn main() {
         ("scratch", State::Unmanaged, "90551", "2m", "~/Data/scratch.duckdb",
          Some("not in config — summoned by pilot; retires 90s after the last use")),
         ("probe2", State::Stale, "—", "—", "—",
-         Some("runtime/probe2.lock, held by nobody — harbor forget probe2")),
+         Some("held but no longer configured — harbor forget probe2")),
     ];
     for (name, state, pid, up, db, note) in rows {
         t.row([

@@ -63,6 +63,16 @@ check "a bare word is never a path" 1 "nothing running" \
 if [[ -f $work/nosuchname ]]; then bad "a bare word conjured a file"; else ok "no file conjured for a bare word"; fi
 sleep 3 # the temp's 1s idle window passes; the berth leaves on its own
 
+echo "— a departure leaves the harbor as the berth found it"
+check "the fleet shows nothing where nothing runs" 0 "Nothing configured, nothing running" \
+  "$harbor"
+if [[ -e $work/runtime/x.lock ]]; then bad "a departed temp left its lock"; else ok "a departed temp took its lock with it"; fi
+if [[ -f $work/x.duckdb && ! -e $work/x.duckdb.wal ]]; then
+  ok "the database stays ashore, checkpointed (no wal)"
+else
+  bad "departure left the database missing or with a wal"
+fi
+
 echo "— a name is a service"
 check "add names the database" 0 "added" "$harbor" add "$work/x.duckdb"
 check "the name starts on use" 0 "42" \

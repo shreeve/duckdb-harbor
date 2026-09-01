@@ -141,7 +141,10 @@ berth instead of reporting "database is locked".
 These temp databases run with `--idle-exit <dur>` (`[defaults]
 temp-idle-exit` sets the window; 90s otherwise — a named service never reads
 it): no active countable requests and no live sessions for the window →
-drain, CHECKPOINT, unlink, exit. `harbor show` marks them — `● running (temp 1m30s)` — so a berth that
+drain, CHECKPOINT, depart. A departure leaves the harbor as the berth found
+it — no runtime record, nothing in `harbor show` — and the database file
+stays behind, checkpointed and self-contained. `harbor show` marks the
+living ones — `● running (temp 1m30s)` — so a berth that
 appears and leaves on its own always says so. Idle keep-alive TCP
 connections are not reference-counted. The lifecycle is robust against
 Pilot crashes and has no client refcount. An interactive Pilot sends cheap

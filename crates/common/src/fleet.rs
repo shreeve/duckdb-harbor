@@ -249,10 +249,19 @@ pub fn reconcile(cfg: &FileConfig, home: &Path, probe: &dyn Fn(&Addr) -> bool) -
                 }
                 false => State::Stopped,
             },
-            (Claim::Free, false, false) => {
-                note = Some(format!("left by a database that is gone — harbor forget {name}"));
-                State::Stale
-            }
+            // A free lock with no sidecar and no config entry: residue only
+            // a crash inside the departure window can leave (a departing
+            // berth removes its lock). It records nothing a human can act
+            // on — not even which database it was — so there is no row to
+            // print. A standing hold is the exception: the operator's stop
+            // is a fact worth showing even after everything else went.
+            (Claim::Free, false, false) => match holds.contains(&name) {
+                true => {
+                    note = Some(format!("held but no longer configured — harbor forget {name}"));
+                    State::Stale
+                }
+                false => continue,
+            },
             // Sidecar, no lock at all: the only row that has to be dialled.
             (Claim::None, true, _) => match addr.as_ref().is_some_and(probe) {
                 true if conf.is_some() && same_db => State::Running,

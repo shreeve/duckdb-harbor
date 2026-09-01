@@ -319,12 +319,13 @@ fn claim_lock(path: &Path) -> Result<std::fs::File, String> {
 
 /// Unlink a lock file, but only while holding it.
 ///
-/// The rule everywhere else in this file is *never unlink a lock*, because
-/// unlinking one another claimant has open lets a third create a fresh inode
-/// and flock that: two winners, one database. Holding the lock across the
-/// unlink is what suspends that rule safely — a concurrent `serve` either
-/// loses the flock and waits, or wins after the unlink and revalidates onto
-/// the new inode. Returns whether anything was removed.
+/// The one law about lock files: *unlink only while holding*. Unlinking a
+/// lock another claimant has open lets a third create a fresh inode and
+/// flock that: two winners, one database. Holding the lock across the
+/// unlink is what makes it safe — a concurrent `serve` either loses the
+/// flock and waits, or wins after the unlink and revalidates onto the new
+/// inode. `forget` unlinks through here; a departing `serve` unlinks under
+/// the flock it already holds. Returns whether anything was removed.
 fn unlink_lock_if_free(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -523,10 +524,14 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         let _ = std::fs::remove_file(&sock_path);
     }
     let _ = std::fs::remove_file(&json_path);
-    // The lock file stays. flock releases with the process, and a lock file
-    // with no holder is harmless — but unlinking it while another claimant
-    // has the old inode open lets a third claimant create a fresh inode and
-    // flock it too: two winners, one database. Never unlink a lock file.
+    // Departure: a berth that leaves cleanly leaves the harbor as it found
+    // it, so `harbor` shows nothing where nothing runs. Unlink-while-holding
+    // is the law (see unlink_lock_if_free), and the flock is still held —
+    // claim_lock leaked it for process life — so a concurrent claimant
+    // either holds the old inode and revalidates onto the fresh one, or
+    // arrives after. The token deliberately stays: it is the berth's stable
+    // identity across restarts (clients and Caddy read it).
+    let _ = std::fs::remove_file(&lock_path);
     eprintln!("harbor: {:?} closed ({farewell})", o.name);
     Ok(())
 }
@@ -1377,11 +1382,9 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
     }
 
     if remove {
-        // The lock file stays (see serve): a stale one with no holder is
-        // harmless, and unlinking one is never safe.
-        // Say what was actually removed. The old wording claimed success for
-        // a name that matched nothing at all, which made `forget` a verb that
-        // lied about the one thing it does.
+        // Say what was actually removed: claiming success for a name that
+        // matched nothing at all would make `forget` a verb that lies about
+        // the one thing it does.
         let mut gone: Vec<&str> = Vec::new();
         for (f, path) in [
             ("sock", harbor_common::sock_file(&home, &name)),
@@ -1395,7 +1398,7 @@ fn stop_database(rest: Vec<String>, remove: bool) -> Result<(), String> {
         }
         let _ = std::fs::remove_file(harbor_common::log_file(&home, &name));
         // The lock is the last thing to go, and only while we hold it — see
-        // unlink_lock_if_free. Nothing else in this file may unlink one.
+        // unlink_lock_if_free for the law every unlink obeys.
         if unlink_lock_if_free(&harbor_common::lock_file(&home, &name)) {
             gone.push("lock");
         }

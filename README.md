@@ -287,8 +287,9 @@ config entry, never the database file; `harbor doctor` checks the config for
 what nothing else has a moment to notice. With no `--token`, a per-berth token
 is minted and written to `~/.local/state/harbor/runtime/<name>.token`.
 
-Exits are clean: `SIGTERM` / `Ctrl-C` drain in-flight requests and `CHECKPOINT`
-so the next open never replays a WAL.
+Exits are clean: `SIGTERM` / `Ctrl-C` drain in-flight requests, `CHECKPOINT`
+so the next open never replays a WAL, and depart — the runtime registry is
+left as the berth found it, so `harbor` shows nothing where nothing runs.
 
 Talk to it with `curl` (above), or with the bundled client — a
 duckdb-shell-class REPL with syntax highlighting and completion. Tab accepts

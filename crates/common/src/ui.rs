@@ -493,7 +493,7 @@ mod tests {
         t.row([Cell::new("medlabs"), Cell::new("unmanaged")]);
         t.note(Tone::Yellow, "not in your config");
         t.row([Cell::new("labs"), Cell::new("stopped")]);
-        t.note(Tone::Yellow, "left by a database that is gone");
+        t.note(Tone::Yellow, "held but no longer configured");
         let out = t.render(&boxed());
         // The marker sits after the row's right edge; the text sits below the
         // box under the same superscript, so the grid is never interrupted.
@@ -501,7 +501,7 @@ mod tests {
         assert!(out.lines().any(|l| l.ends_with("│ ²")), "no second marker:\n{out}");
         let bottom = out.lines().position(|l| l.starts_with('╰')).unwrap();
         let below: Vec<&str> = out.lines().skip(bottom + 1).collect();
-        assert_eq!(below, ["¹ not in your config", "² left by a database that is gone"], "{out}");
+        assert_eq!(below, ["¹ not in your config", "² held but no longer configured"], "{out}");
         assert!(!out.contains('!'), "the old inline note style survived:\n{out}");
     }
 
