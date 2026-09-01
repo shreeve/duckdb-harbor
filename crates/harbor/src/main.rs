@@ -58,6 +58,10 @@ fn main() -> ExitCode {
         "stop" => stop_database(rest, false),
         "forget" => stop_database(rest, true),
         "doctor" => doctor_cmd(rest),
+        // The client, in the server's binary — same code the pilot shim
+        // runs. The 0.20 grammar makes this the bare default; until
+        // then it is reachable by name.
+        "repl" => return harbor::repl::cli_main(rest),
         "-h" | "--help" | "help" => {
             print!("{HELP}");
             Ok(())

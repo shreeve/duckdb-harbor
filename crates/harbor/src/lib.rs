@@ -34,6 +34,11 @@ pub use duckdb;
 mod encode;
 use encode::*;
 
+/// The client half — REPL, renderer, transports. Lives in the same
+/// crate so `harbor` and the `pilot` shim binary are one codebase with
+/// one version; the server half above never calls into it.
+pub mod repl;
+
 // ==========================================================================
 //
 // The HTTP server

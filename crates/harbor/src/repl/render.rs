@@ -92,7 +92,7 @@ impl Default for RenderOpts {
 impl RenderOpts {
     /// Defaults, then the config file's [defaults] on top. Flags and
     /// dot-commands override the result — the documented precedence.
-    pub fn with_defaults(d: &crate::config::Defaults) -> Self {
+    pub fn with_defaults(d: &crate::repl::config::Defaults) -> Self {
         let mut o = Self::default();
         if let Some(m) = d.mode.as_deref().and_then(Mode::parse) {
             o.mode = m;

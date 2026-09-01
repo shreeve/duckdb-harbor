@@ -656,17 +656,21 @@ dependencies = [
 name = "harbor"
 version = "0.19.2"
 dependencies = [
+ "crossterm 0.29.0",
  "duckdb",
  "harbor-common",
  "justhttp",
  "libc",
  "libloading",
+ "nu-ansi-term",
  "rand",
+ "reedline",
  "serde",
  "serde_json",
  "signal-hook 0.4.4",
  "toml",
  "toml_edit",
+ "unicode-width",
  "wire",
 ]
 
@@ -1053,17 +1057,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 name = "pilot"
 version = "0.19.2"
 dependencies = [
- "crossterm 0.29.0",
- "harbor-common",
- "libc",
- "nu-ansi-term",
- "reedline",
- "serde",
- "serde_json",
- "signal-hook 0.4.4",
- "toml",
- "unicode-width",
- "wire",
+ "harbor",
 ]
 
 [[package]]
