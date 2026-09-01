@@ -104,13 +104,13 @@ class Harbor:
             raw = e.read()
             return e.code, (json.loads(raw) if raw else {}), dict(e.headers)
 
-    def sql(self, statement, session=None, params=None):
+    def sql(self, statement, session=None, params=None, timeout=30):
         body = {"sql": statement}
         if session:
             body["sessionId"] = session
         if params:
             body["params"] = params
-        return self.call("POST", "/sql", body)
+        return self.call("POST", "/sql", body, timeout=timeout)
 
     def value(self, statement, session=None):
         st, doc, _ = self.sql(statement, session)
@@ -298,7 +298,15 @@ def run_all(h, leases, proc, db, port):
     result = {}
 
     def slow():
-        result["slow"] = h.sql("SELECT count(DISTINCT i) FROM range(200000000) t(i)", sid)[0]
+        # timeout: the v2 alpha engine intermittently loses a scheduler
+        # wakeup and runs this aggregation ~20x slow (worker pool starved,
+        # everything trickling through 20ms-bounded waits — see
+        # misc/upstream-nap-race-report.md). The test's subject is the 409
+        # below, not engine speed, so give the slow mode room rather than
+        # flake on an upstream race. Drop back to the default timeout at GA.
+        result["slow"] = h.sql(
+            "SELECT count(DISTINCT i) FROM range(200000000) t(i)", sid, timeout=120
+        )[0]
 
     t = threading.Thread(target=slow)
     t.start()
