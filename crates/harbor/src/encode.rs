@@ -29,6 +29,114 @@ pub(crate) fn quote_identifier(name: &str) -> String {
 /// 9007199254740993 gets 9007199254740992 and never finds out.
 const JSON_SAFE: i128 = 9_007_199_254_740_991;
 
+/// Every two-digit number, as bytes: "000102...9899". One table lookup
+/// replaces two divisions in the digit writers below.
+pub(crate) const DIGIT_PAIRS: &[u8; 200] = b"\
+0001020304050607080910111213141516171819\
+2021222324252627282930313233343536373839\
+4041424344454647484950515253545556575859\
+6061626364656667686970717273747576777879\
+8081828384858687888990919293949596979899";
+
+/// The decimal digits of a u64, written straight into `out` — the same bytes
+/// `u64::to_string` produces, without the String it allocates. This is the
+/// workhorse under every integer on the wire.
+pub(crate) fn push_u64_raw(out: &mut String, mut v: u64) {
+    let mut buf = [0u8; 20]; // u64::MAX has 20 digits
+    let mut i = buf.len();
+    while v >= 100 {
+        let pair = ((v % 100) as usize) * 2;
+        v /= 100;
+        i -= 2;
+        buf[i..i + 2].copy_from_slice(&DIGIT_PAIRS[pair..pair + 2]);
+    }
+    if v >= 10 {
+        let pair = (v as usize) * 2;
+        i -= 2;
+        buf[i..i + 2].copy_from_slice(&DIGIT_PAIRS[pair..pair + 2]);
+    } else {
+        i -= 1;
+        buf[i] = b'0' + v as u8;
+    }
+    // Safety: the slice holds only ASCII digits.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
+}
+
+/// `u128::to_string`'s bytes without its String. The 128-bit divide loop is
+/// an order of magnitude slower than the 64-bit one, so anything that fits —
+/// which is everything but HUGEINT/UHUGEINT tails — takes the u64 path.
+pub(crate) fn push_u128_raw(out: &mut String, v: u128) {
+    if let Ok(small) = u64::try_from(v) {
+        return push_u64_raw(out, small);
+    }
+    let mut buf = [0u8; 39]; // u128::MAX has 39 digits
+    let mut i = buf.len();
+    let mut v = v;
+    // Peel 19-digit chunks: at most two 128-bit divisions, the rest u64.
+    while v > u64::MAX as u128 {
+        let mut chunk = (v % 10_000_000_000_000_000_000) as u64; // 10^19
+        v /= 10_000_000_000_000_000_000;
+        for _ in 0..19 {
+            i -= 1;
+            buf[i] = b'0' + (chunk % 10) as u8;
+            chunk /= 10;
+        }
+    }
+    let mut v64 = v as u64;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v64 % 10) as u8;
+        v64 /= 10;
+        if v64 == 0 {
+            break;
+        }
+    }
+    // Safety: the slice holds only ASCII digits.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
+}
+
+/// `i128::to_string`'s bytes, allocation-free: a sign, then the digits.
+pub(crate) fn push_i128_raw(out: &mut String, v: i128) {
+    if v < 0 {
+        out.push('-');
+    }
+    push_u128_raw(out, v.unsigned_abs());
+}
+
+/// `i64::to_string`'s bytes, allocation-free — the whole path stays 64-bit.
+pub(crate) fn push_i64_raw(out: &mut String, v: i64) {
+    if v < 0 {
+        out.push('-');
+    }
+    push_u64_raw(out, v.unsigned_abs());
+}
+
+/// An integer zero-padded to `width` the way `format!("{v:0width$}")` pads:
+/// the sign first, then zeros, then the digits, sign counted toward the width.
+pub(crate) fn push_int_pad(out: &mut String, v: i64, width: usize) {
+    let neg = v < 0;
+    if neg {
+        out.push('-');
+    }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let mut x = v.unsigned_abs();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (x % 10) as u8;
+        x /= 10;
+        if x == 0 {
+            break;
+        }
+    }
+    let written = (buf.len() - i) + neg as usize;
+    for _ in written..width {
+        out.push('0');
+    }
+    // Safety: the slice holds only ASCII digits.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
+}
+
 pub(crate) fn push_int(out: &mut String, i: i128) {
     // unsigned_abs, not abs: `i128::MIN` has no positive counterpart, so
     // `abs()` overflows there. In release that wraps back to `i128::MIN`, which
@@ -37,9 +145,14 @@ pub(crate) fn push_int(out: &mut String, i: i128) {
     // to prevent, on a value any `SELECT (-170141183460469231731687303715884105728)::HUGEINT`
     // produces. In debug it panicked instead.
     if i.unsigned_abs() <= JSON_SAFE as u128 {
-        out.push_str(&i.to_string());
+        // Under 2^53 always fits i64; stay on the 64-bit digit writer.
+        push_i64_raw(out, i as i64);
     } else {
-        push_json_string(out, &i.to_string());
+        // Digits and a sign need no JSON escaping; the quotes are the whole
+        // encoding.
+        out.push('"');
+        push_i128_raw(out, i);
+        out.push('"');
     }
 }
 
@@ -60,7 +173,9 @@ pub(crate) fn push_float(out: &mut String, f: f64) {
     if f != 0.0 && f.abs() >= 1e21 {
         push_exponent(out, &format!("{f:e}"));
     } else {
-        out.push_str(&f.to_string());
+        // Display, written straight into the buffer: the same shortest
+        // round-trip text `to_string` yields, without its String.
+        let _ = std::fmt::Write::write_fmt(out, format_args!("{f}"));
     }
 }
 
@@ -83,7 +198,7 @@ pub(crate) fn push_float32(out: &mut String, f: f32) {
     if f != 0.0 && f.abs() >= 1e21 {
         push_exponent(out, &format!("{f:e}"));
     } else {
-        out.push_str(&f.to_string());
+        let _ = std::fmt::Write::write_fmt(out, format_args!("{f}"));
     }
 }
 
@@ -101,30 +216,63 @@ fn push_exponent(out: &mut String, formatted: &str) {
 }
 
 pub(crate) fn push_json_string(out: &mut String, s: &str) {
-    // serde_json owns the escaping rules, including the ones that are easy to
-    // get wrong (control characters, lone surrogates).
-    let encoded = match serde_json::to_string(s) {
-        Ok(encoded) => encoded,
-        Err(_) => return out.push_str("\"\""),
-    };
-    // One rule serde_json correctly does not apply, because it is about the
-    // container rather than the value: U+2028 LINE SEPARATOR and U+2029
-    // PARAGRAPH SEPARATOR are legal inside a JSON string, but this is a
-    // newline-delimited format and they are line terminators to every
-    // Unicode-aware line splitter. Left raw, one row is read as two — and the
-    // half that is left over is not valid JSON, so a client sees a parse error
-    // whose cause is nowhere near where it happened. Escaping them costs a
-    // scan that almost always finds nothing.
-    if !encoded.contains('\u{2028}') && !encoded.contains('\u{2029}') {
-        return out.push_str(&encoded);
-    }
-    for ch in encoded.chars() {
-        match ch {
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            other => out.push(other),
+    // One pass, byte-identical to what serde_json::to_string used to produce
+    // here (its escaping rules are reproduced below and pinned by a
+    // fuzz-comparison test), plus one rule serde_json correctly does not
+    // apply because it is about the container rather than the value: U+2028
+    // LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are legal inside a JSON
+    // string, but this is a newline-delimited format and they are line
+    // terminators to every Unicode-aware line splitter. Left raw, one row is
+    // read as two — and the half that is left over is not valid JSON, so a
+    // client sees a parse error whose cause is nowhere near where it
+    // happened. Writing straight into `out` drops the String serde_json
+    // allocated per cell and the two container scans over it.
+    out.push('"');
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // The overwhelmingly common byte: printable, not a quote or
+        // backslash, and not the 0xE2 that could open U+2028/U+2029.
+        if b >= 0x20 && b != b'"' && b != b'\\' && b != 0xE2 {
+            i += 1;
+            continue;
         }
+        if b == 0xE2 {
+            // U+2028 is E2 80 A8, U+2029 is E2 80 A9; every other E2
+            // sequence passes through raw.
+            if bytes.len() - i >= 3 && bytes[i + 1] == 0x80 && bytes[i + 2] & 0xFE == 0xA8 {
+                out.push_str(&s[start..i]);
+                out.push_str(if bytes[i + 2] == 0xA8 { "\\u2028" } else { "\\u2029" });
+                i += 3;
+                start = i;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        out.push_str(&s[start..i]);
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            0x08 => out.push_str("\\b"),
+            0x09 => out.push_str("\\t"),
+            0x0A => out.push_str("\\n"),
+            0x0C => out.push_str("\\f"),
+            0x0D => out.push_str("\\r"),
+            c => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                out.push_str("\\u00");
+                out.push(HEX[(c >> 4) as usize] as char);
+                out.push(HEX[(c & 0xF) as usize] as char);
+            }
+        }
+        i += 1;
+        start = i;
     }
+    out.push_str(&s[start..]);
+    out.push('"');
 }
 
 // ---------------------------------------------------------------------------
@@ -147,23 +295,62 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-pub(crate) fn fmt_date(days: i32) -> String {
+/// The two digits of a value in 0..=99, from the pair table.
+#[inline]
+pub(crate) fn digit_pair(v: usize) -> [u8; 2] {
+    [DIGIT_PAIRS[v * 2], DIGIT_PAIRS[v * 2 + 1]]
+}
+
+pub(crate) fn push_date(out: &mut String, days: i32) {
     let (y, m, d) = civil_from_days(days as i64);
-    format!("{y:04}-{m:02}-{d:02}")
+    if (0..=9999).contains(&y) {
+        // The common era: one 10-byte write instead of five small ones.
+        let mut b = [0u8; 10];
+        b[0..2].copy_from_slice(&digit_pair(y as usize / 100));
+        b[2..4].copy_from_slice(&digit_pair(y as usize % 100));
+        b[4] = b'-';
+        b[5..7].copy_from_slice(&digit_pair(m as usize));
+        b[7] = b'-';
+        b[8..10].copy_from_slice(&digit_pair(d as usize));
+        // Safety: the buffer holds only ASCII digits and dashes.
+        out.push_str(unsafe { std::str::from_utf8_unchecked(&b) });
+    } else {
+        push_int_pad(out, y, 4);
+        out.push('-');
+        push_int_pad(out, m as i64, 2);
+        out.push('-');
+        push_int_pad(out, d as i64, 2);
+    }
 }
 
 /// HH:MM:SS, with a fraction only when there is one. Six digits unless the
 /// value carries sub-microsecond precision.
-pub(crate) fn fmt_time(nanos: i128) -> String {
-    let (h, min, s, frac) = split_time(nanos.rem_euclid(86_400_000_000_000));
-    let mut out = format!("{h:02}:{min:02}:{s:02}");
-    push_fraction(&mut out, frac);
-    out
+pub(crate) fn push_time(out: &mut String, nanos: i128) {
+    // The i64 path covers every value the encoders pass (micros × 1000 can
+    // exceed i64, hence the i128 signature — but only barely, and rem_euclid
+    // on i128 is an order of magnitude slower).
+    let day = 86_400_000_000_000;
+    let ns = match i64::try_from(nanos) {
+        Ok(n) => n.rem_euclid(day),
+        Err(_) => nanos.rem_euclid(day as i128) as i64,
+    };
+    let (h, min, s, frac) = split_time(ns);
+    let mut b = [0u8; 8];
+    b[0..2].copy_from_slice(&digit_pair(h as usize));
+    b[2] = b':';
+    b[3..5].copy_from_slice(&digit_pair(min as usize));
+    b[5] = b':';
+    b[6..8].copy_from_slice(&digit_pair(s as usize));
+    // Safety: the buffer holds only ASCII digits and colons.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&b) });
+    push_fraction(out, frac);
 }
 
-pub(crate) fn split_time(nanos_in_day: i128) -> (i64, i64, i64, i64) {
-    let total_s = (nanos_in_day / 1_000_000_000) as i64;
-    let frac = (nanos_in_day % 1_000_000_000) as i64;
+/// Splits nanoseconds-since-midnight (already reduced below one day, so it
+/// fits and stays in i64) into hours, minutes, seconds, and the fraction.
+pub(crate) fn split_time(nanos_in_day: i64) -> (i64, i64, i64, i64) {
+    let total_s = nanos_in_day / 1_000_000_000;
+    let frac = nanos_in_day % 1_000_000_000;
     (total_s / 3_600, (total_s % 3_600) / 60, total_s % 60, frac)
 }
 
@@ -174,16 +361,27 @@ pub(crate) fn push_fraction(out: &mut String, nanos: i64) {
     // Six digits for microsecond precision, nine when the value actually
     // carries nanoseconds. Trailing zeros come off either way: a TIMESTAMP_MS
     // of .123 should read as .123, not .123000.
-    let mut digits = if nanos % 1_000 == 0 {
-        format!("{:06}", nanos / 1_000)
+    let (mut v, width) = if nanos % 1_000 == 0 {
+        ((nanos / 1_000) as u64, 6)
     } else {
-        format!("{nanos:09}")
+        (nanos as u64, 9)
     };
-    while digits.ends_with('0') {
-        digits.pop();
+    let mut buf = [b'0'; 9];
+    let mut i = width;
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    // The zero-fill already padded the front; trim the back. At least one
+    // nonzero digit exists because nanos != 0.
+    let mut end = width;
+    while buf[end - 1] == b'0' {
+        end -= 1;
     }
     out.push('.');
-    out.push_str(&digits);
+    // Safety: the slice holds only ASCII digits.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[..end]) });
 }
 
 /// DuckDB stores BIGNUM (formerly VARINT) as a three-byte header followed by
@@ -253,12 +451,12 @@ pub(crate) fn varint_to_decimal(bytes: &[u8]) -> Option<String> {
 /// DuckDB stores BIT as a leading pad-count byte followed by the bits, most
 /// significant first. Without this a bit string goes out base64-encoded, which
 /// is not wrong so much as unusable.
-pub(crate) fn bit_string(bytes: &[u8]) -> String {
+pub(crate) fn push_bit_string(out: &mut String, bytes: &[u8]) {
     let Some((&padding, data)) = bytes.split_first() else {
-        return String::new();
+        return;
     };
     let skip = padding as usize;
-    let mut out = String::with_capacity(data.len() * 8);
+    out.reserve(data.len() * 8);
     for (i, byte) in data.iter().enumerate() {
         for bit in (0..8).rev() {
             if i * 8 + (7 - bit) >= skip {
@@ -266,28 +464,26 @@ pub(crate) fn bit_string(bytes: &[u8]) -> String {
             }
         }
     }
-    out
 }
 
 /// DuckDB stores UUID as a HUGEINT with the high bit flipped, so that the
 /// integer ordering matches the textual ordering.
-pub(crate) fn uuid_to_string(v: i128) -> String {
+pub(crate) fn push_uuid(out: &mut String, v: i128) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let bits = (v as u128) ^ (1u128 << 127);
     let b = bits.to_be_bytes();
-    let hex = |r: &[u8]| r.iter().map(|x| format!("{x:02x}")).collect::<String>();
-    format!(
-        "{}-{}-{}-{}-{}",
-        hex(&b[0..4]),
-        hex(&b[4..6]),
-        hex(&b[6..8]),
-        hex(&b[8..10]),
-        hex(&b[10..16])
-    )
+    for (i, byte) in b.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0xF) as usize] as char);
+    }
 }
 
-pub(crate) fn base64(data: &[u8]) -> String {
+pub(crate) fn push_base64(out: &mut String, data: &[u8]) {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    out.reserve(data.len().div_ceil(3) * 4);
     for c in data.chunks(3) {
         let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
@@ -296,7 +492,6 @@ pub(crate) fn base64(data: &[u8]) -> String {
         out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
         out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
     }
-    out
 }
 
 // ==========================================================================
@@ -375,3 +570,132 @@ pub(crate) static KEYWORDS: &[&str] = &[
     "xmlconcat", "xmlelement", "xmlexists", "xmlforest", "xmlnamespaces", "xmlparse", "xmlpi",
     "xmlroot", "xmlserialize", "xmltable", "year", "years", "yes", "zone",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reference bytes push_json_string must reproduce: serde_json's
+    /// escaping, then the U+2028/U+2029 post-pass — exactly the two-step
+    /// encoding this function replaced.
+    fn reference(s: &str) -> String {
+        let encoded = serde_json::to_string(s).unwrap();
+        let mut out = String::new();
+        for ch in encoded.chars() {
+            match ch {
+                '\u{2028}' => out.push_str("\\u2028"),
+                '\u{2029}' => out.push_str("\\u2029"),
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    fn ours(s: &str) -> String {
+        let mut out = String::new();
+        push_json_string(&mut out, s);
+        out
+    }
+
+    #[test]
+    fn json_string_matches_serde_on_adversarial_inputs() {
+        let cases: &[&str] = &[
+            "",
+            "plain ascii",
+            "quote \" backslash \\ done",
+            "\\\\\"\"",
+            "\u{0}\u{1}\u{2}\u{3}\u{4}\u{5}\u{6}\u{7}\u{8}\u{9}\u{a}\u{b}\u{c}\u{d}\u{e}\u{f}",
+            "\u{10}\u{11}\u{12}\u{13}\u{14}\u{15}\u{16}\u{17}\u{18}\u{19}\u{1a}\u{1b}\u{1c}\u{1d}\u{1e}\u{1f}",
+            "\u{7f}",           // DEL passes through raw
+            "\u{2028}",         // line separator, escaped for NDJSON
+            "\u{2029}",         // paragraph separator
+            "a\u{2028}b\u{2029}c",
+            "\u{2027}\u{202a}", // E2 80 A7 / E2 80 AA — neighbors stay raw
+            "\u{2088}\u{20a8}", // other E2-lead chars sharing trailing bytes
+            "héllo wörld",
+            "日本語テキスト",
+            "🦆 emoji \u{10ffff}",
+            "mixed \" \u{2028} \\ \u{1} 中 🦆 end",
+            "ends with lead-alike \u{2028}",
+            "\u{2028}starts",
+            "e2 near end \u{e0a8}",
+        ];
+        for s in cases {
+            assert_eq!(ours(s), reference(s), "for {s:?}");
+        }
+    }
+
+    #[test]
+    fn json_string_matches_serde_on_random_inputs() {
+        // A cheap deterministic PRNG over a hostile alphabet: escapes,
+        // controls, E2-family multibyte chars, plain ASCII.
+        let alphabet: Vec<char> = ('\u{0}'..='\u{2f}')
+            .chain(['"', '\\', '\u{7f}', '\u{2027}', '\u{2028}', '\u{2029}', '\u{202a}'])
+            .chain(['\u{2088}', '\u{20a8}', 'é', '中', '🦆', 'a', 'z', '\u{e0a8}'])
+            .collect();
+        let mut state = 0x243F6A8885A308D3u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 24) as usize;
+            let s: String =
+                (0..len).map(|_| alphabet[next() as usize % alphabet.len()]).collect();
+            assert_eq!(ours(&s), reference(&s), "for {s:?}");
+        }
+    }
+
+    #[test]
+    fn int_pad_matches_format() {
+        for &(v, w) in &[
+            (0i64, 2usize),
+            (0, 4),
+            (5, 2),
+            (5, 4),
+            (42, 2),
+            (999, 2),
+            (1234, 4),
+            (12345, 4),
+            (-5, 4),
+            (-123, 4),
+            (-1234, 4),
+            (-12345, 4),
+            (5877642, 4),
+            (-5877641, 4),
+            (i64::MAX, 4),
+            (i64::MIN, 4),
+        ] {
+            let mut out = String::new();
+            push_int_pad(&mut out, v, w);
+            assert_eq!(out, format!("{v:0w$}"), "for {v} width {w}");
+        }
+    }
+
+    #[test]
+    fn raw_ints_match_to_string() {
+        for v in [
+            0i128,
+            1,
+            -1,
+            9,
+            10,
+            -10,
+            i128::from(i64::MAX),
+            i128::from(i64::MIN),
+            i128::MAX,
+            i128::MIN,
+        ] {
+            let mut out = String::new();
+            push_i128_raw(&mut out, v);
+            assert_eq!(out, v.to_string());
+        }
+        for v in [0u128, 1, 9, 10, u128::from(u64::MAX), u128::MAX] {
+            let mut out = String::new();
+            push_u128_raw(&mut out, v);
+            assert_eq!(out, v.to_string());
+        }
+    }
+}
