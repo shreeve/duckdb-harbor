@@ -85,7 +85,7 @@ use std::io::Error as IoError;
 use std::io::Result as IoResult;
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::atomic::Ordering::Relaxed;
 use std::thread;
 use std::time::Duration;
@@ -121,6 +121,12 @@ pub struct Server {
 
     // result of TcpListener::local_addr()
     listening_addr: ListenAddr,
+
+    // live client connections, counted at accept and at connection end.
+    // A fact, not a policy: the host reads this to decide lifetime (a
+    // refcounted server exits when nobody has been connected for a
+    // while), and policy stays out of the HTTP layer.
+    connections: Arc<AtomicUsize>,
 }
 
 enum Message {
@@ -194,6 +200,16 @@ const _: () = {
     let _ = assert_send_sync::<Server>;
 };
 
+impl Server {
+    /// Live client connections right now — everything accepted whose
+    /// request loop has not ended. Idle keep-alive connections count;
+    /// that is the point: an attached client, even a quiet one, is a
+    /// claim on the server's lifetime.
+    pub fn connection_count(&self) -> usize {
+        self.connections.load(Relaxed)
+    }
+}
+
 pub struct IncomingRequests<'a> {
     server: &'a Server,
 }
@@ -223,6 +239,7 @@ impl Server {
     fn start(listener: stream::Listener) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
         // building the "close" variable
         let close_trigger = Arc::new(AtomicBool::new(false));
+        let connections = Arc::new(AtomicUsize::new(0));
 
         // building the TcpListener
         let (server, local_addr) = {
@@ -236,6 +253,7 @@ impl Server {
 
         let inside_close_trigger = close_trigger.clone();
         let inside_messages = messages.clone();
+        let inside_connections = connections.clone();
         thread::spawn(move || {
             // a tasks pool is used to dispatch the connections into threads
             let tasks_pool = pool::TaskPool::new();
@@ -301,7 +319,20 @@ impl Server {
                         failing_since = None;
                         let messages = inside_messages.clone();
                         let mut client = Some(client);
+                        // Counted from accept to the end of the connection's
+                        // request loop. A drop guard, not a bare dec, so a
+                        // panic while handling the connection cannot leak the
+                        // count and pin a refcounted host open forever.
+                        struct Connected(Arc<AtomicUsize>);
+                        impl Drop for Connected {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, Relaxed);
+                            }
+                        }
+                        inside_connections.fetch_add(1, Relaxed);
+                        let mut guard = Some(Connected(inside_connections.clone()));
                         tasks_pool.spawn(Box::new(move || {
+                            let _connected = guard.take();
                             if let Some(client) = client.take() {
                                 for rq in client {
                                     messages.push(rq.into());
@@ -349,6 +380,7 @@ impl Server {
             messages,
             close: close_trigger,
             listening_addr: local_addr,
+            connections,
         })
     }
 

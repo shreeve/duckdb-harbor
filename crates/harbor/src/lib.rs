@@ -1209,6 +1209,15 @@ pub fn start(
     Ok(addr)
 }
 
+/// Live client connections on the running server, or None when nothing
+/// is serving. This is the whole lifetime signal for a refcounted
+/// (spawned-on-use) server: the host polls it and leaves when it has
+/// been zero past the grace windows. Idle keep-alive connections count
+/// — an attached client, even a quiet one, is a claim.
+pub fn connection_count() -> Option<usize> {
+    RUNNING.lock().unwrap().as_ref().map(|r| r.server.connection_count())
+}
+
 pub fn stop() -> Result<String, String> {
     // Held for the whole of the shutdown, not just the take(). Releasing it
     // here — which `RUNNING.lock().unwrap().take()` as a statement does, since
