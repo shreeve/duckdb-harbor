@@ -17,7 +17,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use super::encode::{Type, result_columns};
 use super::{Engine, Error, ffi};
@@ -329,7 +331,25 @@ impl Conn {
                 return Err(e);
             }
         };
-        Ok(Stream { eng: self.eng, result, columns })
+
+        // Hand the result to its fetch thread; from here the Fetcher owns
+        // it (destroying it on every exit path, including a failed spawn).
+        let fetcher = Fetcher { eng: self.eng, result };
+        let (tx, rx) = mpsc::sync_channel(PREFETCH);
+        let join = thread::Builder::new()
+            .name("harbor-fetch".into())
+            .spawn(move || fetcher.run(tx))
+            .map_err(|e| Error {
+                code: ffi::ERROR_API,
+                message: format!("could not spawn fetch thread: {e}"),
+            })?;
+        Ok(Stream {
+            columns,
+            rx: Some(rx),
+            join: Some(join),
+            interrupt: Interrupt { eng: self.eng, conn: self.interrupt.clone() },
+            done: false,
+        })
     }
 
     /// Parse and run a whole SQL string, draining every result. The
@@ -383,53 +403,156 @@ impl Drop for Stmt {
 // Streaming result
 // ---------------------------------------------------------------------------
 
-/// A live result: the connection's cursor. Destroy (drop) promptly — while it
-/// lives, the connection refuses new statements.
+/// Chunks buffered between the fetch thread and the consumer. Enough that
+/// the fetch thread can run ahead while the consumer encodes, small enough
+/// to bound memory: a chunk is at most 2048 rows.
+const PREFETCH: usize = 4;
+
+/// A live result, drained by a dedicated fetch thread and consumed here as
+/// a channel of chunks. Drop promptly — while the result lives, the
+/// connection refuses new statements.
+///
+/// The pipeline is the point: fetching and encoding used to share one
+/// thread, so every fetch stall — above all the engine's 20ms WaitForTask
+/// nap between chunks — sat on the critical path, and every encode ran
+/// with the engine idle. With a fetch thread, the engine produces chunk
+/// N+1 (on its full worker pool) while the consumer encodes chunk N; a
+/// nap only costs wall time when the consumer has nothing left to chew.
 pub struct Stream {
-    eng: &'static Engine,
-    result: ffi::result_handle,
     /// The result's columns. Public so a caller can `mem::take` them and
     /// keep them across the mutable borrows the chunk loop needs.
     pub columns: Vec<(String, Type)>,
+    /// Taken (closed) on drop, so the fetch thread's next send fails and
+    /// it stops fetching.
+    rx: Option<mpsc::Receiver<Result<Chunk, Error>>>,
+    join: Option<thread::JoinHandle<()>>,
+    /// Fired on drop when the fetch thread is still mid-query: an
+    /// abandoned stream must not leave the fetch thread blocked inside the
+    /// engine, because the result it holds keeps the connection refusing
+    /// statements. The engine clears the flag at the next query's start
+    /// (ClientContext::InitialCleanup), so a stray interrupt cannot poison
+    /// the statement after this one.
+    interrupt: Interrupt,
+    done: bool,
 }
 
 impl Stream {
     /// The next chunk, or None at end-of-stream. An interrupted query
     /// surfaces here as ERROR_RUNTIME_INTERRUPT.
-    ///
-    /// Driven through result_step first, falling back to
-    /// result_fetch_chunk. The blocking fetch parks in the engine's
-    /// Executor::WaitForTask whenever the stream buffer is momentarily
-    /// empty — a bounded condition wait (20ms) that is only signalled on
-    /// task reschedule, not on chunk-became-ready. A consumer that encodes
-    /// faster than the engine produces hits that nap once per chunk and a
-    /// cheap query spends more wall time asleep than working. Stepping
-    /// dodges the nap — but each step runs its bounded unit of engine work
-    /// on THIS thread only, so a compute-heavy pipeline driven entirely by
-    /// steps executes serially: a wide aggregation measured 17x slower
-    /// than the blocking fetch, which engages the full worker pool. Hence
-    /// the budget: a cheap producer hands back its chunk within a few
-    /// steps and stays on the nap-free path; a query still chunkless after
-    /// the budget is heavy-shaped (or genuinely stalled) and the blocking
-    /// fetch takes over for this chunk, buying back parallelism at the
-    /// cost of a nap that is noise at that scale.
-    ///
-    /// The nap has only been observed on macOS, where dodging it is a
-    /// 2.5-6x win on streaming shapes. On Linux (22-core, same engine
-    /// pin) the blocking fetch streams 5M rows in ~0.15s — no nap to
-    /// dodge — and stepping showed no measurable benefit. So step-first
-    /// is macOS-only; everywhere else takes the engine's own fetch, the
-    /// canonical path. Re-measure both platforms at v2.0.0 GA.
     pub fn next_chunk(&mut self) -> Result<Option<Chunk>, Error> {
-        const STEP_BUDGET: u32 = 32;
-        let api = &self.eng.api;
-        if !cfg!(target_os = "macos") {
-            return self.next_chunk_blocking();
+        if self.done {
+            return Ok(None);
         }
+        let Some(rx) = self.rx.as_ref() else {
+            return Ok(None);
+        };
+        match rx.recv() {
+            Ok(Ok(chunk)) => Ok(Some(chunk)),
+            Ok(Err(e)) => {
+                self.done = true;
+                Err(e)
+            }
+            // Sender gone with no error sent: the stream ended.
+            Err(mpsc::RecvError) => {
+                self.done = true;
+                Ok(None)
+            }
+        }
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        // Close the channel first: the fetch thread's next send fails and
+        // it destroys the result. If it is still inside the engine —
+        // blocked in a fetch, or mid-computation — interrupt so it comes
+        // back promptly; a fully drained stream's thread has already
+        // exited and the join is instant.
+        self.rx.take();
+        if let Some(join) = self.join.take() {
+            if !join.is_finished() {
+                self.interrupt.interrupt();
+            }
+            let _ = join.join();
+        }
+    }
+}
+
+/// The fetch thread's half of a Stream: exclusive owner of the result
+/// handle. The result is single-consumer by spec — moving it wholesale to
+/// one thread is exactly the contract.
+struct Fetcher {
+    eng: &'static Engine,
+    result: ffi::result_handle,
+}
+
+// The result handle is owned exclusively by the fetch thread once spawned;
+// nothing else touches it.
+unsafe impl Send for Fetcher {}
+
+impl Fetcher {
+    /// Fetch until end, error, or the consumer hangs up.
+    fn run(mut self, tx: mpsc::SyncSender<Result<Chunk, Error>>) {
+        loop {
+            match self.next_chunk() {
+                Ok(Some(chunk)) => {
+                    if tx.send(Ok(chunk)).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The next chunk, or None at end-of-stream. An interrupted query
+    /// surfaces here as ERROR_RUNTIME_INTERRUPT.
+    ///
+    /// Driven through result_step, with a time-budgeted fallback to
+    /// result_fetch_chunk. The two primitives fail in opposite ways. The
+    /// blocking fetch engages the engine's full worker pool but parks in
+    /// Executor::WaitForTask whenever it has no runnable task — a bounded
+    /// 20ms condition wait signalled on task reschedule, not on
+    /// chunk-became-ready — and on a streaming query those naps gate
+    /// production. Stepping never naps, and on this dedicated thread the
+    /// engine work each step runs overlaps the consumer's encoding on
+    /// another core — but a step is one bounded work unit on THIS thread
+    /// only, so a compute-heavy pipeline driven entirely by steps executes
+    /// serially (measured 17x slower on a wide aggregation).
+    ///
+    /// Hence the time budget, per chunk: a streaming producer hands back
+    /// its chunk in tens of microseconds of stepping and never trips it; a
+    /// chunk still unproduced after the budget marks a compute phase, and
+    /// the blocking fetch takes over — full parallelism, one nap, and at
+    /// most a budget's worth of serial work lost per chunk, on a query
+    /// shape with few chunks. The budget is per next_chunk call, so a
+    /// heavy phase followed by a streaming tail (a big sort, say) pays it
+    /// only while the phase lasts and steps again from the next chunk on.
+    /// Counting steps does not work as a budget: a step's work unit is far
+    /// smaller than a chunk's production, so any count small enough to
+    /// protect heavy queries trips constantly on streaming ones.
+    fn next_chunk(&mut self) -> Result<Option<Chunk>, Error> {
+        use std::time::{Duration, Instant};
+        // Sized to clear a streaming query's most expensive chunk — the
+        // first, which carries execution start-up (measured ~2ms on shapes
+        // that produce every later chunk in tens of microseconds). Tripping
+        // the budget costs a ~20ms nap in the blocking fetch, so a
+        // too-tight budget taxes exactly the queries it exists to protect.
+        const STEP_BUDGET: Duration = Duration::from_millis(5);
+        // How many steps between clock checks; a step is well under a
+        // microsecond of overhead, the clock read is not free.
+        const CLOCK_EVERY: u32 = 64;
+        let api = &self.eng.api;
         let Some(step) = api.result_step else {
             return self.next_chunk_blocking();
         };
-        for _ in 0..STEP_BUDGET {
+        let start = Instant::now();
+        let mut n = 0u32;
+        loop {
             let mut chunk: ffi::data_chunk_handle = std::ptr::null_mut();
             let mut status: ffi::RESULT_STEP_STATUS = ffi::RESULT_STEP_STATUS_WAITING;
             let mut err: ffi::error_info_handle = std::ptr::null_mut();
@@ -451,8 +574,11 @@ impl Stream {
                 }
                 _ => std::thread::yield_now(),
             }
+            n += 1;
+            if n % CLOCK_EVERY == 0 && start.elapsed() >= STEP_BUDGET {
+                return self.next_chunk_blocking();
+            }
         }
-        self.next_chunk_blocking()
     }
 
     /// The engine's own blocking fetch: full worker-pool parallelism, at
@@ -488,7 +614,7 @@ impl Stream {
     }
 }
 
-impl Drop for Stream {
+impl Drop for Fetcher {
     fn drop(&mut self) {
         unsafe {
             if let Some(f) = self.eng.api.result_destroy {
@@ -504,6 +630,10 @@ pub struct Chunk {
     raw: ffi::data_chunk_handle,
     pub rows: usize,
 }
+
+// Owned exclusively by whoever holds it; the fetch thread produces chunks
+// and hands them across the channel to the consumer.
+unsafe impl Send for Chunk {}
 
 impl Chunk {
     /// Build the readers for the chunk's columns. Valid until the chunk is
