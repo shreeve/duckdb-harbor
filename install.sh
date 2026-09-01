@@ -22,8 +22,16 @@ set -euo pipefail
 REPO=shreeve/duckdb-harbor
 NAME=harbor
 
-say()  { printf '%s\n' "$*"; }
-fail() { printf 'install: %s\n' "$*" >&2; exit 1; }
+# Color only when stdout is a terminal, and never against NO_COLOR.
+Color_Off='' Red='' Green='' Dim='' Bold_Green='' Bold_White=''
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  Color_Off='\033[0m'
+  Red='\033[0;31m' Green='\033[0;32m' Dim='\033[0;2m'
+  Bold_Green='\033[1;32m' Bold_White='\033[1m'
+fi
+
+info() { printf "${Dim}%s${Color_Off}\n" "$*"; }
+fail() { printf "${Red}error${Color_Off}: %s\n" "$*" >&2; exit 1; }
 
 # Everything lives in main() so a truncated `curl | bash` download can
 # never execute a half-delivered script.
@@ -65,7 +73,7 @@ main() {
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT
 
-  say "installing $NAME $tag ($plat)"
+  info "$NAME $tag ($plat)"
   curl -fSL --retry 3 --retry-delay 1 --progress-bar -o "$tmp/$asset" "$base/$asset" \
     || fail "download failed: $base/$asset"
 

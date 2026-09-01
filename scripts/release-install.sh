@@ -24,7 +24,17 @@ cd "$(dirname "$0")"
 BIN=${BIN:-$HOME/.local/bin}
 LIB=${LIB:-$HOME/.local/lib}
 
-fail() { printf 'install: %s\n' "$*" >&2; exit 1; }
+# Color only when stdout is a terminal, and never against NO_COLOR.
+Color_Off='' Red='' Green='' Dim='' Bold_Green='' Bold_White=''
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  Color_Off='\033[0m'
+  Red='\033[0;31m' Green='\033[0;32m' Dim='\033[0;2m'
+  Bold_Green='\033[1;32m' Bold_White='\033[1m'
+fi
+
+info() { printf "${Dim}%s${Color_Off}\n" "$*"; }
+fail() { printf "${Red}error${Color_Off}: %s\n" "$*" >&2; exit 1; }
+tildify() { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
 
 for d in "$BIN" "$LIB"; do
   mkdir -p "$d" 2>/dev/null || fail "cannot create $d"
@@ -44,17 +54,17 @@ install -m 0755 lib/libduckdb.* "$LIB"
 state="${HARBOR_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/harbor}"
 [ -d "$state/runtime" ] && chmod 700 "$state" "$state/runtime" 2>/dev/null || true
 
-echo "installed: harbor + pilot -> $BIN"
-echo "           libduckdb      -> $LIB"
+printf "${Green}harbor + pilot were installed successfully to ${Bold_Green}%s${Color_Off}\n" "$(tildify "$BIN")"
+info "libduckdb -> $(tildify "$LIB")"
 
 case ":${PATH:-}:" in
   *":$BIN:"*) ;;
   *)
-    echo
-    echo "$BIN is not on your PATH. Add it:"
-    echo "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc   # or ~/.bashrc"
+    printf '\n'
+    info "$(tildify "$BIN") is not on your PATH. Add it:"
+    printf "  ${Bold_White}echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc${Color_Off}${Dim}   # or ~/.bashrc${Color_Off}\n"
     ;;
 esac
 
-echo
-echo "try: harbor start mydata.duckdb --create && pilot mydata"
+printf '\n'
+info "Run 'harbor start mydata.duckdb --create && pilot mydata' to get started"
