@@ -67,7 +67,7 @@ fn is_canonical_name(name: &str) -> bool {
             | "UTINYINT" | "USMALLINT" | "UINTEGER" | "UBIGINT" | "FLOAT" | "DOUBLE" | "VARCHAR"
             | "BLOB" | "BIT" | "UUID" | "DATE" | "TIME" | "TIME WITH TIME ZONE" | "TIME_NS"
             | "TIMESTAMP" | "TIMESTAMP_S" | "TIMESTAMP_MS" | "TIMESTAMP_NS"
-            | "TIMESTAMP WITH TIME ZONE" | "TIMESTAMP_NS WITH TIME ZONE" | "INTERVAL"
+            | "TIMESTAMP WITH TIME ZONE" | "TIMESTAMPTZ_NS" | "INTERVAL"
             | "DECIMAL" | "LIST" | "ARRAY" | "MAP" | "STRUCT" | "TUPLE" | "UNION" | "ENUM"
             | "NULL" | "\"NULL\"" | "SQLNULL" | "GEOMETRY" | "VARIANT" | "BIGNUM" | "ANY"
             | "INVALID" | "UNKNOWN" | "ROW"
@@ -236,7 +236,7 @@ fn emit_schema(out: &mut String, name: Option<&str>, ty: &Type, nested: bool) {
             out.push_str(r#","child":"#);
             emit_schema(out, None, &ty.children[0].1, true);
         }
-        LOGICAL_TYPE_ID_STRUCT => {
+        LOGICAL_TYPE_ID_STRUCT | LOGICAL_TYPE_ID_TUPLE => {
             out.push_str(r#","lossless":true,"fields":["#);
             for (i, (n, child)) in ty.children.iter().enumerate() {
                 if i > 0 {
@@ -358,7 +358,7 @@ pub fn type_name(ty: &Type) -> String {
         LOGICAL_TYPE_ID_TIMESTAMP_MS => "TIMESTAMP_MS".into(),
         LOGICAL_TYPE_ID_TIMESTAMP_NS => "TIMESTAMP_NS".into(),
         LOGICAL_TYPE_ID_TIMESTAMP_TZ => "TIMESTAMP WITH TIME ZONE".into(),
-        LOGICAL_TYPE_ID_TIMESTAMP_TZ_NS => "TIMESTAMP_NS WITH TIME ZONE".into(),
+        LOGICAL_TYPE_ID_TIMESTAMP_TZ_NS => "TIMESTAMPTZ_NS".into(),
         LOGICAL_TYPE_ID_INTERVAL => "INTERVAL".into(),
         LOGICAL_TYPE_ID_DECIMAL => format!("DECIMAL({},{})", ty.decimal.0, ty.decimal.1),
         LOGICAL_TYPE_ID_LIST => format!("{}[]", type_name(&ty.children[0].1)),
@@ -368,13 +368,17 @@ pub fn type_name(ty: &Type) -> String {
                 ty.enum_values.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect();
             format!("ENUM({})", values.join(", "))
         }
-        LOGICAL_TYPE_ID_STRUCT | LOGICAL_TYPE_ID_TUPLE => {
+        LOGICAL_TYPE_ID_STRUCT => {
             let fields: Vec<String> = ty
                 .children
                 .iter()
                 .map(|(n, c)| format!("{} {}", quote_identifier(n), type_name(c)))
                 .collect();
             format!("STRUCT({})", fields.join(", "))
+        }
+        LOGICAL_TYPE_ID_TUPLE => {
+            let members: Vec<String> = ty.children.iter().map(|(_, c)| type_name(c)).collect();
+            format!("TUPLE({})", members.join(", "))
         }
         LOGICAL_TYPE_ID_MAP => {
             format!("MAP({}, {})", type_name(&ty.children[0].1), type_name(&ty.children[1].1))
@@ -621,7 +625,7 @@ fn emit(
                 }
                 out.push(']');
             }
-            LOGICAL_TYPE_ID_STRUCT | LOGICAL_TYPE_ID_TUPLE => {
+            LOGICAL_TYPE_ID_STRUCT => {
                 out.push('{');
                 for (i, (name, child_ty)) in ty.children.iter().enumerate() {
                     if i > 0 {
@@ -632,6 +636,18 @@ fn emit(
                     emit(out, api, &r.children[i], child_ty, phys, true)?;
                 }
                 out.push('}');
+            }
+            LOGICAL_TYPE_ID_TUPLE => {
+                // No field names — an object would collide on the empty key.
+                // Order is a tuple's identity; a JSON array carries exactly it.
+                out.push('[');
+                for (i, (_, child_ty)) in ty.children.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    emit(out, api, &r.children[i], child_ty, phys, true)?;
+                }
+                out.push(']');
             }
             LOGICAL_TYPE_ID_MAP => {
                 // Pairs, with the key and value types carried through — the
@@ -673,24 +689,19 @@ fn emit(
                 out.push('}');
             }
             // No committed view layout — the single-cell value bridge is the
-            // committed way in. GEOMETRY keeps v1's shape (base64 of the
-            // blob); VARIANT goes out as the engine's text rendering.
+            // committed way in, and the payload goes out as the engine's text
+            // rendering, exactly what the schema's "varchar-cast" promises.
+            // (v1 emitted base64 of storage bytes under the same lossless:false
+            // label — a payload nothing could decode; text is strictly better.)
             LOGICAL_TYPE_ID_GEOMETRY => {
                 let mut value: ffi::value_handle = std::ptr::null_mut();
                 call!(api, vector_get_value(r.vector, row as ffi::idx_t, &mut value));
-                let mut b = ffi::str_t { ptr: std::ptr::null(), len: 0 };
-                let res = (|| -> Result<(), Error> {
-                    call!(api, value_get_blob(value, &mut b));
-                    Ok(())
-                })();
-                match res {
-                    Ok(()) => {
-                        let data = std::slice::from_raw_parts(b.ptr as *const u8, b.len as usize);
-                        push_json_string(out, &base64(data));
-                    }
-                    Err(_) => out.push_str("null"),
-                }
+                let text = value_text(api, value);
                 destroy_value(api, &mut value);
+                match text {
+                    Some(s) => push_json_string(out, &s),
+                    None => out.push_str("null"),
+                }
             }
             LOGICAL_TYPE_ID_VARIANT => {
                 let mut value: ffi::value_handle = std::ptr::null_mut();
@@ -764,17 +775,18 @@ fn value_text(api: &ffi::Api, value: ffi::value_handle) -> Option<String> {
     let to_string = api.value_to_string?;
     let mut len: ffi::idx_t = 0;
     let mut err: ffi::error_info_handle = std::ptr::null_mut();
-    if unsafe { to_string(value, std::ptr::null_mut(), 0, &mut len, &mut err) } != ffi::ERROR_NONE {
-        let _ = Error::take(api, ffi::ERROR_API, err);
+    let code = unsafe { to_string(value, std::ptr::null_mut(), 0, &mut len, &mut err) };
+    if code != ffi::ERROR_NONE {
+        let _ = Error::take(api, code, err);
         return None;
     }
     let mut buf = vec![0u8; len as usize + 1];
     let mut err: ffi::error_info_handle = std::ptr::null_mut();
-    if unsafe {
+    let code = unsafe {
         to_string(value, buf.as_mut_ptr() as *mut _, buf.len() as ffi::idx_t, &mut len, &mut err)
-    } != ffi::ERROR_NONE
-    {
-        let _ = Error::take(api, ffi::ERROR_API, err);
+    };
+    if code != ffi::ERROR_NONE {
+        let _ = Error::take(api, code, err);
         return None;
     }
     buf.truncate(len as usize);

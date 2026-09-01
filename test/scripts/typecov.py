@@ -11,7 +11,7 @@ and TIME_NS shipped panicking the executor thread and returning 200 with an
 empty body. Both were in no suite, so nothing failed.
 
 This closes the loop by working from the type list the encoder dispatches on —
-the LogicalTypeId enum in the duckdb-rs source, read out of the cargo registry
+the LOGICAL_TYPE_ID list in the generated v2 bindings (crates/harbor/src/v2/ffi.rs)
 at the version Cargo.lock actually pins — and requiring every variant to be
 either produced by a corpus case, deliberately refused, or listed in EXCUSED
 with a reason.
@@ -29,7 +29,7 @@ appears nested still counts.
 The consequence worth having: when a DuckDB upgrade adds a type, this fails on
 the next run, before the type reaches anyone's data.
 
-Exit codes: 0 covered, 1 a gap, 77 could not run (no duckdb-rs source found) —
+Exit codes: 0 covered, 1 a gap, 77 could not run (no generated bindings found) —
 77 so the runner can report it as skipped rather than as a pass.
 """
 
@@ -69,73 +69,58 @@ SKIPPED = 77
 # Every entry needs a reason: an excuse list nobody has to justify is just a
 # way of turning a failing test green.
 EXCUSED = {
-    "Invalid": "not a type — the enum's zero value, used for 'unset'",
-    "Any": "a binder-internal wildcard for function signatures; no value has it",
-    "IntegerLiteral": "an internal type for an un-coerced literal during binding",
-    "StringLiteral": "an internal type for an un-coerced literal during binding",
-    "Geometry": "requires the spatial extension, which harbor does not depend on. "
-                "Worth adding a case if spatial is ever a dependency.",
-    "SqlNull": "the type of an untyped NULL during binding; DuckDB coerces it "
-               "away before a result column exists. Probed against v1.5.5: "
-               "SELECT NULL, NULL::\"NULL\", [NULL] and {a: NULL} all come back "
-               "as INTEGER, INTEGER[] and STRUCT(a INTEGER).",
+    "INVALID": "not a type — the enum's zero value, used for 'unset'",
+    "ANY": "a binder-internal wildcard for function signatures; no value has it",
+    "UNKNOWN": "the type of an unresolved parameter expression during binding",
+    "TYPE": "a type carried as a value; reachable through the C API's "
+            "create_type parameters, not through a result column",
+    "GEOMETRY": "requires the spatial extension, which harbor does not depend "
+                "on. Worth adding a case if spatial is ever a dependency.",
+    "TIMESTAMP_TZ_NS": "the cast is Unimplemented in current v2 engine builds; "
+                       "harbor's encoder is ready — add a case when it lands.",
 }
 
-# Types harbor refuses rather than encodes. Coverage here means a corpus case
-# actually got a 400 naming the type — not that somebody wrote the name down.
-# A refusal that silently stopped happening is exactly as bad as an encoding
-# that silently started being wrong.
-REFUSED = {
-    "TimeNs": "TIME_NS",
-    "Variant": "VARIANT",
-}
+# Types harbor refuses rather than encodes. Empty since 0.21: the v2 C API
+# gave TIME_NS and VARIANT real encodings, so the refusals they justified are
+# gone. The machinery stays, because the next engine type to arrive before
+# its view layout is committed will want it back.
+REFUSED = {}
 
 # duckdbType strings are SQL spellings; the enum is Rust names. Only the ones
 # that differ need an entry — anything else matches case-insensitively.
 SQL_TO_VARIANT = {
-    "VARINT": "Bignum",
-    "BIGNUM": "Bignum",
-    "TIMESTAMP WITH TIME ZONE": "TimestampTZ",
-    "TIMESTAMPTZ": "TimestampTZ",
-    "TIME WITH TIME ZONE": "TimeTZ",
-    "TIMETZ": "TimeTZ",
-    "TIMESTAMP_S": "TimestampS",
-    "TIMESTAMP_MS": "TimestampMs",
-    "TIMESTAMP_NS": "TimestampNs",
-    "TIME_NS": "TimeNs",
-    "NULL": "SqlNull",
-    '"NULL"': "SqlNull",
+    "VARINT": "BIGNUM",
+    "TIMESTAMP WITH TIME ZONE": "TIMESTAMP_TZ",
+    "TIMESTAMPTZ": "TIMESTAMP_TZ",
+    "TIMESTAMPTZ_NS": "TIMESTAMP_TZ_NS",
+    "TIME WITH TIME ZONE": "TIME_TZ",
+    "TIMETZ": "TIME_TZ",
+    "TIMESTAMP_S": "TIMESTAMP_SEC",
+    "NULL": "SQLNULL",
+    '"NULL"': "SQLNULL",
     # DuckDB reports a json column as JSON; it is a VARCHAR underneath and has
-    # no LogicalTypeId of its own.
-    "JSON": "Varchar",
+    # no LOGICAL_TYPE_ID of its own.
+    "JSON": "VARCHAR",
 }
 
 
-def duckdb_rs_source():
-    """The logical_type.rs of the duckdb-rs version this build actually links.
+def spec_source():
+    """The generated v2 FFI, which carries the spec's LOGICAL_TYPE_ID list.
 
-    Picked from Cargo.lock rather than by sorting the registry directory names.
-    Sorting them is lexicographic, so with both 1.9.0 and 1.10505.0 unpacked —
-    the ordinary state after a version bump — the *older* crate wins, and the
-    gate meant to catch "an upgrade added a type" reads the list from before
-    the upgrade.
+    Reading the repo's own generated bindings — not the engine, not a vendored
+    copy — means the gate moves exactly when scripts/gen-v2-ffi.rb is re-run
+    against a new api_spec, which is the moment a new type can first appear in
+    a result column.
     """
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    lock = os.path.join(root, "Cargo.lock")
-    version = None
-    if os.path.exists(lock):
-        m = re.search(r'^name = "duckdb"\nversion = "([^"]+)"', open(lock, encoding="utf-8").read(), re.M)
-        if m:
-            version = m.group(1)
-    pattern = "duckdb-%s" % version if version else "duckdb-*"
-    matches = glob.glob(os.path.expanduser(
-        "~/.cargo/registry/src/*/%s/src/core/logical_type.rs" % pattern))
-    return (matches[0], version) if matches else (None, version)
+    path = os.path.join(root, "crates", "harbor", "src", "v2", "ffi.rs")
+    return (path, None) if os.path.exists(path) else (None, None)
 
 
-def duckdb_rs_types(path):
+def spec_types(path):
     text = open(path, encoding="utf-8").read()
-    return sorted(set(re.findall(r"^\s+([A-Za-z]+) = DUCKDB_TYPE", text, re.M)))
+    return sorted(set(re.findall(
+        r"^pub const LOGICAL_TYPE_ID_([A-Z_0-9]+): LOGICAL_TYPE_ID", text, re.M)))
 
 
 def normalise(sql_type):
@@ -201,13 +186,12 @@ def main():
     ap.add_argument("--token", required=True)
     args = ap.parse_args()
 
-    path, version = duckdb_rs_source()
+    path, _ = spec_source()
     if path is None:
-        print("type coverage: no duckdb-rs source in the cargo registry for %s — cannot run"
-              % (version or "any version"))
+        print("type coverage: crates/harbor/src/v2/ffi.rs not found — cannot run")
         return SKIPPED
-    variants = duckdb_rs_types(path)
-    print("type coverage: checking %d variants from duckdb-rs %s" % (len(variants), version or "?"))
+    variants = spec_types(path)
+    print("type coverage: checking %d variants from the v2 spec bindings" % len(variants))
 
     client = Client(args.host, args.port, args.token)
     produced = set()

@@ -10,14 +10,14 @@
 //!
 //! Cancellation: `Interrupt` is a cross-thread handle (the spec commits
 //! connection_interrupt to being callable from any thread while another
-//! steps the result). It holds the raw connection behind an AtomicPtr that
-//! `Conn::drop` nulls, so a late canceller aims at nothing rather than at
-//! freed memory.
+//! steps the result). It shares a mutex-guarded slot with its Conn: a
+//! canceller fires while holding the lock, and `Conn::drop` disconnects and
+//! nulls the slot under the same lock — so an interrupt can never land on a
+//! freed handle, and a late canceller aims at nothing.
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::encode::{Type, result_columns};
 use super::{Engine, Error, ffi};
@@ -136,8 +136,10 @@ pub struct Conn {
     eng: &'static Engine,
     db: Arc<Db>,
     conn: ffi::connection_handle,
-    /// The cross-thread cancellation slot; nulled by drop.
-    interrupt: Arc<AtomicPtr<ffi::_connection>>,
+    /// The cross-thread cancellation slot. A canceller holds this lock
+    /// across its connection_interrupt call, and drop holds it across
+    /// disconnect — so an interrupt can never land on a freed handle.
+    interrupt: Arc<Mutex<ffi::connection_handle>>,
     /// Parsed-statement cache: SQL text → statements, LRU by tick.
     cache: HashMap<String, CacheEntry>,
     tick: u64,
@@ -163,7 +165,7 @@ impl Conn {
             eng,
             db,
             conn,
-            interrupt: Arc::new(AtomicPtr::new(conn)),
+            interrupt: Arc::new(Mutex::new(conn)),
             cache: HashMap::new(),
             tick: 0,
         })
@@ -176,6 +178,39 @@ impl Conn {
 
     pub fn engine_version(&self) -> &'static str {
         &self.eng.version
+    }
+
+    /// The raw function table, for the encoders.
+    pub fn api(&self) -> &'static ffi::Api {
+        &self.eng.api
+    }
+
+    /// Run one statement and return its first column as text, row per entry —
+    /// the boot-time helper behind `SELECT version()` and the catalog list.
+    pub fn query_strings(&mut self, sql: &str) -> Result<Vec<String>, Error> {
+        let api = &self.eng.api;
+        let stmts = self.statements(sql)?;
+        let mut out = Vec::new();
+        for stmt in stmts.iter() {
+            let mut stream = self.execute(stmt, &[])?;
+            let columns = std::mem::take(&mut stream.columns);
+            while let Some(chunk) = stream.next_chunk()? {
+                let readers = chunk.readers(columns.len().min(1))?;
+                if let (Some(reader), Some((_, ty))) = (readers.first(), columns.first()) {
+                    for row in 0..chunk.rows {
+                        let mut cell = String::new();
+                        super::encode::emit_cell(&mut cell, api, reader, ty, row)?;
+                        // The helper reads VARCHAR columns; strip the JSON
+                        // quoting the encoder applies.
+                        out.push(
+                            serde_json::from_str::<String>(&cell)
+                                .unwrap_or_else(|_| cell.trim_matches('"').to_string()),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The cancellation handle for this connection.
@@ -310,15 +345,16 @@ impl Conn {
 
 impl Drop for Conn {
     fn drop(&mut self) {
-        // Cancellers see null from here on; the tiny window between a load
-        // and this store is the same one v1's InterruptHandle carried.
-        self.interrupt.store(std::ptr::null_mut(), Ordering::SeqCst);
         self.cache.clear();
+        // Disconnect under the interrupt lock: a canceller mid-call finishes
+        // against the live handle first, and every later one sees null.
+        let mut slot = self.interrupt.lock().unwrap_or_else(|p| p.into_inner());
         unsafe {
             if let Some(f) = self.eng.api.disconnect {
                 f(&mut self.conn);
             }
         }
+        *slot = std::ptr::null_mut();
     }
 }
 
@@ -433,7 +469,7 @@ impl Drop for Chunk {
 /// Cross-thread cancellation for one connection.
 pub struct Interrupt {
     eng: &'static Engine,
-    conn: Arc<AtomicPtr<ffi::_connection>>,
+    conn: Arc<Mutex<ffi::connection_handle>>,
 }
 
 // The spec commits connection_interrupt to any-thread use.
@@ -442,15 +478,18 @@ unsafe impl Sync for Interrupt {}
 
 impl Interrupt {
     /// Interrupt whatever runs on the connection right now. A no-op when
-    /// nothing does, or when the connection is already gone.
+    /// nothing does, or when the connection is already gone. Held under the
+    /// same lock Conn::drop disconnects under, so the handle it fires at is
+    /// alive for the duration of the call; connection_interrupt only sets a
+    /// flag, so the hold is momentary.
     pub fn interrupt(&self) {
-        let conn = self.conn.load(Ordering::SeqCst);
-        if conn.is_null() {
+        let slot = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_null() {
             return;
         }
         if let Some(f) = self.eng.api.connection_interrupt {
             let mut err: ffi::error_info_handle = std::ptr::null_mut();
-            unsafe { f(conn, &mut err) };
+            unsafe { f(*slot, &mut err) };
             if !err.is_null() {
                 if let Some(d) = self.eng.api.error_info_destroy {
                     unsafe { d(&mut err) };

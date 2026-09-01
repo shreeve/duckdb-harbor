@@ -71,7 +71,18 @@ fn candidates() -> Vec<PathBuf> {
                 .map(|e| e.path().join(LIB_NAME))
                 .filter(|p| p.is_file())
                 .collect();
-            vers.sort();
+            // Numeric-aware: a plain sort puts 1.9.0 above 1.10.0.
+            vers.sort_by_key(|p| {
+                p.parent()
+                    .and_then(|d| d.file_name())
+                    .map(|n| {
+                        n.to_string_lossy()
+                            .split(|c: char| !c.is_ascii_digit())
+                            .map(|s| s.parse::<u64>().unwrap_or(0))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            });
             if let Some(newest) = vers.pop() {
                 c.push(newest);
             }
@@ -152,6 +163,14 @@ impl Error {
             }
         }
         Error { code, message }
+    }
+}
+
+impl Error {
+    /// The client-facing text: the engine's rendered message when there is
+    /// one, the structured code when there is not.
+    pub fn into_text(self) -> String {
+        if self.message.is_empty() { format!("duckdb error {}", self.code) } else { self.message }
     }
 }
 

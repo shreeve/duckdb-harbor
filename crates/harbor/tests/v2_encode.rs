@@ -280,3 +280,20 @@ fn multi_statement_and_tables_round_trip() {
     assert!(rows.contains(&r#"1,"x""#));
     assert!(rows.contains(&"2,null"));
 }
+
+#[test]
+fn tuples_and_variants() {
+    let Some(eng) = v2_engine() else { return };
+    // TUPLE: unnamed, so values travel as an array — an object would collide
+    // on the empty key — and the type string is the engine's own spelling.
+    row(eng, "SELECT ROW(1, 'a'), (2,)", r#"[1,"a"],[2]"#);
+    schema(
+        eng,
+        "SELECT ROW(1, 'a') AS t",
+        r#"{"name":"t","duckdbType":"TUPLE(INTEGER, VARCHAR)","lossless":true,"fields":[{"duckdbType":"INTEGER","lossless":true},{"duckdbType":"VARCHAR","lossless":true}]}"#,
+    );
+    // VARIANT has no committed view layout; it goes out as the engine's text
+    // rendering, and the schema says the payload is a cast, not the value.
+    row(eng, "SELECT 42::VARIANT, {'a': 1}::VARIANT", r#""42","{'a': 1}""#);
+    schema(eng, "SELECT 42::VARIANT AS v", r#"{"name":"v","duckdbType":"VARIANT","lossless":false,"encoding":"varchar-cast"}"#);
+}

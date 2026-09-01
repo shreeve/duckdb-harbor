@@ -89,6 +89,9 @@ TYPES = [
     ("time-ns",              "SELECT TIME_NS '12:34:56.123456789' AS v"),
     ("time-ns-cast",         "SELECT TIME_NS '12:34:56.123456789'::VARCHAR AS v"),
     ("variant",              "SELECT 42::VARIANT AS v"),
+    # ROW() with no names is TUPLE under the v2 engine (v1 coerced to STRUCT);
+    # it goes out as a JSON array, since an object would collide on the empty key.
+    ("tuple",                "SELECT ROW(1, 'a') AS v"),
 
     ("bignum-zero",          "SELECT 0::VARINT AS v"),
     ("bignum-one",           "SELECT 1::VARINT AS v"),

@@ -9,7 +9,6 @@ license = "MIT"
 # Paths, names, the permission gate, and durations. Shared with ducktable,
 # which takes it without the `term` feature.
 harbor-common = { path = "../common" }
-duckdb = { version = "~1.10505.0", default-features = false, features = ["vtab", "loadable-extension"] }
 libloading = "0.8"
 justhttp = { path = "../justhttp" }
 serde = { version = "1", features = ["derive"] }
