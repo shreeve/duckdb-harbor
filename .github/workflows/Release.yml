@@ -25,6 +25,9 @@ jobs:
           - { runner: windows-2025,     plat: windows-amd64, duck_plat: windows-amd64 }
           - { runner: windows-11-arm,   plat: windows-arm64, duck_plat: windows-arm64 }
     runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: harbor
     env:
       DUCKDB_LIB: ${{ github.workspace }}/.duckdb-engine
     steps:
@@ -83,7 +86,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: harbor-${{ github.ref_name }}-${{ matrix.plat }}
-          path: dist/*
+          path: harbor/dist/*
 
   release:
     needs: build

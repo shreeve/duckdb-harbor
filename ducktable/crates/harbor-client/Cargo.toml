@@ -7,8 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-wire = { path = "../../../crates/wire" }
-harbor-common = { path = "../../../crates/common", default-features = false }
+wire = { path = "../../../harbor/crates/wire" }
+harbor-common = { path = "../../../harbor/crates/common", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
