@@ -106,6 +106,8 @@ stops `harbor start medlabs`, run from the wrong directory, from meaning the
 file ./medlabs. A path carries a slash or a dot; a name never does.
 
 serve/start options (a config entry may set any of these; a flag here wins):
+  --ephemeral         refcounted lifetime: exit once nobody has been connected
+                      for a moment (the spawn-on-use kind; lifetime = clients)
   --create            allow a database file that does not exist yet (the
                       positional is a PATH; without this flag a missing
                       file is an error, never a fresh database)
@@ -136,6 +138,7 @@ serve/start options (a config entry may set any of these; a flag here wins):
 struct Opts {
     db: PathBuf,
     create: bool,
+    ephemeral: bool,
     name: String,
     socket: Option<PathBuf>,
     port: Option<u16>,
@@ -159,6 +162,7 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
     let mut o = Opts {
         db: PathBuf::new(),
         create: false,
+        ephemeral: false,
         name: String::new(),
         socket: None,
         port: None,
@@ -185,6 +189,7 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
                 std::process::exit(0);
             }
             "--create" => o.create = true,
+            "--ephemeral" => o.ephemeral = true,
             "--name" => named = Some(take("name")?),
             "--socket" => o.socket = Some(PathBuf::from(take("socket")?)),
             "--port" => o.port = Some(take("port")?.parse().map_err(|_| "bad --port")?),
@@ -499,7 +504,46 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
     );
 
 
-    // Blocks until harbor_stop / SIGTERM / idle-exit finishes drain + CHECKPOINT.
+    // Refcounted lifetime: the server lives while anyone is connected.
+    // Two constants, not knobs — a startup grace so a spawner that dies
+    // before its client connects cannot orphan us, then a short linger at
+    // zero so curl bursts and exit/connect races do not flap the server.
+    // The env overrides exist for the test suite only; they are not API.
+    if o.ephemeral {
+        let startup = std::env::var("HARBOR_STARTUP_GRACE_MS")
+            .ok().and_then(|v| v.parse().ok())
+            .map_or(Duration::from_secs(30), Duration::from_millis);
+        let linger = std::env::var("HARBOR_LINGER_MS")
+            .ok().and_then(|v| v.parse().ok())
+            .map_or(Duration::from_secs(3), Duration::from_millis);
+        std::thread::spawn(move || {
+            let mut ever_connected = false;
+            let mut zero_since: Option<Instant> = None;
+            loop {
+                std::thread::sleep(Duration::from_millis(200));
+                match harbor::connection_count() {
+                    // Stopped by someone else; nothing left to decide.
+                    None => break,
+                    Some(0) => {
+                        let since = *zero_since.get_or_insert_with(Instant::now);
+                        let allowed = if ever_connected { linger } else { startup };
+                        if since.elapsed() >= allowed {
+                            eprintln!("harbor: no clients — leaving");
+                            let _ = harbor::stop();
+                            break;
+                        }
+                    }
+                    Some(_) => {
+                        ever_connected = true;
+                        zero_since = None;
+                    }
+                }
+            }
+        });
+    }
+
+    // Blocks until harbor_stop / SIGTERM / refcount departure finishes
+    // drain + CHECKPOINT.
     let farewell = harbor::wait()?;
     if !tcp {
         let _ = std::fs::remove_file(&sock_path);

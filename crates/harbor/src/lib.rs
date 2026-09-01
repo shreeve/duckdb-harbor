@@ -1614,6 +1614,11 @@ fn run_info(req: Request) -> (bool, u16) {
             if let Some(obj) = v.as_object_mut() {
                 let up = STARTED_AT.lock().unwrap().map_or(0, |t| t.elapsed().as_millis() as u64);
                 obj.insert("uptimeMs".to_string(), serde_json::Value::from(up));
+                // Live clients right now — the refcount a spawned server's
+                // lifetime rides on, and worth showing in any list.
+                if let Some(n) = connection_count() {
+                    obj.insert("clients".to_string(), serde_json::Value::from(n));
+                }
             }
             let _ = req.respond(json_response(200, &v.to_string()));
             (true, 200)
