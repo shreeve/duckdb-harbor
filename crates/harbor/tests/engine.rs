@@ -11,7 +11,7 @@
 //! engine predates the v2 C API, so the suite stays green on v1-era libs;
 //! point HARBOR_LIBDUCKDB at a v2-bearing build to make it bite.
 
-use harbor::v2::{Engine, Error, engine, ffi};
+use harbor::engine::{Engine, Error, engine, ffi};
 
 /// The engine, or a printed skip.
 fn v2_engine() -> Option<&'static Engine> {
@@ -42,7 +42,7 @@ macro_rules! ok {
 
 mod smoke {
     use super::*;
-    use harbor::v2::bytes_view;
+    use harbor::engine::bytes_view;
 
     #[test]
     fn the_answer_is_42_end_to_end() {
@@ -190,14 +190,14 @@ mod conn {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
-    use harbor::v2::conn::{self, Param};
+    use harbor::engine::conn::{self, Param};
 
     /// Run one statement, return each row as its encoded JSON values line.
     fn rows(
         c: &mut conn::Conn,
         sql: &str,
         params: &[Param],
-    ) -> Result<Vec<String>, harbor::v2::Error> {
+    ) -> Result<Vec<String>, harbor::engine::Error> {
         let api = &engine().unwrap().api;
         let stmts = c.statements(sql)?;
         let mut out = Vec::new();
@@ -206,7 +206,7 @@ mod conn {
             // Encode through the shared cell encoder so this test exercises
             // the same path the server will.
             let columns = std::mem::take(&mut stream.columns);
-            let types: Vec<&harbor::v2::encode::Type> = columns.iter().map(|(_, t)| t).collect();
+            let types: Vec<&harbor::engine::encode::Type> = columns.iter().map(|(_, t)| t).collect();
             while let Some(chunk) = stream.next_chunk()? {
                 let readers = chunk.readers(types.len())?;
                 for row in 0..chunk.rows {
@@ -215,7 +215,7 @@ mod conn {
                         if i > 0 {
                             line.push(',');
                         }
-                        harbor::v2::encode::emit_cell(&mut line, api, &readers[i], ty, row)?;
+                        harbor::engine::encode::emit_cell(&mut line, api, &readers[i], ty, row)?;
                     }
                     out.push(line);
                 }
@@ -309,7 +309,7 @@ mod conn {
 
 mod wire {
     use super::*;
-    use harbor::v2::encode;
+    use harbor::engine::encode;
 
     /// Run one statement and encode every row: [schema_json, row_json, ...].
     fn run(eng: &Engine, sql: &str) -> Result<Vec<String>, Error> {

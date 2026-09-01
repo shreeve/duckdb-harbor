@@ -21,19 +21,19 @@ use std::{
 
 use justhttp::{Header, Method, Request, Response, Server};
 
-use crate::v2::conn::{Conn as Connection, Interrupt as InterruptHandle, Param};
+use crate::engine::conn::{Conn as Connection, Interrupt as InterruptHandle, Param};
 
 mod encode;
 use encode::*;
 
 /// The client half — REPL, renderer, transports. Lives in the same
-/// crate so `harbor` and the `pilot` shim binary are one codebase with
-/// one version; the server half above never calls into it.
+/// crate so both halves of `harbor` are one codebase with one version;
+/// the server half above never calls into it.
 pub mod repl;
 
 // The v2 C API engine, generated from DuckDB's api_spec. The only path to
 // the engine since 0.21's flip retired duckdb-rs.
-pub mod v2;
+pub mod engine;
 
 // ==========================================================================
 //
@@ -2120,7 +2120,7 @@ fn ensure_single_statement(sql: &str) -> Result<(), String> {
                 // single statement and the DROP ran during `prepare`. Same
                 // shape as the CR-comment hole, same consequence.
                 //
-                // pilot's scanner already guarded this (scan.rs, `prev_ident`)
+                // the repl's scanner already guarded this (scan.rs, `prev_ident`)
                 // — the two must agree, and the security lexer was the one
                 // that was wrong.
                 let opens = i == 0 || !is_ident_byte(b[i - 1]);
@@ -3679,7 +3679,7 @@ fn run_statement(
         if i > 0 {
             buf.push(',');
         }
-        crate::v2::encode::emit_column_schema(&mut buf, Some(name), ty);
+        crate::engine::encode::emit_column_schema(&mut buf, Some(name), ty);
     }
     match shape {
         Shape::Ndjson => buf.push_str("]}\n"),
@@ -3748,7 +3748,7 @@ fn run_statement(
                 if i > 0 {
                     buf.push(',');
                 }
-                if let Err(e) = crate::v2::encode::emit_cell(&mut buf, api, reader, ty, row) {
+                if let Err(e) = crate::engine::encode::emit_cell(&mut buf, api, reader, ty, row) {
                     cell_err = Some(e);
                     break;
                 }

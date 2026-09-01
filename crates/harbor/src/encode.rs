@@ -4,8 +4,8 @@
 //! JSON-safe integer rule, temporal formatting, varint decimals,
 //! bit/uuid/base64, string escaping, and the keyword table used to quote
 //! identifiers in type strings. The engine-facing emission (schema lines,
-//! cell values read from vector views) lives in src/v2/encode.rs and calls
-//! down into these; the wire bytes are pinned by the v2_encode suite.
+//! cell values read from vector views) lives in src/engine/encode.rs and calls
+//! down into these; the wire bytes are pinned by tests/engine.rs.
 
 /// Render an identifier the way DuckDB does inside a type string: bare when it
 /// is a simple lowercase identifier and not a keyword, double-quoted

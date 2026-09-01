@@ -11,7 +11,7 @@ and TIME_NS shipped panicking the executor thread and returning 200 with an
 empty body. Both were in no suite, so nothing failed.
 
 This closes the loop by working from the type list the encoder dispatches on —
-the LOGICAL_TYPE_ID list in the generated v2 bindings (crates/harbor/src/v2/ffi.rs)
+the LOGICAL_TYPE_ID list in the generated v2 bindings (crates/harbor/src/engine/ffi.rs)
 at the version Cargo.lock actually pins — and requiring every variant to be
 either produced by a corpus case, deliberately refused, or listed in EXCUSED
 with a reason.
@@ -188,7 +188,7 @@ def main():
 
     path, _ = spec_source()
     if path is None:
-        print("type coverage: crates/harbor/src/v2/ffi.rs not found — cannot run")
+        print("type coverage: crates/harbor/src/engine/ffi.rs not found — cannot run")
         return SKIPPED
     variants = spec_types(path)
     print("type coverage: checking %d variants from the v2 spec bindings" % len(variants))

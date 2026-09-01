@@ -395,7 +395,7 @@ fn serve(db: PathBuf, rest: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-fn duckdb_open(o: &Opts) -> Result<harbor::v2::conn::Conn, String> {
+fn duckdb_open(o: &Opts) -> Result<harbor::engine::conn::Conn, String> {
     // The engine loads on first use — the binary itself has no load-time
     // libduckdb dependency, so invocations that never open a database run
     // on machines without the library.
@@ -420,7 +420,7 @@ fn duckdb_open(o: &Opts) -> Result<harbor::v2::conn::Conn, String> {
         options.push(("enable_external_access", "false"));
         options.push(("allow_community_extensions", "false"));
     }
-    let mut con = harbor::v2::conn::open(&o.db, &options)
+    let mut con = harbor::engine::conn::open(&o.db, &options)
         .map_err(|e| format!("open {}: {e}", o.db.display()))?;
     con.execute_batch(&format!("SET memory_limit='{}'", o.memory_limit))
         .map_err(|e| format!("memory_limit: {e}"))?;

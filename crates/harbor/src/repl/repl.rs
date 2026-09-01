@@ -1,4 +1,4 @@
-//! The pilot REPL: reedline with statement-aware
+//! The harbor REPL: reedline with statement-aware
 //! multi-line editing. A buffer is submitted when it ends with `;` outside
 //! any string or comment — the same rule the duckdb shell uses — or when it
 //! is a dot-command. History persists at ~/.local/state/harbor/history.
@@ -270,7 +270,7 @@ pub fn run(
                     }
                 }
                 // A fresh submission starts with a clean cancel flag. The
-                // SIGINT handler sets CANCEL whenever pilot is in cooked mode,
+                // SIGINT handler sets CANCEL whenever the repl is in cooked mode,
                 // which includes the pager: a Ctrl-C aimed at `less` (or an
                 // external `kill -INT`) would otherwise linger and skip the
                 // next statement the user types. Clearing here, once, drops

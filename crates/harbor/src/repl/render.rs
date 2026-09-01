@@ -98,7 +98,7 @@ pub struct Renderer<'a> {
     opts: &'a RenderOpts,
     out: BufWriter<Stdout>,
     /// First write failure; once set, output stops. EPIPE here is normal
-    /// life (`pilot … | head`), anything else is reported at `end`.
+    /// life (`harbor db … | head`), anything else is reported at `end`.
     broken: Option<std::io::ErrorKind>,
     columns: Vec<String>,
     types: Vec<String>,
@@ -599,7 +599,7 @@ fn json_row(columns: &[String], values: &[Value]) -> String {
 ///
 /// `tty` is the escape gate described on `RenderOpts::tty`: a value carrying
 /// `ESC [ 31 m` is a colour instruction the moment it reaches a terminal, and
-/// `pilot db --mode csv` at a prompt is a terminal. Piped or redirected, the
+/// `harbor db --mode csv` at a prompt is a terminal. Piped or redirected, the
 /// bytes go out exactly as the database holds them.
 fn csv_cell_for(s: &str, tty: bool) -> String {
     let owned;

@@ -1,5 +1,5 @@
 #!/usr/bin/env ruby
-# Regenerate crates/harbor/src/v2/ffi.rs from DuckDB's v2 C API spec.
+# Regenerate crates/harbor/src/engine/ffi.rs from DuckDB's v2 C API spec.
 #
 # The spec (api_spec/v2/**/*.yaml in the duckdb repo) is the same machine-
 # readable source DuckDB's own capigen compiles duckdb_v2.h from: handles,
@@ -14,7 +14,7 @@ require "yaml"
 
 ROOT = File.expand_path("..", __dir__)
 SPEC = ARGV[0] || ENV["DUCKDB_API_SPEC"] || File.expand_path("../duckdb/api_spec/v2", ROOT)
-OUT  = File.join(ROOT, "crates/harbor/src/v2/ffi.rs")
+OUT  = File.join(ROOT, "crates/harbor/src/engine/ffi.rs")
 
 abort "spec not found: #{SPEC}" unless File.exist?(File.join(SPEC, "metadata.yaml"))
 
