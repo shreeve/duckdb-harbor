@@ -7,7 +7,9 @@
 //! proof of life without a round trip); the probe only dials the one row
 //! shape a lock cannot settle. This file layers on what only this client
 //! wants: the remotes reconcile excludes by design, size on disk, and the
-//! whole connection half (Conn, connect, keepalive).
+//! whole connection half (Conn, connect). Harbor 0.20 removed the
+//! `/keepalive` route with the idle-exit machinery it served: a held
+//! connection is presence now, so there is nothing to pulse.
 //!
 //! The lifecycle law is pilot's, verbatim: a name is a service — it starts
 //! on use through harbor's own verb, which applies the whole config entry,
@@ -291,21 +293,6 @@ pub fn info(conn: &Conn) -> Result<wire::InfoResponse, String> {
         });
     }
     serde_json::from_str(&body).map_err(|e| format!("bad /info response: {e}"))
-}
-
-/// `GET /keepalive` — resets the berth's idle clock. Pulsed while a window
-/// holds a connection, so an idle-exit berth never retires under an open
-/// grid.
-pub fn keepalive(conn: &Conn) -> bool {
-    request(
-        &conn.transport,
-        &wire::endpoint::KEEPALIVE,
-        conn.token.as_deref(),
-        None,
-        Some(Duration::from_secs(3)),
-    )
-    .map(|r| r.status == 200)
-    .unwrap_or(false)
 }
 
 #[cfg(test)]

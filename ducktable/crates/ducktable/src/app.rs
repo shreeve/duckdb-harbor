@@ -465,9 +465,6 @@ impl DuckTable {
                     Ok((conn, info, catalog)) => Phase::Connected { conn, info, catalog },
                     Err(message) => Phase::Failed { name: clone_str(&name), message },
                 };
-                if let Phase::Connected { .. } = state.phase {
-                    state.keepalive(fence, cx);
-                }
                 state.refresh(cx);
                 cx.notify();
             })
@@ -485,26 +482,6 @@ impl DuckTable {
         cx.notify();
     }
 
-    fn keepalive(&self, fence: u64, cx: &mut Context<Self>) {
-        let conn = match &self.phase {
-            Phase::Connected { conn, .. } => conn.clone(),
-            _ => return,
-        };
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_secs(30)).await;
-                let still = this
-                    .read_with(cx, |state, _| state.attempt == fence)
-                    .unwrap_or(false);
-                if !still {
-                    return;
-                }
-                let conn = conn.clone();
-                cx.background_executor().spawn(async move { fleet::keepalive(&conn) }).await;
-            }
-        })
-        .detach();
-    }
 }
 
 impl DuckTable {

@@ -44,7 +44,6 @@ fn a_live_berth_yields_identity() {
         identity.name, identity.duckdb_version, identity.harbor_version, identity.database
     );
     assert_eq!(identity.name, row.name);
-    assert!(harbor_client::keepalive(&conn));
 }
 
 #[test]
