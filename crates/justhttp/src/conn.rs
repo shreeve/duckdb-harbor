@@ -1,3 +1,8 @@
+//! One client connection: read requests off the socket in sequence, hand
+//! each to the server's queue, and keep the reader honest — line-length
+//! ceilings, version checks, and the keep-alive/close decision all live
+//! here, below routing and below any authentication.
+
 use std::io::Error as IoError;
 use std::io::Result as IoResult;
 use std::io::{BufReader, BufWriter, ErrorKind, Read};
@@ -50,7 +55,7 @@ const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// while 120 that said nothing at all were reclaimed on schedule.
 ///
 /// Five minutes is far longer than any pooled client's own idle timeout (30–90
-/// seconds is typical, and pilot sends `Connection: close` outright), so a
+/// seconds is typical, and the repl sends `Connection: close` outright), so a
 /// legitimate client either speaks again well inside it or reconnects without
 /// noticing. It does not make holding connections impossible — nothing here
 /// caps concurrent connections — but it does mean they have to be paid for

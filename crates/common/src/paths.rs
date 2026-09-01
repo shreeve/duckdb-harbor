@@ -7,7 +7,7 @@
 //! ~/.local/state/harbor/          actual state — harbor writes this
 //!     runtime/   <name>.{json,sock,token,lock}
 //!     runtime/log/<name>.log      the berth's server log
-//!     history    pilot's REPL history
+//!     history    the repl's command history
 //! ```
 //!
 //! Runtime state does not belong under `~/.config/harbor/`: a config
@@ -176,7 +176,7 @@ pub fn log_file(runtime: &Path, name: &str) -> PathBuf {
     runtime.join("log").join(format!("{name}.log"))
 }
 
-/// pilot's REPL history. State, not config, and not the fleet's business —
+/// The repl's command history. State, not config, and not the fleet's business —
 /// it lived in `runtime/` for a while, where every sweep had to special-case
 /// it forever.
 pub fn history_file() -> Result<PathBuf, String> {

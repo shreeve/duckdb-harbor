@@ -11,8 +11,8 @@ use std::path::Path;
 /// Both binaries need this, and harbor needs it more than it looks. A berth
 /// definition carries `init` SQL, and `init` can `LOAD` a native extension —
 /// so a config file anyone can rewrite is not a settings leak, it is code
-/// execution as its owner the next time a berth starts. Same argument pilot
-/// already makes about `token-cmd`, same answer: refuse the file whole.
+/// execution as its owner the next time a berth starts. Same argument
+/// `token-cmd` already settled, same answer: refuse the file whole.
 #[cfg(unix)]
 pub fn exposed(path: &Path) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};

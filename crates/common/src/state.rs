@@ -41,7 +41,7 @@ pub enum State {
     /// Running, but the database or the options differ from the config now.
     Drifted,
     /// Running, with nothing in the config about it — summoned by a client,
-    /// or started by hand. Not an error; `pilot ./x.duckdb` is meant to work.
+    /// or started by hand. Not an error; `harbor ./x.duckdb` is meant to work.
     Unmanaged,
     /// A sidecar claims a live process and the lock says otherwise.
     Dead,

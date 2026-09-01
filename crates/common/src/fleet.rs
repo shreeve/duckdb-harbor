@@ -1,10 +1,9 @@
 //! The fleet as one list of rows: desired state (config) reconciled against
 //! actual state (the runtime directory).
 //!
-//! This lives in common because three front ends need the same answer and must
-//! not each invent their own. `harbor show` draws it as a table, bare `pilot`
-//! draws the same table to say what is openable, and DuckTable draws it as a
-//! sidebar. When they disagree about whether a berth is running, one of them is
+//! This lives in common because every front end needs the same answer and
+//! must not invent its own. Bare `harbor` draws it as a table to say what
+//! is openable, and DuckTable draws it as a sidebar. When they disagree about whether a berth is running, one of them is
 //! lying to somebody.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -304,7 +303,7 @@ pub fn reconcile(cfg: &FileConfig, home: &Path, probe: &dyn Fn(&Addr) -> bool) -
     rows
 }
 
-/// The fleet as one table. Shared so that `harbor` and `pilot` cannot drift
+/// The fleet as one table. Shared so its consumers cannot drift
 /// into two different pictures of the same directory.
 #[cfg(feature = "term")]
 pub fn table(rows: &[Row]) -> crate::ui::Table {

@@ -51,7 +51,7 @@ pub enum Lifetime {
 pub enum Summoner {
     /// `harbor start` — a human asked for a server.
     Operator,
-    /// `pilot`, `ducktable` — a client opened it on the way to a prompt.
+    /// `harbor <db>`, `ducktable` — a client opened it on the way to a prompt.
     Client,
 }
 
@@ -162,8 +162,8 @@ mod tests {
     #[test]
     fn the_entry_beats_everything() {
         // A berth pinned persistent stays persistent even when a client
-        // summoned it — this is what `harbor start` then `pilot` then quit
-        // must not undo.
+        // summoned it — this is what `harbor start`, then a client connect
+        // and quit, must not undo.
         assert_eq!(
             resolve(Some("never"), Some("90s"), Summoner::Client).unwrap(),
             Lifetime::Persistent

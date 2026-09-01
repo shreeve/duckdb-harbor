@@ -1,4 +1,4 @@
-//! How harbor and pilot look.
+//! How harbor (and ducktable's fleet view) look.
 //!
 //! Three rules hold the whole module together:
 //!
@@ -154,8 +154,8 @@ struct Charset {
     pub v: &'static str,
 }
 
-/// Rounded corners. The straight-cornered set stays in pilot's `render.rs`
-/// for duckbox, which deliberately mirrors the DuckDB shell.
+/// Rounded corners. The straight-cornered set stays in the repl's
+/// `render.rs` for duckbox, which deliberately mirrors the DuckDB shell.
 const ROUNDED: Charset = Charset {
     tl: "╭",
     tm: "┬",

@@ -5,7 +5,7 @@
 //!
 //! ```toml
 //! [defaults]
-//! mode      = "duckbox"     # pilot's taste
+//! mode      = "duckbox"     # the client's taste
 //! temp-idle-exit = "90s"    # how long a client-summoned temp outlives its last use
 //!
 //! [connection.medlabs]      # has `path` -> a local berth, harbor can start it
@@ -20,9 +20,9 @@
 //! mean anything. It is safe for it to — but know where the fence really
 //! is: this ONE deserializer parses the token fields for both binaries;
 //! what keeps the server from shelling out for a credential is that
-//! `resolve_token` (the only `sh -c` path) lives in pilot and nothing in
-//! harbor calls it or reads these fields. Guard the call site, not the
-//! schema.
+//! `resolve_token` (the only `sh -c` path) lives with the fleet-reading
+//! consumer (ducktable) and nothing in harbor calls it or reads these
+//! fields. Guard the call site, not the schema.
 //!
 //! Every berth key is the matching `harbor serve` flag with the dashes
 //! stripped, so there is no second dialect to learn. (The reverse is not
@@ -46,7 +46,7 @@ pub struct FileConfig {
 #[derive(Deserialize, Default, Debug)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Defaults {
-    // --- pilot: how output looks -------------------------------------------
+    // --- the client: how output looks --------------------------------------
     pub mode: Option<String>,
     pub timer: Option<bool>,
     pub maxrows: Option<usize>,
@@ -57,7 +57,7 @@ pub struct Defaults {
     pub appearance: Option<String>,
     /// auto | always | never. `NO_COLOR` in the environment beats all three.
     pub color: Option<String>,
-    /// What bare `pilot` opens. Unset, bare `pilot` lists what is openable
+    /// What the bare client opens. Unset, it lists what is openable
     /// instead — deliberately, rather than connecting to the only berth when
     /// there happens to be one, which would make adding a second database
     /// silently change what the command does.
@@ -77,13 +77,13 @@ pub struct Defaults {
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Connection {
-    // --- a remote: pilot only ----------------------------------------------
+    // --- a remote: client only ---------------------------------------------
     pub url: Option<String>,
     pub token: Option<String>,
     pub token_file: Option<String>,
     pub token_cmd: Option<String>,
 
-    // --- a local berth: harbor starts it, pilot may summon it --------------
+    // --- a local berth: harbor starts it, a client may summon it -----------
     pub path: Option<String>,
     pub idle_exit: Option<String>,
     pub memory_limit: Option<String>,
