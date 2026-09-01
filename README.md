@@ -27,6 +27,37 @@ server instead of hitting "database is locked". The two lifetimes, in one
 breath: **bare, the server is everyone's — it lives while anyone is
 connected; `serve`, the server is yours — it lives until you leave.**
 
+## The Elevator Pitch
+
+Two files. That's the entire install.
+
+The library is DuckDB — all of it, one dynamic library, vanilla, compiled and
+shipped by the DuckDB team. We never patch it, fork it, or wrap it in
+bindings. Version hop = swap the file.
+
+The binary is harbor: one executable under 2MB that is both sides of the
+conversation. As a server it loads libduckdb and serves your database over
+HTTP, on a Unix socket or TCP. As a client it connects to any harbor and
+gives you a modern shell — syntax highlighting, completion, history — in
+place of the DuckDB CLI.
+
+You never choose which one you're running. `harbor mydb.duckdb` connects if
+the database is already being served, and spawns a server and connects to it
+if it isn't. Your connection is the server's lifeline: the database stays
+served while anyone is connected — a second client makes it two, your exit
+makes it one — and when the last client leaves, the server checkpoints and
+departs. Nothing to daemonize, nothing to clean up. (Want it to outlive its
+clients? `harbor mydb.duckdb serve` — then it's yours until you stop it.)
+
+While it's up, anything that speaks HTTP can query it: curl, your app,
+another harbor.
+
+`harbor` by itself shows what's being served.
+
+No config file. No drivers, no ORM, no fleet manager. Built directly on
+DuckDB's new v2 C API — v2.0, out this month — so it's smaller, faster, and
+simpler than everything it replaces.
+
 If it can speak HTTP and parse JSON, it can query your database.
 
 ```console
