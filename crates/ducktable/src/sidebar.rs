@@ -4,10 +4,37 @@ use crate::app::{DuckTable, Phase};
 use crate::chrome::head_glyph;
 use crate::theme::{pal, Pal};
 use crate::util::clone_str;
+use crate::SetTheme;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
+use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
+use gpui_component::menu::{DropdownMenu as _, PopupMenu};
 use gpui_component::*;
 use harbor_client::Level;
+
+/// The theme picker's menu: every bundled theme, grouped under its mode
+/// and check-marked on the active one. A mode with no themes prints no
+/// heading, so the grouping survives a theme set that is all one mode.
+fn theme_menu(menu: PopupMenu, _: &mut Window, cx: &mut Context<PopupMenu>) -> PopupMenu {
+    let themes = crate::theme::list(cx);
+    let current = crate::theme::current_index(cx);
+    let mut menu = menu;
+    let mut first = true;
+    for (dark, heading) in [(false, "Light"), (true, "Dark")] {
+        let group = themes.iter().enumerate().filter(|(_, (_, d))| *d == dark);
+        for (n, (ix, (name, _))) in group.enumerate() {
+            if n == 0 {
+                if !first {
+                    menu = menu.separator();
+                }
+                first = false;
+                menu = menu.label(heading);
+            }
+            menu = menu.menu_with_check(name.clone(), ix == current, Box::new(SetTheme { ix }));
+        }
+    }
+    menu
+}
 
 impl DuckTable {
     pub(crate) fn dot(level: Level, t: Pal) -> Div {
@@ -152,20 +179,21 @@ impl DuckTable {
                     .h_flex()
                     .items_center()
                     .gap_2()
-                    // The theme cycler leads the footer.
+                    // The theme picker leads the footer: the active
+                    // theme's name, opening the full list on one click.
+                    // Anchored BottomLeft so it grows up off the footer
+                    // rather than off the bottom of the window.
                     .child(
-                        div()
-                            .id("theme")
-                            .px_2()
-                            .py_1()
-                            .text_xs()
-                            .text_color(t.muted)
-                            .cursor_pointer()
-                            .hover(|d| d.text_color(t.accent))
-                            .child(crate::theme::current_name(cx))
-                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                                crate::theme::cycle(cx);
-                            })),
+                        Button::new("theme")
+                            .label(crate::theme::current_name(cx))
+                            .custom(
+                                ButtonCustomVariant::new(cx)
+                                    .foreground(t.muted)
+                                    .hover(t.row_hover),
+                            )
+                            .compact()
+                            .xsmall()
+                            .dropdown_menu_with_anchor(Corner::BottomLeft, theme_menu),
                     )
                     .child(div().flex_1()),
             )

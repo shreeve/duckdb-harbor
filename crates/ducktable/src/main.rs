@@ -31,6 +31,16 @@ actions!(
     ]
 );
 
+/// Pick a theme by its index in `theme::list` — carried as data so one
+/// action serves every theme the sidebar picker lists. `no_json`:
+/// nothing loads DuckTable's keymap from disk, so the action needs no
+/// serde derives.
+#[derive(Clone, Default, PartialEq, Debug, Action)]
+#[action(namespace = ducktable, no_json)]
+pub struct SetTheme {
+    pub ix: usize,
+}
+
 /// ⌥←/⌥→: the previous/next table in the sidebar (App::step_table).
 /// App-level, like the view keys, so it works from any view; text
 /// inputs stay safe — their own alt-arrow bindings (word jump) sit
@@ -334,6 +344,9 @@ fn main() {
         cx.on_action(|_: &ZoomReset, cx| {
             prefs::toggle(cx, |p| p.zoom = prefs::DEFAULT_ZOOM);
         });
+        // The sidebar picker dispatches this into the window; it lands
+        // here, the way the zoom and view actions do.
+        cx.on_action(|a: &SetTheme, cx| theme::select(a.ix, cx));
         // Global fallback so the menu item validates and works; the
         // view-scoped listener handles the keyboard path first and a
         // handled action never reaches here (no double toggle).

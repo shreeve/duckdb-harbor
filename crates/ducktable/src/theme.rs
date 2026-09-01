@@ -21,7 +21,7 @@ pub const HEADER_TEXT: f32 = 11.5;
 pub const GUTTER_TEXT: f32 = 11.;
 pub const TAG_TEXT: f32 = 10.;
 
-use gpui::{App, Global, Hsla};
+use gpui::{App, Global, Hsla, SharedString};
 use gpui_component::theme::{Theme, ThemeConfig, ThemeSet};
 use gpui_component::ActiveTheme as _;
 use harbor_client::Level;
@@ -177,21 +177,45 @@ pub fn current_name(cx: &App) -> String {
     themes.configs[themes.current].name.to_string()
 }
 
-/// Advance to the next theme, apply it, persist the choice, and repaint.
-pub fn cycle(cx: &mut App) {
-    let (config, name) = {
+/// The bundled themes in set order, each paired with whether it is dark.
+/// The picker renders them grouped by mode, so the mode travels with the
+/// name; the position in this list is the index [`select`] takes.
+pub fn list(cx: &App) -> Vec<(SharedString, bool)> {
+    cx.global::<Themes>()
+        .configs
+        .iter()
+        .map(|c| (c.name.clone(), c.mode.is_dark()))
+        .collect()
+}
+
+/// Which entry of [`list`] is active — the picker check-marks it.
+pub fn current_index(cx: &App) -> usize {
+    cx.global::<Themes>().current
+}
+
+/// Apply one theme by its index in [`list`], persist the choice, and
+/// repaint. An out-of-range index, or the theme already showing, is a
+/// quiet no-op: re-applying would repaint every surface for nothing.
+pub fn select(ix: usize, cx: &mut App) {
+    let config = {
         let themes = cx.global_mut::<Themes>();
-        themes.current = (themes.current + 1) % themes.configs.len();
-        let c = themes.configs[themes.current].clone();
-        let name = c.name.to_string();
-        (c, name)
+        if ix >= themes.configs.len() || ix == themes.current {
+            return;
+        }
+        themes.current = ix;
+        themes.configs[ix].clone()
     };
     apply(&config, cx);
+    persist(&config.name);
+    cx.refresh_windows();
+}
+
+/// Write the chosen theme's name where `init` looks for it.
+fn persist(name: &str) {
     if let Some(p) = choice_file() {
         if let Some(dir) = p.parent() {
             std::fs::create_dir_all(dir).ok();
         }
         std::fs::write(p, name).ok();
     }
-    cx.refresh_windows();
 }
