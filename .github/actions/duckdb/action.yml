@@ -1,7 +1,7 @@
 name: Set up DuckDB
 description: >
-  Put a DuckDB engine where CI can link and run it: DuckDB's official v2.0-dev
-  nightly — libduckdb (harbor links this) plus the duckdb CLI (builds the
+  Put a DuckDB engine where CI can run it: DuckDB's official v2.0-dev
+  nightly — libduckdb (harbor dlopens this) plus the duckdb CLI (builds the
   fixture) — from artifacts.duckdb.org, unpacked into ~/duckdb. This is the 2.0
   line harbor targets, straight from upstream: no version pinned, no fork, it
   just tracks whatever main built last. `/latest/` is the v2.0-dev channel
@@ -21,3 +21,7 @@ runs:
         unzip -oq 'duckdb_cli-*.zip'   # -> duckdb CLI
         echo "$dir" >> "$GITHUB_PATH"
         echo "DUCKDB_LIB=$dir" >> "$GITHUB_ENV"
+        # Nothing links the engine — harbor dlopens it at runtime, and this
+        # directory is not on its search path. The env override is the
+        # designed door, and it wants the file, not the directory.
+        echo "HARBOR_LIBDUCKDB=$dir/libduckdb.so" >> "$GITHUB_ENV"
