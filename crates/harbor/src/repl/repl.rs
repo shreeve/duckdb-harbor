@@ -10,93 +10,11 @@ use reedline::{
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
 };
 use std::borrow::Cow;
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
-use crate::complete::SqlCompleter;
-use crate::render::{Mode, RenderOpts};
-use crate::scan::{Kind, scan};
-use crate::{Conn, Outcome, run_sql};
-
-/// Keep an idle-exit berth alive while Reedline is blocked at the prompt.
-/// This is intentionally an activity pulse rather than a SQL session: a REPL
-/// that is merely waiting for input must not reserve one of Harbor's scarce
-/// transaction connections. The channel makes Drop prompt even when the next
-/// pulse is many seconds away; a vanished Pilot leaves no server-side state.
-struct ReplKeepalive {
-    stop: Option<mpsc::Sender<()>>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-impl ReplKeepalive {
-    fn new(conn: Conn) -> Self {
-        // Pulse synchronously first, closing the race with an idle deadline
-        // that was already near before the thread below takes over.
-        pulse(&conn);
-
-        let Some(period) = keepalive_period(&conn) else {
-            return Self { stop: None, thread: None };
-        };
-        let (tx, rx) = mpsc::channel();
-        let thread = thread::spawn(move || {
-            while matches!(rx.recv_timeout(period), Err(mpsc::RecvTimeoutError::Timeout)) {
-                pulse(&conn);
-            }
-        });
-        Self { stop: Some(tx), thread: Some(thread) }
-    }
-}
-
-impl Drop for ReplKeepalive {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-fn pulse(conn: &Conn) {
-    if let Ok(resp) = crate::http::request(
-        &conn.transport,
-        &wire::endpoint::KEEPALIVE,
-        conn.token.as_deref(),
-        None,
-        Some(Duration::from_secs(2)),
-    ) {
-        // Complete the exchange before closing the socket. The body is tiny;
-        // its contents do not matter because activity was counted at dispatch.
-        let _ = resp.body_string();
-    }
-}
-
-/// The berth publishes its idle window in /info. Pulse at a third of it,
-/// capped so long windows do not make recovery from scheduling stalls
-/// fragile. A permanent berth (null) needs no heartbeat; when /info cannot
-/// be read at all, pulse gently anyway — a spare keepalive is harmless, a
-/// missed one closes the berth under the prompt.
-fn keepalive_period(conn: &Conn) -> Option<Duration> {
-    let fallback = Some(Duration::from_secs(10));
-    let resp = match crate::http::request(
-        &conn.transport,
-        &wire::endpoint::INFO,
-        conn.token.as_deref(),
-        None,
-        Some(Duration::from_secs(2)),
-    ) {
-        Ok(resp) => resp,
-        Err(_) => return fallback,
-    };
-    if resp.status != 200 {
-        return fallback;
-    }
-    let Ok(text) = resp.body_string() else { return fallback };
-    let Ok(info) = serde_json::from_str::<wire::InfoResponse>(&text) else { return fallback };
-    info.idle_exit_ms.map(|ms| Duration::from_millis((ms / 3).clamp(1, 10_000)))
-}
+use crate::repl::complete::SqlCompleter;
+use crate::repl::render::{Mode, RenderOpts};
+use crate::repl::scan::{Kind, scan};
+use crate::repl::{Conn, Outcome, run_sql};
 
 struct BerthPrompt {
     name: String,
@@ -273,10 +191,10 @@ fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
         Box::new(Emacs::new(kb))
     };
     let menu = ColumnarMenu::default().with_name("completion_menu");
-    let history = crate::config::history_file();
+    let history = harbor_common::history_file().ok();
     Reedline::create()
         .with_validator(Box::new(SqlValidator))
-        .with_highlighter(Box::new(crate::highlight::SqlHighlighter))
+        .with_highlighter(Box::new(crate::repl::highlight::SqlHighlighter))
         .with_hinter(Box::new(DefaultHinter::default()))
         .with_completer(Box::new(completer.clone()))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
@@ -291,7 +209,7 @@ fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
                 match history.map(|p| FileBackedHistory::with_file(1000, p)) {
                     Some(Ok(h)) => Box::new(h),
                     _ => {
-                        eprintln!("pilot: history file unavailable; using in-memory history");
+                        eprintln!("harbor: history file unavailable; using in-memory history");
                         Box::new(FileBackedHistory::default())
                     }
                 };
@@ -299,12 +217,13 @@ fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
         })
 }
 
-pub fn run(conn: &Conn, name: &str, mut opts: RenderOpts) -> std::process::ExitCode {
+pub fn run(
+    conn: &Conn,
+    name: &str,
+    mut opts: RenderOpts,
+    mut _anchor: Option<crate::repl::http::Anchor>,
+) -> std::process::ExitCode {
     let mut conn = conn.clone();
-    // Never read, deliberately: this binding is the pulse thread's anchor —
-    // its Drop stops the thread, and .open reassigns it to re-anchor onto
-    // the new connection. The underscore says "held, not consulted".
-    let mut _keepalive = ReplKeepalive::new(conn.clone());
     let mut vi = false;
     // One completer for the session: its catalog cache loads lazily on the
     // first Tab and survives editor rebuilds (.keymode), refreshing on .open.
@@ -326,25 +245,26 @@ pub fn run(conn: &Conn, name: &str, mut opts: RenderOpts) -> std::process::ExitC
                         DotResult::Quit => return std::process::ExitCode::SUCCESS,
                         DotResult::Handled => continue,
                         DotResult::Open(target) => {
-                            // A fresh config read on purpose: .open should
-                            // see entries added since the session began.
-                            let (cfg, cfg_err) = crate::config::load();
-                            match crate::resolve(&cfg, &target, None, cfg_err.as_ref()) {
+                            match crate::repl::resolve(&target, None) {
                                 Ok(c) => {
+                                    // Moor at the new server before letting
+                                    // the old mooring go: the switch must
+                                    // never be the moment both lifetimes hit
+                                    // zero clients.
+                                    _anchor = crate::repl::http::hold(&c.transport);
                                     conn = c;
-                                    _keepalive = ReplKeepalive::new(conn.clone());
                                     completer.reconnect(conn.clone());
                                     // The prompt changing name announces the switch.
-                                    prompt = BerthPrompt { name: crate::prompt_name(&target) };
+                                    prompt = BerthPrompt { name: crate::repl::prompt_name(&target) };
                                 }
-                                Err(e) => eprintln!("pilot: {e}"),
+                                Err(e) => eprintln!("harbor: {e}"),
                             }
                             continue;
                         }
                         DotResult::Keymode(v) => {
                             vi = v;
                             line_editor = make_editor(&completer, vi);
-                            eprintln!("pilot: {} keybindings", if vi { "vi" } else { "emacs" });
+                            eprintln!("harbor: {} keybindings", if vi { "vi" } else { "emacs" });
                             continue;
                         }
                     }
@@ -357,7 +277,7 @@ pub fn run(conn: &Conn, name: &str, mut opts: RenderOpts) -> std::process::ExitC
                 // that staleness while preserving the intra-buffer skip below
                 // (a Ctrl-C during `a; b; c` still aborts b and c — those
                 // checks are inside this loop, with no read_line between them).
-                crate::CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
+                crate::repl::CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
                 // One statement per request is the protocol's rule; the
                 // trailing terminator is ours to strip. Multi-statement
                 // buffers split at terminators outside strings/comments,
@@ -372,7 +292,7 @@ pub fn run(conn: &Conn, name: &str, mut opts: RenderOpts) -> std::process::ExitC
             Ok(Signal::CtrlD) => return std::process::ExitCode::SUCCESS,
             Ok(_) => continue, // other signals (resize, etc.): nothing to do
             Err(e) => {
-                eprintln!("pilot: editor error: {e}");
+                eprintln!("harbor: editor error: {e}");
                 return std::process::ExitCode::FAILURE;
             }
         }
@@ -394,38 +314,38 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
         "quit" | "exit" | "q" => return DotResult::Quit,
         "open" => match parts.next() {
             Some(t) => return DotResult::Open(t.to_string()),
-            None => eprintln!("pilot: .open <name|path|url>"),
+            None => eprintln!("harbor: .open <name|path|url>"),
         },
         "keymode" => match parts.next() {
             Some("vi") => return DotResult::Keymode(true),
             Some("emacs") => return DotResult::Keymode(false),
-            _ => eprintln!("pilot: .keymode vi|emacs"),
+            _ => eprintln!("harbor: .keymode vi|emacs"),
         },
         "theme" => match parts.next() {
             None => {
-                let (name, _) = crate::theme::describe();
-                println!("theme: {name} ({})", crate::theme::NAMES.join(" "));
+                let (name, _) = crate::repl::theme::describe();
+                println!("theme: {name} ({})", crate::repl::theme::NAMES.join(" "));
             }
-            Some(name) if crate::theme::set_theme(name) => eprintln!("pilot: theme {name}"),
+            Some(name) if crate::repl::theme::set_theme(name) => eprintln!("harbor: theme {name}"),
             Some(name) => {
-                eprintln!("pilot: unknown theme {name:?} ({})", crate::theme::NAMES.join(" "))
+                eprintln!("harbor: unknown theme {name:?} ({})", crate::repl::theme::NAMES.join(" "))
             }
         },
         "appearance" => {
-            use crate::theme::Appearance::{Dark, Light};
+            use crate::repl::theme::Appearance::{Dark, Light};
             match parts.next() {
                 None => {
-                    let (_, a) = crate::theme::describe();
+                    let (_, a) = crate::repl::theme::describe();
                     println!("appearance: {}", if a == Light { "light" } else { "dark" });
                 }
-                Some("light") => crate::theme::set_appearance(Light),
-                Some("dark") => crate::theme::set_appearance(Dark),
-                Some("auto") => crate::theme::set_appearance(crate::theme::detect_appearance()),
-                Some(other) => eprintln!("pilot: .appearance auto|light|dark (got {other:?})"),
+                Some("light") => crate::repl::theme::set_appearance(Light),
+                Some("dark") => crate::repl::theme::set_appearance(Dark),
+                Some("auto") => crate::repl::theme::set_appearance(crate::repl::theme::detect_appearance()),
+                Some(other) => eprintln!("harbor: .appearance auto|light|dark (got {other:?})"),
             }
         }
         "read" => match parts.next() {
-            Some(f) => match std::fs::read_to_string(crate::config::expand(f)) {
+            Some(f) => match std::fs::read_to_string(harbor_common::paths::expand(f)) {
                 Ok(text) => {
                     for stmt in split_statements(&text) {
                         if run_sql(conn, &stmt, opts) != Outcome::Done {
@@ -433,20 +353,20 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
                         }
                     }
                 }
-                Err(e) => eprintln!("pilot: .read {f}: {e}"),
+                Err(e) => eprintln!("harbor: .read {f}: {e}"),
             },
-            None => eprintln!("pilot: .read <file.sql>"),
+            None => eprintln!("harbor: .read <file.sql>"),
         },
         "databases" | "db" => {
-            // Reloaded, not captured at startup: an edit made in another window
-            // is exactly what someone typing `.databases` wants to see.
-            let _ = crate::show_fleet(&crate::config::load().0);
+            // The same list bare `harbor` prints — one reconcile, not a
+            // second one that agrees most of the time.
+            let _ = crate::repl::list_main();
         }
         "mode" => match parts.next() {
             None => println!("mode: {} (duckbox duckboxy markdown csv json jsonlines line list trash)", opts.mode.name()),
             Some(m) => match Mode::parse(m) {
                 Some(m) => opts.mode = m,
-                None => eprintln!("pilot: unknown mode {m:?}"),
+                None => eprintln!("harbor: unknown mode {m:?}"),
             },
         },
         "maxrows" => match parts.next().and_then(|n| n.parse::<usize>().ok()) {
@@ -482,7 +402,7 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
             println!("  statements end with ;   Ctrl-C clears the line");
         }
         other => {
-            eprintln!("pilot: no such command .{other} (.help lists them)");
+            eprintln!("harbor: no such command .{other} (.help lists them)");
         }
     }
     DotResult::Handled

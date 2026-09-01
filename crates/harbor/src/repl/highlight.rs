@@ -6,9 +6,9 @@
 //! String/comment/dollar-quote boundaries come from the shared scanner
 //! (scan.rs) — the same spans the validator and splitter obey.
 
-use crate::keywords::KEYWORDS;
-use crate::scan::{Kind, scan};
-use crate::theme;
+use crate::repl::keywords::KEYWORDS;
+use crate::repl::scan::{Kind, scan};
+use crate::repl::theme;
 use nu_ansi_term::Style;
 use reedline::{Highlighter, StyledText};
 

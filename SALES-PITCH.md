@@ -173,7 +173,7 @@ and direct `ValueRef` emission is mechanical work worth a further multiple.
 | Remote catalog | SQL endpoint and `/catalog` | Native `ATTACH`/`CONNECT` with pushdown |
 | Type fidelity | JSON with explicit type metadata | Native, fully lossless |
 | Process ownership | The entire point | Out of scope |
-| Human client | Pilot | DuckDB CLI |
+| Human client | the same binary — `harbor <db>` | DuckDB CLI |
 | Desktop UI | DuckTable | Not the proposition |
 
 ## Where Quack is better
@@ -223,17 +223,19 @@ session capacity; client-named cancellation; statement deadlines;
 abandoned-session reclamation; readiness that tests the database rather than the
 process; graceful drain, checkpoint and shutdown; per-database process
 isolation; Unix sockets locally and Caddy at the edge; sealed mode, memory and
-spill limits; and fleet discovery with no supervising daemon.
+spill limits; spawn-on-use with a refcounted lifetime; and server discovery
+with no supervising daemon and no registry — the listening socket is the
+registration.
 
 The client protocol stays small and versioned —
 [`crates/wire/src/lib.rs`](crates/wire/src/lib.rs) defines a handful of request
 types and four streaming events: `schema`, `row`, `end`, `error`.
 
-Pilot completes it for humans: DuckDB-style REPL, highlighting and completion,
-named berths, join-or-spawn on a database path, no engine linked into the
-client, and real Ctrl-C cancellation translated into
+The same binary completes it for humans: `harbor <db>` is a DuckDB-style REPL
+with highlighting and completion, join-or-spawn on a database path, no engine
+loaded in the client half, and real Ctrl-C cancellation translated into
 `DELETE /sql/queries/<id>`. DuckTable is the native desktop face on the same
-fleet.
+servers.
 
 ## Conclusion
 

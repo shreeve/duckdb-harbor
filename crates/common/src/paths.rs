@@ -96,6 +96,68 @@ pub fn runtime_dir() -> Result<PathBuf, String> {
 pub fn sock_file(runtime: &Path, name: &str) -> PathBuf {
     runtime.join(format!("{name}.sock"))
 }
+/// The one true socket for a database file — identity derived, never
+/// registered. The canonical path (symlinks resolved, absolutized; for a
+/// file that does not exist yet, its parent canonicalized) is hashed so
+/// every spelling of the same file lands on the same server, and two
+/// `data.duckdb` in different directories never fight over one socket.
+/// The basename keeps `ls` readable; the hash carries uniqueness; the
+/// full path cannot be the name because sun_path is ~104 bytes on macOS.
+/// FNV-1a, hand-rolled, because the name must be STABLE across releases
+/// — a 0.20.1 must find a 0.20.0's socket — and std's hasher is not.
+pub fn socket_for(runtime: &Path, db: &Path) -> Result<PathBuf, String> {
+    let canon = canonical_db(db)?;
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in canon.to_string_lossy().as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let base = canon
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "db".into());
+    // The basename is readability, so it is what yields: the whole path must
+    // fit sun_path (104 bytes with NUL on macOS — 103 is the universal
+    // budget), and the runtime dir eats what it eats ($TMPDIR sandboxes run
+    // deep). The hash carries the identity either way. Truncation is by
+    // BYTES, on char boundaries — a multi-byte name must not overshoot.
+    let dir = runtime.as_os_str().len();
+    let budget = 103usize.saturating_sub(dir + 1 + 1 + 8 + 5); // '/', '-', hash8, ".sock"
+    if budget == 0 {
+        return Err(format!(
+            "runtime dir is too deep for a unix socket ({}): shorten $HARBOR_HOME",
+            runtime.display()
+        ));
+    }
+    let mut cut = base.len().min(40);
+    while cut < base.len() && !base.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut cut = cut.min(budget);
+    while !base.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Ok(runtime.join(format!("{}-{h:08x}.sock", &base[..cut], h = h as u32)))
+}
+
+/// The canonical identity of a database path: symlinks resolved and
+/// absolutized. A not-yet-created file (--create) canonicalizes its
+/// parent and keeps its own name.
+pub fn canonical_db(db: &Path) -> Result<PathBuf, String> {
+    if let Ok(c) = db.canonicalize() {
+        return Ok(c);
+    }
+    let parent = match db.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let name = db.file_name().ok_or_else(|| format!("not a file path: {}", db.display()))?;
+    let parent = parent
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", parent.display()))?;
+    Ok(parent.join(name))
+}
+
 pub fn sidecar_file(runtime: &Path, name: &str) -> PathBuf {
     runtime.join(format!("{name}.json"))
 }
@@ -210,6 +272,23 @@ mod tests {
         assert!(looks_like_path("sub/dir"));
         assert!(looks_like_path("."));
         assert!(looks_like_path(".."));
+    }
+
+    #[test]
+    fn the_socket_fits_sun_path_even_in_a_deep_runtime_dir() {
+        // macOS $TMPDIR sandboxes produce runtime dirs ~80 bytes deep; the
+        // basename is what yields, the hash stays whole. (The db must exist —
+        // socket_for canonicalizes it.)
+        let db = std::env::temp_dir().join(format!("sunlen-{}.duckdb", std::process::id()));
+        std::fs::write(&db, b"").unwrap();
+        let deep = PathBuf::from(format!("/{}runtime", "sandbox/".repeat(9)));
+        let sock = socket_for(&deep, &db).unwrap();
+        assert!(sock.as_os_str().len() <= 103, "{} bytes: {}", sock.as_os_str().len(), sock.display());
+        assert!(sock.extension().is_some_and(|e| e == "sock"));
+        // Too deep to fit anything is an error with a name, not a bad bind.
+        let hopeless = PathBuf::from(format!("/{}", "x/".repeat(60)));
+        assert!(socket_for(&hopeless, &db).is_err());
+        let _ = std::fs::remove_file(&db);
     }
 
     #[test]

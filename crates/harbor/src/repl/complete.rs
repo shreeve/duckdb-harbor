@@ -12,8 +12,8 @@
 //! prompt. The cache lives behind an Arc so editor rebuilds (.keymode) share
 //! it; .open swaps the connection and marks it stale.
 
-use crate::keywords::KEYWORDS;
-use crate::{Conn, http};
+use crate::repl::keywords::KEYWORDS;
+use crate::repl::{Conn, http};
 use wire::{Event, SqlRequest, endpoint};
 use reedline::{Completer, CompletionResult, Span, Suggestion};
 use std::io::BufRead;
@@ -152,7 +152,7 @@ impl Completer for SqlCompleter {
         let prefix = &line[..pos];
         let list: Vec<Suggestion> = if prefix.trim_start().starts_with('.') {
             // Dot-commands are client-side (lane A), from the one list.
-            crate::repl::DOT_COMMANDS
+            crate::repl::repl::DOT_COMMANDS
                 .iter()
                 .map(|(name, _, _)| format!(".{name}"))
                 .filter(|c| c.starts_with(prefix.trim_start()))
@@ -240,7 +240,7 @@ fn quiet_sql(conn: &Conn, sql: &str) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::Transport;
+    use crate::repl::http::Transport;
 
     #[test]
     fn word_boundary_is_char_safe() {

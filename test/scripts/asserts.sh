@@ -38,7 +38,7 @@ if [[ ! -f "$src_db" ]]; then
   echo "asserts: no database at $src_db" >&2
   exit 2
 fi
-launcher="${HARBOR_LAUNCHER:-$here/target/release/harbor serve}"
+launcher="${HARBOR_LAUNCHER:-$here/target/release/harbor}"
 if [[ ! -x "${launcher%% *}" ]]; then
   echo "asserts: ${launcher%% *} is missing (cargo build -p harbor --release)" >&2
   exit 2
@@ -225,7 +225,7 @@ fi
 
 section "Startup"
 
-$launcher "$db" --port "$port" --token "$token" --workers 6 >"$log" 2>&1 &
+$launcher "$db" serve --port "$port" --token "$token" --workers 6 >"$log" 2>&1 &
 server_pid=$!
 
 up=0

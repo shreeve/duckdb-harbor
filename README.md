@@ -8,14 +8,24 @@
 > back.**
 
 Only one process can access a DuckDB file at a time. Harbor fixes that: it
-runs a small server in front of each file so all your apps can share it, and
-handles starting, stopping, and listing those servers for you.
+puts a small server in front of the file so all your apps can share it — and
+it feels exactly like the duckdb shell, except a database can also serve.
 
-DuckDB Harbor is `harbor`, a small Rust binary that opens a DuckDB database and
-serves it over HTTP. Point it at a file and that one process becomes a server:
-many clients, any language, all at once — no driver, no client library, no wire
-protocol to implement. It ships with `pilot`, a companion CLI that speaks the
-same protocol for a duckdb-shell-class REPL over the socket.
+DuckDB Harbor is `harbor`, one small Rust binary with one grammar:
+
+```console
+$ harbor                       # what's running
+$ harbor mydata.duckdb         # open it — REPL, or -c "SQL", or stdin
+$ harbor mydata.duckdb serve   # serve it yourself, until you leave
+```
+
+`harbor mydata.duckdb` is the duckdb-shell muscle memory, kept: a REPL with
+highlighting and completion, `-c` for one-shots, stdin for scripts. The
+difference is what happens behind it — if nothing serves the file yet, a
+server is spawned for it, and every other client of the same file joins that
+server instead of hitting "database is locked". The two lifetimes, in one
+breath: **bare, the server is everyone's — it lives while anyone is
+connected; `serve`, the server is yours — it lives until you leave.**
 
 If it can speak HTTP and parse JSON, it can query your database.
 
@@ -34,11 +44,10 @@ One `schema` message, one `row` per row, one `end`. Rows go out as DuckDB
 produces them, so a client can start on row one while the server is still
 producing the last one.
 
-Ten routes. That is the whole surface — two of them for queries, three so a
+Nine routes. That is the whole surface — two of them for queries, three so a
 transaction can outlive one request, one to stop a statement that is running,
 one to read the schema without asking five questions, one that says who a
-berth is, one cheap activity pulse for an interactive Pilot, and one graceful
-fleet shutdown route:
+server is, and one graceful shutdown route:
 
 ```
 POST /sql                  run one statement, stream the result as NDJSON
@@ -47,8 +56,8 @@ GET  /ready                can this server answer a query? no credential require
 GET  /catalog              everything about the database in one stable JSON
                            document — schema, sizes, row estimates, DDL
                            (?style=lite for the cheap sketch)
-GET  /info                 berth identity — name, harbor + DuckDB versions, pid
-GET  /keepalive            keep an idle-exit berth alive while Pilot has a prompt
+GET  /info                 identity — database path, versions, pid, uptime,
+                           and the live client count
 DELETE /shutdown           authenticated drain, checkpoint, and stop
 POST /sql/sessions/new     take a connection and hold it, for a transaction
 DELETE /sql/sessions/<id>  give it back
@@ -204,7 +213,7 @@ indexes and sequences — plus the engine's row estimate and its own
 exact bytes at the top:
 
 ```json
-{"harborVersion":"0.18.0","duckdbVersion":"v2.0.0-alpha38195",
+{"harborVersion":"0.20.0","duckdbVersion":"v2.0.0-alpha38195",
  "databaseSizeBytes":12582912,"walSizeBytes":0,
  "tables":[{"name":"orders","schema":"main","estimatedRows":300000,
             "columns":[…],"primaryKey":["id"],
@@ -213,7 +222,7 @@ exact bytes at the top:
 ```
 
 The document is stable — same database, same bytes — so clients can diff it.
-A fleet client that only wants to paint a sidebar asks
+A client that only wants to paint a sidebar asks
 `GET /catalog?style=lite` and gets the versions, the sizes, and
 `{name, schema, estimatedRows}` per table: what exists and how big, without
 how it is built, at a fraction of the bytes. An unknown style value is a loud
@@ -222,28 +231,28 @@ newer client's ask with the full document instead of a 404.
 
 ## Get it running
 
-Two binaries: **`harbor`** (the server and fleet manager) and **`pilot`** (the
-client). `harbor` links an external `libduckdb`; the same build has been
-verified against DuckDB 1.5.5 and current 2.0 nightlies by resolving a
-compatible library at runtime. A build needs a libduckdb to link against.
-`make fetch-duckdb` pulls DuckDB's official v2 nightly into
-`~/.duckdb/cli/2.0.0/`; then:
+One binary, and nothing to configure. The client half never touches DuckDB —
+the engine (`libduckdb`) loads on demand, only when this process is the one
+serving a file, so the same 2.7MB `harbor` is a pure protocol client on
+machines that never host a database. `make fetch-duckdb` pulls DuckDB's
+official v2 nightly into `~/.duckdb/cli/2.0.0/`, one of the places harbor
+looks at runtime; then:
 
 ```console
-$ make fetch-duckdb                       # libduckdb + duckdb CLI -> ~/.duckdb/cli/2.0.0/
-$ make harbor pilot                       # -> target/release/{harbor,pilot}
-$ harbor serve mydata.duckdb --token secret
-harbor 0.18.0: berth "mydata" serving mydata.duckdb on ~/.local/state/harbor/runtime/mydata.sock (duckdb v2.0.0-alpha38195, memory_limit 2GB)
+$ make fetch-duckdb            # libduckdb + duckdb CLI -> ~/.duckdb/cli/2.0.0/
+$ make harbor                  # -> target/release/harbor (no engine needed to build)
+$ harbor mydata.duckdb
+mydata>
 ```
 
 `make bootstrap` does the whole thing in one shot — fetch the engine into
-`~/.duckdb`, then build and install `harbor` + `pilot` into `~/.local/bin`. It
-takes an empty `~/.duckdb` to a working fleet, and no step needs root.
+`~/.duckdb`, then build and install `harbor` into `~/.local/bin`. No step
+needs root.
 
 No toolchain? One command installs the latest release — it picks the right
 archive for the platform, verifies its sha256 against the published checksums,
-and installs harbor + pilot into `~/.local/bin` with `libduckdb` in
-`~/.local/lib` (override with `BIN=...` `LIB=...`):
+and installs `harbor` into `~/.local/bin` with `libduckdb` in `~/.local/lib`
+(override with `BIN=...` `LIB=...`):
 
 ```bash
 # macOS and Linux
@@ -258,58 +267,76 @@ spec puts user executables; Debian and Fedora already have it on `PATH`, macOS
 does not, and the installer says so rather than putting binaries somewhere you
 cannot see. A system-wide install is `BIN=/usr/local/bin LIB=/usr/local/lib`
 with `sudo` in front of the whole command — the installer never escalates on
-its own. On Windows the binaries land in `%LOCALAPPDATA%\Programs\harbor\bin`,
+its own. On Windows the binary lands in `%LOCALAPPDATA%\Programs\harbor\bin`,
 which the installer adds to your user `PATH`.
 
-Pin a version with `... | bash -s v0.18.0` (or `-Tag v0.18.0` on Windows). Each
+Pin a version with `... | bash -s v0.20.0` (or `-Tag v0.20.0` on Windows). Each
 [release](https://github.com/shreeve/duckdb-harbor/releases)
 ships one self-contained archive per
 platform (osx-arm64, linux-amd64, linux-arm64, windows-amd64, windows-arm64):
-harbor + pilot and the exact DuckDB shared library they were built against.
-Unix archives carry `bin/`, `lib/` and `install.sh`; Windows archives put
-`duckdb.dll` beside the two executables and run in place.
+harbor and the exact DuckDB shared library it was tested against. Unix
+archives carry `bin/`, `lib/` and `install.sh`; Windows archives put
+`duckdb.dll` beside the executable and run in place.
 
-`harbor serve` runs in the foreground. `harbor start <name|db.duckdb>` starts a
-database in the **background** and returns once it answers `/ready` — a bare
-word names an entry in your config, a path names a file. `harbor add
-<db.duckdb> [name]` gives a database a name, and the name is the whole
-contract: **a name is a service — it starts on use and runs until you say
-stop.** `pilot <name>` raises it if it is down and leaves it running on exit;
-`harbor stop <name>` drains, `CHECKPOINT`s, and holds it stopped — a held name
-refuses every client's autostart, and only `harbor start` lifts the hold. A
-*path* handed to `pilot` is the other shape: a session — it joins the running
-server for that file or summons a temp one that exits on its own after
-sitting idle (`harbor show` marks these: `● running (temp 1m30s)`).
-`harbor expose <name> <port|off>` moves a service onto loopback TCP and back.
-`harbor show` (or bare `harbor`) lists the fleet and `harbor show <name>`
-details one; `harbor forget <name>` drops the name — registry files and its
-config entry, never the database file; `harbor doctor` checks the config for
-what nothing else has a moment to notice. With no `--token`, a per-berth token
-is minted and written to `~/.local/state/harbor/runtime/<name>.token`.
+### The two lifetimes
 
-Exits are clean: `SIGTERM` / `Ctrl-C` drain in-flight requests, `CHECKPOINT`
-so the next open never replays a WAL, and depart — the runtime registry is
-left as the berth found it, so `harbor` shows nothing where nothing runs.
+**`harbor <db.duckdb>` — the server is everyone's.** On a terminal it is the
+REPL — highlighting, Tab completion, the duckdb-shell dot commands. With `-c`
+or stdin it runs statements and exits. Either way, if nothing serves the file
+yet, a server is spawned behind the scenes: detached, refcounted, alive while
+anyone is connected. Every client holds one silent connection for its
+lifetime, so a human thinking at a prompt counts as presence; when the last
+client leaves, the server drains, `CHECKPOINT`s, sweeps its socket, and exits
+a few seconds later. A second `harbor` on the same file — any spelling of the
+same path — joins the same server instead of reporting "database is locked".
 
-Talk to it with `curl` (above), or with the bundled client — a
-duckdb-shell-class REPL with syntax highlighting and completion. Tab accepts
-the inline suggestion or highlighted panel entry; Down opens the completion
-panel, and the arrow keys navigate it:
+**`harbor <db.duckdb> serve` — the server is yours.** Foreground, no
+refcount: it lives until you leave. On a terminal you get the same prompt,
+dialled at the server's own socket, and `.quit` ends the server; headless it
+runs until `SIGTERM`. Either exit is clean — drain, `CHECKPOINT` so the next
+open never replays a WAL, socket swept. Boot persistence belongs to launchd
+or a systemd user unit running exactly this command; harbor never becomes a
+supervisor.
+
+There is no registry and no config file. The socket **is** the registration:
+its name is derived from the database's canonical path
+(`~/.local/state/harbor/runtime/<basename>-<hash>.sock`), so discovery is
+`readdir` plus a `GET /info` to each socket — which is precisely what bare
+`harbor` prints:
 
 ```console
-$ pilot mydata                 # a REPL over the socket
-$ pilot mydata -c "SELECT count(*) FROM orders"   # one-shot
+$ harbor
+DATABASE            PID    CLIENTS  UPTIME  ADDRESS
+~/Data/labs.duckdb  72840  2        3d      ~/.local/state/harbor/runtime/labs-1a2b3c4d.sock
+```
+
+A socket nothing answers on is a leftover from a `kill -9`, and the list
+unlinks it. There is nothing else to clean up, because nothing else is
+written.
+
+### Sockets, TCP, and tokens
+
+The unix socket is the default face, and the `0700` runtime directory is the
+whole local access control — no token exists on a socket, and `--token` is
+refused there so nobody believes an extra lock is doing something. TCP is the
+one door that leaves the filesystem's protection, so `--port` makes `--token`
+mandatory:
+
+```console
+$ harbor mydata.duckdb serve --port 9495 --token secret
+$ harbor http://127.0.0.1:9495 --token secret -c "SELECT count(*) FROM orders"
 ```
 
 Remote access is Caddy's job at the edge (TLS + auth); harbor itself speaks
-plain HTTP over a unix socket or a loopback TCP port.
+plain HTTP over a unix socket or a loopback TCP port. A human reaches a
+remote host over ssh and uses the socket.
 
-A bearer token grants the ability to run SQL, and ordinary DuckDB SQL can read
-host files or load extensions. For a berth reachable by an untrusted token
-holder, `--sealed` disables host-file access and community extensions.
-`--max-temp-size` bounds disk spill, and `--statement-timeout` places the hard
-statement ceiling described above. These are independent of Caddy's transport
-and HTTP policy.
+A bearer token grants the ability to run SQL, and ordinary DuckDB SQL can
+read host files or load extensions. For a server reachable by an untrusted
+token holder, `--sealed` disables host-file access and community extensions.
+`--max-temp-size` bounds disk spill, and `--statement-timeout` places the
+hard statement ceiling described above. These are independent of Caddy's
+transport and HTTP policy.
 
 ### Request logging
 
@@ -493,12 +520,12 @@ covers everyone else.
 
 `quack` is a DuckDB extension; `harbor` is a standalone server. It can
 still load an extension into its own database with
-`harbor serve db.duckdb --unsigned --init 'LOAD <ext>'`, so one process can answer
-HTTP clients and other DuckDB instances over one file at once. Harbor
+`harbor db.duckdb serve --unsigned --init 'LOAD <ext>'`, so one process can
+answer HTTP clients and other DuckDB instances over one file at once. Harbor
 ships no extension of its own — whatever `LOAD` resolves by name in `~/.duckdb`
-is what it gets, matching that to the linked engine is the operator's call, and
+is what it gets, matching that to the loaded engine is the operator's call, and
 Harbor does not patch extension source while loading it. For a desktop face on
-a Harbor fleet, [DuckTable](https://github.com/shreeve/ducktable) is the
+Harbor servers, [DuckTable](https://github.com/shreeve/ducktable) is the
 native client.
 
 ## Known limitations
@@ -518,44 +545,46 @@ There is no rate limiting and no CORS — defensible for a service behind a prox
 worth knowing before it faces a browser. Request logging is available with
 `--log`, off by default.
 
-**Windows berths use loopback TCP.** Unix keeps its Unix-socket default and
-SIGTERM lifecycle. Windows assigns each berth a loopback port, records it in
-the same sidecar registry, and uses Harbor's authenticated shutdown route to
-drain and checkpoint.
+**Windows serves over loopback TCP only.** Unix sockets — and with them
+spawn-on-use and the list — are a unix feature. On Windows, serving is
+explicit (`harbor <db> serve --port <p> --token <t>`) and the client half
+works the same everywhere.
 
-**The engine is the linked `libduckdb`, not the binary.** harbor links
-dynamically, and the same build has been verified against DuckDB 1.5.5 and a
-2.0 development build. Treat that as tested compatibility, not a promise that
-an arbitrary past or future DuckDB ABI will work.
-`make install` puts harbor + pilot on PATH in `~/.local/bin`, and harbor's
-baked rpath resolves the engine in `~/.duckdb` — DuckDB's own world, disposable
-and refetchable. The caveat that comes with that: point it at a library whose
-storage format matches the database file.
+**The engine is the loaded `libduckdb`, not the binary.** Nothing is linked:
+harbor loads the engine on demand (`HARBOR_LIBDUCKDB`, then `../lib` beside
+the binary, `~/.local/lib`, and `~/.duckdb/cli/*` — DuckDB's own world,
+disposable and refetchable). The same build has been verified against DuckDB
+1.5.5 and 2.0 development builds. Treat that as tested compatibility, not a
+promise that an arbitrary past or future DuckDB ABI will work — and point it
+at a library whose storage format matches the database file. A machine with
+no engine at all still runs the client half; only serving needs the library,
+and the error says exactly where it looked.
 
 ## Working on it
 
-Building is only needed to change it. The workspace has five first-party
+Building is only needed to change it. The workspace has four first-party
 crates:
 
-- **`harbor`** — the server engine and fleet CLI;
-- **`pilot`** — the DuckDB-shell-class Harbor client;
-- **`harbor-common`** — paths, the config schema, fleet reconciliation: the
-  vocabulary both binaries share, so neither can drift from the other;
-- **`wire`** — protocol request and response types consumed by Pilot; and
-- **`justhttp`** — Harbor's small synchronous HTTP/1.1 server over TCP and Unix
-  sockets.
+- **`harbor`** — the server engine, the client (`src/repl/`, which never
+  touches DuckDB), and the CLI, all in one binary;
+- **`harbor-common`** — paths, names, permissions, durations: the vocabulary
+  shared with DuckTable so the two cannot drift;
+- **`wire`** — protocol request and response types consumed by the client
+  half; and
+- **`justhttp`** — Harbor's small synchronous HTTP/1.1 server over TCP and
+  Unix sockets.
 
-Harbor implements its protocol shapes directly rather than depending
-on `wire`, so a wire change needs tests on both sides; drift is not a Rust
-compile error. Harbor links an external `libduckdb` rather than embedding one,
-so no DuckDB source tree is required — `make fetch-duckdb` fetches a libduckdb
-to link against, then `make harbor pilot` builds. The crate ships pregenerated
-bindings, so there is no bindgen and no headers to find.
+The server implements its protocol shapes directly rather than depending on
+`wire`, so a wire change needs tests on both sides; drift is not a Rust
+compile error. Nothing links `libduckdb` — the engine loads on demand — so no
+DuckDB source tree, library, or header is required to build: `make harbor`
+works on a bare machine, and `make fetch-duckdb` fetches an engine to serve
+with. The crate ships pregenerated bindings, so there is no bindgen.
 
 `make unit` runs the fast Rust tests and `make test` runs the full suite. The
 full suite expects `sample.duckdb`; create it with
 `test/scripts/fixture.sh sample.duckdb` when it is absent. CI performs that
-fixture step explicitly. The eleven suites use independent oracles where answers
+fixture step explicitly. The twelve suites use independent oracles where answers
 need comparison — values read from the database file before the server takes
 the lock, and Python's own `datetime` and `base64` for fuzzed values. An oracle
 that shares an implementation with the thing it checks confirms only that the
@@ -563,11 +592,10 @@ code is self-consistent.
 
 ## Status
 
-Pre-production. harbor and pilot are two small binaries. Harbor is dynamically
-linked: the same build has served DuckDB 1.5.5 and a 2.0 development build by
-resolving the compatible `libduckdb` beside it. Deploy remote TCP behind
-Caddy, which owns TLS and edge request policy; Harbor independently owns SQL
-statement deadlines.
+Pre-production. One small binary. Nothing is linked: the same build has served
+DuckDB 1.5.5 and 2.0 development builds by loading the compatible `libduckdb`
+at runtime. Deploy remote TCP behind Caddy, which owns TLS and edge request
+policy; Harbor independently owns SQL statement deadlines.
 
 ## License
 

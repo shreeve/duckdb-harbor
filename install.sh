@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# install.sh — install harbor + pilot with one command (macOS and Linux):
+# install.sh — install harbor with one command (macOS and Linux):
 #
 #   curl -fsSL https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.sh | bash
 #
@@ -9,9 +9,9 @@
 #   curl -fsSL .../install.sh | bash -s v0.18.0
 #
 # Downloads the release archive for this platform, verifies its sha256 against
-# the published checksums, and runs the archive's own installer — binaries to
-# ~/.local/bin and libduckdb to ~/.local/lib, both overridable with BIN= and
-# LIB=. Nothing here needs root.
+# the published checksums, and runs the archive's own installer — the binary
+# to ~/.local/bin and libduckdb to ~/.local/lib, both overridable with BIN=
+# and LIB=. Nothing here needs root.
 #
 # On Windows use install.ps1 instead:
 #

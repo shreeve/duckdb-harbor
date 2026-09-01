@@ -204,7 +204,7 @@ def start_server(db, pool_size, workers, port, env_extra=None):
     log = open(db + ".log", "w")
     proc = subprocess.Popen(
         [
-            *os.environ.get("HARBOR_LAUNCHER", os.path.join(HERE, "target", "release", "harbor") + " serve").split(), db,
+            *os.environ.get("HARBOR_LAUNCHER", os.path.join(HERE, "target", "release", "harbor")).split(), db, "serve",
             "--port", str(port), "--token", TOKEN, "--workers", str(workers),
         ],
         stdout=log, stderr=log, stdin=subprocess.DEVNULL, env=env,

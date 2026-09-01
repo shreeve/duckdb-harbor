@@ -7,7 +7,7 @@
 # `cargo test -p justhttp`.
 [workspace]
 members = ["crates/*"]
-default-members = ["crates/wire", "crates/pilot", "crates/harbor"]
+default-members = ["crates/wire", "crates/harbor"]
 # Vendored crates are patch sources, not members — excluded so their own
 # test suites can run in place (cd vendor/<crate> && cargo test).
 exclude = ["vendor/reedline"]
@@ -19,7 +19,7 @@ resolver = "2"
 # archive would have shipped a `pilot --version` that disagreed with its own
 # filename. Inheriting removes the chance to forget one.
 [workspace.package]
-version = "0.19.2"
+version = "0.20.0"
 
 [profile.release]
 lto = true

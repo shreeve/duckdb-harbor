@@ -2,21 +2,31 @@
 name = "harbor"
 version.workspace = true
 edition = "2024"
-description = "harbor — DuckDB wearing a server: fleet manager + HTTP/UDS engine"
+description = "harbor — a DuckDB database, served: one binary, client and server"
 license = "MIT"
 
 [dependencies]
-# Paths, names, the permission gate, the config schema, berth lifetimes and
-# states, and the renderer. Shared with pilot so the two cannot drift, and
-# with ducktable, which takes it without the `term` feature.
+# Paths, names, the permission gate, and durations. Shared with ducktable,
+# which takes it without the `term` feature.
 harbor-common = { path = "../common" }
-duckdb = { version = "~1.10505.0", default-features = false, features = ["vtab"] }
+duckdb = { version = "~1.10505.0", default-features = false, features = ["vtab", "loadable-extension"] }
+libloading = "0.8"
 justhttp = { path = "../justhttp" }
-serde = "1"
-serde_json = "1"
-# The one writer config.toml has: document edits preserve the operator's
-# comments and formatting — a struct round-trip would erase them.
-toml_edit = "0.25"
+serde = { version = "1", features = ["derive"] }
+# preserve_order: --json rows must keep column order, not alphabetize it
+serde_json = { version = "1", features = ["preserve_order"] }
+# --- the client half (src/repl/) ---------------------------------------------
+# Pure protocol client: it never touches DuckDB. HTTP/1.1 over
+# UnixStream/TcpStream is hand-rolled because dragging an async stack in
+# for one request at a time buys nothing. TLS-free on purpose; remote
+# human access goes through SSH, while Caddy serves HTTPS app clients.
+wire = { path = "../wire" }
+crossterm = "0.29.0"
+nu-ansi-term = "0.50.3"
+reedline = "0.50.0"
+signal-hook = { version = "0.4", default-features = false }
+# already in reedline's tree: terminal-cell widths for duckbox alignment
+unicode-width = "0.2"
 rand = "0.8"
 libc = "0.2"
 
@@ -24,8 +34,6 @@ libc = "0.2"
 # the tests check it against the crate that publishes it.
 [dev-dependencies]
 wire = { path = "../wire" }
-# Test-only: doctor's checks are driven from config literals.
-toml = "1.1.4"
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }

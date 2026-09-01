@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 <#
-install.ps1 — install harbor + pilot with one command (Windows):
+install.ps1 — install harbor with one command (Windows):
 
     irm https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.ps1 | iex
 
@@ -92,7 +92,7 @@ try {
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
 
-Write-Host "installed: harbor + pilot -> $bin"
+Write-Host "installed: harbor -> $bin"
 
 # --- PATH, for this user only ------------------------------------------------
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -103,4 +103,7 @@ if (($userPath -split ';') -notcontains $bin) {
 }
 
 Write-Host ""
-Write-Host "try: harbor start mydata.duckdb --create ; pilot mydata"
+# Windows has no unix sockets, so serving is explicit here (spawn-on-use is a
+# unix-socket feature); the client half works the same everywhere.
+Write-Host "try: harbor mydata.duckdb serve --create --port 9495 --token secret"
+Write-Host "     harbor http://127.0.0.1:9495 --token secret"

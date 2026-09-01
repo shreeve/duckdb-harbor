@@ -89,27 +89,6 @@ impl Default for RenderOpts {
     }
 }
 
-impl RenderOpts {
-    /// Defaults, then the config file's [defaults] on top. Flags and
-    /// dot-commands override the result — the documented precedence.
-    pub fn with_defaults(d: &crate::config::Defaults) -> Self {
-        let mut o = Self::default();
-        if let Some(m) = d.mode.as_deref().and_then(Mode::parse) {
-            o.mode = m;
-        }
-        if let Some(t) = d.timer {
-            o.timer = t;
-        }
-        if let Some(n) = d.maxrows {
-            o.max_rows = n;
-        }
-        if let Some(nv) = &d.nullvalue {
-            o.null = nv.clone();
-        }
-        o
-    }
-}
-
 /// Streaming renderer: fed one event at a time, finishes on `end`.
 ///
 /// Pipe modes write through one BufWriter — a large export costs pages, not

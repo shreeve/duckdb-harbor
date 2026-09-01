@@ -1,8 +1,8 @@
 # Release — push a v* tag and five self-contained archives appear on the
 # GitHub Release: osx-arm64, linux-amd64, linux-arm64, windows-amd64, and
 # windows-arm64. Each is built on a native runner against DuckDB's official v2
-# nightly and smoke-tested as packaged. Unix archives carry harbor, pilot and
-# libduckdb; Windows archives carry harbor.exe, pilot.exe, and duckdb.dll.
+# nightly and smoke-tested as packaged. Unix archives carry harbor and
+# libduckdb; Windows archives carry harbor.exe and duckdb.dll.
 name: Release
 
 on:
@@ -19,9 +19,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: macos-15,        plat: osx-arm64,     duck_plat: osx,             rpath: '@loader_path' }
-          - { runner: ubuntu-24.04,     plat: linux-amd64,   duck_plat: linux-amd64,     rpath: '$ORIGIN' }
-          - { runner: ubuntu-24.04-arm, plat: linux-arm64,   duck_plat: linux-arm64,     rpath: '$ORIGIN' }
+          - { runner: macos-15,         plat: osx-arm64,     duck_plat: osx }
+          - { runner: ubuntu-24.04,     plat: linux-amd64,   duck_plat: linux-amd64 }
+          - { runner: ubuntu-24.04-arm, plat: linux-arm64,   duck_plat: linux-arm64 }
           - { runner: windows-2025,     plat: windows-amd64, duck_plat: windows-amd64 }
           - { runner: windows-11-arm,   plat: windows-arm64, duck_plat: windows-arm64 }
     runs-on: ${{ matrix.runner }}
@@ -35,21 +35,12 @@ jobs:
         shell: bash
         run: DEST="$DUCKDB_LIB" DUCKDB_PLATFORM=${{ matrix.duck_plat }} scripts/fetch-duckdb.sh
 
-      # Relative rpath instead of the Makefile's absolute one: the binary
-      # looks beside itself and in ../lib, so the archive works anywhere.
-      - name: Build harbor + pilot
-        if: ${{ !startsWith(matrix.plat, 'windows-') }}
-        run: |
-          export DUCKDB_LIB_DIR="$DUCKDB_LIB"
-          export RUSTFLAGS='-C link-args=-Wl,-rpath,${{ matrix.rpath }} -C link-args=-Wl,-rpath,${{ matrix.rpath }}/../lib'
-          cargo build -p harbor -p pilot --release
-
-      - name: Build harbor + pilot (Windows)
-        if: ${{ startsWith(matrix.plat, 'windows-') }}
+      # Nothing links the engine — harbor dlopens it at runtime (bin/../lib
+      # is the first place it looks), so the build needs no rpath and no
+      # library at all.
+      - name: Build harbor
         shell: bash
-        run: |
-          export DUCKDB_LIB_DIR="$DUCKDB_LIB"
-          cargo build -p harbor -p pilot --release
+        run: cargo build -p harbor --release
 
       - name: Package
         shell: bash
@@ -57,19 +48,17 @@ jobs:
           TAG="$GITHUB_REF_NAME" PLAT=${{ matrix.plat }} \
             scripts/package-release.sh
 
-      # Prove the archive as shipped: extract, run harbor from bin/ (exercises
-      # the relative rpath -> lib/), and query it through pilot.
+      # Prove the archive as shipped: extract, and open a database straight
+      # from bin/ — spawn-on-use exercises the whole thing in one line (the
+      # ../lib engine lookup, the server, the wire round-trip), and the
+      # refcounted server reaps itself.
       - name: Smoke-test packaged layout
         if: ${{ !startsWith(matrix.plat, 'windows-') }}
         run: |
           tar -C /tmp -xzf dist/harbor-"$GITHUB_REF_NAME"-${{ matrix.plat }}.tar.gz
           root=/tmp/harbor-"$GITHUB_REF_NAME"-${{ matrix.plat }}
-          # --create: a fresh smoke db is the point here; harbor never
-          # mints database files implicitly.
-          "$root/bin/harbor" start /tmp/smoke.duckdb --create --name smoke
-          "$root/bin/pilot" smoke -c "SELECT 42 AS ok" --mode csv | grep -q 42
-          "$root/bin/harbor" stop smoke
-          echo "smoke: rpath and wire round-trip both good"
+          "$root/bin/harbor" /tmp/smoke.duckdb -c "SELECT 42 AS ok" --mode csv | grep -q 42
+          echo "smoke: engine lookup and wire round-trip both good"
 
       - name: Smoke-test packaged layout (Windows)
         if: ${{ startsWith(matrix.plat, 'windows-') }}
@@ -79,11 +68,17 @@ jobs:
           7z x "$archive" -o"$RUNNER_TEMP" -y >/dev/null
           root="$RUNNER_TEMP/harbor-$GITHUB_REF_NAME-${{ matrix.plat }}"
           export HARBOR_HOME="$RUNNER_TEMP/harbor-home"
-          "$root/bin/harbor.exe" start "$RUNNER_TEMP/smoke.duckdb" \
-            --create --name smoke --token ''
-          "$root/bin/pilot.exe" smoke -c "SELECT 42 AS ok" --mode csv | grep -q 42
-          "$root/bin/harbor.exe" stop smoke
-          echo "smoke: DLL loading, TCP fleet, and wire round-trip all good"
+          "$root/bin/harbor.exe" "$RUNNER_TEMP/smoke.duckdb" serve \
+            --create --port 9495 --token smoke &
+          srv=$!
+          for _ in $(seq 1 50); do
+            curl -sf http://127.0.0.1:9495/ready >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+          "$root/bin/harbor.exe" http://127.0.0.1:9495 --token smoke \
+            -c "SELECT 42 AS ok" --mode csv | grep -q 42
+          kill "$srv"
+          echo "smoke: DLL loading, TCP serve, and wire round-trip all good"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -105,7 +100,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" *.tar.gz *.zip \
             "harbor-$GITHUB_REF_NAME-checksums.txt" \
             --repo "$GITHUB_REPOSITORY" --title "harbor $GITHUB_REF_NAME" \
-            --notes "Self-contained harbor + pilot releases, version-locked to \
+            --notes "Self-contained harbor releases, version-locked to \
           one DuckDB v2 nightly. Unix archives carry libduckdb and install.sh; \
-          Windows archives carry duckdb.dll beside the binaries. \
+          Windows archives carry duckdb.dll beside the binary. \
           Extract and run in place."
