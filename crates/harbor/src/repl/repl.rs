@@ -19,85 +19,6 @@ use crate::repl::render::{Mode, RenderOpts};
 use crate::repl::scan::{Kind, scan};
 use crate::repl::{Conn, Outcome, run_sql};
 
-/// Keep an idle-exit berth alive while Reedline is blocked at the prompt.
-/// This is intentionally an activity pulse rather than a SQL session: a REPL
-/// that is merely waiting for input must not reserve one of Harbor's scarce
-/// transaction connections. The channel makes Drop prompt even when the next
-/// pulse is many seconds away; a vanished Pilot leaves no server-side state.
-struct ReplKeepalive {
-    stop: Option<mpsc::Sender<()>>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-impl ReplKeepalive {
-    fn new(conn: Conn) -> Self {
-        // Pulse synchronously first, closing the race with an idle deadline
-        // that was already near before the thread below takes over.
-        pulse(&conn);
-
-        let Some(period) = keepalive_period(&conn) else {
-            return Self { stop: None, thread: None };
-        };
-        let (tx, rx) = mpsc::channel();
-        let thread = thread::spawn(move || {
-            while matches!(rx.recv_timeout(period), Err(mpsc::RecvTimeoutError::Timeout)) {
-                pulse(&conn);
-            }
-        });
-        Self { stop: Some(tx), thread: Some(thread) }
-    }
-}
-
-impl Drop for ReplKeepalive {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-fn pulse(conn: &Conn) {
-    if let Ok(resp) = crate::repl::http::request(
-        &conn.transport,
-        &wire::endpoint::KEEPALIVE,
-        conn.token.as_deref(),
-        None,
-        Some(Duration::from_secs(2)),
-    ) {
-        // Complete the exchange before closing the socket. The body is tiny;
-        // its contents do not matter because activity was counted at dispatch.
-        let _ = resp.body_string();
-    }
-}
-
-/// The berth publishes its idle window in /info. Pulse at a third of it,
-/// capped so long windows do not make recovery from scheduling stalls
-/// fragile. A permanent berth (null) needs no heartbeat; when /info cannot
-/// be read at all, pulse gently anyway — a spare keepalive is harmless, a
-/// missed one closes the berth under the prompt.
-fn keepalive_period(conn: &Conn) -> Option<Duration> {
-    let fallback = Some(Duration::from_secs(10));
-    let resp = match crate::repl::http::request(
-        &conn.transport,
-        &wire::endpoint::INFO,
-        conn.token.as_deref(),
-        None,
-        Some(Duration::from_secs(2)),
-    ) {
-        Ok(resp) => resp,
-        Err(_) => return fallback,
-    };
-    if resp.status != 200 {
-        return fallback;
-    }
-    let Ok(text) = resp.body_string() else { return fallback };
-    let Ok(info) = serde_json::from_str::<wire::InfoResponse>(&text) else { return fallback };
-    info.idle_exit_ms.map(|ms| Duration::from_millis((ms / 3).clamp(1, 10_000)))
-}
-
 struct BerthPrompt {
     name: String,
 }
@@ -301,10 +222,6 @@ fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
 
 pub fn run(conn: &Conn, name: &str, mut opts: RenderOpts) -> std::process::ExitCode {
     let mut conn = conn.clone();
-    // Never read, deliberately: this binding is the pulse thread's anchor —
-    // its Drop stops the thread, and .open reassigns it to re-anchor onto
-    // the new connection. The underscore says "held, not consulted".
-    let mut _keepalive = ReplKeepalive::new(conn.clone());
     let mut vi = false;
     // One completer for the session: its catalog cache loads lazily on the
     // first Tab and survives editor rebuilds (.keymode), refreshing on .open.
@@ -332,7 +249,6 @@ pub fn run(conn: &Conn, name: &str, mut opts: RenderOpts) -> std::process::ExitC
                             match crate::repl::resolve(&cfg, &target, None, cfg_err.as_ref()) {
                                 Ok(c) => {
                                     conn = c;
-                                    _keepalive = ReplKeepalive::new(conn.clone());
                                     completer.reconnect(conn.clone());
                                     // The prompt changing name announces the switch.
                                     prompt = BerthPrompt { name: crate::repl::prompt_name(&target) };

@@ -61,17 +61,19 @@ check "a second pilot joins the same berth" 0 "42" \
 check "a bare word is never a path" 1 "nothing running" \
   "$pilot" -c "SELECT 1" nosuchname
 if [[ -f $work/nosuchname ]]; then bad "a bare word conjured a file"; else ok "no file conjured for a bare word"; fi
-sleep 3 # the temp's 1s idle window passes; the berth leaves on its own
-
+# Idle-exit is gone (0.20): a summoned server no longer leaves on its own,
+# so departure-by-clock has nothing to test. Stop it by hand and check the
+# same invariant — a stop departs clean: no lock left, database checkpointed.
 echo "— a departure leaves the harbor as the berth found it"
-check "the fleet shows nothing where nothing runs" 0 "Nothing configured, nothing running" \
-  "$harbor"
+check "stopping the summoned temp departs" 0 "" "$harbor" stop x
+check "the fleet shows the held name, nothing running" 0 "" "$harbor"
 if [[ -e $work/runtime/x.lock ]]; then bad "a departed temp left its lock"; else ok "a departed temp took its lock with it"; fi
 if [[ -f $work/x.duckdb && ! -e $work/x.duckdb.wal ]]; then
   ok "the database stays ashore, checkpointed (no wal)"
 else
   bad "departure left the database missing or with a wal"
 fi
+"$harbor" start x >/dev/null 2>&1 || true  # lift the hold for the sections below
 
 echo "— a name is a service"
 check "add names the database" 0 "added" "$harbor" add "$work/x.duckdb"

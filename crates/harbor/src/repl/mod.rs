@@ -486,9 +486,10 @@ fn ensure_berth(
     if !canon.exists() {
         args.push("--create".into());
     }
-    // A Lifetime knows its own argv, so "never" reaches harbor as the absence
-    // of --idle-exit rather than as a duration string harbor cannot parse.
-    args.extend(life.to_args().into_iter().map(std::ffi::OsString::from));
+    // Idle-exit is gone (0.20): a spawned server's lifetime is no longer a
+    // clock's business. The Lifetime is still resolved above so a bad
+    // config duration fails loudly here rather than never.
+    let _ = life;
     exec_harbor_start(&args).map_err(|e| format!("cannot start {}: {e}", canon.display()))?;
     let transport = berth_transport(&home, &name)
         .ok_or_else(|| format!("harbor start returned without registering {name:?}"))?;

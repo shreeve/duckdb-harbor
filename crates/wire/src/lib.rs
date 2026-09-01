@@ -61,11 +61,6 @@ pub mod endpoint {
     /// GET — the whole schema as one document, cheaper and more complete than
     /// walking `duckdb_*()` a table at a time.
     pub const CATALOG: Route = Route::fixed("GET", "/catalog");
-    /// GET, but not idempotent: it resets the berth's idle clock, which is the
-    /// entire point. Interactive clients pulse this while sitting at a prompt
-    /// so an idle-exit berth stays moored without holding a session or a
-    /// DuckDB connection.
-    pub const KEEPALIVE: Route = Route::fixed("GET", "/keepalive");
     /// DELETE, not POST — graceful shutdown reads as removing the berth, and
     /// harbor's dispatch table agrees. Fleet managers use this on platforms
     /// without Unix signals; the response is sent before draining.
@@ -79,7 +74,7 @@ pub mod endpoint {
     /// the contract instead of transcribing it. The two builders below are
     /// not here: their paths carry an id, so there is nothing to enumerate.
     pub const FIXED: &[Route] =
-        &[SQL, SESSIONS_NEW, SESSIONS, CATALOG, KEEPALIVE, SHUTDOWN, READY, INFO];
+        &[SQL, SESSIONS_NEW, SESSIONS, CATALOG, SHUTDOWN, READY, INFO];
 
     /// DELETE — release the session `id` holds, rolling back any open
     /// transaction. A builder, since the id rides in the path.
@@ -277,10 +272,6 @@ pub struct InfoResponse {
     pub databases: Vec<String>,
     pub pid: u32,
     pub uptime_ms: u64,
-    /// The configured idle window, or null on a permanent berth. Clients
-    /// pace their keepalive inside it; null means no heartbeat is needed.
-    #[serde(default)]
-    pub idle_exit_ms: Option<u64>,
 }
 
 #[cfg(test)]

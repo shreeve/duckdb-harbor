@@ -1074,14 +1074,9 @@ pub fn start(
         Listen::Unix(path) => path.display().to_string(),
     };
     *STARTED_AT.lock().unwrap() = Some(Instant::now());
-    // Reset the process-global accumulators for this instance. One process
-    // may serve, stop, and serve again (tests do exactly this), and
-    // a request abandoned by the bounded-join shutdown may decrement
-    // INFLIGHT_REQUESTS late — so a fresh instance must not inherit a nonzero
-    // count (which would wedge quiet()/--idle-exit) or a stale readiness
-    // verdict from its predecessor.
-    INFLIGHT_REQUESTS.store(0, Ordering::SeqCst);
-    *LAST_ACTIVITY.lock().unwrap() = None;
+    // Reset the process-global readiness verdict for this instance. One
+    // process may serve, stop, and serve again (tests do exactly this), and
+    // a fresh instance must not inherit a stale verdict from its predecessor.
     *LAST_READY.lock().unwrap() = None;
     let server = Arc::new(server);
     let stop = Arc::new(AtomicBool::new(false));
@@ -1593,16 +1588,6 @@ fn shed(req: Request) -> (bool, u16) {
 /// lean on as a version probe.
 static INFO: Mutex<Option<serde_json::Value>> = Mutex::new(None);
 static STARTED_AT: Mutex<Option<Instant>> = Mutex::new(None);
-/// The last moment a countable request began or finished. `/ready` and
-/// `/info` do not count: a fleet `show` probing liveness must not keep an
-/// --idle-exit berth alive forever.
-static LAST_ACTIVITY: Mutex<Option<Instant>> = Mutex::new(None);
-/// Countable requests currently being served, statement and stream included.
-/// This is what actually protects a long-running statement from --idle-exit:
-/// the activity clock ticks only at request start and finish, so without this
-/// a 5-minute COPY on an otherwise quiet berth would be "idle" at the 90s
-/// mark and cancelled out from under its caller.
-static INFLIGHT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 /// The workers' slots alone (SLOTS holds leases too), set at start(). The
 /// probe thread reads these to decide whether the workers are wedged — every
 /// one of them busy on a statement old enough to matter — which is the only
@@ -1611,43 +1596,6 @@ static WORKER_SLOTS: Mutex<Vec<Arc<SlotState>>> = Mutex::new(Vec::new());
 
 pub fn set_info(base: serde_json::Value) {
     *INFO.lock().unwrap() = Some(base);
-}
-
-fn touch_activity() {
-    *LAST_ACTIVITY.lock().unwrap() = Some(Instant::now());
-}
-
-/// Milliseconds since the last countable request began or ended. The clock
-/// resets at both edges of a request, but the guarantee that a statement
-/// longer than the idle window is never idled out from under its caller
-/// comes from `quiet()`, which refuses while any request is in flight.
-pub fn idle_ms() -> u64 {
-    let last = *LAST_ACTIVITY.lock().unwrap();
-    let base = last.or(*STARTED_AT.lock().unwrap());
-    base.map_or(0, |t| t.elapsed().as_millis() as u64)
-}
-
-/// True when nothing is held: no request mid-flight (statement or stream),
-/// no live leases, no lease statement in flight. An --idle-exit berth may
-/// leave only when this is true — an open transaction with no traffic is
-/// still a claim on this berth, and so is a statement in its fifth minute.
-///
-/// A *doomed* lease is not a claim. It is one the server has already decided
-/// to reclaim, waiting only for a cancelled statement to unwind, and a client
-/// that asked to be released is not asking to be kept alive. Counting one is
-/// how a single cancel that never lands turns `--idle-exit` off permanently:
-/// `live` never empties, `quiet()` is false forever, and the berth outlives
-/// every clock meant to retire it. That is not hypothetical — it is the shape
-/// of a berth found still serving hours after its last session, deaf to the
-/// idle timer that should have ended it.
-pub fn quiet() -> bool {
-    if INFLIGHT_REQUESTS.load(Ordering::SeqCst) != 0 {
-        return false;
-    }
-    match LEASES.lock().unwrap().as_ref() {
-        Some(l) => l.live.values().all(|lease| lease.doomed) && l.inflight == 0,
-        None => false,
-    }
 }
 
 fn run_info(req: Request) -> (bool, u16) {
@@ -1682,12 +1630,6 @@ fn handle(
 ) -> bool {
     let path = req.url().split('?').next().unwrap_or("/").to_string();
     let method = req.method().clone();
-    let countable = path != "/ready" && path != "/info";
-    // A drop guard, not a bare inc/dec, so a panic anywhere in this function
-    // (a poisoned global lock, a panic inside response construction) cannot
-    // leak the count and wedge quiet()/--idle-exit — the same RAII discipline
-    // as Claim/Cancellable/OnSlot. Touches the activity clock on both edges.
-    let _inflight = countable.then(InFlight::enter);
     // Only a worker marks a slot: the probe thread owns no connection and is
     // never what `workers_wedged` is asking about.
     let _occupied = exec.map(|(_, slot)| OnRequest::enter(slot));
@@ -1793,15 +1735,6 @@ fn handle(
                 let _ = req.respond(json_response(200, &sessions_report()));
                 (true, 200)
             }
-            // A Pilot sitting at its prompt is active even though it has no
-            // SQL request in flight. This route deliberately does no engine
-            // work and holds no lease; being a countable request is its whole
-            // job. When Pilot disappears, the pulses disappear too and the
-            // ordinary idle-exit clock reaps the berth.
-            (Method::Get, "/keepalive") => {
-                let _ = req.respond(json_response(200, r#"{"alive":true}"#));
-                (true, 200)
-            }
             // Fleet shutdown is authenticated and returns before the drain
             // begins. Running stop() on a fresh thread matters: this handler
             // is itself one of the workers stop() waits to join.
@@ -1880,9 +1813,6 @@ fn handle(
             t.elapsed().as_millis()
         );
     }
-    // The finish counts too (see idle_ms): a long statement resets the idle
-    // clock when it completes, not only when it began. `_inflight` drops on
-    // return — after respond(), so the whole stream was this request.
     keep_going
 }
 
@@ -1907,30 +1837,6 @@ impl<'a> OnRequest<'a> {
 impl Drop for OnRequest<'_> {
     fn drop(&mut self) {
         self.slot.run.lock().unwrap().request = None;
-    }
-}
-
-/// Marks a countable request in flight for the life of the value: increments
-/// on `enter`, decrements on drop, and touches the activity clock at both
-/// edges. Dropping on every path (return, `?`, panic) is the point.
-struct InFlight;
-
-impl InFlight {
-    fn enter() -> Self {
-        touch_activity();
-        INFLIGHT_REQUESTS.fetch_add(1, Ordering::SeqCst);
-        InFlight
-    }
-}
-
-impl Drop for InFlight {
-    fn drop(&mut self) {
-        // Saturating, so a request abandoned by one server instance whose
-        // guard drops after the next instance reset the counter to 0 can
-        // never underflow it (u64 wrap would leave quiet() false forever).
-        let _ = INFLIGHT_REQUESTS
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(1)));
-        touch_activity();
     }
 }
 
@@ -1961,7 +1867,7 @@ fn utc_now() -> String {
 fn route_exists(method: &Method, path: &str) -> bool {
     matches!(
         (method, path),
-        (Method::Get, "/ready" | "/sessions" | "/info" | "/catalog" | "/keepalive")
+        (Method::Get, "/ready" | "/sessions" | "/info" | "/catalog")
             | (Method::Delete, "/shutdown")
             | (Method::Post, "/sql" | "/sql/sessions/new")
     ) || (*method == Method::Delete

@@ -144,7 +144,6 @@ struct Opts {
     workers: usize,
     memory_limit: String,
     threads: Option<u32>,
-    idle_exit: Option<Duration>,
     init: Vec<String>,
     log: bool,
     unsigned: bool,
@@ -168,7 +167,6 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
         workers: harbor::DEFAULT_MAX_INFLIGHT,
         memory_limit: "2GB".into(),
         threads: None,
-        idle_exit: None,
         init: Vec::new(),
         log: false,
         unsigned: false,
@@ -195,7 +193,6 @@ fn parse_opts(rest: Vec<String>) -> Result<Opts, String> {
             "--workers" => o.workers = take("workers")?.parse().map_err(|_| "bad --workers")?,
             "--memory-limit" => o.memory_limit = take("memory-limit")?,
             "--threads" => o.threads = Some(take("threads")?.parse().map_err(|_| "bad --threads")?),
-            "--idle-exit" => o.idle_exit = Some(parse_duration(&take("idle-exit")?)?),
             "--init" => o.init.push(take("init")?),
             "--log" => o.log = true,
             "--unsigned" => o.unsigned = true,
@@ -471,7 +468,6 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         "pid": std::process::id(),
         // Pilot uses this to pulse comfortably inside the actual idle window.
         // null means this berth is permanent and needs no prompt heartbeat.
-        "idleExitMs": o.idle_exit.map(|d| d.as_millis() as u64),
     }));
 
     let started_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
@@ -486,7 +482,6 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         "duckdbVersion": duckdb_version,
         "startedAtMs": started_ms,
         // `show` marks a temp database with its idle window; null = permanent.
-        "idleExitMs": o.idle_exit.map(|d| d.as_millis() as u64),
     });
     let json_path = harbor_common::sidecar_file(&home, &o.name);
     let tmp = harbor_common::sidecar_file(&home, &o.name).with_extension("json.tmp");
@@ -503,26 +498,6 @@ fn serve(rest: Vec<String>) -> Result<(), String> {
         o.memory_limit
     );
 
-    // Temp berths: no countable requests AND no live sessions for the
-    // window → leave through the normal drain + CHECKPOINT door. Nothing
-    // cleverer than this on purpose — no refcounts, no control sockets.
-    if let Some(idle) = o.idle_exit {
-        let tick = idle
-            .div_f32(4.0)
-            .min(Duration::from_secs(5))
-            .max(Duration::from_millis(250));
-        std::thread::spawn(move || loop {
-            std::thread::sleep(tick);
-            if harbor::idle_ms() >= idle.as_millis() as u64 && harbor::quiet() {
-                eprintln!(
-                    "harbor: idle {}s with no sessions — exiting",
-                    idle.as_secs()
-                );
-                let _ = harbor::stop();
-                break;
-            }
-        });
-    }
 
     // Blocks until harbor_stop / SIGTERM / idle-exit finishes drain + CHECKPOINT.
     let farewell = harbor::wait()?;
@@ -842,12 +817,12 @@ fn entry_args(
     let mut v: Vec<String> = Vec::new();
     // A name is a service: absent an entry idle-exit it is persistent, and
     // no fleet-wide temp window has any say here.
-    let life = harbor_common::lifetime::resolve(
+    // Idle-exit is gone (0.20); the entry's value is validated, not emitted.
+    let _ = harbor_common::lifetime::resolve(
         c.idle_exit.as_deref(),
         None,
         harbor_common::Summoner::Operator,
     )?;
-    v.extend(life.to_args());
 
     let (threads, workers, port) = (
         c.threads.or(d.threads).map(|n| n.to_string()),
