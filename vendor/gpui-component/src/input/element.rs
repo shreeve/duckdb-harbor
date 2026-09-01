@@ -1491,12 +1491,20 @@ impl Element for TextElement {
         if let Some(line_numbers) = prepaint.line_numbers.as_ref() {
             offset_y += invisible_top_padding;
 
+            // DuckTable patch: ceil() the backdrop's top — the hairline
+            // law's fill side. A host seating content on the half pixel
+            // would otherwise have this column backdrop cover the
+            // bottom device px of the header band's border just above
+            // (the audit's "bizarre half-height" sliver between the "#"
+            // and row 1). Integer origins are untouched.
+            let backdrop_top = input_bounds.origin.y.ceil();
             window.paint_quad(fill(
                 Bounds {
-                    origin: input_bounds.origin,
+                    origin: point(input_bounds.origin.x, backdrop_top),
                     size: size(
                         prepaint.last_layout.line_number_width - LINE_NUMBER_RIGHT_MARGIN,
-                        input_bounds.size.height + prepaint.ghost_lines_height,
+                        input_bounds.size.height + prepaint.ghost_lines_height
+                            - (backdrop_top - input_bounds.origin.y),
                     ),
                 },
                 cx.theme().editor_background(),
@@ -1517,12 +1525,17 @@ impl Element for TextElement {
             // dressing (separators, hairlines) layers on inside the
             // loop.
             if let Some(gs) = &gutter {
-                let rp = point(
-                    input_bounds.origin.x + gs.left_inset,
-                    input_bounds.origin.y,
-                );
+                // ceil(): the hairline law again — the host seats the
+                // content on a half pixel, and a fill starting there
+                // would cover the bottom half of the header band's own
+                // border just above. The base never rises above the
+                // integer its origin rounds up to; integer origins are
+                // untouched.
+                let top = input_bounds.origin.y.ceil();
+                let rp = point(input_bounds.origin.x + gs.left_inset, top);
                 let rw = gs.width - gs.left_inset;
-                let rh = input_bounds.size.height + prepaint.ghost_lines_height;
+                let rh = input_bounds.size.height + prepaint.ghost_lines_height
+                    - (top - input_bounds.origin.y);
                 window.paint_quad(fill(Bounds::new(rp, size(rw, rh)), gs.background));
                 window.paint_quad(fill(
                     Bounds::new(
@@ -1574,10 +1587,21 @@ impl Element for TextElement {
                     // the border itself and the border-colored
                     // statement hairlines may touch it, so the mark
                     // stops one pixel short.
+                    // The mark fill spans BETWEEN the snapped boundary
+                    // lines (the hairline law: content on the half
+                    // pixel, lines on the integer grid) — a fill from
+                    // the raw row box would overpaint the bottom half
+                    // of the line above it (the audit's half-height
+                    // separators inside the marked statement).
+                    let row_top = (rp.y - px(1.)).round() + px(1.);
+                    let row_bot = (rp.y + height - px(1.)).round();
                     if let Some((mark, color)) = &send_mark {
                         if mark.contains(&row) {
                             window.paint_quad(fill(
-                                Bounds::new(rp, size(rw - px(1.), height)),
+                                Bounds::new(
+                                    point(rp.x, row_top),
+                                    size(rw - px(1.), row_bot - row_top),
+                                ),
                                 *color,
                             ));
                         }
@@ -1597,10 +1621,17 @@ impl Element for TextElement {
                         None => label > 0 && next_label != label + 1,
                     };
                     let begins_next = next_label == 1;
+                    // round(): the hairline law (see the fixed-top
+                    // paint below) — half-pixel content, integer
+                    // lines. Rounds the half up into the boundary row,
+                    // exactly where the data grids seat their row
+                    // separators; the mark fill above already stops at
+                    // this same edge.
+                    let line_y = row_bot;
                     if ends || begins_next {
                         window.paint_quad(fill(
                             Bounds::new(
-                                point(rp.x, rp.y + height - px(1.)),
+                                point(rp.x, line_y),
                                 size(full_w, px(1.)),
                             ),
                             gs.border,
@@ -1615,7 +1646,7 @@ impl Element for TextElement {
                         // dot at the junction).
                         window.paint_quad(fill(
                             Bounds::new(
-                                point(rp.x, rp.y + height - px(1.)),
+                                point(rp.x, line_y),
                                 size(rw - px(1.), px(1.)),
                             ),
                             gs.row_line,
@@ -1660,25 +1691,11 @@ impl Element for TextElement {
             }
         }
 
-        // DuckTable patch: the pane's top boundary — the header band's
-        // bottom edge — painted at the viewport's FIXED top, after the
-        // rows, so scrolling slides text under the line instead of
-        // carrying it away. At scroll-top these are the exact device
-        // pixels the first row's opening hairline would claim, so it
-        // is one line, never two. OUTSIDE the line-number block: the
-        // band's edge survives the rail being hidden (⌥7 off).
-        if let Some(gs) = self.state.read(cx).gutter_style.clone() {
-            window.paint_quad(fill(
-                Bounds::new(
-                    point(
-                        input_bounds.origin.x + gs.left_inset,
-                        input_bounds.origin.y,
-                    ),
-                    size(input_bounds.size.width - gs.left_inset, px(1.)),
-                ),
-                gs.border,
-            ));
-        }
+        // DuckTable patch (retired paint): the pane's top boundary is
+        // the header band's OWN border_b now (query.rs) — a paint here
+        // clips to the editor's half-pixel content bounds and renders
+        // half-height. Row 0 still draws no opening hairline (see the
+        // row loop), so the boundary stays one line, never two.
 
         self.state.update(cx, |state, cx| {
             state.last_layout = Some(prepaint.last_layout.clone());

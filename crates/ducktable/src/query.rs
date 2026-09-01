@@ -238,7 +238,10 @@ impl QueryView {
             text_size: px(crate::theme::GUTTER_TEXT),
             background: t.raised,
             row_line: t.grid_line,
-            border: t.border,
+            // The rail's edge, the band boundary, and the statement
+            // hairlines are all grid lines — the one slot (red-audit
+            // ruling, 2026-09-01).
+            border: t.grid_line,
         };
         let stale = {
             let e = editor.read(cx);
@@ -528,11 +531,18 @@ impl Render for QueryView {
                     .h(row_h)
                     .h_flex()
                     .items_center()
-                    // No bottom border of its own: the editor paints
-                    // the boundary at its viewport's fixed top — one
-                    // line, never two, and scrolling can't carry it
-                    // away (it would collide with the -0.5px overlap
-                    // here and render half-weight).
+                    // The band OWNS its bottom border, exactly like the
+                    // grids' header row — border inside row_h, so the
+                    // "#" centers in row_h minus the border px and the
+                    // line is full height by construction. (The editor
+                    // used to paint this boundary at its viewport top,
+                    // but that paint clips to the editor's half-pixel
+                    // content bounds — the audit's half-height band
+                    // line. The vendored fixed-top paint is retired;
+                    // the editor's row-0 top hairline stays suppressed,
+                    // so it is still one line, never two.)
+                    .border_b_1()
+                    .border_color(t.grid_line)
                     .bg({
                         use gpui_component::ActiveTheme as _;
                         cx.theme().table_head
@@ -551,12 +561,18 @@ impl Render for QueryView {
                             .h_flex()
                             .items_center()
                             .border_r_1()
-                            .border_color(t.border)
+                            .border_color(t.grid_line)
                             .child(
                                 div()
                                     .w_full()
                                     .text_right()
-                                    .pr(px(6.))
+                                    // 5, not 6: the grids' rail divider
+                                    // is a painted overlay taking no
+                                    // layout space, so their "#" ends
+                                    // 5px before the line; border_r_1
+                                    // here DOES take a px, and 6 would
+                                    // land the text 1px further left.
+                                    .pr(px(5.))
                                     .text_size(px(crate::theme::GUTTER_TEXT))
                                     .font_family(value_font())
                                     .text_color(t.muted)
@@ -578,8 +594,11 @@ impl Render for QueryView {
                     // Half a logical pixel up: the grids center row
                     // content in row_h minus the 1px bottom border,
                     // the editor in the full line box — this is the
-                    // difference, measured on screen. No bottom
-                    // padding: the rail runs all the way to the
+                    // difference, measured on screen. The editor's
+                    // hairlines do NOT ride the half pixel with the
+                    // text: the vendored paint snaps them to the
+                    // integer grid (element.rs "hairline law"). No
+                    // bottom padding: the rail runs all the way to the
                     // footer.
                     .mt(px(-0.5))
                     .font_family(value_font())

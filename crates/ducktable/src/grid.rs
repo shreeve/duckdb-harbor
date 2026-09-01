@@ -2295,9 +2295,14 @@ impl TableDelegate for GridDelegate {
                         // the number says so (plain digits, like Sheets).
                         .child(self.row_labels.get(row_ix).cloned().unwrap_or_default()),
                 )
-                // The gutter's divider is firmer than the data grid lines
-                // (design.css `.grid td.num`), so it is its own strip.
-                .child(div().absolute().right_0().top_0().bottom_0().w(px(1.)).bg(t.border))
+                // The gutter's divider strip, in the ONE grid-line
+                // color. The vendored Table used to draw its own
+                // fixed-region edge 1px beside this — the "two
+                // verticals" the red audit exposed (2026-09-01) — and
+                // half-occluded by the scrolling cells at that; the
+                // vendor edge is now silenced (state.rs patch) and this
+                // strip is the boundary's one owner.
+                .child(div().absolute().right_0().top_0().bottom_0().w(px(1.)).bg(t.grid_line))
                 .into_any_element();
         }
         // Display position -> schema index, through the visible map.
@@ -2468,7 +2473,7 @@ impl TableDelegate for GridDelegate {
                             .flex_none()
                             .px(px(5.))
                             .rounded(px(4.))
-                            .bg(t.grid_line.opacity(0.55))
+                            .bg(t.pill.opacity(0.55))
                             .text_size(px(TAG_TEXT * p.zoom_factor()))
                             .font_family(ui_font())
                             .text_color(t.muted.opacity(0.65))
@@ -2491,7 +2496,7 @@ impl TableDelegate for GridDelegate {
                                 .bg(if accent {
                                     t.accent.opacity(0.15)
                                 } else {
-                                    t.grid_line.opacity(0.55)
+                                    t.pill.opacity(0.55)
                                 })
                                 .text_size(px(TAG_TEXT * p.zoom_factor()))
                                 .font_family(ui_font())
@@ -2579,7 +2584,7 @@ impl TableDelegate for GridDelegate {
                         .text_color(t.muted)
                         .child("#"),
                 )
-                .child(edge(t.border))
+                .child(edge(t.grid_line))
                 .into_any_element();
         }
         let data_col =
@@ -2876,7 +2881,10 @@ impl Render for Grid {
                     // is raised, and two identical bands would merge.
                     .bg(t.strip)
                     .border_b_1()
-                    .border_color(t.border)
+                    // The grid's top frame line, so it reads the slot —
+                    // the title strip is chrome but this edge is the
+                    // grid's (the red audit's "not red", 2026-09-01).
+                    .border_color(t.grid_line)
                     .child(
                         // Semibold like the design proof's breadcrumb table
                         // name (`.crumb b`, weight 600).
@@ -2910,7 +2918,7 @@ impl Render for Grid {
                             // relationship the footer seg has to its bar.
                             .bg(t.surface)
                             .border_1()
-                            .border_color(t.grid_line)
+                            .border_color(t.pill)
                             .child(toggle_tile(
                                 "toggle-rows",
                                 "#",
@@ -2981,7 +2989,7 @@ impl Render for Grid {
                             .py_1()
                             .bg(t.raised)
                             .border_b_1()
-                            .border_color(t.border)
+                            .border_color(t.grid_line)
                             .child(
                                 div()
                                     .flex_none()

@@ -167,7 +167,10 @@ impl Grid {
             .pr(px(10.))
             .bg(t.raised)
             .border_t_1()
-            .border_color(t.border)
+            // The pane's bottom frame line — the grid-line slot, like
+            // every line that frames the data surface (red-audit
+            // ruling, 2026-09-01).
+            .border_color(t.grid_line)
             .child(
                 // design.css `.seg`: the active fill runs flush to the
                 // track's edges. gpui does not clip child backgrounds to

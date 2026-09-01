@@ -888,7 +888,10 @@ where
             .h(self.options.size.table_row_height())
             .flex_shrink_0()
             .border_b_1()
-            .border_color(cx.theme().border)
+            // DuckTable patch: the header's bottom hairline is a grid
+            // line, so it reads the grid-line slot (table_row_border),
+            // not the chrome border — one hairline color.
+            .border_color(cx.theme().table_row_border)
             .text_color(cx.theme().table_head_foreground)
             .refine_style(&style)
             .when(left_columns_count > 0, |this| {
@@ -915,9 +918,12 @@ where
                                 .right_0()
                                 .bottom_0()
                                 .w_0()
-                                .flex_shrink_0()
-                                .border_r_1()
-                                .border_color(cx.theme().border),
+                                .flex_shrink_0(),
+                                // DuckTable patch: no fixed-region edge
+                                // — the host's gutter cells draw this
+                                // boundary (one line, one owner); the
+                                // vendor's rendered half-occluded by
+                                // the scrolling cells painted after it.
                         )
                         .child(
                             canvas(
@@ -1025,9 +1031,9 @@ where
                                     .right_0()
                                     .bottom_0()
                                     .w_0()
-                                    .flex_shrink_0()
-                                    .border_r_1()
-                                    .border_color(cx.theme().border),
+                                    .flex_shrink_0(),
+                                    // DuckTable patch: no fixed-region
+                                    // edge — see the head divider note.
                             ),
                     )
                 })

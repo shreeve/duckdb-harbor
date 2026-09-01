@@ -105,10 +105,15 @@ impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
         window.with_element_state(id.unwrap(), |state, window| {
             let state = state.unwrap_or(ResizeHandleState::default());
 
+            // DuckTable patch: a divider handle's resting line is a
+            // grid/pane line, so it reads the grid-line slot
+            // (table_row_border) — one hairline color everywhere
+            // (sidebar, inspector, query split, structure split). The
+            // active drag color stays the theme's own.
             let bg_color = if state.is_active() {
                 cx.theme().drag_border
             } else {
-                cx.theme().border
+                cx.theme().table_row_border
             };
 
             let mut el = div()

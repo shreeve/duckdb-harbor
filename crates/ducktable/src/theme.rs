@@ -55,6 +55,12 @@ pub struct Pal {
     pub row_active: Hsla,
     pub row_hover: Hsla,
     pub grid_line: Hsla,
+    /// The soft fill for tag pills (NULL, NOT NULL) and small control
+    /// chassis — the component theme's original table_row_border,
+    /// captured BEFORE apply() overrides that color to the grid-line
+    /// slot. Pills are surfaces, not lines: they must not follow the
+    /// hairline color.
+    pub pill: Hsla,
 }
 
 impl gpui::Global for Pal {}
@@ -91,7 +97,14 @@ fn compute_pal(cx: &App) -> Pal {
         row_selected: t.list_active,
         row_active: t.primary.opacity(if t.background.l < 0.5 { 0.17 } else { 0.10 }),
         row_hover: t.list_hover,
-        grid_line: t.table_row_border,
+        // ONE hairline color, exactly (Steve's ruling, 2026-09-01): the
+        // chrome border, so every line in the app — grid mesh, rail,
+        // frames, divider handles — is literally the same color. Proven
+        // by the red audit: paint this slot #FF0000 and every hairline
+        // must scream; any line that doesn't is drawing from somewhere
+        // else and needs to be routed here.
+        grid_line: t.border,
+        pill: t.table_row_border,
     }
 }
 
@@ -170,6 +183,12 @@ fn apply(config: &Rc<ThemeConfig>, cx: &mut App) {
     theme.mode = config.mode;
     theme.apply_config(config);
     cx.set_global(compute_pal(cx));
+    // The vendored Table paints its own row separators from
+    // table_row_border, ON TOP of the grid's cell borders — the actual
+    // source of the old two-tone mesh. One hairline color means the
+    // component reads the same slot the grid does. Overridden AFTER
+    // compute_pal captured the original for the pills' soft fill.
+    Theme::global_mut(cx).colors.table_row_border = pal(cx).grid_line;
 }
 
 pub fn current_name(cx: &App) -> String {
