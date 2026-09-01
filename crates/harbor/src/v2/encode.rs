@@ -13,8 +13,9 @@
 use super::ffi;
 use super::{Error, str_view};
 use crate::encode::{
-    base64, bit_string, civil_from_days, fmt_date, fmt_time, push_float, push_float32,
-    push_fraction, push_int, push_json_string, quote_identifier, split_time, uuid_to_string,
+    civil_from_days, digit_pair, push_base64, push_bit_string, push_date, push_float,
+    push_float32, push_fraction, push_i64_raw, push_int, push_int_pad, push_json_string,
+    push_time, push_u128_raw, push_u64_raw, push_uuid, quote_identifier, split_time,
     varint_to_decimal,
 };
 
@@ -511,12 +512,12 @@ fn emit(
             LOGICAL_TYPE_ID_BOOLEAN => {
                 out.push_str(if r.get::<u8>(phys) != 0 { "true" } else { "false" })
             }
-            LOGICAL_TYPE_ID_TINYINT => out.push_str(&r.get::<i8>(phys).to_string()),
-            LOGICAL_TYPE_ID_SMALLINT => out.push_str(&r.get::<i16>(phys).to_string()),
-            LOGICAL_TYPE_ID_INTEGER => out.push_str(&r.get::<i32>(phys).to_string()),
-            LOGICAL_TYPE_ID_UTINYINT => out.push_str(&r.get::<u8>(phys).to_string()),
-            LOGICAL_TYPE_ID_USMALLINT => out.push_str(&r.get::<u16>(phys).to_string()),
-            LOGICAL_TYPE_ID_UINTEGER => out.push_str(&r.get::<u32>(phys).to_string()),
+            LOGICAL_TYPE_ID_TINYINT => push_i64_raw(out, r.get::<i8>(phys) as i64),
+            LOGICAL_TYPE_ID_SMALLINT => push_i64_raw(out, r.get::<i16>(phys) as i64),
+            LOGICAL_TYPE_ID_INTEGER => push_i64_raw(out, r.get::<i32>(phys) as i64),
+            LOGICAL_TYPE_ID_UTINYINT => push_u64_raw(out, r.get::<u8>(phys) as u64),
+            LOGICAL_TYPE_ID_USMALLINT => push_u64_raw(out, r.get::<u16>(phys) as u64),
+            LOGICAL_TYPE_ID_UINTEGER => push_u64_raw(out, r.get::<u32>(phys) as u64),
             LOGICAL_TYPE_ID_BIGINT => push_int(out, r.get::<i64>(phys) as i128),
             LOGICAL_TYPE_ID_UBIGINT => push_int(out, r.get::<u64>(phys) as i128),
             LOGICAL_TYPE_ID_HUGEINT => push_int(out, hugeint(r.get(phys))),
@@ -525,9 +526,11 @@ fn emit(
                 let v = (h.upper as u128) << 64 | h.lower as u128;
                 // Same JSON-safe rule as push_int, on the unsigned side.
                 if v <= 9_007_199_254_740_991u128 {
-                    out.push_str(&v.to_string());
+                    push_u128_raw(out, v);
                 } else {
-                    push_json_string(out, &v.to_string());
+                    out.push('"');
+                    push_u128_raw(out, v);
+                    out.push('"');
                 }
             }
             LOGICAL_TYPE_ID_FLOAT => push_float32(out, r.get::<f32>(phys)),
@@ -539,62 +542,114 @@ fn emit(
                     ..=18 => r.get::<i64>(phys) as i128,
                     _ => hugeint(r.get(phys)),
                 };
-                push_json_string(out, &decimal_string(v, ty.decimal.1));
+                // Sign, digits, and a dot need no JSON escaping.
+                out.push('"');
+                push_decimal(out, v, ty.decimal.1);
+                out.push('"');
             }
             LOGICAL_TYPE_ID_VARCHAR => {
                 push_json_string(out, &String::from_utf8_lossy(bytes(r, phys)))
             }
-            LOGICAL_TYPE_ID_BLOB => push_json_string(out, &base64(bytes(r, phys))),
-            LOGICAL_TYPE_ID_BIT => push_json_string(out, &bit_string(bytes(r, phys))),
+            // BLOB/BIT/BIGNUM/UUID and the temporal types below all render
+            // into JSON-safe alphabets (base64, digits, hex, 0/1, ISO
+            // punctuation), so the quotes are the whole encoding — no escape
+            // scan, no intermediate String.
+            LOGICAL_TYPE_ID_BLOB => {
+                out.push('"');
+                push_base64(out, bytes(r, phys));
+                out.push('"');
+            }
+            LOGICAL_TYPE_ID_BIT => {
+                out.push('"');
+                push_bit_string(out, bytes(r, phys));
+                out.push('"');
+            }
             LOGICAL_TYPE_ID_BIGNUM => {
                 let b = bytes(r, phys);
                 match varint_to_decimal(b) {
                     Some(digits) => match digits.parse::<i128>() {
                         Ok(v) => push_int(out, v),
-                        Err(_) => push_json_string(out, &digits),
+                        Err(_) => {
+                            out.push('"');
+                            out.push_str(&digits);
+                            out.push('"');
+                        }
                     },
-                    None => push_json_string(out, &base64(b)),
+                    None => {
+                        out.push('"');
+                        push_base64(out, b);
+                        out.push('"');
+                    }
                 }
             }
-            LOGICAL_TYPE_ID_UUID => push_json_string(out, &uuid_to_string(hugeint(r.get(phys)))),
-            LOGICAL_TYPE_ID_DATE => push_json_string(out, &fmt_date(r.get::<i32>(phys))),
+            LOGICAL_TYPE_ID_UUID => {
+                out.push('"');
+                push_uuid(out, hugeint(r.get(phys)));
+                out.push('"');
+            }
+            LOGICAL_TYPE_ID_DATE => {
+                out.push('"');
+                push_date(out, r.get::<i32>(phys));
+                out.push('"');
+            }
             LOGICAL_TYPE_ID_TIME => {
-                push_json_string(out, &fmt_time(r.get::<i64>(phys) as i128 * 1_000))
+                out.push('"');
+                push_time(out, r.get::<i64>(phys) as i128 * 1_000);
+                out.push('"');
             }
             LOGICAL_TYPE_ID_TIME_NS => {
-                push_json_string(out, &fmt_time(r.get::<i64>(phys) as i128))
+                out.push('"');
+                push_time(out, r.get::<i64>(phys) as i128);
+                out.push('"');
             }
             // The stored value packs microseconds-since-midnight above a
             // 24-bit UTC offset. The wire keeps v1's shape — the local time,
             // offset dropped — and the schema line says so.
             LOGICAL_TYPE_ID_TIME_TZ => {
                 let packed: u64 = r.get(phys);
-                push_json_string(out, &fmt_time((packed >> 24) as i128 * 1_000));
+                out.push('"');
+                push_time(out, (packed >> 24) as i128 * 1_000);
+                out.push('"');
             }
             LOGICAL_TYPE_ID_TIMESTAMP_SEC => {
-                push_json_string(out, &fmt_ts(r.get::<i64>(phys) as i128 * 1_000_000_000, true, false))
+                out.push('"');
+                push_ts(out, r.get::<i64>(phys) as i128 * 1_000_000_000, true, false);
+                out.push('"');
             }
             LOGICAL_TYPE_ID_TIMESTAMP_MS => {
-                push_json_string(out, &fmt_ts(r.get::<i64>(phys) as i128 * 1_000_000, false, false))
+                out.push('"');
+                push_ts(out, r.get::<i64>(phys) as i128 * 1_000_000, false, false);
+                out.push('"');
             }
             LOGICAL_TYPE_ID_TIMESTAMP => {
-                push_json_string(out, &fmt_ts(r.get::<i64>(phys) as i128 * 1_000, false, false))
+                out.push('"');
+                push_ts(out, r.get::<i64>(phys) as i128 * 1_000, false, false);
+                out.push('"');
             }
             LOGICAL_TYPE_ID_TIMESTAMP_NS => {
-                push_json_string(out, &fmt_ts(r.get::<i64>(phys) as i128, false, false))
+                out.push('"');
+                push_ts(out, r.get::<i64>(phys) as i128, false, false);
+                out.push('"');
             }
             LOGICAL_TYPE_ID_TIMESTAMP_TZ => {
-                push_json_string(out, &fmt_ts(r.get::<i64>(phys) as i128 * 1_000, false, true))
+                out.push('"');
+                push_ts(out, r.get::<i64>(phys) as i128 * 1_000, false, true);
+                out.push('"');
             }
             LOGICAL_TYPE_ID_TIMESTAMP_TZ_NS => {
-                push_json_string(out, &fmt_ts(r.get::<i64>(phys) as i128, false, true))
+                out.push('"');
+                push_ts(out, r.get::<i64>(phys) as i128, false, true);
+                out.push('"');
             }
             LOGICAL_TYPE_ID_INTERVAL => {
                 let iv: ffi::interval_t = r.get(phys);
-                out.push_str(&format!(
-                    r#"{{"months":{},"days":{},"micros":"{}"}}"#,
-                    iv.months, iv.days, iv.micros
-                ));
+                out.push_str(r#"{"months":"#);
+                push_i64_raw(out, iv.months as i64);
+                out.push_str(r#","days":"#);
+                push_i64_raw(out, iv.days as i64);
+                out.push_str(r#","micros":""#);
+                push_i64_raw(out, iv.micros);
+                out.push_str("\"}");
             }
             LOGICAL_TYPE_ID_ENUM => {
                 let idx = match ty.enum_values.len() {
@@ -735,39 +790,81 @@ unsafe fn bytes<'a>(r: &'a Reader, phys: usize) -> &'a [u8] {
 
 /// rust_decimal's Display, reproduced: sign, integer digits, and exactly
 /// `scale` fractional digits when scale is nonzero.
-fn decimal_string(v: i128, scale: u8) -> String {
-    let neg = v < 0;
+fn push_decimal(out: &mut String, v: i128, scale: u8) {
+    if v < 0 {
+        out.push('-');
+    }
     let abs = v.unsigned_abs();
     if scale == 0 {
-        return format!("{}{}", if neg { "-" } else { "" }, abs);
+        return push_u128_raw(out, abs);
     }
     let p = 10u128.pow(scale as u32);
-    format!(
-        "{}{}.{:0width$}",
-        if neg { "-" } else { "" },
-        abs / p,
-        abs % p,
-        width = scale as usize
-    )
+    push_u128_raw(out, abs / p);
+    out.push('.');
+    // The fraction, zero-padded to exactly `scale` digits.
+    let mut buf = [b'0'; 39];
+    let mut x = abs % p;
+    let mut i = buf.len();
+    while x > 0 {
+        i -= 1;
+        buf[i] = b'0' + (x % 10) as u8;
+        x /= 10;
+    }
+    let start = buf.len() - scale as usize;
+    // Safety: the slice holds only ASCII digits.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[start..]) });
 }
 
 /// src/encode.rs fmt_timestamp, minus its duckdb-rs TimeUnit parameter:
 /// `seconds_only` suppresses the fraction (TIMESTAMP_S), `zulu` appends the
 /// timezone marker.
-fn fmt_ts(nanos: i128, seconds_only: bool, zulu: bool) -> String {
-    let day = 86_400_000_000_000i128;
-    let days = nanos.div_euclid(day);
-    let rest = nanos.rem_euclid(day);
-    let (y, m, d) = civil_from_days(days as i64);
+fn push_ts(out: &mut String, nanos: i128, seconds_only: bool, zulu: bool) {
+    const DAY: i64 = 86_400_000_000_000;
+    // Micros × 1000 can spill past i64 — hence the i128 signature — but
+    // almost never does, and 128-bit div_euclid costs an order of magnitude
+    // more than the 64-bit one.
+    let (days, rest) = match i64::try_from(nanos) {
+        Ok(n) => (n.div_euclid(DAY), n.rem_euclid(DAY)),
+        Err(_) => (nanos.div_euclid(DAY as i128) as i64, nanos.rem_euclid(DAY as i128) as i64),
+    };
+    let (y, m, d) = civil_from_days(days);
     let (h, min, s, frac) = split_time(rest);
-    let mut out = format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}");
+    if (0..=9999).contains(&y) {
+        // The common era: one 19-byte write instead of eleven small ones.
+        let mut b = [0u8; 19];
+        b[0..2].copy_from_slice(&digit_pair(y as usize / 100));
+        b[2..4].copy_from_slice(&digit_pair(y as usize % 100));
+        b[4] = b'-';
+        b[5..7].copy_from_slice(&digit_pair(m as usize));
+        b[7] = b'-';
+        b[8..10].copy_from_slice(&digit_pair(d as usize));
+        b[10] = b'T';
+        b[11..13].copy_from_slice(&digit_pair(h as usize));
+        b[13] = b':';
+        b[14..16].copy_from_slice(&digit_pair(min as usize));
+        b[16] = b':';
+        b[17..19].copy_from_slice(&digit_pair(s as usize));
+        // Safety: the buffer holds only ASCII digits and punctuation.
+        out.push_str(unsafe { std::str::from_utf8_unchecked(&b) });
+    } else {
+        push_int_pad(out, y, 4);
+        out.push('-');
+        push_int_pad(out, m as i64, 2);
+        out.push('-');
+        push_int_pad(out, d as i64, 2);
+        out.push('T');
+        push_int_pad(out, h, 2);
+        out.push(':');
+        push_int_pad(out, min, 2);
+        out.push(':');
+        push_int_pad(out, s, 2);
+    }
     if !seconds_only {
-        push_fraction(&mut out, frac);
+        push_fraction(out, frac);
     }
     if zulu {
         out.push('Z');
     }
-    out
 }
 
 /// The engine's text rendering of a value, via the sized two-call protocol.

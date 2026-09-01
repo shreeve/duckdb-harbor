@@ -396,13 +396,76 @@ pub struct Stream {
 impl Stream {
     /// The next chunk, or None at end-of-stream. An interrupted query
     /// surfaces here as ERROR_RUNTIME_INTERRUPT.
+    ///
+    /// Driven through result_step rather than result_fetch_chunk. The
+    /// blocking fetch parks in the engine's Executor::WaitForTask whenever
+    /// the stream buffer is momentarily empty — a bounded condition wait
+    /// (20ms) that is only signalled on task reschedule, not on
+    /// chunk-became-ready. A consumer that encodes faster than the engine
+    /// produces hits that nap once per chunk and a cheap query spends more
+    /// wall time asleep than working. Stepping keeps the loop in our hands:
+    /// each step runs engine work on this thread when there is any, and a
+    /// short yield spin bridges the sub-millisecond gaps while a background
+    /// pipeline finishes the next chunk. Only when the gap outlives the
+    /// spin — a genuinely slow producer — does it fall back to the engine's
+    /// own bounded wait, so nothing busy-loops on a long-running query.
     pub fn next_chunk(&mut self) -> Result<Option<Chunk>, Error> {
+        let api = &self.eng.api;
+        let (Some(step), Some(wait)) = (api.result_step, api.result_wait) else {
+            return self.next_chunk_blocking();
+        };
+        let mut yields = 0u32;
+        loop {
+            let mut chunk: ffi::data_chunk_handle = std::ptr::null_mut();
+            let mut status: ffi::RESULT_STEP_STATUS = ffi::RESULT_STEP_STATUS_WAITING;
+            let mut err: ffi::error_info_handle = std::ptr::null_mut();
+            let code = unsafe { step(self.result, &mut chunk, &mut status, &mut err) };
+            if code != ffi::ERROR_NONE {
+                return Err(Error::take(api, code, err));
+            }
+            match status {
+                ffi::RESULT_STEP_STATUS_CHUNK => return self.sized(chunk),
+                ffi::RESULT_STEP_STATUS_FINISHED => return Ok(None),
+                // The same shape result_fetch_chunk reports for a cancelled
+                // query: the code the callers key on, with the engine's
+                // rendering of the InterruptException it would have thrown.
+                ffi::RESULT_STEP_STATUS_CANCELLED => {
+                    return Err(Error {
+                        code: ffi::ERROR_RUNTIME_INTERRUPT,
+                        message: "INTERRUPT Error: Interrupted!".to_string(),
+                    });
+                }
+                _ => {
+                    if yields < 64 {
+                        yields += 1;
+                        std::thread::yield_now();
+                    } else {
+                        let mut err: ffi::error_info_handle = std::ptr::null_mut();
+                        let code = unsafe { wait(self.result, &mut err) };
+                        if code != ffi::ERROR_NONE {
+                            return Err(Error::take(api, code, err));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The engine's own blocking fetch, for a build whose v2 surface lacks
+    /// step/wait.
+    fn next_chunk_blocking(&mut self) -> Result<Option<Chunk>, Error> {
         let api = &self.eng.api;
         let mut chunk: ffi::data_chunk_handle = std::ptr::null_mut();
         call!(api, result_fetch_chunk(self.result, &mut chunk));
         if chunk.is_null() {
             return Ok(None);
         }
+        self.sized(chunk)
+    }
+
+    /// Wrap a non-null chunk handle with its row count.
+    fn sized(&self, mut chunk: ffi::data_chunk_handle) -> Result<Option<Chunk>, Error> {
+        let api = &self.eng.api;
         let mut rows: ffi::idx_t = 0;
         let sized = (|| -> Result<(), Error> {
             call!(api, data_chunk_get_size(chunk, &mut rows));
