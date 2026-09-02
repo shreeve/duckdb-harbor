@@ -38,7 +38,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: ~/duckdb-engine
-        key: duckdb-libduckdb-${{ runner.os }}-${{ steps.pin.outputs.sha }}
+        key: duckdb-libduckdb-${{ runner.os }}-${{ steps.pin.outputs.sha }}-icu-json
 
     - name: Build libduckdb at the pin (cache miss only)
       if: steps.engine.outputs.cache-hit != 'true'
@@ -56,9 +56,15 @@ runs:
         git checkout -q FETCH_HEAD
         # OVERRIDE_GIT_DESCRIBE: a shallow, tagless clone gives `git describe`
         # nothing, so the engine would report a bogus version string.
+        # CORE_EXTENSIONS: icu and json ride INSIDE libduckdb. The stack
+        # depends on both (rip's ORM stamps timestamps through
+        # timezone(), an icu function), and a custom-pinned engine can
+        # never autoload them — the extension repos only carry official
+        # versions, so a missing extension is an unfixable runtime error.
         cmake -G Ninja -B build \
           -DCMAKE_BUILD_TYPE=Release \
           -DOVERRIDE_GIT_DESCRIBE=v2.0.0-dev83323 \
+          -DCORE_EXTENSIONS='icu;json' \
           -DBUILD_SHELL=FALSE -DBUILD_UNITTESTS=FALSE >/dev/null
         cmake --build build --target duckdb -j "$(nproc)"
         mkdir -p "$HOME/duckdb-engine"

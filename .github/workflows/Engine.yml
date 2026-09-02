@@ -90,9 +90,13 @@ jobs:
           git fetch -q --depth 1 origin "$PIN"
           git checkout -q FETCH_HEAD
           export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+          # CORE_EXTENSIONS: icu and json ride INSIDE libduckdb — a
+          # custom-pinned engine can never autoload them (see the
+          # duckdb action, the recipe this mirrors).
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DOVERRIDE_GIT_DESCRIBE="$DESCRIBE" \
+            -DCORE_EXTENSIONS='icu;json' \
             -DBUILD_SHELL=TRUE -DBUILD_UNITTESTS=FALSE
           cmake --build build --config Release
 
