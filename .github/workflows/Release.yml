@@ -100,9 +100,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           sha256sum harbor-*.tar.gz harbor-*.zip > "harbor-$GITHUB_REF_NAME-checksums.txt"
+          # --latest explicitly: DuckTable releases share this repo under
+          # ducktable-v* tags, and install.sh resolves the /releases/latest
+          # redirect — that pointer must always be a harbor release.
           gh release create "$GITHUB_REF_NAME" *.tar.gz *.zip \
             "harbor-$GITHUB_REF_NAME-checksums.txt" \
             --repo "$GITHUB_REPOSITORY" --title "harbor $GITHUB_REF_NAME" \
+            --latest \
             --notes "Self-contained harbor releases, version-locked to \
           one DuckDB v2 nightly. Unix archives carry libduckdb and install.sh; \
           Windows archives carry duckdb.dll beside the binary. \

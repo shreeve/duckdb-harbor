@@ -1,9 +1,10 @@
 #!/bin/sh
-# Installs DuckTable.app from the latest GitHub release — no signing, no
-# ceremony. curl never sets macOS's quarantine attribute, so the app opens
-# on first launch, and the binary already carries cargo's ad-hoc signature.
+# Installs DuckTable.app from the newest ducktable-v* GitHub release — no
+# signing, no ceremony. curl never sets macOS's quarantine attribute, so the
+# app opens on first launch, and the binary already carries cargo's ad-hoc
+# signature.
 #
-#   curl -fsSL https://raw.githubusercontent.com/shreeve/ducktable/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/ducktable/scripts/install.sh | bash
 set -e
 
 # Color only when stdout is a terminal, and never against NO_COLOR.
@@ -24,15 +25,20 @@ fail() { printf "${Red}error${Color_Off}: %s\n" "$*" >&2; exit 1; }
     exit 1
 }
 
-# The release asset keeps one name, so "latest" is a stable URL forever.
-url="https://github.com/shreeve/ducktable/releases/latest/download/DuckTable.zip"
+# DuckTable shares its repo with harbor, and the repo's "latest" release is
+# harbor's — so resolve the newest ducktable-v* tag by name. The asset keeps
+# one name, so the tag is all that varies.
+tag=$(curl -fsSL "https://api.github.com/repos/shreeve/duckdb-harbor/releases?per_page=50" \
+      | grep -o '"tag_name": *"ducktable-v[^"]*"' | head -1 | cut -d'"' -f4)
+[ -n "$tag" ] || fail "could not find a ducktable-v* release"
+url="https://github.com/shreeve/duckdb-harbor/releases/download/$tag/DuckTable.zip"
 dest="/Applications"
 [ -w "$dest" ] || dest="$HOME/Applications"
 mkdir -p "$dest"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-info "DuckTable (latest release, Apple Silicon)"
+info "DuckTable ($tag, Apple Silicon)"
 curl -fSL --progress-bar "$url" -o "$tmp/DuckTable.zip"
 # ditto, not unzip: it preserves the bundle exactly as it was archived.
 ditto -x -k "$tmp/DuckTable.zip" "$tmp"

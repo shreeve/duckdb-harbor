@@ -6,7 +6,7 @@ members = ["crates/ducktable", "crates/duckdb-lang", "crates/harbor-client"]
 version = "0.10.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/shreeve/ducktable"
+repository = "https://github.com/shreeve/duckdb-harbor"
 
 [workspace.dependencies]
 gpui = "0.2.2"

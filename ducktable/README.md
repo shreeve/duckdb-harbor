@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/shreeve/ducktable/raw/main/social-ducktable.png" alt="DuckTable" width="600">
+  <img src="social-ducktable.png" alt="DuckTable" width="600">
 </p>
 
 # DuckTable
@@ -22,25 +22,25 @@ shot for full resolution.
 and the table's DDL below, drawn as the engine would write it. *(Duck
 Light theme.)*
 
-[![Structure view](https://raw.githubusercontent.com/shreeve/ducktable/main/docs/shots/01-structure.png)](https://raw.githubusercontent.com/shreeve/ducktable/main/docs/shots/01-structure.png)
+[![Structure view](docs/shots/01-structure.png)](docs/shots/01-structure.png)
 
 **Data** — 27k rows paged 5,000 at a time in 28ms, with row numbers,
 right-aligned numerics, and NULL tags each one keystroke away. *(Paper
 theme.)*
 
-[![Data view](https://raw.githubusercontent.com/shreeve/ducktable/main/docs/shots/02-data.png)](https://raw.githubusercontent.com/shreeve/ducktable/main/docs/shots/02-data.png)
+[![Data view](docs/shots/02-data.png)](docs/shots/02-data.png)
 
 **Query** — a SQL scratchpad above live results. Statements wear bands
 in the gutter, line numbers restart per statement to match the engine's
 own `LINE n` diagnostics, and ⌘Enter sends the statement under the
 caret. *(Midnight theme.)*
 
-[![Query view](https://raw.githubusercontent.com/shreeve/ducktable/main/docs/shots/03-query.png)](https://raw.githubusercontent.com/shreeve/ducktable/main/docs/shots/03-query.png)
+[![Query view](docs/shots/03-query.png)](docs/shots/03-query.png)
 
 ## Install
 
 ```console
-$ curl -fsSL https://raw.githubusercontent.com/shreeve/ducktable/main/scripts/install.sh | sh
+$ curl -fsSL https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/ducktable/scripts/install.sh | bash
 ```
 
 One command, Apple Silicon, no Gatekeeper dialog — the script drops

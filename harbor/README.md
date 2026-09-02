@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/shreeve/duckdb-harbor/raw/main/duckdb-harbor-social.png" alt="DuckDB Harbor" width="600">
+  <img src="duckdb-harbor-social.png" alt="DuckDB Harbor" width="600">
 </p>
 
 # duckdb-harbor
@@ -567,8 +567,8 @@ answer HTTP clients and other DuckDB instances over one file at once. Harbor
 ships no extension of its own — whatever `LOAD` resolves by name in `~/.duckdb`
 is what it gets, matching that to the loaded engine is the operator's call, and
 Harbor does not patch extension source while loading it. For a desktop face on
-Harbor servers, [DuckTable](https://github.com/shreeve/ducktable) is the
-native client.
+Harbor servers, [DuckTable](../ducktable/) is the
+native client, developed in this repository beside harbor.
 
 ## Known limitations
 

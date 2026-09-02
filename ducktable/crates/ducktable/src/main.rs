@@ -165,7 +165,7 @@ fn about(window: &mut Window, cx: &mut App) {
     );
     cx.spawn(async move |cx| {
         if answer.await == Ok(1) {
-            cx.update(|cx| cx.open_url("https://github.com/shreeve/ducktable")).ok();
+            cx.update(|cx| cx.open_url("https://github.com/shreeve/duckdb-harbor")).ok();
         }
     })
     .detach();
