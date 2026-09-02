@@ -472,6 +472,55 @@ impl DuckTable {
         .detach();
     }
 
+    /// File→Open and drag-drop land here: connect to a database FILE the
+    /// picker or the drop named. No config entry needed — the path is the
+    /// target — and the flow is `connect`'s exactly: current content keeps
+    /// rendering, the pane swaps in one frame when the outcome lands, and
+    /// the refresh that follows shows the server under its own /info name.
+    /// This is the trunk the open-anything dispatcher (CSV, Parquet,
+    /// Sheets URLs…) grows from later; today it speaks .duckdb.
+    pub(crate) fn open_path(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        let shown = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.attempt += 1;
+        let fence = self.attempt;
+        self.connecting = Some(clone_str(&shown));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let target = path.clone();
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    let conn = fleet::connect_path(&target)?;
+                    let info = fleet::info(&conn)?;
+                    let catalog = harbor_client::catalog(&conn)?;
+                    Ok::<_, String>((conn, info, catalog))
+                })
+                .await;
+            this.update(cx, |state, cx| {
+                if state.attempt != fence {
+                    return;
+                }
+                state.connecting = None;
+                state.selected_table = None;
+                state.grid = None;
+                state.query = None;
+                state.staged.clear();
+                state.select_seq += 1;
+                state.phase = match outcome {
+                    Ok((conn, info, catalog)) => Phase::Connected { conn, info, catalog },
+                    Err(message) => Phase::Failed { name: clone_str(&shown), message },
+                };
+                state.refresh(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Abort the in-flight connect. The current phase never changed, so
     /// whatever was on screen simply stays (a cancelled connect is not a
     /// failed connect).

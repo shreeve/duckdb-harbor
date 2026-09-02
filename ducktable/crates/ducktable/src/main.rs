@@ -27,7 +27,7 @@ actions!(
     [
         ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset, FitColumns, TablePrev,
         TableNext, View1, View2, View3, ToggleFullScreen, ToggleRowNumbers, ToggleRightAlign,
-        ToggleNullTags
+        ToggleNullTags, OpenDatabase
     ]
 );
 
@@ -111,6 +111,14 @@ fn app_menus() -> Vec<Menu> {
                 MenuItem::action("About DuckTable", About),
                 MenuItem::separator(),
                 MenuItem::action("Quit DuckTable", Quit),
+            ],
+        },
+        Menu {
+            name: "File".into(),
+            items: vec![
+                // The platform picker, then the same door a drop uses.
+                // ⌘O advertises itself from the keymap binding.
+                MenuItem::action("Open Database…", OpenDatabase),
             ],
         },
         // macOS shows each item's key equivalent from the keymap, so this
@@ -217,6 +225,14 @@ impl Render for DuckTable {
             .on_action(cx.listener(|_, _: &ToggleInspector, _, cx| {
                 prefs::toggle(cx, |p| p.inspector = !p.inspector);
             }))
+            // Drop a database file anywhere on the window: the same door
+            // as File→Open. First path wins — a multi-file drop opening N
+            // databases would be N-1 surprises.
+            .on_drop(cx.listener(|this, dropped: &ExternalPaths, _, cx| {
+                if let Some(path) = dropped.paths().first().cloned() {
+                    this.open_path(path, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &FitColumns, _, cx| {
                 if let Some(grid) = &this.grid {
                     grid.update(cx, |grid, cx| grid.fit_columns(cx));
@@ -296,6 +312,7 @@ fn main() {
         prefs::init(cx);
         cx.bind_keys([
             KeyBinding::new("cmd-i", ToggleInspector, None),
+            KeyBinding::new("cmd-o", OpenDatabase, None),
             KeyBinding::new("cmd-q", Quit, None),
             // Cmd-Plus arrives as cmd-= (unshifted) or cmd-shift-= — bind
             // both, the way browsers treat the pair.
@@ -323,6 +340,35 @@ fn main() {
             KeyBinding::new("cmd-8", ToggleRightAlign, None),
             KeyBinding::new("cmd-9", ToggleNullTags, None),
         ]);
+        // File→Open: the platform picker, then app.open_path — the same
+        // door a drag-drop uses. .duckdb is what it speaks today; the
+        // open-anything dispatcher (CSV, Parquet, Sheets URLs…) grows on
+        // this trunk. The picker offers no extension filter (gpui's
+        // PathPromptOptions has none), and none is enforced here: a wrong
+        // file fails honestly in the connect card with harbor's own error.
+        cx.on_action(|_: &OpenDatabase, cx| {
+            let rx = cx.prompt_for_paths(PathPromptOptions {
+                files: true,
+                directories: false,
+                multiple: false,
+                prompt: Some("Open".into()),
+            });
+            cx.spawn(async move |cx| {
+                if let Ok(Ok(Some(mut paths))) = rx.await
+                    && let Some(path) = paths.pop()
+                {
+                    cx.update(|cx| {
+                        if let Some(view) =
+                            cx.try_global::<AppView>().and_then(|v| v.0.upgrade())
+                        {
+                            view.update(cx, |this, cx| this.open_path(path, cx));
+                        }
+                    })
+                    .ok();
+                }
+            })
+            .detach();
+        });
         cx.on_action(|_: &TablePrev, cx| step_table(-1, cx));
         cx.on_action(|_: &TableNext, cx| step_table(1, cx));
         cx.on_action(|_: &ToggleFullScreen, cx| {

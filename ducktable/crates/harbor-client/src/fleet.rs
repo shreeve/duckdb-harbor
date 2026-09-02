@@ -115,7 +115,18 @@ fn discover() -> Vec<Live> {
             let Ok(info) = serde_json::from_str::<wire::InfoResponse>(body.trim()) else {
                 continue;
             };
-            out.push(Live { name: info.name, db: PathBuf::from(info.database), sock });
+            // 0.22.1-and-earlier servers send no name (the field entered
+            // /info after them) — label the row from the file stem rather
+            // than showing a blank.
+            let name = if info.name.is_empty() {
+                std::path::Path::new(&info.database)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| info.database.clone())
+            } else {
+                info.name
+            };
+            out.push(Live { name, db: PathBuf::from(info.database), sock });
         }
     }
     out
@@ -326,11 +337,70 @@ pub fn connect(name: &str) -> Result<Conn, String> {
     ))
 }
 
+/// Open a database FILE directly — the File→Open / drag-drop door. No
+/// config consulted: the path itself is the identity. Canonicalized first,
+/// so every spelling of one file meets the same server, then the named
+/// flow's exact discipline: join before summoning, both socket
+/// generations, and a `serve` when nothing answers.
+pub fn connect_path(db: &Path) -> Result<Conn, String> {
+    let db = std::fs::canonicalize(db).map_err(|e| format!("{}: {e}", db.display()))?;
+    // The stem-derived name harbor itself would mint for this path — used
+    // only for the 0.19-era socket and token lookups; the server's /info
+    // answers with its own truth on the next refresh.
+    let name = db
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("no usable name in {}", db.display()))
+        .and_then(harbor_common::paths::normalize)?;
+    let token = std::env::var("HARBOR_TOKEN").ok();
+    let home = runtime_dir()?;
+    let sock21 = paths::socket_for(&home, &db)?;
+    let sock19 = paths::sock_file(&home, &name);
+    let join = |summoned: bool| {
+        [&sock21, &sock19].into_iter().find(|s| sock_ready(s)).map(|s| Conn {
+            name: name.clone(),
+            #[cfg(unix)]
+            transport: Transport::Unix(s.clone()),
+            #[cfg(not(unix))]
+            transport: Transport::Tcp(String::new()),
+            token: token.clone().or_else(|| berth_token(&home, &name)),
+            summoned,
+        })
+    };
+    if let Some(conn) = join(false) {
+        return Ok(conn);
+    }
+    let spawn_err = harbor_serve(&db).err();
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Some(conn) = join(true) {
+            return Ok(conn);
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(spawn_err
+                .unwrap_or_else(|| format!("harbor never answered for {}", db.display())));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Summon through harbor's own front door: `harbor <db> serve`, detached and
 /// headless. The child owns its lifetime; this process only waits for the
 /// socket to answer.
 fn harbor_serve(db: &Path) -> Result<(), String> {
-    let harbor = std::env::var("HARBOR_BIN").unwrap_or_else(|_| "harbor".to_string());
+    // A Finder-launched app inherits launchd's PATH — /usr/bin:/bin and
+    // friends — which lacks every directory harbor actually installs
+    // into. Probe the usual homes before trusting a bare PATH lookup, or
+    // drag-and-drop spawns work from a terminal and fail from the Dock.
+    let harbor = std::env::var("HARBOR_BIN").ok().or_else(|| {
+        let home = std::env::var("HOME").ok()?;
+        [format!("{home}/.local/bin/harbor"),
+         "/usr/local/bin/harbor".to_string(),
+         "/opt/homebrew/bin/harbor".to_string()]
+            .into_iter()
+            .find(|p| std::fs::metadata(p).is_ok())
+    })
+    .unwrap_or_else(|| "harbor".to_string());
     std::process::Command::new(&harbor)
         .arg(db)
         .arg("serve")
