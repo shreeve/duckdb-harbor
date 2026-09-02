@@ -1,3 +1,9 @@
+//! One request: parsed line and headers, a body readable exactly once
+//! under byte and time budgets, and `respond()` — the single door a
+//! response leaves through. The drop path answers 500 and drains the
+//! unread body, bounded, so an abandoned request cannot strand the
+//! connection or the thread.
+
 use std::io::Error as IoError;
 use std::io::{self, Cursor, ErrorKind, Read, Write};
 

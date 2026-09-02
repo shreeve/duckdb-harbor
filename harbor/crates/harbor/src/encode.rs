@@ -1,55 +1,11 @@
-//! Wire encoders: DuckDB values and types → the NDJSON envelope's JSON.
+//! Wire formatters: the pure half of the NDJSON envelope's JSON.
 //!
-//! Pure and stateless — no server state, no statics, no locks. Everything a
-//! result row or schema needs to become bytes on the wire lives here: value
-//! and type emission, the JSON-safe integer rule, temporal formatting,
-//! varint decimals, bit/uuid/base64, and the keyword table used to quote
-//! identifiers in type strings. Split out of lib.rs so the server file is
-//! about serving, and these encoders (pinned by tests against captured wire
-//! bytes) read as one subsystem.
-
-use duckdb::{
-    ffi,
-    core::{LogicalTypeHandle, LogicalTypeId},
-    types::{TimeUnit, Value, ValueRef},
-};
-
-// duckdb-rs keeps the raw `duckdb_logical_type` private, and two details are
-// reachable only through the C API: an ARRAY's length and an ENUM's value
-// list. `LogicalTypeHandle` is a single-field newtype around that pointer, so
-// a copy of its bytes is the pointer. The assertion turns a layout change in
-// duckdb-rs into a compile error instead of a crash at runtime.
-const _: () = assert!(
-    std::mem::size_of::<LogicalTypeHandle>() == std::mem::size_of::<ffi::duckdb_logical_type>()
-);
-
-/// Borrow the handle's pointer. The handle keeps ownership; the result must
-/// not outlive it and must not be destroyed.
-pub(crate) fn raw_type(ty: &LogicalTypeHandle) -> ffi::duckdb_logical_type {
-    unsafe { std::mem::transmute_copy(ty) }
-}
-
-pub(crate) fn array_size(ty: &LogicalTypeHandle) -> u64 {
-    unsafe { ffi::duckdb_array_type_array_size(raw_type(ty)) }
-}
-
-pub(crate) fn enum_values(ty: &LogicalTypeHandle) -> Vec<String> {
-    unsafe {
-        let handle = raw_type(ty);
-        let count = ffi::duckdb_enum_dictionary_size(handle) as usize;
-        (0..count)
-            .map(|i| {
-                let ptr = ffi::duckdb_enum_dictionary_value(handle, i as u64);
-                if ptr.is_null() {
-                    return String::new();
-                }
-                let value = std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned();
-                ffi::duckdb_free(ptr as *mut std::ffi::c_void);
-                value
-            })
-            .collect()
-    }
-}
+//! Stateless and engine-free — no FFI, no handles, no duckdb types. The
+//! JSON-safe integer rule, temporal formatting, varint decimals,
+//! bit/uuid/base64, string escaping, and the keyword table used to quote
+//! identifiers in type strings. The engine-facing emission (schema lines,
+//! cell values read from vector views) lives in src/engine/encode.rs and calls
+//! down into these; the wire bytes are pinned by tests/engine.rs.
 
 /// Render an identifier the way DuckDB does inside a type string: bare when it
 /// is a simple lowercase identifier and not a keyword, double-quoted
@@ -64,237 +20,8 @@ pub(crate) fn quote_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-// Schema emission
 // ---------------------------------------------------------------------------
-
-/// Emit one column's schema. `nested` marks a type that sits inside a
-/// container (a list element, a struct field, a map key or value, a union
-/// member) rather than being a column of the result itself. It changes one
-/// verdict — see the `Union` arm — and nothing else.
-pub(crate) fn emit_column_schema(out: &mut String, name: Option<&str>, ty: &LogicalTypeHandle) {
-    emit_schema(out, name, ty, false)
-}
-
-/// A container's element schema: same shape, but flagged as nested.
-fn emit_child_schema(out: &mut String, name: Option<&str>, ty: &LogicalTypeHandle) {
-    emit_schema(out, name, ty, true)
-}
-
-fn emit_schema(out: &mut String, name: Option<&str>, ty: &LogicalTypeHandle, nested: bool) {
-    out.push('{');
-    if let Some(n) = name.filter(|n| !n.is_empty()) {
-        out.push_str(r#""name":"#);
-        push_json_string(out, n);
-        out.push(',');
-    }
-    out.push_str(r#""duckdbType":"#);
-    push_json_string(out, &type_name(ty));
-
-    let id = ty.try_id().unwrap_or(LogicalTypeId::Unsupported);
-    match id {
-        LogicalTypeId::Decimal => {
-            out.push_str(r#","lossless":true,"decimal":{"width":"#);
-            out.push_str(&ty.decimal_width().to_string());
-            out.push_str(r#","scale":"#);
-            out.push_str(&ty.decimal_scale().to_string());
-            out.push('}');
-        }
-        LogicalTypeId::List => {
-            out.push_str(r#","lossless":true,"child":"#);
-            emit_child_schema(out, None, &ty.child(0));
-        }
-        LogicalTypeId::Array => {
-            out.push_str(r#","lossless":true,"arrayLength":"#);
-            out.push_str(&array_size(ty).to_string());
-            out.push_str(r#","child":"#);
-            emit_child_schema(out, None, &ty.child(0));
-        }
-        LogicalTypeId::Struct => {
-            out.push_str(r#","lossless":true,"fields":["#);
-            for i in 0..ty.num_children() {
-                if i > 0 {
-                    out.push(',');
-                }
-                emit_child_schema(out, Some(&ty.child_name(i)), &ty.child(i));
-            }
-            out.push(']');
-        }
-        LogicalTypeId::Map => {
-            // A SQL MAP has no JSON counterpart — its keys need not be strings
-            // — so values go out as pairs and the encoding says so.
-            out.push_str(r#","lossless":true,"keyType":"#);
-            emit_child_schema(out, None, &ty.child(0));
-            out.push_str(r#","valueType":"#);
-            emit_child_schema(out, None, &ty.child(1));
-            out.push_str(r#","encoding":"pairs""#);
-        }
-        LogicalTypeId::Union => {
-            // A UNION's value is only meaningful with its tag: `union_value(a
-            // := 2)` and `union_value(b := 2)` are different values with the
-            // same payload. At the top of a column the tag is recoverable —
-            // `union_tag` reads it off the arrow array through the row's
-            // ValueRef — and the value goes out as {"tag":…,"value":…}.
-            //
-            // Nested, it is not. Inside a container harbor holds a decoded
-            // `Value::Union(Box<Value>)`, which carries the payload and
-            // nothing else, so the tag is already gone by the time this
-            // encoder sees it and the member type cannot be chosen either.
-            // Both `[union_value(a := 2)]` and `[union_value(b := 2)]`
-            // therefore emit `[2]`.
-            //
-            // Saying so is the point. This used to claim lossless:true beside
-            // a members list, which told a client the payload carried
-            // something it does not. Same contract as TimeTZ below: name the
-            // loss rather than let a client discover it.
-            match nested {
-                true => out.push_str(r#","lossless":false,"encoding":"union-tag-dropped","members":["#),
-                false => out.push_str(r#","lossless":true,"members":["#),
-            }
-            for i in 0..ty.num_children() {
-                if i > 0 {
-                    out.push(',');
-                }
-                emit_child_schema(out, Some(&ty.child_name(i)), &ty.child(i));
-            }
-            out.push(']');
-        }
-        LogicalTypeId::Enum => {
-            out.push_str(r#","lossless":true,"values":["#);
-            for (i, value) in enum_values(ty).iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                push_json_string(out, value);
-            }
-            out.push(']');
-        }
-        // TIME WITH TIME ZONE is the one type harbor cannot carry
-        // losslessly: duckdb-rs decodes it to a local time and drops the UTC
-        // offset before harbor ever sees the value, so the offset cannot be
-        // recovered. Saying so is better than emitting a time that silently
-        // means something else.
-        LogicalTypeId::TimeTZ => out.push_str(r#","lossless":false,"encoding":"time-offset-dropped""#),
-        _ if is_lossless(id) => out.push_str(r#","lossless":true"#),
-        // User-defined and extension types round-trip as text. Saying so
-        // explicitly is better than silently handing back a string that
-        // looks like a native value.
-        _ => out.push_str(r#","lossless":false,"encoding":"varchar-cast""#),
-    }
-    out.push('}');
-}
-
-pub(crate) fn is_lossless(id: LogicalTypeId) -> bool {
-    use LogicalTypeId::*;
-    matches!(
-        id,
-        Boolean
-            | Tinyint
-            | Smallint
-            | Integer
-            | Bigint
-            | Hugeint
-            | UHugeint
-            | UTinyint
-            | USmallint
-            | UInteger
-            | UBigint
-            | Float
-            | Double
-            | Varchar
-            | Uuid
-            | Date
-            | Time
-            | Timestamp
-            | TimestampS
-            | TimestampMs
-            | TimestampNs
-            | TimestampTZ
-            | Interval
-            | Blob
-            | Bit
-            // Lossless because it goes out as its decimal digits — a string
-            // when it exceeds what a double holds, so no precision is lost on
-            // the way through a JSON parser.
-            | Bignum
-            | Enum
-            | SqlNull
-    )
-}
-
-pub(crate) fn type_name(ty: &LogicalTypeHandle) -> String {
-    use LogicalTypeId::*;
-    // An alias is the user's own name for the type (JSON, for one); it is
-    // more informative than the storage type underneath it.
-    if let Some(alias) = ty.get_alias()
-        && !alias.is_empty()
-    {
-        return alias;
-    }
-    match ty.try_id().unwrap_or(Unsupported) {
-        Boolean => "BOOLEAN".into(),
-        Tinyint => "TINYINT".into(),
-        Smallint => "SMALLINT".into(),
-        Integer => "INTEGER".into(),
-        Bigint => "BIGINT".into(),
-        Hugeint => "HUGEINT".into(),
-        UHugeint => "UHUGEINT".into(),
-        UTinyint => "UTINYINT".into(),
-        USmallint => "USMALLINT".into(),
-        UInteger => "UINTEGER".into(),
-        UBigint => "UBIGINT".into(),
-        Float => "FLOAT".into(),
-        Double => "DOUBLE".into(),
-        Varchar | StringLiteral => "VARCHAR".into(),
-        Blob => "BLOB".into(),
-        Bit => "BIT".into(),
-        Uuid => "UUID".into(),
-        Date => "DATE".into(),
-        Time => "TIME".into(),
-        TimeTZ => "TIME WITH TIME ZONE".into(),
-        TimeNs => "TIME_NS".into(),
-        Timestamp => "TIMESTAMP".into(),
-        TimestampS => "TIMESTAMP_S".into(),
-        TimestampMs => "TIMESTAMP_MS".into(),
-        TimestampNs => "TIMESTAMP_NS".into(),
-        TimestampTZ => "TIMESTAMP WITH TIME ZONE".into(),
-        Interval => "INTERVAL".into(),
-        Decimal => format!("DECIMAL({},{})", ty.decimal_width(), ty.decimal_scale()),
-        List => format!("{}[]", type_name(&ty.child(0))),
-        Array => format!("{}[{}]", type_name(&ty.child(0)), array_size(ty)),
-        Enum => {
-            let values: Vec<String> =
-                enum_values(ty).iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect();
-            format!("ENUM({})", values.join(", "))
-        }
-        Struct => {
-            let fields: Vec<String> = (0..ty.num_children())
-                .map(|i| format!("{} {}", quote_identifier(&ty.child_name(i)), type_name(&ty.child(i))))
-                .collect();
-            format!("STRUCT({})", fields.join(", "))
-        }
-        Map => format!("MAP({}, {})", type_name(&ty.child(0)), type_name(&ty.child(1))),
-        Union => {
-            let members: Vec<String> = (0..ty.num_children())
-                .map(|i| format!("{} {}", quote_identifier(&ty.child_name(i)), type_name(&ty.child(i))))
-                .collect();
-            format!("UNION({})", members.join(", "))
-        }
-        SqlNull => "\"NULL\"".into(),
-        Geometry => "GEOMETRY".into(),
-        Variant => "VARIANT".into(),
-        Bignum => "BIGNUM".into(),
-        _ => "UNKNOWN".into(),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Value emission
-//
-// Dispatch is on the decoded value rather than the column type, because the
-// value already carries what it needs — DECIMAL brings its width and scale,
-// TIMESTAMP brings its unit. The column type is consulted only where the
-// value is genuinely ambiguous: UUID and TIMESTAMP WITH TIME ZONE share a
-// representation with plain integers and naive timestamps.
+// Scalar emission — the JSON-safe rules every encoder shares.
 // ---------------------------------------------------------------------------
 
 /// IEEE-754 doubles hold integers exactly only up to 2^53 - 1. Anything
@@ -302,159 +29,112 @@ pub(crate) fn type_name(ty: &LogicalTypeHandle) -> String {
 /// 9007199254740993 gets 9007199254740992 and never finds out.
 const JSON_SAFE: i128 = 9_007_199_254_740_991;
 
-/// The name of the member a UNION value actually holds, if this is one.
-pub(crate) fn union_tag(v: &ValueRef<'_>) -> Option<String> {
-    use duckdb::arrow::{array::{Array, UnionArray}, datatypes::DataType};
-    let ValueRef::Union(column, idx) = v else {
-        return None;
-    };
-    let union = column.as_any().downcast_ref::<UnionArray>()?;
-    let DataType::Union(fields, _) = column.data_type() else {
-        return None;
-    };
-    let type_id = union.type_id(*idx);
-    fields.iter().find(|(id, _)| *id == type_id).map(|(_, field)| field.name().clone())
+/// Every two-digit number, as bytes: "000102...9899". One table lookup
+/// replaces two divisions in the digit writers below.
+pub(crate) const DIGIT_PAIRS: &[u8; 200] = b"\
+0001020304050607080910111213141516171819\
+2021222324252627282930313233343536373839\
+4041424344454647484950515253545556575859\
+6061626364656667686970717273747576777879\
+8081828384858687888990919293949596979899";
+
+/// The decimal digits of a u64, written straight into `out` — the same bytes
+/// `u64::to_string` produces, without the String it allocates. This is the
+/// workhorse under every integer on the wire.
+pub(crate) fn push_u64_raw(out: &mut String, mut v: u64) {
+    let mut buf = [0u8; 20]; // u64::MAX has 20 digits
+    let mut i = buf.len();
+    while v >= 100 {
+        let pair = ((v % 100) as usize) * 2;
+        v /= 100;
+        i -= 2;
+        buf[i..i + 2].copy_from_slice(&DIGIT_PAIRS[pair..pair + 2]);
+    }
+    if v >= 10 {
+        let pair = (v as usize) * 2;
+        i -= 2;
+        buf[i..i + 2].copy_from_slice(&DIGIT_PAIRS[pair..pair + 2]);
+    } else {
+        i -= 1;
+        buf[i] = b'0' + v as u8;
+    }
+    // Safety: the slice holds only ASCII digits.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
 }
 
-/// A UNION goes out as {"tag": member, "value": ...}; everything else is just
-/// its value.
-pub(crate) fn emit_tagged(out: &mut String, tag: Option<String>, v: &Value, ty: Option<&LogicalTypeHandle>) {
-    match (tag, v) {
-        (Some(name), Value::Union(inner)) => {
-            let member = ty.and_then(|t| {
-                (0..t.num_children()).find(|i| t.child_name(*i) == name).map(|i| t.child(i))
-            });
-            out.push_str(r#"{"tag":"#);
-            push_json_string(out, &name);
-            out.push_str(r#","value":"#);
-            emit_value(out, inner, member.as_ref());
-            out.push('}');
-        }
-        (_, value) => emit_value(out, value, ty),
+/// `u128::to_string`'s bytes without its String. The 128-bit divide loop is
+/// an order of magnitude slower than the 64-bit one, so anything that fits —
+/// which is everything but HUGEINT/UHUGEINT tails — takes the u64 path.
+pub(crate) fn push_u128_raw(out: &mut String, v: u128) {
+    if let Ok(small) = u64::try_from(v) {
+        return push_u64_raw(out, small);
     }
+    let mut buf = [0u8; 39]; // u128::MAX has 39 digits
+    let mut i = buf.len();
+    let mut v = v;
+    // Peel 19-digit chunks: at most two 128-bit divisions, the rest u64.
+    while v > u64::MAX as u128 {
+        let mut chunk = (v % 10_000_000_000_000_000_000) as u64; // 10^19
+        v /= 10_000_000_000_000_000_000;
+        for _ in 0..19 {
+            i -= 1;
+            buf[i] = b'0' + (chunk % 10) as u8;
+            chunk /= 10;
+        }
+    }
+    let mut v64 = v as u64;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v64 % 10) as u8;
+        v64 /= 10;
+        if v64 == 0 {
+            break;
+        }
+    }
+    // Safety: the slice holds only ASCII digits.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
 }
 
-pub(crate) fn emit_value(out: &mut String, v: &Value, ty: Option<&LogicalTypeHandle>) {
-    let id = ty.and_then(|t| t.try_id().ok());
-    match v {
-        Value::Null => out.push_str("null"),
-        Value::Boolean(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::TinyInt(i) => out.push_str(&i.to_string()),
-        Value::SmallInt(i) => out.push_str(&i.to_string()),
-        Value::Int(i) => out.push_str(&i.to_string()),
-        Value::UTinyInt(i) => out.push_str(&i.to_string()),
-        Value::USmallInt(i) => out.push_str(&i.to_string()),
-        Value::UInt(i) => out.push_str(&i.to_string()),
-        Value::BigInt(i) => push_int(out, *i as i128),
-        Value::UBigInt(i) => push_int(out, *i as i128),
-        Value::HugeInt(i) => {
-            if id == Some(LogicalTypeId::Uuid) {
-                push_json_string(out, &uuid_to_string(*i));
-            } else {
-                push_int(out, *i)
-            }
-        }
-        Value::UHugeInt(i) => {
-            if *i <= JSON_SAFE as u128 {
-                out.push_str(&i.to_string());
-            } else {
-                push_json_string(out, &i.to_string());
-            }
-        }
-        Value::Float(f) => push_float32(out, *f),
-        Value::Double(f) => push_float(out, *f),
-        Value::Decimal(d) => push_json_string(out, &d.to_string()),
-        Value::Text(s) | Value::Enum(s) => push_json_string(out, s),
-        Value::Blob(b) if id == Some(LogicalTypeId::Bit) => push_json_string(out, &bit_string(b)),
-        // Same JSON-safe rule as every other integer: bare when a double holds
-        // it exactly, quoted past that. A BIGNUM is arbitrary precision, so it
-        // is usually quoted — but a small one should not look different from
-        // the same value in a BIGINT column.
-        Value::Blob(b) if id == Some(LogicalTypeId::Bignum) => match varint_to_decimal(b) {
-            Some(digits) => match digits.parse::<i128>() {
-                Ok(v) => push_int(out, v),
-                Err(_) => push_json_string(out, &digits),
-            },
-            None => push_json_string(out, &base64(b)),
-        },
-        Value::Blob(b) | Value::Geometry(b) => push_json_string(out, &base64(b)),
-        Value::Date32(d) => push_json_string(out, &fmt_date(*d)),
-        Value::Time64(unit, v) => push_json_string(out, &fmt_time(to_nanos(*unit, *v))),
-        Value::Timestamp(unit, v) => {
-            let mut s = fmt_timestamp(to_nanos(*unit, *v), *unit);
-            if id == Some(LogicalTypeId::TimestampTZ) {
-                s.push('Z');
-            }
-            push_json_string(out, &s);
-        }
-        Value::Interval { months, days, nanos } => {
-            // micros as a string: it is an int64 and JSON numbers are not.
-            out.push_str(&format!(
-                r#"{{"months":{},"days":{},"micros":"{}"}}"#,
-                months,
-                days,
-                nanos / 1_000
-            ));
-        }
-        Value::List(items) | Value::Array(items) => {
-            let child = ty.map(|t| t.child(0));
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                emit_value(out, item, child.as_ref());
-            }
-            out.push(']');
-        }
-        Value::Struct(fields) => {
-            out.push('{');
-            for (i, (k, val)) in fields.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                push_json_string(out, k);
-                out.push(':');
-                emit_value(out, val, ty.map(|t| t.child(i)).as_ref());
-            }
-            out.push('}');
-        }
-        Value::Map(entries) => {
-            // A SQL MAP has no JSON counterpart: its keys need not be
-            // strings. Pairs keep it lossless; the schema line says so with
-            // "encoding":"pairs".
-            //
-            // The key and value types travel with the pair, exactly as LIST
-            // passes child(0) and STRUCT passes child(i). They used to be
-            // dropped, and the values that need a type to be written correctly
-            // were then written wrongly *while the schema line above described
-            // them accurately*: a BIT went out as base64 of DuckDB's private
-            // storage ("Bf0=" for "101"), a BIGNUM likewise, and a TIMESTAMPTZ
-            // lost its Z and read as a naive local time — all of them still
-            // labelled "lossless":true.
-            let (key_ty, value_ty) = match ty {
-                Some(t) => (Some(t.child(0)), Some(t.child(1))),
-                None => (None, None),
-            };
-            out.push('[');
-            for (i, (k, val)) in entries.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                out.push('[');
-                emit_value(out, k, key_ty.as_ref());
-                out.push(',');
-                emit_value(out, val, value_ty.as_ref());
-                out.push(']');
-            }
-            out.push(']');
-        }
-        Value::Union(inner) => emit_value(out, inner, None),
-        // `Value` is #[non_exhaustive]: a later DuckDB can add a variant this
-        // build has never seen. The schema line already flags such a column
-        // lossless:false, so a client knows not to trust the payload.
-        _ => out.push_str("null"),
+/// `i128::to_string`'s bytes, allocation-free: a sign, then the digits.
+pub(crate) fn push_i128_raw(out: &mut String, v: i128) {
+    if v < 0 {
+        out.push('-');
     }
+    push_u128_raw(out, v.unsigned_abs());
+}
+
+/// `i64::to_string`'s bytes, allocation-free — the whole path stays 64-bit.
+pub(crate) fn push_i64_raw(out: &mut String, v: i64) {
+    if v < 0 {
+        out.push('-');
+    }
+    push_u64_raw(out, v.unsigned_abs());
+}
+
+/// An integer zero-padded to `width` the way `format!("{v:0width$}")` pads:
+/// the sign first, then zeros, then the digits, sign counted toward the width.
+pub(crate) fn push_int_pad(out: &mut String, v: i64, width: usize) {
+    let neg = v < 0;
+    if neg {
+        out.push('-');
+    }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let mut x = v.unsigned_abs();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (x % 10) as u8;
+        x /= 10;
+        if x == 0 {
+            break;
+        }
+    }
+    let written = (buf.len() - i) + neg as usize;
+    for _ in written..width {
+        out.push('0');
+    }
+    // Safety: the slice holds only ASCII digits.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
 }
 
 pub(crate) fn push_int(out: &mut String, i: i128) {
@@ -465,9 +145,14 @@ pub(crate) fn push_int(out: &mut String, i: i128) {
     // to prevent, on a value any `SELECT (-170141183460469231731687303715884105728)::HUGEINT`
     // produces. In debug it panicked instead.
     if i.unsigned_abs() <= JSON_SAFE as u128 {
-        out.push_str(&i.to_string());
+        // Under 2^53 always fits i64; stay on the 64-bit digit writer.
+        push_i64_raw(out, i as i64);
     } else {
-        push_json_string(out, &i.to_string());
+        // Digits and a sign need no JSON escaping; the quotes are the whole
+        // encoding.
+        out.push('"');
+        push_i128_raw(out, i);
+        out.push('"');
     }
 }
 
@@ -488,7 +173,9 @@ pub(crate) fn push_float(out: &mut String, f: f64) {
     if f != 0.0 && f.abs() >= 1e21 {
         push_exponent(out, &format!("{f:e}"));
     } else {
-        out.push_str(&f.to_string());
+        // Display, written straight into the buffer: the same shortest
+        // round-trip text `to_string` yields, without its String.
+        let _ = std::fmt::Write::write_fmt(out, format_args!("{f}"));
     }
 }
 
@@ -511,7 +198,7 @@ pub(crate) fn push_float32(out: &mut String, f: f32) {
     if f != 0.0 && f.abs() >= 1e21 {
         push_exponent(out, &format!("{f:e}"));
     } else {
-        out.push_str(&f.to_string());
+        let _ = std::fmt::Write::write_fmt(out, format_args!("{f}"));
     }
 }
 
@@ -529,45 +216,68 @@ fn push_exponent(out: &mut String, formatted: &str) {
 }
 
 pub(crate) fn push_json_string(out: &mut String, s: &str) {
-    // serde_json owns the escaping rules, including the ones that are easy to
-    // get wrong (control characters, lone surrogates).
-    let encoded = match serde_json::to_string(s) {
-        Ok(encoded) => encoded,
-        Err(_) => return out.push_str("\"\""),
-    };
-    // One rule serde_json correctly does not apply, because it is about the
-    // container rather than the value: U+2028 LINE SEPARATOR and U+2029
-    // PARAGRAPH SEPARATOR are legal inside a JSON string, but this is a
-    // newline-delimited format and they are line terminators to every
-    // Unicode-aware line splitter. Left raw, one row is read as two — and the
-    // half that is left over is not valid JSON, so a client sees a parse error
-    // whose cause is nowhere near where it happened. Escaping them costs a
-    // scan that almost always finds nothing.
-    if !encoded.contains('\u{2028}') && !encoded.contains('\u{2029}') {
-        return out.push_str(&encoded);
-    }
-    for ch in encoded.chars() {
-        match ch {
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            other => out.push(other),
+    // One pass, byte-identical to what serde_json::to_string used to produce
+    // here (its escaping rules are reproduced below and pinned by a
+    // fuzz-comparison test), plus one rule serde_json correctly does not
+    // apply because it is about the container rather than the value: U+2028
+    // LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are legal inside a JSON
+    // string, but this is a newline-delimited format and they are line
+    // terminators to every Unicode-aware line splitter. Left raw, one row is
+    // read as two — and the half that is left over is not valid JSON, so a
+    // client sees a parse error whose cause is nowhere near where it
+    // happened. Writing straight into `out` drops the String serde_json
+    // allocated per cell and the two container scans over it.
+    out.push('"');
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // The overwhelmingly common byte: printable, not a quote or
+        // backslash, and not the 0xE2 that could open U+2028/U+2029.
+        if b >= 0x20 && b != b'"' && b != b'\\' && b != 0xE2 {
+            i += 1;
+            continue;
         }
+        if b == 0xE2 {
+            // U+2028 is E2 80 A8, U+2029 is E2 80 A9; every other E2
+            // sequence passes through raw.
+            if bytes.len() - i >= 3 && bytes[i + 1] == 0x80 && bytes[i + 2] & 0xFE == 0xA8 {
+                out.push_str(&s[start..i]);
+                out.push_str(if bytes[i + 2] == 0xA8 { "\\u2028" } else { "\\u2029" });
+                i += 3;
+                start = i;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        out.push_str(&s[start..i]);
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            0x08 => out.push_str("\\b"),
+            0x09 => out.push_str("\\t"),
+            0x0A => out.push_str("\\n"),
+            0x0C => out.push_str("\\f"),
+            0x0D => out.push_str("\\r"),
+            c => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                out.push_str("\\u00");
+                out.push(HEX[(c >> 4) as usize] as char);
+                out.push(HEX[(c & 0xF) as usize] as char);
+            }
+        }
+        i += 1;
+        start = i;
     }
+    out.push_str(&s[start..]);
+    out.push('"');
 }
 
 // ---------------------------------------------------------------------------
 // Scalar formatting
 // ---------------------------------------------------------------------------
-
-pub(crate) fn to_nanos(unit: TimeUnit, v: i64) -> i128 {
-    let v = v as i128;
-    match unit {
-        TimeUnit::Second => v * 1_000_000_000,
-        TimeUnit::Millisecond => v * 1_000_000,
-        TimeUnit::Microsecond => v * 1_000,
-        TimeUnit::Nanosecond => v,
-    }
-}
 
 /// Days since 1970-01-01 to a civil date, by Howard Hinnant's
 /// `civil_from_days`. Correct for the proleptic Gregorian calendar over the
@@ -585,38 +295,62 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-pub(crate) fn fmt_date(days: i32) -> String {
+/// The two digits of a value in 0..=99, from the pair table.
+#[inline]
+pub(crate) fn digit_pair(v: usize) -> [u8; 2] {
+    [DIGIT_PAIRS[v * 2], DIGIT_PAIRS[v * 2 + 1]]
+}
+
+pub(crate) fn push_date(out: &mut String, days: i32) {
     let (y, m, d) = civil_from_days(days as i64);
-    format!("{y:04}-{m:02}-{d:02}")
+    if (0..=9999).contains(&y) {
+        // The common era: one 10-byte write instead of five small ones.
+        let mut b = [0u8; 10];
+        b[0..2].copy_from_slice(&digit_pair(y as usize / 100));
+        b[2..4].copy_from_slice(&digit_pair(y as usize % 100));
+        b[4] = b'-';
+        b[5..7].copy_from_slice(&digit_pair(m as usize));
+        b[7] = b'-';
+        b[8..10].copy_from_slice(&digit_pair(d as usize));
+        // Safety: the buffer holds only ASCII digits and dashes.
+        out.push_str(unsafe { std::str::from_utf8_unchecked(&b) });
+    } else {
+        push_int_pad(out, y, 4);
+        out.push('-');
+        push_int_pad(out, m as i64, 2);
+        out.push('-');
+        push_int_pad(out, d as i64, 2);
+    }
 }
 
 /// HH:MM:SS, with a fraction only when there is one. Six digits unless the
 /// value carries sub-microsecond precision.
-pub(crate) fn fmt_time(nanos: i128) -> String {
-    let (h, min, s, frac) = split_time(nanos.rem_euclid(86_400_000_000_000));
-    let mut out = format!("{h:02}:{min:02}:{s:02}");
-    push_fraction(&mut out, frac);
-    out
+pub(crate) fn push_time(out: &mut String, nanos: i128) {
+    // The i64 path covers every value the encoders pass (micros × 1000 can
+    // exceed i64, hence the i128 signature — but only barely, and rem_euclid
+    // on i128 is an order of magnitude slower).
+    let day = 86_400_000_000_000;
+    let ns = match i64::try_from(nanos) {
+        Ok(n) => n.rem_euclid(day),
+        Err(_) => nanos.rem_euclid(day as i128) as i64,
+    };
+    let (h, min, s, frac) = split_time(ns);
+    let mut b = [0u8; 8];
+    b[0..2].copy_from_slice(&digit_pair(h as usize));
+    b[2] = b':';
+    b[3..5].copy_from_slice(&digit_pair(min as usize));
+    b[5] = b':';
+    b[6..8].copy_from_slice(&digit_pair(s as usize));
+    // Safety: the buffer holds only ASCII digits and colons.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&b) });
+    push_fraction(out, frac);
 }
 
-pub(crate) fn fmt_timestamp(nanos: i128, unit: TimeUnit) -> String {
-    let day = 86_400_000_000_000i128;
-    let days = nanos.div_euclid(day);
-    let rest = nanos.rem_euclid(day);
-    let (y, m, d) = civil_from_days(days as i64);
-    let (h, min, s, frac) = split_time(rest);
-    let mut out = format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}");
-    // TIMESTAMP_S has no fractional part by definition; emitting one would
-    // invent precision the column does not have.
-    if unit != TimeUnit::Second {
-        push_fraction(&mut out, frac);
-    }
-    out
-}
-
-pub(crate) fn split_time(nanos_in_day: i128) -> (i64, i64, i64, i64) {
-    let total_s = (nanos_in_day / 1_000_000_000) as i64;
-    let frac = (nanos_in_day % 1_000_000_000) as i64;
+/// Splits nanoseconds-since-midnight (already reduced below one day, so it
+/// fits and stays in i64) into hours, minutes, seconds, and the fraction.
+pub(crate) fn split_time(nanos_in_day: i64) -> (i64, i64, i64, i64) {
+    let total_s = nanos_in_day / 1_000_000_000;
+    let frac = nanos_in_day % 1_000_000_000;
     (total_s / 3_600, (total_s % 3_600) / 60, total_s % 60, frac)
 }
 
@@ -627,16 +361,27 @@ pub(crate) fn push_fraction(out: &mut String, nanos: i64) {
     // Six digits for microsecond precision, nine when the value actually
     // carries nanoseconds. Trailing zeros come off either way: a TIMESTAMP_MS
     // of .123 should read as .123, not .123000.
-    let mut digits = if nanos % 1_000 == 0 {
-        format!("{:06}", nanos / 1_000)
+    let (mut v, width) = if nanos % 1_000 == 0 {
+        ((nanos / 1_000) as u64, 6)
     } else {
-        format!("{nanos:09}")
+        (nanos as u64, 9)
     };
-    while digits.ends_with('0') {
-        digits.pop();
+    let mut buf = [b'0'; 9];
+    let mut i = width;
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    // The zero-fill already padded the front; trim the back. At least one
+    // nonzero digit exists because nanos != 0.
+    let mut end = width;
+    while buf[end - 1] == b'0' {
+        end -= 1;
     }
     out.push('.');
-    out.push_str(&digits);
+    // Safety: the slice holds only ASCII digits.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[..end]) });
 }
 
 /// DuckDB stores BIGNUM (formerly VARINT) as a three-byte header followed by
@@ -706,12 +451,12 @@ pub(crate) fn varint_to_decimal(bytes: &[u8]) -> Option<String> {
 /// DuckDB stores BIT as a leading pad-count byte followed by the bits, most
 /// significant first. Without this a bit string goes out base64-encoded, which
 /// is not wrong so much as unusable.
-pub(crate) fn bit_string(bytes: &[u8]) -> String {
+pub(crate) fn push_bit_string(out: &mut String, bytes: &[u8]) {
     let Some((&padding, data)) = bytes.split_first() else {
-        return String::new();
+        return;
     };
     let skip = padding as usize;
-    let mut out = String::with_capacity(data.len() * 8);
+    out.reserve(data.len() * 8);
     for (i, byte) in data.iter().enumerate() {
         for bit in (0..8).rev() {
             if i * 8 + (7 - bit) >= skip {
@@ -719,28 +464,26 @@ pub(crate) fn bit_string(bytes: &[u8]) -> String {
             }
         }
     }
-    out
 }
 
 /// DuckDB stores UUID as a HUGEINT with the high bit flipped, so that the
 /// integer ordering matches the textual ordering.
-pub(crate) fn uuid_to_string(v: i128) -> String {
+pub(crate) fn push_uuid(out: &mut String, v: i128) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let bits = (v as u128) ^ (1u128 << 127);
     let b = bits.to_be_bytes();
-    let hex = |r: &[u8]| r.iter().map(|x| format!("{x:02x}")).collect::<String>();
-    format!(
-        "{}-{}-{}-{}-{}",
-        hex(&b[0..4]),
-        hex(&b[4..6]),
-        hex(&b[6..8]),
-        hex(&b[8..10]),
-        hex(&b[10..16])
-    )
+    for (i, byte) in b.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0xF) as usize] as char);
+    }
 }
 
-pub(crate) fn base64(data: &[u8]) -> String {
+pub(crate) fn push_base64(out: &mut String, data: &[u8]) {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    out.reserve(data.len().div_ceil(3) * 4);
     for c in data.chunks(3) {
         let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
@@ -749,7 +492,6 @@ pub(crate) fn base64(data: &[u8]) -> String {
         out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
         out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
     }
-    out
 }
 
 // ==========================================================================
@@ -828,3 +570,132 @@ pub(crate) static KEYWORDS: &[&str] = &[
     "xmlconcat", "xmlelement", "xmlexists", "xmlforest", "xmlnamespaces", "xmlparse", "xmlpi",
     "xmlroot", "xmlserialize", "xmltable", "year", "years", "yes", "zone",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reference bytes push_json_string must reproduce: serde_json's
+    /// escaping, then the U+2028/U+2029 post-pass — exactly the two-step
+    /// encoding this function replaced.
+    fn reference(s: &str) -> String {
+        let encoded = serde_json::to_string(s).unwrap();
+        let mut out = String::new();
+        for ch in encoded.chars() {
+            match ch {
+                '\u{2028}' => out.push_str("\\u2028"),
+                '\u{2029}' => out.push_str("\\u2029"),
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    fn ours(s: &str) -> String {
+        let mut out = String::new();
+        push_json_string(&mut out, s);
+        out
+    }
+
+    #[test]
+    fn json_string_matches_serde_on_adversarial_inputs() {
+        let cases: &[&str] = &[
+            "",
+            "plain ascii",
+            "quote \" backslash \\ done",
+            "\\\\\"\"",
+            "\u{0}\u{1}\u{2}\u{3}\u{4}\u{5}\u{6}\u{7}\u{8}\u{9}\u{a}\u{b}\u{c}\u{d}\u{e}\u{f}",
+            "\u{10}\u{11}\u{12}\u{13}\u{14}\u{15}\u{16}\u{17}\u{18}\u{19}\u{1a}\u{1b}\u{1c}\u{1d}\u{1e}\u{1f}",
+            "\u{7f}",           // DEL passes through raw
+            "\u{2028}",         // line separator, escaped for NDJSON
+            "\u{2029}",         // paragraph separator
+            "a\u{2028}b\u{2029}c",
+            "\u{2027}\u{202a}", // E2 80 A7 / E2 80 AA — neighbors stay raw
+            "\u{2088}\u{20a8}", // other E2-lead chars sharing trailing bytes
+            "héllo wörld",
+            "日本語テキスト",
+            "🦆 emoji \u{10ffff}",
+            "mixed \" \u{2028} \\ \u{1} 中 🦆 end",
+            "ends with lead-alike \u{2028}",
+            "\u{2028}starts",
+            "e2 near end \u{e0a8}",
+        ];
+        for s in cases {
+            assert_eq!(ours(s), reference(s), "for {s:?}");
+        }
+    }
+
+    #[test]
+    fn json_string_matches_serde_on_random_inputs() {
+        // A cheap deterministic PRNG over a hostile alphabet: escapes,
+        // controls, E2-family multibyte chars, plain ASCII.
+        let alphabet: Vec<char> = ('\u{0}'..='\u{2f}')
+            .chain(['"', '\\', '\u{7f}', '\u{2027}', '\u{2028}', '\u{2029}', '\u{202a}'])
+            .chain(['\u{2088}', '\u{20a8}', 'é', '中', '🦆', 'a', 'z', '\u{e0a8}'])
+            .collect();
+        let mut state = 0x243F6A8885A308D3u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 24) as usize;
+            let s: String =
+                (0..len).map(|_| alphabet[next() as usize % alphabet.len()]).collect();
+            assert_eq!(ours(&s), reference(&s), "for {s:?}");
+        }
+    }
+
+    #[test]
+    fn int_pad_matches_format() {
+        for &(v, w) in &[
+            (0i64, 2usize),
+            (0, 4),
+            (5, 2),
+            (5, 4),
+            (42, 2),
+            (999, 2),
+            (1234, 4),
+            (12345, 4),
+            (-5, 4),
+            (-123, 4),
+            (-1234, 4),
+            (-12345, 4),
+            (5877642, 4),
+            (-5877641, 4),
+            (i64::MAX, 4),
+            (i64::MIN, 4),
+        ] {
+            let mut out = String::new();
+            push_int_pad(&mut out, v, w);
+            assert_eq!(out, format!("{v:0w$}"), "for {v} width {w}");
+        }
+    }
+
+    #[test]
+    fn raw_ints_match_to_string() {
+        for v in [
+            0i128,
+            1,
+            -1,
+            9,
+            10,
+            -10,
+            i128::from(i64::MAX),
+            i128::from(i64::MIN),
+            i128::MAX,
+            i128::MIN,
+        ] {
+            let mut out = String::new();
+            push_i128_raw(&mut out, v);
+            assert_eq!(out, v.to_string());
+        }
+        for v in [0u128, 1, 9, 10, u128::from(u64::MAX), u128::MAX] {
+            let mut out = String::new();
+            push_u128_raw(&mut out, v);
+            assert_eq!(out, v.to_string());
+        }
+    }
+}

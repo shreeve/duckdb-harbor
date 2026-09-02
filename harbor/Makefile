@@ -7,7 +7,7 @@
 # fetch-duckdb` pulls the engine (DuckDB's official v2 nightly) into
 # ~/.duckdb; `make install` copies the binary to $(BIN). No step needs root.
 
-.PHONY: all harbor unit test install fetch-duckdb bootstrap clean
+.PHONY: all harbor unit test bench install fetch-duckdb bootstrap clean
 
 # The libduckdb `make fetch-duckdb` installs, and one of the places harbor
 # looks at runtime (see crates/harbor/src/engine.rs for the full search
@@ -32,6 +32,11 @@ unit:
 
 test: harbor
 	test/scripts/check.sh
+
+# Interleaved shape benchmark. Pass binaries to A/B:
+#   make bench BENCH_ARGS="./harbor-old ./harbor-new"
+bench: harbor
+	test/scripts/bench.py $(BENCH_ARGS)
 
 # Copy the binary onto PATH in $(BIN).
 # The rm first is load-bearing on macOS: overwriting a binary in place leaves

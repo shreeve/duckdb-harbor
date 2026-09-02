@@ -22,8 +22,29 @@ resolver = "2"
 version = "0.20.0"
 
 [profile.release]
+# Fat LTO: measured smaller than thin (1.88MB vs 2.04MB at codegen-units=1,
+# 2.35MB at thin's default units); hot-query time is identical either way —
+# LTO here buys size, not speed.
 lto = true
+# One codegen unit gives LTO the whole picture: -6.6% binary size for the
+# same ~23s clean build as the old lto=true default.
+codegen-units = 1
+# Same as "symbols": debug info is already split out on macOS; this drops
+# the symbol table too.
 strip = true
+
+# The helm's line editor and terminal deps never run while serving — the
+# server hot path is justhttp + serde_json + the engine (dlopened, unaffected
+# by any of this). Optimizing them for size shaves another ~32KB and ~5s of
+# clean-build time with zero effect on query latency.
+[profile.release.package.reedline]
+opt-level = "s"
+
+[profile.release.package.crossterm]
+opt-level = "s"
+
+[profile.release.package.nu-ansi-term]
+opt-level = "s"
 
 # vendor/reedline is 0.50.0 verbatim except two patches in src/engine.rs (both
 # proposed upstream; see vendor/reedline/HARBOR.md): a completion menu with

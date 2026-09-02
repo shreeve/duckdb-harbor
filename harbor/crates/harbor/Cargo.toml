@@ -9,10 +9,8 @@ license = "MIT"
 # Paths, names, the permission gate, and durations. Shared with ducktable,
 # which takes it without the `term` feature.
 harbor-common = { path = "../common" }
-duckdb = { version = "~1.10505.0", default-features = false, features = ["vtab", "loadable-extension"] }
 libloading = "0.8"
 justhttp = { path = "../justhttp" }
-serde = { version = "1", features = ["derive"] }
 # preserve_order: --json rows must keep column order, not alphabetize it
 serde_json = { version = "1", features = ["preserve_order"] }
 # --- the client half (src/repl/) ---------------------------------------------
@@ -27,13 +25,15 @@ reedline = "0.50.0"
 signal-hook = { version = "0.4", default-features = false }
 # already in reedline's tree: terminal-cell widths for duckbox alignment
 unicode-width = "0.2"
-rand = "0.8"
+getrandom = "0.2"
+# Negotiated wire compression (Accept-Encoding: zstd) — the
+# IANA-registered coding browsers, newer curl, and Node/Bun speak
+# natively. Measured within 10% of lz4's wall in lz4's best case and free
+# when the query does any real work, at 2-24x the density — so zstd is
+# the only coding harbor offers. Binds libzstd (no pure-Rust encoder
+# exists), the one C dependency in the binary.
+zstd = "0.13"
 libc = "0.2"
-
-# Test-only: the route table below is harbor's half of the wire contract, so
-# the tests check it against the crate that publishes it.
-[dev-dependencies]
-wire = { path = "../wire" }
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }

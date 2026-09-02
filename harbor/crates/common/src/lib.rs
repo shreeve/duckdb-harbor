@@ -1,8 +1,8 @@
-//! What harbor, pilot and ducktable all need.
+//! What harbor and ducktable both need.
 //!
 //! Before this crate each binary had its own copy of "where does config
 //! live", "what is a legal berth name", and "may I trust this file" — and the
-//! copies disagreed: harbor refused to start without `$HOME` while pilot
+//! copies disagreed: harbor refused to start without `$HOME` while the client
 //! quietly resolved to `./.config/harbor` and looked for sockets in a
 //! relative directory. One definition, imported everywhere, is the point.
 //!
@@ -17,7 +17,9 @@
 //! stylesheet. Nothing in this crate decides that a running berth is
 //! `#22c55e`.
 
+#[cfg(feature = "fleet")]
 pub mod config;
+#[cfg(feature = "fleet")]
 pub mod fleet;
 pub mod lifetime;
 pub mod paths;

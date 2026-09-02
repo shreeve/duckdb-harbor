@@ -133,6 +133,35 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+section "Compression"
+# ---------------------------------------------------------------------------
+
+# The one negotiated coding. A client that asks gets zstd frames; one that
+# does not must get identity — silence about codings is a promise too.
+enc=$(curl -sS -m 20 -D - -o /dev/null "${auth[@]}" -H 'Accept-Encoding: zstd' \
+      -H 'Content-Type: application/json' --data '{"sql":"SELECT 1"}' "$url/sql" 2>/dev/null \
+      | tr -d '\r' | awk -F': ' 'tolower($1)=="content-encoding"{print $2}')
+eq "zstd negotiates when offered" "zstd" "$enc"
+enc=$(curl -sS -m 20 -D - -o /dev/null "${auth[@]}" \
+      -H 'Content-Type: application/json' --data '{"sql":"SELECT 1"}' "$url/sql" 2>/dev/null \
+      | tr -d '\r' | awk -F': ' 'tolower($1)=="content-encoding"{print $2}')
+eq "identity when nothing is offered" "" "$enc"
+if command -v zstd >/dev/null 2>&1; then
+  # The frame is the standard one: the stock CLI must recover the stream,
+  # and the recovered bytes must be the identity response.
+  plain=$(curl -sS -m 20 "${auth[@]}" -H 'Content-Type: application/json' \
+          --data '{"sql":"SELECT 7 * 6 AS answer"}' "$url/sql" 2>/dev/null)
+  round=$(curl -sS -m 20 "${auth[@]}" -H 'Accept-Encoding: zstd' -H 'Content-Type: application/json' \
+          --data '{"sql":"SELECT 7 * 6 AS answer"}' "$url/sql" 2>/dev/null | zstd -d -c 2>/dev/null)
+  # timeMs differs per run; compare everything before the end line.
+  eq "the frame decodes to the identity stream" \
+     "$(printf '%s' "$plain" | grep -v '"type":"end"')" \
+     "$(printf '%s' "$round" | grep -v '"type":"end"')"
+else
+  soft "zstd round-trip" "no zstd CLI on this machine"
+fi
+
+# ---------------------------------------------------------------------------
 section "The query path"
 # ---------------------------------------------------------------------------
 

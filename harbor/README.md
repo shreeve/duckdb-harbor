@@ -1,18 +1,23 @@
-<p align="center">
-  <img src="https://github.com/shreeve/duckdb-harbor/raw/main/duckdb-harbor-social.png" alt="DuckDB Harbor" width="600">
-</p>
+# DuckDB Harbor
 
-# duckdb-harbor
+Only one process can open a DuckDB file at a time. This repository ships the
+two programs that fix that, together because they are built together:
 
-> **Many clients, one DuckDB, over plain HTTP. `POST` a statement, read NDJSON
-> back.**
+- **[`harbor/`](harbor/)** — a small server that puts a DuckDB file behind
+  plain HTTP so all your apps can share it, and a DuckDB-style shell in the
+  same 2MB binary. Many clients, one DuckDB. Start with
+  [harbor/README.md](harbor/README.md).
+- **[`ducktable/`](ducktable/)** — the native macOS desktop face for those
+  servers: a fast, minimal table client built on GPUI. Start with
+  [ducktable/README.md](ducktable/README.md).
 
-Only one process can access a DuckDB file at a time. Harbor fixes that: it
-puts a small server in front of the file so all your apps can share it — and
-it feels exactly like the duckdb shell, except a database can also serve.
+Each directory is its own Cargo workspace with its own version and releases;
+DuckTable's client crates build Harbor's protocol crates from source, so the
+wire contract is checked on both sides of every commit.
 
-DuckDB Harbor is `harbor`, one small Rust binary with one grammar:
+Install harbor:
 
+<<<<<<<< HEAD:harbor/README.md
 ```console
 $ harbor                       # what's running
 $ harbor mydata.duckdb         # open it — REPL, or -c "SQL", or stdin
@@ -26,6 +31,37 @@ server is spawned for it, and every other client of the same file joins that
 server instead of hitting "database is locked". The two lifetimes, in one
 breath: **bare, the server is everyone's — it lives while anyone is
 connected; `serve`, the server is yours — it lives until you leave.**
+
+## The Elevator Pitch
+
+Two files. That's the entire install.
+
+The library is DuckDB — all of it, one dynamic library, vanilla, compiled and
+shipped by the DuckDB team. We never patch it, fork it, or wrap it in
+bindings. Version hop = swap the file.
+
+The binary is harbor: one 2.2MB executable that is both sides of the
+conversation. As a server it loads libduckdb and serves your database over
+HTTP, on a Unix socket or TCP. As a client it connects to any harbor and
+gives you a modern shell — syntax highlighting, completion, history — in
+place of the DuckDB CLI.
+
+You never choose which one you're running. `harbor mydb.duckdb` connects if
+the database is already being served, and spawns a server and connects to it
+if it isn't. Your connection is the server's lifeline: the database stays
+served while anyone is connected — a second client makes it two, your exit
+makes it one — and when the last client leaves, the server checkpoints and
+departs. Nothing to daemonize, nothing to clean up. (Want it to outlive its
+clients? `harbor mydb.duckdb serve` — then it's yours until you stop it.)
+
+While it's up, anything that speaks HTTP can query it: curl, your app,
+another harbor.
+
+`harbor` by itself shows what's being served.
+
+No config file. No drivers, no ORM, no fleet manager. Built directly on
+DuckDB's new v2 C API — v2.0, out this month — so it's smaller, faster, and
+simpler than everything it replaces.
 
 If it can speak HTTP and parse JSON, it can query your database.
 
@@ -86,6 +122,15 @@ naming NDJSON as the remedy. Streaming has no such limit.
 The one thing one-shot does better: since nothing has been sent when the last
 row lands, a failure is still a real status code. The same query that streams a
 `200` with an `{"type":"error"}` line at the end answers `400` in this shape.
+
+The stream compresses on request — `Accept-Encoding: zstd`, the standard
+coding browsers, newer curl, and Node/Bun offer on their own. The wrapped
+bytes are the identical NDJSON: a 5M-row integer result measures 161MB
+plain and 1.1MB as zstd, and when the query does any real work the
+compression rides the writer thread for free. Anything else — gzip
+included, its encoder would throttle the stream — gets identity, and
+`curl -H 'Accept-Encoding: zstd' ... | zstd -d` recovers the stream
+byte-for-byte.
 
 `/ready` normally runs `SELECT 1` through an ordinary executor and answers `200
 {"status":"ready"}` or `503`. Under sustained worker saturation, the dedicated
@@ -233,7 +278,7 @@ newer client's ask with the full document instead of a 404.
 
 One binary, and nothing to configure. The client half never touches DuckDB —
 the engine (`libduckdb`) loads on demand, only when this process is the one
-serving a file, so the same 2.7MB `harbor` is a pure protocol client on
+serving a file, so the same 2.2MB `harbor` is a pure protocol client on
 machines that never host a database. `make fetch-duckdb` pulls DuckDB's
 official v2 nightly into `~/.duckdb/cli/2.0.0/`, one of the places harbor
 looks at runtime; then:
@@ -256,12 +301,13 @@ and installs `harbor` into `~/.local/bin` with `libduckdb` in `~/.local/lib`
 
 ```bash
 # macOS and Linux
+========
+```sh
+>>>>>>>> main:README.md
 curl -fsSL https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.sh | bash
-
-# Windows
-irm https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.ps1 | iex
 ```
 
+<<<<<<<< HEAD:harbor/README.md
 Nothing there asks for root. `~/.local/bin` is where the XDG base directory
 spec puts user executables; Debian and Fedora already have it on `PATH`, macOS
 does not, and the installer says so rather than putting binaries somewhere you
@@ -312,7 +358,9 @@ DATABASE            PID    CLIENTS  UPTIME  ADDRESS
 
 A socket nothing answers on is a leftover from a `kill -9`, and the list
 unlinks it. There is nothing else to clean up, because nothing else is
-written.
+written. Set `HARBOR_HOME` (absolute path) to collapse everything harbor
+writes — sockets and state alike — into that one directory instead; the
+test suites use it to keep their servers out of the real fleet view.
 
 ### Sockets, TCP, and tokens
 
@@ -553,10 +601,12 @@ works the same everywhere.
 **The engine is the loaded `libduckdb`, not the binary.** Nothing is linked:
 harbor loads the engine on demand (`HARBOR_LIBDUCKDB`, then `../lib` beside
 the binary, `~/.local/lib`, and `~/.duckdb/cli/*` — DuckDB's own world,
-disposable and refetchable). The same build has been verified against DuckDB
-1.5.5 and 2.0 development builds. Treat that as tested compatibility, not a
-promise that an arbitrary past or future DuckDB ABI will work — and point it
-at a library whose storage format matches the database file. A machine with
+disposable and refetchable). Harbor binds DuckDB's v2 C API, so DuckDB 2.0
+is the engine floor; the same build has been verified against the 2.0
+development line as it moves. Treat that as tested compatibility, not a
+promise that an arbitrary future DuckDB ABI will work. Your database files
+need no such care: a file created by a 1.5-era DuckDB opens as-is, because
+2.0's storage layer reads it. A machine with
 no engine at all still runs the client half; only serving needs the library,
 and the error says exactly where it looked.
 
@@ -592,11 +642,14 @@ code is self-consistent.
 
 ## Status
 
-Pre-production. One small binary. Nothing is linked: the same build has served
-DuckDB 1.5.5 and 2.0 development builds by loading the compatible `libduckdb`
-at runtime. Deploy remote TCP behind Caddy, which owns TLS and edge request
+Pre-production. One small binary. Nothing is linked: harbor loads a DuckDB
+2.0+ `libduckdb` at runtime — the v2 C API is the floor — and database files
+from 1.5-era DuckDBs open as-is. Deploy remote TCP behind Caddy, which owns
+TLS and edge request
 policy; Harbor independently owns SQL statement deadlines.
 
 ## License
 
+========
+>>>>>>>> main:README.md
 MIT.

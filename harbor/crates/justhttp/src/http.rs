@@ -1,3 +1,6 @@
+//! The HTTP vocabulary: status codes, methods, versions, and header
+//! fields — plain data types with parsing and display, no I/O.
+
 use ascii::{AsciiStr, AsciiString, FromAsciiError};
 use std::cmp::Ordering;
 use std::fmt::{self, Display, Formatter};

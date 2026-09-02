@@ -20,8 +20,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-mod engine;
-mod engine_fill;
 
 use harbor_common::lifetime::parse_duration;
 use harbor_common::perms::chmod;
@@ -266,10 +264,12 @@ fn serve(db: PathBuf, rest: Vec<String>) -> Result<(), String> {
     // past this line; the loser exits here without ever touching the
     // winner's socket. No lock files, no flock protocol: the database
     // guards itself.
-    let con = duckdb_open(&o)?;
+    let mut con = duckdb_open(&o)?;
     let duckdb_version: String = con
-        .query_row("SELECT version()", [], |r| r.get(0))
-        .map_err(|e| format!("version: {e}"))?;
+        .query_strings("SELECT version()")
+        .map_err(|e| format!("version: {e}"))?
+        .pop()
+        .unwrap_or_default();
     // Boot SQL runs on the control connection before the pool forms, so its
     // effects (LOAD, settings, secrets) are instance-wide and in place
     // before the first request. This one flag is the whole extension story —
@@ -283,11 +283,9 @@ fn serve(db: PathBuf, rest: Vec<String>) -> Result<(), String> {
     // not; /info is a pure in-memory read and must stay one, since it has to
     // keep answering when every worker is busy.
     let databases: Vec<String> = con
-        .prepare("SELECT database_name FROM duckdb_databases() WHERE NOT internal ORDER BY database_name")
-        .and_then(|mut stmt| {
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            rows.collect::<Result<Vec<String>, _>>()
-        })
+        .query_strings(
+            "SELECT database_name FROM duckdb_databases() WHERE NOT internal ORDER BY database_name",
+        )
         .unwrap_or_default();
     harbor::open_pool(con)?;
 
@@ -397,14 +395,13 @@ fn serve(db: PathBuf, rest: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-fn duckdb_open(o: &Opts) -> Result<harbor::duckdb::Connection, String> {
-    use harbor::duckdb::{Config, Connection};
-    // The engine loads here, on demand — the binary itself has no
-    // load-time libduckdb dependency, so invocations that never open a
-    // database run on machines without the library.
-    engine::ensure_loaded()?;
-    // These four settings can only be chosen when the connection is opened,
-    // not with a later SET, so they must reach the Connection here:
+fn duckdb_open(o: &Opts) -> Result<harbor::engine::conn::Conn, String> {
+    // The engine loads on first use — the binary itself has no load-time
+    // libduckdb dependency, so invocations that never open a database run
+    // on machines without the library.
+    //
+    // These settings can only be chosen when the database is opened, not
+    // with a later SET, so they travel as open-time options:
     //   --unsigned  allow_unsigned_extensions — the one door for loading a
     //               locally built, unsigned extension via --init 'LOAD <ext>'.
     //   --sealed    enable_external_access=false + allow_community_extensions
@@ -415,22 +412,16 @@ fn duckdb_open(o: &Opts) -> Result<harbor::duckdb::Connection, String> {
     //               (the test fixtures themselves load CSV), so the safe edge
     //               is the operator's to draw, like TLS.
     // Signed-only, full-access is the default; each is opt-in.
-    let con = if o.unsigned || o.sealed {
-        let mut config = Config::default();
-        if o.unsigned {
-            config = config.allow_unsigned_extensions().map_err(|e| format!("config: {e}"))?;
-        }
-        if o.sealed {
-            config = config
-                .with("enable_external_access", "false")
-                .and_then(|c| c.with("allow_community_extensions", "false"))
-                .map_err(|e| format!("config: {e}"))?;
-        }
-        Connection::open_with_flags(&o.db, config)
-            .map_err(|e| format!("open {}: {e}", o.db.display()))?
-    } else {
-        Connection::open(&o.db).map_err(|e| format!("open {}: {e}", o.db.display()))?
-    };
+    let mut options: Vec<(&str, &str)> = Vec::new();
+    if o.unsigned {
+        options.push(("allow_unsigned_extensions", "true"));
+    }
+    if o.sealed {
+        options.push(("enable_external_access", "false"));
+        options.push(("allow_community_extensions", "false"));
+    }
+    let mut con = harbor::engine::conn::open(&o.db, &options)
+        .map_err(|e| format!("open {}: {e}", o.db.display()))?;
     con.execute_batch(&format!("SET memory_limit='{}'", o.memory_limit))
         .map_err(|e| format!("memory_limit: {e}"))?;
     if let Some(t) = o.threads {

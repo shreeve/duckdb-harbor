@@ -1,3 +1,7 @@
+//! One response: status, headers, and a body streamed from any `Read` —
+//! chunked when the length is unknown, with the connection-management
+//! headers owned here so a handler cannot lie about them.
+
 use crate::http::{Header, HttpVersion, StatusCode};
 use httpdate::HttpDate;
 use std::cmp::Ordering;
