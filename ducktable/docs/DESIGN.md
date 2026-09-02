@@ -24,20 +24,20 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
   never sees a database file path. This removes FFI, engine version lock, WAL
   handling, and checkpoint hazards from the client entirely; they are Harbor's
   job.
-- **Berths are addressed by name.** Connection UX mirrors `pilot`: a name is
-  resolved through Harbor config, spawn-on-demand aliases launch Harbor for a
-  local file, and tokens come from `~/.local/state/harbor/runtime/<name>.token`.
-  Harbor is MIT and first-party: DuckTable consumes the `wire` protocol crate
-  and `harbor-common` (config, paths, berth state semantics) as git
-  dependencies pinned by rev, with a `[patch]` for local iteration. The
+- **Berths are addressed by name.** Connection UX mirrors `harbor`'s own: a
+  name resolves to a database, spawn-on-demand launches Harbor for a local
+  file, and Harbor 0.20+'s socket discovery replaces registries. Harbor is
+  MIT and first-party: DuckTable consumes the `wire` protocol crate and
+  `harbor-common` (paths, fleet-state semantics, feature `fleet`) as plain
+  path dependencies into the sibling `../../../harbor/crates/*` — the
+  monorepo checks the wire contract on both sides of every commit. The
   HTTP layer (blocking client, NDJSON streaming, chunked decoding) lives in
-  DuckTable's own client crate until Harbor hoists it into `harbor-common`.
-- **A connected berth is kept alive and its lifetime is respected.** While a
-  window holds a connection, DuckTable pulses `GET /keepalive` so an
-  idle-exit berth does not retire under an open grid. The lifetime rule is
-  pilot's: if DuckTable summoned the berth (spawn-on-demand), closing the
-  window lets it retire; if it joined one already running, closing the
-  window changes nothing.
+  DuckTable's own client crate.
+- **A connected berth is kept alive by presence, not pulses.** Under Harbor
+  0.20+ a held connection *is* the keepalive — the old `GET /keepalive`
+  route died with the idle-exit machinery it served. The lifetime rule is
+  harbor's own: a refcounted server lives while anyone is connected; a
+  `serve`d one runs until stopped.
 - **UI stack**: GPUI (pinned crates.io release, currently 0.2.2) with
   gpui-component (0.5.1) supplying the virtualized Table and the code editor.
   Both are pre-1.0, and the versions are PINNED — an upgrade is a

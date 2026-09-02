@@ -1,14 +1,9 @@
 /target
 crates/*/target
 vendor/*/target
-build
-configure
-.idea
-duckdb_unittest_tempdir
 /test/bin
-venvtarget/
 .venv/
-build/
+.idea
 .DS_Store
 
 # Python bytecode from the test harnesses in scripts/

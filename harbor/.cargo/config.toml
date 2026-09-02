@@ -1,3 +1,9 @@
-# statically linking the C runtime on windows seems sensible?
+# Statically link the C runtime on Windows so harbor.exe runs on a bare
+# machine with no vcredist install. Both MSVC targets the release matrix
+# builds — leaving one out ships an amd64 binary that is self-contained
+# beside an arm64 one that demands VCRUNTIME140.dll.
 [target.x86_64-pc-windows-msvc]
+rustflags = ["-Ctarget-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
 rustflags = ["-Ctarget-feature=+crt-static"]

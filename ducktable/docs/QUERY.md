@@ -6,7 +6,7 @@ research sweep, under one governing ruling: **DuckDB's PEG grammar is
 the bible.** DuckDB has its own SQL philosophy; the grammar files at
 `src/parser/peg/grammar/` are its law, and everything here derives from
 them or from the engine itself. No third-party SQL parser appears
-anywhere in this design. This document extends docs/EDITING.md and
+anywhere in this design. This document extends EDITING.md and
 never contradicts it; where docs/UI.md's older Query-surface notes
 disagree, the two amendments are flagged inline.
 

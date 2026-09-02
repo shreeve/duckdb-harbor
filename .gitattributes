@@ -1,0 +1,3 @@
+# Generated tree-sitter output: 15MB of parser.c nobody reviews by hand.
+# Marking it keeps diffs collapsed and language stats honest.
+ducktable/crates/duckdb-lang/grammar/src/* linguist-generated

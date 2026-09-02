@@ -95,7 +95,7 @@ security regression, not a flake.
 
 ## Layout
 
-Seven one-word files, ~2,650 lines, edition 2024, `forbid(unsafe_code)`,
+Seven one-word files, ~2,700 lines, edition 2024, `forbid(unsafe_code)`,
 three tiny dependencies (`ascii`, `chunked_transfer`, `httpdate`):
 
 | File | Owns |
@@ -110,7 +110,7 @@ three tiny dependencies (`ascii`, `chunked_transfer`, `httpdate`):
 
 ## Tests
 
-`cargo test -p justhttp` (from the repo root) runs the default suite — green on
+`cargo test -p justhttp` (from `harbor/`) runs the default suite — green on
 macOS and Linux. Two files:
 `tests/suite.rs`, one module per property (`basic`, `input`, `network`,
 `keepalive` — connection reuse + chunked streaming, `buffering` —

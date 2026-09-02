@@ -3,6 +3,7 @@
 [package]
 name = "justhttp"
 version.workspace = true
+repository.workspace = true
 edition = "2024"
 rust-version = "1.85"
 authors = ["Steve Shreeve <steve.shreeve@gmail.com>"]

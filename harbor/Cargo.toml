@@ -20,6 +20,7 @@ resolver = "2"
 # filename. Inheriting removes the chance to forget one.
 [workspace.package]
 version = "0.21.0"
+repository = "https://github.com/shreeve/duckdb-harbor"
 
 [profile.release]
 # Fat LTO: measured smaller than thin (1.88MB vs 2.04MB at codegen-units=1,

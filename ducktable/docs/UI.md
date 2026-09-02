@@ -90,7 +90,7 @@ connects; the attempt is fenced, so a late completion discards itself
 and a cancel works synchronously. Context menu (roadmap): connect,
 disconnect, start, stop, rename; add and remove edit Harbor config and
 ship after v1. Plain verbs only; the nautical vocabulary is frozen at
-harbor, pilot, berth — and stays INTERNAL: on-screen labels use user
+harbor, berth — and stays INTERNAL: on-screen labels use user
 words (DATABASES, TABLES, "database").
 
 **TABLES** shows the connected berth's tables from Harbor's catalog

@@ -8,7 +8,6 @@
 use crate::util::clone_str;
 use gpui::*;
 use harbor_client::{fleet, Conn, State};
-use std::time::Duration;
 
 pub(crate) struct RowVm {
     pub(crate) name: String,

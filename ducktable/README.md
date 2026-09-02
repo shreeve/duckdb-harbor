@@ -9,9 +9,9 @@
 
 DuckTable speaks to [DuckDB Harbor](https://github.com/shreeve/duckdb-harbor)
 and requires it. It never links DuckDB, never opens a database file, and never
-asks you for a path. You connect to a berth by name; Harbor owns the engine,
-the files, and the versioning. Local files work through Harbor's
-spawn-on-demand aliases, the same way `pilot` opens them.
+asks you for a path. You connect to a database by name; Harbor owns the
+engine, the files, and the versioning. Local files work through Harbor's
+spawn-on-demand, the same way `harbor <file>` opens them.
 
 ## Screenshots
 
@@ -49,7 +49,7 @@ the zip in a browser instead will trip Gatekeeper's quarantine; if you go
 that way, allow it under System Settings → Privacy & Security → Open Anyway.)
 
 On Intel, or to build from source: clone the repo and run
-`scripts/macos-app.sh release`.
+`ducktable/scripts/macos-app.sh release`.
 
 ## Why Harbor-only
 
@@ -70,13 +70,17 @@ feature.
 Rust, [GPUI](https://crates.io/crates/gpui) (Zed's GPU-accelerated UI
 framework), and [gpui-component](https://github.com/longbridge/gpui-component)
 for the virtualized data table and code editor. Dependencies are pinned to
-crates.io releases, not git.
+crates.io releases, not git — with one surgical local patch to
+gpui-component (`vendor/gpui-component`), and Harbor's protocol crates
+built from the sibling `harbor/` tree in this repository.
 
 ## Status
 
-Early releases, moving fast. Browsing works today — the fleet sidebar, the
-paged data grid, filters, and the Structure view; editing lands next.
-Requires Harbor 0.18+. See `docs/DESIGN.md` for the architecture and roadmap.
+Early releases, moving fast. Working today: the fleet sidebar, the paged
+data grid with filters and column control, the Structure view with DDL,
+staged cell editing with a Sheets-style keyboard grammar, and the Query
+scratchpad with per-statement send. Requires Harbor 0.20+. See
+`docs/DESIGN.md` for the architecture and roadmap.
 
 ## License
 

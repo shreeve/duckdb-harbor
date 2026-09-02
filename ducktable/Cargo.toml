@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/ducktable", "crates/duckdb-lang", "crates/harbor-client"]
+# The vendored patch source is not a member — excluded so its own test
+# suite can run in place (cd vendor/gpui-component && cargo test) before
+# re-carrying the "DuckTable patch:" marks on a pin bump.
+exclude = ["vendor/gpui-component"]
 
 [workspace.package]
 version = "0.10.0"

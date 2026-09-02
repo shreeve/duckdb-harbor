@@ -275,14 +275,15 @@ It vastly increases the number of people who will understand why it exists.
 | --- | --- |
 | DuckDB CLI | `v2.0.0-alpha38195` (Cyanoptera, `8cbdaba6ac`) |
 | `quack` extension | `b2f2d10`, installed from `core` |
-| Harbor / Pilot | `0.19.2` |
+| Harbor | `0.19.2` |
 
 **Method.** A Quack server was started with
 `CALL quack_serve('quack:localhost:9494', token => '…')`. A Python TCP proxy sat
 between client and server, logging raw bytes in both directions; the DuckDB
 client connected through it with `ATTACH 'quack:127.0.0.1:9493'`. All headers,
 status codes, request counts and token positions quoted above are from those
-captures. Harbor was run as `harbor serve bench.duckdb --port 9495 --token …`
+captures. Harbor was run as `harbor bench.duckdb serve --port 9495 --token …` (0.19 spelled this
+`harbor serve bench.duckdb`)
 and driven with `curl`.
 
 **Wire bytes** were counted by the proxy for Quack (server→client, 34,935,381)
