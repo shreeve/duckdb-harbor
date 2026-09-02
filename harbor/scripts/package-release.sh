@@ -46,9 +46,16 @@ root="$OUT/$name"
 rm -rf "$root"; mkdir -p "$root/bin" "$root/lib"
 
 install -m 0755 target/release/harbor "$root/bin/harbor"
+got=""
 for lib in libduckdb.dylib libduckdb.so; do
-  [ -f "$DUCKDB_LIB/$lib" ] && install -m 0755 "$DUCKDB_LIB/$lib" "$root/lib/$lib"
+  # if, not `[ ] &&`: under set -e a false test as the loop's last command
+  # would kill the whole script.
+  if [ -f "$DUCKDB_LIB/$lib" ]; then
+    install -m 0755 "$DUCKDB_LIB/$lib" "$root/lib/$lib"
+    got=$lib
+  fi
 done
+[ -n "$got" ] || { echo "package-release: no libduckdb in $DUCKDB_LIB" >&2; exit 2; }
 install -m 0755 scripts/release-install.sh "$root/install.sh"
 
 tar -C "$OUT" -czf "$OUT/$name.tar.gz" "$name"

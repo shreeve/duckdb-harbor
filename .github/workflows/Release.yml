@@ -55,8 +55,14 @@ jobs:
       - name: Engine can serve this harbor
         shell: bash
         run: |
-          lib=$(ls "$DUCKDB_LIB"/libduckdb.so "$DUCKDB_LIB"/libduckdb.dylib \
-                   "$DUCKDB_LIB"/duckdb.dll 2>/dev/null | head -1)
+          # No `ls | head`: a candidate that doesn't exist makes ls exit
+          # nonzero, and -e/pipefail would kill the step before any
+          # diagnostic prints.
+          lib=""
+          for f in "$DUCKDB_LIB"/libduckdb.so "$DUCKDB_LIB"/libduckdb.dylib \
+                   "$DUCKDB_LIB"/duckdb.dll; do
+            if [ -f "$f" ]; then lib=$f; break; fi
+          done
           [ -n "$lib" ] || { echo "no libduckdb found in $DUCKDB_LIB"; exit 1; }
           if ! grep -qc duckdb_v2_connect "$lib"; then
             echo "::error::$lib exports no v2 C API symbols — harbor $(grep -m1 '^version' Cargo.toml) cannot serve with it."
