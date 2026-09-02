@@ -210,7 +210,7 @@ fn resolve(target: &str, flag_token: Option<String>) -> Result<Conn, String> {
 }
 
 /// Join the server that owns this file, or spawn one — this same binary,
-/// detached, `--ephemeral`: it lives while anyone is connected and takes its
+/// detached and refcounted: it lives while anyone is connected and takes its
 /// socket with it when the last client leaves. The socket is identity, not
 /// registry: derived from the file's canonical path, so every spelling of the
 /// same file lands on the same server and no scan or sidecar is needed.
@@ -246,7 +246,12 @@ fn ensure_server(path: &Path) -> Result<Transport, String> {
             .map_err(|e| format!("log file: {e}"))?;
         let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
         let mut cmd = std::process::Command::new(exe);
-        cmd.arg(&canon).arg("start").arg("--ephemeral");
+        cmd.arg(&canon).arg("start");
+        // The private lifetime signal: a summoned server is refcounted, so it
+        // leaves when idle. It rides an env channel, not the command line —
+        // ephemerality is something membership says (a detached start), never a
+        // flag, and a spawn is not a verb the user typed.
+        cmd.env("HARBOR_EPHEMERAL", "1");
         // A typed path is the duckdb-cli contract: open it, existing or not.
         if !canon.exists() {
             cmd.arg("--create");

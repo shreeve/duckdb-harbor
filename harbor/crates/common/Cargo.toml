@@ -22,10 +22,17 @@ term = ["dep:unicode-width"]
 # carries no toml/serde stack for modules it never calls. (state stays
 # unconditional: pure semantics, no deps, and ui's Tone conversion needs it.)
 config = ["dep:serde", "dep:toml", "dep:serde_json"]
+# The membership writer: attach/detach editing the [connection.*] sections of
+# config.toml, format-preserving via toml_edit's DOM. harbor enables this (it
+# owns the CLI verbs); it is separate from `config` so a pure reader need not
+# link the editor, and a GUI that wants neither takes default-features = false.
+membership = ["dep:toml_edit"]
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"], optional = true }
 toml = { version = "1.1.4", optional = true }
+# format-preserving TOML edits (comments and ordering survive) for membership
+toml_edit = { version = "0.22", optional = true }
 # the berth sidecar is a shared format: harbor writes it, pilot and DuckTable read it
 serde_json = { version = "1", optional = true }
 # terminal-cell widths: a path with CJK or an emoji in it must not shear a

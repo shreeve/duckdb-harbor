@@ -12,9 +12,9 @@
 //! "armed for login but off right now").
 //!
 //! Membership carries the lifetime: a running server that is attached is
-//! persistent; one that is detached is ephemeral (what `--ephemeral` used to
-//! spell). So `detach start` is the ephemeral start, `attach start` the
-//! persistent one.
+//! persistent; one that is detached is ephemeral — it lives while anyone is
+//! connected and leaves when idle. So `detach start` is the ephemeral start,
+//! `attach start` the persistent one.
 
 use std::collections::HashMap;
 
@@ -71,9 +71,8 @@ pub struct Plan {
 impl Plan {
     /// A running server is ephemeral exactly when it is being started while
     /// detached — membership carries the lifetime. (`attach start` and a bare
-    /// `start` are persistent; only `detach start` is ephemeral.) Consumed by
-    /// the membership layer, which will translate it into start's `--ephemeral`.
-    #[allow(dead_code)]
+    /// `start` are persistent; only `detach start` is ephemeral.) The dispatch
+    /// hands this to `start` as the server's refcounted-lifetime fact.
     pub fn ephemeral(&self) -> bool {
         self.run == Some(true) && self.attach == Some(false)
     }

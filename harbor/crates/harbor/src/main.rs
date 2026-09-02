@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 
 use harbor_common::lifetime::parse_duration;
+use harbor_common::membership::{self, Attached};
 use harbor_common::perms::chmod;
 
 mod verbs;
@@ -50,7 +51,8 @@ fn main() -> ExitCode {
 
     // Noun first, then a bag of bare verbs, then that verb's own flags. A
     // client invocation has no leading verb and falls straight through to
-    // cli_main; a management one hands its verb bag to the grammar.
+    // cli_main; a management one hands its verb bag to the grammar and carries
+    // the resulting plan out right here — two axes, membership then running.
     let db = args.remove(0);
     let split = args.iter().take_while(|a| verbs::Verb::is_verb(a.as_str())).count();
     if split == 0 {
@@ -64,43 +66,65 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match enact(PathBuf::from(db), plan, args) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("harbor: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
+    let db = PathBuf::from(db);
+    let flags = args; // whatever followed the verbs — start's, and only start's
 
-/// Enact a validated [`verbs::Plan`] against one database. The running axis is
-/// live — `start` stands a server up (persistent, or refcounted with
-/// `--ephemeral`), `stop` takes one down. Membership (attach/detach) and
-/// autostart change on-disk state that has no writer yet, so they refuse
-/// loudly rather than half-applying.
-fn enact(db: PathBuf, plan: verbs::Plan, flags: Vec<String>) -> Result<(), String> {
-    if plan.attach.is_some() || plan.autostart {
-        return Err(
-            "attach/detach and autostart aren't wired yet — this build does start and stop".into(),
-        );
+    if plan.autostart {
+        eprintln!("harbor: autostart isn't wired yet — this build does attach, detach, start, stop");
+        return ExitCode::FAILURE;
     }
+    if plan.run != Some(true) && !flags.is_empty() {
+        eprintln!("harbor: only `start` takes options — got: {}", flags.join(" "));
+        return ExitCode::FAILURE;
+    }
+
+    // Membership first — durable and quick, and it is what a start's lifetime
+    // keys off: a listed database is persistent, an unlisted one ephemeral.
+    match plan.attach {
+        Some(true) => match membership::attach(&db) {
+            Ok((name, Attached::Added)) => eprintln!("harbor: attached {name}"),
+            Ok((name, Attached::AlreadyThere)) => eprintln!("harbor: {name} is already attached"),
+            Err(e) => {
+                eprintln!("harbor: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        Some(false) => match membership::detach(&db) {
+            Ok((name, true)) => eprintln!("harbor: detached {name}"),
+            Ok((_, false)) => {} // idempotent: nothing there to detach
+            Err(e) => {
+                eprintln!("harbor: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => {}
+    }
+
+    // Running. The grammar owns the lifetime — a detached start is ephemeral —
+    // so start takes that as a plain fact, not a flag.
     match plan.run {
-        Some(true) => start(db, flags),
-        Some(false) => {
-            if !flags.is_empty() {
-                return Err(format!("stop takes no options (got: {})", flags.join(" ")));
+        Some(true) => match start(db, flags, plan.ephemeral()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("harbor: {e}");
+                ExitCode::FAILURE
             }
-            if harbor::repl::shutdown(&db)? {
+        },
+        Some(false) => match harbor::repl::shutdown(&db) {
+            Ok(true) => {
                 eprintln!("harbor: {} stopped", db.display());
-            } else {
-                eprintln!("harbor: {} was not running", db.display());
+                ExitCode::SUCCESS
             }
-            Ok(())
-        }
-        // plan.run is None only when the bag held no running verb; but the
-        // membership-only bags that produce it are refused above, so this is
-        // the empty-bag-behind-a-noun case a split of 0 already handled.
-        None => Err("nothing to do — say start or stop".into()),
+            Ok(false) => {
+                eprintln!("harbor: {} was not running", db.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("harbor: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        None => ExitCode::SUCCESS, // a bare attach/detach: membership done
     }
 }
 
@@ -119,7 +143,14 @@ usage:
                                headless it runs until SIGTERM
   harbor <db.duckdb> stop      stop the server for this database, if one is
                                running (a quiet no-op if nothing is)
+  harbor <db.duckdb> attach    add this database to your list (config.toml) —
+                               a listed database is persistent when started
+  harbor <db.duckdb> detach    remove it from your list
   harbor version               print this binary's version (also -V)
+
+Verbs combine, in any order: `attach start` remembers it and starts it
+persistent; `detach start` starts an ephemeral one; `attach` alone just
+lists it. At most one of attach/detach and one of start/stop.
 
 The two lifetimes, in one breath — bare: the server is everyone's, it lives
 while anyone is connected. start: the server is yours, it lives until you
@@ -139,8 +170,6 @@ start options:
                        which is what secures the socket)
   --bind <addr>        TCP bind address (with --port; default 127.0.0.1)
   --token <t>          bearer token (TCP only)
-  --ephemeral          refcounted lifetime: exit once nobody has been
-                       connected for a moment (what spawn-on-use passes)
   --workers <n>        executor pool size (default 6)
   --memory-limit <s>   DuckDB memory_limit (default 2GB)
   --threads <n>        DuckDB threads (default: DuckDB's own)
@@ -199,7 +228,6 @@ fn parse_opts(db: PathBuf, rest: Vec<String>) -> Result<Opts, String> {
                 std::process::exit(0);
             }
             "--create" => o.create = true,
-            "--ephemeral" => o.ephemeral = true,
             "--port" => o.port = Some(take("port")?.parse().map_err(|_| "bad --port")?),
             "--bind" => o.bind = take("bind")?,
             "--token" => o.token = Some(take("token")?),
@@ -263,8 +291,12 @@ fn ensure_runtime_dir() -> Result<PathBuf, String> {
 // start — the one verb, and the only code path that touches the engine
 // ---------------------------------------------------------------------------
 
-fn start(db: PathBuf, rest: Vec<String>) -> Result<(), String> {
-    let o = parse_opts(db, rest)?;
+fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> {
+    let mut o = parse_opts(db, rest)?;
+    // Ephemerality is the grammar's word (a detached start), or the private
+    // signal spawn-on-use sets on the child it launches — never a CLI flag.
+    // Either way this server is refcounted: it leaves once nobody's connected.
+    o.ephemeral = ephemeral || std::env::var_os("HARBOR_EPHEMERAL").is_some();
     let home = ensure_runtime_dir()?;
     let canon = harbor_common::paths::canonical_db(&o.db)?;
 
