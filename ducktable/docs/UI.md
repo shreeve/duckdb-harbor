@@ -83,15 +83,20 @@ rules, in order:
 Two stacked sections, each collapsible.
 
 **DATABASES** lists every berth Harbor knows: live sockets found by
-discovery plus spawn-on-demand databases, each with a status dot
-(connected, running, stopped), the table count in parentheses for live
+discovery plus spawn-on-demand databases, each with a **status dot —
+green running, dim stopped** (one signal, nothing more; the full model
+is DESIGN.md's Berth lifecycle), the table count in parentheses for live
 berths, and the size on disk right-justified in decimal units (MB/GB,
-never MiB). Click connects; the attempt is fenced, so a late completion
-discards itself and a cancel works synchronously. Context menu
-(roadmap): connect, disconnect, start, stop, rename; add and remove
-ship after v1. Plain verbs only; the nautical vocabulary is frozen at
-harbor, berth — and stays INTERNAL: on-screen labels use user
-words (DATABASES, TABLES, "database").
+never MiB). Click opens the berth (attach + start); the attempt is
+fenced, so a late completion discards itself and a cancel works
+synchronously. Right-click carries the verbs matched to the two axes,
+each landing on its own transition (DESIGN.md, Berth lifecycle). Shipped:
+**Stop** (running — drops this window's anchor, green→dim). The settled
+menu adds **Detach** (membership — remove from the list, the row fades
+out and is gone) and the **Auto-start** toggle (the boot property);
+those are the committed direction, not yet shipped. Plain verbs only; the nautical vocabulary is frozen at harbor, berth —
+and stays INTERNAL: on-screen labels use user words (DATABASES, TABLES,
+"database").
 
 **TABLES** shows the connected berth's tables from Harbor's catalog
 endpoint as a flat list (schema headings appear only when there is more
@@ -270,14 +275,18 @@ Every surface defines empty, loading, and failed:
 
 - Harbor unreachable or auth failed: full-window state with the reason,
   a retry, and where the token lives. Never a blank pane.
-- No berths: points at how to open one (`harbor <db> serve`).
+- No berths: points at how to open one — drag a `.duckdb` file in, ⌘O,
+  or `harbor <db> start` at a shell.
 - Berth start failure: inline in the sidebar row, with stderr excerpt.
 - Connection lost mid-session: status line goes red, tabs keep their
   data with a stale badge, reconnect retries with backoff; staged edits
   survive a reconnect.
 - Empty schema, empty table, empty result: say so, in one line.
-- Errors carry copyable detail. Timing labels engine time explicitly;
-  end-to-end time appears alongside when they differ materially.
+- Errors carry copyable detail — an explicit copy tile, not
+  drag-select, since painted labels have no OS text-selection (DESIGN.md,
+  "Explicit copy, never selection"). Timing labels engine time
+  explicitly; end-to-end time appears alongside when they differ
+  materially.
 
 ## Keyboard map (v1)
 
@@ -308,6 +317,45 @@ dark ship first, plus about three more (e.g. a warm paper light, a
 midnight blue dark, a high-contrast). The accent is themeable
 independently. Value rendering (NULL tags, conflict cells, dirty-cell
 marks) uses tokens too, so every theme keeps the same meaning.
+
+## Motion
+
+Animation is felt, not seen: a transition exists to prevent a jarring
+snap, never to announce itself. If a user notices "there's an animation
+here," it is too slow. Durations follow human motion perception, scaled
+to the size of the thing moving:
+
+- **~100ms** is the floor. Below it, a fade reads as a hard cut rather
+  than motion.
+- **120-200ms** is the pocket for an *in-place* micro-fade — an icon
+  swap, a hover, a copy tile's check reverting, a small element breathing
+  in. **150ms is the one default** here, shared as `chrome::QUICK_FADE_MS`
+  so these can't drift apart. (350ms, tried first for the copy tile, read
+  as "look, a crossfade" — the tell that it was ~2x too slow.)
+- **200-250ms** is for *structural* enter/leave — a whole row fading out
+  of the list, the layout reflowing. A departure is a bigger motion than
+  an in-place swap and the eye tracks it, so it runs a hair longer on
+  purpose (the departing-row fade is 220ms). This is the one reason a
+  fade is NOT the shared 150.
+- **250-300ms** suits larger moves only — a pane, a card, a sheet.
+- **>400ms** feels laggy for anything small; reserve it for deliberate,
+  attention-worthy transitions, which this app has none of.
+
+Two things that look like durations but are NOT motion, and keep their
+own numbers:
+
+- A continuous **loop** (a spinner) — a full turn at ~800ms reads as
+  "working" without spinning frantically.
+- A **dwell** timer — how long a "Copied" confirmation holds before it
+  reverts (~1.2s). A readability budget: "can the eye catch the word."
+  You initiated the copy and are looking right at it, so it need not
+  linger; longer starts to read as "stuck," not "confirmed." Never
+  confuse it with the 150ms crossfade that follows it.
+
+Concrete constants live at their use sites (copy_button.rs
+FADE_MS=`QUICK_FADE_MS` / HOLD_MS=1200; the berth stop spinner 800ms turn
+with a 150ms fade-in; the departing-row fade 220ms). This section is the
+why they cluster where they do.
 
 ## Platform fit
 

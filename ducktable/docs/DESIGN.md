@@ -37,7 +37,9 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
   0.20+ a held connection *is* the keepalive — the old `GET /keepalive`
   route died with the idle-exit machinery it served. The lifetime rule is
   harbor's own: a refcounted server lives while anyone is connected; a
-  `serve`d one runs until stopped.
+  `serve`d one runs until stopped. (The settled lifecycle direction folds
+  these two modes into one `start` — see Berth lifecycle in Design rules
+  — but that rename has not shipped.)
 - **UI stack**: GPUI (pinned crates.io release, currently 0.2.2) with
   gpui-component (0.5.1) supplying the virtualized Table and the code editor.
   Both are pre-1.0, and the versions are PINNED — an upgrade is a
@@ -81,9 +83,49 @@ Client architecture:
   timings, and page position describe one grid's contents and live on
   that grid; the view's chrome merely displays the active grid's facts.
 
+Berth lifecycle — two verb pairs and a boot flag, each verb matched to
+what it changes. The vocabulary is settled and the model is the target;
+on-screen labels stay plain and the nautical harbor/berth stays
+internal. Shipped today: drag-in Open (attach+start) and Stop. Still the
+committed direction: Detach, the Auto-start toggle, and the `serve`→
+`start` rename (harbor still exposes `serve` until that lands — see "kept
+alive by presence" under Architecture).
+
+- **Two verbs pairs, one noun.** *attach/detach* is membership — whether
+  a database is on the list, a config entry remembered across quit.
+  *start/stop* is running — whether its server is green right now.
+  *auto-start* is a property, not an action: the OS (launchd/systemd)
+  runs `start` at boot. Verbs act, the noun persists — the parts of
+  speech lining up with what is transient vs stored is the sign the
+  split is right. Flipping the noun still takes a verb (the toggle), like
+  "favorite" the property vs "Favorite it" the act.
+- **Open = attach + start.** Bringing a database in (drag-drop, ⌘O) is
+  one gesture: add it and run it. There is no bare "attach" affordance —
+  dim is a RESTING state reached by stopping or by relaunch, never a row
+  someone deliberately creates. A start that fails on a real database
+  still attaches (lands dim, shows the error); only a non-database
+  attaches nothing.
+- **The refcount lives in start/stop, never in attach/detach.** start
+  holds a client anchor (refcount++); stop drops it (refcount-- → the
+  server departs only if it was the last holder). So stop is safe by
+  construction: it closes MY view and can never nuke a server another
+  client still holds.
+- **`serve` is dead — it is `start`.** The old owned-vs-refcounted CLI
+  modes collapse into one verb: `start` runs until `stop`. "Always up
+  with nobody present" is not a mode, it is *auto-start* — the OS firing
+  `start` at boot (launchd `RunAtLoad`, never `KeepAlive`, or a stop
+  would just relaunch). start and stop are symmetric across CLI and REST
+  (`harbor <db> start` ↔ POST /shutdown).
+- **Status is one signal, rendered per surface.** green = running, dim =
+  stopped — the mark carries nothing else. DuckTable paints a dot with a
+  plain name beside it; the terminal fleet table tints the NAME instead
+  (a dot there would be redundant with the color). Same meaning, form
+  suited to the surface — and no anchor/lock glyph: a status mark should
+  inform, not decorate.
+
 Motion and feel — the reusable techniques, each minted once, named, and
 meant to be reached for anywhere (the umbrella law is EDITING.md's
-"content snaps, chrome fades"):
+"content snaps, chrome fades"; durations live in UI.md's Motion):
 
 - **Atomic swap, single writer.** When two visuals must move together
   (selection ring + row wash), one code path mutates both in one frame;
@@ -112,6 +154,13 @@ meant to be reached for anywhere (the umbrella law is EDITING.md's
   directions, played inside a state window its own timer closes — an
   instant vanish beside a fade-in reads as a glitch (chrome.rs
   crossfade; first user: the copy tile's check → copy revert).
+- **Explicit copy, never selection.** Painted labels have no OS
+  text-selection, so any copy-worthy value — a database path, DDL, an
+  error detail — carries its own self-confirming copy tile (glyph →
+  green check "Copied" → crossfade home), never relies on drag-select +
+  ⌘C. The widget owns its text, clipboard write, and flash timers; the
+  host just drops the entity in (copy_button.rs; used by the DDL block
+  and the connected-berth info card's path).
 
 DuckDB facts (measured):
 
