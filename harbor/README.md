@@ -253,7 +253,7 @@ indexes and sequences — plus the engine's row estimate and its own
 exact bytes at the top:
 
 ```json
-{"harborVersion":"0.20.0","duckdbVersion":"v2.0.0-alpha38195",
+{"harborVersion":"0.21.0","duckdbVersion":"v2.0.0-dev83323",
  "databaseSizeBytes":12582912,"walSizeBytes":0,
  "tables":[{"name":"orders","schema":"main","estimatedRows":300000,
             "columns":[…],"primaryKey":["id"],
@@ -292,10 +292,12 @@ needs root.
 One caveat that ends at DuckDB 2.0 GA: the official artifact channel is
 currently frozen at a build that predates the v2 C API, so the `libduckdb`
 it delivers cannot *serve* (harbor says so plainly: "engine has no v2 C
-API"). `fetch-duckdb` warns when this happens. Until GA, a serving engine
-is built from DuckDB source at a pinned commit — CI does exactly this, and
-the recipe lives in `.github/actions/duckdb/action.yml`. The fetched
-`duckdb` CLI is unaffected either way.
+API"). `fetch-duckdb` warns when this happens. Until GA, serving engines
+come from this repo's own shelf — the Engine workflow builds all five
+platforms from DuckDB source at CI's pinned commit and publishes them on
+the `engine-<pin>` prerelease; `fetch-duckdb` takes it via `ENGINE_URL`,
+and the release archives below already bundle it. The fetched `duckdb`
+CLI is unaffected either way.
 
 No toolchain? One command installs the latest release — it picks the right
 archive for the platform, verifies its sha256 against the published checksums,
@@ -318,7 +320,7 @@ with `sudo` in front of the whole command — the installer never escalates on
 its own. On Windows the binary lands in `%LOCALAPPDATA%\Programs\harbor\bin`,
 which the installer adds to your user `PATH`.
 
-Pin a version with `... | bash -s v0.20.0` (or `-Tag v0.20.0` on Windows). Each
+Pin a version with `... | bash -s v0.21.0` (or `-Tag v0.21.0` on Windows). Each
 [release](https://github.com/shreeve/duckdb-harbor/releases)
 ships one self-contained archive per
 platform (osx-arm64, linux-amd64, linux-arm64, windows-amd64, windows-arm64):
@@ -605,8 +607,9 @@ harbor loads the engine on demand (`HARBOR_LIBDUCKDB`, then `../lib` beside
 the binary, `~/.local/lib`, and `~/.duckdb/cli/*` — DuckDB's own world,
 disposable and refetchable). Harbor binds DuckDB's v2 C API, so DuckDB 2.0
 is the engine floor; the same build has been verified against every
-v2-API engine it has met (currently self-built at CI's pinned commit — the
-published artifacts are frozen pre-v2-API until GA). Treat that as tested
+v2-API engine it has met (currently built at CI's pinned commit and shelved
+on the `engine-<pin>` prerelease — the official artifacts are frozen
+pre-v2-API until GA). Treat that as tested
 compatibility, not a
 promise that an arbitrary future DuckDB ABI will work. Your database files
 need no such care: a file created by a 1.5-era DuckDB opens as-is, because
