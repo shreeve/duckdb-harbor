@@ -167,9 +167,8 @@ impl DuckTable {
                             d.child(dim(t, crate::util::human(s as f64, "B")))
                         })
                         .when_some(row.note.clone(), |d, note| {
-                            // reconcile's fix-it line ("… harbor forget x")
-                            // rides the row as a tooltip: the unhealthy dot
-                            // explains itself.
+                            // a survey note rides the row as a tooltip: an
+                            // unusual dot explains itself.
                             d.tooltip(move |window, cx| {
                                 gpui_component::tooltip::Tooltip::new(clone_str(&note))
                                     .build(window, cx)

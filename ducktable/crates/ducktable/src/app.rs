@@ -16,8 +16,8 @@ pub(crate) struct RowVm {
     pub(crate) tables: Option<usize>,
     /// Size on disk (data + WAL) — knowable for every berth.
     pub(crate) size: Option<u64>,
-    /// reconcile's human-readable fix for an unhealthy row
-    /// ("… harbor forget x"), surfaced as the row's tooltip.
+    /// the survey's human-readable note for an unusual row,
+    /// surfaced as the row's tooltip.
     pub(crate) note: Option<String>,
 }
 

@@ -16,11 +16,12 @@ license = "MIT"
 # the semantics (see `state::Level`), not the ANSI.
 default = ["term"]
 term = ["dep:unicode-width"]
-# The fleet-reading half (config, fleet) that only DuckTable consumes since
-# harbor 0.20 deleted its fleet layer. Off by default so harbor's build graph
+# The config reader that only DuckTable consumes since harbor 0.20 deleted
+# its fleet layer (the fleet module itself retired when DuckTable moved to
+# socket discovery). Off by default so harbor's build graph
 # carries no toml/serde stack for modules it never calls. (state stays
 # unconditional: pure semantics, no deps, and ui's Tone conversion needs it.)
-fleet = ["dep:serde", "dep:toml", "dep:serde_json"]
+config = ["dep:serde", "dep:toml", "dep:serde_json"]
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"], optional = true }
