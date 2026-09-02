@@ -42,17 +42,23 @@ jobs:
       - uses: actions/checkout@v5
 
 
+      # The official channel is frozen pre-v2-C-API until DuckDB 2.0 GA, so
+      # fetch from our own shelf instead: the Engine workflow builds all five
+      # platforms at CI's pinned commit and shelves them on the engine-<pin>
+      # prerelease in this repo, in the official channel's exact zip shape.
+      # The pin is READ from .github/actions/duckdb/action.yml — the same
+      # commit the test batteries validate — so tested-equals-shipped holds
+      # by construction: bump the pin there, and this step fetches the
+      # matching shelf or fails loudly on a 404 telling you to dispatch
+      # Engine.yml. At GA, delete this derivation and the ENGINE_URL line;
+      # fetch-duckdb.sh falls back to artifacts.duckdb.org on its own.
       - name: Fetch DuckDB engine
         shell: bash
-        env:
-          # The official channel is frozen pre-v2-C-API until DuckDB 2.0 GA,
-          # so fetch from our own shelf instead: the Engine workflow builds
-          # all five platforms at CI's pinned commit and shelves them on the
-          # engine-<pin> prerelease in this repo, in the official channel's
-          # exact zip shape. At GA, delete this env block and fetch-duckdb.sh
-          # falls back to artifacts.duckdb.org on its own.
-          ENGINE_URL: https://github.com/${{ github.repository }}/releases/download/engine-1582849bf9/duckdb-binaries-${{ matrix.duck_plat }}.zip
-        run: DEST="$DUCKDB_LIB" DUCKDB_PLATFORM=${{ matrix.duck_plat }} scripts/fetch-duckdb.sh
+        run: |
+          pin=$(grep -o 'sha=[0-9a-f]\{40\}' "$GITHUB_WORKSPACE/.github/actions/duckdb/action.yml" | cut -d= -f2)
+          [ -n "$pin" ] || { echo "no engine pin found in action.yml"; exit 1; }
+          ENGINE_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/engine-${pin:0:10}/duckdb-binaries-${{ matrix.duck_plat }}.zip" \
+            DEST="$DUCKDB_LIB" DUCKDB_PLATFORM=${{ matrix.duck_plat }} scripts/fetch-duckdb.sh
 
       # Fail FAST if the fetched library cannot serve this harbor — grep the
       # v2 symbol names straight out of the binary. With ENGINE_URL above

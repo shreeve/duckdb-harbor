@@ -17,10 +17,12 @@
 # shelves them on this repo's engine-<pin> prerelease, in the official
 # channel's exact zip shape:
 #
-#   ENGINE_URL=https://github.com/shreeve/duckdb-harbor/releases/download/engine-1582849bf9/duckdb-binaries-<plat>.zip
+#   ENGINE_URL=https://github.com/shreeve/duckdb-harbor/releases/download/engine-<pin>/duckdb-binaries-<plat>.zip
 #
-# (or build from source yourself — recipe in .github/actions/duckdb/
-# action.yml). The CLI from the frozen zip is still fine: it only builds
+# where <pin> is the first 10 chars of the commit in
+# .github/actions/duckdb/action.yml — the ONE place the pin lives (the
+# repo's Releases page lists the current engine-* tag). The CLI from the
+# frozen zip is still fine: it only builds
 # fixtures and needs no v2 API. This script warns loudly when the fetched
 # library cannot serve. At GA, delete the caveat and the warning below.
 #
