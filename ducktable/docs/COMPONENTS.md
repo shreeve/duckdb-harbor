@@ -31,9 +31,9 @@ grid's selection painting and cell borders are the pattern), not wrapped.
    the staged/live pipeline are ours, built on the delegate API. This
    is the app's core engineering and is governed by DESIGN.md's rules.
 2. **SQL syntax highlighting.** The tree-sitter highlighter has a
-   language registry but bundles no SQL grammar. We register
-   `tree-sitter-sql`; the bundled `languages/` directory is the
-   template. Completion itself is Harbor-side (`sql_auto_complete`).
+   language registry but bundles no SQL grammar. We ship a first-party
+   `duckdb-lang` crate (tree-sitter-duckdb; see QUERY.md) and register
+   it. Completion itself is Harbor-side (`sql_auto_complete`).
 3. **Berth status, LIVE badge, NULL tags, conflict cells.** Small
    custom drawing inside our wrappers.
 

@@ -560,7 +560,7 @@ mod equal_reader {
         R: Read,
     {
         fn drop(&mut self) {
-            // THE BOUNDED DRAIN (one of the two hardening behaviors this crate carries,
+            // THE BOUNDED DRAIN (one of the hardening behaviors this crate carries,
             // with a regression test in tests/drain.rs): a fixed 64 KiB buffer instead
             // of `vec![0; remaining_to_read]`. The
             // remaining size is the client's *declared* Content-Length minus what

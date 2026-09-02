@@ -156,6 +156,19 @@ pub(crate) fn push_int(out: &mut String, i: i128) {
     }
 }
 
+/// The unsigned mirror of [`push_int`]: the single home for the JSON-safe rule
+/// on the u128 side (UBIGINT past i64, UHUGEINT). Anything wider than 2^53 - 1
+/// goes out quoted so a JS client never silently reprecisions it.
+pub(crate) fn push_uint(out: &mut String, v: u128) {
+    if v <= JSON_SAFE as u128 {
+        push_u128_raw(out, v);
+    } else {
+        out.push('"');
+        push_u128_raw(out, v);
+        out.push('"');
+    }
+}
+
 pub(crate) fn push_float(out: &mut String, f: f64) {
     // JSON has no NaN or Infinity, but null is not the answer: it is
     // indistinguishable from SQL NULL, so a client cannot tell a missing value

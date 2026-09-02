@@ -21,7 +21,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 
-use harbor_common::lifetime::parse_duration;
+use harbor_common::duration::parse_duration;
 use harbor_common::autostart;
 use harbor_common::membership::{self, Attached};
 use harbor_common::perms::chmod;
@@ -426,6 +426,9 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> 
         "database": canon.display().to_string(),
         "databases": databases,
         "pid": std::process::id(),
+        // The lifetime mode, so a client that restarts this server (to upgrade
+        // the binary) can bring it back the same way it was running.
+        "ephemeral": o.ephemeral,
     }));
 
     eprintln!(

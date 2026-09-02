@@ -14,7 +14,7 @@ use super::{Error, str_view};
 use crate::encode::{
     civil_from_days, digit_pair, push_base64, push_bit_string, push_date, push_float,
     push_float32, push_fraction, push_i64_raw, push_int, push_int_pad, push_json_string,
-    push_time, push_tz_offset, push_u128_raw, push_u64_raw, push_uuid, quote_identifier,
+    push_time, push_tz_offset, push_u128_raw, push_u64_raw, push_uint, push_uuid, quote_identifier,
     split_time,
     varint_to_decimal,
 };
@@ -183,7 +183,7 @@ pub fn result_columns(api: &ffi::Api, result: ffi::result_handle) -> Result<Vec<
 }
 
 // ---------------------------------------------------------------------------
-// Schema emission — byte-identical to src/encode.rs emit_column_schema.
+// Schema emission — the type tree, over the scalar writers in src/encode.rs.
 // ---------------------------------------------------------------------------
 
 pub fn emit_column_schema(out: &mut String, name: Option<&str>, ty: &Type) {
@@ -450,7 +450,7 @@ impl Reader {
 }
 
 // ---------------------------------------------------------------------------
-// Cell emission — byte-identical to src/encode.rs emit_tagged/emit_value.
+// Cell emission — one value per call, over the scalar writers in src/encode.rs.
 // ---------------------------------------------------------------------------
 
 /// Emit one column's cell at `row` of the chunk the reader was built from.
@@ -501,15 +501,7 @@ fn emit(
             LOGICAL_TYPE_ID_HUGEINT => push_int(out, hugeint(r.get(phys))),
             LOGICAL_TYPE_ID_UHUGEINT => {
                 let h: ffi::uhugeint_t = r.get(phys);
-                let v = (h.upper as u128) << 64 | h.lower as u128;
-                // Same JSON-safe rule as push_int, on the unsigned side.
-                if v <= 9_007_199_254_740_991u128 {
-                    push_u128_raw(out, v);
-                } else {
-                    out.push('"');
-                    push_u128_raw(out, v);
-                    out.push('"');
-                }
+                push_uint(out, (h.upper as u128) << 64 | h.lower as u128);
             }
             LOGICAL_TYPE_ID_FLOAT => push_float32(out, r.get::<f32>(phys)),
             LOGICAL_TYPE_ID_DOUBLE => push_float(out, r.get::<f64>(phys)),
@@ -784,9 +776,8 @@ fn push_decimal(out: &mut String, v: i128, scale: u8) {
     out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[start..]) });
 }
 
-/// src/encode.rs fmt_timestamp, minus its duckdb-rs TimeUnit parameter:
-/// `seconds_only` suppresses the fraction (TIMESTAMP_S), `zulu` appends the
-/// timezone marker.
+/// Format a timestamp from nanoseconds: `seconds_only` suppresses the
+/// fraction (TIMESTAMP_S), `zulu` appends the timezone marker.
 fn push_ts(out: &mut String, nanos: i128, seconds_only: bool, zulu: bool) {
     const DAY: i64 = 86_400_000_000_000;
     // Micros × 1000 can spill past i64 — hence the i128 signature — but

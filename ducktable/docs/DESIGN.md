@@ -36,10 +36,10 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
 - **A connected berth is kept alive by presence, not pulses.** Under Harbor
   0.20+ a held connection *is* the keepalive — the old `GET /keepalive`
   route died with the idle-exit machinery it served. The lifetime rule is
-  harbor's own: a refcounted server lives while anyone is connected; a
-  `serve`d one runs until stopped. (The settled lifecycle direction folds
-  these two modes into one `start` — see Berth lifecycle in Design rules
-  — but that rename has not shipped.)
+  harbor's own: one `start` verb, two lifetimes. A plain start is
+  persistent and runs until stopped; an ephemeral start (spawned with
+  `HARBOR_EPHEMERAL`, the way opening a database summons one) self-retires
+  once its last client disconnects. See Berth lifecycle in Design rules.
 - **UI stack**: GPUI (pinned crates.io release, currently 0.2.2) with
   gpui-component (0.5.1) supplying the virtualized Table and the code editor.
   Both are pre-1.0, and the versions are PINNED — an upgrade is a
@@ -84,14 +84,13 @@ Client architecture:
   that grid; the view's chrome merely displays the active grid's facts.
 
 Berth lifecycle — two verb pairs and a boot flag, each verb matched to
-what it changes. The vocabulary is settled and the model is the target;
-on-screen labels stay plain and the nautical harbor/berth stays
-internal. Shipped today: drag-in Open (attach+start) and Stop. Still the
-committed direction: Detach, the Auto-start toggle, and the `serve`→
-`start` rename (harbor still exposes `serve` until that lands — see "kept
-alive by presence" under Architecture).
+what it changes. The vocabulary is settled and shipped; on-screen labels
+stay plain and the nautical harbor/berth stays internal. All of it is
+live: drag-in Open (attach+start), Stop, Detach, and the Auto-start
+toggle, over harbor's single `start` verb (the old `serve` is gone — see
+"kept alive by presence" under Architecture).
 
-- **Two verbs pairs, one noun.** *attach/detach* is membership — whether
+- **Two verb pairs, one noun.** *attach/detach* is membership — whether
   a database is on the list, a config entry remembered across quit.
   *start/stop* is running — whether its server is green right now.
   *auto-start* is a property, not an action: the OS (launchd/systemd)

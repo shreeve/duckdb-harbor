@@ -279,6 +279,10 @@ pub struct InfoResponse {
     pub databases: Vec<String>,
     pub pid: u32,
     pub uptime_ms: u64,
+    /// True when this server self-retires once its last client leaves (spawned
+    /// with `HARBOR_EPHEMERAL` / a `detach start`). A client restarting it — to
+    /// upgrade the binary, say — reads this to bring it back in the same mode.
+    pub ephemeral: bool,
 }
 
 #[cfg(test)]

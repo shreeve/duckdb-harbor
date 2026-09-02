@@ -17,8 +17,8 @@ mod complete;
 mod render;
 mod highlight;
 mod http;
+mod interactive;
 mod keywords;
-mod repl;
 mod scan;
 mod theme;
 
@@ -55,7 +55,7 @@ enum Outcome {
 }
 
 /// The client's whole CLI: everything except bare `harbor` (the list, which
-/// main dispatches straight to list_main) and `<db> serve` (the server).
+/// main dispatches straight to list_main) and `<db> start` (the server).
 pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
     // Ctrl-C cancels the running statement (via its queryId), it does not
     // kill the client. At the REPL prompt reedline runs raw mode, so SIGINT
@@ -126,7 +126,7 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
                 // "auto" appearance queries the terminal (OSC 11), which needs
                 // an interactive stdin/stdout and must run before reedline does.
                 theme::init(None, None);
-                return repl::run(&conn, &prompt_name(&target), opts, anchor);
+                return interactive::run(&conn, &prompt_name(&target), opts, anchor);
             }
             let mut s = String::new();
             if std::io::stdin().read_to_string(&mut s).is_err() || s.trim().is_empty() {
@@ -143,7 +143,7 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
     // one per request, so split exactly the way the REPL and .read do,
     // stopping at the first failure or interrupt.
     let mut last = Outcome::Done;
-    for stmt in repl::split_statements(&sql) {
+    for stmt in interactive::split_statements(&sql) {
         last = run_sql(&conn, &stmt, &opts);
         if last != Outcome::Done {
             break;
@@ -453,7 +453,7 @@ fn list() -> Result<(), String> {
                         .unwrap_or_else(|| "?".into()),
                     pid: v["pid"].as_u64().map_or_else(|| "?".into(), |p| p.to_string()),
                     clients: v["clients"].as_u64().map_or_else(|| "?".into(), |c| c.to_string()),
-                    uptime: harbor_common::lifetime::humanize(Duration::from_millis(ms)),
+                    uptime: harbor_common::duration::humanize(Duration::from_millis(ms)),
                     address: shown,
                 });
             }
@@ -527,14 +527,15 @@ fn list() -> Result<(), String> {
 /// The prompt a foreground server wears: the same REPL, dialled at the
 /// server's own front door, so what the operator types is what any client
 /// would get. Returning ends the server — the caller stops and waits — which
-/// is the serve doctrine: the server is yours, it lives until you leave.
+/// is the foreground-start doctrine: the server is yours, it lives until you
+/// leave.
 pub fn helm(transport: Transport, token: Option<String>, name: &str) {
     let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, CANCEL.clone());
     theme::init(None, None);
     let conn = Conn { transport, token };
     // No anchor: an owned server's lifetime is the operator's presence at
     // this prompt, not its client count.
-    let _ = repl::run(&conn, name, RenderOpts::default(), None);
+    let _ = interactive::run(&conn, name, RenderOpts::default(), None);
 }
 
 fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {

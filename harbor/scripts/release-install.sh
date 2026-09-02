@@ -45,7 +45,7 @@ done
 # rm first, install second: macOS caches a binary's code signature per inode,
 # and overwriting in place leaves every later exec SIGKILL'd against the stale
 # cache. A fresh inode gets a fresh verdict; upgrades stay safe.
-rm -f "$BIN/harbor" "$BIN/pilot"
+rm -f "$BIN/harbor"
 rm -f "$LIB"/libduckdb.dylib "$LIB"/libduckdb.so
 install -m 0755 bin/harbor "$BIN"
 install -m 0755 lib/libduckdb.* "$LIB"

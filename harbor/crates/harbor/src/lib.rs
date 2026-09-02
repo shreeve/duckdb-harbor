@@ -1588,7 +1588,7 @@ fn shed(req: Request) -> (bool, u16) {
 }
 
 // ---------------------------------------------------------------------------
-// Berth identity (GET /info) and idle accounting (--idle-exit)
+// Berth identity (GET /info) and refcounted idle exit (HARBOR_EPHEMERAL)
 // ---------------------------------------------------------------------------
 
 /// Identity document the embedding host sets before `start()`; GET /info

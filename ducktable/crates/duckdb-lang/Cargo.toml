@@ -1,3 +1,6 @@
+# Deliberately NOT on the workspace version: this crate is meant to be
+# published standalone as the first tree-sitter-duckdb grammar (see
+# docs/QUERY.md), so it carries its own version, edition, and description.
 [package]
 name = "duckdb-lang"
 version = "0.1.0"

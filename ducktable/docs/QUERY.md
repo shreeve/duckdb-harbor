@@ -335,6 +335,11 @@ a rung:
 
 ## Architecture: three clean rooms
 
+> **Status (roadmap):** `crates/duckdb-lang` has shipped and is wired in;
+> `crates/sql-intel`, the `keywords/*.list` build tables, and the
+> `cargo xtask grammar-sync` tooling below are the phase-2 target, not
+> yet built. The rest of this section describes the intended shape.
+
 The user constraint — editor code in its own space, nice and tidy —
 holds structurally, not by convention. Two new workspace crates plus
 one app module, each with one job and a narrow doorway:

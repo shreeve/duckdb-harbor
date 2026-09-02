@@ -253,7 +253,7 @@ where
         self.headers.push(header);
     }
 
-    /// Returns the same request, but with an additional header.
+    /// Returns the same response, but with an additional header.
     ///
     /// Some headers cannot be modified and some other have a
     ///  special behavior. See the documentation above.
@@ -267,7 +267,7 @@ where
         self
     }
 
-    /// Returns the same request, but with a different status code.
+    /// Returns the same response, but with a different status code.
     #[inline]
     #[must_use]
     pub fn with_status_code<S>(mut self, code: S) -> Response<R>
@@ -278,7 +278,7 @@ where
         self
     }
 
-    /// Returns the same request, but with different data.
+    /// Returns the same response, but with different data.
     #[must_use]
     pub fn with_data<S>(self, reader: S, data_length: Option<usize>) -> Response<S>
     where
@@ -355,11 +355,8 @@ where
         // barely wants, at the cost of holding the entire response in memory —
         // and harbor streams results with no size limit down this path, so the
         // cost was unbounded and chosen by the caller.
-        let (mut reader, data_length): (Box<dyn Read>, _) =
-            match (self.data_length, transfer_encoding) {
-                (Some(l), _) => (Box::new(self.reader), Some(l)),
-                _ => (Box::new(self.reader), None),
-            };
+        let mut reader: Box<dyn Read> = Box::new(self.reader);
+        let data_length = self.data_length;
 
         // checking whether to ignore the body of the response
         // status code 1xx, 204 and 304 MUST not include a body

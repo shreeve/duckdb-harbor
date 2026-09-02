@@ -141,6 +141,41 @@ impl DuckTable {
                                 })),
                         )
                     })
+                    // The upgrade badge: a red count of local servers running
+                    // an older harbor than the one installed. Click to restart
+                    // them onto the current binary. Refresh (below) keeps its
+                    // plain meaning; upgrading is this deliberate, separate tap.
+                    .when(self.outdated_count() > 0, |d| {
+                        let n = self.outdated_count();
+                        d.child(
+                            div()
+                                .id("upgrade-badge")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .min_w(px(16.))
+                                .h(px(16.))
+                                .px_1()
+                                .rounded_full()
+                                .bg(t.bad)
+                                .text_color(gpui::white())
+                                .text_xs()
+                                .font_weight(FontWeight::BOLD)
+                                .cursor_pointer()
+                                .child(n.to_string())
+                                .tooltip(move |window, cx| {
+                                    let what = if n == 1 {
+                                        "1 database on an old harbor — click to upgrade".to_string()
+                                    } else {
+                                        format!("{n} databases on an old harbor — click to upgrade")
+                                    };
+                                    gpui_component::tooltip::Tooltip::new(what).build(window, cx)
+                                })
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.prompt_upgrade(window, cx);
+                                })),
+                        )
+                    })
                     .child(
                         head_glyph("refresh-berths", false, t)
                             .child(

@@ -4,7 +4,7 @@
 //!
 //! 1. **A pipe gets data, a terminal gets a picture.** Box-drawing and color
 //!    appear only when stdout is a tty. Piped output is tab-separated and
-//!    byte-stable, so `harbor show | awk` keeps working forever.
+//!    byte-stable, so `harbor | awk` keeps working forever.
 //! 2. **`NO_COLOR` wins.** It is the de facto standard and it costs one line.
 //! 3. **Nothing from disk is ever printed raw.** A database path containing
 //!    an escape sequence must not be able to repaint the terminal or forge a
@@ -339,104 +339,6 @@ fn superscript(n: usize) -> String {
     n.to_string().chars().map(|d| DIGITS[d as usize - '0' as usize]).collect()
 }
 
-// ---------------------------------------------------------------------------
-// panel
-// ---------------------------------------------------------------------------
-
-/// A detail view for one thing: `harbor status <name>`.
-#[derive(Default)]
-pub struct Panel {
-    title: String,
-    badge: (String, Tone),
-    footer: String,
-    fields: Vec<(String, String, Tone)>,
-}
-
-impl Panel {
-    pub fn new(title: impl AsRef<str>) -> Self {
-        Panel { title: sanitize(title.as_ref()), ..Default::default() }
-    }
-
-    pub fn badge(mut self, text: impl AsRef<str>, tone: Tone) -> Self {
-        self.badge = (sanitize(text.as_ref()), tone);
-        self
-    }
-
-    pub fn footer(mut self, text: impl AsRef<str>) -> Self {
-        self.footer = sanitize(text.as_ref());
-        self
-    }
-
-    pub fn field(mut self, label: impl AsRef<str>, value: impl AsRef<str>) -> Self {
-        self.fields.push((sanitize(label.as_ref()), sanitize(value.as_ref()), Tone::Plain));
-        self
-    }
-
-    pub fn field_toned(mut self, label: impl AsRef<str>, value: impl AsRef<str>, t: Tone) -> Self {
-        self.fields.push((sanitize(label.as_ref()), sanitize(value.as_ref()), t));
-        self
-    }
-
-    pub fn render(&self, st: &Style) -> String {
-        if !st.boxed {
-            let mut out = String::new();
-            for (l, v, _) in &self.fields {
-                out.push_str(&format!("{l}\t{v}\n"));
-            }
-            return out;
-        }
-        let c = &ROUNDED;
-        let lw = self.fields.iter().map(|(l, _, _)| cells(l)).max().unwrap_or(0);
-        let lines: Vec<String> =
-            self.fields.iter().map(|(l, v, _)| format!("  {}  {v}", pad(l, lw, false))).collect();
-        let tones: Vec<Tone> = self.fields.iter().map(|(_, _, t)| *t).collect();
-
-        // Caps first: the border has to fit its own text before anything else.
-        let left_cap = format!("{} {} ", c.h, self.title);
-        let right_cap = match self.badge.0.is_empty() {
-            true => String::new(),
-            false => format!(" {} {}", self.badge.0, c.h),
-        };
-        let foot_cap = match self.footer.is_empty() {
-            true => String::new(),
-            false => format!(" {} {}", self.footer, c.h),
-        };
-        let inner = lines
-            .iter()
-            .map(|l| cells(l))
-            .chain([cells(&left_cap) + cells(&right_cap) + 2])
-            .chain([cells(&foot_cap) + 2])
-            .max()
-            .unwrap_or(0)
-            + 2;
-
-        let mut out = String::new();
-        let fill = inner.saturating_sub(cells(&left_cap) + cells(&right_cap));
-        out.push_str(&format!(
-            "{}{}{}{}{}\n",
-            c.tl,
-            st.paint(Tone::Bold, &left_cap),
-            c.h.repeat(fill),
-            st.paint(self.badge.1, &right_cap),
-            c.tr
-        ));
-        out.push_str(&format!("{}{}{}\n", c.v, " ".repeat(inner), c.v));
-        for (l, t) in lines.iter().zip(tones) {
-            out.push_str(&format!("{}{}{}\n", c.v, st.paint(t, &pad(l, inner, false)), c.v));
-        }
-        out.push_str(&format!("{}{}{}\n", c.v, " ".repeat(inner), c.v));
-        let ffill = inner.saturating_sub(cells(&foot_cap));
-        out.push_str(&format!(
-            "{}{}{}{}\n",
-            c.bl,
-            c.h.repeat(ffill),
-            st.paint(Tone::Dim, &foot_cap),
-            c.br
-        ));
-        out
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,20 +433,6 @@ mod tests {
     fn no_color_beats_everything() {
         let st = Style { color: false, boxed: true };
         assert_eq!(st.paint(Tone::Red, "x"), "x");
-    }
-
-    #[test]
-    fn a_panel_is_square_and_carries_its_caps() {
-        let p = Panel::new("medlabs")
-            .badge("running · 1h12m", Tone::Green)
-            .footer("pid 12699")
-            .field("database", "~/Data/medlabs.duckdb")
-            .field("limits", "6 workers · 2 GB");
-        let out = p.render(&boxed());
-        let widths: Vec<usize> = out.lines().map(cells).collect();
-        assert!(widths.windows(2).all(|w| w[0] == w[1]), "ragged: {widths:?}\n{out}");
-        assert!(out.contains("medlabs") && out.contains("running") && out.contains("pid 12699"));
-        assert!(out.starts_with('╭') && out.trim_end().ends_with('╯'));
     }
 
 }

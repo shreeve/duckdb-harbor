@@ -367,10 +367,10 @@ impl QueryView {
                 .background_executor()
                 .spawn(async move {
                     if wrappable(&sql) {
-                        let src = crate::queries::query_source(&sql);
+                        let src = crate::sql::query_source(&sql);
                         let probe = harbor_client::query(
                             &conn,
-                            &crate::queries::page_sql(&src, false, &None, 0, size + 1),
+                            &crate::sql::page_sql(&src, false, &None, 0, size + 1),
                         );
                         if let Ok(mut result) = probe {
                             if result.rows.len() <= size {
@@ -385,10 +385,10 @@ impl QueryView {
                             // "1–5,000 rows" — honest, not wrong.
                             let total = harbor_client::query(
                                 &conn,
-                                &crate::queries::count_sql(&src, &None),
+                                &crate::sql::count_sql(&src, &None),
                             )
                             .ok()
-                            .and_then(|r| crate::queries::count_of(&r));
+                            .and_then(|r| crate::sql::count_of(&r));
                             return (Ok(result), total, true);
                         }
                     }

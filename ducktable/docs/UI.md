@@ -90,11 +90,12 @@ berths, and the size on disk right-justified in decimal units (MB/GB,
 never MiB). Click opens the berth (attach + start); the attempt is
 fenced, so a late completion discards itself and a cancel works
 synchronously. Right-click carries the verbs matched to the two axes,
-each landing on its own transition (DESIGN.md, Berth lifecycle). Shipped:
-**Stop** (running — drops this window's anchor, green→dim). The settled
-menu adds **Detach** (membership — remove from the list, the row fades
-out and is gone) and the **Auto-start** toggle (the boot property);
-those are the committed direction, not yet shipped. Plain verbs only; the nautical vocabulary is frozen at harbor, berth —
+each landing on its own transition (DESIGN.md, Berth lifecycle). The menu
+shows, per axis, only the move that applies: **Start** or **Stop**
+(running — Start summons the server, Stop drops this window's anchor,
+green→dim), **Attach** or **Detach** (membership — add to or remove from
+the list, the row fading out on Detach), and the **Auto-start** toggle
+(the boot property, a single checked item). Plain verbs only; the nautical vocabulary is frozen at harbor, berth —
 and stays INTERNAL: on-screen labels use user words (DATABASES, TABLES,
 "database").
 
@@ -121,7 +122,7 @@ Switching berths in the sidebar never retargets an existing tab; a query
 always runs against the berth its tab was born on. A tab is a surface:
 
 - **Table**: the grid, opened from the catalog tree.
-- **Query**: SQL editor above, results grid below, EXPLAIN toggle.
+- **Query**: SQL editor above, results grid below, one-shot EXPLAIN (⌘⇧E).
 - **Notebook** (later, not in the v1 build): a vertical stack of
   independent query panes, not a run-in-order document. Each pane is a
   collapsible SQL editor above a flexible result grid; either half
@@ -237,7 +238,7 @@ discards an in-progress edit in either mode.
 
 The editor uses DuckDB keywords and Harbor-side completion
 (sql_auto_complete). Cmd+Enter runs the statement under the cursor,
-Cmd+Shift+Enter runs all; statements split server-side. A running query
+Cmd+Shift+Enter runs all; statements split client-side (QUERY.md). A running query
 shows elapsed time and a Cancel action (Cmd+.), which cancels through
 Harbor; responses are fenced so a stale response can never replace a
 newer result. Multi-statement runs execute in order, stop at the first
@@ -247,9 +248,9 @@ cancels its running query.
 
 Results are read-only in v1. Copy (cells, rows, with headers) and
 export of the fetched result to CSV or Parquet via DuckDB `COPY` are
-part of the query flow, not extras. The EXPLAIN toggle renders the
-server's plan text verbatim in a monospaced pane; plans are text, not
-diagrams.
+part of the query flow, not extras. EXPLAIN (⌘⇧E) is a one-shot — not a
+sticky toggle — that renders the server's plan text verbatim in a
+monospaced pane; plans are text, not diagrams.
 
 ## Inspector (right panel)
 

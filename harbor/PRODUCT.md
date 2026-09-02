@@ -120,8 +120,9 @@ between requests forever, which is what makes presence expressible at all.
 the helm — the same REPL, dialled at the server's own socket, so what the
 operator sees is what any client would get — and leaving the prompt ends the
 server. Headless, it runs until `SIGTERM`. Spawn-on-use spawns exactly this
-(`current_exe() <db> start --ephemeral`, detached, stderr to a log beside the
-socket), so there is one start path however a server comes to exist.
+(`current_exe() <db> start` with `HARBOR_EPHEMERAL` in its environment,
+detached, stderr to a log beside the socket), so there is one start path
+however a server comes to exist.
 
 `curl` works iff something is listening, by design: a bare HTTP client does
 not summon a database. An application that wants spawn-on-use runs

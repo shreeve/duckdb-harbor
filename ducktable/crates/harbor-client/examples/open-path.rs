@@ -1,7 +1,9 @@
 //! Drive the File→Open plumbing exactly as the UI does: connect_path on a
 //! bare .duckdb path (join-or-summon), one query through the wire, then
-//! stop the summoned server. `cargo run -p harbor-client --example
-//! open-path -- <db>`; point HARBOR_BIN/HARBOR_LIBDUCKDB as needed.
+//! stop the summoned server. A summoned server is ephemeral — it would
+//! self-retire once its last client left — so this stop is only to skip the
+//! idle grace and free the file at once. `cargo run -p harbor-client
+//! --example open-path -- <db>`; point HARBOR_BIN/HARBOR_LIBDUCKDB as needed.
 
 use std::path::Path;
 
@@ -13,7 +15,8 @@ fn main() {
     println!("query answered: {:?}", result.rows);
     let info = harbor_client::fleet::info(&conn).expect("info");
     println!("server: {} pid={} db={}", info.name, info.pid, info.database);
-    // Leave the harbor as found: the server we summoned, we stop.
+    // Leave the harbor as found now, rather than after the idle grace: the
+    // ephemeral server we summoned, we stop.
     if conn.summoned {
         harbor_client::http::request(
             &conn.transport,

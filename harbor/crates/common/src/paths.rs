@@ -167,11 +167,6 @@ pub fn token_file(runtime: &Path, name: &str) -> PathBuf {
 pub fn lock_file(runtime: &Path, name: &str) -> PathBuf {
     runtime.join(format!("{name}.lock"))
 }
-/// The operator's stop, made durable: while this exists, no client may
-/// raise the name — `harbor start` lifts it, `harbor forget` sweeps it.
-pub fn hold_file(runtime: &Path, name: &str) -> PathBuf {
-    runtime.join(format!("{name}.hold"))
-}
 pub fn log_file(runtime: &Path, name: &str) -> PathBuf {
     runtime.join("log").join(format!("{name}.log"))
 }

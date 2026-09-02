@@ -77,7 +77,19 @@ impl DuckTable {
                         move |this, _, _, cx| this.connect(clone_str(&name), cx),
                     ))
                 }),
-            Phase::Connected { conn, info, catalog } => div()
+            Phase::Connected { conn, info, catalog } => {
+                let installed = self.installed_version.clone();
+                let stale = installed.as_deref().is_some_and(|iv| {
+                    harbor_client::fleet::version_older(&info.harbor_version, iv)
+                });
+                // A local server (its row carries a path) can be restarted from
+                // here; a remote one can only be noted as behind.
+                let is_local = self
+                    .rows
+                    .iter()
+                    .find(|r| r.name == info.name)
+                    .is_some_and(|r| r.path.is_some());
+                div()
                 .v_flex()
                 .gap_1()
                 .items_start()
@@ -98,7 +110,7 @@ impl DuckTable {
                         .child(div().text_lg().text_color(t.text).child(clone_str(&info.name))),
                 )
                 .child(meta(t, "DuckDB", clone_str(&info.duckdb_version)))
-                .child(meta(t, "Harbor", clone_str(&info.harbor_version)))
+                .child(harbor_meta(t, &info.harbor_version, stale, is_local, installed.as_deref()))
                 // The path row is the one worth copying (paste into a shell,
                 // a bug report, another tool), so it carries the same
                 // self-confirming copy tile the DDL block uses — painted
@@ -143,7 +155,8 @@ impl DuckTable {
                     t,
                     "Lifetime",
                     if conn.summoned { "started by this window".into() } else { "was already running".into() },
-                )),
+                ))
+            }
             }
         };
         div()
@@ -168,4 +181,42 @@ fn meta(t: Pal, k: &'static str, v: String) -> impl IntoElement {
         .text_sm()
         .child(div().w_20().flex_none().text_color(t.muted).child(k))
         .child(div().flex_1().min_w_0().truncate().text_color(t.text).child(v))
+}
+
+/// The Harbor version row, with an upgrade hint when the server runs behind the
+/// installed binary: a red "harbor X available" for a local server (the
+/// sidebar badge does the actual restart), a quiet yellow "behind harbor X" for
+/// a remote one, which cannot be relaunched from here.
+fn harbor_meta(
+    t: Pal,
+    version: &str,
+    stale: bool,
+    is_local: bool,
+    installed: Option<&str>,
+) -> impl IntoElement {
+    div()
+        .h_flex()
+        .gap_2()
+        .w_full()
+        .items_center()
+        .text_sm()
+        .child(div().w_20().flex_none().text_color(t.muted).child("Harbor"))
+        .child(div().flex_none().text_color(t.text).child(version.to_string()))
+        .when(stale, |d| {
+            let (color, label) = if is_local {
+                (t.bad, format!("harbor {} available", installed.unwrap_or_default()))
+            } else {
+                (t.warn, format!("behind harbor {}", installed.unwrap_or_default()))
+            };
+            d.child(
+                div()
+                    .px_1()
+                    .rounded_md()
+                    .text_xs()
+                    .text_color(color)
+                    .border_1()
+                    .border_color(color)
+                    .child(label),
+            )
+        })
 }

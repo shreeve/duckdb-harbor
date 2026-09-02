@@ -27,6 +27,25 @@ pub(crate) struct RowVm {
     /// the survey's human-readable note for an unusual row,
     /// surfaced as the row's tooltip.
     pub(crate) note: Option<String>,
+    /// The harbor version a running server reports (`None` when stopped).
+    pub(crate) version: Option<String>,
+    /// Whether a running server self-retires with its last client — the mode
+    /// an upgrade restart preserves.
+    pub(crate) ephemeral: bool,
+}
+
+impl RowVm {
+    /// A local, running server older than the installed binary: actionable,
+    /// because it can be restarted onto the new version. Remote rows (no path)
+    /// never qualify — you cannot relaunch someone else's server from here.
+    pub(crate) fn upgradable(&self, installed: &str) -> bool {
+        self.path.is_some()
+            && self.state.is_live()
+            && self
+                .version
+                .as_deref()
+                .is_some_and(|v| harbor_client::fleet::version_older(v, installed))
+    }
 }
 
 pub(crate) enum Phase {
@@ -91,6 +110,11 @@ pub struct DuckTable {
     /// the same self-confirming widget the DDL block uses. Rebuilt on each
     /// connect (it holds the path it copies), None when not connected.
     pub(crate) path_copy: Option<Entity<crate::copy_button::CopyButton>>,
+    /// The version of the `harbor` binary this app spawns — the yardstick a
+    /// row's reported version is judged outdated against. Re-probed on each
+    /// refresh, so installing a newer binary lights up the upgrade badge
+    /// without a restart of the app. `None` until the first probe answers.
+    pub(crate) installed_version: Option<String>,
 }
 
 impl DuckTable {
@@ -159,6 +183,7 @@ impl DuckTable {
             stopping: std::collections::HashSet::new(),
             leaving: std::collections::HashSet::new(),
             path_copy: None,
+            installed_version: None,
         };
         this.refresh(cx);
         this
@@ -210,11 +235,11 @@ impl DuckTable {
                 .is_some_and(|s| !s.cols.iter().any(|c| c.pk));
             let page_task = cx.background_executor().spawn({
                 let (conn, schema, name) = (conn.clone(), clone_str(&schema), clone_str(&name));
-                async move { crate::queries::first_page(&conn, &schema, &name, rowid, page_size) }
+                async move { crate::sql::first_page(&conn, &schema, &name, rowid, page_size) }
             });
             let total_task = cx.background_executor().spawn({
                 let (conn, schema, name) = (conn.clone(), clone_str(&schema), clone_str(&name));
-                async move { crate::queries::total_rows(&conn, &schema, &name) }
+                async move { crate::sql::total_rows(&conn, &schema, &name) }
             });
             let outcome = page_task.await;
             let total = if outcome.is_ok() { total_task.await } else { None };
@@ -242,7 +267,7 @@ impl DuckTable {
                     )
                 });
                 // And returning to a table hands its parked edits back.
-                let source = crate::queries::source(&schema, &name);
+                let source = crate::sql::source(&schema, &name);
                 if let Some(stash) = state.staged.remove(&source) {
                     grid.update(cx, |g, cx| g.adopt_edits(stash, cx));
                 }
@@ -402,6 +427,12 @@ impl DuckTable {
             // (stale locks, running-but-unregistered berths).
             let fleet = cx.background_executor().spawn(async move { fleet::survey() }).await;
             let warning = fleet.warning;
+            // Re-probed each sweep so a freshly installed binary lights the
+            // upgrade badge without relaunching the app.
+            let installed_version = cx
+                .background_executor()
+                .spawn(async move { fleet::installed_harbor_version() })
+                .await;
             // One task per berth for the catalog fetches (table counts
             // need the database open; only live berths answer).
             let tasks: Vec<_> = fleet
@@ -433,6 +464,8 @@ impl DuckTable {
                             size: row.size,
                             note: row.note,
                             name: row.name,
+                            version: row.version,
+                            ephemeral: row.ephemeral,
                         }
                     })
                 })
@@ -467,9 +500,76 @@ impl DuckTable {
                 }
                 state.rows = rows;
                 state.warning = warning;
+                state.installed_version = installed_version;
                 cx.notify();
             })
             .ok();
+        })
+        .detach();
+    }
+
+    /// The local, running servers older than the installed binary — the ones a
+    /// one-click upgrade would restart. Empty when the version is unknown, so a
+    /// failed probe never nags.
+    pub(crate) fn outdated(&self) -> Vec<&RowVm> {
+        let Some(installed) = self.installed_version.as_deref() else { return Vec::new() };
+        self.rows.iter().filter(|r| r.upgradable(installed)).collect()
+    }
+
+    /// How many local servers are outdated — the upgrade badge's number,
+    /// counted without allocating on every sidebar paint.
+    pub(crate) fn outdated_count(&self) -> usize {
+        let Some(installed) = self.installed_version.as_deref() else { return 0 };
+        self.rows.iter().filter(|r| r.upgradable(installed)).count()
+    }
+
+    /// Upgrade every outdated local server: restart each onto the installed
+    /// binary in the mode it was running, then refresh so the badge clears as
+    /// they come back current. Runs on a background thread; the first failure
+    /// is surfaced, the rest still attempted.
+    pub(crate) fn upgrade_outdated(&mut self, cx: &mut Context<Self>) {
+        let targets: Vec<(std::path::PathBuf, bool)> = self
+            .outdated()
+            .iter()
+            .filter_map(|r| r.path.clone().map(|p| (p, r.ephemeral)))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        self.fleet_then_refresh(
+            move || {
+                let mut first_err = None;
+                for (path, ephemeral) in targets {
+                    if let Err(e) = fleet::restart(&path, ephemeral) {
+                        first_err.get_or_insert(e);
+                    }
+                }
+                first_err.map_or(Ok(()), Err)
+            },
+            cx,
+        );
+    }
+
+    /// The upgrade badge's action: name the count, confirm once, and on yes
+    /// restart every outdated local server onto the installed binary.
+    pub(crate) fn prompt_upgrade(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let n = self.outdated().len();
+        if n == 0 {
+            return;
+        }
+        let installed = self.installed_version.clone().unwrap_or_default();
+        let noun = if n == 1 { "database".to_string() } else { format!("{n} databases") };
+        let title = format!("Upgrade {noun}");
+        let body = format!(
+            "Restart {noun} onto harbor {installed}. Each server stops and comes \
+             back in the same mode; any connected clients reconnect."
+        );
+        let answer =
+            window.prompt(PromptLevel::Info, &title, Some(&body), &["Upgrade", "Cancel"], cx);
+        cx.spawn(async move |this, cx| {
+            if answer.await == Ok(0) {
+                this.update(cx, |state, cx| state.upgrade_outdated(cx)).ok();
+            }
         })
         .detach();
     }
@@ -481,21 +581,36 @@ impl DuckTable {
     /// in-flight name shows on the sidebar row; the idle/failed cards show
     /// a connecting card since they hold nothing worth preserving.
     pub(crate) fn connect(&mut self, name: String, cx: &mut Context<Self>) {
+        let target = clone_str(&name);
+        self.dial(
+            name,
+            move || {
+                let conn = fleet::connect(&target)?;
+                let info = fleet::info(&conn)?;
+                let catalog = harbor_client::catalog(&conn)?;
+                Ok((conn, info, catalog))
+            },
+            cx,
+        );
+    }
+
+    /// The shared spine of connect / open_path: show `shown` as the connecting
+    /// label under a fresh fence, run `dial` (raise-or-join the server and read
+    /// its catalog) on a background thread, then swap the pane to the outcome
+    /// in one frame. A stale fence discards itself, so a slow attempt never
+    /// clobbers a newer one; current content keeps rendering until it lands.
+    fn dial<F>(&mut self, shown: String, dial: F, cx: &mut Context<Self>)
+    where
+        F: FnOnce() -> Result<(Conn, wire::InfoResponse, harbor_client::Catalog), String>
+            + Send
+            + 'static,
+    {
         self.attempt += 1;
         let fence = self.attempt;
-        self.connecting = Some(clone_str(&name));
+        self.connecting = Some(clone_str(&shown));
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let target = clone_str(&name);
-            let outcome = cx
-                .background_executor()
-                .spawn(async move {
-                    let conn = fleet::connect(&target)?;
-                    let info = fleet::info(&conn)?;
-                    let catalog = harbor_client::catalog(&conn)?;
-                    Ok::<_, String>((conn, info, catalog))
-                })
-                .await;
+            let outcome = cx.background_executor().spawn(async move { dial() }).await;
             this.update(cx, |state, cx| {
                 if state.attempt != fence {
                     return;
@@ -508,7 +623,7 @@ impl DuckTable {
                 state.select_seq += 1;
                 state.phase = match outcome {
                     Ok((conn, info, catalog)) => Phase::Connected { conn, info, catalog },
-                    Err(message) => Phase::Failed { name: clone_str(&name), message },
+                    Err(message) => Phase::Failed { name: clone_str(&shown), message },
                 };
                 state.sync_path_copy(cx);
                 state.refresh(cx);
@@ -545,42 +660,16 @@ impl DuckTable {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        self.attempt += 1;
-        let fence = self.attempt;
-        self.connecting = Some(clone_str(&shown));
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let target = path.clone();
-            let outcome = cx
-                .background_executor()
-                .spawn(async move {
-                    let conn = fleet::connect_path(&target)?;
-                    let info = fleet::info(&conn)?;
-                    let catalog = harbor_client::catalog(&conn)?;
-                    Ok::<_, String>((conn, info, catalog))
-                })
-                .await;
-            this.update(cx, |state, cx| {
-                if state.attempt != fence {
-                    return;
-                }
-                state.connecting = None;
-                state.selected_table = None;
-                state.grid = None;
-                state.query = None;
-                state.staged.clear();
-                state.select_seq += 1;
-                state.phase = match outcome {
-                    Ok((conn, info, catalog)) => Phase::Connected { conn, info, catalog },
-                    Err(message) => Phase::Failed { name: clone_str(&shown), message },
-                };
-                state.sync_path_copy(cx);
-                state.refresh(cx);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.dial(
+            shown,
+            move || {
+                let conn = fleet::connect_path(&path)?;
+                let info = fleet::info(&conn)?;
+                let catalog = harbor_client::catalog(&conn)?;
+                Ok((conn, info, catalog))
+            },
+            cx,
+        );
     }
 
     /// Stop a berth's server — the close half of open. Right-click → Stop
@@ -653,11 +742,17 @@ impl DuckTable {
         .detach();
     }
 
-    /// Start a persistent server for a stopped berth, then refresh the list.
-    pub(crate) fn start_berth(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+    /// Run a one-shot fleet operation on a background thread, then refresh the
+    /// list; any error becomes the warning banner. The shared body behind
+    /// Start / Attach / Detach / Auto-start — each differs only in the call it
+    /// makes, none touches the phase or fences (that is `dial`'s job).
+    fn fleet_then_refresh(
+        &self,
+        op: impl FnOnce() -> Result<(), String> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
-            let outcome =
-                cx.background_executor().spawn(async move { fleet::start(&path) }).await;
+            let outcome = cx.background_executor().spawn(async move { op() }).await;
             this.update(cx, |state, cx| {
                 if let Err(message) = outcome {
                     state.warning = Some(message);
@@ -668,41 +763,22 @@ impl DuckTable {
             .ok();
         })
         .detach();
+    }
+
+    /// Start a persistent server for a stopped berth, then refresh the list.
+    pub(crate) fn start_berth(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        self.fleet_then_refresh(move || fleet::start(&path), cx);
     }
 
     /// Add a berth to the list (config.toml), then refresh so Attach flips to
     /// Detach.
     pub(crate) fn attach_berth(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let outcome =
-                cx.background_executor().spawn(async move { fleet::attach(&path) }).await;
-            this.update(cx, |state, cx| {
-                if let Err(message) = outcome {
-                    state.warning = Some(message);
-                }
-                state.refresh(cx);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.fleet_then_refresh(move || fleet::attach(&path), cx);
     }
 
     /// Remove a berth from the list, then refresh.
     pub(crate) fn detach_berth(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let outcome =
-                cx.background_executor().spawn(async move { fleet::detach(&path) }).await;
-            this.update(cx, |state, cx| {
-                if let Err(message) = outcome {
-                    state.warning = Some(message);
-                }
-                state.refresh(cx);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.fleet_then_refresh(move || fleet::detach(&path), cx);
     }
 
     /// Arm or disarm the login item for a berth, then refresh so the checkmark
@@ -713,21 +789,7 @@ impl DuckTable {
         on: bool,
         cx: &mut Context<Self>,
     ) {
-        cx.spawn(async move |this, cx| {
-            let outcome = cx
-                .background_executor()
-                .spawn(async move { fleet::set_autostart(&path, on) })
-                .await;
-            this.update(cx, |state, cx| {
-                if let Err(message) = outcome {
-                    state.warning = Some(message);
-                }
-                state.refresh(cx);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.fleet_then_refresh(move || fleet::set_autostart(&path, on), cx);
     }
 
     /// Abort the in-flight connect. The current phase never changed, so

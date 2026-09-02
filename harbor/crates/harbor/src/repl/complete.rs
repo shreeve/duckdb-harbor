@@ -152,7 +152,7 @@ impl Completer for SqlCompleter {
         let prefix = &line[..pos];
         let list: Vec<Suggestion> = if prefix.trim_start().starts_with('.') {
             // Dot-commands are client-side (lane A), from the one list.
-            crate::repl::repl::DOT_COMMANDS
+            crate::repl::interactive::DOT_COMMANDS
                 .iter()
                 .map(|(name, _, _)| format!(".{name}"))
                 .filter(|c| c.starts_with(prefix.trim_start()))

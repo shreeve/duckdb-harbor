@@ -3,8 +3,8 @@
 //! plain-cell probe of the library — not of this delegate), DuckTable's
 //! delegate on top.
 //! This surface owns fetching (server-side pages via `POST /sql`), value
-//! presentation, and its header/status strips. Editing layers on later
-//! (`edits.rs`); display ships first.
+//! presentation, its header/status strips, and inline editing (the cell
+//! editor and staging here, the edit model in `edits.rs`).
 //!
 //! Rows arrive as explicit pages: a fetched page REPLACES the rows in one
 //! frame (DESIGN.md: fetch first, commit over the old value), so the grid
@@ -67,7 +67,7 @@ pub(crate) struct Grid {
     /// for a statement whose entire result already sits on page 0.
     pub(crate) pageable: bool,
     /// The FROM target this grid pages: a quoted `"schema"."table"`, or
-    /// a parenthesized user statement (queries::query_source).
+    /// a parenthesized user statement (sql::query_source).
     source: String,
     title: String,
     /// Current page (0-based) and the size its rows were fetched with.
@@ -309,7 +309,7 @@ impl Grid {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let source = crate::queries::source(schema, name);
+        let source = crate::sql::source(schema, name);
         Self::build(
             conn, source, title, outcome, total_rows, page_size, structure, false,
             true, window, cx,
@@ -333,7 +333,7 @@ impl Grid {
     ) -> Self {
         Self::build(
             conn,
-            crate::queries::query_source(sql),
+            crate::sql::query_source(sql),
             String::new(),
             outcome,
             total_rows,
@@ -676,8 +676,8 @@ impl Grid {
         };
         let conn = self.conn.clone();
         let sql =
-            crate::queries::page_sql(&self.source, self.rowid, &filter, req.page, req.size);
-        let count_sql = req.recount.then(|| crate::queries::count_sql(&self.source, &filter));
+            crate::sql::page_sql(&self.source, self.rowid, &filter, req.page, req.size);
+        let count_sql = req.recount.then(|| crate::sql::count_sql(&self.source, &filter));
         let PageReq { page, size, filter, .. } = req;
         self.table.update(cx, |state, _| state.delegate_mut().loading = true);
         cx.spawn(async move |this, cx| {
@@ -688,7 +688,7 @@ impl Grid {
                     let total = count_sql.map(|c| {
                         harbor_client::query(&conn, &c)
                             .ok()
-                            .and_then(|r| crate::queries::count_of(&r))
+                            .and_then(|r| crate::sql::count_of(&r))
                     });
                     Ok::<_, String>((result, total))
                 })
@@ -1966,7 +1966,7 @@ impl Grid {
                             // The engine answers UPDATE/DELETE with one
                             // count row; anything but exactly 1 means the
                             // row is not what we fetched. Nothing lands.
-                            let affected = crate::queries::count_of(&r).unwrap_or(0);
+                            let affected = crate::sql::count_of(&r).unwrap_or(0);
                             if affected != 1 {
                                 return Err(format!(
                                     "a row changed since you read it \

@@ -103,7 +103,7 @@ if (($userPath -split ';') -notcontains $bin) {
 }
 
 Write-Host ""
-# Windows has no unix sockets, so serving is explicit here (spawn-on-use is a
+# Windows has no unix sockets, so starting is explicit here (spawn-on-use is a
 # unix-socket feature); the client half works the same everywhere.
-Write-Host "try: harbor mydata.duckdb serve --create --port 9495 --token secret"
+Write-Host "try: harbor mydata.duckdb start --port 9495 --token secret"
 Write-Host "     harbor http://127.0.0.1:9495 --token secret"

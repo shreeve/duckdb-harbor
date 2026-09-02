@@ -46,6 +46,13 @@ pub struct Survey {
     /// Size on disk (data file + WAL) — knowable without a connection,
     /// so stopped databases answer too.
     pub size: Option<u64>,
+    /// The harbor version a running server reports (`None` when stopped or
+    /// when an older server did not answer `/info`). Compared against the
+    /// installed binary to decide whether the row is outdated.
+    pub version: Option<String>,
+    /// Whether a running server self-retires when its last client leaves — the
+    /// mode a restart must preserve. Meaningless for stopped or remote rows.
+    pub ephemeral: bool,
 }
 
 /// The whole survey: the rows, and the one thing a GUI must not eat — a
@@ -69,6 +76,12 @@ struct Live {
     name: String,
     db: PathBuf,
     sock: PathBuf,
+    /// The harbor version this server is running — the yardstick for whether
+    /// it is outdated relative to the installed binary.
+    version: String,
+    /// Whether it self-retires when its last client leaves, so a restart can
+    /// bring it back in the same lifetime mode.
+    ephemeral: bool,
 }
 
 /// A 0.19-era runtime token, when one exists beside the socket. Current
@@ -134,7 +147,13 @@ fn discover() -> Vec<Live> {
             } else {
                 info.name
             };
-            out.push(Live { name, db: PathBuf::from(info.database), sock });
+            out.push(Live {
+                name,
+                db: PathBuf::from(info.database),
+                sock,
+                version: info.harbor_version,
+                ephemeral: info.ephemeral,
+            });
         }
     }
     out
@@ -181,6 +200,8 @@ pub fn survey() -> Fleet {
             path: Some(l.db.clone()),
             note: None,
             size: disk_size(&l.db),
+            version: Some(l.version.clone()),
+            ephemeral: l.ephemeral,
         })
         .collect();
 
@@ -210,6 +231,10 @@ pub fn survey() -> Fleet {
                 path: Some(db.clone()),
                 note: None,
                 size: disk_size(&db),
+                // A server we found only by its ready socket (not `/info`)
+                // reports no version — treat it as unknown, never outdated.
+                version: None,
+                ephemeral: false,
             });
         }
     }
@@ -219,11 +244,18 @@ pub fn survey() -> Fleet {
         if out.iter().any(|s| s.name == name) {
             continue;
         }
-        let alive = entry
-            .url
-            .as_deref()
-            .and_then(|u| url_transport(u).ok())
-            .is_some_and(|t| probe(&t));
+        let transport = entry.url.as_deref().and_then(|u| url_transport(u).ok());
+        let alive = transport.as_ref().is_some_and(probe);
+        // Best-effort version, so the card can note a remote running behind
+        // your own binary. Informational only — you cannot restart a remote
+        // from here, so this never counts toward the upgrade badge.
+        let version = alive
+            .then(|| {
+                let token = std::env::var("HARBOR_TOKEN").ok().or_else(|| tokens::resolve(entry));
+                transport.as_ref().and_then(|t| info_of(t, token.as_deref()))
+            })
+            .flatten()
+            .map(|i| i.harbor_version);
         out.push(Survey {
             name: name.to_string(),
             state: if alive { State::Running } else { State::Stopped },
@@ -232,6 +264,8 @@ pub fn survey() -> Fleet {
             path: None,
             note: None,
             size: None,
+            version,
+            ephemeral: false,
         });
     }
 
@@ -266,8 +300,9 @@ pub struct Conn {
     pub transport: Transport,
     pub token: Option<String>,
     /// True when this connect raised the server (worth a status line).
-    /// A summoned server is a persistent `start` — it runs until stopped, not
-    /// until a window closes.
+    /// A summoned server is an ephemeral `start` — it self-retires once its
+    /// last client disconnects, so closing the window that opened it lets it
+    /// go. The explicit Start action is the way to keep a server up.
     pub summoned: bool,
 }
 
@@ -316,12 +351,13 @@ pub fn connect(name: &str) -> Result<Conn, String> {
         if let Some(conn) = join(false) {
             return Ok(conn);
         }
-        // Nothing serves the file yet: summon a `serve` — harbor's own
-        // owned lifetime, up until the operator stops it. Two windows can
-        // race one summon; DuckDB's file lock lets exactly one server win
-        // and the loser exits nonzero, so the loser judges by the end
-        // state: if a socket comes ready anyway, its exit was noise.
-        let spawn_err = harbor_serve(&db).err();
+        // Nothing serves the file yet: summon an ephemeral server — it
+        // self-retires when this window's connection drops, since opening a
+        // database is not a request to keep it running. Two windows can race
+        // one summon; DuckDB's file lock lets exactly one server win and the
+        // loser exits nonzero, so the loser judges by the end state: if a
+        // socket comes ready anyway, its exit was noise.
+        let spawn_err = summon(&db, true).err();
         let deadline = std::time::Instant::now() + Duration::from_secs(8);
         loop {
             if let Some(conn) = join(true) {
@@ -358,9 +394,9 @@ pub fn connect(name: &str) -> Result<Conn, String> {
 /// config consulted: the path itself is the identity. Canonicalized first,
 /// so every spelling of one file meets the same server, then the named
 /// flow's exact discipline: join before summoning, both socket
-/// generations, and a persistent `start` when nothing answers.
+/// generations, and an ephemeral `start` when nothing answers.
 pub fn connect_path(db: &Path) -> Result<Conn, String> {
-    let db = std::fs::canonicalize(db).map_err(|e| format!("{}: {e}", db.display()))?;
+    let db = paths::canonical_db(db).map_err(|e| format!("{}: {e}", db.display()))?;
     // The stem-derived name harbor itself would mint for this path — used
     // only for the 0.19-era socket and token lookups; the server's /info
     // answers with its own truth on the next refresh.
@@ -387,7 +423,7 @@ pub fn connect_path(db: &Path) -> Result<Conn, String> {
     if let Some(conn) = join(false) {
         return Ok(conn);
     }
-    let spawn_err = harbor_serve(&db).err();
+    let spawn_err = summon(&db, true).err();
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
     loop {
         if let Some(conn) = join(true) {
@@ -454,7 +490,7 @@ pub fn start(db: &Path) -> Result<(), String> {
     if sock_ready(&sock) {
         return Ok(()); // already running
     }
-    harbor_serve(&canon)?;
+    summon(&canon, false)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while std::time::Instant::now() < deadline {
         if sock_ready(&sock) {
@@ -489,30 +525,134 @@ pub fn set_autostart(db: &Path, on: bool) -> Result<(), String> {
     }
 }
 
-/// Summon through harbor's own front door: `harbor <db> start`, detached and
-/// headless. A bare start is persistent, so the child owns its lifetime and
-/// runs until stopped; this process only waits for the socket to answer.
-fn harbor_serve(db: &Path) -> Result<(), String> {
-    // A Finder-launched app inherits launchd's PATH — /usr/bin:/bin and
-    // friends — which lacks every directory harbor actually installs
-    // into. Probe the usual homes before trusting a bare PATH lookup, or
-    // drag-and-drop spawns work from a terminal and fail from the Dock.
-    let harbor = std::env::var("HARBOR_BIN").ok().or_else(|| {
-        let home = std::env::var("HOME").ok()?;
-        [format!("{home}/.local/bin/harbor"),
-         "/usr/local/bin/harbor".to_string(),
-         "/opt/homebrew/bin/harbor".to_string()]
+/// Resolve the `harbor` binary this process spawns and probes. A Finder-
+/// launched app inherits launchd's PATH — /usr/bin:/bin and friends — which
+/// lacks every directory harbor actually installs into, so probe the usual
+/// homes before trusting a bare PATH lookup, or drag-and-drop spawns work from
+/// a terminal and fail from the Dock.
+fn harbor_bin() -> String {
+    std::env::var("HARBOR_BIN")
+        .ok()
+        .or_else(|| {
+            let home = std::env::var("HOME").ok()?;
+            [
+                format!("{home}/.local/bin/harbor"),
+                "/usr/local/bin/harbor".to_string(),
+                "/opt/homebrew/bin/harbor".to_string(),
+            ]
             .into_iter()
             .find(|p| std::fs::metadata(p).is_ok())
-    })
-    .unwrap_or_else(|| "harbor".to_string());
-    std::process::Command::new(&harbor)
-        .arg(db)
+        })
+        .unwrap_or_else(|| "harbor".to_string())
+}
+
+/// The version of the `harbor` binary this process would spawn — the yardstick
+/// for "is a running server outdated". `harbor version` prints `harbor X.Y.Z`;
+/// we take the last whitespace-delimited token. `None` if the binary cannot be
+/// run, in which case nothing is ever judged outdated.
+pub fn installed_harbor_version() -> Option<String> {
+    let out = std::process::Command::new(harbor_bin()).arg("version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace().last().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Dotted-numeric version compare: is `running` strictly older than
+/// `installed`? Each component is parsed up to its first non-digit, missing
+/// components read as 0, and anything unparseable sorts as 0 — so a malformed
+/// version is never judged outdated (we do not nag on garbage).
+pub fn version_older(running: &str, installed: &str) -> bool {
+    fn parts(v: &str) -> Vec<u64> {
+        v.trim().trim_start_matches('v')
+            .split('.')
+            .map(|p| {
+                p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0)
+            })
+            .collect()
+    }
+    let (a, b) = (parts(running), parts(installed));
+    for i in 0..a.len().max(b.len()) {
+        let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
+        if x != y {
+            return x < y;
+        }
+    }
+    false
+}
+
+/// `/info` on a transport, parsed. Used for a remote's best-effort version.
+fn info_of(t: &Transport, token: Option<&str>) -> Option<wire::InfoResponse> {
+    let r = request(t, &wire::endpoint::INFO, token, None, Some(Duration::from_millis(800))).ok()?;
+    if r.status != 200 {
+        return None;
+    }
+    serde_json::from_str(r.body_string().ok()?.trim()).ok()
+}
+
+/// Restart a running local server so it comes back on the current binary: stop
+/// it, wait for its socket to clear (so DuckDB's file lock is released — the
+/// one thing a hand-typed `stop; start` gets wrong), then summon it again in
+/// the same lifetime mode. The one-click upgrade path.
+pub fn restart(db: &Path, ephemeral: bool) -> Result<(), String> {
+    let home = runtime_dir()?;
+    let canon = paths::canonical_db(db)?;
+    let sock = paths::socket_for(&home, &canon)?;
+    let name = canon
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("no usable name in {}", db.display()))
+        .and_then(harbor_common::paths::normalize)?;
+    // Shut down the server on this file's socket.
+    if sock_ready(&sock) {
+        let token = std::env::var("HARBOR_TOKEN").ok().or_else(|| berth_token(&home, &name));
+        #[cfg(unix)]
+        let t = Transport::Unix(sock.clone());
+        #[cfg(not(unix))]
+        let t = Transport::Tcp(String::new());
+        request(&t, &wire::endpoint::SHUTDOWN, token.as_deref(), None, Some(Duration::from_secs(5)))
+            .map_err(|e| format!("stop {}: {e}", db.display()))?;
+    }
+    // Wait for the server to drain and release the lock.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while sock_ready(&sock) {
+        if std::time::Instant::now() > deadline {
+            return Err(format!("{} did not stop in time to upgrade", db.display()));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Bring it back the way it was running.
+    summon(&canon, ephemeral)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !sock_ready(&sock) {
+        if std::time::Instant::now() > deadline {
+            return Err(format!("{} did not come back up — see its harbor log", db.display()));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+/// Summon through harbor's own front door: `harbor <db> start`, detached and
+/// headless. `ephemeral` sets `HARBOR_EPHEMERAL` so the child self-retires
+/// once its last client disconnects — the implicit open-a-database path, where
+/// a server nobody asked to persist should not outlive the window that raised
+/// it. Without it the child is a plain persistent `start` that runs until
+/// stopped, which is what the explicit Start action wants. Either way this
+/// process only waits for the socket to answer.
+fn summon(db: &Path, ephemeral: bool) -> Result<(), String> {
+    let harbor = harbor_bin();
+    let mut cmd = std::process::Command::new(&harbor);
+    cmd.arg(db)
         .arg("start")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+        .stderr(std::process::Stdio::null());
+    if ephemeral {
+        cmd.env("HARBOR_EPHEMERAL", "1");
+    }
+    cmd.spawn()
         .map_err(|e| format!("cannot run {harbor:?} (is harbor installed?): {e}"))?;
     Ok(())
 }

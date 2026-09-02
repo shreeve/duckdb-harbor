@@ -24,11 +24,12 @@
 //! consumer (ducktable) and nothing in harbor calls it or reads these
 //! fields. Guard the call site, not the schema.
 //!
-//! Every berth key is the matching `harbor start` flag with the dashes
-//! stripped, so there is no second dialect to learn. (The reverse is not
-//! quite total: `--name`, `--socket`, and `--token` are flag-only —
-//! identity and credentials are the operator's word at spawn time, not
-//! standing config.)
+//! Every berth key that harbor acts on is the matching `harbor start` flag
+//! with the dashes stripped, so there is no second dialect to learn.
+//! `--token` is the one flag with no key — a credential is the operator's
+//! word at spawn time, not standing config. (`idle-exit` is the mirror
+//! case: a key with no flag yet, read only by a client deciding how long a
+//! berth it summoned should outlive its last use.)
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -93,7 +94,6 @@ pub struct Connection {
     pub max_temp_size: Option<String>,
     pub sealed: Option<bool>,
     pub unsigned: Option<bool>,
-    pub create: Option<bool>,
     pub log: Option<bool>,
     pub init: Option<Vec<String>>,
     pub port: Option<u16>,
