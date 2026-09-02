@@ -68,12 +68,11 @@ pub fn engine() -> Result<&'static Engine, String> {
 }
 
 /// Where to look, in order. First hit wins; the bare name at the end lets
-/// the system loader's own search have the final say.
+/// the system loader's own search have the final say. `HARBOR_LIBDUCKDB` is
+/// not in this list — an explicit override is handled first in `load`,
+/// where a miss is a hard error rather than a fall-through.
 fn candidates() -> Vec<PathBuf> {
     let mut c = Vec::new();
-    if let Ok(p) = env::var("HARBOR_LIBDUCKDB") {
-        c.push(PathBuf::from(p));
-    }
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
             c.push(dir.join("../lib").join(LIB_NAME));
@@ -122,29 +121,61 @@ fn open_lib(path: &PathBuf) -> Result<Library, libloading::Error> {
 }
 
 fn load() -> Result<Engine, String> {
-    let tried = candidates();
-    let (lib, path) = tried
-        .iter()
-        .filter(|p| p.as_os_str() == LIB_NAME.as_ref() as &std::ffi::OsStr || p.exists())
-        .find_map(|p| open_lib(p).ok().map(|l| (l, p.clone())))
-        .ok_or_else(|| {
-            format!(
-                "libduckdb not found (searched: {})",
-                tried.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
-            )
-        })?;
-
-    let (api, symbols) = unsafe { ffi::Api::fill(&lib) };
-    if api.create_environment.is_none() {
-        return Err(format!(
-            "{}: engine has no v2 C API ({symbols} v2 symbols) — needs DuckDB v2.0.0 or later",
-            path.display()
-        ));
+    // An explicit override is a contract, not a hint: when HARBOR_LIBDUCKDB
+    // is set, the engine comes from that file or the load fails naming it.
+    // Falling through to the search would silently bind a different
+    // libduckdb — in CI, exactly the failure that must be loud.
+    if let Ok(p) = env::var("HARBOR_LIBDUCKDB") {
+        let path = PathBuf::from(&p);
+        if !path.exists() {
+            return Err(format!("HARBOR_LIBDUCKDB={p}: no such file"));
+        }
+        let lib = open_lib(&path).map_err(|e| format!("HARBOR_LIBDUCKDB={p}: {e}"))?;
+        return boot(lib, path);
     }
+
+    let tried = candidates();
+    let mut failed = Vec::new();
+    for p in &tried {
+        let bare = p.as_os_str() == LIB_NAME.as_ref() as &std::ffi::OsStr;
+        if !bare && !p.exists() {
+            continue;
+        }
+        match open_lib(p) {
+            Ok(lib) => return boot(lib, p.clone()),
+            // A candidate that exists but will not load carries the real
+            // story (wrong arch, missing dependency) — keep it for the
+            // error instead of reporting a bare "not found".
+            Err(e) => failed.push(format!("{}: {e}", p.display())),
+        }
+    }
+    let mut msg = format!(
+        "libduckdb not found (searched: {})",
+        tried.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+    );
+    if !failed.is_empty() {
+        msg.push_str(&format!("; failed to load: {}", failed.join("; ")));
+    }
+    Err(msg)
+}
+
+fn boot(lib: Library, path: PathBuf) -> Result<Engine, String> {
+    let (api, symbols) = unsafe { ffi::Api::fill(&lib) };
+    // Both symbols gate together: an engine odd enough to export one
+    // without the other must not reach the unwrap-free calls below.
+    let version_fn = match (api.create_environment, api.library_version) {
+        (Some(_), Some(f)) => f,
+        _ => {
+            return Err(format!(
+                "{}: engine has no v2 C API ({symbols} v2 symbols) — needs DuckDB v2.0.0 or later",
+                path.display()
+            ));
+        }
+    };
 
     let mut ver = ffi::str_t { ptr: std::ptr::null(), len: 0 };
     let mut err = std::ptr::null_mut();
-    let code = unsafe { (api.library_version.unwrap())(&mut ver, &mut err) };
+    let code = unsafe { version_fn(&mut ver, &mut err) };
     if code != ffi::ERROR_NONE {
         return Err(Error::take(&api, code, err).to_string());
     }
