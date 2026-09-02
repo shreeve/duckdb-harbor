@@ -49,6 +49,32 @@ impl DuckTable {
         div().size_2().rounded_full().bg(t.level(level))
     }
 
+    /// The dot's stand-in while a berth is shutting down: the same disc's
+    /// worth of space, filled by a slowly rotating refresh glyph in the
+    /// row's live color, faded in so the swap from dot is not a hard cut.
+    /// Reuses the embedded refresh-cw.svg — the Spinner component defaults
+    /// to a Loader icon this app does not embed, which would draw blank.
+    /// `seed` (the berth name) keys the animations so simultaneous stops
+    /// never share an element id.
+    fn spin_dot(seed: &str, level: Level, t: Pal) -> impl IntoElement {
+        let spin = svg()
+            .path("icons/refresh-cw.svg")
+            .size_2()
+            .text_color(t.level(level))
+            .with_animation(
+                SharedString::from(format!("berth-spin-{seed}")),
+                Animation::new(std::time::Duration::from_millis(800)).repeat(),
+                |el, delta| el.with_transformation(Transformation::rotate(percentage(delta))),
+            );
+        // In-place micro-fade — one shared duration with the copy tile's
+        // crossfade (chrome::QUICK_FADE_MS), so the app's small fades match.
+        div().child(spin).with_animation(
+            SharedString::from(format!("berth-spinfade-{seed}")),
+            Animation::new(std::time::Duration::from_millis(crate::chrome::QUICK_FADE_MS)),
+            |el, delta| el.opacity(delta),
+        )
+    }
+
     pub(crate) fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let t = pal(cx);
         let berth_filter = self
@@ -155,9 +181,15 @@ impl DuckTable {
                 |row| {
                     let name = clone_str(&row.name);
                     let selected = active.as_deref() == Some(row.name.as_str());
-                    list_row(SharedString::from(clone_str(&row.name)), selected, t)
+                    let stopping = self.stopping.contains(&row.name);
+                    let leaving = self.leaving.contains(&row.name);
+                    let base = list_row(SharedString::from(clone_str(&row.name)), selected, t)
                         .px_2()
-                        .child(Self::dot(row.state.level(), t))
+                        .child(if stopping {
+                            Self::spin_dot(&row.name, row.state.level(), t).into_any_element()
+                        } else {
+                            Self::dot(row.state.level(), t).into_any_element()
+                        })
                         // Same grammar as the table rows below: name with
                         // its count hugging it, magnitude on the right.
                         // (The dot alone says stopped; "on demand" gave
@@ -173,7 +205,28 @@ impl DuckTable {
                                 gpui_component::tooltip::Tooltip::new(clone_str(&note))
                                     .build(window, cx)
                             })
-                        })
+                        });
+                    if leaving {
+                        // Departed: hold the slot and fade out, no clicks —
+                        // the fade timer in stop_berth drops the row once
+                        // this animation has played. A whole row LEAVING is a
+                        // structural motion, so it runs a touch longer than an
+                        // in-place micro-fade (QUICK_FADE_MS) on purpose — the
+                        // eye needs to track the departure (docs/UI.md, Motion).
+                        return base
+                            .with_animation(
+                                SharedString::from(format!("berth-leaving-{}", row.name)),
+                                Animation::new(std::time::Duration::from_millis(220)),
+                                |el, delta| el.opacity(1.0 - delta),
+                            )
+                            .into_any_element();
+                    }
+                    if stopping {
+                        // Shutting down: the spinner already says so, and a
+                        // click mid-stop would only race the departure.
+                        return base.into_any_element();
+                    }
+                    base
                         .on_click(cx.listener({
                             let name = clone_str(&name);
                             move |this, _: &ClickEvent, _, cx| this.connect(clone_str(&name), cx)
@@ -195,6 +248,7 @@ impl DuckTable {
                                 )
                             }
                         })
+                        .into_any_element()
                 },
             ))
             .child(self.catalog_tree(cx))

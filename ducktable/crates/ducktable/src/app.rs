@@ -71,6 +71,18 @@ pub struct DuckTable {
     /// The sidebar/content divider (UI.md: divider positions persist —
     /// the width saves at the end of each drag).
     pub(crate) sidebar_resize: Entity<gpui_component::resizable::ResizableState>,
+    /// Berths with a Stop in flight: the row keeps its slot but swaps its
+    /// dot for a spinner and stops taking clicks until the shutdown lands.
+    pub(crate) stopping: std::collections::HashSet<String>,
+    /// Berths mid-departure: the shutdown returned and the survey no
+    /// longer reports them, but the row lingers one fade before it's
+    /// dropped. `refresh` re-splices these so the survey's removal can't
+    /// yank a row out from under its own fade-out.
+    pub(crate) leaving: std::collections::HashSet<String>,
+    /// The connected berth's info-card copy tile for the database path —
+    /// the same self-confirming widget the DDL block uses. Rebuilt on each
+    /// connect (it holds the path it copies), None when not connected.
+    pub(crate) path_copy: Option<Entity<crate::copy_button::CopyButton>>,
 }
 
 impl DuckTable {
@@ -136,6 +148,9 @@ impl DuckTable {
             query: None,
             staged: std::collections::HashMap::new(),
             sidebar_resize,
+            stopping: std::collections::HashSet::new(),
+            leaving: std::collections::HashSet::new(),
+            path_copy: None,
         };
         this.refresh(cx);
         this
@@ -419,6 +434,26 @@ impl DuckTable {
                 if state.refresh_seq != fence {
                     return;
                 }
+                // Keep departing rows on screen through their fade: the
+                // survey has already forgotten a stopped berth, but its
+                // row must linger until the fade timer drops it. Re-splice
+                // each leaving ghost at (near) its old index so nothing
+                // below it jumps while it dims.
+                if !state.leaving.is_empty() {
+                    let mut old = std::mem::take(&mut state.rows);
+                    let mut carried: Vec<(usize, RowVm)> = Vec::new();
+                    for (i, r) in old.drain(..).enumerate() {
+                        if state.leaving.contains(&r.name)
+                            && !rows.iter().any(|n| n.name == r.name)
+                        {
+                            carried.push((i, r));
+                        }
+                    }
+                    for (i, r) in carried {
+                        let at = i.min(rows.len());
+                        rows.insert(at, r);
+                    }
+                }
                 state.rows = rows;
                 state.warning = warning;
                 cx.notify();
@@ -464,12 +499,27 @@ impl DuckTable {
                     Ok((conn, info, catalog)) => Phase::Connected { conn, info, catalog },
                     Err(message) => Phase::Failed { name: clone_str(&name), message },
                 };
+                state.sync_path_copy(cx);
                 state.refresh(cx);
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Rebuild the info-card path copy tile from the current phase: a fresh
+    /// widget carrying the connected berth's (shortened) path, or None when
+    /// not connected. Called at every phase change, never from the fleet
+    /// refresh (that leaves the connected berth in place).
+    fn sync_path_copy(&mut self, cx: &mut Context<Self>) {
+        self.path_copy = match &self.phase {
+            Phase::Connected { info, .. } => {
+                let p = harbor_client::paths::shorten(std::path::Path::new(&info.database));
+                Some(cx.new(|_| crate::copy_button::CopyButton::new("Copy path", p)))
+            }
+            _ => None,
+        };
     }
 
     /// File→Open and drag-drop land here: connect to a database FILE the
@@ -513,6 +563,7 @@ impl DuckTable {
                     Ok((conn, info, catalog)) => Phase::Connected { conn, info, catalog },
                     Err(message) => Phase::Failed { name: clone_str(&shown), message },
                 };
+                state.sync_path_copy(cx);
                 state.refresh(cx);
                 cx.notify();
             })
@@ -527,28 +578,63 @@ impl DuckTable {
     /// the berth we're viewing is the one stopped, the view returns to Idle
     /// — a stopped server has nothing to show.
     pub(crate) fn stop_berth(&mut self, name: String, cx: &mut Context<Self>) {
+        // Idempotent: a second Stop while one is already in flight (or the
+        // row is already fading out) is a no-op.
+        if self.stopping.contains(&name) || self.leaving.contains(&name) {
+            return;
+        }
         let connected_here = matches!(
             &self.phase,
             Phase::Connected { info, .. } if info.name == name
         );
+        // The row keeps its slot and spins while the shutdown runs.
+        self.stopping.insert(clone_str(&name));
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let target = clone_str(&name);
             let outcome =
                 cx.background_executor().spawn(async move { fleet::stop(&target) }).await;
+            let stopped = this
+                .update(cx, |state, cx| {
+                    state.stopping.remove(&name);
+                    match outcome {
+                        Err(message) => {
+                            // The berth is still alive — no fade, no reset.
+                            state.warning = Some(message);
+                            state.refresh(cx);
+                            cx.notify();
+                            false
+                        }
+                        Ok(()) => {
+                            // It departed: hold the row for one fade, then
+                            // let refresh's survey drop it for real.
+                            state.leaving.insert(clone_str(&name));
+                            if connected_here {
+                                // The world we were showing just departed.
+                                state.phase = Phase::Idle;
+                                state.selected_table = None;
+                                state.grid = None;
+                                state.query = None;
+                                state.staged.clear();
+                                state.select_seq += 1;
+                                state.sync_path_copy(cx);
+                            }
+                            state.refresh(cx);
+                            cx.notify();
+                            true
+                        }
+                    }
+                })
+                .unwrap_or(false);
+            if !stopped {
+                return;
+            }
+            // Fade-out window (must outlast FADE_MS in the sidebar), then
+            // drop the ghost so the gap closes.
+            cx.background_executor().timer(std::time::Duration::from_millis(260)).await;
             this.update(cx, |state, cx| {
-                if let Err(message) = outcome {
-                    state.warning = Some(message);
-                }
-                if connected_here {
-                    // The world we were showing just departed.
-                    state.phase = Phase::Idle;
-                    state.selected_table = None;
-                    state.grid = None;
-                    state.query = None;
-                    state.staged.clear();
-                    state.select_seq += 1;
-                }
-                state.refresh(cx);
+                state.leaving.remove(&name);
+                state.rows.retain(|r| r.name != name);
                 cx.notify();
             })
             .ok();

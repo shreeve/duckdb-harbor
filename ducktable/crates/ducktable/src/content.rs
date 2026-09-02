@@ -99,11 +99,30 @@ impl DuckTable {
                 )
                 .child(meta(t, "DuckDB", clone_str(&info.duckdb_version)))
                 .child(meta(t, "Harbor", clone_str(&info.harbor_version)))
-                .child(meta(
-                    t,
-                    "Database",
-                    harbor_client::paths::shorten(std::path::Path::new(&info.database)),
-                ))
+                // The path row is the one worth copying (paste into a shell,
+                // a bug report, another tool), so it carries the same
+                // self-confirming copy tile the DDL block uses — painted
+                // labels have no OS text-selection, so this is the way out.
+                .child(
+                    div()
+                        .h_flex()
+                        .gap_2()
+                        .w_full()
+                        .items_center()
+                        .text_sm()
+                        .child(div().w_20().flex_none().text_color(t.muted).child("Database"))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(t.text)
+                                .child(harbor_client::paths::shorten(std::path::Path::new(
+                                    &info.database,
+                                ))),
+                        )
+                        .when_some(self.path_copy.clone(), |d, btn| d.child(btn)),
+                )
                 .when_some(catalog.database_size_bytes, |d, data| {
                     let h = |n: u64| crate::util::human(n as f64, "B");
                     d.child(meta(

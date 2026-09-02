@@ -21,8 +21,14 @@ enum Phase {
     Crossfade,
 }
 
-const HOLD_MS: u64 = 1600;
-const FADE_MS: u64 = 350;
+// How long the green check DWELLS before reverting — a readability budget,
+// not a motion one (see docs/UI.md, Motion). You initiated the copy and are
+// looking right at it, so you register the check in <100ms; ~1.2s is
+// un-missable without overstaying (1.6s + the fade read as "stuck").
+const HOLD_MS: u64 = 1200;
+// The revert crossfade is an in-place micro-fade: one shared duration with
+// the rest of the app's small fades, so they can't drift.
+const FADE_MS: u64 = crate::chrome::QUICK_FADE_MS;
 
 pub(crate) struct CopyButton {
     /// Tooltip label in the resting state ("Copy DDL").

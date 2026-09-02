@@ -142,6 +142,16 @@ pub(crate) fn seg_sep(t: Pal) -> Div {
     div().w(px(1.)).h_full().flex_none().bg(t.border)
 }
 
+/// The one duration for an in-place micro-fade — an icon swap, a small
+/// element breathing in or out. ~150ms: above the ~100ms motion floor,
+/// below the ~250ms where a tiny element feels slow (see docs/UI.md,
+/// Motion). Shared so the copy tile's crossfade and the stop spinner's
+/// fade-in can't drift apart. NOT for structural enter/leave (a whole row
+/// departing runs a hair longer), loops (a spinner's turn), or dwell
+/// timers (how long a confirmation holds to be read) — those measure
+/// different things and keep their own numbers.
+pub(crate) const QUICK_FADE_MS: u64 = 150;
+
 /// Crossfade: two elements stacked on ONE clock, opposite directions —
 /// the outgoing breathes out exactly as the incoming breathes in. An
 /// instant vanish beside a fade-in reads as a glitch; this is the
