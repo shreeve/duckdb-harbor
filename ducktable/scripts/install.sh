@@ -26,10 +26,12 @@ fail() { printf "${Red}error${Color_Off}: %s\n" "$*" >&2; exit 1; }
 }
 
 # DuckTable shares its repo with harbor, and the repo's "latest" release is
-# harbor's — so resolve the newest ducktable-v* tag by name. The asset keeps
-# one name, so the tag is all that varies.
-tag=$(curl -fsSL "https://api.github.com/repos/shreeve/duckdb-harbor/releases?per_page=50" \
-      | grep -o '"tag_name": *"ducktable-v[^"]*"' | head -1 | cut -d'"' -f4)
+# harbor's — so resolve the highest ducktable-v* tag by version. sort -V,
+# not creation order: a re-released hotfix of an old line must not win.
+# (This script only runs on macOS, whose sort has -V.) The asset keeps one
+# name, so the tag is all that varies.
+tag=$(curl -fsSL "https://api.github.com/repos/shreeve/duckdb-harbor/releases?per_page=100" \
+      | grep -o '"tag_name": *"ducktable-v[^"]*"' | cut -d'"' -f4 | sort -V | tail -1)
 [ -n "$tag" ] || fail "could not find a ducktable-v* release"
 url="https://github.com/shreeve/duckdb-harbor/releases/download/$tag/DuckTable.zip"
 dest="/Applications"
