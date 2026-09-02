@@ -582,15 +582,12 @@ native client, developed in this repository beside harbor.
 
 ## Known limitations
 
-**`TIME WITH TIME ZONE` loses its offset.** DuckDB's Arrow exporter discards it
-before DuckDB Harbor sees the value, so times at different offsets become
-indistinguishable. The column is marked `"lossless": false` rather than
-returning a time that silently means something else. Recover the offset with
-`date_part('timezone', t)`, or cast to `VARCHAR`.
-
-**`TIME_NS` and `VARIANT` are refused with `400`.** Neither can cross the Arrow
-boundary the Rust client uses. Cast to `VARCHAR` and the value comes back
-intact.
+**`VARIANT` and `GEOMETRY` arrive as text.** Neither has a committed vector
+layout in the v2 C API, so the value goes out as the engine's own text
+rendering, and the column says `"lossless": false, "encoding": "varchar-cast"`
+rather than pretending otherwise. (Two limitations this section used to carry
+are gone: `TIME WITH TIME ZONE` keeps its offset since 0.22, and `TIME_NS`
+encodes since 0.21.)
 
 **Bodies are capped at 8 MiB**, declared or delivered; over that is a `413`.
 There is no rate limiting and no CORS — defensible for a service behind a proxy,

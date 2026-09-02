@@ -14,7 +14,8 @@ use super::{Error, str_view};
 use crate::encode::{
     civil_from_days, digit_pair, push_base64, push_bit_string, push_date, push_float,
     push_float32, push_fraction, push_i64_raw, push_int, push_int_pad, push_json_string,
-    push_time, push_u128_raw, push_u64_raw, push_uuid, quote_identifier, split_time,
+    push_time, push_tz_offset, push_u128_raw, push_u64_raw, push_uuid, quote_identifier,
+    split_time,
     varint_to_decimal,
 };
 
@@ -186,10 +187,10 @@ pub fn result_columns(api: &ffi::Api, result: ffi::result_handle) -> Result<Vec<
 // ---------------------------------------------------------------------------
 
 pub fn emit_column_schema(out: &mut String, name: Option<&str>, ty: &Type) {
-    emit_schema(out, name, ty, false)
+    emit_schema(out, name, ty)
 }
 
-fn emit_schema(out: &mut String, name: Option<&str>, ty: &Type, nested: bool) {
+fn emit_schema(out: &mut String, name: Option<&str>, ty: &Type) {
     use ffi::*;
     out.push('{');
     if let Some(n) = name.filter(|n| !n.is_empty()) {
@@ -210,13 +211,13 @@ fn emit_schema(out: &mut String, name: Option<&str>, ty: &Type, nested: bool) {
         }
         LOGICAL_TYPE_ID_LIST => {
             out.push_str(r#","lossless":true,"child":"#);
-            emit_schema(out, None, &ty.children[0].1, true);
+            emit_schema(out, None, &ty.children[0].1);
         }
         LOGICAL_TYPE_ID_ARRAY => {
             out.push_str(r#","lossless":true,"arrayLength":"#);
             out.push_str(&ty.array_len.to_string());
             out.push_str(r#","child":"#);
-            emit_schema(out, None, &ty.children[0].1, true);
+            emit_schema(out, None, &ty.children[0].1);
         }
         LOGICAL_TYPE_ID_STRUCT | LOGICAL_TYPE_ID_TUPLE => {
             out.push_str(r#","lossless":true,"fields":["#);
@@ -224,30 +225,27 @@ fn emit_schema(out: &mut String, name: Option<&str>, ty: &Type, nested: bool) {
                 if i > 0 {
                     out.push(',');
                 }
-                emit_schema(out, Some(n), child, true);
+                emit_schema(out, Some(n), child);
             }
             out.push(']');
         }
         LOGICAL_TYPE_ID_MAP => {
             out.push_str(r#","lossless":true,"keyType":"#);
-            emit_schema(out, None, &ty.children[0].1, true);
+            emit_schema(out, None, &ty.children[0].1);
             out.push_str(r#","valueType":"#);
-            emit_schema(out, None, &ty.children[1].1, true);
+            emit_schema(out, None, &ty.children[1].1);
             out.push_str(r#","encoding":"pairs""#);
         }
         LOGICAL_TYPE_ID_UNION => {
-            // Same contract as v1 — except that the v2 vector interface keeps
-            // the tag reachable inside containers too, so nothing is dropped
-            // anywhere. v1 could only recover the tag at the top of a column.
-            match nested {
-                true => out.push_str(r#","lossless":false,"encoding":"union-tag-dropped","members":["#),
-                false => out.push_str(r#","lossless":true,"members":["#),
-            }
+            // The v2 vector interface keeps the tag reachable inside
+            // containers too, so since 0.22 nothing is dropped anywhere —
+            // v1 could only recover the tag at the top of a column.
+            out.push_str(r#","lossless":true,"members":["#);
             for (i, (n, child)) in ty.children.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
                 }
-                emit_schema(out, Some(n), child, true);
+                emit_schema(out, Some(n), child);
             }
             out.push(']');
         }
@@ -261,7 +259,6 @@ fn emit_schema(out: &mut String, name: Option<&str>, ty: &Type, nested: bool) {
             }
             out.push(']');
         }
-        LOGICAL_TYPE_ID_TIME_TZ => out.push_str(r#","lossless":false,"encoding":"time-offset-dropped""#),
         id if is_lossless(id) => out.push_str(r#","lossless":true"#),
         _ => out.push_str(r#","lossless":false,"encoding":"varchar-cast""#),
     }
@@ -289,6 +286,7 @@ fn is_lossless(id: ffi::LOGICAL_TYPE_ID) -> bool {
             | LOGICAL_TYPE_ID_UUID
             | LOGICAL_TYPE_ID_DATE
             | LOGICAL_TYPE_ID_TIME
+            | LOGICAL_TYPE_ID_TIME_TZ
             | LOGICAL_TYPE_ID_TIMESTAMP
             | LOGICAL_TYPE_ID_TIMESTAMP_SEC
             | LOGICAL_TYPE_ID_TIMESTAMP_MS
@@ -463,7 +461,7 @@ pub fn emit_cell(
     ty: &Type,
     row: usize,
 ) -> Result<(), Error> {
-    emit(out, api, r, ty, row, false)
+    emit(out, api, r, ty, row)
 }
 
 fn emit(
@@ -472,7 +470,6 @@ fn emit(
     r: &Reader,
     ty: &Type,
     row: usize,
-    nested: bool,
 ) -> Result<(), Error> {
     use ffi::*;
 
@@ -584,12 +581,15 @@ fn emit(
                 out.push('"');
             }
             // The stored value packs microseconds-since-midnight above a
-            // 24-bit UTC offset. The wire keeps v1's shape — the local time,
-            // offset dropped — and the schema line says so.
+            // 24-bit UTC offset in seconds, biased and reverse-ordered so
+            // +14:00 sorts before UTC. Since 0.22 both survive to the wire:
+            // the local clock, then the offset PostgreSQL-style.
             LOGICAL_TYPE_ID_TIME_TZ => {
                 let packed: u64 = r.get(phys);
                 out.push('"');
                 push_time(out, (packed >> 24) as i128 * 1_000);
+                const MAX_OFFSET: i32 = 16 * 60 * 60 - 1; // ±15:59:59
+                push_tz_offset(out, MAX_OFFSET - (packed & 0xFF_FFFF) as i32);
                 out.push('"');
             }
             LOGICAL_TYPE_ID_TIMESTAMP_SEC => {
@@ -647,7 +647,7 @@ fn emit(
                     if j > 0 {
                         out.push(',');
                     }
-                    emit(out, api, &r.children[0], &ty.children[0].1, (entry.offset + j) as usize, true)?;
+                    emit(out, api, &r.children[0], &ty.children[0].1, (entry.offset + j) as usize)?;
                 }
                 out.push(']');
             }
@@ -657,7 +657,7 @@ fn emit(
                     if j > 0 {
                         out.push(',');
                     }
-                    emit(out, api, &r.children[0], &ty.children[0].1, phys * ty.array_len as usize + j as usize, true)?;
+                    emit(out, api, &r.children[0], &ty.children[0].1, phys * ty.array_len as usize + j as usize)?;
                 }
                 out.push(']');
             }
@@ -669,7 +669,7 @@ fn emit(
                     }
                     push_json_string(out, name);
                     out.push(':');
-                    emit(out, api, &r.children[i], child_ty, phys, true)?;
+                    emit(out, api, &r.children[i], child_ty, phys)?;
                 }
                 out.push('}');
             }
@@ -681,7 +681,7 @@ fn emit(
                     if i > 0 {
                         out.push(',');
                     }
-                    emit(out, api, &r.children[i], child_ty, phys, true)?;
+                    emit(out, api, &r.children[i], child_ty, phys)?;
                 }
                 out.push(']');
             }
@@ -696,16 +696,17 @@ fn emit(
                         out.push(',');
                     }
                     out.push('[');
-                    emit(out, api, &r.children[0], &ty.children[0].1, (entry.offset + j) as usize, true)?;
+                    emit(out, api, &r.children[0], &ty.children[0].1, (entry.offset + j) as usize)?;
                     out.push(',');
-                    emit(out, api, &r.children[1], &ty.children[1].1, (entry.offset + j) as usize, true)?;
+                    emit(out, api, &r.children[1], &ty.children[1].1, (entry.offset + j) as usize)?;
                     out.push(']');
                 }
                 out.push(']');
             }
             LOGICAL_TYPE_ID_UNION => {
-                // children[0] is the tag, children[1..] the members. Nested
-                // unions keep v1's wire shape: the payload alone.
+                // children[0] is the tag, children[1..] the members. The
+                // tagged object goes out at every depth since 0.22 — v1
+                // could only tag at the top of a column.
                 let tag = {
                     let t = &r.children[0];
                     let p = t.phys(phys);
@@ -715,13 +716,10 @@ fn emit(
                     out.push_str("null");
                     return Ok(());
                 };
-                if nested {
-                    return emit(out, api, &r.children[1 + tag], member_ty, phys, true);
-                }
                 out.push_str(r#"{"tag":"#);
                 push_json_string(out, name);
                 out.push_str(r#","value":"#);
-                emit(out, api, &r.children[1 + tag], member_ty, phys, true)?;
+                emit(out, api, &r.children[1 + tag], member_ty, phys)?;
                 out.push('}');
             }
             // No committed view layout — the single-cell value bridge is the

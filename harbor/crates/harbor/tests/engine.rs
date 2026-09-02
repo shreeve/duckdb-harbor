@@ -476,9 +476,12 @@ mod wire {
         row(eng, "SELECT DATE '1600-02-29'", r#""1600-02-29""#);
         // v1 refused TIME_NS outright; v2 encodes it.
         row(eng, "SELECT TIME_NS '14:30:00.123456789'", r#""14:30:00.123456789""#);
-        // TIME WITH TIME ZONE: local time kept, offset dropped, schema says
-        // so.
-        row(eng, "SELECT TIMETZ '14:30:00+02'", r#""14:30:00""#);
+        // TIME WITH TIME ZONE: local time plus the ISO offset — v1 dropped
+        // the offset; 0.22 keeps it, down to second precision.
+        row(eng, "SELECT TIMETZ '14:30:00+02'", r#""14:30:00+02:00""#);
+        row(eng, "SELECT TIMETZ '14:30:00-08:15'", r#""14:30:00-08:15""#);
+        row(eng, "SELECT TIMETZ '14:30:00+05:30:15'", r#""14:30:00+05:30:15""#);
+        row(eng, "SELECT TIMETZ '14:30:00+00'", r#""14:30:00+00:00""#);
         row(eng, "SELECT INTERVAL '1 year 2 days 3 seconds'", r#"{"months":12,"days":2,"micros":"3000000"}"#);
     }
 
@@ -516,12 +519,18 @@ mod wire {
     }
 
     #[test]
-    fn unions_keep_their_tags_at_the_top() {
+    fn unions_keep_their_tags_everywhere() {
         let Some(eng) = v2_engine() else { return };
         row(eng, "SELECT union_value(a := 2)::UNION(a INTEGER, b VARCHAR)", r#"{"tag":"a","value":2}"#);
         row(eng, "SELECT union_value(b := 'x')::UNION(a INTEGER, b VARCHAR)", r#"{"tag":"b","value":"x"}"#);
-        // Nested, the wire keeps v1's shape: the payload alone.
-        row(eng, "SELECT [union_value(a := 2)::UNION(a INTEGER, b VARCHAR)]", "[2]");
+        // Nested too — v1 could only tag at the top of a column and sent the
+        // payload alone inside containers; 0.22 tags at every depth.
+        row(eng, "SELECT [union_value(a := 2)::UNION(a INTEGER, b VARCHAR)]", r#"[{"tag":"a","value":2}]"#);
+        row(
+            eng,
+            "SELECT {'u': union_value(b := 'x')::UNION(a INTEGER, b VARCHAR)}",
+            r#"{"u":{"tag":"b","value":"x"}}"#,
+        );
     }
 
     #[test]
@@ -536,7 +545,7 @@ mod wire {
         schema(eng, "SELECT {'name': 1} AS s", r#"{"name":"s","duckdbType":"STRUCT(\"name\" INTEGER)","lossless":true,"fields":[{"name":"name","duckdbType":"INTEGER","lossless":true}]}"#);
         schema(eng, "SELECT MAP([1],['x']) AS m", r#"{"name":"m","duckdbType":"MAP(INTEGER, VARCHAR)","lossless":true,"keyType":{"duckdbType":"INTEGER","lossless":true},"valueType":{"duckdbType":"VARCHAR","lossless":true},"encoding":"pairs"}"#);
         schema(eng, "SELECT 'a'::ENUM('a','b') AS e", r#"{"name":"e","duckdbType":"ENUM('a', 'b')","lossless":true,"values":["a","b"]}"#);
-        schema(eng, "SELECT TIMETZ '14:30:00+02' AS t", r#"{"name":"t","duckdbType":"TIME WITH TIME ZONE","lossless":false,"encoding":"time-offset-dropped"}"#);
+        schema(eng, "SELECT TIMETZ '14:30:00+02' AS t", r#"{"name":"t","duckdbType":"TIME WITH TIME ZONE","lossless":true}"#);
         schema(
             eng,
             "SELECT union_value(a := 2)::UNION(a INTEGER, b VARCHAR) AS u",
@@ -545,7 +554,7 @@ mod wire {
         schema(
             eng,
             "SELECT [union_value(a := 2)::UNION(a INTEGER, b VARCHAR)] AS lu",
-            r#"{"name":"lu","duckdbType":"UNION(a INTEGER, b VARCHAR)[]","lossless":true,"child":{"duckdbType":"UNION(a INTEGER, b VARCHAR)","lossless":false,"encoding":"union-tag-dropped","members":[{"name":"a","duckdbType":"INTEGER","lossless":true},{"name":"b","duckdbType":"VARCHAR","lossless":true}]}}"#,
+            r#"{"name":"lu","duckdbType":"UNION(a INTEGER, b VARCHAR)[]","lossless":true,"child":{"duckdbType":"UNION(a INTEGER, b VARCHAR)","lossless":true,"members":[{"name":"a","duckdbType":"INTEGER","lossless":true},{"name":"b","duckdbType":"VARCHAR","lossless":true}]}}"#,
         );
         schema(eng, "SELECT NULL AS x", r#"{"name":"x","duckdbType":"\"NULL\"","lossless":true}"#);
         schema(eng, "SELECT TIME_NS '14:30:00' AS t", r#"{"name":"t","duckdbType":"TIME_NS","lossless":true}"#);

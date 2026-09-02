@@ -323,6 +323,29 @@ pub(crate) fn push_date(out: &mut String, days: i32) {
     }
 }
 
+/// ±HH:MM, plus :SS only when the offset has seconds. ISO 8601's shape
+/// (DuckDB's own text form drops the minutes when zero, which standard
+/// datetime parsers refuse); the :SS case is RFC-less but DuckDB accepts
+/// offsets down to ±15:59:59 and dropping seconds would un-round-trip them.
+pub(crate) fn push_tz_offset(out: &mut String, seconds: i32) {
+    let (sign, s) = match seconds < 0 {
+        true => ('-', -seconds as usize),
+        false => ('+', seconds as usize),
+    };
+    out.push(sign);
+    let mut b = [0u8; 5];
+    b[0..2].copy_from_slice(&digit_pair(s / 3600));
+    b[2] = b':';
+    b[3..5].copy_from_slice(&digit_pair(s / 60 % 60));
+    // Safety: the buffer holds only ASCII digits and a colon.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&b) });
+    if s % 60 != 0 {
+        out.push(':');
+        let sec = digit_pair(s % 60);
+        out.push_str(unsafe { std::str::from_utf8_unchecked(&sec) });
+    }
+}
+
 /// HH:MM:SS, with a fraction only when there is one. Six digits unless the
 /// value carries sub-microsecond precision.
 pub(crate) fn push_time(out: &mut String, nanos: i128) {

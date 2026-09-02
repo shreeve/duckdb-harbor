@@ -202,7 +202,7 @@ pub struct Column {
     /// ENUM
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<String>>,
-    /// "pairs" | "time-offset-dropped" | "varchar-cast"
+    /// "pairs" | "varchar-cast"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,
 }
@@ -329,8 +329,8 @@ mod tests {
         let c: Column = serde_json::from_str(map).unwrap();
         assert_eq!(c.encoding.as_deref(), Some("pairs"));
 
-        let timetz = r#"{"name":"t","duckdbType":"TIME WITH TIME ZONE","lossless":false,"encoding":"time-offset-dropped"}"#;
-        let c: Column = serde_json::from_str(timetz).unwrap();
+        let lossy = r#"{"name":"g","duckdbType":"GEOMETRY","lossless":false,"encoding":"varchar-cast"}"#;
+        let c: Column = serde_json::from_str(lossy).unwrap();
         assert!(!c.lossless);
     }
 

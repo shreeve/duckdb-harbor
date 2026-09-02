@@ -183,28 +183,33 @@ CASES = [
     ("null-date",      "SELECT NULL::DATE AS v",     "DATE",     True, None),
     ("null-decimal",   "SELECT NULL::DECIMAL(10,2) AS v", "DECIMAL(10,2)", True, None),
 
+    # -- TIME WITH TIME ZONE ------------------------------------------------
+    # Lossy through 0.21 (the offset was dropped, schema said so); 0.22 keeps
+    # the offset in ISO shape — ±HH:MM, plus :SS only when the offset has
+    # seconds — so the value round-trips and the column reads lossless.
+    ("timetz-utc",     "SELECT '12:34:56+00'::TIMETZ AS v",
+                       "TIME WITH TIME ZONE", True, "12:34:56+00:00"),
+    ("timetz-offset",  "SELECT '12:34:56+05'::TIMETZ AS v",
+                       "TIME WITH TIME ZONE", True, "12:34:56+05:00"),
+    ("timetz-negative", "SELECT '12:34:56-08'::TIMETZ AS v",
+                       "TIME WITH TIME ZONE", True, "12:34:56-08:00"),
+    ("timetz-seconds", "SELECT '12:34:56+05:30:15'::TIMETZ AS v",
+                       "TIME WITH TIME ZONE", True, "12:34:56+05:30:15"),
+    # The wire offset must agree with SQL's own reading of the same value.
+    ("timetz-offset-recoverable",
+                       "SELECT date_part('timezone', '12:34:56+05'::TIMETZ) AS v",
+                       "BIGINT", True, 18000),
+
     # -- the lossy column ---------------------------------------------------
     # Every case above asserts lossless=True, which means the flag had never
     # been checked in the one state that carries information. A column that
     # silently started reporting lossless:true would have passed this suite
-    # from top to bottom.
-    #
-    # TIME WITH TIME ZONE is harbor's only lossy type: DuckDB's Arrow exporter
-    # drops the offset before harbor sees the value, keeping the local wall
-    # clock, so 12:34:56+05 and 12:34:56-08 arrive indistinguishable. The
-    # contract is that harbor says so rather than emitting a time that means
-    # something else.
-    ("timetz-utc",     "SELECT '12:34:56+00'::TIMETZ AS v",
-                       "TIME WITH TIME ZONE", False, "12:34:56"),
-    ("timetz-offset",  "SELECT '12:34:56+05'::TIMETZ AS v",
-                       "TIME WITH TIME ZONE", False, "12:34:56"),
-    ("timetz-negative", "SELECT '12:34:56-08'::TIMETZ AS v",
-                       "TIME WITH TIME ZONE", False, "12:34:56"),
-    # The documented recovery: the offset is still reachable through SQL, and
-    # that column is exact.
-    ("timetz-offset-recoverable",
-                       "SELECT date_part('timezone', '12:34:56+05'::TIMETZ) AS v",
-                       "BIGINT", True, 18000),
+    # from top to bottom. VARIANT is the representative since TIMETZ turned
+    # lossless in 0.22: no committed view layout, so the payload goes out as
+    # the engine's text rendering, and the schema says which property of the
+    # value not to trust.
+    ("variant-lossy",  "SELECT 42::VARIANT AS v",
+                       "VARIANT", False, "42"),
 
     # -- HUGEINT minimum ----------------------------------------------------
     # i128::MIN has no positive counterpart, so the "is this JSON-safe" test
@@ -224,9 +229,7 @@ SCHEMA_EXTRAS = {
     "enum":           {"values": ["sad", "ok", "happy"]},
     # Not just lossless:false — the reason, so a client can tell which of the
     # value's properties it must not trust.
-    "timetz-utc":      {"encoding": "time-offset-dropped"},
-    "timetz-offset":   {"encoding": "time-offset-dropped"},
-    "timetz-negative": {"encoding": "time-offset-dropped"},
+    "variant-lossy":  {"encoding": "varchar-cast"},
 }
 
 
