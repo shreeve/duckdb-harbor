@@ -305,6 +305,35 @@ pub fn sock_ready(sock: &Path) -> bool {
     ready(&Transport::Unix(sock.to_path_buf()))
 }
 
+/// Stop the server for a database FILE, if one is running. Never spawns —
+/// stopping a stopped berth is a quiet no-op. Returns whether a server was
+/// actually there to stop. The `stop` verb's whole implementation.
+#[cfg(unix)]
+pub fn shutdown(db: &Path) -> Result<bool, String> {
+    if !db.exists() {
+        return Ok(false); // no file, nothing behind it
+    }
+    let runtime = harbor_common::runtime_dir()?;
+    let canon = harbor_common::paths::canonical_db(db)?;
+    let transport = Transport::Unix(harbor_common::socket_for(&runtime, &canon)?);
+    if !ready(&transport) {
+        return Ok(false); // nothing answering on its socket
+    }
+    // POST /shutdown drains, checkpoints, and exits. The server can close the
+    // socket as it goes, so a dropped connection right after the request is
+    // success, not failure — re-probe to be sure which it was.
+    match http::request(&transport, &endpoint::SHUTDOWN, None, None, Some(Duration::from_secs(30))) {
+        Ok(_) => Ok(true),
+        Err(_) if !ready(&transport) => Ok(true),
+        Err(e) => Err(format!("stop: {e}")),
+    }
+}
+
+#[cfg(windows)]
+pub fn shutdown(_db: &Path) -> Result<bool, String> {
+    Err("a TCP server is stopped by its own SIGTERM, not over a socket".into())
+}
+
 /// GET /ready, 200 or bust. Unauthenticated by design, so no token needed.
 fn ready(transport: &Transport) -> bool {
     matches!(

@@ -16,10 +16,6 @@
 //! spell). So `detach start` is the ephemeral start, `attach start` the
 //! persistent one.
 
-// The dispatch that calls these lands in the next layer; for now only the
-// tests exercise them, so quiet dead-code until `main` wires the grammar in.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -75,7 +71,9 @@ pub struct Plan {
 impl Plan {
     /// A running server is ephemeral exactly when it is being started while
     /// detached — membership carries the lifetime. (`attach start` and a bare
-    /// `start` are persistent; only `detach start` is ephemeral.)
+    /// `start` are persistent; only `detach start` is ephemeral.) Consumed by
+    /// the membership layer, which will translate it into start's `--ephemeral`.
+    #[allow(dead_code)]
     pub fn ephemeral(&self) -> bool {
         self.run == Some(true) && self.attach == Some(false)
     }

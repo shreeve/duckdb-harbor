@@ -40,25 +40,68 @@ fn main() -> ExitCode {
             println!("harbor {VERSION}");
             return ExitCode::SUCCESS;
         }
-        // The verb rides behind the noun; point, don't just error out.
-        Some("start") => {
-            eprintln!("harbor: the database comes first — harbor <db.duckdb> start");
+        // A verb with no database in front of it: the noun comes first.
+        Some(v) if verbs::Verb::is_verb(v) => {
+            eprintln!("harbor: the database comes first — harbor <db.duckdb> {v}");
             return ExitCode::FAILURE;
         }
         _ => {}
     }
-    if args.get(1).map(String::as_str) == Some("start") {
-        let db = args.remove(0);
-        args.remove(0); // "start"
-        return match start(PathBuf::from(db), args) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("harbor: {e}");
-                ExitCode::FAILURE
-            }
-        };
+
+    // Noun first, then a bag of bare verbs, then that verb's own flags. A
+    // client invocation has no leading verb and falls straight through to
+    // cli_main; a management one hands its verb bag to the grammar.
+    let db = args.remove(0);
+    let split = args.iter().take_while(|a| verbs::Verb::is_verb(a.as_str())).count();
+    if split == 0 {
+        return harbor::repl::cli_main(std::iter::once(db).chain(args));
     }
-    harbor::repl::cli_main(args)
+    let verb_words: Vec<String> = args.drain(..split).collect();
+    let plan = match verbs::plan(&verb_words) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("harbor: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match enact(PathBuf::from(db), plan, args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("harbor: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Enact a validated [`verbs::Plan`] against one database. The running axis is
+/// live — `start` stands a server up (persistent, or refcounted with
+/// `--ephemeral`), `stop` takes one down. Membership (attach/detach) and
+/// autostart change on-disk state that has no writer yet, so they refuse
+/// loudly rather than half-applying.
+fn enact(db: PathBuf, plan: verbs::Plan, flags: Vec<String>) -> Result<(), String> {
+    if plan.attach.is_some() || plan.autostart {
+        return Err(
+            "attach/detach and autostart aren't wired yet — this build does start and stop".into(),
+        );
+    }
+    match plan.run {
+        Some(true) => start(db, flags),
+        Some(false) => {
+            if !flags.is_empty() {
+                return Err(format!("stop takes no options (got: {})", flags.join(" ")));
+            }
+            if harbor::repl::shutdown(&db)? {
+                eprintln!("harbor: {} stopped", db.display());
+            } else {
+                eprintln!("harbor: {} was not running", db.display());
+            }
+            Ok(())
+        }
+        // plan.run is None only when the bag held no running verb; but the
+        // membership-only bags that produce it are refused above, so this is
+        // the empty-bag-behind-a-noun case a split of 0 already handled.
+        None => Err("nothing to do — say start or stop".into()),
+    }
 }
 
 const HELP: &str = "\
@@ -74,6 +117,8 @@ usage:
   harbor <db.duckdb> start     start it yourself (foreground): on a terminal
                                you get the prompt and .quit ends the server;
                                headless it runs until SIGTERM
+  harbor <db.duckdb> stop      stop the server for this database, if one is
+                               running (a quiet no-op if nothing is)
   harbor version               print this binary's version (also -V)
 
 The two lifetimes, in one breath — bare: the server is everyone's, it lives
