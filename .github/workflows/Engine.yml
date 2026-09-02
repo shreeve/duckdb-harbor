@@ -95,16 +95,24 @@ jobs:
           cp src/include/duckdb.h src/include/duckdb_extension.h "$stage/"
 
           cd "$stage"
+          ls -la
           if command -v zip >/dev/null 2>&1; then
             Z() { zip -qj "$@"; }
           else
             Z() { out=$1; shift; 7z a -bd "$out" "$@" >/dev/null; }
           fi
-          libs=(); for f in libduckdb.so libduckdb.dylib duckdb.dll duckdb.lib \
-                            duckdb.h duckdb_extension.h; do
-            [ -f "$f" ] && libs+=("$f"); done
+          # Sort real directory entries into the two zips by glob — never by
+          # testing candidate names: MSYS makes `[ -f duckdb ]` true when
+          # only duckdb.exe exists, and native 7-Zip then warns on the
+          # phantom name and exits 1.
+          libs=(); clis=()
+          for f in *; do
+            case "$f" in
+              duckdb|duckdb.exe) clis+=("$f") ;;
+              *)                 libs+=("$f") ;;
+            esac
+          done
           Z "libduckdb-$PLAT.zip" "${libs[@]}"
-          clis=(); for f in duckdb duckdb.exe; do [ -f "$f" ] && clis+=("$f"); done
           Z "duckdb_cli-$PLAT.zip" "${clis[@]}"
           Z "duckdb-binaries-$PLAT.zip" "libduckdb-$PLAT.zip" "duckdb_cli-$PLAT.zip"
           ls -lh "duckdb-binaries-$PLAT.zip"
