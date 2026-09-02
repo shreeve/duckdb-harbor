@@ -192,6 +192,17 @@ different matter — a file created by a 1.5-era DuckDB opens as-is, because
 — the new PEG parser; execution is at parity. See the README's Performance
 section.)
 
+**Planned for the GA timeframe** — collected here so GA day has one list:
+unwind the frozen-channel scaffolding (the `ENGINE_URL` block in Release.yml,
+the Engine workflow and its `engine-<pin>` shelf, this section's wrinkle, and
+`fetch-duckdb`'s warning — each is marked at its site); and revisit the
+prepared-statement cache size. Harbor keeps a small per-connection LRU of
+parsed statements, which is what makes repeated statements skip the 2× parse
+cost entirely — whether that cache should grow is a tuning question worth
+answering against the GA engine's parser, not the alpha's, since upstream is
+still optimizing it. Re-run the Linux benchmarks on quiet hardware at the
+same time.
+
 **Harbor ships no extension.** A release archive carries harbor and the exact
 libduckdb it was tested against — nothing else. The extension door is the
 operator's: the loaded engine exports the full C++ ABI, so an extension built
