@@ -25,6 +25,7 @@ use harbor_common::lifetime::parse_duration;
 use harbor_common::membership::{self, Attached};
 use harbor_common::perms::chmod;
 
+mod autostart;
 mod verbs;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -69,10 +70,6 @@ fn main() -> ExitCode {
     let db = PathBuf::from(db);
     let flags = args; // whatever followed the verbs — start's, and only start's
 
-    if plan.autostart {
-        eprintln!("harbor: autostart isn't wired yet — this build does attach, detach, start, stop");
-        return ExitCode::FAILURE;
-    }
     if plan.run != Some(true) && !flags.is_empty() {
         eprintln!("harbor: only `start` takes options — got: {}", flags.join(" "));
         return ExitCode::FAILURE;
@@ -80,6 +77,8 @@ fn main() -> ExitCode {
 
     // Membership first — durable and quick, and it is what a start's lifetime
     // keys off: a listed database is persistent, an unlisted one ephemeral.
+    // Detach also tears down any login item, since one for a database you no
+    // longer keep makes no sense.
     match plan.attach {
         Some(true) => match membership::attach(&db) {
             Ok((name, Attached::Added)) => eprintln!("harbor: attached {name}"),
@@ -90,14 +89,44 @@ fn main() -> ExitCode {
             }
         },
         Some(false) => match membership::detach(&db) {
-            Ok((name, true)) => eprintln!("harbor: detached {name}"),
-            Ok((_, false)) => {} // idempotent: nothing there to detach
+            Ok((name, removed)) => {
+                if removed {
+                    eprintln!("harbor: detached {name}");
+                }
+            }
             Err(e) => {
                 eprintln!("harbor: {e}");
                 return ExitCode::FAILURE;
             }
         },
         None => {}
+    }
+
+    // autostart is declarative and defaults off: any lifetime change re-applies
+    // it — an explicit `autostart` installs the login item, its absence removes
+    // one — and a detach tears it down too. We act before the running axis,
+    // since a persistent start blocks at the helm and would defer the install.
+    if plan.run.is_some() || plan.attach == Some(false) {
+        let name = match membership::name_of(&db) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("harbor: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let synced = if plan.autostart {
+            autostart::install(&db, &name).inspect(|()| eprintln!("harbor: {name} will start at login"))
+        } else {
+            autostart::remove(&name).map(|removed| {
+                if removed {
+                    eprintln!("harbor: {name} will no longer start at login");
+                }
+            })
+        };
+        if let Err(e) = synced {
+            eprintln!("harbor: {e}");
+            return ExitCode::FAILURE;
+        }
     }
 
     // Running. The grammar owns the lifetime — a detached start is ephemeral —
@@ -145,7 +174,9 @@ usage:
                                running (a quiet no-op if nothing is)
   harbor <db.duckdb> attach    add this database to your list (config.toml) —
                                a listed database is persistent when started
-  harbor <db.duckdb> detach    remove it from your list
+  harbor <db.duckdb> detach    remove it from your list (and its login item)
+  harbor <db.duckdb> autostart start it at every login (implies attach + start;
+                               `autostart stop` arms login but leaves it off now)
   harbor version               print this binary's version (also -V)
 
 Verbs combine, in any order: `attach start` remembers it and starts it
@@ -163,8 +194,6 @@ client options:
   --json                       shorthand for --mode jsonlines
 
 start options:
-  --create             allow a database file that does not exist yet (without
-                       it a missing file is an error, never a fresh database)
   --port <p>           listen on TCP instead of the unix socket (--token
                        becomes mandatory: TCP leaves the 0700 runtime dir,
                        which is what secures the socket)
@@ -185,7 +214,6 @@ start options:
 
 struct Opts {
     db: PathBuf,
-    create: bool,
     ephemeral: bool,
     port: Option<u16>,
     bind: String,
@@ -205,7 +233,6 @@ fn parse_opts(db: PathBuf, rest: Vec<String>) -> Result<Opts, String> {
     let mut it = rest.into_iter();
     let mut o = Opts {
         db,
-        create: false,
         ephemeral: false,
         port: None,
         bind: "127.0.0.1".into(),
@@ -227,7 +254,6 @@ fn parse_opts(db: PathBuf, rest: Vec<String>) -> Result<Opts, String> {
                 print!("{HELP}");
                 std::process::exit(0);
             }
-            "--create" => o.create = true,
             "--port" => o.port = Some(take("port")?.parse().map_err(|_| "bad --port")?),
             "--bind" => o.bind = take("bind")?,
             "--token" => o.token = Some(take("token")?),
@@ -245,12 +271,8 @@ fn parse_opts(db: PathBuf, rest: Vec<String>) -> Result<Opts, String> {
             other => return Err(format!("unexpected argument: {other}")),
         }
     }
-    if !o.db.exists() && !o.create {
-        return Err(format!(
-            "database file not found: {} (pass --create to make a new database here)",
-            o.db.display()
-        ));
-    }
+    // A typed path is the duckdb-cli contract: open it, existing or not, so a
+    // missing file becomes a fresh database rather than an error.
     // The token law, both directions. A unix socket in the 0700 runtime dir
     // is already access-controlled by the filesystem, so a token there is a
     // second lock on a door only you can reach — refused, so nobody believes

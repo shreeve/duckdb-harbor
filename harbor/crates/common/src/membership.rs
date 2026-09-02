@@ -78,7 +78,7 @@ pub fn detach(db: &Path) -> Result<(String, bool), String> {
 
 /// The name a database files under: its stem, normalized to the registry
 /// alphabet — the same derivation every other harbor name goes through.
-fn name_of(db: &Path) -> Result<String, String> {
+pub fn name_of(db: &Path) -> Result<String, String> {
     let stem = db
         .file_stem()
         .and_then(|s| s.to_str())

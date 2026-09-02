@@ -252,10 +252,8 @@ fn ensure_server(path: &Path) -> Result<Transport, String> {
         // ephemerality is something membership says (a detached start), never a
         // flag, and a spawn is not a verb the user typed.
         cmd.env("HARBOR_EPHEMERAL", "1");
-        // A typed path is the duckdb-cli contract: open it, existing or not.
-        if !canon.exists() {
-            cmd.arg("--create");
-        }
+        // A typed path is the duckdb-cli contract: start opens it existing or
+        // not, so a summoned database that isn't there yet is simply created.
         {
             use std::os::unix::process::CommandExt;
             use std::process::Stdio;

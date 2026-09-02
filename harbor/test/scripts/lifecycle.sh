@@ -132,8 +132,6 @@ check "--port without --token is refused" 1 "mandatory" \
   "$harbor" "$work/x.duckdb" start --port 9499
 check "--token on a unix socket is refused" 1 "no meaning" \
   "$harbor" "$work/x.duckdb" start --token abc
-check "a missing file without --create is an error, not a database" 1 "not found" \
-  "$harbor" "$work/absent.duckdb" start
 check "verb-first is redirected, not parsed" 1 "database comes first" \
   "$harbor" start "$work/x.duckdb"
 

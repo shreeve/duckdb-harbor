@@ -141,8 +141,8 @@ pub fn socket_for(runtime: &Path, db: &Path) -> Result<PathBuf, String> {
 }
 
 /// The canonical identity of a database path: symlinks resolved and
-/// absolutized. A not-yet-created file (--create) canonicalizes its
-/// parent and keeps its own name.
+/// absolutized. A not-yet-created file canonicalizes its parent and keeps
+/// its own name.
 pub fn canonical_db(db: &Path) -> Result<PathBuf, String> {
     if let Ok(c) = db.canonicalize() {
         return Ok(c);
