@@ -482,6 +482,18 @@ mod wire {
         row(eng, "SELECT TIMETZ '14:30:00-08:15'", r#""14:30:00-08:15""#);
         row(eng, "SELECT TIMETZ '14:30:00+05:30:15'", r#""14:30:00+05:30:15""#);
         row(eng, "SELECT TIMETZ '14:30:00+00'", r#""14:30:00+00:00""#);
+        // The full offset range DuckDB accepts, at both extremes.
+        row(eng, "SELECT TIMETZ '12:00:00+15:59:59'", r#""12:00:00+15:59:59""#);
+        row(eng, "SELECT TIMETZ '12:00:00-15:59:59'", r#""12:00:00-15:59:59""#);
+        // 24:00:00 is end-of-day, a legal value distinct from midnight —
+        // the wraparound used to fold it onto 00:00:00, on all three time
+        // types, while the schema claimed lossless.
+        row(eng, "SELECT TIME '24:00:00'", r#""24:00:00""#);
+        row(eng, "SELECT TIME_NS '24:00:00'", r#""24:00:00""#);
+        row(eng, "SELECT TIMETZ '24:00:00+00'", r#""24:00:00+00:00""#);
+        // NULL and nesting take the validity path, not the offset path.
+        row(eng, "SELECT NULL::TIMETZ", "null");
+        row(eng, "SELECT [TIMETZ '01:02:03.5+04:30', NULL]", r#"["01:02:03.5+04:30",null]"#);
         row(eng, "SELECT INTERVAL '1 year 2 days 3 seconds'", r#"{"months":12,"days":2,"micros":"3000000"}"#);
     }
 

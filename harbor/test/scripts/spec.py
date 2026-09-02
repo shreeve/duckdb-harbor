@@ -195,6 +195,9 @@ CASES = [
                        "TIME WITH TIME ZONE", True, "12:34:56-08:00"),
     ("timetz-seconds", "SELECT '12:34:56+05:30:15'::TIMETZ AS v",
                        "TIME WITH TIME ZONE", True, "12:34:56+05:30:15"),
+    # End-of-day is a legal value distinct from midnight; it must not wrap.
+    ("timetz-endofday", "SELECT '24:00:00+00'::TIMETZ AS v",
+                       "TIME WITH TIME ZONE", True, "24:00:00+00:00"),
     # The wire offset must agree with SQL's own reading of the same value.
     ("timetz-offset-recoverable",
                        "SELECT date_part('timezone', '12:34:56+05'::TIMETZ) AS v",

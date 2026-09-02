@@ -353,6 +353,15 @@ pub(crate) fn push_time(out: &mut String, nanos: i128) {
     // exceed i64, hence the i128 signature — but only barely, and rem_euclid
     // on i128 is an order of magnitude slower).
     let day = 86_400_000_000_000;
+    // 24:00:00 — the SQL standard's end-of-day — is a legal TIME distinct
+    // from 00:00:00, and DuckDB stores and compares it as such. It is also
+    // exactly one day, so the wraparound below would fold it onto midnight
+    // and break the lossless promise. Print it as itself; only genuinely
+    // out-of-range values wrap.
+    if nanos == day as i128 {
+        out.push_str("24:00:00");
+        return;
+    }
     let ns = match i64::try_from(nanos) {
         Ok(n) => n.rem_euclid(day),
         Err(_) => nanos.rem_euclid(day as i128) as i64,
