@@ -477,8 +477,15 @@ fn list() -> Result<(), String> {
         }
     }
 
+    use harbor_common::ui::{Cell, Style, Table, Tone};
+
+    // Empty and populated wear the same frame: the fleet is a table whether
+    // it holds 0 rows or 30, so the eye (and a script) meets one shape. The
+    // tally line below carries the words.
     if rows.is_empty() {
-        println!("Nothing running.\n");
+        let t = Table::new(["DATABASE", "PID", "CLIENTS", "UPTIME"]);
+        println!("{}", t.render(&Style::stdout()));
+        println!("  Nothing running\n");
         println!("  harbor <db.duckdb>   open a database — served while anyone is connected");
         return Ok(());
     }
@@ -493,7 +500,6 @@ fn list() -> Result<(), String> {
     // the long socket path hangs below the grid as a footnote, so the columns
     // stay tight and the address is still one glance away. A tally closes it,
     // live rows first. Piped output degrades to plain text (Style::stdout).
-    use harbor_common::ui::{Cell, Style, Table, Tone};
     let mut t = Table::new(["DATABASE", "PID", "CLIENTS", "UPTIME"]);
     for r in &rows {
         let running = r.pid != "?";
