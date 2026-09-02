@@ -12,12 +12,17 @@
 # (2026-08-18), which predates the v2 C API landing on DuckDB main — the
 # libduckdb it delivers exports ZERO v2 symbols, and harbor 0.21 (which
 # binds the v2 C API) will refuse it with "engine has no v2 C API". Until
-# GA publishes v2-capable binaries, a serving engine must be built from
-# source at the commit CI pins — see .github/actions/duckdb/action.yml for
-# the exact recipe (clone duckdb at the pin, cmake Release, target duckdb).
-# The CLI from this zip is still fine: it only builds fixtures and needs
-# no v2 API. This script warns loudly when the fetched library cannot
-# serve. At GA, delete the caveat and the warning below.
+# GA publishes v2-capable binaries, set ENGINE_URL to our own shelf — the
+# Engine workflow builds all five platforms at CI's pinned commit and
+# shelves them on this repo's engine-<pin> prerelease, in the official
+# channel's exact zip shape:
+#
+#   ENGINE_URL=https://github.com/shreeve/duckdb-harbor/releases/download/engine-1582849bf9/duckdb-binaries-<plat>.zip
+#
+# (or build from source yourself — recipe in .github/actions/duckdb/
+# action.yml). The CLI from the frozen zip is still fine: it only builds
+# fixtures and needs no v2 API. This script warns loudly when the fetched
+# library cannot serve. At GA, delete the caveat and the warning below.
 #
 # Override DEST to install elsewhere.
 

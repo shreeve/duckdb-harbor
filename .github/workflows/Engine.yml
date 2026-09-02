@@ -1,0 +1,134 @@
+# Engine — mint the five libduckdb artifacts Release.yml downloads.
+#
+# DuckDB's official artifact channel (artifacts.duckdb.org/latest) is frozen
+# at alpha38195 (2026-08-18), which predates the v2 C API landing on main —
+# so until 2.0 GA, no official artifact can serve harbor 0.21. This workflow
+# rebuilds the channel ourselves: five native runners each build libduckdb
+# (and the duckdb CLI) from source at CI's pinned commit and package the
+# result in the official channel's exact shape — duckdb-binaries-<plat>.zip
+# wrapping libduckdb-<plat>.zip and duckdb_cli-<plat>.zip — so
+# fetch-duckdb.sh consumes it unchanged through its ENGINE_URL override.
+# The publish job shelves the five zips on a prerelease tagged engine-<pin>
+# (prerelease and never --latest: /releases/latest belongs to harbor).
+#
+# Not bit-identical to the official artifacts — our toolchains, the default
+# in-tree extension set, and an arm64-only osx build (harbor only ships
+# osx-arm64) — but it is the exact commit the local batteries validate.
+#
+# Run on demand, once per engine pin. At GA this workflow retires and the
+# official channel serves again.
+name: Engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      pin:
+        description: DuckDB commit to build (keep in step with CI's engine pin)
+        default: 1582849bf9e35de3fa3c330935ede5ce598e28a3
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-15,         duck_plat: osx           }
+          - { runner: ubuntu-24.04,     duck_plat: linux-amd64   }
+          - { runner: ubuntu-24.04-arm, duck_plat: linux-arm64   }
+          - { runner: windows-2025,     duck_plat: windows-amd64 }
+          - { runner: windows-11-arm,   duck_plat: windows-arm64 }
+    runs-on: ${{ matrix.runner }}
+    env:
+      PIN: ${{ inputs.pin }}
+      PLAT: ${{ matrix.duck_plat }}
+    steps:
+      - name: Build DuckDB at the pin
+        shell: bash
+        # Same recipe as .github/actions/duckdb/action.yml, minus -j caching
+        # (this runs once per pin) and plus the CLI. OVERRIDE_GIT_DESCRIBE:
+        # a shallow, tagless clone gives `git describe` nothing, so the
+        # engine would otherwise report a bogus version string. No --target:
+        # the default generators differ per OS (Makefiles, Xcode-less make,
+        # Visual Studio) and the `all` target reliably covers library and
+        # shell on every one of them.
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/duckdb-src"; mkdir -p "$src"; cd "$src"
+          git init -q
+          git remote add origin https://github.com/duckdb/duckdb.git
+          git fetch -q --depth 1 origin "$PIN"
+          git checkout -q FETCH_HEAD
+          export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOVERRIDE_GIT_DESCRIBE=v2.0.0-dev83323 \
+            -DBUILD_SHELL=TRUE -DBUILD_UNITTESTS=FALSE
+          cmake --build build --config Release
+
+      - name: Package in the official channel's shape
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/duckdb-src"
+          stage="$RUNNER_TEMP/stage"; mkdir -p "$stage"
+
+          lib=$(find build -type f \( -name libduckdb.so -o -name libduckdb.dylib -o -name duckdb.dll \) | head -1)
+          [ -n "$lib" ] || { echo "::error::no libduckdb produced"; exit 1; }
+          # The entire point: refuse to shelve an engine harbor 0.21 refuses.
+          grep -qc duckdb_v2_connect "$lib" || {
+            echo "::error::built library exports no v2 C API symbols"; exit 1; }
+          cp "$lib" "$stage/"
+          imp=$(find build -type f -name duckdb.lib | head -1)
+          [ -n "$imp" ] && cp "$imp" "$stage/"
+          cli=$(find build -type f \( -name duckdb -o -name duckdb.exe \) | head -1)
+          [ -n "$cli" ] || { echo "::error::no duckdb CLI produced"; exit 1; }
+          cp "$cli" "$stage/"
+          cp src/include/duckdb.h src/include/duckdb_extension.h "$stage/"
+
+          cd "$stage"
+          if command -v zip >/dev/null 2>&1; then
+            Z() { zip -qj "$@"; }
+          else
+            Z() { out=$1; shift; 7z a -bd "$out" "$@" >/dev/null; }
+          fi
+          libs=(); for f in libduckdb.so libduckdb.dylib duckdb.dll duckdb.lib \
+                            duckdb.h duckdb_extension.h; do
+            [ -f "$f" ] && libs+=("$f"); done
+          Z "libduckdb-$PLAT.zip" "${libs[@]}"
+          clis=(); for f in duckdb duckdb.exe; do [ -f "$f" ] && clis+=("$f"); done
+          Z "duckdb_cli-$PLAT.zip" "${clis[@]}"
+          Z "duckdb-binaries-$PLAT.zip" "libduckdb-$PLAT.zip" "duckdb_cli-$PLAT.zip"
+          ls -lh "duckdb-binaries-$PLAT.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: engine-${{ matrix.duck_plat }}
+          path: ${{ runner.temp }}/stage/duckdb-binaries-*.zip
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      PIN: ${{ inputs.pin }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with: { merge-multiple: true }
+      - name: Shelve on the engine-<pin> prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="engine-${PIN:0:10}"
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+              --prerelease --latest=false \
+              --title "DuckDB engine @ ${PIN:0:10}" \
+              --notes "libduckdb + duckdb CLI built from duckdb/duckdb@$PIN \
+          (v2 C API), packaged in the official artifact channel's shape. \
+          Stopgap until DuckDB 2.0 GA — consumed by Release.yml via \
+          fetch-duckdb.sh's ENGINE_URL override. Not a harbor release."
+          gh release upload "$tag" duckdb-binaries-*.zip --clobber \
+            --repo "$GITHUB_REPOSITORY"
