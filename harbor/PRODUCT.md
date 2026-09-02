@@ -46,8 +46,8 @@ each load-bearing:
 - **The engine swaps by file.** `HARBOR_LIBDUCKDB`, then `../lib` beside the
   binary (the release-archive layout), `~/.local/lib`, and `~/.duckdb/cli/*`
   — DuckDB's own world, disposable and refetchable. Harbor binds the v2 C
-  API, so DuckDB 2.0 is the engine floor; one build has served every 2.0
-  nightly it has met, and the engine pin *is* the dylib.
+  API, so DuckDB 2.0 is the engine floor; one build has served every v2-API
+  engine it has met, and the engine pin *is* the dylib.
 - **Building needs nothing.** No DuckDB source tree, library, or header —
   the crate ships pregenerated bindings, so `cargo build` works on a bare
   machine and CI needs the engine only to run the suite.
@@ -140,6 +140,10 @@ a dot or a slash, so an argument carrying one can only be a path. That
 classifier is also the safety rule: a typo can never silently become a fresh
 empty database served under a name clients trust.
 
+(One nuance for completeness: `harbor-common` still ships a config/fleet
+*reader* behind an off-by-default cargo feature, consumed only by DuckTable's
+sidebar. Harbor itself never reads or writes any config file.)
+
 ## The token law
 
 The unix socket needs no token, and refuses one: the `0700` runtime dir is
@@ -161,27 +165,32 @@ and application clients go through Caddy.
 
 ## Protocol changes are additive only
 
-The wire protocol is untouched by 0.20 — DuckTable and the Rip harbor
-adapter run unmodified. `/keepalive` (an additive 0.19 route) is gone with
+The wire protocol is untouched by 0.20 and 0.21 — DuckTable and the Rip
+harbor adapter run unmodified. `/keepalive` (an additive 0.19 route) is gone with
 the idle-exit machinery it served; the core routes, events, fields, and error
 codes are exactly as they were. No `database` field on `/sql`: a server holds
 one database; per-session work is `USE`/ATTACH as plain SQL on a lease.
 
-## The engine is DuckDB's official v2.0-dev nightly — no fork
+## The engine is upstream DuckDB 2.0 — no fork
 
-DuckDB publishes the 2.0 line as an official nightly:
-`artifacts.duckdb.org/latest/duckdb-binaries-<plat>.zip`, rebuilt from `main`
-daily — `libduckdb` (+ headers) and the `duckdb` CLI. That is the whole
-engine harbor needs, from upstream, so there is nothing to build and nothing
-to fork. `make fetch-duckdb` pulls it into `~/.duckdb/cli/2.0.0/`; CI fetches
-the same nightly via `.github/actions/duckdb`. Verified: one harbor build
-loads and runs clean against multiple 2.0 alphas — tested compatibility for
-Harbor's exercised C-API surface, not a claim about every future ABI. The
-floor is DuckDB 2.0 by construction: harbor binds the v2 C API, whose symbols
-older engines do not export. Database files are a different matter — a file
-created by a 1.5-era DuckDB opens as-is, because 2.0's storage layer reads
-it. (The v2 nightlies parse SQL ~2× slower than 1.5.5 — the new PEG parser;
-execution is at parity. See the README's Performance section.)
+The engine is DuckDB's own `main` line, unmodified: `libduckdb` plus the
+`duckdb` CLI. Nothing is forked and nothing is patched — but until 2.0 GA,
+one honest wrinkle: DuckDB's published artifact channel
+(`artifacts.duckdb.org/latest/…`) is frozen at a build that predates the v2
+C API landing upstream, so the library it delivers cannot serve harbor. A
+serving engine is therefore *built* from upstream source at one pinned
+commit — CI does this (cached; `.github/actions/duckdb` holds the pin and
+the recipe), local development does the same, and `make fetch-duckdb` warns
+when the artifact it fetched can't serve. At GA this section loses the
+wrinkle and everything returns to the published zip. Verified: one harbor
+build loads and runs clean against every v2-API engine it has met — tested
+compatibility for Harbor's exercised C-API surface, not a claim about every
+future ABI. The floor is DuckDB 2.0 by construction: harbor binds the v2 C
+API, whose symbols older engines do not export. Database files are a
+different matter — a file created by a 1.5-era DuckDB opens as-is, because
+2.0's storage layer reads it. (The v2 line parses SQL ~2× slower than 1.5.5
+— the new PEG parser; execution is at parity. See the README's Performance
+section.)
 
 **Harbor ships no extension.** A release archive carries harbor and the exact
 libduckdb it was tested against — nothing else. The extension door is the

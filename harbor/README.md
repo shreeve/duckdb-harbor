@@ -55,7 +55,7 @@ another harbor.
 `harbor` by itself shows what's being served.
 
 No config file. No drivers, no ORM, no fleet manager. Built directly on
-DuckDB's new v2 C API — v2.0, out this month — so it's smaller, faster, and
+DuckDB's new v2 C API — the API of the 2.0 line — so it's smaller, faster, and
 simpler than everything it replaces.
 
 If it can speak HTTP and parse JSON, it can query your database.
@@ -275,7 +275,7 @@ One binary, and nothing to configure. The client half never touches DuckDB —
 the engine (`libduckdb`) loads on demand, only when this process is the one
 serving a file, so the same 2.2MB `harbor` is a pure protocol client on
 machines that never host a database. `make fetch-duckdb` pulls DuckDB's
-official v2 nightly into `~/.duckdb/cli/2.0.0/`, one of the places harbor
+official artifacts into `~/.duckdb/cli/2.0.0/`, one of the places harbor
 looks at runtime; then:
 
 ```console
@@ -288,6 +288,14 @@ mydata>
 `make bootstrap` does the whole thing in one shot — fetch the engine into
 `~/.duckdb`, then build and install `harbor` into `~/.local/bin`. No step
 needs root.
+
+One caveat that ends at DuckDB 2.0 GA: the official artifact channel is
+currently frozen at a build that predates the v2 C API, so the `libduckdb`
+it delivers cannot *serve* (harbor says so plainly: "engine has no v2 C
+API"). `fetch-duckdb` warns when this happens. Until GA, a serving engine
+is built from DuckDB source at a pinned commit — CI does exactly this, and
+the recipe lives in `.github/actions/duckdb/action.yml`. The fetched
+`duckdb` CLI is unaffected either way.
 
 No toolchain? One command installs the latest release — it picks the right
 archive for the platform, verifies its sha256 against the published checksums,
@@ -596,8 +604,10 @@ works the same everywhere.
 harbor loads the engine on demand (`HARBOR_LIBDUCKDB`, then `../lib` beside
 the binary, `~/.local/lib`, and `~/.duckdb/cli/*` — DuckDB's own world,
 disposable and refetchable). Harbor binds DuckDB's v2 C API, so DuckDB 2.0
-is the engine floor; the same build has been verified against the 2.0
-development line as it moves. Treat that as tested compatibility, not a
+is the engine floor; the same build has been verified against every
+v2-API engine it has met (currently self-built at CI's pinned commit — the
+published artifacts are frozen pre-v2-API until GA). Treat that as tested
+compatibility, not a
 promise that an arbitrary future DuckDB ABI will work. Your database files
 need no such care: a file created by a 1.5-era DuckDB opens as-is, because
 2.0's storage layer reads it. A machine with
@@ -622,8 +632,10 @@ The server implements its protocol shapes directly rather than depending on
 `wire`, so a wire change needs tests on both sides; drift is not a Rust
 compile error. Nothing links `libduckdb` — the engine loads on demand — so no
 DuckDB source tree, library, or header is required to build: `make harbor`
-works on a bare machine, and `make fetch-duckdb` fetches an engine to serve
-with. The crate ships pregenerated bindings, so there is no bindgen.
+works on a bare machine, and `make fetch-duckdb` fetches the duckdb CLI plus
+a library (see the GA caveat under "Get it running" — until then a serving
+engine is built at CI's pin). The crate ships pregenerated bindings, so
+there is no bindgen.
 
 `make unit` runs the fast Rust tests and `make test` runs the full suite. The
 full suite expects `sample.duckdb`; create it with

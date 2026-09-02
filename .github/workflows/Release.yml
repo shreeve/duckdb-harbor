@@ -34,9 +34,27 @@ jobs:
       - uses: actions/checkout@v5
 
 
-      - name: Fetch DuckDB engine (official v2 nightly)
+      - name: Fetch DuckDB engine (official artifacts)
         shell: bash
         run: DEST="$DUCKDB_LIB" DUCKDB_PLATFORM=${{ matrix.duck_plat }} scripts/fetch-duckdb.sh
+
+      # Fail FAST if the fetched library cannot serve this harbor. Until
+      # DuckDB 2.0 GA the artifact channel is frozen pre-v2-C-API, so a
+      # v0.21.0 tag would otherwise burn five native runners packaging an
+      # engine harbor refuses at dlopen — the smoke test would catch it, but
+      # late and cryptically. Grep the dynamic symbol names straight out of
+      # the binary; delete this step at GA when artifacts carry the v2 API.
+      - name: Engine can serve this harbor
+        shell: bash
+        run: |
+          lib=$(ls "$DUCKDB_LIB"/libduckdb.so "$DUCKDB_LIB"/libduckdb.dylib \
+                   "$DUCKDB_LIB"/duckdb.dll 2>/dev/null | head -1)
+          [ -n "$lib" ] || { echo "no libduckdb found in $DUCKDB_LIB"; exit 1; }
+          if ! grep -qc duckdb_v2_connect "$lib"; then
+            echo "::error::$lib exports no v2 C API symbols — harbor $(grep -m1 '^version' Cargo.toml) cannot serve with it."
+            echo "::error::The official artifact channel is frozen pre-v2-API; the 0.21 release is gated on DuckDB 2.0 GA."
+            exit 1
+          fi
 
       # Nothing links the engine — harbor dlopens it at runtime (bin/../lib
       # is the first place it looks), so the build needs no rpath and no

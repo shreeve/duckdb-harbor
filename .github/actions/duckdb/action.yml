@@ -14,6 +14,9 @@ runs:
   steps:
     - name: DuckDB CLI (official artifact — fixture builder only)
       shell: bash
+      # /latest/ is unpinned and currently frozen; either way is fine here —
+      # the CLI only builds the fixture database and needs no v2 API. If the
+      # channel ever moves, the CLI moving with it is correct.
       run: |
         set -euo pipefail
         dir="$HOME/duckdb"; mkdir -p "$dir"; cd "$dir"
@@ -42,14 +45,20 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        sudo apt-get install -y -qq ninja-build >/dev/null
+        command -v ninja >/dev/null || {
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build >/dev/null
+        }
         src="$RUNNER_TEMP/duckdb-src"; mkdir -p "$src"; cd "$src"
         git init -q
         git remote add origin https://github.com/duckdb/duckdb.git
         git fetch -q --depth 1 origin ${{ steps.pin.outputs.sha }}
         git checkout -q FETCH_HEAD
+        # OVERRIDE_GIT_DESCRIBE: a shallow, tagless clone gives `git describe`
+        # nothing, so the engine would report a bogus version string.
         cmake -G Ninja -B build \
           -DCMAKE_BUILD_TYPE=Release \
+          -DOVERRIDE_GIT_DESCRIBE=v2.0.0-dev83323 \
           -DBUILD_SHELL=FALSE -DBUILD_UNITTESTS=FALSE >/dev/null
         cmake --build build --target duckdb -j "$(nproc)"
         mkdir -p "$HOME/duckdb-engine"

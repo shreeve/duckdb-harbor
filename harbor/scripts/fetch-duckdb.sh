@@ -2,15 +2,22 @@
 #
 # fetch-duckdb.sh — put a DuckDB engine into ~/.duckdb/cli/2.0.0/
 #
-# harbor carries no engine; this fetches one for it to link, along
+# harbor carries no engine; this fetches one for it to load, along
 # with the two headers (kept for reference — the crate ships pregenerated
 # bindings, so the build never reads them) and the duckdb CLI that builds
-# fixtures. The source is DuckDB's official v2.0-dev nightly, from
-# artifacts.duckdb.org — the current 2.0 line straight from upstream, no fork,
-# nothing to pin. `/latest/` is the v2.0-dev channel today (it reported
-# v2.0.0-alpha38069 when this was written); if main ever rolls past 2.0, pin the
-# v2.0 channel URL below. Every binary a release ships is linked against the
-# one engine this installs — that is what "version-locked" means here.
+# fixtures. The source is DuckDB's official artifact channel at
+# artifacts.duckdb.org.
+#
+# CAVEAT, until DuckDB 2.0 GA: that channel is frozen at alpha38195
+# (2026-08-18), which predates the v2 C API landing on DuckDB main — the
+# libduckdb it delivers exports ZERO v2 symbols, and harbor 0.21 (which
+# binds the v2 C API) will refuse it with "engine has no v2 C API". Until
+# GA publishes v2-capable binaries, a serving engine must be built from
+# source at the commit CI pins — see .github/actions/duckdb/action.yml for
+# the exact recipe (clone duckdb at the pin, cmake Release, target duckdb).
+# The CLI from this zip is still fine: it only builds fixtures and needs
+# no v2 API. This script warns loudly when the fetched library cannot
+# serve. At GA, delete the caveat and the warning below.
 #
 # Override DEST to install elsewhere.
 
@@ -61,4 +68,21 @@ if [ "$dest" = "$HOME/.duckdb/cli/2.0.0" ]; then
   ln -sfn "$dest" "$HOME/.duckdb/cli/latest"
   say "cli/latest -> $dest"
 fi
+
+# ---- can this engine actually serve harbor 0.21? ---------------------------
+# harbor 0.21 binds the v2 C API; the frozen artifact channel predates it.
+# grep the dynamic symbol names straight out of the binary — present on every
+# platform, no nm/objdump dependency. Delete this check at GA.
+lib=$(grab 'libduckdb.*') || true
+for f in "$dest"/libduckdb.dylib "$dest"/libduckdb.so "$dest"/duckdb.dll; do
+  [ -f "$f" ] || continue
+  if ! grep -qc duckdb_v2_connect "$f" 2>/dev/null; then
+    echo "" >&2
+    echo "fetch-duckdb: WARNING — this libduckdb exports no v2 C API symbols." >&2
+    echo "  harbor 0.21 cannot serve with it (the artifact channel is frozen" >&2
+    echo "  pre-v2-API until DuckDB 2.0 GA). Build the engine from source at" >&2
+    echo "  the pinned commit instead — recipe in .github/actions/duckdb/action.yml." >&2
+  fi
+  break
+done
 echo "fetch-duckdb: ready in $dest"

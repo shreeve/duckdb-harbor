@@ -4,8 +4,10 @@
 # asserts) is a separate workflow, FullSuite.yml, that runs on main and nightly,
 # so it never appears here as a skipped check.
 #
-# The focused suite selection is explicit below; the engine is fetched by the
-# local composite action (.github/actions/duckdb) — DuckDB's official v2 nightly.
+# The focused suite selection is explicit below; the engine comes from the
+# local composite action (.github/actions/duckdb) — libduckdb built from
+# source at the pinned commit (published artifacts are frozen pre-v2-API
+# until GA), the duckdb CLI from the artifact zip.
 #
 name: Tests
 
