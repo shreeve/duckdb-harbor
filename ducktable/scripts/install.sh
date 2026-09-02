@@ -31,7 +31,7 @@ fail() { printf "${Red}error${Color_Off}: %s\n" "$*" >&2; exit 1; }
 # (This script only runs on macOS, whose sort has -V.) The asset keeps one
 # name, so the tag is all that varies.
 tag=$(curl -fsSL "https://api.github.com/repos/shreeve/duckdb-harbor/releases?per_page=100" \
-      | grep -o '"tag_name": *"ducktable-v[^"]*"' | cut -d'"' -f4 | sort -V | tail -1)
+      | grep -o '"tag_name": *"ducktable-v[0-9][0-9.]*"' | cut -d'"' -f4 | sort -V | tail -1)
 [ -n "$tag" ] || fail "could not find a ducktable-v* release"
 url="https://github.com/shreeve/duckdb-harbor/releases/download/$tag/DuckTable.zip"
 dest="/Applications"

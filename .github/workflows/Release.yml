@@ -108,7 +108,9 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    # refs/tags/v, not refs/tags/: a workflow_dispatch aimed at a
+    # ducktable-v* tag must not mint harbor archives or steal --latest.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v8

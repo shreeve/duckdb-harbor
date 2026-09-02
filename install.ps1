@@ -86,7 +86,7 @@ try {
   foreach ($f in Get-ChildItem $src -File) {
     $dest = Join-Path $bin $f.Name
     try { Copy-Item $f.FullName $dest -Force }
-    catch { Fail "cannot replace $dest — stop any running berths first (harbor stop <name>), then re-run" }
+    catch { Fail "cannot replace $dest — a running harbor is holding it; stop your harbor servers (close their windows or end the processes), then re-run" }
   }
 } finally {
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
