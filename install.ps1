@@ -14,8 +14,8 @@ the per-user convention on Windows, so nothing here needs Administrator.
 
 duckdb.dll sits beside the executables, which is where Windows looks first.
 
-Harbor's own directories follow the same split as everywhere else:
-config at %USERPROFILE%\.config\harbor, state at %LOCALAPPDATA%\harbor.
+Harbor keeps its state (sockets, tokens, logs, repl history) at
+%LOCALAPPDATA%\harbor. There is no config file.
 #>
 [CmdletBinding()]
 param(

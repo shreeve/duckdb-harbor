@@ -23,14 +23,41 @@ on:
   workflow_dispatch:
     inputs:
       pin:
-        description: DuckDB commit to build (keep in step with CI's engine pin)
-        default: 1582849bf9e35de3fa3c330935ede5ce598e28a3
+        description: >-
+          Override the DuckDB commit (defaults to CI's engine pin, read from
+          .github/actions/duckdb/action.yml)
+        default: ''
 
 permissions:
   contents: write
 
 jobs:
+  # The pin and the OVERRIDE_GIT_DESCRIBE string live in ONE place —
+  # .github/actions/duckdb/action.yml, the same file Tests builds from —
+  # and this job reads them out, so a pin bump there flows here without a
+  # second edit. The dispatch input can still override the commit for a
+  # one-off build.
+  pin:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.read.outputs.sha }}
+      describe: ${{ steps.read.outputs.describe }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: read
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=.github/actions/duckdb/action.yml
+          sha='${{ inputs.pin }}'
+          [ -n "$sha" ] || sha=$(grep -o 'sha=[0-9a-f]\{40\}' "$f" | cut -d= -f2)
+          describe=$(grep -o 'OVERRIDE_GIT_DESCRIBE=[^ ]*' "$f" | cut -d= -f2)
+          [ -n "$sha" ] && [ -n "$describe" ] || { echo "could not read pin/describe from $f"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "describe=$describe" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: pin
     strategy:
       fail-fast: false
       matrix:
@@ -42,7 +69,8 @@ jobs:
           - { runner: windows-11-arm,   duck_plat: windows-arm64 }
     runs-on: ${{ matrix.runner }}
     env:
-      PIN: ${{ inputs.pin }}
+      PIN: ${{ needs.pin.outputs.sha }}
+      DESCRIBE: ${{ needs.pin.outputs.describe }}
       PLAT: ${{ matrix.duck_plat }}
     steps:
       - name: Build DuckDB at the pin
@@ -64,7 +92,7 @@ jobs:
           export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DOVERRIDE_GIT_DESCRIBE=v2.0.0-dev83323 \
+            -DOVERRIDE_GIT_DESCRIBE="$DESCRIBE" \
             -DBUILD_SHELL=TRUE -DBUILD_UNITTESTS=FALSE
           cmake --build build --config Release
 
@@ -123,10 +151,10 @@ jobs:
           path: ${{ runner.temp }}/stage/duckdb-binaries-*.zip
 
   publish:
-    needs: build
+    needs: [pin, build]
     runs-on: ubuntu-24.04
     env:
-      PIN: ${{ inputs.pin }}
+      PIN: ${{ needs.pin.outputs.sha }}
     steps:
       - uses: actions/download-artifact@v8
         with: { merge-multiple: true }

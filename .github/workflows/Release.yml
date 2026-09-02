@@ -13,6 +13,14 @@ on:
 permissions:
   contents: write
 
+# One release run at a time, queued not cancelled: two v* tags pushed close
+# together (or a tag deleted and re-pushed with a run still in flight) must
+# not race — the last finisher would take --latest even if it's the older
+# version, and install.sh resolves /releases/latest.
+concurrency:
+  group: harbor-release
+  cancel-in-progress: false
+
 jobs:
   build:
     strategy:
@@ -134,14 +142,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           sha256sum harbor-*.tar.gz harbor-*.zip > "harbor-$GITHUB_REF_NAME-checksums.txt"
-          # --latest explicitly: DuckTable releases share this repo under
-          # ducktable-v* tags, and install.sh resolves the /releases/latest
-          # redirect — that pointer must always be a harbor release.
-          gh release create "$GITHUB_REF_NAME" *.tar.gz *.zip \
+          # Create-if-missing, then upload with --clobber: a re-run after a
+          # transient asset failure repairs the release instead of dying on
+          # "already exists". --latest explicitly: DuckTable releases share
+          # this repo under ducktable-v* tags, and install.sh resolves the
+          # /releases/latest redirect — that pointer must always be a harbor
+          # release.
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" --title "harbor $GITHUB_REF_NAME" \
+              --latest \
+              --notes "Self-contained harbor releases, version-locked to one DuckDB v2 nightly. Unix archives carry libduckdb and install.sh; Windows archives carry duckdb.dll beside the binary. Extract and run in place."
+          gh release upload "$GITHUB_REF_NAME" *.tar.gz *.zip \
             "harbor-$GITHUB_REF_NAME-checksums.txt" \
-            --repo "$GITHUB_REPOSITORY" --title "harbor $GITHUB_REF_NAME" \
-            --latest \
-            --notes "Self-contained harbor releases, version-locked to \
-          one DuckDB v2 nightly. Unix archives carry libduckdb and install.sh; \
-          Windows archives carry duckdb.dll beside the binary. \
-          Extract and run in place."
+            --clobber --repo "$GITHUB_REPOSITORY"

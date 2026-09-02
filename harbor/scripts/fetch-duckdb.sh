@@ -44,9 +44,20 @@ fi
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/fetch-duckdb.XXXXXX")
 trap 'rm -rf "$work"' EXIT
-say()   { printf '  %s\n' "$*"; }
-grab()  { find "$work" -type f -name "$1" 2>/dev/null | head -1; }
-place() { local s; s=$(grab "$1") || true; [ -n "$s" ] && install -m "$2" "$s" "$dest/$1" && say "-> $dest/$1"; return 0; }
+say()  { printf '  %s\n' "$*"; }
+# /usr/bin/find + -print -quit: GNU find by absolute path (Git Bash can
+# shadow bare `find` with the DOS one), and no `| head` for pipefail to
+# turn into a silent death. Empty result is status 0 by design.
+grab() { /usr/bin/find "$work" -type f -name "$1" -print -quit 2>/dev/null; }
+place() {
+  # A file the archive doesn't carry is skipped (each platform ships its
+  # own subset); a failed install is a real error and propagates.
+  local s; s=$(grab "$1")
+  if [ -n "$s" ]; then
+    install -m "$2" "$s" "$dest/$1"
+    say "-> $dest/$1"
+  fi
+}
 
 # ---- the engine: one "binaries" zip, two sub-zips nested inside -------------
 engine_url=${ENGINE_URL:-https://artifacts.duckdb.org/latest/duckdb-binaries-$duck_plat.zip}
@@ -66,6 +77,12 @@ place duckdb.exe         0755
 place duckdb.h           0644
 place duckdb_extension.h 0644
 
+# A fetch that placed no engine is a failure, not a quiet success — the
+# same rule package-release.sh enforces. Without this, a malformed or
+# empty archive would sail through to "ready" with nothing installed.
+[ -f "$dest/libduckdb.dylib" ] || [ -f "$dest/libduckdb.so" ] || [ -f "$dest/duckdb.dll" ] \
+  || { echo "fetch-duckdb: the archive contained no libduckdb" >&2; exit 1; }
+
 # ---- point cli/latest at what we just refreshed ----------------------------
 # Only when we filled the canonical dir — a throwaway DEST elsewhere (a scratch
 # test, a one-off build root) has no business owning `latest`.
@@ -78,15 +95,15 @@ fi
 # harbor 0.21 binds the v2 C API; the frozen artifact channel predates it.
 # grep the dynamic symbol names straight out of the binary — present on every
 # platform, no nm/objdump dependency. Delete this check at GA.
-lib=$(grab 'libduckdb.*') || true
 for f in "$dest"/libduckdb.dylib "$dest"/libduckdb.so "$dest"/duckdb.dll; do
   [ -f "$f" ] || continue
-  if ! grep -qc duckdb_v2_connect "$f" 2>/dev/null; then
+  if ! grep -q duckdb_v2_connect "$f" 2>/dev/null; then
     echo "" >&2
     echo "fetch-duckdb: WARNING — this libduckdb exports no v2 C API symbols." >&2
-    echo "  harbor 0.21 cannot serve with it (the artifact channel is frozen" >&2
-    echo "  pre-v2-API until DuckDB 2.0 GA). Build the engine from source at" >&2
-    echo "  the pinned commit instead — recipe in .github/actions/duckdb/action.yml." >&2
+    echo "  harbor cannot serve with it (the official channel is frozen" >&2
+    echo "  pre-v2-API until DuckDB 2.0 GA). Re-run with ENGINE_URL pointed" >&2
+    echo "  at this repo's engine-<pin> release — the exact line is in this" >&2
+    echo "  script's header." >&2
   fi
   break
 done

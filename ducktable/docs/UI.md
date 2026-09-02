@@ -82,13 +82,13 @@ rules, in order:
 
 Two stacked sections, each collapsible.
 
-**DATABASES** lists every berth Harbor knows: configured berths and
-spawn-on-demand aliases, each with a status dot (connected, running,
-stopped), the table count in parentheses for live berths, and the size
-on disk right-justified in decimal units (MB/GB, never MiB). Click
-connects; the attempt is fenced, so a late completion discards itself
-and a cancel works synchronously. Context menu (roadmap): connect,
-disconnect, start, stop, rename; add and remove edit Harbor config and
+**DATABASES** lists every berth Harbor knows: live sockets found by
+discovery plus spawn-on-demand databases, each with a status dot
+(connected, running, stopped), the table count in parentheses for live
+berths, and the size on disk right-justified in decimal units (MB/GB,
+never MiB). Click connects; the attempt is fenced, so a late completion
+discards itself and a cancel works synchronously. Context menu
+(roadmap): connect, disconnect, start, stop, rename; add and remove
 ship after v1. Plain verbs only; the nautical vocabulary is frozen at
 harbor, berth — and stays INTERNAL: on-screen labels use user
 words (DATABASES, TABLES, "database").
@@ -269,8 +269,8 @@ and marked.
 Every surface defines empty, loading, and failed:
 
 - Harbor unreachable or auth failed: full-window state with the reason,
-  a retry, and where the config/token lives. Never a blank pane.
-- No berths: points at Harbor config.
+  a retry, and where the token lives. Never a blank pane.
+- No berths: points at how to open one (`harbor <db> serve`).
 - Berth start failure: inline in the sidebar row, with stderr excerpt.
 - Connection lost mid-session: status line goes red, tabs keep their
   data with a stale badge, reconnect retries with backoff; staged edits

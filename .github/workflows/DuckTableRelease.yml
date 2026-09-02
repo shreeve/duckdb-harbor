@@ -44,8 +44,11 @@ jobs:
           tag="${GITHUB_REF_NAME#ducktable-v}"
           [ "$ver" = "$tag" ] || { echo "bundle says $ver, tag says $tag"; exit 1; }
 
+      # refs/tags/ducktable-v, not refs/tags/: a workflow_dispatch aimed at
+      # a harbor v* tag must not mint a DuckTable release. (Mirror of the
+      # guard in Release.yml, pointing the other way.)
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/ducktable-v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

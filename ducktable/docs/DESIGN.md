@@ -142,8 +142,8 @@ by subsurface (grid: rendering, editing, selection), not by line count.
 
 ## Roadmap
 
-1. **Shell**: window, berth picker (names from Harbor config), connect flow
-   with cancel, status line.
+1. **Shell**: window, berth picker (names from socket discovery), connect
+   flow with cancel, status line.
 2. **Catalog**: schema tree from Harbor `/catalog`.
 3. **Grid**: starts with the wide-table probe (see COMPONENTS.md), then
    results in the wrapped virtualized Table; value font; NULL
