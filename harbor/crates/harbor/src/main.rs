@@ -313,6 +313,13 @@ fn serve(db: PathBuf, rest: Vec<String>) -> Result<(), String> {
     // by the core. This is the whole registry — the list dials it.
     harbor::set_info(serde_json::json!({
         "protocolVersion": 1,
+        // The display name clients label this server with — the wire's
+        // InfoResponse has always declared it; 0.22.1 and earlier never
+        // sent it, and clients showed blank rows for discovered servers.
+        "name": canon
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "harbor".into()),
         "harborVersion": VERSION,
         "duckdbVersion": duckdb_version,
         "database": canon.display().to_string(),

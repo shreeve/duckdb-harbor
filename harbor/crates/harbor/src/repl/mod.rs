@@ -451,19 +451,37 @@ fn list() -> Result<(), String> {
         return Ok(());
     }
 
-    let head =
-        ListRow { database: "DATABASE".into(), pid: "PID".into(), clients: "CLIENTS".into(), uptime: "UPTIME".into(), address: "ADDRESS".into() };
-    let w = |f: fn(&ListRow) -> &str| {
-        std::iter::once(&head).chain(rows.iter()).map(|r| f(r).len()).max().unwrap_or(0)
-    };
-    let (wd, wp, wc, wu) =
-        (w(|r| &r.database), w(|r| &r.pid), w(|r| &r.clients), w(|r| &r.uptime));
-    for r in std::iter::once(&head).chain(rows.iter()) {
-        println!(
-            "{:<wd$}  {:>wp$}  {:>wc$}  {:>wu$}  {}",
-            r.database, r.pid, r.clients, r.uptime, r.address
-        );
+    // The fleet as one box: the database green when its server answered
+    // /info (running and readable), dim when it answered without one (an
+    // older, token-gated server — alive, but mute). PID/CLIENTS/UPTIME
+    // right-align under their heads, and the long socket path hangs below
+    // the grid as a footnote, so the columns stay tight and the address is
+    // still one glance away. A tally closes it, live rows first. Piped
+    // output degrades to plain text on its own (Style::stdout).
+    use harbor_common::ui::{Cell, Style, Table, Tone};
+    let mut t = Table::new(["DATABASE", "PID", "CLIENTS", "UPTIME"]);
+    for r in &rows {
+        let running = r.pid != "?";
+        t.row([
+            Cell::new(&r.database).tone(if running { Tone::Green } else { Tone::Dim }),
+            Cell::new(&r.pid).right(),
+            Cell::new(&r.clients).right(),
+            Cell::new(&r.uptime).right(),
+        ]);
+        t.note(Tone::Dim, &r.address);
     }
+    println!("{}", t.render(&Style::stdout()));
+
+    let running = rows.iter().filter(|r| r.pid != "?").count();
+    let mute = rows.len() - running;
+    let mut parts = Vec::new();
+    if running > 0 {
+        parts.push(format!("{running} running"));
+    }
+    if mute > 0 {
+        parts.push(format!("{mute} unreadable"));
+    }
+    println!("  {}\n", parts.join(", "));
     Ok(())
 }
 
