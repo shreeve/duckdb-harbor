@@ -4,11 +4,11 @@ use crate::app::{DuckTable, Phase};
 use crate::chrome::head_glyph;
 use crate::theme::{pal, Pal};
 use crate::util::clone_str;
-use crate::SetTheme;
+use crate::{SetTheme, StopBerth};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
-use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::*;
 use harbor_client::Level;
 
@@ -174,9 +174,27 @@ impl DuckTable {
                                     .build(window, cx)
                             })
                         })
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.connect(clone_str(&name), cx);
+                        .on_click(cx.listener({
+                            let name = clone_str(&name);
+                            move |this, _: &ClickEvent, _, cx| this.connect(clone_str(&name), cx)
                         }))
+                        // Right-click → Stop: shut this berth's server down.
+                        // Disabled (greyed) for a stopped row — nothing to
+                        // stop — so the menu is honest at a glance. stop()
+                        // itself is idempotent, so the guard is UX, not
+                        // safety. `stopped` is read here, not in the 'static
+                        // menu closure, which may capture only owned data.
+                        .context_menu({
+                            let name = clone_str(&name);
+                            let stopped = matches!(row.state.level(), Level::Idle);
+                            move |menu, _, _| {
+                                menu.menu_with_disabled(
+                                    "Stop",
+                                    Box::new(StopBerth { name: clone_str(&name) }),
+                                    stopped,
+                                )
+                            }
+                        })
                 },
             ))
             .child(self.catalog_tree(cx))

@@ -41,6 +41,15 @@ pub struct SetTheme {
     pub ix: usize,
 }
 
+/// Right-click → Stop on a sidebar berth: shut its server down. Carries the
+/// berth name as data, the way SetTheme carries its index, so one action
+/// serves every row the sidebar lists.
+#[derive(Clone, Default, PartialEq, Debug, Action)]
+#[action(namespace = ducktable, no_json)]
+pub struct StopBerth {
+    pub name: String,
+}
+
 /// ⌥←/⌥→: the previous/next table in the sidebar (App::step_table).
 /// App-level, like the view keys, so it works from any view; text
 /// inputs stay safe — their own alt-arrow bindings (word jump) sit
@@ -368,6 +377,18 @@ fn main() {
                 }
             })
             .detach();
+        });
+        // Right-click → Stop. Reaches the view through AppView (the menu
+        // fires at App level) and defers, the FitColumns pattern — a menu
+        // action arrives inside the window's update, so the view is touched
+        // on the next tick, not re-entrantly.
+        cx.on_action(|a: &StopBerth, cx| {
+            let name = a.name.clone();
+            if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
+                cx.defer(move |cx| {
+                    view.update(cx, |this, cx| this.stop_berth(name, cx));
+                });
+            }
         });
         cx.on_action(|_: &TablePrev, cx| step_table(-1, cx));
         cx.on_action(|_: &TableNext, cx| step_table(1, cx));

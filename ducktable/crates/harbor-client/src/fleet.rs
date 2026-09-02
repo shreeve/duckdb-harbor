@@ -384,6 +384,50 @@ pub fn connect_path(db: &Path) -> Result<Conn, String> {
     }
 }
 
+/// Stop a running server by name: POST /shutdown to its live socket, if one
+/// answers. The counterpart to spawn-on-open — the GUI can now close what it
+/// opened. Idempotent and never-spawning: a name with nothing running is
+/// Ok(()), the same as a Stop that raced the server's own departure. Probes
+/// both socket generations and any discovered server carrying the name, so a
+/// mixed-era fleet stops as cleanly as a current one.
+pub fn stop(name: &str) -> Result<(), String> {
+    let name = harbor_common::normalize(name)?;
+    let home = runtime_dir()?;
+    let cfg = load_config().unwrap_or_default();
+    let token = std::env::var("HARBOR_TOKEN")
+        .ok()
+        .or_else(|| cfg.get(&name).and_then(tokens::resolve))
+        .or_else(|| berth_token(&home, &name));
+
+    let mut socks: Vec<PathBuf> = Vec::new();
+    if let Some(db) = cfg.get(&name).and_then(|e| e.database()) {
+        if let Ok(s) = paths::socket_for(&home, &db) {
+            socks.push(s);
+        }
+    }
+    socks.push(paths::sock_file(&home, &name));
+    for l in discover() {
+        if l.name == name {
+            socks.push(l.sock);
+        }
+    }
+
+    for s in socks {
+        if sock_ready(&s) {
+            #[cfg(unix)]
+            let t = Transport::Unix(s);
+            #[cfg(not(unix))]
+            let t = Transport::Tcp(String::new());
+            // 202 {"stopping":true}, then the server drains and the socket
+            // goes away — a refresh a beat later drops the row.
+            request(&t, &wire::endpoint::SHUTDOWN, token.as_deref(), None, Some(Duration::from_secs(5)))
+                .map_err(|e| format!("stop {name:?}: {e}"))?;
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 /// Summon through harbor's own front door: `harbor <db> serve`, detached and
 /// headless. The child owns its lifetime; this process only waits for the
 /// socket to answer.

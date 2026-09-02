@@ -521,6 +521,41 @@ impl DuckTable {
         .detach();
     }
 
+    /// Stop a berth's server — the close half of open. Right-click → Stop
+    /// lands here: POST /shutdown to the named server, then refresh so its
+    /// row goes from green to stopped (or leaves, if it was ephemeral). If
+    /// the berth we're viewing is the one stopped, the view returns to Idle
+    /// — a stopped server has nothing to show.
+    pub(crate) fn stop_berth(&mut self, name: String, cx: &mut Context<Self>) {
+        let connected_here = matches!(
+            &self.phase,
+            Phase::Connected { info, .. } if info.name == name
+        );
+        cx.spawn(async move |this, cx| {
+            let target = clone_str(&name);
+            let outcome =
+                cx.background_executor().spawn(async move { fleet::stop(&target) }).await;
+            this.update(cx, |state, cx| {
+                if let Err(message) = outcome {
+                    state.warning = Some(message);
+                }
+                if connected_here {
+                    // The world we were showing just departed.
+                    state.phase = Phase::Idle;
+                    state.selected_table = None;
+                    state.grid = None;
+                    state.query = None;
+                    state.staged.clear();
+                    state.select_seq += 1;
+                }
+                state.refresh(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Abort the in-flight connect. The current phase never changed, so
     /// whatever was on screen simply stays (a cancelled connect is not a
     /// failed connect).
