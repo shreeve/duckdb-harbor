@@ -24,6 +24,8 @@ use std::time::{Duration, Instant};
 use harbor_common::lifetime::parse_duration;
 use harbor_common::perms::chmod;
 
+mod verbs;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> ExitCode {
