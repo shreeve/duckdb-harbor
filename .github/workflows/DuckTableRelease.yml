@@ -1,0 +1,57 @@
+#
+# DuckTable release — push a ducktable-v* tag and DuckTable.zip appears on a
+# GitHub Release. The tag prefix keeps it out of harbor's Release.yml (which
+# triggers on v*), and --latest=false keeps the repo's /releases/latest
+# pointer on harbor's newest release — harbor's install.sh resolves that
+# redirect, and DuckTable's installer resolves ducktable-v* tags by name.
+#
+name: DuckTable release
+
+on:
+  push:
+    tags: ['ducktable-v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    working-directory: ducktable
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ducktable
+
+      - name: Build DuckTable.app
+        run: scripts/macos-app.sh release
+
+      - name: Zip the bundle
+        # ditto --keepParent preserves the bundle exactly; unzipping with
+        # ditto on the other end restores it byte-for-byte.
+        run: ditto -c -k --keepParent target/DuckTable.app target/DuckTable.zip
+
+      - name: Smoke-test the bundle
+        run: |
+          test -x target/DuckTable.app/Contents/MacOS/ducktable
+          ver=$(plutil -extract CFBundleShortVersionString raw target/DuckTable.app/Contents/Info.plist)
+          tag="${GITHUB_REF_NAME#ducktable-v}"
+          [ "$ver" = "$tag" ] || { echo "bundle says $ver, tag says $tag"; exit 1; }
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" target/DuckTable.zip \
+            --repo "$GITHUB_REPOSITORY" --title "DuckTable ${GITHUB_REF_NAME#ducktable-}" \
+            --latest=false \
+            --notes "DuckTable for macOS (Apple Silicon), ad-hoc signed. \
+          Install with the one-liner in the README, or unzip and clear \
+          quarantine: xattr -dr com.apple.quarantine DuckTable.app"

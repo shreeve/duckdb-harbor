@@ -1,0 +1,36 @@
+#
+# DuckTable gate — makes the monorepo's core promise true: the wire contract
+# is checked on BOTH sides of every commit. DuckTable builds harbor's wire
+# and harbor-common crates by path, so a harbor change that breaks the
+# protocol seam fails here instead of landing green. macOS runner because
+# GPUI needs Apple frameworks; check, not build — the seam is a compile-time
+# fact and codegen buys nothing.
+#
+name: DuckTable
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ducktable-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: ducktable
+
+jobs:
+  check:
+    name: ducktable check
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ducktable
+      - name: Check the workspace
+        run: cargo check --workspace --all-targets
