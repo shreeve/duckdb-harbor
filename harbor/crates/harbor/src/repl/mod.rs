@@ -168,8 +168,8 @@ usage:
                                it lives while anyone is connected.
   harbor <path/to.sock>        a harbor unix socket
   harbor http://host:port      a harbor TCP listener
-  harbor <db.duckdb> serve     serve it yourself — the server is yours, and
-                               lives until you leave (harbor <db> serve -h)
+  harbor <db.duckdb> start     start it yourself — the server is yours, and
+                               lives until you leave (harbor <db> start -h)
 
 options:
   -c \"SQL\"                     run statements and exit (stdin works too)
@@ -219,7 +219,7 @@ fn ensure_server(path: &Path) -> Result<Transport, String> {
     {
         let _ = path;
         return Err(
-            "spawn-on-use needs unix sockets; on Windows run `harbor <db> serve --port <p> --token <t>` \
+            "spawn-on-use needs unix sockets; on Windows run `harbor <db> start --port <p> --token <t>` \
              and connect to http://127.0.0.1:<p>"
                 .into(),
         );
@@ -246,7 +246,7 @@ fn ensure_server(path: &Path) -> Result<Transport, String> {
             .map_err(|e| format!("log file: {e}"))?;
         let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
         let mut cmd = std::process::Command::new(exe);
-        cmd.arg(&canon).arg("serve").arg("--ephemeral");
+        cmd.arg(&canon).arg("start").arg("--ephemeral");
         // A typed path is the duckdb-cli contract: open it, existing or not.
         if !canon.exists() {
             cmd.arg("--create");
@@ -298,7 +298,7 @@ fn log_tail(log_path: &Path) -> String {
     }
 }
 
-/// Is a harbor answering on this socket right now? serve's pre-flight, for
+/// Is a harbor answering on this socket right now? start's pre-flight, for
 /// a friendlier refusal than the database lock error.
 #[cfg(unix)]
 pub fn sock_ready(sock: &Path) -> bool {
@@ -451,13 +451,16 @@ fn list() -> Result<(), String> {
         return Ok(());
     }
 
-    // The fleet as one box: the database green when its server answered
-    // /info (running and readable), dim when it answered without one (an
-    // older, token-gated server — alive, but mute). PID/CLIENTS/UPTIME
-    // right-align under their heads, and the long socket path hangs below
-    // the grid as a footnote, so the columns stay tight and the address is
-    // still one glance away. A tally closes it, live rows first. Piped
-    // output degrades to plain text on its own (Style::stdout).
+    // The fleet as one box: the database name itself carries status — green
+    // when its server answered /info (running and readable), dim when it
+    // answered without one (an older, token-gated server — alive, but mute)
+    // or isn't running. No status dot here: the terminal tints the NAME (a
+    // dot sharing that tone would be pure redundancy), whereas DuckTable's
+    // sidebar uses a plain name + a colored dot — same meaning, form suited
+    // to each surface. PID/CLIENTS/UPTIME right-align under their heads, and
+    // the long socket path hangs below the grid as a footnote, so the columns
+    // stay tight and the address is still one glance away. A tally closes it,
+    // live rows first. Piped output degrades to plain text (Style::stdout).
     use harbor_common::ui::{Cell, Style, Table, Tone};
     let mut t = Table::new(["DATABASE", "PID", "CLIENTS", "UPTIME"]);
     for r in &rows {
@@ -486,7 +489,7 @@ fn list() -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// The helm — `harbor <db> serve` on a terminal
+// The helm — `harbor <db> start` on a terminal
 // ---------------------------------------------------------------------------
 
 /// The prompt a foreground server wears: the same REPL, dialled at the

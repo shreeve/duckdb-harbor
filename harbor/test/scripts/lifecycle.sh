@@ -5,11 +5,11 @@
 #   test/scripts/lifecycle.sh
 #
 # The law under test is the product's one breath: bare — the server is
-# everyone's, it lives while anyone is connected; serve — the server is
+# everyone's, it lives while anyone is connected; start — the server is
 # yours, it lives until you leave. Everything here is behavior no unit test
 # can see: spawn-on-use across processes, two clients landing on one server,
 # an idle connection as a mooring, the last departure sweeping the socket,
-# and a served server ignoring the refcount entirely.
+# and a start-lifetime server ignoring the refcount entirely.
 
 set -uo pipefail
 
@@ -24,7 +24,7 @@ export HARBOR_HOME="$work"
 export HARBOR_STARTUP_GRACE_MS=5000
 export HARBOR_LINGER_MS=1500
 cleanup() {
-  pkill -f "serve.*$work" 2>/dev/null
+  pkill -f "start.*$work" 2>/dev/null
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -104,21 +104,21 @@ else
   bad "departure left the database missing or with a wal"
 fi
 
-echo "— serve: the server is yours, it lives until you leave"
-"$harbor" "$work/x.duckdb" serve >"$work/serve.log" 2>&1 &
+echo "— start: the server is yours, it lives until you leave"
+"$harbor" "$work/x.duckdb" start >"$work/start.log" 2>&1 &
 srv=$!
 up=0
 for _ in $(seq 1 50); do [[ -n $(live_sock) ]] && { up=1; break; }; sleep 0.1; done
-(( up )) && ok "serve came up" || bad "serve never came up: $(cat "$work/serve.log")"
-check "a client joins the served database" 0 "7" \
+(( up )) && ok "start came up" || bad "start never came up: $(cat "$work/start.log")"
+check "a client joins the started database" 0 "7" \
   "$harbor" "$work/x.duckdb" --mode csv -c "SELECT 7 AS seven"
-# Well past the linger an ephemeral server would have left on. A serve
+# Well past the linger an ephemeral server would have left on. A start
 # lifetime has no clock at all — only SIGTERM (or .quit at the helm) ends it.
 sleep 2
 kill -0 "$srv" 2>/dev/null && ok "no refcount: it survives its clients leaving" \
-                           || bad "a served server left on the refcount"
-check "a second serve on the same file is refused" 1 "already being served" \
-  "$harbor" "$work/x.duckdb" serve
+                           || bad "the start-lifetime server left on the refcount"
+check "a second start on the same file is refused" 1 "already being served" \
+  "$harbor" "$work/x.duckdb" start
 kill -TERM "$srv"
 wait "$srv" 2>/dev/null
 if [[ -z $(live_sock) && ! -e $work/x.duckdb.wal ]]; then
@@ -129,13 +129,13 @@ fi
 
 echo "— the doors are guarded"
 check "--port without --token is refused" 1 "mandatory" \
-  "$harbor" "$work/x.duckdb" serve --port 9499
+  "$harbor" "$work/x.duckdb" start --port 9499
 check "--token on a unix socket is refused" 1 "no meaning" \
-  "$harbor" "$work/x.duckdb" serve --token abc
+  "$harbor" "$work/x.duckdb" start --token abc
 check "a missing file without --create is an error, not a database" 1 "not found" \
-  "$harbor" "$work/absent.duckdb" serve
+  "$harbor" "$work/absent.duckdb" start
 check "verb-first is redirected, not parsed" 1 "database comes first" \
-  "$harbor" serve "$work/x.duckdb"
+  "$harbor" start "$work/x.duckdb"
 
 echo "— the list is the truth, and sweeps what is not"
 python3 - "$work/runtime/dead-cafe0000.sock" <<'PY'

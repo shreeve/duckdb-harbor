@@ -24,7 +24,7 @@
 //! consumer (ducktable) and nothing in harbor calls it or reads these
 //! fields. Guard the call site, not the schema.
 //!
-//! Every berth key is the matching `harbor serve` flag with the dashes
+//! Every berth key is the matching `harbor start` flag with the dashes
 //! stripped, so there is no second dialect to learn. (The reverse is not
 //! quite total: `--name`, `--socket`, and `--token` are flag-only —
 //! identity and credentials are the operator's word at spawn time, not

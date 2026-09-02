@@ -56,8 +56,8 @@ pub enum Summoner {
 }
 
 impl Lifetime {
-    /// The `harbor serve` argv this lifetime means. Config is translated into
-    /// flags rather than read twice, so `serve` stays flag-complete and a
+    /// The `harbor start` argv this lifetime means. Config is translated into
+    /// flags rather than read twice, so `start` stays flag-complete and a
     /// systemd unit or a container never needs a config file at all.
     pub fn to_args(self) -> Vec<String> {
         match self {

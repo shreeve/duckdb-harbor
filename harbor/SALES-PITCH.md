@@ -282,8 +282,7 @@ It vastly increases the number of people who will understand why it exists.
 between client and server, logging raw bytes in both directions; the DuckDB
 client connected through it with `ATTACH 'quack:127.0.0.1:9493'`. All headers,
 status codes, request counts and token positions quoted above are from those
-captures. Harbor was run as `harbor bench.duckdb serve --port 9495 --token …` (0.19 spelled this
-`harbor serve bench.duckdb`)
+captures. Harbor was run as `harbor bench.duckdb start --port 9495 --token …`
 and driven with `curl`.
 
 **Wire bytes** were counted by the proxy for Quack (server→client, 34,935,381)

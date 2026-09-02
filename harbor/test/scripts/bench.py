@@ -72,7 +72,7 @@ class Server:
         self.db = os.path.join(workdir, f"bench-{port}.duckdb")
         self.log = open(os.path.join(workdir, f"bench-{port}.log"), "wb")
         self.proc = subprocess.Popen(
-            [binary, self.db, "serve", "--create", "--port", str(port), "--token", TOKEN],
+            [binary, self.db, "start", "--create", "--port", str(port), "--token", TOKEN],
             stdout=self.log, stderr=self.log,
         )
         self.conn = None

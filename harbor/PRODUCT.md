@@ -14,11 +14,11 @@ harbor <db.duckdb>              → open it: REPL / -c "SQL" / stdin;
                                   spawns a refcounted server if none exists
 harbor <path/to.sock>           → connect to a server by its socket
 harbor http://host:port         → connect to a server over TCP
-harbor <db.duckdb> serve        → serve it yourself, until you leave
+harbor <db.duckdb> start        → start it yourself, until you leave
 ```
 
 The doctrine, in one breath: **bare, the server is everyone's — it lives
-while anyone is connected; `serve`, the server is yours — it lives until you
+while anyone is connected; `start`, the server is yours — it lives until you
 leave.** Everything below is the machinery that makes those two sentences
 true, and nothing else.
 
@@ -32,7 +32,7 @@ crate, so protocol changes require tests on both sides.
 
 ---
 
-## One binary, engine on demand (~2.2MB until asked to serve)
+## One binary, engine on demand (~2.2MB until asked to start)
 
 Nothing links `libduckdb`. The generated bindings route every DuckDB C call
 through null-initialized function pointers, and `engine/mod.rs` fills them by
@@ -65,7 +65,7 @@ process-wide statics). That gives crash isolation, per-server engine versions,
 and independent drain→CHECKPOINT lifecycles.
 
 There are no lock files. When two servers race for one database — two clients
-spawning at once, or an operator typing `serve` against a live file — exactly
+spawning at once, or an operator typing `start` against a live file — exactly
 one gets past `Connection::open`, because DuckDB itself locks the database
 file per process. The loser exits before ever touching a socket, and the
 winner's socket has a deterministic name, so both racing clients land on the
@@ -74,7 +74,7 @@ implementation in flock, and the whole revalidate-the-inode protocol that
 came with one is gone.
 
 **Mandatory guard**: DuckDB defaults to ~80% RAM / all cores *per instance*.
-`serve` ships a conservative default (`--memory-limit`, default 2GB;
+`start` ships a conservative default (`--memory-limit`, default 2GB;
 `--threads`) and prints it at startup. This is a multi-server safety
 requirement, not an option.
 
@@ -97,7 +97,7 @@ nothing. There are no sidecar JSONs, no token files, no hold files, and no
 log directory to sweep, because none of them exist. `/info` itself is the
 identity document, with uptime and the client refcount spliced in live.
 
-## The refcounted lifetime (bare) and the owned lifetime (serve)
+## The refcounted lifetime (bare) and the owned lifetime (start)
 
 A spawned server's lifetime is its client count, counted where connections
 actually live: justhttp increments at accept and decrements — through a
@@ -116,12 +116,12 @@ releases it by definition. justhttp deliberately lets an idle connection wait
 between requests forever, which is what makes presence expressible at all.
 `.open` moors at the new server before releasing the old one.
 
-`serve` ignores the refcount entirely. On a terminal it puts the operator at
+`start` ignores the refcount entirely. On a terminal it puts the operator at
 the helm — the same REPL, dialled at the server's own socket, so what the
 operator sees is what any client would get — and leaving the prompt ends the
 server. Headless, it runs until `SIGTERM`. Spawn-on-use spawns exactly this
-(`current_exe() <db> serve --ephemeral`, detached, stderr to a log beside the
-socket), so there is one serve path however a server comes to exist.
+(`current_exe() <db> start --ephemeral`, detached, stderr to a log beside the
+socket), so there is one start path however a server comes to exist.
 
 `curl` works iff something is listening, by design: a bare HTTP client does
 not summon a database. An application that wants spawn-on-use runs
@@ -132,7 +132,7 @@ not summon a database. An application that wants spawn-on-use runs
 There is nothing to configure, so there is no file, no schema, no trust gate
 on its permissions, no `token-cmd` shelling out, and no "the config could not
 be read" failure class. What the old config carried is now either derived
-(socket names), spelled at the command line (`serve` flags — a systemd unit
+(socket names), spelled at the command line (`start` flags — a systemd unit
 is the place a server's desired state gets written down), or deleted
 (names-as-services, holds, REPL defaults). A target is a path, a socket, or a
 url; a bare word is refused with the law spelled out — a name never contains
@@ -217,7 +217,7 @@ same time.
 libduckdb it was tested against — nothing else. The extension door is the
 operator's: the loaded engine exports the full C++ ABI, so an extension built
 against the *same* engine loads from it —
-`harbor db.duckdb serve --unsigned --init 'LOAD <ext>'`. Matching extension
+`harbor db.duckdb start --unsigned --init 'LOAD <ext>'`. Matching extension
 to engine is the caller's responsibility, because the C++ ABI admits no other
 answer.
 

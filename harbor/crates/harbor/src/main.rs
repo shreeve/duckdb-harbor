@@ -8,7 +8,7 @@
 //!                                 spawned that lives while anyone is connected
 //!   harbor <path/to.sock>         connect to a server by its socket
 //!   harbor http://host:port       connect to a server over TCP
-//!   harbor <db.duckdb> serve      serve it yourself, until you leave
+//!   harbor <db.duckdb> start      start it yourself, until you leave
 //!
 //! There is no registry and no config: the socket IS the registration, its
 //! name is derived from the database's canonical path (socket_for), and the
@@ -38,17 +38,17 @@ fn main() -> ExitCode {
             println!("harbor {VERSION}");
             return ExitCode::SUCCESS;
         }
-        // Old muscle memory deserves a pointer, not a parse error.
-        Some("serve") => {
-            eprintln!("harbor: the database comes first — harbor <db.duckdb> serve");
+        // The verb rides behind the noun; point, don't just error out.
+        Some("start") => {
+            eprintln!("harbor: the database comes first — harbor <db.duckdb> start");
             return ExitCode::FAILURE;
         }
         _ => {}
     }
-    if args.get(1).map(String::as_str) == Some("serve") {
+    if args.get(1).map(String::as_str) == Some("start") {
         let db = args.remove(0);
-        args.remove(0); // "serve"
-        return match serve(PathBuf::from(db), args) {
+        args.remove(0); // "start"
+        return match start(PathBuf::from(db), args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("harbor: {e}");
@@ -69,13 +69,13 @@ usage:
                                behind the file yet? One is spawned for it.
   harbor <path/to.sock>        connect to a server by its unix socket
   harbor http://host:port      connect to a server over TCP
-  harbor <db.duckdb> serve     serve it yourself (foreground): on a terminal
+  harbor <db.duckdb> start     start it yourself (foreground): on a terminal
                                you get the prompt and .quit ends the server;
                                headless it runs until SIGTERM
   harbor version               print this binary's version (also -V)
 
 The two lifetimes, in one breath — bare: the server is everyone's, it lives
-while anyone is connected. serve: the server is yours, it lives until you
+while anyone is connected. start: the server is yours, it lives until you
 leave.
 
 client options:
@@ -84,7 +84,7 @@ client options:
   --mode <m>                   duckbox, duckboxy, markdown, csv, json, jsonlines, line, list, trash
   --json                       shorthand for --mode jsonlines
 
-serve options:
+start options:
   --create             allow a database file that does not exist yet (without
                        it a missing file is an error, never a fresh database)
   --port <p>           listen on TCP instead of the unix socket (--token
@@ -195,7 +195,7 @@ fn parse_opts(db: PathBuf, rest: Vec<String>) -> Result<Opts, String> {
     }
     #[cfg(windows)]
     if o.port.is_none() {
-        return Err("Windows has no unix sockets — serve with --port <p> --token <t>".into());
+        return Err("Windows has no unix sockets — start with --port <p> --token <t>".into());
     }
     Ok(o)
 }
@@ -213,10 +213,10 @@ fn ensure_runtime_dir() -> Result<PathBuf, String> {
 }
 
 // ---------------------------------------------------------------------------
-// serve — the one verb, and the only code path that touches the engine
+// start — the one verb, and the only code path that touches the engine
 // ---------------------------------------------------------------------------
 
-fn serve(db: PathBuf, rest: Vec<String>) -> Result<(), String> {
+fn start(db: PathBuf, rest: Vec<String>) -> Result<(), String> {
     let o = parse_opts(db, rest)?;
     let home = ensure_runtime_dir()?;
     let canon = harbor_common::paths::canonical_db(&o.db)?;
@@ -373,9 +373,9 @@ fn serve(db: PathBuf, rest: Vec<String>) -> Result<(), String> {
         });
     }
 
-    // At the helm: serve on a terminal gets the prompt, dialled at this
+    // At the helm: start on a terminal gets the prompt, dialled at this
     // server's own front door. Leaving the prompt ends the server — the
-    // serve doctrine, enacted: the server is yours, it lives until you leave.
+    // start doctrine, enacted: the server is yours, it lives until you leave.
     if !o.ephemeral && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         let name = canon
             .file_stem()

@@ -225,7 +225,7 @@ fi
 
 section "Startup"
 
-$launcher "$db" serve --port "$port" --token "$token" --workers 6 >"$log" 2>&1 &
+$launcher "$db" start --port "$port" --token "$token" --workers 6 >"$log" 2>&1 &
 server_pid=$!
 
 up=0

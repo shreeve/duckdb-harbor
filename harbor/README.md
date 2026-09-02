@@ -16,7 +16,7 @@ DuckDB Harbor is `harbor`, one small Rust binary with one grammar:
 ```console
 $ harbor                       # what's running
 $ harbor mydata.duckdb         # open it — REPL, or -c "SQL", or stdin
-$ harbor mydata.duckdb serve   # serve it yourself, until you leave
+$ harbor mydata.duckdb start   # start it yourself, until you leave
 ```
 
 `harbor mydata.duckdb` is the duckdb-shell muscle memory, kept: a REPL with
@@ -25,7 +25,7 @@ difference is what happens behind it — if nothing serves the file yet, a
 server is spawned for it, and every other client of the same file joins that
 server instead of hitting "database is locked". The two lifetimes, in one
 breath: **bare, the server is everyone's — it lives while anyone is
-connected; `serve`, the server is yours — it lives until you leave.**
+connected; `start`, the server is yours — it lives until you leave.**
 
 ## The Elevator Pitch
 
@@ -47,7 +47,7 @@ if it isn't. Your connection is the server's lifeline: the database stays
 served while anyone is connected — a second client makes it two, your exit
 makes it one — and when the last client leaves, the server checkpoints and
 departs. Nothing to daemonize, nothing to clean up. (Want it to outlive its
-clients? `harbor mydb.duckdb serve` — then it's yours until you stop it.)
+clients? `harbor mydb.duckdb start` — then it's yours until you stop it.)
 
 While it's up, anything that speaks HTTP can query it: curl, your app,
 another harbor.
@@ -346,7 +346,7 @@ client leaves, the server drains, `CHECKPOINT`s, sweeps its socket, and exits
 a few seconds later. A second `harbor` on the same file — any spelling of the
 same path — joins the same server instead of reporting "database is locked".
 
-**`harbor <db.duckdb> serve` — the server is yours.** Foreground, no
+**`harbor <db.duckdb> start` — the server is yours.** Foreground, no
 refcount: it lives until you leave. On a terminal you get the same prompt,
 dialled at the server's own socket, and `.quit` ends the server; headless it
 runs until `SIGTERM`. Either exit is clean — drain, `CHECKPOINT` so the next
@@ -381,7 +381,7 @@ one door that leaves the filesystem's protection, so `--port` makes `--token`
 mandatory:
 
 ```console
-$ harbor mydata.duckdb serve --port 9495 --token secret
+$ harbor mydata.duckdb start --port 9495 --token secret
 $ harbor http://127.0.0.1:9495 --token secret -c "SELECT count(*) FROM orders"
 ```
 
@@ -578,7 +578,7 @@ covers everyone else.
 
 `quack` is a DuckDB extension; `harbor` is a standalone server. It can
 still load an extension into its own database with
-`harbor db.duckdb serve --unsigned --init 'LOAD <ext>'`, so one process can
+`harbor db.duckdb start --unsigned --init 'LOAD <ext>'`, so one process can
 answer HTTP clients and other DuckDB instances over one file at once. Harbor
 ships no extension of its own — whatever `LOAD` resolves by name in `~/.duckdb`
 is what it gets, matching that to the loaded engine is the operator's call, and
@@ -602,7 +602,7 @@ worth knowing before it faces a browser. Request logging is available with
 
 **Windows serves over loopback TCP only.** Unix sockets — and with them
 spawn-on-use and the list — are a unix feature. On Windows, serving is
-explicit (`harbor <db> serve --port <p> --token <t>`) and the client half
+explicit (`harbor <db> start --port <p> --token <t>`) and the client half
 works the same everywhere.
 
 **The engine is the loaded `libduckdb`, not the binary.** Nothing is linked:

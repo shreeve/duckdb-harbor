@@ -104,7 +104,7 @@ if (( needs_server )); then
   cp "$db" "$work/check.duckdb"
   launcher="${HARBOR_LAUNCHER:-$here/target/release/harbor}"
   ${launcher%% *} --help >/dev/null 2>&1 || cargo build -p harbor --release
-  $launcher "$work/check.duckdb" serve --port "$port" --token "$token" --workers 8 \
+  $launcher "$work/check.duckdb" start --port "$port" --token "$token" --workers 8 \
       >"$work/server.log" 2>&1 &
   server_pid=$!
   up=0

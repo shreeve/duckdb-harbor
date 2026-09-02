@@ -2,7 +2,7 @@
 // timeouts, the NDJSON envelope, /sql /catalog /ready routing, and the
 // SIGTERM → drain → CHECKPOINT shutdown path. The CLI (src/main.rs) is the
 // only consumer — one crate, bin beside lib. The embedding host —
-// `harbor serve` — opens the DuckDB Connection, hands it to `open_pool`, and
+// `harbor start` — opens the DuckDB Connection, hands it to `open_pool`, and
 // calls `start`/`wait`/`stop`.
 
 use std::{
@@ -123,7 +123,7 @@ const MAX_JSON_RESPONSE: usize = 32 << 20;
 // harbor IS DuckDB's process, so "the server" is a process singleton: one
 // listener, one worker pool.
 //
-// The pool is built up front, in one place: `serve` opens the engine and
+// The pool is built up front, in one place: `start` opens the engine and
 // hands every connection harbor will ever use to `open_pool` before the
 // listener exists, and everything after draws from what is already there.
 // (The shape survives harbor's extension-era origin, where opening late was
@@ -962,7 +962,7 @@ struct Running {
     addr: String,
 }
 
-/// Open every connection harbor will need. Called once, by `serve` right
+/// Open every connection harbor will need. Called once, by `start` right
 /// after it opens the engine — see the note above on why the pool is fixed.
 pub fn open_pool(con: Connection) -> Result<(), String> {
     let mut pool = POOL.lock().unwrap();
@@ -971,7 +971,7 @@ pub fn open_pool(con: Connection) -> Result<(), String> {
     // but the entrypoint runs once per *database instance* — a host that opens
     // two DuckDB databases and loads harbor into both would otherwise append
     // eight more connections to the same vector and overwrite CONTROL with the
-    // second database's. `start()` drains from the tail, so harbor_serve on the
+    // second database's. `start()` drains from the tail, so harbor_start on the
     // first instance would then serve the second one's data, and the shutdown
     // CHECKPOINT would run against whichever loaded last. Refusing is the only
     // honest answer: harbor is a process singleton and cannot serve two.
@@ -1076,7 +1076,7 @@ pub fn start(
     };
     *STARTED_AT.lock().unwrap() = Some(Instant::now());
     // Reset the process-global readiness verdict for this instance. One
-    // process may serve, stop, and serve again (tests do exactly this), and
+    // process may start, stop, and start again (tests do exactly this), and
     // a fresh instance must not inherit a stale verdict from its predecessor.
     *LAST_READY.lock().unwrap() = None;
     let server = Arc::new(server);
@@ -1224,7 +1224,7 @@ pub fn stop() -> Result<String, String> {
     // here — which `RUNNING.lock().unwrap().take()` as a statement does, since
     // the guard is a temporary — leaves a window in which RUNNING is None while
     // the listener is still bound and the workers are still draining. A
-    // harbor_serve arriving in that window sees no server, takes whichever
+    // harbor_start arriving in that window sees no server, takes whichever
     // connections happen to be back in the pool, and then fails to bind a port
     // the old listener has not released yet.
     let mut running = RUNNING.lock().unwrap();
@@ -1261,7 +1261,7 @@ pub fn stop() -> Result<String, String> {
     *QUERIES.lock().unwrap() = None;
 
     // Workers hand their connection back as they exit, so a later
-    // harbor_serve has a pool to draw from. A panicked worker forfeits its
+    // harbor_start has a pool to draw from. A panicked worker forfeits its
     // connection rather than taking the shutdown down with it.
     //
     // Bounded patience, not join(): a worker whose client stopped reading is
@@ -3220,7 +3220,7 @@ fn run_sql(
             400,
             "sql_error",
             &format!(
-                "{setting} is fixed when the berth starts (harbor serve --memory-limit/--threads) \
+                "{setting} is fixed when the berth starts (harbor start --memory-limit/--threads) \
                  and cannot be changed over the wire: it is process-global, and this berth may \
                  share its host with others"
             ),
@@ -3965,7 +3965,7 @@ fn execute_jobs(
         };
     }
     // And once more on the way out, so a connection going back to the pool for
-    // the next harbor_serve is clean too. Unconditional here: this runs once
+    // the next harbor_start is clean too. Unconditional here: this runs once
     // per server lifetime, so the extra statement costs nothing.
     reset_transaction(&mut conn);
     conn
