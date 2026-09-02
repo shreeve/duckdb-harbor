@@ -163,13 +163,20 @@ edge auth, proxies to the socket. The client deliberately speaks UDS and
 plain `http://` only. A human reaches a remote server through SSH; browser
 and application clients go through Caddy.
 
-## Protocol changes are additive only
+## Protocol changes are deliberate, not promised away
 
-The wire protocol is untouched by 0.20 and 0.21 — DuckTable and the Rip
-harbor adapter run unmodified. `/keepalive` (an additive 0.19 route) is gone with
-the idle-exit machinery it served; the core routes, events, fields, and error
-codes are exactly as they were. No `database` field on `/sql`: a server holds
-one database; per-session work is `USE`/ATTACH as plain SQL on a lease.
+Pre-1.0, the wire contract improves when the truth improves — compatibility
+is a cost we weigh, not a vow. The record so far: 0.20 and 0.21 left the
+protocol untouched (DuckTable and the Rip harbor adapter ran unmodified;
+`/keepalive`, an additive 0.19 route, left with the idle-exit machinery it
+served). 0.22 made the first breaking change, to stop dropping data: TIMETZ
+values gained their UTC offset, nested unions gained their tags, and the
+`time-offset-dropped`/`union-tag-dropped` schema encodings — which existed
+only to confess those losses — were removed. Clients pinned to the old
+shapes notice; clients that read the schema's `lossless` flag get strictly
+better data. The core routes, events, and error codes are as they were. No
+`database` field on `/sql`: a server holds one database; per-session work
+is `USE`/ATTACH as plain SQL on a lease.
 
 ## The engine is upstream DuckDB 2.0 — no fork
 
@@ -193,9 +200,12 @@ different matter — a file created by a 1.5-era DuckDB opens as-is, because
 section.)
 
 **Planned for the GA timeframe** — collected here so GA day has one list:
-unwind the frozen-channel scaffolding (the `ENGINE_URL` block in Release.yml,
+unwind the frozen-channel scaffolding (the shelf derivation in Release.yml,
 the Engine workflow and its `engine-<pin>` shelf, this section's wrinkle, and
-`fetch-duckdb`'s warning — each is marked at its site); and revisit the
+`fetch-duckdb`'s warning — each is marked at its site), taking care to pin
+the release fetch to a *versioned* GA artifact URL rather than the moving
+`/latest` channel, so tested-equals-shipped survives the unwind; and revisit
+the
 prepared-statement cache size. Harbor keeps a small per-connection LRU of
 parsed statements, which is what makes repeated statements skip the 2× parse
 cost entirely — whether that cache should grow is a tuning question worth
