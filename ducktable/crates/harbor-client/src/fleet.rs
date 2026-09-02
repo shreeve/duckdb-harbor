@@ -10,12 +10,12 @@
 //! only this client wants: config-named remotes, size on disk, and the
 //! whole connection half (Conn, connect).
 //!
-//! The lifecycle law is harbor's own, verbatim: **bare, the server is
-//! everyone's — it lives while anyone is connected; `serve`, the server is
-//! yours — it lives until you leave.** DuckTable holds no anchor connection
-//! (its requests are one-shot), so when it summons a database it summons a
-//! `serve` — an owned server that stays up until stopped — rather than a
-//! refcounted one that would retire between clicks.
+//! The lifecycle law is harbor's own, verbatim: **a detached start is
+//! ephemeral — it lives while anyone is connected; an attached (or bare)
+//! start is persistent — it lives until stopped.** DuckTable holds no anchor
+//! connection (its requests are one-shot), so when it summons a database it
+//! summons a persistent `start` — up until stopped — rather than a refcounted
+//! one that would retire between clicks.
 
 use crate::http::{Transport, request};
 use crate::tokens;
@@ -31,6 +31,14 @@ use std::time::Duration;
 pub struct Survey {
     pub name: String,
     pub state: State,
+    /// On your list — a `[connection.*]` in config.toml. A live server that
+    /// is not in config (a bare-spawned one) is running-but-unattached.
+    pub attached: bool,
+    /// A login item exists for this berth — the menu's Autostart checkmark.
+    pub autostart: bool,
+    /// The database file, when this row is a local berth (not a remote). What
+    /// the lifecycle verbs target.
+    pub path: Option<PathBuf>,
     /// A human-readable note for an unusual row (kept for future use; the
     /// socket-scan world has far fewer ways to be unhealthy than the
     /// sidecar world did).
@@ -168,6 +176,9 @@ pub fn survey() -> Fleet {
         .map(|l| Survey {
             name: l.name.clone(),
             state: State::Running,
+            attached: cfg.get(&l.name).is_some(),
+            autostart: harbor_common::autostart::installed(&l.name),
+            path: Some(l.db.clone()),
             note: None,
             size: disk_size(&l.db),
         })
@@ -194,6 +205,9 @@ pub fn survey() -> Fleet {
             out.push(Survey {
                 name: name.to_string(),
                 state: if running { State::Running } else { State::Stopped },
+                attached: true,
+                autostart: harbor_common::autostart::installed(name),
+                path: Some(db.clone()),
                 note: None,
                 size: disk_size(&db),
             });
@@ -213,6 +227,9 @@ pub fn survey() -> Fleet {
         out.push(Survey {
             name: name.to_string(),
             state: if alive { State::Running } else { State::Stopped },
+            attached: true,
+            autostart: false, // a remote has no local login item
+            path: None,
             note: None,
             size: None,
         });
@@ -249,7 +266,7 @@ pub struct Conn {
     pub transport: Transport,
     pub token: Option<String>,
     /// True when this connect raised the server (worth a status line).
-    /// A summoned server is a `serve` — owned, it runs until stopped, not
+    /// A summoned server is a persistent `start` — it runs until stopped, not
     /// until a window closes.
     pub summoned: bool,
 }
@@ -341,7 +358,7 @@ pub fn connect(name: &str) -> Result<Conn, String> {
 /// config consulted: the path itself is the identity. Canonicalized first,
 /// so every spelling of one file meets the same server, then the named
 /// flow's exact discipline: join before summoning, both socket
-/// generations, and a `serve` when nothing answers.
+/// generations, and a persistent `start` when nothing answers.
 pub fn connect_path(db: &Path) -> Result<Conn, String> {
     let db = std::fs::canonicalize(db).map_err(|e| format!("{}: {e}", db.display()))?;
     // The stem-derived name harbor itself would mint for this path — used
@@ -428,9 +445,53 @@ pub fn stop(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Summon through harbor's own front door: `harbor <db> serve`, detached and
-/// headless. The child owns its lifetime; this process only waits for the
-/// socket to answer.
+/// Start a persistent server for this database, if one is not already up:
+/// summon `harbor <db> start` and wait for its socket to answer.
+pub fn start(db: &Path) -> Result<(), String> {
+    let home = runtime_dir()?;
+    let canon = paths::canonical_db(db)?;
+    let sock = paths::socket_for(&home, &canon)?;
+    if sock_ready(&sock) {
+        return Ok(()); // already running
+    }
+    harbor_serve(&canon)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if sock_ready(&sock) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(format!("{} did not come up — see its harbor log", db.display()))
+}
+
+/// Add this database to your list (config.toml): membership is what makes a
+/// started server persistent.
+pub fn attach(db: &Path) -> Result<(), String> {
+    harbor_common::membership::attach(db).map(|_| ())
+}
+
+/// Remove this database from your list.
+pub fn detach(db: &Path) -> Result<(), String> {
+    harbor_common::membership::detach(db).map(|_| ())
+}
+
+/// Arm or disarm the login item. Arming attaches the database too (autostart
+/// needs it on your list) but never starts it — running is the Start/Stop
+/// axis's business; disarming leaves membership and the running server alone.
+pub fn set_autostart(db: &Path, on: bool) -> Result<(), String> {
+    let name = harbor_common::membership::name_of(db)?;
+    if on {
+        harbor_common::membership::attach(db)?;
+        harbor_common::autostart::install(db, &name)
+    } else {
+        harbor_common::autostart::remove(&name).map(|_| ())
+    }
+}
+
+/// Summon through harbor's own front door: `harbor <db> start`, detached and
+/// headless. A bare start is persistent, so the child owns its lifetime and
+/// runs until stopped; this process only waits for the socket to answer.
 fn harbor_serve(db: &Path) -> Result<(), String> {
     // A Finder-launched app inherits launchd's PATH — /usr/bin:/bin and
     // friends — which lacks every directory harbor actually installs
@@ -447,7 +508,7 @@ fn harbor_serve(db: &Path) -> Result<(), String> {
     .unwrap_or_else(|| "harbor".to_string());
     std::process::Command::new(&harbor)
         .arg(db)
-        .arg("serve")
+        .arg("start")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

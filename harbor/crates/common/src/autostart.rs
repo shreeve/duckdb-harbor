@@ -2,27 +2,29 @@
 //!
 //! Installing it is just placing a file the platform's session manager already
 //! reads at login: a launchd LaunchAgent on macOS, a systemd user unit on
-//! Linux. It arms the NEXT login and leaves "now" to the running axis — so
-//! `autostart` is attach + start + this, and `autostart stop` is attach + stop
-//! + this (armed for login, off right now). Tearing it down is `detach`'s job,
-//! since a login item for a database you no longer keep makes no sense.
+//! Linux. It arms the NEXT login and leaves "now" to whoever asked — the CLI's
+//! running axis, or nobody (a GUI checkbox arms login without starting).
 //!
 //! RunAtLoad / WantedBy, never KeepAlive: it starts the server once when you
 //! log in, and does not resurrect one you stop. The server it launches is a
 //! plain `start`, so it is persistent — up until you stop it or log out.
+//!
+//! Shared so the CLI and DuckTable arm and disarm it through the same code and
+//! read the same `installed` truth for a menu checkmark.
 
+use crate::paths;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // macOS — a ~/Library/LaunchAgents plist. Placing the file arms the next
-// login; we deliberately do not `launchctl load` it, so "run now" stays the
-// running axis's job and there is no double-start to reconcile.
+// login; we deliberately do not `launchctl load` it, so "run now" is never a
+// side effect of arming — there is no double-start to reconcile.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
 pub fn install(db: &Path, name: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let canon = harbor_common::paths::canonical_db(db)?;
+    let canon = paths::canonical_db(db)?;
     let plist = agent_path(name)?;
     if let Some(dir) = plist.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -43,6 +45,12 @@ pub fn remove(name: &str) -> Result<bool, String> {
     let _ = std::process::Command::new("launchctl").arg("unload").arg(&plist).output();
     std::fs::remove_file(&plist).map_err(|e| format!("removing {}: {e}", plist.display()))?;
     Ok(true)
+}
+
+/// Whether a login item exists for this name — the menu checkmark's truth.
+#[cfg(target_os = "macos")]
+pub fn installed(name: &str) -> bool {
+    agent_path(name).map(|p| p.exists()).unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -82,13 +90,13 @@ fn xml(s: &str) -> String {
 // ---------------------------------------------------------------------------
 // Linux — a ~/.config/systemd/user unit, enabled so default.target pulls it in
 // at login. `enable` (not `enable --now`) arms the next login without starting
-// one now; the running axis handles now.
+// one now.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
 pub fn install(db: &Path, name: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let canon = harbor_common::paths::canonical_db(db)?;
+    let canon = paths::canonical_db(db)?;
     let unit = unit_path(name)?;
     if let Some(dir) = unit.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -115,6 +123,12 @@ pub fn remove(name: &str) -> Result<bool, String> {
         .output();
     std::fs::remove_file(&unit).map_err(|e| format!("removing {}: {e}", unit.display()))?;
     Ok(true)
+}
+
+/// Whether a login item exists for this name — the menu checkmark's truth.
+#[cfg(target_os = "linux")]
+pub fn installed(name: &str) -> bool {
+    unit_path(name).map(|p| p.exists()).unwrap_or(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -157,14 +171,17 @@ pub fn remove(_name: &str) -> Result<bool, String> {
     Ok(false)
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn installed(_name: &str) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[cfg(target_os = "macos")]
     #[test]
     fn plist_names_the_verb_and_escapes_paths() {
-        let body = plist_body("my-db", "/opt/harbor & co/harbor", "/data/my-db.duckdb");
+        let body = super::plist_body("my-db", "/opt/harbor & co/harbor", "/data/my-db.duckdb");
         assert!(body.contains("<string>harbor.my-db</string>"));
         assert!(body.contains("<string>start</string>"));
         assert!(body.contains("<key>RunAtLoad</key>"));
@@ -175,7 +192,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn unit_names_the_verb_and_quotes_paths() {
-        let body = unit_body("my-db", "/opt/harbor/harbor", "/data/my db.duckdb");
+        let body = super::unit_body("my-db", "/opt/harbor/harbor", "/data/my db.duckdb");
         assert!(body.contains("ExecStart=\"/opt/harbor/harbor\" \"/data/my db.duckdb\" start"));
         assert!(body.contains("WantedBy=default.target"));
         assert!(!body.contains("Restart="), "no KeepAlive equivalent");

@@ -4,7 +4,7 @@ use crate::app::{DuckTable, Phase};
 use crate::chrome::head_glyph;
 use crate::theme::{pal, Pal};
 use crate::util::clone_str;
-use crate::{SetTheme, StopBerth};
+use crate::{AttachBerth, DetachBerth, SetTheme, StartBerth, StopBerth, ToggleAutostart};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
@@ -239,12 +239,40 @@ impl DuckTable {
                         // menu closure, which may capture only owned data.
                         .context_menu({
                             let name = clone_str(&name);
-                            let stopped = matches!(row.state.level(), Level::Idle);
+                            let running = !matches!(row.state.level(), Level::Idle);
+                            let attached = row.attached;
+                            let autostart = row.autostart;
+                            let path =
+                                row.path.as_ref().map(|p| p.to_string_lossy().into_owned());
                             move |menu, _, _| {
-                                menu.menu_with_disabled(
-                                    "Stop",
-                                    Box::new(StopBerth { name: clone_str(&name) }),
-                                    stopped,
+                                // A remote has no local file, so no lifecycle —
+                                // only a (no-op) Stop, as the menu had before.
+                                let Some(path) = path.clone() else {
+                                    return menu.menu_with_disabled(
+                                        "Stop",
+                                        Box::new(StopBerth { name: clone_str(&name) }),
+                                        !running,
+                                    );
+                                };
+                                // Running axis: exactly one of Start / Stop.
+                                let menu = if running {
+                                    menu.menu("Stop", Box::new(StopBerth { name: clone_str(&name) }))
+                                } else {
+                                    menu.menu("Start", Box::new(StartBerth { path: path.clone() }))
+                                };
+                                // Membership axis: exactly one of Attach / Detach.
+                                let menu = menu.separator();
+                                let menu = if attached {
+                                    menu.menu("Detach", Box::new(DetachBerth { path: path.clone() }))
+                                } else {
+                                    menu.menu("Attach", Box::new(AttachBerth { path: path.clone() }))
+                                };
+                                // Autostart: one checkmark item that flips the
+                                // login item (check on the left, by default).
+                                menu.menu_with_check(
+                                    "Autostart",
+                                    autostart,
+                                    Box::new(ToggleAutostart { path, on: !autostart }),
                                 )
                             }
                         })

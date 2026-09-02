@@ -22,10 +22,10 @@ use std::time::{Duration, Instant};
 
 
 use harbor_common::lifetime::parse_duration;
+use harbor_common::autostart;
 use harbor_common::membership::{self, Attached};
 use harbor_common::perms::chmod;
 
-mod autostart;
 mod verbs;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");

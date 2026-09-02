@@ -1,5 +1,5 @@
-//! DuckTable: a fast, minimal desktop client for DuckDB, speaking to
-//! DuckDB Harbor. This file is only the entry point; each surface owns a
+//! DuckTable: a fast, minimal, and clean desktop client for DuckDB
+//! Harbor. This file is only the entry point; each surface owns a
 //! file (`app.rs` state, `sidebar.rs`, `content.rs`, `theme.rs`).
 
 mod app;
@@ -48,6 +48,38 @@ pub struct SetTheme {
 #[action(namespace = ducktable, no_json)]
 pub struct StopBerth {
     pub name: String,
+}
+
+/// Right-click → Start a stopped berth. The rest of the lifecycle menu carries
+/// the database file path as data (the verbs target the file, not the name).
+#[derive(Clone, Default, PartialEq, Debug, Action)]
+#[action(namespace = ducktable, no_json)]
+pub struct StartBerth {
+    pub path: String,
+}
+
+/// Right-click → Attach: add the berth to config.toml.
+#[derive(Clone, Default, PartialEq, Debug, Action)]
+#[action(namespace = ducktable, no_json)]
+pub struct AttachBerth {
+    pub path: String,
+}
+
+/// Right-click → Detach: remove the berth from config.toml.
+#[derive(Clone, Default, PartialEq, Debug, Action)]
+#[action(namespace = ducktable, no_json)]
+pub struct DetachBerth {
+    pub path: String,
+}
+
+/// Right-click → Autostart: the checkmark item. `on` carries the side to flip
+/// to (the opposite of the current checkmark), so the toggle stays honest even
+/// if the survey changed under the open menu.
+#[derive(Clone, Default, PartialEq, Debug, Action)]
+#[action(namespace = ducktable, no_json)]
+pub struct ToggleAutostart {
+    pub path: String,
+    pub on: bool,
 }
 
 /// ⌥←/⌥→: the previous/next table in the sidebar (App::step_table).
@@ -174,8 +206,8 @@ fn about(window: &mut Window, cx: &mut App) {
         PromptLevel::Info,
         concat!("DuckTable ", env!("CARGO_PKG_VERSION")),
         Some(
-            "A fast, minimal desktop client for DuckDB, speaking to \
-             DuckDB Harbor.\n\nMIT License \u{00b7} \u{00a9} 2026 Steve Shreeve",
+            "A fast, minimal, and clean desktop client for DuckDB \
+             Harbor.\n\nMIT License \u{00a9} 2026 Steve Shreeve",
         ),
         &["OK", "View on GitHub"],
         cx,
@@ -387,6 +419,39 @@ fn main() {
             if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
                 cx.defer(move |cx| {
                     view.update(cx, |this, cx| this.stop_berth(name, cx));
+                });
+            }
+        });
+        cx.on_action(|a: &StartBerth, cx| {
+            let path = std::path::PathBuf::from(&a.path);
+            if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
+                cx.defer(move |cx| {
+                    view.update(cx, |this, cx| this.start_berth(path, cx));
+                });
+            }
+        });
+        cx.on_action(|a: &AttachBerth, cx| {
+            let path = std::path::PathBuf::from(&a.path);
+            if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
+                cx.defer(move |cx| {
+                    view.update(cx, |this, cx| this.attach_berth(path, cx));
+                });
+            }
+        });
+        cx.on_action(|a: &DetachBerth, cx| {
+            let path = std::path::PathBuf::from(&a.path);
+            if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
+                cx.defer(move |cx| {
+                    view.update(cx, |this, cx| this.detach_berth(path, cx));
+                });
+            }
+        });
+        cx.on_action(|a: &ToggleAutostart, cx| {
+            let path = std::path::PathBuf::from(&a.path);
+            let on = a.on;
+            if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
+                cx.defer(move |cx| {
+                    view.update(cx, |this, cx| this.toggle_autostart(path, on, cx));
                 });
             }
         });

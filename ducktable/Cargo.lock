@@ -1439,7 +1439,7 @@ dependencies = [
 
 [[package]]
 name = "ducktable"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "duckdb-lang",
@@ -2507,7 +2507,7 @@ dependencies = [
 
 [[package]]
 name = "harbor-client"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "harbor-common",
  "serde",
@@ -2518,12 +2518,13 @@ dependencies = [
 
 [[package]]
 name = "harbor-common"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "libc",
  "serde",
  "serde_json",
  "toml 1.1.4+spec-1.1.0",
+ "toml_edit 0.22.27",
 ]
 
 [[package]]
@@ -7253,7 +7254,7 @@ dependencies = [
 
 [[package]]
 name = "wire"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "serde",
  "serde_json",

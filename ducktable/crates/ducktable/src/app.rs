@@ -12,6 +12,14 @@ use harbor_client::{fleet, Conn, State};
 pub(crate) struct RowVm {
     pub(crate) name: String,
     pub(crate) state: State,
+    /// On your list (a `[connection.*]` in config.toml) — what the menu shows
+    /// Attach vs Detach from.
+    pub(crate) attached: bool,
+    /// A login item exists — the Autostart menu item's checkmark.
+    pub(crate) autostart: bool,
+    /// The database file, when this is a local berth — what the lifecycle
+    /// menu items target.
+    pub(crate) path: Option<std::path::PathBuf>,
     /// Table count, knowable only for live berths (a catalog fetch).
     pub(crate) tables: Option<usize>,
     /// Size on disk (data + WAL) — knowable for every berth.
@@ -418,6 +426,9 @@ impl DuckTable {
                         };
                         RowVm {
                             state: row.state,
+                            attached: row.attached,
+                            autostart: row.autostart,
+                            path: row.path,
                             tables,
                             size: row.size,
                             note: row.note,
@@ -635,6 +646,83 @@ impl DuckTable {
             this.update(cx, |state, cx| {
                 state.leaving.remove(&name);
                 state.rows.retain(|r| r.name != name);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Start a persistent server for a stopped berth, then refresh the list.
+    pub(crate) fn start_berth(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let outcome =
+                cx.background_executor().spawn(async move { fleet::start(&path) }).await;
+            this.update(cx, |state, cx| {
+                if let Err(message) = outcome {
+                    state.warning = Some(message);
+                }
+                state.refresh(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Add a berth to the list (config.toml), then refresh so Attach flips to
+    /// Detach.
+    pub(crate) fn attach_berth(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let outcome =
+                cx.background_executor().spawn(async move { fleet::attach(&path) }).await;
+            this.update(cx, |state, cx| {
+                if let Err(message) = outcome {
+                    state.warning = Some(message);
+                }
+                state.refresh(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Remove a berth from the list, then refresh.
+    pub(crate) fn detach_berth(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let outcome =
+                cx.background_executor().spawn(async move { fleet::detach(&path) }).await;
+            this.update(cx, |state, cx| {
+                if let Err(message) = outcome {
+                    state.warning = Some(message);
+                }
+                state.refresh(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Arm or disarm the login item for a berth, then refresh so the checkmark
+    /// flips. Arming never starts the database — running stays Start/Stop's job.
+    pub(crate) fn toggle_autostart(
+        &mut self,
+        path: std::path::PathBuf,
+        on: bool,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { fleet::set_autostart(&path, on) })
+                .await;
+            this.update(cx, |state, cx| {
+                if let Err(message) = outcome {
+                    state.warning = Some(message);
+                }
+                state.refresh(cx);
                 cx.notify();
             })
             .ok();

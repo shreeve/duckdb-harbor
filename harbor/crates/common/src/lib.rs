@@ -21,6 +21,8 @@
 pub mod config;
 pub mod lifetime;
 #[cfg(feature = "membership")]
+pub mod autostart;
+#[cfg(feature = "membership")]
 pub mod membership;
 pub mod paths;
 pub mod perms;
