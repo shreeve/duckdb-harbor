@@ -1,27 +1,63 @@
 name: Set up DuckDB
 description: >
-  Put a DuckDB engine where CI can run it: DuckDB's official v2.0-dev
-  nightly — libduckdb (harbor dlopens this) plus the duckdb CLI (builds the
-  fixture) — from artifacts.duckdb.org, unpacked into ~/duckdb. This is the 2.0
-  line harbor targets, straight from upstream: no version pinned, no fork, it
-  just tracks whatever main built last. `/latest/` is the v2.0-dev channel
-  today; if DuckDB's main ever rolls past 2.0, pin the v2.0 channel URL here.
-  One place, so the two jobs cannot drift.
+  Put a DuckDB engine where CI can run it. Two pieces, two sources, one
+  reason: harbor 0.21 binds DuckDB's v2 C API, and the official nightly
+  artifacts are frozen at a commit (alpha38195, 2026-08-18) that predates
+  the v2 C API landing on main — so no official artifact can serve. The
+  library is therefore built from source at the same pinned commit the
+  local batteries validate against, and cached so only the first run pays
+  for it. The duckdb CLI (which only builds the test fixture and needs no
+  v2 API) still comes from the frozen artifact zip. When DuckDB ships v2
+  binaries at GA, delete the build steps and go back to the zip for both.
 runs:
   using: composite
   steps:
-    - shell: bash
+    - name: DuckDB CLI (official artifact — fixture builder only)
+      shell: bash
       run: |
         set -euo pipefail
         dir="$HOME/duckdb"; mkdir -p "$dir"; cd "$dir"
         curl -fsSL -o binaries.zip \
           https://artifacts.duckdb.org/latest/duckdb-binaries-linux-amd64.zip
-        unzip -oq binaries.zip         # -> libduckdb-*.zip, duckdb_cli-*.zip
-        unzip -oq 'libduckdb-*.zip'    # -> libduckdb.so (+ headers)
-        unzip -oq 'duckdb_cli-*.zip'   # -> duckdb CLI
+        unzip -oq binaries.zip
+        unzip -oq 'duckdb_cli-*.zip'
         echo "$dir" >> "$GITHUB_PATH"
-        echo "DUCKDB_LIB=$dir" >> "$GITHUB_ENV"
-        # Nothing links the engine — harbor dlopens it at runtime, and this
-        # directory is not on its search path. The env override is the
-        # designed door, and it wants the file, not the directory.
-        echo "HARBOR_LIBDUCKDB=$dir/libduckdb.so" >> "$GITHUB_ENV"
+
+    - name: Engine pin
+      id: pin
+      shell: bash
+      # The commit the local batteries validate against. Bump deliberately,
+      # with a full battery — the engine pin is the dylib.
+      run: echo "sha=1582849bf9e35de3fa3c330935ede5ce598e28a3" >> "$GITHUB_OUTPUT"
+
+    - name: Cached engine
+      id: engine
+      uses: actions/cache@v4
+      with:
+        path: ~/duckdb-engine
+        key: duckdb-libduckdb-${{ runner.os }}-${{ steps.pin.outputs.sha }}
+
+    - name: Build libduckdb at the pin (cache miss only)
+      if: steps.engine.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get install -y -qq ninja-build >/dev/null
+        src="$RUNNER_TEMP/duckdb-src"; mkdir -p "$src"; cd "$src"
+        git init -q
+        git remote add origin https://github.com/duckdb/duckdb.git
+        git fetch -q --depth 1 origin ${{ steps.pin.outputs.sha }}
+        git checkout -q FETCH_HEAD
+        cmake -G Ninja -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_SHELL=FALSE -DBUILD_UNITTESTS=FALSE >/dev/null
+        cmake --build build --target duckdb -j "$(nproc)"
+        mkdir -p "$HOME/duckdb-engine"
+        cp build/src/libduckdb.so "$HOME/duckdb-engine/"
+
+    - name: Point harbor at the engine
+      shell: bash
+      # Nothing links the engine — harbor dlopens it at runtime, and this
+      # directory is not on its search path. The env override is the
+      # designed door, and it wants the file, not the directory.
+      run: echo "HARBOR_LIBDUCKDB=$HOME/duckdb-engine/libduckdb.so" >> "$GITHUB_ENV"
