@@ -2,12 +2,12 @@
 //! swapped in for the data grid via the footer's view switcher. Viewing
 //! data and viewing schema are exclusive by design — a schema change
 //! reshapes the data view, so the two never render side by side. Read-only
-//! in this slice; the editor arrives with the staged/live pipeline
-//! (edits.rs).
+//! for now: the grid already edits through the staged/live pipeline
+//! (edits.rs), and the schema editor will join it.
 //!
 //! Everything shown here is a projection of the `/catalog` document —
-//! columns, constraints, and (harbor 0.18+) the engine's own CREATE TABLE
-//! text — so opening the Structure view costs no query at all.
+//! columns, constraints, and the engine's own CREATE TABLE text — so opening
+//! the Structure view costs no query at all.
 
 use crate::grid::Grid;
 use crate::theme::{pal, value_font, CELL_TEXT, PANE_INSET};

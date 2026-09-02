@@ -149,6 +149,63 @@ else
   bad "the stale socket survived the list"
 fi
 
+echo "— config supplies a berth's standing settings"
+# A bare start reads this file's entry and applies it — no flags. The marker
+# table proves the init SQL ran; the memory-limit proves a typed field lands
+# (1234MB is 1.1 GiB, distinct from the 2GB / 1.9 GiB default).
+cat > "$work/config.toml" <<TOML
+[connection.cfg]
+path = "$work/cfg.duckdb"
+memory-limit = "1234MB"
+init = ["CREATE TABLE cfg_marker(x INTEGER)", "INSERT INTO cfg_marker VALUES (7)"]
+
+[connection.cfg.settings]
+preserve_insertion_order = false
+
+[connection.tcp]
+path = "$work/tcp.duckdb"
+port = 9531
+TOML
+chmod 600 "$work/config.toml"
+"$harbor" "$work/cfg.duckdb" start >"$work/cfg.log" 2>&1 &
+csrv=$!
+cup=0
+for _ in $(seq 1 50); do
+  "$harbor" "$work/cfg.duckdb" -c "SELECT 1" >/dev/null 2>&1 && { cup=1; break; }
+  sleep 0.1
+done
+(( cup )) || bad "config-started server never came up: $(cat "$work/cfg.log")"
+check "a bare start runs the config's init SQL" 0 "7" \
+  "$harbor" "$work/cfg.duckdb" --mode csv -c "SELECT x FROM cfg_marker"
+check "a bare start applies the config's memory-limit" 0 "1.1 GiB" \
+  "$harbor" "$work/cfg.duckdb" --mode csv -c "SELECT current_setting('memory_limit')"
+check "a [settings] key becomes a SET (default is true)" 0 "false" \
+  "$harbor" "$work/cfg.duckdb" --mode csv -c "SELECT current_setting('preserve_insertion_order')"
+kill -TERM "$csrv" 2>/dev/null
+wait "$csrv" 2>/dev/null
+
+# Exposure from config: an explicit start honors the entry's port (token is
+# still the operator's word — mandatory, flag-only), while a summon ignores
+# it and stays on the unix socket, so opening the file never lands on TCP.
+check "a summon ignores the config port (unix socket answers)" 0 "5" \
+  "$harbor" "$work/tcp.duckdb" --mode csv -c "SELECT 5 AS five"
+wait_gone
+check "config port without a token is still refused" 1 "mandatory" \
+  "$harbor" "$work/tcp.duckdb" start
+"$harbor" "$work/tcp.duckdb" start --token cfgtok >"$work/tcp.log" 2>&1 &
+tsrv=$!
+tup=0
+for _ in $(seq 1 50); do
+  curl -sf http://127.0.0.1:9531/ready >/dev/null 2>&1 && { tup=1; break; }
+  sleep 0.1
+done
+(( tup )) && ok "an explicit start binds the config port" \
+          || bad "config port never answered: $(cat "$work/tcp.log")"
+check "and serves on it" 0 "9" \
+  "$harbor" http://127.0.0.1:9531 --token cfgtok --mode csv -c "SELECT 9 AS nine"
+kill -TERM "$tsrv" 2>/dev/null
+wait "$tsrv" 2>/dev/null
+
 echo
 if ((fails)); then
   echo "lifecycle: $fails failing"

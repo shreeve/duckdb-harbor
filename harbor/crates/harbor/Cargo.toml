@@ -10,7 +10,7 @@ license = "MIT"
 # Paths, names, the permission gate, durations, and the membership writer
 # (attach/detach editing config.toml). Shared with ducktable, which takes it
 # without the `term` feature.
-harbor-common = { path = "../common", features = ["membership"] }
+harbor-common = { path = "../common", features = ["config", "membership"] }
 libloading = "0.8"
 justhttp = { path = "../justhttp" }
 # preserve_order: --json rows must keep column order, not alphabetize it

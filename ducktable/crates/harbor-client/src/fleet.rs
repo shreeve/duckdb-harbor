@@ -4,11 +4,10 @@
 //! Truth comes the same way `harbor` (bare) finds it: the runtime dir is
 //! scanned for `*.sock` and each socket answers `GET /info` — the listening
 //! socket IS the registration, there is no sidecar, lock file, or registry
-//! to read. Harbor 0.20 removed all three along with the `/keepalive` route
-//! and its idle-exit machinery: a held connection is presence now, so there
-//! is nothing to pulse and nothing to reconcile. This file layers on what
-//! only this client wants: config-named remotes, size on disk, and the
-//! whole connection half (Conn, connect).
+//! to read. A held connection is presence itself, so there is nothing to
+//! pulse and nothing to reconcile. This file layers on what only this client
+//! wants: config-named remotes, size on disk, and the whole connection half
+//! (Conn, connect).
 //!
 //! The lifecycle law is harbor's own, verbatim: **a detached start is
 //! ephemeral — it lives while anyone is connected; an attached (or bare)

@@ -16,7 +16,7 @@
 //! needs a credential, so `--port` makes `--token` mandatory.
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -229,9 +229,9 @@ struct Opts {
     max_temp_size: Option<String>,
 }
 
-fn parse_opts(db: PathBuf, rest: Vec<String>) -> Result<Opts, String> {
-    let mut it = rest.into_iter();
-    let mut o = Opts {
+/// The built-in defaults, before config or flags speak.
+fn default_opts(db: PathBuf) -> Opts {
+    Opts {
         db,
         ephemeral: false,
         port: None,
@@ -246,7 +246,83 @@ fn parse_opts(db: PathBuf, rest: Vec<String>) -> Result<Opts, String> {
         sealed: false,
         statement_timeout: None,
         max_temp_size: None,
+    }
+}
+
+/// Fill server options from this database's `[connection.*]` entry, if it has
+/// one — the standing settings a bare start should honor. Only a config that
+/// loads cleanly is trusted: its `init` runs SQL and `LOAD` can run native
+/// code, so an entry from a file anyone else could write is ignored (the same
+/// refusal the client applies). The credential is never read here: the token
+/// fields belong to the client, and `--token` has no config key — a secret is
+/// the operator's explicit word at spawn. `port`/`bind` ARE config keys, but
+/// only an explicit start honors them: a summon (`ephemeral`) stays on the
+/// unix socket, so opening a database can never silently expose it to the
+/// network — and the summoning client is waiting on that socket anyway.
+fn apply_berth_config(o: &mut Opts, canon: &Path, ephemeral: bool) {
+    use harbor_common::config;
+    let cfg = match config::load() {
+        Ok(c) => c,
+        Err(config::Error::Missing(_)) => return,
+        Err(e) => {
+            eprintln!("harbor: ignoring config — {e}");
+            return;
+        }
     };
+    // The entry whose database file is the one being started.
+    let entry = cfg.berths().into_iter().find_map(|(_, c)| {
+        let p = c.database()?;
+        (harbor_common::paths::canonical_db(&p).ok()? == *canon).then_some(c)
+    });
+    let Some(c) = entry else { return };
+
+    if !ephemeral {
+        if let Some(p) = c.port {
+            o.port = Some(p);
+        }
+        if let Some(b) = &c.bind {
+            o.bind = b.clone();
+        }
+    }
+    if let Some(v) = &c.memory_limit {
+        o.memory_limit = v.clone();
+    }
+    if let Some(v) = c.threads {
+        o.threads = Some(v as u32);
+    }
+    if let Some(v) = c.workers {
+        o.workers = v;
+    }
+    if let Some(v) = &c.max_temp_size {
+        o.max_temp_size = Some(v.clone());
+    }
+    if let Some(v) = &c.statement_timeout
+        && let Ok(d) = parse_duration(v)
+    {
+        o.statement_timeout = Some(d);
+    }
+    if c.sealed == Some(true) {
+        o.sealed = true;
+    }
+    if c.unsigned == Some(true) {
+        o.unsigned = true;
+    }
+    if c.log == Some(true) {
+        o.log = true;
+    }
+    // The extension/settings door. The entry's `init` runs first — harbor
+    // stays agnostic about what it says (INSTALL/LOAD, SET, secrets) — then
+    // its `[settings]` block as `SET key = value`, so a setting can tune an
+    // extension the init just loaded. Any --init the operator adds on the
+    // command line is appended after this (parse_opts), giving it the last
+    // word. All of it passes straight to DuckDB at open.
+    let mut init = c.init.clone().unwrap_or_default();
+    init.extend(c.setting_statements());
+    o.init = init;
+}
+
+fn parse_opts(mut o: Opts, rest: Vec<String>) -> Result<Opts, String> {
+    let mut it = rest.into_iter();
     while let Some(a) = it.next() {
         let mut take = |what: &str| it.next().ok_or(format!("--{what} needs a value"));
         match a.as_str() {
@@ -314,13 +390,23 @@ fn ensure_runtime_dir() -> Result<PathBuf, String> {
 // ---------------------------------------------------------------------------
 
 fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> {
-    let mut o = parse_opts(db, rest)?;
     // Ephemerality is the grammar's word (a detached start), or the private
     // signal spawn-on-use sets on the child it launches — never a CLI flag.
     // Either way this server is refcounted: it leaves once nobody's connected.
-    o.ephemeral = ephemeral || std::env::var_os("HARBOR_EPHEMERAL").is_some();
+    // Settled before config is read, because a summon must not inherit the
+    // entry's TCP exposure (see apply_berth_config).
+    let ephemeral = ephemeral || std::env::var_os("HARBOR_EPHEMERAL").is_some();
+    // A database's config entry supplies its standing settings — memory,
+    // threads, boot SQL, extensions — so a bare `harbor <db> start` (a summon,
+    // an autostart at boot) honors them without flags. Read against the
+    // canonical file, so any spelling of the path finds the same entry;
+    // explicit flags parsed next override whatever the entry set.
+    let canon = harbor_common::paths::canonical_db(&db)?;
+    let mut o = default_opts(db);
+    apply_berth_config(&mut o, &canon, ephemeral);
+    let mut o = parse_opts(o, rest)?;
+    o.ephemeral = ephemeral;
     let home = ensure_runtime_dir()?;
-    let canon = harbor_common::paths::canonical_db(&o.db)?;
 
     // Where this database answers, derived, never chosen: one file, one
     // socket, every time. A TCP server has no socket to derive — and must

@@ -398,9 +398,11 @@ impl DuckTable {
                             *catalog = new_catalog;
                         }
                     }
-                    // A dead refresh click must not read as "nothing
-                    // changed, so nothing was wrong".
-                    Err(e) => state.warning = Some(format!("catalog refresh failed: {e}")),
+                    // The fetch failed — most often because the server departed
+                    // while we held it. Reconcile against the survey instead of
+                    // surfacing a raw OS error: refresh drops a dead connection
+                    // (with a way back) or, if the server is fine, re-surveys.
+                    Err(_) => state.refresh(cx),
                 }
                 cx.notify();
             })
@@ -501,6 +503,21 @@ impl DuckTable {
                 state.rows = rows;
                 state.warning = warning;
                 state.installed_version = installed_version;
+                // Reconcile the connection against the survey's truth: if we
+                // still think we're connected to a berth the survey no longer
+                // shows running, its server exited out from under us. Drop it
+                // cleanly and point the way back, rather than leaving a dead
+                // connection to fail the next catalog or query with an OS error.
+                let connected = match &state.phase {
+                    Phase::Connected { info, .. } => Some(clone_str(&info.name)),
+                    _ => None,
+                };
+                if let Some(name) = connected
+                    && !state.rows.iter().any(|r| r.name == name && r.state.is_live())
+                {
+                    state.drop_connection(cx);
+                    state.warning = Some(format!("{name} stopped — click it to reconnect"));
+                }
                 cx.notify();
             })
             .ok();
@@ -672,6 +689,21 @@ impl DuckTable {
         );
     }
 
+    /// Clear the connected world back to Idle, forgetting its table, grid,
+    /// query, and staged edits. Shared by Stop and by refresh's reconciliation
+    /// when the server exits out from under us — either way there is nothing
+    /// left to show, and a lingering dead connection would only fail the next
+    /// catalog or query with a raw OS error.
+    fn drop_connection(&mut self, cx: &mut Context<Self>) {
+        self.phase = Phase::Idle;
+        self.selected_table = None;
+        self.grid = None;
+        self.query = None;
+        self.staged.clear();
+        self.select_seq += 1;
+        self.sync_path_copy(cx);
+    }
+
     /// Stop a berth's server — the close half of open. Right-click → Stop
     /// lands here: POST /shutdown to the named server, then refresh so its
     /// row goes from green to stopped (or leaves, if it was ephemeral). If
@@ -711,13 +743,7 @@ impl DuckTable {
                             state.leaving.insert(clone_str(&name));
                             if connected_here {
                                 // The world we were showing just departed.
-                                state.phase = Phase::Idle;
-                                state.selected_table = None;
-                                state.grid = None;
-                                state.query = None;
-                                state.staged.clear();
-                                state.select_seq += 1;
-                                state.sync_path_copy(cx);
+                                state.drop_connection(cx);
                             }
                             state.refresh(cx);
                             cx.notify();

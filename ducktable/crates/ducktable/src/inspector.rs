@@ -4,9 +4,9 @@
 //! panel opens. It shows ROW-LEVEL data only: the selected row's values,
 //! vertically. Berth facts (versions, size) live on the identity card and
 //! row counts in the grid's status line — different data urgency levels
-//! never share this pane. Read-only in this slice; the row editor arrives
-//! with the staged/live pipeline (edits.rs) — it and the grid's inline
-//! editor will be one editing session with one owner.
+//! never share this pane. Read-only for now: the grid already edits through
+//! the staged/live pipeline (edits.rs), and this pane's row editor will join
+//! it — one editing session, one owner.
 
 use crate::grid::Grid;
 use crate::theme::{pal, value_font, Pal, CELL_TEXT, HEADER_TEXT};

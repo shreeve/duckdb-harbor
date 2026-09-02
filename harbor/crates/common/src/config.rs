@@ -6,30 +6,36 @@
 //! ```toml
 //! [defaults]
 //! mode      = "duckbox"     # the client's taste
-//! temp-idle-exit = "90s"    # how long a client-summoned temp outlives its last use
 //!
 //! [connection.medlabs]      # has `path` -> a local berth, harbor can start it
 //! path = "~/Data/Code/medlabs/api/db/medlabs.duckdb"
+//! memory-limit = "8GB"      # typed tuning fields mirror `harbor start` flags
+//! init = ["INSTALL ui", "LOAD ui"]   # any boot SQL: extensions, secrets, SET
+//!
+//! [connection.medlabs.settings]      # any DuckDB option -> SET <key> = <value>
+//! enable_progress_bar = true         # keys are DuckDB's own, passed through
+//! default_null_order  = "NULLS LAST" # verbatim (string quoted, bool/int bare)
 //!
 //! [connection.prod]         # has `url` -> a remote, harbor never touches it
 //! url       = "https://db.example.com"
 //! token-cmd = "op read op://vault/prod/token"
 //! ```
 //!
-//! Harbor reads this file too, which is what makes `harbor start medlabs`
-//! mean anything. It is safe for it to — but know where the fence really
-//! is: this ONE deserializer parses the token fields for both binaries;
-//! what keeps the server from shelling out for a credential is that
-//! `resolve_token` (the only `sh -c` path) lives with the fleet-reading
-//! consumer (ducktable) and nothing in harbor calls it or reads these
-//! fields. Guard the call site, not the schema.
+//! Harbor reads this file too: a berth's entry supplies its standing
+//! settings — memory, threads, boot SQL, extensions — so starting it honors
+//! them without flags. Know where the fence is, though: harbor reads the
+//! tuning fields and never the credential ones. `resolve_token` (the only
+//! `sh -c` path) lives with the fleet-reading consumer (ducktable); harbor
+//! never calls it and never reads `token`/`token-cmd`/`token-file`, so a
+//! server cannot be made to shell out for a secret. Guard the call site,
+//! not the schema. A config anyone else can write is refused whole before
+//! any of it is read, since a berth's `init` runs SQL and `LOAD` runs code.
 //!
 //! Every berth key that harbor acts on is the matching `harbor start` flag
 //! with the dashes stripped, so there is no second dialect to learn.
-//! `--token` is the one flag with no key — a credential is the operator's
-//! word at spawn time, not standing config. (`idle-exit` is the mirror
-//! case: a key with no flag yet, read only by a client deciding how long a
-//! berth it summoned should outlive its last use.)
+//! `--token` is the one flag with no key — the credential is the operator's
+//! word at spawn time, not standing config. (`port`/`bind` have keys, but
+//! only an explicit start honors them; a summon stays on the unix socket.)
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -65,11 +71,6 @@ pub struct Defaults {
     pub connection: Option<String>,
 
     // --- harbor: how a berth is started ------------------------------------
-    /// How long a client-summoned temp lives after its last use. Scope-honest
-    /// by name: this key never touches a configured name — a name is a
-    /// service and defaults persistent; only its own entry's `idle-exit`
-    /// says otherwise.
-    pub temp_idle_exit: Option<String>,
     pub memory_limit: Option<String>,
     pub workers: Option<usize>,
     pub threads: Option<usize>,
@@ -86,7 +87,6 @@ pub struct Connection {
 
     // --- a local berth: harbor starts it, a client may summon it -----------
     pub path: Option<String>,
-    pub idle_exit: Option<String>,
     pub memory_limit: Option<String>,
     pub threads: Option<usize>,
     pub workers: Option<usize>,
@@ -96,8 +96,19 @@ pub struct Connection {
     pub unsigned: Option<bool>,
     pub log: Option<bool>,
     pub init: Option<Vec<String>>,
+    /// TCP exposure, honored only by an explicit `harbor <db> start` — a
+    /// summon ignores both and stays on the unix socket, so opening a
+    /// database can never silently put it on the network. `--token` remains
+    /// mandatory with a port and has no config key: the credential is the
+    /// operator's word at spawn.
     pub port: Option<u16>,
     pub bind: Option<String>,
+    /// Arbitrary DuckDB settings, each applied as `SET key = value` at start.
+    /// The escape hatch for any option harbor has no typed field for — the
+    /// keys are DuckDB's, not harbor's, so harbor passes them through without
+    /// knowing them. Run after `init`, so a setting can tune an extension the
+    /// entry just loaded.
+    pub settings: Option<HashMap<String, toml::Value>>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -126,6 +137,31 @@ impl Connection {
     /// The database file, expanded. `None` unless this is a berth.
     pub fn database(&self) -> Option<PathBuf> {
         self.path.as_deref().map(crate::paths::expand)
+    }
+
+    /// The `[connection.*.settings]` block rendered as `SET key = value`
+    /// statements, in a stable (sorted) order so a start is reproducible.
+    /// Each value's TOML type maps to a SQL literal; a non-scalar value
+    /// (array, table) has no SQL setting form and is skipped.
+    pub fn setting_statements(&self) -> Vec<String> {
+        let Some(settings) = &self.settings else { return Vec::new() };
+        let mut keys: Vec<&String> = settings.keys().collect();
+        keys.sort();
+        keys.into_iter()
+            .filter_map(|k| sql_literal(&settings[k]).map(|lit| format!("SET {k} = {lit}")))
+            .collect()
+    }
+}
+
+/// A scalar TOML value as a DuckDB SQL literal: strings single-quoted (with
+/// `'` doubled), numbers and booleans bare. Non-scalars have no literal form.
+fn sql_literal(v: &toml::Value) -> Option<String> {
+    match v {
+        toml::Value::String(s) => Some(format!("'{}'", s.replace('\'', "''"))),
+        toml::Value::Integer(n) => Some(n.to_string()),
+        toml::Value::Float(f) => Some(f.to_string()),
+        toml::Value::Boolean(b) => Some(b.to_string()),
+        _ => None,
     }
 }
 
@@ -256,7 +292,6 @@ mod tests {
     const SAMPLE: &str = r#"
         [defaults]
         mode = "duckbox"
-        temp-idle-exit = "90s"
 
         [connection.medlabs]
         path = "~/Data/Code/medlabs/api/db/medlabs.duckdb"
@@ -275,7 +310,6 @@ mod tests {
     fn one_namespace_two_kinds() {
         let c: FileConfig = toml::from_str(SAMPLE).unwrap();
         assert_eq!(c.defaults.mode.as_deref(), Some("duckbox"));
-        assert_eq!(c.defaults.temp_idle_exit.as_deref(), Some("90s"));
 
         let berths: Vec<_> = c.berths().iter().map(|(n, _)| *n).collect();
         assert_eq!(berths, ["medlabs", "warehouse"]);
@@ -318,5 +352,40 @@ mod tests {
         // years. A misspelled key here is a hard error naming the key.
         let e = toml::from_str::<FileConfig>("[connection.x]\npth = \"/a.duckdb\"\n");
         assert!(e.is_err());
+    }
+
+    #[test]
+    fn settings_render_as_typed_sorted_set_statements() {
+        let c: FileConfig = toml::from_str(
+            r#"
+            [connection.warehouse]
+            path = "/w.duckdb"
+            init = ["LOAD httpfs"]
+
+            [connection.warehouse.settings]
+            s3_region = "us-east-1"
+            enable_progress_bar = true
+            checkpoint_threshold = 16
+            "#,
+        )
+        .unwrap();
+        // Sorted for a reproducible start; typed: string quoted, bool/int bare.
+        assert_eq!(
+            c.get("warehouse").unwrap().setting_statements(),
+            [
+                "SET checkpoint_threshold = 16",
+                "SET enable_progress_bar = true",
+                "SET s3_region = 'us-east-1'",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_quote_in_a_setting_value_is_doubled_not_broken_out() {
+        let c: FileConfig = toml::from_str(
+            "[connection.x]\npath = \"/x.duckdb\"\n[connection.x.settings]\nname = \"a'b\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.get("x").unwrap().setting_statements(), ["SET name = 'a''b'"]);
     }
 }
