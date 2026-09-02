@@ -75,15 +75,21 @@ jobs:
           cd "$RUNNER_TEMP/duckdb-src"
           stage="$RUNNER_TEMP/stage"; mkdir -p "$stage"
 
-          lib=$(find build -type f \( -name libduckdb.so -o -name libduckdb.dylib -o -name duckdb.dll \) | head -1)
+          # /usr/bin/find by absolute path: inside the Git Bash that GitHub
+          # uses for `shell: bash` on Windows runners, bare `find` can
+          # resolve to System32's DOS find.exe, which mangles these
+          # arguments into a text search and dies. Same path is GNU find on
+          # Linux and macOS too. -print -quit instead of `| head -1`: no
+          # pipe, so no SIGPIPE-under-pipefail hazard on a huge build tree.
+          lib=$(/usr/bin/find build -type f \( -name libduckdb.so -o -name libduckdb.dylib -o -name duckdb.dll \) -print -quit)
           [ -n "$lib" ] || { echo "::error::no libduckdb produced"; exit 1; }
           # The entire point: refuse to shelve an engine harbor 0.21 refuses.
           grep -qc duckdb_v2_connect "$lib" || {
             echo "::error::built library exports no v2 C API symbols"; exit 1; }
           cp "$lib" "$stage/"
-          imp=$(find build -type f -name duckdb.lib | head -1)
-          [ -n "$imp" ] && cp "$imp" "$stage/"
-          cli=$(find build -type f \( -name duckdb -o -name duckdb.exe \) | head -1)
+          imp=$(/usr/bin/find build -type f -name duckdb.lib -print -quit)
+          if [ -n "$imp" ]; then cp "$imp" "$stage/"; fi
+          cli=$(/usr/bin/find build -type f \( -name duckdb -o -name duckdb.exe \) -print -quit)
           [ -n "$cli" ] || { echo "::error::no duckdb CLI produced"; exit 1; }
           cp "$cli" "$stage/"
           cp src/include/duckdb.h src/include/duckdb_extension.h "$stage/"
