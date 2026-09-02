@@ -147,7 +147,7 @@ class Harbor:
 
     def open(self, ttl_ms=None):
         body = {} if ttl_ms is None else {"ttlMs": ttl_ms}
-        return self.call("POST", "/sql/sessions/new", body)
+        return self.call("POST", "/sql/sessions", body)
 
     def release(self, sid):
         return self.call("DELETE", "/sql/sessions/" + sid)
@@ -156,7 +156,7 @@ class Harbor:
         return self.call("DELETE", "/sql/queries/" + qid)
 
     def connections(self):
-        return self.call("GET", "/sessions")[1]["connections"]
+        return self.call("GET", "/sql/sessions")[1]["connections"]
 
 
 class Background:

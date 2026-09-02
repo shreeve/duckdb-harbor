@@ -81,20 +81,26 @@ one to read the schema without asking five questions, one that says who a
 server is, and one graceful shutdown route:
 
 ```
-POST /sql                  run one statement, stream the result as NDJSON
-                           (Accept: application/json for one document instead)
 GET  /ready                can this server answer a query? no credential required
+POST /shutdown             authenticated drain, checkpoint, and stop
+
+GET  /info                 identity — database path, versions, pid, uptime,
+                           and the live client count
 GET  /catalog              everything about the database in one stable JSON
                            document — schema, sizes, row estimates, DDL
                            (?style=lite for the cheap sketch)
-GET  /info                 identity — database path, versions, pid, uptime,
-                           and the live client count
-DELETE /shutdown           authenticated drain, checkpoint, and stop
-POST /sql/sessions/new     take a connection and hold it, for a transaction
-DELETE /sql/sessions/<id>  give it back
-GET  /sessions             what is holding one, and for how long
+
+POST /sql                  run one statement, stream the result as NDJSON
+                           (Accept: application/json for one document instead)
+POST /sql/sessions         take a connection and hold it, for a transaction
+GET  /sql/sessions         list ALL open sessions — who holds each, how long
+DELETE /sql/sessions/<id>  give that one back
 DELETE /sql/queries/<id>   stop a statement the caller named when it sent it
 ```
+
+Three legacy spellings from 0.22 and earlier stay served until the next
+deliberate break: `POST /sql/sessions/new`, `GET /sessions`, and
+`DELETE /shutdown`.
 
 `POST /sql` streams by default. Send `Accept: application/json` and the same
 result comes back as one document instead:

@@ -267,6 +267,8 @@ def one_response_per_request(port, rng):
         s.sendall(b"POST /sql HTTP/1.1\r\nHost: x\r\nContent-Length: 4000000\r\n\r\n")
         for _ in range(rng.randint(3, 10)):
             try:
+                # DELETE is the legacy shutdown verb — using it here also
+                # proves the alias stays served beside canonical POST.
                 s.sendall(b"DELETE /shutdown HTTP/1.1\r\nHost: x\r\n\r\n")
             except OSError:
                 break

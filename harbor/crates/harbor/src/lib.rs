@@ -46,13 +46,18 @@ pub mod engine;
 //
 // Shape (the data plane is deliberately small; the rest is bookkeeping):
 //
-//   POST /sql          run one statement, stream the NDJSON envelope back
-//   GET  /ready        can this server answer a query? no auth
-//   GET  /info         who am I, serving what, since when
-//   GET  /catalog      schema document for completion and browsers
-//   GET  /sessions     who holds a lease right now
-//   POST /sessions …   session lifecycle (new/release), cancel by query id
-//   DELETE /shutdown   drain, CHECKPOINT, exit (the graceful stop)
+//   GET    /ready               can this server answer a query? no auth
+//   POST   /shutdown            drain, CHECKPOINT, exit (the graceful stop)
+//   GET    /info                who am I, serving what, since when
+//   GET    /catalog             schema document for completion and browsers
+//   POST   /sql                 run one statement, stream the NDJSON envelope
+//   POST   /sql/sessions        open a lease (a pinned connection)
+//   GET    /sql/sessions        list ALL open leases — holder, age, deadline
+//   DELETE /sql/sessions/<id>   release that one
+//   DELETE /sql/queries/<id>    cancel a statement the caller named
+//
+// Legacy spellings served until the next deliberate break: POST
+// /sql/sessions/new, GET /sessions, DELETE /shutdown.
 //
 // The envelope is the one thing that must not drift from the v1 harbor,
 // because it is the contract every client already speaks:
@@ -1705,9 +1710,11 @@ fn handle(
                 Some((jobs, _)) => run_ready(req, jobs),
                 None => run_ready_control(req),
             },
-            // Open a transaction lease. It consumes a connection, which is the
-            // scarcest thing here.
-            (Method::Post, "/sql/sessions/new") => run_session_open(req),
+            // Open a transaction lease: POST to the collection, REST's create.
+            // It consumes a connection, which is the scarcest thing here.
+            // `/new` is the legacy 0.22-era spelling, kept until the next
+            // deliberate break.
+            (Method::Post, "/sql/sessions" | "/sql/sessions/new") => run_session_open(req),
             // Release one. Idempotent by design: a client retrying a DELETE it
             // is not sure landed must not be able to free a connection twice.
             //
@@ -1740,15 +1747,17 @@ fn handle(
             // What is holding a connection, and for how long. The question an
             // operator asks when everything is suddenly waiting, and the reason
             // this exists at all: a pool you cannot see into is a pool you
-            // debug by guessing.
-            (Method::Get, "/sessions") => {
+            // debug by guessing. Lives at the collection the ids live under;
+            // bare `/sessions` is the legacy spelling.
+            (Method::Get, "/sql/sessions" | "/sessions") => {
                 let _ = req.respond(json_response(200, &sessions_report()));
                 (true, 200)
             }
             // Fleet shutdown is authenticated and returns before the drain
             // begins. Running stop() on a fresh thread matters: this handler
-            // is itself one of the workers stop() waits to join.
-            (Method::Delete, "/shutdown") => {
+            // is itself one of the workers stop() waits to join. POST — an
+            // action, not a resource removal; DELETE is the legacy verb.
+            (Method::Post | Method::Delete, "/shutdown") => {
                 let _ = req.respond(json_response(202, r#"{"stopping":true}"#));
                 let _ = thread::Builder::new()
                     .name("harbor-shutdown".to_string())
@@ -1877,9 +1886,9 @@ fn utc_now() -> String {
 fn route_exists(method: &Method, path: &str) -> bool {
     matches!(
         (method, path),
-        (Method::Get, "/ready" | "/sessions" | "/info" | "/catalog")
-            | (Method::Delete, "/shutdown")
-            | (Method::Post, "/sql" | "/sql/sessions/new")
+        (Method::Get, "/ready" | "/sql/sessions" | "/sessions" | "/info" | "/catalog")
+            | (Method::Post | Method::Delete, "/shutdown")
+            | (Method::Post, "/sql" | "/sql/sessions" | "/sql/sessions/new")
     ) || (*method == Method::Delete
         && (path.starts_with("/sql/sessions/") || path.starts_with("/sql/queries/")))
 }
@@ -2302,7 +2311,7 @@ const READY_MAX_AGE: Duration = Duration::from_secs(1);
 /// second.
 static LAST_READY: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
 
-/// `POST /sql/sessions/new` — take a connection out of the pool and hold it.
+/// `POST /sql/sessions` — take a connection out of the pool and hold it.
 ///
 /// The body may ask for a lifetime (`{"ttlMs": N}`); harbor caps it at its own
 /// maximum and answers with the one it actually granted, alongside the idle
@@ -4539,10 +4548,19 @@ mod tests {
             (Method::Get, "/health"),   // never existed
             (Method::Get, "/"),
             (Method::Put, "/sql"),
-            (Method::Post, "/sql/sessions"), // no trailing id/segment
         ];
         for (m, p) in &non_routes {
             assert!(!route_exists(m, p), "should NOT be a route: {m:?} {p}");
+        }
+        // The legacy spellings stay served until the next deliberate break:
+        // the Rails-ism, the stray collection path, and the DELETE verb.
+        let legacy = [
+            (Method::Post, "/sql/sessions/new"),
+            (Method::Get, "/sessions"),
+            (Method::Delete, "/shutdown"),
+        ];
+        for (m, p) in &legacy {
+            assert!(route_exists(m, p), "legacy alias must stay served: {m:?} {p}");
         }
     }
 

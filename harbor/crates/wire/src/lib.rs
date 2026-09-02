@@ -53,18 +53,25 @@ pub mod endpoint {
     /// POST — run exactly one statement. NDJSON unless the caller asks for
     /// `application/json`.
     pub const SQL: Route = Route::fixed("POST", "/sql");
-    /// POST — open a session: a pinned connection that holds a transaction
-    /// across requests. Release it with [`session`].
-    pub const SESSIONS_NEW: Route = Route::fixed("POST", "/sql/sessions/new");
-    /// GET — the open sessions.
-    pub const SESSIONS: Route = Route::fixed("GET", "/sessions");
+    /// POST to the collection — open a session: a pinned connection that
+    /// holds a transaction across requests. Release it with [`session`].
+    /// (Servers also accept the legacy `/sql/sessions/new` spelling.)
+    pub const SESSIONS_CREATE: Route = Route::fixed("POST", "/sql/sessions");
+    /// The pre-0.22.1 spelling of [`SESSIONS_CREATE`]. Not in [`FIXED`]
+    /// (new servers advertise the canonical route); clients keep it only
+    /// to fall back when an older harbor answers 404 — joining older
+    /// servers is a feature.
+    pub const SESSIONS_CREATE_LEGACY: Route = Route::fixed("POST", "/sql/sessions/new");
+    /// GET the collection — the open sessions. (Legacy spelling: `/sessions`.)
+    pub const SESSIONS: Route = Route::fixed("GET", "/sql/sessions");
     /// GET — the whole schema as one document, cheaper and more complete than
     /// walking `duckdb_*()` a table at a time.
     pub const CATALOG: Route = Route::fixed("GET", "/catalog");
-    /// DELETE, not POST — graceful shutdown reads as removing the berth, and
-    /// harbor's dispatch table agrees. Fleet managers use this on platforms
-    /// without Unix signals; the response is sent before draining.
-    pub const SHUTDOWN: Route = Route::fixed("DELETE", "/shutdown");
+    /// POST, not DELETE — shutdown is an action, and DELETE names a resource
+    /// to remove that doesn't exist ("delete the shutdown"). Fleet managers
+    /// use this on platforms without Unix signals; the response is sent
+    /// before draining. (Servers also accept the legacy DELETE.)
+    pub const SHUTDOWN: Route = Route::fixed("POST", "/shutdown");
     /// GET — the only unauthenticated route, by design.
     pub const READY: Route = Route::fixed("GET", "/ready");
     /// GET — berth identity (auth required: it names paths and pids).
@@ -74,7 +81,7 @@ pub mod endpoint {
     /// the contract instead of transcribing it. The two builders below are
     /// not here: their paths carry an id, so there is nothing to enumerate.
     pub const FIXED: &[Route] =
-        &[SQL, SESSIONS_NEW, SESSIONS, CATALOG, SHUTDOWN, READY, INFO];
+        &[SQL, SESSIONS_CREATE, SESSIONS, CATALOG, SHUTDOWN, READY, INFO];
 
     /// DELETE — release the session `id` holds, rolling back any open
     /// transaction. A builder, since the id rides in the path.
@@ -139,7 +146,7 @@ pub struct SqlRequest {
     pub timeout_ms: Option<u64>,
 }
 
-/// POST /sql/sessions/new request body (may be empty / absent).
+/// POST /sql/sessions request body (may be empty / absent).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionNewRequest {

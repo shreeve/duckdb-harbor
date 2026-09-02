@@ -83,14 +83,22 @@ pub fn exec(
 /// requests. Release it with [`session_release`] — which rolls back
 /// anything uncommitted, so an abandoned session can never half-commit.
 pub fn session_new(conn: &Conn) -> Result<String, String> {
-    let resp = http::request(
-        &conn.transport,
-        &endpoint::SESSIONS_NEW,
-        conn.token.as_deref(),
-        Some("{}"),
-        Some(Duration::from_secs(10)),
-    )
-    .map_err(|e| format!("session: {e}"))?;
+    let open = |route: &wire::endpoint::Route| {
+        http::request(
+            &conn.transport,
+            route,
+            conn.token.as_deref(),
+            Some("{}"),
+            Some(Duration::from_secs(10)),
+        )
+        .map_err(|e| format!("session: {e}"))
+    };
+    let mut resp = open(&endpoint::SESSIONS_CREATE)?;
+    if resp.status == 404 {
+        // A pre-0.22.1 harbor only knows the old spelling — and joining
+        // older servers is a feature, so fall back rather than fail.
+        resp = open(&endpoint::SESSIONS_CREATE_LEGACY)?;
+    }
     let status = resp.status;
     let body = resp.body_string().map_err(|e| e.to_string())?;
     if !(200..300).contains(&status) {
