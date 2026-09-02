@@ -1,20 +1,23 @@
-<p align="center">
-  <a href="harbor/"><img src="harbor/duckdb-harbor-social.png" alt="DuckDB Harbor" width="600"></a>
-</p>
-
-<p align="center">
+<table>
+<tr>
+<td align="center" width="50%">
+  <a href="harbor/"><img src="harbor/duckdb-harbor-social.png" alt="DuckDB Harbor" width="100%"></a>
+</td>
+<td align="center" width="50%">
+  <a href="ducktable/"><img src="ducktable/social-ducktable.png" alt="DuckTable" width="100%"></a>
+</td>
+</tr>
+<tr>
+<td align="center" valign="top">
   <b><a href="harbor/">DuckDB Harbor</a></b> — many clients, one DuckDB, over plain HTTP.<br>
   One small binary that serves a DuckDB file to everything, and is its own modern shell.
-</p>
-
-<p align="center">
-  <a href="ducktable/"><img src="ducktable/social-ducktable.png" alt="DuckTable" width="600"></a>
-</p>
-
-<p align="center">
+</td>
+<td align="center" valign="top">
   <b><a href="ducktable/">DuckTable</a></b> — the native macOS desktop face for Harbor servers.<br>
   Query, browse, and edit your data. Nothing else.
-</p>
+</td>
+</tr>
+</table>
 
 ---
 
