@@ -2190,11 +2190,13 @@ impl GridDelegate {
     /// caret lookahead: the input scrolls whenever the caret comes within
     /// 10px of its right edge, so a fitted column must leave 10px past
     /// its content or a cell shifts the instant it opens for editing —
-    /// view and edit must paint the same pixels. 14 is where the caret
+    /// view and edit must paint the same pixels. 16 is where the caret
     /// breathes: inside the editor's ring the text clears the left edge
-    /// by 10px, and 14 gives the caret the same 10px on the right (14 −
-    /// 2px ring − 1.5px caret); anything less reads as cramped the
-    /// moment the caret lands at the end of a fitted value.
+    /// by 10px, and 16 gives the caret 12.5px on the right (16 − 2px
+    /// ring − 1.5px caret) — a touch MORE than the left, deliberately: a
+    /// 1.5px caret doesn't hold space the way a wall of glyphs does, so
+    /// equal air reads tight beside it. Judged on screen at 14 (tight)
+    /// and 16 (right).
     fn fitted_width(&self, schema_ix: usize, zoom: f32) -> Pixels {
         const CAP: usize = 60;
         let advance = CELL_TEXT * (1233. / 2048.) * zoom;
@@ -2212,7 +2214,7 @@ impl GridDelegate {
             self.schema_cols[schema_ix].name.as_deref().map_or(4, |n| n.chars().count());
         let content = chars.min(CAP) as f32 * advance;
         let header = name_len as f32 * header_advance;
-        px((content.max(header) + PANE_INSET + 14.).clamp(60. * zoom, 460. * zoom))
+        px((content.max(header) + PANE_INSET + 16.).clamp(60. * zoom, 460. * zoom))
     }
 
     /// Rebuild the display columns from the schema minus the hidden set
