@@ -120,7 +120,9 @@ pub struct Server {
     messages: Arc<MessagesQueue<Message>>,
 
     // result of TcpListener::local_addr()
-    listening_addr: ListenAddr,
+    // Every bound address, primary first (server_addr() reports the first;
+    // Drop wakes and, for unix paths, unlinks each one).
+    listening_addrs: Vec<ListenAddr>,
 
     // live client connections, counted at accept and at connection end.
     // A fact, not a policy: the host reads this to decide lifetime (a
@@ -235,26 +237,73 @@ impl Server {
         Self::start(stream::Listener::Unix(listener))
     }
 
+    #[cfg(unix)]
+    #[inline]
+    /// A server with two doors into one request queue: a UNIX socket and a
+    /// TCP address. Requests carry which door they came through
+    /// ([`Request::is_local`]), so a host can hold the TCP side to a
+    /// credential while the filesystem authenticates the socket side.
+    pub fn http_dual<A>(
+        addr: A,
+        path: &std::path::Path,
+    ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>>
+    where
+        A: ToSocketAddrs,
+    {
+        let tcp = std::net::TcpListener::bind(addr)?;
+        let unix = std::os::unix::net::UnixListener::bind(path)?;
+        // TCP first: server_addr() reports the primary, dialable address.
+        Self::start_multi(vec![stream::Listener::Tcp(tcp), stream::Listener::Unix(unix)])
+    }
+
     /// Spawns the accept thread over a bound listener.
     fn start(listener: stream::Listener) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
-        // building the "close" variable
+        Self::start_multi(vec![listener])
+    }
+
+    /// One server over any number of bound listeners: one request queue, one
+    /// close trigger, one connection count — and one accept thread per
+    /// listener feeding them.
+    fn start_multi(
+        listeners: Vec<stream::Listener>,
+    ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
         let close_trigger = Arc::new(AtomicBool::new(false));
         let connections = Arc::new(AtomicUsize::new(0));
-
-        // building the TcpListener
-        let (server, local_addr) = {
-            let local_addr = listener.local_addr()?;
-            (listener, local_addr)
-        };
-
-        // creating a task where server.accept() is continuously called
-        // and ClientConnection objects are pushed in the messages queue
         let messages = MessagesQueue::with_capacity(8);
 
-        let inside_close_trigger = close_trigger.clone();
-        let inside_messages = messages.clone();
-        let inside_connections = connections.clone();
-        thread::spawn(move || {
+        let mut listening_addrs = Vec::with_capacity(listeners.len());
+        for listener in &listeners {
+            listening_addrs.push(listener.local_addr()?);
+        }
+        for listener in listeners {
+            #[cfg(unix)]
+            let local = matches!(listener, stream::Listener::Unix(_));
+            #[cfg(not(unix))]
+            let local = false;
+            spawn_accept(
+                listener,
+                local,
+                close_trigger.clone(),
+                messages.clone(),
+                connections.clone(),
+            );
+        }
+
+        Ok(Server { messages, close: close_trigger, listening_addrs, connections })
+    }
+}
+
+/// The accept loop for one listener: accepted connections are dispatched to
+/// the task pool, and every request they produce lands in the shared queue,
+/// stamped with `local` (which door it came through).
+fn spawn_accept(
+    server: stream::Listener,
+    local: bool,
+    inside_close_trigger: Arc<AtomicBool>,
+    inside_messages: Arc<MessagesQueue<Message>>,
+    inside_connections: Arc<AtomicUsize>,
+) {
+    thread::spawn(move || {
             // a tasks pool is used to dispatch the connections into threads
             let tasks_pool = pool::TaskPool::new();
 
@@ -308,7 +357,7 @@ impl Server {
                         let _ = sock.set_nodelay(true);
                         let (read_closable, write_closable) = RefinedTcpStream::new(sock);
 
-                        Ok(ClientConnection::new(write_closable, read_closable))
+                        Ok(ClientConnection::new(write_closable, read_closable, local))
                     }
                     Err(e) => Err(e),
                 };
@@ -373,17 +422,10 @@ impl Server {
                     }
                 }
             }
-        });
+    });
+}
 
-        // result
-        Ok(Server {
-            messages,
-            close: close_trigger,
-            listening_addr: local_addr,
-            connections,
-        })
-    }
-
+impl Server {
     /// Returns an iterator for all the incoming requests.
     ///
     /// The iterator will return `None` if the server socket is shutdown.
@@ -392,10 +434,11 @@ impl Server {
         IncomingRequests { server: self }
     }
 
-    /// Returns the address the server is listening to.
+    /// Returns the primary address the server is listening to (the first
+    /// bound listener; a dual server reports its TCP address here).
     #[inline]
     pub fn server_addr(&self) -> ListenAddr {
-        self.listening_addr.clone()
+        self.listening_addrs[0].clone()
     }
 
     /// Blocks until an HTTP request has been submitted and returns it.
@@ -443,24 +486,27 @@ impl Iterator for IncomingRequests<'_> {
 impl Drop for Server {
     fn drop(&mut self) {
         self.close.store(true, Relaxed);
-        // Connect briefly to ourselves to unblock the accept thread
-        let maybe_stream = match &self.listening_addr {
-            ListenAddr::Ip(addr) => TcpStream::connect(addr).map(Connection::from),
-            #[cfg(unix)]
-            ListenAddr::Unix(addr) => {
-                // TODO: use connect_addr when its stabilized.
-                let path = addr.as_pathname().unwrap();
-                std::os::unix::net::UnixStream::connect(path).map(Connection::from)
+        // Connect briefly to each listener to unblock its accept thread,
+        // then sweep every unix socket path off disk.
+        for addr in &self.listening_addrs {
+            let maybe_stream = match addr {
+                ListenAddr::Ip(addr) => TcpStream::connect(addr).map(Connection::from),
+                #[cfg(unix)]
+                ListenAddr::Unix(addr) => {
+                    // TODO: use connect_addr when its stabilized.
+                    let path = addr.as_pathname().unwrap();
+                    std::os::unix::net::UnixStream::connect(path).map(Connection::from)
+                }
+            };
+            if let Ok(stream) = maybe_stream {
+                let _ = stream.shutdown(Shutdown::Both);
             }
-        };
-        if let Ok(stream) = maybe_stream {
-            let _ = stream.shutdown(Shutdown::Both);
-        }
 
-        #[cfg(unix)]
-        if let ListenAddr::Unix(addr) = &self.listening_addr {
-            if let Some(path) = addr.as_pathname() {
-                let _ = std::fs::remove_file(path);
+            #[cfg(unix)]
+            if let ListenAddr::Unix(addr) = addr {
+                if let Some(path) = addr.as_pathname() {
+                    let _ = std::fs::remove_file(path);
+                }
             }
         }
     }

@@ -194,9 +194,9 @@ client options:
   --json                       shorthand for --mode jsonlines
 
 start options:
-  --port <p>           listen on TCP instead of the unix socket (--token
-                       becomes mandatory: TCP leaves the 0700 runtime dir,
-                       which is what secures the socket)
+  --port <p>           also listen on TCP, beside the unix socket (--token
+                       becomes mandatory for the TCP door: it leaves the
+                       0700 runtime dir, which is what secures the socket)
   --bind <addr>        TCP bind address (with --port; default 127.0.0.1)
   --token <t>          bearer token (TCP only)
   --workers <n>        executor pool size (default 6)
@@ -409,13 +409,11 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> 
     let home = ensure_runtime_dir()?;
 
     // Where this database answers, derived, never chosen: one file, one
-    // socket, every time. A TCP server has no socket to derive — and must
-    // not fail on a runtime dir too deep to hold one it will never bind.
+    // socket, every time. The socket exists whether or not a port does — a
+    // port is an additional door, and the socket is what keeps a TCP-exposed
+    // server visible to the fleet (the list, DuckTable, join-before-summon).
     #[cfg(unix)]
-    let sock_path = match o.port {
-        None => harbor_common::socket_for(&home, &canon)?,
-        Some(_) => PathBuf::new(),
-    };
+    let sock_path = harbor_common::socket_for(&home, &canon)?;
     #[cfg(windows)]
     let sock_path = {
         let _ = &home; // created for its 0700 healing; TCP needs no socket
@@ -427,7 +425,7 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> 
     // file lock below is the real mutex, so a race here just falls through
     // to that.
     #[cfg(unix)]
-    if o.port.is_none() && sock_path.exists() && harbor::repl::sock_ready(&sock_path) {
+    if sock_path.exists() && harbor::repl::sock_ready(&sock_path) {
         return Err(format!(
             "{} is already being served — `harbor {}` connects to it",
             canon.display(),
@@ -479,22 +477,24 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> 
     // We hold the database lock, so anything at the socket path is a
     // leftover by definition — a kill -9, a crash — and safe to sweep.
     #[cfg(unix)]
-    if o.port.is_none() && sock_path.exists() {
+    if sock_path.exists() {
         std::fs::remove_file(&sock_path).map_err(|e| format!("stale socket: {e}"))?;
     }
 
+    // The socket is always bound; a port adds the TCP door beside it. The
+    // token guards TCP only — the 0700 runtime dir already guards the socket.
     #[cfg(unix)]
     let listen = match o.port {
-        Some(port) => harbor::Listen::Tcp { bind: o.bind.clone(), port },
+        Some(port) => {
+            harbor::Listen::Dual { bind: o.bind.clone(), port, sock: sock_path.clone() }
+        }
         None => harbor::Listen::Unix(sock_path.clone()),
     };
     #[cfg(windows)]
     let listen = harbor::Listen::Tcp { bind: o.bind.clone(), port: o.port.unwrap_or(0) };
     let addr = harbor::start(listen, o.token.clone(), o.workers, o.log)?;
-    let tcp = o.port.is_some() || cfg!(windows);
-    if !tcp {
-        let _ = chmod(&sock_path, 0o600);
-    }
+    #[cfg(unix)]
+    let _ = chmod(&sock_path, 0o600);
 
     // GET /info: identity, with uptime and the live client count spliced in
     // by the core. This is the whole registry — the list dials it.
@@ -515,6 +515,9 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> 
         // The lifetime mode, so a client that restarts this server (to upgrade
         // the binary) can bring it back the same way it was running.
         "ephemeral": o.ephemeral,
+        // The TCP door, when one is open (the unix socket needs no
+        // advertising — finding it is how a client got here).
+        "port": o.port,
     }));
 
     eprintln!(
@@ -571,11 +574,10 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> 
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "harbor".into());
+        // The helm dials the home door: the unix socket is always bound (a
+        // port only adds TCP beside it) and needs no token.
         #[cfg(unix)]
-        let transport = match o.port {
-            Some(p) => harbor::repl::Transport::Tcp(format!("127.0.0.1:{p}")),
-            None => harbor::repl::Transport::Unix(sock_path.clone()),
-        };
+        let transport = harbor::repl::Transport::Unix(sock_path.clone());
         #[cfg(windows)]
         let transport = harbor::repl::Transport::Tcp(format!("127.0.0.1:{}", o.port.unwrap_or(0)));
         harbor::repl::helm(transport, o.token.clone(), &name);
@@ -585,9 +587,8 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> 
     // Blocks until SIGTERM / .quit at the helm / the refcount departure
     // finishes drain + CHECKPOINT.
     let farewell = harbor::wait()?;
-    if !tcp {
-        let _ = std::fs::remove_file(&sock_path);
-    }
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(&sock_path);
     eprintln!("harbor: {} closed ({farewell})", canon.display());
     Ok(())
 }

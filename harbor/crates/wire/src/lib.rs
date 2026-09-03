@@ -283,6 +283,8 @@ pub struct InfoResponse {
     /// with `HARBOR_EPHEMERAL` / a `detach start`). A client restarting it — to
     /// upgrade the binary, say — reads this to bring it back in the same mode.
     pub ephemeral: bool,
+    /// The TCP door, when one is open beside the unix socket (`--port`).
+    pub port: Option<u16>,
 }
 
 #[cfg(test)]

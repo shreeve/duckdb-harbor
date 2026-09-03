@@ -259,7 +259,7 @@ indexes and sequences — plus the engine's row estimate and its own
 exact bytes at the top:
 
 ```json
-{"harborVersion":"0.26.1","duckdbVersion":"v2.0.0-dev83323",
+{"harborVersion":"0.27.0","duckdbVersion":"v2.0.0-dev83323",
  "databaseSizeBytes":12582912,"walSizeBytes":0,
  "tables":[{"name":"orders","schema":"main","estimatedRows":300000,
             "columns":[…],"primaryKey":["id"],
@@ -326,7 +326,7 @@ with `sudo` in front of the whole command — the installer never escalates on
 its own. On Windows the binary lands in `%LOCALAPPDATA%\Programs\harbor\bin`,
 which the installer adds to your user `PATH`.
 
-Pin a version with `... | bash -s v0.26.1` (or `-Tag v0.26.1` on Windows). Each
+Pin a version with `... | bash -s v0.27.0` (or `-Tag v0.27.0` on Windows). Each
 [release](https://github.com/shreeve/duckdb-harbor/releases)
 ships one self-contained archive per
 platform (osx-arm64, linux-amd64, linux-arm64, windows-amd64, windows-arm64):
@@ -374,11 +374,13 @@ test suites use it to keep their servers out of the real fleet view.
 
 ### Sockets, TCP, and tokens
 
-The unix socket is the default face, and the `0700` runtime directory is the
+The unix socket is always there, and the `0700` runtime directory is the
 whole local access control — no token exists on a socket, and `--token` is
-refused there so nobody believes an extra lock is doing something. TCP is the
-one door that leaves the filesystem's protection, so `--port` makes `--token`
-mandatory:
+refused there so nobody believes an extra lock is doing something. `--port`
+adds a TCP door *beside* the socket, never in place of it, so a TCP-exposed
+server stays visible to the fleet (the list, DuckTable, join-before-summon)
+like any other. TCP is the one door that leaves the filesystem's protection,
+so `--port` makes `--token` mandatory:
 
 ```console
 $ harbor mydata.duckdb start --port 9495 --token secret

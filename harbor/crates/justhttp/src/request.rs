@@ -79,6 +79,13 @@ pub struct Request {
 
     remote_addr: Option<SocketAddr>,
 
+    // Whether this request arrived over the unix-socket listener. Stamped by
+    // the accept loop from which listener produced the connection — never
+    // derived from request or peer data — so a host can hang access decisions
+    // on it (a unix socket in a 0700 dir is filesystem-authenticated; TCP is
+    // not).
+    local: bool,
+
     method: Method,
 
     path: String,
@@ -125,6 +132,7 @@ pub fn new_request<R, W>(
     version: HttpVersion,
     headers: Vec<Header>,
     remote_addr: Option<SocketAddr>,
+    local: bool,
     mut source_data: R,
     writer: W,
     shutdown: Option<ShutdownHandle>,
@@ -224,6 +232,7 @@ where
         data_reader: Some(reader),
         response_writer: Some(Box::new(writer) as Box<dyn Write + Send + 'static>),
         remote_addr,
+        local,
         method,
         path,
         http_version: version,
@@ -287,6 +296,14 @@ impl Request {
     #[inline]
     pub fn remote_addr(&self) -> Option<&SocketAddr> {
         self.remote_addr.as_ref()
+    }
+
+    /// True when this request arrived over the unix-socket listener, whose
+    /// 0700 directory is itself the access control. Stamped from the
+    /// listener at accept, never from anything the peer sent.
+    #[inline]
+    pub fn is_local(&self) -> bool {
+        self.local
     }
 
     /// Allows to read the body of the request.

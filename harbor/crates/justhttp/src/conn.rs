@@ -75,6 +75,10 @@ pub struct ClientConnection {
     // address of the client
     remote_addr: IoResult<Option<SocketAddr>>,
 
+    // whether this connection came in over the unix-socket listener; every
+    // request it produces is stamped with it (see Request::is_local)
+    local: bool,
+
     // sequence of Readers to the stream, so that the data is not read in
     //  the wrong order
     source: SequentialReaderBuilder<BufReader<RefinedTcpStream>>,
@@ -117,10 +121,13 @@ enum ReadError {
 }
 
 impl ClientConnection {
-    /// Creates a new `ClientConnection` that takes ownership of the `TcpStream`.
+    /// Creates a new `ClientConnection` that takes ownership of the stream.
+    /// `local` records which listener accepted it: true for the unix socket,
+    /// false for TCP.
     pub fn new(
         write_socket: RefinedTcpStream,
         mut read_socket: RefinedTcpStream,
+        local: bool,
     ) -> ClientConnection {
         let remote_addr = read_socket.peer_addr();
         // Taken while the stream is still here, exactly as the interrupt
@@ -137,6 +144,7 @@ impl ClientConnection {
             // a full chunk + the terminator coalesce into a single write().
             sink: SequentialWriterBuilder::new(BufWriter::with_capacity(8192, write_socket)),
             remote_addr,
+            local,
             next_header_source: first_header,
             no_more_requests: false,
             served_a_request: false,
@@ -298,6 +306,7 @@ impl ClientConnection {
             version,
             headers,
             *self.remote_addr.as_ref().unwrap(),
+            self.local,
             data_source,
             writer,
             self.shutdown.clone(),

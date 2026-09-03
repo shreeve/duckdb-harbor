@@ -1007,12 +1007,17 @@ pub fn open_pool(con: Connection) -> Result<(), String> {
 // start / stop / wait
 // ---------------------------------------------------------------------------
 
-/// Where the server listens. Unix sockets are the fleet's default face;
-/// TCP remains for loopback and trusted-LAN use.
+/// Where the server listens. Unix sockets are the fleet's default face; a
+/// port is an additional door, not a different server — Dual keeps the
+/// socket (the fleet's registration and the tokenless local path) while
+/// also answering TCP, where the token is mandatory. Plain Tcp exists for
+/// Windows, which has no unix sockets.
 pub enum Listen {
     Tcp { bind: String, port: u16 },
     #[cfg(unix)]
     Unix(std::path::PathBuf),
+    #[cfg(unix)]
+    Dual { bind: String, port: u16, sock: std::path::PathBuf },
 }
 
 pub fn start(
@@ -1059,6 +1064,11 @@ pub fn start(
         #[cfg(unix)]
         Listen::Unix(path) => Server::http_unix(path.as_path())
             .map_err(|e| format!("harbor: cannot bind {}: {e}", path.display())),
+        #[cfg(unix)]
+        Listen::Dual { bind, port, sock } => Server::http_dual((bind.as_str(), *port), sock)
+            .map_err(|e| {
+                format!("harbor: cannot bind {bind}:{port} + {}: {e}", sock.display())
+            }),
     };
     let server = match bound {
         Ok(s) => s,
@@ -1073,6 +1083,10 @@ pub fn start(
         Listen::Tcp { .. } => server.server_addr().to_string(),
         #[cfg(unix)]
         Listen::Unix(path) => path.display().to_string(),
+        #[cfg(unix)]
+        Listen::Dual { sock, .. } => {
+            format!("{} + {}", server.server_addr(), sock.display())
+        }
     };
     *STARTED_AT.lock().unwrap() = Some(Instant::now());
     // Reset the process-global readiness verdict for this instance. One
@@ -1689,7 +1703,11 @@ fn handle(
             &format!("body is {n} bytes; the limit is {MAX_BODY}"),
         ));
         (true, 413)
-    } else if path != "/ready" && !authorized(&req, token) {
+    } else if path != "/ready" && !req.is_local() && !authorized(&req, token) {
+        // is_local: a request in over the unix socket was authenticated by
+        // the 0700 runtime dir before it reached us — the token guards the
+        // TCP door only. The flag is stamped by the accept loop from which
+        // listener produced the connection, never from peer data.
         // Unknown paths stay 404 even unauthenticated — the contract the
         // clients pinned long before this gate was hoisted. Known endpoints
         // answer 401 so a caller with a bad token learns which problem it has.
