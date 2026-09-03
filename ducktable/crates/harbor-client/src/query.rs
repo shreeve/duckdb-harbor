@@ -39,7 +39,7 @@ pub fn exec(
     })
     .map_err(|e| e.to_string())?;
     let resp = http::request(
-        &conn.transport,
+        conn.transport()?,
         &endpoint::SQL,
         Some(&body),
         Some(Duration::from_secs(120)),
@@ -82,9 +82,10 @@ pub fn exec(
 /// requests. Release it with [`session_release`] — which rolls back
 /// anything uncommitted, so an abandoned session can never half-commit.
 pub fn session_new(conn: &Conn) -> Result<String, String> {
+    let transport = conn.transport()?;
     let open = |route: &wire::endpoint::Route| {
         http::request(
-            &conn.transport,
+            transport,
             route,
             Some("{}"),
             Some(Duration::from_secs(10)),
@@ -114,10 +115,12 @@ pub fn session_new(conn: &Conn) -> Result<String, String> {
 /// transaction. Best-effort by design: the server's TTL reaps what a
 /// dropped connection leaves behind.
 pub fn session_release(conn: &Conn, session_id: &str) {
-    let _ = http::request(
-        &conn.transport,
-        &endpoint::session(session_id),
-        None,
-        Some(Duration::from_secs(10)),
-    );
+    if let Ok(transport) = conn.transport() {
+        let _ = http::request(
+            transport,
+            &endpoint::session(session_id),
+            None,
+            Some(Duration::from_secs(10)),
+        );
+    }
 }

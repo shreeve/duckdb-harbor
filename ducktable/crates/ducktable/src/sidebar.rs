@@ -280,13 +280,15 @@ impl DuckTable {
                             let path =
                                 row.path.as_ref().map(|p| p.to_string_lossy().into_owned());
                             move |menu, _, _| {
-                                // A remote has no local file, so no lifecycle —
-                                // only a (no-op) Stop, as the menu had before.
+                                // A remote has no local server lifecycle. Its
+                                // one operation forgets the saved connection;
+                                // dropping the active Conn also closes SSH.
                                 let Some(path) = path.clone() else {
-                                    return menu.menu_with_disabled(
-                                        "Stop",
-                                        Box::new(StopBerth { name: clone_str(&name) }),
-                                        !running,
+                                    return menu.menu(
+                                        "Remove Database",
+                                        Box::new(crate::RemoveRemoteDatabase {
+                                            name: clone_str(&name),
+                                        }),
                                     );
                                 };
                                 // Running axis: exactly one of Start / Stop.

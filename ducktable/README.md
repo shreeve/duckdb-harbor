@@ -54,6 +54,41 @@ Uninstall with `... | bash -s -- --uninstall` — the app goes; your settings
 On Intel, or to build from source: clone the repo and run
 `ducktable/scripts/macos-app.sh release`.
 
+## Databases by port
+
+Choose **File → Add Database…** when Harbor is already listening on a TCP
+port. Give the database a sidebar name, host, and Harbor port. `localhost`
+connects directly; any other host makes DuckTable create the SSH tunnel:
+
+```text
+Name         Production
+Host         foo.bar.com
+Harbor port  9494
+```
+
+DuckTable asks macOS's `/usr/bin/ssh` to forward an arbitrary local IPv4
+loopback port to `127.0.0.1:9494` as seen from `foo.bar.com`, then speaks Harbor
+through that local port. SSH runs unattended and honors `~/.ssh/config`, keys,
+certificates, ProxyJump, ssh-agent, and the macOS Keychain. Run `ssh
+foo.bar.com` once in Terminal if a host key or login still needs confirmation.
+
+The SSH process belongs to that database connection. It uses protocol
+keepalives, stays alive while queries still hold the connection, and is closed
+and reaped when the database is closed, removed, replaced by another database,
+or DuckTable exits. Removing the sidebar entry forgets only its connection
+details; it never changes the database server.
+
+The saved form is intentionally small:
+
+```toml
+[connection.production]
+url = "http://foo.bar.com:9494"
+```
+
+For a local listener, save `http://localhost:9494`; DuckTable normalizes that
+to IPv4 `127.0.0.1` when connecting. Use **File → Open Database File…** when
+starting from a DuckDB filename instead of a Harbor port.
+
 ## Why Harbor-only
 
 - One wire protocol, one type system, one EXPLAIN dialect.

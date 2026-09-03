@@ -103,7 +103,7 @@ pub fn catalog_lite(conn: &Conn) -> Result<Catalog, String> {
 
 fn fetch(conn: &Conn, route: &wire::endpoint::Route) -> Result<Catalog, String> {
     let r = request(
-        &conn.transport,
+        conn.transport()?,
         route,
         None,
         Some(Duration::from_secs(15)),

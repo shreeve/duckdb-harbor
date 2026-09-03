@@ -19,7 +19,7 @@ fn main() {
     // ephemeral server we summoned, we stop.
     if conn.summoned {
         harbor_client::http::request(
-            &conn.transport,
+            conn.transport().expect("transport"),
             &wire::endpoint::SHUTDOWN,
             None,
             Some(std::time::Duration::from_secs(5)),

@@ -3,6 +3,7 @@
 //! file (`app.rs` state, `sidebar.rs`, `content.rs`, `theme.rs`).
 
 mod app;
+mod add_database;
 mod chrome;
 mod content;
 mod copy_button;
@@ -27,7 +28,7 @@ actions!(
     [
         ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset, FitColumns, TablePrev,
         TableNext, View1, View2, View3, ToggleFullScreen, ToggleRowNumbers, ToggleRightAlign,
-        ToggleNullTags, OpenDatabase
+        ToggleNullTags, OpenDatabase, AddDatabase
     ]
 );
 
@@ -80,6 +81,14 @@ pub struct DetachBerth {
 pub struct ToggleAutostart {
     pub path: String,
     pub on: bool,
+}
+
+/// Remove a saved port-based database. This forgets only its connection
+/// details; it never reaches the database server itself.
+#[derive(Clone, Default, PartialEq, Debug, Action)]
+#[action(namespace = ducktable, no_json)]
+pub struct RemoveRemoteDatabase {
+    pub name: String,
 }
 
 /// ⌥←/⌥→: the previous/next table in the sidebar (App::step_table).
@@ -159,7 +168,8 @@ fn app_menus() -> Vec<Menu> {
             items: vec![
                 // The platform picker, then the same door a drop uses.
                 // ⌘O advertises itself from the keymap binding.
-                MenuItem::action("Open Database…", OpenDatabase),
+                MenuItem::action("Open Database File…", OpenDatabase),
+                MenuItem::action("Add Database…", AddDatabase),
             ],
         },
         // macOS shows each item's key equivalent from the keymap, so this
@@ -410,6 +420,16 @@ fn main() {
             })
             .detach();
         });
+        cx.on_action(|_: &AddDatabase, cx| {
+            let view = cx.try_global::<AppView>().map(|v| v.0.clone());
+            cx.defer(move |cx| {
+                let Some(view) = view else { return };
+                if let Some(w) = cx.active_window() {
+                    w.update(cx, |_, window, cx| add_database::open(view, window, cx))
+                        .ok();
+                }
+            });
+        });
         // Right-click → Stop. Reaches the view through AppView (the menu
         // fires at App level) and defers, the FitColumns pattern — a menu
         // action arrives inside the window's update, so the view is touched
@@ -452,6 +472,14 @@ fn main() {
             if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
                 cx.defer(move |cx| {
                     view.update(cx, |this, cx| this.toggle_autostart(path, on, cx));
+                });
+            }
+        });
+        cx.on_action(|a: &RemoveRemoteDatabase, cx| {
+            let name = a.name.clone();
+            if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
+                cx.defer(move |cx| {
+                    view.update(cx, |this, cx| this.remove_remote_database(name, cx));
                 });
             }
         });
