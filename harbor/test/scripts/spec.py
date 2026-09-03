@@ -2,7 +2,7 @@
 """
 spec.py — assert the encoding harbor produces, spelled out.
 
-    test/scripts/spec.py --port 9499 --token T
+    test/scripts/spec.py --port 9499
 
 This suite proves the answer on the wire is the right one, straight from
 SPEC. An implementation that misreads SPEC §5.4 agrees with itself
@@ -236,11 +236,11 @@ SCHEMA_EXTRAS = {
 }
 
 
-def request(host, port, token, sql):
+def request(host, port, sql):
     conn = http.client.HTTPConnection(host, port, timeout=60)
     try:
         conn.request("POST", "/sql", json.dumps({"sql": sql}),
-                     {"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+                     {"Content-Type": "application/json"})
         resp = conn.getresponse()
         payload = resp.read().decode("utf-8", "replace")
         # split("\n"), not splitlines(): the latter also breaks on U+2028.
@@ -253,14 +253,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9499)
-    ap.add_argument("--token", required=True)
     args = ap.parse_args()
 
     passed = 0
     failures = []
 
     for name, sql, want_type, want_lossless, want_value in CASES:
-        status, lines = request(args.host, args.port, args.token, sql)
+        status, lines = request(args.host, args.port, sql)
         schema = next((l for l in lines if l.get("type") == "schema"), None)
         rows = [l["values"] for l in lines if l.get("type") == "row"]
 

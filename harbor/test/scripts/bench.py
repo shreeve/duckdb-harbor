@@ -59,7 +59,6 @@ SHAPES = [
 ]
 
 BASE_PORT = 18800
-TOKEN = "bench"
 
 
 class Server:
@@ -72,7 +71,7 @@ class Server:
         self.db = os.path.join(workdir, f"bench-{port}.duckdb")
         self.log = open(os.path.join(workdir, f"bench-{port}.log"), "wb")
         self.proc = subprocess.Popen(
-            [binary, self.db, "start", "--port", str(port), "--token", TOKEN],
+            [binary, self.db, "start", "--port", str(port)],
             stdout=self.log, stderr=self.log,
         )
         self.conn = None
@@ -103,7 +102,7 @@ class Server:
         body = json.dumps({"sql": query})
         start = time.monotonic()
         try:
-            self.conn.request("POST", "/sql", body, {"Authorization": f"Bearer {TOKEN}"})
+            self.conn.request("POST", "/sql", body, {"Content-Type": "application/json"})
             resp = self.conn.getresponse()
             data = resp.read()
         except OSError:

@@ -87,12 +87,9 @@ customizations straight to DuckDB without knowing what they are. A
 `[connection.<name>.settings]` block is the same door in key-value form — each
 `key = value` becomes `SET key = value` (applied after `init`, so it can tune
 an extension just loaded), for any DuckDB option harbor has no typed field for.
-The credential (`token`)
-is never read from config — a secret stays the operator's word at spawn. TCP
-exposure (`port`, `bind`) is config-settable but honored only by an explicit
-start; a summon stays on the unix socket, so opening a database never silently
-puts it on the network. A config file others can write is refused whole before
-any of it is read.
+TCP exposure (`port`) is config-settable but honored only by an explicit
+start; it binds loopback, and a summon stays on the Unix socket. A config file
+others can write is refused whole before any of it is read.
 
 ## No registry — the listening socket is the registration
 
@@ -109,9 +106,8 @@ Discovery is therefore `readdir` + `GET /info` per socket — which is exactly
 what bare `harbor` prints: database path, pid, live client count, uptime,
 address. A socket that refuses the connection is a leftover from a `kill -9`
 and is unlinked on sight; any other failure proves nothing and removes
-nothing. There are no sidecar JSONs, no token files, no hold files, and no
-log directory to sweep, because none of them exist. `/info` itself is the
-identity document, with uptime and the client refcount spliced in live.
+nothing. The listening socket is the only runtime registration; `/info` is
+the identity document, with uptime and the client refcount spliced in live.
 
 ## The refcounted lifetime (bare) and the owned lifetime (start)
 
@@ -144,39 +140,30 @@ however a server comes to exist.
 not summon a database. An application that wants spawn-on-use runs
 `harbor <db> -c "SELECT 1"` once and connects within the startup grace.
 
-## No config file
+## Shared config; derived runtime identity
 
-There is nothing to configure, so there is no file, no schema, no trust gate
-on its permissions, no `token-cmd` shelling out, and no "the config could not
-be read" failure class. What the old config carried is now either derived
-(socket names), spelled at the command line (`start` flags — a systemd unit
-is the place a server's desired state gets written down), or deleted
-(names-as-services, holds, REPL defaults). A target is a path, a socket, or a
-url; a bare word is refused with the law spelled out — a name never contains
-a dot or a slash, so an argument carrying one can only be a path. That
-classifier is also the safety rule: a typo can never silently become a fresh
-empty database served under a name clients trust.
+`~/.config/harbor/config.toml` names local paths and remote URLs, sets the
+default output mode, and gives each local berth standing resource limits,
+boot SQL, DuckDB settings, and an optional loopback port. Harbor and DuckTable
+read the same schema. Harbor refuses a file or containing directory writable
+by another user before applying any setting, because boot SQL can load code.
 
-(One nuance for completeness: `harbor-common` still ships a config/fleet
-*reader* behind an off-by-default cargo feature, consumed only by DuckTable's
-sidebar. Harbor itself never reads or writes any config file.)
+Runtime identity remains derived rather than registered: a database path maps
+to its socket name, and live discovery reads those sockets. `attach` and
+`detach` edit desired membership in config; they do not create a second live
+registry.
 
-## The token law
+## The local access boundary
 
-The unix socket needs no token, and refuses one: the `0700` runtime dir is
-the access control, and a second lock on a door only you can reach teaches
-people it does something. TCP leaves the filesystem's protection, so `--port`
-makes `--token` mandatory — there is no unauthenticated TCP face and no
-minted-token machinery, because the operator who opens the one door that
-needs a credential supplies it in the same breath. `/ready` is the one
-unauthenticated route (a load balancer should not need a credential to learn
-up-or-down); on a token'd server everything else, `/info` included, requires
-the bearer.
+Unix sockets live in a `0700` runtime directory. TCP binds loopback only —
+`127.0.0.1` and, where available, `::1` — and is added with `--port` or the
+matching config entry. Remote clients arrive through SSH or an edge proxy;
+Harbor itself does not expose a non-loopback listener.
 
 ## Caddy is the optional edge; UDS is the default face
 
-Local security = filesystem perms. Remote = Caddy terminates TLS/HTTP3 and
-edge auth, proxies to the socket. The client deliberately speaks UDS and
+Local security = filesystem perms. Remote = Caddy terminates TLS/HTTP3,
+enforces edge policy, and proxies to the socket. The client deliberately speaks UDS and
 plain `http://` only. A human reaches a remote server through SSH; browser
 and application clients go through Caddy.
 

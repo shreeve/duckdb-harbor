@@ -274,8 +274,8 @@ and marked.
 
 Every surface defines empty, loading, and failed:
 
-- Harbor unreachable or auth failed: full-window state with the reason,
-  a retry, and where the token lives. Never a blank pane.
+- Harbor unreachable: full-window state with the reason and a retry. Never a
+  blank pane.
 - No berths: points at how to open one — drag a `.duckdb` file in, ⌘O,
   or `harbor <db> start` at a shell.
 - Berth start failure: inline in the sidebar row, with stderr excerpt.

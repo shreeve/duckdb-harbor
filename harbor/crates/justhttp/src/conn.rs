@@ -1,7 +1,7 @@
 //! One client connection: read requests off the socket in sequence, hand
 //! each to the server's queue, and keep the reader honest — line-length
 //! ceilings, version checks, and the keep-alive/close decision all live
-//! here, below routing and below any authentication.
+//! here, before routing and application handling.
 
 use std::io::Error as IoError;
 use std::io::Result as IoResult;
@@ -19,11 +19,11 @@ use sequential::{SequentialReader, SequentialReaderBuilder, SequentialWriterBuil
 /// The largest request line or header line we will assemble.
 ///
 /// There was no ceiling here at all, and the buffer grows a byte at a time
-/// until CRLF — so an unauthenticated client could open one socket, send
+/// until CRLF — so a remote client could open one socket, send
 /// `GET / HTTP/1.1\r\nX-Junk: ` and then never stop, and watch the server's
 /// RSS climb at line speed (measured: 30 MB to 1.5 GB in under five seconds).
-/// The check has to live here, below routing and below any authentication,
-/// because the allocation happens before either of them can run.
+/// The check has to live here, before routing and application handling,
+/// because the allocation happens before either can run.
 const MAX_LINE: usize = 8 * 1024;
 
 /// The largest number of header lines in one request. Same reasoning as
@@ -47,10 +47,8 @@ const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// This clock used to not exist: serving one request took a connection off the
 /// first-request timeout permanently, on the reasoning that a REPL at its
 /// prompt or a pooled client between queries is doing nothing wrong. The gap
-/// is that the cheapest request on the server is also the unauthenticated one
-/// — harbor answers `/ready` without a token on purpose, so a load balancer
-/// need not hold a credential — so one anonymous `/ready` bought a connection
-/// the right to idle forever. Measured: 120 such connections held 120 threads
+/// is that the cheapest request on the server — a bare `/ready` — bought a
+/// connection the right to idle forever. Measured: 120 such connections held 120 threads
 /// and 240 descriptors indefinitely, still answering after 100 seconds idle,
 /// while 120 that said nothing at all were reclaimed on schedule.
 ///
@@ -74,10 +72,6 @@ fn is_read_timeout(e: &IoError) -> bool {
 pub struct ClientConnection {
     // address of the client
     remote_addr: IoResult<Option<SocketAddr>>,
-
-    // whether this connection came in over the unix-socket listener; every
-    // request it produces is stamped with it (see Request::is_local)
-    local: bool,
 
     // sequence of Readers to the stream, so that the data is not read in
     //  the wrong order
@@ -122,12 +116,9 @@ enum ReadError {
 
 impl ClientConnection {
     /// Creates a new `ClientConnection` that takes ownership of the stream.
-    /// `local` records which listener accepted it: true for the unix socket,
-    /// false for TCP.
     pub fn new(
         write_socket: RefinedTcpStream,
         mut read_socket: RefinedTcpStream,
-        local: bool,
     ) -> ClientConnection {
         let remote_addr = read_socket.peer_addr();
         // Taken while the stream is still here, exactly as the interrupt
@@ -144,7 +135,6 @@ impl ClientConnection {
             // a full chunk + the terminator coalesce into a single write().
             sink: SequentialWriterBuilder::new(BufWriter::with_capacity(8192, write_socket)),
             remote_addr,
-            local,
             next_header_source: first_header,
             no_more_requests: false,
             served_a_request: false,
@@ -306,7 +296,6 @@ impl ClientConnection {
             version,
             headers,
             *self.remote_addr.as_ref().unwrap(),
-            self.local,
             data_source,
             writer,
             self.shutdown.clone(),
@@ -416,7 +405,7 @@ impl Iterator for ClientConnection {
                 // after the write returned. So the connection thread parked
                 // forever, holding its descriptors, in a wait no socket timeout
                 // covers because it is a channel and not a read. One
-                // unauthenticated `GET / HTTP/2.0` cost a thread and three
+                // `GET / HTTP/2.0` cost a thread and three
                 // descriptors permanently, and a client merely *attempting*
                 // HTTP/2 — curl --http2, an h2c upgrade probe — triggered it by
                 // accident.

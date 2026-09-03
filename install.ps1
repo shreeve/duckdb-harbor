@@ -14,8 +14,8 @@ the per-user convention on Windows, so nothing here needs Administrator.
 
 duckdb.dll sits beside the executables, which is where Windows looks first.
 
-Harbor keeps its state (sockets, tokens, logs, repl history) at
-%LOCALAPPDATA%\harbor. There is no config file.
+Harbor keeps its state (logs and repl history) at
+%LOCALAPPDATA%\harbor.
 #>
 [CmdletBinding()]
 param(
@@ -105,5 +105,5 @@ if (($userPath -split ';') -notcontains $bin) {
 Write-Host ""
 # Windows has no unix sockets, so starting is explicit here (spawn-on-use is a
 # unix-socket feature); the client half works the same everywhere.
-Write-Host "try: harbor mydata.duckdb start --port 9495 --token secret"
-Write-Host "     harbor http://127.0.0.1:9495 --token secret"
+Write-Host "try: harbor mydata.duckdb start --port 9495"
+Write-Host "     harbor http://127.0.0.1:9495"

@@ -32,7 +32,7 @@ import urllib.request
 
 # Every berth a test starts registers under $HARBOR_HOME. Run through the
 # suite, check.sh sets it; run directly — which the usage line above invites —
-# nothing did, so sockets, tokens and lock files landed in the operator's real
+# nothing did, so sockets and logs landed in the operator's real
 # runtime directory and each run left a dead name behind. `setdefault` keeps
 # the harness in charge when there is one.
 #
@@ -48,8 +48,6 @@ _isolate_fleet()
 
 
 HERE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-TOKEN = "cancel-suite-token"
-
 # Long enough to cancel by hand, short enough that a test which fails to cancel
 # finishes rather than hanging the suite. Measured at roughly five seconds on an
 # M-series laptop; the assertions below check elapsed time against a fraction of
@@ -105,9 +103,8 @@ def section(title):
 
 
 class Harbor:
-    def __init__(self, base, token=TOKEN):
+    def __init__(self, base):
         self.base = base
-        self.token = token
 
     def call(self, method, path, body=None, timeout=120):
         data = json.dumps(body).encode() if body is not None else None
@@ -116,7 +113,6 @@ class Harbor:
             data=data,
             method=method,
             headers={
-                "Authorization": f"Bearer {self.token}",
                 "Accept": "application/json",
                 "Content-Type": "application/json",
             },
@@ -205,7 +201,7 @@ def start_server(db, pool_size, workers, port, env_extra=None):
     proc = subprocess.Popen(
         [
             *os.environ.get("HARBOR_LAUNCHER", os.path.join(HERE, "target", "release", "harbor")).split(), db, "start",
-            "--port", str(port), "--token", TOKEN, "--workers", str(workers),
+            "--port", str(port), "--workers", str(workers),
         ],
         stdout=log, stderr=log, stdin=subprocess.DEVNULL, env=env,
     )

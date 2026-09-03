@@ -68,7 +68,7 @@ fn big_declared_body_dropped_unread() {
 /// The drain must also be bounded in TIME, not only in buffer size: a client
 /// that keeps dribbling bytes kept every read succeeding, so the loop followed
 /// the declared length forever — on the thread that handled the request, and
-/// after the response, so no credential was needed to start one. Six of them
+/// after the response, so six of them
 /// took every harbor worker and the berth stopped answering at all.
 ///
 /// And when it gives up it must END THE CONNECTION. The stream is left at an
@@ -135,7 +135,7 @@ fn dribbling_body_does_not_hold_the_drain_forever() {
 /// still held the first. A sequential writer blocks on its predecessor's
 /// release before its first byte, and that predecessor could only drop after
 /// the write returned — so the thread parked forever, holding its descriptors,
-/// in a channel wait no socket timeout covers. One unauthenticated
+/// in a channel wait no socket timeout covers. One
 /// `GET / HTTP/2.0` leaked a thread and three descriptors permanently, and a
 /// client merely attempting HTTP/2 tripped it by accident.
 #[test]

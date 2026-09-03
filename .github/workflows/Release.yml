@@ -118,13 +118,13 @@ jobs:
           root="$RUNNER_TEMP/harbor-$GITHUB_REF_NAME-${{ matrix.plat }}"
           export HARBOR_HOME="$RUNNER_TEMP/harbor-home"
           "$root/bin/harbor.exe" "$RUNNER_TEMP/smoke.duckdb" start \
-            --port 9495 --token smoke &
+            --port 9495 &
           srv=$!
           for _ in $(seq 1 50); do
             curl -sf http://127.0.0.1:9495/ready >/dev/null 2>&1 && break
             sleep 0.2
           done
-          "$root/bin/harbor.exe" http://127.0.0.1:9495 --token smoke \
+          "$root/bin/harbor.exe" http://127.0.0.1:9495 \
             -c "SELECT 42 AS ok" --mode csv | grep -q 42
           kill "$srv"
           echo "smoke: DLL loading, TCP serve, and wire round-trip all good"

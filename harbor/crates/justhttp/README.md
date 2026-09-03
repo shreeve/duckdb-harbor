@@ -42,7 +42,7 @@ security regression, not a flake.
 1. **Bounded body drain.** Discarding an unread request body streams
    through a fixed 64 KiB buffer — never an allocation sized by the
    client's declared `Content-Length`. (Upstream allocated the declared
-   size, an unauthenticated memory-exhaustion DoS: a request declaring
+   size, a memory-exhaustion DoS: a request declaring
    `Content-Length: 1000000000` while sending three bytes cost the
    process a gigabyte at drop time.)
 2. **Response write timeout.** Every accepted socket gets a 10 s write
@@ -52,8 +52,7 @@ security regression, not a flake.
    8 KiB and a request at 128 headers; over either is `431` and a close.
    The line buffer grew a byte at a time with no ceiling, so one socket
    sending `X-Junk: ` and never stopping took RSS from 30 MB to 1.5 GB in
-   under five seconds — before routing, and so before any credential was
-   asked for.
+   under five seconds — before routing or application handling.
 4. **Read timeout.** Every accepted socket gets a 5 s read timeout, and
    the whole request head gets 10 s from its first byte. Before the first
    byte the connection is only idle, so it waits on the connection clocks
@@ -78,9 +77,9 @@ security regression, not a flake.
    closed after 60 s. Once it has served one request it is a keep-alive
    client and gets 5 minutes between requests — far longer than any pooled
    client's own idle timeout, so a REPL at its prompt or a pool between
-   queries is untouched. Neither clock existed: an anonymous caller could
-   hold sockets, and a thread apiece, for as long as it liked, and one
-   unauthenticated `/ready` was enough to buy that right permanently
+   queries is untouched. Without those clocks, a caller could hold sockets,
+   and a thread apiece, for as long as it liked, and one `/ready` was enough
+   to buy that right permanently
    (measured: 120 connections holding 120 threads and 240 descriptors,
    still answering after 100 s idle).
 8. **Transient accept failures are retried.** `ECONNABORTED` (the peer

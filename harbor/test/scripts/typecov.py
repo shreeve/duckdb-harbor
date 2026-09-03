@@ -2,7 +2,7 @@
 """
 typecov.py — fail when a DuckDB type is not exercised by any suite.
 
-    test/scripts/typecov.py --port 9495 --token secret
+    test/scripts/typecov.py --port 9495
 
 Every other suite checks that the types it knows about are encoded correctly.
 None of them notices a type nobody thought to write a case for, and that is not
@@ -47,7 +47,7 @@ import corpus  # noqa: E402
 
 # Every berth a test starts registers under $HARBOR_HOME. Run through the
 # suite, check.sh sets it; run directly — which the usage line above invites —
-# nothing did, so sockets, tokens and lock files landed in the operator's real
+# nothing did, so sockets and logs landed in the operator's real
 # runtime directory and each run left a dead name behind. `setdefault` keeps
 # the harness in charge when there is one.
 #
@@ -151,8 +151,8 @@ def types_in(column, found):
 
 
 class Client:
-    def __init__(self, host, port, token):
-        self.host, self.port, self.token = host, port, token
+    def __init__(self, host, port):
+        self.host, self.port = host, port
         self.conn = None
 
     def sql(self, statement, params=None):
@@ -160,8 +160,7 @@ class Client:
         if params is not None:
             body["params"] = params
         payload = json.dumps(body)
-        headers = {"Authorization": "Bearer " + self.token,
-                   "Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json"}
         for attempt in (0, 1):
             try:
                 if self.conn is None:
@@ -183,7 +182,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, required=True)
-    ap.add_argument("--token", required=True)
     args = ap.parse_args()
 
     path, _ = spec_source()
@@ -193,7 +191,7 @@ def main():
     variants = spec_types(path)
     print("type coverage: checking %d variants from the v2 spec bindings" % len(variants))
 
-    client = Client(args.host, args.port, args.token)
+    client = Client(args.host, args.port)
     produced = set()
     refused = set()
 

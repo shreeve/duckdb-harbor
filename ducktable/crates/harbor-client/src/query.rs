@@ -41,13 +41,12 @@ pub fn exec(
     let resp = http::request(
         &conn.transport,
         &endpoint::SQL,
-        conn.token.as_deref(),
         Some(&body),
         Some(Duration::from_secs(120)),
     )
     .map_err(|e| format!("query: {e}"))?;
 
-    // Status first: a 401 or a proxy's HTML body must answer as itself, not
+    // Status first: a non-2xx or a proxy's HTML body must answer as itself, not
     // as "bad wire line" from trying to decode it as NDJSON.
     let status = resp.status;
     if !(200..300).contains(&status) {
@@ -87,7 +86,6 @@ pub fn session_new(conn: &Conn) -> Result<String, String> {
         http::request(
             &conn.transport,
             route,
-            conn.token.as_deref(),
             Some("{}"),
             Some(Duration::from_secs(10)),
         )
@@ -119,7 +117,6 @@ pub fn session_release(conn: &Conn, session_id: &str) {
     let _ = http::request(
         &conn.transport,
         &endpoint::session(session_id),
-        conn.token.as_deref(),
         None,
         Some(Duration::from_secs(10)),
     );

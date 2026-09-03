@@ -97,7 +97,7 @@ use stream::Connection;
 pub use http::{Header, Method, StatusCode};
 pub use request::Request;
 pub use response::Response;
-pub use stream::ListenAddr;
+pub use stream::{ListenAddr, Listener};
 
 mod conn;
 mod http;
@@ -237,34 +237,17 @@ impl Server {
         Self::start(stream::Listener::Unix(listener))
     }
 
-    #[cfg(unix)]
-    #[inline]
-    /// A server with two doors into one request queue: a UNIX socket and a
-    /// TCP address. Requests carry which door they came through
-    /// ([`Request::is_local`]), so a host can hold the TCP side to a
-    /// credential while the filesystem authenticates the socket side.
-    pub fn http_dual<A>(
-        addr: A,
-        path: &std::path::Path,
-    ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>>
-    where
-        A: ToSocketAddrs,
-    {
-        let tcp = std::net::TcpListener::bind(addr)?;
-        let unix = std::os::unix::net::UnixListener::bind(path)?;
-        // TCP first: server_addr() reports the primary, dialable address.
-        Self::start_multi(vec![stream::Listener::Tcp(tcp), stream::Listener::Unix(unix)])
-    }
-
     /// Spawns the accept thread over a bound listener.
     fn start(listener: stream::Listener) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
-        Self::start_multi(vec![listener])
+        Self::serve(vec![listener])
     }
 
-    /// One server over any number of bound listeners: one request queue, one
+    /// One server over any number of pre-bound doors: one request queue, one
     /// close trigger, one connection count — and one accept thread per
-    /// listener feeding them.
-    fn start_multi(
+    /// listener feeding them. The caller owns the binding policy (which
+    /// addresses, which sockets); this owns everything after the bind. The
+    /// first listener is the primary: `server_addr()` reports it.
+    pub fn serve(
         listeners: Vec<stream::Listener>,
     ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
         let close_trigger = Arc::new(AtomicBool::new(false));
@@ -276,17 +259,7 @@ impl Server {
             listening_addrs.push(listener.local_addr()?);
         }
         for listener in listeners {
-            #[cfg(unix)]
-            let local = matches!(listener, stream::Listener::Unix(_));
-            #[cfg(not(unix))]
-            let local = false;
-            spawn_accept(
-                listener,
-                local,
-                close_trigger.clone(),
-                messages.clone(),
-                connections.clone(),
-            );
+            spawn_accept(listener, close_trigger.clone(), messages.clone(), connections.clone());
         }
 
         Ok(Server { messages, close: close_trigger, listening_addrs, connections })
@@ -294,11 +267,9 @@ impl Server {
 }
 
 /// The accept loop for one listener: accepted connections are dispatched to
-/// the task pool, and every request they produce lands in the shared queue,
-/// stamped with `local` (which door it came through).
+/// the task pool, and every request they produce lands in the shared queue.
 fn spawn_accept(
     server: stream::Listener,
-    local: bool,
     inside_close_trigger: Arc<AtomicBool>,
     inside_messages: Arc<MessagesQueue<Message>>,
     inside_connections: Arc<AtomicUsize>,
@@ -357,7 +328,7 @@ fn spawn_accept(
                         let _ = sock.set_nodelay(true);
                         let (read_closable, write_closable) = RefinedTcpStream::new(sock);
 
-                        Ok(ClientConnection::new(write_closable, read_closable, local))
+                        Ok(ClientConnection::new(write_closable, read_closable))
                     }
                     Err(e) => Err(e),
                 };

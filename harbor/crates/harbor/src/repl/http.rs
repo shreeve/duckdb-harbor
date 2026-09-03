@@ -71,11 +71,10 @@ impl<T: Read + Write> Stream for T {}
 pub fn request(
     transport: &Transport,
     route: &Route,
-    token: Option<&str>,
     body: Option<&str>,
     timeout: Option<Duration>,
 ) -> io::Result<Response> {
-    request_inner(transport, route, token, body, timeout, None)
+    request_inner(transport, route, body, timeout, None)
 }
 
 /// Like `request`, but built for long-running /sql streams: the socket gets a
@@ -84,17 +83,15 @@ pub fn request(
 pub fn request_streaming(
     transport: &Transport,
     route: &Route,
-    token: Option<&str>,
     body: Option<&str>,
     on_tick: &dyn Fn(),
 ) -> io::Result<Response> {
-    request_inner(transport, route, token, body, Some(Duration::from_millis(250)), Some(on_tick))
+    request_inner(transport, route, body, Some(Duration::from_millis(250)), Some(on_tick))
 }
 
 fn request_inner(
     transport: &Transport,
     route: &Route,
-    token: Option<&str>,
     body: Option<&str>,
     timeout: Option<Duration>,
     on_tick: Option<&dyn Fn()>,
@@ -116,18 +113,6 @@ fn request_inner(
 
     let mut req = format!("{route} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
     req.push_str(&format!("Accept: {}\r\n", wire::CONTENT_NDJSON));
-    if let Some(t) = token {
-        // The token reaches here from argv, the environment, a token-file,
-        // or a token-cmd — one gate for all four. A control byte in a header
-        // is request splitting, so it is refused, never quoted around.
-        if t.bytes().any(|b| b.is_ascii_control()) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "token contains control characters (newline?) — refusing to send it",
-            ));
-        }
-        req.push_str(&format!("Authorization: Bearer {t}\r\n"));
-    }
     if let Some(b) = body {
         req.push_str(&format!(
             "Content-Type: application/json\r\nContent-Length: {}\r\n",

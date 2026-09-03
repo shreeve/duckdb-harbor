@@ -17,25 +17,20 @@
 //! default_null_order  = "NULLS LAST" # verbatim (string quoted, bool/int bare)
 //!
 //! [connection.prod]         # has `url` -> a remote, harbor never touches it
-//! url       = "https://db.example.com"
-//! token-cmd = "op read op://vault/prod/token"
+//! url = "http://127.0.0.1:9495"
 //! ```
 //!
 //! Harbor reads this file too: a berth's entry supplies its standing
 //! settings — memory, threads, boot SQL, extensions — so starting it honors
-//! them without flags. Know where the fence is, though: harbor reads the
-//! tuning fields and never the credential ones. `resolve_token` (the only
-//! `sh -c` path) lives with the fleet-reading consumer (ducktable); harbor
-//! never calls it and never reads `token`/`token-cmd`/`token-file`, so a
-//! server cannot be made to shell out for a secret. Guard the call site,
-//! not the schema. A config anyone else can write is refused whole before
-//! any of it is read, since a berth's `init` runs SQL and `LOAD` runs code.
+//! them without flags. A config anyone else can write is refused whole
+//! before any of it is read, since a berth's `init` runs SQL and `LOAD`
+//! runs code.
 //!
 //! Every berth key that harbor acts on is the matching `harbor start` flag
 //! with the dashes stripped, so there is no second dialect to learn.
-//! `--token` is the one flag with no key — the credential is the operator's
-//! word at spawn time, not standing config. (`port`/`bind` have keys, but
-//! only an explicit start honors them; a summon stays on the unix socket.)
+//! (`port` has a key, but only an explicit start honors it; a summon stays
+//! on the unix socket.) Every door is machine-local; remote policy belongs
+//! to the edge proxy in front.
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -81,9 +76,6 @@ pub struct Defaults {
 pub struct Connection {
     // --- a remote: client only ---------------------------------------------
     pub url: Option<String>,
-    pub token: Option<String>,
-    pub token_file: Option<String>,
-    pub token_cmd: Option<String>,
 
     // --- a local berth: harbor starts it, a client may summon it -----------
     pub path: Option<String>,
@@ -96,13 +88,10 @@ pub struct Connection {
     pub unsigned: Option<bool>,
     pub log: Option<bool>,
     pub init: Option<Vec<String>>,
-    /// TCP exposure, honored only by an explicit `harbor <db> start` — a
-    /// summon ignores both and stays on the unix socket, so opening a
-    /// database can never silently put it on the network. `--token` remains
-    /// mandatory with a port and has no config key: the credential is the
-    /// operator's word at spawn.
+    /// The TCP door (always loopback), honored only by an explicit
+    /// `harbor <db> start` — a summon ignores it and stays on the unix
+    /// socket, so opening a database never silently opens its TCP door.
     pub port: Option<u16>,
-    pub bind: Option<String>,
     /// Arbitrary DuckDB settings, each applied as `SET key = value` at start.
     /// The escape hatch for any option harbor has no typed field for — the
     /// keys are DuckDB's, not harbor's, so harbor passes them through without
@@ -213,7 +202,7 @@ impl FileConfig {
 
 #[derive(Debug)]
 pub enum Error {
-    /// No config file. Normal: zero-config local always works.
+    /// The optional config is absent. Normal: zero-config local always works.
     Missing(PathBuf),
     /// The file, or the directory holding it, is writable by someone else.
     Refused { file: PathBuf, offender: PathBuf },
@@ -271,10 +260,9 @@ pub fn load() -> Result<FileConfig, Error> {
         return Err(Error::Missing(file));
     };
     // Anyone who can rewrite this file is not editing settings, they are
-    // writing a program: `token-cmd` runs through `sh -c`, `init` runs SQL
-    // that can load native code, and `url` decides who receives the bearer
-    // token. Refuse it whole, the way ssh refuses a loose identity file,
-    // rather than trust it in part.
+    // writing a program: `init` runs SQL that can load native code, and
+    // `url` decides which server a client dials. Refuse it whole, the way
+    // ssh refuses a loose identity file, rather than trust it in part.
     for p in [&file, &root] {
         if crate::perms::exposed(p) {
             return Err(Error::Refused { file: file.clone(), offender: p.clone() });
@@ -302,8 +290,7 @@ mod tests {
         init = ["SET threads=4"]
 
         [connection.prod]
-        url = "https://db.example.com"
-        token-cmd = "op read op://vault/prod/token"
+        url = "http://127.0.0.1:9495"
     "#;
 
     #[test]

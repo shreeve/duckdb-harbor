@@ -3,8 +3,8 @@
 fuzz.py — throw a lot of random values at the encoder and check every one
 against an oracle that is not harbor.
 
-    test/scripts/fuzz.py --port 9499 --token T --cases 20000
-    test/scripts/fuzz.py --port 9499 --token T --seed 7    # reproduce a failure
+    test/scripts/fuzz.py --port 9499 --cases 20000
+    test/scripts/fuzz.py --port 9499 --seed 7    # reproduce a failure
 
 The hand-written suites cover the boundaries someone thought of. This covers
 the ones nobody did. It is aimed squarely at the conversions harbor
@@ -36,7 +36,7 @@ import tempfile
 
 # Every berth a test starts registers under $HARBOR_HOME. Run through the
 # suite, check.sh sets it; run directly — which the usage line above invites —
-# nothing did, so sockets, tokens and lock files landed in the operator's real
+# nothing did, so sockets and logs landed in the operator's real
 # runtime directory and each run left a dead name behind. `setdefault` keeps
 # the harness in charge when there is one.
 #
@@ -58,11 +58,11 @@ BATCH = 250
 JSON_SAFE = 9007199254740991
 
 
-def request(host, port, token, sql):
+def request(host, port, sql):
     conn = http.client.HTTPConnection(host, port, timeout=120)
     try:
         conn.request("POST", "/sql", json.dumps({"sql": sql}),
-                     {"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+                     {"Content-Type": "application/json"})
         resp = conn.getresponse()
         payload = resp.read().decode("utf-8", "replace")
         rows, err = [], None
@@ -104,7 +104,7 @@ def run_batch(args, literals, expected, failures, label):
         chunk = literals[start:start + BATCH]
         want = expected[start:start + BATCH]
         sql = "SELECT * FROM (VALUES " + ", ".join("(%s)" % lit for lit in chunk) + ") t(v)"
-        status, rows, err = request(args.host, args.port, args.token, sql)
+        status, rows, err = request(args.host, args.port, sql)
         if status != 200 or len(rows) != len(chunk):
             failures.append((label, "batch failed: status=%s rows=%d want=%d err=%s"
                              % (status, len(rows), len(chunk), (err or {}).get("message", "")[:400])))
@@ -264,9 +264,9 @@ def fuzz_statement_fence(args, rng, n, failures):
     for _ in range(n):
         body = "".join(rng.choice(FENCE_FRAGMENTS) for _ in range(rng.randint(1, 9)))
         probe = "SELECT 1 %s; DROP TABLE canary" % body
-        request(args.host, args.port, args.token, "CREATE TABLE IF NOT EXISTS canary(x INT)")
-        status, _, _ = request(args.host, args.port, args.token, probe)
-        _, rows, _ = request(args.host, args.port, args.token,
+        request(args.host, args.port, "CREATE TABLE IF NOT EXISTS canary(x INT)")
+        status, _, _ = request(args.host, args.port, probe)
+        _, rows, _ = request(args.host, args.port,
                              "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'canary'")
         alive = bool(rows) and rows[0][0] == 1
         if status == 200 and not alive:
@@ -280,7 +280,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9499)
-    ap.add_argument("--token", required=True)
     ap.add_argument("--cases", type=int, default=14000, help="total values, split across types")
     ap.add_argument("--fence-cases", type=int, default=400,
                     help="randomized single-statement fence probes (one request each)")

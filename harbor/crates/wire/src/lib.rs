@@ -72,9 +72,9 @@ pub mod endpoint {
     /// use this on platforms without Unix signals; the response is sent
     /// before draining. (Servers also accept the legacy DELETE.)
     pub const SHUTDOWN: Route = Route::fixed("POST", "/shutdown");
-    /// GET — the only unauthenticated route, by design.
+    /// GET — readiness backed by a real database probe.
     pub const READY: Route = Route::fixed("GET", "/ready");
-    /// GET — berth identity (auth required: it names paths and pids).
+    /// GET — berth identity, including its path and process id.
     pub const INFO: Route = Route::fixed("GET", "/info");
 
     /// Every fixed route, so a client (or a test on harbor's side) can walk
@@ -111,7 +111,6 @@ pub mod endpoint {
 pub mod code {
     pub const BAD_REQUEST: &str = "bad_request";
     pub const SQL_ERROR: &str = "sql_error";
-    pub const UNAUTHORIZED: &str = "unauthorized";
     pub const NOT_FOUND: &str = "not_found";
     pub const BODY_TOO_LARGE: &str = "body_too_large";
     pub const RESPONSE_TOO_LARGE: &str = "response_too_large";
@@ -284,10 +283,9 @@ pub struct InfoResponse {
     /// upgrade the binary, say — reads this to bring it back in the same mode.
     pub ephemeral: bool,
     /// The TCP door, when one is open beside the unix socket (`--port`).
+    /// The door is always loopback, so the port alone spells it:
+    /// `http://127.0.0.1:{port}`.
     pub port: Option<u16>,
-    /// The TCP door's address (`--bind`), present exactly when `port` is —
-    /// together they spell the door: `http://{bind}:{port}`.
-    pub bind: Option<String>,
 }
 
 #[cfg(test)]
@@ -321,11 +319,11 @@ mod tests {
     #[test]
     fn error_shape_serves_both_faces() {
         // In-stream terminal event and HTTP error body are the same shape.
-        let e = r#"{"type":"error","code":"unauthorized","message":"missing or invalid bearer token"}"#;
+        let e = r#"{"type":"error","code":"not_found","message":"no such endpoint"}"#;
         match Event::parse(e).unwrap() {
             Event::Error { code, message } => {
-                assert_eq!(code, code::UNAUTHORIZED);
-                assert!(message.contains("bearer"));
+                assert_eq!(code, code::NOT_FOUND);
+                assert!(message.contains("endpoint"));
             }
             other => panic!("wrong event: {other:?}"),
         }

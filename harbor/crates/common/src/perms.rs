@@ -11,8 +11,8 @@ use std::path::Path;
 /// Both binaries need this, and harbor needs it more than it looks. A berth
 /// definition carries `init` SQL, and `init` can `LOAD` a native extension —
 /// so a config file anyone can rewrite is not a settings leak, it is code
-/// execution as its owner the next time a berth starts. Same argument
-/// `token-cmd` already settled, same answer: refuse the file whole.
+/// execution as its owner the next time a berth starts. Refuse the file
+/// whole, never in part.
 #[cfg(unix)]
 pub fn exposed(path: &Path) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -54,10 +54,10 @@ pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
 }
 
 /// Create a directory that is 0700 from the moment it exists. Same reasoning
-/// as `write_private`, for the directory the tokens live in: `create_dir_all`
-/// applies the umask, so the plain form is 0755 for the instant before a
-/// chmod — and in that window another local user can plant a `<name>.token`
-/// this process would then adopt as its own credential.
+/// as `write_private`, for the runtime dir whose mode IS the access control:
+/// `create_dir_all` applies the umask, so the plain form is 0755 for the
+/// instant before a chmod — and in that window another local user can reach
+/// sockets this directory exists to fence off.
 pub fn create_dir_private(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {

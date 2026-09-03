@@ -1,9 +1,9 @@
 //! The socket layer: TCP + unix-socket listeners, and the half-close
 //! stream that lets one connection be read and written from two threads.
 
-pub use listen::ListenAddr;
+pub use listen::{ListenAddr, Listener};
 pub use refined::ShutdownHandle;
-pub(crate) use listen::{Connection, Listener};
+pub(crate) use listen::Connection;
 pub(crate) use refined::RefinedTcpStream;
 
 mod listen {

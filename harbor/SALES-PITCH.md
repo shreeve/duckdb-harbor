@@ -79,8 +79,8 @@ were authenticated solely by an opaque `connection_id`
 
 To a reverse proxy, load balancer, API gateway or WAF, those five requests are
 indistinguishable, and four of them contain no credential at all. Authorization
-state lives in server memory. Caddy cannot gate this. Harbor's
-`Authorization: Bearer` header is checked by anything that speaks HTTP.
+state lives in server memory. Caddy cannot gate this. Harbor uses independent,
+ordinary HTTP requests, so an edge can apply its policy to every request.
 
 ### 2. Failures return HTTP 200
 
@@ -96,8 +96,6 @@ Access-Control-Allow-Origin: *
 carries a single `string` from `error.RawMessage()` — no code, no class, no
 retryable flag — and the POST handler never sets a status
 ([`src/quack_http_server.cpp:225`](https://github.com/duckdb/duckdb-quack/blob/main/src/quack_http_server.cpp)).
-
-Harbor, same query, same minute: `HTTP/1.1 401 Unauthorized`.
 
 This is not a tidiness complaint. Nothing above the codec can tell success from
 failure: not a proxy, not a metrics sidecar, not `fail2ban`. **A brute-force
@@ -170,7 +168,7 @@ chunk. The wall-time gap in the table was the old encoder, not the protocol.
 | Primary client | Any HTTP-capable program | Another DuckDB |
 | Payload | JSON / NDJSON | `application/vnd.duckdb` binary |
 | Client dependency | HTTP + JSON parser | DuckDB, or a Quack implementation |
-| Auth visible to proxy | Yes — `Authorization: Bearer` | No — in-body, first request only |
+| Edge policy per request | Yes — ordinary independent HTTP requests | No — in-body, first request only |
 | Failure visible to proxy | Yes — real status codes | No — HTTP 200 |
 | Browser use | Natural with `fetch()` | Wasm or a hand-written JS codec |
 | Shell use | `curl` works | DuckDB client required |
@@ -296,8 +294,8 @@ It vastly increases the number of people who will understand why it exists.
 between client and server, logging raw bytes in both directions; the DuckDB
 client connected through it with `ATTACH 'quack:127.0.0.1:9493'`. All headers,
 status codes, request counts and token positions quoted above are from those
-captures. Harbor was run as `harbor bench.duckdb start --port 9495 --token …`
-and driven with `curl`.
+captures. Harbor was run as `harbor bench.duckdb start --port 9495` and driven
+with `curl`.
 
 **Wire bytes** were counted by the proxy for Quack (server→client, 34,935,381)
 and as the response body size for Harbor (57,037,316). Compressed sizes are

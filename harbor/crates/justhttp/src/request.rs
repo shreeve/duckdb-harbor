@@ -79,13 +79,6 @@ pub struct Request {
 
     remote_addr: Option<SocketAddr>,
 
-    // Whether this request arrived over the unix-socket listener. Stamped by
-    // the accept loop from which listener produced the connection — never
-    // derived from request or peer data — so a host can hang access decisions
-    // on it (a unix socket in a 0700 dir is filesystem-authenticated; TCP is
-    // not).
-    local: bool,
-
     method: Method,
 
     path: String,
@@ -132,7 +125,6 @@ pub fn new_request<R, W>(
     version: HttpVersion,
     headers: Vec<Header>,
     remote_addr: Option<SocketAddr>,
-    local: bool,
     mut source_data: R,
     writer: W,
     shutdown: Option<ShutdownHandle>,
@@ -188,8 +180,8 @@ where
             // read happens during request construction, before any handler or
             // route exists to time it out, so a client dribbling into a
             // declared 1024 bytes held this connection's thread for as long as
-            // it cared to — measured at ~51 minutes a connection, 60 of them at
-            // once, with no credential.
+            // it cared to — measured at ~51 minutes a connection, 60 of them
+            // at once, before any application handler ran.
             let deadline = Instant::now() + BODY_TIMEOUT;
 
             while offset != content_length {
@@ -232,7 +224,6 @@ where
         data_reader: Some(reader),
         response_writer: Some(Box::new(writer) as Box<dyn Write + Send + 'static>),
         remote_addr,
-        local,
         method,
         path,
         http_version: version,
@@ -296,14 +287,6 @@ impl Request {
     #[inline]
     pub fn remote_addr(&self) -> Option<&SocketAddr> {
         self.remote_addr.as_ref()
-    }
-
-    /// True when this request arrived over the unix-socket listener, whose
-    /// 0700 directory is itself the access control. Stamped from the
-    /// listener at accept, never from anything the peer sent.
-    #[inline]
-    pub fn is_local(&self) -> bool {
-        self.local
     }
 
     /// Allows to read the body of the request.
@@ -512,7 +495,7 @@ mod equal_reader {
     /// dribbling one byte every few seconds kept every read succeeding and the
     /// drain running forever. That drain runs on the thread that handled the
     /// request (the `Request` is dropped when the handler returns), and it runs
-    /// *after* the response, so no credential is needed to start one: six of
+    /// *after* the response, so six of
     /// them took every harbor worker and the berth answered nothing at all,
     /// `/ready` included. Measured: 8 connections at one byte per 3s, and
     /// /ready went from 0.01s to a hard timeout until the drip stopped.
@@ -582,7 +565,7 @@ mod equal_reader {
             // of `vec![0; remaining_to_read]`. The
             // remaining size is the client's *declared* Content-Length minus what
             // was read — attacker-chosen and unbounded — so the upstream code let
-            // an unauthenticated request declaring 1 GB and sending 9 bytes cost
+            // a request declaring 1 GB and sending 9 bytes cost
             // this process a 1 GB zeroed allocation per connection at drop time,
             // no matter what the server responded. Measured live before the
             // patch: 6 such requests drove RSS from 22 MB to 2.2 GB.

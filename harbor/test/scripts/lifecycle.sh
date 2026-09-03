@@ -127,11 +127,7 @@ else
   bad "SIGTERM left residue (socket or wal)"
 fi
 
-echo "— the doors are guarded"
-check "--port without --token is refused" 1 "mandatory" \
-  "$harbor" "$work/x.duckdb" start --port 9499
-check "--token on a unix socket is refused" 1 "no meaning" \
-  "$harbor" "$work/x.duckdb" start --token abc
+echo "— the grammar is database-first"
 check "verb-first is redirected, not parsed" 1 "database comes first" \
   "$harbor" start "$work/x.duckdb"
 
@@ -184,15 +180,13 @@ check "a [settings] key becomes a SET (default is true)" 0 "false" \
 kill -TERM "$csrv" 2>/dev/null
 wait "$csrv" 2>/dev/null
 
-# Exposure from config: an explicit start honors the entry's port (token is
-# still the operator's word — mandatory, flag-only), while a summon ignores
-# it and stays on the unix socket, so opening the file never lands on TCP.
+# Exposure from config: an explicit start honors the entry's port, while a
+# summon ignores it and stays on the unix socket, so opening the file never
+# lands on TCP.
 check "a summon ignores the config port (unix socket answers)" 0 "5" \
   "$harbor" "$work/tcp.duckdb" --mode csv -c "SELECT 5 AS five"
 wait_gone
-check "config port without a token is still refused" 1 "mandatory" \
-  "$harbor" "$work/tcp.duckdb" start
-"$harbor" "$work/tcp.duckdb" start --token cfgtok >"$work/tcp.log" 2>&1 &
+"$harbor" "$work/tcp.duckdb" start >"$work/tcp.log" 2>&1 &
 tsrv=$!
 tup=0
 for _ in $(seq 1 50); do
@@ -202,7 +196,7 @@ done
 (( tup )) && ok "an explicit start binds the config port" \
           || bad "config port never answered: $(cat "$work/tcp.log")"
 check "and serves on it" 0 "9" \
-  "$harbor" http://127.0.0.1:9531 --token cfgtok --mode csv -c "SELECT 9 AS nine"
+  "$harbor" http://127.0.0.1:9531 --mode csv -c "SELECT 9 AS nine"
 kill -TERM "$tsrv" 2>/dev/null
 wait "$tsrv" 2>/dev/null
 
