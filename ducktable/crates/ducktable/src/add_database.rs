@@ -42,8 +42,8 @@ pub(crate) fn open(view: WeakEntity<DuckTable>, window: &mut Window, cx: &mut Ap
                 )
                 .child(
                     field()
-                        .label("Harbor port")
-                        .description("The Harbor listener on that host")
+                        .label("Port")
+                        .description("The port that Harbor listens on that host")
                         .required(true)
                         .child(Input::new(&port)),
                 );

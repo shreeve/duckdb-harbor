@@ -57,13 +57,13 @@ On Intel, or to build from source: clone the repo and run
 ## Databases by port
 
 Choose **File → Open Database URL…** when Harbor is already listening on a TCP
-port. Give the database a sidebar name, host, and Harbor port. `localhost`
+port. Give the database a sidebar name, host, and port. `localhost`
 connects directly; any other host makes DuckTable create the SSH tunnel:
 
 ```text
-Name         Production
-Host         foo.bar.com
-Harbor port  9494
+Name  Production
+Host  foo.bar.com
+Port  9494
 ```
 
 DuckTable asks macOS's `/usr/bin/ssh` to forward an arbitrary local IPv4
@@ -87,7 +87,7 @@ url = "http://foo.bar.com:9494"
 
 For a local listener, save `http://localhost:9494`; DuckTable normalizes that
 to IPv4 `127.0.0.1` when connecting. Use **File → Open Database File…** when
-starting from a DuckDB filename instead of a Harbor port.
+starting from a DuckDB filename instead of a port.
 
 ## Why Harbor-only
 

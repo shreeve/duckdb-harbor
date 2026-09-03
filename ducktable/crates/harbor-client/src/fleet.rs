@@ -900,9 +900,9 @@ fn harbor_port(port: &str) -> Result<u16, String> {
     let port = port.trim();
     let parsed = port
         .parse::<u16>()
-        .map_err(|_| "Harbor port must be between 1 and 65535".to_string())?;
+        .map_err(|_| "Port must be between 1 and 65535".to_string())?;
     if parsed == 0 {
-        return Err("Harbor port must be between 1 and 65535".into());
+        return Err("Port must be between 1 and 65535".into());
     }
     Ok(parsed)
 }
