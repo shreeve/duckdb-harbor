@@ -31,7 +31,7 @@ runs:
       shell: bash
       # The commit the local batteries validate against. Bump deliberately,
       # with a full battery — the engine pin is the dylib.
-      run: echo "sha=1582849bf9e35de3fa3c330935ede5ce598e28a3" >> "$GITHUB_OUTPUT"
+      run: echo "sha=ee95013f175bea7aa813f56c86fea983db6bc8e5" >> "$GITHUB_OUTPUT"
 
     - name: Cached engine
       id: engine
@@ -63,7 +63,7 @@ runs:
         # versions, so a missing extension is an unfixable runtime error.
         cmake -G Ninja -B build \
           -DCMAKE_BUILD_TYPE=Release \
-          -DOVERRIDE_GIT_DESCRIBE=v2.0.0-dev83323 \
+          -DOVERRIDE_GIT_DESCRIBE=v2.0.0-alpha39998 \
           -DCORE_EXTENSIONS='icu;json' \
           -DBUILD_SHELL=FALSE -DBUILD_UNITTESTS=FALSE >/dev/null
         cmake --build build --target duckdb -j "$(nproc)"
