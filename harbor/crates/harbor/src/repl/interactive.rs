@@ -246,7 +246,7 @@ pub fn run(
                         DotResult::Handled => continue,
                         DotResult::Open(target) => {
                             match crate::repl::resolve(&target, None) {
-                                Ok(c) => {
+                                Ok((c, name)) => {
                                     // Moor at the new server before letting
                                     // the old mooring go: the switch must
                                     // never be the moment both lifetimes hit
@@ -255,7 +255,7 @@ pub fn run(
                                     conn = c;
                                     completer.reconnect(conn.clone());
                                     // The prompt changing name announces the switch.
-                                    prompt = BerthPrompt { name: crate::repl::prompt_name(&target) };
+                                    prompt = BerthPrompt { name };
                                 }
                                 Err(e) => eprintln!("harbor: {e}"),
                             }

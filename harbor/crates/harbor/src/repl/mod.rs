@@ -97,7 +97,7 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
     let Some(target) = target else {
         return fail("which database? (harbor <db.duckdb> — or bare harbor to see what's running)");
     };
-    let conn = match resolve(&target, token) {
+    let (conn, name) = match resolve(&target, token) {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
@@ -127,7 +127,7 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
                 // "auto" appearance queries the terminal (OSC 11), which needs
                 // an interactive stdin/stdout and must run before reedline does.
                 theme::init(None, None);
-                return interactive::run(&conn, &prompt_name(&target), opts, anchor);
+                return interactive::run(&conn, &name, opts, anchor);
             }
             let mut s = String::new();
             if std::io::stdin().read_to_string(&mut s).is_err() || s.trim().is_empty() {
@@ -254,19 +254,27 @@ pub fn deref_db(target: &str) -> Result<PathBuf, String> {
 
 /// A target is spelled out, running, or refused: a plain-HTTP url, a socket,
 /// a database file (a path carries a slash or a dot), or — for what's already
-/// serving — a bare name or the list's footnote number.
-fn resolve(target: &str, flag_token: Option<String>) -> Result<Conn, String> {
+/// serving — a bare name or the list's footnote number. Returns the
+/// connection and the name the prompt wears: what the server calls itself
+/// when the fleet resolved the target (so `harbor 1` prompts `ducks>`, not
+/// `1>`), the target's own stem otherwise.
+fn resolve(target: &str, flag_token: Option<String>) -> Result<(Conn, String), String> {
     let token = flag_token.or_else(|| std::env::var("HARBOR_TOKEN").ok());
 
     if target.starts_with("http://") || target.starts_with("https://") {
-        return Ok(Conn { transport: url_transport(target)?, token });
+        return Ok((Conn { transport: url_transport(target)?, token }, prompt_name(target)));
     }
     if !harbor_common::looks_like_path(target) {
         // A bare word reaches only what is already running — never a file.
         let row = fleet_find(target)?;
         #[cfg(unix)]
         {
-            return Ok(Conn { transport: Transport::Unix(row.sock), token });
+            let name = row
+                .info
+                .as_ref()
+                .and_then(|v| v["name"].as_str())
+                .map_or_else(|| target.to_string(), str::to_string);
+            return Ok((Conn { transport: Transport::Unix(row.sock), token }, name));
         }
         #[cfg(windows)]
         {
@@ -285,11 +293,11 @@ fn resolve(target: &str, flag_token: Option<String>) -> Result<Conn, String> {
     // quietly becoming a fresh database.
     if is_socket(&p) || target.ends_with(".sock") {
         #[cfg(unix)]
-        return Ok(Conn { transport: Transport::Unix(p), token });
+        return Ok((Conn { transport: Transport::Unix(p), token }, prompt_name(target)));
         #[cfg(windows)]
         return Err("Unix socket targets are not supported on Windows; use http://host:port".into());
     }
-    Ok(Conn { transport: ensure_server(&p)?, token })
+    Ok((Conn { transport: ensure_server(&p)?, token }, prompt_name(target)))
 }
 
 /// Join the server that owns this file, or spawn one — this same binary,
@@ -449,7 +457,7 @@ fn url_transport(url: &str) -> Result<Transport, String> {
 
 /// The short name a prompt wears: a path or socket shows its stem, a url
 /// drops its scheme. The prompt orients; the full target is in the list.
-pub fn prompt_name(target: &str) -> String {
+fn prompt_name(target: &str) -> String {
     if let Some(rest) = target.split_once("://").map(|(_, r)| r) {
         return rest.trim_end_matches('/').to_string();
     }
