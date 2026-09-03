@@ -95,12 +95,9 @@ pub mod endpoint {
         Route::built("DELETE", format!("/sql/queries/{id}"))
     }
 
-    /// GET — the catalog's lite style (harbor 0.17+): what exists and how
-    /// big — tables with their schema and `estimatedRows`, the database's
-    /// sizes — without how it is built (no columns, keys, indexes, DDL, or
-    /// sequences). An older harbor ignores the parameter and answers the
-    /// full document, so a client degrades to correct-but-heavier, never
-    /// to an error.
+    /// GET — the catalog's lite style: what exists — tables with their
+    /// schemas and the database's sizes — without counts or how it is built
+    /// (no columns, keys, indexes, DDL, or sequences).
     pub fn catalog_lite() -> Route {
         Route::built("GET", "/catalog?style=lite".to_string())
     }

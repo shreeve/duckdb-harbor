@@ -50,7 +50,7 @@ Keyboard shortcuts are written as Cmd here; on Linux and Windows every
 Cmd reads as Ctrl.
 
 The File menu offers the two pieces of information a user can start with.
-**Open Database File…** chooses a DuckDB path. **Add Database…** asks for a
+**Open Database File…** chooses a DuckDB path. **Open Database URL…** asks for a
 sidebar name, host, and Harbor port. Host defaults to `localhost`, which
 DuckTable resolves explicitly to IPv4 `127.0.0.1` and connects to directly. Any
 other host tells DuckTable to create an SSH tunnel to that host and forward its
@@ -112,9 +112,9 @@ and stays INTERNAL: on-screen labels use user words (DATABASES, TABLES,
 **TABLES** shows the connected berth's tables from Harbor's catalog
 endpoint as a flat list (schema headings appear only when there is more
 than one schema), each row carrying its column count in parentheses and
-an SI-rounded row count right-justified (13k, 4.6M — estimated_size,
-which matches exact counts in practice). Sequences follow in their own
-SEQUENCES section. Views, macros, and ATTACHed sibling catalogs join
+an SI-rounded exact row count right-justified (13k, 4.6M). Sequences
+follow in their own SEQUENCES section. Views, macros, and ATTACHed sibling
+catalogs join
 the tree when the catalog endpoint carries them. Each section header
 has its own filter glyph — a filter field only appears once a section
 exceeds 10 items — and a refresh glyph. Refresh refetches then swaps in

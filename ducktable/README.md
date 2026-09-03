@@ -56,7 +56,7 @@ On Intel, or to build from source: clone the repo and run
 
 ## Databases by port
 
-Choose **File → Add Database…** when Harbor is already listening on a TCP
+Choose **File → Open Database URL…** when Harbor is already listening on a TCP
 port. Give the database a sidebar name, host, and Harbor port. `localhost`
 connects directly; any other host makes DuckTable create the SSH tunnel:
 

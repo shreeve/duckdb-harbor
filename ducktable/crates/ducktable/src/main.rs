@@ -28,7 +28,7 @@ actions!(
     [
         ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset, FitColumns, TablePrev,
         TableNext, View1, View2, View3, ToggleFullScreen, ToggleRowNumbers, ToggleRightAlign,
-        ToggleNullTags, OpenDatabase, AddDatabase
+        ToggleNullTags, OpenDatabase, OpenDatabaseUrl
     ]
 );
 
@@ -169,7 +169,7 @@ fn app_menus() -> Vec<Menu> {
                 // The platform picker, then the same door a drop uses.
                 // ⌘O advertises itself from the keymap binding.
                 MenuItem::action("Open Database File…", OpenDatabase),
-                MenuItem::action("Add Database…", AddDatabase),
+                MenuItem::action("Open Database URL…", OpenDatabaseUrl),
             ],
         },
         // macOS shows each item's key equivalent from the keymap, so this
@@ -420,7 +420,7 @@ fn main() {
             })
             .detach();
         });
-        cx.on_action(|_: &AddDatabase, cx| {
+        cx.on_action(|_: &OpenDatabaseUrl, cx| {
             let view = cx.try_global::<AppView>().map(|v| v.0.clone());
             cx.defer(move |cx| {
                 let Some(view) = view else { return };

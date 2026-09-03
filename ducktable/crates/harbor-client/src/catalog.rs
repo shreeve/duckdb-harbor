@@ -35,10 +35,9 @@ pub struct Catalog {
 pub struct Table {
     pub name: String,
     pub schema: String,
-    /// The engine's cardinality estimate (harbor 0.18+) — a sidebar
-    /// figure, not a COUNT(*).
+    /// Exact COUNT(*) from the full catalog; absent from the lite inventory.
     #[serde(default)]
-    pub estimated_rows: Option<u64>,
+    pub row_count: Option<u64>,
     /// The engine's own CREATE TABLE rendering (harbor 0.18+).
     #[serde(default)]
     pub ddl: Option<String>,
@@ -92,11 +91,9 @@ pub fn catalog(conn: &Conn) -> Result<Catalog, String> {
     fetch(conn, &wire::endpoint::CATALOG)
 }
 
-/// The catalog's lite style (harbor 0.18+): the versions, the sizes, and
-/// each table as name, schema, and `estimatedRows` — enough to draw a
-/// database list without paying for columns, DDL, or sequences. An older
-/// harbor ignores the parameter and answers the full document, so this
-/// degrades to correct-but-heavier, never to an error.
+/// The catalog's lite style: versions, sizes, and table names/schemas — enough
+/// to draw a database list without paying for counts, columns, DDL, or
+/// sequences.
 pub fn catalog_lite(conn: &Conn) -> Result<Catalog, String> {
     fetch(conn, &wire::endpoint::catalog_lite())
 }
@@ -134,11 +131,11 @@ mod tests {
             "databaseSizeBytes": 1310720,
             "walSizeBytes": 0,
             "tables": [
-                {"name": "events", "schema": "main", "estimatedRows": 42,
+                {"name": "events", "schema": "main", "rowCount": 42,
                  "columns": [{"name": "id", "type": "INTEGER", "notNull": true, "default": "nextval('id')", "primary": true}],
                  "primaryKey": ["id"], "uniqueConstraints": [], "indexes": [], "foreignKeys": [],
                  "ddl": "CREATE TABLE events(id INTEGER PRIMARY KEY DEFAULT(nextval('id')));"},
-                {"name": "zeta", "schema": "audit", "columns": [], "primaryKey": []}
+                {"name": "zeta", "schema": "audit", "rowCount": 7, "columns": [], "primaryKey": []}
             ],
             "sequences": [{"name": "id", "start": 1}],
             "viewsSomeday": []
@@ -147,13 +144,20 @@ mod tests {
         assert_eq!(c.schemas(), vec!["main", "audit"]);
         assert_eq!(c.tables_in("main")[0].columns[0].duck_type, "INTEGER");
         assert!(c.tables_in("main")[0].columns[0].primary);
-        assert_eq!(c.tables_in("main")[0].estimated_rows, Some(42));
+        assert_eq!(c.tables_in("main")[0].row_count, Some(42));
         assert!(c.tables_in("main")[0].ddl.as_deref().unwrap().starts_with("CREATE TABLE"));
-        // The audit table came from an older Harbor with no enrichment:
-        // every new field is an absence, never an error.
-        assert_eq!(c.tables_in("audit")[0].estimated_rows, None);
+        assert_eq!(c.tables_in("audit")[0].row_count, Some(7));
         assert_eq!(c.database_size_bytes, Some(1310720));
         assert_eq!(c.wal_size_bytes, Some(0));
         assert_eq!(c.sequences[0].name, "id");
+    }
+
+    #[test]
+    fn lite_catalog_omits_row_counts() {
+        let c: Catalog = serde_json::from_str(
+            r#"{"tables":[{"name":"events","schema":"main"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(c.tables[0].row_count, None);
     }
 }
