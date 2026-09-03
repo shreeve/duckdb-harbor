@@ -258,7 +258,7 @@ TABLE` rendering per table, and the database and WAL file sizes in exact bytes
 at the top:
 
 ```json
-{"harborVersion":"0.31.0","duckdbVersion":"v2.0.0-dev83323",
+{"harborVersion":"0.31.1","duckdbVersion":"v2.0.0-dev83323",
  "databaseSizeBytes":12582912,"walSizeBytes":0,
  "tables":[{"name":"orders","schema":"main","rowCount":300000,
             "columns":[…],"primaryKey":["id"],
@@ -326,7 +326,7 @@ with `sudo` in front of the whole command — the installer never escalates on
 its own. On Windows the binary lands in `%LOCALAPPDATA%\Programs\harbor\bin`,
 which the installer adds to your user `PATH`.
 
-Pin a version with `... | bash -s v0.31.0` (or `-Tag v0.31.0` on Windows). Each
+Pin a version with `... | bash -s v0.31.1` (or `-Tag v0.31.1` on Windows). Each
 [release](https://github.com/shreeve/duckdb-harbor/releases)
 ships one self-contained archive per
 platform (osx-arm64, linux-amd64, linux-arm64, windows-amd64, windows-arm64):
