@@ -98,9 +98,8 @@ DELETE /sql/sessions/<id>  give that one back
 DELETE /sql/queries/<id>   stop a statement the caller named when it sent it
 ```
 
-Three legacy spellings from 0.22 and earlier stay served until the next
-deliberate break: `POST /sql/sessions/new`, `GET /sessions`, and
-`DELETE /shutdown`.
+Three alias spellings stay served beside the canonical routes:
+`POST /sql/sessions/new`, `GET /sessions`, and `DELETE /shutdown`.
 
 `POST /sql` streams by default. Send `Accept: application/json` and the same
 result comes back as one document instead:
@@ -640,7 +639,8 @@ disposable and refetchable). Harbor binds DuckDB's v2 C API, so DuckDB 2.0
 is the engine floor; the same build has been verified against every
 v2-API engine it has met (currently built at CI's pinned commit and shelved
 on the `engine-<pin>` prerelease — the official artifacts are frozen
-pre-v2-API until GA). Treat that as tested
+pre-v2-API until GA, and the 2.0 alpha channel ships the CLI only, no
+library). Treat that as tested
 compatibility, not a
 promise that an arbitrary future DuckDB ABI will work. Your database files
 need no such care: a file created by a 1.5-era DuckDB opens as-is, because

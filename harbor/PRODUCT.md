@@ -201,7 +201,9 @@ The engine is DuckDB's own `main` line, unmodified: `libduckdb` plus the
 `duckdb` CLI. Nothing is forked and nothing is patched — but until 2.0 GA,
 one honest wrinkle: DuckDB's published artifact channel
 (`artifacts.duckdb.org/latest/…`) is frozen at a build that predates the v2
-C API landing upstream, so the library it delivers cannot serve harbor. A
+C API landing upstream, so the library it delivers cannot serve harbor —
+and the 2.0 alpha program's channel (`install.duckdb.org`) distributes the
+CLI only, no `libduckdb`, so it doesn't close the gap either. A
 serving engine is therefore *built* from upstream source at one pinned
 commit — CI does this (cached; `.github/actions/duckdb` holds the pin and
 the recipe), local development does the same, and `make fetch-duckdb` warns

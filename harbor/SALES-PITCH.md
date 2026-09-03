@@ -204,17 +204,31 @@ the compute one.
 JSON encoding for decimals, nested types and oversized integers. Quack gets it
 for free.
 
-**First-party momentum.** Quack graduates to stable in DuckDB 2.0. `CONNECT`
+**First-party momentum.** Quack ships as 1.0 with DuckDB 2.0 — the alpha
+program already carries it, citing higher throughput both directions. `CONNECT`
 and the remote optimizer will receive upstream investment that Harbor will not.
 This is the item to take most seriously — not because the protocol competes with
 Harbor, but because a first-party server with a lifecycle story eventually
 might.
 
-Two caveats in Quack's favor, stated plainly: DuckDB documents Quack as **beta**
-and expects breaking changes, and the shipped build negotiates **protocol
-version 1** while the source tree is already at `QUACK_VERSION = 3`. The
-HTTP-200-on-error behavior in particular could be fixed at any time. The
-in-body auth and the absent lifecycle are architectural and will not be.
+Two caveats in Quack's favor, stated plainly: at the first capture DuckDB
+documented Quack as **beta** and the shipped build negotiated **protocol
+version 1** while the source tree was already at `QUACK_VERSION = 3` — so any
+observed behavior, the HTTP-200-on-error in particular, could have been fixed
+at any time. The in-body auth and the absent lifecycle are architectural and
+will not be.
+
+That caveat has been put to the test. The 2.0 alpha program (announced
+2026-09-02) graduates quack from 0.x to **1.0**, and findings 1 and 2 were
+re-verified against it — same method, versions in the appendix. Both hold:
+the token still travels in the body of the first request only, every later
+request authenticating by an opaque `connection_id`, and a wrong token still
+answers `HTTP/1.1 200 OK` with `Authentication failed` inside the binary
+body. One path did gain a status code: a body the codec cannot decode at all
+now draws a 500 — so the 200s are not an HTTP-layer limitation, they are the
+protocol's own error path, which makes the architectural reading more likely,
+not less. Finding 3 is unchanged by construction: `quack_serve()` is still a
+call inside an already-running DuckDB.
 
 ## What Harbor is actually for
 
@@ -298,3 +312,22 @@ advantage, and is reported that way deliberately.
 
 **Reproducing it** requires only the versions above; no code in this repository
 was modified for these measurements.
+
+**Re-verification, 2026-09-03** — against the 2.0 alpha program's quack 1.0,
+one day after the alpha branched:
+
+| Component | Version |
+| --- | --- |
+| DuckDB CLI | `v2.1.0-alpha40144` (`780c7c743f`, alpha staging channel) |
+| `quack` extension | `f4328c5333`, installed from `core` |
+
+Same method: `CALL quack_serve('quack:localhost:9494', token => '…')`, a
+byte-logging TCP proxy on 9493, the DuckDB client attaching through it with
+wrong and right tokens. Observed: every response on the wire was
+`HTTP/1.1 200 OK` including the authentication failure (`Authentication
+failed` as a string inside the `application/vnd.duckdb` body); the token
+appeared in exactly one of the captured requests (the `CONNECTION_REQUEST`),
+the rest authenticating by `connection_id`; an undecodable body drew a 500,
+so the 200s are the protocol's chosen error path, not an HTTP-layer
+limitation. One operational note from the same run: `quack:localhost:9494`
+bound IPv6 `::1` only — a client dialing `127.0.0.1` is refused.
