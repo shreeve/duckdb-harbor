@@ -47,7 +47,11 @@ green=$(tput setaf 2 2>/dev/null || true); dim=$(tput dim 2>/dev/null || true)
 off=$(tput sgr0 2>/dev/null || true)
 
 declare -a failed=() skipped=() passed=()
-work=$(mktemp -d "${TMPDIR:-/tmp}/harbor-check.XXXXXX")
+# /tmp, never ${TMPDIR}: macOS's per-user TMPDIR is ~50 characters deep, and
+# $work/harbor-home/runtime/<db>-<hash>.sock must fit sockaddr_un (104 bytes
+# there) — the server rightly refuses a runtime dir that deep, and the whole
+# battery dies at "the server did not come up".
+work=$(mktemp -d /tmp/harbor-check.XXXXXX)
 # Every berth this suite starts registers under $HARBOR_HOME. Without this the
 # sockets, tokens and lock files land in the operator's real runtime directory,
 # and each run leaves a fistful of dead names behind — invisible before
