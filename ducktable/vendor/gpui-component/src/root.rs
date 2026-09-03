@@ -281,24 +281,32 @@ impl Root {
         cx: &mut App,
     ) -> Option<impl IntoElement + use<>> {
         let root = window.root::<Root>()??;
+        let root = root.read(cx);
+        Some(Self::notification_layer(
+            root.active_sheet.clone().map(|sheet| sheet.placement),
+            root.sheet_size,
+            root.notification.clone(),
+        ))
+    }
 
-        let active_sheet_placement = root.read(cx).active_sheet.clone().map(|d| d.placement);
-
+    fn notification_layer(
+        active_sheet_placement: Option<Placement>,
+        sheet_size: Option<DefiniteLength>,
+        notification: Entity<NotificationList>,
+    ) -> impl IntoElement + use<> {
         let (mt, mr) = match active_sheet_placement {
-            Some(Placement::Right) => (None, root.read(cx).sheet_size),
-            Some(Placement::Top) => (root.read(cx).sheet_size, None),
+            Some(Placement::Right) => (None, sheet_size),
+            Some(Placement::Top) => (sheet_size, None),
             _ => (None, None),
         };
 
-        Some(
-            div()
-                .absolute()
-                .top_0()
-                .right_0()
-                .when_some(mt, |this, offset| this.mt(offset))
-                .when_some(mr, |this, offset| this.mr(offset))
-                .child(root.read(cx).notification.clone()),
-        )
+        div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .when_some(mt, |this, offset| this.mt(offset))
+            .when_some(mr, |this, offset| this.mr(offset))
+            .child(notification)
     }
 
     /// Render the Sheet layer.
@@ -307,8 +315,17 @@ impl Root {
         cx: &mut App,
     ) -> Option<impl IntoElement + use<>> {
         let root = window.root::<Root>()??;
+        let active_sheet = root.read(cx).active_sheet.clone();
+        Self::sheet_layer(active_sheet, root, window, cx)
+    }
 
-        if let Some(active_sheet) = root.read(cx).active_sheet.clone() {
+    fn sheet_layer(
+        active_sheet: Option<ActiveSheet>,
+        root: Entity<Self>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<impl IntoElement + use<>> {
+        if let Some(active_sheet) = active_sheet {
             let mut sheet = Sheet::new(window, cx);
             sheet = (active_sheet.builder)(sheet, window, cx);
             sheet.focus_handle = active_sheet.focus_handle.clone();
@@ -337,9 +354,15 @@ impl Root {
         cx: &mut App,
     ) -> Option<impl IntoElement + use<>> {
         let root = window.root::<Root>()??;
-
         let active_dialogs = root.read(cx).active_dialogs.clone();
+        Self::dialog_layer(active_dialogs, window, cx)
+    }
 
+    fn dialog_layer(
+        active_dialogs: Vec<ActiveDialog>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<impl IntoElement + use<>> {
         if active_dialogs.is_empty() {
             return None;
         }
@@ -361,6 +384,7 @@ impl Root {
                 dialog.focus_handle = active_dialog.focus_handle.clone();
 
                 dialog.layer_ix = i;
+                dialog.layer_count = active_dialogs.len();
                 // Find the dialog which one needs to show overlay.
                 if dialog.has_overlay() {
                     show_overlay_ix = Some(i);
@@ -397,18 +421,37 @@ impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.set_rem_size(cx.theme().font_size);
 
-        window_border().child(
-            div()
-                .id("root")
-                .key_context(CONTEXT)
-                .on_action(cx.listener(Self::on_action_tab))
-                .on_action(cx.listener(Self::on_action_tab_prev))
-                .relative()
-                .size_full()
-                .font_family(cx.theme().font_family.clone())
-                .bg(cx.theme().background)
-                .text_color(cx.theme().foreground)
-                .child(self.view.clone()),
-        )
+        // DuckTable patch: gpui-component 0.5.1 stores these layers on Root,
+        // but its render path never paints them. Keep the content first and
+        // overlays afterward so dialogs, sheets, and notices are visible.
+        let root = window
+            .root::<Root>()
+            .flatten()
+            .expect("BUG: window first layer should be a gpui_component::Root.");
+        let sheet = Self::sheet_layer(self.active_sheet.clone(), root, window, cx);
+        let dialog = Self::dialog_layer(self.active_dialogs.clone(), window, cx);
+        let notification = Self::notification_layer(
+            self.active_sheet.clone().map(|sheet| sheet.placement),
+            self.sheet_size,
+            self.notification.clone(),
+        );
+
+        window_border()
+            .child(
+                div()
+                    .id("root")
+                    .key_context(CONTEXT)
+                    .on_action(cx.listener(Self::on_action_tab))
+                    .on_action(cx.listener(Self::on_action_tab_prev))
+                    .relative()
+                    .size_full()
+                    .font_family(cx.theme().font_family.clone())
+                    .bg(cx.theme().background)
+                    .text_color(cx.theme().foreground)
+                    .child(self.view.clone()),
+            )
+            .children(sheet)
+            .children(dialog)
+            .child(notification)
     }
 }

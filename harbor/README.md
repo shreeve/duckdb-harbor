@@ -87,8 +87,8 @@ POST /shutdown             drain, checkpoint, and stop
 GET  /info                 identity — database path, versions, pid, uptime,
                            and the live client count
 GET  /catalog              everything about the database in one stable JSON
-                           document — schema, sizes, row estimates, DDL
-                           (?style=lite for the cheap sketch)
+                           document — schema, sizes, exact row counts, DDL
+                           (?style=lite for the count-free inventory)
 
 POST /sql                  run one statement, stream the result as NDJSON
                            (Accept: application/json for one document instead)
@@ -253,26 +253,24 @@ you.
 
 `GET /catalog` answers what a client would otherwise ask in a dozen queries:
 every table with its columns, primary key, unique constraints, foreign keys,
-indexes and sequences — plus the engine's row estimate and its own
-`CREATE TABLE` rendering per table, and the database and WAL file sizes in
-exact bytes at the top:
+indexes and sequences — plus its exact row count and the engine's own `CREATE
+TABLE` rendering per table, and the database and WAL file sizes in exact bytes
+at the top:
 
 ```json
-{"harborVersion":"0.30.0","duckdbVersion":"v2.0.0-dev83323",
+{"harborVersion":"0.31.0","duckdbVersion":"v2.0.0-dev83323",
  "databaseSizeBytes":12582912,"walSizeBytes":0,
- "tables":[{"name":"orders","schema":"main","estimatedRows":300000,
+ "tables":[{"name":"orders","schema":"main","rowCount":300000,
             "columns":[…],"primaryKey":["id"],
             "ddl":"CREATE TABLE orders(id BIGINT PRIMARY KEY, …);"}, …],
  …}
 ```
 
 The document is stable — same database, same bytes — so clients can diff it.
-A client that only wants to paint a sidebar asks
-`GET /catalog?style=lite` and gets the versions, the sizes, and
-`{name, schema, estimatedRows}` per table: what exists and how big, without
-how it is built, at a fraction of the bytes. An unknown style value is a loud
-`400`; unknown parameters pass, which is what lets an older harbor answer a
-newer client's ask with the full document instead of a 404.
+A client that only wants an inventory asks `GET /catalog?style=lite` and gets
+the versions, the sizes, and `{name, schema}` per table: what exists, without
+counting it or describing how it is built, at a fraction of the work and bytes.
+An unknown style value is a loud `400`; unknown parameters pass.
 
 ## Get it running
 
@@ -328,7 +326,7 @@ with `sudo` in front of the whole command — the installer never escalates on
 its own. On Windows the binary lands in `%LOCALAPPDATA%\Programs\harbor\bin`,
 which the installer adds to your user `PATH`.
 
-Pin a version with `... | bash -s v0.30.0` (or `-Tag v0.30.0` on Windows). Each
+Pin a version with `... | bash -s v0.31.0` (or `-Tag v0.31.0` on Windows). Each
 [release](https://github.com/shreeve/duckdb-harbor/releases)
 ships one self-contained archive per
 platform (osx-arm64, linux-amd64, linux-arm64, windows-amd64, windows-arm64):

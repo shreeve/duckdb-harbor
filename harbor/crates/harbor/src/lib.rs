@@ -2490,12 +2490,11 @@ fn cell_bool(row: &[serde_json::Value], i: usize) -> bool {
     row.get(i).and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
-fn cell_u64(row: &[serde_json::Value], i: usize) -> u64 {
+fn cell_opt_u64(row: &[serde_json::Value], i: usize) -> Option<u64> {
     // The executor's integer policy quotes a value past JSON's exact range,
     // so a cell can arrive as either a number or its decimal string.
     row.get(i)
         .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
-        .unwrap_or(0)
 }
 
 fn cell_list(row: &[serde_json::Value], i: usize) -> Vec<String> {
@@ -2646,7 +2645,7 @@ struct CatalogFk {
 struct CatalogTable {
     schema: String,
     name: String,
-    estimated_rows: u64,
+    row_count: u64,
     ddl: Option<String>,
     columns: Vec<CatalogColumn>,
     primary_key: Vec<String>,
@@ -2694,7 +2693,8 @@ fn database_disk_sizes() -> (Option<u64>, Option<u64>) {
 }
 
 /// Which fidelity `/catalog` answers at. Lite is the inventory — what
-/// exists and how big; full adds how everything is built.
+/// exists; full adds how everything is built and its exact row counts.
+#[derive(Clone, Copy)]
 enum CatalogStyle {
     Full,
     Lite,
@@ -2720,6 +2720,35 @@ fn catalog_style(url: &str) -> Result<CatalogStyle, String> {
         }
     }
     Ok(CatalogStyle::Full)
+}
+
+/// Build the one exact-count statement for a catalog inventory. The ordinal
+/// travels through the result and is sorted explicitly: UNION ALL preserves
+/// duplicates, not branch order, and the caller must never attach a count to
+/// the wrong table. Identifiers come only from DuckDB's catalog and are still
+/// quoted as SQL identifiers, including embedded double quotes.
+fn catalog_count_sql(table_rows: &[Vec<serde_json::Value>]) -> Option<String> {
+    if table_rows.is_empty() {
+        return None;
+    }
+    let mut sql = String::from("SELECT table_ordinal, row_count FROM (");
+    for (i, row) in table_rows.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(" UNION ALL ");
+        }
+        let schema = catalog_identifier(&cell_str(row, 0));
+        let table = catalog_identifier(&cell_str(row, 1));
+        let _ = write!(
+            sql,
+            "SELECT {i}::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FROM {schema}.{table}"
+        );
+    }
+    sql.push_str(") AS exact_counts ORDER BY table_ordinal");
+    Some(sql)
+}
+
+fn catalog_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// `GET /catalog` — the complete schema shape a migration differ needs, as
@@ -2748,20 +2777,18 @@ fn catalog_style(url: &str) -> Result<CatalogStyle, String> {
 /// uniqueness at all. PRIMARY KEY is its own constraint type and its own
 /// field, and never appears here.
 ///
-/// The document also carries what a browsing client otherwise dials three
-/// more queries for: each table's `estimatedRows` (the engine's cardinality
-/// estimate — a sidebar figure, not a COUNT(*)), each table's `ddl` as the
-/// engine renders it, and `databaseSizeBytes`/`walSizeBytes` statted from
-/// the served file by the one process sitting next to it — exact bytes,
-/// never the engine's pretty-printed strings, and null for a berth serving
-/// no file.
+/// The document also carries what a browsing client otherwise dials more
+/// queries for: each table's exact `rowCount`, each table's `ddl` as the
+/// engine renders it, and `databaseSizeBytes`/`walSizeBytes` statted from the
+/// served file by the one process sitting next to it — exact bytes, never
+/// the engine's pretty-printed strings, and null for a berth serving no file.
 ///
 /// `?style=lite` answers the inventory alone: the versions, the sizes, and
-/// each table as name, schema, and `estimatedRows` — enough to draw a
-/// database list without paying for columns, constraints, indexes, DDL, or
-/// sequences, in queries here or in bytes on the wire. It is the same
-/// document family at lower fidelity, not a second contract: a field a
-/// style omits is absent, never differently shaped.
+/// each table's name and schema — enough to draw a database list without
+/// paying for counts, columns, constraints, indexes, DDL, or sequences, in
+/// queries here or in bytes on the wire. It is the same document family at
+/// lower fidelity, not a second contract: a field a style omits is absent,
+/// never differently shaped.
 ///
 /// Ordering is part of the contract: tables by (schema, name), columns in
 /// ordinal position, indexes and sequences by name, unique constraints by
@@ -2782,19 +2809,26 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
     };
-    let table_rows = match catalog_rows(
-        jobs,
-        "SELECT schema_name, table_name, estimated_size, sql FROM duckdb_tables() \
-         WHERE database_name = current_database() AND NOT internal AND NOT temporary \
-         ORDER BY schema_name, table_name",
-    ) {
+    let table_sql = match style {
+        CatalogStyle::Full => {
+            "SELECT schema_name, table_name, sql FROM duckdb_tables() \
+             WHERE database_name = current_database() AND NOT internal AND NOT temporary \
+             ORDER BY schema_name, table_name"
+        }
+        CatalogStyle::Lite => {
+            "SELECT schema_name, table_name FROM duckdb_tables() \
+             WHERE database_name = current_database() AND NOT internal AND NOT temporary \
+             ORDER BY schema_name, table_name"
+        }
+    };
+    let table_rows = match catalog_rows(jobs, table_sql) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
     };
     let duckdb_version = version_rows.first().map(|r| cell_str(r, 0)).unwrap_or_default();
 
     // The lite style stops here: everything it answers is already in hand,
-    // and the four shape queries below never run.
+    // and the count plus four shape queries below never run.
     if let CatalogStyle::Lite = style {
         let mut out = catalog_header(&duckdb_version);
         out.push_str(",\"tables\":[");
@@ -2806,14 +2840,51 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
             push_json_string(&mut out, &cell_str(row, 1));
             out.push_str(",\"schema\":");
             push_json_string(&mut out, &cell_str(row, 0));
-            out.push_str(",\"estimatedRows\":");
-            out.push_str(&cell_u64(row, 2).to_string());
             out.push('}');
         }
         out.push_str("]}");
         let _ = req.respond(json_response(200, &out));
         return (true, 200);
     }
+
+    // SQL cannot turn values returned by duckdb_tables() into relation
+    // identifiers. Build those identifiers here, where they can be quoted
+    // exactly, then let one UNION ALL statement count every table under one
+    // query snapshot. COUNT(*) projects no application columns; it reads the
+    // engine's visibility information and therefore excludes deleted rows
+    // that the physical storage cardinality still includes.
+    let count_rows = if let Some(sql) = catalog_count_sql(&table_rows) {
+        match catalog_rows(jobs, &sql) {
+            Ok(rows) => rows,
+            Err(failure) => return catalog_refuse(req, failure),
+        }
+    } else {
+        Vec::new()
+    };
+    let row_counts = if count_rows.len() == table_rows.len() {
+        count_rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                if cell_opt_u64(row, 0) != Some(i as u64) {
+                    return None;
+                }
+                cell_opt_u64(row, 1)
+            })
+            .collect::<Option<Vec<_>>>()
+    } else {
+        None
+    };
+    let Some(row_counts) = row_counts else {
+        return catalog_refuse(
+            req,
+            CatalogFailure::Refused(Refusal {
+                status: 500,
+                code: "internal",
+                message: "the catalog row-count query returned an invalid shape".to_string(),
+            }),
+        );
+    };
 
     let column_rows = match catalog_rows(
         jobs,
@@ -2866,15 +2937,15 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
     // map, so nothing about the output depends on hash order.
     let mut tables: Vec<CatalogTable> = Vec::new();
     let mut index_of: HashMap<(String, String), usize> = HashMap::new();
-    for row in &table_rows {
+    for (row, row_count) in table_rows.iter().zip(row_counts) {
         let schema = cell_str(row, 0);
         let name = cell_str(row, 1);
         index_of.insert((schema.clone(), name.clone()), tables.len());
         tables.push(CatalogTable {
             schema,
             name,
-            estimated_rows: cell_u64(row, 2),
-            ddl: cell_opt_str(row, 3),
+            row_count,
+            ddl: cell_opt_str(row, 2),
             columns: Vec::new(),
             primary_key: Vec::new(),
             unique_constraints: Vec::new(),
@@ -2956,8 +3027,8 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         push_json_string(&mut out, &table.name);
         out.push_str(",\"schema\":");
         push_json_string(&mut out, &table.schema);
-        out.push_str(",\"estimatedRows\":");
-        out.push_str(&table.estimated_rows.to_string());
+        out.push_str(",\"rowCount\":");
+        out.push_str(&table.row_count.to_string());
         out.push_str(",\"columns\":[");
         for (j, column) in table.columns.iter().enumerate() {
             if j > 0 {
@@ -4093,7 +4164,7 @@ mod tests {
     use super::fenced_setting;
     use super::route_exists;
     use super::index_columns;
-    use super::{IndexPart, index_parts};
+    use super::{IndexPart, catalog_count_sql, index_parts};
     use crate::encode::varint_to_decimal;
     use super::{Cancel, SlotRun};
     use std::time::{Duration, Instant};
@@ -4406,6 +4477,24 @@ mod tests {
             vec![r#""a, b""#, r#""c'd""#, "plain"]
         );
         assert_eq!(index_columns("[]"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn exact_catalog_counts_quote_every_relation() {
+        let rows = vec![
+            vec![serde_json::json!("main"), serde_json::json!("orders")],
+            vec![serde_json::json!("odd schema"), serde_json::json!("say \"hi\"")],
+        ];
+        assert_eq!(
+            catalog_count_sql(&rows).as_deref(),
+            Some(
+                "SELECT table_ordinal, row_count FROM (\
+SELECT 0::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FROM \"main\".\"orders\" \
+UNION ALL SELECT 1::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FROM \
+\"odd schema\".\"say \"\"hi\"\"\") AS exact_counts ORDER BY table_ordinal"
+            )
+        );
+        assert_eq!(catalog_count_sql(&[]), None);
     }
 
     /// `indexes[].columns` exists to be joined against `columns[].name`, so

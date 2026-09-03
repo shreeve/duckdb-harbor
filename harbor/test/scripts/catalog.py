@@ -146,7 +146,8 @@ CREATE TABLE posts (
   title VARCHAR
 );
 CREATE INDEX idx_posts_title ON posts(title);
-INSERT INTO posts VALUES (1, NULL, 'ada'), (2, NULL, 'bo'), (3, NULL, 'cy');
+INSERT INTO posts VALUES
+  (1, NULL, 'ada'), (2, NULL, 'bo'), (3, NULL, 'cy'), (4, NULL, 'deleted');
 CREATE TABLE awkward (
   "a b" INTEGER,
   "c'd" INTEGER,
@@ -169,7 +170,11 @@ CREATE TABLE app.post_tags (
   tag_id INTEGER REFERENCES app.tags(id),
   note VARCHAR
 );
+CREATE SCHEMA "odd schema";
+CREATE TABLE "odd schema"."say ""hi"" now" (i INTEGER);
+INSERT INTO "odd schema"."say ""hi"" now" VALUES (1), (2);
 CHECKPOINT;
+DELETE FROM posts WHERE id = 4;
 """
 
 
@@ -246,7 +251,7 @@ def run_fixture(base):
         table.pop("ddl", None)
 
     expected = [
-        {"name": "post_tags", "schema": "app", "estimatedRows": 0,
+        {"name": "post_tags", "schema": "app", "rowCount": 0,
          "columns": [
              {"name": "tag_id", "type": "INTEGER", "notNull": False, "default": None, "primary": False},
              {"name": "note", "type": "VARCHAR", "notNull": False, "default": None, "primary": False},
@@ -257,7 +262,7 @@ def run_fixture(base):
          "foreignKeys": [
              {"columns": ["tag_id"], "refTable": "tags", "refSchema": "app", "refColumns": ["id"]},
          ]},
-        {"name": "tags", "schema": "app", "estimatedRows": 0,
+        {"name": "tags", "schema": "app", "rowCount": 0,
          "columns": [
              {"name": "id", "type": "INTEGER", "notNull": True, "default": None, "primary": True},
              {"name": "label", "type": "VARCHAR", "notNull": False, "default": None, "primary": False},
@@ -268,7 +273,7 @@ def run_fixture(base):
          ],
          "indexes": [],
          "foreignKeys": []},
-        {"name": "memberships", "schema": "main", "estimatedRows": 0,
+        {"name": "memberships", "schema": "main", "rowCount": 0,
          "columns": [
              {"name": "org_id", "type": "INTEGER", "notNull": False, "default": None, "primary": False},
              {"name": "user_id", "type": "INTEGER", "notNull": False, "default": None, "primary": False},
@@ -281,7 +286,7 @@ def run_fixture(base):
          ],
          "indexes": [],
          "foreignKeys": []},
-        {"name": "posts", "schema": "main", "estimatedRows": 3,
+        {"name": "posts", "schema": "main", "rowCount": 3,
          "columns": [
              {"name": "id", "type": "INTEGER", "notNull": True, "default": None, "primary": True},
              {"name": "user_id", "type": "INTEGER", "notNull": False, "default": None, "primary": False},
@@ -295,7 +300,7 @@ def run_fixture(base):
          "foreignKeys": [
              {"columns": ["user_id"], "refTable": "users", "refSchema": "main", "refColumns": ["id"]},
          ]},
-        {"name": "users", "schema": "main", "estimatedRows": 0,
+        {"name": "users", "schema": "main", "rowCount": 0,
          "columns": [
              {"name": "id", "type": "INTEGER", "notNull": True, "primary": True},
              {"name": "email", "type": "VARCHAR", "notNull": True, "primary": False},
@@ -313,8 +318,14 @@ def run_fixture(base):
         eq(f"{want['schema']}.{want['name']} answers its whole shape", want, got)
     eq("tables are ordered by (schema, name)",
        [("app", "post_tags"), ("app", "tags"), ("main", "awkward"), ("main", "memberships"),
-        ("main", "posts"), ("main", "users")],
+        ("main", "posts"), ("main", "users"), ("odd schema", 'say "hi" now')],
        [(t["schema"], t["name"]) for t in doc["tables"]])
+    eq("every full table has one exact rowCount", [],
+       [t["name"] for t in doc["tables"] if not isinstance(t.get("rowCount"), int)])
+    eq("physical deletes do not inflate rowCount", 3,
+       next(t for t in doc["tables"] if t["name"] == "posts")["rowCount"])
+    eq("quoted relations are counted exactly", 2,
+       next(t for t in doc["tables"] if t["name"] == 'say "hi" now')["rowCount"])
     eq("the sequence is there, with its start", [{"name": "users_seq", "start": 1}], doc["sequences"])
 
     # The point of the endpoint: the foreign key arrived from structured
@@ -368,23 +379,23 @@ def run_fixture(base):
     eq("a plain index has no expressions", [], by_name["idx_awk_space"]["expressions"])
 
     # -----------------------------------------------------------------------
-    section("The lite style: what exists and how big, not how it is built")
+    section("The lite style: what exists, not how big or how it is built")
     # -----------------------------------------------------------------------
     # Same document family at lower fidelity: the versions, the sizes, and
-    # each table as name/schema/estimatedRows — nothing else, so a client
-    # drawing a database list pays neither the shape queries nor the DDL
-    # bytes. A field a style omits is absent, never differently shaped.
+    # each table as name/schema — nothing else, so a client drawing a
+    # database list pays neither the count/shape queries nor the DDL bytes. A
+    # field a style omits is absent, never differently shaped.
     st, lbody, _ = fetch(base, "/catalog?style=lite")
     eq("lite is a 200", 200, st)
     lite = json.loads(lbody)
     eq("its keys are the inventory alone",
        ["harborVersion", "duckdbVersion", "databaseSizeBytes", "walSizeBytes", "tables"],
        list(lite.keys()))
-    eq("a lite table is name, schema, estimatedRows — nothing else",
-       [], [t for t in lite["tables"] if sorted(t.keys()) != ["estimatedRows", "name", "schema"]])
+    eq("a lite table is name and schema — nothing else",
+       [], [t for t in lite["tables"] if sorted(t.keys()) != ["name", "schema"]])
     eq("the same tables in the same order as the full document",
-       [(t["schema"], t["name"], t["estimatedRows"]) for t in doc["tables"]],
-       [(t["schema"], t["name"], t["estimatedRows"]) for t in lite["tables"]])
+       [(t["schema"], t["name"]) for t in doc["tables"]],
+       [(t["schema"], t["name"]) for t in lite["tables"]])
     eq("and the same sizes", (doc["databaseSizeBytes"], doc["walSizeBytes"]),
        (lite["databaseSizeBytes"], lite["walSizeBytes"]))
     eq("lite too answers byte-identical documents", lbody, fetch(base, "/catalog?style=lite")[1])

@@ -1,4 +1,4 @@
-//! File → Add Database: save a Harbor host and port under a sidebar name.
+//! File → Open Database URL: save a Harbor host and port under a sidebar name.
 //! Localhost connects directly; any other host is reached through SSH.
 
 use crate::app::DuckTable;
@@ -49,9 +49,9 @@ pub(crate) fn open(view: WeakEntity<DuckTable>, window: &mut Window, cx: &mut Ap
                 );
 
             dialog
-                .title("Add Database")
+                .title("Open Database URL")
                 .confirm()
-                .button_props(DialogButtonProps::default().ok_text("Add Database"))
+                .button_props(DialogButtonProps::default().ok_text("Open Database"))
                 .child(form)
                 .when_some(error.borrow().clone(), |dialog, message| {
                     dialog.child(div().text_sm().text_color(cx.theme().danger).child(message))

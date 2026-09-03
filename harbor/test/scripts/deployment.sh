@@ -346,7 +346,7 @@ section "Data at rest"
 tables=$(scalar "SELECT count(*) AS n FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','pg_catalog')")
 if [[ "$tables" =~ ^[0-9]+$ ]] && (( tables > 0 )); then
   ok "the attached database has tables" "$tables"
-  (( verbose )) && post "SELECT table_name, estimated_size FROM duckdb_tables() ORDER BY 1" | jq -rs 'map(select(.type=="row"))|.[]|.values|"       \(.[0]) — \(.[1]) rows"'
+  (( verbose )) && post "SELECT schema_name, table_name FROM duckdb_tables() WHERE NOT internal ORDER BY 1, 2" | jq -rs 'map(select(.type=="row"))|.[]|.values|"       \(.[0]).\(.[1])"'
 else
   soft "the attached database has tables" "none found — is this the database you meant to serve?"
 fi

@@ -127,5 +127,5 @@ if [[ -f "$out.wal" ]]; then
   exit 1
 fi
 
-duckdb -no-init -readonly "$out" -c "SELECT table_name, estimated_size AS rows FROM duckdb_tables() ORDER BY 1"
+duckdb -no-init -readonly "$out" -c "SELECT schema_name, table_name FROM duckdb_tables() WHERE NOT internal ORDER BY 1, 2"
 echo "fixture: wrote $out ($(du -h "$out" | cut -f1))"

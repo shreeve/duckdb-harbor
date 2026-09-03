@@ -54,7 +54,7 @@ pub(crate) enum Phase {
         conn: Conn,
         info: wire::InfoResponse,
         /// The one snapshot everything schema-shaped renders from: tables,
-        /// columns, DDL, row estimates, and the file's size on disk all
+        /// columns, DDL, exact row counts, and the file's size on disk all
         /// arrive in this single document (harbor 0.18+).
         catalog: harbor_client::Catalog,
     },
@@ -615,7 +615,7 @@ impl DuckTable {
         );
     }
 
-    /// File → Add Database: persist the named Harbor port, then connect
+    /// File → Open Database URL: persist the named Harbor port, then connect
     /// through the same path a sidebar click uses. A failed dial still leaves
     /// the database saved so Retry has something durable to target.
     pub(crate) fn add_database(

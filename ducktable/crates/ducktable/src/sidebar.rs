@@ -465,10 +465,10 @@ impl DuckTable {
                     // "users (35)" — the column count hugs the name; a
                     // long name truncates but keeps its count visible.
                     .child(named_count(&table.name, Some(table.columns.len()), t))
-                    // Row count in compact SI form — rows are what a
+                    // Exact row count in compact SI form — rows are what a
                     // scan of a database cares about; column counts
                     // live in the footer status and Structure view.
-                    .when_some(table.estimated_rows, |d, n| {
+                    .when_some(table.row_count, |d, n| {
                         d.child(dim(t, crate::util::human(n as f64, "")))
                     })
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -600,7 +600,7 @@ fn named_count(name: &str, count: Option<usize>, t: Pal) -> Div {
         })
 }
 
-/// A row's right-side magnitude (size on disk, row estimate), muted.
+/// A row's right-side magnitude (size on disk, exact row count), muted.
 fn dim(t: Pal, text: String) -> Div {
     div().text_xs().text_color(t.muted).child(text)
 }

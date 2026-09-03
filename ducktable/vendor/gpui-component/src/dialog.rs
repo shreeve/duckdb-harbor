@@ -9,7 +9,7 @@ use gpui::{
 use rust_i18n::t;
 
 use crate::{
-    ActiveTheme as _, IconName, Root, Sizable as _, StyledExt, WindowExt as _,
+    ActiveTheme as _, IconName, Sizable as _, StyledExt, WindowExt as _,
     actions::{Cancel, Confirm},
     animation::cubic_bezier,
     button::{Button, ButtonVariant, ButtonVariants as _},
@@ -98,6 +98,9 @@ pub struct Dialog {
     /// This will be change when open the dialog, the focus handle is create when open the dialog.
     pub(crate) focus_handle: FocusHandle,
     pub(crate) layer_ix: usize,
+    // DuckTable patch: Root supplies this while constructing the rendered
+    // layer, avoiding a nested Root read during Root's own render update.
+    pub(crate) layer_count: usize,
     pub(crate) overlay_visible: bool,
 }
 
@@ -124,6 +127,7 @@ impl Dialog {
             overlay: true,
             keyboard: true,
             layer_ix: 0,
+            layer_count: 1,
             overlay_visible: false,
             on_close: Rc::new(|_, _, _| {}),
             on_ok: None,
@@ -401,7 +405,7 @@ impl RenderOnce for Dialog {
                     })
                     .when(self.overlay, |this| {
                         // Only the last dialog owns the `mouse down - close dialog` event.
-                        if (self.layer_ix + 1) != Root::read(window, cx).active_dialogs.len() {
+                        if (self.layer_ix + 1) != self.layer_count {
                             return this;
                         }
 

@@ -35,7 +35,7 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
   HTTP layer (blocking client, NDJSON streaming, chunked decoding) lives in
   DuckTable's own client crate.
 - **A database can be opened by file or added by port.** File → Open Database
-  File chooses a DuckDB path. File → Add Database saves a sidebar name and a
+  File chooses a DuckDB path. File → Open Database URL saves a sidebar name and a
   Harbor host and port. `localhost` means a direct IPv4-loopback connection;
   any other host means SSH. DuckTable runs `/usr/bin/ssh` directly, forwards an
   arbitrary local `127.0.0.1` port to that machine's Harbor loopback port, and
