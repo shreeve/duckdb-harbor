@@ -1,6 +1,7 @@
 //! The membership store: the `[connection.<name>]` sections of config.toml.
 //!
-//! `attach` and `detach` add or remove one connection, editing the file through
+//! Local attach/detach and DuckTable's remote-database flow add or remove one
+//! connection, editing the file through
 //! toml_edit's DOM so the comments and ordering the operator wrote survive
 //! untouched — we mutate one node, we don't reserialize the file. The full
 //! schema stays with the `config` reader; here we only ever touch a section's
@@ -74,6 +75,39 @@ pub fn detach(db: &Path) -> Result<(String, bool), String> {
     verify(&text, &name, false)?;
     write(&text)?;
     Ok((name, true))
+}
+
+/// Add a named database reached through an existing Harbor TCP listener.
+pub fn add_remote(name: &str, url: &str) -> Result<String, String> {
+    let name = paths::normalize(name)?;
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("database address is empty".into());
+    }
+    let mut doc = parse(&read()?)?;
+    if find(&doc, &name)?.is_some() {
+        return Err(format!("'{name}' already exists — choose another name"));
+    }
+    insert_remote(&mut doc, &name, url)?;
+    let text = doc.to_string();
+    verify(&text, &name, true)?;
+    write(&text)?;
+    Ok(name)
+}
+
+/// Remove a named connection without interpreting what kind it is. Front ends
+/// establish that policy before calling; this layer only preserves the TOML.
+pub fn remove_named(name: &str) -> Result<bool, String> {
+    let name = paths::normalize(name)?;
+    let mut doc = parse(&read()?)?;
+    let Some((key, _)) = find(&doc, &name)? else {
+        return Ok(false);
+    };
+    remove(&mut doc, &key)?;
+    let text = doc.to_string();
+    verify(&text, &name, false)?;
+    write(&text)?;
+    Ok(true)
 }
 
 /// The name a database files under: its stem, normalized to the registry
@@ -151,6 +185,22 @@ fn insert(doc: &mut DocumentMut, name: &str, stored: &str) -> Result<(), String>
         .ok_or("`connection` in config.toml is not a table")?;
     let mut entry = Table::new();
     entry["path"] = value(stored);
+    conn.insert(name, Item::Table(entry));
+    Ok(())
+}
+
+/// Add a remote section without disturbing the document around it.
+fn insert_remote(doc: &mut DocumentMut, name: &str, url: &str) -> Result<(), String> {
+    if doc.get("connection").is_none() {
+        let mut parent = Table::new();
+        parent.set_implicit(true);
+        doc.insert("connection", Item::Table(parent));
+    }
+    let conn = doc["connection"]
+        .as_table_mut()
+        .ok_or("`connection` in config.toml is not a table")?;
+    let mut entry = Table::new();
+    entry["url"] = value(url);
     conn.insert(name, Item::Table(entry));
     Ok(())
 }
@@ -310,5 +360,16 @@ url = \"https://x\"
     #[test]
     fn invalid_toml_is_rejected_not_edited() {
         assert!(parse("[connection.foo\npath =").is_err());
+    }
+
+    #[test]
+    fn remote_addition_is_named_and_transport_explicit() {
+        let mut doc = parse("# mine\n").unwrap();
+        insert_remote(&mut doc, "prod", "http://foo.bar.com:9494").unwrap();
+        let text = doc.to_string();
+        assert!(text.contains("# mine"));
+        assert!(text.contains("[connection.prod]"));
+        assert!(text.contains("url = \"http://foo.bar.com:9494\""));
+        verify(&text, "prod", true).unwrap();
     }
 }

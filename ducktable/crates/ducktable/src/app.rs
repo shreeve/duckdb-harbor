@@ -443,6 +443,10 @@ impl DuckTable {
                 .map(|row| {
                     let known = connected.clone();
                     cx.background_executor().spawn(async move {
+                        let connected_here = matches!(
+                            &known,
+                            Some((name, _)) if *name == row.name
+                        );
                         let tables = match &known {
                             Some((name, count)) if *name == row.name => Some(*count),
                             _ => row
@@ -458,7 +462,7 @@ impl DuckTable {
                                 .flatten(),
                         };
                         RowVm {
-                            state: row.state,
+                            state: if connected_here { State::Running } else { row.state },
                             attached: row.attached,
                             autostart: row.autostart,
                             path: row.path,
@@ -509,7 +513,7 @@ impl DuckTable {
                 // cleanly and point the way back, rather than leaving a dead
                 // connection to fail the next catalog or query with an OS error.
                 let connected = match &state.phase {
-                    Phase::Connected { info, .. } => Some(clone_str(&info.name)),
+                    Phase::Connected { conn, .. } => Some(clone_str(&conn.name)),
                     _ => None,
                 };
                 if let Some(name) = connected
@@ -609,6 +613,44 @@ impl DuckTable {
             },
             cx,
         );
+    }
+
+    /// File → Add Database: persist the named Harbor port, then connect
+    /// through the same path a sidebar click uses. A failed dial still leaves
+    /// the database saved so Retry has something durable to target.
+    pub(crate) fn add_database(
+        &mut self,
+        name: String,
+        host: String,
+        port: String,
+        cx: &mut Context<Self>,
+    ) {
+        let shown = harbor_client::paths::normalize(&name).unwrap_or(name);
+        self.dial(
+            clone_str(&shown),
+            move || {
+                let name = fleet::add_database(&shown, &host, &port)?;
+                let conn = fleet::connect(&name)?;
+                let info = fleet::info(&conn)?;
+                let catalog = harbor_client::catalog(&conn)?;
+                Ok((conn, info, catalog))
+            },
+            cx,
+        );
+    }
+
+    /// Forget a port-based database and close its tunnel if it is the one on
+    /// screen. No remote shutdown is sent: removing connection details must
+    /// never mutate the database they point at.
+    pub(crate) fn remove_remote_database(&mut self, name: String, cx: &mut Context<Self>) {
+        let connected_here = matches!(
+            &self.phase,
+            Phase::Connected { conn, .. } if conn.name == name
+        );
+        if connected_here {
+            self.drop_connection(cx);
+        }
+        self.fleet_then_refresh(move || fleet::remove_remote(&name), cx);
     }
 
     /// The shared spine of connect / open_path: show `shown` as the connecting

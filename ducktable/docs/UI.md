@@ -49,6 +49,16 @@ double-clicking a divider toggles; and Cmd+0 (sidebar) / Cmd+Alt+0
 Keyboard shortcuts are written as Cmd here; on Linux and Windows every
 Cmd reads as Ctrl.
 
+The File menu offers the two pieces of information a user can start with.
+**Open Database File…** chooses a DuckDB path. **Add Database…** asks for a
+sidebar name, host, and Harbor port. Host defaults to `localhost`, which
+DuckTable resolves explicitly to IPv4 `127.0.0.1` and connects to directly. Any
+other host tells DuckTable to create an SSH tunnel to that host and forward its
+Harbor loopback port. A tunneled row remains a normal DATABASES row and says
+“Connects over SSH to <host>” in its tooltip. Its context menu says **Remove
+Database**, which forgets the saved route and closes its tunnel without sending
+a shutdown request to the database server.
+
 ## Sizing
 
 Rigidity is part of feeling native: content pushes back instead of

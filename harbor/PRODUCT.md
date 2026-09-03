@@ -155,9 +155,9 @@ registry.
 
 ## The local access boundary
 
-Unix sockets live in a `0700` runtime directory. TCP binds loopback only —
-`127.0.0.1` and, where available, `::1` — and is added with `--port` or the
-matching config entry. Remote clients arrive through SSH or an edge proxy;
+Unix sockets live in a `0700` runtime directory. TCP binds IPv4 loopback only —
+`127.0.0.1` — and is added with `--port` or the matching config entry. Remote
+clients arrive through SSH or an edge proxy;
 Harbor itself does not expose a non-loopback listener.
 
 ## Caddy is the optional edge; UDS is the default face

@@ -15,7 +15,7 @@
 //! The socket IS the runtime registration: its name is derived from the
 //! database's canonical path (`socket_for`). Shared config supplies named
 //! connections and standing settings. The 0700 runtime directory protects
-//! Unix sockets; TCP, when `--port` adds it, binds loopback only. Remote reach
+//! Unix sockets; TCP, when `--port` adds it, binds IPv4 loopback only. Remote reach
 //! and policy belong to an edge proxy.
 
 use std::io::IsTerminal;
@@ -217,8 +217,8 @@ client options:
 
 start options:
   --port <p>           also listen on TCP, beside the unix socket — loopback
-                       only (127.0.0.1, plus ::1 when the host has IPv6);
-                       remote reach and access policy belong to an edge proxy
+                       only (127.0.0.1); remote reach and access policy
+                       belong to an edge proxy
   --workers <n>        executor pool size (default 6)
   --memory-limit <s>   DuckDB memory_limit (default 2GB)
   --threads <n>        DuckDB threads (default: DuckDB's own)

@@ -16,8 +16,11 @@
 //! enable_progress_bar = true         # keys are DuckDB's own, passed through
 //! default_null_order  = "NULLS LAST" # verbatim (string quoted, bool/int bare)
 //!
-//! [connection.prod]         # has `url` -> a remote, harbor never touches it
-//! url = "http://127.0.0.1:9495"
+//! [connection.local]        # localhost -> connect directly over IPv4
+//! url = "http://localhost:9495"
+//!
+//! [connection.warehouse]    # another host -> DuckTable owns the SSH tunnel
+//! url = "http://warehouse.example.com:9495"
 //! ```
 //!
 //! Harbor reads this file too: a berth's entry supplies its standing
@@ -289,8 +292,11 @@ mod tests {
         memory-limit = "8GB"
         init = ["SET threads=4"]
 
-        [connection.prod]
-        url = "http://127.0.0.1:9495"
+        [connection.local]
+        url = "http://localhost:9495"
+
+        [connection.tunneled]
+        url = "http://warehouse.example.com:9495"
     "#;
 
     #[test]
@@ -301,7 +307,7 @@ mod tests {
         let berths: Vec<_> = c.berths().iter().map(|(n, _)| *n).collect();
         assert_eq!(berths, ["medlabs", "warehouse"]);
         let remotes: Vec<_> = c.remotes().iter().map(|(n, _)| *n).collect();
-        assert_eq!(remotes, ["prod"]);
+        assert_eq!(remotes, ["local", "tunneled"]);
 
         let w = c.get("warehouse").unwrap();
         assert_eq!(w.memory_limit.as_deref(), Some("8GB"));

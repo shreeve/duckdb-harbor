@@ -61,7 +61,7 @@ and simpler than everything it replaces.
 If it can speak HTTP and parse JSON, it can query your database.
 
 ```console
-$ curl -s localhost:9495/sql -H 'Content-Type: application/json' \
+$ curl -s 127.0.0.1:9495/sql -H 'Content-Type: application/json' \
        -d '{"sql":"SELECT id, total FROM orders LIMIT 2"}'
 {"type":"schema","columns":[{"name":"id","duckdbType":"BIGINT","lossless":true},
                             {"name":"total","duckdbType":"DECIMAL(10,2)","lossless":true,
@@ -149,9 +149,9 @@ are the whole server.
 Name a statement when you send it, and you can stop it:
 
 ```console
-$ curl -s localhost:9495/sql -H 'Content-Type: application/json' \
+$ curl -s 127.0.0.1:9495/sql -H 'Content-Type: application/json' \
        -d '{"sql":"SELECT count(*) FROM huge","queryId":"report-7"}' &
-$ curl -s -X DELETE localhost:9495/sql/queries/report-7
+$ curl -s -X DELETE 127.0.0.1:9495/sql/queries/report-7
 {"cancelled":true}
 ```
 
@@ -207,13 +207,13 @@ per statement means no transaction can span two. A session bridges that: a
 connection pinned to you until you commit, roll back, or stop answering.
 
 ```console
-$ sid=$(curl -s -X POST localhost:9495/sql/sessions | jq -r .sessionId)
-$ post() { curl -s localhost:9495/sql -H 'Content-Type: application/json' -d "{\"sql\":\"$1\",\"sessionId\":\"$sid\"}"; }
+$ sid=$(curl -s -X POST 127.0.0.1:9495/sql/sessions | jq -r .sessionId)
+$ post() { curl -s 127.0.0.1:9495/sql -H 'Content-Type: application/json' -d "{\"sql\":\"$1\",\"sessionId\":\"$sid\"}"; }
 $ post "BEGIN"
 $ post "INSERT INTO orders (total) VALUES (19.99) RETURNING id"
 $ post "INSERT INTO order_items (order_id, price) VALUES (1, 19.99)"
 $ post "COMMIT"
-$ curl -s -X DELETE localhost:9495/sql/sessions/$sid
+$ curl -s -X DELETE 127.0.0.1:9495/sql/sessions/$sid
 ```
 
 This is PgBouncer's transaction pooling, or ActiveRecord checking a connection
@@ -258,7 +258,7 @@ indexes and sequences — plus the engine's row estimate and its own
 exact bytes at the top:
 
 ```json
-{"harborVersion":"0.29.0","duckdbVersion":"v2.0.0-dev83323",
+{"harborVersion":"0.30.0","duckdbVersion":"v2.0.0-dev83323",
  "databaseSizeBytes":12582912,"walSizeBytes":0,
  "tables":[{"name":"orders","schema":"main","estimatedRows":300000,
             "columns":[…],"primaryKey":["id"],
@@ -328,7 +328,7 @@ with `sudo` in front of the whole command — the installer never escalates on
 its own. On Windows the binary lands in `%LOCALAPPDATA%\Programs\harbor\bin`,
 which the installer adds to your user `PATH`.
 
-Pin a version with `... | bash -s v0.29.0` (or `-Tag v0.29.0` on Windows). Each
+Pin a version with `... | bash -s v0.30.0` (or `-Tag v0.30.0` on Windows). Each
 [release](https://github.com/shreeve/duckdb-harbor/releases)
 ships one self-contained archive per
 platform (osx-arm64, linux-amd64, linux-arm64, windows-amd64, windows-arm64):
@@ -411,7 +411,7 @@ $ harbor http://127.0.0.1:9495 -c "SELECT count(*) FROM orders"
 An explicit start can also take its port from the matching
 `[connection.<name>]` entry in `~/.config/harbor/config.toml`; a summon stays
 on the Unix socket, so opening a database never silently adds a TCP listener.
-TCP binds `127.0.0.1` and, where available, `::1`.
+TCP binds IPv4 loopback only: `127.0.0.1`.
 
 Remote access is Caddy's job at the edge (TLS and access policy); harbor itself speaks
 plain HTTP over a unix socket or a loopback TCP port. A human reaches a
@@ -448,7 +448,7 @@ job, and it does them better than harbor would.
 There is nothing to install on the client side. Shell:
 
 ```console
-$ curl -sN localhost:9495/sql -H 'Content-Type: application/json' \
+$ curl -sN 127.0.0.1:9495/sql -H 'Content-Type: application/json' \
        -d '{"sql":"SELECT count(*) FROM orders"}'
 ```
 

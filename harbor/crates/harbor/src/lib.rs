@@ -1014,7 +1014,7 @@ pub fn open_pool(con: Connection) -> Result<(), String> {
 /// also answering TCP. Plain Tcp exists for Windows, which has no unix
 /// sockets.
 ///
-/// TCP is loopback only, always: this process trusts its own machine and
+/// TCP is IPv4 loopback only, always: this process trusts its own machine and
 /// nothing else, and anything wider — remote reach, access policy — belongs to an
 /// edge proxy in front of it.
 pub enum Listen {
@@ -1025,20 +1025,13 @@ pub enum Listen {
     Dual { port: u16, sock: std::path::PathBuf },
 }
 
-/// The TCP door on loopback. Localhost is two addresses: 127.0.0.1 is
-/// required, and ::1 is added when the host has IPv6 — a client dialing
-/// `localhost` resolves to either, and answering only one strands the
-/// other. The ::1 bind reuses whatever port IPv4 actually got, so an
-/// ephemeral port (0) still yields one number for both.
-fn loopback(port: u16) -> Result<Vec<justhttp::Listener>, String> {
+/// The TCP door is deliberately one IPv4 loopback listener. Callers use the
+/// literal `127.0.0.1`, so name resolution never changes which address Harbor
+/// serves.
+fn ipv4_loopback(port: u16) -> Result<Vec<justhttp::Listener>, String> {
     let v4 = std::net::TcpListener::bind(("127.0.0.1", port))
         .map_err(|e| format!("harbor: cannot bind 127.0.0.1:{port}: {e}"))?;
-    let port = v4.local_addr().map_err(|e| format!("harbor: local_addr: {e}"))?.port();
-    let mut doors = vec![justhttp::Listener::from(v4)];
-    if let Ok(v6) = std::net::TcpListener::bind(("::1", port)) {
-        doors.push(justhttp::Listener::from(v6));
-    }
-    Ok(doors)
+    Ok(vec![justhttp::Listener::from(v4)])
 }
 
 pub fn start(listen: Listen, workers: usize, log: bool) -> Result<String, String> {
@@ -1075,14 +1068,14 @@ pub fn start(listen: Listen, workers: usize, log: bool) -> Result<String, String
     drop(pool);
 
     let bound = match &listen {
-        Listen::Tcp { port } => loopback(*port).and_then(|doors| {
+        Listen::Tcp { port } => ipv4_loopback(*port).and_then(|doors| {
             Server::serve(doors).map_err(|e| format!("harbor: cannot serve: {e}"))
         }),
         #[cfg(unix)]
         Listen::Unix(path) => Server::http_unix(path.as_path())
             .map_err(|e| format!("harbor: cannot bind {}: {e}", path.display())),
         #[cfg(unix)]
-        Listen::Dual { port, sock } => loopback(*port).and_then(|mut doors| {
+        Listen::Dual { port, sock } => ipv4_loopback(*port).and_then(|mut doors| {
             let unix = std::os::unix::net::UnixListener::bind(sock)
                 .map_err(|e| format!("harbor: cannot bind {}: {e}", sock.display()))?;
             doors.push(justhttp::Listener::from(unix));
@@ -4104,6 +4097,16 @@ mod tests {
     use crate::encode::varint_to_decimal;
     use super::{Cancel, SlotRun};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_tcp_door_is_one_ipv4_listener() {
+        let doors = super::ipv4_loopback(0).unwrap();
+        assert_eq!(doors.len(), 1);
+        let justhttp::Listener::Tcp(listener) = &doors[0] else {
+            panic!("the TCP door returned a unix listener");
+        };
+        assert_eq!(listener.local_addr().unwrap().ip(), std::net::Ipv4Addr::LOCALHOST);
+    }
 
     fn idle() -> SlotRun {
         SlotRun { job: 0, started: Instant::now(), pending: None, cancelled: false, deadline: None, request: None }

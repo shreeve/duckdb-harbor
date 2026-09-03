@@ -20,7 +20,10 @@ use crate::http::{Transport, request};
 use harbor_common::State;
 use harbor_common::config;
 use harbor_common::paths::{self, runtime_dir};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// One sidebar row: a database's honest state, plus the size on disk only
@@ -220,7 +223,14 @@ pub fn survey() -> Fleet {
         if out.iter().any(|s| s.name == name) {
             continue;
         }
-        let transport = entry.url.as_deref().and_then(|u| url_transport(u).ok());
+        // Surveying must never open SSH sessions. A tunneled database is
+        // dialed only when the user selects it; while selected, app.rs folds
+        // the already-connected phase back into this row as Running.
+        let target = entry.url.as_deref().and_then(|url| http_target(url).ok());
+        let transport = target
+            .as_ref()
+            .filter(|target| target.is_local())
+            .map(|target| Transport::Tcp(target.addr()));
         let alive = transport.as_ref().is_some_and(probe);
         // Best-effort version, so the card can note a remote running behind
         // your own binary. Informational only — you cannot restart a remote
@@ -235,7 +245,10 @@ pub fn survey() -> Fleet {
             attached: true,
             autostart: false, // a remote has no local login item
             path: None,
-            note: None,
+            note: target
+                .as_ref()
+                .filter(|target| !target.is_local())
+                .map(|target| format!("Connects over SSH to {}", target.host)),
             size: None,
             version,
             ephemeral: false,
@@ -270,12 +283,33 @@ fn sock_ready(sock: &Path) -> bool {
 #[derive(Clone)]
 pub struct Conn {
     pub name: String,
-    pub transport: Transport,
+    transport: Transport,
     /// True when this connect raised the server (worth a status line).
     /// A summoned server is an ephemeral `start` — it self-retires once its
     /// last client disconnects, so closing the window that opened it lets it
     /// go. The explicit Start action is the way to keep a server up.
     pub summoned: bool,
+    /// Every clone participating in this database connection shares the
+    /// tunnel. The final clone closes SSH, so an in-flight query cannot lose
+    /// its route merely because the window switched databases.
+    tunnel: Option<Arc<SshTunnel>>,
+}
+
+impl Conn {
+    fn plain(name: String, transport: Transport, summoned: bool) -> Self {
+        Self { name, transport, summoned, tunnel: None }
+    }
+
+    fn tunneled(name: String, transport: Transport, tunnel: SshTunnel) -> Self {
+        Self { name, transport, summoned: false, tunnel: Some(Arc::new(tunnel)) }
+    }
+
+    pub fn transport(&self) -> Result<&Transport, String> {
+        if let Some(tunnel) = &self.tunnel {
+            tunnel.ensure_running()?;
+        }
+        Ok(&self.transport)
+    }
 }
 
 /// Resolution: config entry (url, else spawn-or-join the path's server),
@@ -294,7 +328,13 @@ pub fn connect(name: &str) -> Result<Conn, String> {
             return Err(format!("config entry {name:?} needs exactly one of url or path"));
         }
         if let Some(url) = &entry.url {
-            return Ok(Conn { name, transport: url_transport(url)?, summoned: false });
+            let target = http_target(url)?;
+            if !target.is_local() {
+                validate_ssh_host(&target.host)?;
+                let (transport, tunnel) = open_tunnel(&target.host, target.port)?;
+                return Ok(Conn::tunneled(name, transport, tunnel));
+            }
+            return Ok(Conn::plain(name, Transport::Tcp(target.addr()), false));
         }
         let db = entry
             .database()
@@ -307,14 +347,14 @@ pub fn connect(name: &str) -> Result<Conn, String> {
         let sock21 = paths::socket_for(&home, &db)?;
         let sock19 = paths::sock_file(&home, &name);
         let join = |summoned: bool| {
-            [&sock21, &sock19].into_iter().find(|s| sock_ready(s)).map(|s| Conn {
-                name: name.clone(),
+            [&sock21, &sock19].into_iter().find(|s| sock_ready(s)).map(|s| Conn::plain(
+                name.clone(),
                 #[cfg(unix)]
-                transport: Transport::Unix(s.clone()),
+                Transport::Unix(s.clone()),
                 #[cfg(not(unix))]
-                transport: Transport::Tcp(String::new()),
+                Transport::Tcp(String::new()),
                 summoned,
-            })
+            ))
         };
         if let Some(conn) = join(false) {
             return Ok(conn);
@@ -344,11 +384,11 @@ pub fn connect(name: &str) -> Result<Conn, String> {
     if let Some(l) = discover().into_iter().find(|l| l.name == name) {
         #[cfg(unix)]
         {
-            return Ok(Conn {
+            return Ok(Conn::plain(
                 name,
-                transport: Transport::Unix(l.sock),
-                summoned: false,
-            });
+                Transport::Unix(l.sock),
+                false,
+            ));
         }
     }
     Err(format!(
@@ -376,14 +416,14 @@ pub fn connect_path(db: &Path) -> Result<Conn, String> {
     let sock21 = paths::socket_for(&home, &db)?;
     let sock19 = paths::sock_file(&home, &name);
     let join = |summoned: bool| {
-        [&sock21, &sock19].into_iter().find(|s| sock_ready(s)).map(|s| Conn {
-            name: name.clone(),
+        [&sock21, &sock19].into_iter().find(|s| sock_ready(s)).map(|s| Conn::plain(
+            name.clone(),
             #[cfg(unix)]
-            transport: Transport::Unix(s.clone()),
+            Transport::Unix(s.clone()),
             #[cfg(not(unix))]
-            transport: Transport::Tcp(String::new()),
+            Transport::Tcp(String::new()),
             summoned,
-        })
+        ))
     };
     if let Some(conn) = join(false) {
         return Ok(conn);
@@ -612,25 +652,275 @@ fn summon(db: &Path, ephemeral: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn url_transport(url: &str) -> Result<Transport, String> {
-    if let Some(rest) = url.strip_prefix("http://") {
-        let (addr, extra) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
-        if !extra.is_empty() {
-            return Err("path-prefixed HTTP targets are not supported".into());
-        }
-        let addr = if addr.contains(':') { addr.to_string() } else { format!("{addr}:9495") };
-        return Ok(Transport::Tcp(addr));
+#[derive(Debug, PartialEq, Eq)]
+struct HttpTarget {
+    host: String,
+    port: u16,
+}
+
+impl HttpTarget {
+    fn addr(&self) -> String {
+        format!("{}:{}", self.host, self.port)
     }
+
+    fn is_local(&self) -> bool {
+        self.host == "127.0.0.1"
+    }
+}
+
+/// The deliberately small URL grammar Harbor speaks: plain HTTP, one host,
+/// one optional port, and no path. IPv6 literals are outside DuckTable's
+/// transport contract; Harbor's TCP door is IPv4-only.
+fn http_target(url: &str) -> Result<HttpTarget, String> {
     if url.starts_with("https://") {
         return Err("TLS terminates in front of Harbor; use http:// or the socket".into());
     }
-    Err(format!("not a url: {url}"))
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("not a url: {url}"))?;
+    if rest.contains(['/', '?', '#']) {
+        return Err("path-prefixed HTTP targets are not supported".into());
+    }
+    if rest.is_empty() {
+        return Err("database address has no host".into());
+    }
+    if rest.matches(':').count() > 1 || rest.starts_with('[') {
+        return Err("IPv6 database addresses are not supported".into());
+    }
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((host, port)) => {
+            let port = port.parse::<u16>().map_err(|_| format!("bad port in {url}"))?;
+            if port == 0 {
+                return Err("database port must be between 1 and 65535".into());
+            }
+            (host, port)
+        }
+        None => (rest, 9495),
+    };
+    if host.is_empty() || host.chars().any(char::is_whitespace) {
+        return Err("database address has an invalid host".into());
+    }
+    let host = if host.eq_ignore_ascii_case("localhost") {
+        "127.0.0.1".to_string()
+    } else {
+        host.to_string()
+    };
+    Ok(HttpTarget { host, port })
+}
+
+/// One app-owned OpenSSH process. It is shared by every clone of its Conn;
+/// the last clone kills and reaps it, which binds tunnel lifetime to the
+/// matching database connection without a global registry.
+struct SshTunnel {
+    child: Mutex<Child>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    host: String,
+}
+
+impl SshTunnel {
+    fn ensure_running(&self) -> Result<(), String> {
+        let mut child = self.child.lock().map_err(|_| "SSH process lock failed")?;
+        match child.try_wait().map_err(|e| format!("checking SSH to {}: {e}", self.host))? {
+            None => Ok(()),
+            Some(status) => Err(ssh_failure(&self.host, status.to_string(), &self.stderr)),
+        }
+    }
+}
+
+impl Drop for SshTunnel {
+    fn drop(&mut self) {
+        if let Ok(child) = self.child.get_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn ssh_failure(host: &str, status: String, stderr: &Arc<Mutex<Vec<u8>>>) -> String {
+    let detail = stderr
+        .lock()
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("ssh exited with {status}"));
+    format!(
+        "SSH connection to {host} failed: {detail}\n\nVerify the connection in Terminal:\n    ssh {host}"
+    )
+}
+
+fn ssh_command(ssh_host: &str, remote_port: u16, local_port: u16) -> Command {
+    let mut command = Command::new("/usr/bin/ssh");
+    command
+        .arg("-N")
+        .arg("-T")
+        .arg("-S")
+        .arg("none")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=3")
+        .arg("-o")
+        .arg("TCPKeepAlive=yes")
+        .arg("-L")
+        .arg(format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"))
+        .arg(ssh_host)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn capture_stderr(mut pipe: impl Read + Send + 'static, captured: Arc<Mutex<Vec<u8>>>) {
+    std::thread::spawn(move || {
+        let mut buf = [0_u8; 1024];
+        while let Ok(n) = pipe.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let Ok(mut out) = captured.lock() else { break };
+            let room = (64_usize * 1024).saturating_sub(out.len());
+            out.extend_from_slice(&buf[..n.min(room)]);
+        }
+    });
+}
+
+fn open_tunnel(ssh_host: &str, remote_port: u16) -> Result<(Transport, SshTunnel), String> {
+    for attempt in 0..5 {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|e| format!("choosing a local SSH port: {e}"))?;
+        let local_port = listener
+            .local_addr()
+            .map_err(|e| format!("reading the local SSH port: {e}"))?
+            .port();
+        drop(listener);
+
+        let mut child = ssh_command(ssh_host, remote_port, local_port)
+            .spawn()
+            .map_err(|e| format!("cannot run /usr/bin/ssh: {e}"))?;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        if let Some(stderr) = child.stderr.take() {
+            capture_stderr(stderr, Arc::clone(&captured));
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|e| format!("checking SSH to {ssh_host}: {e}"))?
+            {
+                // Let the stderr reader consume the final bytes before the
+                // diagnostic is built.
+                std::thread::sleep(Duration::from_millis(10));
+                let message = ssh_failure(ssh_host, status.to_string(), &captured);
+                let port_race = message.contains("Address already in use")
+                    || message.contains("cannot listen to port");
+                if port_race && attempt < 4 {
+                    break;
+                }
+                return Err(message);
+            }
+            let addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, local_port);
+            if std::net::TcpStream::connect_timeout(&addr.into(), Duration::from_millis(100))
+                .is_ok()
+            {
+                return Ok((
+                    Transport::Tcp(format!("127.0.0.1:{local_port}")),
+                    SshTunnel {
+                        child: Mutex::new(child),
+                        stderr: captured,
+                        host: ssh_host.to_string(),
+                    },
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "SSH connection to {} timed out\n\nVerify the connection in Terminal:\n    ssh {}",
+                    ssh_host, ssh_host
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    Err("could not allocate a local SSH port after five attempts".into())
+}
+
+/// Validate and persist the dialog's port-based database without opening its
+/// network connection. The returned name is the normalized sidebar identity.
+pub fn add_database(name: &str, host: &str, port: &str) -> Result<String, String> {
+    let name = harbor_common::normalize(name)?;
+    let url = database_url(host, port)?;
+    harbor_common::membership::add_remote(&name, &url)
+}
+
+/// Remove only a configured remote. The kind check prevents a stale UI action
+/// from ever deleting a local database's membership entry.
+pub fn remove_remote(name: &str) -> Result<(), String> {
+    let name = harbor_common::normalize(name)?;
+    let cfg = load_config()?;
+    match cfg.get(&name) {
+        None => return Ok(()),
+        Some(entry) if entry.kind() == config::Kind::Remote => {}
+        Some(_) => return Err(format!("'{name}' is not a port-based database")),
+    }
+    harbor_common::membership::remove_named(&name).map(|_| ())
+}
+
+pub fn validate_database(name: &str, host: &str, port: &str) -> Result<(), String> {
+    let name = harbor_common::normalize(name)?;
+    database_url(host, port)?;
+    if load_config()?.get(&name).is_some() {
+        return Err(format!("'{name}' already exists — choose another name"));
+    }
+    Ok(())
+}
+
+fn database_url(host: &str, port: &str) -> Result<String, String> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err("Host is required".into());
+    }
+    let port = harbor_port(port)?;
+    let local = host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1";
+    if !local {
+        validate_ssh_host(host)?;
+    }
+    let host = if local { "localhost" } else { host };
+    let url = format!("http://{host}:{port}");
+    http_target(&url)?;
+    Ok(url)
+}
+
+fn harbor_port(port: &str) -> Result<u16, String> {
+    let port = port.trim();
+    let parsed = port
+        .parse::<u16>()
+        .map_err(|_| "Harbor port must be between 1 and 65535".to_string())?;
+    if parsed == 0 {
+        return Err("Harbor port must be between 1 and 65535".into());
+    }
+    Ok(parsed)
+}
+
+fn validate_ssh_host(host: &str) -> Result<(), String> {
+    if host.is_empty() {
+        return Err("SSH host is empty".into());
+    }
+    if host.starts_with('-') || host.chars().any(char::is_whitespace) {
+        return Err("SSH host must be a host, SSH alias, or user@host".into());
+    }
+    Ok(())
 }
 
 /// `GET /info` — server identity, for the inspector's Metadata section.
 pub fn info(conn: &Conn) -> Result<wire::InfoResponse, String> {
     let r = request(
-        &conn.transport,
+        conn.transport()?,
         &wire::endpoint::INFO,
         None,
         Some(Duration::from_secs(5)),
@@ -656,10 +946,87 @@ mod tests {
     // shared with harbor itself — no client-side copy to drift.
 
     #[test]
-    fn url_transport_defaults_the_port_and_refuses_tls() {
-        assert!(matches!(url_transport("http://box").unwrap(), Transport::Tcp(a) if a == "box:9495"));
-        assert!(matches!(url_transport("http://box:9600").unwrap(), Transport::Tcp(a) if a == "box:9600"));
-        assert!(url_transport("https://box").is_err());
-        assert!(url_transport("http://box/api").is_err());
+    fn http_target_defaults_the_port_normalizes_localhost_and_refuses_tls() {
+        let local = http_target("http://localhost").unwrap();
+        assert_eq!(local.addr(), "127.0.0.1:9495");
+        assert!(local.is_local());
+        assert_eq!(http_target("http://box:9600").unwrap().addr(), "box:9600");
+        assert!(http_target("https://box").is_err());
+        assert!(http_target("http://box/api").is_err());
+        assert!(http_target("http://[::1]:9495").is_err());
+    }
+
+    #[test]
+    fn ssh_command_is_loopback_only_unattended_and_owned() {
+        let command = ssh_command("foo.bar.com", 9494, 53172);
+        assert_eq!(command.get_program(), "/usr/bin/ssh");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|a| a == ["-S", "none"]));
+        assert!(args.windows(2).any(|a| a == ["-o", "BatchMode=yes"]));
+        assert!(args.windows(2).any(|a| a == ["-o", "ExitOnForwardFailure=yes"]));
+        assert!(args.windows(2).any(|a| a == ["-o", "ServerAliveInterval=15"]));
+        assert!(args.windows(2).any(|a| a == ["-o", "ServerAliveCountMax=3"]));
+        assert!(args.windows(2).any(|a| a == ["-o", "TCPKeepAlive=yes"]));
+        assert!(args.windows(2).any(|a| {
+            a == ["-L", "127.0.0.1:53172:127.0.0.1:9494"]
+        }));
+        assert_eq!(args.last().map(String::as_str), Some("foo.bar.com"));
+    }
+
+    #[test]
+    fn database_form_accepts_only_a_real_port_and_safe_host() {
+        assert_eq!(harbor_port("9494"), Ok(9494));
+        assert!(harbor_port("0").is_err());
+        assert!(harbor_port("65536").is_err());
+        assert!(validate_ssh_host("deploy@warehouse").is_ok());
+        assert!(validate_ssh_host("").is_err());
+        assert!(validate_ssh_host("-oProxyCommand=bad").is_err());
+        assert!(validate_ssh_host("two hosts").is_err());
+        assert_eq!(database_url("localhost", "9495").unwrap(), "http://localhost:9495");
+        assert_eq!(database_url("127.0.0.1", "9495").unwrap(), "http://localhost:9495");
+        assert_eq!(
+            database_url("deploy@warehouse", "9494").unwrap(),
+            "http://deploy@warehouse:9494"
+        );
+    }
+
+    #[test]
+    fn the_url_host_selects_direct_or_ssh_transport() {
+        assert!(http_target("http://localhost:9495").unwrap().is_local());
+        assert!(http_target("http://127.0.0.1:9495").unwrap().is_local());
+        assert!(!http_target("http://foo.bar.com:9494").unwrap().is_local());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_last_connection_clone_closes_its_ssh_process() {
+        let exists = |pid: &str| {
+            Command::new("/bin/kill")
+                .args(["-0", pid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = child.id().to_string();
+        let conn = Conn::tunneled(
+            "remote".into(),
+            Transport::Tcp("127.0.0.1:1".into()),
+            SshTunnel {
+                child: Mutex::new(child),
+                stderr: Arc::new(Mutex::new(Vec::new())),
+                host: "remote".into(),
+            },
+        );
+        let last = conn.clone();
+        drop(conn);
+        assert!(exists(&pid));
+        drop(last);
+        assert!(!exists(&pid));
     }
 }

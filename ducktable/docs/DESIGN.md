@@ -12,7 +12,8 @@ values. No charting, no multi-engine driver matrix, no sync, no plugins.
 
 ```
 DuckTable (Rust + GPUI, single static binary)
-    |  HTTP over a local socket or loopback TCP
+    |  HTTP over a local socket or IPv4 loopback TCP
+    |  optional app-owned OpenSSH local forward
     v
 DuckDB Harbor (required; owns engine, files, versions)
     |
@@ -33,6 +34,16 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
   monorepo checks the wire contract on both sides of every commit. The
   HTTP layer (blocking client, NDJSON streaming, chunked decoding) lives in
   DuckTable's own client crate.
+- **A database can be opened by file or added by port.** File → Open Database
+  File chooses a DuckDB path. File → Add Database saves a sidebar name and a
+  Harbor host and port. `localhost` means a direct IPv4-loopback connection;
+  any other host means SSH. DuckTable runs `/usr/bin/ssh` directly, forwards an
+  arbitrary local `127.0.0.1` port to that machine's Harbor loopback port, and
+  keeps the tunnel inside the connection's reference-counted lifetime. No
+  survey opens SSH; selecting the database does. The last connection clone
+  kills and reaps the process. `-S none` makes that process the owner,
+  `BatchMode=yes` keeps GUI failures visible rather than interactive, and SSH
+  protocol keepalives detect a dead path.
 - **A connected berth is kept alive by presence, not pulses.** Under Harbor
   0.20+ a held connection *is* the keepalive — the old `GET /keepalive`
   route died with the idle-exit machinery it served. The lifetime rule is
