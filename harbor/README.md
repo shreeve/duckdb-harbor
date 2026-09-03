@@ -318,6 +318,9 @@ curl -fsSL https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.
 irm https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.ps1 | iex
 ```
 
+Uninstall with `... | bash -s -- --uninstall` — the binary and `libduckdb`
+go; your databases, state, and config stay.
+
 Nothing there asks for root. `~/.local/bin` is where the XDG base directory
 spec puts user executables; Debian and Fedora already have it on `PATH`, macOS
 does not, and the installer says so rather than putting binaries somewhere you
