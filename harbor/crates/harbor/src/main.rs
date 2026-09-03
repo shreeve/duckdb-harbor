@@ -121,7 +121,12 @@ fn main() -> ExitCode {
     // it — an explicit `autostart` installs the login item, its absence removes
     // one — and a detach tears it down too. We act before the running axis,
     // since a persistent start blocks at the helm and would defer the install.
-    if plan.run.is_some() || plan.attach == Some(false) {
+    // The one exempt caller is the login item itself: its `start` is the boot
+    // machinery running what the user armed, not the user declaring a new
+    // lifetime — reconciling there would delete the unit at every boot. Like
+    // ephemerality, that rides an env channel, never a flag.
+    let booted = std::env::var_os("HARBOR_AUTOSTART").is_some();
+    if !booted && (plan.run.is_some() || plan.attach == Some(false)) {
         let name = match membership::name_of(&db) {
             Ok(n) => n,
             Err(e) => {

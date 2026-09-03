@@ -72,6 +72,9 @@ fn plist_body(name: &str, exe: &str, db: &str) -> String {
          \t<key>ProgramArguments</key>\n\t<array>\n\
          \t\t<string>{exe}</string>\n\t\t<string>{db}</string>\n\t\t<string>start</string>\n\
          \t</array>\n\
+         \t<key>EnvironmentVariables</key>\n\t<dict>\n\
+         \t\t<key>HARBOR_AUTOSTART</key>\n\t\t<string>1</string>\n\
+         \t</dict>\n\
          \t<key>RunAtLoad</key>\n\t<true/>\n\
          \t<key>ProcessType</key>\n\t<string>Background</string>\n\
          </dict>\n\
@@ -149,6 +152,7 @@ fn unit_body(name: &str, exe: &str, db: &str) -> String {
          After=default.target\n\n\
          [Service]\n\
          Type=simple\n\
+         Environment=HARBOR_AUTOSTART=1\n\
          ExecStart=\"{exe}\" \"{db}\" start\n\n\
          [Install]\n\
          WantedBy=default.target\n",
@@ -186,6 +190,9 @@ mod tests {
         assert!(body.contains("<string>start</string>"));
         assert!(body.contains("<key>RunAtLoad</key>"));
         assert!(!body.contains("<key>KeepAlive</key>"), "RunAtLoad, never KeepAlive");
+        // The login item's own start must not reconcile autostart — without
+        // this marker the agent deletes its plist at every login.
+        assert!(body.contains("<key>HARBOR_AUTOSTART</key>"));
         assert!(body.contains("/opt/harbor &amp; co/harbor"), "the & must be XML-escaped");
     }
 
@@ -196,5 +203,8 @@ mod tests {
         assert!(body.contains("ExecStart=\"/opt/harbor/harbor\" \"/data/my db.duckdb\" start"));
         assert!(body.contains("WantedBy=default.target"));
         assert!(!body.contains("Restart="), "no KeepAlive equivalent");
+        // The unit's own start must not reconcile autostart — without this
+        // marker the service deletes its unit file every time it starts.
+        assert!(body.contains("Environment=HARBOR_AUTOSTART=1"));
     }
 }
