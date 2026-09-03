@@ -77,7 +77,7 @@ pid2=$(server_pid)
 [[ -n $pid1 && $pid1 == "$pid2" ]] && ok "same server both times (pid $pid1)" \
                                    || bad "the second client raised a second server ($pid1 vs $pid2)"
 check "the list shows the database" 0 "x.duckdb" "$harbor"
-check "a bare word is refused, never served" 1 "not a database file" \
+check "a bare word is refused, never served" 1 "names nothing running" \
   "$harbor" nosuchname -c "SELECT 1"
 if [[ -f $work/nosuchname ]]; then bad "a bare word conjured a file"; else ok "no file conjured for a bare word"; fi
 
