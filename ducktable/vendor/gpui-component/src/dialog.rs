@@ -427,6 +427,7 @@ impl RenderOnce for Dialog {
                         v_flex()
                             .id(layer_ix)
                             .bg(cx.theme().background)
+                            .text_color(cx.theme().foreground)
                             .border_1()
                             .border_color(cx.theme().border)
                             .rounded(cx.theme().radius_lg)
