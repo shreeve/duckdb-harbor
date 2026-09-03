@@ -51,7 +51,7 @@ Cmd reads as Ctrl.
 
 The File menu offers the two pieces of information a user can start with.
 **Open Database File…** chooses a DuckDB path. **Open Database URL…** asks for a
-sidebar name, host, and Harbor port. Host defaults to `localhost`, which
+sidebar name, host, and port. Host defaults to `localhost`, which
 DuckTable resolves explicitly to IPv4 `127.0.0.1` and connects to directly. Any
 other host tells DuckTable to create an SSH tunnel to that host and forward its
 Harbor loopback port. A tunneled row remains a normal DATABASES row and says

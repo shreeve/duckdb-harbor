@@ -615,7 +615,7 @@ impl DuckTable {
         );
     }
 
-    /// File → Open Database URL: persist the named Harbor port, then connect
+    /// File → Open Database URL: persist the named port, then connect
     /// through the same path a sidebar click uses. A failed dial still leaves
     /// the database saved so Retry has something durable to target.
     pub(crate) fn add_database(
