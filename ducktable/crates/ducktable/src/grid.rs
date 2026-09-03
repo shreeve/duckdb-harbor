@@ -2182,13 +2182,22 @@ impl GridDelegate {
         self.rebuild_cols();
     }
 
-    /// One column's content-fit width. Menlo's advance scales linearly
-    /// (7px at 11px); the header is the proportional UI font, estimated a
-    /// touch narrower. The extra covers the cell's own insets (PANE_INSET
-    /// pad + 1px divider + breathing room).
+    /// One column's content-fit width. Menlo's advance is 1233/2048 em —
+    /// CoreText's own number, linear in size, so character count times
+    /// advance IS the text width, no measurement pass. The header is the
+    /// proportional UI font, estimated generously. The extra covers the
+    /// cell's own insets (PANE_INSET pad + 1px divider) and the editor's
+    /// caret lookahead: the input scrolls whenever the caret comes within
+    /// 10px of its right edge, so a fitted column must leave 10px past
+    /// its content or a cell shifts the instant it opens for editing —
+    /// view and edit must paint the same pixels. 14 is where the caret
+    /// breathes: inside the editor's ring the text clears the left edge
+    /// by 10px, and 14 gives the caret the same 10px on the right (14 −
+    /// 2px ring − 1.5px caret); anything less reads as cramped the
+    /// moment the caret lands at the end of a fitted value.
     fn fitted_width(&self, schema_ix: usize, zoom: f32) -> Pixels {
         const CAP: usize = 60;
-        let advance = CELL_TEXT * (7. / 11.) * zoom;
+        let advance = CELL_TEXT * (1233. / 2048.) * zoom;
         let header_advance = HEADER_TEXT * (7. / 11.) * zoom;
         let mut chars = 4; // the NULL tag's footprint
         for row in &self.rows {
@@ -2203,7 +2212,7 @@ impl GridDelegate {
             self.schema_cols[schema_ix].name.as_deref().map_or(4, |n| n.chars().count());
         let content = chars.min(CAP) as f32 * advance;
         let header = name_len as f32 * header_advance;
-        px((content.max(header) + PANE_INSET + 10.).clamp(60. * zoom, 460. * zoom))
+        px((content.max(header) + PANE_INSET + 14.).clamp(60. * zoom, 460. * zoom))
     }
 
     /// Rebuild the display columns from the schema minus the hidden set
@@ -2338,11 +2347,20 @@ impl TableDelegate for GridDelegate {
                         div().w_full().child(
                             gpui_component::input::Input::new(&input)
                                 .appearance(false)
-                                // Zero the input's built-in left inset so
-                                // the caret sits exactly on the column's
-                                // text axis — editing must not nudge the
-                                // value sideways.
+                                // Zero the input's built-in insets, both
+                                // sides. Left pins the caret exactly on
+                                // the column's text axis; right keeps the
+                                // editor's text area at least as wide as
+                                // the display cell's, so opening the
+                                // editor on a fitted column never scrolls
+                                // the value — view and edit paint the
+                                // same pixels. (The input's Medium inset
+                                // is 12px a side; a fitted column has
+                                // only ~9px of slack, and the caret needs
+                                // 1.5px more — the old right inset made
+                                // every fitted cell start edit shifted.)
                                 .pl(px(0.))
+                                .pr(px(0.))
                                 .text_size(px(CELL_TEXT * p.zoom_factor()))
                                 .font_family(value_font()),
                         ),
