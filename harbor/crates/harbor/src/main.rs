@@ -8,6 +8,8 @@
 //!                                 spawned that lives while anyone is connected
 //!   harbor <path/to.sock>         connect to a server by its socket
 //!   harbor http://host:port       connect to a server over TCP
+//!   harbor <name> | <footnote>    a running database, by its name or its
+//!                                 number in the list (always the socket)
 //!   harbor <db.duckdb> start      start it yourself, until you leave
 //!
 //! There is no registry and no config: the socket IS the registration, its
@@ -67,7 +69,20 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let db = PathBuf::from(db);
+    // A bare word in front of a verb means a running server (`harbor medlabs
+    // stop`, `harbor 1 stop`), dereferenced to the file it actually serves —
+    // never a file made from the word (the safety law in looks_like_path).
+    let db = if harbor_common::looks_like_path(&db) {
+        PathBuf::from(db)
+    } else {
+        match harbor::repl::deref_db(&db) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("harbor: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
     let flags = args; // whatever followed the verbs — start's, and only start's
 
     if plan.run != Some(true) && !flags.is_empty() {
@@ -167,6 +182,8 @@ usage:
                                behind the file yet? One is spawned for it.
   harbor <path/to.sock>        connect to a server by its unix socket
   harbor http://host:port      connect to a server over TCP
+  harbor <name> | <footnote>   a running database, by its name (medlabs) or
+                               its number in the list — always via the socket
   harbor <db.duckdb> start     start it yourself (foreground): on a terminal
                                you get the prompt and .quit ends the server;
                                headless it runs until SIGTERM
@@ -516,8 +533,10 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> 
         // the binary) can bring it back the same way it was running.
         "ephemeral": o.ephemeral,
         // The TCP door, when one is open (the unix socket needs no
-        // advertising — finding it is how a client got here).
+        // advertising — finding it is how a client got here). bind rides
+        // along exactly when port does, so a reader can spell the door.
         "port": o.port,
+        "bind": o.port.map(|_| o.bind.clone()),
     }));
 
     eprintln!(

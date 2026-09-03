@@ -285,6 +285,9 @@ pub struct InfoResponse {
     pub ephemeral: bool,
     /// The TCP door, when one is open beside the unix socket (`--port`).
     pub port: Option<u16>,
+    /// The TCP door's address (`--bind`), present exactly when `port` is —
+    /// together they spell the door: `http://{bind}:{port}`.
+    pub bind: Option<String>,
 }
 
 #[cfg(test)]

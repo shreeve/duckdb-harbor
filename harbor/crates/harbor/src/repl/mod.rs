@@ -10,6 +10,7 @@
 //!   harbor <db.duckdb>              the REPL (or stdin/-c on a pipe)
 //!   harbor <path/to.sock>           a harbor unix socket
 //!   harbor http://host:port         a harbor TCP listener
+//!   harbor <name> | <footnote>      a running database, by name or list number
 //!
 //! TLS is Caddy's job — the client speaks plain HTTP over UDS/TCP.
 
@@ -168,6 +169,8 @@ usage:
                                it lives while anyone is connected.
   harbor <path/to.sock>        a harbor unix socket
   harbor http://host:port      a harbor TCP listener
+  harbor <name> | <footnote>   a running database, by its name (medlabs) or
+                               its number in the list — always via the socket
   harbor <db.duckdb> start     start it yourself — the server is yours, and
                                lives until you leave (harbor <db> start -h)
 
@@ -180,8 +183,78 @@ options:
 Remote TLS is Caddy's job; ssh is the human path to a remote host.
 ";
 
-/// A target is spelled out or it is refused: a plain-HTTP url, a socket, or
-/// a database file (a path carries a slash or a dot; there are no names).
+/// Which running server a bare word means, over the survey's footnote order.
+/// All digits is a footnote number (1-based, as printed); anything else is a
+/// name, which must match exactly one running server or it is refused — a
+/// near-miss on data is worse than an error.
+fn pick(names: &[Option<String>], target: &str) -> Result<usize, String> {
+    if names.is_empty() {
+        return Err(format!("{target:?} names nothing — nothing is running"));
+    }
+    if target.chars().all(|c| c.is_ascii_digit()) {
+        let n: usize = target.parse().map_err(|_| format!("{target:?} is not a footnote"))?;
+        if n == 0 || n > names.len() {
+            return Err(format!(
+                "no footnote {n} in the list — {} running (run `harbor` to see them)",
+                names.len()
+            ));
+        }
+        return Ok(n - 1);
+    }
+    let hits: Vec<usize> = names
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.as_deref() == Some(target))
+        .map(|(i, _)| i)
+        .collect();
+    match hits.as_slice() {
+        [] => Err(format!(
+            "{target:?} names nothing running — a path carries a / or a dot; \
+             harbor takes a file, a running name or footnote, a .sock, or http://host:port"
+        )),
+        [i] => Ok(*i),
+        many => Err(format!(
+            "{target:?} is ambiguous — {} running databases share that name; \
+             use the socket path, the URL, or the footnote number from `harbor`",
+            many.len()
+        )),
+    }
+}
+
+/// A bare word, resolved against the running fleet: the row it means, or why
+/// it can't. A name or footnote always lands on the unix socket — TCP is
+/// dialled only when the target is spelled as a URL.
+fn fleet_find(target: &str) -> Result<SurveyRow, String> {
+    let mut rows = survey()?;
+    let names: Vec<Option<String>> = rows
+        .iter()
+        .map(|r| {
+            r.info
+                .as_ref()
+                .and_then(|v| v["name"].as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    let i = pick(&names, target)?;
+    Ok(rows.swap_remove(i))
+}
+
+/// The database file behind a bare-word argument in the verb grammar
+/// (`harbor medlabs stop`, `harbor 1 stop`) — the path the running server
+/// itself declares. A word that names nothing running stays an error: a bare
+/// word never becomes a file (the safety law in `looks_like_path`).
+pub fn deref_db(target: &str) -> Result<PathBuf, String> {
+    let row = fleet_find(target)?;
+    row.info
+        .as_ref()
+        .and_then(|v| v["database"].as_str())
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{target:?} answered without /info — use its socket path"))
+}
+
+/// A target is spelled out, running, or refused: a plain-HTTP url, a socket,
+/// a database file (a path carries a slash or a dot), or — for what's already
+/// serving — a bare name or the list's footnote number.
 fn resolve(target: &str, flag_token: Option<String>) -> Result<Conn, String> {
     let token = flag_token.or_else(|| std::env::var("HARBOR_TOKEN").ok());
 
@@ -189,10 +262,20 @@ fn resolve(target: &str, flag_token: Option<String>) -> Result<Conn, String> {
         return Ok(Conn { transport: url_transport(target)?, token });
     }
     if !harbor_common::looks_like_path(target) {
-        return Err(format!(
-            "{target:?} is not a database file (a path carries a / or a dot) — \
-             harbor takes a file, a .sock, or http://host:port"
-        ));
+        // A bare word reaches only what is already running — never a file.
+        let row = fleet_find(target)?;
+        #[cfg(unix)]
+        {
+            return Ok(Conn { transport: Transport::Unix(row.sock), token });
+        }
+        #[cfg(windows)]
+        {
+            let _ = row;
+            return Err(format!(
+                "{target:?}: names and footnotes ride the unix socket, which Windows lacks — \
+                 use http://host:port"
+            ));
+        }
     }
     let p = harbor_common::paths::expand(target);
     // The filesystem says which kind of path this is: a live socket is
@@ -399,10 +482,76 @@ fn is_socket(p: &Path) -> bool {
 /// One live server, as its own /info tells it.
 struct ListRow {
     database: String,
+    url: String,
     pid: String,
     clients: String,
     uptime: String,
     address: String,
+}
+
+/// One answering socket: its path, and its /info document when it gave one
+/// (None: alive but mute — an older, token'd server, say). The order is the
+/// display order, so an index here IS the list's footnote number − 1.
+struct SurveyRow {
+    sock: PathBuf,
+    info: Option<serde_json::Value>,
+}
+
+/// Every server that answered, in footnote order. Readdir the runtime dir
+/// for sockets, ask each for /info, and unlink the ones nothing answers on —
+/// the registry IS the listening socket, so a stale file is litter, not
+/// state. Both faces of the fleet read this: the list renders it, and a
+/// bare-name or footnote target resolves against it.
+fn survey() -> Result<Vec<SurveyRow>, String> {
+    let runtime = harbor_common::runtime_dir()?;
+    let mut socks: Vec<PathBuf> = match std::fs::read_dir(&runtime) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "sock"))
+            .collect(),
+        Err(_) => Vec::new(), // no runtime dir yet: nothing has ever served
+    };
+    socks.sort();
+
+    let mut rows: Vec<SurveyRow> = Vec::new();
+    for sock in socks {
+        let transport = {
+            #[cfg(unix)]
+            {
+                Transport::Unix(sock.clone())
+            }
+            #[cfg(windows)]
+            {
+                continue;
+            }
+        };
+        match http::request(&transport, &endpoint::INFO, None, None, Some(Duration::from_secs(2))) {
+            Ok(r) if r.status == 200 => {
+                let info = serde_json::from_str(r.body_string().unwrap_or_default().trim())
+                    .unwrap_or_default();
+                rows.push(SurveyRow { sock, info: Some(info) });
+            }
+            // It answered, just not with an open /info (an older, token'd
+            // server, say). Alive is alive — show the row, claim nothing.
+            Ok(_) => rows.push(SurveyRow { sock, info: None }),
+            // Refused means nothing listens: a leftover from a kill -9 or a
+            // crash. Anything else (a transient error, a permission oddity)
+            // proves nothing, and an unlink on "proves nothing" is how a live
+            // server loses its front door.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                let _ = std::fs::remove_file(&sock);
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(rows)
+}
+
+/// The TCP door as one pasteable string, when /info advertises one.
+fn url_of(info: &serde_json::Value) -> Option<String> {
+    let port = info["port"].as_u64()?;
+    let bind = info["bind"].as_str().unwrap_or("127.0.0.1");
+    Some(format!("http://{bind}:{port}"))
 }
 
 /// Bare `harbor`: what's running, straight from the filesystem and the
@@ -417,65 +566,38 @@ pub fn list_main() -> ExitCode {
 }
 
 fn list() -> Result<(), String> {
-    let runtime = harbor_common::runtime_dir()?;
-    let mut socks: Vec<PathBuf> = match std::fs::read_dir(&runtime) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "sock"))
-            .collect(),
-        Err(_) => Vec::new(), // no runtime dir yet: nothing has ever served
-    };
-    socks.sort();
-
-    let mut rows: Vec<ListRow> = Vec::new();
-    for sock in socks {
-        let transport = {
-            #[cfg(unix)]
-            {
-                Transport::Unix(sock.clone())
-            }
-            #[cfg(windows)]
-            {
-                continue;
-            }
-        };
-        let shown = harbor_common::paths::shorten(&sock);
-        match http::request(&transport, &endpoint::INFO, None, None, Some(Duration::from_secs(2))) {
-            Ok(r) if r.status == 200 => {
-                let v: serde_json::Value =
-                    serde_json::from_str(r.body_string().unwrap_or_default().trim())
-                        .unwrap_or_default();
-                let ms = v["uptimeMs"].as_u64().unwrap_or(0);
-                rows.push(ListRow {
-                    database: v["database"]
-                        .as_str()
-                        .map(|d| harbor_common::paths::shorten(Path::new(d)))
-                        .unwrap_or_else(|| "?".into()),
-                    pid: v["pid"].as_u64().map_or_else(|| "?".into(), |p| p.to_string()),
-                    clients: v["clients"].as_u64().map_or_else(|| "?".into(), |c| c.to_string()),
-                    uptime: harbor_common::duration::humanize(Duration::from_millis(ms)),
+    let rows: Vec<ListRow> = survey()?
+        .into_iter()
+        .map(|s| {
+            let shown = harbor_common::paths::shorten(&s.sock);
+            match s.info {
+                Some(v) => {
+                    let ms = v["uptimeMs"].as_u64().unwrap_or(0);
+                    ListRow {
+                        database: v["database"]
+                            .as_str()
+                            .map(|d| harbor_common::paths::shorten(Path::new(d)))
+                            .unwrap_or_else(|| "?".into()),
+                        url: url_of(&v).unwrap_or_default(),
+                        pid: v["pid"].as_u64().map_or_else(|| "?".into(), |p| p.to_string()),
+                        clients: v["clients"]
+                            .as_u64()
+                            .map_or_else(|| "?".into(), |c| c.to_string()),
+                        uptime: harbor_common::duration::humanize(Duration::from_millis(ms)),
+                        address: shown,
+                    }
+                }
+                None => ListRow {
+                    database: "?".into(),
+                    url: String::new(),
+                    pid: "?".into(),
+                    clients: "?".into(),
+                    uptime: "?".into(),
                     address: shown,
-                });
+                },
             }
-            // It answered, just not with an open /info (an older, token'd
-            // server, say). Alive is alive — show the row, claim nothing.
-            Ok(_) => rows.push(ListRow {
-                database: "?".into(),
-                pid: "?".into(),
-                clients: "?".into(),
-                uptime: "?".into(),
-                address: shown,
-            }),
-            // Refused means nothing listens: a leftover from a kill -9 or a
-            // crash. Anything else (a transient error, a permission oddity)
-            // proves nothing, and an unlink on "proves nothing" is how a live
-            // server loses its front door.
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                let _ = std::fs::remove_file(&sock);
-            }
-            Err(_) => {}
-        }
-    }
+        })
+        .collect();
 
     use harbor_common::ui::{Cell, Style, Table, Tone};
 
@@ -500,15 +622,30 @@ fn list() -> Result<(), String> {
     // the long socket path hangs below the grid as a footnote, so the columns
     // stay tight and the address is still one glance away. A tally closes it,
     // live rows first. Piped output degrades to plain text (Style::stdout).
-    let mut t = Table::new(["DATABASE", "PID", "CLIENTS", "UPTIME"]);
+    // The URL column exists only when some server has a TCP door — an
+    // all-socket fleet keeps the four-column shape, no empty column earning
+    // its keep. The URL is the bare base (no /ready, no /info): it is a
+    // client target as it stands — `harbor <url> --token <t>` — and any
+    // route suffix would narrow it to one verb.
+    let tcp = rows.iter().any(|r| !r.url.is_empty());
+    let mut head = vec!["DATABASE"];
+    if tcp {
+        head.push("URL");
+    }
+    head.extend(["PID", "CLIENTS", "UPTIME"]);
+    let mut t = Table::new(head);
     for r in &rows {
         let running = r.pid != "?";
-        t.row([
-            Cell::new(&r.database).tone(if running { Tone::Green } else { Tone::Dim }),
+        let mut cells = vec![Cell::new(&r.database).tone(if running { Tone::Green } else { Tone::Dim })];
+        if tcp {
+            cells.push(Cell::new(&r.url));
+        }
+        cells.extend([
             Cell::new(&r.pid).right(),
             Cell::new(&r.clients).right(),
             Cell::new(&r.uptime).right(),
         ]);
+        t.row(cells);
         t.note(Tone::Dim, &r.address);
     }
     println!("{}", t.render(&Style::stdout()));
@@ -741,4 +878,64 @@ fn err(msg: &str) -> Outcome {
 fn fail(msg: &str) -> ExitCode {
     eprintln!("harbor: {msg}");
     ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick;
+
+    fn names(v: &[Option<&str>]) -> Vec<Option<String>> {
+        v.iter().map(|n| n.map(str::to_string)).collect()
+    }
+
+    #[test]
+    fn a_unique_name_finds_its_row() {
+        let n = names(&[Some("medlabs"), Some("scratch")]);
+        assert_eq!(pick(&n, "scratch"), Ok(1));
+    }
+
+    #[test]
+    fn a_shared_name_is_refused_as_ambiguous() {
+        let n = names(&[Some("medlabs"), Some("medlabs")]);
+        let e = pick(&n, "medlabs").unwrap_err();
+        assert!(e.contains("ambiguous"), "{e}");
+        assert!(e.contains('2'), "{e}");
+    }
+
+    #[test]
+    fn an_unknown_name_is_refused_not_created() {
+        let n = names(&[Some("medlabs")]);
+        let e = pick(&n, "scratch").unwrap_err();
+        assert!(e.contains("names nothing running"), "{e}");
+    }
+
+    #[test]
+    fn a_footnote_is_one_based_display_order() {
+        let n = names(&[Some("a"), None, Some("c")]);
+        assert_eq!(pick(&n, "1"), Ok(0));
+        // A mute row (alive, no /info) still owns its printed number.
+        assert_eq!(pick(&n, "2"), Ok(1));
+        assert_eq!(pick(&n, "3"), Ok(2));
+    }
+
+    #[test]
+    fn footnote_zero_and_past_the_end_are_refused() {
+        let n = names(&[Some("a")]);
+        assert!(pick(&n, "0").is_err());
+        assert!(pick(&n, "2").is_err());
+    }
+
+    #[test]
+    fn a_mute_row_never_answers_to_a_name() {
+        // Its name is unknown, so a word cannot mean it — only its footnote
+        // or socket path reaches it.
+        let n = names(&[None]);
+        assert!(pick(&n, "medlabs").is_err());
+    }
+
+    #[test]
+    fn an_empty_fleet_says_so() {
+        let e = pick(&[], "medlabs").unwrap_err();
+        assert!(e.contains("nothing is running"), "{e}");
+    }
 }

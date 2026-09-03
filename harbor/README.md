@@ -259,7 +259,7 @@ indexes and sequences — plus the engine's row estimate and its own
 exact bytes at the top:
 
 ```json
-{"harborVersion":"0.27.0","duckdbVersion":"v2.0.0-dev83323",
+{"harborVersion":"0.28.0","duckdbVersion":"v2.0.0-dev83323",
  "databaseSizeBytes":12582912,"walSizeBytes":0,
  "tables":[{"name":"orders","schema":"main","estimatedRows":300000,
             "columns":[…],"primaryKey":["id"],
@@ -329,7 +329,7 @@ with `sudo` in front of the whole command — the installer never escalates on
 its own. On Windows the binary lands in `%LOCALAPPDATA%\Programs\harbor\bin`,
 which the installer adds to your user `PATH`.
 
-Pin a version with `... | bash -s v0.27.0` (or `-Tag v0.27.0` on Windows). Each
+Pin a version with `... | bash -s v0.28.0` (or `-Tag v0.28.0` on Windows). Each
 [release](https://github.com/shreeve/duckdb-harbor/releases)
 ships one self-contained archive per
 platform (osx-arm64, linux-amd64, linux-arm64, windows-amd64, windows-arm64):
@@ -365,9 +365,32 @@ its name is derived from the database's canonical path
 
 ```console
 $ harbor
-DATABASE            PID    CLIENTS  UPTIME  ADDRESS
-~/Data/labs.duckdb  72840  2        3d      ~/.local/state/harbor/runtime/labs-1a2b3c4d.sock
+╭────────────────────┬───────────────────────┬───────┬─────────┬────────╮
+│ DATABASE           │ URL                   │ PID   │ CLIENTS │ UPTIME │
+├────────────────────┼───────────────────────┼───────┼─────────┼────────┤
+│ ~/Data/labs.duckdb │ http://127.0.0.1:9495 │ 72840 │       2 │     3d │ ¹
+╰────────────────────┴───────────────────────┴───────┴─────────┴────────╯
+¹ ~/.local/state/harbor/runtime/labs.duckdb-1a2b3c4d.sock
 ```
+
+The socket path hangs below the grid under the row's footnote, and the URL
+column exists only while some server has a TCP door — an all-socket fleet
+keeps the four-column shape.
+
+A running database answers to four spellings, and the last two come straight
+off this list:
+
+```console
+$ harbor ~/.local/state/harbor/runtime/labs.duckdb-1a2b3c4d.sock   # its socket
+$ harbor http://127.0.0.1:9495 --token t                           # its URL
+$ harbor labs                                                      # its name
+$ harbor 1                                                         # its footnote
+```
+
+A name or a footnote always rides the unix socket, and reaches only what is
+already running — a bare word never becomes a file, and a name two running
+databases share is refused as ambiguous rather than guessed. The verbs take
+the same spellings: `harbor labs stop`, `harbor 1 stop`.
 
 A socket nothing answers on is a leftover from a `kill -9`, and the list
 unlinks it. There is nothing else to clean up, because nothing else is
