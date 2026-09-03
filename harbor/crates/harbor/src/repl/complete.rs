@@ -67,7 +67,6 @@ impl Inner {
         let resp = http::request(
             &self.conn.transport,
             &endpoint::SQL,
-            self.conn.token.as_deref(),
             Some(&body),
             Some(Duration::from_millis(150)),
         )
@@ -176,7 +175,6 @@ fn fetch_catalog_names(conn: &Conn) -> Option<Vec<String>> {
     let resp = http::request(
         &conn.transport,
         &endpoint::CATALOG,
-        conn.token.as_deref(),
         None,
         Some(Duration::from_secs(2)),
     )
@@ -215,7 +213,6 @@ fn quiet_sql(conn: &Conn, sql: &str) -> Option<()> {
     let resp = http::request(
         &conn.transport,
         &endpoint::SQL,
-        conn.token.as_deref(),
         Some(&body),
         Some(Duration::from_secs(5)),
     )
@@ -247,7 +244,7 @@ mod tests {
         // An em dash (or any multi-byte delimiter) before the word must not
         // slice mid-char — this input panicked the old byte-arithmetic.
         let inner = Inner {
-            conn: Conn { transport: Transport::Tcp("127.0.0.1:1".into()), token: None },
+            conn: Conn { transport: Transport::Tcp("127.0.0.1:1".into()) },
             catalog: Some(vec!["people".into()]),
         };
         for line in ["select —peo", "select “peo", "select peo"] {

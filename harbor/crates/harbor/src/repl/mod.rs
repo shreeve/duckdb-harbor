@@ -43,7 +43,6 @@ static QUERY_SEQ: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 struct Conn {
     transport: Transport,
-    token: Option<String>,
 }
 
 /// What became of one statement. The REPL and `.read` stop a multi-statement
@@ -66,7 +65,6 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
     let mut args = args.into_iter();
     let mut target: Option<String> = None;
     let mut sql: Option<String> = None;
-    let mut token: Option<String> = None;
     let mut json = false;
     let mut mode: Option<String> = None;
 
@@ -75,10 +73,6 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
             "-c" | "--command" => match args.next() {
                 Some(v) => sql = Some(v),
                 None => return fail("-c needs the SQL to run"),
-            },
-            "--token" => match args.next() {
-                Some(v) => token = Some(v),
-                None => return fail("--token needs a value"),
             },
             "--json" => json = true,
             "--mode" => match args.next() {
@@ -97,7 +91,7 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
     let Some(target) = target else {
         return fail("which database? (harbor <db.duckdb> — or bare harbor to see what's running)");
     };
-    let (conn, name) = match resolve(&target, token) {
+    let (conn, name) = match resolve(&target) {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
@@ -176,7 +170,6 @@ usage:
 
 options:
   -c \"SQL\"                     run statements and exit (stdin works too)
-  --token <t>                  bearer token for a TCP server (else $HARBOR_TOKEN)
   --mode <m>                   duckbox, duckboxy, markdown, csv, json, jsonlines, line, list, trash
   --json                       shorthand for --mode jsonlines
 
@@ -258,11 +251,9 @@ pub fn deref_db(target: &str) -> Result<PathBuf, String> {
 /// connection and the name the prompt wears: what the server calls itself
 /// when the fleet resolved the target (so `harbor 1` prompts `ducks>`, not
 /// `1>`), the target's own stem otherwise.
-fn resolve(target: &str, flag_token: Option<String>) -> Result<(Conn, String), String> {
-    let token = flag_token.or_else(|| std::env::var("HARBOR_TOKEN").ok());
-
+fn resolve(target: &str) -> Result<(Conn, String), String> {
     if target.starts_with("http://") || target.starts_with("https://") {
-        return Ok((Conn { transport: url_transport(target)?, token }, prompt_name(target)));
+        return Ok((Conn { transport: url_transport(target)? }, prompt_name(target)));
     }
     if !harbor_common::looks_like_path(target) {
         // A bare word reaches only what is already running — never a file.
@@ -274,7 +265,7 @@ fn resolve(target: &str, flag_token: Option<String>) -> Result<(Conn, String), S
                 .as_ref()
                 .and_then(|v| v["name"].as_str())
                 .map_or_else(|| target.to_string(), str::to_string);
-            return Ok((Conn { transport: Transport::Unix(row.sock), token }, name));
+            return Ok((Conn { transport: Transport::Unix(row.sock) }, name));
         }
         #[cfg(windows)]
         {
@@ -293,11 +284,11 @@ fn resolve(target: &str, flag_token: Option<String>) -> Result<(Conn, String), S
     // quietly becoming a fresh database.
     if is_socket(&p) || target.ends_with(".sock") {
         #[cfg(unix)]
-        return Ok((Conn { transport: Transport::Unix(p), token }, prompt_name(target)));
+        return Ok((Conn { transport: Transport::Unix(p) }, prompt_name(target)));
         #[cfg(windows)]
         return Err("Unix socket targets are not supported on Windows; use http://host:port".into());
     }
-    Ok((Conn { transport: ensure_server(&p)?, token }, prompt_name(target)))
+    Ok((Conn { transport: ensure_server(&p)? }, prompt_name(target)))
 }
 
 /// Join the server that owns this file, or spawn one — this same binary,
@@ -310,7 +301,7 @@ fn ensure_server(path: &Path) -> Result<Transport, String> {
     {
         let _ = path;
         return Err(
-            "spawn-on-use needs unix sockets; on Windows run `harbor <db> start --port <p> --token <t>` \
+            "spawn-on-use needs unix sockets; on Windows run `harbor <db> start --port <p>` \
              and connect to http://127.0.0.1:<p>"
                 .into(),
         );
@@ -416,7 +407,7 @@ pub fn shutdown(db: &Path) -> Result<bool, String> {
     // POST /shutdown drains, checkpoints, and exits. The server can close the
     // socket as it goes, so a dropped connection right after the request is
     // success, not failure — re-probe to be sure which it was.
-    match http::request(&transport, &endpoint::SHUTDOWN, None, None, Some(Duration::from_secs(30))) {
+    match http::request(&transport, &endpoint::SHUTDOWN, None, Some(Duration::from_secs(30))) {
         Ok(_) => Ok(true),
         Err(_) if !ready(&transport) => Ok(true),
         Err(e) => Err(format!("stop: {e}")),
@@ -428,10 +419,10 @@ pub fn shutdown(_db: &Path) -> Result<bool, String> {
     Err("a TCP server is stopped by its own SIGTERM, not over a socket".into())
 }
 
-/// GET /ready, 200 or bust. Unauthenticated by design, so no token needed.
+/// GET /ready, 200 or bust.
 fn ready(transport: &Transport) -> bool {
     matches!(
-        http::request(transport, &endpoint::READY, None, None, Some(Duration::from_secs(2))),
+        http::request(transport, &endpoint::READY, None, Some(Duration::from_secs(2))),
         Ok(r) if r.status == 200
     )
 }
@@ -498,7 +489,7 @@ struct ListRow {
 }
 
 /// One answering socket: its path, and its /info document when it gave one
-/// (None: alive but mute — an older, token'd server, say). The order is the
+/// (None: alive but mute — it answered, just not 200). The order is the
 /// display order, so an index here IS the list's footnote number − 1.
 struct SurveyRow {
     sock: PathBuf,
@@ -533,14 +524,14 @@ fn survey() -> Result<Vec<SurveyRow>, String> {
                 continue;
             }
         };
-        match http::request(&transport, &endpoint::INFO, None, None, Some(Duration::from_secs(2))) {
+        match http::request(&transport, &endpoint::INFO, None, Some(Duration::from_secs(2))) {
             Ok(r) if r.status == 200 => {
                 let info = serde_json::from_str(r.body_string().unwrap_or_default().trim())
                     .unwrap_or_default();
                 rows.push(SurveyRow { sock, info: Some(info) });
             }
-            // It answered, just not with an open /info (an older, token'd
-            // server, say). Alive is alive — show the row, claim nothing.
+            // It answered, just not with an /info this client could read.
+            // Alive is alive — show the row, claim nothing.
             Ok(_) => rows.push(SurveyRow { sock, info: None }),
             // Refused means nothing listens: a leftover from a kill -9 or a
             // crash. Anything else (a transient error, a permission oddity)
@@ -555,11 +546,11 @@ fn survey() -> Result<Vec<SurveyRow>, String> {
     Ok(rows)
 }
 
-/// The TCP door as one pasteable string, when /info advertises one.
+/// The TCP door as one pasteable string, when /info advertises one. The door
+/// is always loopback, so the port alone spells it.
 fn url_of(info: &serde_json::Value) -> Option<String> {
     let port = info["port"].as_u64()?;
-    let bind = info["bind"].as_str().unwrap_or("127.0.0.1");
-    Some(format!("http://{bind}:{port}"))
+    Some(format!("http://127.0.0.1:{port}"))
 }
 
 /// Bare `harbor`: what's running, straight from the filesystem and the
@@ -622,8 +613,8 @@ fn list() -> Result<(), String> {
 
     // The fleet as one box: the database name itself carries status — green
     // when its server answered /info (running and readable), dim when it
-    // answered without one (an older, token-gated server — alive, but mute)
-    // or isn't running. No status dot here: the terminal tints the NAME (a
+    // answered without one (alive, but mute) or isn't running. No status
+    // dot here: the terminal tints the NAME (a
     // dot sharing that tone would be pure redundancy), whereas DuckTable's
     // sidebar uses a plain name + a colored dot — same meaning, form suited
     // to each surface. PID/CLIENTS/UPTIME right-align under their heads, and
@@ -633,8 +624,8 @@ fn list() -> Result<(), String> {
     // The URL column exists only when some server has a TCP door — an
     // all-socket fleet keeps the four-column shape, no empty column earning
     // its keep. The URL is the bare base (no /ready, no /info): it is a
-    // client target as it stands — `harbor <url> --token <t>` — and any
-    // route suffix would narrow it to one verb.
+    // client target as it stands — `harbor <url>` — and any route suffix
+    // would narrow it to one verb.
     let tcp = rows.iter().any(|r| !r.url.is_empty());
     let mut head = vec!["DATABASE"];
     if tcp {
@@ -680,10 +671,10 @@ fn list() -> Result<(), String> {
 /// would get. Returning ends the server — the caller stops and waits — which
 /// is the foreground-start doctrine: the server is yours, it lives until you
 /// leave.
-pub fn helm(transport: Transport, token: Option<String>, name: &str) {
+pub fn helm(transport: Transport, name: &str) {
     let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, CANCEL.clone());
     theme::init(None, None);
-    let conn = Conn { transport, token };
+    let conn = Conn { transport };
     // No anchor: an owned server's lifetime is the operator's presence at
     // this prompt, not its client count.
     let _ = interactive::run(&conn, name, RenderOpts::default(), None);
@@ -728,7 +719,6 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
                     let _ = http::request(
                         &conn.transport,
                         &endpoint::query(&qid),
-                        conn.token.as_deref(),
                         None,
                         Some(Duration::from_secs(2)),
                     );
@@ -739,7 +729,7 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
             }
         }
     };
-    let resp = match http::request_streaming(&conn.transport, &endpoint::SQL, conn.token.as_deref(), Some(&body), &on_tick) {
+    let resp = match http::request_streaming(&conn.transport, &endpoint::SQL, Some(&body), &on_tick) {
         Ok(r) => r,
         Err(e) => return err(&format!("cannot reach harbor: {e}")),
     };

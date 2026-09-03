@@ -12,7 +12,7 @@ values. No charting, no multi-engine driver matrix, no sync, no plugins.
 
 ```
 DuckTable (Rust + GPUI, single static binary)
-    |  HTTP, token auth (token-file, never argv)
+    |  HTTP over a local socket or loopback TCP
     v
 DuckDB Harbor (required; owns engine, files, versions)
     |
@@ -69,7 +69,7 @@ Client architecture:
   only while settings are at defaults.
 - **An async row replacement never silently discards an in-progress edit.**
 - **A cancelled connect is not a failed connect.** Cancel updates the UI
-  synchronously and fences the in-flight attempt with a token; a late
+  synchronously and fences the in-flight attempt with a generation id; a late
   completion discards itself instead of clobbering newer state.
 - **One grid, many sources.** Anything that shows rows IS the Grid — the
   Data view pages a table, the Query view's results pane pages the user's

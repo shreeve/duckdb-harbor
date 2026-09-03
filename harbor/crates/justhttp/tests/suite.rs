@@ -258,7 +258,7 @@ mod input {
 }
 
 /// The request head is the one part of a request that is parsed before any
-/// routing, any authentication, and any application code. Everything it costs
+/// routing and any application code. Everything it costs
 /// is spent on behalf of an anonymous caller, so all of it is bounded, and
 /// anything it cannot frame unambiguously is refused rather than guessed at.
 /// A failure in this module is a security regression, not a flake.
@@ -270,7 +270,7 @@ mod head {
     /// A header line with no end must not be an unbounded allocation. Before
     /// `MAX_LINE` this loop had no ceiling: one socket, one never-terminated
     /// header, and RSS climbed at line speed (30 MB to 1.5 GB in under five
-    /// seconds, measured, with no credential presented).
+    /// seconds, measured, before any application handler ran).
     #[test]
     fn an_endless_header_line_is_refused() {
         let (_server, mut client) = support::new_one_server_one_client();

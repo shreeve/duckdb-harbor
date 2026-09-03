@@ -5,13 +5,13 @@
 //! ```text
 //! ~/.config/harbor/config.toml    desired state — you edit this
 //! ~/.local/state/harbor/          actual state — harbor writes this
-//!     runtime/   <name>.{json,sock,token,lock}
-//!     runtime/log/<name>.log      the berth's server log
+//!     runtime/   <name>.sock      the berth's listening socket
+//!     runtime/   <name>.log       the berth's server log
 //!     history    the repl's command history
 //! ```
 //!
 //! Runtime state does not belong under `~/.config/harbor/`: a config
-//! directory holding sockets, tombstoned lock files and a shell history is
+//! directory holding sockets, server logs and a shell history is
 //! unreadable enough that deleting it looks like the reasonable
 //! move. `~/.local/state` is the XDG home for exactly this: files that
 //! accumulate, that you would not back up, and that you are meant to be able
@@ -85,7 +85,7 @@ pub fn state_root() -> Result<PathBuf, String> {
     Ok(home()?.join(".local").join("state").join(APP))
 }
 
-/// Sockets, sidecars, tokens, locks.
+/// Listening sockets and server logs.
 pub fn runtime_dir() -> Result<PathBuf, String> {
     Ok(state_root()?.join("runtime"))
 }
@@ -160,9 +160,6 @@ pub fn canonical_db(db: &Path) -> Result<PathBuf, String> {
 
 pub fn sidecar_file(runtime: &Path, name: &str) -> PathBuf {
     runtime.join(format!("{name}.json"))
-}
-pub fn token_file(runtime: &Path, name: &str) -> PathBuf {
-    runtime.join(format!("{name}.token"))
 }
 pub fn lock_file(runtime: &Path, name: &str) -> PathBuf {
     runtime.join(format!("{name}.lock"))

@@ -21,7 +21,6 @@ fn main() {
         harbor_client::http::request(
             &conn.transport,
             &wire::endpoint::SHUTDOWN,
-            conn.token.as_deref(),
             None,
             Some(std::time::Duration::from_secs(5)),
         )

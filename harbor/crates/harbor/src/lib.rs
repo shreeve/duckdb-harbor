@@ -46,7 +46,7 @@ pub mod engine;
 //
 // Shape (the data plane is deliberately small; the rest is bookkeeping):
 //
-//   GET    /ready               can this server answer a query? no auth
+//   GET    /ready               can this server answer a query?
 //   POST   /shutdown            drain, CHECKPOINT, exit (the graceful stop)
 //   GET    /info                who am I, serving what, since when
 //   GET    /catalog             schema document for completion and browsers
@@ -175,7 +175,7 @@ static CONTROL_SLOT: Mutex<Option<Arc<SlotState>>> = Mutex::new(None);
 
 static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
 
-/// Woken when the server stops, so `harbor_wait()` can block without polling.
+/// Woken when the server stops, so `wait()` can block without polling.
 static STOPPED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 
 // ---------------------------------------------------------------------------
@@ -197,8 +197,8 @@ static STOPPED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 //
 // `duckdb_interrupt` is per connection, not per database (`InterruptHandle`
 // wraps a `duckdb_connection`), so interrupting one statement cannot disturb
-// another — including `harbor_wait()`, which runs on the caller's own
-// connection and is not in the pool at all.
+// another — including control work running on the dedicated connection,
+// which is not in the worker pool at all.
 //
 // The hazard worth naming is the one that makes this subtle: an interrupt is
 // aimed at a connection, but the thing being cancelled is a *statement*, and
@@ -578,9 +578,10 @@ const LEASE_IDLE_TTL: Duration = Duration::from_secs(30);
 const LEASE_MAX_TTL: Duration = Duration::from_secs(300);
 const REAP_INTERVAL: Duration = Duration::from_millis(500);
 
-/// 18 bytes of CSPRNG, hex. Sessions are not a privilege boundary here — one
-/// token admits every caller — so this is about never colliding and never
-/// reusing, not about resisting an attacker who already has the token.
+/// 18 bytes of CSPRNG, hex. Sessions are not a privilege boundary here —
+/// every door is machine-local and admits every caller who can reach it —
+/// so this is about never colliding and never reusing, not about resisting
+/// an attacker who can already dial the server.
 fn new_lease_id() -> String {
     let mut bytes = [0u8; 18];
     // Best-effort never happens in practice; the id only has to not collide.
@@ -1009,23 +1010,38 @@ pub fn open_pool(con: Connection) -> Result<(), String> {
 
 /// Where the server listens. Unix sockets are the fleet's default face; a
 /// port is an additional door, not a different server — Dual keeps the
-/// socket (the fleet's registration and the tokenless local path) while
-/// also answering TCP, where the token is mandatory. Plain Tcp exists for
-/// Windows, which has no unix sockets.
+/// socket (the fleet's registration and the fastest local path) while
+/// also answering TCP. Plain Tcp exists for Windows, which has no unix
+/// sockets.
+///
+/// TCP is loopback only, always: this process trusts its own machine and
+/// nothing else, and anything wider — remote reach, access policy — belongs to an
+/// edge proxy in front of it.
 pub enum Listen {
-    Tcp { bind: String, port: u16 },
+    Tcp { port: u16 },
     #[cfg(unix)]
     Unix(std::path::PathBuf),
     #[cfg(unix)]
-    Dual { bind: String, port: u16, sock: std::path::PathBuf },
+    Dual { port: u16, sock: std::path::PathBuf },
 }
 
-pub fn start(
-    listen: Listen,
-    token: Option<String>,
-    workers: usize,
-    log: bool,
-) -> Result<String, String> {
+/// The TCP door on loopback. Localhost is two addresses: 127.0.0.1 is
+/// required, and ::1 is added when the host has IPv6 — a client dialing
+/// `localhost` resolves to either, and answering only one strands the
+/// other. The ::1 bind reuses whatever port IPv4 actually got, so an
+/// ephemeral port (0) still yields one number for both.
+fn loopback(port: u16) -> Result<Vec<justhttp::Listener>, String> {
+    let v4 = std::net::TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| format!("harbor: cannot bind 127.0.0.1:{port}: {e}"))?;
+    let port = v4.local_addr().map_err(|e| format!("harbor: local_addr: {e}"))?.port();
+    let mut doors = vec![justhttp::Listener::from(v4)];
+    if let Ok(v6) = std::net::TcpListener::bind(("::1", port)) {
+        doors.push(justhttp::Listener::from(v6));
+    }
+    Ok(doors)
+}
+
+pub fn start(listen: Listen, workers: usize, log: bool) -> Result<String, String> {
     let mut running = RUNNING.lock().unwrap();
     if let Some(r) = running.as_ref() {
         return Err(format!("harbor is already serving on {}", r.addr));
@@ -1059,16 +1075,19 @@ pub fn start(
     drop(pool);
 
     let bound = match &listen {
-        Listen::Tcp { bind, port } => Server::http((bind.as_str(), *port))
-            .map_err(|e| format!("harbor: cannot bind {bind}:{port}: {e}")),
+        Listen::Tcp { port } => loopback(*port).and_then(|doors| {
+            Server::serve(doors).map_err(|e| format!("harbor: cannot serve: {e}"))
+        }),
         #[cfg(unix)]
         Listen::Unix(path) => Server::http_unix(path.as_path())
             .map_err(|e| format!("harbor: cannot bind {}: {e}", path.display())),
         #[cfg(unix)]
-        Listen::Dual { bind, port, sock } => Server::http_dual((bind.as_str(), *port), sock)
-            .map_err(|e| {
-                format!("harbor: cannot bind {bind}:{port} + {}: {e}", sock.display())
-            }),
+        Listen::Dual { port, sock } => loopback(*port).and_then(|mut doors| {
+            let unix = std::os::unix::net::UnixListener::bind(sock)
+                .map_err(|e| format!("harbor: cannot bind {}: {e}", sock.display()))?;
+            doors.push(justhttp::Listener::from(unix));
+            Server::serve(doors).map_err(|e| format!("harbor: cannot serve: {e}"))
+        }),
     };
     let server = match bound {
         Ok(s) => s,
@@ -1095,7 +1114,6 @@ pub fn start(
     *LAST_READY.lock().unwrap() = None;
     let server = Arc::new(server);
     let stop = Arc::new(AtomicBool::new(false));
-    let token = Arc::new(token);
 
     // Every executor gets a slot before it gets a thread. The interrupt handle
     // has to be taken from the connection while it is still here — an executor
@@ -1120,13 +1138,12 @@ pub fn start(
     for (i, conn) in conns.into_iter().enumerate() {
         let server = Arc::clone(&server);
         let stop = Arc::clone(&stop);
-        let token = Arc::clone(&token);
         let state = new_slot(&conn);
         slots.push(Arc::clone(&state));
         handles.push(
             thread::Builder::new()
                 .name(format!("harbor-{i}"))
-                .spawn(move || worker(server, stop, token, conn, state, log))
+                .spawn(move || worker(server, stop, conn, state, log))
                 .map_err(|e| e.to_string())?,
         );
     }
@@ -1204,10 +1221,9 @@ pub fn start(
     let probe = {
         let server = Arc::clone(&server);
         let stop = Arc::clone(&stop);
-        let token = Arc::clone(&token);
         thread::Builder::new()
             .name("harbor-probe".to_string())
-            .spawn(move || probe_worker(server, stop, token, log))
+            .spawn(move || probe_worker(server, stop, log))
             .ok()
     };
 
@@ -1432,7 +1448,6 @@ pub fn wait() -> Result<String, String> {
 fn worker(
     server: Arc<Server>,
     stop: Arc<AtomicBool>,
-    token: Arc<Option<String>>,
     conn: Connection,
     state: Arc<SlotState>,
     log: bool,
@@ -1461,7 +1476,7 @@ fn worker(
             // 503 rather than a cheerful hardcoded 200 — but reporting it is
             // not enough: the worker still has to leave.
             Ok(Some(req)) => {
-                if !handle(req, Some((&jobs_tx, &state)), token.as_ref().as_deref(), log) {
+                if !handle(req, Some((&jobs_tx, &state)), log) {
                     break;
                 }
             }
@@ -1496,7 +1511,7 @@ fn worker(
 /// connection, so a client that stops reading can wedge a worker but not the
 /// berth's last open door. Statements and /catalog get a fast honest 503
 /// instead of queueing invisibly behind the analytics.
-fn probe_worker(server: Arc<Server>, stop: Arc<AtomicBool>, token: Arc<Option<String>>, log: bool) {
+fn probe_worker(server: Arc<Server>, stop: Arc<AtomicBool>, log: bool) {
     while !stop.load(Ordering::SeqCst) {
         // Only join the accept queue when the workers are WEDGED — every one
         // of them mid-statement for at least 250ms — not merely busy. All
@@ -1514,7 +1529,7 @@ fn probe_worker(server: Arc<Server>, stop: Arc<AtomicBool>, token: Arc<Option<St
         }
         match server.recv_timeout(Duration::from_millis(100)) {
             Ok(Some(req)) => {
-                let _ = handle(req, None, token.as_ref().as_deref(), log);
+                let _ = handle(req, None, log);
             }
             Ok(None) => continue,
             // Same as a worker: the listener is gone. Whichever thread pops
@@ -1654,7 +1669,6 @@ fn run_info(req: Request) -> (bool, u16) {
 fn handle(
     mut req: Request,
     exec: Option<(&mpsc::SyncSender<Job>, &Arc<SlotState>)>,
-    token: Option<&str>,
     log: bool,
 ) -> bool {
     let path = req.url().split('?').next().unwrap_or("/").to_string();
@@ -1675,22 +1689,18 @@ fn handle(
     // previous one's left on this worker thread.
     LAST_REASON.with(|c| c.set(""));
 
-    // Two gates before any routing, in this order.
+    // One gate before any routing: the declared length. justhttp drains an
+    // undelivered body when a request is dropped — with a single
+    // `vec![0; remaining]` — and it does so for EVERY response path, 404s
+    // included. `take()` bounds what harbor buffers but not what the client
+    // may declare, and the declared length is attacker-chosen; a request
+    // declaring 1 GB and sending 9 bytes used to cost this process a 1 GB
+    // zeroed allocation. Refusing here, before anything else can respond,
+    // means the allocation never happens on any path.
     //
-    // The declared length first: justhttp drains an undelivered body when a
-    // request is dropped — with a single `vec![0; remaining]` — and it does so
-    // for EVERY response path, 401s and 404s included. `take()` bounds what
-    // harbor buffers but not what the client may declare, and the declared
-    // length is attacker-chosen; a request declaring 1 GB and sending 9 bytes
-    // used to cost this process a 1 GB zeroed allocation, unauthenticated.
-    // Refusing here, before anything else can respond, means the allocation
-    // never happens on any path.
-    //
-    // Then the token: /ready is the one unauthenticated route (a load balancer
-    // should not need a credential to learn up-or-down, and the answer reveals
-    // nothing else), so the property "everything except /ready requires the
-    // token" is enforced once, here, instead of being re-asserted arm by arm —
-    // where the arm someone adds next year would forget it.
+    // Every listener is machine-local: the unix socket is protected by its
+    // 0700 runtime directory and TCP binds loopback only. Callers beyond this
+    // machine go through an edge proxy, where deployment policy is enforced.
     //
     // Each arm reports the status it sent, so the log line below is written in
     // one place instead of at every `respond` call. The SQL text is not
@@ -1703,25 +1713,9 @@ fn handle(
             &format!("body is {n} bytes; the limit is {MAX_BODY}"),
         ));
         (true, 413)
-    } else if path != "/ready" && !req.is_local() && !authorized(&req, token) {
-        // is_local: a request in over the unix socket was authenticated by
-        // the 0700 runtime dir before it reached us — the token guards the
-        // TCP door only. The flag is stamped by the accept loop from which
-        // listener produced the connection, never from peer data.
-        // Unknown paths stay 404 even unauthenticated — the contract the
-        // clients pinned long before this gate was hoisted. Known endpoints
-        // answer 401 so a caller with a bad token learns which problem it has.
-        if route_exists(&method, &path) {
-            let _ = req.respond(error_response(401, "unauthorized", "missing or invalid bearer token"));
-            (true, 401)
-        } else {
-            let _ = req.respond(error_response(404, "not_found", "no such endpoint"));
-            (true, 404)
-        }
     } else {
         match (&method, path.as_str()) {
-            // Readiness is unauthenticated on purpose (see the gate above).
-            // Workers answer it down the full query path; the probe thread —
+            // Workers answer readiness down the full query path; the probe thread —
             // the one still listening when every worker is saturated —
             // answers from the CONTROL connection instead of queueing.
             (Method::Get, "/ready") => match exec {
@@ -1771,8 +1765,8 @@ fn handle(
                 let _ = req.respond(json_response(200, &sessions_report()));
                 (true, 200)
             }
-            // Fleet shutdown is authenticated and returns before the drain
-            // begins. Running stop() on a fresh thread matters: this handler
+            // Fleet shutdown returns before the drain begins. Running stop()
+            // on a fresh thread matters: this handler
             // is itself one of the workers stop() waits to join. POST — an
             // action, not a resource removal; DELETE is the legacy verb.
             (Method::Post | Method::Delete, "/shutdown") => {
@@ -1784,10 +1778,7 @@ fn handle(
                     });
                 (false, 202)
             }
-            // Berth identity: who serves here, which engine, since when. Auth
-            // required — it names filesystem paths and pids. 404 when the host
-            // never set one, which is also what pre-fleet servers answer:
-            // absence is the version probe.
+            // Berth identity: who serves here, which engine, since when.
             (Method::Get, "/info") => run_info(req),
             // The whole schema — tables, columns, keys, indexes, sequences — in
             // one call, in one shape. It lives here so a migration differ asks
@@ -1897,10 +1888,11 @@ fn utc_now() -> String {
 }
 
 
-/// The route list, method included, for the auth gate above: it must agree
-/// with the match in `handle` so 401-vs-404 answers stay truthful. GET /sql
-/// is not a route (the method matters), and unknown paths are 404 with or
-/// without a token.
+/// The route list, method included — a test-checked mirror of the dispatch
+/// match in `handle`, kept so the wire crate's published endpoints and what
+/// this server actually answers can never drift apart silently. GET /sql is
+/// not a route (the method matters).
+#[cfg(test)]
 fn route_exists(method: &Method, path: &str) -> bool {
     matches!(
         (method, path),
@@ -1909,40 +1901,6 @@ fn route_exists(method: &Method, path: &str) -> bool {
             | (Method::Post, "/sql" | "/sql/sessions" | "/sql/sessions/new")
     ) || (*method == Method::Delete
         && (path.starts_with("/sql/sessions/") || path.starts_with("/sql/queries/")))
-}
-
-fn authorized(req: &Request, token: Option<&str>) -> bool {
-    let Some(expected) = token else { return true };
-
-    // Exactly one Authorization header, or none of them count. Taking the first
-    // and ignoring the rest means harbor and anything in front of it can read
-    // the same request differently, which is how a proxy and an origin end up
-    // disagreeing about who the caller is. Duplicates are not something a
-    // correct client sends, so refusing them costs nothing.
-    let mut found = req.headers().iter().filter(|h| h.field.equiv("Authorization"));
-    let Some(h) = found.next() else { return false };
-    if found.next().is_some() {
-        return false;
-    }
-
-    // RFC 7235 makes the scheme case-insensitive; the value after it is not.
-    let value = h.value.as_str();
-    let split = value.find(' ').unwrap_or(value.len());
-    let (scheme, rest) = value.split_at(split);
-    if !scheme.eq_ignore_ascii_case("Bearer") {
-        return false;
-    }
-    let Some(presented) = rest.strip_prefix(' ') else { return false };
-    constant_time_eq(presented.as_bytes(), expected.as_bytes())
-}
-
-/// Compare without leaking the match length through timing. Lengths are not
-/// secret, so an early return on length is fine.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// The request body: one statement, optional positional parameters.
@@ -1985,7 +1943,7 @@ fn parse_request(body: &str) -> Result<SqlRequest, String> {
     let query = match v.get("queryId") {
         None | Some(serde_json::Value::Null) => None,
         // Bounded, because it becomes a key in a map that lives as long as the
-        // server and is written by anyone holding the token.
+        // server and is written by any caller.
         Some(serde_json::Value::String(id)) if !id.is_empty() && id.len() <= 128 => {
             Some(id.clone())
         }
@@ -1996,7 +1954,7 @@ fn parse_request(body: &str) -> Result<SqlRequest, String> {
     };
     // The operator's `--statement-timeout` is a hard ceiling, not just a
     // default: a request may ask for *less*, but not for more, and `0` ("no
-    // limit") is bounded by it too. Without the clamp, any token holder could
+    // limit") is bounded by it too. Without the clamp, any caller could
     // send `timeoutMs:0` and pin a worker indefinitely — defeating the very
     // knob a `--sealed` deployment leans on. When no cap is configured the cap
     // is `None`, so the historical behaviour (0 = unlimited, N = exactly N) is
@@ -2315,10 +2273,9 @@ const BODY_QUEUE: usize = 4;
 /// How long a `/ready` verdict is served before another query is run to
 /// refresh it.
 ///
-/// Readiness has to run a real query to mean anything, and this endpoint takes
-/// no credential, so without a cache anyone who can reach the port has a free
-/// way to make the server work — on the same bounded pool that serves paying
-/// traffic. One second bounds that to one query per second no matter how often
+/// Readiness has to run a real query to mean anything, so without a cache a
+/// busy prober can make the server work on the same bounded pool that serves
+/// query traffic. One second bounds that to one query per second no matter how often
 /// it is asked, which is well inside what any prober polls at. The cost is that
 /// a database that wedges is reported ready for up to a second longer; a probe
 /// interval is measured in seconds, so nothing observes the difference.
@@ -4538,12 +4495,10 @@ mod tests {
 
     #[test]
     fn route_exists_matches_the_dispatch_table() {
-        // Guards the hand-maintained coupling between `route_exists` (which
-        // decides 401-vs-404 for an unauthenticated caller) and the dispatch
-        // match in `handle`. Every real endpoint is a route; a known path
+        // Guards the hand-maintained coupling between `route_exists` and the
+        // dispatch match in `handle`. Every real endpoint is a route; a known path
         // with the wrong method, and any unknown path, is not — so adding a
-        // route to `handle` without updating `route_exists` (which would
-        // 404 a real endpoint's unauthenticated caller) fails here.
+        // route to `handle` without updating `route_exists` fails here.
         //
         // The route list is not transcribed: it comes from the wire crate,
         // which is what clients read. A verb published there that harbor does

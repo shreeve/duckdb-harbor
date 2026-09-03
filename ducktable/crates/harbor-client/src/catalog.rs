@@ -1,4 +1,4 @@
-//! `GET /catalog` — the whole schema as one authenticated document.
+//! `GET /catalog` — the whole schema as one document.
 //!
 //! Harbor curates what the engine's catalog functions expose, so version
 //! differences between DuckDB releases vanish before they reach a client.
@@ -105,7 +105,6 @@ fn fetch(conn: &Conn, route: &wire::endpoint::Route) -> Result<Catalog, String> 
     let r = request(
         &conn.transport,
         route,
-        conn.token.as_deref(),
         None,
         Some(Duration::from_secs(15)),
     )

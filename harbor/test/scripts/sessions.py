@@ -30,7 +30,7 @@ import urllib.request
 
 # Every berth a test starts registers under $HARBOR_HOME. Run through the
 # suite, check.sh sets it; run directly — which the usage line above invites —
-# nothing did, so sockets, tokens and lock files landed in the operator's real
+# nothing did, so sockets and logs landed in the operator's real
 # runtime directory and each run left a dead name behind. `setdefault` keeps
 # the harness in charge when there is one.
 #
@@ -46,8 +46,6 @@ _isolate_fleet()
 
 
 HERE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-TOKEN = "sessions-suite-token"
-
 passed = 0
 failed = []
 
@@ -80,9 +78,8 @@ def section(title):
 
 
 class Harbor:
-    def __init__(self, base, token=TOKEN):
+    def __init__(self, base):
         self.base = base
-        self.token = token
 
     def call(self, method, path, body=None, timeout=30):
         data = json.dumps(body).encode() if body is not None else None
@@ -91,7 +88,6 @@ class Harbor:
             data=data,
             method=method,
             headers={
-                "Authorization": f"Bearer {self.token}",
                 "Accept": "application/json",
                 "Content-Type": "application/json",
             },
@@ -146,7 +142,7 @@ def start_server(db, pool_size, workers, port):
     proc = subprocess.Popen(
         [
             *os.environ.get("HARBOR_LAUNCHER", os.path.join(HERE, "target", "release", "harbor")).split(), db, "start",
-            "--port", str(port), "--token", TOKEN, "--workers", str(workers),
+            "--port", str(port), "--workers", str(workers),
         ],
         stdout=log, stderr=log, stdin=subprocess.DEVNULL, env=env,
     )
@@ -366,10 +362,9 @@ def run_all(h, leases, proc, db, port):
     # assertion above and still leaked the thing that matters.
     #
     # (Not a CHECKPOINT assertion, though it is the obvious one to reach for:
-    # `harbor_wait` holds a read transaction older than every write for as long
-    # as the server runs, so CHECKPOINT over HTTP fails after the first write
-    # whether leases exist or not. The shutdown section below is where that
-    # property is actually tested, at the one moment it matters.)
+    # the server's long-lived control connection makes CHECKPOINT over HTTP
+    # unsuitable after writes. The shutdown section below tests that property
+    # at the one moment it matters.)
     sid = h.open()[1]["sessionId"]
     h.sql("BEGIN", sid)
     eq("the row the abandoned lease held is writable again", 200,

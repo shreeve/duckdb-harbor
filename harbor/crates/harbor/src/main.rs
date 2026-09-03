@@ -12,10 +12,11 @@
 //!                                 number in the list (always the socket)
 //!   harbor <db.duckdb> start      start it yourself, until you leave
 //!
-//! There is no registry and no config: the socket IS the registration, its
-//! name is derived from the database's canonical path (socket_for), and the
-//! 0700 runtime dir is the local access control. TCP is the one door that
-//! needs a credential, so `--port` makes `--token` mandatory.
+//! The socket IS the runtime registration: its name is derived from the
+//! database's canonical path (`socket_for`). Shared config supplies named
+//! connections and standing settings. The 0700 runtime directory protects
+//! Unix sockets; TCP, when `--port` adds it, binds loopback only. Remote reach
+//! and policy belong to an edge proxy.
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -211,18 +212,13 @@ leave.
 
 client options:
   -c \"SQL\"                     run statements and exit (stdin works too)
-  --token <t>                  bearer token for a TCP server (else $HARBOR_TOKEN)
   --mode <m>                   duckbox, duckboxy, markdown, csv, json, jsonlines, line, list, trash
   --json                       shorthand for --mode jsonlines
 
 start options:
-  --port <p>           also listen on TCP, beside the unix socket (--token
-                       becomes mandatory for the TCP door: it leaves the
-                       0700 runtime dir, which is what secures the socket)
-  --bind <addr>        TCP bind address (with --port; default 127.0.0.1)
-  --token <t>          bearer token (TCP only; else $HARBOR_TOKEN — the
-                       channel for a flagless start, e.g. a systemd unit
-                       serving a config `port`)
+  --port <p>           also listen on TCP, beside the unix socket — loopback
+                       only (127.0.0.1, plus ::1 when the host has IPv6);
+                       remote reach and access policy belong to an edge proxy
   --workers <n>        executor pool size (default 6)
   --memory-limit <s>   DuckDB memory_limit (default 2GB)
   --threads <n>        DuckDB threads (default: DuckDB's own)
@@ -240,8 +236,6 @@ struct Opts {
     db: PathBuf,
     ephemeral: bool,
     port: Option<u16>,
-    bind: String,
-    token: Option<String>,
     workers: usize,
     memory_limit: String,
     threads: Option<u32>,
@@ -259,8 +253,6 @@ fn default_opts(db: PathBuf) -> Opts {
         db,
         ephemeral: false,
         port: None,
-        bind: "127.0.0.1".into(),
-        token: None,
         workers: harbor::DEFAULT_MAX_INFLIGHT,
         memory_limit: "2GB".into(),
         threads: None,
@@ -277,12 +269,10 @@ fn default_opts(db: PathBuf) -> Opts {
 /// one — the standing settings a bare start should honor. Only a config that
 /// loads cleanly is trusted: its `init` runs SQL and `LOAD` can run native
 /// code, so an entry from a file anyone else could write is ignored (the same
-/// refusal the client applies). The credential is never read here: the token
-/// fields belong to the client, and `--token` has no config key — a secret is
-/// the operator's explicit word at spawn. `port`/`bind` ARE config keys, but
-/// only an explicit start honors them: a summon (`ephemeral`) stays on the
-/// unix socket, so opening a database can never silently expose it to the
-/// network — and the summoning client is waiting on that socket anyway.
+/// refusal the client applies). `port` IS a config key, but only an explicit
+/// start honors it: a summon (`ephemeral`) stays on the unix socket, so
+/// opening a database never silently opens its TCP door — and the summoning
+/// client is waiting on that socket anyway.
 fn apply_berth_config(o: &mut Opts, canon: &Path, ephemeral: bool) {
     use harbor_common::config;
     let cfg = match config::load() {
@@ -300,13 +290,10 @@ fn apply_berth_config(o: &mut Opts, canon: &Path, ephemeral: bool) {
     });
     let Some(c) = entry else { return };
 
-    if !ephemeral {
-        if let Some(p) = c.port {
-            o.port = Some(p);
-        }
-        if let Some(b) = &c.bind {
-            o.bind = b.clone();
-        }
+    if !ephemeral
+        && let Some(p) = c.port
+    {
+        o.port = Some(p);
     }
     if let Some(v) = &c.memory_limit {
         o.memory_limit = v.clone();
@@ -355,8 +342,6 @@ fn parse_opts(mut o: Opts, rest: Vec<String>) -> Result<Opts, String> {
                 std::process::exit(0);
             }
             "--port" => o.port = Some(take("port")?.parse().map_err(|_| "bad --port")?),
-            "--bind" => o.bind = take("bind")?,
-            "--token" => o.token = Some(take("token")?),
             "--workers" => o.workers = take("workers")?.parse().map_err(|_| "bad --workers")?,
             "--memory-limit" => o.memory_limit = take("memory-limit")?,
             "--threads" => o.threads = Some(take("threads")?.parse().map_err(|_| "bad --threads")?),
@@ -373,36 +358,9 @@ fn parse_opts(mut o: Opts, rest: Vec<String>) -> Result<Opts, String> {
     }
     // A typed path is the duckdb-cli contract: open it, existing or not, so a
     // missing file becomes a fresh database rather than an error.
-    // A port with no `--token` looks to the environment before it refuses:
-    // `$HARBOR_TOKEN` is the secret's channel for a flagless start — a systemd
-    // `Environment=` line or a launchd plist, exactly where `port` in config
-    // (which has no token key, by design) needs its mandatory credential to
-    // come from. Only consulted WITH a port: a bare socket start ignores the
-    // variable, so a client's dial token in the environment never turns into a
-    // spurious "token has no meaning on a socket".
-    if o.port.is_some() && o.token.is_none() {
-        o.token = std::env::var("HARBOR_TOKEN").ok().filter(|t| !t.is_empty());
-    }
-    // The token law, both directions. A unix socket in the 0700 runtime dir
-    // is already access-controlled by the filesystem, so a token there is a
-    // second lock on a door only you can reach — refused, so nobody believes
-    // it does something. TCP is reachable by anything that can dial the
-    // address, so there the token is not optional.
-    match (&o.port, &o.token) {
-        (Some(_), None) => {
-            return Err("--port exposes the server beyond this user — --token is mandatory with it".into());
-        }
-        (Some(_), Some(t)) if t.is_empty() => {
-            return Err("--token must not be empty with --port".into());
-        }
-        (None, Some(_)) => {
-            return Err("--token has no meaning on a unix socket — the 0700 runtime dir is the access control (use --port for TCP)".into());
-        }
-        _ => {}
-    }
     #[cfg(windows)]
     if o.port.is_none() {
-        return Err("Windows has no unix sockets — start with --port <p> --token <t>".into());
+        return Err("Windows has no unix sockets — start with --port <p>".into());
     }
     Ok(o)
 }
@@ -515,18 +473,15 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> 
         std::fs::remove_file(&sock_path).map_err(|e| format!("stale socket: {e}"))?;
     }
 
-    // The socket is always bound; a port adds the TCP door beside it. The
-    // token guards TCP only — the 0700 runtime dir already guards the socket.
+    // The socket is always bound; a port adds the loopback TCP door beside it.
     #[cfg(unix)]
     let listen = match o.port {
-        Some(port) => {
-            harbor::Listen::Dual { bind: o.bind.clone(), port, sock: sock_path.clone() }
-        }
+        Some(port) => harbor::Listen::Dual { port, sock: sock_path.clone() },
         None => harbor::Listen::Unix(sock_path.clone()),
     };
     #[cfg(windows)]
-    let listen = harbor::Listen::Tcp { bind: o.bind.clone(), port: o.port.unwrap_or(0) };
-    let addr = harbor::start(listen, o.token.clone(), o.workers, o.log)?;
+    let listen = harbor::Listen::Tcp { port: o.port.unwrap_or(0) };
+    let addr = harbor::start(listen, o.workers, o.log)?;
     #[cfg(unix)]
     let _ = chmod(&sock_path, 0o600);
 
@@ -550,10 +505,9 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> 
         // the binary) can bring it back the same way it was running.
         "ephemeral": o.ephemeral,
         // The TCP door, when one is open (the unix socket needs no
-        // advertising — finding it is how a client got here). bind rides
-        // along exactly when port does, so a reader can spell the door.
+        // advertising — finding it is how a client got here). Always
+        // loopback, so the port alone spells the door.
         "port": o.port,
-        "bind": o.port.map(|_| o.bind.clone()),
     }));
 
     eprintln!(
@@ -611,12 +565,12 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> 
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "harbor".into());
         // The helm dials the home door: the unix socket is always bound (a
-        // port only adds TCP beside it) and needs no token.
+        // port only adds TCP beside it).
         #[cfg(unix)]
         let transport = harbor::repl::Transport::Unix(sock_path.clone());
         #[cfg(windows)]
         let transport = harbor::repl::Transport::Tcp(format!("127.0.0.1:{}", o.port.unwrap_or(0)));
-        harbor::repl::helm(transport, o.token.clone(), &name);
+        harbor::repl::helm(transport, &name);
         let _ = harbor::stop();
     }
 
@@ -639,10 +593,11 @@ fn duckdb_open(o: &Opts) -> Result<harbor::engine::conn::Conn, String> {
     //   --unsigned  allow_unsigned_extensions — the one door for loading a
     //               locally built, unsigned extension via --init 'LOAD <ext>'.
     //   --sealed    enable_external_access=false + allow_community_extensions
-    //               =false — shrinks a token from host access (read_csv of any
-    //               file, COPY TO disk, community native code) to a credential
-    //               for this one database. For a server an untrusted caller can
-    //               reach. Default off: read_csv/COPY are core data workflows
+    //               =false — shrinks a caller's reach from host access
+    //               (read_csv of any file, COPY TO disk, community native
+    //               code) to SQL on this one database. For a server an
+    //               untrusted caller can reach.
+    //               Default off: read_csv/COPY are core data workflows
     //               (the test fixtures themselves load CSV), so the safe edge
     //               is the operator's to draw, like TLS.
     // Signed-only, full-access is the default; each is opt-in.

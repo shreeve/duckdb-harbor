@@ -29,7 +29,6 @@ set -uo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 src_db=${1:-$here/../sample.duckdb}
 port=${PORT:-9499}
-token=${TOKEN:-stress-$$}
 soak=${SOAK:-0}
 base="http://127.0.0.1:$port"
 timeout=${TIMEOUT:-120}
@@ -44,9 +43,10 @@ if [[ ! -x "${launcher%% *}" ]]; then
   exit 2
 fi
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/harbor-asserts.XXXXXX")
+# Keep the root short enough for macOS's 104-byte sockaddr_un limit.
+work=$(mktemp -d /tmp/harbor-asserts.XXXXXX)
 # Every berth this suite starts registers under $HARBOR_HOME. Without this the
-# sockets, tokens and lock files land in the operator's real runtime directory,
+# sockets and logs land in the operator's real runtime directory,
 # and each run leaves a fistful of dead names behind — invisible before
 # `harbor show` learned to report them, and noise in the fleet view now.
 export HARBOR_HOME="$work/harbor-home"
@@ -97,8 +97,8 @@ p = os.environ.get("PARAMS") or ""
 if p:
     d["params"] = json.loads(p)
 sys.stdout.write(json.dumps(d))')
-  curl -sS -m "$timeout" -H "Authorization: Bearer $token" \
-       -H 'Content-Type: application/json' --data-binary "$body" "$base/sql"
+  curl -sS -m "$timeout" -H 'Content-Type: application/json' \
+       --data-binary "$body" "$base/sql"
 }
 
 # status <sql> [params-json] — send one statement, print only the HTTP status
@@ -112,13 +112,13 @@ if p:
     d["params"] = json.loads(p)
 sys.stdout.write(json.dumps(d))')
   curl -sS -m "$timeout" -o /dev/null -w '%{http_code}\n' \
-       -H "Authorization: Bearer $token" --data-binary "$body" "$base/sql"
+       -H 'Content-Type: application/json' --data-binary "$body" "$base/sql"
 }
 
 # raw <body> — send an arbitrary body, print "<status> <body>"
 raw() {
-  curl -sS -m "$timeout" -w '\n%{http_code}' -H "Authorization: Bearer $token" \
-       --data-binary "$1" "$base/sql"
+  curl -sS -m "$timeout" -w '\n%{http_code}' \
+       -H 'Content-Type: application/json' --data-binary "$1" "$base/sql"
 }
 
 # nd <expr> — evaluate a Python expression over an NDJSON envelope on stdin.
@@ -225,7 +225,7 @@ fi
 
 section "Startup"
 
-$launcher "$db" start --port "$port" --token "$token" --workers 6 >"$log" 2>&1 &
+$launcher "$db" start --port "$port" --workers 6 >"$log" 2>&1 &
 server_pid=$!
 
 up=0
@@ -242,25 +242,17 @@ fi
 ok "server listening on $base (pid $server_pid)"
 
 # ---------------------------------------------------------------------------
-section "Readiness and authentication"
+section "HTTP routing"
 # ---------------------------------------------------------------------------
 
-eq "/ready answers without a token" "200" \
+eq "/ready answers" "200" \
    "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$base/ready")"
 eq "/ready body" '{"status":"ready"}' "$(curl -sS -m 5 "$base/ready")"
 # The endpoint it replaced. Readiness and liveness are not synonyms, and a
 # static 200 answered the question nobody was asking.
 eq "/health is gone" "404" \
    "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$base/health")"
-eq "/sql refuses a missing token" "401" \
-   "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' --data '{"sql":"SELECT 1"}' "$base/sql")"
-eq "/sql refuses a wrong token" "401" \
-   "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer wrong' \
-        --data '{"sql":"SELECT 1"}' "$base/sql")"
-eq "/sql refuses a malformed Authorization header" "401" \
-   "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: $token" \
-        --data '{"sql":"SELECT 1"}' "$base/sql")"
-eq "/sql accepts the right token" "200" "$(status 'SELECT 1')"
+eq "/sql accepts a query" "200" "$(status 'SELECT 1')"
 eq "unknown path is 404" "404" \
    "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$base/nope")"
 eq "GET /sql is 404" "404" \
@@ -285,7 +277,7 @@ eq "timeMs is present and numeric" "True" \
 eq "row width matches column count" "True" \
    "$(post 'SELECT * FROM sites LIMIT 5' | nd 'all(len(r) == len(cols) for r in rows)')"
 eq "response is chunked, not buffered" "chunked" \
-   "$(curl -sS -m 30 -D - -o /dev/null -H "Authorization: Bearer $token" \
+   "$(curl -sS -m 30 -D - -o /dev/null -H 'Content-Type: application/json' \
         --data '{"sql":"SELECT * FROM plans"}' "$base/sql" \
       | tr -d '\r' | awk -F': ' 'tolower($1)=="transfer-encoding"{print $2}')"
 
@@ -452,14 +444,14 @@ python3 -c "
 import json, sys
 sys.stdout.write(json.dumps({'sql': 'SELECT 1;' + ' ' * 4000000}))" > "$work/big.json"
 eq "a megabytes-long trailing tail is scanned promptly" "1" \
-   "$(curl -sS -m 30 -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+   "$(curl -sS -m 30 -H 'Content-Type: application/json' \
         --data-binary "@$work/big.json" "$base/sql" | nd 'rows[0][0]')"
 
 # The declared length is checked before the body is read: justhttp drains the
 # undelivered remainder into a single zeroed allocation of whatever was claimed.
 eq "an oversized Content-Length is refused" "413" \
    "$(curl -sS -m 20 -o /dev/null -w '%{http_code}' -X POST "$base/sql" \
-        -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+        -H 'Content-Type: application/json' \
         -H 'Content-Length: 629145600' --data '{"sql":"SELECT 1"}' 2>/dev/null || echo curl-refused)"
 
 # ---------------------------------------------------------------------------
@@ -543,8 +535,8 @@ json() {
   body=$(SQL="$1" python3 -c '
 import json, os, sys
 sys.stdout.write(json.dumps({"sql": os.environ["SQL"]}))')
-  curl -sS -m "$timeout" -H "Authorization: Bearer $token" \
-       -H "Accept: ${2:-application/json}" --data-binary "$body" "$base/sql"
+  curl -sS -m "$timeout" -H "Accept: ${2:-application/json}" \
+       -H 'Content-Type: application/json' --data-binary "$body" "$base/sql"
 }
 
 # jstatus <sql> [accept] — the status code for the same
@@ -553,8 +545,9 @@ jstatus() {
   body=$(SQL="$1" python3 -c '
 import json, os, sys
 sys.stdout.write(json.dumps({"sql": os.environ["SQL"]}))')
-  curl -sS -m "$timeout" -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" \
-       -H "Accept: ${2:-application/json}" --data-binary "$body" "$base/sql"
+  curl -sS -m "$timeout" -o /dev/null -w '%{http_code}' \
+       -H "Accept: ${2:-application/json}" -H 'Content-Type: application/json' \
+       --data-binary "$body" "$base/sql"
 }
 
 # js <expr> — evaluate a Python expression over a one-shot document on stdin.
@@ -587,11 +580,11 @@ eq "rowCount agrees with the rows" "3|3" \
 eq "an empty result is still a document" "0|[]" \
    "$(json 'SELECT 1 WHERE false' | js '"%s|%s" % (doc["rowCount"], rows)')"
 eq "it declares Content-Length, not chunked" "True" \
-   "$(curl -sS -m "$timeout" -D - -o /dev/null -H "Authorization: Bearer $token" \
+   "$(curl -sS -m "$timeout" -D - -o /dev/null \
         -H 'Accept: application/json' --data '{"sql":"SELECT 1"}' "$base/sql" \
       | tr -d '\r' | grep -qi '^content-length:' && echo True || echo False)"
 eq "and says it is JSON" "True" \
-   "$(curl -sS -m "$timeout" -D - -o /dev/null -H "Authorization: Bearer $token" \
+   "$(curl -sS -m "$timeout" -D - -o /dev/null \
         -H 'Accept: application/json' --data '{"sql":"SELECT 1"}' "$base/sql" \
       | tr -d '\r' | grep -qi '^content-type: application/json' && echo True || echo False)"
 
@@ -656,7 +649,7 @@ eq "a wide row with mixed types is well formed" "True" \
 # Time to first byte should be a small fraction of total on a long stream. If
 # the server buffered the whole result, the two would be nearly equal.
 curl -sS -m "$timeout" -o /dev/null \
-  -w '%{time_starttransfer} %{time_total}' -H "Authorization: Bearer $token" \
+  -w '%{time_starttransfer} %{time_total}' -H 'Content-Type: application/json' \
   --data '{"sql":"SELECT i, repeat(i::VARCHAR, 40) AS pad FROM range(2000000) t(i)"}' \
   "$base/sql" > "$work/timing.txt"
 read -r ttfb total < "$work/timing.txt"
@@ -713,10 +706,10 @@ section "Abuse"
 
 eq "an oversized body does not take the server down" "True" \
    "$(python3 -c 'print("x" * 200000)' > "$work/huge.txt"; \
-      curl -sS -m 30 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" \
+      curl -sS -m 30 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
         --data-binary "@$work/huge.txt" "$base/sql" | grep -q '^4' && echo True || echo False)"
 eq "a client that hangs up mid-stream does not wedge a worker" "200" \
-   "$(curl -sS -m 1 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" \
+   "$(curl -sS -m 1 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
         --data '{"sql":"SELECT i FROM range(5000000) t(i)"}' "$base/sql" >/dev/null 2>&1; \
       sleep 1; curl -sS -m 10 -o /dev/null -w '%{http_code}' "$base/ready")"
 eq "the server still answers correctly afterwards" "$exp_n_sites" \

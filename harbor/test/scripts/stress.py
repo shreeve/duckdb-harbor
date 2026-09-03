@@ -2,8 +2,8 @@
 """
 stress.py — how does harbor behave when many HTTP clients hit it at once?
 
-    test/scripts/stress.py --port 9499 --token T --levels 1,2,4,8,16,32,64
-    test/scripts/stress.py --port 9499 --token T --write-pct 25 --seconds 5
+    test/scripts/stress.py --port 9499 --levels 1,2,4,8,16,32,64
+    test/scripts/stress.py --port 9499 --write-pct 25 --seconds 5
 
 Each level runs N client threads for a fixed wall-clock duration, each thread
 issuing requests back to back, and reports throughput and the latency
@@ -61,8 +61,8 @@ class Level:
 class Client:
     """A single HTTP connection, reopened if the server or network drops it."""
 
-    def __init__(self, host, port, token, keepalive=True, timeout=60):
-        self.host, self.port, self.token = host, port, token
+    def __init__(self, host, port, keepalive=True, timeout=60):
+        self.host, self.port = host, port
         self.keepalive, self.timeout = keepalive, timeout
         self.conn = None
         self.reconnects = 0
@@ -78,8 +78,7 @@ class Client:
     def request(self, sql, params=None):
         """One POST /sql. Returns (status, seconds, parsed-envelope)."""
         body = json.dumps({"sql": sql, **({"params": params} if params else {})})
-        headers = {"Authorization": "Bearer " + self.token,
-                   "Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json"}
         started = time.perf_counter()
         for attempt in (0, 1):
             try:
@@ -107,9 +106,9 @@ class Client:
         return 0, time.perf_counter() - started, []
 
 
-def request(host, port, token, sql, params=None, timeout=60):
+def request(host, port, sql, params=None, timeout=60):
     """One-off request, for setup and probing."""
-    c = Client(host, port, token, keepalive=False, timeout=timeout)
+    c = Client(host, port, keepalive=False, timeout=timeout)
     try:
         return c.request(sql, params)
     finally:
@@ -127,7 +126,7 @@ def run_level(args, clients, expected, stop_after):
 
     def worker(idx):
         rng = random.Random(idx)
-        client = Client(args.host, args.port, args.token, keepalive=not args.no_keepalive)
+        client = Client(args.host, args.port, keepalive=not args.no_keepalive)
         # Connect before the clock starts. Otherwise the first request of every
         # thread pays for a simultaneous connect storm: at high client counts
         # the accept backlog overflows, the kernel drops SYNs, and TCP retries
@@ -223,7 +222,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9499)
-    ap.add_argument("--token", required=True)
     ap.add_argument("--levels", default="1,2,4,8,16,32,64")
     ap.add_argument("--seconds", type=float, default=4.0)
     ap.add_argument("--write-pct", type=float, default=0.0,
@@ -242,7 +240,7 @@ def main():
     if args is None:
         return dump_oracle_sql()
 
-    code, _, lines = request(args.host, args.port, args.token, "SELECT 1 AS up")
+    code, _, lines = request(args.host, args.port, "SELECT 1 AS up")
     if code != 200:
         print("stress: server did not answer (status %s)" % code, file=sys.stderr)
         return 2
@@ -266,7 +264,7 @@ def main():
         return 2
 
     if args.write_pct > 0:
-        request(args.host, args.port, args.token,
+        request(args.host, args.port,
                 "CREATE TABLE IF NOT EXISTS stress_log(client BIGINT, n BIGINT)")
 
     print("harbor stress — %.0fs per level, %.0f%% writes, %s connections, "

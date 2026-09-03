@@ -50,7 +50,7 @@ rm -f "$LIB"/libduckdb.dylib "$LIB"/libduckdb.so
 install -m 0755 bin/harbor "$BIN"
 install -m 0755 lib/libduckdb.* "$LIB"
 
-# Sockets and tokens live in the runtime dir. harbor heals these permissions on
+# Sockets and logs live in the runtime dir. harbor heals these permissions on
 # every run; doing it here covers a fleet that is currently stopped.
 state="${HARBOR_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/harbor}"
 [ -d "$state/runtime" ] && chmod 700 "$state" "$state/runtime" 2>/dev/null || true

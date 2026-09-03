@@ -31,7 +31,7 @@ import urllib.request
 
 # Every berth a test starts registers under $HARBOR_HOME. Run through the
 # suite, check.sh sets it; run directly — which the usage line above invites —
-# nothing did, so sockets, tokens and lock files landed in the operator's real
+# nothing did, so sockets and logs landed in the operator's real
 # runtime directory and each run left a dead name behind. `setdefault` keeps
 # the harness in charge when there is one.
 #
@@ -47,8 +47,6 @@ _isolate_fleet()
 
 
 HERE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-TOKEN = "catalog-suite-token"
-
 passed = 0
 failed = []
 
@@ -80,13 +78,10 @@ def section(title):
 # ---------------------------------------------------------------------------
 
 
-def fetch(base, path, token=TOKEN):
+def fetch(base, path):
     """Status, raw bytes, headers. Raw rather than parsed, because one of the
     assertions below is about the bytes themselves."""
-    headers = {}
-    if token is not None:
-        headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(base + path, headers=headers)
+    req = urllib.request.Request(base + path)
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return r.status, r.read(), dict(r.headers)
@@ -107,7 +102,7 @@ def start_server(db, port):
     proc = subprocess.Popen(
         [
             *os.environ.get("HARBOR_LAUNCHER", os.path.join(HERE, "target", "release", "harbor")).split(), db, "start",
-            "--port", str(port), "--token", TOKEN, "--workers", "2",
+            "--port", str(port), "--workers", "2",
         ],
         stdout=log, stderr=log, stdin=subprocess.DEVNULL,
     )
@@ -220,15 +215,6 @@ def main():
 
 
 def run_fixture(base):
-    # -----------------------------------------------------------------------
-    section("The door is locked")
-    # -----------------------------------------------------------------------
-    st, body, _ = fetch(base, "/catalog", token=None)
-    eq("no token is a 401", 401, st)
-    eq("with the usual envelope", "unauthorized", json.loads(body).get("code"))
-    st, _, _ = fetch(base, "/catalog", token="not-the-token")
-    eq("a wrong token is a 401 too", 401, st)
-
     # -----------------------------------------------------------------------
     section("One call, the whole schema")
     # -----------------------------------------------------------------------

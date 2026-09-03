@@ -3,7 +3,7 @@ name = "harbor-common"
 version.workspace = true
 repository.workspace = true
 edition = "2024"
-description = "harbor-common — what harbor, pilot and ducktable all need: paths, names, permissions, config, lifetimes, states"
+description = "harbor-common — shared paths, names, permissions, config, lifetimes, and states"
 license = "MIT"
 
 # No DuckDB, no HTTP, no process spawning, and nothing that shells out. Both
@@ -11,16 +11,13 @@ license = "MIT"
 # server too — including in the process holding an exclusive write lock on a
 # database. Keep it to files, strings, and formatting.
 [features]
-# The terminal renderer. On by default, for harbor and pilot. A GUI takes
+# The terminal renderer. On by default for harbor. A GUI takes
 # `default-features = false` and skips it along with unicode-width — it wants
 # the semantics (see `state::Level`), not the ANSI.
 default = ["term"]
 term = ["dep:unicode-width"]
-# The config reader that only DuckTable consumes since harbor 0.20 deleted
-# its fleet layer (the fleet module itself retired when DuckTable moved to
-# socket discovery). Off by default so harbor's build graph
-# carries no toml/serde stack for modules it never calls. (state stays
-# unconditional: pure semantics, no deps, and ui's Tone conversion needs it.)
+# The shared config reader. Off by default so consumers that need only paths
+# and state semantics do not carry the TOML/serde stack.
 config = ["dep:serde", "dep:toml", "dep:serde_json"]
 # The membership writer: attach/detach editing the [connection.*] sections of
 # config.toml, format-preserving via toml_edit's DOM. harbor enables this (it

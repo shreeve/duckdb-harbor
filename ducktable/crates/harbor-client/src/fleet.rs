@@ -17,7 +17,6 @@
 //! one that would retire between clicks.
 
 use crate::http::{Transport, request};
-use crate::tokens;
 use harbor_common::State;
 use harbor_common::config;
 use harbor_common::paths::{self, runtime_dir};
@@ -83,16 +82,6 @@ struct Live {
     ephemeral: bool,
 }
 
-/// A 0.19-era runtime token, when one exists beside the socket. Current
-/// harbors put no token on a unix socket (the 0700 dir is the access
-/// control), but a fleet mid-upgrade still runs older servers that demand
-/// theirs — and a mixed fleet is the normal state of a real machine.
-fn berth_token(home: &Path, name: &str) -> Option<String> {
-    let t = std::fs::read_to_string(paths::token_file(home, name)).ok()?;
-    let t = t.trim().to_string();
-    if t.is_empty() { None } else { Some(t) }
-}
-
 /// Every server actually listening right now — the same discovery bare
 /// `harbor` performs: `readdir` for `*.sock`, `GET /info` per socket. A
 /// socket that does not answer is skipped, not unlinked: sweeping residue
@@ -112,22 +101,11 @@ fn discover() -> Vec<Live> {
         #[cfg(unix)]
         {
             let t = Transport::Unix(sock.clone());
-            let ask = |token: Option<&str>| {
-                request(&t, &wire::endpoint::INFO, token, None, Some(Duration::from_secs(2))).ok()
+            let Ok(r) =
+                request(&t, &wire::endpoint::INFO, None, Some(Duration::from_secs(2)))
+            else {
+                continue;
             };
-            let mut r = match ask(None) {
-                Some(r) => r,
-                None => continue,
-            };
-            // An older server may guard /info with its runtime token; the
-            // token file sits beside the socket, named after it.
-            if r.status == 401
-                && let Some(stem) = sock.file_stem().and_then(|s| s.to_str())
-                && let Some(tok) = sock.parent().and_then(|d| berth_token(d, stem))
-                && let Some(retry) = ask(Some(&tok))
-            {
-                r = retry;
-            }
             if r.status != 200 {
                 continue;
             }
@@ -206,9 +184,8 @@ pub fn survey() -> Fleet {
 
     // Config entries with a local path: a row each, unless a live server
     // already owns the name (its own /info name) or the file's socket.
-    // A server /info could not identify (an older one with no readable
-    // token) still answers /ready — probe both socket generations so a
-    // running database is never shown stopped.
+    // A server /info could not identify still answers /ready — probe both
+    // socket generations so a running database is never shown stopped.
     if let Ok(home) = runtime_dir() {
         for (name, entry) in cfg.berths() {
             let Some(db) = entry.database() else { continue };
@@ -249,10 +226,7 @@ pub fn survey() -> Fleet {
         // your own binary. Informational only — you cannot restart a remote
         // from here, so this never counts toward the upgrade badge.
         let version = alive
-            .then(|| {
-                let token = std::env::var("HARBOR_TOKEN").ok().or_else(|| tokens::resolve(entry));
-                transport.as_ref().and_then(|t| info_of(t, token.as_deref()))
-            })
+            .then(|| transport.as_ref().and_then(info_of))
             .flatten()
             .map(|i| i.harbor_version);
         out.push(Survey {
@@ -272,9 +246,9 @@ pub fn survey() -> Fleet {
     Fleet { rows: out, warning }
 }
 
-/// `GET /ready` — the only unauthenticated route, and the truth test.
+/// `GET /ready` — the truth test.
 fn probe(transport: &Transport) -> bool {
-    request(transport, &wire::endpoint::READY, None, None, Some(Duration::from_millis(800)))
+    request(transport, &wire::endpoint::READY, None, Some(Duration::from_millis(800)))
         .map(|r| r.status == 200)
         .unwrap_or(false)
 }
@@ -292,12 +266,11 @@ fn sock_ready(sock: &Path) -> bool {
     }
 }
 
-/// A dialable, authenticated connection to one database.
+/// A dialable connection to one database.
 #[derive(Clone)]
 pub struct Conn {
     pub name: String,
     pub transport: Transport,
-    pub token: Option<String>,
     /// True when this connect raised the server (worth a status line).
     /// A summoned server is an ephemeral `start` — it self-retires once its
     /// last client disconnects, so closing the window that opened it lets it
@@ -306,10 +279,8 @@ pub struct Conn {
 }
 
 /// Resolution: config entry (url, else spawn-or-join the path's server),
-/// else a live server by its own `/info` name. `HARBOR_TOKEN` beats the
-/// entry's own token sources; a unix socket needs no token at all.
+/// else a live server by its own `/info` name.
 pub fn connect(name: &str) -> Result<Conn, String> {
-    let env_token = std::env::var("HARBOR_TOKEN").ok();
     // One name law for the whole fleet: harbor normalizes every name it
     // mints, so every lookup normalizes too.
     let name = harbor_common::normalize(name)?;
@@ -322,9 +293,8 @@ pub fn connect(name: &str) -> Result<Conn, String> {
         if entry.kind() == config::Kind::Malformed {
             return Err(format!("config entry {name:?} needs exactly one of url or path"));
         }
-        let token = env_token.clone().or_else(|| tokens::resolve(entry));
         if let Some(url) = &entry.url {
-            return Ok(Conn { name, transport: url_transport(url)?, token, summoned: false });
+            return Ok(Conn { name, transport: url_transport(url)?, summoned: false });
         }
         let db = entry
             .database()
@@ -343,7 +313,6 @@ pub fn connect(name: &str) -> Result<Conn, String> {
                 transport: Transport::Unix(s.clone()),
                 #[cfg(not(unix))]
                 transport: Transport::Tcp(String::new()),
-                token: token.clone().or_else(|| berth_token(&home, &name)),
                 summoned,
             })
         };
@@ -378,7 +347,6 @@ pub fn connect(name: &str) -> Result<Conn, String> {
             return Ok(Conn {
                 name,
                 transport: Transport::Unix(l.sock),
-                token: env_token,
                 summoned: false,
             });
         }
@@ -397,14 +365,13 @@ pub fn connect(name: &str) -> Result<Conn, String> {
 pub fn connect_path(db: &Path) -> Result<Conn, String> {
     let db = paths::canonical_db(db).map_err(|e| format!("{}: {e}", db.display()))?;
     // The stem-derived name harbor itself would mint for this path — used
-    // only for the 0.19-era socket and token lookups; the server's /info
-    // answers with its own truth on the next refresh.
+    // only for the name-keyed socket lookup; the server's /info answers
+    // with its own truth on the next refresh.
     let name = db
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or_else(|| format!("no usable name in {}", db.display()))
         .and_then(harbor_common::paths::normalize)?;
-    let token = std::env::var("HARBOR_TOKEN").ok();
     let home = runtime_dir()?;
     let sock21 = paths::socket_for(&home, &db)?;
     let sock19 = paths::sock_file(&home, &name);
@@ -415,7 +382,6 @@ pub fn connect_path(db: &Path) -> Result<Conn, String> {
             transport: Transport::Unix(s.clone()),
             #[cfg(not(unix))]
             transport: Transport::Tcp(String::new()),
-            token: token.clone().or_else(|| berth_token(&home, &name)),
             summoned,
         })
     };
@@ -446,16 +412,12 @@ pub fn stop(name: &str) -> Result<(), String> {
     let name = harbor_common::normalize(name)?;
     let home = runtime_dir()?;
     let cfg = load_config().unwrap_or_default();
-    let token = std::env::var("HARBOR_TOKEN")
-        .ok()
-        .or_else(|| cfg.get(&name).and_then(tokens::resolve))
-        .or_else(|| berth_token(&home, &name));
 
     let mut socks: Vec<PathBuf> = Vec::new();
-    if let Some(db) = cfg.get(&name).and_then(|e| e.database()) {
-        if let Ok(s) = paths::socket_for(&home, &db) {
-            socks.push(s);
-        }
+    if let Some(db) = cfg.get(&name).and_then(|e| e.database())
+        && let Ok(s) = paths::socket_for(&home, &db)
+    {
+        socks.push(s);
     }
     socks.push(paths::sock_file(&home, &name));
     for l in discover() {
@@ -472,7 +434,7 @@ pub fn stop(name: &str) -> Result<(), String> {
             let t = Transport::Tcp(String::new());
             // 202 {"stopping":true}, then the server drains and the socket
             // goes away — a refresh a beat later drops the row.
-            request(&t, &wire::endpoint::SHUTDOWN, token.as_deref(), None, Some(Duration::from_secs(5)))
+            request(&t, &wire::endpoint::SHUTDOWN, None, Some(Duration::from_secs(5)))
                 .map_err(|e| format!("stop {name:?}: {e}"))?;
             return Ok(());
         }
@@ -582,8 +544,8 @@ pub fn version_older(running: &str, installed: &str) -> bool {
 }
 
 /// `/info` on a transport, parsed. Used for a remote's best-effort version.
-fn info_of(t: &Transport, token: Option<&str>) -> Option<wire::InfoResponse> {
-    let r = request(t, &wire::endpoint::INFO, token, None, Some(Duration::from_millis(800))).ok()?;
+fn info_of(t: &Transport) -> Option<wire::InfoResponse> {
+    let r = request(t, &wire::endpoint::INFO, None, Some(Duration::from_millis(800))).ok()?;
     if r.status != 200 {
         return None;
     }
@@ -598,19 +560,13 @@ pub fn restart(db: &Path, ephemeral: bool) -> Result<(), String> {
     let home = runtime_dir()?;
     let canon = paths::canonical_db(db)?;
     let sock = paths::socket_for(&home, &canon)?;
-    let name = canon
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| format!("no usable name in {}", db.display()))
-        .and_then(harbor_common::paths::normalize)?;
     // Shut down the server on this file's socket.
     if sock_ready(&sock) {
-        let token = std::env::var("HARBOR_TOKEN").ok().or_else(|| berth_token(&home, &name));
         #[cfg(unix)]
         let t = Transport::Unix(sock.clone());
         #[cfg(not(unix))]
         let t = Transport::Tcp(String::new());
-        request(&t, &wire::endpoint::SHUTDOWN, token.as_deref(), None, Some(Duration::from_secs(5)))
+        request(&t, &wire::endpoint::SHUTDOWN, None, Some(Duration::from_secs(5)))
             .map_err(|e| format!("stop {}: {e}", db.display()))?;
     }
     // Wait for the server to drain and release the lock.
@@ -676,14 +632,13 @@ pub fn info(conn: &Conn) -> Result<wire::InfoResponse, String> {
     let r = request(
         &conn.transport,
         &wire::endpoint::INFO,
-        conn.token.as_deref(),
         None,
         Some(Duration::from_secs(5)),
     )
     .map_err(|e| e.to_string())?;
     let status = r.status;
     let body = r.body_string().map_err(|e| e.to_string())?;
-    // Status first: a 401's error body must not decode as an identity.
+    // Status first: an error body must not decode as an identity.
     if status != 200 {
         return Err(match wire::Event::parse(body.trim()) {
             Ok(wire::Event::Error { code, message }) => format!("{code}: {message}"),

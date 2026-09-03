@@ -11,7 +11,7 @@ WHAT THIS IS FOR, AND WHY IT IS NOT A PARSER FUZZER
 
 Every network-facing bug found in this server so far parsed *fine*. The header
 flood, the unbounded body drain, the dripping body that took every worker, the
-connection held open forever by one anonymous /ready, the 51-minute eager read:
+connection held open forever by one idle /ready, the 51-minute eager read:
 in all of them the request was well-formed and the parser was right. What was
 wrong was everything around it — what got allocated, what got held, and for how
 long. A `cargo-fuzz` target asserting "no panic" would have caught none of them.
@@ -48,7 +48,7 @@ import urllib.request
 
 # Every berth a test starts registers under $HARBOR_HOME. Run through the
 # suite, check.sh sets it; run directly — which the usage line above invites —
-# nothing did, so sockets, tokens and lock files landed in the operator's real
+# nothing did, so sockets and logs landed in the operator's real
 # runtime directory and each run left a dead name behind. `setdefault` keeps
 # the harness in charge when there is one.
 #
@@ -64,7 +64,6 @@ _isolate_fleet()
 
 
 HERE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-TOKEN = "hostile-suite-token"
 WORKERS = 6
 
 passed = 0
@@ -108,7 +107,7 @@ def start_server(db, port):
                 os.path.join(HERE, "target", "release", "harbor"),
             ).split(),
             db, "start",
-            "--port", str(port), "--token", TOKEN, "--workers", str(WORKERS),
+            "--port", str(port), "--workers", str(WORKERS),
         ],
         stdout=log, stderr=log, stdin=subprocess.DEVNULL,
     )
@@ -223,9 +222,8 @@ FRAMING = [
 ODD = [
     "Connection: close", "Connection: keep-alive", "Connection: upgrade",
     "Expect: 100-continue", "Expect: something-else",
-    "Authorization: Bearer " + TOKEN, "Authorization: Bearer wrong",
-    "Authorization: bearer " + TOKEN, "Authorization: Basic x",
-    "Authorization: Bearer " + TOKEN + "\r\nAuthorization: Bearer " + TOKEN,
+    "X-Odd: whatever", "X-Odd: Whatever",
+    "X-Repeat: a\r\nX-Repeat: b",
     "Accept: application/json", "Accept: application/x-ndjson", "Accept: */*",
     "Host: x", "Host:", "X-Long: " + "v" * 4000, "X-Empty:",
     ": novalue", "NoColon", "X-Bad\x00Name: v", "X-Space : v",
@@ -336,7 +334,7 @@ def case_slowloris_head(port, rng, n):
     return alive
 
 
-def case_dripping_body(port, n, authed):
+def case_dripping_body(port, n):
     """The wedge: a declared body delivered slower than anyone will wait."""
     stop = [False]
     socks = []
@@ -345,8 +343,7 @@ def case_dripping_body(port, n, authed):
         try:
             s = socket.create_connection(("127.0.0.1", port), timeout=60)
             socks.append(s)
-            auth = (b"Authorization: Bearer " + TOKEN.encode() + b"\r\n") if authed else b""
-            s.sendall(b"POST /sql HTTP/1.1\r\nHost: x\r\n" + auth +
+            s.sendall(b"POST /sql HTTP/1.1\r\nHost: x\r\n"
                       b"Content-Length: 8000000\r\n\r\n")
             while not stop[0]:
                 s.sendall(b'{"sql":')
@@ -386,7 +383,7 @@ def case_stalled_heads(port, n):
 
 
 def case_held_connections(port, n):
-    """One cheap unauthenticated request, then silence forever.
+    """One cheap request, then silence forever.
 
     The quiet accumulation: nothing errors, the berth answers normally, and a
     thread plus two descriptors pile up per socket. Reclaimed only on the
@@ -455,15 +452,13 @@ def main():
             bad("slowloris head", f"/ready failed after {secs:.2f}s")
 
         section("Dripping body — the wedge")
-        for authed in (False, True):
-            label = "authenticated" if authed else "anonymous"
-            alive, secs = case_dripping_body(port, WORKERS + 2, authed)
-            if alive:
-                ok(f"{WORKERS + 2} {label} dripping bodies, berth still answering",
-                   f"{secs:.2f}s")
-            else:
-                bad(f"dripping body ({label})",
-                    f"/ready failed after {secs:.2f}s — every worker is held")
+        alive, secs = case_dripping_body(port, WORKERS + 2)
+        if alive:
+            ok(f"{WORKERS + 2} dripping bodies, berth still answering",
+               f"{secs:.2f}s")
+        else:
+            bad("dripping body",
+                f"/ready failed after {secs:.2f}s — every worker is held")
 
         section("No desync")
         worst = 0

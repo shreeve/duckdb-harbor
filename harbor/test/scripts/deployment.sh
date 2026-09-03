@@ -3,8 +3,8 @@
 # deployment.sh — point this at a server that is already running and
 # find out whether it is one you would put traffic on.
 #
-#   scripts/deployment.sh --url http://127.0.0.1:9500 --token T
-#   scripts/deployment.sh --url https://harbor.internal --token "$TOK" --json
+#   scripts/deployment.sh --url http://127.0.0.1:9500
+#   scripts/deployment.sh --url https://harbor.internal --json
 #
 # Every other suite in this directory starts its own server on a copy of a
 # database. This one does not start anything and does not create anything: it
@@ -16,8 +16,8 @@
 # The distinction matters because the interesting failures are the ones that
 # only exist in a deployment: a reverse proxy that buffers a streaming response
 # until the last row, a load balancer that closes idle keep-alive connections,
-# a token that was configured in one place and not another, a TLS terminator
-# that mangles UTF-8. None of those can be caught on a developer's laptop by a
+# a TLS terminator that mangles UTF-8, or an edge policy that rejects valid
+# requests. None of those can be caught on a developer's laptop by a
 # suite that starts its own listener.
 #
 # Exit status is 0 when the deployment is fit to serve, 1 otherwise. With
@@ -26,18 +26,17 @@
 
 set -uo pipefail
 
-url=""; token=""; as_json=0; verbose=0
+url=""; as_json=0; verbose=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --url)     url=$2; shift 2 ;;
-    --token)   token=$2; shift 2 ;;
     --json)    as_json=1; shift ;;
     --verbose) verbose=1; shift ;;
     -h|--help) sed -n '2,28p' "$0" | cut -c3-; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
-[[ -z "$url" ]] && { echo "usage: $0 --url URL [--token T] [--json]" >&2; exit 2; }
+[[ -z "$url" ]] && { echo "usage: $0 --url URL [--json]" >&2; exit 2; }
 url=${url%/}
 
 pass=0; fail=0; warn=0
@@ -65,8 +64,6 @@ command -v jq >/dev/null || { echo "validate-deployment needs jq" >&2; exit 2; }
 work=$(mktemp -d "${TMPDIR:-/tmp}/harbor-validate.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
-auth=(); [[ -n "$token" ]] && auth=(-H "Authorization: Bearer $token")
-
 # post <sql> [params-json] — the NDJSON body, or empty on transport failure
 post() {
   local body
@@ -75,10 +72,10 @@ post() {
   else
     body=$(jq -cn --arg s "$1" '{sql:$s}')
   fi
-  curl -sS -m 60 "${auth[@]}" -H 'Content-Type: application/json' --data "$body" "$url/sql" 2>/dev/null
+  curl -sS -m 60 -H 'Content-Type: application/json' --data "$body" "$url/sql" 2>/dev/null
 }
 code() { # code <sql> — the HTTP status alone
-  curl -sS -m 60 -o /dev/null -w '%{http_code}' "${auth[@]}" -H 'Content-Type: application/json' \
+  curl -sS -m 60 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
        --data "$(jq -cn --arg s "$1" '{sql:$s}')" "$url/sql" 2>/dev/null
 }
 # The first value of the first row, via the same NDJSON parse a client uses.
@@ -101,35 +98,15 @@ else
   exit 1
 fi
 
-# /ready must not need the token, or an orchestrator's probe fails closed and
-# takes a working deployment out of rotation.
-eq "ready needs no credential" "200" "$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "$url/ready" 2>/dev/null)"
+# A second request catches listeners or proxies that answer only once.
+eq "ready remains reachable" "200" "$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "$url/ready" 2>/dev/null)"
 
-# There is no /version endpoint; the extension reports its version through
-# SQL, which is the route that exists in every build.
-ver=$(scalar 'SELECT version FROM harbor_version()')
-if [[ -n "$ver" && "$ver" != "NO-ROWS" ]]; then
+# Server identity and version are part of the HTTP protocol.
+ver=$(curl -sS -m 10 "$url/info" 2>/dev/null | jq -r '.harborVersion // empty')
+if [[ -n "$ver" ]]; then
   ok "reports its version" "$ver"
 else
-  soft "reports its version" "harbor_version() returned nothing"
-fi
-
-# ---------------------------------------------------------------------------
-section "Authentication"
-# ---------------------------------------------------------------------------
-
-if [[ -n "$token" ]]; then
-  eq "no credential is refused" "401" \
-     "$(curl -sS -m 20 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' --data '{"sql":"SELECT 1"}' "$url/sql" 2>/dev/null)"
-  eq "a wrong credential is refused" "401" \
-     "$(curl -sS -m 20 -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer not-the-token' -H 'Content-Type: application/json' --data '{"sql":"SELECT 1"}' "$url/sql" 2>/dev/null)"
-  # A prefix of the real token must not pass; that would mean a comparison
-  # that stops at the first difference in length rather than in content.
-  eq "a truncated credential is refused" "401" \
-     "$(curl -sS -m 20 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${token:0:${#token}-1}" -H 'Content-Type: application/json' --data '{"sql":"SELECT 1"}' "$url/sql" 2>/dev/null)"
-  eq "the right credential is accepted" "200" "$(code 'SELECT 1')"
-else
-  soft "authentication" "no --token given, so this deployment is either open or untested here"
+  bad "reports its version" "/info did not return harborVersion"
 fi
 
 # ---------------------------------------------------------------------------
@@ -138,20 +115,20 @@ section "Compression"
 
 # The one negotiated coding. A client that asks gets zstd frames; one that
 # does not must get identity — silence about codings is a promise too.
-enc=$(curl -sS -m 20 -D - -o /dev/null "${auth[@]}" -H 'Accept-Encoding: zstd' \
+enc=$(curl -sS -m 20 -D - -o /dev/null -H 'Accept-Encoding: zstd' \
       -H 'Content-Type: application/json' --data '{"sql":"SELECT 1"}' "$url/sql" 2>/dev/null \
       | tr -d '\r' | awk -F': ' 'tolower($1)=="content-encoding"{print $2}')
 eq "zstd negotiates when offered" "zstd" "$enc"
-enc=$(curl -sS -m 20 -D - -o /dev/null "${auth[@]}" \
+enc=$(curl -sS -m 20 -D - -o /dev/null \
       -H 'Content-Type: application/json' --data '{"sql":"SELECT 1"}' "$url/sql" 2>/dev/null \
       | tr -d '\r' | awk -F': ' 'tolower($1)=="content-encoding"{print $2}')
 eq "identity when nothing is offered" "" "$enc"
 if command -v zstd >/dev/null 2>&1; then
   # The frame is the standard one: the stock CLI must recover the stream,
   # and the recovered bytes must be the identity response.
-  plain=$(curl -sS -m 20 "${auth[@]}" -H 'Content-Type: application/json' \
+  plain=$(curl -sS -m 20 -H 'Content-Type: application/json' \
           --data '{"sql":"SELECT 7 * 6 AS answer"}' "$url/sql" 2>/dev/null)
-  round=$(curl -sS -m 20 "${auth[@]}" -H 'Accept-Encoding: zstd' -H 'Content-Type: application/json' \
+  round=$(curl -sS -m 20 -H 'Accept-Encoding: zstd' -H 'Content-Type: application/json' \
           --data '{"sql":"SELECT 7 * 6 AS answer"}' "$url/sql" 2>/dev/null | zstd -d -c 2>/dev/null)
   # timeMs differs per run; compare everything before the end line.
   eq "the frame decodes to the identity stream" \
@@ -239,7 +216,7 @@ section "Errors and refusals"
 eq "a syntax error is 400, not 500"   "400" "$(code 'SELEKT 1')"
 eq "an unknown table is 400"          "400" "$(code 'SELECT * FROM no_such_table_here')"
 eq "malformed JSON is 400"            "400" \
-   "$(curl -sS -m 20 -o /dev/null -w '%{http_code}' "${auth[@]}" -H 'Content-Type: application/json' --data '{"sql":' "$url/sql" 2>/dev/null)"
+   "$(curl -sS -m 20 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' --data '{"sql":' "$url/sql" 2>/dev/null)"
 eq "an empty statement is 400"        "400" "$(code '')"
 
 err=$(post 'SELECT * FROM no_such_table_here' | jq -rs 'map(select(.type=="error"))|.[0]' 2>/dev/null)
@@ -270,7 +247,7 @@ eq "a null parameter binds"     "null"     "$(post 'SELECT ?::INTEGER AS n' '[nu
 eq "a parameter is never interpolated" "1; DROP TABLE x" \
    "$(scalar 'SELECT ?::VARCHAR AS s' '["1; DROP TABLE x"]')"
 eq "too few parameters is 400"  "400" \
-   "$(curl -sS -m 20 -o /dev/null -w '%{http_code}' "${auth[@]}" -H 'Content-Type: application/json' --data '{"sql":"SELECT ?::INTEGER","params":[]}' "$url/sql" 2>/dev/null)"
+   "$(curl -sS -m 20 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' --data '{"sql":"SELECT ?::INTEGER","params":[]}' "$url/sql" 2>/dev/null)"
 
 # ---------------------------------------------------------------------------
 section "Streaming and concurrency, as deployed"
@@ -280,12 +257,10 @@ section "Streaming and concurrency, as deployed"
 # response — the single most common way a streaming deployment stops streaming
 # — makes these two numbers equal, and the query looks fine while every client
 # waits for the last row before seeing the first.
-python3 - "$url" "$token" > "$work/stream.txt" <<'PY'
+python3 - "$url" > "$work/stream.txt" <<'PY'
 import subprocess, sys, time
-url, token = sys.argv[1], sys.argv[2]
+url = sys.argv[1]
 cmd = ["curl", "-sSN", "-m", "120", "-H", "Content-Type: application/json"]
-if token:
-    cmd += ["-H", "Authorization: Bearer " + token]
 cmd += ["--data", '{"sql":"SELECT i, repeat(\'x\',100) FROM range(300000) t(i)"}', url + "/sql"]
 start = time.time()
 first = None
@@ -322,9 +297,9 @@ fi
 
 # Keep-alive is what stops a busy client from exhausting its ephemeral ports.
 # A load balancer that closes after every response reintroduces exactly that.
-reused=$(curl -sS -m 30 "${auth[@]}" -H 'Content-Type: application/json' \
+reused=$(curl -sS -m 30 -H 'Content-Type: application/json' \
               --data '{"sql":"SELECT 1"}' "$url/sql" \
-              --next -sS -m 30 "${auth[@]}" -H 'Content-Type: application/json' \
+              --next -sS -m 30 -H 'Content-Type: application/json' \
               --data '{"sql":"SELECT 2"}' "$url/sql" -w '%{num_connects}' -o /dev/null 2>/dev/null | tail -1)
 # num_connects is reported per transfer, so 0 on the second request means it
 # went out over the connection the first one opened.
@@ -337,13 +312,12 @@ fi
 
 # Concurrency, at the shape a real client uses: several connections at once,
 # each making several requests, all of which must be correct.
-python3 - "$url" "$token" > "$work/conc.txt" <<'PY'
+python3 - "$url" > "$work/conc.txt" <<'PY'
 import http.client, json, sys, threading
 from urllib.parse import urlparse
-u = urlparse(sys.argv[1]); token = sys.argv[2]
+u = urlparse(sys.argv[1])
 cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
 headers = {"Content-Type": "application/json"}
-if token: headers["Authorization"] = "Bearer " + token
 good = [0]; lock = threading.Lock()
 def work():
     c = cls(u.hostname, u.port, timeout=60)

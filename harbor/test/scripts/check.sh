@@ -34,7 +34,6 @@ s = socket.socket()
 s.bind(("127.0.0.1", 0))
 print(s.getsockname()[1])
 s.close()')}
-token=${TOKEN:-check-$$}
 # Unset, not just shadowed. The suites below read PORT from the environment as
 # their own default, so leaving it set makes every one of them try to bind the
 # port this runner has already given to the shared server — the run dies at
@@ -53,7 +52,7 @@ declare -a failed=() skipped=() passed=()
 # battery dies at "the server did not come up".
 work=$(mktemp -d /tmp/harbor-check.XXXXXX)
 # Every berth this suite starts registers under $HARBOR_HOME. Without this the
-# sockets, tokens and lock files land in the operator's real runtime directory,
+# sockets and logs land in the operator's real runtime directory,
 # and each run leaves a fistful of dead names behind — invisible before
 # `harbor show` learned to report them, and noise in the fleet view now.
 export HARBOR_HOME="$work/harbor-home"
@@ -108,7 +107,7 @@ if (( needs_server )); then
   cp "$db" "$work/check.duckdb"
   launcher="${HARBOR_LAUNCHER:-$here/target/release/harbor}"
   ${launcher%% *} --help >/dev/null 2>&1 || cargo build -p harbor --release
-  $launcher "$work/check.duckdb" start --port "$port" --token "$token" --workers 8 \
+  $launcher "$work/check.duckdb" start --port "$port" --workers 8 \
       >"$work/server.log" 2>&1 &
   server_pid=$!
   up=0
@@ -132,11 +131,11 @@ run asserts "$here/test/scripts/asserts.sh" "$db"
 # schema lines, so it needs a server; it used to grep the query text instead.
 # (The file is not named types.py: a script dir on sys.path[0] would then
 # shadow the stdlib `types` module and break every Python suite run from here.)
-run types "$here/test/scripts/typecov.py" --port "$port" --token "$token"
+run types "$here/test/scripts/typecov.py" --port "$port"
 
-run spec  "$here/test/scripts/spec.py" --port "$port" --token "$token"
-run fuzz  "$here/test/scripts/fuzz.py"       --port "$port" --token "$token"
-run deployment "$here/test/scripts/deployment.sh" --url "http://127.0.0.1:$port" --token "$token"
+run spec  "$here/test/scripts/spec.py" --port "$port"
+run fuzz  "$here/test/scripts/fuzz.py"       --port "$port"
+run deployment "$here/test/scripts/deployment.sh" --url "http://127.0.0.1:$port"
 # Load runs against the same server as the read-only suites rather than
 # standing up its own. There was a second copy of the start-and-wait logic in
 # the CI workflow doing exactly this, and it was the only place that could not
@@ -155,7 +154,7 @@ if [[ " $suites " == *" stress "* ]]; then
   expect_top=$(duckdb   -readonly -csv -noheader "$db" -c "${mapfile_compat[1]}" | tail -1)
   expect_join=$(duckdb  -readonly -csv -noheader "$db" -c "${mapfile_compat[2]}" | tail -1)
 fi
-run stress "$here/test/scripts/stress.py" --port "$port" --token "$token" \
+run stress "$here/test/scripts/stress.py" --port "$port" \
            --levels "${SWARM_LEVELS:-1,4,16}" --seconds "${SWARM_SECONDS:-10}" \
            --write-pct "${SWARM_WRITE_PCT:-20}" \
            --expect-sites "${expect_sites:-}" --expect-top-plans "${expect_top:-}" \

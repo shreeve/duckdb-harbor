@@ -245,7 +245,7 @@ pub fn run(
                         DotResult::Quit => return std::process::ExitCode::SUCCESS,
                         DotResult::Handled => continue,
                         DotResult::Open(target) => {
-                            match crate::repl::resolve(&target, None) {
+                            match crate::repl::resolve(&target) {
                                 Ok((c, name)) => {
                                     // Moor at the new server before letting
                                     // the old mooring go: the switch must

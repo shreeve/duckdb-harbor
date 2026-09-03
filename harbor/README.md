@@ -54,14 +54,14 @@ another harbor.
 
 `harbor` by itself shows what's being served.
 
-No config file. No drivers, no ORM, no fleet manager. Built directly on
-DuckDB's new v2 C API — the API of the 2.0 line — so it's smaller, faster, and
-simpler than everything it replaces.
+Zero-config by default. No drivers, no ORM, no fleet manager. Built directly
+on DuckDB's new v2 C API — the API of the 2.0 line — so it's smaller, faster,
+and simpler than everything it replaces.
 
 If it can speak HTTP and parse JSON, it can query your database.
 
 ```console
-$ curl -s localhost:9495/sql -H 'Authorization: Bearer …' \
+$ curl -s localhost:9495/sql -H 'Content-Type: application/json' \
        -d '{"sql":"SELECT id, total FROM orders LIMIT 2"}'
 {"type":"schema","columns":[{"name":"id","duckdbType":"BIGINT","lossless":true},
                             {"name":"total","duckdbType":"DECIMAL(10,2)","lossless":true,
@@ -81,8 +81,8 @@ one to read the schema without asking five questions, one that says who a
 server is, and one graceful shutdown route:
 
 ```
-GET  /ready                can this server answer a query? no credential required
-POST /shutdown             authenticated drain, checkpoint, and stop
+GET  /ready                can this server answer a query?
+POST /shutdown             drain, checkpoint, and stop
 
 GET  /info                 identity — database path, versions, pid, uptime,
                            and the live client count
@@ -149,9 +149,9 @@ are the whole server.
 Name a statement when you send it, and you can stop it:
 
 ```console
-$ curl -s localhost:9495/sql -H "$auth" \
+$ curl -s localhost:9495/sql -H 'Content-Type: application/json' \
        -d '{"sql":"SELECT count(*) FROM huge","queryId":"report-7"}' &
-$ curl -s -X DELETE localhost:9495/sql/queries/report-7 -H "$auth"
+$ curl -s -X DELETE localhost:9495/sql/queries/report-7
 {"cancelled":true}
 ```
 
@@ -207,13 +207,13 @@ per statement means no transaction can span two. A session bridges that: a
 connection pinned to you until you commit, roll back, or stop answering.
 
 ```console
-$ sid=$(curl -s localhost:9495/sql/sessions/new -H "$auth" | jq -r .sessionId)
-$ post() { curl -s localhost:9495/sql -H "$auth" -d "{\"sql\":\"$1\",\"sessionId\":\"$sid\"}"; }
+$ sid=$(curl -s -X POST localhost:9495/sql/sessions | jq -r .sessionId)
+$ post() { curl -s localhost:9495/sql -H 'Content-Type: application/json' -d "{\"sql\":\"$1\",\"sessionId\":\"$sid\"}"; }
 $ post "BEGIN"
 $ post "INSERT INTO orders (total) VALUES (19.99) RETURNING id"
 $ post "INSERT INTO order_items (order_id, price) VALUES (1, 19.99)"
 $ post "COMMIT"
-$ curl -s -X DELETE localhost:9495/sql/sessions/$sid -H "$auth"
+$ curl -s -X DELETE localhost:9495/sql/sessions/$sid
 ```
 
 This is PgBouncer's transaction pooling, or ActiveRecord checking a connection
@@ -276,7 +276,7 @@ newer client's ask with the full document instead of a 404.
 
 ## Get it running
 
-One binary, and nothing to configure. The client half never touches DuckDB —
+One binary, ready without configuration. The client half never touches DuckDB —
 the engine (`libduckdb`) loads on demand, only when this process is the one
 serving a file, so the same 2.2MB `harbor` is a pure protocol client on
 machines that never host a database. `make fetch-duckdb` pulls DuckDB's
@@ -356,8 +356,8 @@ open never replays a WAL, socket swept. Boot persistence belongs to launchd
 or a systemd user unit running exactly this command; harbor never becomes a
 supervisor.
 
-There is no registry and no config file. The socket **is** the registration:
-its name is derived from the database's canonical path
+There is no registry. The socket **is** the runtime registration: its name is
+derived from the database's canonical path
 (`~/.local/state/harbor/runtime/<basename>-<hash>.sock`), so discovery is
 `readdir` plus a `GET /info` to each socket — which is precisely what bare
 `harbor` prints:
@@ -381,7 +381,7 @@ off this list:
 
 ```console
 $ harbor ~/.local/state/harbor/runtime/labs.duckdb-1a2b3c4d.sock   # its socket
-$ harbor http://127.0.0.1:9495 --token t                           # its URL
+$ harbor http://127.0.0.1:9495                                     # its URL
 $ harbor labs                                                      # its name
 $ harbor 1                                                         # its footnote
 ```
@@ -392,44 +392,34 @@ databases share is refused as ambiguous rather than guessed. The verbs take
 the same spellings: `harbor labs stop`, `harbor 1 stop`.
 
 A socket nothing answers on is a leftover from a `kill -9`, and the list
-unlinks it. There is nothing else to clean up, because nothing else is
-written. Set `HARBOR_HOME` (absolute path) to collapse everything harbor
-writes — sockets and state alike — into that one directory instead; the
-test suites use it to keep their servers out of the real fleet view.
+unlinks it. Set `HARBOR_HOME` (absolute path) to collapse configuration and
+runtime state — sockets, logs, and history — into one directory; the test
+suites use it to keep their servers out of the real fleet view.
 
-### Sockets, TCP, and tokens
+### Sockets and TCP
 
-The unix socket is always there, and the `0700` runtime directory is the
-whole local access control — no token exists on a socket, and `--token` is
-refused there so nobody believes an extra lock is doing something. `--port`
-adds a TCP door *beside* the socket, never in place of it, so a TCP-exposed
+The Unix socket is always there, protected by the `0700` runtime directory.
+`--port` adds loopback TCP *beside* the socket, never in place of it, so the
 server stays visible to the fleet (the list, DuckTable, join-before-summon)
-like any other. TCP is the one door that leaves the filesystem's protection,
-so `--port` makes `--token` mandatory:
+like any other. Both doors are machine-local:
 
 ```console
-$ harbor mydata.duckdb start --port 9495 --token secret
-$ harbor http://127.0.0.1:9495 --token secret -c "SELECT count(*) FROM orders"
+$ harbor mydata.duckdb start --port 9495
+$ harbor http://127.0.0.1:9495 -c "SELECT count(*) FROM orders"
 ```
 
-A flagless start reaches the port two other ways, for a server run by a
-supervisor rather than a shell. `port` (and optional `bind`) are
-`[connection.<name>]` keys, honored by an explicit `start` — a summon stays
-on the socket, so opening a database never silently exposes it. The token has
-no config key by design; a flagless start reads it from `$HARBOR_TOKEN`
-instead, which is where a systemd unit or launchd plist puts a secret. So a
-config `port` plus an `Environment=HARBOR_TOKEN=…` line serves TCP with the
-unit's own `harbor <db> start` unchanged — a systemd drop-in
-(`harbor-<name>.service.d/`) carries the secret and survives `harbor <db>
-autostart` rewriting the unit.
+An explicit start can also take its port from the matching
+`[connection.<name>]` entry in `~/.config/harbor/config.toml`; a summon stays
+on the Unix socket, so opening a database never silently adds a TCP listener.
+TCP binds `127.0.0.1` and, where available, `::1`.
 
-Remote access is Caddy's job at the edge (TLS + auth); harbor itself speaks
+Remote access is Caddy's job at the edge (TLS and access policy); harbor itself speaks
 plain HTTP over a unix socket or a loopback TCP port. A human reaches a
 remote host over ssh and uses the socket.
 
-A bearer token grants the ability to run SQL, and ordinary DuckDB SQL can
-read host files or load extensions. For a server reachable by an untrusted
-token holder, `--sealed` disables host-file access and community extensions.
+Ordinary DuckDB SQL can read host files or load extensions. For a server whose
+callers should not receive those capabilities, `--sealed` disables host-file
+access and community extensions.
 `--max-temp-size` bounds disk spill, and `--statement-timeout` places the
 hard statement ceiling described above. These are independent of Caddy's
 transport and HTTP policy.
@@ -458,7 +448,7 @@ job, and it does them better than harbor would.
 There is nothing to install on the client side. Shell:
 
 ```console
-$ curl -sN localhost:9495/sql -H "Authorization: Bearer $TOKEN" \
+$ curl -sN localhost:9495/sql -H 'Content-Type: application/json' \
        -d '{"sql":"SELECT count(*) FROM orders"}'
 ```
 
@@ -470,7 +460,7 @@ import http.client, json
 
 conn = http.client.HTTPConnection("127.0.0.1", 9495)
 conn.request("POST", "/sql", json.dumps({"sql": "SELECT id, total FROM orders"}),
-             {"Authorization": f"Bearer {token}"})
+             {"Content-Type": "application/json"})
 
 for line in conn.getresponse():
     msg = json.loads(line)
@@ -483,10 +473,7 @@ JavaScript, with `fetch` — and `params`, which is how values are passed:
 ```js
 const res = await fetch("http://127.0.0.1:9495/sql", {
   method: "POST",
-  headers: {
-    Authorization: `Bearer ${token}`,
-    "Content-Type": "application/json",
-  },
+  headers: { "Content-Type": "application/json" },
   body: JSON.stringify({ sql: "SELECT id, total FROM orders WHERE id > ?",
                          params: [100] }),
 });
@@ -640,7 +627,7 @@ worth knowing before it faces a browser. Request logging is available with
 
 **Windows serves over loopback TCP only.** Unix sockets — and with them
 spawn-on-use and the list — are a unix feature. On Windows, serving is
-explicit (`harbor <db> start --port <p> --token <t>`) and the client half
+explicit (`harbor <db> start --port <p>`) and the client half
 works the same everywhere.
 
 **The engine is the loaded `libduckdb`, not the binary.** Nothing is linked:
