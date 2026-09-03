@@ -258,7 +258,7 @@ indexes and sequences — plus the engine's row estimate and its own
 exact bytes at the top:
 
 ```json
-{"harborVersion":"0.28.2","duckdbVersion":"v2.0.0-dev83323",
+{"harborVersion":"0.28.3","duckdbVersion":"v2.0.0-dev83323",
  "databaseSizeBytes":12582912,"walSizeBytes":0,
  "tables":[{"name":"orders","schema":"main","estimatedRows":300000,
             "columns":[…],"primaryKey":["id"],
@@ -328,7 +328,7 @@ with `sudo` in front of the whole command — the installer never escalates on
 its own. On Windows the binary lands in `%LOCALAPPDATA%\Programs\harbor\bin`,
 which the installer adds to your user `PATH`.
 
-Pin a version with `... | bash -s v0.28.2` (or `-Tag v0.28.2` on Windows). Each
+Pin a version with `... | bash -s v0.28.3` (or `-Tag v0.28.3` on Windows). Each
 [release](https://github.com/shreeve/duckdb-harbor/releases)
 ships one self-contained archive per
 platform (osx-arm64, linux-amd64, linux-arm64, windows-amd64, windows-arm64):
@@ -411,6 +411,17 @@ so `--port` makes `--token` mandatory:
 $ harbor mydata.duckdb start --port 9495 --token secret
 $ harbor http://127.0.0.1:9495 --token secret -c "SELECT count(*) FROM orders"
 ```
+
+A flagless start reaches the port two other ways, for a server run by a
+supervisor rather than a shell. `port` (and optional `bind`) are
+`[connection.<name>]` keys, honored by an explicit `start` — a summon stays
+on the socket, so opening a database never silently exposes it. The token has
+no config key by design; a flagless start reads it from `$HARBOR_TOKEN`
+instead, which is where a systemd unit or launchd plist puts a secret. So a
+config `port` plus an `Environment=HARBOR_TOKEN=…` line serves TCP with the
+unit's own `harbor <db> start` unchanged — a systemd drop-in
+(`harbor-<name>.service.d/`) carries the secret and survives `harbor <db>
+autostart` rewriting the unit.
 
 Remote access is Caddy's job at the edge (TLS + auth); harbor itself speaks
 plain HTTP over a unix socket or a loopback TCP port. A human reaches a

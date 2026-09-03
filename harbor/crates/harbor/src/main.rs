@@ -220,7 +220,9 @@ start options:
                        becomes mandatory for the TCP door: it leaves the
                        0700 runtime dir, which is what secures the socket)
   --bind <addr>        TCP bind address (with --port; default 127.0.0.1)
-  --token <t>          bearer token (TCP only)
+  --token <t>          bearer token (TCP only; else $HARBOR_TOKEN — the
+                       channel for a flagless start, e.g. a systemd unit
+                       serving a config `port`)
   --workers <n>        executor pool size (default 6)
   --memory-limit <s>   DuckDB memory_limit (default 2GB)
   --threads <n>        DuckDB threads (default: DuckDB's own)
@@ -371,6 +373,16 @@ fn parse_opts(mut o: Opts, rest: Vec<String>) -> Result<Opts, String> {
     }
     // A typed path is the duckdb-cli contract: open it, existing or not, so a
     // missing file becomes a fresh database rather than an error.
+    // A port with no `--token` looks to the environment before it refuses:
+    // `$HARBOR_TOKEN` is the secret's channel for a flagless start — a systemd
+    // `Environment=` line or a launchd plist, exactly where `port` in config
+    // (which has no token key, by design) needs its mandatory credential to
+    // come from. Only consulted WITH a port: a bare socket start ignores the
+    // variable, so a client's dial token in the environment never turns into a
+    // spurious "token has no meaning on a socket".
+    if o.port.is_some() && o.token.is_none() {
+        o.token = std::env::var("HARBOR_TOKEN").ok().filter(|t| !t.is_empty());
+    }
     // The token law, both directions. A unix socket in the 0700 runtime dir
     // is already access-controlled by the filesystem, so a token there is a
     // second lock on a door only you can reach — refused, so nobody believes
