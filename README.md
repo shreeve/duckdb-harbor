@@ -38,4 +38,7 @@ Install DuckTable (macOS, Apple Silicon):
 curl -fsSL https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/ducktable/scripts/install.sh | bash
 ```
 
+Uninstall either with `... | bash -s -- --uninstall` — your databases,
+state, and settings stay.
+
 MIT.

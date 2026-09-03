@@ -13,6 +13,11 @@
 # to ~/.local/bin and libduckdb to ~/.local/lib, both overridable with BIN=
 # and LIB=. Nothing here needs root.
 #
+# Uninstall the same way — the binary and libduckdb go; your databases,
+# state, and config stay:
+#
+#   curl -fsSL .../install.sh | bash -s -- --uninstall
+#
 # On Windows use install.ps1 instead:
 #
 #   irm https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.ps1 | iex
@@ -32,10 +37,42 @@ fi
 
 info() { printf "${Dim}%s${Color_Off}\n" "$*"; }
 fail() { printf "${Red}error${Color_Off}: %s\n" "$*" >&2; exit 1; }
+tildify() { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
+
+# Remove only what install put down — the binary and the engine. Databases,
+# state (the fleet's sockets die with their servers), and config belong to
+# the user, and an uninstaller that reaches for those is malware with a
+# manual. No network: what is installed is answered by the filesystem.
+uninstall() {
+  BIN=${BIN:-$HOME/.local/bin}
+  LIB=${LIB:-$HOME/.local/lib}
+  if [ ! -e "$BIN/$NAME" ] && [ ! -e "$LIB/libduckdb.dylib" ] && [ ! -e "$LIB/libduckdb.so" ]; then
+    fail "$NAME is not installed at $(tildify "$BIN/$NAME") (BIN=/LIB= if it lives elsewhere)"
+  fi
+  if [ -e "$BIN/$NAME" ]; then
+    rm -f "$BIN/$NAME" || fail "cannot remove $(tildify "$BIN/$NAME") — re-run under sudo if it was installed system-wide"
+    printf "${Green}$NAME was removed from ${Bold_Green}%s${Color_Off}\n" "$(tildify "$BIN")"
+  fi
+  removed_lib=false
+  for lib in "$LIB"/libduckdb.dylib "$LIB"/libduckdb.so; do
+    if [ -e "$lib" ]; then
+      rm -f "$lib" || fail "cannot remove $(tildify "$lib")"
+      removed_lib=true
+    fi
+  done
+  if $removed_lib; then
+    printf "${Green}libduckdb was removed from ${Bold_Green}%s${Color_Off}\n" "$(tildify "$LIB")"
+  fi
+  info "your databases, state ($(tildify "${XDG_STATE_HOME:-$HOME/.local/state}/harbor")), and config ($(tildify "${XDG_CONFIG_HOME:-$HOME/.config}/harbor")) are untouched"
+}
 
 # Everything lives in main() so a truncated `curl | bash` download can
 # never execute a half-delivered script.
 main() {
+  case "${1:-}" in
+    --uninstall) uninstall; return ;;
+  esac
+
   command -v curl >/dev/null || fail "curl is required"
   command -v tar  >/dev/null || fail "tar is required"
 

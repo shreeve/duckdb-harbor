@@ -48,6 +48,9 @@ One command, Apple Silicon, no Gatekeeper dialog — the script drops
 the zip in a browser instead will trip Gatekeeper's quarantine; if you go
 that way, allow it under System Settings → Privacy & Security → Open Anyway.)
 
+Uninstall with `... | bash -s -- --uninstall` — the app goes; your settings
+(`~/.config/ducktable`) and your databases stay.
+
 On Intel, or to build from source: clone the repo and run
 `ducktable/scripts/macos-app.sh release`.
 

@@ -55,15 +55,15 @@ install -m 0755 lib/libduckdb.* "$LIB"
 state="${HARBOR_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/harbor}"
 [ -d "$state/runtime" ] && chmod 700 "$state" "$state/runtime" 2>/dev/null || true
 
-printf "${Green}harbor was installed successfully to ${Bold_Green}%s${Color_Off}\n" "$(tildify "$BIN")"
-info "libduckdb -> $(tildify "$LIB")"
+printf "${Green}harbor was installed to ${Bold_Green}%s${Color_Off}\n" "$(tildify "$BIN")"
+printf "${Green}libduckdb was installed to ${Bold_Green}%s${Color_Off}\n" "$(tildify "$LIB")"
 
 case ":${PATH:-}:" in
   *":$BIN:"*) ;;
   *)
     printf '\n'
     info "$(tildify "$BIN") is not on your PATH. Add it:"
-    printf "  ${Bold_White}echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc${Color_Off}${Dim}   # or ~/.bashrc${Color_Off}\n"
+    printf "  ${Bold_White}echo 'export PATH=\"%s:\$PATH\"' >> ~/.zshrc${Color_Off}${Dim}   # or ~/.bashrc${Color_Off}\n" "$BIN"
     ;;
 esac
 
