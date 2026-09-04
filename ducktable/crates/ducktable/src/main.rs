@@ -242,7 +242,7 @@ macro_rules! icon {
     };
 }
 
-const ICONS: [(&str, &[u8]); 12] = [
+const ICONS: [(&str, &[u8]); 13] = [
     icon!("shapes"),
     icon!("panel-right"),
     icon!("search"),
@@ -255,6 +255,7 @@ const ICONS: [(&str, &[u8]); 12] = [
     icon!("check"),
     icon!("copy"),
     icon!("funnel"),
+    icon!("plus"),
 ];
 
 impl AssetSource for Assets {

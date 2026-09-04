@@ -29,9 +29,28 @@ pub struct CellEdit {
 /// One row's staged fate.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RowChange {
+    /// A not-yet-persisted row. Missing columns mean SQL DEFAULT; a
+    /// present cell means the user explicitly supplied a value or NULL.
+    Insert(BTreeMap<usize, CellEdit>),
     /// Schema column index -> staged cell.
     Update(BTreeMap<usize, CellEdit>),
     Delete,
+}
+
+/// How commit verifies one generated statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatementExpectation {
+    /// UPDATE/DELETE return DuckDB's one-cell affected-row count.
+    AffectedOne,
+    /// INSERT ... RETURNING * must return exactly one row.
+    ReturnedOne,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Statement {
+    pub sql: String,
+    pub params: Vec<Value>,
+    pub expectation: StatementExpectation,
 }
 
 /// One undo step: the row entry's state before and after a mutation.
@@ -60,6 +79,7 @@ pub struct Edits {
     changes: HashMap<String, Entry>,
     undo: Vec<Op>,
     redo: Vec<Op>,
+    next_draft: u64,
 }
 
 /// A row identity's map key: its canonical JSON. Values compare by
@@ -77,6 +97,7 @@ impl Edits {
             changes: HashMap::new(),
             undo: Vec::new(),
             redo: Vec::new(),
+            next_draft: 1,
         }
     }
 
@@ -100,14 +121,19 @@ impl Edits {
             && self.columns == other.columns
     }
 
-    /// (updates, deletes) — the verb-split the status line shows.
-    pub fn counts(&self) -> (usize, usize) {
+    /// (inserts, updates, deletes) — the verb-split status line.
+    pub fn counts(&self) -> (usize, usize, usize) {
+        let inserts = self
+            .changes
+            .values()
+            .filter(|e| matches!(e.change, RowChange::Insert(_)))
+            .count();
         let deletes = self
             .changes
             .values()
             .filter(|e| matches!(e.change, RowChange::Delete))
             .count();
-        (self.changes.len() - deletes, deletes)
+        (inserts, self.changes.len() - inserts - deletes, deletes)
     }
 
     /// The staged display text for a cell, if any. `Some(None)` means
@@ -115,7 +141,9 @@ impl Edits {
     #[cfg(test)]
     pub fn staged_text(&self, key: &str, col: usize) -> Option<Option<SharedString>> {
         match &self.changes.get(key)?.change {
-            RowChange::Update(cells) => cells.get(&col).map(|c| c.text.clone()),
+            RowChange::Insert(cells) | RowChange::Update(cells) => {
+                cells.get(&col).map(|c| c.text.clone())
+            }
             RowChange::Delete => None,
         }
     }
@@ -139,6 +167,76 @@ impl Edits {
 
     pub fn column_name(&self, ix: usize) -> &str {
         self.columns.get(ix).map(String::as_str).unwrap_or("?")
+    }
+
+    /// The first INSERT cell DuckTable can prove is missing before it
+    /// asks the server. CHECK/UNIQUE/FK remain DuckDB's verdict.
+    pub fn first_missing_required(
+        &self,
+        not_null: &[bool],
+        defaults: &[Option<String>],
+        generated: &[bool],
+    ) -> Option<(String, usize)> {
+        self.entries().into_iter().find_map(|(key, _, change)| {
+            let RowChange::Insert(cells) = change else { return None };
+            not_null.iter().enumerate().find_map(|(col, required)| {
+                (*required
+                    && !generated.get(col).copied().unwrap_or(false)
+                    && defaults.get(col).and_then(Option::as_ref).is_none()
+                    && !cells.contains_key(&col))
+                .then(|| (key.to_string(), col))
+            })
+        })
+    }
+
+    /// Add an intentional all-DEFAULT draft. It is staged immediately:
+    /// DEFAULT VALUES can itself be a valid insert, and one undo removes it.
+    pub fn stage_insert(&mut self) -> String {
+        let key = format!("draft:{:020}", self.next_draft);
+        self.next_draft += 1;
+        self.apply(Op {
+            key: key.clone(),
+            identity: Vec::new(),
+            prev: None,
+            next: Some(RowChange::Insert(BTreeMap::new())),
+        });
+        key
+    }
+
+    /// Supply one draft cell. `text = None` is explicit SQL NULL; an
+    /// untouched/removed cell is DEFAULT and is absent from the map.
+    pub fn stage_insert_cell(
+        &mut self,
+        key: &str,
+        col: usize,
+        text: Option<SharedString>,
+        value: Value,
+    ) {
+        let Some(entry) = self.changes.get(key) else { return };
+        let RowChange::Insert(mut cells) = entry.change.clone() else { return };
+        let prev = Some(entry.change.clone());
+        cells.insert(col, CellEdit { original: None, text, value });
+        let next = Some(RowChange::Insert(cells));
+        if prev == next {
+            return;
+        }
+        self.apply(Op { key: key.to_string(), identity: Vec::new(), prev, next });
+    }
+
+    /// Restore a draft cell to DEFAULT by omitting it from INSERT.
+    pub fn stage_insert_default(&mut self, key: &str, col: usize) {
+        let Some(entry) = self.changes.get(key) else { return };
+        let RowChange::Insert(mut cells) = entry.change.clone() else { return };
+        let prev = Some(entry.change.clone());
+        if cells.remove(&col).is_none() {
+            return;
+        }
+        self.apply(Op {
+            key: key.to_string(),
+            identity: Vec::new(),
+            prev,
+            next: Some(RowChange::Insert(cells)),
+        });
     }
 
     fn apply(&mut self, op: Op) {
@@ -252,10 +350,11 @@ impl Edits {
         self.redo.clear();
     }
 
-    /// The staged set as parameterized statements, updates before
-    /// deletes, deterministic order. The WHERE binds the ORIGINAL key
-    /// values — a row's identity is what we fetched, not what we typed.
-    pub fn statements(&self) -> Vec<(String, Vec<Value>)> {
+    /// The staged set as parameterized statements: inserts, updates,
+    /// deletes, deterministic within each verb. Missing insert columns
+    /// stay out of the statement so DuckDB supplies DEFAULT. The WHERE
+    /// binds the ORIGINAL key values for existing rows.
+    pub fn statements(&self) -> Vec<Statement> {
         let mut out = Vec::new();
         let where_clause = self
             .pk_cols
@@ -263,6 +362,29 @@ impl Edits {
             .map(|c| format!("{} = ?", qident(c)))
             .collect::<Vec<_>>()
             .join(" AND ");
+        for (_, _, change) in self.entries() {
+            if let RowChange::Insert(cells) = change {
+                let (sql, params) = if cells.is_empty() {
+                    (format!("INSERT INTO {} DEFAULT VALUES RETURNING *", self.source), Vec::new())
+                } else {
+                    let names = cells
+                        .keys()
+                        .map(|ix| qident(self.column_name(*ix)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let marks = std::iter::repeat_n("?", cells.len()).collect::<Vec<_>>().join(", ");
+                    (
+                        format!("INSERT INTO {} ({names}) VALUES ({marks}) RETURNING *", self.source),
+                        cells.values().map(|c| c.value.clone()).collect(),
+                    )
+                };
+                out.push(Statement {
+                    sql,
+                    params,
+                    expectation: StatementExpectation::ReturnedOne,
+                });
+            }
+        }
         for (_, identity, change) in self.entries() {
             if let RowChange::Update(cells) = change {
                 let set = cells
@@ -273,18 +395,20 @@ impl Edits {
                 let mut params: Vec<Value> =
                     cells.values().map(|c| c.value.clone()).collect();
                 params.extend(identity.iter().cloned());
-                out.push((
-                    format!("UPDATE {} SET {} WHERE {}", self.source, set, where_clause),
+                out.push(Statement {
+                    sql: format!("UPDATE {} SET {} WHERE {}", self.source, set, where_clause),
                     params,
-                ));
+                    expectation: StatementExpectation::AffectedOne,
+                });
             }
         }
         for (_, identity, change) in self.entries() {
             if matches!(change, RowChange::Delete) {
-                out.push((
-                    format!("DELETE FROM {} WHERE {}", self.source, where_clause),
-                    identity.to_vec(),
-                ));
+                out.push(Statement {
+                    sql: format!("DELETE FROM {} WHERE {}", self.source, where_clause),
+                    params: identity.to_vec(),
+                    expectation: StatementExpectation::AffectedOne,
+                });
             }
         }
         out
@@ -369,7 +493,7 @@ mod tests {
     fn a_cell_edited_back_to_its_original_auto_cleans() {
         let mut e = edits();
         e.stage_cell(vec![json!(1)], 1, txt("a"), txt("b"), json!("b"));
-        assert_eq!(e.counts(), (1, 0));
+        assert_eq!(e.counts(), (0, 1, 0));
         e.stage_cell(vec![json!(1)], 1, txt("a"), txt("a"), json!("a"));
         assert!(e.is_empty(), "diff, not log: equal-to-original leaves no entry");
     }
@@ -408,11 +532,11 @@ mod tests {
         e.stage_delete(vec![json!(9)]);
         let stmts = e.statements();
         assert_eq!(stmts.len(), 2);
-        assert_eq!(stmts[0].0, "UPDATE \"main\".\"t\" SET \"id\" = ?, \"qty\" = ? WHERE \"id\" = ?");
+        assert_eq!(stmts[0].sql, "UPDATE \"main\".\"t\" SET \"id\" = ?, \"qty\" = ? WHERE \"id\" = ?");
         // A PK edit is just an update: SET binds the new value, WHERE the original.
-        assert_eq!(stmts[0].1, vec![json!(7), Value::Null, json!(5)]);
-        assert_eq!(stmts[1].0, "DELETE FROM \"main\".\"t\" WHERE \"id\" = ?");
-        assert_eq!(stmts[1].1, vec![json!(9)]);
+        assert_eq!(stmts[0].params, vec![json!(7), Value::Null, json!(5)]);
+        assert_eq!(stmts[1].sql, "DELETE FROM \"main\".\"t\" WHERE \"id\" = ?");
+        assert_eq!(stmts[1].params, vec![json!(9)]);
     }
 
     #[test]
@@ -422,7 +546,7 @@ mod tests {
         e.stage_delete(vec![json!(1)]);
         let key = key_of(&[json!(1)]);
         assert!(e.is_deleted(&key));
-        assert_eq!(e.counts(), (0, 1));
+        assert_eq!(e.counts(), (0, 0, 1));
         assert!(e.undo());
         assert!(!e.is_deleted(&key));
         assert_eq!(e.staged_text(&key, 1), Some(txt("b")));
@@ -436,5 +560,65 @@ mod tests {
         assert_eq!(parse_value("null", "VARCHAR").unwrap(), json!("null"));
         assert_eq!(parse_value("19.99", "DECIMAL(10,2)").unwrap(), json!("19.99"));
         assert_eq!(parse_value("true", "BOOLEAN").unwrap(), json!(true));
+    }
+
+    #[test]
+    fn inserts_omit_defaults_bind_values_and_undo_as_rows() {
+        let mut e = edits();
+        let defaults = e.stage_insert();
+        let supplied = e.stage_insert();
+        e.stage_insert_cell(&supplied, 1, txt("Ada"), json!("Ada"));
+        e.stage_insert_cell(&supplied, 2, None, Value::Null);
+        assert_eq!(e.counts(), (2, 0, 0));
+
+        let stmts = e.statements();
+        assert_eq!(stmts[0].sql, "INSERT INTO \"main\".\"t\" DEFAULT VALUES RETURNING *");
+        assert!(stmts[0].params.is_empty());
+        assert_eq!(
+            stmts[1].sql,
+            "INSERT INTO \"main\".\"t\" (\"name\", \"qty\") VALUES (?, ?) RETURNING *"
+        );
+        assert_eq!(stmts[1].params, vec![json!("Ada"), Value::Null]);
+        assert_eq!(stmts[1].expectation, StatementExpectation::ReturnedOne);
+
+        e.discard(&defaults);
+        assert_eq!(e.counts(), (1, 0, 0));
+        assert!(e.undo());
+        assert_eq!(e.counts(), (2, 0, 0));
+    }
+
+    #[test]
+    fn restoring_a_draft_cell_to_default_removes_it_from_insert() {
+        let mut e = edits();
+        let key = e.stage_insert();
+        e.stage_insert_cell(&key, 0, txt("7"), json!(7));
+        e.stage_insert_default(&key, 0);
+        assert_eq!(
+            e.statements()[0].sql,
+            "INSERT INTO \"main\".\"t\" DEFAULT VALUES RETURNING *"
+        );
+    }
+
+    #[test]
+    fn required_insert_validation_respects_defaults_and_generated_columns() {
+        let mut e = edits();
+        let key = e.stage_insert();
+        assert_eq!(
+            e.first_missing_required(
+                &[true, true, true],
+                &[Some("nextval('s')".into()), None, None],
+                &[false, false, true],
+            ),
+            Some((key.clone(), 1))
+        );
+        e.stage_insert_cell(&key, 1, txt("Ada"), json!("Ada"));
+        assert_eq!(
+            e.first_missing_required(
+                &[true, true, true],
+                &[Some("nextval('s')".into()), None, None],
+                &[false, false, true],
+            ),
+            None
+        );
     }
 }

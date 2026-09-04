@@ -137,7 +137,8 @@ CREATE SEQUENCE users_seq START 1;
 CREATE TABLE users (
   id INTEGER PRIMARY KEY DEFAULT nextval('users_seq'),
   email VARCHAR NOT NULL,
-  name VARCHAR
+  name VARCHAR,
+  slug VARCHAR GENERATED ALWAYS AS (lower(name))
 );
 CREATE UNIQUE INDEX idx_users_email ON users(email);
 CREATE TABLE posts (
@@ -237,8 +238,20 @@ def run_fixture(base):
     users = next((t for t in doc["tables"] if t["name"] == "users"), {})
     default = (users.get("columns") or [{}])[0].get("default") or ""
     eq("the sequence-backed pk keeps its default", True, default.startswith("nextval("))
+    generated = next((c for c in users.get("columns", []) if c["name"] == "slug"), {})
+    eq("generated columns are identified structurally", True, generated.get("generated"))
+    expression = generated.get("generationExpression") or ""
+    eq("their engine-rendered expression is carried separately", True,
+       "lower" in expression and "name" in expression)
+    eq("every column declares whether DuckDB generates it", [],
+       [c["name"] for t in doc["tables"] for c in t.get("columns", [])
+        if not isinstance(c.get("generated"), bool)])
     for column in users.get("columns", []):
         column.pop("default", None)
+    for table in doc["tables"]:
+        for column in table.get("columns", []):
+            column.pop("generated", None)
+            column.pop("generationExpression", None)
 
     # The DDL is likewise the engine's own rendering — asserted for presence
     # and shape, then set aside so the structural expectations below stay
@@ -305,6 +318,7 @@ def run_fixture(base):
              {"name": "id", "type": "INTEGER", "notNull": True, "primary": True},
              {"name": "email", "type": "VARCHAR", "notNull": True, "primary": False},
              {"name": "name", "type": "VARCHAR", "notNull": False, "primary": False},
+             {"name": "slug", "type": "VARCHAR", "notNull": False, "primary": False},
          ],
          "primaryKey": ["id"],
          "uniqueConstraints": [],

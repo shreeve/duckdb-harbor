@@ -13,7 +13,7 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::ButtonVariants as _;
 use gpui_component::tooltip::Tooltip;
-use gpui_component::{Sizable as _, StyledExt as _};
+use gpui_component::{Disableable as _, Sizable as _, StyledExt as _};
 
 /// A key value as the review popover shows it: strings bare, everything
 /// else in its JSON spelling.
@@ -249,14 +249,27 @@ impl Grid {
                 // read as separate controls, not a fused cluster.
                 d.child(div().ml_1().child(self.columns_popover(cx)))
             })
+            .when(view == ViewMode::Data && self.edits.is_some(), |d| {
+                d.child(
+                    gpui_component::button::Button::new("add-row")
+                        .icon(gpui_component::IconName::Plus)
+                        .ghost()
+                        .xsmall()
+                        .disabled(self.committing)
+                        .tooltip("Add row")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.add_row(window, cx);
+                        })),
+                )
+            })
             // The staging story, told where the eye rests between edits:
             // the verb-split count while changes wait, "committing…"
             // while the transaction runs, or the read-only reason when
             // there is no primary key to key changes by (docs/EDITING.md
             // — a refusal is stated, never a mystery).
             .when(view == ViewMode::Data, |d| {
-                let (updates, deletes) =
-                    self.edits.as_ref().map(|e| e.counts()).unwrap_or((0, 0));
+                let (inserts, updates, deletes) =
+                    self.edits.as_ref().map(|e| e.counts()).unwrap_or((0, 0, 0));
                 if self.committing {
                     d.child(
                         div()
@@ -265,8 +278,12 @@ impl Grid {
                             .text_color(t.muted)
                             .child("committing\u{2026}"),
                     )
-                } else if updates + deletes > 0 {
-                    d.child(div().ml_2().child(self.staged_popover(updates, deletes, cx)))
+                } else if inserts + updates + deletes > 0 {
+                    d.child(
+                        div()
+                            .ml_2()
+                            .child(self.staged_popover(inserts, updates, deletes, cx)),
+                    )
                 } else if self.edits.is_none() && !loading_empty {
                     d.child(
                         div()
@@ -389,6 +406,7 @@ impl Grid {
     /// Commit and Discard all sit at the bottom.
     fn staged_popover(
         &self,
+        inserts: usize,
         updates: usize,
         deletes: usize,
         cx: &mut Context<Self>,
@@ -402,9 +420,15 @@ impl Grid {
                 format!("{n} {word}s")
             }
         };
-        // Verb-split label: updates in accent, deletes in the danger
+        // Verb-split label: inserts/updates in accent, deletes in the danger
         // color — destruction never hides inside a neutral count.
         let mut label = div().h_flex().items_center().gap_1().text_xs();
+        if inserts > 0 {
+            label = label.child(div().text_color(t.accent).child(plural(inserts, "insert")));
+        }
+        if inserts > 0 && (updates > 0 || deletes > 0) {
+            label = label.child(div().text_color(t.muted).child("\u{00b7}"));
+        }
         if updates > 0 {
             label = label.child(div().text_color(t.accent).child(plural(updates, "update")));
         }
@@ -441,6 +465,29 @@ impl Grid {
                                     .collect::<Vec<_>>()
                                     .join(", ");
                                 match change {
+                                    crate::edits::RowChange::Insert(cells) => (
+                                        key.to_string(),
+                                        "new row".to_string(),
+                                        if cells.is_empty() {
+                                            vec!["all columns: DEFAULT".to_string()]
+                                        } else {
+                                            cells
+                                                .iter()
+                                                .map(|(col, cell)| {
+                                                    format!(
+                                                        "{}: {}",
+                                                        e.column_name(*col),
+                                                        cell
+                                                            .text
+                                                            .as_ref()
+                                                            .map(|s| s.as_ref())
+                                                            .unwrap_or("NULL"),
+                                                    )
+                                                })
+                                                .collect()
+                                        },
+                                        false,
+                                    ),
                                     crate::edits::RowChange::Delete => (
                                         key.to_string(),
                                         format!("row ({id})"),

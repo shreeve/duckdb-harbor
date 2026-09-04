@@ -20,6 +20,8 @@ pub(crate) struct StructCol {
     pub(crate) ty: String,
     pub(crate) notnull: bool,
     pub(crate) dflt: Option<String>,
+    pub(crate) generated: bool,
+    pub(crate) generation_expression: Option<String>,
     pub(crate) pk: bool,
 }
 
@@ -40,6 +42,8 @@ pub(crate) fn table_structure(table: &harbor_client::Table) -> TableStructure {
             ty: c.duck_type.clone(),
             notnull: c.not_null,
             dflt: c.default.clone(),
+            generated: c.generated,
+            generation_expression: c.generation_expression.clone(),
             pk: c.primary,
         })
         .collect();
@@ -201,17 +205,25 @@ pub(crate) fn columns_grid(
         .cols
         .iter()
         .map(|c| {
-            let attrs = match (c.pk, c.notnull) {
-                (true, true) => "PK \u{00b7} NOT NULL",
-                (true, false) => "PK",
-                (false, true) => "NOT NULL",
-                (false, false) => "",
-            };
+            let mut attrs = Vec::new();
+            if c.pk {
+                attrs.push("PK");
+            }
+            if c.notnull {
+                attrs.push("NOT NULL");
+            }
+            if c.generated {
+                attrs.push("GENERATED");
+            }
             vec![
                 c.name.clone().into(),
                 c.ty.clone().into(),
-                attrs.into(),
-                c.dflt.clone().unwrap_or_default().into(),
+                attrs.join(" \u{00b7} ").into(),
+                c.generation_expression
+                    .clone()
+                    .or_else(|| c.dflt.clone())
+                    .unwrap_or_default()
+                    .into(),
             ]
         })
         .collect();

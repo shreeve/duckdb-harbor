@@ -58,6 +58,10 @@ pub struct Column {
     #[serde(default)]
     pub default: Option<String>,
     #[serde(default)]
+    pub generated: bool,
+    #[serde(default)]
+    pub generation_expression: Option<String>,
+    #[serde(default)]
     pub primary: bool,
 }
 
@@ -132,7 +136,8 @@ mod tests {
             "walSizeBytes": 0,
             "tables": [
                 {"name": "events", "schema": "main", "rowCount": 42,
-                 "columns": [{"name": "id", "type": "INTEGER", "notNull": true, "default": "nextval('id')", "primary": true}],
+                 "columns": [{"name": "id", "type": "INTEGER", "notNull": true, "default": "nextval('id')", "generated": false, "generationExpression": null, "primary": true},
+                              {"name": "slug", "type": "VARCHAR", "notNull": false, "default": "lower(name)", "generated": true, "generationExpression": "lower(name)", "primary": false}],
                  "primaryKey": ["id"], "uniqueConstraints": [], "indexes": [], "foreignKeys": [],
                  "ddl": "CREATE TABLE events(id INTEGER PRIMARY KEY DEFAULT(nextval('id')));"},
                 {"name": "zeta", "schema": "audit", "rowCount": 7, "columns": [], "primaryKey": []}
@@ -144,6 +149,12 @@ mod tests {
         assert_eq!(c.schemas(), vec!["main", "audit"]);
         assert_eq!(c.tables_in("main")[0].columns[0].duck_type, "INTEGER");
         assert!(c.tables_in("main")[0].columns[0].primary);
+        assert!(!c.tables_in("main")[0].columns[0].generated);
+        assert!(c.tables_in("main")[0].columns[1].generated);
+        assert_eq!(
+            c.tables_in("main")[0].columns[1].generation_expression.as_deref(),
+            Some("lower(name)")
+        );
         assert_eq!(c.tables_in("main")[0].row_count, Some(42));
         assert!(c.tables_in("main")[0].ddl.as_deref().unwrap().starts_with("CREATE TABLE"));
         assert_eq!(c.tables_in("audit")[0].row_count, Some(7));
