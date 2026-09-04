@@ -10,7 +10,7 @@
 //! [connection.medlabs]      # has `path` -> a local berth, harbor can start it
 //! path = "~/Data/Code/medlabs/api/db/medlabs.duckdb"
 //! memory-limit = "8GB"      # typed tuning fields mirror `harbor start` flags
-//! init = ["INSTALL ui", "LOAD ui"]   # any boot SQL: extensions, secrets, SET
+//! init = ["INSTALL httpfs", "LOAD httpfs"]  # any boot SQL: extensions, secrets, SET
 //!
 //! [connection.medlabs.settings]      # any DuckDB option -> SET <key> = <value>
 //! enable_progress_bar = true         # keys are DuckDB's own, passed through

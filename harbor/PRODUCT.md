@@ -81,13 +81,13 @@ requirement, not an option.
 **Standing settings live in config**: a database's `[connection.*]` entry
 supplies its own memory, threads, and boot SQL, so a bare start — a summon, an
 autostart at boot — honors them without flags; explicit flags override. `init`
-is the open door: `init = ["INSTALL ui", "LOAD ui"]` or any `SET`/secret runs
-verbatim on the control connection before serving, so harbor passes a berth's
-customizations straight to DuckDB without knowing what they are. A
-`[connection.<name>.settings]` block is the same door in key-value form — each
-`key = value` becomes `SET key = value` (applied after `init`, so it can tune
-an extension just loaded), for any DuckDB option harbor has no typed field for.
-TCP exposure (`port`) is config-settable but honored only by an explicit
+is the open door: `init = ["INSTALL httpfs", "LOAD httpfs"]` or any
+`SET`/secret runs verbatim on the control connection before serving, so harbor
+passes a berth's customizations straight to DuckDB without knowing what they
+are. A `[connection.<name>.settings]` block is the same door in key-value form
+— each `key = value` becomes `SET key = value` (applied after `init`, so it can
+tune an extension just loaded), for any DuckDB option harbor has no typed field
+for. TCP exposure (`port`) is config-settable but honored only by an explicit
 start; it binds loopback, and a summon stays on the Unix socket. A config file
 others can write is refused whole before any of it is read.
 
