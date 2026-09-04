@@ -9,12 +9,11 @@
 //! wants: config-named remotes, size on disk, and the whole connection half
 //! (Conn, connect).
 //!
-//! The lifecycle law is harbor's own, verbatim: **a detached start is
-//! ephemeral — it lives while anyone is connected; an attached (or bare)
-//! start is persistent — it lives until stopped.** DuckTable holds no anchor
-//! connection (its requests are one-shot), so when it summons a database it
-//! summons a persistent `start` — up until stopped — rather than a refcounted
-//! one that would retire between clicks.
+//! The lifecycle law is harbor's own: **a detached start is ephemeral — it
+//! lives while anyone is connected; an attached (or bare) start is persistent
+//! — it lives until stopped.** DuckTable owns one quiet anchor connection for
+//! as long as a database is open, so an ephemeral server stays present between
+//! its otherwise one-shot requests and retires when the database closes.
 
 use crate::http::{Transport, request};
 use harbor_common::State;
@@ -284,6 +283,10 @@ fn sock_ready(sock: &Path) -> bool {
 pub struct Conn {
     pub name: String,
     transport: Transport,
+    /// Presence is shared with every clone, just like the tunnel. The final
+    /// clone closes it, allowing an ephemeral Harbor server to retire.
+    #[allow(dead_code)]
+    anchor: Arc<crate::http::Anchor>,
     /// True when this connect raised the server (worth a status line).
     /// A summoned server is an ephemeral `start` — it self-retires once its
     /// last client disconnects, so closing the window that opened it lets it
@@ -296,12 +299,24 @@ pub struct Conn {
 }
 
 impl Conn {
-    fn plain(name: String, transport: Transport, summoned: bool) -> Self {
-        Self { name, transport, summoned, tunnel: None }
+    fn plain(name: String, transport: Transport, summoned: bool) -> Result<Self, String> {
+        let anchor = crate::http::hold(&transport)
+            .map(Arc::new)
+            .map_err(|e| format!("connecting to Harbor: {e}"))?;
+        Ok(Self { name, transport, anchor, summoned, tunnel: None })
     }
 
-    fn tunneled(name: String, transport: Transport, tunnel: SshTunnel) -> Self {
-        Self { name, transport, summoned: false, tunnel: Some(Arc::new(tunnel)) }
+    fn tunneled(name: String, transport: Transport, tunnel: SshTunnel) -> Result<Self, String> {
+        let anchor = crate::http::hold(&transport)
+            .map(Arc::new)
+            .map_err(|e| format!("connecting to Harbor through SSH: {e}"))?;
+        Ok(Self {
+            name,
+            transport,
+            anchor,
+            summoned: false,
+            tunnel: Some(Arc::new(tunnel)),
+        })
     }
 
     pub fn transport(&self) -> Result<&Transport, String> {
@@ -332,9 +347,9 @@ pub fn connect(name: &str) -> Result<Conn, String> {
             if !target.is_local() {
                 validate_ssh_host(&target.host)?;
                 let (transport, tunnel) = open_tunnel(&target.host, target.port)?;
-                return Ok(Conn::tunneled(name, transport, tunnel));
+                return Conn::tunneled(name, transport, tunnel);
             }
-            return Ok(Conn::plain(name, Transport::Tcp(target.addr()), false));
+            return Conn::plain(name, Transport::Tcp(target.addr()), false);
         }
         let db = entry
             .database()
@@ -347,14 +362,17 @@ pub fn connect(name: &str) -> Result<Conn, String> {
         let sock21 = paths::socket_for(&home, &db)?;
         let sock19 = paths::sock_file(&home, &name);
         let join = |summoned: bool| {
-            [&sock21, &sock19].into_iter().find(|s| sock_ready(s)).map(|s| Conn::plain(
-                name.clone(),
-                #[cfg(unix)]
-                Transport::Unix(s.clone()),
-                #[cfg(not(unix))]
-                Transport::Tcp(String::new()),
-                summoned,
-            ))
+            [&sock21, &sock19].into_iter().find(|s| sock_ready(s)).and_then(|s| {
+                Conn::plain(
+                    name.clone(),
+                    #[cfg(unix)]
+                    Transport::Unix(s.clone()),
+                    #[cfg(not(unix))]
+                    Transport::Tcp(String::new()),
+                    summoned,
+                )
+                .ok()
+            })
         };
         if let Some(conn) = join(false) {
             return Ok(conn);
@@ -384,11 +402,11 @@ pub fn connect(name: &str) -> Result<Conn, String> {
     if let Some(l) = discover().into_iter().find(|l| l.name == name) {
         #[cfg(unix)]
         {
-            return Ok(Conn::plain(
+            return Conn::plain(
                 name,
                 Transport::Unix(l.sock),
                 false,
-            ));
+            );
         }
     }
     Err(format!(
@@ -416,14 +434,17 @@ pub fn connect_path(db: &Path) -> Result<Conn, String> {
     let sock21 = paths::socket_for(&home, &db)?;
     let sock19 = paths::sock_file(&home, &name);
     let join = |summoned: bool| {
-        [&sock21, &sock19].into_iter().find(|s| sock_ready(s)).map(|s| Conn::plain(
-            name.clone(),
-            #[cfg(unix)]
-            Transport::Unix(s.clone()),
-            #[cfg(not(unix))]
-            Transport::Tcp(String::new()),
-            summoned,
-        ))
+        [&sock21, &sock19].into_iter().find(|s| sock_ready(s)).and_then(|s| {
+            Conn::plain(
+                name.clone(),
+                #[cfg(unix)]
+                Transport::Unix(s.clone()),
+                #[cfg(not(unix))]
+                Transport::Tcp(String::new()),
+                summoned,
+            )
+            .ok()
+        })
     };
     if let Some(conn) = join(false) {
         return Ok(conn);
@@ -941,6 +962,30 @@ pub fn info(conn: &Conn) -> Result<wire::InfoResponse, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+
+    fn accepting_transport() -> (Transport, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while stream.read(&mut byte).unwrap() == 1 {
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert!(String::from_utf8(request).unwrap().contains("Connection: keep-alive"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            let mut byte = [0_u8; 1];
+            assert_eq!(stream.read(&mut byte).unwrap(), 0);
+        });
+        (Transport::Tcp(addr.to_string()), server)
+    }
 
     // The name law and the socket-naming rule live in harbor-common,
     // shared with harbor itself — no client-side copy to drift.
@@ -1000,6 +1045,19 @@ mod tests {
         assert!(!http_target("http://foo.bar.com:9494").unwrap().is_local());
     }
 
+    #[test]
+    fn the_last_connection_clone_releases_its_harbor_presence() {
+        let (transport, server) = accepting_transport();
+        let conn = Conn::plain("local".into(), transport, true).unwrap();
+        let last = conn.clone();
+        drop(conn);
+
+        // The shared anchor still belongs to the remaining connection.
+        assert!(!server.is_finished());
+        drop(last);
+        server.join().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_last_connection_clone_closes_its_ssh_process() {
@@ -1014,19 +1072,22 @@ mod tests {
         };
         let child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         let pid = child.id().to_string();
+        let (transport, server) = accepting_transport();
         let conn = Conn::tunneled(
             "remote".into(),
-            Transport::Tcp("127.0.0.1:1".into()),
+            transport,
             SshTunnel {
                 child: Mutex::new(child),
                 stderr: Arc::new(Mutex::new(Vec::new())),
                 host: "remote".into(),
             },
-        );
+        )
+        .unwrap();
         let last = conn.clone();
         drop(conn);
         assert!(exists(&pid));
         drop(last);
         assert!(!exists(&pid));
+        server.join().unwrap();
     }
 }
