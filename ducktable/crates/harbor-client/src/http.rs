@@ -12,6 +12,7 @@ use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::Duration;
 use wire::endpoint::Route;
 
@@ -22,9 +23,52 @@ pub enum Transport {
     Tcp(String), // host:port
 }
 
+/// One quiet keep-alive connection that keeps a Harbor database present while
+/// its DuckTable connection is alive. It refreshes before Harbor's idle clock,
+/// and closes promptly when the final owner drops it.
+pub struct Anchor {
+    stop: Option<mpsc::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+pub fn hold(transport: &Transport) -> io::Result<Anchor> {
+    let first = keepalive(transport)?;
+    let transport = transport.clone();
+    let (stop, stopped) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut held = first;
+        let mut wait = Duration::from_secs(240);
+        loop {
+            match stopped.recv_timeout(wait) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => match keepalive(&transport) {
+                    Ok(next) => {
+                        drop(std::mem::replace(&mut held, next));
+                        wait = Duration::from_secs(240);
+                    }
+                    // Keep the current connection and retry well inside the
+                    // remaining idle-time margin.
+                    Err(_) => wait = Duration::from_secs(5),
+                },
+            }
+        }
+        drop(held);
+    });
+    Ok(Anchor { stop: Some(stop), worker: Some(worker) })
+}
+
+impl Drop for Anchor {
+    fn drop(&mut self) {
+        self.stop.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 pub struct Response {
     pub status: u16,
-    pub body: Box<dyn BufRead>,
+    pub body: Box<dyn BufRead + Send>,
 }
 
 impl Response {
@@ -35,8 +79,8 @@ impl Response {
     }
 }
 
-trait Stream: Read + Write {}
-impl<T: Read + Write> Stream for T {}
+trait Stream: Read + Write + Send {}
+impl<T: Read + Write + Send> Stream for T {}
 
 /// The route carries its own verb, so a caller cannot pair `GET` with a path
 /// harbor only answers to `POST` — the mistake that reads as a 404.
@@ -45,6 +89,33 @@ pub fn request(
     route: &Route,
     body: Option<&str>,
     timeout: Option<Duration>,
+) -> io::Result<Response> {
+    request_inner(transport, route, body, timeout, false)
+}
+
+fn keepalive(transport: &Transport) -> io::Result<Response> {
+    let response = request_inner(
+        transport,
+        &wire::endpoint::READY,
+        None,
+        Some(Duration::from_secs(5)),
+        true,
+    )?;
+    if response.status != 200 {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("Harbor readiness returned HTTP {}", response.status),
+        ));
+    }
+    Ok(response)
+}
+
+fn request_inner(
+    transport: &Transport,
+    route: &Route,
+    body: Option<&str>,
+    timeout: Option<Duration>,
+    keep_alive: bool,
 ) -> io::Result<Response> {
     let (stream, host): (Box<dyn Stream>, String) = match transport {
         #[cfg(unix)]
@@ -61,7 +132,8 @@ pub fn request(
     };
     let mut stream = stream;
 
-    let mut req = format!("{route} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
+    let connection = if keep_alive { "keep-alive" } else { "close" };
+    let mut req = format!("{route} HTTP/1.1\r\nHost: {host}\r\nConnection: {connection}\r\n");
     req.push_str(&format!("Accept: {}\r\n", wire::CONTENT_NDJSON));
     if let Some(b) = body {
         req.push_str(&format!(
@@ -108,7 +180,7 @@ pub fn request(
         }
     }
 
-    let body: Box<dyn BufRead> = if chunked {
+    let body: Box<dyn BufRead + Send> = if chunked {
         Box::new(BufReader::new(ChunkedReader::new(reader)))
     } else if let Some(n) = content_length {
         Box::new(BufReader::new(reader.take(n)))

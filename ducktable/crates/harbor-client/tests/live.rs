@@ -67,6 +67,40 @@ fn a_live_berth_answers_sql() {
     assert_eq!(result.rows[0][2], serde_json::Value::Null);
 }
 
+/// The File→Open lifetime regression: with a sub-second Harbor linger, pause
+/// well beyond zero clients and prove the same DuckTable connection still
+/// answers. Run with:
+/// `HARBOR_BIN="$(pwd)/../harbor/target/debug/harbor" HARBOR_FIXTURE="$(pwd)/../harbor/sample.duckdb" HARBOR_LINGER_MS=500 cargo test -p harbor-client --test live an_open_database_outlives_harbors_linger -- --ignored`
+#[test]
+#[ignore]
+fn an_open_database_outlives_harbors_linger() {
+    let fixture = std::env::var("HARBOR_FIXTURE").expect("set HARBOR_FIXTURE");
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let db = std::env::temp_dir().join(format!("ducktable-anchor-{unique}.duckdb"));
+    std::fs::copy(fixture, &db).expect("copy fixture");
+    let socket = harbor_common::paths::socket_for(
+        &harbor_common::paths::runtime_dir().expect("runtime dir"),
+        &db,
+    )
+    .expect("socket path");
+
+    let conn = fleet::connect_path(&db).expect("connect_path");
+    harbor_client::query(&conn, "SELECT 1").expect("first query");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    harbor_client::query(&conn, "SELECT 2").expect("query after Harbor linger");
+    drop(conn);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while socket.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!socket.exists(), "ephemeral Harbor stayed after its connection closed");
+    let _ = std::fs::remove_file(db);
+}
+
 /// The exact wire sequence the GUI's ⌘S performs (docs/EDITING.md):
 /// a session pins one connection, BEGIN..COMMIT spans requests on it,
 /// parameters bind instead of concatenating, and UPDATE answers with a
