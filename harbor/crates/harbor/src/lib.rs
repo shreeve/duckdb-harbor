@@ -2625,6 +2625,8 @@ struct CatalogColumn {
     ty: String,
     not_null: bool,
     default: Option<String>,
+    generated: bool,
+    generation_expression: Option<String>,
     primary: bool,
 }
 
@@ -2888,7 +2890,8 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
 
     let column_rows = match catalog_rows(
         jobs,
-        "SELECT schema_name, table_name, column_name, data_type, is_nullable, column_default \
+        "SELECT schema_name, table_name, column_name, data_type, is_nullable, column_default, \
+                is_generated, generation_expression \
          FROM duckdb_columns() \
          WHERE database_name = current_database() AND NOT internal \
          ORDER BY schema_name, table_name, column_index",
@@ -2960,6 +2963,8 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
             ty: cell_str(row, 3),
             not_null: !cell_bool(row, 4),
             default: cell_opt_str(row, 5),
+            generated: cell_bool(row, 6),
+            generation_expression: cell_opt_str(row, 7),
             primary: false,
         });
     }
@@ -3042,6 +3047,13 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
             out.push_str(if column.not_null { "true" } else { "false" });
             out.push_str(",\"default\":");
             match &column.default {
+                Some(expression) => push_json_string(&mut out, expression),
+                None => out.push_str("null"),
+            }
+            out.push_str(",\"generated\":");
+            out.push_str(if column.generated { "true" } else { "false" });
+            out.push_str(",\"generationExpression\":");
+            match &column.generation_expression {
                 Some(expression) => push_json_string(&mut out, expression),
                 None => out.push_str("null"),
             }

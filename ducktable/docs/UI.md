@@ -179,7 +179,8 @@ appear.
 
 Bottom bar per table: the Data | Structure view switcher (JSON view
 later), the raw-SQL filter toggle, the Columns popover (search past 10
-columns, Show all / Hide all, full-row click targets), and the
+columns, Show all / Hide all, full-row click targets), the Data view's
+Add Row button (a staged draft appears above the fetched page), and the
 right-anchored status line: `1 ms · 1–500 of 5,410 rows · 9 columns ·
 |< < 500 per > >|`. The ordering is the anti-jump rule: in a
 right-justified cluster an element only moves when something to its

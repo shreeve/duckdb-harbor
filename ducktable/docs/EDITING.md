@@ -24,6 +24,27 @@ disagree, this document wins.
    ease. After commit the grid refetches, so every row shows the
    database's truth — defaults filled, triggers applied.
 
+## Inserting rows
+
+The `+` button in the Data footer creates a draft row at the top of the
+current grid and opens its first required writable cell. The `+` in its row
+number rail is its identity: it is staged, not yet a database row. Additional
+clicks create additional drafts. Drafts stay above the fetched page through
+filter and page changes because hiding an uncommitted insert would be data
+loss disguised as navigation.
+
+An untouched draft cell means SQL `DEFAULT`, not NULL. DuckTable omits it from
+the INSERT so DuckDB can apply declared defaults, sequences, and generated
+expressions. The placeholder says what will happen: `REQUIRED`, `DEFAULT`,
+`NULL`, or `GENERATED`. Generated cells are read-only. Delete/Backspace keeps
+the grid's type-honest meaning — empty string for text, explicit NULL for
+other nullable types — and ⌃⇧N is always explicit NULL.
+
+Moving out of a draft never writes it. The row joins the same staged set as
+updates and deletes immediately, including undo, review, discard, table
+switches, and the all-or-nothing commit. Discarding/deleting a draft removes
+the pending INSERT; it never emits a DELETE.
+
 ## The grammar
 
 One meaning per key. No contextual double-agents.
@@ -109,14 +130,15 @@ not change, and printable exotica (AltGr, IME) already land on rung 6.
 
 ## Staging
 
-- A staged cell shows a soft accent tint. A staged delete shows the row
-  ghosted with strikethrough. While an editor is open there is no tint —
-  the editor surface is the state; staging happens when the editor
-  confirms.
+- A staged cell shows a soft accent tint. A draft insert shows the same tint
+  across its synthetic row; a staged delete shows the row ghosted with
+  strikethrough. While an editor is open there is no tint — the editor surface
+  is the state; staging happens when the editor confirms.
 - One entry per cell, last wins. A cell edited back to its original
   value auto-cleans: "3 changes" always means three real diffs.
 - The status line counts, verb-split when destruction is pending:
-  `3 changes · ⌘S to commit`, or `2 updates · 1 delete · ⌘S to commit`
+  `3 changes · ⌘S to commit`, or
+  `1 insert · 2 updates · 1 delete · ⌘S to commit`
   with the delete in the danger color. Clicking the count opens a
   popover listing every staged change (`column: old → new`, per-change
   discard) — audit is pull-based, never pushed.
@@ -142,14 +164,19 @@ not change, and printable exotica (AltGr, IME) already land on rung 6.
   someday.)
 - Primary-key cells are editable like any other — the WHERE holds the
   original, so `SET id = 7 WHERE id = 5` is just an update.
+- Draft inserts need no fetched identity. Each carries a private local key
+  until commit; `INSERT … RETURNING *` verifies that exactly one row landed,
+  and the post-commit refetch acquires its real primary key or rowid.
 - Statements are parameterized (`?` + bound params), never assembled
   from strings. Identifiers are quoted.
 
 ## Commit
 
 ⌘S opens a Harbor session (a pinned connection), then:
-`BEGIN` → each staged statement in order, each verified to have affected
-**exactly one row** → `COMMIT` → release. Any failure — SQL error,
+`BEGIN` → parameterized inserts, updates, and deletes, each verified to have
+affected or returned **exactly one row** → `COMMIT` → release. Before opening
+the session, DuckTable refuses a draft missing a `NOT NULL` column with no
+default. Any failure — SQL error,
 constraint, or a row that no longer matches its original values — rolls
 the whole transaction back: nothing landed, every staged change is kept
 and still visible, the offender is marked, and the status line says why,
@@ -170,6 +197,6 @@ only at ⌘S. Reversibility replaces confirmation.
 - **Live mode** (write-per-edit): designed in UI.md, deferred until it
   re-clears an adversarial review. If it ships, type-to-edit turns off
   in it — the two are certified only as a pair with staging.
-- Ghost insert row, duplicate-row (menu, blanking key/unique columns),
-  value popout editor for long/nested values, range selection and
+- Duplicate-row (menu, blanking key/unique columns), value popout editor for
+  long/nested values, range selection and
   TSV paste-spread, crash-recovery journal for staged edits.

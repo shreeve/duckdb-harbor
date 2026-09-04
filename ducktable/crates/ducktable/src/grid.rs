@@ -95,6 +95,13 @@ pub(crate) struct Grid {
     /// NOT NULL per schema column (from the catalog, by name) — staging
     /// NULL into one refuses at the fingers, not at the server.
     not_null: Vec<bool>,
+    /// Declared defaults per schema column. A missing draft cell is
+    /// omitted from INSERT; this tells validation whether NOT NULL is
+    /// already satisfied by the engine.
+    defaults: Vec<Option<String>>,
+    /// Generated columns are visible but never writable. DuckDB computes
+    /// them from the supplied columns and INSERT RETURNING exposes them.
+    generated: Vec<bool>,
     /// A commit is in flight; ⌘S is a no-op until it resolves.
     pub(crate) committing: bool,
     /// Focus should return to the table on the next frame — set by paths
@@ -172,6 +179,12 @@ struct CellEditor {
     row: usize,
     /// Schema column index.
     col: usize,
+    /// Present for a synthetic INSERT row; existing rows resolve through
+    /// their fetched identity instead.
+    draft_key: Option<String>,
+    /// Distinguishes an untouched DEFAULT cell from explicit NULL; both
+    /// render without ordinary text.
+    draft_explicit: bool,
     input: Entity<gpui_component::input::InputState>,
     replace: bool,
 }
@@ -213,6 +226,15 @@ pub(crate) struct GridDelegate {
     /// Projection of the staged layer onto this page: (row, schema col)
     /// -> staged display text (None = staged NULL).
     staged: std::collections::HashMap<(usize, usize), Option<SharedString>>,
+    /// Synthetic INSERT rows prepended to the fetched page, in display
+    /// order. Their private keys live only in Edits and never enter SQL.
+    draft_keys: Vec<String>,
+    /// Explicit draft values. Absence means DEFAULT, distinct from a
+    /// present None which means explicit SQL NULL.
+    draft_cells: std::collections::HashMap<(usize, usize), Option<SharedString>>,
+    /// Placeholder for an untouched draft cell: REQUIRED, DEFAULT, NULL,
+    /// or GENERATED. Derived once from catalog metadata.
+    draft_hints: Vec<SharedString>,
     /// Rows staged for DELETE — ghosted with strikethrough until commit.
     deleted: std::collections::HashSet<usize>,
     /// The cell whose editor is open, and the editor to render there.
@@ -270,7 +292,7 @@ impl Grid {
     pub(crate) fn last_visible_row(&self, cx: &App) -> u64 {
         let d = self.table.read(cx).delegate();
         if d.gutter {
-            (d.base + d.rows.len()) as u64
+            (d.base + d.fetched_count()) as u64
         } else {
             0
         }
@@ -383,6 +405,9 @@ impl Grid {
             identities: Vec::new(),
             row_of: std::collections::HashMap::new(),
             staged: std::collections::HashMap::new(),
+            draft_keys: Vec::new(),
+            draft_cells: std::collections::HashMap::new(),
+            draft_hints: Vec::new(),
             deleted: std::collections::HashSet::new(),
             editing: None,
             tab_anchor: None,
@@ -415,16 +440,9 @@ impl Grid {
                 delegate.names.iter().map(|n| n.to_string()).collect(),
             )
         });
-        let not_null = delegate
-            .names
-            .iter()
-            .map(|n| {
-                structure
-                    .as_ref()
-                    .and_then(|s| s.cols.iter().find(|c| c.name == n.as_ref()))
-                    .is_some_and(|c| c.notnull)
-            })
-            .collect();
+        let (not_null, defaults, generated, hints) =
+            insert_metadata(&delegate.names, structure.as_ref());
+        delegate.draft_hints = hints;
         // Header dragging stays off until move_column permutes the
         // visible map for real — the library default half-enables it
         // (widths reorder, contents don't).
@@ -642,6 +660,8 @@ impl Grid {
             rowid,
             pk_cols,
             not_null,
+            defaults,
+            generated,
             committing: false,
             needs_focus: false,
             ring_keep: None,
@@ -802,6 +822,20 @@ impl Grid {
                         ));
                     }
                 }
+                // A grid born from a failed first fetch had no result
+                // columns when build() derived these arrays. Populate them
+                // alongside the first schema that eventually succeeds.
+                let names = grid.table.read(cx).delegate().names.clone();
+                if grid.not_null.len() != names.len() {
+                    let (not_null, defaults, generated, hints) =
+                        insert_metadata(&names, grid.structure.as_ref());
+                    grid.not_null = not_null;
+                    grid.defaults = defaults;
+                    grid.generated = generated;
+                    grid.table.update(cx, |state, _| {
+                        state.delegate_mut().draft_hints = hints;
+                    });
+                }
                 // Staged changes are identity-keyed; the new page gets
                 // them projected wherever (and whether) its rows match.
                 grid.sync_staged(cx);
@@ -857,7 +891,7 @@ impl Grid {
     pub(crate) fn has_next(&self, cx: &App) -> bool {
         match self.last_page() {
             Some(last) => self.page < last,
-            None => self.table.read(cx).delegate().rows.len() == self.page_size,
+            None => self.table.read(cx).delegate().fetched_count() == self.page_size,
         }
     }
 
@@ -1124,7 +1158,7 @@ impl Grid {
     /// line (footer.rs; Grid's side reads straight off the fields).
     pub(crate) fn table_facts(&self, cx: &App) -> (usize, usize, bool) {
         let d = self.table.read(cx).delegate();
-        (d.rows.len(), d.cols.len().saturating_sub(d.gutter as usize), d.loading)
+        (d.fetched_count(), d.cols.len().saturating_sub(d.gutter as usize), d.loading)
     }
 
     /// The selected row as (column, display value, is_null) pairs, for the
@@ -1134,15 +1168,29 @@ impl Grid {
     /// tints from.
     pub(crate) fn row_kv(&self, cx: &App) -> Option<Vec<(SharedString, SharedString, bool)>> {
         let d = self.table.read(cx).delegate();
-        let row = d.rows.get(d.selected?)?;
+        let row_ix = d.selected?;
+        let row = d.rows.get(row_ix)?;
+        let is_draft = d.draft_key(row_ix).is_some();
         Some(
             d.names
                 .iter()
                 .enumerate()
                 .skip(d.identity as usize)
-                .map(|(i, name)| match row.get(i) {
-                    None | Some(None) => (name.clone(), SharedString::from("NULL"), true),
-                    Some(Some(s)) => (name.clone(), s.clone(), false),
+                .map(|(i, name)| {
+                    if is_draft && !d.draft_cells.contains_key(&(row_ix, i)) {
+                        return (
+                            name.clone(),
+                            d.draft_hints
+                                .get(i)
+                                .cloned()
+                                .unwrap_or_else(|| SharedString::from("DEFAULT")),
+                            false,
+                        );
+                    }
+                    match row.get(i) {
+                        None | Some(None) => (name.clone(), SharedString::from("NULL"), true),
+                        Some(Some(s)) => (name.clone(), s.clone(), false),
+                    }
                 })
                 .collect(),
         )
@@ -1152,6 +1200,66 @@ impl Grid {
     // Editing (docs/EDITING.md). One meaning per key; Esc is lossless;
     // nothing writes until ⌘S.
     // ------------------------------------------------------------------
+
+    /// Add an intentional all-DEFAULT draft at the top of the current
+    /// page, then enter its first useful writable cell. The draft is an
+    /// ordinary staged change immediately; moving focus never writes it.
+    pub(crate) fn add_row(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.committing || self.edits.is_none() {
+            return;
+        }
+        if self.editor.is_some() && !self.confirm_and_move(0, 0, false, cx) {
+            return;
+        }
+        let key = self.edits.as_mut().expect("checked above").stage_insert();
+        self.error = None;
+        self.sync_staged(cx);
+        // sync_staged normally returns focus after a draft row appears or
+        // disappears; Add Row is the exception because its editor is the
+        // intended destination.
+        self.needs_focus = false;
+        let (row, col, reveal) = {
+            let d = self.table.read(cx).delegate();
+            let row = d.draft_keys.iter().position(|k| k == &key).unwrap_or(0);
+            let first_schema = d.identity as usize;
+            let required = (first_schema..d.names.len()).find(|&col| {
+                self.not_null.get(col).copied().unwrap_or(false)
+                    && self.defaults.get(col).and_then(Option::as_ref).is_none()
+                    && !self.generated.get(col).copied().unwrap_or(false)
+            });
+            let fallback = d
+                .visible
+                .iter()
+                .copied()
+                .find(|&col| !self.generated.get(col).copied().unwrap_or(false));
+            let col = required.or(fallback);
+            (row, col, col.is_some_and(|col| d.hidden.contains(&col)))
+        };
+        if reveal {
+            self.remap_columns(cx, |d| d.hidden.remove(&col.expect("reveal has a column")));
+        }
+        self.table.update(cx, |state, cx| {
+            if let Some(col) = col {
+                state.delegate_mut().active_cell = Some((row, col));
+            }
+            select_row(state, row, cx);
+            state.scroll_to_row(row, cx);
+            cx.notify();
+        });
+        if let Some(col) = col {
+            self.open_editor(row, col, None, window, cx);
+        } else {
+            // A generated-only table has no writable destination for an
+            // editor, but the staged DEFAULT row still needs keyboard
+            // focus so it can be committed or discarded.
+            self.needs_focus = true;
+        }
+        cx.notify();
+    }
 
     /// The grid's whole keymap, focus-scoped by construction: this
     /// listener sits on the grid wrapper, so it hears keys only when
@@ -1464,14 +1572,30 @@ impl Grid {
         if self.edits.is_none() || self.committing {
             return; // read-only says why in the footer, not with a beep
         }
-        let (original, deleted) = {
+        if self.generated.get(col).copied().unwrap_or(false) {
+            let name = self.table.read(cx).delegate().names[col].clone();
+            self.error = Some(format!("{name} is generated by DuckDB"));
+            cx.notify();
+            return;
+        }
+        let (original, deleted, draft_key, draft_explicit) = {
             let d = self.table.read(cx).delegate();
             if row >= d.rows.len() {
                 return;
             }
             let base = d.rows[row].get(col).cloned().flatten();
-            let staged = d.staged.get(&(row, col)).cloned();
-            (staged.unwrap_or(base), d.deleted.contains(&row))
+            let draft_key = d.draft_key(row).map(str::to_string);
+            let staged = if draft_key.is_some() {
+                d.draft_cells.get(&(row, col)).cloned()
+            } else {
+                d.staged.get(&(row, col)).cloned()
+            };
+            (
+                staged.unwrap_or(base),
+                d.deleted.contains(&row),
+                draft_key,
+                d.draft_cells.contains_key(&(row, col)),
+            )
         };
         if deleted {
             return; // you cannot edit a ghost; revert the delete first (⌘Z)
@@ -1509,7 +1633,14 @@ impl Grid {
             }
         })
         .detach();
-        self.editor = Some(CellEditor { row, col, input: input.clone(), replace });
+        self.editor = Some(CellEditor {
+            row,
+            col,
+            draft_key,
+            draft_explicit,
+            input: input.clone(),
+            replace,
+        });
         self.table.update(cx, |state, cx| {
             let d = state.delegate_mut();
             d.editing = Some((row, col));
@@ -1562,11 +1693,17 @@ impl Grid {
                 d.identities.get(ed.row).cloned(),
             )
         };
-        let staged = if text.is_empty() {
-            if fetched.is_none() {
+        let leave_default = ed.draft_key.is_some() && !ed.draft_explicit && text.is_empty();
+        let staged = if leave_default {
+            None
+        } else if text.is_empty() {
+            if fetched.is_none() && ed.draft_key.is_none() {
                 // NULL in, nothing typed, NULL out: confirming an empty
                 // editor over NULL is a no-op (stage_cell auto-cleans),
                 // not a NULL→'' edit.
+                Some((None, Value::Null))
+            } else if fetched.is_none() {
+                // Reconfirming an explicit NULL draft keeps it NULL.
                 Some((None, Value::Null))
             } else if edits::is_text_type(&ty) {
                 // An emptied editor: '' for text (the one honest way to
@@ -1589,19 +1726,31 @@ impl Grid {
                 }
             }
         };
-        let (staged_text, value) = match staged {
+        let staged_value = match staged {
             Some(pair) => pair,
             None => {
-                if !self.stageable_null(ed.col, cx) {
-                    self.editor = Some(ed);
-                    return false;
+                if leave_default {
+                    (None, Value::Null)
+                } else {
+                    if !self.stageable_null(ed.col, cx) {
+                        self.editor = Some(ed);
+                        return false;
+                    }
+                    (None, Value::Null)
                 }
-                (None, Value::Null)
             }
         };
-        if let (Some(edits), Some(identity)) = (&mut self.edits, identity) {
+        if let Some(edits) = &mut self.edits {
             self.error = None;
-            edits.stage_cell(identity, ed.col, fetched, staged_text, value);
+            if let Some(key) = &ed.draft_key {
+                if leave_default {
+                    edits.stage_insert_default(key, ed.col);
+                } else {
+                    edits.stage_insert_cell(key, ed.col, staged_value.0, staged_value.1);
+                }
+            } else if let Some(identity) = identity {
+                edits.stage_cell(identity, ed.col, fetched, staged_value.0, staged_value.1);
+            }
         }
         self.close_editor_cell(cx);
         self.sync_staged(cx);
@@ -1634,12 +1783,19 @@ impl Grid {
     /// Delete on a cell: clear it, type-honestly — '' for text columns,
     /// NULL for everything else. Never touches the row.
     fn stage_clear(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
-        let (ty, fetched, identity, deleted) = {
+        if self.generated.get(col).copied().unwrap_or(false) {
+            let name = self.table.read(cx).delegate().names[col].clone();
+            self.error = Some(format!("{name} is generated by DuckDB"));
+            cx.notify();
+            return;
+        }
+        let (ty, fetched, identity, draft_key, deleted) = {
             let d = self.table.read(cx).delegate();
             (
                 d.schema_cols.get(col).map(|c| c.duckdb_type.clone()).unwrap_or_default(),
                 d.rows.get(row).and_then(|r| r.get(col)).cloned().flatten(),
                 d.identities.get(row).cloned(),
+                d.draft_key(row).map(str::to_string),
                 d.deleted.contains(&row),
             )
         };
@@ -1654,9 +1810,13 @@ impl Grid {
             }
             (None, Value::Null)
         };
-        if let (Some(edits), Some(identity)) = (&mut self.edits, identity) {
+        if let Some(edits) = &mut self.edits {
             self.error = None;
-            edits.stage_cell(identity, col, fetched, text, value);
+            if let Some(key) = draft_key {
+                edits.stage_insert_cell(&key, col, text, value);
+            } else if let Some(identity) = identity {
+                edits.stage_cell(identity, col, fetched, text, value);
+            }
             self.sync_staged(cx);
         }
     }
@@ -1664,18 +1824,29 @@ impl Grid {
     /// ⌃⇧N: SQL NULL, deliberately, any column type.
     fn stage_null(&mut self, cx: &mut Context<Self>) {
         let Some((row, col)) = self.table.read(cx).delegate().active_cell else { return };
-        let (fetched, identity) = {
+        if self.generated.get(col).copied().unwrap_or(false) {
+            let name = self.table.read(cx).delegate().names[col].clone();
+            self.error = Some(format!("{name} is generated by DuckDB"));
+            cx.notify();
+            return;
+        }
+        let (fetched, identity, draft_key) = {
             let d = self.table.read(cx).delegate();
             (
                 d.rows.get(row).and_then(|r| r.get(col)).cloned().flatten(),
                 d.identities.get(row).cloned(),
+                d.draft_key(row).map(str::to_string),
             )
         };
         if !self.stageable_null(col, cx) {
             return;
         }
-        if let (Some(edits), Some(identity)) = (&mut self.edits, identity) {
-            edits.stage_cell(identity, col, fetched, None, Value::Null);
+        if let Some(edits) = &mut self.edits {
+            if let Some(key) = draft_key {
+                edits.stage_insert_cell(&key, col, None, Value::Null);
+            } else if let Some(identity) = identity {
+                edits.stage_cell(identity, col, fetched, None, Value::Null);
+            }
             self.sync_staged(cx);
         }
     }
@@ -1684,14 +1855,19 @@ impl Grid {
     /// reversible until commit. No dialog, ever: reversibility replaces
     /// confirmation.
     fn stage_delete_row(&mut self, cx: &mut Context<Self>) {
-        let identity = {
+        let (identity, draft_key) = {
             let d = self.table.read(cx).delegate();
-            d.selected
+            let row = d.selected
                 .or(d.active_cell.map(|(r, _)| r))
-                .and_then(|r| d.identities.get(r).cloned())
+                .unwrap_or(usize::MAX);
+            (d.identities.get(row).cloned(), d.draft_key(row).map(str::to_string))
         };
-        if let (Some(edits), Some(identity)) = (&mut self.edits, identity) {
-            edits.stage_delete(identity);
+        if let Some(edits) = &mut self.edits {
+            if let Some(key) = draft_key {
+                edits.discard(&key);
+            } else if let Some(identity) = identity {
+                edits.stage_delete(identity);
+            }
             self.sync_staged(cx);
         }
     }
@@ -1848,34 +2024,94 @@ impl Grid {
         cx.notify();
     }
 
-    /// Project the staged layer onto the current page: identity-keyed
-    /// changes land wherever (and whether) their rows appear.
+    /// Project the staging model into the grid. INSERT drafts are
+    /// synthetic rows before the fetched page; existing-row changes land
+    /// by identity wherever (and whether) their rows currently appear.
     fn sync_staged(&mut self, cx: &mut Context<Self>) {
-        let (staged, deleted) = {
-            let d = self.table.read(cx).delegate();
-            let mut staged = std::collections::HashMap::new();
-            let mut deleted = std::collections::HashSet::new();
-            if let Some(e) = &self.edits {
-                for (key, _, change) in e.entries() {
-                    let Some(&row) = d.row_of.get(key) else { continue };
-                    match change {
-                        edits::RowChange::Delete => {
-                            deleted.insert(row);
-                        }
-                        edits::RowChange::Update(cells) => {
-                            for (col, cell) in cells {
-                                staged.insert((row, *col), cell.text.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            (staged, deleted)
-        };
+        let changes: Vec<(String, Vec<Value>, edits::RowChange)> = self
+            .edits
+            .as_ref()
+            .map(|e| {
+                e.entries()
+                    .into_iter()
+                    .map(|(key, identity, change)| {
+                        (key.to_string(), identity.to_vec(), change.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let next_drafts: Vec<String> = changes
+            .iter()
+            .filter(|(_, _, change)| matches!(change, edits::RowChange::Insert(_)))
+            .map(|(key, _, _)| key.clone())
+            .collect();
+        let draft_shape_changed =
+            self.table.read(cx).delegate().draft_keys.as_slice() != next_drafts.as_slice();
+        if draft_shape_changed {
+            self.editor = None;
+            self.needs_focus = true;
+        }
         self.table.update(cx, |state, cx| {
             let d = state.delegate_mut();
-            d.staged = staged;
-            d.deleted = deleted;
+            d.remove_drafts();
+            d.staged.clear();
+            d.deleted.clear();
+
+            let width = d.schema_cols.len();
+            let mut draft_rows = Vec::new();
+            for (key, _, change) in &changes {
+                let edits::RowChange::Insert(cells) = change else { continue };
+                let row = draft_rows.len();
+                let mut values = vec![None; width];
+                for (col, cell) in cells {
+                    if *col < width {
+                        values[*col] = cell.text.clone();
+                        d.draft_cells.insert((row, *col), cell.text.clone());
+                    }
+                }
+                d.draft_keys.push(key.clone());
+                draft_rows.push(values);
+            }
+            let draft_count = draft_rows.len();
+            draft_rows.append(&mut d.rows);
+            d.rows = draft_rows;
+            let mut identities = vec![Vec::new(); draft_count];
+            identities.append(&mut d.identities);
+            d.identities = identities;
+            let mut labels = vec![SharedString::from("+"); draft_count];
+            labels.append(&mut d.row_labels);
+            d.row_labels = labels;
+
+            // Fetched identities shifted down by the inserted drafts.
+            d.row_of = d
+                .identities
+                .iter()
+                .enumerate()
+                .skip(draft_count)
+                .map(|(ix, id)| (edits::key_of(id), ix))
+                .collect();
+            for (key, _, change) in &changes {
+                let Some(&row) = d.row_of.get(key) else { continue };
+                match change {
+                    edits::RowChange::Update(cells) => {
+                        for (col, cell) in cells {
+                            d.staged.insert((row, *col), cell.text.clone());
+                        }
+                    }
+                    edits::RowChange::Delete => {
+                        d.deleted.insert(row);
+                    }
+                    edits::RowChange::Insert(_) => {}
+                }
+            }
+            if draft_shape_changed {
+                d.selected = None;
+                d.active_cell = None;
+                d.editing = None;
+                d.editor_input = None;
+                d.tab_anchor = None;
+                state.clear_selection(cx);
+            }
             // Dirtiness just changed under the selection: re-decide the
             // wash (undoing a row's last edit gives its wash back).
             if let Some(row) = state.delegate().selected {
@@ -1891,8 +2127,8 @@ impl Grid {
     /// only if there is actually something staged to carry.
     pub(crate) fn take_edits(&mut self) -> Option<Edits> {
         let e = self.edits.take()?;
-        let (updates, deletes) = e.counts();
-        if updates + deletes == 0 {
+        let (inserts, updates, deletes) = e.counts();
+        if inserts + updates + deletes == 0 {
             self.edits = Some(e);
             return None;
         }
@@ -1941,6 +2177,33 @@ impl Grid {
             return;
         }
         let Some(edits) = &self.edits else { return };
+        let missing = edits.first_missing_required(
+            &self.not_null,
+            &self.defaults,
+            &self.generated,
+        );
+        if let Some((key, col)) = missing {
+            let name = self
+                .table
+                .read(cx)
+                .delegate()
+                .names
+                .get(col)
+                .cloned()
+                .unwrap_or_else(|| SharedString::from("column"));
+            self.error = Some(format!("{name} is required for the new row · edits kept"));
+            self.remap_columns(cx, |d| d.hidden.remove(&col));
+            self.table.update(cx, |state, cx| {
+                let d = state.delegate_mut();
+                if let Some(row) = d.draft_keys.iter().position(|k| k == &key) {
+                    d.active_cell = Some((row, col));
+                    select_row(state, row, cx);
+                }
+                cx.notify();
+            });
+            cx.notify();
+            return;
+        }
         let stmts = edits.statements();
         if stmts.is_empty() {
             return;
@@ -1956,22 +2219,34 @@ impl Grid {
                     let sid = harbor_client::session_new(&conn)?;
                     let run = || -> Result<usize, String> {
                         harbor_client::exec(&conn, "BEGIN", None, Some(&sid))?;
-                        for (sql, params) in &stmts {
+                        for stmt in &stmts {
                             let r = harbor_client::exec(
                                 &conn,
-                                sql,
-                                Some(params.clone()),
+                                &stmt.sql,
+                                Some(stmt.params.clone()),
                                 Some(&sid),
                             )?;
-                            // The engine answers UPDATE/DELETE with one
-                            // count row; anything but exactly 1 means the
-                            // row is not what we fetched. Nothing lands.
-                            let affected = crate::sql::count_of(&r).unwrap_or(0);
-                            if affected != 1 {
-                                return Err(format!(
-                                    "a row changed since you read it \
-                                     ({affected} rows matched) — refresh and retry"
-                                ));
+                            match stmt.expectation {
+                                edits::StatementExpectation::AffectedOne => {
+                                    // The engine answers UPDATE/DELETE with one
+                                    // count row; anything but exactly 1 means the
+                                    // row is not what we fetched. Nothing lands.
+                                    let affected = crate::sql::count_of(&r).unwrap_or(0);
+                                    if affected != 1 {
+                                        return Err(format!(
+                                            "a row changed since you read it \
+                                             ({affected} rows matched) — refresh and retry"
+                                        ));
+                                    }
+                                }
+                                edits::StatementExpectation::ReturnedOne => {
+                                    if r.rows.len() != 1 {
+                                        return Err(format!(
+                                            "insert returned {} rows instead of 1",
+                                            r.rows.len()
+                                        ));
+                                    }
+                                }
                             }
                         }
                         harbor_client::exec(&conn, "COMMIT", None, Some(&sid))?;
@@ -2012,6 +2287,19 @@ impl Grid {
                         if let Some(e) = &mut grid.edits {
                             e.clear();
                         }
+                        // INSERT drafts have no fetched identity to fold
+                        // into the existing page. Remove their synthetic
+                        // rows now; the refetch below decides whether each
+                        // committed row belongs on this page/filter.
+                        grid.table.update(cx, |state, cx| {
+                            state.delegate_mut().remove_drafts();
+                            state.clear_selection(cx);
+                            let d = state.delegate_mut();
+                            d.selected = None;
+                            d.active_cell = None;
+                            state.refresh(cx);
+                            cx.notify();
+                        });
                         // No sync_staged here: it would also clear the
                         // delete ghosts. The refetch's own sync does.
                         // Fetch-first still holds: the page refetches so
@@ -2076,10 +2364,54 @@ fn select_row(
 }
 
 impl GridDelegate {
+    fn draft_count(&self) -> usize {
+        self.draft_keys.len()
+    }
+
+    fn fetched_count(&self) -> usize {
+        self.rows.len().saturating_sub(self.draft_count())
+    }
+
+    fn draft_key(&self, row: usize) -> Option<&str> {
+        self.draft_keys.get(row).map(String::as_str)
+    }
+
+    fn remove_drafts(&mut self) {
+        let count = self.draft_count();
+        if count == 0 {
+            return;
+        }
+        self.rows.drain(..count.min(self.rows.len()));
+        self.identities.drain(..count.min(self.identities.len()));
+        self.row_labels.drain(..count.min(self.row_labels.len()));
+        self.draft_keys.clear();
+        self.draft_cells.clear();
+        self.staged = self
+            .staged
+            .drain()
+            .filter_map(|((row, col), value)| {
+                (row >= count).then_some(((row - count, col), value))
+            })
+            .collect();
+        self.deleted = self
+            .deleted
+            .drain()
+            .filter_map(|row| (row >= count).then_some(row - count))
+            .collect();
+        self.row_of = self
+            .identities
+            .iter()
+            .enumerate()
+            .map(|(ix, id)| (edits::key_of(id), ix))
+            .collect();
+    }
+
     /// A row carrying any staged change — the rows whose color already
     /// tells a story, so the selection wash stays off them.
     fn row_dirty(&self, row: usize) -> bool {
-        self.deleted.contains(&row) || self.staged.keys().any(|(r, _)| *r == row)
+        row < self.draft_count()
+            || self.deleted.contains(&row)
+            || self.staged.keys().any(|(r, _)| *r == row)
     }
 
     /// Adopt a page's schema and rows — the one birth, shared by Grid::new
@@ -2122,6 +2454,10 @@ impl GridDelegate {
     /// raw values) before display conversion, then derive the render-side
     /// strings and labels. The one door rows enter the delegate through.
     fn adopt_rows(&mut self, rows: Vec<Vec<Value>>, base: usize) {
+        self.draft_keys.clear();
+        self.draft_cells.clear();
+        self.staged.clear();
+        self.deleted.clear();
         self.identities = if self.pk_ix.is_empty() {
             Vec::new()
         } else {
@@ -2231,7 +2567,7 @@ impl GridDelegate {
             }
         }
         if self.gutter {
-            let last = (self.base + self.rows.len()) as u64;
+            let last = (self.base + self.fetched_count()) as u64;
             self.cols[0].width = px(gutter_width(last));
         }
     }
@@ -2268,8 +2604,10 @@ impl TableDelegate for GridDelegate {
         // Column 0 is the row-number gutter: raised, muted, and a firmer
         // divider than the data cells (design.css `.grid td.num`).
         if self.gutter && col_ix == 0 {
+            let is_draft = row_ix < self.draft_count();
             let row_deleted = self.deleted.contains(&row_ix);
-            let row_dirty = !row_deleted && self.staged.keys().any(|(r, _)| *r == row_ix);
+            let row_dirty = is_draft
+                || (!row_deleted && self.staged.keys().any(|(r, _)| *r == row_ix));
             return div()
                 .h_flex()
                 .relative()
@@ -2301,7 +2639,7 @@ impl TableDelegate for GridDelegate {
                         .text_right()
                         .text_size(px(GUTTER_TEXT))
                         .font_family(value_font())
-                        .text_color(t.muted)
+                        .text_color(if is_draft { t.warn } else { t.muted })
                         // Absolute position: page 2 starts at 5,001, and
                         // the number says so (plain digits, like Sheets).
                         .child(self.row_labels.get(row_ix).cloned().unwrap_or_default()),
@@ -2374,8 +2712,10 @@ impl TableDelegate for GridDelegate {
         // The staged layer overrides the fetched value: a confirmed edit
         // shows its new text (or NULL) under a soft accent tint until ⌘S
         // makes it the database's truth.
-        let staged = self.staged.get(&(row_ix, data_col)).cloned();
-        let is_staged = staged.is_some();
+        let is_draft = row_ix < self.draft_count();
+        let draft_explicit = is_draft && self.draft_cells.contains_key(&(row_ix, data_col));
+        let staged = (!is_draft).then(|| self.staged.get(&(row_ix, data_col)).cloned()).flatten();
+        let is_staged = is_draft || staged.is_some();
         let value = match staged {
             Some(v) => Some(v),
             None => self.rows.get(row_ix).and_then(|r| r.get(data_col)).cloned(),
@@ -2482,6 +2822,32 @@ impl TableDelegate for GridDelegate {
                         .border_color(t.accent),
                 )
             });
+        if is_draft && !draft_explicit {
+            let hint = self
+                .draft_hints
+                .get(data_col)
+                .cloned()
+                .unwrap_or_else(|| SharedString::from("DEFAULT"));
+            let required = hint.as_ref() == "REQUIRED";
+            return cell
+                .when(right, |d| d.justify_end())
+                .child(
+                    div()
+                        .flex_none()
+                        .px(px(5.))
+                        .rounded(px(4.))
+                        .bg(if required {
+                            t.warn.opacity(0.18)
+                        } else {
+                            t.pill.opacity(0.45)
+                        })
+                        .text_size(px(TAG_TEXT * p.zoom_factor()))
+                        .font_family(ui_font())
+                        .text_color(if required { t.warn } else { t.muted.opacity(0.7) })
+                        .child(hint),
+                )
+                .into_any_element();
+        }
         match value {
             None | Some(None) => {
                 if !p.null_tags {
@@ -3094,6 +3460,46 @@ impl Render for Grid {
             .child(self.footer(cx))
             .into_any_element()
     }
+}
+
+type InsertMetadata = (
+    Vec<bool>,
+    Vec<Option<String>>,
+    Vec<bool>,
+    Vec<SharedString>,
+);
+
+/// Align catalog insert capabilities to the result schema. The hidden
+/// rowid has no catalog column and therefore receives the harmless NULL
+/// defaults; users never see or insert it.
+fn insert_metadata(
+    names: &[SharedString],
+    structure: Option<&crate::structure::TableStructure>,
+) -> InsertMetadata {
+    let cols: Vec<_> = names
+        .iter()
+        .map(|name| {
+            structure.and_then(|s| s.cols.iter().find(|c| c.name == name.as_ref()))
+        })
+        .collect();
+    let not_null: Vec<bool> = cols.iter().map(|c| c.is_some_and(|c| c.notnull)).collect();
+    let defaults: Vec<Option<String>> =
+        cols.iter().map(|c| c.and_then(|c| c.dflt.clone())).collect();
+    let generated: Vec<bool> = cols.iter().map(|c| c.is_some_and(|c| c.generated)).collect();
+    let hints = (0..names.len())
+        .map(|col| {
+            SharedString::from(if generated[col] {
+                "GENERATED"
+            } else if defaults[col].is_some() {
+                "DEFAULT"
+            } else if not_null[col] {
+                "REQUIRED"
+            } else {
+                "NULL"
+            })
+        })
+        .collect();
+    (not_null, defaults, generated, hints)
 }
 
 /// Wire values -> render-ready cell text (None = NULL), once per page.

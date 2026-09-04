@@ -118,8 +118,12 @@ fn a_session_carries_a_transaction_with_bound_params() {
     let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
         harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
     };
-    // A TEMP table lives on the pinned connection and dies with it —
-    // the probe never touches the database's real schema.
+    // TEMP tables stay on the pinned worker rather than entering the
+    // database's real schema. A released session returns that connection
+    // to Harbor's pool, so clean up names explicitly for repeatability.
+    run("DROP TABLE IF EXISTS _dt_edit_probe", None);
+    run("DROP TABLE IF EXISTS _dt_insert_probe", None);
+    run("DROP TABLE IF EXISTS _dt_default_probe", None);
     run("CREATE TEMP TABLE _dt_edit_probe(id INTEGER PRIMARY KEY, name VARCHAR)", None);
     run("INSERT INTO _dt_edit_probe VALUES (?, ?), (?, ?)",
         Some(vec![json!(1), json!("a"), json!(2), json!("b")]));
@@ -143,6 +147,29 @@ fn a_session_carries_a_transaction_with_bound_params() {
     run("ROLLBACK", None);
     let intact = run("SELECT name FROM _dt_edit_probe WHERE id = 2", None);
     assert_eq!(intact.rows[0][0], json!("b"), "rollback left the row untouched");
+
+    // The staged-INSERT shape: omitted columns keep DEFAULT semantics,
+    // values bind, and RETURNING exposes the engine-computed truth.
+    run(
+        "CREATE TEMP TABLE _dt_insert_probe(\
+         id INTEGER PRIMARY KEY DEFAULT 41, \
+         name VARCHAR NOT NULL, \
+         doubled INTEGER GENERATED ALWAYS AS (id * 2))",
+        None,
+    );
+    run("BEGIN", None);
+    let inserted = run(
+        "INSERT INTO _dt_insert_probe (name) VALUES (?) RETURNING *",
+        Some(vec![json!("Ada")]),
+    );
+    assert_eq!(inserted.rows, vec![vec![json!(41), json!("Ada"), json!(82)]]);
+    run("COMMIT", None);
+    run("CREATE TEMP TABLE _dt_default_probe(answer INTEGER DEFAULT 42)", None);
+    let defaults = run("INSERT INTO _dt_default_probe DEFAULT VALUES RETURNING *", None);
+    assert_eq!(defaults.rows, vec![vec![json!(42)]]);
+    run("DROP TABLE _dt_edit_probe", None);
+    run("DROP TABLE _dt_insert_probe", None);
+    run("DROP TABLE _dt_default_probe", None);
     harbor_client::session_release(&conn, &sid);
     println!("session {sid}: transaction, params, counts — all as the spec assumes");
 }
