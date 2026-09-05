@@ -141,8 +141,8 @@ command. Query results remain the snapshot produced by the SQL the user
 explicitly ran. If refreshes overlap, only the newest response may replace a
 snapshot.
 
-Single click selects; Enter or double-click opens a table in a new tab
-(or focuses the already-open tab for that table).
+Single-clicking a table selects it and preserves the current Structure, Data,
+or Query view. Double-clicking selects it and switches directly to Data.
 
 ## Tabs
 

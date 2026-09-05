@@ -471,7 +471,12 @@ impl DuckTable {
                     .when_some(table.row_count, |d, n| {
                         d.child(dim(t, crate::util::human(n as f64, "")))
                     })
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        if event.click_count() == 2 {
+                            crate::prefs::toggle(cx, |prefs| {
+                                prefs.view = crate::prefs::ViewMode::Data;
+                            });
+                        }
                         this.select_table(
                             clone_str(&key.0),
                             clone_str(&key.1),

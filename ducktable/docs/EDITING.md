@@ -40,6 +40,11 @@ expressions. The placeholder says what will happen: `REQUIRED`, `DEFAULT`,
 the grid's type-honest meaning — empty string for text, explicit NULL for
 other nullable types — and ⌃⇧N is always explicit NULL.
 
+Ordinary viewing keeps columns at their compact content-fit widths. While a
+cell editor or draft row is present, columns expand only as needed to fit these
+placeholder pills; they return to their compact widths when editing ends and no
+draft remains.
+
 Moving out of a draft never writes it. The row joins the same staged set as
 updates and deletes immediately, including undo, review, discard, table
 switches, and the all-or-nothing commit. Discarding/deleting a draft removes
@@ -61,7 +66,7 @@ One meaning per key. No contextual double-agents.
 | typing | opens the editor **replacing** the value, seeded with the keystroke | inserts text |
 | Enter | opens the editor **keeping** the value, caret at end — but during a Tab run, sweeps to the run's anchor column one row down (the carriage return) | confirms the cell, ring moves down — or sweeps, if a Tab run is going |
 | ⇧Enter | (same as Enter, sweeping/moving up) | inserts a line break — the chat-composer convention (Slack, every message box); confirm-and-move-up retired in its favor |
-| Tab / ⇧Tab | moves the ring right / left, arming the typewriter anchor | confirms, ring moves right / left, anchor kept |
+| Tab / ⇧Tab | moves the ring right / left with row-local wraparound, arming the typewriter anchor | confirms, moves right / left with row-local wraparound, anchor kept |
 | arrows | move the ring | *replace entry:* confirm + move the ring · *kept-value entry:* move the caret |
 | double-click | opens the editor keeping the value, caret at the click | — |
 | Esc | clears the selection | cancels the edit, restores what was there, ring stays |

@@ -454,10 +454,6 @@ impl Grid {
         let (not_null, defaults, generated, hints) =
             insert_metadata(&delegate.names, structure.as_ref());
         delegate.draft_hints = hints;
-        // commit_schema fitted ordinary values before catalog metadata
-        // supplied the draft hints. Refit once so the initial columns
-        // already honor the pills they may later render.
-        delegate.fit_widths(p.zoom_factor());
         // Header dragging stays off until move_column permutes the
         // visible map for real — the library default half-enables it
         // (widths reorder, contents don't).
@@ -850,7 +846,7 @@ impl Grid {
                     grid.table.update(cx, |state, cx| {
                         let d = state.delegate_mut();
                         d.draft_hints = hints;
-                        d.fit_widths(zoom);
+                        d.rebuild_cols();
                         state.refresh(cx);
                     });
                 }
@@ -1736,6 +1732,7 @@ impl Grid {
             let d = state.delegate_mut();
             d.editing = Some((row, col));
             d.editor_input = Some(input);
+            d.rebuild_cols();
             state.refresh(cx);
             cx.notify();
         });
@@ -1754,6 +1751,7 @@ impl Grid {
             let d = state.delegate_mut();
             d.editing = None;
             d.editor_input = None;
+            d.rebuild_cols();
             state.refresh(cx);
             cx.notify();
         });
@@ -2022,23 +2020,33 @@ impl Grid {
         cx.notify();
     }
 
-    /// Tab / ⇧Tab: move along the row, remembering where the run began
-    /// (Sheets' typewriter anchor) so Enter can sweep back to it.
+    /// Tab / ⇧Tab: move along the row with wraparound, remembering where
+    /// the run began (Sheets' typewriter anchor) so Enter can sweep back
+    /// to it. Tab at the right edge returns to the first visible cell;
+    /// Shift-Tab at the left edge returns to the last.
     fn tab_move(&mut self, dc: i32, cx: &mut Context<Self>) {
-        let (col, had) = {
-            let d = self.table.read(cx).delegate();
-            (d.active_cell.map(|(_, c)| c), d.tab_anchor)
-        };
-        self.move_ring(0, dc, cx);
-        if let Some(col) = col {
-            // move_ring ends runs; a Tab re-arms, keeping the original
-            // anchor if the run was already going. Only a FORWARD Tab
-            // starts a run (the Excel/Univer reference rule): ⇧Tab
-            // retreats within one but never begins one.
-            self.table.update(cx, |state, _| {
-                state.delegate_mut().tab_anchor = had.or((dc > 0).then_some(col));
-            });
-        }
+        self.table.update(cx, |state, cx| {
+            let d = state.delegate_mut();
+            let Some((row, col)) = d.active_cell else { return };
+            if d.visible.is_empty() {
+                return;
+            }
+            let pos = d.visible.iter().position(|&visible| visible == col).unwrap_or(0);
+            let next = wrapped_step(d.visible.len(), pos, dc);
+            let next_col = d.visible[next];
+            // A Tab keeps the original anchor if the run was already
+            // going. Only a FORWARD Tab starts a run (the Excel/Univer
+            // reference rule): Shift-Tab retreats within one but never
+            // begins one.
+            d.tab_anchor = d.tab_anchor.or((dc > 0).then_some(col));
+            d.active_cell = Some((row, next_col));
+            let display_col = next + d.gutter as usize;
+            select_row(state, row, cx);
+            state.scroll_to_col(display_col, cx);
+            cx.notify();
+        });
+        self.header_chase = true;
+        cx.notify();
     }
 
     /// The carriage return: Enter after a Tab run goes back to the run's
@@ -2209,6 +2217,12 @@ impl Grid {
                 d.editing = None;
                 d.editor_input = None;
                 d.tab_anchor = None;
+            }
+            // Draft hints need room only while a draft or editor is on
+            // screen. Rebuild from the compact fitted widths whenever
+            // staging changes so the grid grows and shrinks with mode.
+            d.rebuild_cols();
+            if draft_shape_changed {
                 state.clear_selection(cx);
             }
             // Dirtiness just changed under the selection: re-decide the
@@ -2391,7 +2405,9 @@ impl Grid {
                         // rows now; the refetch below decides whether each
                         // committed row belongs on this page/filter.
                         grid.table.update(cx, |state, cx| {
-                            state.delegate_mut().remove_drafts();
+                            let d = state.delegate_mut();
+                            d.remove_drafts();
+                            d.rebuild_cols();
                             state.clear_selection(cx);
                             let d = state.delegate_mut();
                             d.selected = None;
@@ -2665,14 +2681,7 @@ impl GridDelegate {
             self.schema_cols[schema_ix].name.as_deref().map_or(4, |n| n.chars().count());
         let content = chars.min(CAP) as f32 * advance;
         let header = name_len as f32 * header_advance;
-        let fitted = px((content.max(header) + PANE_INSET + 16.)
-            .clamp(60. * zoom, 460. * zoom));
-        let hint = self
-            .draft_hints
-            .get(schema_ix)
-            .map(|hint| draft_hint_min_width(hint, zoom))
-            .unwrap_or(px(10.));
-        fitted.max(hint)
+        px((content.max(header) + PANE_INSET + 16.).clamp(60. * zoom, 460. * zoom))
     }
 
     /// Rebuild the display columns from the schema minus the hidden set
@@ -2681,13 +2690,14 @@ impl GridDelegate {
         self.visible = (self.identity as usize..self.schema_cols.len())
             .filter(|i| !self.hidden.contains(i))
             .collect();
+        let editing_widths = self.editing.is_some() || !self.draft_keys.is_empty();
         let minimums: Vec<Pixels> = self
             .visible
             .iter()
             .map(|&schema_ix| {
                 self.draft_hints
                     .get(schema_ix)
-                    .map(|hint| draft_hint_min_width(hint, self.zoom))
+                    .map(|hint| conditional_hint_min_width(hint, editing_widths, self.zoom))
                     .unwrap_or(px(10.))
             })
             .collect();
@@ -3690,6 +3700,10 @@ fn draft_hint_min_width(hint: &str, zoom: f32) -> Pixels {
     px(text + PILL_PADDING + PANE_INSET + TRAILING)
 }
 
+fn conditional_hint_min_width(hint: &str, editing: bool, zoom: f32) -> Pixels {
+    if editing { draft_hint_min_width(hint, zoom) } else { px(10.) }
+}
+
 fn build_columns(
     names: &[SharedString],
     visible: &[usize],
@@ -3736,9 +3750,15 @@ fn numeric(ty: &str) -> bool {
         || ty.starts_with("REAL")
 }
 
+fn wrapped_step(len: usize, position: usize, delta: i32) -> usize {
+    (position as i32 + delta).rem_euclid(len as i32) as usize
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{draft_hint_min_width, duplicate_values};
+    use super::{
+        conditional_hint_min_width, draft_hint_min_width, duplicate_values, wrapped_step,
+    };
     use serde_json::{Value, json};
 
     #[test]
@@ -3748,6 +3768,16 @@ mod tests {
         assert_eq!(f32::from(draft_hint_min_width("REQUIRED", 1.)), 86.);
         assert_eq!(f32::from(draft_hint_min_width("GENERATED", 1.)), 93.);
         assert_eq!(f32::from(draft_hint_min_width("DEFAULT", 2.)), 128.);
+        assert_eq!(f32::from(conditional_hint_min_width("GENERATED", false, 1.)), 10.);
+        assert_eq!(f32::from(conditional_hint_min_width("GENERATED", true, 1.)), 93.);
+    }
+
+    #[test]
+    fn tab_steps_wrap_at_both_ends_of_a_row() {
+        assert_eq!(wrapped_step(4, 0, 1), 1);
+        assert_eq!(wrapped_step(4, 3, 1), 0);
+        assert_eq!(wrapped_step(4, 3, -1), 2);
+        assert_eq!(wrapped_step(4, 0, -1), 3);
     }
 
     #[test]
