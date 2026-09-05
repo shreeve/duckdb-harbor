@@ -1261,6 +1261,18 @@ impl Grid {
         cx.notify();
     }
 
+    /// Native Edit-menu actions arrive at App scope, so they need one
+    /// explicit gate before reaching the grid. Row commands belong only
+    /// to the focused Data table, never to text inputs or embedded grids.
+    pub(crate) fn accepts_row_commands(&self, window: &Window, cx: &App) -> bool {
+        !self.embedded
+            && prefs::get(cx).view == ViewMode::Data
+            && self.editor.is_none()
+            && self.edits.is_some()
+            && !self.committing
+            && self.table.focus_handle(cx).contains_focused(window, cx)
+    }
+
     /// The grid's whole keymap, focus-scoped by construction: this
     /// listener sits on the grid wrapper, so it hears keys only when
     /// focus is inside — the table or an open cell editor.
@@ -1851,9 +1863,14 @@ impl Grid {
         }
     }
 
-    /// ⌘⌫: stage the selected row's DELETE — visible, ghosted,
-    /// reversible until commit. No dialog, ever: reversibility replaces
-    /// confirmation.
+    /// Edit-menu entry point; the window argument keeps its signature
+    /// parallel with New Row for the shared App-level dispatcher.
+    pub(crate) fn delete_row(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.stage_delete_row(cx);
+    }
+
+    /// Stage the selected row's DELETE — visible, ghosted, reversible
+    /// until commit. No dialog: reversibility is the confirmation model.
     fn stage_delete_row(&mut self, cx: &mut Context<Self>) {
         let (identity, draft_key) = {
             let d = self.table.read(cx).delegate();

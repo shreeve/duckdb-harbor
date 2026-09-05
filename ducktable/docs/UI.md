@@ -59,6 +59,11 @@ Harbor loopback port. A tunneled row remains a normal DATABASES row and says
 Database**, which forgets the saved route and closes its tunnel without sending
 a shutdown request to the database server.
 
+The Edit menu owns Data-grid row operations. **New Row** (Cmd+N) creates an
+all-DEFAULT draft and enters its first useful writable cell. **Delete Row**
+(Cmd+D) stages the selected row for deletion. The row remains visibly ghosted
+and undoable until the final Cmd+S commit boundary.
+
 ## Sizing
 
 Rigidity is part of feeling native: content pushes back instead of
@@ -119,7 +124,8 @@ the tree when the catalog endpoint carries them. Each section header
 has its own filter glyph — a filter field only appears once a section
 exceeds 10 items — and a refresh glyph. Refresh refetches then swaps in
 one frame; it never blanks the tree while loading, and a failed refresh
-keeps the old tree unchanged.
+keeps the old tree unchanged. **Refresh Tables** is also available from
+the View menu and with Cmd+R; all three entrances perform the same action.
 
 Single click selects; Enter or double-click opens a table in a new tab
 (or focuses the already-open tab for that table).
@@ -304,6 +310,9 @@ Every surface defines empty, loading, and failed:
 
 - Cmd+K: berth switcher (fuzzy)
 - Cmd+P: table switcher (fuzzy, within connected berth)
+- Cmd+R: Refresh Tables
+- Cmd+N: New Row (Data grid)
+- Cmd+D: stage Delete Row (Data grid)
 - Cmd+T / Cmd+W: new query tab / close tab
 - Cmd+Enter / Cmd+Shift+Enter: run statement / run all
 - Cmd+. : cancel running query

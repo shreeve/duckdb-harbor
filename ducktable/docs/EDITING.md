@@ -60,7 +60,8 @@ One meaning per key. No contextual double-agents.
 | Esc | clears the selection | cancels the edit, restores what was there, ring stays |
 | Delete / ⌫ | clears the cell: text → `''`, everything else → NULL (NOT NULL columns refuse, with the reason in the status line) | deletes text |
 | ⌃⇧N | stages NULL explicitly, any type | — |
-| ⌘⌫ | stages a row DELETE (ghost strikethrough; reversible until commit) | — |
+| ⌘N | creates a new all-DEFAULT row and opens its first useful writable cell | — |
+| ⌘D / ⌘⌫ | stages a row DELETE (ghost strikethrough; reversible until commit) | — |
 | ⌘Z / ⌘⇧Z | un-stages / re-stages the most recent change | text undo / redo |
 | ⌘S | commits all staged changes — one transaction, all or nothing | confirms the cell, then commits (⌘Enter is its equal) |
 | ⌥Enter | — | newline (the Sheets-hand twin of ⇧Enter) |

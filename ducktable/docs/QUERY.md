@@ -134,9 +134,9 @@ Harbor; responses are fenced, so a stale result can never replace a
 newer one. Closing the connection cancels the run.
 
 **⌘S** flushes the scratch to disk immediately; the status line
-flashes `saved`. It never runs anything. **⌘R** runs again: it repeats
-the previous run's captured text exactly — refresh means "what I last
-looked at," even if the scratch has moved on.
+flashes `saved`. It never runs anything. **⌘R** is the app-level
+**Refresh Tables** command: it refreshes the sidebar's catalog snapshot
+from either pane without changing or running the scratch.
 
 ⌘Enter works from **either pane**: with focus in the results grid it
 still sends the marked statement. Results have no staged powers, so
@@ -293,7 +293,7 @@ a rung:
 | ⌘Enter | send: the selection if any, else the marked statement — from either pane |
 | ⌘⇧Enter | run all, top to bottom, stop at first error |
 | ⌘. | cancel the running query |
-| ⌘R | run again — repeat the previous run exactly |
+| ⌘R | Refresh Tables — refresh the sidebar catalog without running the scratch |
 | ⌘S | flush the scratch to disk (`saved` flashes; it was already safe) |
 | ⌘L | from anywhere in the window: switch to Query, focus the editor — the address-bar reflex |
 | Enter / ⇧Enter / ⌥Enter | newline, always; Enter never accepts a completion |
@@ -424,7 +424,8 @@ DuckTable.
 
 **v1 — one phase, shippable:** the Query segment with focus handoff;
 per-berth scratch, autosave, restore; the split; statement spans and
-the send mark; ⌘Enter / ⌘⇧Enter / ⌘. / ⌘R / ⌘S / ⌘L; the
+the send mark; ⌘Enter / ⌘⇧Enter / ⌘. / ⌘S / ⌘L; app-level ⌘R
+Refresh Tables; the
 session-holding runner; read-only results grid, chips, acknowledgment
 cards, error strip with caret jump; status-line timing; local
 completion (keywords, functions, schema, dot-members, ⌃Space,
