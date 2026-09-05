@@ -3,6 +3,14 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by signed
 tag date, newest first.
 
+## 0.20.2 — 2026-09-05
+
+- Fixes Tab and Shift-Tab while a cell editor is active: the edited value is
+  confirmed and the active cell moves right or left instead of remaining in
+  the input.
+- Preserves row-local wraparound, so Tab from the final visible cell selects
+  the first and Shift-Tab from the first selects the final cell.
+
 ## 0.20.1 — 2026-09-05
 
 - Makes a sidebar table-name double-click select the table and switch directly

@@ -21,6 +21,7 @@ use crate::theme::{
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
+use gpui_component::input::{IndentInline, OutdentInline};
 use gpui_component::table::{Column as TableColumn, Table, TableDelegate, TableState};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::resizable::{
@@ -1606,6 +1607,36 @@ impl Grid {
                     }
                 }
             }
+        }
+    }
+
+    /// A focused Input maps Tab / Shift-Tab to these actions before the
+    /// raw KeyDownEvent can bubble to `on_key`. Catch them on the cell
+    /// editor's ancestor and run the same confirm-and-wrap path as the
+    /// grid-level keyboard handler.
+    fn on_editor_tab(
+        &mut self,
+        _: &IndentInline,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editor.as_ref().is_some_and(|ed| ed.input.focus_handle(cx).is_focused(window)) {
+            self.confirm_and_move(0, 1, true, cx);
+        } else {
+            cx.propagate();
+        }
+    }
+
+    fn on_editor_shift_tab(
+        &mut self,
+        _: &OutdentInline,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editor.as_ref().is_some_and(|ed| ed.input.focus_handle(cx).is_focused(window)) {
+            self.confirm_and_move(0, -1, true, cx);
+        } else {
+            cx.propagate();
         }
     }
 
@@ -3302,6 +3333,7 @@ impl Render for Grid {
             self.title.clone()
         };
         let error = self.error.clone();
+        let editing_cell = self.editor.is_some();
         // Embedded (the Query view's results pane): body only. The host
         // owns the chrome — its editor above, the app footer below,
         // which reads this grid's stats and pager state through it. The
@@ -3381,6 +3413,14 @@ impl Render for Grid {
             // The whole editing keymap rides the pane, on the bubble path
             // from wherever focus is — the table or an open cell editor.
             .on_key_down(cx.listener(Self::on_key))
+            // gpui-component binds Tab inside Input to indentation
+            // actions. A single-line cell editor has nothing to indent,
+            // so intercept those actions here and give Tab its grid
+            // meaning: confirm, then move to the adjacent visible cell.
+            .when(editing_cell, |d| {
+                d.on_action(cx.listener(Self::on_editor_tab))
+                    .on_action(cx.listener(Self::on_editor_shift_tab))
+            })
             .child(
                 div()
                     .h_flex()
