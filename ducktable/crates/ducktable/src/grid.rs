@@ -258,6 +258,9 @@ pub(crate) struct GridDelegate {
     /// User drag-resizes, schema index → width, reapplied whenever the
     /// column list rebuilds (toggles, refreshes).
     widths: std::collections::HashMap<usize, Pixels>,
+    /// Current data-surface zoom, retained so every column rebuild can
+    /// reproduce its zoom-aware semantic minimum.
+    zoom: f32,
     /// Schema index for each data column currently displayed — the map
     /// render_td/th use, since col_ix stops matching schema order once
     /// anything is hidden.
@@ -417,6 +420,7 @@ impl Grid {
             pill_cols: std::collections::HashSet::new(),
             identity: rowid,
             widths: std::collections::HashMap::new(),
+            zoom: p.zoom_factor(),
             visible: Vec::new(),
             gutter,
             rows: Vec::new(),
@@ -443,6 +447,10 @@ impl Grid {
         let (not_null, defaults, generated, hints) =
             insert_metadata(&delegate.names, structure.as_ref());
         delegate.draft_hints = hints;
+        // commit_schema fitted ordinary values before catalog metadata
+        // supplied the draft hints. Refit once so the initial columns
+        // already honor the pills they may later render.
+        delegate.fit_widths(p.zoom_factor());
         // Header dragging stays off until move_column permutes the
         // visible map for real — the library default half-enables it
         // (widths reorder, contents don't).
@@ -832,8 +840,11 @@ impl Grid {
                     grid.not_null = not_null;
                     grid.defaults = defaults;
                     grid.generated = generated;
-                    grid.table.update(cx, |state, _| {
-                        state.delegate_mut().draft_hints = hints;
+                    grid.table.update(cx, |state, cx| {
+                        let d = state.delegate_mut();
+                        d.draft_hints = hints;
+                        d.fit_widths(zoom);
+                        state.refresh(cx);
                     });
                 }
                 // Staged changes are identity-keyed; the new page gets
@@ -2515,6 +2526,7 @@ impl GridDelegate {
     /// use: later rebuilds keep them, page flips never re-fit, and a drag
     /// still overrides a fit.
     fn fit_widths(&mut self, zoom: f32) {
+        self.zoom = zoom;
         self.rebuild_cols();
         let fits: Vec<(usize, Pixels)> = self
             .visible
@@ -2567,7 +2579,14 @@ impl GridDelegate {
             self.schema_cols[schema_ix].name.as_deref().map_or(4, |n| n.chars().count());
         let content = chars.min(CAP) as f32 * advance;
         let header = name_len as f32 * header_advance;
-        px((content.max(header) + PANE_INSET + 16.).clamp(60. * zoom, 460. * zoom))
+        let fitted = px((content.max(header) + PANE_INSET + 16.)
+            .clamp(60. * zoom, 460. * zoom));
+        let hint = self
+            .draft_hints
+            .get(schema_ix)
+            .map(|hint| draft_hint_min_width(hint, zoom))
+            .unwrap_or(px(10.));
+        fitted.max(hint)
     }
 
     /// Rebuild the display columns from the schema minus the hidden set
@@ -2576,11 +2595,24 @@ impl GridDelegate {
         self.visible = (self.identity as usize..self.schema_cols.len())
             .filter(|i| !self.hidden.contains(i))
             .collect();
+        let minimums: Vec<Pixels> = self
+            .visible
+            .iter()
+            .map(|&schema_ix| {
+                self.draft_hints
+                    .get(schema_ix)
+                    .map(|hint| draft_hint_min_width(hint, self.zoom))
+                    .unwrap_or(px(10.))
+            })
+            .collect();
         self.cols = build_columns(&self.names, &self.visible, self.gutter);
         let g = self.gutter as usize;
-        for (disp, schema_ix) in self.visible.iter().enumerate() {
+        for (disp, (schema_ix, minimum)) in
+            self.visible.iter().zip(minimums).enumerate()
+        {
+            self.cols[disp + g].min_width = minimum;
             if let Some(&w) = self.widths.get(schema_ix) {
-                self.cols[disp + g].width = w;
+                self.cols[disp + g].width = w.max(minimum);
             }
         }
         if self.gutter {
@@ -3536,6 +3568,19 @@ fn display_rows(rows: Vec<Vec<Value>>) -> Vec<Vec<Option<SharedString>>> {
         .collect()
 }
 
+/// The full horizontal footprint of an untouched draft hint: estimated
+/// proportional UI-font advance, the pill's 5px padding on both sides,
+/// the cell's left inset, and its 8px trailing breathing room. The
+/// estimate is deliberately a little generous so rounded ends never
+/// disappear at a theme or rasterization boundary.
+fn draft_hint_min_width(hint: &str, zoom: f32) -> Pixels {
+    const UI_ADVANCE_EM: f32 = 0.7;
+    const PILL_PADDING: f32 = 10.;
+    const TRAILING: f32 = 8.;
+    let text = hint.chars().count() as f32 * TAG_TEXT * UI_ADVANCE_EM * zoom;
+    px(text + PILL_PADDING + PANE_INSET + TRAILING)
+}
+
 fn build_columns(
     names: &[SharedString],
     visible: &[usize],
@@ -3580,4 +3625,18 @@ fn numeric(ty: &str) -> bool {
         || ty.starts_with("DOUBLE")
         || ty.starts_with("FLOAT")
         || ty.starts_with("REAL")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::draft_hint_min_width;
+
+    #[test]
+    fn draft_hint_floors_fit_each_pill_and_scale_with_zoom() {
+        assert_eq!(f32::from(draft_hint_min_width("NULL", 1.)), 58.);
+        assert_eq!(f32::from(draft_hint_min_width("DEFAULT", 1.)), 79.);
+        assert_eq!(f32::from(draft_hint_min_width("REQUIRED", 1.)), 86.);
+        assert_eq!(f32::from(draft_hint_min_width("GENERATED", 1.)), 93.);
+        assert_eq!(f32::from(draft_hint_min_width("DEFAULT", 2.)), 128.);
+    }
 }

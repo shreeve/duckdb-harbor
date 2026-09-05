@@ -93,6 +93,12 @@ rules, in order:
    out, the response is a deliberate state change (a pane collapses),
    not gradual squeezing.
 
+Grid columns add one semantic floor to content fitting: a column must fit the
+draft hint it can display, including the pill and cell insets. `DEFAULT`,
+`REQUIRED`, `GENERATED`, and `NULL` therefore remain whole at every zoom and
+cannot be clipped by dragging a divider narrower. The floor is known from
+catalog metadata before a draft appears, so adding a row never moves columns.
+
 ## Sidebar
 
 Two stacked sections, each collapsible.

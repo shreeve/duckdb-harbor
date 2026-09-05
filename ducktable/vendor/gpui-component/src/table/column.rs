@@ -26,6 +26,10 @@ pub struct Column {
     pub paddings: Option<Edges<Pixels>>,
     /// The width of the column.
     pub width: Pixels,
+    /// DuckTable patch: the smallest width this column may be fitted or
+    /// manually resized to. Upstream has only a table-wide 10px floor,
+    /// which cannot account for per-column content such as draft pills.
+    pub min_width: Pixels,
     /// Whether the column is fixed, the fixed column will pin at the left side when scrolling horizontally.
     pub fixed: Option<ColumnFixed>,
     /// Whether the column is resizable.
@@ -45,6 +49,7 @@ impl Default for Column {
             sort: None,
             paddings: None,
             width: px(100.),
+            min_width: px(10.),
             fixed: None,
             resizable: true,
             movable: true,
@@ -114,6 +119,12 @@ impl Column {
     /// Set the width of the column, default is 100px.
     pub fn width(mut self, width: impl Into<Pixels>) -> Self {
         self.width = width.into();
+        self
+    }
+
+    /// DuckTable patch: set this column's resize floor.
+    pub fn min_width(mut self, min_width: impl Into<Pixels>) -> Self {
+        self.min_width = min_width.into();
         self
     }
 
