@@ -1387,7 +1387,7 @@ impl Grid {
                     self.confirm_and_move(1, 0, false, cx);
                 }
                 "tab" => {
-                    self.confirm_and_move(0, if m.shift { -1 } else { 1 }, true, cx);
+                    self.confirm_and_tab(if m.shift { -1 } else { 1 }, window, cx);
                 }
                 "up" if replace => {
                     self.confirm_and_move(-1, 0, false, cx);
@@ -1621,7 +1621,7 @@ impl Grid {
         cx: &mut Context<Self>,
     ) {
         if self.editor.as_ref().is_some_and(|ed| ed.input.focus_handle(cx).is_focused(window)) {
-            self.confirm_and_move(0, 1, true, cx);
+            self.confirm_and_tab(1, window, cx);
         } else {
             cx.propagate();
         }
@@ -1634,7 +1634,7 @@ impl Grid {
         cx: &mut Context<Self>,
     ) {
         if self.editor.as_ref().is_some_and(|ed| ed.input.focus_handle(cx).is_focused(window)) {
-            self.confirm_and_move(0, -1, true, cx);
+            self.confirm_and_tab(-1, window, cx);
         } else {
             cx.propagate();
         }
@@ -1718,6 +1718,10 @@ impl Grid {
         if deleted {
             return; // you cannot edit a ghost; revert the delete first (⌘Z)
         }
+        // Closing the preceding editor schedules table focus for the next
+        // frame. A Tab run opens its neighbor immediately, so cancel that
+        // handoff before it can steal focus back from the new input.
+        self.needs_focus = false;
         let replace = seed.is_some();
         let text = seed
             .unwrap_or_else(|| original.as_ref().map(|s| s.to_string()).unwrap_or_default());
@@ -1768,6 +1772,18 @@ impl Grid {
             cx.notify();
         });
         cx.notify();
+    }
+
+    /// Tab while editing is a continuous entry gesture: confirm the current
+    /// cell, wrap the ring to its neighbor, then immediately open that cell's
+    /// editor. Validation failure leaves the original editor in place.
+    fn confirm_and_tab(&mut self, dc: i32, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.confirm_and_move(0, dc, true, cx) {
+            return;
+        }
+        if let Some((row, col)) = self.table.read(cx).delegate().active_cell {
+            self.open_editor(row, col, None, window, cx);
+        }
     }
 
     /// Esc: the in-progress text never happened; what was there before —

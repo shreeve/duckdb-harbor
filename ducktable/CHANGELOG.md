@@ -3,6 +3,12 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by signed
 tag date, newest first.
 
+## 0.20.3 — 2026-09-05
+
+- Keeps cell editing continuous across Tab and Shift-Tab: DuckTable confirms
+  the current value, moves with row-local wraparound, and immediately opens
+  the destination cell for editing.
+
 ## 0.20.2 — 2026-09-05
 
 - Fixes Tab and Shift-Tab while a cell editor is active: the edited value is
