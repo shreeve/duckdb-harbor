@@ -280,7 +280,9 @@ where
             .map(|col_ix| {
                 let column = self.delegate().column(col_ix, cx);
                 ColGroup {
-                    width: column.width,
+                    // DuckTable patch: initial construction obeys the
+                    // same per-column floor as a later drag resize.
+                    width: column.width.max(column.min_width),
                     bounds: Bounds::default(),
                     column: column.clone(),
                 }
@@ -471,7 +473,6 @@ where
             return;
         }
 
-        const MIN_WIDTH: Pixels = px(10.0);
         const MAX_WIDTH: Pixels = px(1200.0);
         let Some(col_group) = self.col_groups.get_mut(ix) else {
             return;
@@ -484,7 +485,9 @@ where
 
         let old_width = col_group.width;
         let new_width = size;
-        if new_width < MIN_WIDTH {
+        // DuckTable patch: draft pills and other semantic cell content
+        // can declare a stronger floor than the upstream 10px default.
+        if new_width < col_group.column.min_width {
             return;
         }
         let changed_width = new_width - old_width;
