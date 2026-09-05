@@ -9,6 +9,20 @@ use crate::util::clone_str;
 use gpui::*;
 use harbor_client::{fleet, Conn, State};
 
+fn catalog_refresh_is_current(
+    current_attempt: u64,
+    current_refresh: u64,
+    fenced_attempt: u64,
+    fenced_refresh: u64,
+) -> bool {
+    current_attempt == fenced_attempt && current_refresh == fenced_refresh
+}
+
+/// A child surface finished work that may have changed any table. The root
+/// owns the catalog snapshot, so grids and query views request a refresh
+/// instead of trying to update sidebar counts themselves.
+pub(crate) struct CatalogRefreshRequested;
+
 pub(crate) struct RowVm {
     pub(crate) name: String,
     pub(crate) state: State,
@@ -81,6 +95,9 @@ pub struct DuckTable {
     /// click racing the one connect fires) commit newest-wins instead of
     /// arbitrary order.
     refresh_seq: u64,
+    /// Fence for catalog refreshes. Writes and manual refreshes can overlap;
+    /// only the newest `/catalog` response may replace the sidebar snapshot.
+    catalog_seq: u64,
     /// The sidebar's out-loud line: a refused config, or a catalog
     /// refresh that failed — a GUI has no stderr, and both would
     /// otherwise fail silently (an unexplained empty list reads as
@@ -176,6 +193,7 @@ impl DuckTable {
             berth_filter: None,
             select_seq: 0,
             refresh_seq: 0,
+            catalog_seq: 0,
             warning: None,
             query: None,
             staged: std::collections::HashMap::new(),
@@ -266,6 +284,10 @@ impl DuckTable {
                         window, cx,
                     )
                 });
+                cx.subscribe(&grid, |state, _, _: &CatalogRefreshRequested, cx| {
+                    state.refresh_catalog(cx)
+                })
+                .detach();
                 // And returning to a table hands its parked edits back.
                 let source = crate::sql::source(&schema, &name);
                 if let Some(stash) = state.staged.remove(&source) {
@@ -277,11 +299,19 @@ impl DuckTable {
                     Phase::Connected { info, .. } => clone_str(&info.name),
                     _ => String::new(),
                 };
-                if !state.query.as_ref().is_some_and(|q| q.read(cx).is_for(&berth)) {
+                if !state
+                    .query
+                    .as_ref()
+                    .is_some_and(|q| q.read(cx).is_for(&berth))
+                {
                     let qconn = grid.read(cx).conn.clone();
-                    state.query = Some(cx.new(|cx| {
-                        crate::query::QueryView::new(qconn, &berth, window, cx)
-                    }));
+                    let query =
+                        cx.new(|cx| crate::query::QueryView::new(qconn, &berth, window, cx));
+                    cx.subscribe(&query, |state, _, _: &CatalogRefreshRequested, cx| {
+                        state.refresh_catalog(cx)
+                    })
+                    .detach();
+                    state.query = Some(query);
                 }
                 grid.update(cx, |g, cx| {
                     g.query_view = state.query.clone();
@@ -382,14 +412,16 @@ impl DuckTable {
             Phase::Connected { conn, .. } => conn.clone(),
             _ => return,
         };
-        let fence = self.attempt;
+        self.catalog_seq += 1;
+        let attempt = self.attempt;
+        let refresh = self.catalog_seq;
         cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_executor()
                 .spawn(async move { harbor_client::catalog(&conn) })
                 .await;
             this.update(cx, |state, cx| {
-                if state.attempt != fence {
+                if !catalog_refresh_is_current(state.attempt, state.catalog_seq, attempt, refresh) {
                     return;
                 }
                 match outcome {
@@ -878,5 +910,17 @@ impl DuckTable {
         if let Some(q) = &self.query {
             q.update(cx, |q, cx| q.request_focus(cx));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::catalog_refresh_is_current;
+
+    #[test]
+    fn catalog_refresh_accepts_only_the_current_connection_and_request() {
+        assert!(catalog_refresh_is_current(7, 11, 7, 11));
+        assert!(!catalog_refresh_is_current(8, 11, 7, 11));
+        assert!(!catalog_refresh_is_current(7, 12, 7, 11));
     }
 }

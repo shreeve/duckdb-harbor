@@ -54,6 +54,8 @@ pub(crate) struct QueryView {
     _intercept: Subscription,
 }
 
+impl EventEmitter<crate::app::CatalogRefreshRequested> for QueryView {}
+
 impl QueryView {
     pub(crate) fn new(
         conn: Conn,
@@ -456,6 +458,11 @@ impl QueryView {
                         this.ok_ms = None;
                     }
                 }
+                // Arbitrary SQL may change any table. Request a catalog
+                // refresh after every completed send, including an error:
+                // an earlier statement may have committed before a later
+                // statement failed.
+                cx.emit(crate::app::CatalogRefreshRequested);
                 cx.notify();
             })
             .ok();

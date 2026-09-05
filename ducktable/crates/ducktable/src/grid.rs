@@ -161,6 +161,8 @@ pub(crate) struct Grid {
 
 }
 
+impl EventEmitter<crate::app::CatalogRefreshRequested> for Grid {}
+
 /// Everything a fetch commits along with its rows. The delegate is not
 /// touched until the data arrives — the footer, funnel, and gutter always
 /// describe the rows actually on screen, and a failed or superseded fetch
@@ -2336,6 +2338,7 @@ impl Grid {
                         // over pixels that already match it.
                         let page = grid.page;
                         grid.fetch_page_now(page, cx);
+                        cx.emit(crate::app::CatalogRefreshRequested);
                     }
                     Err(message) => {
                         grid.error = Some(format!("{message} · edits kept"));
