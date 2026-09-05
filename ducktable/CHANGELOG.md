@@ -7,6 +7,10 @@ tag date, newest first.
 
 - Makes a sidebar table-name double-click select the table and switch directly
   to its Data view while a single click preserves the current view.
+- Makes Tab and Shift-Tab wrap between the first and last visible cells of the
+  current row while navigating or confirming an edit.
+- Keeps content-fit columns compact during ordinary viewing and applies wider
+  draft-placeholder minimums only while editing or displaying draft rows.
 
 ## 0.20.0 — 2026-09-05
 
