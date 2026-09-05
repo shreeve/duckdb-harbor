@@ -26,9 +26,9 @@ use gpui_component::{Root, StyledExt as _};
 actions!(
     ducktable,
     [
-        ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset, FitColumns, TablePrev,
-        TableNext, View1, View2, View3, ToggleFullScreen, ToggleRowNumbers, ToggleRightAlign,
-        ToggleNullTags, OpenDatabase, OpenDatabaseUrl
+        ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset, FitColumns, RefreshTables,
+        AddRow, DeleteRow, TablePrev, TableNext, View1, View2, View3, ToggleFullScreen,
+        ToggleRowNumbers, ToggleRightAlign, ToggleNullTags, OpenDatabase, OpenDatabaseUrl
     ]
 );
 
@@ -111,6 +111,32 @@ fn step_table(delta: i32, cx: &mut App) {
     });
 }
 
+/// Run an Edit-menu row command only when the Data table itself owns
+/// focus. App-level registration makes native menu items work; the grid
+/// gate keeps the same shortcuts inert in Query, Structure, filters, and
+/// cell editors.
+fn run_row_action(
+    action: fn(&mut grid::Grid, &mut Window, &mut Context<grid::Grid>),
+    cx: &mut App,
+) {
+    let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) else {
+        return;
+    };
+    cx.defer(move |cx| {
+        let Some(active) = cx.active_window() else { return };
+        active
+            .update(cx, |_, window, cx| {
+                view.update(cx, |this, cx| {
+                    let Some(grid) = this.grid.clone() else { return };
+                    if grid.read(cx).accepts_row_commands(window, cx) {
+                        grid.update(cx, |grid, cx| action(grid, window, cx));
+                    }
+                });
+            })
+            .ok();
+    });
+}
+
 /// The switcher's one ordering — the footer renders it and ⌘1/⌘2/⌘3
 /// address it (Finder's ⌘1–4 idiom; these keys migrate to the tab
 /// strip when tabs ship, the ⌥↑/↓ pattern).
@@ -172,6 +198,13 @@ fn app_menus() -> Vec<Menu> {
                 MenuItem::action("Open Database URL…", OpenDatabaseUrl),
             ],
         },
+        Menu {
+            name: "Edit".into(),
+            items: vec![
+                MenuItem::action("New Row", AddRow),
+                MenuItem::action("Delete Row", DeleteRow),
+            ],
+        },
         // macOS shows each item's key equivalent from the keymap, so this
         // menu is also where the zoom shortcuts advertise themselves.
         Menu {
@@ -182,6 +215,8 @@ fn app_menus() -> Vec<Menu> {
                 MenuItem::action("Structure", View1),
                 MenuItem::action("Data", View2),
                 MenuItem::action("Query", View3),
+                MenuItem::separator(),
+                MenuItem::action("Refresh Tables", RefreshTables),
                 MenuItem::separator(),
                 MenuItem::action("Previous Table", TablePrev),
                 MenuItem::action("Next Table", TableNext),
@@ -366,6 +401,9 @@ fn main() {
             KeyBinding::new("cmd-i", ToggleInspector, None),
             KeyBinding::new("cmd-o", OpenDatabase, None),
             KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-r", RefreshTables, None),
+            KeyBinding::new("cmd-n", AddRow, None),
+            KeyBinding::new("cmd-d", DeleteRow, None),
             // Cmd-Plus arrives as cmd-= (unshifted) or cmd-shift-= — bind
             // both, the way browsers treat the pair.
             KeyBinding::new("cmd-=", ZoomIn, None),
@@ -486,6 +524,21 @@ fn main() {
         });
         cx.on_action(|_: &TablePrev, cx| step_table(-1, cx));
         cx.on_action(|_: &TableNext, cx| step_table(1, cx));
+        cx.on_action(|_: &AddRow, cx| run_row_action(grid::Grid::add_row, cx));
+        cx.on_action(|_: &DeleteRow, cx| {
+            run_row_action(grid::Grid::delete_row, cx)
+        });
+        // One command behind both the View menu and Cmd+R. The sidebar
+        // glyph calls the same refresh_catalog method directly from its
+        // DuckTable context, so every entrance has identical semantics.
+        cx.on_action(|_: &RefreshTables, cx| {
+            let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) else {
+                return;
+            };
+            cx.defer(move |cx| {
+                view.update(cx, |this, cx| this.refresh_catalog(cx));
+            });
+        });
         cx.on_action(|_: &ToggleFullScreen, cx| {
             cx.defer(|cx| {
                 if let Some(w) = cx.active_window() {

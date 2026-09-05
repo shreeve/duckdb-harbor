@@ -424,7 +424,7 @@ impl DuckTable {
                         // sets it explicitly); without this it's invisible.
                         .child(svg().path("icons/refresh-cw.svg").size_3p5().text_color(t.muted))
                         .tooltip(move |window, cx| {
-                            gpui_component::tooltip::Tooltip::new("Refresh tables")
+                            gpui_component::tooltip::Tooltip::new("Refresh Tables (⌘R)")
                                 .build(window, cx)
                         })
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
