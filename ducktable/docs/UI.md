@@ -132,6 +132,10 @@ exceeds 10 items — and a refresh glyph. Refresh refetches then swaps in
 one frame; it never blanks the tree while loading, and a failed refresh
 keeps the old tree unchanged. **Refresh Tables** is also available from
 the View menu and with Cmd+R; all three entrances perform the same action.
+A successful staged-edit commit and every completed Query run perform that
+same refresh automatically, so row counts and schema changes land without a
+second command. If refreshes overlap, only the newest response may replace
+the catalog snapshot.
 
 Single click selects; Enter or double-click opens a table in a new tab
 (or focuses the already-open tab for that table).

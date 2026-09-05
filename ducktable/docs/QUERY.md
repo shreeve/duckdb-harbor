@@ -125,8 +125,10 @@ temp state is gone and the note says so.
 **No implicit transaction.** Statements auto-commit individually, like
 the duckdb CLI; write `BEGIN`/`COMMIT` yourself. A run-all stops at the
 first error; whatever completed stays completed, and the status line
-says how far it got. Runs containing non-SELECT statements refresh the
-sidebar catalog afterward (fetch first, swap in one frame).
+says how far it got. Every completed send refreshes the sidebar catalog
+afterward (fetch first, swap in one frame): arbitrary SQL can mutate through
+forms that cannot be classified reliably, and an earlier statement may have
+committed before a later statement reports an error.
 
 **One run in flight** per view. ⌘Enter during a run answers
 `already running · ⌘. to cancel` — no queue. **⌘.** cancels through

@@ -184,8 +184,9 @@ and still visible, the offender is marked, and the status line says why,
 ending with "edits kept."
 
 After a successful commit the page refetches so the grid shows the
-database's truth. NULL renders as the NULL tag, visually distinct from
-empty, always.
+database's truth, and Refresh Tables refetches `/catalog` so every sidebar
+row count reflects the committed transaction. NULL renders as the NULL tag,
+visually distinct from empty, always.
 
 ## Dialogs
 
