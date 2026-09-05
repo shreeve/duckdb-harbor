@@ -192,13 +192,29 @@ impl Edits {
     /// Add an intentional all-DEFAULT draft. It is staged immediately:
     /// DEFAULT VALUES can itself be a valid insert, and one undo removes it.
     pub fn stage_insert(&mut self) -> String {
+        self.stage_insert_values(Vec::new())
+    }
+
+    /// Add a draft whose supplied cells are already known. This is the
+    /// duplicate-row path: the whole copied row is one undo step, just as
+    /// an empty New Row is one undo step.
+    pub fn stage_insert_values(
+        &mut self,
+        values: Vec<(usize, Option<SharedString>, Value)>,
+    ) -> String {
         let key = format!("draft:{:020}", self.next_draft);
         self.next_draft += 1;
+        let cells = values
+            .into_iter()
+            .map(|(col, text, value)| {
+                (col, CellEdit { original: None, text, value })
+            })
+            .collect();
         self.apply(Op {
             key: key.clone(),
             identity: Vec::new(),
             prev: None,
-            next: Some(RowChange::Insert(BTreeMap::new())),
+            next: Some(RowChange::Insert(cells)),
         });
         key
     }
@@ -585,6 +601,23 @@ mod tests {
         assert_eq!(e.counts(), (1, 0, 0));
         assert!(e.undo());
         assert_eq!(e.counts(), (2, 0, 0));
+    }
+
+    #[test]
+    fn a_prefilled_duplicate_is_one_insert_and_one_undo_step() {
+        let mut e = edits();
+        let key = e.stage_insert_values(vec![
+            (1, txt("Ada"), json!("Ada")),
+            (2, None, Value::Null),
+        ]);
+        assert_eq!(e.counts(), (1, 0, 0));
+        assert_eq!(e.staged_text(&key, 1), Some(txt("Ada")));
+        assert_eq!(
+            e.statements()[0].sql,
+            "INSERT INTO \"main\".\"t\" (\"name\", \"qty\") VALUES (?, ?) RETURNING *"
+        );
+        assert!(e.undo());
+        assert!(e.is_empty(), "the whole duplicate must undo at once");
     }
 
     #[test]

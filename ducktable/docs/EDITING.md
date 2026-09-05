@@ -45,6 +45,13 @@ updates and deletes immediately, including undo, review, discard, table
 switches, and the all-or-nothing commit. Discarding/deleting a draft removes
 the pending INSERT; it never emits a DELETE.
 
+**Duplicate Row** (⌘D) copies the selected persisted row into a new staged
+INSERT. It copies exact wire values rather than formatted cell text, includes
+any staged updates already visible on the source row, and omits primary-key and
+generated columns so DuckDB can supply the new identity and derived values. A
+natural key without a default therefore remains `REQUIRED`. The entire copied
+row is one undo step and is not written until ⌘S.
+
 ## The grammar
 
 One meaning per key. No contextual double-agents.
@@ -61,7 +68,8 @@ One meaning per key. No contextual double-agents.
 | Delete / ⌫ | clears the cell: text → `''`, everything else → NULL (NOT NULL columns refuse, with the reason in the status line) | deletes text |
 | ⌃⇧N | stages NULL explicitly, any type | — |
 | ⌘N | creates a new all-DEFAULT row and opens its first useful writable cell | — |
-| ⌘D / ⌘⌫ | stages a row DELETE (ghost strikethrough; reversible until commit) | — |
+| ⌘D | duplicates the selected persisted row as one staged INSERT | — |
+| ⌘⌫ | stages a row DELETE (ghost strikethrough; reversible until commit) | — |
 | ⌘Z / ⌘⇧Z | un-stages / re-stages the most recent change | text undo / redo |
 | ⌘S | commits all staged changes — one transaction, all or nothing | confirms the cell, then commits (⌘Enter is its equal) |
 | ⌥Enter | — | newline (the Sheets-hand twin of ⇧Enter) |
@@ -185,8 +193,9 @@ ending with "edits kept."
 
 After a successful commit the page refetches so the grid shows the
 database's truth, and Refresh Tables refetches `/catalog` so every sidebar
-row count reflects the committed transaction. NULL renders as the NULL tag,
-visually distinct from empty, always.
+row count reflects the committed transaction. Manual Refresh Tables and a
+completed Query run also refetch the currently open Data page. NULL renders as
+the NULL tag, visually distinct from empty, always.
 
 ## Dialogs
 
@@ -199,6 +208,5 @@ only at ⌘S. Reversibility replaces confirmation.
 - **Live mode** (write-per-edit): designed in UI.md, deferred until it
   re-clears an adversarial review. If it ships, type-to-edit turns off
   in it — the two are certified only as a pair with staging.
-- Duplicate-row (menu, blanking key/unique columns), value popout editor for
-  long/nested values, range selection and
+- Value popout editor for long/nested values, range selection and
   TSV paste-spread, crash-recovery journal for staged edits.

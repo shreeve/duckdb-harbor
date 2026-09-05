@@ -308,7 +308,7 @@ impl DuckTable {
                     let query =
                         cx.new(|cx| crate::query::QueryView::new(qconn, &berth, window, cx));
                     cx.subscribe(&query, |state, _, _: &CatalogRefreshRequested, cx| {
-                        state.refresh_catalog(cx)
+                        state.refresh_tables(cx)
                     })
                     .detach();
                     state.query = Some(query);
@@ -441,6 +441,16 @@ impl DuckTable {
             .ok();
         })
         .detach();
+    }
+
+    /// Refresh every table-facing snapshot: exact catalog counts in the
+    /// sidebar and the currently open Data page. Query results are an
+    /// explicit SQL snapshot and are intentionally left unchanged.
+    pub(crate) fn refresh_tables(&mut self, cx: &mut Context<Self>) {
+        self.refresh_catalog(cx);
+        if let Some(grid) = self.grid.clone() {
+            grid.update(cx, |grid, cx| grid.refresh_current(cx));
+        }
     }
 
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {

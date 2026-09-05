@@ -273,6 +273,10 @@ pub(crate) struct GridDelegate {
     /// commit — render_td runs per visible cell per frame and must not
     /// allocate, so it only bumps these SharedStrings.
     rows: Vec<Vec<Option<SharedString>>>,
+    /// Raw wire values aligned with `rows`. INSERT drafts carry empty
+    /// placeholders; fetched rows retain exact values so Duplicate Row
+    /// never round-trips through display formatting.
+    raw_rows: Vec<Vec<Value>>,
     /// Mirror of the table's selected row (synced from TableEvent), so
     /// render_tr can tint the selection — the delegate cannot read the
     /// TableState it is rendering inside.
@@ -426,6 +430,7 @@ impl Grid {
             visible: Vec::new(),
             gutter,
             rows: Vec::new(),
+            raw_rows: Vec::new(),
             selected: None,
             all_selected: false,
             active_cell: None,
@@ -1231,13 +1236,74 @@ impl Grid {
         let key = self.edits.as_mut().expect("checked above").stage_insert();
         self.error = None;
         self.sync_staged(cx);
+        self.focus_draft(&key, window, cx);
+    }
+
+    /// Stage a new INSERT copied from the selected fetched row. Generated
+    /// columns and primary-key columns are omitted so DuckDB can compute
+    /// them; a natural key without a default therefore appears REQUIRED.
+    /// Exact raw values are copied, with any staged updates overlaid.
+    pub(crate) fn duplicate_row(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.committing || self.edits.is_none() {
+            return;
+        }
+        if self.editor.is_some() && !self.confirm_and_move(0, 0, false, cx) {
+            return;
+        }
+        let (identity, mut raw, first_schema, pk_ix) = {
+            let d = self.table.read(cx).delegate();
+            let row = d.selected.or(d.active_cell.map(|(row, _)| row));
+            let Some(row) = row else { return };
+            // A draft is already an INSERT. Duplicate Row deliberately
+            // targets persisted rows so it always has exact source values.
+            if d.draft_key(row).is_some() || d.deleted.contains(&row) {
+                return;
+            }
+            let Some(raw) = d.raw_rows.get(row).cloned() else { return };
+            let Some(identity) = d.identities.get(row).cloned() else { return };
+            (identity, raw, d.identity as usize, d.pk_ix.clone())
+        };
+
+        let source_key = edits::key_of(&identity);
+        if let Some(edits::RowChange::Update(cells)) = self.edits.as_ref().and_then(|edits| {
+            edits
+                .entries()
+                .into_iter()
+                .find(|(key, _, _)| *key == source_key)
+                .map(|(_, _, change)| change)
+        }) {
+            for (col, cell) in cells {
+                if let Some(value) = raw.get_mut(*col) {
+                    *value = cell.value.clone();
+                }
+            }
+        }
+
+        let values = duplicate_values(raw, first_schema, &pk_ix, &self.generated);
+        let key = self
+            .edits
+            .as_mut()
+            .expect("checked above")
+            .stage_insert_values(values);
+        self.error = None;
+        self.sync_staged(cx);
+        self.focus_draft(&key, window, cx);
+    }
+
+    /// Select a staged INSERT and enter the first field that needs or can
+    /// accept input. Shared by New Row and Duplicate Row.
+    fn focus_draft(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
         // sync_staged normally returns focus after a draft row appears or
-        // disappears; Add Row is the exception because its editor is the
-        // intended destination.
+        // disappears; row creation is the exception because its editor is
+        // the intended destination.
         self.needs_focus = false;
         let (row, col, reveal) = {
             let d = self.table.read(cx).delegate();
-            let row = d.draft_keys.iter().position(|k| k == &key).unwrap_or(0);
+            let row = d.draft_keys.iter().position(|k| k == key).unwrap_or(0);
             let first_schema = d.identity as usize;
             let required = (first_schema..d.names.len()).find(|&col| {
                 self.not_null.get(col).copied().unwrap_or(false)
@@ -2105,6 +2171,9 @@ impl Grid {
             let draft_count = draft_rows.len();
             draft_rows.append(&mut d.rows);
             d.rows = draft_rows;
+            let mut raw_drafts = vec![Vec::new(); draft_count];
+            raw_drafts.append(&mut d.raw_rows);
+            d.raw_rows = raw_drafts;
             let mut identities = vec![Vec::new(); draft_count];
             identities.append(&mut d.identities);
             d.identities = identities;
@@ -2361,6 +2430,16 @@ impl Grid {
         );
     }
 
+    /// Refresh the current Data page in place. A provisional editor value
+    /// is first staged (or the refresh stops on validation failure), so a
+    /// refresh can never silently discard what the user was typing.
+    pub(crate) fn refresh_current(&mut self, cx: &mut Context<Self>) {
+        if self.editor.is_some() && !self.confirm_and_move(0, 0, false, cx) {
+            return;
+        }
+        self.fetch_page_now(self.page, cx);
+    }
+
     /// Rebuild the column list after the row-number preference flips.
     fn sync_columns(&mut self, cx: &mut Context<Self>) {
         let want = prefs::get(cx).row_numbers;
@@ -2413,6 +2492,7 @@ impl GridDelegate {
             return;
         }
         self.rows.drain(..count.min(self.rows.len()));
+        self.raw_rows.drain(..count.min(self.raw_rows.len()));
         self.identities.drain(..count.min(self.identities.len()));
         self.row_labels.drain(..count.min(self.row_labels.len()));
         self.draft_keys.clear();
@@ -2507,7 +2587,10 @@ impl GridDelegate {
             .enumerate()
             .map(|(ix, id)| (edits::key_of(id), ix))
             .collect();
-        self.rows = display_rows(rows);
+        self.rows = display_rows(&rows);
+        // Read-only result grids never offer Duplicate Row, so retaining a
+        // second copy of a potentially large query page would buy nothing.
+        self.raw_rows = if self.pk_ix.is_empty() { Vec::new() } else { rows };
         self.relabel(base);
     }
 
@@ -3555,19 +3638,42 @@ fn insert_metadata(
 }
 
 /// Wire values -> render-ready cell text (None = NULL), once per page.
-/// The String arm moves the buffer instead of cloning; everything else
-/// pays its Display cost here so render never does.
-fn display_rows(rows: Vec<Vec<Value>>) -> Vec<Vec<Option<SharedString>>> {
-    rows.into_iter()
+/// Raw values remain beside these strings for exact duplication; render
+/// never performs conversion or allocation.
+fn display_rows(rows: &[Vec<Value>]) -> Vec<Vec<Option<SharedString>>> {
+    rows.iter()
         .map(|row| {
-            row.into_iter()
-                .map(|v| match v {
-                    Value::Null => None,
-                    Value::String(s) => Some(SharedString::from(s)),
-                    other => Some(SharedString::from(other.to_string())),
-                })
+            row.iter()
+                .map(display_value)
                 .collect()
         })
+        .collect()
+}
+
+fn display_value(value: &Value) -> Option<SharedString> {
+    match value {
+        Value::Null => None,
+        Value::String(s) => Some(SharedString::from(s.clone())),
+        other => Some(SharedString::from(other.to_string())),
+    }
+}
+
+/// Build one duplicate-row INSERT payload from exact fetched values.
+/// Hidden rowid, declared primary keys, and generated expressions stay
+/// absent so DuckDB supplies the new row's identity and derived values.
+fn duplicate_values(
+    raw: Vec<Value>,
+    first_schema: usize,
+    pk_ix: &[usize],
+    generated: &[bool],
+) -> Vec<(usize, Option<SharedString>, Value)> {
+    raw.into_iter()
+        .enumerate()
+        .skip(first_schema)
+        .filter(|(col, _)| {
+            !pk_ix.contains(col) && !generated.get(*col).copied().unwrap_or(false)
+        })
+        .map(|(col, value)| (col, display_value(&value), value))
         .collect()
 }
 
@@ -3632,7 +3738,8 @@ fn numeric(ty: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::draft_hint_min_width;
+    use super::{draft_hint_min_width, duplicate_values};
+    use serde_json::{Value, json};
 
     #[test]
     fn draft_hint_floors_fit_each_pill_and_scale_with_zoom() {
@@ -3641,5 +3748,35 @@ mod tests {
         assert_eq!(f32::from(draft_hint_min_width("REQUIRED", 1.)), 86.);
         assert_eq!(f32::from(draft_hint_min_width("GENERATED", 1.)), 93.);
         assert_eq!(f32::from(draft_hint_min_width("DEFAULT", 2.)), 128.);
+    }
+
+    #[test]
+    fn duplicate_uses_raw_values_and_omits_identity_and_generated_columns() {
+        let values = duplicate_values(
+            vec![json!(99), json!(7), json!("00123"), Value::Null, json!(14)],
+            0,
+            &[0],
+            &[false, false, false, false, true],
+        );
+        assert_eq!(
+            values.iter().map(|(col, _, _)| *col).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(values[1].1.as_ref().map(ToString::to_string), Some("00123".into()));
+        assert_eq!(values[1].2, json!("00123"));
+        assert_eq!(values[2].1, None);
+        assert_eq!(values[2].2, Value::Null);
+
+        // A keyless table's hidden rowid occupies schema column zero.
+        let values = duplicate_values(
+            vec![json!(99), json!(7), json!("Ada")],
+            1,
+            &[0],
+            &[false, false, false],
+        );
+        assert_eq!(
+            values.iter().map(|(col, _, _)| *col).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 }

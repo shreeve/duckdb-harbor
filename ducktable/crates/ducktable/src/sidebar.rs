@@ -428,7 +428,7 @@ impl DuckTable {
                                 .build(window, cx)
                         })
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.refresh_catalog(cx);
+                            this.refresh_tables(cx);
                         })),
                 ),
         );

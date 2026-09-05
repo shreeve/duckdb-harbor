@@ -27,7 +27,7 @@ actions!(
     ducktable,
     [
         ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset, FitColumns, RefreshTables,
-        AddRow, DeleteRow, TablePrev, TableNext, View1, View2, View3, ToggleFullScreen,
+        AddRow, DuplicateRow, DeleteRow, TablePrev, TableNext, View1, View2, View3, ToggleFullScreen,
         ToggleRowNumbers, ToggleRightAlign, ToggleNullTags, OpenDatabase, OpenDatabaseUrl
     ]
 );
@@ -202,6 +202,7 @@ fn app_menus() -> Vec<Menu> {
             name: "Edit".into(),
             items: vec![
                 MenuItem::action("New Row", AddRow),
+                MenuItem::action("Duplicate Row", DuplicateRow),
                 MenuItem::action("Delete Row", DeleteRow),
             ],
         },
@@ -403,7 +404,7 @@ fn main() {
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-r", RefreshTables, None),
             KeyBinding::new("cmd-n", AddRow, None),
-            KeyBinding::new("cmd-d", DeleteRow, None),
+            KeyBinding::new("cmd-d", DuplicateRow, None),
             // Cmd-Plus arrives as cmd-= (unshifted) or cmd-shift-= — bind
             // both, the way browsers treat the pair.
             KeyBinding::new("cmd-=", ZoomIn, None),
@@ -525,18 +526,21 @@ fn main() {
         cx.on_action(|_: &TablePrev, cx| step_table(-1, cx));
         cx.on_action(|_: &TableNext, cx| step_table(1, cx));
         cx.on_action(|_: &AddRow, cx| run_row_action(grid::Grid::add_row, cx));
+        cx.on_action(|_: &DuplicateRow, cx| {
+            run_row_action(grid::Grid::duplicate_row, cx)
+        });
         cx.on_action(|_: &DeleteRow, cx| {
             run_row_action(grid::Grid::delete_row, cx)
         });
         // One command behind both the View menu and Cmd+R. The sidebar
-        // glyph calls the same refresh_catalog method directly from its
+        // glyph calls the same refresh_tables method directly from its
         // DuckTable context, so every entrance has identical semantics.
         cx.on_action(|_: &RefreshTables, cx| {
             let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) else {
                 return;
             };
             cx.defer(move |cx| {
-                view.update(cx, |this, cx| this.refresh_catalog(cx));
+                view.update(cx, |this, cx| this.refresh_tables(cx));
             });
         });
         cx.on_action(|_: &ToggleFullScreen, cx| {

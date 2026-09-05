@@ -125,10 +125,12 @@ temp state is gone and the note says so.
 **No implicit transaction.** Statements auto-commit individually, like
 the duckdb CLI; write `BEGIN`/`COMMIT` yourself. A run-all stops at the
 first error; whatever completed stays completed, and the status line
-says how far it got. Every completed send refreshes the sidebar catalog
-afterward (fetch first, swap in one frame): arbitrary SQL can mutate through
-forms that cannot be classified reliably, and an earlier statement may have
-committed before a later statement reports an error.
+says how far it got. Every completed send refreshes the sidebar catalog and
+the currently open Data grid afterward (fetch first, swap in one frame):
+arbitrary SQL can mutate through forms that cannot be classified reliably, and
+an earlier statement may have committed before a later statement reports an
+error. The Query result itself remains the snapshot returned by that explicit
+send; DuckTable never silently reruns arbitrary SQL.
 
 **One run in flight** per view. ⌘Enter during a run answers
 `already running · ⌘. to cancel` — no queue. **⌘.** cancels through
@@ -137,8 +139,9 @@ newer one. Closing the connection cancels the run.
 
 **⌘S** flushes the scratch to disk immediately; the status line
 flashes `saved`. It never runs anything. **⌘R** is the app-level
-**Refresh Tables** command: it refreshes the sidebar's catalog snapshot
-from either pane without changing or running the scratch.
+**Refresh Tables** command: it refreshes the sidebar's catalog snapshot and the
+currently open Data grid from either pane without changing or running the
+scratch, and without replacing the current Query result.
 
 ⌘Enter works from **either pane**: with focus in the results grid it
 still sends the marked statement. Results have no staged powers, so
@@ -295,7 +298,7 @@ a rung:
 | ⌘Enter | send: the selection if any, else the marked statement — from either pane |
 | ⌘⇧Enter | run all, top to bottom, stop at first error |
 | ⌘. | cancel the running query |
-| ⌘R | Refresh Tables — refresh the sidebar catalog without running the scratch |
+| ⌘R | Refresh Tables — refresh the catalog and current Data grid without running the scratch or replacing Query results |
 | ⌘S | flush the scratch to disk (`saved` flashes; it was already safe) |
 | ⌘L | from anywhere in the window: switch to Query, focus the editor — the address-bar reflex |
 | Enter / ⇧Enter / ⌥Enter | newline, always; Enter never accepts a completion |
