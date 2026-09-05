@@ -3,6 +3,11 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by signed
 tag date, newest first.
 
+## 0.20.1 — 2026-09-05
+
+- Makes a sidebar table-name double-click select the table and switch directly
+  to its Data view while a single click preserves the current view.
+
 ## 0.20.0 — 2026-09-05
 
 - Adds **Duplicate Row** with Cmd+D as a staged insert that copies exact source
