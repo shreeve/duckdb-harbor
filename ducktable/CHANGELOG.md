@@ -3,6 +3,16 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by signed
 tag date, newest first.
 
+## 0.20.0 — 2026-09-05
+
+- Adds **Duplicate Row** with Cmd+D as a staged insert that copies exact source
+  values while leaving primary-key and generated columns to DuckDB.
+- Keeps **Delete Row** on Cmd+Delete and preserves staged, reversible deletion.
+- Makes **Refresh Tables** update both the catalog and the currently open Data
+  grid while leaving Query results unchanged.
+- Refreshes the current Data grid after every completed Query run so external
+  mutations become visible immediately.
+
 ## 0.19.3 — 2026-09-04
 
 - Refreshes `/catalog` and all sidebar row counts after a successful staged
