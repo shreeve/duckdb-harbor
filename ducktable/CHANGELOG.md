@@ -3,6 +3,13 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by signed
 tag date, newest first.
 
+## 0.20.4 — 2026-09-05
+
+- Keeps the active-cell coordinates intact when a staged row intentionally
+  suppresses the ordinary row-selection color.
+- Makes Tab and Shift-Tab resolve their destination before staging the edited
+  value, then reliably open that destination for continued editing.
+
 ## 0.20.3 — 2026-09-05
 
 - Keeps cell editing continuous across Tab and Shift-Tab: DuckTable confirms

@@ -579,7 +579,13 @@ impl Grid {
             table.update(cx, |state, cx| {
                 let real = state.selected_row();
                 let d = state.delegate_mut();
-                if d.selected != real {
+                // Dirty rows deliberately suppress the Table's blue row
+                // selection so their amber/red staging wash has one owner.
+                // That intentional `real = None` is not an Escape and must
+                // not erase the active-cell ring (especially between a
+                // Tab-confirm and opening its destination editor).
+                let dirty_mirror = d.selected.is_some_and(|row| d.row_dirty(row));
+                if should_reconcile_selection(real, d.selected, dirty_mirror) {
                     d.selected = real;
                     if real.is_none() {
                         d.active_cell = None;
@@ -1227,7 +1233,7 @@ impl Grid {
         if self.committing || self.edits.is_none() {
             return;
         }
-        if self.editor.is_some() && !self.confirm_and_move(0, 0, false, cx) {
+        if self.editor.is_some() && !self.confirm_and_move(0, 0, cx) {
             return;
         }
         let key = self.edits.as_mut().expect("checked above").stage_insert();
@@ -1248,7 +1254,7 @@ impl Grid {
         if self.committing || self.edits.is_none() {
             return;
         }
-        if self.editor.is_some() && !self.confirm_and_move(0, 0, false, cx) {
+        if self.editor.is_some() && !self.confirm_and_move(0, 0, cx) {
             return;
         }
         let (identity, mut raw, first_schema, pk_ix) = {
@@ -1379,31 +1385,31 @@ impl Grid {
                     // ⌘Enter — "send it" (normally consumed by the input
                     // and routed via PressEnter{secondary}; this arm is
                     // the backstop).
-                    if self.confirm_and_move(0, 0, false, cx) {
+                    if self.confirm_and_move(0, 0, cx) {
                         self.commit(cx);
                     }
                 }
                 "enter" => {
-                    self.confirm_and_move(1, 0, false, cx);
+                    self.confirm_and_move(1, 0, cx);
                 }
                 "tab" => {
                     self.confirm_and_tab(if m.shift { -1 } else { 1 }, window, cx);
                 }
                 "up" if replace => {
-                    self.confirm_and_move(-1, 0, false, cx);
+                    self.confirm_and_move(-1, 0, cx);
                 }
                 "down" if replace => {
-                    self.confirm_and_move(1, 0, false, cx);
+                    self.confirm_and_move(1, 0, cx);
                 }
                 "left" if replace => {
-                    self.confirm_and_move(0, -1, false, cx);
+                    self.confirm_and_move(0, -1, cx);
                 }
                 "right" if replace => {
-                    self.confirm_and_move(0, 1, false, cx);
+                    self.confirm_and_move(0, 1, cx);
                 }
                 "s" if m.platform => {
                     // "I'm done, make it real": confirm in place, commit.
-                    if self.confirm_and_move(0, 0, false, cx) {
+                    if self.confirm_and_move(0, 0, cx) {
                         self.commit(cx);
                     }
                 }
@@ -1660,7 +1666,7 @@ impl Grid {
                 (d.editing, d.active_cell)
             };
             if editing != active {
-                self.confirm_and_move(0, 0, false, cx);
+                self.confirm_and_move(0, 0, cx);
             }
         }
         if e.click_count != 2 || self.editor.is_some() {
@@ -1746,11 +1752,11 @@ impl Grid {
                 if *secondary {
                     // ⌘Enter — "send it", the AI-era universal: confirm
                     // this cell, then commit everything staged.
-                    if grid.confirm_and_move(0, 0, false, cx) {
+                    if grid.confirm_and_move(0, 0, cx) {
                         grid.commit(cx);
                     }
                 } else {
-                    grid.confirm_and_move(1, 0, false, cx);
+                    grid.confirm_and_move(1, 0, cx);
                 }
             }
         })
@@ -1778,12 +1784,37 @@ impl Grid {
     /// cell, wrap the ring to its neighbor, then immediately open that cell's
     /// editor. Validation failure leaves the original editor in place.
     fn confirm_and_tab(&mut self, dc: i32, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.confirm_and_move(0, dc, true, cx) {
+        // Resolve the destination BEFORE confirmation projects the new staged
+        // value into the table. A dirty row intentionally has no library row
+        // selection, so the cell coordinates—not selection paint—are the
+        // durable source of truth for this horizontal move.
+        let Some((row, next_col, next_pos, anchor)) = self.editor.as_ref().and_then(|ed| {
+            let d = self.table.read(cx).delegate();
+            let pos = d.visible.iter().position(|&col| col == ed.col)?;
+            let next_pos = wrapped_step(d.visible.len(), pos, dc);
+            Some((
+                ed.row,
+                d.visible[next_pos],
+                next_pos,
+                d.tab_anchor.or((dc > 0).then_some(ed.col)),
+            ))
+        }) else {
+            return;
+        };
+        if !self.confirm_and_move(0, 0, cx) {
             return;
         }
-        if let Some((row, col)) = self.table.read(cx).delegate().active_cell {
-            self.open_editor(row, col, None, window, cx);
-        }
+        self.table.update(cx, |state, cx| {
+            let d = state.delegate_mut();
+            d.tab_anchor = anchor;
+            d.active_cell = Some((row, next_col));
+            let gutter = d.gutter as usize;
+            select_row(state, row, cx);
+            state.scroll_to_col(next_pos + gutter, cx);
+            cx.notify();
+        });
+        self.header_chase = true;
+        self.open_editor(row, next_col, None, window, cx);
     }
 
     /// Esc: the in-progress text never happened; what was there before —
@@ -1807,16 +1838,14 @@ impl Grid {
     }
 
     /// Confirm the open editor: validate, stage (auto-clean if equal to
-    /// the fetched original), close, move the ring. `via_tab` keeps the
-    /// Tab run's anchor alive; a vertical confirm during a run sweeps
-    /// back to the anchor column (Sheets' carriage return). Returns
-    /// false when validation refused — the editor stays open with the
-    /// reason.
+    /// the fetched original), close, move the ring. A vertical confirm
+    /// during a Tab run sweeps back to the anchor column (Sheets' carriage
+    /// return). Returns false when validation refused — the editor stays
+    /// open with the reason.
     fn confirm_and_move(
         &mut self,
         dr: i32,
         dc: i32,
-        via_tab: bool,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(ed) = self.editor.take() else { return true };
@@ -1890,9 +1919,7 @@ impl Grid {
         }
         self.close_editor_cell(cx);
         self.sync_staged(cx);
-        if via_tab && dc != 0 {
-            self.tab_move(dc, cx);
-        } else if dr != 0 && dc == 0 {
+        if dr != 0 && dc == 0 {
             let anchor = self.table.read(cx).delegate().tab_anchor;
             match anchor {
                 Some(col) => self.sweep(dr, col, cx),
@@ -2497,7 +2524,7 @@ impl Grid {
     /// is first staged (or the refresh stops on validation failure), so a
     /// refresh can never silently discard what the user was typing.
     pub(crate) fn refresh_current(&mut self, cx: &mut Context<Self>) {
-        if self.editor.is_some() && !self.confirm_and_move(0, 0, false, cx) {
+        if self.editor.is_some() && !self.confirm_and_move(0, 0, cx) {
             return;
         }
         self.fetch_page_now(self.page, cx);
@@ -3810,10 +3837,22 @@ fn wrapped_step(len: usize, position: usize, delta: i32) -> usize {
     (position as i32 + delta).rem_euclid(len as i32) as usize
 }
 
+/// The delegate mirrors TableState selection except for a staged row: its
+/// missing library selection is intentional presentation, not a user Escape.
+fn should_reconcile_selection(
+    table_selection: Option<usize>,
+    mirror: Option<usize>,
+    mirror_is_dirty: bool,
+) -> bool {
+    mirror != table_selection
+        && !(table_selection.is_none() && mirror.is_some() && mirror_is_dirty)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        conditional_hint_min_width, draft_hint_min_width, duplicate_values, wrapped_step,
+        conditional_hint_min_width, draft_hint_min_width, duplicate_values,
+        should_reconcile_selection, wrapped_step,
     };
     use serde_json::{Value, json};
 
@@ -3834,6 +3873,14 @@ mod tests {
         assert_eq!(wrapped_step(4, 3, 1), 0);
         assert_eq!(wrapped_step(4, 3, -1), 2);
         assert_eq!(wrapped_step(4, 0, -1), 3);
+    }
+
+    #[test]
+    fn an_unpainted_dirty_row_is_not_mistaken_for_escape() {
+        assert!(!should_reconcile_selection(None, Some(0), true));
+        assert!(should_reconcile_selection(None, Some(0), false));
+        assert!(should_reconcile_selection(Some(1), Some(0), true));
+        assert!(!should_reconcile_selection(Some(0), Some(0), false));
     }
 
     #[test]
