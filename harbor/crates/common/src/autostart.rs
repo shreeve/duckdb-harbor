@@ -23,16 +23,17 @@
 use crate::paths;
 use std::path::Path;
 
-/// What `install` found when it went to load the job.
+/// What `install` found when it went to run the job.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Installed {
-    /// The manager loaded the item and the server is starting under it.
+    /// The manager is starting the server under the item now. It is not
+    /// listening yet when this returns — the caller waits on the socket.
     Started,
-    /// The manager already held the item; nothing to start.
-    AlreadyLoaded,
+    /// The manager's own server is already up; nothing to do.
+    AlreadyRunning,
     /// Something else is serving the database, so the item was registered
-    /// but not loaded — a load would only fail against the file lock and
-    /// then retry. `restart` hands the server over.
+    /// but not run — a run would only fail against the file lock and then
+    /// retry. `restart` hands the server over.
     Deferred,
 }
 
@@ -83,17 +84,20 @@ pub fn arm(db: &Path, name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Register and load: the server starts now under launchd and at every login.
-/// `serving` says whether something already answers for this database; when
-/// it does, the item is registered but not loaded.
+/// Register and run: the server starts now under launchd and at every login.
+/// `serving` says whether something already answers for this database. A job
+/// launchd still holds with no process — what a clean `stop` leaves, since
+/// KeepAlive only revives failures — is booted out and loaded afresh: a
+/// fresh load runs at once, where a kickstart of the old job waits out
+/// launchd's throttle from its last exit.
 #[cfg(target_os = "macos")]
 pub fn install(db: &Path, name: &str, serving: bool) -> Result<Installed, String> {
     arm(db, name)?;
-    if loaded(name) {
-        return Ok(Installed::AlreadyLoaded);
-    }
     if serving {
-        return Ok(Installed::Deferred);
+        return Ok(if loaded(name) { Installed::AlreadyRunning } else { Installed::Deferred });
+    }
+    if loaded(name) {
+        unload(name);
     }
     let plist = agent_path(name)?;
     let out = std::process::Command::new("launchctl")
@@ -112,10 +116,16 @@ pub fn install(db: &Path, name: &str, serving: bool) -> Result<Installed, String
 }
 
 /// Take the job out of this session. The server, if launchd is running one,
-/// receives SIGTERM and exits cleanly. Registration is untouched.
+/// receives SIGTERM and exits cleanly; this returns once the job is gone, so
+/// a bootstrap that follows loads the plist afresh instead of finding the
+/// old job still on its way out. Registration is untouched.
 #[cfg(target_os = "macos")]
 pub fn unload(name: &str) {
     launchctl(&["bootout", &format!("{}/{}", domain(), label(name))]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while loaded(name) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// Unregister: delete the plist. A running server is left alone; it ends
@@ -141,6 +151,7 @@ pub fn installed(name: &str) -> bool {
 fn loaded(name: &str) -> bool {
     launchctl(&["print", &format!("{}/{}", domain(), label(name))])
 }
+
 
 #[cfg(target_os = "macos")]
 fn agent_path(name: &str) -> Result<std::path::PathBuf, String> {
@@ -232,15 +243,14 @@ pub fn arm(db: &Path, name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Register, enable, and start now. A unit already active is left running.
+/// Register, enable, and start now. `serving` says whether something already
+/// answers for this database; `start` on an active unit is a no-op either way.
 #[cfg(target_os = "linux")]
 pub fn install(db: &Path, name: &str, serving: bool) -> Result<Installed, String> {
     arm(db, name)?;
-    if systemctl(&["is-active", "--quiet", &unit(name)]).is_ok() {
-        return Ok(Installed::AlreadyLoaded);
-    }
     if serving {
-        return Ok(Installed::Deferred);
+        let active = systemctl(&["is-active", "--quiet", &unit(name)]).is_ok();
+        return Ok(if active { Installed::AlreadyRunning } else { Installed::Deferred });
     }
     systemctl(&["start", &unit(name)])?;
     Ok(Installed::Started)

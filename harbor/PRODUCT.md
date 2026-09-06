@@ -14,12 +14,12 @@ harbor <db.duckdb>              → open it: REPL / -c "SQL" / stdin;
                                   spawns a refcounted server if none exists
 harbor <path/to.sock>           → connect to a server by its socket
 harbor http://host:port         → connect to a server over TCP
-harbor <db.duckdb> start        → start it yourself, until you leave
+harbor <db.duckdb> start        → bring it up in the background, until you stop it
 ```
 
 The doctrine, in one breath: **bare, the server is everyone's — it lives
 while anyone is connected; `start`, the server is yours — it lives until you
-leave.** Everything below is the machinery that makes those two sentences
+stop it.** Everything below is the machinery that makes those two sentences
 true, and nothing else.
 
 The workspace has four first-party crates: **`harbor`** (server engine,
@@ -129,13 +129,16 @@ releases it by definition. justhttp deliberately lets an idle connection wait
 between requests forever, which is what makes presence expressible at all.
 `.open` moors at the new server before releasing the old one.
 
-`start` ignores the refcount entirely. On a terminal it puts the operator at
-the helm — the same REPL, dialled at the server's own socket, so what the
-operator sees is what any client would get — and leaving the prompt ends the
-server. Headless, it runs until `SIGTERM`. Spawn-on-use spawns exactly this
-(`current_exe() <db> start` with `HARBOR_EPHEMERAL` in its environment,
-detached, stderr to a log beside the socket), so there is one start path
-however a server comes to exist.
+`start` ignores the refcount entirely. At a terminal it brings the server up
+in the background and returns: under the database's login item when it has
+one (launchd or systemd owns the process from the first second), otherwise
+as a detached child that runs until `stop`. Headless, it serves in place
+until `SIGTERM`; `--foreground` asks for that at a terminal. Spawn-on-use
+and a terminal `start` are the same launch (`current_exe() <db> start`,
+detached, output to a log beside the socket) — the summon adds
+`HARBOR_EPHEMERAL` to its child's environment and a hand start does not —
+so there is one start path however a server comes to exist. The prompt is
+what bare `harbor <db>` is for; `start` never opens one.
 
 `curl` works iff something is listening, by design: a bare HTTP client does
 not summon a database. An application that wants spawn-on-use runs

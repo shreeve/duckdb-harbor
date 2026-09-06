@@ -16,7 +16,7 @@ DuckDB Harbor is `harbor`, one small Rust binary with one grammar:
 ```console
 $ harbor                       # what's running
 $ harbor mydata.duckdb         # open it — REPL, or -c "SQL", or stdin
-$ harbor mydata.duckdb start   # start it yourself, until you leave
+$ harbor mydata.duckdb start   # bring it up in the background, until you stop it
 ```
 
 `harbor mydata.duckdb` is the duckdb-shell muscle memory, kept: a REPL with
@@ -25,7 +25,7 @@ difference is what happens behind it — if nothing serves the file yet, a
 server is spawned for it, and every other client of the same file joins that
 server instead of hitting "database is locked". The two lifetimes, in one
 breath: **bare, the server is everyone's — it lives while anyone is
-connected; `start`, the server is yours — it lives until you leave.**
+connected; `start`, the server is yours — it lives until you stop it.**
 
 ## The Elevator Pitch
 
@@ -350,11 +350,15 @@ client leaves, the server drains, `CHECKPOINT`s, sweeps its socket, and exits
 a few seconds later. A second `harbor` on the same file — any spelling of the
 same path — joins the same server instead of reporting "database is locked".
 
-**`harbor <db.duckdb> start` — the server is yours.** Foreground, no
-refcount: it lives until you leave. On a terminal you get the same prompt,
-dialled at the server's own socket, and `.quit` ends the server; headless it
-runs until `SIGTERM`. Either exit is clean — drain, `CHECKPOINT` so the next
-open never replays a WAL, socket swept.
+**`harbor <db.duckdb> start` — the server is yours.** No refcount: it lives
+until you stop it. At a terminal the server comes up in the background and
+`start` returns — under the database's login item when it has one, so the
+session manager owns it from the first second, otherwise as a detached
+process that `harbor <db> stop` ends. Headless, meaning no terminal on
+stdin, it serves in place until `SIGTERM`, which is the shape launchd,
+systemd and a spawn want; `--foreground` asks for that shape at a terminal,
+to watch a server work. Either exit is clean — drain, `CHECKPOINT` so the
+next open never replays a WAL, socket swept.
 
 **`harbor <db.duckdb> autostart` — the server is the session manager's.**
 harbor never becomes a supervisor; it hands exactly this `start` to one that

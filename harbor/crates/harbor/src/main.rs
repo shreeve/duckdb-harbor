@@ -174,12 +174,18 @@ fn main() -> ExitCode {
                 autostart::unload(&name);
             }
             return match autostart::install(&db, &name, serving(&db)) {
-                Ok(autostart::Installed::Started) => {
-                    eprintln!("harbor: {name} started; it will start at every login");
-                    ExitCode::SUCCESS
-                }
-                Ok(autostart::Installed::AlreadyLoaded) => {
-                    eprintln!("harbor: {name} is already running at login — `restart` applies a changed config");
+                Ok(autostart::Installed::Started) => match wait_serving(&db) {
+                    Ok(sock) => {
+                        eprintln!("harbor: {name} serving on {} — it will start at every login", sock.display());
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("harbor: {e}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Ok(autostart::Installed::AlreadyRunning) => {
+                    eprintln!("harbor: {name} is already running under its login item — `restart` applies a changed config");
                     ExitCode::SUCCESS
                 }
                 Ok(autostart::Installed::Deferred) => {
@@ -272,9 +278,9 @@ fn main() -> ExitCode {
             }
             if autostart::installed(&name) {
                 autostart::unload(&name);
-                return match autostart::install(&db, &name, false) {
-                    Ok(_) => {
-                        eprintln!("harbor: {name} restarted; it will start at every login");
+                return match autostart::install(&db, &name, false).and_then(|_| wait_serving(&db)) {
+                    Ok(sock) => {
+                        eprintln!("harbor: {name} restarted, serving on {} — it will start at every login", sock.display());
                         ExitCode::SUCCESS
                     }
                     Err(e) => {
@@ -292,6 +298,35 @@ fn main() -> ExitCode {
             }
         }
         None => ExitCode::SUCCESS, // a bare attach/detach: membership done
+    }
+}
+
+/// The session manager starts a server asynchronously: block until it
+/// answers on its socket, or say why not with the log to read. The same
+/// budget a summon gives its child.
+fn wait_serving(db: &Path) -> Result<PathBuf, String> {
+    #[cfg(unix)]
+    {
+        let runtime = harbor_common::runtime_dir()?;
+        let canon = harbor_common::paths::canonical_db(db)?;
+        let sock = harbor_common::socket_for(&runtime, &canon)?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if sock.exists() && harbor::repl::sock_ready(&sock) {
+                return Ok(sock);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let name = membership::name_of(&canon)?;
+        Err(format!(
+            "{} did not come up in 15s — see {}",
+            canon.display(),
+            harbor_common::paths::log_file(&runtime, &name).display()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        Err(format!("{}: login items need unix sockets", db.display()))
     }
 }
 
@@ -324,9 +359,11 @@ usage:
   harbor http://host:port      connect to a server over TCP
   harbor <name> | <footnote>   a database by its name (medlabs) or its number
                                in the list — running, or attached and stopped
-  harbor <db.duckdb> start     start it yourself (foreground): on a terminal
-                               you get the prompt and .quit ends the server;
-                               headless it runs until SIGTERM
+  harbor <db.duckdb> start     bring its server up in the background — under
+                               the login item when there is one — and return;
+                               it runs until `stop`. Headless (no terminal) it
+                               runs in place until SIGTERM, which is what a
+                               service manager wants
   harbor <db.duckdb> stop      stop the server for this database, if one is
                                running (a quiet no-op if nothing is); a login
                                item brings it back at the next login
@@ -352,7 +389,7 @@ A login item runs a bare `start`, so its options live in config.toml under
 
 The two lifetimes, in one breath — bare: the server is everyone's, it lives
 while anyone is connected. start: the server is yours, it lives until you
-leave.
+stop it.
 
 client options:
   -c \"SQL\"                     run statements and exit (stdin works too)
@@ -374,6 +411,8 @@ start options:
   --statement-timeout <d>  hard deadline ceiling per statement (e.g. 30s)
   --max-temp-size <s>  cap spill-to-disk (e.g. 10GB; default: DuckDB's own)
   --log                log requests to stderr
+  --foreground         run in this terminal until Ctrl-C, output here, no
+                       prompt — for watching a server work
 ";
 
 struct Opts {
@@ -389,6 +428,7 @@ struct Opts {
     sealed: bool,
     statement_timeout: Option<Duration>,
     max_temp_size: Option<String>,
+    foreground: bool,
 }
 
 /// The built-in defaults, before config or flags speak.
@@ -406,6 +446,7 @@ fn default_opts(db: PathBuf) -> Opts {
         sealed: false,
         statement_timeout: None,
         max_temp_size: None,
+        foreground: false,
     }
 }
 
@@ -491,6 +532,7 @@ fn parse_opts(mut o: Opts, rest: Vec<String>) -> Result<Opts, String> {
             "--threads" => o.threads = Some(take("threads")?.parse().map_err(|_| "bad --threads")?),
             "--init" => o.init.push(take("init")?),
             "--log" => o.log = true,
+            "--foreground" => o.foreground = true,
             "--unsigned" => o.unsigned = true,
             "--sealed" => o.sealed = true,
             "--statement-timeout" => {
@@ -540,6 +582,7 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> 
     let canon = harbor_common::paths::canonical_db(&db)?;
     let mut o = default_opts(db);
     apply_berth_config(&mut o, &canon, ephemeral);
+    let typed = rest.clone();
     let mut o = parse_opts(o, rest)?;
     o.ephemeral = ephemeral;
     let home = ensure_runtime_dir()?;
@@ -567,6 +610,31 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> 
             canon.display(),
             o.db.display()
         ));
+    }
+
+    // At a terminal, `start` brings the server up in the background and
+    // returns — under the login item when the database has one, so launchd
+    // or systemd owns it from the first second; otherwise as a detached
+    // child that runs until `stop`. Only a headless start (a service
+    // manager, a spawn, a pipe) or `--foreground` serves from this process.
+    #[cfg(unix)]
+    if !o.ephemeral && !o.foreground && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        let name = membership::name_of(&canon)?;
+        if autostart::installed(&name) {
+            if !typed.is_empty() {
+                return Err(format!(
+                    "{name} starts at login from config.toml, not flags — put {} under [connection.{name}]",
+                    typed.join(" ")
+                ));
+            }
+            autostart::install(&o.db, &name, false)?;
+            let sock = wait_serving(&o.db)?;
+            eprintln!("harbor: {name} serving on {} under its login item — `harbor {name} stop` ends it", sock.display());
+            return Ok(());
+        }
+        let sock = harbor::repl::start_detached(&o.db, &typed)?;
+        eprintln!("harbor: serving {} on {} — `harbor {} stop` ends it", canon.display(), sock.display(), name);
+        return Ok(());
     }
 
     // A statement deadline ceiling, if asked. The engine reads
@@ -700,26 +768,8 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> 
         });
     }
 
-    // At the helm: start on a terminal gets the prompt, dialled at this
-    // server's own front door. Leaving the prompt ends the server — the
-    // start doctrine, enacted: the server is yours, it lives until you leave.
-    if !o.ephemeral && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        let name = canon
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "harbor".into());
-        // The helm dials the home door: the unix socket is always bound (a
-        // port only adds TCP beside it).
-        #[cfg(unix)]
-        let transport = harbor::repl::Transport::Unix(sock_path.clone());
-        #[cfg(windows)]
-        let transport = harbor::repl::Transport::Tcp(format!("127.0.0.1:{}", o.port.unwrap_or(0)));
-        harbor::repl::helm(transport, &name);
-        let _ = harbor::stop();
-    }
-
-    // Blocks until SIGTERM / .quit at the helm / the refcount departure
-    // finishes drain + CHECKPOINT.
+    // Blocks until SIGTERM (Ctrl-C in the foreground) or the refcount
+    // departure finishes drain + CHECKPOINT.
     let farewell = harbor::wait()?;
     #[cfg(unix)]
     let _ = std::fs::remove_file(&sock_path);
