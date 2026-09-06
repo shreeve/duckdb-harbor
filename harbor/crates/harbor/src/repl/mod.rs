@@ -482,6 +482,7 @@ fn is_socket(p: &Path) -> bool {
 struct ListRow {
     database: String,
     url: String,
+    version: String,
     pid: String,
     clients: String,
     uptime: String,
@@ -578,6 +579,9 @@ fn list() -> Result<(), String> {
                             .map(|d| harbor_common::paths::shorten(Path::new(d)))
                             .unwrap_or_else(|| "?".into()),
                         url: url_of(&v).unwrap_or_default(),
+                        version: v["harborVersion"]
+                            .as_str()
+                            .map_or_else(|| "?".into(), Into::into),
                         pid: v["pid"].as_u64().map_or_else(|| "?".into(), |p| p.to_string()),
                         clients: v["clients"]
                             .as_u64()
@@ -589,6 +593,7 @@ fn list() -> Result<(), String> {
                 None => ListRow {
                     database: "?".into(),
                     url: String::new(),
+                    version: "?".into(),
                     pid: "?".into(),
                     clients: "?".into(),
                     uptime: "?".into(),
@@ -604,7 +609,8 @@ fn list() -> Result<(), String> {
     // it holds 0 rows or 30, so the eye (and a script) meets one shape. The
     // tally line below carries the words.
     if rows.is_empty() {
-        let t = Table::new(["DATABASE", "PID", "CLIENTS", "UPTIME"]);
+        let mut t = Table::new(["DATABASE", "VERSION", "PID", "CLIENTS", "UPTIME"]);
+        t.caption(format!("harbor {}", env!("CARGO_PKG_VERSION")));
         println!("{}", t.render(&Style::stdout()));
         println!("  Nothing running\n");
         println!("  harbor <db.duckdb>   open a database — served while anyone is connected");
@@ -622,7 +628,7 @@ fn list() -> Result<(), String> {
     // stay tight and the address is still one glance away. A tally closes it,
     // live rows first. Piped output degrades to plain text (Style::stdout).
     // The URL column exists only when some server has a TCP door — an
-    // all-socket fleet keeps the four-column shape, no empty column earning
+    // all-socket fleet keeps the five-column shape, no empty column earning
     // its keep. The URL is the bare base (no /ready, no /info): it is a
     // client target as it stands — `harbor <url>` — and any route suffix
     // would narrow it to one verb.
@@ -631,14 +637,19 @@ fn list() -> Result<(), String> {
     if tcp {
         head.push("URL");
     }
-    head.extend(["PID", "CLIENTS", "UPTIME"]);
+    head.extend(["VERSION", "PID", "CLIENTS", "UPTIME"]);
     let mut t = Table::new(head);
+    // The caption identifies this CLI binary; the VERSION column identifies
+    // each independently running server binary. They can differ after an
+    // installation replaces harbor but existing servers keep running.
+    t.caption(format!("harbor {}", env!("CARGO_PKG_VERSION")));
     for r in &rows {
         let running = r.pid != "?";
         let mut cells = vec![Cell::new(&r.database).tone(if running { Tone::Green } else { Tone::Dim })];
         if tcp {
             cells.push(Cell::new(&r.url));
         }
+        cells.push(Cell::new(&r.version));
         cells.extend([
             Cell::new(&r.pid).right(),
             Cell::new(&r.clients).right(),

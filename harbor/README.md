@@ -259,7 +259,7 @@ TABLE` rendering per table, and the database and WAL file sizes in exact bytes
 at the top:
 
 ```json
-{"harborVersion":"0.32.0","duckdbVersion":"v2.0.0-dev83323",
+{"harborVersion":"0.32.1","duckdbVersion":"v2.0.0-dev83323",
  "databaseSizeBytes":12582912,"walSizeBytes":0,
  "tables":[{"name":"orders","schema":"main","rowCount":300000,
             "columns":[{"name":"id","type":"BIGINT","notNull":true,
@@ -330,7 +330,7 @@ with `sudo` in front of the whole command — the installer never escalates on
 its own. On Windows the binary lands in `%LOCALAPPDATA%\Programs\harbor\bin`,
 which the installer adds to your user `PATH`.
 
-Pin a version with `... | bash -s v0.32.0` (or `-Tag v0.32.0` on Windows). Each
+Pin a version with `... | bash -s v0.32.1` (or `-Tag v0.32.1` on Windows). Each
 [release](https://github.com/shreeve/duckdb-harbor/releases)
 ships one self-contained archive per
 platform (osx-arm64, linux-amd64, linux-arm64, windows-amd64, windows-arm64):
@@ -366,17 +366,21 @@ derived from the database's canonical path
 
 ```console
 $ harbor
-╭────────────────────┬───────────────────────┬───────┬─────────┬────────╮
-│ DATABASE           │ URL                   │ PID   │ CLIENTS │ UPTIME │
-├────────────────────┼───────────────────────┼───────┼─────────┼────────┤
-│ ~/Data/labs.duckdb │ http://127.0.0.1:9495 │ 72840 │       2 │     3d │ ¹
-╰────────────────────┴───────────────────────┴───────┴─────────┴────────╯
+╭───────────────╮
+│ harbor 0.32.1 │
+├───────────────┴────┬───────────────────────┬─────────┬───────┬─────────┬────────╮
+│ DATABASE           │ URL                   │ VERSION │ PID   │ CLIENTS │ UPTIME │
+├────────────────────┼───────────────────────┼─────────┼───────┼─────────┼────────┤
+│ ~/Data/labs.duckdb │ http://127.0.0.1:9495 │ 0.32.1  │ 72840 │       2 │     3d │ ¹
+╰────────────────────┴───────────────────────┴─────────┴───────┴─────────┴────────╯
 ¹ ~/.local/state/harbor/runtime/labs.duckdb-1a2b3c4d.sock
 ```
 
-The socket path hangs below the grid under the row's footnote, and the URL
-column exists only while some server has a TCP door — an all-socket fleet
-keeps the four-column shape.
+The caption is the installed CLI version. Each row's version comes from that
+running server, so an installation update is visible immediately and servers
+that still need a restart stand out. The socket path hangs below the grid
+under the row's footnote, and the URL column exists only while some server has
+a TCP door — an all-socket fleet keeps the five-column shape.
 
 A running database answers to four spellings, and the last two come straight
 off this list:

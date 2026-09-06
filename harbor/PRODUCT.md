@@ -103,11 +103,12 @@ while the whole path stays under `sun_path` (the basename yields bytes when
 the runtime dir runs deep).
 
 Discovery is therefore `readdir` + `GET /info` per socket — which is exactly
-what bare `harbor` prints: database path, pid, live client count, uptime,
-address. A socket that refuses the connection is a leftover from a `kill -9`
-and is unlinked on sight; any other failure proves nothing and removes
-nothing. The listening socket is the only runtime registration; `/info` is
-the identity document, with uptime and the client refcount spliced in live.
+what bare `harbor` prints: the installed CLI version, then each database's
+path, serving Harbor version, pid, live client count, uptime, and address. A
+socket that refuses the connection is a leftover from a `kill -9` and is
+unlinked on sight; any other failure proves nothing and removes nothing. The
+listening socket is the only runtime registration; `/info` is the identity
+document, with uptime and the client refcount spliced in live.
 
 ## The refcounted lifetime (bare) and the owned lifetime (start)
 

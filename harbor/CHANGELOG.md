@@ -4,6 +4,13 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by signed tag date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.32.1 — 2026-09-05
+
+- Shows the installed Harbor CLI version as a caption joined to the fleet
+  table printed by bare `harbor`.
+- Adds a `VERSION` column with the version reported by each running database
+  server, making processes that still need a restart immediately visible.
+
 ## 0.32.0 — 2026-09-04
 
 - Adds generated-column metadata to `/catalog` through `generated` and
