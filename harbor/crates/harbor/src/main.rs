@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use harbor_common::duration::parse_duration;
 use harbor_common::autostart;
+use verbs::Running;
 use harbor_common::membership::{self, Attached};
 use harbor_common::perms::chmod;
 
@@ -86,14 +87,24 @@ fn main() -> ExitCode {
     };
     let flags = args; // whatever followed the verbs — start's, and only start's
 
-    if plan.run != Some(true) && !flags.is_empty() {
+    // Only a hand start takes options. The login item runs a bare `start`
+    // that reads the database's config.toml entry, so options given to
+    // `autostart` would be honored once and silently dropped at every login.
+    if plan.autostart == Some(true) && !flags.is_empty() {
+        eprintln!(
+            "harbor: a login item starts from config.toml, not flags — put {} under [connection.<name>]",
+            flags.join(" ")
+        );
+        return ExitCode::FAILURE;
+    }
+    if !matches!(plan.run, Some(Running::Start | Running::Restart)) && !flags.is_empty() {
         eprintln!("harbor: only `start` takes options — got: {}", flags.join(" "));
         return ExitCode::FAILURE;
     }
 
     // Membership first — durable and quick, and it is what a start's lifetime
     // keys off: a listed database is persistent, an unlisted one ephemeral.
-    // Detach also tears down any login item, since one for a database you no
+    // Detach also removes any login item, since one for a database you no
     // longer keep makes no sense.
     match plan.attach {
         Some(true) => match membership::attach(&db) {
@@ -118,49 +129,118 @@ fn main() -> ExitCode {
         None => {}
     }
 
-    // autostart is declarative and defaults off: any lifetime change re-applies
-    // it — an explicit `autostart` installs the login item, its absence removes
-    // one — and a detach tears it down too. We act before the running axis,
-    // since a persistent start blocks at the helm and would defer the install.
-    // The one exempt caller is the login item itself: its `start` is the boot
-    // machinery running what the user armed, not the user declaring a new
-    // lifetime — reconciling there would delete the unit at every boot. Like
-    // ephemerality, that rides an env channel, never a flag.
-    let booted = std::env::var_os("HARBOR_AUTOSTART").is_some();
-    if !booted && (plan.run.is_some() || plan.attach == Some(false)) {
-        let name = match membership::name_of(&db) {
-            Ok(n) => n,
+    let name = match membership::name_of(&db) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("harbor: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // The login item. Installing it loads it too, so the session manager
+    // starts the server now and at every login; the running axis is carried
+    // out by the manager, never by a start in this process. Removing it
+    // leaves whatever is running alone unless a stop was asked for. A plain
+    // start or stop never touches it: stopped stays stopped until the next
+    // login, which is what a login item means.
+    if let Some(install) = plan.autostart {
+        if install {
+            let stopped = match plan.run {
+                Some(Running::Stop | Running::Restart) => match harbor::repl::shutdown(&db) {
+                    Ok(stopped) => stopped,
+                    Err(e) => {
+                        eprintln!("harbor: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+                _ => false,
+            };
+            if stopped {
+                eprintln!("harbor: {} stopped", db.display());
+            }
+            if plan.run == Some(Running::Stop) {
+                return match autostart::arm(&db, &name) {
+                    Ok(()) => {
+                        eprintln!("harbor: {name} will start at login");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("harbor: {e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            if plan.run == Some(Running::Restart) {
+                autostart::unload(&name);
+            }
+            return match autostart::install(&db, &name, serving(&db)) {
+                Ok(autostart::Installed::Started) => {
+                    eprintln!("harbor: {name} started; it will start at every login");
+                    ExitCode::SUCCESS
+                }
+                Ok(autostart::Installed::AlreadyLoaded) => {
+                    eprintln!("harbor: {name} is already running at login — `restart` applies a changed config");
+                    ExitCode::SUCCESS
+                }
+                Ok(autostart::Installed::Deferred) => {
+                    eprintln!(
+                        "harbor: {name} is already being served; it will start at login — `harbor {} restart` hands it over now",
+                        db.display()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("harbor: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        if plan.run == Some(Running::Stop) {
+            match harbor::repl::shutdown(&db) {
+                Ok(true) => eprintln!("harbor: {} stopped", db.display()),
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("harbor: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            autostart::unload(&name);
+        }
+        match autostart::remove(&name) {
+            Ok(true) => eprintln!("harbor: {name} will no longer start at login"),
+            Ok(false) => eprintln!("harbor: {name} was not set to start at login"),
             Err(e) => {
                 eprintln!("harbor: {e}");
                 return ExitCode::FAILURE;
             }
-        };
-        let synced = if plan.autostart {
-            autostart::install(&db, &name).inspect(|()| eprintln!("harbor: {name} will start at login"))
-        } else {
-            autostart::remove(&name).map(|removed| {
-                if removed {
-                    eprintln!("harbor: {name} will no longer start at login");
-                }
-            })
-        };
-        if let Err(e) = synced {
-            eprintln!("harbor: {e}");
-            return ExitCode::FAILURE;
+        }
+        if plan.run != Some(Running::Start) {
+            return ExitCode::SUCCESS;
+        }
+    } else if plan.attach == Some(false) {
+        match autostart::remove(&name) {
+            Ok(true) => eprintln!("harbor: {name} will no longer start at login"),
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("harbor: {e}");
+                return ExitCode::FAILURE;
+            }
         }
     }
 
     // Running. The grammar owns the lifetime — a detached start is ephemeral —
-    // so start takes that as a plain fact, not a flag.
+    // so start takes that as a plain fact, not a flag. A restart of a database
+    // with a login item is the manager's to do: the server comes back under
+    // launchd or systemd with a fresh read of its config, not in this process.
     match plan.run {
-        Some(true) => match start(db, flags, plan.ephemeral()) {
+        Some(Running::Start) => match start(db, flags, plan.ephemeral()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("harbor: {e}");
                 ExitCode::FAILURE
             }
         },
-        Some(false) => match harbor::repl::shutdown(&db) {
+        Some(Running::Stop) => match harbor::repl::shutdown(&db) {
             Ok(true) => {
                 eprintln!("harbor: {} stopped", db.display());
                 ExitCode::SUCCESS
@@ -174,7 +254,61 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some(Running::Restart) => {
+            if autostart::installed(&name) && !flags.is_empty() {
+                eprintln!(
+                    "harbor: {name} starts at login from config.toml, not flags — put {} under [connection.{name}]",
+                    flags.join(" ")
+                );
+                return ExitCode::FAILURE;
+            }
+            match harbor::repl::shutdown(&db) {
+                Ok(true) => eprintln!("harbor: {} stopped", db.display()),
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("harbor: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            if autostart::installed(&name) {
+                autostart::unload(&name);
+                return match autostart::install(&db, &name, false) {
+                    Ok(_) => {
+                        eprintln!("harbor: {name} restarted; it will start at every login");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("harbor: {e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            match start(db, flags, plan.ephemeral()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("harbor: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         None => ExitCode::SUCCESS, // a bare attach/detach: membership done
+    }
+}
+
+/// Is anything answering for this database right now — a hand start, a
+/// summon, or the login item's own server?
+fn serving(db: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(runtime) = harbor_common::runtime_dir() else { return false };
+        let Ok(canon) = harbor_common::paths::canonical_db(db) else { return false };
+        let Ok(sock) = harbor_common::socket_for(&runtime, &canon) else { return false };
+        sock.exists() && harbor::repl::sock_ready(&sock)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = db;
+        false
     }
 }
 
@@ -194,17 +328,27 @@ usage:
                                you get the prompt and .quit ends the server;
                                headless it runs until SIGTERM
   harbor <db.duckdb> stop      stop the server for this database, if one is
-                               running (a quiet no-op if nothing is)
+                               running (a quiet no-op if nothing is); a login
+                               item brings it back at the next login
+  harbor <db.duckdb> restart   stop and start again — under the login item
+                               when there is one, re-reading config.toml
   harbor <db.duckdb> attach    add this database to your list (config.toml) —
                                a listed database is persistent when started
   harbor <db.duckdb> detach    remove it from your list (and its login item)
-  harbor <db.duckdb> autostart start it at every login (implies attach + start;
-                               `autostart stop` arms login but leaves it off now)
+  harbor <db.duckdb> autostart keep it running: starts now under launchd or
+                               systemd, at every login, and again after a
+                               crash (implies attach; `autostart stop` arms
+                               login but leaves it off now)
+  harbor <db.duckdb> autostart off
+                               drop the login item; a running server is left
+                               alone (`autostart off stop` takes both down)
   harbor version               print this binary's version (also -V)
 
 Verbs combine, in any order: `attach start` remembers it and starts it
 persistent; `detach start` starts an ephemeral one; `attach` alone just
-lists it. At most one of attach/detach and one of start/stop.
+lists it. At most one of attach/detach and one of start/stop/restart.
+A login item runs a bare `start`, so its options live in config.toml under
+[connection.<name>] — statement-timeout, memory-limit, workers, threads, init.
 
 The two lifetimes, in one breath — bare: the server is everyone's, it lives
 while anyone is connected. start: the server is yours, it lives until you

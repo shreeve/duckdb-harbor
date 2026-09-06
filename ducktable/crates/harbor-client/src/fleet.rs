@@ -541,7 +541,7 @@ pub fn set_autostart(db: &Path, on: bool) -> Result<(), String> {
     let name = harbor_common::membership::name_of(db)?;
     if on {
         harbor_common::membership::attach(db)?;
-        harbor_common::autostart::install(db, &name)
+        harbor_common::autostart::arm(db, &name)
     } else {
         harbor_common::autostart::remove(&name).map(|_| ())
     }
