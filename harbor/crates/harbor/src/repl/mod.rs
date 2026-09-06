@@ -10,7 +10,7 @@
 //!   harbor <db.duckdb>              the REPL (or stdin/-c on a pipe)
 //!   harbor <path/to.sock>           a harbor unix socket
 //!   harbor http://host:port         a harbor TCP listener
-//!   harbor <name> | <footnote>      a running database, by name or list number
+//!   harbor <name> | <footnote>      a listed database, by name or list number
 //!
 //! TLS is Caddy's job — the client speaks plain HTTP over UDS/TCP.
 
@@ -34,7 +34,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// Set by SIGINT while a statement streams (registered in cli_main/helm);
+/// Set by SIGINT while a statement streams (registered in cli_main);
 /// checked at every read tick. Cleared before each statement.
 static CANCEL: LazyLock<std::sync::Arc<AtomicBool>> =
     LazyLock::new(|| std::sync::Arc::new(AtomicBool::new(false)));
@@ -322,16 +322,17 @@ fn ensure_server(path: &Path) -> Result<Transport, String> {
     }
 }
 
-/// `harbor <db> start` at a terminal: the server comes up in the background,
-/// persistent — it runs until `stop` — and this returns once it answers.
-/// The same launch a summon uses, minus the ephemeral signal, plus whatever
-/// start options were typed. Returns the socket the server answers on.
+/// `harbor <db> start` at a terminal: the server comes up in the background
+/// and this returns once it answers. Persistent — it runs until `stop` —
+/// unless the grammar said `detach start`, which is the refcounted lifetime a
+/// summon gets. The same launch a summon uses, plus whatever start options
+/// were typed. Returns the socket the server answers on.
 #[cfg(unix)]
-pub fn start_detached(db: &Path, args: &[String]) -> Result<PathBuf, String> {
+pub fn start_detached(db: &Path, args: &[String], ephemeral: bool) -> Result<PathBuf, String> {
     let runtime = harbor_common::runtime_dir()?;
     let canon = harbor_common::paths::canonical_db(db)?;
     let sock = harbor_common::socket_for(&runtime, &canon)?;
-    launch(&runtime, &canon, &sock, args, false)?;
+    launch(&runtime, &canon, &sock, args, ephemeral)?;
     Ok(sock)
 }
 
@@ -418,31 +419,30 @@ pub fn sock_ready(sock: &Path) -> bool {
 /// actually there to stop. The `stop` verb's whole implementation.
 #[cfg(unix)]
 pub fn shutdown(db: &Path) -> Result<bool, String> {
-    if !db.exists() {
-        return Ok(false); // no file, nothing behind it
-    }
     let runtime = harbor_common::runtime_dir()?;
     let canon = harbor_common::paths::canonical_db(db)?;
-    let transport = Transport::Unix(harbor_common::socket_for(&runtime, &canon)?);
+    let sock = harbor_common::socket_for(&runtime, &canon)?;
+    let transport = Transport::Unix(sock.clone());
     if !ready(&transport) {
         return Ok(false); // nothing answering on its socket
     }
     // POST /shutdown drains, checkpoints, and exits. The server can close the
     // socket as it goes, so a dropped connection right after the request is
-    // success, not failure. Either way, `stop` means stopped: wait until the
-    // socket no longer answers, so `stop` followed by `start` — by hand, or
-    // inside `restart` — meets a database that is actually free.
+    // success, not failure. Either way, `stop` means stopped: the server
+    // unlinks its socket as the last thing before it exits and releases the
+    // database lock, so wait for the file to be gone — then a `start` that
+    // follows, by hand or inside `restart`, meets a database that is free.
     if let Err(e) = http::request(&transport, &endpoint::SHUTDOWN, None, Some(Duration::from_secs(30)))
         && ready(&transport)
     {
         return Err(format!("stop: {e}"));
     }
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while ready(&transport) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while sock.exists() || ready(&transport) {
         if Instant::now() > deadline {
-            return Err(format!("stop: {} is still answering after 30s", canon.display()));
+            return Err(format!("stop: {} is still shutting down after 60s", canon.display()));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(50));
     }
     Ok(true)
 }
@@ -627,11 +627,14 @@ fn survey() -> Result<Vec<SurveyRow>, String> {
         let Some(db) = entry.database() else { continue };
         let canon = harbor_common::paths::canonical_db(&db).unwrap_or_else(|_| db.clone());
         let sock = harbor_common::socket_for(&runtime, &db).ok();
+        // Claimed by the file — its socket, or the path a server declares —
+        // never by a shared name: a server on some other `medlabs.duckdb`
+        // must not hide the attached one, or `harbor medlabs stop` would land
+        // on the wrong file.
         let claimed = rows.iter().any(|r| {
             sock.as_ref() == Some(&r.sock)
                 || r.info.as_ref().is_some_and(|v| {
-                    v["name"].as_str() == Some(name)
-                        || v["database"].as_str().map(Path::new) == Some(canon.as_path())
+                    v["database"].as_str().map(Path::new) == Some(canon.as_path())
                 })
         });
         if claimed {

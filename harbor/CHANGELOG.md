@@ -26,6 +26,24 @@ Harbor releases, and are not included here.
   terminal. `stop` returns once the server has actually gone quiet, so
   `stop` followed by `start` — by hand or inside `restart` — always meets a
   free database.
+- Names a database by the config key that lists it, wherever a name is
+  derived — the login item, the stopped row, `attach`, `detach` — so an entry
+  such as `[connection.warehouse]` pointing at `inventory.duckdb` never grows
+  an `inventory` twin and never boots without its settings.
+- Fixes the systemd unit, which ordered itself after the target that wants
+  it — a cycle systemd resolves by dropping a job — and sends the unit's
+  output to the berth's log like the LaunchAgent does.
+- Carries `HARBOR_HOME` and the XDG home variables into the login item when
+  the installing shell had them set, so the manager's server and the CLI
+  agree on where the socket is.
+- Makes `start` at a terminal a success when the server is already up, the
+  way `systemctl start` treats an active unit; headless it stays a refusal,
+  so a manager or a spawn never reads a clean exit as a server it did not
+  get. A running server announces the config key that lists it in `/info`,
+  so its bare name is the same word whether it is running or stopped.
+- Unloads a login item whose server fails to come up within 15s, instead of
+  letting the manager retry it every ten seconds until logout; the item stays
+  registered for the next login and the next `start`.
 - Lists attached databases that are not running as dimmed `stopped` rows in
   bare `harbor`, with the file path and whether a login item will bring them
   back. Their names and footnote numbers now resolve everywhere a running

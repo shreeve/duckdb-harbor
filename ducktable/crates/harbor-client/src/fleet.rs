@@ -538,7 +538,7 @@ pub fn detach(db: &Path) -> Result<(), String> {
 /// needs it on your list) but never starts it — running is the Start/Stop
 /// axis's business; disarming leaves membership and the running server alone.
 pub fn set_autostart(db: &Path, on: bool) -> Result<(), String> {
-    let name = harbor_common::membership::name_of(db)?;
+    let name = harbor_common::membership::name_for(db)?;
     if on {
         harbor_common::membership::attach(db)?;
         harbor_common::autostart::arm(db, &name)
