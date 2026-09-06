@@ -18,16 +18,57 @@ harbor=${LIFECYCLE_HARBOR:-$here/target/release/harbor}
 [[ -x $harbor ]] || { echo "lifecycle: build first (make harbor)" >&2; exit 77; }
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/harbor-lifecycle.XXXXXX")
+# Servers hold the canonical spelling (macOS resolves /var to /private/var),
+# which is too long for a unix socket to live under, so $work stays as typed
+# and cleanup matches either form when it inspects a command line.
+work_real=$(cd "$work" && pwd -P)
 export HARBOR_HOME="$work"
 # Short windows so departure is waitable. Test-only overrides, not API: the
 # shipped constants are 30s grace / 3s linger.
 export HARBOR_STARTUP_GRACE_MS=5000
 export HARBOR_LINGER_MS=1500
 cleanup() {
-  pkill -f "start.*$work" 2>/dev/null
+  local sock pid tracked args
+  # Bash 3.2 treats an empty array expansion as unbound under `set -u`, even
+  # after declaration. The skipped sentinel keeps all expansions portable.
+  local -a pids=("")
+
+  # Keep direct children even if they were interrupted before binding their
+  # socket. Clear these variables after an intentional wait below so a PID
+  # that has already exited can never be mistaken for something new.
+  for tracked in "${srv:-}" "${csrv:-}" "${tsrv:-}"; do
+    [[ $tracked =~ ^[0-9]+$ ]] && pids+=("$tracked")
+  done
+
+  # Spawn-on-use servers are reparented and are not shell children. Discover
+  # them through this test's private runtime registry instead of matching a
+  # command line: the database precedes `start`, paths contain regex syntax,
+  # and either detail makes pkill an unreliable cleanup mechanism.
+  for sock in "$work"/runtime/*.sock; do
+    [[ -S $sock ]] || continue
+    pid=$(curl -s --max-time 1 --unix-socket "$sock" http://harbor/info \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin).get("pid",""))' 2>/dev/null)
+    [[ $pid =~ ^[0-9]+$ ]] && pids+=("$pid")
+  done
+
+  for pid in "${pids[@]}"; do
+    [[ -n $pid ]] && kill -TERM "$pid" 2>/dev/null
+  done
+  sleep 0.5
+  for pid in "${pids[@]}"; do
+    [[ -n $pid ]] || continue
+    args=$(ps -p "$pid" -o command= 2>/dev/null)
+    [[ $args == *"$work"* || $args == *"$work_real"* ]] && kill -KILL "$pid" 2>/dev/null
+  done
+  for pid in "${pids[@]}"; do
+    [[ -n $pid ]] && wait "$pid" 2>/dev/null
+  done
   rm -rf "$work"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 fails=0
 ok() { printf '  ✓ %s\n' "$1"; }
@@ -121,6 +162,7 @@ check "a second start on the same file is refused" 1 "already being served" \
   "$harbor" "$work/x.duckdb" start
 kill -TERM "$srv"
 wait "$srv" 2>/dev/null
+srv=""
 if [[ -z $(live_sock) && ! -e $work/x.duckdb.wal ]]; then
   ok "SIGTERM departs clean: socket swept, database checkpointed"
 else
@@ -179,6 +221,7 @@ check "a [settings] key becomes a SET (default is true)" 0 "false" \
   "$harbor" "$work/cfg.duckdb" --mode csv -c "SELECT current_setting('preserve_insertion_order')"
 kill -TERM "$csrv" 2>/dev/null
 wait "$csrv" 2>/dev/null
+csrv=""
 
 # Exposure from config: an explicit start honors the entry's port, while a
 # summon ignores it and stays on the unix socket, so opening the file never
@@ -199,6 +242,7 @@ check "and serves on it" 0 "9" \
   "$harbor" http://127.0.0.1:9531 --mode csv -c "SELECT 9 AS nine"
 kill -TERM "$tsrv" 2>/dev/null
 wait "$tsrv" 2>/dev/null
+tsrv=""
 
 echo
 if ((fails)); then
