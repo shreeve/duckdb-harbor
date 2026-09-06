@@ -153,22 +153,22 @@ fn go_view(next: prefs::ViewMode, cx: &mut App) {
     prefs::toggle(cx, |p| p.view = next);
     // Landing on Data hands focus back to the table; landing on Query
     // hands it to the editor — the same symmetry (docs/QUERY.md).
-    if matches!(next, ViewMode::Data | ViewMode::Query) {
-        if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
-            cx.defer(move |cx| {
-                view.update(cx, |this, cx| {
-                    match next {
-                        ViewMode::Data => {
-                            if let Some(grid) = &this.grid {
-                                grid.update(cx, |grid, cx| grid.request_focus(cx));
-                            }
+    if matches!(next, ViewMode::Data | ViewMode::Query)
+        && let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade())
+    {
+        cx.defer(move |cx| {
+            view.update(cx, |this, cx| {
+                match next {
+                    ViewMode::Data => {
+                        if let Some(grid) = &this.grid {
+                            grid.update(cx, |grid, cx| grid.request_focus(cx));
                         }
-                        ViewMode::Query => this.focus_query(cx),
-                        ViewMode::Structure => {}
                     }
-                });
+                    ViewMode::Query => this.focus_query(cx),
+                    ViewMode::Structure => {}
+                }
             });
-        }
+        });
     }
 }
 

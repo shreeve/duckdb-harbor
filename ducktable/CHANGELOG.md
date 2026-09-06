@@ -3,6 +3,12 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by signed
 tag date, newest first.
 
+## 0.21.1 — 2026-09-06
+
+- The first version to arrive through Check for Updates rather than the
+  installer. Also folds a nested `if` in the view switcher into one, which
+  clippy had been asking for.
+
 ## 0.21.0 — 2026-09-06
 
 - Updates itself: DuckTable → Check for Updates…, and a daily check once you
