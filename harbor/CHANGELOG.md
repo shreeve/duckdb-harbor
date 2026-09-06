@@ -4,6 +4,12 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by signed tag date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.33.1 — 2026-09-06
+
+- A verb typed without a database (`harbor restart`) now names the attached
+  databases in its redirect, with the command spelled out for the first one,
+  instead of showing only the file form.
+
 ## 0.33.0 — 2026-09-06
 
 - Makes `autostart` a service: the login item is loaded the moment it is
