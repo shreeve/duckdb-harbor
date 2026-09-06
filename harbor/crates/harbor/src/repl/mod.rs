@@ -163,8 +163,8 @@ usage:
                                it lives while anyone is connected.
   harbor <path/to.sock>        a harbor unix socket
   harbor http://host:port      a harbor TCP listener
-  harbor <name> | <footnote>   a running database, by its name (medlabs) or
-                               its number in the list — always via the socket
+  harbor <name> | <footnote>   a database by its name (medlabs) or its number
+                               in the list — running, or attached and stopped
   harbor <db.duckdb> start     start it yourself — the server is yours, and
                                lives until you leave (harbor <db> start -h)
 
@@ -176,19 +176,19 @@ options:
 Remote TLS is Caddy's job; ssh is the human path to a remote host.
 ";
 
-/// Which running server a bare word means, over the survey's footnote order.
-/// All digits is a footnote number (1-based, as printed); anything else is a
-/// name, which must match exactly one running server or it is refused — a
-/// near-miss on data is worse than an error.
+/// Which database a bare word means, over the survey's footnote order. All
+/// digits is a footnote number (1-based, as printed); anything else is a
+/// name, which must match exactly one row or it is refused — a near-miss on
+/// data is worse than an error.
 fn pick(names: &[Option<String>], target: &str) -> Result<usize, String> {
     if names.is_empty() {
-        return Err(format!("{target:?} names nothing — nothing is running"));
+        return Err(format!("{target:?} names nothing — nothing is running or attached"));
     }
     if target.chars().all(|c| c.is_ascii_digit()) {
         let n: usize = target.parse().map_err(|_| format!("{target:?} is not a footnote"))?;
         if n == 0 || n > names.len() {
             return Err(format!(
-                "no footnote {n} in the list — {} running (run `harbor` to see them)",
+                "no footnote {n} in the list — {} listed (run `harbor` to see them)",
                 names.len()
             ));
         }
@@ -202,42 +202,39 @@ fn pick(names: &[Option<String>], target: &str) -> Result<usize, String> {
         .collect();
     match hits.as_slice() {
         [] => Err(format!(
-            "{target:?} names nothing running — a path carries a / or a dot; \
-             harbor takes a file, a running name or footnote, a .sock, or http://host:port"
+            "{target:?} names nothing running or attached — a path carries a / or a dot; \
+             harbor takes a file, a listed name or footnote, a .sock, or http://host:port"
         )),
         [i] => Ok(*i),
         many => Err(format!(
-            "{target:?} is ambiguous — {} running databases share that name; \
+            "{target:?} is ambiguous — {} databases share that name; \
              use the socket path, the URL, or the footnote number from `harbor`",
             many.len()
         )),
     }
 }
 
-/// A bare word, resolved against the running fleet: the row it means, or why
-/// it can't. A name or footnote always lands on the unix socket — TCP is
-/// dialled only when the target is spelled as a URL.
+/// A bare word, resolved against the fleet: the row it means, or why it
+/// can't. A running row is named by its own /info; an attached, stopped row
+/// by its config entry. A name or footnote always lands on the unix socket —
+/// TCP is dialled only when the target is spelled as a URL.
 fn fleet_find(target: &str) -> Result<SurveyRow, String> {
     let mut rows = survey()?;
-    let names: Vec<Option<String>> = rows
-        .iter()
-        .map(|r| {
-            r.info
-                .as_ref()
-                .and_then(|v| v["name"].as_str())
-                .map(str::to_string)
-        })
-        .collect();
+    let names: Vec<Option<String>> = rows.iter().map(SurveyRow::name).collect();
     let i = pick(&names, target)?;
     Ok(rows.swap_remove(i))
 }
 
 /// The database file behind a bare-word argument in the verb grammar
-/// (`harbor medlabs stop`, `harbor 1 stop`) — the path the running server
-/// itself declares. A word that names nothing running stays an error: a bare
-/// word never becomes a file (the safety law in `looks_like_path`).
+/// (`harbor medlabs stop`, `harbor 2 start`) — the path the running server
+/// itself declares, or the path the config entry names for a stopped one.
+/// A word that names nothing listed stays an error: a bare word never
+/// becomes a file (the safety law in `looks_like_path`).
 pub fn deref_db(target: &str) -> Result<PathBuf, String> {
     let row = fleet_find(target)?;
+    if let Some(stopped) = row.stopped {
+        return Ok(stopped.db);
+    }
     row.info
         .as_ref()
         .and_then(|v| v["database"].as_str())
@@ -256,8 +253,13 @@ fn resolve(target: &str) -> Result<(Conn, String), String> {
         return Ok((Conn { transport: url_transport(target)? }, prompt_name(target)));
     }
     if !harbor_common::looks_like_path(target) {
-        // A bare word reaches only what is already running — never a file.
+        // A bare word reaches what is listed — running, or attached — never
+        // a file made from the word. An attached database nothing serves is
+        // opened the way its path would be: joined or summoned.
         let row = fleet_find(target)?;
+        if let Some(stopped) = row.stopped {
+            return Ok((Conn { transport: ensure_server(&stopped.db)? }, stopped.name));
+        }
         #[cfg(unix)]
         {
             let name = row
@@ -479,7 +481,17 @@ fn is_socket(p: &Path) -> bool {
 // ---------------------------------------------------------------------------
 
 /// One live server, as its own /info tells it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowState {
+    Running,
+    /// Alive, but its /info could not be read.
+    Mute,
+    /// Attached, nothing serving it.
+    Stopped,
+}
+
 struct ListRow {
+    state: RowState,
     database: String,
     url: String,
     version: String,
@@ -493,15 +505,40 @@ struct ListRow {
 /// (None: alive but mute — it answered, just not 200). The order is the
 /// display order, so an index here IS the list's footnote number − 1.
 struct SurveyRow {
+    /// A live row's socket; for a stopped row, the socket it will answer on.
     sock: PathBuf,
     info: Option<serde_json::Value>,
+    /// Set when this is an attached database nothing is serving.
+    stopped: Option<Stopped>,
 }
 
-/// Every server that answered, in footnote order. Readdir the runtime dir
-/// for sockets, ask each for /info, and unlink the ones nothing answers on —
-/// the registry IS the listening socket, so a stale file is litter, not
-/// state. Both faces of the fleet read this: the list renders it, and a
-/// bare-name or footnote target resolves against it.
+/// An attached database with no server: what config.toml knows about it.
+struct Stopped {
+    name: String,
+    db: PathBuf,
+    /// Whether a login item will bring it back.
+    autostart: bool,
+}
+
+impl SurveyRow {
+    /// The word that reaches this row: a running server's own name, an
+    /// attached database's entry name, or nothing for a mute server.
+    fn name(&self) -> Option<String> {
+        if let Some(stopped) = &self.stopped {
+            return Some(stopped.name.clone());
+        }
+        self.info.as_ref().and_then(|v| v["name"].as_str()).map(str::to_string)
+    }
+}
+
+/// The fleet, in footnote order: every server that answered, then every
+/// attached database nothing is serving. Readdir the runtime dir for
+/// sockets, ask each for /info, and unlink the ones nothing answers on — the
+/// registry IS the listening socket, so a stale file is litter, not state.
+/// Then config.toml's berths, less the ones a live row already claimed by
+/// socket, name, or file: the socket decides running, config decides mine,
+/// and a bare `harbor` answers both. Both faces of the fleet read this: the
+/// list renders it, and a bare-name or footnote target resolves against it.
 fn survey() -> Result<Vec<SurveyRow>, String> {
     let runtime = harbor_common::runtime_dir()?;
     let mut socks: Vec<PathBuf> = match std::fs::read_dir(&runtime) {
@@ -529,11 +566,11 @@ fn survey() -> Result<Vec<SurveyRow>, String> {
             Ok(r) if r.status == 200 => {
                 let info = serde_json::from_str(r.body_string().unwrap_or_default().trim())
                     .unwrap_or_default();
-                rows.push(SurveyRow { sock, info: Some(info) });
+                rows.push(SurveyRow { sock, info: Some(info), stopped: None });
             }
             // It answered, just not with an /info this client could read.
             // Alive is alive — show the row, claim nothing.
-            Ok(_) => rows.push(SurveyRow { sock, info: None }),
+            Ok(_) => rows.push(SurveyRow { sock, info: None, stopped: None }),
             // Refused means nothing listens: a leftover from a kill -9 or a
             // crash. Anything else (a transient error, a permission oddity)
             // proves nothing, and an unlink on "proves nothing" is how a live
@@ -543,6 +580,41 @@ fn survey() -> Result<Vec<SurveyRow>, String> {
             }
             Err(_) => {}
         }
+    }
+
+    // A config that will not load is reported, not fatal: the running half
+    // of the fleet is still the truth, and a broken file must not hide it.
+    let cfg = match harbor_common::config::load() {
+        Ok(c) => c,
+        Err(harbor_common::config::Error::Missing(_)) => Default::default(),
+        Err(e) => {
+            eprintln!("harbor: {e}");
+            Default::default()
+        }
+    };
+    for (name, entry) in cfg.berths() {
+        let Some(db) = entry.database() else { continue };
+        let canon = harbor_common::paths::canonical_db(&db).unwrap_or_else(|_| db.clone());
+        let sock = harbor_common::socket_for(&runtime, &db).ok();
+        let claimed = rows.iter().any(|r| {
+            sock.as_ref() == Some(&r.sock)
+                || r.info.as_ref().is_some_and(|v| {
+                    v["name"].as_str() == Some(name)
+                        || v["database"].as_str().map(Path::new) == Some(canon.as_path())
+                })
+        });
+        if claimed {
+            continue;
+        }
+        rows.push(SurveyRow {
+            sock: sock.unwrap_or_default(),
+            info: None,
+            stopped: Some(Stopped {
+                name: name.to_string(),
+                db: canon,
+                autostart: harbor_common::autostart::installed(name),
+            }),
+        });
     }
     Ok(rows)
 }
@@ -569,6 +641,24 @@ fn list() -> Result<(), String> {
     let rows: Vec<ListRow> = survey()?
         .into_iter()
         .map(|s| {
+            if let Some(stopped) = s.stopped {
+                // The same column the live rows fill: the file. The footnote
+                // carries the word that reaches it and whether login will.
+                let mut note = format!("attached as {}", stopped.name);
+                if stopped.autostart {
+                    note.push_str(" — starts at login");
+                }
+                return ListRow {
+                    database: harbor_common::paths::shorten(&stopped.db),
+                    url: String::new(),
+                    version: String::new(),
+                    pid: String::new(),
+                    clients: String::new(),
+                    uptime: "stopped".into(),
+                    address: note,
+                    state: RowState::Stopped,
+                };
+            }
             let shown = harbor_common::paths::shorten(&s.sock);
             match s.info {
                 Some(v) => {
@@ -588,6 +678,7 @@ fn list() -> Result<(), String> {
                             .map_or_else(|| "?".into(), |c| c.to_string()),
                         uptime: harbor_common::duration::humanize(Duration::from_millis(ms)),
                         address: shown,
+                        state: RowState::Running,
                     }
                 }
                 None => ListRow {
@@ -598,6 +689,7 @@ fn list() -> Result<(), String> {
                     clients: "?".into(),
                     uptime: "?".into(),
                     address: shown,
+                    state: RowState::Mute,
                 },
             }
         })
@@ -644,8 +736,11 @@ fn list() -> Result<(), String> {
     // installation replaces harbor but existing servers keep running.
     t.caption(format!("harbor {}", env!("CARGO_PKG_VERSION")));
     for r in &rows {
-        let running = r.pid != "?";
-        let mut cells = vec![Cell::new(&r.database).tone(if running { Tone::Green } else { Tone::Dim })];
+        let tone = match r.state {
+            RowState::Running => Tone::Green,
+            RowState::Mute | RowState::Stopped => Tone::Dim,
+        };
+        let mut cells = vec![Cell::new(&r.database).tone(tone)];
         if tcp {
             cells.push(Cell::new(&r.url));
         }
@@ -653,21 +748,24 @@ fn list() -> Result<(), String> {
         cells.extend([
             Cell::new(&r.pid).right(),
             Cell::new(&r.clients).right(),
-            Cell::new(&r.uptime).right(),
+            Cell::new(&r.uptime).right().tone(tone),
         ]);
         t.row(cells);
         t.note(Tone::Dim, &r.address);
     }
     println!("{}", t.render(&Style::stdout()));
 
-    let running = rows.iter().filter(|r| r.pid != "?").count();
-    let mute = rows.len() - running;
+    let count = |state: RowState| rows.iter().filter(|r| r.state == state).count();
+    let (running, mute, stopped) = (count(RowState::Running), count(RowState::Mute), count(RowState::Stopped));
     let mut parts = Vec::new();
     if running > 0 {
         parts.push(format!("{running} running"));
     }
     if mute > 0 {
         parts.push(format!("{mute} unreadable"));
+    }
+    if stopped > 0 {
+        parts.push(format!("{stopped} stopped"));
     }
     println!("  {}\n", parts.join(", "));
     Ok(())
@@ -915,7 +1013,7 @@ mod tests {
     fn an_unknown_name_is_refused_not_created() {
         let n = names(&[Some("medlabs")]);
         let e = pick(&n, "scratch").unwrap_err();
-        assert!(e.contains("names nothing running"), "{e}");
+        assert!(e.contains("names nothing running or attached"), "{e}");
     }
 
     #[test]
@@ -945,6 +1043,15 @@ mod tests {
     #[test]
     fn an_empty_fleet_says_so() {
         let e = pick(&[], "medlabs").unwrap_err();
-        assert!(e.contains("nothing is running"), "{e}");
+        assert!(e.contains("nothing is running or attached"), "{e}");
+    }
+
+    #[test]
+    fn a_stopped_database_answers_to_its_name_and_footnote() {
+        // Live rows first, then attached-but-stopped ones: the footnote is
+        // the printed position either way, and the name reaches both kinds.
+        let n = names(&[Some("scratch"), Some("medlabs")]);
+        assert_eq!(pick(&n, "medlabs"), Ok(1));
+        assert_eq!(pick(&n, "2"), Ok(1));
     }
 }

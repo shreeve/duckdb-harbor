@@ -322,8 +322,8 @@ usage:
                                behind the file yet? One is spawned for it.
   harbor <path/to.sock>        connect to a server by its unix socket
   harbor http://host:port      connect to a server over TCP
-  harbor <name> | <footnote>   a running database, by its name (medlabs) or
-                               its number in the list — always via the socket
+  harbor <name> | <footnote>   a database by its name (medlabs) or its number
+                               in the list — running, or attached and stopped
   harbor <db.duckdb> start     start it yourself (foreground): on a terminal
                                you get the prompt and .quit ends the server;
                                headless it runs until SIGTERM

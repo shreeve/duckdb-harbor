@@ -18,6 +18,11 @@ Harbor releases, and are not included here.
 - Refuses start options on `autostart` and on a login item's `restart`,
   pointing at the `[connection.<name>]` entry a login item actually reads.
 - Sends the login item's output to the berth's log under `runtime/log/`.
+- Lists attached databases that are not running as dimmed `stopped` rows in
+  bare `harbor`, with the file path and whether a login item will bring them
+  back. Their names and footnote numbers now resolve everywhere a running
+  one's do, so `harbor medlabs start`, `harbor 2 autostart` and a bare
+  `harbor medlabs` all work with nothing running.
 
 ## 0.32.1 — 2026-09-05
 
