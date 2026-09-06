@@ -3,7 +3,7 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by signed
 tag date, newest first.
 
-## Unreleased
+## 0.21.0 — 2026-09-06
 
 - Updates itself: DuckTable → Check for Updates…, and a daily check once you
   say yes to the first-launch prompt. Sparkle, fed from the `ducktable-updates`
