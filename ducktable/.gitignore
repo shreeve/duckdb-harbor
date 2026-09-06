@@ -4,3 +4,4 @@ vendor/*/target
 assets/AppIcon.iconset
 .claude/
 dist
+.ducktable-cache/

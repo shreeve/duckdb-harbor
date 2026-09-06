@@ -17,6 +17,7 @@ mod sql;
 mod sidebar;
 mod structure;
 mod theme;
+mod updater;
 mod util;
 
 use app::DuckTable;
@@ -28,7 +29,8 @@ actions!(
     [
         ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset, FitColumns, RefreshTables,
         AddRow, DuplicateRow, DeleteRow, TablePrev, TableNext, View1, View2, View3, ToggleFullScreen,
-        ToggleRowNumbers, ToggleRightAlign, ToggleNullTags, OpenDatabase, OpenDatabaseUrl
+        ToggleRowNumbers, ToggleRightAlign, ToggleNullTags, OpenDatabase, OpenDatabaseUrl,
+        CheckForUpdates
     ]
 );
 
@@ -178,16 +180,21 @@ impl Global for AppView {}
 
 /// The macOS menu bar. The first menu becomes the application menu; the
 /// About item opens the platform's standard dialog (window.prompt ->
-/// NSAlert) with the version and a GitHub link.
-fn app_menus() -> Vec<Menu> {
+/// NSAlert) with the version and a GitHub link. Check for Updates sits
+/// under it in the conventional slot, and only when this build can update
+/// itself (docs/UPDATES.md) — a dev bundle has no such item to disappoint.
+fn app_menus(can_update: bool) -> Vec<Menu> {
+    let mut app_menu = vec![MenuItem::action("About DuckTable", About)];
+    if can_update {
+        app_menu.push(MenuItem::separator());
+        app_menu.push(MenuItem::action("Check for Updates…", CheckForUpdates));
+    }
+    app_menu.push(MenuItem::separator());
+    app_menu.push(MenuItem::action("Quit DuckTable", Quit));
     vec![
         Menu {
             name: "DuckTable".into(),
-            items: vec![
-                MenuItem::action("About DuckTable", About),
-                MenuItem::separator(),
-                MenuItem::action("Quit DuckTable", Quit),
-            ],
+            items: app_menu,
         },
         Menu {
             name: "File".into(),
@@ -398,6 +405,17 @@ fn main() {
         );
         theme::init(cx);
         prefs::init(cx);
+        // Sparkle, from the framework the bundle embeds. None in debug
+        // builds and bare `cargo run` binaries, and the menu item goes
+        // with it.
+        let updater = updater::Updater::init();
+        let can_update = updater.is_some();
+        cx.set_global(updater::UpdaterState(updater));
+        cx.on_action(|_: &CheckForUpdates, cx| {
+            if let Some(updater) = &cx.global::<updater::UpdaterState>().0 {
+                updater.check_for_updates();
+            }
+        });
         cx.bind_keys([
             KeyBinding::new("cmd-i", ToggleInspector, None),
             KeyBinding::new("cmd-o", OpenDatabase, None),
@@ -617,7 +635,7 @@ fn main() {
                 }
             });
         });
-        cx.set_menus(app_menus());
+        cx.set_menus(app_menus(can_update));
 
         // The window opens where it last stood — the frame saved on
         // every move and resize below. A fresh install has no frame

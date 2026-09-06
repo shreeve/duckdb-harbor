@@ -1446,7 +1446,9 @@ dependencies = [
  "gpui",
  "gpui-component",
  "harbor-client",
+ "libc",
  "objc",
+ "objc2",
  "serde_json",
  "wire",
 ]
