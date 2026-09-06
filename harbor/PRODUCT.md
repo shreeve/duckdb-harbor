@@ -79,8 +79,8 @@ came with one is gone.
 requirement, not an option.
 
 **Standing settings live in config**: a database's `[connection.*]` entry
-supplies its own memory, threads, and boot SQL, so a bare start — a summon, an
-autostart at boot — honors them without flags; explicit flags override. `init`
+supplies its own memory, threads, and boot SQL, so a bare start — a summon, the
+login item — honors them without flags; explicit flags override. `init`
 is the open door: `init = ["INSTALL httpfs", "LOAD httpfs"]` or any
 `SET`/secret runs verbatim on the control connection before serving, so harbor
 passes a berth's customizations straight to DuckDB without knowing what they

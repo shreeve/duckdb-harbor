@@ -31,11 +31,14 @@ pub enum Attached {
 // ---------------------------------------------------------------------------
 
 /// Add `db` to the config under its normalized stem, or confirm it is already
-/// there. Returns the name it was filed under. Errors if that name already
-/// belongs to a different file.
+/// there — under whatever key already names this file. Returns the name it is
+/// filed under. Errors if the stem already belongs to a different file.
 pub fn attach(db: &Path) -> Result<(String, Attached), String> {
-    let name = name_of(db)?;
     let canon = paths::canonical_db(db)?;
+    if let Some(key) = listed_as(&canon) {
+        return Ok((key, Attached::AlreadyThere));
+    }
+    let name = name_of(db)?;
     let stored = paths::shorten(&canon);
     let mut doc = parse(&read()?)?;
 
@@ -60,11 +63,11 @@ pub fn attach(db: &Path) -> Result<(String, Attached), String> {
     Ok((name, Attached::Added))
 }
 
-/// Remove `db` from the config, matched by its normalized stem. Returns whether
-/// a section was actually there to remove; a missing file or absent name is a
+/// Remove `db` from the config, whatever key names it. Returns whether a
+/// section was actually there to remove; a missing file or absent name is a
 /// quiet `false`, never an error.
 pub fn detach(db: &Path) -> Result<(String, bool), String> {
-    let name = name_of(db)?;
+    let name = name_for(db)?;
     let mut doc = parse(&read()?)?;
 
     let Some((key, _)) = find(&doc, &name)? else {
@@ -110,8 +113,31 @@ pub fn remove_named(name: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-/// The name a database files under: its stem, normalized to the registry
-/// alphabet — the same derivation every other harbor name goes through.
+/// The name a database answers to: the config key that already names this
+/// file, when one does, else the stem it would be filed under. A login item,
+/// a footnote row and a `stop` all go through this, so `[connection.warehouse]`
+/// pointing at `inventory.duckdb` is `warehouse` everywhere and never grows
+/// an `inventory` twin.
+pub fn name_for(db: &Path) -> Result<String, String> {
+    let canon = paths::canonical_db(db)?;
+    match listed_as(&canon) {
+        Some(key) => Ok(key),
+        None => name_of(db),
+    }
+}
+
+/// The config key whose `path` is this canonical file, if any. A config that
+/// will not load names nothing — the caller falls back to the stem.
+fn listed_as(canon: &Path) -> Option<String> {
+    let cfg = crate::config::load().ok()?;
+    cfg.berths().into_iter().find_map(|(key, c)| {
+        let p = c.database()?;
+        (paths::canonical_db(&p).ok()? == *canon).then(|| key.to_string())
+    })
+}
+
+/// The name a database files under when nothing names it yet: its stem,
+/// normalized to the registry alphabet.
 pub fn name_of(db: &Path) -> Result<String, String> {
     let stem = db
         .file_stem()

@@ -381,7 +381,13 @@ flags. The verbs move two independent facts, the way `brew services` and
 | `restart`            | unchanged           | yes               |
 | `autostart off`      | no                  | unchanged         |
 | `autostart off stop` | no                  | no                |
-| `detach`             | no                  | no, and forgotten |
+| `detach`             | no                  | unchanged         |
+| `detach stop`        | no                  | no, and forgotten |
+
+Removing the login item never kills a server: `autostart off` and `detach`
+take the registration away and leave whatever is running to `stop` — though
+until logout the manager still restarts that server after a crash, since it
+holds the job it loaded.
 
 There is no registry. The socket **is** the runtime registration: its name is
 derived from the database's canonical path
@@ -417,10 +423,11 @@ $ harbor labs                                                      # its name
 $ harbor 1                                                         # its footnote
 ```
 
-A name or a footnote always rides the unix socket, and reaches only what is
-already running — a bare word never becomes a file, and a name two running
-databases share is refused as ambiguous rather than guessed. The verbs take
-the same spellings: `harbor labs stop`, `harbor 1 stop`.
+A name or a footnote reaches what is listed — a running server by the name
+it declares, an attached database by its config key — and a bare word never
+becomes a file. A name two running databases share is refused as ambiguous
+rather than guessed. The verbs take the same spellings: `harbor labs stop`,
+`harbor 3 start`; opening a stopped one summons it the way its path would.
 
 A socket nothing answers on is a leftover from a `kill -9`, and the list
 unlinks it. Set `HARBOR_HOME` (absolute path) to collapse configuration and
