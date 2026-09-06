@@ -4,6 +4,21 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by signed tag date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.33.0 — 2026-09-06
+
+- Makes `autostart` a service: the login item is loaded the moment it is
+  installed, so the server starts now under launchd or systemd, at every
+  login, and again after a crash (`KeepAlive` on failure only; systemd
+  `Restart=on-failure`). A clean `stop` stays stopped until the next login.
+- Adds `restart`, which bounces a database under its login item with a fresh
+  read of config.toml, and `autostart off`, which drops the login item and
+  leaves a running server alone (`autostart off stop` takes both down).
+- Stops a plain `start` or `stop` from removing the login item; only
+  `autostart off` and `detach` do.
+- Refuses start options on `autostart` and on a login item's `restart`,
+  pointing at the `[connection.<name>]` entry a login item actually reads.
+- Sends the login item's output to the berth's log under `runtime/log/`.
+
 ## 0.32.1 — 2026-09-05
 
 - Shows the installed Harbor CLI version as a caption joined to the fleet

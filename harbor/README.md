@@ -354,9 +354,30 @@ same path — joins the same server instead of reporting "database is locked".
 refcount: it lives until you leave. On a terminal you get the same prompt,
 dialled at the server's own socket, and `.quit` ends the server; headless it
 runs until `SIGTERM`. Either exit is clean — drain, `CHECKPOINT` so the next
-open never replays a WAL, socket swept. Boot persistence belongs to launchd
-or a systemd user unit running exactly this command; harbor never becomes a
-supervisor.
+open never replays a WAL, socket swept.
+
+**`harbor <db.duckdb> autostart` — the server is the session manager's.**
+harbor never becomes a supervisor; it hands exactly this `start` to one that
+already exists. On macOS it writes a LaunchAgent and loads it, on Linux a
+systemd user unit, enabled and started. The server comes up now, at every
+login, and again after a crash — never after a clean exit, so `stop` stays
+stopped until the next login and `restart` bounces it with a fresh read of
+its config. `autostart off` drops the login item and leaves a running server
+alone; `autostart off stop` takes both down. A login item runs a bare
+`start`, so its options are the `[connection.<name>]` entry in config.toml
+(`statement-timeout`, `memory-limit`, `workers`, `threads`, `init`), never
+flags. The verbs move two independent facts, the way `brew services` and
+`systemctl` do:
+
+| You type             | Registered at login | Running now       |
+| -------------------- | ------------------- | ----------------- |
+| `autostart`          | yes                 | yes               |
+| `autostart stop`     | yes                 | no                |
+| `stop`               | unchanged           | no                |
+| `restart`            | unchanged           | yes               |
+| `autostart off`      | no                  | unchanged         |
+| `autostart off stop` | no                  | no                |
+| `detach`             | no                  | no, and forgotten |
 
 There is no registry. The socket **is** the runtime registration: its name is
 derived from the database's canonical path
