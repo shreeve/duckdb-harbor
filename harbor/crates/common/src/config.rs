@@ -159,9 +159,8 @@ fn sql_literal(v: &toml::Value) -> Option<String> {
 
 impl FileConfig {
     /// Configured local berths, sorted. The name is the section key — never
-    /// the database file's stem, which is how `[connection.warehouse]`
-    /// pointing at `inventory.duckdb` used to produce a berth called
-    /// `inventory` and an alias nobody could use.
+    /// the database file's stem: `[connection.warehouse]` pointing at
+    /// `inventory.duckdb` is a berth called `warehouse`.
     pub fn berths(&self) -> Vec<(&str, &Connection)> {
         let mut v: Vec<_> = self
             .connection

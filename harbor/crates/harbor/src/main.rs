@@ -46,9 +46,14 @@ fn main() -> ExitCode {
             println!("harbor {VERSION}");
             return ExitCode::SUCCESS;
         }
-        // A verb with no database in front of it: the noun comes first.
+        // A verb with no database in front of it: the noun comes first. The
+        // attached names are the short way to say it, so name them.
         Some(v) if verbs::Verb::is_verb(v) => {
-            eprintln!("harbor: the database comes first — harbor <db.duckdb> {v}");
+            eprintln!("harbor: the database comes first — harbor <db.duckdb|name|footnote> {v}");
+            let names = attached_names();
+            if let Some(first) = names.first() {
+                eprintln!("harbor: attached: {} — harbor {first} {v}", names.join(", "));
+            }
             return ExitCode::FAILURE;
         }
         _ => {}
@@ -466,6 +471,14 @@ fn default_opts(db: PathBuf) -> Opts {
 /// start honors it: a summon (`ephemeral`) stays on the unix socket, so
 /// opening a database never silently opens its TCP door — and the summoning
 /// client is waiting on that socket anyway.
+/// The config keys of every attached database, sorted, or nothing when there
+/// is no usable config — a hint never turns into an error of its own.
+fn attached_names() -> Vec<String> {
+    harbor_common::config::load()
+        .map(|cfg| cfg.berths().into_iter().map(|(k, _)| k.to_string()).collect())
+        .unwrap_or_default()
+}
+
 fn apply_berth_config(o: &mut Opts, canon: &Path, ephemeral: bool) {
     use harbor_common::config;
     let cfg = match config::load() {
