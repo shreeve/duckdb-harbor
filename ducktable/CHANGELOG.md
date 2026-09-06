@@ -3,6 +3,12 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by signed
 tag date, newest first.
 
+## Unreleased
+
+- Updates itself: DuckTable → Check for Updates…, and a daily check once you
+  say yes to the first-launch prompt. Sparkle, fed from the `ducktable-updates`
+  GitHub release (docs/UPDATES.md).
+
 ## 0.20.4 — 2026-09-05
 
 - Keeps the active-cell coordinates intact when a staged row intentionally

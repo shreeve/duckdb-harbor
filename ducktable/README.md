@@ -51,6 +51,10 @@ that way, allow it under System Settings → Privacy & Security → Open Anyway.
 Uninstall with `... | bash -s -- --uninstall` — the app goes; your settings
 (`~/.config/ducktable`) and your databases stay.
 
+After that, DuckTable keeps itself current: DuckTable → Check for Updates…,
+or say yes to the first-launch prompt and it checks once a day
+([docs/UPDATES.md](docs/UPDATES.md)).
+
 On Intel, or to build from source: clone the repo and run
 `ducktable/scripts/macos-app.sh release`.
 
