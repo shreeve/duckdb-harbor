@@ -2518,7 +2518,7 @@ dependencies = [
 
 [[package]]
 name = "harbor-common"
-version = "0.32.0"
+version = "0.32.1"
 dependencies = [
  "libc",
  "serde",
@@ -7254,7 +7254,7 @@ dependencies = [
 
 [[package]]
 name = "wire"
-version = "0.32.0"
+version = "0.32.1"
 dependencies = [
  "serde",
  "serde_json",

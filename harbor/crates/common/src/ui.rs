@@ -202,6 +202,7 @@ impl Cell {
 /// they need the answer is the only moment they will read anything.
 #[derive(Default)]
 pub struct Table {
+    caption: Option<String>,
     head: Vec<String>,
     rows: Vec<Vec<Cell>>,
     notes: Vec<(usize, Tone, String)>,
@@ -213,6 +214,14 @@ impl Table {
             head: head.into_iter().map(|h| sanitize(h.as_ref())).collect(),
             ..Default::default()
         }
+    }
+
+    /// Give the table a title. On a terminal it becomes a small tab joined
+    /// to the table's top border; through a pipe it is a plain line before
+    /// the TSV header.
+    pub fn caption(&mut self, text: impl AsRef<str>) -> &mut Self {
+        self.caption = Some(sanitize(text.as_ref()));
+        self
     }
 
     pub fn row(&mut self, cells: impl IntoIterator<Item = Cell>) -> &mut Self {
@@ -235,9 +244,13 @@ impl Table {
         }
     }
 
-    /// Tab-separated, no notes, no color. What a pipe wants.
+    /// Plain caption, then tab-separated data; no notes or color. What a pipe wants.
     fn render_plain(&self) -> String {
         let mut out = String::new();
+        if let Some(caption) = &self.caption {
+            out.push_str(caption);
+            out.push('\n');
+        }
         if !self.head.is_empty() {
             out.push_str(&self.head.join("\t"));
             out.push('\n');
@@ -261,6 +274,12 @@ impl Table {
                 w[i] = w[i].max(cells(&c.text));
             }
         }
+        // Keep the caption's right edge inside the first cell rather than
+        // colliding with its first column joint. Usually DATABASE is already
+        // much wider; this matters for an empty fleet.
+        if let (Some(caption), Some(first)) = (&self.caption, w.first_mut()) {
+            *first = (*first).max(cells(caption) + 1);
+        }
         w
     }
 
@@ -277,8 +296,29 @@ impl Table {
         };
 
         let mut out = String::new();
-        out.push_str(&rule(c.tl, c.tm, c.tr));
-        out.push('\n');
+        if let Some(caption) = &self.caption {
+            let caption_width = cells(caption);
+            out.push_str(&format!("{}{}{}\n", c.tl, c.h.repeat(caption_width + 2), c.tr));
+            out.push_str(&format!(
+                "{} {} {}\n",
+                c.v,
+                st.paint(Tone::Bold, caption),
+                c.v
+            ));
+
+            // The caption's lower border is also the table's top border.
+            // Because widths() keeps its endpoint inside column zero, the
+            // join is a T pointing up, followed later by the normal column
+            // joints pointing down.
+            let mut top: Vec<char> = rule(c.tl, c.tm, c.tr).chars().collect();
+            top[0] = c.ml.chars().next().unwrap();
+            top[caption_width + 3] = c.bm.chars().next().unwrap();
+            out.extend(top);
+            out.push('\n');
+        } else {
+            out.push_str(&rule(c.tl, c.tm, c.tr));
+            out.push('\n');
+        }
 
         if !self.head.is_empty() {
             let hs: Vec<String> = (0..w.len())
@@ -365,6 +405,29 @@ mod tests {
         assert!(out.starts_with("╭─"), "{out}");
         assert!(out.contains('┬') && out.contains('┼') && out.contains('┴'));
         assert!(out.trim_end().ends_with('╯'), "{out}");
+    }
+
+    #[test]
+    fn a_caption_is_a_tab_joined_to_the_top_border() {
+        let mut t = Table::new(["DATABASE", "VERSION"]);
+        t.caption("fleet");
+        t.row([Cell::new("~/labs.duckdb"), Cell::new("old")]);
+        let out = t.render(&boxed());
+        let mut lines = out.lines();
+        assert_eq!(lines.next(), Some("╭───────╮"));
+        assert_eq!(lines.next(), Some("│ fleet │"));
+        assert_eq!(lines.next(), Some("├───────┴───────┬─────────╮"));
+    }
+
+    #[test]
+    fn a_caption_stays_a_plain_line_in_tsv() {
+        let mut t = Table::new(["DATABASE", "VERSION"]);
+        t.caption("fleet");
+        t.row([Cell::new("db.duckdb"), Cell::new("old")]);
+        assert_eq!(
+            t.render(&Style::plain()),
+            "fleet\nDATABASE\tVERSION\ndb.duckdb\told\n"
+        );
     }
 
     #[test]
