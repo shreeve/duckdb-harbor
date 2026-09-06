@@ -6,7 +6,7 @@
 #
 # The law under test is the product's one breath: bare — the server is
 # everyone's, it lives while anyone is connected; start — the server is
-# yours, it lives until you leave. Everything here is behavior no unit test
+# yours, it lives until you stop it. Everything here is behavior no unit test
 # can see: spawn-on-use across processes, two clients landing on one server,
 # an idle connection as a mooring, the last departure sweeping the socket,
 # and a start-lifetime server ignoring the refcount entirely.
@@ -145,7 +145,7 @@ else
   bad "departure left the database missing or with a wal"
 fi
 
-echo "— start: the server is yours, it lives until you leave"
+echo "— start: the server is yours, it lives until you stop it"
 "$harbor" "$work/x.duckdb" start >"$work/start.log" 2>&1 &
 srv=$!
 up=0
@@ -154,7 +154,7 @@ for _ in $(seq 1 50); do [[ -n $(live_sock) ]] && { up=1; break; }; sleep 0.1; d
 check "a client joins the started database" 0 "7" \
   "$harbor" "$work/x.duckdb" --mode csv -c "SELECT 7 AS seven"
 # Well past the linger an ephemeral server would have left on. A start
-# lifetime has no clock at all — only SIGTERM (or .quit at the helm) ends it.
+# lifetime has no clock at all — only SIGTERM or `stop` ends it.
 sleep 2
 kill -0 "$srv" 2>/dev/null && ok "no refcount: it survives its clients leaving" \
                            || bad "the start-lifetime server left on the refcount"

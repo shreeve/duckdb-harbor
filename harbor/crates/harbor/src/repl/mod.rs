@@ -165,8 +165,8 @@ usage:
   harbor http://host:port      a harbor TCP listener
   harbor <name> | <footnote>   a database by its name (medlabs) or its number
                                in the list — running, or attached and stopped
-  harbor <db.duckdb> start     start it yourself — the server is yours, and
-                               lives until you leave (harbor <db> start -h)
+  harbor <db.duckdb> start     bring its server up in the background and
+                               return; it runs until `stop` (harbor <db> start -h)
 
 options:
   -c \"SQL\"                     run statements and exit (stdin works too)
@@ -317,59 +317,80 @@ fn ensure_server(path: &Path) -> Result<Transport, String> {
         if ready(&transport) {
             return Ok(transport);
         }
-
-        // Spawn. Same binary, no PATH lookup, no environment contract —
-        // current_exe is the whole story. Detached (own process group, no
-        // tty), stderr to a log beside the socket so a failure has a face.
-        harbor_common::perms::ensure_private_dir(&runtime)?;
-        let log_path = sock.with_extension("log");
-        let log = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&log_path)
-            .map_err(|e| format!("log file: {e}"))?;
-        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-        let mut cmd = std::process::Command::new(exe);
-        cmd.arg(&canon).arg("start");
-        // The private lifetime signal: a summoned server is refcounted, so it
-        // leaves when idle. It rides an env channel, not the command line —
-        // ephemerality is something membership says (a detached start), never a
-        // flag, and a spawn is not a verb the user typed.
-        cmd.env("HARBOR_EPHEMERAL", "1");
-        // A typed path is the duckdb-cli contract: start opens it existing or
-        // not, so a summoned database that isn't there yet is simply created.
-        {
-            use std::os::unix::process::CommandExt;
-            use std::process::Stdio;
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
-                .stderr(Stdio::from(log))
-                .process_group(0); // detached from our tty/session
-        }
-        let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
-
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline {
-            if ready(&transport) {
-                return Ok(transport);
-            }
-            // The child dying is an answer, not a timeout — but it can be the
-            // GOOD answer: two clients raced, ours lost the database lock to
-            // the winner, and the winner's socket (same derived path) serves
-            // us fine. Only a dead child AND no listener is a failure.
-            if let Ok(Some(status)) = child.try_wait() {
-                if ready(&transport) {
-                    return Ok(transport);
-                }
-                return Err(format!(
-                    "the server did not start ({status}) — {}",
-                    log_tail(&log_path)
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        Err(format!("{} did not come up in 15s — {}", canon.display(), log_tail(&log_path)))
+        launch(&runtime, &canon, &sock, &[], true)?;
+        Ok(transport)
     }
+}
+
+/// `harbor <db> start` at a terminal: the server comes up in the background,
+/// persistent — it runs until `stop` — and this returns once it answers.
+/// The same launch a summon uses, minus the ephemeral signal, plus whatever
+/// start options were typed. Returns the socket the server answers on.
+#[cfg(unix)]
+pub fn start_detached(db: &Path, args: &[String]) -> Result<PathBuf, String> {
+    let runtime = harbor_common::runtime_dir()?;
+    let canon = harbor_common::paths::canonical_db(db)?;
+    let sock = harbor_common::socket_for(&runtime, &canon)?;
+    launch(&runtime, &canon, &sock, args, false)?;
+    Ok(sock)
+}
+
+/// Spawn a server for `canon` and wait until it answers on `sock`. Same
+/// binary, no PATH lookup, no environment contract — current_exe is the whole
+/// story. Detached (own process group, no tty), stdout and stderr to a log
+/// beside the socket so a failure has a face. `ephemeral` is the private
+/// lifetime signal: a summoned server is refcounted, so it leaves when idle.
+/// It rides an env channel, not the command line — ephemerality is something
+/// membership says, never a flag, and a spawn is not a verb the user typed.
+#[cfg(unix)]
+fn launch(runtime: &Path, canon: &Path, sock: &Path, args: &[String], ephemeral: bool) -> Result<(), String> {
+    let transport = Transport::Unix(sock.to_path_buf());
+    harbor_common::perms::ensure_private_dir(runtime)?;
+    let log_path = sock.with_extension("log");
+    let log = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&log_path)
+        .map_err(|e| format!("log file: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg(canon).arg("start").args(args);
+    if ephemeral {
+        cmd.env("HARBOR_EPHEMERAL", "1");
+    }
+    // A typed path is the duckdb-cli contract: start opens it existing or
+    // not, so a database that isn't there yet is simply created.
+    {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
+            .stderr(Stdio::from(log))
+            .process_group(0); // detached from our tty/session
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if ready(&transport) {
+            return Ok(());
+        }
+        // The child dying is an answer, not a timeout — but it can be the
+        // GOOD answer: two clients raced, ours lost the database lock to
+        // the winner, and the winner's socket (same derived path) serves
+        // us fine. Only a dead child AND no listener is a failure.
+        if let Ok(Some(status)) = child.try_wait() {
+            if ready(&transport) {
+                return Ok(());
+            }
+            return Err(format!(
+                "the server did not start ({status}) — {}",
+                log_tail(&log_path)
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!("{} did not come up in 15s — {}", canon.display(), log_tail(&log_path)))
 }
 
 /// The last few log lines, inlined — the operator should not have to go
@@ -408,12 +429,22 @@ pub fn shutdown(db: &Path) -> Result<bool, String> {
     }
     // POST /shutdown drains, checkpoints, and exits. The server can close the
     // socket as it goes, so a dropped connection right after the request is
-    // success, not failure — re-probe to be sure which it was.
-    match http::request(&transport, &endpoint::SHUTDOWN, None, Some(Duration::from_secs(30))) {
-        Ok(_) => Ok(true),
-        Err(_) if !ready(&transport) => Ok(true),
-        Err(e) => Err(format!("stop: {e}")),
+    // success, not failure. Either way, `stop` means stopped: wait until the
+    // socket no longer answers, so `stop` followed by `start` — by hand, or
+    // inside `restart` — meets a database that is actually free.
+    if let Err(e) = http::request(&transport, &endpoint::SHUTDOWN, None, Some(Duration::from_secs(30)))
+        && ready(&transport)
+    {
+        return Err(format!("stop: {e}"));
     }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while ready(&transport) {
+        if Instant::now() > deadline {
+            return Err(format!("stop: {} is still answering after 30s", canon.display()));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(true)
 }
 
 #[cfg(windows)]
@@ -769,24 +800,6 @@ fn list() -> Result<(), String> {
     }
     println!("  {}\n", parts.join(", "));
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// The helm — `harbor <db> start` on a terminal
-// ---------------------------------------------------------------------------
-
-/// The prompt a foreground server wears: the same REPL, dialled at the
-/// server's own front door, so what the operator types is what any client
-/// would get. Returning ends the server — the caller stops and waits — which
-/// is the foreground-start doctrine: the server is yours, it lives until you
-/// leave.
-pub fn helm(transport: Transport, name: &str) {
-    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, CANCEL.clone());
-    theme::init(None, None);
-    let conn = Conn { transport };
-    // No anchor: an owned server's lifetime is the operator's presence at
-    // this prompt, not its client count.
-    let _ = interactive::run(&conn, name, RenderOpts::default(), None);
 }
 
 fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {

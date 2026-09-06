@@ -18,6 +18,14 @@ Harbor releases, and are not included here.
 - Refuses start options on `autostart` and on a login item's `restart`,
   pointing at the `[connection.<name>]` entry a login item actually reads.
 - Sends the login item's output to the berth's log under `runtime/log/`.
+- Makes `start` at a terminal bring the server up in the background and
+  return — under the database's login item when it has one, otherwise as a
+  detached process that runs until `stop`. The prompt-as-server helm is
+  gone: a prompt is what bare `harbor <db>` opens. Headless `start` still
+  serves in place until SIGTERM, and `--foreground` asks for that shape at a
+  terminal. `stop` returns once the server has actually gone quiet, so
+  `stop` followed by `start` — by hand or inside `restart` — always meets a
+  free database.
 - Lists attached databases that are not running as dimmed `stopped` rows in
   bare `harbor`, with the file path and whether a login item will bring them
   back. Their names and footnote numbers now resolve everywhere a running
