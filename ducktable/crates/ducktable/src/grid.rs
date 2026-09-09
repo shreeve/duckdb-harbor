@@ -1446,7 +1446,7 @@ impl Grid {
         }
         if m.platform && m.shift && ks.key == "backspace" {
             // ⌘⇧⌫, TablePlus's own chord: discard everything staged —
-            // each discard is an undo entry, so even this is reversible.
+            // one undo entry, so even this is reversible.
             self.discard_all(cx);
             cx.stop_propagation();
             return;
@@ -2023,8 +2023,8 @@ impl Grid {
 
     /// Stage a DELETE for every selected row — visible, ghosted,
     /// reversible until commit. No dialog: reversibility is the
-    /// confirmation model. Each row is its own staged change, so the
-    /// review popover and ⌘Z see them one at a time.
+    /// confirmation model. Each row is its own staged change for the
+    /// review popover; the gesture is one ⌘Z.
     fn stage_delete_row(&mut self, cx: &mut Context<Self>) {
         let targets: Vec<(Option<Vec<Value>>, Option<String>)> = {
             let d = self.table.read(cx).delegate();
@@ -2038,13 +2038,15 @@ impl Grid {
                 .collect()
         };
         let Some(edits) = &mut self.edits else { return };
-        for (identity, draft_key) in targets {
-            if let Some(key) = draft_key {
-                edits.discard(&key);
-            } else if let Some(identity) = identity {
-                edits.stage_delete(identity);
+        edits.grouped(|edits| {
+            for (identity, draft_key) in targets {
+                if let Some(key) = draft_key {
+                    edits.discard(&key);
+                } else if let Some(identity) = identity {
+                    edits.stage_delete(identity);
+                }
             }
-        }
+        });
         self.sync_staged(cx);
     }
 
@@ -2354,15 +2356,17 @@ impl Grid {
         self.sync_staged(cx);
     }
 
-    /// Discard everything staged — as individual discards, so each one
-    /// stays on the undo stack.
+    /// Discard everything staged — one gesture, one undo step, so ⌘Z
+    /// brings all of it back at once.
     pub(crate) fn discard_all(&mut self, cx: &mut Context<Self>) {
         if let Some(e) = &mut self.edits {
             let keys: Vec<String> =
                 e.entries().iter().map(|(k, _, _)| k.to_string()).collect();
-            for key in keys {
-                e.discard(&key);
-            }
+            e.grouped(|e| {
+                for key in keys {
+                    e.discard(&key);
+                }
+            });
         }
         self.sync_staged(cx);
     }

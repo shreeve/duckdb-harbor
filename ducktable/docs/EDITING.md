@@ -76,7 +76,7 @@ One meaning per key. No contextual double-agents.
 | ⌃⇧N | stages NULL explicitly, any type | — |
 | ⌘N | creates a new all-DEFAULT row and opens its first useful writable cell | — |
 | ⌘D | duplicates the lead selected persisted row as one staged INSERT | — |
-| ⌘⌫ | stages a DELETE for every selected row (ghost strikethrough; each its own change, reversible until commit) | — |
+| ⌘⌫ | stages a DELETE for every selected row (ghost strikethrough; one undo step, each row its own entry for review; reversible until commit) | — |
 | ⌘Z / ⌘⇧Z | un-stages / re-stages the most recent change | text undo / redo |
 | ⌘S | commits all staged changes — one transaction, all or nothing | confirms the cell, then commits (⌘Enter is its equal) |
 | ⌥Enter | — | newline (the Sheets-hand twin of ⇧Enter) |
@@ -90,7 +90,7 @@ mode names, no status chip, no mid-edit toggle.
 
 A click selects one row (and, in the body, seats the ring on the clicked cell). The macOS list grammar builds on it: ⌘-click toggles a row in or out, ⇧-click selects the span from the anchor through the clicked row, replacing whatever was selected. The anchor is the last row clicked without ⇧, so a second ⇧-click re-spans from the same place. The gutter and the body cells select the same way.
 
-The selection has a lead: the row the ring, the inspector, and ⌘D act on. It is the row last clicked into the selection; ⌘-clicking the lead away hands the role to the last remaining row. ⌘⌫ acts on every selected row. Esc, a page change, and a commit clear the selection whole.
+The selection has a lead: the row the ring, the inspector, and ⌘D act on. It is the row last clicked into the selection; ⌘-clicking the lead away hands the role to the last remaining row. ⌘⌫ acts on every selected row as one gesture: one ⌘Z brings them all back, while the review popover still lists and discards them one by one. Esc, a page change, and a commit clear the selection whole.
 
 ⇧-click in the body takes a seat that cell ranges would want (TablePro spans cells there and keeps row spans on its gutter); if cell ranges ship, body ⇧-click moves to them and the gutter keeps the row span.
 
@@ -110,7 +110,7 @@ combination has a deliberate answer:
 | PageUp / PageDown | one screenful up / down within the loaded page (Sheets' meaning), a row of overlap, clamped at the page edge |
 | ⌥↑ / ⌥↓ | previous / next DATABASE page (the pager) — the ring keeps its seat (same column, row clamped); when multiple grid tabs exist someday, these migrate to tab switching (Sheets' worksheet keys) |
 | ⌥← / ⌥→ | step the view switcher's segments left / right, rolling over at the ends (Data / Structure today; a carousel, ready for more segments) |
-| ⌘⇧⌫ | discard all staged changes (TablePlus's chord; every discard stays undoable) |
+| ⌘⇧⌫ | discard all staged changes (TablePlus's chord; one undo step, so even this is reversible) |
 | ⇧ + arrows | deliberately inert — range selection's seat, reserved until ranges ship; a ring that moved when you expected a range to grow would lie |
 | ⌃ + arrows | never bound — macOS owns them (Mission Control, Spaces) |
 
