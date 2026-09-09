@@ -36,6 +36,12 @@ use std::time::{Duration, Instant};
 
 /// Set by SIGINT while a statement streams (registered in cli_main);
 /// checked at every read tick. Cleared before each statement.
+/// Set when this invocation spawned the server it is talking to, rather
+/// than joining one already up. Only `--block-size` reads it, and only to
+/// tell the caller when their size had nothing to shape — a flag that
+/// silently does nothing is worse than one that is refused.
+static SPAWNED: AtomicBool = AtomicBool::new(false);
+
 static CANCEL: LazyLock<std::sync::Arc<AtomicBool>> =
     LazyLock::new(|| std::sync::Arc::new(AtomicBool::new(false)));
 static QUERY_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -67,12 +73,24 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
     let mut sql: Option<String> = None;
     let mut json = false;
     let mut mode: Option<String> = None;
+    let mut block_size: Option<String> = None;
 
     while let Some(a) = args.next() {
         match a.as_str() {
             "-c" | "--command" => match args.next() {
                 Some(v) => sql = Some(v),
                 None => return fail("-c needs the SQL to run"),
+            },
+            // Not a server tuning knob, which is why it is here and not
+            // only in config.toml: block size shapes the FILE, and this is
+            // one of the paths that creates a file. It reaches the server
+            // only when this call spawns one — see below.
+            "--block-size" => match args.next() {
+                Some(v) => match crate::parse_block_size(&v) {
+                    Ok(_) => block_size = Some(v),
+                    Err(e) => return fail(&e),
+                },
+                None => return fail("--block-size needs a size (16k, 32k, 64k, 128k, 256k)"),
             },
             "--json" => json = true,
             "--mode" => match args.next() {
@@ -91,10 +109,24 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
     let Some(target) = target else {
         return fail("which database? (harbor <db.duckdb> — or bare harbor to see what's running)");
     };
-    let (conn, name) = match resolve(&target) {
+    let spawn: Vec<String> = match &block_size {
+        Some(v) => vec!["--block-size".into(), v.clone()],
+        None => Vec::new(),
+    };
+    let (conn, name) = match resolve(&target, &spawn) {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
+    // A size that reached nothing is worth a word. It only shapes a file at
+    // the moment of creation, so joining a server that is already up — or
+    // opening a database that already exists — leaves it with nothing to do,
+    // and silence there reads exactly like success.
+    if block_size.is_some() && !SPAWNED.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "harbor: --block-size was not used — {name} is already being served, and a block \
+             size is fixed when a database is created"
+        );
+    }
     // The mooring, held for the life of this invocation: a spawned server
     // lives while anyone is connected, and between statements — a human
     // thinking at the prompt, a script paused mid-pipe — this silent open
@@ -248,7 +280,7 @@ pub fn deref_db(target: &str) -> Result<PathBuf, String> {
 /// connection and the name the prompt wears: what the server calls itself
 /// when the fleet resolved the target (so `harbor 1` prompts `ducks>`, not
 /// `1>`), the target's own stem otherwise.
-fn resolve(target: &str) -> Result<(Conn, String), String> {
+fn resolve(target: &str, spawn: &[String]) -> Result<(Conn, String), String> {
     if target.starts_with("http://") || target.starts_with("https://") {
         return Ok((Conn { transport: url_transport(target)? }, prompt_name(target)));
     }
@@ -258,7 +290,7 @@ fn resolve(target: &str) -> Result<(Conn, String), String> {
         // opened the way its path would be: joined or summoned.
         let row = fleet_find(target)?;
         if let Some(stopped) = row.stopped {
-            return Ok((Conn { transport: ensure_server(&stopped.db)? }, stopped.name));
+            return Ok((Conn { transport: ensure_server(&stopped.db, spawn)? }, stopped.name));
         }
         #[cfg(unix)]
         {
@@ -290,7 +322,7 @@ fn resolve(target: &str) -> Result<(Conn, String), String> {
         #[cfg(windows)]
         return Err("Unix socket targets are not supported on Windows; use http://host:port".into());
     }
-    Ok((Conn { transport: ensure_server(&p)? }, prompt_name(target)))
+    Ok((Conn { transport: ensure_server(&p, spawn)? }, prompt_name(target)))
 }
 
 /// Join the server that owns this file, or spawn one — this same binary,
@@ -298,10 +330,10 @@ fn resolve(target: &str) -> Result<(Conn, String), String> {
 /// socket with it when the last client leaves. The socket is identity, not
 /// registry: derived from the file's canonical path, so every spelling of the
 /// same file lands on the same server and no scan or sidecar is needed.
-fn ensure_server(path: &Path) -> Result<Transport, String> {
+fn ensure_server(path: &Path, spawn: &[String]) -> Result<Transport, String> {
     #[cfg(windows)]
     {
-        let _ = path;
+        let _ = (path, spawn);
         return Err(
             "spawn-on-use needs unix sockets; on Windows run `harbor <db> start --port <p>` \
              and connect to http://127.0.0.1:<p>"
@@ -317,7 +349,8 @@ fn ensure_server(path: &Path) -> Result<Transport, String> {
         if ready(&transport) {
             return Ok(transport);
         }
-        launch(&runtime, &canon, &sock, &[], true)?;
+        SPAWNED.store(true, std::sync::atomic::Ordering::Relaxed);
+        launch(&runtime, &canon, &sock, spawn, true)?;
         Ok(transport)
     }
 }

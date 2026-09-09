@@ -408,6 +408,10 @@ client options:
   -c \"SQL\"                     run statements and exit (stdin works too)
   --mode <m>                   duckbox, duckboxy, markdown, csv, json, jsonlines, line, list, trash
   --json                       shorthand for --mode jsonlines
+  --block-size <s>             when this call CREATES the database, its block
+                               size: 16k, 32k, 64k, 128k or 256k. Ignored,
+                               with a word, if a server is already up — the
+                               size is fixed when the file is made
 
 start options:
   --port <p>           also listen on TCP, beside the unix socket — loopback
@@ -427,7 +431,8 @@ start options:
                        64k, 128k or 256k (default: DuckDB's own 256k). Fixed
                        at creation — ignored, with a warning, for a file that
                        already exists. 64k suits many small tables; 256k suits
-                       few large ones
+                       few large ones. Also a client option, for the database
+                       a bare `harbor <db>` summons into being
   --log                log requests to stderr
   --foreground         run in this terminal until Ctrl-C, output here, no
                        prompt — for watching a server work
@@ -521,7 +526,7 @@ fn apply_berth_config(o: &mut Opts, canon: &Path, ephemeral: bool) {
         o.max_temp_size = Some(v.clone());
     }
     if let Some(v) = &c.block_size {
-        match parse_block_size(v) {
+        match harbor::parse_block_size(v) {
             Ok(n) => o.block_size = Some(n),
             Err(e) => eprintln!("harbor: ignoring block-size — {e}"),
         }
@@ -569,7 +574,7 @@ fn parse_opts(mut o: Opts, rest: Vec<String>) -> Result<Opts, String> {
             "--port" => o.port = Some(take("port")?.parse().map_err(|_| "bad --port")?),
             "--workers" => o.workers = take("workers")?.parse().map_err(|_| "bad --workers")?,
             "--memory-limit" => o.memory_limit = take("memory-limit")?,
-            "--block-size" => o.block_size = Some(parse_block_size(&take("block-size")?)?),
+            "--block-size" => o.block_size = Some(harbor::parse_block_size(&take("block-size")?)?),
             "--threads" => o.threads = Some(take("threads")?.parse().map_err(|_| "bad --threads")?),
             "--init" => o.init.push(take("init")?),
             "--log" => o.log = true,
@@ -831,29 +836,6 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> 
     Ok(())
 }
 
-/// A block size as bytes: `65536`, or a `k`/`kb`/`kib` suffix on the number
-/// people actually say — `64k`. DuckDB takes only a power of two from 16 KiB
-/// to 256 KiB, and refusing the rest HERE rather than at open means the
-/// complaint can name the flag and list the answers.
-fn parse_block_size(s: &str) -> Result<u64, String> {
-    let t = s.trim().to_ascii_lowercase();
-    let digits = t.trim_end_matches(|c: char| c.is_ascii_alphabetic());
-    let unit = &t[digits.len()..];
-    let n: u64 = digits.parse().map_err(|_| format!("bad --block-size {s:?}"))?;
-    let bytes = match unit {
-        "" | "b" => n,
-        "k" | "kb" | "kib" => n * 1024,
-        _ => return Err(format!("bad --block-size {s:?} — use bytes or a k suffix, e.g. 64k")),
-    };
-    if !(16384..=262144).contains(&bytes) || !bytes.is_power_of_two() {
-        return Err(format!(
-            "bad --block-size {s:?} — DuckDB takes a power of two from 16k to 256k \
-             (16k, 32k, 64k, 128k, 256k)"
-        ));
-    }
-    Ok(bytes)
-}
-
 fn duckdb_open(o: &Opts) -> Result<harbor::engine::conn::Conn, String> {
     // The engine loads on first use — the binary itself has no load-time
     // libduckdb dependency, so invocations that never open a database run
@@ -923,7 +905,6 @@ fn duckdb_open(o: &Opts) -> Result<harbor::engine::conn::Conn, String> {
 
 #[cfg(test)]
 mod block_size_tests {
-    use super::parse_block_size;
 
     #[test]
     fn accepts_the_five_sizes_duckdb_takes() {
@@ -936,7 +917,7 @@ mod block_size_tests {
             ("65536", 65536), // bare bytes
             (" 64k ", 65536), // trimmed
         ] {
-            assert_eq!(parse_block_size(text).unwrap(), want, "{text}");
+            assert_eq!(harbor::parse_block_size(text).unwrap(), want, "{text}");
         }
     }
 
@@ -945,11 +926,11 @@ mod block_size_tests {
         // Below the floor, above the ceiling, and a non-power-of-two between
         // them — DuckDB rejects all three, so the flag does too, by name.
         for text in ["8k", "512k", "48k", "0"] {
-            let e = parse_block_size(text).expect_err(text);
+            let e = harbor::parse_block_size(text).expect_err(text);
             assert!(e.contains("power of two from 16k to 256k"), "{text}: {e}");
         }
         // A unit that is not a unit must not be read as bytes.
-        let e = parse_block_size("64X").expect_err("64X");
+        let e = harbor::parse_block_size("64X").expect_err("64X");
         assert!(e.contains("k suffix"), "{e}");
     }
 }
