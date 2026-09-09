@@ -58,10 +58,29 @@ work=$(mktemp -d /tmp/harbor-check.XXXXXX)
 export HARBOR_HOME="$work/harbor-home"
 mkdir -p "$HARBOR_HOME"
 server_pid=""
+# Stop the shared server and wait for it, but never forever. A TERM'd
+# harbor folds its WAL and goes: a quarter second idle, half a second
+# measured against a three-million-row write. So ten seconds is not a
+# deadline a healthy server ever reaches — it is the one a WEDGED server
+# reaches, and reaching it costs a KILL rather than the run.
+#
+# Both callers need the same thing, which is why it is a function rather
+# than two copies. The mid-script call is the one that mattered: a bare
+# `wait` there is unbounded, and the EXIT trap that would have killed the
+# server cannot help, because a script stuck in `wait` never reaches EXIT.
+reap() {
+  [[ -n "$server_pid" ]] || return 0
+  kill -TERM "$server_pid" 2>/dev/null
+  for _ in $(seq 1 40); do
+    kill -0 "$server_pid" 2>/dev/null || break
+    sleep 0.25
+  done
+  kill -KILL "$server_pid" 2>/dev/null
+  wait "$server_pid" 2>/dev/null
+  server_pid=""
+}
 cleanup() {
-  [[ -n "$server_pid" ]] && kill -TERM "$server_pid" 2>/dev/null
-  sleep 0.5
-  [[ -n "$server_pid" ]] && kill -KILL "$server_pid" 2>/dev/null
+  reap
   [[ "${KEEP:-0}" == 1 ]] || rm -rf "$work"
 }
 trap cleanup EXIT
@@ -159,9 +178,15 @@ if [[ " $suites " == *" stress "* ]]; then
   oracle_sql=$("$here/test/scripts/stress.py" --dump-oracle-sql)
   mapfile_compat=()
   while IFS= read -r line; do mapfile_compat+=("$line"); done <<< "$oracle_sql"
+  # -no-init on all three. An operator's ~/.duckdbrc runs otherwise, and
+  # the flags here do not shield every setting it can carry: `-csv`
+  # overrides .mode and .separator, but nothing on this line overrides
+  # .nullvalue, which rewrites how a NULL prints. These are the ORACLE
+  # values the stress suite compares the server against — a value that
+  # depends on whose machine ran the suite is not an oracle.
   expect_sites=$(duckdb -no-init -readonly -csv -noheader "$db" -c "${mapfile_compat[0]}" | tail -1)
-  expect_top=$(duckdb   -readonly -csv -noheader "$db" -c "${mapfile_compat[1]}" | tail -1)
-  expect_join=$(duckdb  -readonly -csv -noheader "$db" -c "${mapfile_compat[2]}" | tail -1)
+  expect_top=$(duckdb   -no-init -readonly -csv -noheader "$db" -c "${mapfile_compat[1]}" | tail -1)
+  expect_join=$(duckdb  -no-init -readonly -csv -noheader "$db" -c "${mapfile_compat[2]}" | tail -1)
 fi
 run stress "$here/test/scripts/stress.py" --port "$port" \
            --levels "${SWARM_LEVELS:-1,4,16}" --seconds "${SWARM_SECONDS:-10}" \
@@ -169,7 +194,7 @@ run stress "$here/test/scripts/stress.py" --port "$port" \
            --expect-sites "${expect_sites:-}" --expect-top-plans "${expect_top:-}" \
            --expect-join "${expect_join:-}"
 
-[[ -n "$server_pid" ]] && { kill -TERM "$server_pid" 2>/dev/null; wait "$server_pid" 2>/dev/null; server_pid=""; }
+reap
 
 # ---------------------------------------------------------------------------
 # The suites that manage their own servers
