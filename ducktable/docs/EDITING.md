@@ -69,12 +69,14 @@ One meaning per key. No contextual double-agents.
 | Tab / ⇧Tab | moves the ring right / left with row-local wraparound, arming the typewriter anchor | confirms, moves right / left with row-local wraparound, and immediately edits the destination cell; anchor kept |
 | arrows | move the ring | *replace entry:* confirm + move the ring · *kept-value entry:* move the caret |
 | double-click | opens the editor keeping the value, caret at the click | — |
+| ⌘-click | adds the row to the selection, or removes it | — |
+| ⇧-click | selects every row from the anchor through this one, replacing the selection | — |
 | Esc | clears the selection | cancels the edit, restores what was there, ring stays |
 | Delete / ⌫ | clears the cell: text → `''`, everything else → NULL (NOT NULL columns refuse, with the reason in the status line) | deletes text |
 | ⌃⇧N | stages NULL explicitly, any type | — |
 | ⌘N | creates a new all-DEFAULT row and opens its first useful writable cell | — |
-| ⌘D | duplicates the selected persisted row as one staged INSERT | — |
-| ⌘⌫ | stages a row DELETE (ghost strikethrough; reversible until commit) | — |
+| ⌘D | duplicates the lead selected persisted row as one staged INSERT | — |
+| ⌘⌫ | stages a DELETE for every selected row (ghost strikethrough; each its own change, reversible until commit) | — |
 | ⌘Z / ⌘⇧Z | un-stages / re-stages the most recent change | text undo / redo |
 | ⌘S | commits all staged changes — one transaction, all or nothing | confirms the cell, then commits (⌘Enter is its equal) |
 | ⌥Enter | — | newline (the Sheets-hand twin of ⇧Enter) |
@@ -83,6 +85,14 @@ One meaning per key. No contextual double-agents.
 The replace-vs-kept-value arrow split is Sheets' own physics, unnamed:
 the entry gesture *is* the state, your finger chose it a second ago. No
 mode names, no status chip, no mid-edit toggle.
+
+## Selecting rows
+
+A click selects one row (and, in the body, seats the ring on the clicked cell). The macOS list grammar builds on it: ⌘-click toggles a row in or out, ⇧-click selects the span from the anchor through the clicked row, replacing whatever was selected. The anchor is the last row clicked without ⇧, so a second ⇧-click re-spans from the same place. The gutter and the body cells select the same way.
+
+The selection has a lead: the row the ring, the inspector, and ⌘D act on. It is the row last clicked into the selection; ⌘-clicking the lead away hands the role to the last remaining row. ⌘⌫ acts on every selected row. Esc, a page change, and a commit clear the selection whole.
+
+⇧-click in the body takes a seat that cell ranges would want (TablePro spans cells there and keeps row spans on its gutter); if cell ranges ship, body ⇧-click moves to them and the gutter keeps the row span.
 
 ## Navigation
 

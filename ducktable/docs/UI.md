@@ -62,8 +62,8 @@ a shutdown request to the database server.
 The Edit menu owns Data-grid row operations. **New Row** (Cmd+N) creates an
 all-DEFAULT draft and enters its first useful writable cell. **Duplicate Row**
 (Cmd+D) copies the selected persisted row into one staged insert, omitting its
-primary-key and generated columns. **Delete Row** (Cmd+Delete) stages the
-selected row for deletion. Inserts and deletes remain visible and undoable
+primary-key and generated columns. **Delete Row** (Cmd+Delete) stages every
+selected row for deletion (Cmd-click and Shift-click build the selection). Inserts and deletes remain visible and undoable
 until the final Cmd+S commit boundary.
 
 ## Sizing

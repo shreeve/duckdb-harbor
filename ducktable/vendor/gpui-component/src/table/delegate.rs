@@ -56,6 +56,14 @@ pub trait TableDelegate: Sized + 'static {
             .child(self.column(col_ix, cx).name.clone())
     }
 
+    /// DuckTable patch: whether the delegate counts this row as selected.
+    /// The table knows one selected row; a delegate keeping a multi-row
+    /// selection answers here so the hover wash stays off every selected
+    /// row, not only the table's own.
+    fn row_selected(&self, _row_ix: usize, _cx: &App) -> bool {
+        false
+    }
+
     /// Render the row at the given row and column.
     ///
     /// Not include the table head row.

@@ -319,7 +319,13 @@ where
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.set_selected_row(row_ix, cx);
+        // DuckTable patch: a ⌘- or ⇧-click belongs to the delegate's own
+        // multi-row selection, decided on mouse down; re-selecting the
+        // row here on mouse up would undo a ⌘-click that deselected it.
+        let m = e.modifiers();
+        if !(m.platform || m.shift) {
+            self.set_selected_row(row_ix, cx);
+        }
 
         if e.click_count() == 2 {
             cx.emit(TableEvent::DoubleClickedRow(row_ix));
@@ -1001,7 +1007,11 @@ where
                 .when(is_stripe_row, |this| this.bg(cx.theme().table_even))
                 .refine_style(&style)
                 .hover(|this| {
-                    if is_selected || self.right_clicked_row == Some(row_ix) {
+                    // DuckTable patch: the delegate's selection counts too.
+                    if is_selected
+                        || self.delegate.row_selected(row_ix, cx)
+                        || self.right_clicked_row == Some(row_ix)
+                    {
                         this
                     } else {
                         this.bg(cx.theme().table_hover)
