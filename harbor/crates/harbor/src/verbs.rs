@@ -33,9 +33,20 @@ pub enum Verb {
     Autostart,
     /// The modifier after `autostart`; never a verb on its own.
     Off,
+    /// One-shot operations on the database's CONTENTS rather than its
+    /// lifetime. They combine with nothing, so they never reach `plan` —
+    /// the dispatcher takes them first. They are Verbs only so that
+    /// `is_verb` keeps `harbor <db> backup` off the client path.
+    Backup,
+    Restore,
 }
 
 impl Verb {
+    /// A one-shot content verb: dispatched on its own, never planned.
+    pub fn is_oneshot(self) -> bool {
+        matches!(self, Verb::Backup | Verb::Restore)
+    }
+
     pub fn parse(s: &str) -> Option<Verb> {
         Some(match s {
             "attach" => Verb::Attach,
@@ -45,6 +56,8 @@ impl Verb {
             "restart" => Verb::Restart,
             "autostart" => Verb::Autostart,
             "off" => Verb::Off,
+            "backup" => Verb::Backup,
+            "restore" => Verb::Restore,
             _ => return None,
         })
     }
@@ -64,6 +77,8 @@ impl Verb {
             Verb::Restart => "restart",
             Verb::Autostart => "autostart",
             Verb::Off => "off",
+            Verb::Backup => "backup",
+            Verb::Restore => "restore",
         }
     }
 }
@@ -120,6 +135,15 @@ pub fn plan(words: &[String]) -> Result<Plan, String> {
                 return Err("'off' goes right after autostart — `autostart off`".into());
             }
             off = true;
+        }
+        // A one-shot never reaches here in practice — the dispatcher takes it
+        // first — but `has()` below would silently ignore one, and a plan that
+        // quietly drops the verb the user typed is the worst way to be wrong.
+        if v.is_oneshot() {
+            return Err(format!(
+                "'{}' is not a lifetime verb and combines with nothing — run it alone",
+                v.as_str()
+            ));
         }
         *counts.entry(v).or_insert(0) += 1;
     }
@@ -198,6 +222,21 @@ mod tests {
         assert_eq!(ok("start"), Plan { attach: None, run: Some(Running::Start), autostart: None });
         assert_eq!(ok("stop"), Plan { attach: None, run: Some(Running::Stop), autostart: None });
         assert_eq!(ok("restart"), Plan { attach: None, run: Some(Running::Restart), autostart: None });
+    }
+
+    // The one-shots are Verbs so that `is_verb` keeps `harbor <db> backup` off
+    // the client path, and the dispatcher takes them before `plan` is called.
+    // If one ever reaches here it must be refused, never absorbed: `plan` reads
+    // the bag with `has()`, so an absorbed one-shot would produce an empty plan
+    // and a silent no-op.
+    #[test]
+    fn one_shots_are_refused_by_the_plan_grammar() {
+        assert!(Verb::parse("backup").expect("a verb").is_oneshot());
+        assert!(Verb::parse("restore").expect("a verb").is_oneshot());
+        assert!(!Verb::parse("start").expect("a verb").is_oneshot());
+        assert!(err("backup").contains("run it alone"));
+        assert!(err("start backup").contains("run it alone"));
+        assert!(err("backup restore").contains("run it alone"));
     }
 
     #[test]

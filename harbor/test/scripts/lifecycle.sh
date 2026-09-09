@@ -260,6 +260,71 @@ kill -TERM "$tsrv" 2>/dev/null
 wait "$tsrv" 2>/dev/null
 tsrv=""
 
+# — backup and restore ---------------------------------------------------
+#
+# The round trip is the whole claim, and only a real EXPORT/IMPORT pair can
+# make it: the three-value dialect (bare NULL, quoted "NULL", empty field),
+# a sequence's current value, and a block size that only exists because the
+# restore created the file.
+echo
+echo "— backup and restore"
+wait_gone
+"$harbor" "$work/bk.duckdb" -c "
+  CREATE TABLE t(id INTEGER, s VARCHAR);
+  INSERT INTO t VALUES (1, 'NULL'), (2, ''), (3, NULL);
+  CREATE SEQUENCE bkseq START 42;" >/dev/null 2>&1
+wait_gone
+check "backup writes a directory of tab-separated files" 0 "backed up 1 table" \
+  "$harbor" "$work/bk.duckdb" backup "$work/bk.out"
+[[ -f $work/bk.out/schema.sql && -f $work/bk.out/load.sql && -f $work/bk.out/t.csv ]] \
+  && ok "schema.sql, load.sql and one .csv per table" \
+  || bad "the backup directory is missing a file: $(ls "$work/bk.out" 2>&1)"
+check "and refuses to write into a directory that is there" 1 "already exists" \
+  "$harbor" "$work/bk.duckdb" backup "$work/bk.out"
+# Each COPY names its file and nothing more. An absolute path would nail the
+# directory to the machine that wrote it, which is the opposite of the point.
+grep -q "FROM 't.csv'" "$work/bk.out/load.sql" \
+  && ok "load.sql names its files relatively, so the directory can move" \
+  || bad "load.sql carries a path: $(grep FROM "$work/bk.out/load.sql")"
+wait_gone
+
+check "restore builds a new database at a chosen block size" 0 "restored 1 table" \
+  "$harbor" "$work/rs.duckdb" restore "$work/bk.out" --block-size 16k
+check "the block size is the restore's, not the original's" 0 "16384" \
+  "$harbor" "$work/rs.duckdb" --mode csv -c "SELECT block_size FROM pragma_database_size()"
+# Bare NULL is a null and quoted "NULL" is the string: the failure this
+# guards is duckdb#25501, where load.sql reads both back as NULL.
+check "a bare NULL restores as a null" 0 "1" \
+  "$harbor" "$work/rs.duckdb" --mode csv -c "SELECT count(*) FROM t WHERE s IS NULL"
+check 'a quoted "NULL" restores as the string' 0 "1" \
+  "$harbor" "$work/rs.duckdb" --mode csv -c "SELECT count(*) FROM t WHERE s = 'NULL'"
+check "an empty field restores as an empty string" 0 "1" \
+  "$harbor" "$work/rs.duckdb" --mode csv -c "SELECT count(*) FROM t WHERE s = ''"
+check "a sequence restores at its current value" 0 "42" \
+  "$harbor" "$work/rs.duckdb" --mode csv -c "SELECT nextval('bkseq')"
+wait_gone
+
+# The proof of a relative load.sql: move the whole directory and restore again.
+mv "$work/bk.out" "$work/bk.moved"
+check "a moved backup directory still restores" 0 "restored 1 table" \
+  "$harbor" "$work/mv.duckdb" restore "$work/bk.moved"
+check "with its rows" 0 "3" \
+  "$harbor" "$work/mv.duckdb" --mode csv -c "SELECT count(*) FROM t"
+wait_gone
+mv "$work/bk.moved" "$work/bk.out"
+
+check "restore refuses a database that exists" 1 "only ever makes a NEW database" \
+  "$harbor" "$work/rs.duckdb" restore "$work/bk.out"
+check "and refuses a directory that is not a backup" 1 "no load.sql" \
+  "$harbor" "$work/no.duckdb" restore "$work"
+[[ -e $work/no.duckdb ]] && bad "a refused restore left a file behind" \
+                         || ok "a refused restore leaves no file behind"
+check "neither verb combines with a lifetime verb" 1 "combines with nothing" \
+  "$harbor" "$work/bk.duckdb" start backup
+check "nor with each other" 1 "runs alone" \
+  "$harbor" "$work/bk.duckdb" backup restore
+wait_gone
+
 echo
 if ((fails)); then
   echo "lifecycle: $fails failing"

@@ -157,6 +157,22 @@ to its socket name, and live discovery reads those sockets. `attach` and
 `detach` edit desired membership in config; they do not create a second live
 registry.
 
+## Backup is contents, not a file copy
+
+`backup` and `restore` are the two verbs that act on a database's contents
+rather than its lifetime, so they stand alone and take no other verb. Backup
+writes `EXPORT DATABASE` as tab-separated files with the dialect pinned —
+bare `NULL` is a null, quoted `"NULL"` is the string, an empty field is an
+empty string — because the artifact has to be greppable, diffable and
+readable by anything, which a `.duckdb` written by one engine build is not.
+Restore reads that directory into a **new** file and refuses an existing one:
+a restore that can overwrite can be run at the wrong moment and destroy what
+it was meant to protect, so putting the result into place stays a human act.
+It is also where `--block-size` is applied, block size being fixed at
+creation. Out of scope on purpose: retention, rotation, scheduling,
+compression, and remote targets — cron, a filesystem and `rsync` already do
+those, and doing them here would make harbor a backup product.
+
 ## The local access boundary
 
 Unix sockets live in a `0700` runtime directory. TCP binds IPv4 loopback only —

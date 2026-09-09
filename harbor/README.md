@@ -434,6 +434,41 @@ unlinks it. Set `HARBOR_HOME` (absolute path) to collapse configuration and
 runtime state — sockets, logs, and history — into one directory; the test
 suites use it to keep their servers out of the real fleet view.
 
+### Backup and restore
+
+A `.duckdb` file is only as portable as the engine that wrote it, so copying
+one is a snapshot, not a backup. `backup` writes the durable thing instead —
+`schema.sql`, `load.sql`, and one tab-separated file per table:
+
+```console
+$ harbor medlabs backup
+harbor: backed up 14 tables to ~/db/medlabs.backups/20260909044118 (612K)
+harbor: restore it with — harbor <new.duckdb> restore ~/db/medlabs.backups/20260909044118
+
+$ harbor fresh.duckdb restore ~/db/medlabs.backups/20260909044118 --block-size 64k
+harbor: restored 14 tables into fresh.duckdb (740K)
+```
+
+Tab-separated rather than parquet, deliberately: both round-trip exactly and
+both come to about the same size, so the tie goes to what you can do with the
+artifact six months from now — grep it, diff two of them, read one in an
+editor, keep one in a repo. Three values and one escape cover the whole
+dialect: a bare `NULL` is a real null, a quoted `"NULL"` is the string, and an
+empty field is an empty string. Sequences come back at their current value and
+indexes come back with them.
+
+The directory is self-contained. Each `COPY` in `load.sql` names its file and
+nothing more, so the backup can be moved, renamed, copied to another machine
+or committed to a repo and still restore — an absolute path would have nailed
+it to the machine that wrote it.
+
+`restore` always builds a **new** file and refuses one that exists. A restore
+that can overwrite is a restore that can be run at the wrong moment and take
+the very thing it was meant to protect; moving the restored file into place is
+a human's job, and a deliberate one. It is also the only moment `--block-size`
+can be applied, since DuckDB fixes that when a file is created and offers no
+`ALTER` — which makes `backup` then `restore` the way to change it.
+
 ### Sockets and TCP
 
 The Unix socket is always there, protected by the `0700` runtime directory.

@@ -4,6 +4,28 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by signed tag date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## Unreleased
+
+- Adds `harbor <db> backup [dir]` and `harbor <new.duckdb> restore <dir>`.
+  A `.duckdb` file is only as portable as the engine that wrote it, so
+  copying one is a snapshot, not a backup; `backup` writes the durable thing
+  — `schema.sql`, `load.sql`, and one tab-separated file per table — with the
+  dialect pinned so the pair agree: a bare `NULL` is a null, a quoted
+  `"NULL"` is the string, an empty field is an empty string. `restore` builds
+  a **new** database and refuses one that exists, since a restore that can
+  overwrite can be run at the wrong moment and destroy what it was meant to
+  protect. It is also where `--block-size` applies, block size being fixed at
+  creation. The directory is self-contained — each `COPY` names its file and
+  nothing more — so a backup can be moved, renamed, copied to another machine
+  or committed to a repo and still restore. The two act on contents rather
+  than lifetime, so they stand alone and combine with no other verb.
+  Retention, rotation, scheduling, compression and remote targets stay out:
+  cron, a filesystem and `rsync` already do those.
+- `--block-size` now also works on the summon — `harbor <db> --block-size 64k
+  -c "..."` shapes the database that call creates, instead of the size being
+  reachable only through an explicit `start`. A size that reached nothing,
+  because a server was already up or the file already existed, says so.
+
 ## 0.34.0 — 2026-09-09
 
 - **`USE` outside a session is now refused instead of silently discarded.**

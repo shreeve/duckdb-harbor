@@ -325,6 +325,31 @@ fn resolve(target: &str, spawn: &[String]) -> Result<(Conn, String), String> {
     Ok((Conn { transport: ensure_server(&p, spawn)? }, prompt_name(target)))
 }
 
+/// Run statements against `target` in order, rendering nothing, stopping at
+/// the first that fails. The management verbs that are really SQL underneath
+/// — backup, restore — go through the same resolve/summon path a client
+/// does, so they inherit spawn-on-use, the error shapes, and Ctrl-C for free.
+/// Errors are reported by run_sql itself; this only says whether they got
+/// through.
+///
+/// A LIST rather than one string: a group-expanding statement (`IMPORT
+/// DATABASE`) is many statements once the parser has it, so it can never
+/// share a request with anything else. One anchor covers the lot, since a
+/// summoned server would otherwise depart between two of them.
+pub fn exec_quiet(target: &str, sql: &[&str], spawn: &[String]) -> Result<(), String> {
+    let (conn, _name) = resolve(target, spawn)?;
+    let _anchor = http::hold(&conn.transport);
+    let opts = RenderOpts { mode: Mode::Trash, ..RenderOpts::default() };
+    for one in sql {
+        match run_sql(&conn, one, &opts) {
+            Outcome::Done => {}
+            Outcome::Cancelled => return Err("interrupted".into()),
+            Outcome::Failed => return Err("the statement failed".into()),
+        }
+    }
+    Ok(())
+}
+
 /// Join the server that owns this file, or spawn one — this same binary,
 /// detached and refcounted: it lives while anyone is connected and takes its
 /// socket with it when the last client leaves. The socket is identity, not
