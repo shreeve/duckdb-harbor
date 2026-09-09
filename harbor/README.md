@@ -434,6 +434,91 @@ unlinks it. Set `HARBOR_HOME` (absolute path) to collapse configuration and
 runtime state — sockets, logs, and history — into one directory; the test
 suites use it to keep their servers out of the real fleet view.
 
+### Backup and restore
+
+A `.duckdb` file is only as portable as the engine that wrote it, so copying
+one is a snapshot, not a backup. `backup` writes the durable thing instead —
+`schema.sql`, `load.sql`, and one tab-separated file per table:
+
+```console
+$ harbor medlabs backup
+harbor: backed up 14 tables to ~/db/medlabs.backups/20260909044118 (612K)
+harbor: restore it with — harbor <new.duckdb> restore ~/db/medlabs.backups/20260909044118
+
+$ harbor fresh.duckdb restore ~/db/medlabs.backups/20260909044118 --block-size 64k
+harbor: restored 14 tables into fresh.duckdb (740K)
+```
+
+Tab-separated rather than parquet, deliberately: both round-trip exactly and
+both come to about the same size, so the tie goes to what you can do with the
+artifact six months from now — grep it, diff two of them, read one in an
+editor, keep one in a repo. Sequences come back at their current value and
+indexes come back with them.
+
+Three values and one escape cover the whole dialect: a bare `NULL` is a real
+null, a quoted `"NULL"` is the string, and an empty field is an empty string.
+Quotes are always *allowed* and rarely *required* — a value containing a tab,
+a newline or a quote is wrapped and a `"` inside doubles to `""` (RFC 4180,
+which every CSV reader already knows), and everything else is written plain.
+Nothing is backslash-escaped, so a backslash in the data is only ever a
+backslash. The reader takes a bare field and a written `""` the same way, so a
+backup stays editable by hand.
+
+One file per backup may look different, and it is a row of data rather than a
+matter of taste. A one-column table holding an empty string would write an
+empty LINE, and every CSV reader skips those — that row would not come back
+and nothing would say so. `FORCE_QUOTE` is the only lever DuckDB offers and it
+takes a column list rather than a predicate, so it is spent per file: a table
+whose export contains a blank record is written again with every value quoted,
+said out loud, and no other file pays for it. One thing worth knowing before
+you reach for `wc -l`: a value holding a newline spans physical lines, so a
+row is a record, not always a line.
+
+**Neither format holds every type**, and that is why `--format` exists:
+
+| | tsv | parquet |
+| --- | --- | --- |
+| `UNION` | loses its tag — the restore refuses | ✅ |
+| `VARIANT` | contents come back retyped, *silently* | ✅ |
+| negative `INTERVAL` | ✅ | refused outright |
+| `TIMETZ` with an offset | ✅ | normalised to UTC, *silently* |
+
+Each hole is the other format's solid ground, so a table the chosen format
+cannot carry is written in the other one and said out loud:
+
+```console
+$ harbor mydata.duckdb backup
+harbor: settings is parquet, not text — a VARIANT's contents come back retyped
+harbor: backed up 14 tables to ~/db/mydata.backups/20260909051315 (612K)
+```
+
+`load.sql` names the format per table, so the directory stays self-describing
+and the choice is visible in `ls`. A database with one variant column keeps
+every other table greppable. `--format parquet` asks for one format
+throughout — with the same swap running the other way for a `TIMETZ` column —
+and `--strict` refuses rather than swapping, for a backup that has to be one
+format or nothing. What no mode will do is write something that will not come
+back: a negative interval under `--format parquet` is an error, not a
+surprise six months from now.
+
+The whole of this is a test suite rather than a claim: `test/scripts/roundtrip.py`
+backs up and restores every type in the shared corpus, a schema of constraints
+and indexes and views and sequences, the strings that attack the format, and a
+seeded fuzz of random tables — then attaches both databases and asks DuckDB
+whether anything differs.
+
+The directory is self-contained. Each `COPY` in `load.sql` names its file and
+nothing more, so the backup can be moved, renamed, copied to another machine
+or committed to a repo and still restore — an absolute path would have nailed
+it to the machine that wrote it.
+
+`restore` always builds a **new** file and refuses one that exists. A restore
+that can overwrite is a restore that can be run at the wrong moment and take
+the very thing it was meant to protect; moving the restored file into place is
+a human's job, and a deliberate one. It is also the only moment `--block-size`
+can be applied, since DuckDB fixes that when a file is created and offers no
+`ALTER` — which makes `backup` then `restore` the way to change it.
+
 ### Sockets and TCP
 
 The Unix socket is always there, protected by the `0700` runtime directory.

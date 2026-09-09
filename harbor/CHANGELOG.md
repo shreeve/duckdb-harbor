@@ -4,6 +4,56 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by signed tag date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.35.0 — 2026-09-09
+
+- Adds `harbor <db> backup [dir]` and `harbor <new.duckdb> restore <dir>`.
+  A `.duckdb` file is only as portable as the engine that wrote it, so copying
+  one is a snapshot, not a backup. `backup` writes the durable thing —
+  `schema.sql`, `load.sql`, and one tab-separated file per table — greppable,
+  diffable, and readable by anything.
+- The dialect is three values and one escape: a bare `NULL` is a real null, a
+  quoted `"NULL"` is the string, an empty field is an empty string. Quotes are
+  always allowed and rarely required — the reader takes a bare field and a
+  written `""` the same way, so a backup stays editable by hand.
+- One exception, and it is a row of data rather than a matter of taste: a
+  one-column table holding an empty string writes an empty LINE, and every CSV
+  reader skips those — the row would not come back and nothing would say so.
+  `FORCE_QUOTE` takes a column list rather than a predicate, so it is spent per
+  FILE: a table whose export contains a blank record is written again with
+  every value quoted, and no other file pays for it. The test is the failure
+  itself rather than a proxy — a blank record between rows, walked
+  quote-aware, so a blank line inside a multi-line value is left alone.
+- The backup directory is self-contained. Each `COPY` names its file and
+  nothing more, so it can be moved, renamed, copied to another machine or
+  committed to a repo and still restore — an absolute path would have nailed
+  it to the machine that wrote it.
+- `restore` builds a **new** database and refuses one that exists, since a
+  restore that can overwrite can be run at the wrong moment and destroy what
+  it was meant to protect. It is also where `--block-size` applies, block size
+  being fixed at creation. Both verbs act on contents rather than lifetime, so
+  they stand alone and combine with no other verb. Retention, rotation,
+  scheduling, compression and remote targets stay out: cron, a filesystem and
+  `rsync` already do those.
+- `backup` takes `--format tsv|parquet` and `--strict`. Neither format holds
+  every type and the holes are not the same shape: text loses a `UNION`'s tag
+  (the restore then refuses) and retypes a `VARIANT`'s contents (it does not),
+  while parquet refuses a negative `INTERVAL` outright and normalises a
+  `TIMETZ` to UTC — `12:00:00+02:30` returns as `09:30:00+00`, the same
+  instant, a different value, and nothing said. Each hole is the other
+  format's solid ground, so a table the chosen format cannot carry is written
+  in the other one and named out loud, with `load.sql` recording the format
+  per table. `--strict` refuses instead of swapping. The rule under all three
+  is the same: never write something that will not come back.
+- New `roundtrip` suite: back up and restore every type in the shared corpus,
+  a schema of constraints, indexes, views and sequences, the strings that
+  attack the format, and a seeded fuzz of random tables — then attach both
+  databases and ask DuckDB whether anything differs, rather than reading the
+  export back and finding the writer agrees with the writer.
+- `--block-size` now also works on the summon — `harbor <db> --block-size 64k
+  -c "..."` shapes the database that call creates, instead of the size being
+  reachable only through an explicit `start`. A size that reached nothing,
+  because a server was already up or the file already existed, says so.
+
 ## 0.34.0 — 2026-09-09
 
 - **`USE` outside a session is now refused instead of silently discarded.**

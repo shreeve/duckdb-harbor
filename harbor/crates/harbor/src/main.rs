@@ -11,6 +11,8 @@
 //!   harbor <name> | <footnote>    a listed database, by its name or its
 //!                                 number in the list — running or stopped
 //!   harbor <db.duckdb> start      bring it up in the background, until you stop it
+//!   harbor <db.duckdb> backup     its contents, as files you can read
+//!   harbor <new.duckdb> restore <dir>  a new database from those files
 //!
 //! The socket IS the runtime registration: its name is derived from the
 //! database's canonical path (`socket_for`). Shared config supplies named
@@ -30,6 +32,7 @@ use verbs::Running;
 use harbor_common::membership::{self, Attached};
 use harbor_common::perms::chmod;
 
+mod backup;
 mod verbs;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -69,6 +72,35 @@ fn main() -> ExitCode {
         return harbor::repl::cli_main(std::iter::once(db).chain(args));
     }
     let verb_words: Vec<String> = args.drain(..split).collect();
+
+    // The one-shots come off first. They act on the database's CONTENTS, not
+    // its lifetime, so they combine with nothing and carry their own flags —
+    // neither of which the plan grammar has anywhere to put.
+    if let Some(v) = verbs::Verb::parse(&verb_words[0]).filter(|v| v.is_oneshot()) {
+        if verb_words.len() > 1 {
+            eprintln!("harbor: {} runs alone — drop {}", verb_words[0], verb_words[1..].join(" "));
+            return ExitCode::FAILURE;
+        }
+        let db = match db_path(&db) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("harbor: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let done = match v {
+            verbs::Verb::Backup => backup::backup(&db, &args),
+            _ => backup::restore(&db, &args),
+        };
+        return match done {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("harbor: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let plan = match verbs::plan(&verb_words) {
         Ok(p) => p,
         Err(e) => {
@@ -76,19 +108,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // A bare word in front of a verb means a listed database (`harbor medlabs
-    // stop`, `harbor 3 start`), dereferenced to the file a running server
-    // declares or a config entry names — never a file made from the word
-    // (the safety law in looks_like_path).
-    let db = if harbor_common::looks_like_path(&db) {
-        PathBuf::from(db)
-    } else {
-        match harbor::repl::deref_db(&db) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("harbor: {e}");
-                return ExitCode::FAILURE;
-            }
+    let db = match db_path(&db) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("harbor: {e}");
+            return ExitCode::FAILURE;
         }
     };
     let flags = args; // whatever followed the verbs — start's, and only start's
@@ -309,6 +333,18 @@ fn main() -> ExitCode {
     }
 }
 
+/// A bare word in front of a verb means a LISTED database (`harbor medlabs
+/// stop`, `harbor 3 start`), dereferenced to the file a running server
+/// declares or a config entry names — never a file made from the word (the
+/// safety law in `looks_like_path`).
+fn db_path(db: &str) -> Result<PathBuf, String> {
+    if harbor_common::looks_like_path(db) {
+        Ok(PathBuf::from(db))
+    } else {
+        harbor::repl::deref_db(db)
+    }
+}
+
 /// The session manager starts a server asynchronously: block until it
 /// answers on its socket, or say why not with the log to read. The same
 /// budget a summon gives its child. A start that never comes up is taken
@@ -384,6 +420,21 @@ usage:
   harbor <db.duckdb> attach    add this database to your list (config.toml) —
                                a listed database is persistent when started
   harbor <db.duckdb> detach    remove it from your list (and its login item)
+  harbor <db.duckdb> backup [dir] [--format tsv|parquet] [--strict]
+                               write its CONTENTS to a directory: schema.sql,
+                               load.sql, and one file per table. Tab-separated
+                               by default — greppable, diffable, readable by
+                               anything, unlike the .duckdb file itself.
+                               Defaults to <db>.backups/<stamp>, and never
+                               writes into a directory that is there.
+                               Neither format holds every type, so a table the
+                               chosen one cannot carry is written in the other
+                               and said out loud; --strict refuses instead
+  harbor <new.duckdb> restore <dir> [--block-size <s>]
+                               build a NEW database from a backup directory.
+                               Refuses an existing file, always — moving the
+                               restored one into place is a human's job. The
+                               only moment block size can be chosen
   harbor <db.duckdb> autostart keep it running: starts now under launchd or
                                systemd, at every login, and again after a
                                crash (implies attach; `autostart stop` arms
@@ -393,11 +444,12 @@ usage:
                                alone (`autostart off stop` takes both down)
   harbor version               print this binary's version (also -V)
 
-Verbs combine, in any order: `attach start` remembers it and starts it
-persistent; `detach start` starts an ephemeral one (it leaves when its last
-client does); `attach` alone just
-lists it. At most one of attach/detach and one of start/stop/restart.
-A login item runs a bare `start`, so its options live in config.toml under
+backup and restore stand alone: they act on a database's contents rather than
+its lifetime, so they take no other verb. The rest combine, in any order:
+`attach start` remembers it and starts it persistent; `detach start` starts
+an ephemeral one (it leaves when its last client does); `attach` alone just
+lists it. At most one of attach/detach and one of start/stop/restart. A login
+item runs a bare `start`, so its options live in config.toml under
 [connection.<name>] — statement-timeout, memory-limit, workers, threads, init.
 
 The two lifetimes, in one breath — bare: the server is everyone's, it lives
