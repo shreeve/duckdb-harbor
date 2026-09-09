@@ -278,10 +278,11 @@ pub(crate) struct GridDelegate {
     /// placeholders; fetched rows retain exact values so Duplicate Row
     /// never round-trips through display formatting.
     raw_rows: Vec<Vec<Value>>,
-    /// Mirror of the table's selected row (synced from TableEvent), so
-    /// render_tr can tint the selection — the delegate cannot read the
-    /// TableState it is rendering inside.
-    selected: Option<usize>,
+    /// Every selected row, and the one that leads them (docs/EDITING.md
+    /// "Selecting rows"). The lead mirrors the table's own selected row
+    /// (synced from TableEvent) — the delegate cannot read the TableState
+    /// it is rendering inside, so render_tr tints from here.
+    selection: RowSelection,
     /// The Sheets corner state: "#" was clicked, every cell highlights,
     /// and the next divider double-click fits the whole table. Any
     /// ordinary cell or row click disarms it.
@@ -432,7 +433,7 @@ impl Grid {
             gutter,
             rows: Vec::new(),
             raw_rows: Vec::new(),
-            selected: None,
+            selection: RowSelection::default(),
             all_selected: false,
             active_cell: None,
             loading: false,
@@ -516,7 +517,7 @@ impl Grid {
                     let ix = *ix;
                     table.update(cx, |state, cx| {
                         let d = state.delegate_mut();
-                        d.selected = Some(ix);
+                        d.selection.lead_on(Some(ix));
                         // Keyboard row moves carry the active-cell ring to
                         // the same column of the new row (Sheets' arrow
                         // behavior).
@@ -584,9 +585,9 @@ impl Grid {
                 // That intentional `real = None` is not an Escape and must
                 // not erase the active-cell ring (especially between a
                 // Tab-confirm and opening its destination editor).
-                let dirty_mirror = d.selected.is_some_and(|row| d.row_dirty(row));
-                if should_reconcile_selection(real, d.selected, dirty_mirror) {
-                    d.selected = real;
+                let dirty_mirror = d.selection.lead.is_some_and(|row| d.row_dirty(row));
+                if should_reconcile_selection(real, d.selection.lead, dirty_mirror) {
+                    d.selection.lead_on(real);
                     if real.is_none() {
                         d.active_cell = None;
                     }
@@ -780,7 +781,7 @@ impl Grid {
                             } else {
                                 d.adopt_rows(result.rows, base);
                             }
-                            d.selected = None;
+                            d.selection.clear();
                             d.active_cell = None;
                             d.editing = None;
                             d.editor_input = None;
@@ -1189,7 +1190,7 @@ impl Grid {
     /// tints from.
     pub(crate) fn row_kv(&self, cx: &App) -> Option<Vec<(SharedString, SharedString, bool)>> {
         let d = self.table.read(cx).delegate();
-        let row_ix = d.selected?;
+        let row_ix = d.selection.lead?;
         let row = d.rows.get(row_ix)?;
         let is_draft = d.draft_key(row_ix).is_some();
         Some(
@@ -1259,7 +1260,7 @@ impl Grid {
         }
         let (identity, mut raw, first_schema, pk_ix) = {
             let d = self.table.read(cx).delegate();
-            let row = d.selected.or(d.active_cell.map(|(row, _)| row));
+            let row = d.selection.lead.or(d.active_cell.map(|(row, _)| row));
             let Some(row) = row else { return };
             // A draft is already an INSERT. Duplicate Row deliberately
             // targets persisted rows so it always has exact source values.
@@ -1445,7 +1446,7 @@ impl Grid {
         }
         if m.platform && m.shift && ks.key == "backspace" {
             // ⌘⇧⌫, TablePlus's own chord: discard everything staged —
-            // each discard is an undo entry, so even this is reversible.
+            // one undo entry, so even this is reversible.
             self.discard_all(cx);
             cx.stop_propagation();
             return;
@@ -2020,24 +2021,33 @@ impl Grid {
         self.stage_delete_row(cx);
     }
 
-    /// Stage the selected row's DELETE — visible, ghosted, reversible
-    /// until commit. No dialog: reversibility is the confirmation model.
+    /// Stage a DELETE for every selected row — visible, ghosted,
+    /// reversible until commit. No dialog: reversibility is the
+    /// confirmation model. Each row is its own staged change for the
+    /// review popover; the gesture is one ⌘Z.
     fn stage_delete_row(&mut self, cx: &mut Context<Self>) {
-        let (identity, draft_key) = {
+        let targets: Vec<(Option<Vec<Value>>, Option<String>)> = {
             let d = self.table.read(cx).delegate();
-            let row = d.selected
-                .or(d.active_cell.map(|(r, _)| r))
-                .unwrap_or(usize::MAX);
-            (d.identities.get(row).cloned(), d.draft_key(row).map(str::to_string))
+            let rows: Vec<usize> = if d.selection.rows.is_empty() {
+                d.active_cell.map(|(r, _)| r).into_iter().collect()
+            } else {
+                d.selection.rows.iter().copied().collect()
+            };
+            rows.into_iter()
+                .map(|row| (d.identities.get(row).cloned(), d.draft_key(row).map(str::to_string)))
+                .collect()
         };
-        if let Some(edits) = &mut self.edits {
-            if let Some(key) = draft_key {
-                edits.discard(&key);
-            } else if let Some(identity) = identity {
-                edits.stage_delete(identity);
+        let Some(edits) = &mut self.edits else { return };
+        edits.grouped(|edits| {
+            for (identity, draft_key) in targets {
+                if let Some(key) = draft_key {
+                    edits.discard(&key);
+                } else if let Some(identity) = identity {
+                    edits.stage_delete(identity);
+                }
             }
-            self.sync_staged(cx);
-        }
+        });
+        self.sync_staged(cx);
     }
 
     /// PageUp/PageDown: one screenful within the loaded page — Sheets'
@@ -2088,6 +2098,10 @@ impl Grid {
             let d = state.delegate_mut();
             d.active_cell = None;
             d.tab_anchor = None;
+            // Cleared here, not left to the reconcile observer: a dirty
+            // lead deliberately has no library selection to lose, so the
+            // observer would read the Escape as nothing having happened.
+            d.selection.clear();
             state.clear_selection(cx);
             cx.notify();
         });
@@ -2286,7 +2300,7 @@ impl Grid {
                 }
             }
             if draft_shape_changed {
-                d.selected = None;
+                d.selection.clear();
                 d.active_cell = None;
                 d.editing = None;
                 d.editor_input = None;
@@ -2301,7 +2315,7 @@ impl Grid {
             }
             // Dirtiness just changed under the selection: re-decide the
             // wash (undoing a row's last edit gives its wash back).
-            if let Some(row) = state.delegate().selected {
+            if let Some(row) = state.delegate().selection.lead {
                 select_row(state, row, cx);
             }
             state.refresh(cx);
@@ -2342,15 +2356,17 @@ impl Grid {
         self.sync_staged(cx);
     }
 
-    /// Discard everything staged — as individual discards, so each one
-    /// stays on the undo stack.
+    /// Discard everything staged — one gesture, one undo step, so ⌘Z
+    /// brings all of it back at once.
     pub(crate) fn discard_all(&mut self, cx: &mut Context<Self>) {
         if let Some(e) = &mut self.edits {
             let keys: Vec<String> =
                 e.entries().iter().map(|(k, _, _)| k.to_string()).collect();
-            for key in keys {
-                e.discard(&key);
-            }
+            e.grouped(|e| {
+                for key in keys {
+                    e.discard(&key);
+                }
+            });
         }
         self.sync_staged(cx);
     }
@@ -2484,7 +2500,7 @@ impl Grid {
                             d.rebuild_cols();
                             state.clear_selection(cx);
                             let d = state.delegate_mut();
-                            d.selected = None;
+                            d.selection.clear();
                             d.active_cell = None;
                             state.refresh(cx);
                             cx.notify();
@@ -2543,23 +2559,144 @@ impl Grid {
     }
 }
 
-/// Select a row the dirty-aware way. The delegate always records it —
-/// the ring and ⌘⌫ need a selected row — but the library's selection
-/// (the blue row wash) is only requested for clean rows: once a row
-/// carries staged changes, its amber or red owns the story, and two
-/// washes fighting on one row read as confusion, not state.
+/// Make a row the selection's lead the dirty-aware way. The delegate
+/// always records it — the ring and ⌘⌫ need a selected row — but the
+/// library's selection (the blue row wash) is only requested for clean
+/// rows: once a row carries staged changes, its amber or red owns the
+/// story, and two washes fighting on one row read as confusion, not
+/// state. A row not yet in the selection replaces it.
 fn select_row(
     state: &mut TableState<GridDelegate>,
     row: usize,
     cx: &mut Context<TableState<GridDelegate>>,
 ) {
-    state.delegate_mut().selected = Some(row);
+    state.delegate_mut().selection.lead_on(Some(row));
     if state.delegate().row_dirty(row) {
         state.clear_selection(cx);
-        state.delegate_mut().selected = Some(row);
+        state.delegate_mut().selection.lead_on(Some(row));
         state.scroll_to_row(row, cx);
     } else {
         state.set_selected_row(row, cx);
+    }
+}
+
+/// Route a click on a row through the selection grammar, then seat the
+/// library on the new lead. Returns that lead — None when the click
+/// emptied the selection, which the library learns about through
+/// clear_selection. A click that deselects the ring's row takes the ring
+/// with it, from the gutter and the body alike: a ring on a row the
+/// selection no longer includes would lie about where the keys act.
+fn click_row(
+    state: &mut TableState<GridDelegate>,
+    row: usize,
+    kind: ClickKind,
+    cx: &mut Context<TableState<GridDelegate>>,
+) -> Option<usize> {
+    let d = state.delegate_mut();
+    let lead = d.selection.click(row, kind);
+    if !d.selection.contains(row) && d.active_cell.is_some_and(|(r, _)| r == row) {
+        d.active_cell = None;
+    }
+    match lead {
+        Some(lead) => select_row(state, lead, cx),
+        None => state.clear_selection(cx),
+    }
+    lead
+}
+
+/// What a click on a row means for the selection — the macOS list
+/// grammar (Finder, NSTableView, TablePro's row gutter): plain replaces,
+/// ⌘ toggles one row, ⇧ spans from the anchor. ⇧ wins when both are down.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClickKind {
+    Plain,
+    Toggle,
+    Extend,
+}
+
+impl ClickKind {
+    fn of(m: &Modifiers) -> Self {
+        if m.shift {
+            Self::Extend
+        } else if m.platform {
+            Self::Toggle
+        } else {
+            Self::Plain
+        }
+    }
+}
+
+/// The rows a grid has selected. `rows` is every one of them; `lead` is
+/// the one the ring, the inspector, and the library's own selection
+/// follow; `anchor` is where the next ⇧-click spans from. All display
+/// positions, like every selection index here (docs/DESIGN.md). Invariant:
+/// the lead is in `rows`, and an empty selection has no lead.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+struct RowSelection {
+    rows: std::collections::BTreeSet<usize>,
+    lead: Option<usize>,
+    anchor: Option<usize>,
+}
+
+impl RowSelection {
+    /// Apply a click and return the new lead.
+    fn click(&mut self, row: usize, kind: ClickKind) -> Option<usize> {
+        match kind {
+            ClickKind::Plain => {
+                self.rows.clear();
+                self.rows.insert(row);
+                self.anchor = Some(row);
+                self.lead = Some(row);
+            }
+            ClickKind::Toggle => {
+                self.anchor = Some(row);
+                if self.rows.remove(&row) {
+                    // Deselecting the lead hands the role to the last
+                    // remaining row; deselecting any other row leaves
+                    // the lead where it was, so nothing scrolls.
+                    if self.lead == Some(row) {
+                        self.lead = self.rows.iter().next_back().copied();
+                    }
+                } else {
+                    self.rows.insert(row);
+                    self.lead = Some(row);
+                }
+            }
+            ClickKind::Extend => {
+                // The span REPLACES the selection rather than joining it,
+                // the way Finder and TablePro read a ⇧-click; the anchor
+                // stays put so a second ⇧-click re-spans from the same row.
+                let anchor = self.anchor.unwrap_or(row);
+                self.rows = (anchor.min(row)..=anchor.max(row)).collect();
+                self.anchor = Some(anchor);
+                self.lead = Some(row);
+            }
+        }
+        self.lead
+    }
+
+    /// Adopt a lead chosen elsewhere — the library's own click, or a
+    /// re-select after staging changed a row's wash. A lead already
+    /// selected keeps the rest of the selection; any other row replaces
+    /// it; None empties it.
+    fn lead_on(&mut self, row: Option<usize>) {
+        match row {
+            Some(row) if self.rows.contains(&row) => self.lead = Some(row),
+            Some(row) => {
+                self.click(row, ClickKind::Plain);
+            }
+            None => self.clear(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.rows.clear();
+        self.lead = None;
+        self.anchor = None;
+    }
+
+    fn contains(&self, row: usize) -> bool {
+        self.rows.contains(&row)
     }
 }
 
@@ -2847,9 +2984,9 @@ impl TableDelegate for GridDelegate {
                 .border_color(t.grid_line)
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |state, _, _, cx| {
+                    cx.listener(move |state, e: &MouseDownEvent, _, cx| {
                         state.delegate_mut().all_selected = false;
-                        select_row(state, row_ix, cx);
+                        click_row(state, row_ix, ClickKind::of(&e.modifiers), cx);
                     }),
                 )
                 .child(
@@ -3014,15 +3151,20 @@ impl TableDelegate for GridDelegate {
             )
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |state, _, _, cx| {
+                cx.listener(move |state, e: &MouseDownEvent, _, cx| {
                     // Row and cell select together on mouse DOWN — the
                     // Table's own row selection waits for the click (mouse
                     // up), which reads as lag next to the ring.
                     let d = state.delegate_mut();
                     d.all_selected = false;
-                    d.active_cell = Some((row_ix, data_col));
                     d.tab_anchor = None;
-                    select_row(state, row_ix, cx);
+                    let lead = click_row(state, row_ix, ClickKind::of(&e.modifiers), cx);
+                    // The ring sits on the clicked cell while its row is
+                    // selected; click_row has already dropped it if the
+                    // click deselected the row.
+                    if lead == Some(row_ix) {
+                        state.delegate_mut().active_cell = Some((row_ix, data_col));
+                    }
                     cx.notify();
                 }),
             )
@@ -3234,7 +3376,7 @@ impl TableDelegate for GridDelegate {
         div()
             .id(("row", row_ix))
             .relative()
-            .when(self.selected == Some(row_ix), |d| {
+            .when(self.selection.contains(row_ix), |d| {
                 d.bg(t.row_active).child(
                     // The Table makes the selected row's own bottom border
                     // transparent (expecting its overlay border, which the
@@ -3253,6 +3395,12 @@ impl TableDelegate for GridDelegate {
 
     fn loading(&self, _: &App) -> bool {
         self.loading && self.rows.is_empty()
+    }
+
+    /// Keeps the Table's hover wash off every selected row, not only the
+    /// lead it knows about.
+    fn row_selected(&self, row_ix: usize, _: &App) -> bool {
+        self.selection.contains(row_ix)
     }
 }
 
@@ -3851,9 +3999,10 @@ fn should_reconcile_selection(
 #[cfg(test)]
 mod tests {
     use super::{
-        conditional_hint_min_width, draft_hint_min_width, duplicate_values,
-        should_reconcile_selection, wrapped_step,
+        ClickKind, RowSelection, conditional_hint_min_width, draft_hint_min_width,
+        duplicate_values, should_reconcile_selection, wrapped_step,
     };
+    use gpui::Modifiers;
     use serde_json::{Value, json};
 
     #[test]
@@ -3881,6 +4030,77 @@ mod tests {
         assert!(should_reconcile_selection(None, Some(0), false));
         assert!(should_reconcile_selection(Some(1), Some(0), true));
         assert!(!should_reconcile_selection(Some(0), Some(0), false));
+    }
+
+    fn rows(sel: &RowSelection) -> Vec<usize> {
+        sel.rows.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_plain_click_replaces_the_selection_and_moves_the_anchor() {
+        let mut sel = RowSelection::default();
+        assert_eq!(sel.click(4, ClickKind::Plain), Some(4));
+        sel.click(7, ClickKind::Toggle);
+        assert_eq!(sel.click(2, ClickKind::Plain), Some(2));
+        assert_eq!(rows(&sel), vec![2]);
+        assert_eq!(sel.anchor, Some(2));
+    }
+
+    #[test]
+    fn a_command_click_toggles_one_row_and_keeps_the_lead_unless_it_left() {
+        let mut sel = RowSelection::default();
+        sel.click(3, ClickKind::Plain);
+        assert_eq!(sel.click(6, ClickKind::Toggle), Some(6));
+        assert_eq!(sel.click(1, ClickKind::Toggle), Some(1));
+        assert_eq!(rows(&sel), vec![1, 3, 6]);
+        // Removing a row that is not the lead leaves the lead alone.
+        assert_eq!(sel.click(3, ClickKind::Toggle), Some(1));
+        // Removing the lead hands it to the last remaining row.
+        assert_eq!(sel.click(1, ClickKind::Toggle), Some(6));
+        assert_eq!(sel.anchor, Some(1));
+        // Emptying the selection leaves no lead and no anchor to span from.
+        assert_eq!(sel.click(6, ClickKind::Toggle), None);
+        assert!(rows(&sel).is_empty());
+        assert_eq!(sel.anchor, Some(6));
+    }
+
+    #[test]
+    fn a_shift_click_spans_from_the_anchor_in_either_direction() {
+        let mut sel = RowSelection::default();
+        sel.click(5, ClickKind::Plain);
+        assert_eq!(sel.click(8, ClickKind::Extend), Some(8));
+        assert_eq!(rows(&sel), vec![5, 6, 7, 8]);
+        // A second ⇧-click re-spans from the same anchor, replacing the first.
+        assert_eq!(sel.click(3, ClickKind::Extend), Some(3));
+        assert_eq!(rows(&sel), vec![3, 4, 5]);
+        assert_eq!(sel.anchor, Some(5));
+        // With nothing to span from, ⇧-click is a plain click.
+        let mut fresh = RowSelection::default();
+        assert_eq!(fresh.click(2, ClickKind::Extend), Some(2));
+        assert_eq!(rows(&fresh), vec![2]);
+    }
+
+    #[test]
+    fn a_lead_chosen_elsewhere_joins_or_replaces_the_selection() {
+        let mut sel = RowSelection::default();
+        sel.click(1, ClickKind::Plain);
+        sel.click(4, ClickKind::Extend);
+        sel.lead_on(Some(2));
+        assert_eq!(rows(&sel), vec![1, 2, 3, 4]);
+        assert_eq!(sel.lead, Some(2));
+        sel.lead_on(Some(9));
+        assert_eq!(rows(&sel), vec![9]);
+        sel.lead_on(None);
+        assert_eq!(sel, RowSelection::default());
+    }
+
+    #[test]
+    fn shift_outranks_command_and_a_bare_click_is_plain() {
+        let cmd = Modifiers { platform: true, ..Modifiers::default() };
+        let both = Modifiers { platform: true, shift: true, ..Modifiers::default() };
+        assert_eq!(ClickKind::of(&Modifiers::default()), ClickKind::Plain);
+        assert_eq!(ClickKind::of(&cmd), ClickKind::Toggle);
+        assert_eq!(ClickKind::of(&both), ClickKind::Extend);
     }
 
     #[test]

@@ -5,9 +5,11 @@
 //!
 //! This module is pure model: no GPUI, no HTTP. The grid projects it
 //! onto the current page for rendering; commit turns it into
-//! parameterized statements. Every mutation — including a discard — is
+//! parameterized statements. Every gesture — including a discard — is
 //! one entry on the undo stack, so nothing is ever more than one
-//! keystroke from recovery.
+//! keystroke from recovery. A gesture that touches many rows (⌘⌫ over a
+//! selection, discard-all) is one entry too: the rows stay separate
+//! changes for review, and one ⌘Z takes the whole gesture back.
 
 use gpui::SharedString;
 use serde_json::Value;
@@ -53,9 +55,10 @@ pub struct Statement {
     pub expectation: StatementExpectation,
 }
 
-/// One undo step: the row entry's state before and after a mutation.
-/// Undo restores `prev`, redo restores `next` — one uniform shape for
-/// edits, clears, deletes, and discards.
+/// One row mutation: the row entry's state before and after. Undo
+/// restores `prev`, redo restores `next` — one uniform shape for edits,
+/// clears, deletes, and discards. An undo step is a group of these:
+/// usually one, many for a gesture over many rows.
 struct Op {
     key: String,
     identity: Vec<Value>,
@@ -77,8 +80,8 @@ pub struct Edits {
     /// All schema column names, in result order (for SET clauses).
     columns: Vec<String>,
     changes: HashMap<String, Entry>,
-    undo: Vec<Op>,
-    redo: Vec<Op>,
+    undo: Vec<Vec<Op>>,
+    redo: Vec<Vec<Op>>,
     next_draft: u64,
 }
 
@@ -267,8 +270,22 @@ impl Edits {
                 self.changes.remove(&op.key);
             }
         }
-        self.undo.push(op);
+        self.undo.push(vec![op]);
         self.redo.clear();
+    }
+
+    /// Run a gesture over many rows as ONE undo step. Every mutation the
+    /// closure makes lands on the stack as usual; afterwards they are
+    /// folded into a single group, so ⌘Z takes the gesture back whole
+    /// and ⌘⇧Z replays it whole. A gesture of one mutation, or none,
+    /// leaves the stack exactly as the mutations did.
+    pub fn grouped(&mut self, f: impl FnOnce(&mut Self)) {
+        let start = self.undo.len();
+        f(self);
+        if self.undo.len() > start + 1 {
+            let ops: Vec<Op> = self.undo.drain(start..).flatten().collect();
+            self.undo.push(ops);
+        }
     }
 
     /// Stage one cell. Editing a value back to its original auto-cleans;
@@ -324,37 +341,37 @@ impl Edits {
     }
 
     pub fn undo(&mut self) -> bool {
-        let Some(op) = self.undo.pop() else { return false };
-        match &op.prev {
-            Some(change) => {
-                self.changes.insert(
-                    op.key.clone(),
-                    Entry { identity: op.identity.clone(), change: change.clone() },
-                );
-            }
-            None => {
-                self.changes.remove(&op.key);
-            }
+        let Some(group) = self.undo.pop() else { return false };
+        // Walked backwards: within a group the same row may appear
+        // twice, and its earlier state must be the one that stands.
+        for op in group.iter().rev() {
+            self.restore(&op.key, &op.identity, &op.prev);
         }
-        self.redo.push(op);
+        self.redo.push(group);
         true
     }
 
     pub fn redo(&mut self) -> bool {
-        let Some(op) = self.redo.pop() else { return false };
-        match &op.next {
+        let Some(group) = self.redo.pop() else { return false };
+        for op in &group {
+            self.restore(&op.key, &op.identity, &op.next);
+        }
+        self.undo.push(group);
+        true
+    }
+
+    fn restore(&mut self, key: &str, identity: &[Value], change: &Option<RowChange>) {
+        match change {
             Some(change) => {
                 self.changes.insert(
-                    op.key.clone(),
-                    Entry { identity: op.identity.clone(), change: change.clone() },
+                    key.to_string(),
+                    Entry { identity: identity.to_vec(), change: change.clone() },
                 );
             }
             None => {
-                self.changes.remove(&op.key);
+                self.changes.remove(key);
             }
         }
-        self.undo.push(op);
-        true
     }
 
     /// Everything is committed or nothing is: clear after a successful
@@ -566,6 +583,43 @@ mod tests {
         assert!(e.undo());
         assert!(!e.is_deleted(&key));
         assert_eq!(e.staged_text(&key, 1), Some(txt("b")));
+    }
+
+    #[test]
+    fn a_gesture_over_many_rows_is_one_undo_step() {
+        let mut e = edits();
+        e.stage_cell(vec![json!(1)], 1, txt("a"), txt("b"), json!("b"));
+        e.grouped(|e| {
+            e.stage_delete(vec![json!(1)]);
+            e.stage_delete(vec![json!(2)]);
+            e.stage_delete(vec![json!(3)]);
+        });
+        assert_eq!(e.counts(), (0, 0, 3));
+        // One ⌘Z takes the whole gesture back, and the cell edit the
+        // delete had replaced is standing again.
+        assert!(e.undo());
+        assert_eq!(e.counts(), (0, 1, 0));
+        assert_eq!(e.staged_text(&key_of(&[json!(1)]), 1), Some(txt("b")));
+        // One ⌘⇧Z replays it whole.
+        assert!(e.redo());
+        assert_eq!(e.counts(), (0, 0, 3));
+        // Then the cell edit is its own step, as before.
+        assert!(e.undo());
+        assert!(e.undo());
+        assert!(e.is_empty());
+        assert!(!e.undo());
+    }
+
+    #[test]
+    fn a_gesture_of_one_or_no_mutations_leaves_the_stack_as_it_was() {
+        let mut e = edits();
+        e.grouped(|_| {});
+        assert!(!e.undo());
+        e.grouped(|e| e.stage_delete(vec![json!(1)]));
+        e.grouped(|e| e.stage_delete(vec![json!(1)])); // already deleted: no-op
+        assert!(e.undo());
+        assert!(e.is_empty());
+        assert!(!e.undo());
     }
 
     #[test]
