@@ -455,20 +455,24 @@ artifact six months from now — grep it, diff two of them, read one in an
 editor, keep one in a repo. Sequences come back at their current value and
 indexes come back with them.
 
-The dialect is one rule: **a bare `NULL` is the only bare thing in the file,
-and every other value is quoted.** So `""` is the empty string, `"NULL"` is
-the string, and a `"` inside a value doubles to `""` — RFC 4180, which every
-CSV reader already knows. Nothing is backslash-escaped, so a backslash in the
-data is only ever a backslash and a tab inside a value is a real tab sitting
-inside the quotes. The reader still takes a bare field as an empty string, so
-a backup stays editable by hand.
+Three values and one escape cover the whole dialect: a bare `NULL` is a real
+null, a quoted `"NULL"` is the string, and an empty field is an empty string.
+Quotes are always *allowed* and rarely *required* — a value containing a tab,
+a newline or a quote is wrapped and a `"` inside doubles to `""` (RFC 4180,
+which every CSV reader already knows), and everything else is written plain.
+Nothing is backslash-escaped, so a backslash in the data is only ever a
+backslash. The reader takes a bare field and a written `""` the same way, so a
+backup stays editable by hand.
 
-Quoting every value costs about 14% and is not decoration: written bare, an
-empty string is an empty FIELD, and in a one-column table an empty field is an
-empty LINE — which every CSV reader skips. That row would not come back and
-nothing would say so. One thing worth knowing before you reach for `wc -l`: a
-value holding a newline spans physical lines, so a row is a record, not always
-a line.
+One file per backup may look different, and it is a row of data rather than a
+matter of taste. A one-column table holding an empty string would write an
+empty LINE, and every CSV reader skips those — that row would not come back
+and nothing would say so. `FORCE_QUOTE` is the only lever DuckDB offers and it
+takes a column list rather than a predicate, so it is spent per file: a table
+whose export contains a blank record is written again with every value quoted,
+said out loud, and no other file pays for it. One thing worth knowing before
+you reach for `wc -l`: a value holding a newline spans physical lines, so a
+row is a record, not always a line.
 
 **Neither format holds every type**, and that is why `--format` exists:
 

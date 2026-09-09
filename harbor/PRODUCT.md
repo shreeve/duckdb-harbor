@@ -161,12 +161,13 @@ registry.
 
 `backup` and `restore` are the two verbs that act on a database's contents
 rather than its lifetime, so they stand alone and take no other verb. Backup
-writes `EXPORT DATABASE` as tab-separated files with the dialect pinned to one
-rule — a bare `NULL` is the only bare thing in the file, every other value is
-quoted — because the artifact has to be greppable, diffable and readable by
-anything, which a `.duckdb` written by one engine build is not. Quoting
-everything is a correctness cost, not a style one: an unquoted empty string in
-a one-column table is an empty line, and every CSV reader skips those.
+writes `EXPORT DATABASE` as tab-separated files with the dialect pinned — bare
+`NULL` is a null, quoted `"NULL"` is the string, an empty field is an empty
+string — because the artifact has to be greppable, diffable and readable by
+anything, which a `.duckdb` written by one engine build is not. Quotes are
+allowed everywhere and required almost nowhere; the one file that gets them is
+a single-column table holding an empty string, which written plain would be an
+empty line, and every CSV reader skips those.
 Restore reads that directory into a **new** file and refuses an existing one:
 a restore that can overwrite can be run at the wrong moment and destroy what
 it was meant to protect, so putting the result into place stays a human act.

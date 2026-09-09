@@ -300,12 +300,11 @@ check 'a quoted "NULL" restores as the string' 0 "1" \
   "$harbor" "$work/rs.duckdb" --mode csv -c "SELECT count(*) FROM t WHERE s = 'NULL'"
 check "an empty string restores as an empty string" 0 "1" \
   "$harbor" "$work/rs.duckdb" --mode csv -c "SELECT count(*) FROM t WHERE s = ''"
-# The one that costs the quotes. Written bare, an empty string in a ONE-column
-# table is an empty LINE, and every CSV reader skips those: the row would not
-# come back and nothing would say so.
-grep -q '	""$' "$work/bk.out/t.csv" \
-  && ok "an empty string is written \"\", never as an empty line" \
-  || bad "an empty string was written bare: $(cat -e "$work/bk.out/t.csv")"
+# The ordinary file pays nothing for the quoting rule: an empty string beside
+# another column is an empty FIELD, which is unambiguous once NULL has a name.
+grep -q '^2	$' "$work/bk.out/t.csv" \
+  && ok "an empty string stays bare where a bare field is safe" \
+  || bad "an empty string was quoted needlessly: $(cat -e "$work/bk.out/t.csv")"
 check "a sequence restores at its current value" 0 "42" \
   "$harbor" "$work/rs.duckdb" --mode csv -c "SELECT nextval('bkseq')"
 wait_gone
@@ -331,6 +330,9 @@ wait_gone
 wait_gone
 "$harbor" "$work/solo.duckdb" backup "$work/solo.out" >/dev/null 2>&1
 wait_gone
+grep -q '^""$' "$work/solo.out/s.csv" \
+  && ok "and is quoted in the one place it would be an empty line" \
+  || bad "a one-column empty string was left bare: $(cat -e "$work/solo.out/s.csv")"
 check "an empty string in a ONE-column table survives the trip" 0 "3 rows, 1 empty" \
   bash -c '"$1" "$2" restore "$3" >/dev/null 2>&1
            "$1" "$2" --mode csv -c "

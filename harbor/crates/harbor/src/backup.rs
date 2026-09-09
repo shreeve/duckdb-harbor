@@ -12,20 +12,24 @@
 //! artifact six months from now: grep it, diff two of them, read one in an
 //! editor, keep one in a repo. A parquet file answers none of those.
 //!
-//! The dialect is one rule: a bare `NULL` is the only bare thing in the file,
-//! and every other value is quoted.
+//! The dialect is three values and one escape, which is the whole of it:
 //!
 //!   NULL        a real null — four bare characters
-//!   "NULL"      the STRING "NULL"
-//!   ""          an empty string
-//!   "anything"  itself
+//!   "NULL"      the STRING "NULL", quoted to escape the marker
+//!   <nothing>   an empty string (a written `""` reads the same way)
 //!
-//! Nothing can collide, and nothing is invisible — which matters more than it
-//! sounds. Written bare, an empty string is an empty field, and in a
-//! one-column table an empty field is an empty LINE; every CSV reader skips
-//! those, so the row would not come back and nothing would say so. The reader
-//! still takes a bare field as an empty string, so a backup stays editable by
-//! hand.
+//! Nothing else can collide, because any value that would read as the marker
+//! is quoted on the way out. An empty string is left bare: once a null has a
+//! name of its own an empty field can only be the empty string, and quotes on
+//! every row of every file would be noise.
+//!
+//! With ONE exception, and it is a row of data rather than a matter of taste.
+//! A one-column table holding an empty string writes an empty LINE, and every
+//! CSV reader skips those — the row does not come back and nothing says so.
+//! `FORCE_QUOTE` is the only lever DuckDB offers, and it takes a column list
+//! rather than a predicate, so it is spent per FILE: a table whose export
+//! contains a blank record is written again with every value quoted, and no
+//! other file pays for it.
 //!
 //! Values that contain the separators are QUOTED, not escaped — RFC 4180, the
 //! same rule every CSV reader already knows. A value holding a tab, a newline
@@ -65,14 +69,13 @@ use std::path::{Path, PathBuf};
 
 /// The writer's dialect. Backup and restore must agree on it, so it is said
 /// once. `\t` is the two-character spelling DuckDB reads as a tab.
-///
-/// `FORCE_QUOTE *` is not decoration. Left off, an empty string is written as
-/// an empty FIELD — and in a one-column table an empty field is an empty
-/// LINE, which every CSV reader skips. The row does not come back and nothing
-/// says so. Quoting every value costs about 14% on a small database and buys
-/// a format with one rule instead of four cases: bare `NULL` is the only bare
-/// thing in the file, and everything else is a quoted value.
-const DIALECT: &str = "FORMAT csv, DELIMITER '\\t', NULLSTR 'NULL', FORCE_QUOTE *";
+const DIALECT: &str = "FORMAT csv, DELIMITER '\\t', NULLSTR 'NULL'";
+
+/// The same dialect with every value quoted, for the one file at a time that
+/// needs it — see [`has_blank_record`]. Quoting is the only lever DuckDB
+/// offers here (`FORCE_QUOTE` takes a column list, not a predicate), so it is
+/// spent where a row would otherwise vanish and nowhere else.
+const QUOTED: &str = "FORMAT csv, DELIMITER '\\t', NULLSTR 'NULL', FORCE_QUOTE *";
 
 /// What the tables are written as.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -322,10 +325,11 @@ pub fn restore(db: &Path, args: &[String]) -> Result<(), String> {
 
 /// What a rewritten `load.sql` still needs doing to it.
 struct Reformat {
-    /// `COPY <table> TO '<dir>/<name>.parquet' (FORMAT parquet)`, one per
-    /// table text cannot carry.
+    /// The `COPY <table> TO ...` that fixes a table the first export got
+    /// wrong — a different format, or the same one with quotes.
     statements: Vec<String>,
-    /// The csv files the parquet replaces, removed once it is written.
+    /// Files a different format supersedes, removed once it is written.
+    /// A requote overwrites its own file and adds nothing here.
     replaced: Vec<PathBuf>,
     /// One line each, for the operator: which table, and why.
     notes: Vec<String>,
@@ -388,7 +392,18 @@ fn patch_loader(dir: &Path, format: Format, strict: bool) -> Result<Reformat, St
                     format.other().flag()
                 ));
             }
-            None => lines.push(line.to_string()),
+            // No format change wanted. But a value can still be written in a
+            // way the reader will not give back, and that is not a matter of
+            // format — so it is checked here, on the file itself.
+            None => {
+                if format == Format::Tsv
+                    && let Some((statement, note)) = requote(dir, line)?
+                {
+                    again.statements.push(statement);
+                    again.notes.push(note);
+                }
+                lines.push(line.to_string());
+            }
         }
     }
 
@@ -447,6 +462,60 @@ fn reformat(
         dir.join(format!("{name}.{}", format.extension())),
         format!("{table} is {}, not {} — {why}", instead.name(), format.name()),
     ))
+}
+
+/// Does this table's export hold a record the reader would throw away? If so,
+/// the statement that writes the file again with every value quoted, and the
+/// word to say about the one file that will not look like the others.
+///
+/// The condition is exact because it is the failure itself rather than a
+/// proxy for it: a blank line is what a CSV reader skips, so a file without
+/// one cannot lose a row and pays nothing.
+fn requote(dir: &Path, line: &str) -> Result<Option<(String, String)>, String> {
+    let Some(table) = line.strip_prefix("COPY ").and_then(|r| r.split(" FROM '").next()) else {
+        return Ok(None);
+    };
+    let Some(name) = line.split(" FROM '").nth(1).and_then(|r| r.split('\'').next()) else {
+        return Ok(None);
+    };
+    let file = dir.join(name);
+    if !has_blank_record(&read(&file)?) {
+        return Ok(None);
+    }
+    Ok(Some((
+        format!("COPY {table} TO {} ({QUOTED})", quote(&file)),
+        format!(
+            "{table} is quoted throughout — it holds an empty string in a single \
+             column, which unquoted is an empty line, which a reader skips"
+        ),
+    )))
+}
+
+/// Is any RECORD in this csv an empty line?
+///
+/// Records, not lines: a value holding a newline spans several physical
+/// lines, and a blank one INSIDE the quotes is part of the value and comes
+/// back fine. Only a blank line between records is lost, so the quotes have
+/// to be walked — which is the same thing the reader does.
+fn has_blank_record(text: &str) -> bool {
+    let (mut quoted, mut at_record_start) = (false, false);
+    for ch in text.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                at_record_start = false;
+            }
+            '\n' if !quoted => {
+                if at_record_start {
+                    return true;
+                }
+                at_record_start = true;
+            }
+            _ if !quoted => at_record_start = false,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The identifier after `CREATE TABLE`, spelled the way `load.sql` spells it

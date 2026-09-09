@@ -11,12 +11,18 @@ Harbor releases, and are not included here.
   one is a snapshot, not a backup. `backup` writes the durable thing —
   `schema.sql`, `load.sql`, and one tab-separated file per table — greppable,
   diffable, and readable by anything.
-- The dialect is one rule: a bare `NULL` is the only bare thing in the file
-  and every other value is quoted, so `""` is the empty string and `"NULL"` is
-  the string. Quoting everything costs about 14% and is not decoration —
-  written bare, an empty string is an empty FIELD, and in a one-column table
-  an empty field is an empty LINE, which every CSV reader skips: the row would
-  not come back and nothing would say so.
+- The dialect is three values and one escape: a bare `NULL` is a real null, a
+  quoted `"NULL"` is the string, an empty field is an empty string. Quotes are
+  always allowed and rarely required — the reader takes a bare field and a
+  written `""` the same way, so a backup stays editable by hand.
+- One exception, and it is a row of data rather than a matter of taste: a
+  one-column table holding an empty string writes an empty LINE, and every CSV
+  reader skips those — the row would not come back and nothing would say so.
+  `FORCE_QUOTE` takes a column list rather than a predicate, so it is spent per
+  FILE: a table whose export contains a blank record is written again with
+  every value quoted, and no other file pays for it. The test is the failure
+  itself rather than a proxy — a blank record between rows, walked
+  quote-aware, so a blank line inside a multi-line value is left alone.
 - The backup directory is self-contained. Each `COPY` names its file and
   nothing more, so it can be moved, renamed, copied to another machine or
   committed to a repo and still restore — an absolute path would have nailed
