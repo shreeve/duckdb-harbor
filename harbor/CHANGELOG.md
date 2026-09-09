@@ -4,6 +4,36 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by signed tag date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.34.0 — 2026-09-09
+
+- **`USE` outside a session is now refused instead of silently discarded.**
+  It sets the current database on the connection it runs on; that connection
+  is pooled, and a request carries exactly one statement, so nothing could
+  ever follow it there. It reported success and was thrown away, every time.
+  The refusal names the session that does persist (`POST /sql/sessions`) and
+  the qualified names — `database.schema.table` — that need no session at all.
+  Inside a session `USE` is unchanged.
+- Adds `--block-size` and the matching `block-size` config key: the block size
+  for a database the call CREATES, from 16k to 256k. A block is both the unit
+  of allocation and the window a column's compression works in, and the
+  default suits few large tables rather than many small ones — a dozen
+  near-empty tables cost 9.5 MiB at 256k. It travels as an open-time option
+  because a later `SET` cannot reach it.
+- `default_block_size` under `[settings]` is now dropped and reported rather
+  than emitted as a `SET` that succeeds and changes nothing, and a server
+  asked for a block size the file does not have says so — block size is fixed
+  when a database is created, so a config naming another one was a wish that
+  read like a setting.
+- Fixes statements that expand to a group of statements — `COPY FROM DATABASE`
+  and `IMPORT DATABASE` — which could not run at all. The result schema was
+  read before anything had stepped, and for these the result-producing member
+  of the group is not prepared until something does. A failing group statement
+  now reports its own complaint rather than the readiness error that was only
+  how it surfaced.
+- The `unit` suite runs `--workspace --all-features`. `default-members` and two
+  off-by-default features had been hiding 101 tests — all of `crates/justhttp`
+  and all of the config reader — which compiled but never ran.
+
 ## 0.33.1 — 2026-09-06
 
 - A verb typed without a database (`harbor restart`) now names the attached

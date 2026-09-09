@@ -87,6 +87,7 @@ pub struct Connection {
     pub workers: Option<usize>,
     pub statement_timeout: Option<String>,
     pub max_temp_size: Option<String>,
+    pub block_size: Option<String>,
     pub sealed: Option<bool>,
     pub unsigned: Option<bool>,
     pub log: Option<bool>,
@@ -140,9 +141,32 @@ impl Connection {
         let mut keys: Vec<&String> = settings.keys().collect();
         keys.sort();
         keys.into_iter()
+            .filter(|k| !is_open_time_only(k))
             .filter_map(|k| sql_literal(&settings[k]).map(|lit| format!("SET {k} = {lit}")))
             .collect()
     }
+
+    /// Keys in `[settings]` that setting_statements refused, so the caller
+    /// can say so. Silence here would be the worst outcome: the SET runs,
+    /// reports success, and changes nothing.
+    pub fn rejected_settings(&self) -> Vec<&str> {
+        let Some(settings) = &self.settings else { return Vec::new() };
+        let mut out: Vec<&str> =
+            settings.keys().map(String::as_str).filter(|k| is_open_time_only(k)).collect();
+        out.sort_unstable();
+        out
+    }
+}
+
+/// Settings that are chosen when the database is OPENED and cannot be
+/// reached by a later SET — the SET succeeds and does nothing. Each has a
+/// config key of its own; `[settings]` is the wrong door for them.
+///
+/// `default_block_size` is the whole list today. It fixes a database file's
+/// block size at creation, which is exactly the moment before any statement
+/// can run — use `block-size` instead.
+pub fn is_open_time_only(key: &str) -> bool {
+    matches!(key.trim().to_ascii_lowercase().as_str(), "default_block_size")
 }
 
 /// A scalar TOML value as a DuckDB SQL literal: strings single-quoted (with
@@ -277,6 +301,20 @@ pub fn load() -> Result<FileConfig, Error> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `default_block_size` cannot be reached by SET, so naming it in
+    /// `[settings]` would emit a statement that succeeds and does nothing.
+    /// It is dropped from the emitted SETs and reported separately.
+    #[test]
+    fn open_time_settings_are_refused_not_emitted() {
+        let c: Connection = toml::from_str(
+            "path = \"/tmp/x.duckdb\"\n[settings]\ndefault_block_size = 65536\nthreads = 3\n",
+        )
+        .expect("parse");
+        let sets = c.setting_statements();
+        assert_eq!(sets, ["SET threads = 3"], "the reachable setting still goes out");
+        assert_eq!(c.rejected_settings(), ["default_block_size"]);
+    }
     use super::*;
 
     const SAMPLE: &str = r#"

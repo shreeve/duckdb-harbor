@@ -179,8 +179,13 @@ impl Conn {
         for stmt in stmts.iter() {
             // In place, no fetch thread: boot-time helpers read a handful
             // of rows and should not depend on spawn succeeding.
-            let (mut fetcher, columns) = self.open_result(stmt, &[])?;
-            while let Some(chunk) = fetcher.next_chunk()? {
+            let (mut fetcher, mut held, columns) = self.open_result(stmt, &[])?;
+            // `held` first, then the rest: it is a chunk already taken off
+            // the result, not a chunk still to come.
+            while let Some(chunk) = match held.take() {
+                Some(c) => Some(c),
+                None => fetcher.next_chunk()?,
+            } {
                 let readers = chunk.readers(columns.len().min(1))?;
                 if let (Some(reader), Some((_, ty))) = (readers.first(), columns.first()) {
                     for row in 0..chunk.rows {
@@ -269,10 +274,22 @@ impl Conn {
     }
 
     /// Execute one parsed statement into a live result: the Fetcher that
-    /// owns it plus its prepare-time columns. The shared front half of
-    /// `execute` (which pipelines it) and `drain` (which consumes it in
-    /// place).
-    fn open_result(&self, stmt: &Stmt, params: &[Param]) -> Result<(Fetcher, Vec<(String, Type)>), Error> {
+    /// owns it, a chunk already taken off it, and its columns. The shared
+    /// front half of `execute` (which pipelines it) and `drain` (which
+    /// consumes it in place).
+    ///
+    /// The held chunk is normally None. It is Some only for a statement
+    /// that expands to a GROUP of statements — `COPY FROM DATABASE`,
+    /// `IMPORT DATABASE` — where the schema cannot be read until the
+    /// result-producing member of the group has been prepared, and the
+    /// only way to prepare it is to step. That step yields a chunk, and a
+    /// chunk cannot be pushed back, so it travels out with the result and
+    /// every caller must consume it FIRST. Losing it truncates the result.
+    fn open_result(
+        &self,
+        stmt: &Stmt,
+        params: &[Param],
+    ) -> Result<(Fetcher, Option<Chunk>, Vec<(String, Type)>), Error> {
         let api = &self.eng.api;
 
         // Params go in as owned values, positional ($1 = element 0).
@@ -310,15 +327,38 @@ impl Conn {
         executed?;
 
         // From here the Fetcher owns the result and destroys it on drop.
-        let fetcher = Fetcher { eng: self.eng, result };
-        let columns = result_columns(api, result)?;
-        Ok((fetcher, columns))
+        let mut fetcher = Fetcher { eng: self.eng, result };
+
+        // Ask first, step only if asking failed. The ordinary statement —
+        // every SELECT, every INSERT — answers here and never steps on
+        // this thread, which matters: next_chunk carries a step budget and
+        // falls back to a blocking fetch, and moving that work off the
+        // fetch thread would serialise the first chunk against the caller.
+        //
+        // Deliberately keyed on the failure, not on the statement type:
+        // the set of group-expanding statements is DuckDB's to grow, and a
+        // retry that asks again after one step needs no list of them.
+        match result_columns(api, result) {
+            Ok(columns) => Ok((fetcher, None, columns)),
+            Err(first) => {
+                // A step that fails carries the REAL complaint — the group's
+                // own error, the one naming the table or the file. The
+                // schema error above is only how it reached us, so it is
+                // dropped rather than reported over the top of it.
+                let held = fetcher.next_chunk()?;
+                // Still no schema after a successful step means the first
+                // error was never about readiness. Report that one — it is
+                // the one that describes what actually went wrong.
+                let columns = result_columns(api, result).map_err(|_| first)?;
+                Ok((fetcher, held, columns))
+            }
+        }
     }
 
     /// Execute one parsed statement as a pipelined stream. The statement is
     /// borrowed, not consumed.
     pub fn execute(&self, stmt: &Stmt, params: &[Param]) -> Result<Stream, Error> {
-        let (fetcher, columns) = self.open_result(stmt, params)?;
+        let (fetcher, pending, columns) = self.open_result(stmt, params)?;
         let (tx, rx) = mpsc::sync_channel(PREFETCH);
         let join = thread::Builder::new()
             .name("harbor-fetch".into())
@@ -329,6 +369,7 @@ impl Conn {
             })?;
         Ok(Stream {
             columns,
+            pending,
             rx: Some(rx),
             join: Some(join),
             interrupt: Interrupt { eng: self.eng, conn: self.interrupt.clone() },
@@ -340,7 +381,7 @@ impl Conn {
     /// pipeline is pure overhead: a spawn and a join to stream chunks that
     /// will be discarded.
     pub fn drain(&self, stmt: &Stmt) -> Result<(), Error> {
-        let (mut fetcher, _) = self.open_result(stmt, &[])?;
+        let (mut fetcher, _held, _) = self.open_result(stmt, &[])?;
         while fetcher.next_chunk()?.is_some() {}
         Ok(())
     }
@@ -417,6 +458,11 @@ pub struct Stream {
     /// The result's columns. Public so a caller can `mem::take` them and
     /// keep them across the mutable borrows the chunk loop needs.
     pub columns: Vec<(String, Type)>,
+    /// A chunk already taken off the result before the fetch thread got
+    /// it — see open_result. Handed out before anything from the channel,
+    /// because it came off the result first; a stream that skipped it
+    /// would drop its own opening rows.
+    pending: Option<Chunk>,
     /// Taken on the stream's terminal message (end or error) and on drop —
     /// dropping the receiver is what makes the fetch thread's next send
     /// fail and stop fetching.
@@ -446,6 +492,9 @@ impl Stream {
     /// the worst failure a result stream can have: a truncated result
     /// wearing a well-formed end record.
     pub fn next_chunk(&mut self) -> Result<Option<Chunk>, Error> {
+        if let Some(chunk) = self.pending.take() {
+            return Ok(Some(chunk));
+        }
         let Some(rx) = self.rx.as_ref() else {
             return Ok(None);
         };

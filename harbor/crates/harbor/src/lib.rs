@@ -3279,6 +3279,31 @@ fn run_sql(
         return (true, 400);
     }
 
+    // `USE` sets the CURRENT DATABASE on the connection it runs on, and
+    // outside a session that connection is a pooled one that goes back to the
+    // pool when this request ends. Since a request carries exactly one
+    // statement (`ensure_single_statement`, just above), nothing can ever
+    // follow it on that connection — so the USE reports success and is
+    // discarded, every time. There is no case where the old behaviour was
+    // useful, which is what makes refusing safe rather than merely stricter.
+    //
+    // A session is the connection that persists, and inside one USE works
+    // normally; qualifying names (`db.schema.table`) needs no session at all.
+    // Other connection-local state — temp tables, PREPARE, session-scoped
+    // SET — is silently lost the same way; USE is fenced because it is the
+    // one whose whole purpose is to change what the NEXT statement sees.
+    if parsed.session.is_none() && lost_without_session(&parsed.sql) {
+        let _ = req.respond(error_response(
+            400,
+            "sql_error",
+            "USE has no effect outside a session: this connection returns to the pool when \
+             the request ends, and one request carries one statement, so nothing runs on it \
+             afterward. Open a session (POST /sql/sessions) and send USE on that, or qualify \
+             names instead — database.schema.table",
+        ));
+        return (true, 400);
+    }
+
     let shape = if wants_one_shot(&req) { Shape::Json } else { Shape::Ndjson };
 
     // A statement naming a lease goes to that lease's connection, wherever it
@@ -3524,6 +3549,17 @@ fn fenced_setting(sql: &str) -> Option<&'static str> {
         name = next_word(b, &mut i);
     }
     FENCED.iter().find(|f| name.eq_ignore_ascii_case(f)).copied()
+}
+
+/// Statements whose whole effect is connection-local, so a pooled connection
+/// discards it the moment the request ends. Companion to `fenced_setting`:
+/// that one refuses what would reach TOO far (process-global), this one
+/// refuses what would not reach far enough.
+///
+/// `USE` is the list. Reads through comments and whitespace via
+/// `first_keyword`, so `/*x*/ USE d` is caught with the bare form.
+fn lost_without_session(sql: &str) -> bool {
+    first_keyword(sql) == "USE"
 }
 
 /// What a statement does to the surrounding transaction, when that is knowable
@@ -4173,7 +4209,21 @@ mod tests {
     use super::Method;
     use crate::encode::civil_from_days;
     use super::ensure_single_statement as one;
-    use super::fenced_setting;
+    use super::{fenced_setting, lost_without_session};
+
+    /// USE outside a session is refused, not silently discarded: one request
+    /// carries one statement, so nothing can follow it on that connection.
+    #[test]
+    fn use_is_fenced_when_no_session_holds_the_connection() {
+        for sql in ["USE mydb", "use mydb", "  USE  mydb ", "/*x*/ USE mydb", "--c\nUSE mydb"] {
+            assert!(lost_without_session(sql), "should be fenced: {sql:?}");
+        }
+        // Statements that merely mention the word are untouched.
+        for sql in ["SELECT 'USE'", "CREATE TABLE use_log(i INT)", "SELECT * FROM t"] {
+            assert!(!lost_without_session(sql), "should pass: {sql:?}");
+        }
+    }
+
     use super::route_exists;
     use super::index_columns;
     use super::{IndexPart, catalog_count_sql, index_parts};
