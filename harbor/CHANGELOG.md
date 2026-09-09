@@ -4,28 +4,30 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by signed tag date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
-## Unreleased
+## 0.35.0 — 2026-09-09
 
 - Adds `harbor <db> backup [dir]` and `harbor <new.duckdb> restore <dir>`.
-  A `.duckdb` file is only as portable as the engine that wrote it, so
-  copying one is a snapshot, not a backup; `backup` writes the durable thing
-  — `schema.sql`, `load.sql`, and one tab-separated file per table — with the
-  dialect pinned so the pair agree, and the dialect is one rule: a bare
-  `NULL` is the only bare thing in the file and every other value is quoted,
-  so `""` is the empty string and `"NULL"` is the string. Quoting everything
-  costs about 14% and is not decoration — written bare, an empty string is an
-  empty FIELD, and in a one-column table an empty field is an empty LINE,
-  which every CSV reader skips: the row would not come back and nothing would
-  say so. `restore` builds
-  a **new** database and refuses one that exists, since a restore that can
-  overwrite can be run at the wrong moment and destroy what it was meant to
-  protect. It is also where `--block-size` applies, block size being fixed at
-  creation. The directory is self-contained — each `COPY` names its file and
-  nothing more — so a backup can be moved, renamed, copied to another machine
-  or committed to a repo and still restore. The two act on contents rather
-  than lifetime, so they stand alone and combine with no other verb.
-  Retention, rotation, scheduling, compression and remote targets stay out:
-  cron, a filesystem and `rsync` already do those.
+  A `.duckdb` file is only as portable as the engine that wrote it, so copying
+  one is a snapshot, not a backup. `backup` writes the durable thing —
+  `schema.sql`, `load.sql`, and one tab-separated file per table — greppable,
+  diffable, and readable by anything.
+- The dialect is one rule: a bare `NULL` is the only bare thing in the file
+  and every other value is quoted, so `""` is the empty string and `"NULL"` is
+  the string. Quoting everything costs about 14% and is not decoration —
+  written bare, an empty string is an empty FIELD, and in a one-column table
+  an empty field is an empty LINE, which every CSV reader skips: the row would
+  not come back and nothing would say so.
+- The backup directory is self-contained. Each `COPY` names its file and
+  nothing more, so it can be moved, renamed, copied to another machine or
+  committed to a repo and still restore — an absolute path would have nailed
+  it to the machine that wrote it.
+- `restore` builds a **new** database and refuses one that exists, since a
+  restore that can overwrite can be run at the wrong moment and destroy what
+  it was meant to protect. It is also where `--block-size` applies, block size
+  being fixed at creation. Both verbs act on contents rather than lifetime, so
+  they stand alone and combine with no other verb. Retention, rotation,
+  scheduling, compression and remote targets stay out: cron, a filesystem and
+  `rsync` already do those.
 - `backup` takes `--format tsv|parquet` and `--strict`. Neither format holds
   every type and the holes are not the same shape: text loses a `UNION`'s tag
   (the restore then refuses) and retypes a `VARIANT`'s contents (it does not),
