@@ -304,6 +304,20 @@ check "a sequence restores at its current value" 0 "42" \
   "$harbor" "$work/rs.duckdb" --mode csv -c "SELECT nextval('bkseq')"
 wait_gone
 
+# The reader takes all four spellings, which is what makes the file editable by
+# hand: a person fixing one row writes `""` for an empty string without having
+# to know that the writer would have left the field bare.
+cp -R "$work/bk.out" "$work/bk.hand"
+printf 'id\ts\n1\tNULL\n2\t"NULL"\n3\t""\n4\t\n' > "$work/bk.hand/t.csv"
+check "hand-written NULL, \"NULL\", \"\" and a bare field all read as documented" 0 "1,true,~
+2,false,NULL
+3,false,
+4,false," \
+  bash -c '"$1" "$2" restore "$3" >/dev/null 2>&1
+           "$1" "$2" --mode csv -c "SELECT id, s IS NULL, coalesce(s, '"'"'~'"'"') FROM t ORDER BY id" | tail -n +2' \
+  _ "$harbor" "$work/hand.duckdb" "$work/bk.hand"
+wait_gone
+
 # The proof of a relative load.sql: move the whole directory and restore again.
 mv "$work/bk.out" "$work/bk.moved"
 check "a moved backup directory still restores" 0 "restored 1 table" \

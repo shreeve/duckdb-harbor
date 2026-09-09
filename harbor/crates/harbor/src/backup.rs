@@ -19,7 +19,10 @@
 //!   <nothing>   an empty string (a written `""` reads the same way)
 //!
 //! Nothing else can collide, because any value that would read as the marker
-//! is quoted on the way out.
+//! is quoted on the way out. The writer spells an empty string as an empty
+//! field rather than `""`: once a null has a name of its own, an empty field
+//! can only be the empty string, and the quotes would be noise on every row
+//! of every file.
 //!
 //! The directory is self-contained: `load.sql` names each file by its own
 //! name and nothing more, so the whole thing can be moved, renamed, copied to
@@ -162,12 +165,13 @@ pub fn restore(db: &Path, args: &[String]) -> Result<(), String> {
 /// against the directory it was given, so the file's own name is the only
 /// spelling that is always right.
 ///
-/// And duckdb#25501: EXPORT writes `""` for an empty string and a bare field
-/// for NULL, then hands you a load.sql that reads BOTH back as NULL, because
-/// the COPY it generates inherits `allow_quoted_nulls=true` from the CSV
-/// reader's Pandas-compatibility default (duckdb#7162). The writer is right
-/// and the reader is wrong, so the fix goes on the reader. That half comes
-/// out once 25501 lands; the paths stay.
+/// And duckdb#25501: the COPY that EXPORT generates inherits
+/// `allow_quoted_nulls=true` from the CSV reader's Pandas-compatibility
+/// default (duckdb#7162), which reads a QUOTED null marker as a null — so
+/// `"NULL"`, the one spelling that exists to escape the marker, comes back as
+/// a null and the escape has no way to work. The writer is right and the
+/// reader is wrong, so the fix goes on the reader. That half comes out once
+/// 25501 lands; the paths stay.
 fn patch_loader(dir: &Path) -> Result<(), String> {
     let path = dir.join("load.sql");
     let before = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
