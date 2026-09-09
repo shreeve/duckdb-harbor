@@ -39,7 +39,7 @@ s.close()')}
 # port this runner has already given to the shared server — the run dies at
 # startup with "address already in use" and it looks like a harbor bug.
 unset PORT
-suites=${SUITES:-unit lifecycle types asserts spec fuzz hostile deployment stress catalog sessions cancel}
+suites=${SUITES:-unit lifecycle roundtrip types asserts spec fuzz hostile deployment stress catalog sessions cancel}
 
 bold=$(tput bold 2>/dev/null || true); red=$(tput setaf 1 2>/dev/null || true)
 green=$(tput setaf 2 2>/dev/null || true); dim=$(tput dim 2>/dev/null || true)
@@ -98,6 +98,10 @@ run unit     cargo test --release --workspace --all-features
 # The lifetime doctrine runs the real binary in its own $HARBOR_HOME sandbox —
 # no shared server, and nothing it starts outlives it.
 run lifecycle "$here/test/scripts/lifecycle.sh"
+# What goes into a backup comes back out: every corpus type, the schema that
+# is not data, the strings that attack the format, and a seeded fuzz — all
+# compared by DuckDB with both databases attached, never by reading the export.
+run roundtrip "$here/test/scripts/roundtrip.py"
 
 # ---------------------------------------------------------------------------
 # One server, shared by the read-only HTTP suites, on its own copy

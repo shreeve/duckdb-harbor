@@ -11,7 +11,7 @@
 //!   harbor <name> | <footnote>    a listed database, by its name or its
 //!                                 number in the list — running or stopped
 //!   harbor <db.duckdb> start      bring it up in the background, until you stop it
-//!   harbor <db.duckdb> backup     its contents, as tab-separated files
+//!   harbor <db.duckdb> backup     its contents, as files you can read
 //!   harbor <new.duckdb> restore <dir>  a new database from those files
 //!
 //! The socket IS the runtime registration: its name is derived from the
@@ -420,13 +420,16 @@ usage:
   harbor <db.duckdb> attach    add this database to your list (config.toml) —
                                a listed database is persistent when started
   harbor <db.duckdb> detach    remove it from your list (and its login item)
-  harbor <db.duckdb> backup [dir]
-                               write its CONTENTS to a directory of
-                               tab-separated files (schema.sql, load.sql, one
-                               .csv per table) — greppable, diffable, and
-                               readable by anything, unlike the .duckdb file
-                               itself. Defaults to <db>.backups/<stamp>, and
-                               never writes into a directory that is there
+  harbor <db.duckdb> backup [dir] [--format tsv|parquet] [--strict]
+                               write its CONTENTS to a directory: schema.sql,
+                               load.sql, and one file per table. Tab-separated
+                               by default — greppable, diffable, readable by
+                               anything, unlike the .duckdb file itself.
+                               Defaults to <db>.backups/<stamp>, and never
+                               writes into a directory that is there.
+                               Neither format holds every type, so a table the
+                               chosen one cannot carry is written in the other
+                               and said out loud; --strict refuses instead
   harbor <new.duckdb> restore <dir> [--block-size <s>]
                                build a NEW database from a backup directory.
                                Refuses an existing file, always — moving the

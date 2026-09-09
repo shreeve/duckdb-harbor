@@ -10,8 +10,13 @@ Harbor releases, and are not included here.
   A `.duckdb` file is only as portable as the engine that wrote it, so
   copying one is a snapshot, not a backup; `backup` writes the durable thing
   — `schema.sql`, `load.sql`, and one tab-separated file per table — with the
-  dialect pinned so the pair agree: a bare `NULL` is a null, a quoted
-  `"NULL"` is the string, an empty field is an empty string. `restore` builds
+  dialect pinned so the pair agree, and the dialect is one rule: a bare
+  `NULL` is the only bare thing in the file and every other value is quoted,
+  so `""` is the empty string and `"NULL"` is the string. Quoting everything
+  costs about 14% and is not decoration — written bare, an empty string is an
+  empty FIELD, and in a one-column table an empty field is an empty LINE,
+  which every CSV reader skips: the row would not come back and nothing would
+  say so. `restore` builds
   a **new** database and refuses one that exists, since a restore that can
   overwrite can be run at the wrong moment and destroy what it was meant to
   protect. It is also where `--block-size` applies, block size being fixed at
@@ -21,6 +26,21 @@ Harbor releases, and are not included here.
   than lifetime, so they stand alone and combine with no other verb.
   Retention, rotation, scheduling, compression and remote targets stay out:
   cron, a filesystem and `rsync` already do those.
+- `backup` takes `--format tsv|parquet` and `--strict`. Neither format holds
+  every type and the holes are not the same shape: text loses a `UNION`'s tag
+  (the restore then refuses) and retypes a `VARIANT`'s contents (it does not),
+  while parquet refuses a negative `INTERVAL` outright and normalises a
+  `TIMETZ` to UTC — `12:00:00+02:30` returns as `09:30:00+00`, the same
+  instant, a different value, and nothing said. Each hole is the other
+  format's solid ground, so a table the chosen format cannot carry is written
+  in the other one and named out loud, with `load.sql` recording the format
+  per table. `--strict` refuses instead of swapping. The rule under all three
+  is the same: never write something that will not come back.
+- New `roundtrip` suite: back up and restore every type in the shared corpus,
+  a schema of constraints, indexes, views and sequences, the strings that
+  attack the format, and a seeded fuzz of random tables — then attach both
+  databases and ask DuckDB whether anything differs, rather than reading the
+  export back and finding the writer agrees with the writer.
 - `--block-size` now also works on the summon — `harbor <db> --block-size 64k
   -c "..."` shapes the database that call creates, instead of the size being
   reachable only through an explicit `start`. A size that reached nothing,

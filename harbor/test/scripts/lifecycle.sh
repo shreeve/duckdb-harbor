@@ -298,8 +298,14 @@ check "a bare NULL restores as a null" 0 "1" \
   "$harbor" "$work/rs.duckdb" --mode csv -c "SELECT count(*) FROM t WHERE s IS NULL"
 check 'a quoted "NULL" restores as the string' 0 "1" \
   "$harbor" "$work/rs.duckdb" --mode csv -c "SELECT count(*) FROM t WHERE s = 'NULL'"
-check "an empty field restores as an empty string" 0 "1" \
+check "an empty string restores as an empty string" 0 "1" \
   "$harbor" "$work/rs.duckdb" --mode csv -c "SELECT count(*) FROM t WHERE s = ''"
+# The one that costs the quotes. Written bare, an empty string in a ONE-column
+# table is an empty LINE, and every CSV reader skips those: the row would not
+# come back and nothing would say so.
+grep -q '	""$' "$work/bk.out/t.csv" \
+  && ok "an empty string is written \"\", never as an empty line" \
+  || bad "an empty string was written bare: $(cat -e "$work/bk.out/t.csv")"
 check "a sequence restores at its current value" 0 "42" \
   "$harbor" "$work/rs.duckdb" --mode csv -c "SELECT nextval('bkseq')"
 wait_gone
@@ -318,6 +324,20 @@ check "hand-written NULL, \"NULL\", \"\" and a bare field all read as documented
   _ "$harbor" "$work/hand.duckdb" "$work/bk.hand"
 wait_gone
 
+# The row that is only a row if the empty string kept its quotes.
+wait_gone
+"$harbor" "$work/solo.duckdb" -c "CREATE TABLE s(v VARCHAR);
+  INSERT INTO s VALUES ('x'), (''), (NULL);" >/dev/null 2>&1
+wait_gone
+"$harbor" "$work/solo.duckdb" backup "$work/solo.out" >/dev/null 2>&1
+wait_gone
+check "an empty string in a ONE-column table survives the trip" 0 "3 rows, 1 empty" \
+  bash -c '"$1" "$2" restore "$3" >/dev/null 2>&1
+           "$1" "$2" --mode csv -c "
+             SELECT count(*) || '"'"' rows, '"'"' || count(*) FILTER (WHERE length(v) = 0) || '"'"' empty'"'"' FROM s" | tail -1' \
+  _ "$harbor" "$work/solo.rs.duckdb" "$work/solo.out"
+wait_gone
+
 # The proof of a relative load.sql: move the whole directory and restore again.
 mv "$work/bk.out" "$work/bk.moved"
 check "a moved backup directory still restores" 0 "restored 1 table" \
@@ -333,6 +353,37 @@ check "and refuses a directory that is not a backup" 1 "no load.sql" \
   "$harbor" "$work/no.duckdb" restore "$work"
 [[ -e $work/no.duckdb ]] && bad "a refused restore left a file behind" \
                          || ok "a refused restore leaves no file behind"
+# A tab-separated file has to carry a tab. RFC-4180 quoting, not backslash
+# escapes: the field is wrapped and the tab, newline or quote sits inside it
+# literally — so a backslash in the data is just a backslash, and the two
+# characters `\t` stay distinct from a real tab.
+wait_gone
+"$harbor" "$work/hard.duckdb" -c "
+  CREATE TABLE h(id INTEGER, s VARCHAR);
+  INSERT INTO h VALUES
+    (1, e'hey\tyou\tguys!'),
+    (2, e'line one\nline two'),
+    (3, 'she said \"hi\"'),
+    (4, 'back\\slash'),
+    (5, 'two chars: \\t');" >/dev/null 2>&1
+wait_gone
+"$harbor" "$work/hard.duckdb" backup "$work/hard.out" >/dev/null 2>&1
+wait_gone
+grep -q '"hey	you	guys!"' "$work/hard.out/h.csv" \
+  && ok "a value with tabs is quoted, with the tabs literal inside it" \
+  || bad "a tabbed value was not quoted: $(grep -c . "$work/hard.out/h.csv") lines"
+check "tabs, newlines, quotes and backslashes all round-trip" 0 "5 of 5 survived" \
+  bash -c '"$1" "$2" restore "$3" >/dev/null 2>&1
+           "$1" "$2" --mode csv -c "
+             SELECT count(*) || '"'"' of 5 survived'"'"' FROM h WHERE (id, s) IN (
+               (1, e'"'"'hey\tyou\tguys!'"'"'),
+               (2, e'"'"'line one\nline two'"'"'),
+               (3, '"'"'she said \"hi\"'"'"'),
+               (4, '"'"'back\\slash'"'"'),
+               (5, '"'"'two chars: \\t'"'"'))" | tail -1' \
+  _ "$harbor" "$work/hard.rs.duckdb" "$work/hard.out"
+wait_gone
+
 check "neither verb combines with a lifetime verb" 1 "combines with nothing" \
   "$harbor" "$work/bk.duckdb" start backup
 check "nor with each other" 1 "runs alone" \

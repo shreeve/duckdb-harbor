@@ -452,10 +452,56 @@ harbor: restored 14 tables into fresh.duckdb (740K)
 Tab-separated rather than parquet, deliberately: both round-trip exactly and
 both come to about the same size, so the tie goes to what you can do with the
 artifact six months from now — grep it, diff two of them, read one in an
-editor, keep one in a repo. Three values and one escape cover the whole
-dialect: a bare `NULL` is a real null, a quoted `"NULL"` is the string, and an
-empty field is an empty string. Sequences come back at their current value and
+editor, keep one in a repo. Sequences come back at their current value and
 indexes come back with them.
+
+The dialect is one rule: **a bare `NULL` is the only bare thing in the file,
+and every other value is quoted.** So `""` is the empty string, `"NULL"` is
+the string, and a `"` inside a value doubles to `""` — RFC 4180, which every
+CSV reader already knows. Nothing is backslash-escaped, so a backslash in the
+data is only ever a backslash and a tab inside a value is a real tab sitting
+inside the quotes. The reader still takes a bare field as an empty string, so
+a backup stays editable by hand.
+
+Quoting every value costs about 14% and is not decoration: written bare, an
+empty string is an empty FIELD, and in a one-column table an empty field is an
+empty LINE — which every CSV reader skips. That row would not come back and
+nothing would say so. One thing worth knowing before you reach for `wc -l`: a
+value holding a newline spans physical lines, so a row is a record, not always
+a line.
+
+**Neither format holds every type**, and that is why `--format` exists:
+
+| | tsv | parquet |
+| --- | --- | --- |
+| `UNION` | loses its tag — the restore refuses | ✅ |
+| `VARIANT` | contents come back retyped, *silently* | ✅ |
+| negative `INTERVAL` | ✅ | refused outright |
+| `TIMETZ` with an offset | ✅ | normalised to UTC, *silently* |
+
+Each hole is the other format's solid ground, so a table the chosen format
+cannot carry is written in the other one and said out loud:
+
+```console
+$ harbor mydata.duckdb backup
+harbor: settings is parquet, not text — a VARIANT's contents come back retyped
+harbor: backed up 14 tables to ~/db/mydata.backups/20260909051315 (612K)
+```
+
+`load.sql` names the format per table, so the directory stays self-describing
+and the choice is visible in `ls`. A database with one variant column keeps
+every other table greppable. `--format parquet` asks for one format
+throughout — with the same swap running the other way for a `TIMETZ` column —
+and `--strict` refuses rather than swapping, for a backup that has to be one
+format or nothing. What no mode will do is write something that will not come
+back: a negative interval under `--format parquet` is an error, not a
+surprise six months from now.
+
+The whole of this is a test suite rather than a claim: `test/scripts/roundtrip.py`
+backs up and restores every type in the shared corpus, a schema of constraints
+and indexes and views and sequences, the strings that attack the format, and a
+seeded fuzz of random tables — then attaches both databases and asks DuckDB
+whether anything differs.
 
 The directory is self-contained. Each `COPY` in `load.sql` names its file and
 nothing more, so the backup can be moved, renamed, copied to another machine
