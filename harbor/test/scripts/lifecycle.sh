@@ -122,6 +122,22 @@ check "a bare word is refused, never served" 1 "names nothing running" \
   "$harbor" nosuchname -c "SELECT 1"
 if [[ -f $work/nosuchname ]]; then bad "a bare word conjured a file"; else ok "no file conjured for a bare word"; fi
 
+echo "— --block-size shapes the file a summon creates"
+# Block size is fixed when a database is CREATED, and a summon is one of the
+# ways a database gets created — so the flag has to reach the server this
+# client spawns, not just an explicit `start`.
+check "a summoned database takes the block size it was asked for" 0 "16384" \
+  "$harbor" "$work/sized.duckdb" --block-size 16k --mode csv \
+  -c "CREATE TABLE t AS SELECT 1 AS i; CHECKPOINT; SELECT block_size FROM pragma_database_size()"
+# ...and says so when it reached nothing, because the file already existed and
+# a server is already holding it. Silence here would read as success.
+check "the size is refused quietly when there is nothing to shape" 0 "was not used" \
+  "$harbor" "$work/sized.duckdb" --block-size 64k -c "SELECT 1"
+check "a size DuckDB will not take is refused by the client" 1 "power of two" \
+  "$harbor" "$work/other.duckdb" --block-size 48k -c "SELECT 1"
+if [[ -f $work/other.duckdb ]]; then bad "a refused size still conjured a file"; else ok "a refused size conjures no file"; fi
+"$harbor" "$work/sized.duckdb" stop >/dev/null 2>&1
+
 echo "— the server is everyone's: it lives while anyone is connected"
 sock=$(live_sock)
 # A silent open connection, well past the linger AND past justhttp's 5s read

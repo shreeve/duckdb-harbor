@@ -3517,6 +3517,29 @@ fn first_keyword(sql: &str) -> String {
     next_word(sql.as_bytes(), &mut 0)
 }
 
+/// A block size as bytes: `65536`, or a `k`/`kb`/`kib` suffix on the number
+/// people actually say — `64k`. DuckDB takes only a power of two from 16 KiB
+/// to 256 KiB, and refusing the rest HERE rather than at open means the
+/// complaint can name the flag and list the answers.
+pub fn parse_block_size(s: &str) -> Result<u64, String> {
+    let t = s.trim().to_ascii_lowercase();
+    let digits = t.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let unit = &t[digits.len()..];
+    let n: u64 = digits.parse().map_err(|_| format!("bad --block-size {s:?}"))?;
+    let bytes = match unit {
+        "" | "b" => n,
+        "k" | "kb" | "kib" => n * 1024,
+        _ => return Err(format!("bad --block-size {s:?} — use bytes or a k suffix, e.g. 64k")),
+    };
+    if !(16384..=262144).contains(&bytes) || !bytes.is_power_of_two() {
+        return Err(format!(
+            "bad --block-size {s:?} — DuckDB takes a power of two from 16k to 256k \
+             (16k, 32k, 64k, 128k, 256k)"
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Settings a client must not change: they are process-global in DuckDB, so
 /// one `SET memory_limit='100GB'` raises it for every neighbor berth on the
 /// host and defeats the fleet-safe cap the operator chose at berth start.
