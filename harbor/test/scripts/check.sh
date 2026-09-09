@@ -89,7 +89,12 @@ skip() { skipped+=("$1"); printf '%s— %s skipped: %s%s\n' "$dim" "$1" "$2" "$o
 # The suites that need no server
 # ---------------------------------------------------------------------------
 
-run unit     cargo test --release
+# --workspace --all-features, both load-bearing. `default-members` is wire and
+# harbor, so a bare `cargo test` never sees crates/common or crates/justhttp;
+# and `config`/`membership` are off by default, so it never compiles the config
+# reader either. Between them that left 101 tests — every justhttp test and
+# every config test — building fine and running nowhere.
+run unit     cargo test --release --workspace --all-features
 # The lifetime doctrine runs the real binary in its own $HARBOR_HOME sandbox —
 # no shared server, and nothing it starts outlives it.
 run lifecycle "$here/test/scripts/lifecycle.sh"

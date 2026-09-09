@@ -189,7 +189,7 @@ fn boot(lib: Library, path: PathBuf) -> Result<Engine, String> {
 }
 
 /// A failed v2 call: the structured code plus the engine's rendered text.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Error {
     pub code: ffi::ERROR,
     pub message: String,

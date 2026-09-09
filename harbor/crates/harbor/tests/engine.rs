@@ -301,6 +301,86 @@ mod conn {
         // Aims at nothing; must not crash.
         handle.interrupt();
     }
+
+    // -- statements that expand to a GROUP of statements --------------------
+    //
+    // COPY FROM DATABASE, IMPORT DATABASE. Their schema is unreadable until
+    // the group's result-producing member has been prepared, and only a step
+    // prepares it — so opening one takes a chunk off the result before the
+    // caller sees it, and that chunk has to reach the caller first.
+
+    const N: i64 = 5000; // > one 2048-row chunk, so the stream is multi-chunk
+    const SUM: i64 = N * (N - 1) / 2;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("harbor-groups-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The guard that matters most: an ordinary multi-chunk SELECT must not
+    /// lose or repeat its opening rows now that a chunk can arrive out of band.
+    #[test]
+    fn ordinary_statements_deliver_every_row_once() {
+        let Some(_) = v2_engine() else { return };
+        let mut c = conn::open(Path::new(":memory:"), &[]).expect("open");
+        let got = rows(&mut c, &format!("SELECT i FROM range({N}) r(i)"), &[]).unwrap();
+        assert_eq!(got.len(), N as usize, "row count");
+        let total: i64 = got.iter().map(|r| r.parse::<i64>().unwrap()).sum();
+        assert_eq!(total, SUM, "checksum — a dropped or doubled chunk moves this");
+        assert_eq!(got[0], "0", "the first row survived the out-of-band path");
+    }
+
+    #[test]
+    fn copy_from_database_copies_every_row() {
+        let Some(_) = v2_engine() else { return };
+        let dir = scratch("copy");
+        let mut c = conn::open(&dir.join("src.duckdb"), &[]).expect("open");
+        c.execute_batch(&format!("CREATE TABLE t AS SELECT i FROM range({N}) r(i)")).unwrap();
+        c.execute_batch(&format!("ATTACH '{}' AS dst", dir.join("dst.duckdb").display())).unwrap();
+        c.execute_batch("COPY FROM DATABASE src TO dst").unwrap();
+        let got = rows(&mut c, "SELECT count(*)::BIGINT, sum(i)::BIGINT FROM dst.t", &[]).unwrap();
+        assert_eq!(got, [format!("{N},{SUM}")]);
+    }
+
+    #[test]
+    fn import_database_restores_every_row() {
+        let Some(_) = v2_engine() else { return };
+        let dir = scratch("import");
+        let exp = dir.join("exp");
+        let mut c = conn::open(&dir.join("src.duckdb"), &[]).expect("open");
+        c.execute_batch(&format!("CREATE TABLE t AS SELECT i FROM range({N}) r(i)")).unwrap();
+        c.execute_batch(&format!("EXPORT DATABASE '{}' (FORMAT parquet)", exp.display())).unwrap();
+
+        let mut r = conn::open(&dir.join("restored.duckdb"), &[]).expect("open restored");
+        r.execute_batch(&format!("IMPORT DATABASE '{}'", exp.display())).unwrap();
+        let got = rows(&mut r, "SELECT count(*)::BIGINT, sum(i)::BIGINT FROM t", &[]).unwrap();
+        assert_eq!(got, [format!("{N},{SUM}")]);
+    }
+
+    /// A group statement that genuinely fails reports ITS complaint, not the
+    /// schema-not-ready error that is only how the failure reached us.
+    #[test]
+    fn a_failing_group_statement_reports_its_own_error() {
+        let Some(_) = v2_engine() else { return };
+        let dir = scratch("err");
+        let exp = dir.join("exp");
+        let mut c = conn::open(&dir.join("src.duckdb"), &[]).expect("open");
+        c.execute_batch("CREATE TABLE t AS SELECT 1 AS i").unwrap();
+        c.execute_batch(&format!("EXPORT DATABASE '{}' (FORMAT parquet)", exp.display())).unwrap();
+
+        // Importing back over itself collides on `t`.
+        let err = c
+            .execute_batch(&format!("IMPORT DATABASE '{}'", exp.display()))
+            .expect_err("should collide on t");
+        assert!(err.message.contains("already exists"), "want the catalog complaint, got: {}", err.message);
+        assert!(
+            !err.message.contains("result metadata is not yet available"),
+            "the readiness error must not mask the real one: {}",
+            err.message
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
