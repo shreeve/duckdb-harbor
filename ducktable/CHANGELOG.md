@@ -1,7 +1,14 @@
 # DuckTable changelog
 
-DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by signed
-tag date, newest first.
+DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by release
+date, newest first.
+
+## 0.22.1 — 2026-09-11
+
+- Uses Harbor's corrected shared path handling: native canonical paths remain
+  intact for database identity and file operations, while display formatting
+  hides Windows verbatim prefixes. Updates the shared `harbor-common` and
+  `wire` lockfile entries to 0.36.1.
 
 ## 0.22.0 — 2026-09-11
 

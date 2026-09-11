@@ -91,6 +91,10 @@ jobs:
         shell: bash
         run: cargo build -p harbor --release
 
+      - name: Test native path handling
+        shell: bash
+        run: cargo test --release -p harbor-common --all-features --locked paths::tests
+
       - name: Package
         shell: bash
         run: |

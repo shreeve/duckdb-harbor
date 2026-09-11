@@ -145,7 +145,7 @@ pub fn socket_for(runtime: &Path, db: &Path) -> Result<PathBuf, String> {
 /// its own name.
 pub fn canonical_db(db: &Path) -> Result<PathBuf, String> {
     if let Ok(c) = db.canonicalize() {
-        return Ok(without_verbatim_prefix(c));
+        return Ok(c);
     }
     let parent = match db.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -155,24 +155,23 @@ pub fn canonical_db(db: &Path) -> Result<PathBuf, String> {
     let parent = parent
         .canonicalize()
         .map_err(|e| format!("{}: {e}", parent.display()))?;
-    Ok(without_verbatim_prefix(parent.join(name)))
+    Ok(parent.join(name))
 }
 
-/// On Windows, `canonicalize` answers in the verbatim form — `\\?\C:\...`, or
-/// `\\?\UNC\host\share\...` — so that paths past 260 characters keep
-/// working. That prefix is for the kernel, not for a banner or for comparing
-/// against what someone typed, so the canonical identity drops it.
-fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
-    let Some(text) = path.to_str() else {
-        return path;
-    };
-    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        return PathBuf::from(format!(r"\\{rest}"));
+/// Render a path for people. Keep the native canonical path for file access
+/// and identity: Windows' verbatim prefix preserves long paths and names.
+pub fn display_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    #[cfg(windows)]
+    {
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
     }
-    if let Some(rest) = text.strip_prefix(r"\\?\") {
-        return PathBuf::from(rest);
-    }
-    path
+    text
 }
 
 pub fn sidecar_file(runtime: &Path, name: &str) -> PathBuf {
@@ -235,7 +234,7 @@ pub fn expand(p: &str) -> PathBuf {
 
 /// Render a path with `$HOME` shortened back to `~`, for display only.
 pub fn shorten(p: &Path) -> String {
-    let s = p.display().to_string();
+    let s = display_path(p);
     let Ok(h) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) else {
         return s;
     };
@@ -251,12 +250,45 @@ pub fn shorten(p: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     #[test]
-    fn verbatim_prefix_is_dropped() {
-        let strip = |s: &str| super::without_verbatim_prefix(PathBuf::from(s));
-        assert_eq!(strip(r"\\?\C:\d\hb\hb.db"), PathBuf::from(r"C:\d\hb\hb.db"));
-        assert_eq!(strip(r"\\?\UNC\nas\share\hb.db"), PathBuf::from(r"\\nas\share\hb.db"));
-        assert_eq!(strip("/home/me/hb.db"), PathBuf::from("/home/me/hb.db"));
+    fn windows_display_hides_prefix_without_changing_path() {
+        for (native, shown) in [
+            (r"\\?\C:\d\hb\hb.db", r"C:\d\hb\hb.db"),
+            (r"\\?\UNC\nas\share\hb.db", r"\\nas\share\hb.db"),
+        ] {
+            let path = PathBuf::from(native);
+            assert_eq!(display_path(&path), shown);
+            assert_eq!(path, PathBuf::from(native));
+        }
+    }
+
+    #[test]
+    fn canonical_database_preserves_native_path_for_existing_and_new_files() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("hb-path-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let native_root = root.canonicalize().unwrap();
+        // A native Windows path beyond MAX_PATH must still reach the file.
+        let mut deep = native_root.clone();
+        for _ in 0..16 { deep.push("long-path-component"); }
+        std::fs::create_dir_all(&deep).unwrap();
+        let db = deep.join("existing.duckdb");
+        std::fs::write(&db, b"path probe").unwrap();
+        let canonical = canonical_db(&db).unwrap();
+        assert_eq!(canonical, db.canonicalize().unwrap());
+        assert_eq!(std::fs::read(&canonical).unwrap(), b"path probe");
+        assert_eq!(canonical_db(&deep.join("new.duckdb")).unwrap(), deep.canonicalize().unwrap().join("new.duckdb"));
+        #[cfg(windows)]
+        assert!(canonical.to_str().unwrap().starts_with(r"\\?\"));
+        std::fs::remove_dir_all(native_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_display_preserves_backslashes() {
+        assert_eq!(display_path(Path::new(r"\\?\C:\literal")), r"\\?\C:\literal");
     }
 
     use super::*;

@@ -358,6 +358,10 @@ harbor and the exact DuckDB shared library it was tested against. Unix
 archives carry `bin/`, `lib/` and `install.sh`; Windows archives put
 `duckdb.dll` beside the executable and run in place.
 
+On Windows, banners and fleet displays omit the `\\?\` prefix for readability.
+File access, configuration, and `/info` keep native canonical paths, including
+that prefix where needed for long paths.
+
 ### The two lifetimes
 
 **`harbor <db.duckdb>` — the server is everyone's.** On a terminal it is the

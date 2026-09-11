@@ -1,30 +1,55 @@
 # Harbor changelog
 
-Harbor release tags use `vX.Y.Z`. Entries are ordered by signed tag date,
+Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
+
+## 0.36.1 — 2026-09-11
+
+- Keeps Windows' native canonical database paths for file access, server
+  identity, and configuration. The `\\?\` prefix is hidden only when
+  rendering paths in the banner and fleet display, preserving long-path
+  support while keeping displayed paths readable.
+- Adds a regression covering native canonical paths for existing and new
+  databases under long directory names, plus Windows drive/UNC display cases.
+  Release builds run the shared path tests on each supported platform.
+- Sends the round-trip suite's large SQL fixtures through stdin so Linux
+  argument-size limits cannot prevent the backup checks from running.
+- Completes the 0.36.0 backup notes and corrects the description of config
+  permission and symlink protections.
 
 ## 0.36.0 — 2026-09-11
 
 - **A backup reads one snapshot from its first pass to its last.** `backup`
-  walks a table more than once — the export, the blank-record scan, and the
-  quoted rewrite when the scan finds one — and inspects files in between, a
-  gap in which an ordinary session could idle out and hand the next pass a
-  newer snapshot. A session opened with `{"purpose":"backup"}` never idles
-  out; it lives in a 60-second window that `POST /sql/sessions/<id>/renew`
-  extends, and the client renews it from a heartbeat every twenty seconds,
+  may export a table again after scanning its first export for blank records
+  or deciding that its types need another format. These passes previously
+  used separate requests that could see different committed data. They now
+  share one transaction. A session opened with `{"purpose":"backup"}` has no
+  statement-idle timeout; it lives in a 60-second window that
+  `POST /sql/sessions/<id>/renew` extends, and the client renews it from a heartbeat every twenty seconds,
   through SQL and file work alike. Renewals travel the control path, so a busy
   worker cannot starve them. Losing the lease aborts the backup, even
   mid-response, rather than resuming on a snapshot the first pass never saw,
   and an expired or released session cannot be revived. Ordinary sessions
   cannot be renewed; `/sessions` reports `renewable`. An older server without
   the route is refused with an explicit ask to upgrade.
+- Backup loader rewriting handles quoted schemas and identifiers, apostrophes,
+  and newlines using the shared SQL scanner. Loader filenames remain relative
+  so a backup restores after its directory is moved. File scans use bounded
+  buffers, and table-type metadata is indexed once for the rewrite passes.
+- A table whose types cannot round-trip through either supported format is
+  refused, including combinations of text-incompatible types and
+  parquet-incompatible types. Failed exports remove their incomplete directory.
+  Sequence counters remain nontransactional; exact alignment with exported
+  rows requires quiescing sequence users.
+- The backup heartbeat replaces the ordinary five-minute session ceiling,
+  while the operator's statement timeout still limits each export statement.
 - **One statement per request, decided before any of it runs.** A body with
   two statements used to run the leading ones and answer for the last; it is
   now refused with `400` and nothing executes.
 - **A connection is replaced, not rolled back, before another caller sees
   it.** `ROLLBACK` undoes a transaction and nothing else — a `SET VARIABLE`,
-  a temp table, a `PREPARE`, a `USE` all survived it onto the next request.
+  a temp table, and a `PREPARE` survived it onto the next request.
   Any statement that can leave such state, including one wrapped in
   `EXPLAIN ANALYZE`, now costs the worker a fresh engine connection, and a
   released session gets the same treatment. The parsed-statement cache goes
@@ -33,7 +58,8 @@ Harbor releases, and are not included here.
   spill are fixed at `start`, and DuckDB's own `allowed_configs` and
   `lock_configuration` now enforce it — a wrapped `SET threads` or a `SET
   lock_configuration=false` is refused by the engine rather than by a keyword
-  check. Every other setting registered at startup stays changeable. Load
+  check. Other settings registered at startup remain changeable unless
+  initialization imposed stricter locks. Load
   extensions whose settings must be tunable during `--init`; settings that
   arrive later are outside the allowed list.
 - **Limits that answer instead of truncating.** A request body over the limit
@@ -42,9 +68,11 @@ Harbor releases, and are not included here.
   most 64 texts and 1 MiB of SQL, and does not retain a statement over 64
   KiB, so a one-off bulk `INSERT` runs but cannot pin every connection's cache.
 - **`config.toml` writes take a lock.** Concurrent membership updates each
-  land — an exclusive lock file, a per-writer temp file, no following of
-  symlinks — and a config directory exposed to group or world is refused
-  rather than written into.
+  land through a lock spanning read, modification, and atomic replacement.
+  Temporary files use exclusive creation. On Unix, the lock file is opened
+  without following symlinks, owned config directories are secured to `0700`,
+  and foreign-owned directories, permission failures, and unsafe config files
+  are refused. This does not reject symlinks throughout the entire config path.
 - The Windows banner prints `C:\...` rather than the `\\?\C:\...` that
   `canonicalize` returns.
 - New `regressions` suite, run on an isolated one-worker server so connection

@@ -73,9 +73,9 @@ def bad(msg, detail=""):
 # ---------------------------------------------------------------------------
 
 
-def run(*args, expect=0):
+def run(*args, expect=0, stdin=None):
     done = subprocess.run([str(HARBOR), *[str(a) for a in args]],
-                          capture_output=True, text=True)
+                          input=stdin, capture_output=True, text=True)
     if expect is not None and done.returncode != expect:
         raise RuntimeError(
             f"harbor {' '.join(str(a) for a in args)[:120]} exited "
@@ -85,13 +85,15 @@ def run(*args, expect=0):
 
 def sql(db, text, mode="jsonlines"):
     """Run statements against `db` and return the result rows as dicts."""
-    out = run(db, "--mode", mode, "-c", text).stdout
+    # Fixtures can exceed the OS per-argument limit; stdin carries the same
+    # SQL through the CLI without truncating or shrinking the test data.
+    out = run(db, "--mode", mode, stdin=text).stdout
     return [json.loads(line) for line in out.splitlines() if line.strip()]
 
 
 def quiet(db, text):
     """A statement whose result is not wanted — DDL, loads, the big builds."""
-    run(db, "--mode", "trash", "-c", text)
+    run(db, "--mode", "trash", stdin=text)
 
 
 # ---------------------------------------------------------------------------

@@ -746,7 +746,7 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> 
         }
         let sock = harbor::repl::start_detached(&o.db, &typed, o.ephemeral)?;
         let lifetime = if o.ephemeral { "it leaves when its last client does" } else { &format!("`harbor {name} stop` ends it") };
-        eprintln!("harbor: serving {} on {} — {lifetime}", canon.display(), sock.display());
+        eprintln!("harbor: serving {} on {} — {lifetime}", harbor_common::paths::display_path(&canon), sock.display());
         return Ok(());
     }
 
@@ -835,7 +835,7 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> 
 
     eprintln!(
         "harbor {VERSION}: serving {} on {} (duckdb {}, memory_limit {})",
-        canon.display(),
+        harbor_common::paths::display_path(&canon),
         addr,
         duckdb_version,
         o.memory_limit
@@ -884,7 +884,7 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> 
     let farewell = harbor::wait()?;
     #[cfg(unix)]
     let _ = std::fs::remove_file(&sock_path);
-    eprintln!("harbor: {} closed ({farewell})", canon.display());
+    eprintln!("harbor: {} closed ({farewell})", harbor_common::paths::display_path(&canon));
     Ok(())
 }
 
