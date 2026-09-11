@@ -4,8 +4,8 @@
 # cannot evict it. Bump the version and checksum together.
 #
 # Sourcing sets $sparkle_dir; ensure_sparkle populates it on first use.
-sparkle_version="2.9.4"
-sparkle_sha256="ce89daf967db1e1893ed3ebd67575ed82d3902563e3191ca92aaec9164fbdef9"
+sparkle_version="2.9.6"
+sparkle_sha256="52bf9e88cdd972fc0c81501377a880e90d47031bd8ca5462488f843e2609e192"
 sparkle_cache_root=".ducktable-cache/sparkle"
 sparkle_dir="$sparkle_cache_root/$sparkle_version"
 

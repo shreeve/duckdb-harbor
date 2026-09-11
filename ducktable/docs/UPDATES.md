@@ -45,7 +45,7 @@ public half ships in the bundle. The tools land in
 `.ducktable-cache/sparkle/<version>/bin` after any `scripts/macos-app.sh` run.
 
 ```sh
-bin=.ducktable-cache/sparkle/2.9.4/bin
+bin=.ducktable-cache/sparkle/2.9.6/bin
 $bin/generate_keys --account ducktable          # creates the key, prints the public half
 $bin/generate_keys --account ducktable -p > assets/sparkle-public-key.txt
 $bin/generate_keys --account ducktable -x /tmp/ducktable-sparkle-key.txt

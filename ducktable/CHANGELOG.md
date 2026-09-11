@@ -3,6 +3,21 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by signed
 tag date, newest first.
 
+## 0.22.0 — 2026-09-11
+
+- Selects many rows at once, with the grammar every macOS list uses, on the
+  gutter and the body cells alike: a plain click selects one row, ⌘-click
+  toggles a row in or out, ⇧-click selects the span from the anchor through
+  the clicked row. One row is the lead — the ring, the inspector and ⌘D
+  follow it — and ⌘⌫ stages a `DELETE` for every selected row. Esc clears the
+  whole selection. ⇧-click in the body is a seat cell ranges would want;
+  docs/EDITING.md records that if ranges ship, body ⇧-click moves to them and
+  the gutter keeps the row span.
+- Undoes a many-row gesture in one step: one ⌘Z takes back a ⌘⌫ over a
+  selection and one ⌘⇧Z replays it, and ⌘⇧⌫ discard-all is one step for the
+  same reason. Single-row paths are unchanged.
+- Ships Sparkle 2.9.6, up from 2.9.4, so the updater itself is current.
+
 ## 0.21.1 — 2026-09-06
 
 - The first version to arrive through Check for Updates rather than the
