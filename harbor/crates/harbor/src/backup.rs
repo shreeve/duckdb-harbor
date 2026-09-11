@@ -64,8 +64,11 @@
 //! size can be chosen, since DuckDB fixes that when a file is created and
 //! offers no ALTER — so `--block-size` belongs here.
 
+use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use harbor::repl::{scan::{scan, Kind}, split_statements};
 
 /// The writer's dialect. Backup and restore must agree on it, so it is said
 /// once. `\t` is the two-character spelling DuckDB reads as a tab.
@@ -83,7 +86,7 @@ enum Format {
     /// Tab-separated: greppable, diffable, editable. The default, because the
     /// artifact outliving its engine is most of the point.
     Tsv,
-    /// Every table parquet: one format, every type, not readable by eye.
+    /// Binary columnar output, with the compatibility checks below.
     Parquet,
 }
 
@@ -226,23 +229,21 @@ pub fn backup(db: &Path, args: &[String]) -> Result<(), String> {
 /// here is an ordinary outcome rather than a surprise.
 fn write_backup(db: &Path, dir: &Path, format: Format, strict: bool) -> Result<(), String> {
     let target = db.display().to_string();
-    let sql = format!("EXPORT DATABASE {} ({})", quote(dir), format.options());
-    harbor::repl::exec_quiet(&target, &[&sql], &[])?;
-
-    // The loader is rewritten first, because reading it is how the tables
-    // text cannot carry are found — and rewriting it is how they are fixed.
-    let again = patch_loader(dir, format, strict)?;
-    if !again.statements.is_empty() {
-        let refs: Vec<&str> = again.statements.iter().map(String::as_str).collect();
-        harbor::repl::exec_quiet(&target, &refs, &[])?;
+    harbor::repl::with_snapshot(&target, |execute| {
+        let sql = format!("EXPORT DATABASE {} ({})", quote(dir), format.options());
+        execute(&sql)?;
+        let again = patch_loader(dir, format, strict)?;
+        for statement in &again.statements {
+            execute(statement)?;
+        }
         for stale in &again.replaced {
             fs::remove_file(stale).map_err(|e| format!("{}: {e}", stale.display()))?;
         }
         for note in &again.notes {
             eprintln!("harbor: {note}");
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// `harbor <db> restore <dir> [--block-size <s>]`.
@@ -362,26 +363,27 @@ struct Reformat {
 fn patch_loader(dir: &Path, format: Format, strict: bool) -> Result<Reformat, String> {
     let path = dir.join("load.sql");
     let before = read(&path)?;
-    let schema = read(&dir.join("schema.sql"))?;
+    let schema = schema_types(&read(&dir.join("schema.sql"))?);
     let mut again = Reformat { statements: vec![], replaced: vec![], notes: vec![] };
 
     let mut lines: Vec<String> = Vec::new();
-    for line in before
-        .replace(&format!("'{}/", dir.display()), "'")
-        .replace("FORMAT 'csv'", "FORMAT 'csv', allow_quoted_nulls false")
-        .lines()
-    {
-        let swap = reformat(dir, line, &schema, format);
+    for original in split_statements(&before) {
+        let (table, _, name) = copy_parts(&original)
+            .ok_or_else(|| format!("unrecognized backup COPY statement: {original}"))?;
+        let file = Path::new(&name).file_name()
+            .ok_or_else(|| format!("invalid backup path: {name}"))?;
+        let line = format!("COPY {table} FROM {} ({})", quote(Path::new(file)), format.loader());
+        let swap = reformat(dir, &line, &schema, format)?;
         match swap {
-            Some((swapped, statement, stale, note)) if !strict => {
-                lines.push(swapped);
+            Some(TableRewrite { loader, statement, stale, note }) if !strict => {
+                lines.push(loader);
                 again.statements.push(statement);
                 again.replaced.push(stale);
                 again.notes.push(note);
             }
             // --strict: the answer to "text cannot hold this" is an error
             // rather than a change of format, however well announced.
-            Some((_, _, _, note)) => {
+            Some(TableRewrite { note, .. }) => {
                 let (head, why) = note.split_once(" — ").unwrap_or(("", ""));
                 let table = head.split(" is ").next().unwrap_or("");
                 return Err(format!(
@@ -397,7 +399,7 @@ fn patch_loader(dir: &Path, format: Format, strict: bool) -> Result<Reformat, St
             // format — so it is checked here, on the file itself.
             None => {
                 if format == Format::Tsv
-                    && let Some((statement, note)) = requote(dir, line)?
+                    && let Some((statement, note)) = requote(dir, &line)?
                 {
                     again.statements.push(statement);
                     again.notes.push(note);
@@ -407,15 +409,16 @@ fn patch_loader(dir: &Path, format: Format, strict: bool) -> Result<Reformat, St
         }
     }
 
-    let after = lines.join("\n") + "\n";
-    if after == before && !before.trim().is_empty() {
-        return Err(format!(
-            "{} was not in the shape this patch expects — see duckdb#25501",
-            path.display()
-        ));
-    }
+    let after = lines.iter().map(|s| format!("{};\n", s.trim_end_matches(';'))).collect::<String>();
     fs::write(&path, after).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(again)
+}
+
+struct TableRewrite {
+    loader: String,
+    statement: String,
+    stale: PathBuf,
+    note: String,
 }
 
 /// Is this `COPY` line loading a table the chosen format cannot hold? If so,
@@ -424,44 +427,37 @@ fn patch_loader(dir: &Path, format: Format, strict: bool) -> Result<Reformat, St
 fn reformat(
     dir: &Path,
     line: &str,
-    schema: &str,
+    schema: &HashMap<String, String>,
     format: Format,
-) -> Option<(String, String, PathBuf, String)> {
-    let (table, why) = schema.lines().find_map(|create| {
-        let why = format
-            .cannot_hold()
-            .iter()
-            .find(|(spelling, _)| create.contains(spelling))
-            .map(|(_, why)| *why)?;
-        let table = table_of(create)?;
-        line.starts_with(&format!("COPY {table} FROM '"))
-            .then_some((table.to_string(), why))
-    })?;
+) -> Result<Option<TableRewrite>, String> {
+    let (table, _, path) = copy_parts(line).ok_or("invalid backup COPY path")?;
+    let types = schema.get(table).ok_or_else(|| format!("no schema for backup table {table}"))?;
+    let Some((_, why)) = format.cannot_hold().iter().find(|(ty, _)| types.contains(ty)) else {
+        return Ok(None);
+    };
+    if let Some((_, why)) = format.other().cannot_hold().iter().find(|(ty, _)| types.contains(ty)) {
+        return Err(format!("{table} cannot round-trip in either backup format: {why}"));
+    }
 
-    // The file DuckDB chose, which is NOT always the table's name — a space
-    // in one becomes an underscore in the other.
-    let open = line.find('\'')? + 1;
-    let name = line[open..]
-        .split('\'')
-        .next()?
-        .strip_suffix(&format!(".{}", format.extension()))?
-        .to_string();
+    // The export filename need not match the table's SQL identifier.
+    let name = path.strip_suffix(&format!(".{}", format.extension()))
+        .ok_or("unexpected backup file extension")?;
     let instead = format.other();
 
-    Some((
-        format!(
-            "COPY {table} FROM '{name}.{}' ({});",
-            instead.extension(),
+    Ok(Some(TableRewrite {
+        loader: format!(
+            "COPY {table} FROM {} ({})",
+            quote(Path::new(&format!("{name}.{}", instead.extension()))),
             instead.loader()
         ),
-        format!(
+        statement: format!(
             "COPY {table} TO {} ({})",
             quote(&dir.join(format!("{name}.{}", instead.extension()))),
             instead.options()
         ),
-        dir.join(format!("{name}.{}", format.extension())),
-        format!("{table} is {}, not {} — {why}", instead.name(), format.name()),
-    ))
+        stale: dir.join(format!("{name}.{}", format.extension())),
+        note: format!("{table} is {}, not {} — {why}", instead.name(), format.name()),
+    }))
 }
 
 /// Does this table's export hold a record the reader would throw away? If so,
@@ -472,14 +468,14 @@ fn reformat(
 /// proxy for it: a blank line is what a CSV reader skips, so a file without
 /// one cannot lose a row and pays nothing.
 fn requote(dir: &Path, line: &str) -> Result<Option<(String, String)>, String> {
-    let Some(table) = line.strip_prefix("COPY ").and_then(|r| r.split(" FROM '").next()) else {
-        return Ok(None);
-    };
-    let Some(name) = line.split(" FROM '").nth(1).and_then(|r| r.split('\'').next()) else {
-        return Ok(None);
+    let Some((table, _, name)) = copy_parts(line) else {
+        return Err(format!("unrecognized backup COPY statement: {line}"));
     };
     let file = dir.join(name);
-    if !has_blank_record(&read(&file)?) {
+    let input = fs::File::open(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    if !has_blank_record(BufReader::new(input))
+        .map_err(|e| format!("{}: {e}", file.display()))?
+    {
         return Ok(None);
     }
     Ok(Some((
@@ -497,25 +493,32 @@ fn requote(dir: &Path, line: &str) -> Result<Option<(String, String)>, String> {
 /// lines, and a blank one INSIDE the quotes is part of the value and comes
 /// back fine. Only a blank line between records is lost, so the quotes have
 /// to be walked — which is the same thing the reader does.
-fn has_blank_record(text: &str) -> bool {
-    let (mut quoted, mut at_record_start) = (false, false);
-    for ch in text.chars() {
-        match ch {
-            '"' => {
-                quoted = !quoted;
-                at_record_start = false;
-            }
-            '\n' if !quoted => {
-                if at_record_start {
-                    return true;
-                }
-                at_record_start = true;
-            }
-            _ if !quoted => at_record_start = false,
-            _ => {}
+fn has_blank_record(mut input: impl BufRead) -> std::io::Result<bool> {
+    let (mut quoted, mut at_record_start) = (false, true);
+    loop {
+        let chunk = input.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(false);
         }
+        for &ch in chunk {
+            match ch {
+                b'"' => {
+                    quoted = !quoted;
+                    at_record_start = false;
+                }
+                b'\n' if !quoted => {
+                    if at_record_start {
+                        return Ok(true);
+                    }
+                    at_record_start = true;
+                }
+                _ if !quoted => at_record_start = false,
+                _ => {}
+            }
+        }
+        let n = chunk.len();
+        input.consume(n);
     }
-    false
 }
 
 /// The identifier after `CREATE TABLE`, spelled the way `load.sql` spells it
@@ -523,23 +526,43 @@ fn has_blank_record(text: &str) -> bool {
 /// walked rather than searched past.
 fn table_of(create: &str) -> Option<&str> {
     let rest = create.strip_prefix("CREATE TABLE ")?;
-    if !rest.starts_with('"') {
-        return rest.find('(').map(|end| &rest[..end]);
-    }
-    let bytes = rest.as_bytes();
-    let mut i = 1;
-    while i < bytes.len() {
-        if bytes[i] == b'"' {
-            if bytes.get(i + 1) == Some(&b'"') {
-                i += 2;
-                continue;
-            }
-            return Some(&rest[..=i]);
+    for span in scan(rest) {
+        if span.kind == Kind::Code
+            && let Some(end) = rest[span.start..span.end].find('(')
+        {
+            return Some(rest[..span.start + end].trim_end());
         }
-        i += 1;
     }
     None
 }
+
+/// Generated SQL still permits arbitrary quoted identifiers and string paths.
+/// Use the same scanner as the REPL, including escaped quotes and newlines.
+fn copy_parts(sql: &str) -> Option<(&str, std::ops::Range<usize>, String)> {
+    for span in scan(sql) {
+        if span.kind == Kind::Str && sql.as_bytes()[span.start] == b'\'' && span.terminated {
+            let table = sql[..span.start].trim_end().strip_prefix("COPY ")?
+                .strip_suffix(" FROM")?.trim_end();
+            let path = sql[span.start + 1..span.end - 1].replace("''", "'");
+            return Some((table, span.start..span.end, path));
+        }
+    }
+    None
+}
+
+fn unquoted_code(sql: &str) -> String {
+    scan(sql).iter().map(|span| {
+        if span.kind == Kind::Code { &sql[span.start..span.end] } else { " " }
+    }).collect()
+}
+
+/// Index the schema once, rather than rescanning every CREATE for each table.
+fn schema_types(sql: &str) -> HashMap<String, String> {
+    split_statements(sql).iter().filter_map(|create| {
+        Some((table_of(create)?.to_string(), unquoted_code(create)))
+    }).collect()
+}
+
 
 fn read(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
@@ -610,4 +633,44 @@ fn absolute(p: &str) -> Result<PathBuf, String> {
 /// A path as a SQL string literal.
 fn quote(p: &Path) -> String {
     format!("'{}'", p.display().to_string().replace('\'', "''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blank_records_are_scanned_across_buffer_boundaries() {
+        for (text, expected) in [
+            ("x\n\n", true), ("x\n\"\"\n", false), ("x\n\"line\n\nend\"\n", false),
+            ("x\n\"a\"\"b\"\n\n", true), ("\n", true), ("x\nvalue\n", false),
+        ] {
+            for capacity in 1..8 {
+                let input = BufReader::with_capacity(capacity, text.as_bytes());
+                assert_eq!(has_blank_record(input).unwrap(), expected, "{text:?}, {capacity}");
+            }
+        }
+    }
+
+    #[test]
+    fn generated_sql_preserves_quoted_schemas_and_paths() {
+        let table = "\"odd schema\".\"a(\"\"b\n'c\"";
+        assert_eq!(table_of(&format!("CREATE TABLE {table}(v INTEGER);")), Some(table));
+        let sql = format!("COPY {table} FROM '/tmp/it''s here/a.csv' (FORMAT 'csv');");
+        let (got, span, path) = copy_parts(&sql).unwrap();
+        assert_eq!(got, table);
+        assert_eq!(path, "/tmp/it's here/a.csv");
+        assert_eq!(&sql[span], "'/tmp/it''s here/a.csv'");
+        assert_eq!(split_statements(&sql).len(), 1);
+    }
+
+    #[test]
+    fn incompatible_formats_fail_instead_of_losing_values() {
+        let schema = schema_types("CREATE TABLE t(u UNION(x INTEGER), z TIME WITH TIME ZONE)");
+        for (format, path) in [(Format::Tsv, "t.csv"), (Format::Parquet, "t.parquet")] {
+            assert!(reformat(Path::new("/tmp"), &format!("COPY t FROM '{path}'"), &schema, format).is_err());
+        }
+        let schema = schema_types("CREATE TABLE t(\"VARIANT\" VARCHAR DEFAULT 'UNION(x INT)')");
+        assert!(reformat(Path::new("/tmp"), "COPY t FROM 't.csv'", &schema, Format::Tsv).unwrap().is_none());
+    }
 }

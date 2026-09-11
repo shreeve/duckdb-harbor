@@ -4,6 +4,53 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by signed tag date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.36.0 — 2026-09-11
+
+- **A backup reads one snapshot from its first pass to its last.** `backup`
+  walks a table more than once — the export, the blank-record scan, and the
+  quoted rewrite when the scan finds one — and inspects files in between, a
+  gap in which an ordinary session could idle out and hand the next pass a
+  newer snapshot. A session opened with `{"purpose":"backup"}` never idles
+  out; it lives in a 60-second window that `POST /sql/sessions/<id>/renew`
+  extends, and the client renews it from a heartbeat every twenty seconds,
+  through SQL and file work alike. Renewals travel the control path, so a busy
+  worker cannot starve them. Losing the lease aborts the backup, even
+  mid-response, rather than resuming on a snapshot the first pass never saw,
+  and an expired or released session cannot be revived. Ordinary sessions
+  cannot be renewed; `/sessions` reports `renewable`. An older server without
+  the route is refused with an explicit ask to upgrade.
+- **One statement per request, decided before any of it runs.** A body with
+  two statements used to run the leading ones and answer for the last; it is
+  now refused with `400` and nothing executes.
+- **A connection is replaced, not rolled back, before another caller sees
+  it.** `ROLLBACK` undoes a transaction and nothing else — a `SET VARIABLE`,
+  a temp table, a `PREPARE`, a `USE` all survived it onto the next request.
+  Any statement that can leave such state, including one wrapped in
+  `EXPLAIN ANALYZE`, now costs the worker a fresh engine connection, and a
+  released session gets the same treatment. The parsed-statement cache goes
+  with the connection.
+- **Operator settings are locked once the berth is up.** Memory, threads and
+  spill are fixed at `start`, and DuckDB's own `allowed_configs` and
+  `lock_configuration` now enforce it — a wrapped `SET threads` or a `SET
+  lock_configuration=false` is refused by the engine rather than by a keyword
+  check. Every other setting registered at startup stays changeable. Load
+  extensions whose settings must be tunable during `--init`; settings that
+  arrive later are outside the allowed list.
+- **Limits that answer instead of truncating.** A request body over the limit
+  is refused with `413` on both endpoints, chunked or not, where before the
+  excess was quietly cut off and parsed. The parsed-statement cache keeps at
+  most 64 texts and 1 MiB of SQL, and does not retain a statement over 64
+  KiB, so a one-off bulk `INSERT` runs but cannot pin every connection's cache.
+- **`config.toml` writes take a lock.** Concurrent membership updates each
+  land — an exclusive lock file, a per-writer temp file, no following of
+  symlinks — and a config directory exposed to group or world is refused
+  rather than written into.
+- The Windows banner prints `C:\...` rather than the `\\?\C:\...` that
+  `canonicalize` returns.
+- New `regressions` suite, run on an isolated one-worker server so connection
+  reuse is deterministic; `make test` now runs the workspace with all
+  features in release mode.
+
 ## 0.35.0 — 2026-09-09
 
 - Adds `harbor <db> backup [dir]` and `harbor <new.duckdb> restore <dir>`.

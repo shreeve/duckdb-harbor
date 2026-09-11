@@ -145,7 +145,7 @@ pub fn socket_for(runtime: &Path, db: &Path) -> Result<PathBuf, String> {
 /// its own name.
 pub fn canonical_db(db: &Path) -> Result<PathBuf, String> {
     if let Ok(c) = db.canonicalize() {
-        return Ok(c);
+        return Ok(without_verbatim_prefix(c));
     }
     let parent = match db.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -155,7 +155,24 @@ pub fn canonical_db(db: &Path) -> Result<PathBuf, String> {
     let parent = parent
         .canonicalize()
         .map_err(|e| format!("{}: {e}", parent.display()))?;
-    Ok(parent.join(name))
+    Ok(without_verbatim_prefix(parent.join(name)))
+}
+
+/// On Windows, `canonicalize` answers in the verbatim form — `\\?\C:\...`, or
+/// `\\?\UNC\host\share\...` — so that paths past 260 characters keep
+/// working. That prefix is for the kernel, not for a banner or for comparing
+/// against what someone typed, so the canonical identity drops it.
+fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path
 }
 
 pub fn sidecar_file(runtime: &Path, name: &str) -> PathBuf {
@@ -234,6 +251,14 @@ pub fn shorten(p: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn verbatim_prefix_is_dropped() {
+        let strip = |s: &str| super::without_verbatim_prefix(PathBuf::from(s));
+        assert_eq!(strip(r"\\?\C:\d\hb\hb.db"), PathBuf::from(r"C:\d\hb\hb.db"));
+        assert_eq!(strip(r"\\?\UNC\nas\share\hb.db"), PathBuf::from(r"\\nas\share\hb.db"));
+        assert_eq!(strip("/home/me/hb.db"), PathBuf::from("/home/me/hb.db"));
+    }
+
     use super::*;
 
     #[test]

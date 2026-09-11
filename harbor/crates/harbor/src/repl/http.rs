@@ -6,7 +6,7 @@
 //! a time, so an async stack would be pure weight.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 #[cfg(unix)]
@@ -80,11 +80,12 @@ pub fn request(
 /// Like `request`, but built for long-running /sql streams: the socket gets a
 /// short read timeout so the caller's read loop ticks (and can notice a
 /// Ctrl-C), while status and header reads here retry through those ticks.
+/// A callback error aborts the request, including before any headers arrive.
 pub fn request_streaming(
     transport: &Transport,
     route: &Route,
     body: Option<&str>,
-    on_tick: &dyn Fn(),
+    on_tick: &dyn Fn() -> io::Result<()>,
 ) -> io::Result<Response> {
     request_inner(transport, route, body, Some(Duration::from_millis(250)), Some(on_tick))
 }
@@ -94,18 +95,29 @@ fn request_inner(
     route: &Route,
     body: Option<&str>,
     timeout: Option<Duration>,
-    on_tick: Option<&dyn Fn()>,
+    on_tick: Option<&dyn Fn() -> io::Result<()>>,
 ) -> io::Result<Response> {
     let (stream, host): (Box<dyn Stream>, String) = match transport {
         #[cfg(unix)]
         Transport::Unix(p) => {
             let s = UnixStream::connect(p)?;
             s.set_read_timeout(timeout)?;
+            s.set_write_timeout(timeout.map(|t| t.max(Duration::from_secs(5))))?;
             (Box::new(s), "harbor".to_string())
         }
         Transport::Tcp(addr) => {
-            let s = TcpStream::connect(addr)?;
+            let s = if let Some(timeout) = timeout {
+                let mut result = Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "no server address"));
+                for address in addr.to_socket_addrs()? {
+                    result = TcpStream::connect_timeout(&address, timeout.max(Duration::from_secs(5)));
+                    if result.is_ok() { break; }
+                }
+                result?
+            } else {
+                TcpStream::connect(addr)?
+            };
             s.set_read_timeout(timeout)?;
+            s.set_write_timeout(timeout.map(|t| t.max(Duration::from_secs(5))))?;
             (Box::new(s), addr.clone())
         }
     };
@@ -133,11 +145,9 @@ fn request_inner(
     // a query that has not sent a byte yet.
     let read_line = |reader: &mut BufReader<Box<dyn Stream>>, line: &mut String| -> io::Result<usize> {
         loop {
+            if let Some(f) = on_tick { f()?; }
             match reader.read_line(line) {
                 Err(e) if on_tick.is_some() && matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                    if let Some(f) = on_tick {
-                        f();
-                    }
                     continue;
                 }
                 other => return other,

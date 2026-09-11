@@ -13,7 +13,10 @@
 //! same DOM either way.
 
 use crate::{paths, perms};
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use toml_edit::{value, DocumentMut, Item, Table};
 
 /// What an `attach` did, once the already-there case is resolved.
@@ -34,6 +37,7 @@ pub enum Attached {
 /// there — under whatever key already names this file. Returns the name it is
 /// filed under. Errors if the stem already belongs to a different file.
 pub fn attach(db: &Path) -> Result<(String, Attached), String> {
+    let _lock = lock_config()?;
     let canon = paths::canonical_db(db)?;
     if let Some(key) = listed_as(&canon) {
         return Ok((key, Attached::AlreadyThere));
@@ -45,10 +49,10 @@ pub fn attach(db: &Path) -> Result<(String, Attached), String> {
     if let Some((_, existing)) = find(&doc, &name)? {
         // Same file under the same name is idempotent success; a different file
         // wanting the same name is the collision only its author can resolve.
-        if let Some(p) = &existing {
-            if paths::canonical_db(&paths::expand(p)).ok() == Some(canon) {
-                return Ok((name, Attached::AlreadyThere));
-            }
+        if let Some(p) = &existing
+            && paths::canonical_db(&paths::expand(p)).ok() == Some(canon)
+        {
+            return Ok((name, Attached::AlreadyThere));
         }
         return Err(match existing {
             Some(p) => format!("'{name}' already names {p} — detach it first, or rename this one"),
@@ -67,6 +71,7 @@ pub fn attach(db: &Path) -> Result<(String, Attached), String> {
 /// section was actually there to remove; a missing file or absent name is a
 /// quiet `false`, never an error.
 pub fn detach(db: &Path) -> Result<(String, bool), String> {
+    let _lock = lock_config()?;
     let name = name_for(db)?;
     let mut doc = parse(&read()?)?;
 
@@ -82,6 +87,7 @@ pub fn detach(db: &Path) -> Result<(String, bool), String> {
 
 /// Add a named database reached through an existing Harbor TCP listener.
 pub fn add_remote(name: &str, url: &str) -> Result<String, String> {
+    let _lock = lock_config()?;
     let name = paths::normalize(name)?;
     let url = url.trim();
     if url.is_empty() {
@@ -101,6 +107,7 @@ pub fn add_remote(name: &str, url: &str) -> Result<String, String> {
 /// Remove a named connection without interpreting what kind it is. Front ends
 /// establish that policy before calling; this layer only preserves the TOML.
 pub fn remove_named(name: &str) -> Result<bool, String> {
+    let _lock = lock_config()?;
     let name = paths::normalize(name)?;
     let mut doc = parse(&read()?)?;
     let Some((key, _)) = find(&doc, &name)? else {
@@ -146,22 +153,67 @@ pub fn name_of(db: &Path) -> Result<String, String> {
     paths::normalize(stem)
 }
 
-fn read() -> Result<String, String> {
-    let file = paths::config_file()?;
-    Ok(std::fs::read_to_string(&file).unwrap_or_default())
-}
-
-/// Write the new config over the old, atomically and privately: a temp file in
-/// the same directory, then a rename, so a crash mid-write can never leave a
-/// half-config behind.
-fn write(text: &str) -> Result<(), String> {
+/// Hold this separate inode across the entire read-modify-rename operation.
+/// Never unlink the lock file: another process may already be waiting on it.
+fn lock_config() -> Result<File, String> {
     let root = paths::config_root()?;
     perms::ensure_private_dir(&root)?;
-    let file = root.join("config.toml");
-    let tmp = root.join("config.toml.tmp");
-    perms::write_private(&tmp, text).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &file).map_err(|e| format!("replacing {}: {e}", file.display()))?;
-    Ok(())
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts.open(root.join("config.toml.lock"))
+        .map_err(|e| format!("opening config lock: {e}"))?;
+    file.lock().map_err(|e| format!("locking config: {e}"))?;
+    Ok(file)
+}
+
+fn read() -> Result<String, String> {
+    let file = paths::config_file()?;
+    if perms::exposed(&file) {
+        return Err(format!("refusing to edit exposed config {}", file.display()));
+    }
+    match fs::read_to_string(&file) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("reading {}: {e}", file.display())),
+    }
+}
+
+/// Caller holds the config lock. Exclusive creation keeps even a stale temp
+/// file from a killed writer from being overwritten or followed as a symlink.
+fn write(text: &str) -> Result<(), String> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let root = paths::config_root()?;
+    let (tmp, mut out) = loop {
+        let tmp = root.join(format!("config.toml.{}.{}.tmp",
+            std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&tmp) {
+            Ok(out) => break (tmp, out),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("creating {}: {e}", tmp.display())),
+        }
+    };
+    let result = (|| {
+        out.write_all(text.as_bytes())?;
+        out.sync_all()?;
+        drop(out);
+        fs::rename(&tmp, root.join("config.toml"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.map_err(|e| format!("writing config.toml: {e}"))
 }
 
 // ---------------------------------------------------------------------------

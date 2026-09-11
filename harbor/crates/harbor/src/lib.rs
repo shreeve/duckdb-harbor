@@ -79,9 +79,9 @@ pub mod engine;
 //      123456789012345678901234567890 silently becomes 1.2345678901234568e+29
 //      in any JavaScript client.
 //
-// One statement per request, on purpose: it makes SQL injection through
-// string concatenation structurally impossible, and it keeps HTTP status
-// codes meaningful. Multi-statement work belongs on a session.
+// One statement per request keeps HTTP outcomes unambiguous. Bind parameters
+// for values: a single statement can still contain SQL injection if built by
+// concatenation. Multi-statement work belongs on a session.
 //
 // Concurrency: accept many connections, execute few queries. DuckDB
 // parallelises a single query across all cores, so running hundreds
@@ -123,20 +123,15 @@ const MAX_JSON_RESPONSE: usize = 32 << 20;
 // harbor IS DuckDB's process, so "the server" is a process singleton: one
 // listener, one worker pool.
 //
-// The pool is built up front, in one place: `start` opens the engine and
-// hands every connection harbor will ever use to `open_pool` before the
-// listener exists, and everything after draws from what is already there.
-// (The shape survives harbor's extension-era origin, where opening late was
-// impossible; it stays because a fixed pool makes concurrency arithmetic —
-// workers + leases — a boot-time fact instead of a runtime negotiation.)
+// Pool slots are allocated before the listener starts. Their number stays
+// fixed (workers + leases); a slot replaces its engine connection whenever
+// connection-local state must be discarded before reuse.
 //
 // One connection per worker, because a DuckDB connection is Send but not
 // Sync — two threads may not share one.
 // ---------------------------------------------------------------------------
 
-/// How many connections to open at load, when nothing says otherwise. Idle
-/// connections are nearly free; not being able to open one later is not, and
-/// "later" here means "ever" — see the note above.
+/// How many connection slots to allocate at load when nothing says otherwise.
 ///
 /// The default covers the default six workers with ten left over for leases.
 /// `HARBOR_POOL_SIZE` moves it, and has to, because this is the one number
@@ -531,7 +526,7 @@ struct Lease {
     conn: LeaseConn,
     opened: Instant,
     last: Instant,
-    deadline: Instant,
+    lifetime: LeaseLifetime,
     statements: u64,
     /// Whether the last transaction-control statement opened one. This is the
     /// field an operator actually wants: a lease sitting idle is a curiosity,
@@ -548,6 +543,31 @@ struct Lease {
     /// client that wanted to stop a long statement had no way to say so — the
     /// DELETE simply reported false and the lease ran on.
     doomed: bool,
+}
+
+/// Interactive leases have an absolute deadline. Backups instead prove client
+/// liveness with renewals; SQL activity alone never renews either kind.
+struct LeaseLifetime {
+    deadline: Instant,
+    renewal_ttl: Option<Duration>,
+}
+
+impl LeaseLifetime {
+    fn new(now: Instant, ttl: Duration, backup: bool) -> Self {
+        Self { deadline: now + ttl, renewal_ttl: backup.then_some(ttl) }
+    }
+
+    fn expired(&self, now: Instant, last: Instant, busy: bool, idle_ttl: Duration) -> bool {
+        now >= self.deadline
+            || (self.renewal_ttl.is_none() && !busy && now.duration_since(last) >= idle_ttl)
+    }
+
+    fn renew(&mut self, now: Instant) -> bool {
+        let Some(ttl) = self.renewal_ttl else { return false };
+        if now >= self.deadline { return false; }
+        self.deadline = now + ttl;
+        true
+    }
 }
 
 struct Leases {
@@ -570,12 +590,11 @@ impl Leases {
 
 static LEASES: Mutex<Option<Leases>> = Mutex::new(None);
 
-/// How long a lease may sit without a statement before it is reclaimed, and
-/// the longest life it may ask for. The idle timeout is what actually protects
-/// the checkpoint; the ceiling stops a client from asking for a lease that
-/// outlives the reason it was granted.
+/// Ordinary leases expire on statement inactivity or a fixed ceiling. Backup
+/// leases instead expire when the client stops renewing, even during SQL.
 const LEASE_IDLE_TTL: Duration = Duration::from_secs(30);
 const LEASE_MAX_TTL: Duration = Duration::from_secs(300);
+const BACKUP_RENEWAL_TTL: Duration = Duration::from_secs(60);
 const REAP_INTERVAL: Duration = Duration::from_millis(500);
 
 /// 18 bytes of CSPRNG, hex. Sessions are not a privilege boundary here —
@@ -593,9 +612,8 @@ fn new_lease_id() -> String {
     out
 }
 
-/// Run `ROLLBACK` on a lease connection and drain what it says. Called on
-/// every path that returns a connection to the free list, so a lease can never
-/// hand back a connection with a transaction still open on it.
+/// Replace the engine connection before returning a lease to the free list.
+/// This rolls back open work and discards all connection-local state.
 ///
 /// Outside the registry lock, always: this blocks on the executor, and holding
 /// the lock across it would serialise every other lease behind whatever this
@@ -623,7 +641,7 @@ fn quiesce(conn: &LeaseConn) {
 }
 
 /// Open a lease, or say why not. `Err` carries the status and body to send.
-fn lease_open(requested_ttl: Option<Duration>) -> Result<(String, Duration, Duration), Refusal> {
+fn lease_open(requested_ttl: Option<Duration>, backup: bool) -> Result<(String, Duration, Duration), Refusal> {
     let mut guard = LEASES.lock().unwrap();
     let Some(leases) = guard.as_mut() else {
         return Err(Refusal {
@@ -641,14 +659,9 @@ fn lease_open(requested_ttl: Option<Duration>) -> Result<(String, Duration, Dura
                 .to_string(),
         });
     }
-    // Two clocks, and they answer different questions. The deadline caps how
-    // long a lease may live at all, and the client may ask for less. The idle
-    // timeout is harbor's own and is not negotiable: it is what reclaims a
-    // client that stopped talking mid-transaction, which is the case that
-    // blocks checkpoints, and letting a client raise it would let a client
-    // disable it.
-    let ttl = requested_ttl.unwrap_or(leases.max_ttl).min(leases.max_ttl);
-    let idle_ttl = leases.idle_ttl;
+    let max_ttl = if backup { BACKUP_RENEWAL_TTL } else { leases.max_ttl };
+    let ttl = requested_ttl.unwrap_or(max_ttl).min(max_ttl);
+    let idle_ttl = if backup { Duration::ZERO } else { leases.idle_ttl };
     let Some(conn) = leases.free.pop() else {
         return Err(Refusal {
             status: 503,
@@ -660,7 +673,7 @@ fn lease_open(requested_ttl: Option<Duration>) -> Result<(String, Duration, Dura
         });
     };
     let now = Instant::now();
-    let deadline = now + ttl;
+    let lifetime = LeaseLifetime::new(now, ttl, backup);
     let id = new_lease_id();
     leases.live.insert(
         id.clone(),
@@ -668,7 +681,7 @@ fn lease_open(requested_ttl: Option<Duration>) -> Result<(String, Duration, Dura
             conn,
             opened: now,
             last: now,
-            deadline,
+            lifetime,
             statements: 0,
             in_transaction: false,
             busy: false,
@@ -676,6 +689,30 @@ fn lease_open(requested_ttl: Option<Duration>) -> Result<(String, Duration, Dura
         },
     );
     Ok((id, ttl, idle_ttl))
+}
+
+/// Renewals use only the registry lock, so the probe lane can serve them
+/// while SQL workers are occupied. Released or expired leases stay dead.
+fn lease_renew(id: &str) -> Result<(), Refusal> {
+    let missing = || Refusal {
+        status: 404, code: "no_such_session",
+        message: "backup session was released, expired, or never existed".into(),
+    };
+    let mut guard = LEASES.lock().unwrap();
+    let lease = guard.as_mut().and_then(|leases| leases.live.get_mut(id)).ok_or_else(missing)?;
+    let now = Instant::now();
+    if lease.doomed || now >= lease.lifetime.deadline { return Err(missing()); }
+    if !lease.lifetime.renew(now) {
+        return Err(Refusal {
+            status: 400, code: "bad_request", message: "only backup sessions can be renewed".into(),
+        });
+    }
+    Ok(())
+}
+
+fn renewal_session_id(path: &str) -> Option<&str> {
+    path.strip_prefix("/sql/sessions/")?.strip_suffix("/renew")
+        .filter(|id| !id.is_empty() && !id.contains('/'))
 }
 
 /// How long a statement will wait for a lease that is busy before refusing.
@@ -728,7 +765,8 @@ fn try_lease_claim(id: &str) -> Result<(mpsc::SyncSender<Job>, Arc<SlotState>), 
                 .to_string(),
         });
     };
-    if lease.doomed {
+    if lease.doomed || lease.lifetime.expired(Instant::now(), lease.last, lease.busy, leases.idle_ttl) {
+        lease.doomed = true;
         // The client asked for this lease's release; honoring new claims while
         // the cancel unwinds would let a "released" session that keeps sending
         // short statements stay busy at every reaper tick — held, with its
@@ -850,37 +888,35 @@ fn lease_reap() {
         Cancel(Arc<SlotState>, u64),
     }
     let actions: Vec<Action> = {
-        let guard = LEASES.lock().unwrap();
-        let Some(leases) = guard.as_ref() else { return };
+        let mut guard = LEASES.lock().unwrap();
+        let Some(leases) = guard.as_mut() else { return };
         let now = Instant::now();
         leases
             .live
-            .iter()
-            .filter_map(|(id, l)| match l.busy {
-                // Cancel once per tick while it is over its deadline. Repeating
-                // is deliberate: DuckDB checks the interrupt flag between
-                // pipeline steps, and a statement that swallowed the first one
-                // gets asked again rather than being left to run forever.
-                //
-                // The job id is captured with the decision. Between this
-                // snapshot and the fire below sit other actions, each a
-                // blocking quiesce — plenty of time for the doomed statement
-                // to finish and the connection to be reissued to an innocent.
-                // cancel(Some(job)) makes the late fire a no-op instead of a
-                // random casualty. A statement that has not begun yet (job 0)
-                // waits for the next tick.
-                true if now >= l.deadline || l.doomed => {
-                    let job = l.conn.state.current_job();
-                    (job != 0).then(|| Action::Cancel(Arc::clone(&l.conn.state), job))
+            .iter_mut()
+            .filter_map(|(id, l)| {
+                l.doomed |= l.lifetime.expired(now, l.last, l.busy, leases.idle_ttl);
+                match l.busy {
+                    // Cancel once per tick while it is over its deadline. Repeating
+                    // is deliberate: DuckDB checks the interrupt flag between
+                    // pipeline steps, and a statement that swallowed the first one
+                    // gets asked again rather than being left to run forever.
+                    //
+                    // The job id is captured with the decision. Between this
+                    // snapshot and the fire below sit other actions, each a
+                    // blocking quiesce — plenty of time for the doomed statement
+                    // to finish and the connection to be reissued to an innocent.
+                    // cancel(Some(job)) makes the late fire a no-op instead of a
+                    // random casualty. A statement that has not begun yet (job 0)
+                    // waits for the next tick.
+                    true if l.doomed => {
+                        let job = l.conn.state.current_job();
+                        (job != 0).then(|| Action::Cancel(Arc::clone(&l.conn.state), job))
+                    }
+                    true => None,
+                    false if l.doomed => Some(Action::Release(id.clone())),
+                    false => None,
                 }
-                true => None,
-                false if l.doomed
-                    || now >= l.deadline
-                    || now.duration_since(l.last) >= leases.idle_ttl =>
-                {
-                    Some(Action::Release(id.clone()))
-                }
-                false => None,
             })
             .collect()
     };
@@ -963,9 +999,8 @@ struct Running {
     addr: String,
 }
 
-/// Open every connection harbor will need. Called once, by `start` right
-/// after it opens the engine — see the note above on why the pool is fixed.
-pub fn open_pool(con: Connection) -> Result<(), String> {
+/// Allocate the fixed pool and lock operator settings after initialization.
+pub fn open_pool(mut con: Connection) -> Result<(), String> {
     let mut pool = POOL.lock().unwrap();
 
     // Once per process, not once per load. POOL and CONTROL are process-wide,
@@ -983,6 +1018,8 @@ pub fn open_pool(con: Connection) -> Result<(), String> {
                 .to_string(),
         );
     }
+
+    lock_operator_settings(&mut con)?;
 
     for _ in 0..configured_pool_size() {
         pool.push(con.try_clone().map_err(|e| format!("harbor: {e}"))?);
@@ -1720,6 +1757,18 @@ fn handle(
             // `/new` is the legacy 0.22-era spelling, kept until the next
             // deliberate break.
             (Method::Post, "/sql/sessions" | "/sql/sessions/new") => run_session_open(req),
+            (Method::Post, p) if renewal_session_id(p).is_some() => {
+                match lease_renew(renewal_session_id(p).unwrap()) {
+                    Ok(()) => {
+                        let _ = req.respond(json_response(200, r#"{"renewed":true}"#));
+                        (true, 200)
+                    }
+                    Err(e) => {
+                        let _ = req.respond(error_response(e.status, e.code, &e.message));
+                        (true, e.status)
+                    }
+                }
+            }
             // Release one. Idempotent by design: a client retrying a DELETE it
             // is not sure landed must not be able to free a connection twice.
             //
@@ -1785,23 +1834,12 @@ fn handle(
             },
             (Method::Post, "/sql") => match exec {
                 Some((jobs, state)) => {
-                    // Pre-size from the declared length, capped: the value is
-                    // client-chosen (up to MAX_BODY), so trust it only up to
-                    // 16KB and let anything larger grow normally.
-                    let mut body =
-                        String::with_capacity(req.body_length().unwrap_or(0).min(16 * 1024));
-                    // Not only UTF-8 any more: the socket carries a read
-                    // timeout, so a client that stops mid-body lands here too.
-                    if req.as_reader().take(MAX_BODY as u64).read_to_string(&mut body).is_err() {
-                        let _ = req.respond(error_response(
-                            400,
-                            "bad_request",
-                            "the request body could not be read: it is not valid UTF-8, or it \
-                             stopped arriving",
-                        ));
-                        (true, 400)
-                    } else {
-                        run_sql(req, jobs, state, &body)
+                    match read_request_body(&mut req) {
+                        Ok(body) => run_sql(req, jobs, state, &body),
+                        Err(e) => {
+                            let _ = req.respond(error_response(e.status, e.code, &e.message));
+                            (true, e.status)
+                        }
                     }
                 }
                 None => shed(req),
@@ -1892,7 +1930,8 @@ fn route_exists(method: &Method, path: &str) -> bool {
         (Method::Get, "/ready" | "/sql/sessions" | "/sessions" | "/info" | "/catalog")
             | (Method::Post | Method::Delete, "/shutdown")
             | (Method::Post, "/sql" | "/sql/sessions" | "/sql/sessions/new")
-    ) || (*method == Method::Delete
+    ) || (*method == Method::Post && renewal_session_id(path).is_some())
+      || (*method == Method::Delete
         && (path.starts_with("/sql/sessions/") || path.starts_with("/sql/queries/")))
 }
 
@@ -1990,21 +2029,6 @@ fn json_to_duckdb(v: &serde_json::Value) -> Result<Param, String> {
     })
 }
 
-/// Reject anything with a second statement in it.
-///
-/// This has to happen before the text reaches DuckDB, and it is not belt and
-/// braces. Multi-statement text runs everything up front: the executor runs
-/// every statement but the last to completion and streams the last (the
-/// contract v1 inherited from duckdb-rs's `prepare` and 0.21 keeps
-/// deliberately). So `SELECT 1; DROP TABLE orders` drops the table before a
-/// single row is fetched — the injection lands even if no result is read.
-///
-/// The scan is deliberately strict. It tracks the constructs in which a
-/// semicolon is data rather than a separator — string literals, quoted
-/// identifiers, dollar quotes, comments — and rejects a bare `;` with
-/// anything after it. Over-rejecting a statement someone could have written
-/// differently is a much smaller cost than under-rejecting one they should
-/// not have been able to write at all.
 /// A byte that can appear inside a DuckDB identifier. `$` is one of them,
 /// which is why a `$` after one does not open a dollar-quote; bytes >= 0x80
 /// are UTF-8 continuation or lead bytes and belong to whatever identifier
@@ -2013,6 +2037,9 @@ fn is_ident_byte(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80
 }
 
+/// Early rejection for the public one-statement contract. The engine's parsed
+/// statement count is checked again before execution. This lexical scan keeps
+/// the existing strict handling of text following a trailing semicolon.
 fn ensure_single_statement(sql: &str) -> Result<(), String> {
     let b = sql.as_bytes();
     let mut i = 0;
@@ -2279,55 +2306,71 @@ const READY_MAX_AGE: Duration = Duration::from_secs(1);
 /// second.
 static LAST_READY: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
 
+/// Read one extra byte to distinguish a complete body from a valid prefix
+/// of an oversized chunked request. Decode only after enforcing the byte cap.
+fn read_request_body(req: &mut Request) -> Result<String, Refusal> {
+    let capacity = req.body_length().unwrap_or(0).min(16 * 1024);
+    read_body(req.as_reader(), capacity)
+}
+
+fn read_body(reader: impl Read, capacity: usize) -> Result<String, Refusal> {
+    let mut body = Vec::with_capacity(capacity);
+    reader.take(MAX_BODY as u64 + 1).read_to_end(&mut body).map_err(|e| Refusal {
+        status: 400,
+        code: "bad_request",
+        message: format!("the request body could not be read: {e}"),
+    })?;
+    if body.len() > MAX_BODY {
+        return Err(Refusal {
+            status: 413,
+            code: "body_too_large",
+            message: format!("body exceeds the limit of {MAX_BODY} bytes"),
+        });
+    }
+    String::from_utf8(body).map_err(|_| Refusal {
+        status: 400,
+        code: "bad_request",
+        message: "the request body is not valid UTF-8".into(),
+    })
+}
+
 /// `POST /sql/sessions` — take a connection out of the pool and hold it.
 ///
-/// The body may ask for a lifetime (`{"ttlMs": N}`); harbor caps it at its own
-/// maximum and answers with the one it actually granted, alongside the idle
-/// timeout it enforces regardless. Both sides then know when the lease dies,
-/// which beats the client discovering it at COMMIT — the point at which the
-/// work is already done and cannot be redone cheaply.
+/// Interactive leases have a capped lifetime and idle timeout. A backup lease
+/// instead has a renewable liveness window, confirmed by `purpose` in the reply.
 fn run_session_open(mut req: Request) -> (bool, u16) {
-    let mut body = String::new();
-    if req.as_reader().take(MAX_BODY as u64).read_to_string(&mut body).is_err() {
-        let _ = req.respond(error_response(
-            400,
-            "bad_request",
-            "the request body could not be read: it is not valid UTF-8, or it stopped arriving",
-        ));
-        return (true, 400);
-    }
-    let requested = match body.trim().is_empty() {
-        true => None,
-        false => match serde_json::from_str::<serde_json::Value>(&body) {
-            Ok(v) => match v.get("ttlMs") {
-                None | Some(serde_json::Value::Null) => None,
-                Some(n) => match n.as_u64() {
-                    Some(ms) if ms > 0 => Some(Duration::from_millis(ms)),
-                    _ => {
-                        let _ = req.respond(error_response(
-                            400,
-                            "bad_request",
-                            "\"ttlMs\" must be a positive integer",
-                        ));
-                        return (true, 400);
-                    }
-                },
-            },
+    let body = match read_request_body(&mut req) {
+        Ok(body) => body,
+        Err(e) => {
+            let _ = req.respond(error_response(e.status, e.code, &e.message));
+            return (true, e.status);
+        }
+    };
+    let requested = if body.trim().is_empty() {
+        wire::SessionNewRequest::default()
+    } else {
+        match serde_json::from_str::<wire::SessionNewRequest>(&body) {
+            Ok(v) => v,
             Err(e) => {
                 let _ = req.respond(error_response(400, "bad_request", &e.to_string()));
                 return (true, 400);
             }
-        },
+        }
     };
+    if requested.ttl_ms == Some(0) {
+        let _ = req.respond(error_response(400, "bad_request", "\"ttlMs\" must be a positive integer"));
+        return (true, 400);
+    }
+    let backup = requested.purpose == Some(wire::SessionPurpose::Backup);
 
-    match lease_open(requested) {
+    match lease_open(requested.ttl_ms.map(Duration::from_millis), backup) {
         Ok((id, ttl, idle_ttl)) => {
-            let body = format!(
-                r#"{{"sessionId":"{}","ttlMs":{},"idleTtlMs":{}}}"#,
-                id,
-                ttl.as_millis(),
-                idle_ttl.as_millis()
-            );
+            let body = serde_json::to_string(&wire::SessionNewResponse {
+                session_id: id,
+                ttl_ms: ttl.as_millis() as u64,
+                idle_ttl_ms: idle_ttl.as_millis() as u64,
+                purpose: requested.purpose,
+            }).expect("session response serializes");
             let _ = req.respond(json_response(200, &body));
             (true, 200)
         }
@@ -2381,15 +2424,16 @@ fn sessions_report() -> String {
             out.push(',');
         }
         out.push_str(&format!(
-            r#"{{"sessionId":"{}","slot":{},"ageMs":{},"idleMs":{},"expiresInMs":{},"statements":{},"inTransaction":{},"busy":{}}}"#,
+            r#"{{"sessionId":"{}","slot":{},"ageMs":{},"idleMs":{},"expiresInMs":{},"statements":{},"inTransaction":{},"busy":{},"renewable":{}}}"#,
             id,
             lease.conn.slot,
             now.duration_since(lease.opened).as_millis(),
             now.duration_since(lease.last).as_millis(),
-            lease.deadline.saturating_duration_since(now).as_millis(),
+            lease.lifetime.deadline.saturating_duration_since(now).as_millis(),
             lease.statements,
             lease.in_transaction,
-            lease.busy
+            lease.busy,
+            lease.lifetime.renewal_ttl.is_some()
         ));
     }
     out.push_str("]}");
@@ -3271,9 +3315,8 @@ fn run_sql(
             400,
             "sql_error",
             &format!(
-                "{setting} is fixed when the berth starts (harbor start --memory-limit/--threads) \
-                 and cannot be changed over the wire: it is process-global, and this berth may \
-                 share its host with others"
+                "{setting} is protected by Harbor's startup configuration and cannot be \
+                 changed over the wire"
             ),
         ));
         return (true, 400);
@@ -3540,6 +3583,48 @@ pub fn parse_block_size(s: &str) -> Result<u64, String> {
     Ok(bytes)
 }
 
+const FENCED: &[&str] = &[
+    "memory_limit",
+    "max_memory",
+    "threads",
+    "worker_threads",
+    "external_threads",
+    // Disk spill is process-global too, and the operator caps it with
+    // `--max-temp-size` precisely so one query cannot fill the shared host
+    // disk. Left unfenced, `SET max_temp_directory_size='100TB'`
+    // over the wire erases that cap; `temp_directory` redirects the spill
+    // itself. Both are GLOBAL-scope in DuckDB — same class as the rest here.
+    "max_temp_directory_size",
+    "temp_directory",
+    "allowed_configs",
+    "lock_configuration",
+];
+
+/// Apply policy in the engine, so wrappers and future SQL forms cannot bypass
+/// the friendly request-time check. Initialization runs before this function.
+fn lock_operator_settings(conn: &mut Connection) -> Result<(), String> {
+    let locked = conn.query_strings("SELECT current_setting('lock_configuration')")
+        .map_err(|e| e.into_text())?;
+    if locked.first().map(String::as_str) == Some("true") {
+        // An operator may lock configuration during init, but must not leave
+        // any of Harbor's protected settings changeable.
+        let allowed = conn.query_strings("SELECT unnest(current_setting('allowed_configs'))")
+            .map_err(|e| e.into_text())?;
+        if allowed.iter().any(|s| FENCED.iter().any(|f| s.eq_ignore_ascii_case(f))) {
+            return Err("init locked configuration with protected settings in allowed_configs".into());
+        }
+        return Ok(());
+    }
+    let allowed = conn.query_strings("SELECT name FROM duckdb_settings() ORDER BY name")
+        .map_err(|e| e.into_text())?;
+    let allowed = allowed.iter()
+        .filter(|s| !FENCED.contains(&s.as_str()))
+        .map(|s| format!("'{}'", s.replace('\'', "''")))
+        .collect::<Vec<_>>().join(",");
+    conn.execute_batch(&format!("SET allowed_configs=[{allowed}]; SET lock_configuration=true"))
+        .map_err(|e| format!("cannot protect operator settings: {e}"))
+}
+
 /// Settings a client must not change: they are process-global in DuckDB, so
 /// one `SET memory_limit='100GB'` raises it for every neighbor berth on the
 /// host and defeats the fleet-safe cap the operator chose at berth start.
@@ -3548,20 +3633,6 @@ pub fn parse_block_size(s: &str) -> Result<u64, String> {
 /// Reads through comments, whitespace, and double-quoting via `next_word`, so
 /// neither `/*x*/ SET threads=8` nor `SET "memory_limit"=…` slips past.
 fn fenced_setting(sql: &str) -> Option<&'static str> {
-    const FENCED: &[&str] = &[
-        "memory_limit",
-        "max_memory",
-        "threads",
-        "worker_threads",
-        "external_threads",
-        // Disk spill is process-global too, and the operator caps it with
-        // `--max-temp-size` precisely so one query cannot fill the shared host
-        // disk. Left unfenced, `SET max_temp_directory_size='100TB'`
-        // over the wire erases that cap; `temp_directory` redirects the spill
-        // itself. Both are GLOBAL-scope in DuckDB — same class as the rest here.
-        "max_temp_directory_size",
-        "temp_directory",
-    ];
     let b = sql.as_bytes();
     let mut i = 0;
     if !matches!(next_word(b, &mut i).as_str(), "SET" | "RESET" | "PRAGMA") {
@@ -3574,10 +3645,8 @@ fn fenced_setting(sql: &str) -> Option<&'static str> {
     FENCED.iter().find(|f| name.eq_ignore_ascii_case(f)).copied()
 }
 
-/// Statements whose whole effect is connection-local, so a pooled connection
-/// discards it the moment the request ends. Companion to `fenced_setting`:
-/// that one refuses what would reach TOO far (process-global), this one
-/// refuses what would not reach far enough.
+/// Refuse USE outside a session: it cannot affect a later one-shot request.
+/// Other local changes are discarded by connection replacement before reuse.
 ///
 /// `USE` is the list. Reads through comments and whitespace via
 /// `first_keyword`, so `/*x*/ USE d` is caught with the bare form.
@@ -3590,78 +3659,37 @@ fn lost_without_session(sql: &str) -> bool {
 /// leaves it as it was. Used to report whether a lease is holding a
 /// transaction open, which is the thing an operator most needs to see.
 fn transaction_effect(sql: &str) -> Option<bool> {
-    match first_keyword(sql).as_str() {
+    match {
+        let b = sql.as_bytes();
+        let mut i = 0;
+        let word = next_word(b, &mut i);
+        if word == "EXPLAIN" && next_word(b, &mut i) == "ANALYZE" {
+            next_word(b, &mut i)
+        } else {
+            word
+        }
+    }.as_str() {
         "BEGIN" | "START" => Some(true),
         "COMMIT" | "END" | "ROLLBACK" | "ABORT" => Some(false),
         _ => None,
     }
 }
 
-/// Whether a statement could leave a transaction open behind it.
-///
-/// Only transaction-control statements can, because a statement that runs in
-/// autocommit commits or rolls back its own implicit transaction as it
-/// finishes. So the reset before the next job is only needed after one of
-/// these — or after a job that ended abnormally, which the caller tracks
-/// separately.
-///
-/// Fail-safe by construction: this answers true for anything it does not
-/// recognise, so a statement form nobody thought of costs one `ROLLBACK`
-/// rather than leaving a transaction open. Getting it wrong in the other
-/// direction is what took connections out of service permanently.
-fn may_leave_transaction_open(sql: &str) -> bool {
-    let word = first_keyword(sql);
-    if word.is_empty() {
-        return true;
-    }
-    // Statement kinds that run under autocommit and settle themselves. Anything
-    // absent from this list — BEGIN, START, COMMIT, ROLLBACK, ABORT, END, and
-    // whatever DuckDB adds next — takes the safe path.
+/// Statements that can leave connection-local state need a fresh connection
+/// before another caller uses this worker. Only known state-neutral statement
+/// forms keep their parse cache; wrappers, SET, temporary DDL and unknown forms
+/// take the conservative path. Pinned sessions reset only on release.
+fn needs_connection_reset(sql: &str) -> bool {
     !matches!(
-        word.as_str(),
+        first_keyword(sql).as_str(),
         "SELECT" | "WITH" | "FROM" | "VALUES" | "TABLE"
             | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "TRUNCATE"
-            | "CREATE" | "DROP" | "ALTER" | "COMMENT"
-            | "COPY" | "EXPORT" | "IMPORT"
-            | "ATTACH" | "DETACH" | "USE"
-            | "PRAGMA" | "SET" | "RESET" | "CHECKPOINT" | "ANALYZE" | "VACUUM"
-            | "EXPLAIN" | "DESCRIBE" | "SHOW" | "SUMMARIZE" | "PIVOT" | "UNPIVOT"
-            | "CALL" | "PREPARE" | "EXECUTE" | "DEALLOCATE"
-            | "INSTALL" | "LOAD"
+            | "COPY" | "EXPORT" | "CHECKPOINT" | "ANALYZE" | "VACUUM"
+            | "DESCRIBE" | "SHOW" | "SUMMARIZE" | "PIVOT" | "UNPIVOT"
     )
 }
 
-/// Return a connection to autocommit before anything else runs on it.
-///
-/// Pooled connections are handed out per request and are never pinned to a
-/// client, so a transaction cannot usefully span two requests — but a client
-/// can still send `BEGIN`, and DuckDB will honour it. That leaves the
-/// connection inside a transaction for whoever gets it next, and if the
-/// transaction has already failed, every subsequent statement on it comes back
-/// `Current transaction is aborted` for the life of the process. One request
-/// from one careless client would otherwise take a worker out of service
-/// permanently, and with a pool of eight it takes eight such requests to stop
-/// the server answering at all.
-///
-/// Rolling back is the only correct choice here: the client that opened the
-/// transaction has no way to commit it, since its next request will land on a
-/// different connection.
-///
-/// When to run it is decided from the statement TEXT, not from asking the
-/// engine: `execute_jobs` calls this only when `may_leave_transaction_open`
-/// saw a transaction-shaped statement or the job ended abnormally (see the
-/// `needs_reset` widening in `run_statement`). History earned that design
-/// twice over: an engine-side `is_autocommit()` probe once turned out to be
-/// a stub that always said `true`, silently leaving `BEGIN`'s transaction
-/// open until some later job on the same connection happened to end badly —
-/// observable as `cannot start a transaction within a transaction`. And
-/// running it unconditionally afterward cost ~20% of small-statement
-/// throughput. The text-derived flag pays only when the risk exists.
-///
-/// A `ROLLBACK` on a connection that has nothing to roll back is cheap, and far
-/// cheaper than the failure it prevents — an open transaction also blocks
-/// `CHECKPOINT`, including the one `stop()` runs, which is how a WAL goes
-/// unfolded.
+/// Final rollback during server shutdown, before returning connections.
 fn reset_transaction(conn: &mut Connection) {
     let _ = conn.execute_batch("ROLLBACK");
 }
@@ -3699,7 +3727,7 @@ impl Drop for OnSlot<'_> {
 /// One statement, start to finish, on the executor's connection: prepare,
 /// stream (NDJSON) or buffer (one-shot JSON) the result, and report the
 /// outcome on `ready`/`body`. Returns whether the connection needs a
-/// `ROLLBACK` before the next job. Split out of `execute_jobs` so the whole
+/// fresh engine connection before the next job. Split out of `execute_jobs` so the whole
 /// thing runs under one `catch_unwind` there: a panic in the DuckDB client (a
 /// decoder that hits `unreachable!`, a metadata assert) must not take the
 /// executor thread — and with it a worker and a pool slot — down for good.
@@ -3720,7 +3748,7 @@ fn run_statement(
 ) -> bool {
     // Decided from the statement text before it runs, then widened below by
     // any path that ends the job early.
-    let mut needs_reset = may_leave_transaction_open(&sql);
+    let mut needs_reset = needs_connection_reset(&sql);
 
     // Parsed once, cached by SQL text (per-connection LRU) — a repeated
     // statement skips DuckDB's parse, the dominant engine cost for small
@@ -3745,17 +3773,17 @@ fn run_statement(
         return true;
     };
 
-    // Multi-statement text: everything before the last statement runs to
-    // completion first, parameterless, and the stream is the last one's —
-    // v1 behaved this way because duckdb-rs's prepare() executed the front
-    // and returned the tail prepared, and the contract stays.
-    for stmt in front {
-        // In place, no fetch thread: nobody reads these chunks, so the
-        // pipeline would be a spawn and a join per statement for nothing.
-        if let Err(e) = conn.drain(stmt) {
-            let _ = ready.send(Err(refusal_for(on_slot.finish(), e.into_text())));
-            return true;
-        }
+    // Parsing is side-effect free. Enforce the public one-statement contract
+    // with the engine's parser before executing anything, even if the lexical
+    // check at the HTTP boundary misses a new grammar form.
+    if !front.is_empty() {
+        on_slot.finish();
+        let _ = ready.send(Err(Refusal {
+            status: 400,
+            code: "bad_request",
+            message: "exactly one SQL statement is allowed per request".into(),
+        }));
+        return needs_reset;
     }
     let mut stream = match conn.execute(last, &params) {
         Ok(s) => s,
@@ -3984,46 +4012,40 @@ fn run_statement(
     needs_reset
 }
 
-/// The DuckDB side. Owns one connection for the life of the server and runs
+/// The DuckDB side. Owns a connection slot for the life of the server and runs
 /// one statement at a time; concurrency comes from there being several of
 /// these, not from any one of them interleaving work. `pinned` marks a lease
 /// connection: the per-job reset that stops one request's stray transaction
 /// from leaking into the next request on the same connection must not fire on
 /// a lease, because holding that transaction open is precisely what a lease is
-/// for — the rollback happens instead when the lease is released, by commit,
-/// by DELETE, or by the reaper.
+/// for. Connection replacement happens on DELETE or expiry; COMMIT alone
+/// keeps the session and its local state.
 fn execute_jobs(
     mut conn: Connection,
     jobs: mpsc::Receiver<Job>,
     pinned: bool,
     state: Arc<SlotState>,
 ) -> Connection {
-    // The parse cache (64 texts, in Conn itself) covers a working set of
-    // distinct statement texts — dashboards cycle through dozens.
-    // Set by the previous job when it could have left a transaction open: a
-    // transaction-control statement, or any exit other than running to
-    // completion. Resetting unconditionally is also correct, and was what this
-    // did for a while, but it puts a `ROLLBACK` in front of every request —
-    // measurably, about 20% of throughput at 16 clients. The flag has to be set
-    // from something real, though: it used to consult
-    // `Connection::is_autocommit()`, which duckdb-rs hardcodes to `true`, so
-    // that half of the condition never fired at all.
     let mut needs_reset = false;
+    // A failed replacement must never make the contaminated handle usable,
+    // including when a released lease is assigned to another caller.
+    let mut must_reset = false;
     for job in jobs {
-        // Before, not after: a job can leave the loop by several paths, and
-        // this way none of them can skip the reset.
-        if needs_reset && !pinned {
-            reset_transaction(&mut conn);
-        }
-
         let Job { sql, params, shape, id, deadline, reset, ready, body } = job;
-        if reset {
-            // Same call the workers make between requests, and unconditional:
-            // this runs once per lease release, not once per statement, so the
-            // throughput argument that made it conditional there does not
-            // apply here.
-            reset_transaction(&mut conn);
+        must_reset |= reset || (needs_reset && !pinned);
+        if must_reset {
+            if let Err(e) = conn.reset() {
+                let _ = ready.send(Err(Refusal {
+                    status: 503,
+                    code: "unavailable",
+                    message: format!("cannot reset connection: {e}"),
+                }));
+                continue;
+            }
             needs_reset = false;
+            must_reset = false;
+        }
+        if reset {
             let _ = ready.send(Ok(()));
             continue;
         }
@@ -4253,6 +4275,64 @@ mod tests {
     use crate::encode::varint_to_decimal;
     use super::{Cancel, SlotRun};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn delivered_body_limit_checks_the_extra_byte() {
+        let mut input = vec![b' '; super::MAX_BODY];
+        assert_eq!(super::read_body(input.as_slice(), 0).ok().unwrap().len(), super::MAX_BODY);
+        input.push(b'x');
+        assert_eq!(super::read_body(input.as_slice(), 0).err().unwrap().status, 413);
+        assert_eq!(super::read_body(&b"\xff"[..], 0).err().unwrap().status, 400);
+    }
+
+    #[test]
+    fn engine_policy_blocks_wrappers_and_cannot_be_unlocked() {
+        if crate::engine::engine().is_err() { return; }
+        let mut conn = crate::engine::conn::open(std::path::Path::new(":memory:"), &[]).unwrap();
+        super::lock_operator_settings(&mut conn).unwrap();
+        for sql in [
+            "EXPLAIN ANALYZE SET threads=2",
+            "EXPLAIN ANALYZE SET worker_threads=2",
+            "EXPLAIN ANALYZE SET max_memory='1GB'",
+            "EXPLAIN ANALYZE RESET memory_limit",
+            "EXPLAIN ANALYZE SET allowed_configs=['threads']",
+            "EXPLAIN ANALYZE SET lock_configuration=false",
+        ] {
+            assert!(conn.execute_batch(sql).is_err(), "policy bypass: {sql}");
+        }
+        conn.execute_batch("SET default_order='DESC'").unwrap();
+        // A pre-locked safe configuration remains valid on initialization.
+        super::lock_operator_settings(&mut conn).unwrap();
+    }
+
+    #[test]
+    fn engine_statement_count_is_checked_before_any_execution() {
+        if crate::engine::engine().is_err() { return; }
+        let mut conn = crate::engine::conn::open(std::path::Path::new(":memory:"), &[]).unwrap();
+        let state = super::SlotState {
+            interrupt: conn.interrupt_handle(), run: std::sync::Mutex::new(idle()),
+        };
+        state.begin(1, None);
+        let mut slot = super::OnSlot { slot: &state, done: false };
+        let (ready, result) = std::sync::mpsc::sync_channel(1);
+        let (body, _output) = std::sync::mpsc::sync_channel(1);
+        super::run_statement(&mut conn, &mut slot,
+            "CREATE TABLE must_not_exist(x INTEGER); SELECT 1".into(), vec![],
+            super::Shape::Json, ready, body, Instant::now());
+        assert_eq!(result.recv().unwrap().err().unwrap().status, 400);
+        assert!(conn.execute_batch("SELECT * FROM must_not_exist").is_err());
+    }
+
+    #[test]
+    fn wrappers_and_local_mutations_require_connection_reset() {
+        for sql in ["EXPLAIN ANALYZE BEGIN", "CALL f()", "EXECUTE s", "SET VARIABLE x=1",
+            "CREATE TEMP TABLE t(x INTEGER)", "PREPARE s AS SELECT 1", "BEGIN"] {
+            assert!(super::needs_connection_reset(sql), "{sql}");
+        }
+        assert!(!super::needs_connection_reset("INSERT INTO t VALUES (1)"));
+        assert_eq!(super::transaction_effect("EXPLAIN /* x */ ANALYZE BEGIN"), Some(true));
+        assert_eq!(super::transaction_effect("EXPLAIN BEGIN"), None);
+    }
 
     #[test]
     fn the_tcp_door_is_one_ipv4_listener() {
@@ -4671,6 +4751,28 @@ UNION ALL SELECT 1::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FRO
     }
 
     #[test]
+    fn backup_lifetime_renews_beyond_interactive_ceiling_but_cannot_revive() {
+        use super::{LeaseLifetime, BACKUP_RENEWAL_TTL, LEASE_MAX_TTL, LEASE_IDLE_TTL};
+        let start = Instant::now();
+        let mut backup = LeaseLifetime::new(start, BACKUP_RENEWAL_TTL, true);
+        let mut interactive = LeaseLifetime::new(start, LEASE_MAX_TTL, false);
+        assert!(!interactive.renew(start));
+        for seconds in (20..=600).step_by(20) {
+            let now = start + Duration::from_secs(seconds);
+            // No SQL activity: a long file scan does not consume the idle TTL.
+            assert!(!backup.expired(now, start, false, LEASE_IDLE_TTL));
+            assert!(backup.renew(now));
+        }
+        let end = start + Duration::from_secs(660);
+        assert!(backup.expired(end, start, true, LEASE_IDLE_TTL));
+        assert!(!backup.renew(end));
+        assert!(!backup.renew(end + Duration::from_secs(1)));
+        assert!(interactive.expired(start + LEASE_MAX_TTL, start, true, LEASE_IDLE_TTL));
+        assert!(interactive.expired(start + LEASE_IDLE_TTL, start, false, LEASE_IDLE_TTL));
+        assert!(!interactive.expired(start + LEASE_IDLE_TTL, start, true, LEASE_IDLE_TTL));
+    }
+
+    #[test]
     fn route_exists_matches_the_dispatch_table() {
         // Guards the hand-maintained coupling between `route_exists` and the
         // dispatch match in `handle`. Every real endpoint is a route; a known path
@@ -4688,11 +4790,14 @@ UNION ALL SELECT 1::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FRO
                 other => panic!("wire publishes an unmapped method: {other}"),
             }
         }
-        let ids = [wire::endpoint::session("abc"), wire::endpoint::query("xyz")];
+        let ids = [wire::endpoint::session("abc"), wire::endpoint::query("xyz"), wire::endpoint::session_renew("abc")];
         for r in wire::endpoint::FIXED.iter().chain(ids.iter()) {
             assert!(route_exists(&method(r.method), &r.path), "wire publishes {r}, harbor does not serve it");
         }
         let non_routes = [
+            (Method::Post, "/sql/sessions//renew"),
+            (Method::Post, "/sql/sessions/a/b/renew"),
+            (Method::Get, "/sql/sessions/abc/renew"),
             (Method::Get, "/sql"),      // method matters
             (Method::Post, "/ready"),   // method matters
             (Method::Get, "/health"),   // never existed
