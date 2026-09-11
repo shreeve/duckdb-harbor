@@ -116,6 +116,10 @@ pub fn open(path: &Path, options: &[(&str, &str)]) -> Result<Conn, Error> {
 /// How many distinct statement texts each connection keeps parsed. Matches
 /// the v1 prepared-statement cache the executor relied on.
 const STMT_CACHE_CAP: usize = 64;
+// SQL bytes, not an estimate of the engine's AST allocations. Large one-off
+// imports still execute, but cannot fill every connection's retained cache.
+const STMT_CACHE_BYTES: usize = 1024 * 1024;
+const STMT_CACHE_MAX_SQL: usize = 64 * 1024;
 
 pub struct Conn {
     eng: &'static Engine,
@@ -127,6 +131,7 @@ pub struct Conn {
     interrupt: Arc<Mutex<ffi::connection_handle>>,
     /// Parsed-statement cache: SQL text → statements, LRU by tick.
     cache: HashMap<String, CacheEntry>,
+    cache_bytes: usize,
     tick: u64,
 }
 
@@ -152,6 +157,7 @@ impl Conn {
             conn,
             interrupt: Arc::new(Mutex::new(conn)),
             cache: HashMap::new(),
+            cache_bytes: 0,
             tick: 0,
         })
     }
@@ -159,6 +165,24 @@ impl Conn {
     /// Another connection to the same database — the pool's clone.
     pub fn try_clone(&self) -> Result<Conn, Error> {
         Conn::connect(self.db.clone())
+    }
+
+    /// Replace all connection-local state, including transactions, temporary
+    /// objects, variables and prepared statements. Keep the cancellation slot
+    /// stable: executor registrations already hold handles to this slot.
+    pub fn reset(&mut self) -> Result<(), Error> {
+        let mut fresh = Self::connect(self.db.clone())?;
+        let mut slot = self.interrupt.lock().unwrap();
+        // The old connection is dropped with its own slot after the swap.
+        // No caller can interrupt either handle during the replacement.
+        std::mem::swap(&mut self.conn, &mut fresh.conn);
+        *slot = self.conn;
+        *fresh.interrupt.lock().unwrap() = fresh.conn;
+        self.cache.clear();
+        self.cache_bytes = 0;
+        self.tick = 0;
+        drop(fresh);
+        Ok(())
     }
 
     pub fn engine_version(&self) -> &'static str {
@@ -256,7 +280,12 @@ impl Conn {
         self.tick += 1;
         if !self.cache.contains_key(sql) {
             let stmts = Arc::new(self.parse(sql)?);
-            if self.cache.len() >= STMT_CACHE_CAP {
+            if sql.len() > STMT_CACHE_MAX_SQL {
+                return Ok(stmts);
+            }
+            while self.cache.len() >= STMT_CACHE_CAP
+                || self.cache_bytes + sql.len() > STMT_CACHE_BYTES
+            {
                 if let Some(oldest) = self
                     .cache
                     .iter()
@@ -264,8 +293,10 @@ impl Conn {
                     .map(|(k, _)| k.clone())
                 {
                     self.cache.remove(&oldest);
+                    self.cache_bytes -= oldest.len();
                 }
             }
+            self.cache_bytes += sql.len();
             self.cache.insert(sql.to_string(), CacheEntry { stmts, used: self.tick });
         }
         let entry = self.cache.get_mut(sql).expect("just inserted");

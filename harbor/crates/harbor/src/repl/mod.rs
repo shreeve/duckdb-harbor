@@ -20,10 +20,13 @@ mod highlight;
 mod http;
 mod interactive;
 mod keywords;
-mod scan;
+pub mod scan;
 mod theme;
+mod snapshot;
+pub use snapshot::with_snapshot;
 
 pub use http::Transport;
+pub use interactive::split_statements;
 
 use wire::{Event, SqlRequest, endpoint};
 use render::{Mode, RenderOpts, Renderer};
@@ -864,6 +867,13 @@ fn list() -> Result<(), String> {
 }
 
 fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
+    run_sql_in_session(conn, sql, opts, None, None)
+}
+
+fn run_sql_in_session(
+    conn: &Conn, sql: &str, opts: &RenderOpts, session: Option<&str>,
+    health: Option<&snapshot::Health>,
+) -> Outcome {
     let wall = std::time::Instant::now();
     let qid = format!("cli-{}-{}", std::process::id(), QUERY_SEQ.fetch_add(1, Ordering::Relaxed));
     // A Ctrl-C that landed between statements (say, while the pager showed
@@ -875,6 +885,7 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
     let body = serde_json::to_string(&SqlRequest {
         sql: sql.to_string(),
         query_id: Some(qid.clone()),
+        session_id: session.map(str::to_string),
         ..Default::default()
     })
     .expect("request serializes");
@@ -886,7 +897,8 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
         let spun = AtomicU64::new(0);
         let conn = conn.clone();
         let qid = qid.clone();
-        move || {
+        move || -> std::io::Result<()> {
+            if let Some(health) = health { health.check()?; }
             // The spinner rides the same ticks as cancellation: half-second
             // updates on stderr, only at a terminal, erased when data lands.
             if std::io::stderr().is_terminal() {
@@ -910,6 +922,7 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
                     std::process::exit(130);
                 }
             }
+            Ok(())
         }
     };
     let resp = match http::request_streaming(&conn.transport, &endpoint::SQL, Some(&body), &on_tick) {
@@ -921,7 +934,10 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
     // the streaming read timeout, so ride the ticks until the body lands.
     if resp.status >= 300 {
         let status = resp.status;
-        let text = read_patient(resp.body, &on_tick);
+        let text = match read_patient(resp.body, &on_tick) {
+            Ok(text) => text,
+            Err(e) => return err(&format!("reading response: {e}")),
+        };
         clear_spinner();
         return match Event::parse(text.trim()) {
             Ok(Event::Error { code, .. }) if code == wire::code::CANCELLED => {
@@ -946,6 +962,9 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
     let mut scanned = 0usize;
     let mut chunk = [0u8; 8192];
     loop {
+        if let Some(health) = health && let Err(e) = health.check() {
+            return err(&e.to_string());
+        }
         // Reading bytes, not read_line: the socket ticks every 250ms
         // (request_streaming) and a tick can land mid-line. read_line decodes
         // UTF-8 as it goes, so a tick arriving in the middle of a multi-byte
@@ -965,7 +984,7 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) =>
                 {
-                    on_tick();
+                    if let Err(e) = on_tick() { return err(&e.to_string()); }
                 }
                 Err(e) => return err(&format!("stream died: {e}")),
             }
@@ -1019,7 +1038,7 @@ fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
 
 /// Read a whole (small) body over a socket that has the streaming tick
 /// timeout, retrying through the ticks with a hard 5s ceiling.
-fn read_patient(mut body: Box<dyn BufRead>, on_tick: &dyn Fn()) -> String {
+fn read_patient(mut body: Box<dyn BufRead>, on_tick: &dyn Fn() -> std::io::Result<()>) -> std::io::Result<String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -1028,7 +1047,7 @@ fn read_patient(mut body: Box<dyn BufRead>, on_tick: &dyn Fn()) -> String {
             Ok(0) => break,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                on_tick();
+                on_tick()?;
                 if std::time::Instant::now() > deadline {
                     break;
                 }
@@ -1036,7 +1055,7 @@ fn read_patient(mut body: Box<dyn BufRead>, on_tick: &dyn Fn()) -> String {
             Err(_) => break,
         }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Erase a spinner remnant before printing anything else on stderr. The

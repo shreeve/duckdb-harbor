@@ -95,6 +95,7 @@ POST /sql                  run one statement, stream the result as NDJSON
 POST /sql/sessions         take a connection and hold it, for a transaction
 GET  /sql/sessions         list ALL open sessions — who holds each, how long
 DELETE /sql/sessions/<id>  give that one back
+POST /sql/sessions/<id>/renew  renew a backup lease
 DELETE /sql/queries/<id>   stop a statement the caller named when it sent it
 ```
 
@@ -204,7 +205,8 @@ under a client that still believed it was in a transaction.
 
 A transaction lives on a connection and HTTP requests do not, so one request
 per statement means no transaction can span two. A session bridges that: a
-connection pinned to you until you commit, roll back, or stop answering.
+connection pinned to you until you release it or its lease expires. COMMIT and
+ROLLBACK end the transaction; DELETE releases the session.
 
 ```console
 $ sid=$(curl -s -X POST 127.0.0.1:9495/sql/sessions | jq -r .sessionId)
@@ -226,13 +228,31 @@ pool serving both would run out of workers the moment enough clients held
 transactions open, and then answer nothing at all. With none free, opening a
 session is a `503` with `Retry-After` — queries keep working throughout.
 
-**Every session has a deadline.** HTTP has no reliable close signal, so a
+**Every session has a deadline.** Ordinary sessions have a fixed lifetime. HTTP has no reliable close signal, so a
 client that vanishes mid-transaction looks exactly like one that is thinking,
 and a timer is the only way that connection ever comes back. Ask for a lifetime
 with `{"ttlMs": N}`; harbor caps it at five minutes and answers with what it
 granted, alongside the thirty-second idle timeout it enforces regardless. When
 a session is reclaimed its transaction is rolled back, and so is one released
-with a transaction still open.
+with a transaction still open. Before reuse, Harbor replaces the engine
+connection, clearing temporary tables, variables, prepared statements, and
+connection-local settings. These remain available between requests within the
+same live session. One-shot requests also discard local state before the next
+caller; use a session whenever later statements depend on it.
+
+**Backup sessions renew their deadline.** Open one with `{"purpose":"backup"}`
+and require `"purpose":"backup"` in the response (older servers do not support
+this policy). Its `ttlMs` is a renewal window, default and maximum 60 seconds;
+`idleTtlMs` is zero. Send `POST /sql/sessions/<id>/renew` well before each deadline
+(the CLI uses 20-second intervals). Successful renewal returns `{"renewed":true}`
+and starts a fresh window, even while SQL is running. Heartbeats replace both
+the ordinary five-minute ceiling and the thirty-second statement-idle timeout.
+Expired or released leases return `404` and cannot be revived; ordinary leases
+cannot be renewed (`400`). `/sessions` reports `renewable` and `expiresInMs`.
+Renewals use the control path so a busy SQL worker cannot block them indefinitely.
+Custom shorter renewal windows must allow for network and scheduling delays,
+including up to five seconds before the control lane activates for forwarded
+lease work; the CLI uses the full 60-second window.
 
 **One statement at a time.** A second statement sent while the first is running
 gets a `409`: a transaction is a sequence, and two of them interleaving inside
@@ -483,8 +503,8 @@ row is a record, not always a line.
 | negative `INTERVAL` | ✅ | refused outright |
 | `TIMETZ` with an offset | ✅ | normalised to UTC, *silently* |
 
-Each hole is the other format's solid ground, so a table the chosen format
-cannot carry is written in the other one and said out loud:
+A table the chosen format cannot carry is written in the other format when
+that format can preserve all its types, and the change is reported:
 
 ```console
 $ harbor mydata.duckdb backup
@@ -498,14 +518,28 @@ every other table greppable. `--format parquet` asks for one format
 throughout — with the same swap running the other way for a `TIMETZ` column —
 and `--strict` refuses rather than swapping, for a backup that has to be one
 format or nothing. What no mode will do is write something that will not come
-back: a negative interval under `--format parquet` is an error, not a
-surprise six months from now.
+back: a negative interval under `--format parquet` is an error. A table
+combining UNION or VARIANT with TIMETZ is refused because neither whole-table
+format preserves it.
 
 The whole of this is a test suite rather than a claim: `test/scripts/roundtrip.py`
 backs up and restores every type in the shared corpus, a schema of constraints
 and indexes and views and sequences, the strings that attack the format, and a
 seeded fuzz of random tables — then attaches both databases and asks DuckDB
 whether anything differs.
+
+Backup holds one transaction for the initial export and every rewrite pass,
+so concurrent committed table changes cannot mix snapshots. It needs a free
+session connection. The CLI renews a 60-second lease every 20 seconds during
+both SQL and file inspection, so there is no fixed total backup lifetime.
+If the client disappears, missed renewals cause Harbor to cancel active work,
+roll back, and reclaim the connection. A renewal failure or failed pass aborts
+the backup and removes its incomplete directory; it never resumes on a newer
+snapshot. The operator's `--statement-timeout` still limits each SQL statement;
+configure it to accommodate the longest export pass. The server must support
+renewable backup sessions; older servers produce an explicit upgrade error. Exported data is scanned with a bounded buffer. Sequence counters
+are not transactional in DuckDB; quiesce sequence users when their exact
+position must correspond to the exported rows.
 
 The directory is self-contained. Each `COPY` in `load.sql` names its file and
 nothing more, so the backup can be moved, renamed, copied to another machine
@@ -543,6 +577,12 @@ remote host over ssh and uses the socket.
 Ordinary DuckDB SQL can read host files or load extensions. For a server whose
 callers should not receive those capabilities, `--sealed` disables host-file
 access and community extensions.
+After startup initialization, Harbor locks its memory, thread and spill settings
+inside DuckDB. SQL wrappers cannot override them or unlock configuration.
+Other settings registered at startup remain changeable unless `--init` imposed
+a stricter lock. Load extensions that need configurable settings during
+initialization; settings registered later are outside the allowed list.
+
 `--max-temp-size` bounds disk spill, and `--statement-timeout` places the
 hard statement ceiling described above. These are independent of Caddy's
 transport and HTTP policy.
@@ -638,7 +678,7 @@ TCP, 10-second `oha` runs, every response a 200:
 
 The HTTP layer is not the ceiling: `GET /ready` — the same plumbing with no
 SQL — measures ~99,000 req/s at 16 clients. Most of the per-request engine
-cost is amortized by the per-connection prepared-statement cache (below);
+cost is reduced by the per-connection parsed-statement cache (below);
 0.13.0 also coalesced each response head into a single buffered write, set
 `TCP_NODELAY`, and removed most per-request allocations from the HTTP layer.
 
@@ -665,14 +705,13 @@ fixed cost per execute — measured by driving each engine directly, no server:
 re-executing an already-prepared statement costs +11 µs on v2, while parsing
 fresh SQL text costs about 2× v1.5.5, growing with statement size. Execution
 itself is at parity or faster (bulk CTAS is quicker on v2 than on 1.5.5).
-Before 0.13.0 harbor parsed every request's SQL fresh, paying the parser on
-every statement; that was the whole gap. Since 0.13.0 each executor
-connection keeps an LRU of prepared statements keyed by statement text, so a
-repeated statement skips parse and plan entirely — which is why the pure-read
-numbers above sit where they do on a v2 engine. First-seen statement texts
-still pay the parser once; upstream is still optimizing it pre-GA, and real
-analytical queries never notice either way. Measure against the engine you
-deploy.
+The current v2 implementation caches parsed SQL, not bound execution plans.
+Each execution still binds against the current catalog. Each connection keeps
+at most 64 texts and 1 MiB of SQL text, skips caching individual statements
+larger than 64 KiB, and clears its cache when the connection is replaced. AST
+allocations are additional engine memory; these limits bound retained SQL text,
+not total process RSS. Historical benchmark figures above describe their stated
+versions; measure the current build against the engine you deploy.
 
 Every read in the mixed run was checked against an answer taken from the database
 file before the server opened it — a benchmark whose oracle is the server it is

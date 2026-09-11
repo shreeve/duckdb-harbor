@@ -38,13 +38,15 @@ pub fn exposed(_path: &Path) -> bool {
 pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(false) // secure an existing file before replacing its contents
             .mode(0o600)
             .open(path)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.set_len(0)?;
         f.write_all(contents.as_bytes())
     }
     #[cfg(not(unix))]
@@ -88,6 +90,14 @@ pub fn ensure_private_dir(path: &Path) -> Result<(), String> {
     if !path.exists() {
         create_dir_private(path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
     }
-    let _ = chmod(path, 0o700);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if md.uid() != unsafe { libc::getuid() } {
+            return Err(format!("{} is not owned by the current user", path.display()));
+        }
+    }
+    chmod(path, 0o700).map_err(|e| format!("securing {}: {e}", path.display()))?;
     Ok(())
 }

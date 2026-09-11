@@ -268,10 +268,46 @@ mod conn {
     }
 
     #[test]
+    fn reset_discards_local_state_and_rolls_back() {
+        let Some(_) = v2_engine() else { return };
+        let mut c = conn::open(Path::new(":memory:"), &[]).unwrap();
+        c.execute_batch("CREATE TABLE durable(x INTEGER); CREATE TEMP TABLE private(x INTEGER); \
+            SET VARIABLE secret=42; PREPARE private_stmt AS SELECT 1; BEGIN; \
+            INSERT INTO durable VALUES (7)").unwrap();
+        c.reset().unwrap();
+        assert_eq!(rows(&mut c, "SELECT count(*) FROM durable", &[]).unwrap(), ["0"]);
+        assert_eq!(rows(&mut c, "SELECT getvariable('secret')", &[]).unwrap(), ["null"]);
+        assert!(rows(&mut c, "SELECT * FROM private", &[]).is_err());
+        assert!(rows(&mut c, "EXECUTE private_stmt", &[]).is_err());
+    }
+
+    #[test]
+    fn cache_has_a_byte_budget_and_skips_large_text() {
+        use std::sync::Arc;
+        let Some(_) = v2_engine() else { return };
+        let mut c = conn::open(Path::new(":memory:"), &[]).unwrap();
+        let small = c.statements("SELECT 1").unwrap();
+        assert!(Arc::ptr_eq(&small, &c.statements("SELECT 1").unwrap()));
+        let large = format!("SELECT 1 /*{}*/", "x".repeat(65_536));
+        let parsed = c.statements(&large).unwrap();
+        assert!(!Arc::ptr_eq(&parsed, &c.statements(&large).unwrap()));
+        // Fewer than 64 entries, but more than 1 MiB: byte pressure must evict.
+        let first = format!("SELECT 1 /*{}*/", "y".repeat(60_000));
+        let parsed = c.statements(&first).unwrap();
+        for i in 2..22 {
+            c.statements(&format!("SELECT {i} /*{}*/", "y".repeat(60_000))).unwrap();
+        }
+        assert!(!Arc::ptr_eq(&parsed, &c.statements(&first).unwrap()));
+    }
+
+    #[test]
     fn interrupt_crosses_threads() {
         let Some(_) = v2_engine() else { return };
         let mut c = conn::open(Path::new(":memory:"), &[]).expect("open");
         let handle = c.interrupt_handle();
+
+        // The executor keeps this handle across connection replacements.
+        c.reset().unwrap();
 
         // Fire the interrupt shortly after the query starts, from another
         // thread.

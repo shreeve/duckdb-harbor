@@ -39,7 +39,7 @@ s.close()')}
 # port this runner has already given to the shared server — the run dies at
 # startup with "address already in use" and it looks like a harbor bug.
 unset PORT
-suites=${SUITES:-unit lifecycle roundtrip types asserts spec fuzz hostile deployment stress catalog sessions cancel}
+suites=${SUITES:-unit regressions lifecycle roundtrip types asserts spec fuzz hostile deployment stress catalog sessions cancel}
 
 bold=$(tput bold 2>/dev/null || true); red=$(tput setaf 1 2>/dev/null || true)
 green=$(tput setaf 2 2>/dev/null || true); dim=$(tput dim 2>/dev/null || true)
@@ -114,6 +114,7 @@ skip() { skipped+=("$1"); printf '%s— %s skipped: %s%s\n' "$dim" "$1" "$2" "$o
 # reader either. Between them that left 101 tests — every justhttp test and
 # every config test — building fine and running nowhere.
 run unit     cargo test --release --workspace --all-features
+run regressions python3 "$here/test/scripts/regressions.py"
 # The lifetime doctrine runs the real binary in its own $HARBOR_HOME sandbox —
 # no shared server, and nothing it starts outlives it.
 run lifecycle "$here/test/scripts/lifecycle.sh"

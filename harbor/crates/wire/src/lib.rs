@@ -78,13 +78,17 @@ pub mod endpoint {
     pub const INFO: Route = Route::fixed("GET", "/info");
 
     /// Every fixed route, so a client (or a test on harbor's side) can walk
-    /// the contract instead of transcribing it. The two builders below are
+    /// the contract instead of transcribing it. The builders below are
     /// not here: their paths carry an id, so there is nothing to enumerate.
     pub const FIXED: &[Route] =
         &[SQL, SESSIONS_CREATE, SESSIONS, CATALOG, SHUTDOWN, READY, INFO];
 
-    /// DELETE — release the session `id` holds, rolling back any open
-    /// transaction. A builder, since the id rides in the path.
+    /// Renew a backup lease, including while its statement is running.
+    pub fn session_renew(id: &str) -> Route {
+        Route::built("POST", format!("/sql/sessions/{id}/renew"))
+    }
+
+    /// DELETE — release the session, rolling back any open transaction.
     pub fn session(id: &str) -> Route {
         Route::built("DELETE", format!("/sql/sessions/{id}"))
     }
@@ -142,10 +146,24 @@ pub struct SqlRequest {
     pub timeout_ms: Option<u64>,
 }
 
+/// Lease lifetime policy. Interactive leases have a fixed maximum lifetime;
+/// backup leases survive while the client renews them before each deadline.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionPurpose {
+    Interactive,
+    Backup,
+}
+
 /// POST /sql/sessions request body (may be empty / absent).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionNewRequest {
+    /// Absent means interactive. Backup clients must verify this in the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<SessionPurpose>,
+    /// Positive milliseconds: total lifetime for interactive sessions (max 300s),
+    /// renewal window for backups (max 60s). Absent uses the relevant maximum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_ms: Option<u64>,
 }
@@ -153,8 +171,11 @@ pub struct SessionNewRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionNewResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<SessionPurpose>,
     pub session_id: String,
     pub ttl_ms: u64,
+    /// Zero for backups: renewal replaces statement-idle expiry.
     pub idle_ttl_ms: u64,
 }
 

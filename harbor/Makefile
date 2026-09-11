@@ -31,7 +31,7 @@ harbor:
 	cargo build -p harbor --release
 
 unit:
-	cargo test --release
+	cargo test --release --workspace --all-features
 
 test: harbor
 	test/scripts/check.sh
