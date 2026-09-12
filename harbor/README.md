@@ -191,9 +191,9 @@ impatient users, set `HARBOR_STATEMENT_TIMEOUT_MS` or
 
 Two smaller things follow from the same machinery. Releasing a session whose
 statement is still running stops it — `{"released":false,"cancelling":true}`
-— and the connection comes back on the reaper's next tick. And a lease that
-blows its TTL while busy is reclaimed: the lease that most needs taking back
-is the one wedged inside a runaway statement.
+— and the connection comes back on a reaper tick after execution stops. And a
+lease that blows its TTL while busy is reclaimed: the lease that most needs
+taking back is the one wedged inside a runaway statement.
 
 Cancelling a statement inside a transaction aborts that transaction, exactly as
 it does in Postgres. Harbor does not paper over it — the next statement gets
@@ -220,7 +220,7 @@ $ curl -s -X DELETE 127.0.0.1:9495/sql/sessions/$sid
 
 This is PgBouncer's transaction pooling, or ActiveRecord checking a connection
 out of its pool — with an HTTP request where they have a socket and a thread.
-Three things follow from that, and they are the parts worth knowing:
+The session rules are:
 
 **Sessions draw from their own connections.** `HARBOR_POOL_SIZE` (default 16)
 is opened at load and split: the workers take theirs, sessions get the rest. A
@@ -228,17 +228,11 @@ pool serving both would run out of workers the moment enough clients held
 transactions open, and then answer nothing at all. With none free, opening a
 session is a `503` with `Retry-After` — queries keep working throughout.
 
-**Every session has a deadline.** Ordinary sessions have a fixed lifetime. HTTP has no reliable close signal, so a
-client that vanishes mid-transaction looks exactly like one that is thinking,
-and a timer is the only way that connection ever comes back. Ask for a lifetime
-with `{"ttlMs": N}`; harbor caps it at five minutes and answers with what it
-granted, alongside the thirty-second idle timeout it enforces regardless. When
-a session is reclaimed its transaction is rolled back, and so is one released
-with a transaction still open. Before reuse, Harbor replaces the engine
-connection, clearing temporary tables, variables, prepared statements, and
-connection-local settings. These remain available between requests within the
-same live session. One-shot requests also discard local state before the next
-caller; use a session whenever later statements depend on it.
+**Ordinary sessions have a fixed deadline.** Ask for a lifetime with
+`{"ttlMs": N}`; Harbor caps it at five minutes and returns the granted lifetime
+alongside a thirty-second idle timeout. Running SQL does not count as idle,
+but the fixed deadline applies even while a statement is running. Ordinary
+sessions cannot be renewed.
 
 **Backup sessions renew their deadline.** Open one with `{"purpose":"backup"}`
 and require `"purpose":"backup"` in the response (older servers do not support
@@ -247,12 +241,23 @@ this policy). Its `ttlMs` is a renewal window, default and maximum 60 seconds;
 (the CLI uses 20-second intervals). Successful renewal returns `{"renewed":true}`
 and starts a fresh window, even while SQL is running. Heartbeats replace both
 the ordinary five-minute ceiling and the thirty-second statement-idle timeout.
-Expired or released leases return `404` and cannot be revived; ordinary leases
-cannot be renewed (`400`). `/sessions` reports `renewable` and `expiresInMs`.
+Expired or released leases return `404` and cannot be revived; attempts to renew
+ordinary leases return `400`. `/sessions` reports `renewable` and `expiresInMs`.
 Renewals use the control path so a busy SQL worker cannot block them indefinitely.
 Custom shorter renewal windows must allow for network and scheduling delays,
 including up to five seconds before the control lane activates for forwarded
 lease work; the CLI uses the full 60-second window.
+
+**Expired sessions are reclaimed.** If a client disappears, its ordinary
+session expires at its fixed deadline or idle timeout; a backup session expires
+when its renewal window runs out. For either kind, Harbor cancels outstanding
+SQL, then rolls back any open transaction and reclaims the connection once
+execution stops. Explicitly releasing a session also rolls back an open
+transaction. Before reuse, Harbor replaces the engine connection, clearing
+temporary tables, variables, prepared statements, and connection-local
+settings. These remain available between requests within the same live session.
+One-shot requests also discard local state before the next caller; use a
+session whenever later statements depend on it.
 
 **One statement at a time.** A second statement sent while the first is running
 gets a `409`: a transaction is a sequence, and two of them interleaving inside
@@ -536,10 +541,11 @@ Backup holds one transaction for the initial export and every rewrite pass,
 so concurrent committed table changes cannot mix snapshots. It needs a free
 session connection. The CLI renews a 60-second lease every 20 seconds during
 both SQL and file inspection, so there is no fixed total backup lifetime.
-If the client disappears, missed renewals cause Harbor to cancel active work,
-roll back, and reclaim the connection. A renewal failure or failed pass aborts
-the backup and removes its incomplete directory; it never resumes on a newer
-snapshot. The operator's `--statement-timeout` still limits each SQL statement;
+If the client disappears, the lease expires 60 seconds after its last successful
+renewal (or creation if never renewed). Harbor cancels active work, then rolls
+back and reclaims the connection once execution stops. A renewal failure or
+failed pass aborts the backup and removes its incomplete directory; it never
+resumes on a newer snapshot. The operator's `--statement-timeout` still limits each SQL statement;
 configure it to accommodate the longest export pass. The server must support
 renewable backup sessions; older servers produce an explicit upgrade error. Exported data is scanned with a bounded buffer. Sequence counters
 are not transactional in DuckDB; quiesce sequence users when their exact
