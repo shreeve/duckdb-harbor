@@ -1716,9 +1716,14 @@ impl Reedline {
                     // still offers next-statement keywords there, so an
                     // empty-menu check alone does not save the Enter. Only
                     // word chars and '.' (qualified names) keep the menu.
-                    let word_boundary = matches!(commands.first(),
-                        Some(EditCommand::InsertChar(c))
-                            if !c.is_alphanumeric() && *c != '_' && *c != '.');
+                    // Every character in the batch is read, not just the
+                    // first: a burst of typing arrives as one `Edit` with
+                    // several `InsertChar`s, and the word can end anywhere
+                    // in it.
+                    let word_boundary = commands.iter().any(|command| {
+                        matches!(command, EditCommand::InsertChar(c)
+                            if !c.is_alphanumeric() && *c != '_' && *c != '.')
+                    });
                     if !self.persistent_menus
                         && (word_boundary || self.editor.line_buffer().get_buffer().is_empty())
                     {
@@ -4380,6 +4385,25 @@ mod tests {
                 .unwrap();
             assert_eq!(!menu_is_active(&reedline), closes, "inserting {c:?}");
         }
+    }
+
+    /// Typed fast enough, the rest of a statement arrives as one `Edit` of
+    /// several `InsertChar`s. The word still ends inside it.
+    #[test]
+    fn a_word_ends_inside_a_burst_of_typing() {
+        let mut reedline = engine_with_active_menu(false, false);
+        reedline
+            .handle_event(
+                &DefaultPrompt::default(),
+                ReedlineEvent::Edit(vec![
+                    EditCommand::InsertChar('i'),
+                    EditCommand::InsertChar('s'),
+                    EditCommand::InsertChar(';'),
+                    EditCommand::InsertChar(' '),
+                ]),
+            )
+            .unwrap();
+        assert!(!menu_is_active(&reedline), "the ';' ended the word");
     }
 
     /// A completer that always has something to offer, like a grammar-driven

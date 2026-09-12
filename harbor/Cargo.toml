@@ -47,10 +47,10 @@ opt-level = "s"
 [profile.release.package.nu-ansi-term]
 opt-level = "s"
 
-# vendor/reedline is 0.50.0 verbatim except two patches in src/engine.rs (both
-# proposed upstream; see vendor/reedline/HARBOR.md): a completion menu with
-# zero suggestions does not swallow Enter, and typing a word boundary closes
-# the menu — together they stop a stale menu from inserting a stray word
-# instead of submitting.
+# vendor/reedline is 0.50.0 verbatim except three patches in src/engine.rs
+# (see vendor/reedline/HARBOR.md): a completion menu with zero suggestions does
+# not swallow Enter, typing a word boundary closes the menu, and MenuAccept
+# takes a completion without submitting. The first two stop a stale menu from
+# inserting a stray word instead of submitting.
 [patch.crates-io]
 reedline = { path = "vendor/reedline" }
