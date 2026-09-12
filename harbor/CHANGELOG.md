@@ -4,6 +4,23 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.36.2 — 2026-09-11
+
+- **A summoned server no longer leaves while a client is still there.** The
+  mooring that keeps a spawned server ashore was a connection that opened and
+  never sent a request, and such a connection is reclaimed after sixty
+  seconds — its silence is indistinguishable from an anonymous caller sitting
+  on a descriptor. A repl whose human paused to think, or a backup between
+  passes, therefore lost its berth and met `cannot reach harbor: No such file
+  or directory` on the next statement. The mooring now asks `/ready` once and
+  holds the answered connection, renewing every 240 seconds inside the
+  server's 300-second idle clock, so the berth stays for as long as the
+  client does. This reaches every client that summons a server: the repl,
+  piped and `-c` scripts, `backup`, and `restore`.
+- The lifecycle suite holds its mooring past the first-request timeout
+  instead of for a few seconds, putting the clock that reclaims a silent
+  connection inside what the test can see.
+
 ## 0.36.1 — 2026-09-11
 
 - Keeps Windows' native canonical database paths for file access, server

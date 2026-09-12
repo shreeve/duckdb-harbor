@@ -8,7 +8,7 @@
 # everyone's, it lives while anyone is connected; start — the server is
 # yours, it lives until you stop it. Everything here is behavior no unit test
 # can see: spawn-on-use across processes, two clients landing on one server,
-# an idle connection as a mooring, the last departure sweeping the socket,
+# the repl's own anchor as a mooring, the last departure sweeping the socket,
 # and a start-lifetime server ignoring the refcount entirely.
 
 set -uo pipefail
@@ -140,19 +140,51 @@ if [[ -f $work/other.duckdb ]]; then bad "a refused size still conjured a file";
 
 echo "— the server is everyone's: it lives while anyone is connected"
 sock=$(live_sock)
-# A silent open connection, well past the linger AND past justhttp's 5s read
-# timeout — presence is the mooring, no heartbeat, no traffic.
-python3 - "$sock" <<'PY' &
-import socket, sys, time
-s = socket.socket(socket.AF_UNIX)
-s.connect(sys.argv[1])
-time.sleep(7)
-s.close()
+# The mooring belongs to the CLIENT, so only the shipped client can prove it
+# holds — a hand-rolled socket here would test justhttp and let harbor's own
+# anchor rot. The repl wants a terminal, so it gets one. A statement, a pause
+# longer than the first-request timeout (60s, the clock that reclaims a
+# connection which has never spoken), then a second statement. That second
+# one is where a berth which departed while its human was thinking says
+# "cannot reach harbor". Nothing shorter than the real clock can see it.
+if python3 - "$harbor" "$work/x.duckdb" <<'PY' >"$work/repl.log" 2>&1
+import os, pty, select, sys, time
+harbor, db = sys.argv[1], sys.argv[2]
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm"
+    os.execv(harbor, [harbor, db])
+    os._exit(1)
+buf = b""
+def drain(seconds):          # read, and answer the queries a terminal owes
+    global buf
+    end = time.time() + seconds
+    while time.time() < end:
+        if not select.select([fd], [], [], 0.2)[0]:
+            continue
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            return
+        if not chunk:
+            return
+        buf += chunk
+        if b"\x1b]11;?" in chunk: os.write(fd, b"\x1b]11;rgb:1c1c/1c1c/1c1c\x07")
+        if b"\x1b[6n" in chunk:   os.write(fd, b"\x1b[1;1R")
+drain(5)
+os.write(fd, b"SELECT 1 AS early;\r"); drain(3)
+drain(65)
+os.write(fd, b"SELECT 2 AS late;\r");  drain(5)
+os.write(fd, b".quit\r");              drain(3)
+for close in (lambda: os.close(fd), lambda: os.waitpid(pid, 0)):
+    try: close()
+    except Exception: pass
+out = buf.decode("utf8", "replace")
+print(out[-2000:])
+sys.exit(1 if "cannot reach harbor" in out or "late" not in out else 0)
 PY
-holder=$!
-sleep 6
-if [[ -n $(live_sock) ]]; then ok "an idle connection holds the server (6s > 1s linger)"; else bad "the server left while a client was still connected"; fi
-wait "$holder"
+then ok "the repl's own anchor moors the berth across a 65s pause"
+else bad "the berth departed while the repl still held it (see $work/repl.log)"; fi
 if wait_gone; then ok "the last departure ends the server"; else bad "the server outlived its last client"; fi
 if [[ ! -e $sock ]]; then ok "it swept its socket on the way out"; else bad "departure left the socket behind"; fi
 if [[ -f $work/x.duckdb && ! -e $work/x.duckdb.wal ]]; then

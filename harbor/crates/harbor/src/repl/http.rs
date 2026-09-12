@@ -11,6 +11,8 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 use wire::endpoint::Route;
 
@@ -21,38 +23,83 @@ pub enum Transport {
     Tcp(String), // host:port
 }
 
-/// The mooring: one silent connection, held open for the session.
+/// The mooring: one quiet connection, held open for the session.
 ///
 /// A spawned server's lifetime is its client count, so what keeps it ashore
-/// while a human thinks between statements is not a heartbeat but presence —
-/// this stream, connected and quiet. justhttp counts a connection from accept,
-/// and an idle one waits through its read ticks forever, so holding the fd is
-/// the whole protocol. Dropping the Anchor is the goodbye.
-pub struct Anchor(#[allow(dead_code)] AnchorStream);
-
-// The streams are held, never read: their existence is the message.
-enum AnchorStream {
-    #[cfg(unix)]
-    Unix(#[allow(dead_code)] UnixStream),
-    Tcp(#[allow(dead_code)] TcpStream),
+/// while a human thinks between statements is presence. Presence has to be
+/// SPOKEN: a connection that has never sent a request is reclaimed at
+/// `FIRST_REQUEST_TIMEOUT`, and its silence is indistinguishable from an
+/// anonymous caller sitting on a descriptor. So the anchor asks `/ready`
+/// once — that one answer is what buys the connection the long idle clock —
+/// and renews inside it. Dropping the Anchor is the goodbye.
+pub struct Anchor {
+    stop: Option<mpsc::Sender<()>>,
+    worker: Option<JoinHandle<()>>,
 }
+
+/// Inside the server's 300s idle clock, with enough margin left that a
+/// renewal can fail and be retried before the mooring is at risk.
+const RENEW: Duration = Duration::from_secs(240);
+const RETRY: Duration = Duration::from_secs(5);
 
 /// Open the anchor, or nothing — a server that refuses one (gone between
 /// resolve and here) will refuse the first statement too, which is where
 /// the error belongs.
 pub fn hold(transport: &Transport) -> Option<Anchor> {
-    match transport {
-        #[cfg(unix)]
-        Transport::Unix(p) => UnixStream::connect(p).ok().map(|s| Anchor(AnchorStream::Unix(s))),
-        Transport::Tcp(addr) => {
-            TcpStream::connect(addr).ok().map(|s| Anchor(AnchorStream::Tcp(s)))
+    let first = keepalive(transport).ok()?;
+    let transport = transport.clone();
+    let (stop, stopped) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut held = first;
+        let mut wait = RENEW;
+        loop {
+            match stopped.recv_timeout(wait) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => match keepalive(&transport) {
+                    // Moor the new one before letting the old one go: the
+                    // swap must never be the moment the count touches zero.
+                    Ok(next) => {
+                        drop(std::mem::replace(&mut held, next));
+                        wait = RENEW;
+                    }
+                    // Keep the connection already held and try again well
+                    // inside what is left of the margin.
+                    Err(_) => wait = RETRY,
+                },
+            }
+        }
+        drop(held);
+    });
+    Some(Anchor { stop: Some(stop), worker: Some(worker) })
+}
+
+impl Drop for Anchor {
+    fn drop(&mut self) {
+        self.stop.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
     }
 }
 
+/// One `/ready` on a connection that stays open afterwards. The body is
+/// never read — the answer's arrival is the whole point, because it is what
+/// marks the connection as having spoken.
+fn keepalive(transport: &Transport) -> io::Result<Response> {
+    let response =
+        request_inner(transport, &wire::endpoint::READY, None, Some(RETRY), None, true)?;
+    if response.status != 200 {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("harbor readiness returned HTTP {}", response.status),
+        ));
+    }
+    Ok(response)
+}
+
 pub struct Response {
     pub status: u16,
-    pub body: Box<dyn BufRead>,
+    pub body: Box<dyn BufRead + Send>,
 }
 
 impl Response {
@@ -63,8 +110,8 @@ impl Response {
     }
 }
 
-trait Stream: Read + Write {}
-impl<T: Read + Write> Stream for T {}
+trait Stream: Read + Write + Send {}
+impl<T: Read + Write + Send> Stream for T {}
 
 /// The route carries its own verb, so a caller cannot pair `GET` with a path
 /// harbor only answers to `POST` — the mistake that reads as a 404.
@@ -74,7 +121,7 @@ pub fn request(
     body: Option<&str>,
     timeout: Option<Duration>,
 ) -> io::Result<Response> {
-    request_inner(transport, route, body, timeout, None)
+    request_inner(transport, route, body, timeout, None, false)
 }
 
 /// Like `request`, but built for long-running /sql streams: the socket gets a
@@ -87,7 +134,7 @@ pub fn request_streaming(
     body: Option<&str>,
     on_tick: &dyn Fn() -> io::Result<()>,
 ) -> io::Result<Response> {
-    request_inner(transport, route, body, Some(Duration::from_millis(250)), Some(on_tick))
+    request_inner(transport, route, body, Some(Duration::from_millis(250)), Some(on_tick), false)
 }
 
 fn request_inner(
@@ -96,6 +143,7 @@ fn request_inner(
     body: Option<&str>,
     timeout: Option<Duration>,
     on_tick: Option<&dyn Fn() -> io::Result<()>>,
+    keep_alive: bool,
 ) -> io::Result<Response> {
     let (stream, host): (Box<dyn Stream>, String) = match transport {
         #[cfg(unix)]
@@ -123,7 +171,8 @@ fn request_inner(
     };
     let mut stream = stream;
 
-    let mut req = format!("{route} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
+    let connection = if keep_alive { "keep-alive" } else { "close" };
+    let mut req = format!("{route} HTTP/1.1\r\nHost: {host}\r\nConnection: {connection}\r\n");
     req.push_str(&format!("Accept: {}\r\n", wire::CONTENT_NDJSON));
     if let Some(b) = body {
         req.push_str(&format!(
@@ -182,7 +231,7 @@ fn request_inner(
         }
     }
 
-    let body: Box<dyn BufRead> = if chunked {
+    let body: Box<dyn BufRead + Send> = if chunked {
         Box::new(BufReader::new(ChunkedReader::new(reader)))
     } else if let Some(n) = content_length {
         Box::new(BufReader::new(reader.take(n)))

@@ -223,7 +223,6 @@ mod tests {
             .unwrap();
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
-        // The anchor deliberately sends no HTTP request.
         if !matches!(reader.read_line(&mut line), Ok(n) if n > 0) {
             return;
         }
@@ -247,7 +246,12 @@ mod tests {
         }
         let mut body = vec![0; len];
         reader.read_exact(&mut body).unwrap();
-        let (status, body) = if route == "POST /sql/sessions" {
+        // The anchor speaks once, to mark its connection as having spoken, and
+        // then holds it. That is the lifetime of the client, not a step of the
+        // backup, so it is answered and left out of the conversation below.
+        let (status, body) = if route == "GET /ready" {
+            (200, "{}".to_string())
+        } else if route == "POST /sql/sessions" {
             let request: wire::SessionNewRequest = serde_json::from_slice(&body).unwrap();
             assert_eq!(request.purpose, Some(wire::SessionPurpose::Backup));
             let purpose = if supported {
@@ -278,7 +282,9 @@ mod tests {
             assert_eq!(route, "DELETE /sql/sessions/test");
             (200, r#"{"released":true}"#.into())
         };
-        log.lock().unwrap().push(route);
+        if route != "GET /ready" {
+            log.lock().unwrap().push(route);
+        }
         let mut stream = reader.into_inner();
         let _ = write!(
             stream,
