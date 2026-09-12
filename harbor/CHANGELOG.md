@@ -4,6 +4,20 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.36.3 — 2026-09-12
+
+- **A completion menu lets go of the statement it was opened for, however
+  fast it was typed.** The menu stands down when a typed character can no
+  longer extend the word it is completing, but it read only the first
+  character of each batch of edits, and consecutive keystrokes reach the
+  editor fused into one. Typing the tail of a statement at any speed
+  therefore hid the boundary inside the batch: `show tab`, Tab, `les;`,
+  Enter appended the highlighted `table` to a finished statement rather
+  than running it. Every character in a batch is now read, so the word ends
+  wherever its boundary falls.
+- Records the vendored reedline copy as carrying three patches rather than
+  two, with the upstream state of each and what un-vendoring will require.
+
 ## 0.36.2 — 2026-09-11
 
 - **A summoned server no longer leaves while a client is still there.** The
