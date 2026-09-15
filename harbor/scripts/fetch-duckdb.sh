@@ -5,26 +5,27 @@
 # harbor carries no engine; this fetches one for it to load, along
 # with the two headers (kept for reference — the crate ships pregenerated
 # bindings, so the build never reads them) and the duckdb CLI that builds
-# fixtures. The source is DuckDB's official artifact channel at
-# artifacts.duckdb.org.
+# fixtures.
 #
-# CAVEAT, until DuckDB 2.0 GA: that channel is frozen at alpha38195
-# (2026-08-18), which predates the v2 C API landing on DuckDB main — the
-# libduckdb it delivers exports ZERO v2 symbols, and harbor 0.21 (which
-# binds the v2 C API) will refuse it with "engine has no v2 C API". Until
-# GA publishes v2-capable binaries, set ENGINE_URL to our own shelf — the
-# Engine workflow builds all five platforms at CI's pinned commit and
-# shelves them on this repo's engine-<pin> prerelease, in the official
-# channel's exact zip shape:
+# The source, until DuckDB 2.0 GA, is this repo's own shelf: the Engine
+# workflow builds all five platforms at CI's pinned commit and shelves them
+# on the engine-<pin> prerelease, in the shape DuckDB's official channel
+# used to ship (duckdb-binaries-<plat>.zip wrapping libduckdb-<plat>.zip
+# and duckdb_cli-<plat>.zip). No official artifact can serve harbor 0.21:
+# the nightly channel was frozen pre-v2-API, and on 2026-09-14 DuckDB
+# retired it outright — artifacts.duckdb.org/latest is gone, nightlies
+# now live under branch-keyed paths (v2.0-cyanoptera/…) in a new tar.gz
+# shape that still exports no v2 C API.
+#
+# <pin> is the first 10 chars of the commit in
+# .github/actions/duckdb/action.yml — the ONE place the pin lives. This
+# script reads it from there when run inside the checkout; elsewhere, or
+# to fetch any other engine, set ENGINE_URL:
 #
 #   ENGINE_URL=https://github.com/shreeve/duckdb-harbor/releases/download/engine-<pin>/duckdb-binaries-<plat>.zip
 #
-# where <pin> is the first 10 chars of the commit in
-# .github/actions/duckdb/action.yml — the ONE place the pin lives (the
-# repo's Releases page lists the current engine-* tag). The CLI from the
-# frozen zip is still fine: it only builds
-# fixtures and needs no v2 API. This script warns loudly when the fetched
-# library cannot serve. At GA, delete the caveat and the warning below.
+# This script warns loudly when the fetched library cannot serve. At GA,
+# point the default at the official channel and delete the warning below.
 #
 # Override DEST to install elsewhere.
 
@@ -62,7 +63,15 @@ place() {
 }
 
 # ---- the engine: one "binaries" zip, two sub-zips nested inside -------------
-engine_url=${ENGINE_URL:-https://artifacts.duckdb.org/latest/duckdb-binaries-$duck_plat.zip}
+engine_url=${ENGINE_URL:-}
+if [ -z "$engine_url" ]; then
+  # Default to the engine-<pin> shelf, pin read from the composite action so
+  # a pin bump there flows here without a second edit.
+  pin_file="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)/.github/actions/duckdb/action.yml"
+  pin=$(grep -o 'sha=[0-9a-f]\{40\}' "$pin_file" 2>/dev/null | cut -d= -f2 || true)
+  [ -n "$pin" ] || { echo "fetch-duckdb: no engine pin at $pin_file — set ENGINE_URL (see header)" >&2; exit 2; }
+  engine_url="https://github.com/shreeve/duckdb-harbor/releases/download/engine-${pin:0:10}/duckdb-binaries-$duck_plat.zip"
+fi
 say "fetching $engine_url"
 curl -fsSL -o "$work/binaries.zip" "$engine_url"
 ( cd "$work" && unzip -oq binaries.zip )        # -> libduckdb-*.zip, duckdb_cli-*.zip
@@ -94,18 +103,17 @@ if [ "$dest" = "$HOME/.duckdb/cli/2.0.0" ]; then
 fi
 
 # ---- can this engine actually serve harbor 0.21? ---------------------------
-# harbor 0.21 binds the v2 C API; the frozen artifact channel predates it.
-# grep the dynamic symbol names straight out of the binary — present on every
+# harbor 0.21 binds the v2 C API; no official artifact exports it. grep the
+# dynamic symbol names straight out of the binary — present on every
 # platform, no nm/objdump dependency. Delete this check at GA.
 for f in "$dest"/libduckdb.dylib "$dest"/libduckdb.so "$dest"/duckdb.dll; do
   [ -f "$f" ] || continue
   if ! grep -q duckdb_v2_connect "$f" 2>/dev/null; then
     echo "" >&2
     echo "fetch-duckdb: WARNING — this libduckdb exports no v2 C API symbols." >&2
-    echo "  harbor cannot serve with it (the official channel is frozen" >&2
-    echo "  pre-v2-API until DuckDB 2.0 GA). Re-run with ENGINE_URL pointed" >&2
-    echo "  at this repo's engine-<pin> release — the exact line is in this" >&2
-    echo "  script's header." >&2
+    echo "  harbor cannot serve with it (no official artifact will until" >&2
+    echo "  DuckDB 2.0 GA). Re-run with ENGINE_URL pointed at this repo's" >&2
+    echo "  engine-<pin> release — the exact line is in this script's header." >&2
   fi
   break
 done

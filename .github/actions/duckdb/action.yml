@@ -1,37 +1,44 @@
 name: Set up DuckDB
 description: >
-  Put a DuckDB engine where CI can run it. Two pieces, two sources, one
-  reason: harbor 0.21 binds DuckDB's v2 C API, and the official nightly
-  artifacts are frozen at a commit (alpha38195, 2026-08-18) that predates
-  the v2 C API landing on main — so no official artifact can serve. The
-  library is therefore built from source at the same pinned commit the
-  local batteries validate against, and cached so only the first run pays
-  for it. The duckdb CLI (which only builds the test fixture and needs no
-  v2 API) still comes from the frozen artifact zip. When DuckDB ships v2
-  binaries at GA, delete the build steps and go back to the zip for both.
+  Put a DuckDB engine where CI can run it. Two pieces, one source: harbor
+  0.21 binds DuckDB's v2 C API, and no official artifact has ever served
+  it — the nightly channel was frozen pre-v2-API and then, on 2026-09-14,
+  retired outright (artifacts.duckdb.org/latest is gone; nightlies now
+  live under branch-keyed paths in a new tar.gz shape). The library is
+  therefore built from source at the pinned commit the local batteries
+  validate against, and cached so only the first run pays for it. The
+  duckdb CLI (which only builds the test fixture and needs no v2 API)
+  comes from this repo's engine-<pin> prerelease, which the Engine
+  workflow mints from the same commit. When DuckDB ships v2 binaries at
+  GA, delete the build steps and fetch both from the official channel.
 runs:
   using: composite
   steps:
-    - name: DuckDB CLI (official artifact — fixture builder only)
-      shell: bash
-      # /latest/ is unpinned and currently frozen; either way is fine here —
-      # the CLI only builds the fixture database and needs no v2 API. If the
-      # channel ever moves, the CLI moving with it is correct.
-      run: |
-        set -euo pipefail
-        dir="$HOME/duckdb"; mkdir -p "$dir"; cd "$dir"
-        curl -fsSL -o binaries.zip \
-          https://artifacts.duckdb.org/latest/duckdb-binaries-linux-amd64.zip
-        unzip -oq binaries.zip
-        unzip -oq 'duckdb_cli-*.zip'
-        echo "$dir" >> "$GITHUB_PATH"
-
     - name: Engine pin
       id: pin
       shell: bash
       # The commit the local batteries validate against. Bump deliberately,
       # with a full battery — the engine pin is the dylib.
       run: echo "sha=ee95013f175bea7aa813f56c86fea983db6bc8e5" >> "$GITHUB_OUTPUT"
+
+    - name: DuckDB CLI (from the engine-<pin> prerelease — fixture builder only)
+      shell: bash
+      # Same shelf Release.yml fetches from, same zip shape the official
+      # channel used to ship: duckdb-binaries-<plat>.zip wrapping
+      # libduckdb-<plat>.zip and duckdb_cli-<plat>.zip. Only the CLI is
+      # taken here; the library comes from the cached source build below.
+      # A 404 means the pin was bumped without dispatching Engine.yml.
+      env:
+        PIN: ${{ steps.pin.outputs.sha }}
+      run: |
+        set -euo pipefail
+        dir="$HOME/duckdb"; mkdir -p "$dir"; cd "$dir"
+        url="https://github.com/$GITHUB_REPOSITORY/releases/download/engine-${PIN:0:10}/duckdb-binaries-linux-amd64.zip"
+        curl -fsSL -o binaries.zip "$url" \
+          || { echo "no engine-${PIN:0:10} shelf for this pin — dispatch Engine.yml first"; exit 1; }
+        unzip -oq binaries.zip
+        unzip -oq 'duckdb_cli-*.zip'
+        echo "$dir" >> "$GITHUB_PATH"
 
     - name: Cached engine
       id: engine
