@@ -174,13 +174,21 @@ it was meant to protect, so putting the result into place stays a human act.
 It is also where `--block-size` is applied, block size being fixed at
 creation.
 
-No format holds every type, and the holes do not overlap: text loses a
-`UNION`'s tag and retypes a `VARIANT`, parquet refuses a negative `INTERVAL`
-and normalises a `TIMETZ` to UTC. Two of those four are silent, which is the
-reason the verb has an opinion at all. Each hole is the other format's solid
-ground, so a table the chosen format cannot carry is written in the other and
-named out loud; `--strict` refuses instead. The invariant is that harbor never
-writes something that will not come back. Out of scope on purpose: retention, rotation, scheduling,
+A `VARIANT` column travels as JSON text, decoded on restore by `after.sql`
+(DuckDB's `IMPORT DATABASE` takes only `COPY`, so the decode is a file of its
+own beside `load.sql`). A value that entered as JSON — which is how a variant
+is populated in practice — returns exactly; what JSON has no word for, a
+`DATE` or `DECIMAL` put inside a variant from SQL, returns as JSON's nearest
+type and is named out loud, once per column; `--format parquet` keeps it.
+
+No format holds every shape, and the holes do not overlap: text loses a
+`UNION`'s tag and retypes a `VARIANT` nested inside another type, parquet
+refuses a negative `INTERVAL` and normalises a `TIMETZ` to UTC. Two of those
+four are silent, which is the reason the verb has an opinion at all. Each
+hole is the other format's solid ground, so a table the chosen format cannot
+carry is written in the other and named out loud; `--strict` refuses instead.
+The invariant is that harbor never writes something that will not come back
+without saying so. Out of scope on purpose: retention, rotation, scheduling,
 compression, and remote targets — cron, a filesystem and `rsync` already do
 those, and doing them here would make harbor a backup product.
 

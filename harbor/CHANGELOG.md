@@ -4,7 +4,27 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
-## 0.36.3 — 2026-09-12
+## 0.37.0 — 2026-09-15
+
+- **A `VARIANT` column backs up as JSON text, and comes back exactly when
+  it entered as JSON.** Text could not carry one at all: the number 42 and
+  the string "42" both print as `42`, and the reader hands every cell back
+  as a string, so any table with a variant column was quietly written as
+  parquet. It is now written as JSON — `42` for the number, `"42"` for the
+  string, still greppable — and decoded on restore, which returns every
+  value that entered as JSON with its inner types and nesting intact. The
+  decode is an `UPDATE`, and DuckDB's `IMPORT DATABASE` accepts nothing but
+  `COPY`, so it lives in a new `after.sql` beside `load.sql`: `restore` runs
+  both, and a stock `duckdb` importing the directory by hand gets the JSON
+  text and can run the second file itself. What JSON has no word for — a
+  `DATE`, a `DECIMAL`, a `BLOB` put inside a variant from SQL — returns as
+  JSON's nearest type, and the backup says so once per column, naming the
+  types; `--strict` refuses instead, and `--format parquet` keeps them. A
+  `VARIANT` nested inside a `STRUCT`, `LIST` or `MAP` still goes to parquet.
+- The blank-record check, which decides whether a file is written with
+  every value quoted, now looks at the file that will be restored rather
+  than the one `EXPORT` wrote first.
+
 
 - **A completion menu lets go of the statement it was opened for, however
   fast it was typed.** The menu stands down when a typed character can no

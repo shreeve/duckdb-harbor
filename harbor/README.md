@@ -467,7 +467,8 @@ suites use it to keep their servers out of the real fleet view.
 
 A `.duckdb` file is only as portable as the engine that wrote it, so copying
 one is a snapshot, not a backup. `backup` writes the durable thing instead —
-`schema.sql`, `load.sql`, and one tab-separated file per table:
+`schema.sql`, `load.sql`, one tab-separated file per table, and `after.sql`
+when a table has a `VARIANT` column (below):
 
 ```console
 $ harbor medlabs backup
@@ -503,12 +504,37 @@ said out loud, and no other file pays for it. One thing worth knowing before
 you reach for `wc -l`: a value holding a newline spans physical lines, so a
 row is a record, not always a line.
 
-**Neither format holds every type**, and that is why `--format` exists:
+**A `VARIANT` column travels as JSON.** Its display rendering cannot come
+back — the number 42 and the string `"42"` both print as `42`, and the reader
+hands every cell back as a string — but JSON tells them apart, and a value
+that entered as JSON returns exactly as it entered, every inner type and
+every nesting. So the column is written as JSON text (`42` for the number,
+`"42"` for the string, still greppable) and decoded on restore. The decode is
+an `UPDATE`, and DuckDB's `IMPORT DATABASE` takes nothing but `COPY`, so it
+lives in `after.sql` beside `load.sql`: `restore` runs both, and a stock
+`duckdb` importing the directory by hand gets the JSON text and can run the
+second file itself. What JSON has no word for — a `DATE`, a `DECIMAL`, a
+`BLOB`, a `TIMESTAMP` put inside a variant from SQL — comes back as JSON's
+nearest type, and the backup says so, once per column:
+
+```console
+$ harbor mydata.duckdb backup
+harbor: events."payload" holds DATE — written as JSON, which has no such type; --format parquet keeps it
+harbor: backed up 14 tables to ~/db/mydata.backups/20260909051315 (612K)
+```
+
+An integer stored from SQL as a narrow type comes back as JSON's wide one —
+the same value, a different width label — which is what "written as JSON"
+means and is not reported. `--strict` refuses instead of writing the note.
+
+**Neither format holds every shape**, and that is why `--format` exists:
 
 | | tsv | parquet |
 | --- | --- | --- |
 | `UNION` | loses its tag — the restore refuses | ✅ |
-| `VARIANT` | contents come back retyped, *silently* | ✅ |
+| `VARIANT` nested in a `STRUCT`, `LIST` or `MAP` | contents come back retyped, *silently* | ✅ |
+| `VARIANT` holding a `DATE`, `DECIMAL`, `BLOB`, … | JSON's nearest type, *said out loud* | ✅ |
+| `VARIANT` holding an `INTERVAL`, `BIGNUM`, `BIT`, … | JSON's nearest type, *said out loud* | refused outright |
 | negative `INTERVAL` | ✅ | refused outright |
 | `TIMETZ` with an offset | ✅ | normalised to UTC, *silently* |
 
@@ -517,19 +543,18 @@ that format can preserve all its types, and the change is reported:
 
 ```console
 $ harbor mydata.duckdb backup
-harbor: settings is parquet, not text — a VARIANT's contents come back retyped
+harbor: settings is parquet, not text — a VARIANT nested inside another type comes back retyped
 harbor: backed up 14 tables to ~/db/mydata.backups/20260909051315 (612K)
 ```
 
 `load.sql` names the format per table, so the directory stays self-describing
-and the choice is visible in `ls`. A database with one variant column keeps
-every other table greppable. `--format parquet` asks for one format
+and the choice is visible in `ls`. `--format parquet` asks for one format
 throughout — with the same swap running the other way for a `TIMETZ` column —
 and `--strict` refuses rather than swapping, for a backup that has to be one
 format or nothing. What no mode will do is write something that will not come
-back: a negative interval under `--format parquet` is an error. A table
-combining UNION or VARIANT with TIMETZ is refused because neither whole-table
-format preserves it.
+back without saying so: a negative interval under `--format parquet` is an
+error. A table combining UNION or a nested VARIANT with TIMETZ is refused
+because neither whole-table format preserves it.
 
 The whole of this is a test suite rather than a claim: `test/scripts/roundtrip.py`
 backs up and restores every type in the shared corpus, a schema of constraints

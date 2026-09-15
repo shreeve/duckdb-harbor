@@ -44,12 +44,27 @@
 //! name and nothing more, so the whole thing can be moved, renamed, copied to
 //! another machine or committed to a repo and still restore.
 //!
-//! Two types text cannot hold — `UNION`, which loses its tag, and `VARIANT`,
-//! whose contents come back retyped — are written as parquet instead, one
-//! file, beside the others. `load.sql` names the format per table, so the
-//! directory stays self-describing and the choice is visible in `ls`. Text
-//! for what text can carry, parquet only where it must: a database with one
-//! variant column keeps every other table greppable.
+//! A `VARIANT` column travels as JSON. Its display rendering cannot come
+//! back — the number 42 and the string "42" both print as `42`, and the
+//! reader hands every cell back as a string — but JSON tells them apart,
+//! and a value that entered as JSON returns exactly as it entered: every
+//! inner type, every nesting, byte for byte. So the column is cast to JSON
+//! on the way out and decoded on the way in. What JSON has no word for — a
+//! DATE, a DECIMAL, a BLOB, a TIMESTAMP put inside a variant from SQL —
+//! comes back as JSON's nearest type, and the backup says so, once per
+//! column, when it happens; `--format parquet` keeps those. The decode is
+//! an UPDATE, and `IMPORT DATABASE` takes nothing but COPY, so it lives in
+//! `after.sql` beside `load.sql`: restore runs both, and a stock `duckdb`
+//! importing the directory by hand gets the JSON text and can run the
+//! second file itself.
+//!
+//! One type text cannot hold at all — `UNION`, which loses its tag — is
+//! written as parquet instead, one file, beside the others. `load.sql` names
+//! the format per table, so the directory stays self-describing and the
+//! choice is visible in `ls`. Text for what text can carry, parquet only
+//! where it must. A `VARIANT` nested inside another type is beyond both:
+//! the JSON route cannot reach it and parquet has no writer for it, so the
+//! backup refuses rather than write what will not come back.
 //!
 //! `--format parquet` asks for the whole database in one format, and
 //! `--strict` refuses the fallback rather than taking it — for a backup that
@@ -69,6 +84,10 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use harbor::repl::{scan::{scan, Kind}, split_statements};
+
+/// The one-line companion of `load.sql`: what to run after it. Only
+/// [`restore`] reads it; DuckDB's own IMPORT never will.
+const AFTER: &str = "after.sql";
 
 /// The writer's dialect. Backup and restore must agree on it, so it is said
 /// once. `\t` is the two-character spelling DuckDB reads as a tab.
@@ -148,11 +167,18 @@ impl Format {
     /// the exported `schema.sql`, each with the reason to say out loud.
     ///
     /// Neither format is complete, and the holes are not the same shape.
-    /// Text loses a UNION's tag (the restore then refuses) and retypes a
-    /// VARIANT's contents (it does not). Parquet normalises a TIMETZ to UTC,
+    /// Text loses a UNION's tag (the restore then refuses). Parquet
+    /// normalises a TIMETZ to UTC,
     /// so `12:00:00+02:30` returns as `09:30:00+00` — the same instant,
     /// a different value, and nothing said. Each hole is the other format's
     /// solid ground, which is what makes a mixed directory the answer.
+    ///
+    /// A VARIANT nested inside another type is in BOTH lists, and that is
+    /// the point: text retypes it (the JSON route reaches only a plain
+    /// column, see [`json_out`]) and parquet has no writer for a variant
+    /// below the root, so a table holding one is refused whichever format
+    /// was asked for. A plain VARIANT column is in neither: it travels as
+    /// JSON under text and as itself under parquet.
     ///
     /// Not every hole is a TYPE. Parquet also refuses a NEGATIVE interval,
     /// which is a value, invisible in a schema and impossible to route
@@ -160,10 +186,11 @@ impl Format {
     fn cannot_hold(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Format::Tsv => &[
-                ("VARIANT", "a VARIANT's contents come back retyped"),
+                ("VARIANT", "a VARIANT nested inside another type comes back retyped"),
                 ("UNION(", "a UNION loses its tag"),
             ],
             Format::Parquet => &[
+                ("VARIANT", "parquet has no writer for a VARIANT nested inside another type"),
                 ("TIME WITH TIME ZONE", "parquet normalises a TIMETZ to UTC"),
             ],
         }
@@ -232,7 +259,7 @@ fn write_backup(db: &Path, dir: &Path, format: Format, strict: bool) -> Result<(
     harbor::repl::with_snapshot(&target, |execute| {
         let sql = format!("EXPORT DATABASE {} ({})", quote(dir), format.options());
         execute(&sql)?;
-        let again = patch_loader(dir, format, strict)?;
+        let again = patch_loader(dir, format, strict, execute)?;
         for statement in &again.statements {
             execute(statement)?;
         }
@@ -292,8 +319,17 @@ pub fn restore(db: &Path, args: &[String]) -> Result<(), String> {
         None => Vec::new(),
     };
     let target = db.display().to_string();
-    let sql = format!("IMPORT DATABASE {}", quote(&dir));
-    if let Err(e) = harbor::repl::exec_quiet(&target, &[&sql, "CHECKPOINT"], &spawn) {
+    let import = format!("IMPORT DATABASE {}", quote(&dir));
+    // IMPORT DATABASE runs schema.sql and load.sql; after.sql, when the
+    // backup wrote one, is ours to run — the decode of every VARIANT column
+    // that travelled as JSON. An older backup has no such file and needs
+    // nothing after the import.
+    let after = dir.join(AFTER);
+    let decode = if after.exists() { split_statements(&read(&after)?) } else { Vec::new() };
+    let mut sql: Vec<&str> = vec![&import];
+    sql.extend(decode.iter().map(String::as_str));
+    sql.push("CHECKPOINT");
+    if let Err(e) = harbor::repl::exec_quiet(&target, &sql, &spawn) {
         // A half-written database is worse than none: it exists, so the next
         // restore refuses, and it opens, so it can be mistaken for the real
         // thing. Take it back out.
@@ -356,15 +392,27 @@ struct Reformat {
 /// reader is wrong, so the fix goes on the reader. That half comes out once
 /// 25501 lands; the rest stays.
 ///
-/// And the two types text cannot hold, which are read out of `schema.sql` —
+/// And the shapes text cannot hold, which are read out of `schema.sql` —
 /// the artifact's own account of itself — and pointed at a parquet file
 /// instead. `schema.sql` and `load.sql` spell a table the same way, quotes
 /// and all, which is what lets one be looked up in the other.
-fn patch_loader(dir: &Path, format: Format, strict: bool) -> Result<Reformat, String> {
+///
+/// A plain VARIANT column is the fourth edit, and the one that runs NOW
+/// rather than being handed back: the table's file is written again with
+/// the column cast to JSON (see [`json_out`]), because the blank-record
+/// check below has to look at the file that will actually be restored, not
+/// the one EXPORT wrote. The decode goes to `after.sql`.
+fn patch_loader(
+    dir: &Path,
+    format: Format,
+    strict: bool,
+    execute: &dyn Fn(&str) -> Result<(), String>,
+) -> Result<Reformat, String> {
     let path = dir.join("load.sql");
     let before = read(&path)?;
     let schema = schema_types(&read(&dir.join("schema.sql"))?);
     let mut again = Reformat { statements: vec![], replaced: vec![], notes: vec![] };
+    let mut after: Vec<String> = Vec::new();
 
     let mut lines: Vec<String> = Vec::new();
     for original in split_statements(&before) {
@@ -398,22 +446,122 @@ fn patch_loader(dir: &Path, format: Format, strict: bool) -> Result<Reformat, St
             // way the reader will not give back, and that is not a matter of
             // format — so it is checked here, on the file itself.
             None => {
-                if format == Format::Tsv
-                    && let Some((statement, note)) = requote(dir, &line)?
-                {
-                    again.statements.push(statement);
-                    again.notes.push(note);
+                if format == Format::Tsv {
+                    let variants = &schema[table].variants;
+                    let source = if variants.is_empty() {
+                        table.to_string()
+                    } else {
+                        let source = json_out(table, variants);
+                        execute(&format!("COPY {source} TO {} ({DIALECT})", quote(Path::new(&name))))?;
+                        for (column, held) in json_check(execute, dir, table, variants)? {
+                            if strict {
+                                return Err(format!(
+                                    "{table}.{} holds {held} — a VARIANT is written as JSON, which has \
+                                     no such type. Drop --strict to write it as JSON anyway, or \
+                                     --format parquet to keep it",
+                                    ident(&column)
+                                ));
+                            }
+                            again.notes.push(format!(
+                                "{table}.{} holds {held} — written as JSON, which has no such type; \
+                                 --format parquet keeps it",
+                                ident(&column)
+                            ));
+                        }
+                        after.push(json_in(table, variants));
+                        source
+                    };
+                    if let Some((statement, note)) = requote(dir, &line, &source)? {
+                        again.statements.push(statement);
+                        again.notes.push(note);
+                    }
                 }
                 lines.push(line.to_string());
             }
         }
     }
 
-    let after = lines.iter().map(|s| format!("{};\n", s.trim_end_matches(';'))).collect::<String>();
-    fs::write(&path, after).map_err(|e| format!("{}: {e}", path.display()))?;
+    let text = lines.iter().map(|s| format!("{};\n", s.trim_end_matches(';'))).collect::<String>();
+    fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !after.is_empty() {
+        let text = format!(
+            "-- Run after load.sql: the VARIANT columns above travelled as JSON text, and\n\
+             -- IMPORT DATABASE takes nothing but COPY, so their decode is here.\n{}",
+            after.iter().map(|s| format!("{s};\n")).collect::<String>()
+        );
+        let path = dir.join(AFTER);
+        fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
     Ok(again)
 }
 
+/// The table as it goes OUT when some of its columns are plain VARIANT: every
+/// column as it is, those cast to JSON. `SELECT *` with a REPLACE keeps the
+/// column order and never has to spell the others.
+fn json_out(table: &str, variants: &[String]) -> String {
+    let replaced = variants.iter()
+        .map(|c| format!("{}::JSON AS {}", ident(c), ident(c)))
+        .collect::<Vec<_>>().join(", ");
+    format!("(SELECT * REPLACE ({replaced}) FROM {table})")
+}
+
+/// The decode that brings those columns back IN. The COPY in `load.sql`
+/// hands each cell over as a VARIANT holding a string — the JSON text — and
+/// reading that string as JSON gives the value the string described.
+fn json_in(table: &str, variants: &[String]) -> String {
+    let set = variants.iter()
+        .map(|c| format!("{} = {}::VARCHAR::JSON::VARIANT", ident(c), ident(c)))
+        .collect::<Vec<_>>().join(", ");
+    format!("UPDATE {table} SET {set}")
+}
+
+/// Which of a table's plain VARIANT columns hold something JSON cannot carry,
+/// and what: `(column, "DATE, DECIMAL")`, one entry per column that would
+/// change, none when every cell survives the round trip.
+///
+/// A cell survives when it equals itself after a trip through JSON, which
+/// is the failure itself rather than a proxy for it, and is decided by the
+/// engine. What it cannot see is an integer stored from SQL as a narrow
+/// type coming back as JSON's wide one — the same value, a different width
+/// label — which is what "written as JSON" means and is not reported.
+///
+/// The engine answers through a file: the backup session runs statements
+/// and returns nothing, and a `COPY (…) TO` is the one way it can be asked
+/// a question. The probe is removed as soon as it is read.
+fn json_check(
+    execute: &dyn Fn(&str) -> Result<(), String>,
+    dir: &Path,
+    table: &str,
+    variants: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    let probe = dir.join(".variant-check");
+    let selects = variants.iter().map(|c| {
+        let c = ident(c);
+        format!(
+            "coalesce(string_agg(DISTINCT variant_type({c}), ', ') \
+             FILTER (WHERE NOT coalesce({c} = {c}::JSON::VARIANT, true)), '')"
+        )
+    }).collect::<Vec<_>>().join(", ");
+    execute(&format!(
+        "COPY (SELECT {selects} FROM {table}) TO {} (FORMAT csv, DELIMITER '\\t', HEADER false)",
+        quote(&probe)
+    ))?;
+    let text = read(&probe)?;
+    let _ = fs::remove_file(&probe);
+    let fields = text.trim_end_matches(['\n', '\r']).split('\t');
+    Ok(variants.iter().zip(fields).filter_map(|(column, field)| {
+        // The writer quotes an empty string; an inner-type list never needs it.
+        let held = field.strip_prefix('"').and_then(|f| f.strip_suffix('"')).unwrap_or(field);
+        (!held.is_empty()).then(|| (column.clone(), held.to_string()))
+    }).collect())
+}
+
+/// A column name as a SQL identifier — always quoted, which is always right.
+fn ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+#[derive(Debug)]
 struct TableRewrite {
     loader: String,
     statement: String,
@@ -427,11 +575,11 @@ struct TableRewrite {
 fn reformat(
     dir: &Path,
     line: &str,
-    schema: &HashMap<String, String>,
+    schema: &HashMap<String, TableSchema>,
     format: Format,
 ) -> Result<Option<TableRewrite>, String> {
     let (table, _, path) = copy_parts(line).ok_or("invalid backup COPY path")?;
-    let types = schema.get(table).ok_or_else(|| format!("no schema for backup table {table}"))?;
+    let types = &schema.get(table).ok_or_else(|| format!("no schema for backup table {table}"))?.types;
     let Some((_, why)) = format.cannot_hold().iter().find(|(ty, _)| types.contains(ty)) else {
         return Ok(None);
     };
@@ -467,7 +615,7 @@ fn reformat(
 /// The condition is exact because it is the failure itself rather than a
 /// proxy for it: a blank line is what a CSV reader skips, so a file without
 /// one cannot lose a row and pays nothing.
-fn requote(dir: &Path, line: &str) -> Result<Option<(String, String)>, String> {
+fn requote(dir: &Path, line: &str, source: &str) -> Result<Option<(String, String)>, String> {
     let Some((table, _, name)) = copy_parts(line) else {
         return Err(format!("unrecognized backup COPY statement: {line}"));
     };
@@ -479,7 +627,7 @@ fn requote(dir: &Path, line: &str) -> Result<Option<(String, String)>, String> {
         return Ok(None);
     }
     Ok(Some((
-        format!("COPY {table} TO {} ({QUOTED})", quote(&file)),
+        format!("COPY {source} TO {} ({QUOTED})", quote(&file)),
         format!(
             "{table} is quoted throughout — it holds an empty string in a single \
              column, which unquoted is an empty line, which a reader skips"
@@ -556,10 +704,105 @@ fn unquoted_code(sql: &str) -> String {
     }).collect()
 }
 
+/// One table as `schema.sql` declares it, reduced to what decides how it
+/// travels.
+struct TableSchema {
+    /// Every definition except the plain VARIANT columns, as code with the
+    /// strings and identifiers blanked: what the chosen format has to hold
+    /// on its own, searched for the type names it cannot.
+    types: String,
+    /// The plain VARIANT columns, unquoted, in declaration order. These are
+    /// not the format's problem: they travel as JSON whatever it is.
+    variants: Vec<String>,
+}
+
 /// Index the schema once, rather than rescanning every CREATE for each table.
-fn schema_types(sql: &str) -> HashMap<String, String> {
+fn schema_types(sql: &str) -> HashMap<String, TableSchema> {
     split_statements(sql).iter().filter_map(|create| {
-        Some((table_of(create)?.to_string(), unquoted_code(create)))
+        let table = table_of(create)?.to_string();
+        let (mut types, mut variants) = (Vec::new(), Vec::new());
+        for (name, code) in definitions(create) {
+            match name {
+                Some(name) if is_plain_variant(&code) => variants.push(name),
+                _ => types.push(code),
+            }
+        }
+        Some((table, TableSchema { types: types.join(", "), variants }))
+    }).collect()
+}
+
+/// `VARIANT` and nothing else for a type, whatever constraints follow it. A
+/// `VARIANT[]` or a `STRUCT(v VARIANT)` is a shape text cannot reach as JSON
+/// and stays the format's concern.
+fn is_plain_variant(code: &str) -> bool {
+    let upper = code.to_ascii_uppercase();
+    upper == "VARIANT" || upper.starts_with("VARIANT ")
+}
+
+/// The definitions inside a `CREATE TABLE`'s parentheses, each as (column
+/// name, the rest as blanked code) — or (None, code) for a constraint clause
+/// such as `PRIMARY KEY (a, b)`, which has no column. The parentheses and
+/// commas that split them are walked with the scanner, since a quoted name
+/// or a default string can hold either, and a type such as `DECIMAL(5, 2)`
+/// holds both.
+fn definitions(create: &str) -> Vec<(Option<String>, String)> {
+    let Some(table) = table_of(create) else { return Vec::new() };
+    let head = "CREATE TABLE ".len() + table.len();
+    let Some(open) = create[head..].find('(').map(|i| head + i) else { return Vec::new() };
+    let body = &create[open + 1..];
+    let mut spans_of: Vec<(usize, usize)> = Vec::new();
+    let (mut depth, mut start) = (1usize, 0usize);
+    'walk: for span in scan(body) {
+        if span.kind != Kind::Code {
+            continue;
+        }
+        for (i, &b) in body.as_bytes()[span.start..span.end].iter().enumerate() {
+            let at = span.start + i;
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        spans_of.push((start, at));
+                        break 'walk;
+                    }
+                }
+                b',' if depth == 1 => {
+                    spans_of.push((start, at));
+                    start = at + 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    spans_of.into_iter().filter_map(|(s, e)| {
+        let def = body[s..e].trim_start();
+        if def.is_empty() {
+            return None;
+        }
+        if let Some(quoted) = def.strip_prefix('"') {
+            // A quoted name: up to the first `"` that is not doubled.
+            let (mut i, mut end) = (0, None);
+            while let Some(j) = quoted[i..].find('"').map(|j| i + j) {
+                if quoted.as_bytes().get(j + 1) == Some(&b'"') {
+                    i = j + 2;
+                } else {
+                    end = Some(j);
+                    break;
+                }
+            }
+            let end = end?;
+            let name = quoted[..end].replace("\"\"", "\"");
+            return Some((Some(name), unquoted_code(&quoted[end + 1..]).trim().to_string()));
+        }
+        let n = def.find(|c: char| c.is_whitespace() || c == '(').unwrap_or(def.len());
+        let (word, rest) = def.split_at(n);
+        let constraint = matches!(
+            word.to_ascii_uppercase().as_str(),
+            "CONSTRAINT" | "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN"
+        );
+        let code = unquoted_code(if constraint { def } else { rest }).trim().to_string();
+        Some((if constraint { None } else { Some(word.to_string()) }, code))
     }).collect()
 }
 
@@ -665,6 +908,34 @@ mod tests {
     }
 
     #[test]
+    fn definitions_find_plain_variant_columns_and_nothing_else() {
+        let schema = schema_types(
+            "CREATE TABLE \"odd name\"(id INTEGER PRIMARY KEY, v VARIANT, \"quoted \"\"col\"\"\" VARIANT NOT NULL, \
+             n INTEGER DEFAULT(3), CHECK((n > 0)), d VARCHAR DEFAULT 'a, (b) VARIANT', PRIMARY KEY (id, n));\n\
+             CREATE TABLE x.t(s STRUCT(a VARIANT), l VARIANT[], u UNION(num INTEGER, str VARCHAR), plain VARCHAR);\n\
+             CREATE TABLE \"select\"(\"VARIANT\" VARCHAR DEFAULT 'UNION(x INT)');",
+        );
+        let odd = &schema["\"odd name\""];
+        assert_eq!(odd.variants, vec!["v".to_string(), "quoted \"col\"".to_string()]);
+        assert!(!odd.types.contains("VARIANT"), "{}", odd.types);
+        assert!(odd.types.contains("INTEGER PRIMARY KEY"));
+        let nested = &schema["x.t"];
+        assert!(nested.variants.is_empty());
+        assert!(nested.types.contains("STRUCT(a VARIANT)") && nested.types.contains("UNION("));
+        let named = &schema["\"select\""];
+        assert!(named.variants.is_empty());
+        assert!(!named.types.contains("UNION("));
+        assert_eq!(
+            json_out("t", &odd.variants),
+            "(SELECT * REPLACE (\"v\"::JSON AS \"v\", \"quoted \"\"col\"\"\"::JSON AS \"quoted \"\"col\"\"\") FROM t)"
+        );
+        assert_eq!(
+            json_in("t", &["v".to_string()]),
+            "UPDATE t SET \"v\" = \"v\"::VARCHAR::JSON::VARIANT"
+        );
+    }
+
+    #[test]
     fn incompatible_formats_fail_instead_of_losing_values() {
         let schema = schema_types("CREATE TABLE t(u UNION(x INTEGER), z TIME WITH TIME ZONE)");
         for (format, path) in [(Format::Tsv, "t.csv"), (Format::Parquet, "t.parquet")] {
@@ -672,5 +943,14 @@ mod tests {
         }
         let schema = schema_types("CREATE TABLE t(\"VARIANT\" VARCHAR DEFAULT 'UNION(x INT)')");
         assert!(reformat(Path::new("/tmp"), "COPY t FROM 't.csv'", &schema, Format::Tsv).unwrap().is_none());
+        // A plain VARIANT column is text's to carry, as JSON, and parquet's as
+        // itself; a nested one is beyond both and refused either way.
+        let schema = schema_types("CREATE TABLE t(v VARIANT); CREATE TABLE n(s STRUCT(v VARIANT))");
+        assert!(reformat(Path::new("/tmp"), "COPY t FROM 't.csv'", &schema, Format::Tsv).unwrap().is_none());
+        assert!(reformat(Path::new("/tmp"), "COPY t FROM 't.parquet'", &schema, Format::Parquet).unwrap().is_none());
+        for (format, path) in [(Format::Tsv, "n.csv"), (Format::Parquet, "n.parquet")] {
+            let err = reformat(Path::new("/tmp"), &format!("COPY n FROM '{path}'"), &schema, format).unwrap_err();
+            assert!(err.contains("either backup format"), "{err}");
+        }
     }
 }
