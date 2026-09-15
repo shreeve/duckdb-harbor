@@ -1,13 +1,13 @@
 # Engine — mint the five libduckdb artifacts Release.yml downloads.
 #
-# DuckDB's official artifact channel (artifacts.duckdb.org/latest) is frozen
-# at alpha38195 (2026-08-18), which predates the v2 C API landing on main —
-# so until 2.0 GA, no official artifact can serve harbor 0.21. This workflow
+# No official DuckDB artifact can serve harbor 0.21: the nightly channel was
+# frozen pre-v2-API, then retired on 2026-09-14 (artifacts.duckdb.org/latest
+# is gone; nightlies moved to branch-keyed tar.gz paths). This workflow
 # rebuilds the channel ourselves: five native runners each build libduckdb
 # (and the duckdb CLI) from source at CI's pinned commit and package the
 # result in the official channel's exact shape — duckdb-binaries-<plat>.zip
 # wrapping libduckdb-<plat>.zip and duckdb_cli-<plat>.zip — so
-# fetch-duckdb.sh consumes it unchanged through its ENGINE_URL override.
+# fetch-duckdb.sh and the CI composite action consume it unchanged.
 # The publish job shelves the five zips on a prerelease tagged engine-<pin>
 # (prerelease and never --latest: /releases/latest belongs to harbor).
 #

@@ -50,8 +50,9 @@ jobs:
       # commit the test batteries validate — so tested-equals-shipped holds
       # by construction: bump the pin there, and this step fetches the
       # matching shelf or fails loudly on a 404 telling you to dispatch
-      # Engine.yml. At GA, delete this derivation and the ENGINE_URL line;
-      # fetch-duckdb.sh falls back to artifacts.duckdb.org on its own.
+      # Engine.yml. (fetch-duckdb.sh derives the same URL on its own when
+      # run in a checkout; it is spelled out here so the fetch is explicit.)
+      # At GA, delete this derivation and the ENGINE_URL line.
       - name: Fetch DuckDB engine
         shell: bash
         run: |
