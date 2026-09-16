@@ -226,13 +226,12 @@ def types_build(without=frozenset()):
 
 
 def text_gives_way_to_parquet(work):
-    """The two types text cannot hold, and the file that holds them anyway.
+    """The type text cannot hold, and the file that holds it anyway.
 
-    A `UNION` written as csv loses its tag and the restore refuses it; a
-    `VARIANT` is worse, because the restore SUCCEEDS and the contents come
-    back retyped — an INT32 returns as a VARCHAR, printing the same and
-    comparing unequal. Both survive parquet, so those tables and only those
-    become parquet, named in load.sql beside the csv ones.
+    A `UNION` written as csv loses its tag and the restore refuses it. It
+    survives parquet, so those tables and only those become parquet, named
+    in load.sql beside the csv ones. (A plain VARIANT column is not in this
+    list: it travels as JSON, see variant_as_json.)
 
     Checked here rather than left to the bulk comparison because the point is
     not only that the values survive: it is that the SWAP is visible in the
@@ -246,8 +245,7 @@ def text_gives_way_to_parquet(work):
     quiet(src, "CREATE TABLE u AS SELECT union_value(num := 2) AS v")
     # A quoted name, because DuckDB writes `a space` to `a_space.csv` and the
     # swap has to follow the FILE while matching on the TABLE.
-    quiet(src, 'CREATE TABLE "odd name"(v VARIANT)')
-    quiet(src, 'INSERT INTO "odd name" VALUES (42::VARIANT)')
+    quiet(src, 'CREATE TABLE "odd name" AS SELECT union_value(str := \'x\') AS v')
     run(src, "stop")
     said = run(src, "backup", backup).stderr
     run(src, "stop")
@@ -265,14 +263,32 @@ def text_gives_way_to_parquet(work):
         bad("the backup directory is not the mixed shape", f"{names}\nwanted {want}")
 
     run(dst, "restore", backup)
-    got = sql(dst, "SELECT variant_typeof((SELECT v FROM \"odd name\")) AS held, "
+    got = sql(dst, "SELECT union_tag((SELECT v FROM \"odd name\"))::VARCHAR AS held, "
                    "(SELECT v FROM u)::VARCHAR AS tagged, "
                    "(SELECT count(*) FROM plain WHERE length(s) = 0) AS empty")[0]
     run(dst, "stop")
-    if got == {"held": "INT32", "tagged": "2", "empty": 1}:
-        ok("a VARIANT keeps its inner type and a UNION its tag, through parquet")
+    if got == {"held": "str", "tagged": "2", "empty": 1}:
+        ok("a UNION keeps its tag through parquet")
     else:
         bad("the mixed restore did not come back whole", got)
+
+    # A VARIANT nested inside another type is beyond both formats: text
+    # retypes it and parquet has no writer for a variant below the root. So
+    # the answer is a refusal either way. Under text it is harbor's, by
+    # name, before anything is written; under parquet the engine's own
+    # EXPORT fails first, with its own words, and the directory goes too.
+    nested = work / "nested.duckdb"
+    quiet(nested, "CREATE TABLE n(s STRUCT(v VARIANT))")
+    quiet(nested, "INSERT INTO n VALUES ({'v': 42::VARIANT})")
+    run(nested, "stop")
+    for fmt, words in (("tsv", "n cannot round-trip in either backup format"),
+                       ("parquet", "not a root column")):
+        refused = run(nested, "backup", work / f"nested.{fmt}", "--format", fmt, expect=None)
+        run(nested, "stop")
+        if refused.returncode != 0 and words in refused.stderr and not (work / f"nested.{fmt}").exists():
+            ok(f"a nested VARIANT is refused under --format {fmt}, leaving nothing")
+        else:
+            bad(f"a nested VARIANT was not refused cleanly under --format {fmt}", refused.stderr)
 
     # --strict: the same database, and the answer is a refusal instead.
     strict_dir = work / "strict.backup"
@@ -336,6 +352,119 @@ def text_gives_way_to_parquet(work):
         ok("an unknown format is refused, not guessed at")
     else:
         bad("an unknown format was accepted", bogus.stderr)
+
+
+def variant_as_json(work):
+    """A plain VARIANT column travels as JSON text, and the trip is exact for
+    what entered as JSON.
+
+    The display rendering cannot come back — 42 and "42" both print as `42`,
+    and the reader hands every cell back as a string — but JSON tells them
+    apart, so the column is cast to JSON on the way out and decoded on the
+    way in, through after.sql, since IMPORT DATABASE takes nothing but COPY.
+    What JSON has no word for (a DATE put inside a variant from SQL) comes
+    back as JSON's nearest type, and the backup says so; --strict refuses.
+    """
+    src = work / "vj.duckdb"
+    dst = work / "vj_restored.duckdb"
+    backup = work / "vj.backup"
+    # Two VARIANT columns, one with a name that has to be quoted, and a
+    # third column to prove the REPLACE leaves the others alone. Every value
+    # entered as JSON: the number 42 and the string "42", nested containers
+    # with nulls, an empty string, the null marker as a string, the null
+    # word as a string, a real JSON null, and the characters that attack the
+    # dialect.
+    quiet(src, 'CREATE TABLE "odd name"(id INTEGER, v VARIANT, "quoted col" VARIANT, note VARCHAR)')
+    docs = ['42', '"42"', '-1.5', 'true', 'null', '""', '"NULL"', '"null"',
+            '{"n":42,"s":"42","l":[1,"2",null,{"b":false}]}', '[]', '{}',
+            '"tab\\there \\"quoted\\" back\\\\slash \\u00e9"']
+    rows = ", ".join(f"({i}, {literal(d)}::JSON::VARIANT, {literal(docs[-1 - i])}::JSON::VARIANT, 'n{i}')"
+                     for i, d in enumerate(docs))
+    quiet(src, f'INSERT INTO "odd name" VALUES {rows}')
+    quiet(src, "CREATE TABLE one(v VARIANT)")
+    quiet(src, "INSERT INTO one VALUES ('\"\"'::JSON::VARIANT)")
+    run(src, "stop")
+    said = run(src, "backup", backup).stderr
+    run(src, "stop")
+
+    names = sorted(f.name for f in backup.iterdir())
+    want = ["after.sql", "load.sql", "odd_name.csv", "one.csv", "schema.sql"]
+    if names == want:
+        ok("a VARIANT column stays text, with after.sql beside load.sql")
+    else:
+        bad("the backup directory is not the JSON shape", f"{names}\nwanted {want}")
+    if "holds" in said:
+        bad("the backup complained about values that entered as JSON", said)
+    text = (backup / "odd_name.csv").read_text()
+    if "\t42\t" in text and '\t"""42"""\t' in text:
+        ok("the number 42 is written as 42 and the string as \"42\"")
+    else:
+        bad("the JSON text does not tell 42 from \"42\"", text)
+    # Rendered, an empty string is an empty LINE and the one-column table
+    # would need every value quoted; as JSON it is `""`, a record like any
+    # other. The check has to have looked at the JSON file to know that.
+    if "one is quoted throughout" in said:
+        bad("the blank-record check looked at EXPORT's file, not the JSON one", said)
+    else:
+        ok("the blank-record check looked at the JSON file, where \"\" is not blank")
+
+    run(dst, "restore", backup)
+    same = diff(src, dst, ["odd name", "one"])
+    typed = sql(dst, 'SELECT string_agg(variant_typeof(v), \',\' ORDER BY id) AS t FROM "odd name"')[0]["t"]
+    run(dst, "stop")
+    if same:
+        bad("the JSON round trip changed a value", same)
+    elif typed != ("UINT64,VARCHAR,DOUBLE,BOOL_TRUE,VARIANT_NULL,VARCHAR,VARCHAR,VARCHAR,"
+                   "OBJECT(n, s, l),ARRAY(0),OBJECT(),VARCHAR"):
+        bad("the inner types did not come back", typed)
+    else:
+        ok("every value that entered as JSON returns with its inner type")
+
+    # Stock DuckDB gets the same directory: load.sql is still pure COPY, so
+    # IMPORT DATABASE takes it, and after.sql is one more file to run.
+    plain = work / "vj_plain.duckdb"
+    quiet(plain, f"IMPORT DATABASE {literal(str(backup))}")
+    before = sql(plain, 'SELECT variant_typeof(v) AS t FROM "odd name" WHERE id = 0')[0]["t"]
+    quiet(plain, (backup / "after.sql").read_text())
+    after = sql(plain, 'SELECT variant_typeof(v) AS t FROM "odd name" WHERE id = 0')[0]["t"]
+    run(plain, "stop")
+    if (before, after) == ("VARCHAR", "UINT64"):
+        ok("IMPORT DATABASE alone gives the JSON text; after.sql decodes it")
+    else:
+        bad("the directory does not import by hand the way it says", (before, after))
+
+    # What JSON has no word for: said out loud, written anyway, refused
+    # under --strict, and kept by parquet.
+    dated = work / "dated.duckdb"
+    quiet(dated, "CREATE TABLE d(v VARIANT)")
+    quiet(dated, "INSERT INTO d VALUES ('42'::JSON::VARIANT), (DATE '2020-01-01'::VARIANT), "
+                 "({'when': DATE '2020-01-01', 'n': 1}::VARIANT)")
+    run(dated, "stop")
+    said = run(dated, "backup", work / "dated.backup").stderr
+    run(dated, "stop")
+    if 'd."v" holds DATE, OBJECT — written as JSON' in said and "--format parquet keeps it" in said:
+        ok("a DATE inside a VARIANT is named, once, with the way to keep it")
+    else:
+        bad("a DATE inside a VARIANT went out as JSON without a word", said)
+    refused = run(dated, "backup", work / "dated.strict", "--strict", expect=None)
+    run(dated, "stop")
+    if refused.returncode != 0 and "holds DATE" in refused.stderr and not (work / "dated.strict").exists():
+        ok("--strict refuses it, names the column, and leaves nothing")
+    else:
+        bad("--strict did not refuse a VARIANT JSON cannot carry", refused.stderr)
+    run(dated, "backup", work / "dated.pq", "--format", "parquet")
+    run(dated, "stop")
+    kept = work / "dated_pq.duckdb"
+    run(kept, "restore", work / "dated.pq")
+    # Parquet has relabelings of its own (an integer's width, an object's
+    # key order), so the claim is the values and the DATE, not a type string.
+    same = diff(dated, kept, ["d"])
+    held = sql(kept, "SELECT string_agg(variant_typeof(v), ',') AS t FROM d")[0]["t"]
+    run(kept, "stop")
+    if not same and "DATE" in held:
+        ok("--format parquet keeps the DATE, as promised")
+    else:
+        bad("parquet did not keep what the note promised", (held, same))
 
 
 SCHEMA_BUILD = [
@@ -553,6 +682,7 @@ def main():
         check("every type again, through --format parquet", "pq",
               types_build(without=NEGATIVE_INTERVAL), work, fmt="parquet")
         text_gives_way_to_parquet(work)
+        variant_as_json(work)
     finally:
         if args.keep:
             print(f"\n{DIM}roundtrip: kept {work}{OFF}")
