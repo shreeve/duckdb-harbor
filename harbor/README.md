@@ -816,6 +816,48 @@ engine's own text rendering under `"encoding": "varchar-cast"`. (Two
 limitations this section used to carry are gone: `TIME WITH TIME ZONE` keeps
 its offset since 0.22, and `TIME_NS` encodes since 0.21.)
 
+**A `VARIANT` is JSON at every edge, and not quite JSON inside.** A column
+that always enters as JSON can be stored as `VARIANT` for the engine's typed
+field access, and still be handled as JSON by everything outside: harbor
+delivers it as JSON text, and `harbor backup` writes it as JSON text. The
+trip JSON → `VARIANT` → JSON is exact for real documents — any string, any
+Unicode, key order, `1` versus `1.0`, `"42"` versus `42`, integers up to 64
+bits, nested nulls — with these known edges, all measured on the engine:
+
+- *Writes need `::JSON`.* A plain string written into a `VARIANT` column,
+  whether a literal, an `UPDATE`, or a bound parameter, is stored as a
+  string, not parsed: `'{"a":1}'` lands as the text `{"a":1}`, and a client
+  gets `"{\"a\":1}"` back. Write `'{"a":1}'::JSON`, or `$1::JSON` for a
+  parameter, and it lands as an object. `'…'::VARIANT` does not parse either.
+  A `CHECK (v IS NULL OR variant_typeof(v) LIKE 'OBJECT%')` refuses the
+  mistake at write time. The same applies to a column conversion: use
+  `ALTER TABLE t ALTER COLUMN c SET DATA TYPE VARIANT USING c::JSON::VARIANT`.
+- *Integers beyond 64 bits become doubles* and lose digits past the 17th;
+  numbers past the range of a double come back as `Infinity`, which is not
+  JSON. Integers within `INT64`/`UINT64` are exact.
+- *A top-level JSON `null` is SQL `NULL`* once stored; nested nulls survive.
+- *Duplicate keys keep the last value*, and once a table is large enough for
+  the engine to shred the column into typed paths, *keys may come back
+  sorted*. The document is the same; its text is not. Anything that hashes
+  or signs the body text must keep the original text.
+- *Normalization*, the same as DuckDB's `json()`: whitespace and `\u`
+  escapes are dropped, `-0` is `0`, `1.50` is `1.5`, `1e10` is
+  `10000000000.0`.
+- *Fields are typed.* `v.status = 500` finds rows; `v.status = '500'` finds
+  none, without an error. `v.tests.price` through an array is `NULL`, not
+  an error.
+- *`v::VARCHAR` is display text, not JSON*, so `v->'a'`, `json_*(v)`, `LIKE`
+  on the column and `COPY … TO 'x.csv'` all see `{'a': 1}`; use `v.a`,
+  `v['a']`, or `v::JSON->'a'`, and cast to `::JSON` before a text export.
+- *Delivery casts one cell at a time.* The engine's C API has no batch cast,
+  so harbor delivers a `VARIANT` column at roughly 20,000 rows a second
+  against 400,000 for the same documents as `VARCHAR`, measured on 1.5 KB
+  documents. `SELECT v::JSON` in the query is vectorized and delivers at
+  130,000. Fetching one document, or a hundred, does not notice.
+
+Need more fidelity than that? Back the table up with `--format parquet`,
+which keeps the `VARIANT` as itself.
+
 **Bodies are capped at 8 MiB**, declared or delivered; over that is a `413`.
 There is no rate limiting and no CORS — defensible for a service behind a proxy,
 worth knowing before it faces a browser. Request logging is available with

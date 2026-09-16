@@ -266,6 +266,12 @@ fn emit_schema(out: &mut String, name: Option<&str>, ty: &Type) {
     out.push('}');
 }
 
+/// Whether a VARIANT sits anywhere in this type: the column itself, or a
+/// member of a list, struct, map or union at any depth.
+pub fn holds_variant(ty: &Type) -> bool {
+    ty.id == ffi::LOGICAL_TYPE_ID_VARIANT || ty.children.iter().any(|(_, c)| holds_variant(c))
+}
+
 fn is_lossless(id: ffi::LOGICAL_TYPE_ID) -> bool {
     use ffi::*;
     matches!(
