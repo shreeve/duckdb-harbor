@@ -4,7 +4,7 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
-## 0.37.1 — 2026-09-16
+## 0.38.0 — 2026-09-16
 
 - **The engine comes from DuckDB's official nightly channel again.** For a
   month the channel shipped a library without the v2 C API, so harbor built
