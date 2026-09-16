@@ -4,7 +4,7 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
-## 0.37.0 — 2026-09-15
+## 0.37.0 — 2026-09-16
 
 - **A `VARIANT` column backs up as JSON text, and comes back exactly when
   it entered as JSON.** Text could not carry one at all: the number 42 and
