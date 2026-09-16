@@ -47,7 +47,7 @@ each load-bearing:
   binary (the release-archive layout), `~/.local/lib`, and `~/.duckdb/cli/*`
   — DuckDB's own world, disposable and refetchable. Harbor binds the v2 C
   API, so DuckDB 2.0 is the engine floor; one build has served every v2-API
-  engine it has met, and the engine pin *is* the dylib.
+  engine it has met, and the engine *is* the dylib.
 - **Building needs nothing.** No DuckDB source tree, library, or header —
   the crate ships pregenerated bindings, so `cargo build` works on a bare
   machine and CI needs the engine only to run the suite.
@@ -224,20 +224,19 @@ is `USE`/ATTACH as plain SQL on a lease.
 ## The engine is upstream DuckDB 2.0 — no fork
 
 The engine is DuckDB's own `main` line, unmodified: `libduckdb` plus the
-`duckdb` CLI. Nothing is forked and nothing is patched — but until 2.0 GA,
-one honest wrinkle: no published DuckDB artifact exports the v2 C API.
-The nightly channel was frozen at a pre-v2 build and then retired
-(`artifacts.duckdb.org/latest/…` went away on 2026-09-14; nightlies now
-live under branch-keyed paths), and the 2.0 alpha program distributes the
-CLI only, no `libduckdb`, so it doesn't close the gap either. A
-serving engine is therefore *built* from upstream source at one pinned
-commit — CI does this (cached; `.github/actions/duckdb` holds the pin and
-the recipe), local development does the same, and `make fetch-duckdb` warns
-when the artifact it fetched can't serve. At GA this section loses the
-wrinkle and everything returns to the published zip. Verified: one harbor
-build loads and runs clean against every v2-API engine it has met — tested
-compatibility for Harbor's exercised C-API surface, not a claim about every
-future ABI. The floor is DuckDB 2.0 by construction: harbor binds the v2 C
+`duckdb` CLI, as DuckDB publishes them nightly (`artifacts.duckdb.org`,
+keyed by branch; the 2.0 line is `v2.0-cyanoptera`). Nothing is forked and
+nothing is patched, and nothing is built here: `make fetch-duckdb`, CI and
+the release workflow all pull the same two tarballs per platform through one
+script. The channel is the latest green build and cannot be asked for an
+older one, so CI runs against DuckDB's current main and a release archive
+is what pins an engine — it bundles the build it was made with. (For a
+month in 2026 the channel shipped a library without the v2 C API and harbor
+built its own from source at a pinned commit; that scaffolding is gone, and
+the fetch script refuses such a library should it recur.) Verified: one
+harbor build loads and runs clean against every v2-API engine it has met —
+tested compatibility for Harbor's exercised C-API surface, not a claim about
+every future ABI. The floor is DuckDB 2.0 by construction: harbor binds the v2 C
 API, whose symbols older engines do not export. Database files are a
 different matter — a file created by a 1.5-era DuckDB opens as-is, because
 2.0's storage layer reads it. (The v2 line parses SQL ~2× slower than 1.5.5
@@ -245,13 +244,9 @@ different matter — a file created by a 1.5-era DuckDB opens as-is, because
 section.)
 
 **Planned for the GA timeframe** — collected here so GA day has one list:
-unwind the frozen-channel scaffolding (the shelf derivation in Release.yml,
-the Engine workflow and its `engine-<pin>` shelf, this section's wrinkle, and
-`fetch-duckdb`'s warning — each is marked at its site), taking care to pin
-the release fetch to a *versioned* GA artifact URL rather than the moving
-`/latest` channel, so tested-equals-shipped survives the unwind; and revisit
-the
-prepared-statement cache size. Harbor keeps a small per-connection LRU of
+point the release fetch at a *versioned* GA artifact rather than the moving
+nightly channel, so a release names its engine before it is built rather
+than after; and revisit the prepared-statement cache size. Harbor keeps a small per-connection LRU of
 parsed statements, which is what makes repeated statements skip the 2× parse
 cost entirely — whether that cache should grow is a tuning question worth
 answering against the GA engine's parser, not the alpha's, since upstream is

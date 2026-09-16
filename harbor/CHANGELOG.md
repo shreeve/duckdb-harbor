@@ -4,6 +4,17 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.37.1 — 2026-09-16
+
+- **The engine comes from DuckDB's official nightly channel again.** For a
+  month the channel shipped a library without the v2 C API, so harbor built
+  its own from source at a pinned commit and shelved it on an `engine-<pin>`
+  prerelease. The channel now ships the v2 API nightly, so that scaffolding
+  is gone: `make fetch-duckdb`, CI and the release workflow all pull DuckDB's
+  own `v2.0-cyanoptera` tarballs through one script, which refuses a library
+  without the v2 API should the channel ever regress. Release archives
+  bundle the build they were made with, as before.
+
 ## 0.37.0 — 2026-09-16
 
 - **A `VARIANT` column backs up as JSON text, and comes back exactly when

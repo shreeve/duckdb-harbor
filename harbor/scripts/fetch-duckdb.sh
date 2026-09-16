@@ -3,40 +3,35 @@
 # fetch-duckdb.sh — put a DuckDB engine into ~/.duckdb/cli/2.0.0/
 #
 # harbor carries no engine; this fetches one for it to load, along
-# with the two headers (kept for reference — the crate ships pregenerated
+# with the headers (kept for reference — the crate ships pregenerated
 # bindings, so the build never reads them) and the duckdb CLI that builds
-# fixtures.
+# fixtures. The source is DuckDB's official nightly channel at
+# artifacts.duckdb.org: two tarballs per platform, `duckdb-shared-libs-
+# <plat>.tar.gz` (the library and headers) and `duckdb-cli-<plat>.tar.gz`
+# (the CLI), keyed by branch. The 2.0 line is `v2.0-cyanoptera`; override
+# DUCKDB_CHANNEL to fetch another branch, DUCKDB_PLATFORM to fetch for
+# another machine, DEST to install elsewhere.
 #
-# The source, until DuckDB 2.0 GA, is this repo's own shelf: the Engine
-# workflow builds all five platforms at CI's pinned commit and shelves them
-# on the engine-<pin> prerelease, in the shape DuckDB's official channel
-# used to ship (duckdb-binaries-<plat>.zip wrapping libduckdb-<plat>.zip
-# and duckdb_cli-<plat>.zip). No official artifact can serve harbor 0.21:
-# the nightly channel was frozen pre-v2-API, and on 2026-09-14 DuckDB
-# retired it outright — artifacts.duckdb.org/latest is gone, nightlies
-# now live under branch-keyed paths (v2.0-cyanoptera/…) in a new tar.gz
-# shape that still exports no v2 C API.
-#
-# <pin> is the first 10 chars of the commit in
-# .github/actions/duckdb/action.yml — the ONE place the pin lives. This
-# script reads it from there when run inside the checkout; elsewhere, or
-# to fetch any other engine, set ENGINE_URL:
-#
-#   ENGINE_URL=https://github.com/shreeve/duckdb-harbor/releases/download/engine-<pin>/duckdb-binaries-<plat>.zip
-#
-# This script warns loudly when the fetched library cannot serve. At GA,
-# point the default at the official channel and delete the warning below.
+# The channel is a moving pointer — the latest green build of the branch,
+# with no way to ask for an older one — so what this fetches today is not
+# what it fetched yesterday. The release archives bundle the engine they
+# were built with, which is what makes a release reproducible; a local
+# fetch is deliberately current. The script checks that the library it
+# got exports the v2 C API, because for a month in 2026 the channel shipped
+# one that did not, and harbor refuses such an engine at dlopen.
 #
 # Override DEST to install elsewhere.
 
 set -euo pipefail
 
 dest=${DEST:-$HOME/.duckdb/cli/2.0.0}
+channel=${DUCKDB_CHANNEL:-v2.0-cyanoptera}
 
 duck_plat=${DUCKDB_PLATFORM:-}
 if [ -z "$duck_plat" ]; then
   case "$(uname -s)/$(uname -m)" in
-    Darwin/*)                  duck_plat=osx         ;;
+    Darwin/arm64)              duck_plat=osx-arm64   ;;
+    Darwin/*)                  duck_plat=osx-universal ;;
     Linux/x86_64)              duck_plat=linux-amd64 ;;
     Linux/aarch64|Linux/arm64) duck_plat=linux-arm64 ;;
     MINGW*/*86_64|MSYS*/*86_64) duck_plat=windows-amd64 ;;
@@ -62,22 +57,14 @@ place() {
   fi
 }
 
-# ---- the engine: one "binaries" zip, two sub-zips nested inside -------------
-engine_url=${ENGINE_URL:-}
-if [ -z "$engine_url" ]; then
-  # Default to the engine-<pin> shelf, pin read from the composite action so
-  # a pin bump there flows here without a second edit.
-  pin_file="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)/.github/actions/duckdb/action.yml"
-  pin=$(grep -o 'sha=[0-9a-f]\{40\}' "$pin_file" 2>/dev/null | cut -d= -f2 || true)
-  [ -n "$pin" ] || { echo "fetch-duckdb: no engine pin at $pin_file — set ENGINE_URL (see header)" >&2; exit 2; }
-  engine_url="https://github.com/shreeve/duckdb-harbor/releases/download/engine-${pin:0:10}/duckdb-binaries-$duck_plat.zip"
-fi
-say "fetching $engine_url"
-curl -fsSL -o "$work/binaries.zip" "$engine_url"
-( cd "$work" && unzip -oq binaries.zip )        # -> libduckdb-*.zip, duckdb_cli-*.zip
-( cd "$work" && unzip -oq 'libduckdb-*.zip' )   # -> libduckdb.{dylib,so} (+ headers)
-( cd "$work" && unzip -oq 'duckdb_cli-*.zip' )  # -> duckdb CLI
-
+# ---- the engine: two tarballs, the library (with headers) and the CLI -----
+base="https://artifacts.duckdb.org/$channel"
+for kind in shared-libs cli; do
+  url="$base/duckdb-$kind-$duck_plat.tar.gz"
+  say "fetching $url"
+  curl -fsSL -o "$work/$kind.tar.gz" "$url"
+  tar -xzf "$work/$kind.tar.gz" -C "$work"
+done
 mkdir -p "$dest"
 place libduckdb.dylib    0755
 place libduckdb.so       0755
@@ -86,7 +73,9 @@ place duckdb.lib         0644
 place duckdb             0755
 place duckdb.exe         0755
 place duckdb.h           0644
+place duckdb_v2.h        0644
 place duckdb_extension.h 0644
+place duckdb_extension_v2.h 0644
 
 # A fetch that placed no engine is a failure, not a quiet success — the
 # same rule package-release.sh enforces. Without this, a malformed or
@@ -102,18 +91,17 @@ if [ "$dest" = "$HOME/.duckdb/cli/2.0.0" ]; then
   say "cli/latest -> $dest"
 fi
 
-# ---- can this engine actually serve harbor 0.21? ---------------------------
-# harbor 0.21 binds the v2 C API; no official artifact exports it. grep the
-# dynamic symbol names straight out of the binary — present on every
-# platform, no nm/objdump dependency. Delete this check at GA.
+# ---- can this engine actually serve harbor? --------------------------------
+# harbor binds the v2 C API. grep the dynamic symbol names straight out of
+# the binary — present on every platform, no nm/objdump dependency — and
+# refuse a library without them: harbor would refuse it at dlopen anyway,
+# later and less clearly.
 for f in "$dest"/libduckdb.dylib "$dest"/libduckdb.so "$dest"/duckdb.dll; do
   [ -f "$f" ] || continue
   if ! grep -q duckdb_v2_connect "$f" 2>/dev/null; then
-    echo "" >&2
-    echo "fetch-duckdb: WARNING — this libduckdb exports no v2 C API symbols." >&2
-    echo "  harbor cannot serve with it (no official artifact will until" >&2
-    echo "  DuckDB 2.0 GA). Re-run with ENGINE_URL pointed at this repo's" >&2
-    echo "  engine-<pin> release — the exact line is in this script's header." >&2
+    echo "fetch-duckdb: $f exports no v2 C API symbols — harbor cannot serve with it." >&2
+    echo "  The $channel channel shipped a pre-v2 build; try again later, or another DUCKDB_CHANNEL." >&2
+    exit 1
   fi
   break
 done
