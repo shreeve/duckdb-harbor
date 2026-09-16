@@ -4,6 +4,17 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.39.0 — unreleased
+
+- **A `VARIANT` column arrives over HTTP as JSON text.** It used to arrive
+  as the engine's display text — `{'method': POST}` — which no client could
+  parse, and which printed the number 42 and the string "42" the same way.
+  The encoder now casts each variant to JSON on the connection that produced
+  it, so a document that entered as JSON leaves as the same JSON, and the
+  schema line says `"encoding": "json"` instead of `"varchar-cast"`. JSON has
+  no date or timestamp of its own, so those variant members arrive as strings
+  and the column stays `"lossless": false`. `GEOMETRY` is unchanged.
+
 ## 0.38.0 — 2026-09-16
 
 - **The engine comes from DuckDB's official nightly channel again.** For a

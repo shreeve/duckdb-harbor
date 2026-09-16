@@ -260,6 +260,7 @@ fn emit_schema(out: &mut String, name: Option<&str>, ty: &Type) {
             out.push(']');
         }
         id if is_lossless(id) => out.push_str(r#","lossless":true"#),
+        LOGICAL_TYPE_ID_VARIANT => out.push_str(r#","lossless":false,"encoding":"json""#),
         _ => out.push_str(r#","lossless":false,"encoding":"varchar-cast""#),
     }
     out.push('}');
@@ -449,6 +450,36 @@ impl Reader {
     }
 }
 
+/// The one cast the encoder performs itself: a VARIANT to JSON, through the
+/// connection whose result holds the value. A connection makes one lazily
+/// ([`Conn::json`](super::conn::Conn::json)) and hands it to [`emit_cell`];
+/// without one, a VARIANT goes out as the engine's display text.
+#[derive(Clone, Copy)]
+pub struct Json {
+    pub conn: ffi::connection_handle,
+    /// The JSON logical type, made on `conn`. Owned by whoever made it.
+    pub ty: ffi::logical_type_handle,
+}
+
+impl Json {
+    /// Make the JSON type on `conn`. Destroy it with [`Json::destroy`].
+    pub fn of(api: &ffi::Api, conn: ffi::connection_handle) -> Result<Json, Error> {
+        let name = "JSON";
+        let text = ffi::str_t { ptr: name.as_ptr() as *const _, len: name.len() as ffi::idx_t };
+        let mut ty: ffi::logical_type_handle = std::ptr::null_mut();
+        call!(api, connection_create_type_from_text(conn, text, &mut ty));
+        Ok(Json { conn, ty })
+    }
+
+    /// Release the type. The connection handle is not this value's to close.
+    pub fn destroy(self, api: &ffi::Api) {
+        if let Some(d) = api.logical_type_destroy {
+            let mut ty = self.ty;
+            unsafe { d(&mut ty) };
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cell emission — one value per call, over the scalar writers in src/encode.rs.
 // ---------------------------------------------------------------------------
@@ -457,16 +488,18 @@ impl Reader {
 pub fn emit_cell(
     out: &mut String,
     api: &ffi::Api,
+    json: Option<Json>,
     r: &Reader,
     ty: &Type,
     row: usize,
 ) -> Result<(), Error> {
-    emit(out, api, r, ty, row)
+    emit(out, api, json, r, ty, row)
 }
 
 fn emit(
     out: &mut String,
     api: &ffi::Api,
+    json: Option<Json>,
     r: &Reader,
     ty: &Type,
     row: usize,
@@ -639,7 +672,7 @@ fn emit(
                     if j > 0 {
                         out.push(',');
                     }
-                    emit(out, api, &r.children[0], &ty.children[0].1, (entry.offset + j) as usize)?;
+                    emit(out, api, json, &r.children[0], &ty.children[0].1, (entry.offset + j) as usize)?;
                 }
                 out.push(']');
             }
@@ -649,7 +682,7 @@ fn emit(
                     if j > 0 {
                         out.push(',');
                     }
-                    emit(out, api, &r.children[0], &ty.children[0].1, phys * ty.array_len as usize + j as usize)?;
+                    emit(out, api, json, &r.children[0], &ty.children[0].1, phys * ty.array_len as usize + j as usize)?;
                 }
                 out.push(']');
             }
@@ -661,7 +694,7 @@ fn emit(
                     }
                     push_json_string(out, name);
                     out.push(':');
-                    emit(out, api, &r.children[i], child_ty, phys)?;
+                    emit(out, api, json, &r.children[i], child_ty, phys)?;
                 }
                 out.push('}');
             }
@@ -673,7 +706,7 @@ fn emit(
                     if i > 0 {
                         out.push(',');
                     }
-                    emit(out, api, &r.children[i], child_ty, phys)?;
+                    emit(out, api, json, &r.children[i], child_ty, phys)?;
                 }
                 out.push(']');
             }
@@ -688,9 +721,9 @@ fn emit(
                         out.push(',');
                     }
                     out.push('[');
-                    emit(out, api, &r.children[0], &ty.children[0].1, (entry.offset + j) as usize)?;
+                    emit(out, api, json, &r.children[0], &ty.children[0].1, (entry.offset + j) as usize)?;
                     out.push(',');
-                    emit(out, api, &r.children[1], &ty.children[1].1, (entry.offset + j) as usize)?;
+                    emit(out, api, json, &r.children[1], &ty.children[1].1, (entry.offset + j) as usize)?;
                     out.push(']');
                 }
                 out.push(']');
@@ -711,15 +744,50 @@ fn emit(
                 out.push_str(r#"{"tag":"#);
                 push_json_string(out, name);
                 out.push_str(r#","value":"#);
-                emit(out, api, &r.children[1 + tag], member_ty, phys)?;
+                emit(out, api, json, &r.children[1 + tag], member_ty, phys)?;
                 out.push('}');
             }
             // No committed view layout — the single-cell value bridge is the
-            // committed way in, and the payload goes out as the engine's text
-            // rendering, exactly what the schema's "varchar-cast" promises.
-            // (v1 emitted base64 of storage bytes under the same lossless:false
-            // label — a payload nothing could decode; text is strictly better.)
-            LOGICAL_TYPE_ID_GEOMETRY | LOGICAL_TYPE_ID_VARIANT => {
+            // committed way in. A VARIANT goes out as JSON text, the one
+            // rendering a client can parse back: the engine casts the value
+            // on the connection that produced it, and the schema line says
+            // "json". Without a caster (internal helpers) it falls back to
+            // the display text, which cannot tell 42 from '42'.
+            LOGICAL_TYPE_ID_VARIANT => {
+                let mut value: ffi::value_handle = std::ptr::null_mut();
+                call!(api, vector_get_value(r.vector, row as ffi::idx_t, &mut value));
+                let text = match json {
+                    Some(j) => {
+                        let mut cast: ffi::value_handle = std::ptr::null_mut();
+                        let done = (|| -> Result<(), Error> {
+                            call!(api, value_cast_with_connection(j.conn, value, j.ty, &mut cast));
+                            Ok(())
+                        })();
+                        let text = if done.is_ok() { value_text(api, cast) } else { None };
+                        if !cast.is_null() {
+                            destroy_value(api, &mut cast);
+                        }
+                        destroy_value(api, &mut value);
+                        done?;
+                        text
+                    }
+                    None => {
+                        let text = value_text(api, value);
+                        destroy_value(api, &mut value);
+                        text
+                    }
+                };
+                match text {
+                    Some(s) => push_json_string(out, &s),
+                    None => out.push_str("null"),
+                }
+            }
+            // GEOMETRY has no committed view layout either, and no JSON form;
+            // the payload goes out as the engine's text rendering, exactly
+            // what the schema's "varchar-cast" promises. (v1 emitted base64
+            // of storage bytes under the same lossless:false label — a
+            // payload nothing could decode; text is strictly better.)
+            LOGICAL_TYPE_ID_GEOMETRY => {
                 let mut value: ffi::value_handle = std::ptr::null_mut();
                 call!(api, vector_get_value(r.vector, row as ffi::idx_t, &mut value));
                 let text = value_text(api, value);

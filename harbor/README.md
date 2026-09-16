@@ -806,12 +806,15 @@ native client, developed in this repository beside harbor.
 
 ## Known limitations
 
-**`VARIANT` and `GEOMETRY` arrive as text.** Neither has a committed vector
-layout in the v2 C API, so the value goes out as the engine's own text
-rendering, and the column says `"lossless": false, "encoding": "varchar-cast"`
-rather than pretending otherwise. (Two limitations this section used to carry
-are gone: `TIME WITH TIME ZONE` keeps its offset since 0.22, and `TIME_NS`
-encodes since 0.21.)
+**`VARIANT` arrives as JSON text, `GEOMETRY` as display text.** Neither has a
+committed vector layout in the v2 C API, so each cell crosses as one value. A
+`VARIANT` is cast to JSON on the way out, so `42` and `'42'` stay apart and a
+document that entered as JSON leaves as the same JSON; the column says
+`"lossless": false, "encoding": "json"` because JSON has no `DATE` or
+`TIMESTAMP` of its own (those arrive as strings). A `GEOMETRY` goes out as the
+engine's own text rendering under `"encoding": "varchar-cast"`. (Two
+limitations this section used to carry are gone: `TIME WITH TIME ZONE` keeps
+its offset since 0.22, and `TIME_NS` encodes since 0.21.)
 
 **Bodies are capped at 8 MiB**, declared or delivered; over that is a `413`.
 There is no rate limiting and no CORS — defensible for a service behind a proxy,

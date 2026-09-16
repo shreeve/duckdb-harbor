@@ -133,6 +133,9 @@ pub struct Conn {
     cache: HashMap<String, CacheEntry>,
     cache_bytes: usize,
     tick: u64,
+    /// The VARIANT-to-JSON caster for this connection's results, made on
+    /// first use and destroyed with the connection.
+    json: Option<super::encode::Json>,
 }
 
 unsafe impl Send for Conn {}
@@ -159,6 +162,7 @@ impl Conn {
             cache: HashMap::new(),
             cache_bytes: 0,
             tick: 0,
+            json: None,
         })
     }
 
@@ -181,8 +185,21 @@ impl Conn {
         self.cache.clear();
         self.cache_bytes = 0;
         self.tick = 0;
+        // The caster was made on the old handle; it goes out with it.
+        fresh.json = self.json.take();
         drop(fresh);
         Ok(())
+    }
+
+    /// The VARIANT-to-JSON caster for results of this connection, made on
+    /// first use. Hand it to [`encode::emit_cell`](super::encode::emit_cell).
+    pub fn json(&mut self) -> Result<super::encode::Json, Error> {
+        if let Some(j) = self.json {
+            return Ok(j);
+        }
+        let j = super::encode::Json::of(&self.eng.api, self.conn)?;
+        self.json = Some(j);
+        Ok(j)
     }
 
     pub fn engine_version(&self) -> &'static str {
@@ -214,7 +231,7 @@ impl Conn {
                 if let (Some(reader), Some((_, ty))) = (readers.first(), columns.first()) {
                     for row in 0..chunk.rows {
                         let mut cell = String::new();
-                        super::encode::emit_cell(&mut cell, api, reader, ty, row)?;
+                        super::encode::emit_cell(&mut cell, api, None, reader, ty, row)?;
                         // The helper reads VARCHAR columns; strip the JSON
                         // quoting the encoder applies.
                         out.push(
@@ -433,6 +450,9 @@ impl Conn {
 impl Drop for Conn {
     fn drop(&mut self) {
         self.cache.clear();
+        if let Some(j) = self.json.take() {
+            j.destroy(&self.eng.api);
+        }
         // Disconnect under the interrupt lock: a canceller mid-call finishes
         // against the live handle first, and every later one sees null.
         let mut slot = self.interrupt.lock().unwrap_or_else(|p| p.into_inner());

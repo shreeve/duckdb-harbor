@@ -226,7 +226,7 @@ pub struct Column {
     /// ENUM
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<String>>,
-    /// "pairs" | "varchar-cast"
+    /// "pairs" | "json" | "varchar-cast"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,
 }

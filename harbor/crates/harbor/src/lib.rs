@@ -3794,6 +3794,10 @@ fn run_statement(
     };
     let columns = std::mem::take(&mut stream.columns);
     let api = conn.api();
+    // The VARIANT caster, one per connection. Every engine harbor ships has
+    // the cast route; on one that lacks it a VARIANT falls back to display
+    // text, and the cell says so by not parsing as JSON.
+    let json = conn.json().ok();
 
     // NDJSON commits to a 200 here, before the first row, because that is
     // what streaming means. One-shot cannot and must not: nothing goes out
@@ -3895,7 +3899,7 @@ fn run_statement(
                 if i > 0 {
                     buf.push(',');
                 }
-                if let Err(e) = crate::engine::encode::emit_cell(&mut buf, api, reader, ty, row) {
+                if let Err(e) = crate::engine::encode::emit_cell(&mut buf, api, json, reader, ty, row) {
                     cell_err = Some(e);
                     break;
                 }

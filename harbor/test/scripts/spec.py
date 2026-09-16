@@ -209,10 +209,12 @@ CASES = [
     # silently started reporting lossless:true would have passed this suite
     # from top to bottom. VARIANT is the representative since TIMETZ turned
     # lossless in 0.22: no committed view layout, so the payload goes out as
-    # the engine's text rendering, and the schema says which property of the
-    # value not to trust.
+    # JSON text cast by the engine, and the schema says so. JSON keeps the
+    # number 42 and the string "42" apart, which display text never could.
     ("variant-lossy",  "SELECT 42::VARIANT AS v",
                        "VARIANT", False, "42"),
+    ("variant-string", "SELECT '42'::VARIANT AS v",
+                       "VARIANT", False, '"42"'),
 
     # -- HUGEINT minimum ----------------------------------------------------
     # i128::MIN has no positive counterpart, so the "is this JSON-safe" test
@@ -232,7 +234,8 @@ SCHEMA_EXTRAS = {
     "enum":           {"values": ["sad", "ok", "happy"]},
     # Not just lossless:false — the reason, so a client can tell which of the
     # value's properties it must not trust.
-    "variant-lossy":  {"encoding": "varchar-cast"},
+    "variant-lossy":  {"encoding": "json"},
+    "variant-string": {"encoding": "json"},
 }
 
 
