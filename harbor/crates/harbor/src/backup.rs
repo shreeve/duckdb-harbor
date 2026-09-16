@@ -537,8 +537,9 @@ fn json_check(
     let probe = dir.join(".variant-check");
     let selects = variants.iter().map(|c| {
         let c = ident(c);
+        // Ordered, so the note reads the same whichever engine build answers.
         format!(
-            "coalesce(string_agg(DISTINCT variant_type({c}), ', ') \
+            "coalesce(string_agg(DISTINCT variant_type({c}), ', ' ORDER BY variant_type({c})) \
              FILTER (WHERE NOT coalesce({c} = {c}::JSON::VARIANT, true)), '')"
         )
     }).collect::<Vec<_>>().join(", ");
