@@ -321,15 +321,11 @@ mydata>
 `~/.duckdb`, then build and install `harbor` into `~/.local/bin`. No step
 needs root.
 
-One caveat that ends at DuckDB 2.0 GA: the official artifact channel is
-currently frozen at a build that predates the v2 C API, so the `libduckdb`
-it delivers cannot *serve* (harbor says so plainly: "engine has no v2 C
-API"). `fetch-duckdb` warns when this happens. Until GA, serving engines
-come from this repo's own shelf — the Engine workflow builds all five
-platforms from DuckDB source at CI's pinned commit and publishes them on
-the `engine-<pin>` prerelease; `fetch-duckdb` takes it via `ENGINE_URL`,
-and the release archives below already bundle it. The fetched `duckdb`
-CLI is unaffected either way.
+The engine `fetch-duckdb` pulls is DuckDB's official nightly of the 2.0
+branch — the latest green build, which is a moving target by design. The
+release archives below bundle the engine they were built with, so a release
+is reproducible; a local fetch is deliberately current. The script refuses a
+library that lacks the v2 C API, since harbor would refuse it at dlopen.
 
 No toolchain? One command installs the latest release — it picks the right
 archive for the platform, verifies its sha256 against the published checksums,
@@ -832,11 +828,8 @@ harbor loads the engine on demand (`HARBOR_LIBDUCKDB`, then `../lib` beside
 the binary, `~/.local/lib`, and `~/.duckdb/cli/*` — DuckDB's own world,
 disposable and refetchable). Harbor binds DuckDB's v2 C API, so DuckDB 2.0
 is the engine floor; the same build has been verified against every
-v2-API engine it has met (currently built at CI's pinned commit and shelved
-on the `engine-<pin>` prerelease — the official artifacts are frozen
-pre-v2-API until GA, and the 2.0 alpha channel ships the CLI only, no
-library). Treat that as tested
-compatibility, not a
+v2-API engine it has met, and CI runs the suite against DuckDB's current
+nightly of the 2.0 branch. Treat that as tested compatibility, not a
 promise that an arbitrary future DuckDB ABI will work. Your database files
 need no such care: a file created by a 1.5-era DuckDB opens as-is, because
 2.0's storage layer reads it. A machine with

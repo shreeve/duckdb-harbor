@@ -4,11 +4,9 @@
 # so the build needs no engine at all and a pure client runs on machines
 # without one. The engine lives in ~/.duckdb (DuckDB's world), version-scoped
 # so several can coexist; the binary installs into ~/.local/bin. `make
-# fetch-duckdb` pulls DuckDB's official artifacts into ~/.duckdb — though
-# until 2.0 GA those are frozen pre-v2-C-API and cannot SERVE harbor 0.21;
-# the script warns, and CI builds the engine at a pinned commit instead
-# (.github/actions/duckdb). `make install` copies the binary to $(BIN).
-# No step needs root.
+# fetch-duckdb` pulls DuckDB's official nightly artifacts into ~/.duckdb
+# (CI fetches the same way, through .github/actions/duckdb). `make install`
+# copies the binary to $(BIN). No step needs root.
 
 .PHONY: all harbor unit test bench install fetch-duckdb bootstrap clean
 
@@ -54,11 +52,10 @@ install: harbor
 	@case ":$$PATH:" in *":$(BIN):"*) ;; \
 	  *) echo "note: $(BIN) is not on your PATH — add it to your shell rc" ;; esac
 
-# Pull DuckDB's official artifacts (libduckdb + headers + duckdb CLI) from
-# artifacts.duckdb.org into $(DUCKDB_LIB), where harbor's runtime search
-# finds it. Until 2.0 GA the channel is frozen pre-v2-C-API: the CLI works,
-# but the library cannot serve harbor 0.21 — CI builds the engine from
-# source at a pinned commit (.github/actions/duckdb) for exactly this reason.
+# Pull DuckDB's official nightly artifacts (libduckdb + headers + duckdb CLI)
+# from artifacts.duckdb.org into $(DUCKDB_LIB), where harbor's runtime search
+# finds it. The channel is the latest build of the 2.0 branch; the script
+# refuses a library without the v2 C API.
 fetch-duckdb:
 	DEST=$(DUCKDB_LIB) scripts/fetch-duckdb.sh
 

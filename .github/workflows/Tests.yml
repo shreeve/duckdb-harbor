@@ -5,9 +5,9 @@
 # so it never appears here as a skipped check.
 #
 # The focused suite selection is explicit below; the engine comes from the
-# local composite action (.github/actions/duckdb) — libduckdb built from
-# source at the pinned commit (published artifacts are frozen pre-v2-API
-# until GA), the duckdb CLI from the artifact zip.
+# local composite action (.github/actions/duckdb) — libduckdb and the duckdb
+# CLI from DuckDB's official nightly channel, the current build of the 2.0
+# branch.
 #
 name: Tests
 

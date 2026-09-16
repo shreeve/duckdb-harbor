@@ -1,85 +1,22 @@
 name: Set up DuckDB
 description: >
-  Put a DuckDB engine where CI can run it. Two pieces, one source: harbor
-  0.21 binds DuckDB's v2 C API, and no official artifact has ever served
-  it — the nightly channel was frozen pre-v2-API and then, on 2026-09-14,
-  retired outright (artifacts.duckdb.org/latest is gone; nightlies now
-  live under branch-keyed paths in a new tar.gz shape). The library is
-  therefore built from source at the pinned commit the local batteries
-  validate against, and cached so only the first run pays for it. The
-  duckdb CLI (which only builds the test fixture and needs no v2 API)
-  comes from this repo's engine-<pin> prerelease, which the Engine
-  workflow mints from the same commit. When DuckDB ships v2 binaries at
-  GA, delete the build steps and fetch both from the official channel.
+  Put a DuckDB engine where CI can run it: the library harbor dlopens and the
+  duckdb CLI that builds the test fixture, both from DuckDB's official nightly
+  channel, fetched by the same script a developer runs (scripts/fetch-duckdb.sh
+  — the one place the channel and the archive shapes are spelled). The channel
+  is the latest green build of the 2.0 branch, so the suite runs against
+  DuckDB's current main; the script refuses a library that lacks the v2 C API.
 runs:
   using: composite
   steps:
-    - name: Engine pin
-      id: pin
-      shell: bash
-      # The commit the local batteries validate against. Bump deliberately,
-      # with a full battery — the engine pin is the dylib.
-      run: echo "sha=ee95013f175bea7aa813f56c86fea983db6bc8e5" >> "$GITHUB_OUTPUT"
-
-    - name: DuckDB CLI (from the engine-<pin> prerelease — fixture builder only)
-      shell: bash
-      # Same shelf Release.yml fetches from, same zip shape the official
-      # channel used to ship: duckdb-binaries-<plat>.zip wrapping
-      # libduckdb-<plat>.zip and duckdb_cli-<plat>.zip. Only the CLI is
-      # taken here; the library comes from the cached source build below.
-      # A 404 means the pin was bumped without dispatching Engine.yml.
-      env:
-        PIN: ${{ steps.pin.outputs.sha }}
-      run: |
-        set -euo pipefail
-        dir="$HOME/duckdb"; mkdir -p "$dir"; cd "$dir"
-        url="https://github.com/$GITHUB_REPOSITORY/releases/download/engine-${PIN:0:10}/duckdb-binaries-linux-amd64.zip"
-        curl -fsSL -o binaries.zip "$url" \
-          || { echo "no engine-${PIN:0:10} shelf for this pin — dispatch Engine.yml first"; exit 1; }
-        unzip -oq binaries.zip
-        unzip -oq 'duckdb_cli-*.zip'
-        echo "$dir" >> "$GITHUB_PATH"
-
-    - name: Cached engine
-      id: engine
-      uses: actions/cache@v4
-      with:
-        path: ~/duckdb-engine
-        key: duckdb-libduckdb-${{ runner.os }}-${{ steps.pin.outputs.sha }}-icu-json
-
-    - name: Build libduckdb at the pin (cache miss only)
-      if: steps.engine.outputs.cache-hit != 'true'
+    - name: DuckDB engine and CLI (official nightly)
       shell: bash
       run: |
         set -euo pipefail
-        command -v ninja >/dev/null || {
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ninja-build >/dev/null
-        }
-        src="$RUNNER_TEMP/duckdb-src"; mkdir -p "$src"; cd "$src"
-        git init -q
-        git remote add origin https://github.com/duckdb/duckdb.git
-        git fetch -q --depth 1 origin ${{ steps.pin.outputs.sha }}
-        git checkout -q FETCH_HEAD
-        # OVERRIDE_GIT_DESCRIBE: a shallow, tagless clone gives `git describe`
-        # nothing, so the engine would report a bogus version string.
-        # CORE_EXTENSIONS: icu and json ride INSIDE libduckdb. The stack
-        # depends on both (rip's ORM stamps timestamps through
-        # timezone(), an icu function), and a custom-pinned engine can
-        # never autoload them — the extension repos only carry official
-        # versions, so a missing extension is an unfixable runtime error.
-        cmake -G Ninja -B build \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DOVERRIDE_GIT_DESCRIBE=v2.0.0-alpha39998 \
-          -DCORE_EXTENSIONS='icu;json' \
-          -DBUILD_SHELL=FALSE -DBUILD_UNITTESTS=FALSE >/dev/null
-        cmake --build build --target duckdb -j "$(nproc)"
-        mkdir -p "$HOME/duckdb-engine"
-        cp build/src/libduckdb.so "$HOME/duckdb-engine/"
-
-    - name: Point harbor at the engine
-      shell: bash
-      # Nothing links the engine — harbor dlopens it at runtime, and this
-      # directory is not on its search path. The env override is the
-      # designed door, and it wants the file, not the directory.
-      run: echo "HARBOR_LIBDUCKDB=$HOME/duckdb-engine/libduckdb.so" >> "$GITHUB_ENV"
+        DEST="$HOME/duckdb" "$GITHUB_WORKSPACE/harbor/scripts/fetch-duckdb.sh"
+        echo "$HOME/duckdb" >> "$GITHUB_PATH"
+        # Nothing links the engine — harbor dlopens it at runtime, and this
+        # directory is not on its search path. The env override is the
+        # designed door, and it wants the file, not the directory.
+        echo "HARBOR_LIBDUCKDB=$HOME/duckdb/libduckdb.so" >> "$GITHUB_ENV"
+        "$HOME/duckdb/duckdb" -version
