@@ -4,7 +4,7 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
-## 0.39.0 — unreleased
+## 0.39.0 — 2026-09-17
 
 - **A `VARIANT` column arrives over HTTP as JSON text.** It used to arrive
   as the engine's display text — `{'method': POST}` — which no client could
