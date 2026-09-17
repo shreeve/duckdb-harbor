@@ -250,6 +250,18 @@ class Regressions(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), [{"n": 2}])
 
+    def test_deep_json_document_does_not_take_the_server_down(self):
+        # The engine recurses once per nesting level when it builds a
+        # VARIANT from JSON; on the default 2 MiB thread stack a document
+        # ~7,700 levels deep overflowed the executor and aborted the whole
+        # server. The executor now runs on a 16 MiB stack.
+        depth = 20000
+        doc = "[" * depth + "1" + "]" * depth
+        result = self.sql(f"SELECT variant_typeof('{doc}'::JSON::VARIANT) AS t")
+        self.assertIn("ARRAY", json.dumps(result))
+        self.assertEqual(self.request("GET", "/ready")[0], 200)
+        self.assertIn("1", json.dumps(self.sql("SELECT 1 AS one")))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

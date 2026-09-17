@@ -4,6 +4,25 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.39.0 — unreleased
+
+- **A `VARIANT` column arrives over HTTP as JSON text.** It used to arrive
+  as the engine's display text — `{'method': POST}` — which no client could
+  parse, and which printed the number 42 and the string "42" the same way.
+  The encoder now casts each variant to JSON on the connection that produced
+  it, so a document that entered as JSON leaves as the same JSON, and the
+  schema line says `"encoding": "json"` instead of `"varchar-cast"`. JSON has
+  no date or timestamp of its own, so those variant members arrive as strings
+  and the column stays `"lossless": false`. `GEOMETRY` is unchanged. The
+  README's known limitations now carry the measured list of where a
+  `VARIANT` is not quite JSON, and the write rule that goes with it.
+- **A deeply nested JSON document no longer takes the server down.** The
+  engine recurses once per level when it builds a `VARIANT` from JSON, and
+  on the default 2 MiB thread stack a document some 7,700 levels deep
+  overflowed the executor and aborted the whole process. The threads that
+  run SQL now have a 16 MiB stack, reserved rather than committed, which
+  puts the edge past 60,000 levels.
+
 ## 0.38.0 — 2026-09-16
 
 - **The engine comes from DuckDB's official nightly channel again.** For a

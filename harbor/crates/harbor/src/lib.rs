@@ -102,6 +102,15 @@ pub const DEFAULT_MAX_INFLIGHT: usize = 6;
 /// above that so a generous `params` array is never the thing that fails.
 const MAX_BODY: usize = 8 << 20;
 
+/// Stack for the threads that run SQL. The engine recurses once per level
+/// when it turns a JSON document into a VARIANT, and on the 2 MiB default a
+/// document some 7,700 levels deep overflowed the executor and took the
+/// whole server down — with every client's connection. Sixteen mebibytes
+/// puts that past 60,000 levels, and the pages are reserved, not committed,
+/// until a stack actually grows into them, so an idle thread costs nothing
+/// extra.
+const EXEC_STACK: usize = 16 << 20;
+
 /// Rows are buffered to roughly this size before hitting the socket. Small
 /// enough that a slow client sees data promptly, large enough that a wide
 /// result is not one syscall per row.
@@ -1194,6 +1203,7 @@ pub fn start(listen: Listen, workers: usize, log: bool) -> Result<String, String
         let exec_state = Arc::clone(&state);
         let handle = thread::Builder::new()
             .name(format!("harbor-lease-{slot}"))
+            .stack_size(EXEC_STACK)
             .spawn(move || Some(execute_jobs(conn, rx, true, exec_state)))
             .map_err(|e| e.to_string())?;
         lease_handles.push(handle);
@@ -1490,6 +1500,7 @@ fn worker(
     let exec_state = Arc::clone(&state);
     let executor = thread::Builder::new()
         .name("harbor-exec".to_string())
+        .stack_size(EXEC_STACK)
         .spawn(move || execute_jobs(conn, jobs_rx, false, exec_state))
         .ok()?;
 
@@ -3794,6 +3805,20 @@ fn run_statement(
     };
     let columns = std::mem::take(&mut stream.columns);
     let api = conn.api();
+    // The VARIANT caster, one per connection. Every engine harbor ships has
+    // the cast route; one that lacks it can still answer any statement whose
+    // result holds no VARIANT, and refuses the rest rather than send display
+    // text under a schema line that promised JSON.
+    let json = match conn.json() {
+        Ok(j) => Some(j),
+        Err(e) => {
+            if columns.iter().any(|(_, ty)| crate::engine::encode::holds_variant(ty)) {
+                let _ = ready.send(Err(refusal_for(on_slot.finish(), e.into_text())));
+                return needs_reset;
+            }
+            None
+        }
+    };
 
     // NDJSON commits to a 200 here, before the first row, because that is
     // what streaming means. One-shot cannot and must not: nothing goes out
@@ -3895,7 +3920,7 @@ fn run_statement(
                 if i > 0 {
                     buf.push(',');
                 }
-                if let Err(e) = crate::engine::encode::emit_cell(&mut buf, api, reader, ty, row) {
+                if let Err(e) = crate::engine::encode::emit_cell(&mut buf, api, json, reader, ty, row) {
                     cell_err = Some(e);
                     break;
                 }

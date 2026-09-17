@@ -199,6 +199,7 @@ mod conn {
         params: &[Param],
     ) -> Result<Vec<String>, harbor::engine::Error> {
         let api = &engine().unwrap().api;
+        let json = c.json()?;
         let stmts = c.statements(sql)?;
         let mut out = Vec::new();
         for stmt in stmts.iter() {
@@ -215,7 +216,7 @@ mod conn {
                         if i > 0 {
                             line.push(',');
                         }
-                        harbor::engine::encode::emit_cell(&mut line, api, &readers[i], ty, row)?;
+                        harbor::engine::encode::emit_cell(&mut line, api, Some(json), &readers[i], ty, row)?;
                     }
                     out.push(line);
                 }
@@ -453,6 +454,7 @@ mod wire {
         ));
         let mut conn: ffi::connection_handle = std::ptr::null_mut();
         ok!(connect(db, &mut conn));
+        let json = encode::Json::of(api, conn)?;
 
         let sql_c = std::ffi::CString::new(sql).unwrap();
         let mut iter: ffi::statement_iterator_handle = std::ptr::null_mut();
@@ -498,7 +500,7 @@ mod wire {
                         if i > 0 {
                             line.push(',');
                         }
-                        encode::emit_cell(&mut line, api, &readers[i], ty, row)?;
+                        encode::emit_cell(&mut line, api, Some(json), &readers[i], ty, row)?;
                     }
                     lines.push(line);
                 }
@@ -510,6 +512,7 @@ mod wire {
             }
         }
 
+        json.destroy(api);
         unsafe {
             (api.statement_iterator_destroy.unwrap())(&mut iter);
             (api.disconnect.unwrap())(&mut conn);
@@ -734,10 +737,12 @@ mod wire {
             "SELECT ROW(1, 'a') AS t",
             r#"{"name":"t","duckdbType":"TUPLE(INTEGER, VARCHAR)","lossless":true,"fields":[{"duckdbType":"INTEGER","lossless":true},{"duckdbType":"VARCHAR","lossless":true}]}"#,
         );
-        // VARIANT has no committed view layout; it goes out as the engine's
-        // text rendering, and the schema says the payload is a cast, not the
-        // value.
-        row(eng, "SELECT 42::VARIANT, {'a': 1}::VARIANT", r#""42","{'a': 1}""#);
-        schema(eng, "SELECT 42::VARIANT AS v", r#"{"name":"v","duckdbType":"VARIANT","lossless":false,"encoding":"varchar-cast"}"#);
+        // VARIANT has no committed view layout; it goes out as JSON text,
+        // cast by the engine, and the schema says so.
+        row(eng, "SELECT 42::VARIANT, {'a': 1}::VARIANT", r#""42","{\"a\":1}""#);
+        // JSON text tells the number from the string, which display text
+        // could not; a JSON document round-trips byte for byte.
+        row(eng, "SELECT '42'::VARIANT, '{\"n\":42,\"s\":\"42\",\"l\":[1,null]}'::JSON::VARIANT", r#""\"42\"","{\"n\":42,\"s\":\"42\",\"l\":[1,null]}""#);
+        schema(eng, "SELECT 42::VARIANT AS v", r#"{"name":"v","duckdbType":"VARIANT","lossless":false,"encoding":"json"}"#);
     }
 }
