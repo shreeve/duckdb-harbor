@@ -4,7 +4,7 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
-## 0.39.1 — unreleased
+## 0.39.1 — 2026-09-18
 
 - **A `VARIANT` string shows without its quotes in a table.** The wire
   carries a `VARIANT` cell as JSON text, and the display modes (box,
