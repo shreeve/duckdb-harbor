@@ -6,6 +6,16 @@ Harbor releases, and are not included here.
 
 ## 0.39.1 — unreleased
 
+- **A `VARIANT` string shows without its quotes in a table.** The wire
+  carries a `VARIANT` cell as JSON text, and the display modes (box,
+  markdown, line, list) used to print that text as it came, so a string
+  read by path — `raw_request.requisitionNumber` — showed as
+  `"L2605106156"`. A cell that is a JSON string now shows its content, the
+  way a `VARCHAR` always has; a number, a boolean, a null, an object or an
+  array is unchanged. Only the display modes do this: csv, json and
+  jsonlines stay raw, so a program on the other end still tells 42 from
+  "42", and the wire is untouched. Cast a path to `JSON` to see the quotes
+  in a table.
 - **The engine can be pinned to a harbor release.** `DUCKDB_ENGINE_RELEASE`
   names a release (`v0.39.0`) whose archive supplies `libduckdb` to
   `scripts/fetch-duckdb.sh`, CI and `Release.yml`, in place of the channel's
