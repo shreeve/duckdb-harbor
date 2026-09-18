@@ -144,6 +144,17 @@ pub struct Reedline {
     history_exclusion_prefix: Option<String>,
     history_excluded_item: Option<HistoryItem>,
     history_cursor_on_excluded: bool,
+    /// Harbor Patch D. The buffer was recalled from history and has not been
+    /// emptied since: Up and Down keep meaning history on it, edited or not.
+    /// False on the live line — what was typed before any Up, or a fresh
+    /// line — where Down has nothing below it to move to.
+    buffer_from_history: bool,
+    /// Harbor Patch D. Whether the walk now in progress began on the live
+    /// line. A walk that runs off the newest end lands back on the text it
+    /// started from; that text is the live line only if it was live when the
+    /// walk began — for an edited recalled line it is the recalled line,
+    /// which stays recalled.
+    walk_began_live: bool,
     input_mode: InputMode,
 
     // State of the painter after a `ReedlineEvent::ExecuteHostCommand` was requested, used after
@@ -358,6 +369,8 @@ impl Reedline {
             history_exclusion_prefix: None,
             history_excluded_item: None,
             history_cursor_on_excluded: false,
+            buffer_from_history: false,
+            walk_began_live: true,
             input_mode: InputMode::Regular,
             suspended_state: None,
             last_render_snapshot: None,
@@ -981,6 +994,13 @@ impl Reedline {
 
     /// Helper implementing the logic for [`Reedline::read_line()`] to be wrapped
     /// in a `raw_mode` context.
+    /// Harbor Patch D, tests only: what `read_line_helper` does to the
+    /// recalled-line flag as a new line begins.
+    #[cfg(test)]
+    pub(crate) fn read_line_reset_for_test(&mut self) {
+        self.buffer_from_history = false;
+    }
+
     fn read_line_helper(&mut self, prompt: &dyn Prompt) -> Result<Signal> {
         self.painter
             .initialize_prompt_position(self.suspended_state.as_ref())?;
@@ -990,6 +1010,7 @@ impl Reedline {
             self.suspended_state = None;
         }
         self.hide_hints = false;
+        self.buffer_from_history = false;
 
         // Repaint requests raised while no read_line was active are stale:
         // the fresh prompt painted below already reflects the latest state.
@@ -1758,6 +1779,12 @@ impl Reedline {
                 Ok(EventStatus::Handled)
             }
             ReedlineEvent::Down => {
+                // Harbor Patch D: on the live line there is nothing below to
+                // move to, so the event is inapplicable and a binding's next
+                // fallback — say, opening the completion menu — gets its turn.
+                if self.down_has_nothing_below() {
+                    return Ok(EventStatus::Inapplicable);
+                }
                 self.down_command();
                 Ok(EventStatus::Handled)
             }
@@ -1871,6 +1898,7 @@ impl Reedline {
         self.history_cursor_on_excluded = false;
         if self.input_mode != InputMode::HistoryTraversal {
             self.input_mode = InputMode::HistoryTraversal;
+            self.walk_began_live = !self.buffer_from_history || self.editor.get_buffer().is_empty();
             self.history_cursor = HistoryCursor::new(
                 self.get_history_navigation_based_on_line_buffer(),
                 self.get_history_session_id(),
@@ -1899,6 +1927,7 @@ impl Reedline {
     fn next_history(&mut self) {
         if self.input_mode != InputMode::HistoryTraversal {
             self.input_mode = InputMode::HistoryTraversal;
+            self.walk_began_live = !self.buffer_from_history || self.editor.get_buffer().is_empty();
             self.history_cursor = HistoryCursor::new(
                 self.get_history_navigation_based_on_line_buffer(),
                 self.get_history_session_id(),
@@ -2015,6 +2044,11 @@ impl Reedline {
     /// When using the up/down traversal or fish/zsh style prefix search update the main line buffer accordingly.
     /// Not used for the separate modal reverse search!
     fn update_buffer_from_history(&mut self) {
+        // Harbor Patch D: a painted history item marks the buffer as recalled.
+        // Landing back on the walk's original text marks it live again only
+        // if it was live when the walk began.
+        let painted = self.history_cursor_on_excluded || self.history_cursor.string_at_cursor().is_some();
+        self.buffer_from_history = painted || !self.walk_began_live;
         match self.history_cursor.get_navigation() {
             _ if self.history_cursor_on_excluded => self.editor.set_buffer(
                 self.history_excluded_item
@@ -2079,6 +2113,18 @@ impl Reedline {
             // leaving a vi-normal caret past the last grapheme on a short line.
             self.run_edit_commands(&[EditCommand::MoveLineUp { select: false }]);
         }
+    }
+
+    /// Harbor Patch D. True when Down would do nothing: the cursor is on the
+    /// buffer's last line, and the buffer is the live line rather than a
+    /// recalled one — nothing newer sits below the present. A recalled line
+    /// keeps Down as history until it is emptied, edited or not, so the keys
+    /// never change meaning under a user's hands.
+    fn down_has_nothing_below(&self) -> bool {
+        self.editor.is_cursor_at_last_line()
+            && self.input_mode != InputMode::HistoryTraversal
+            && !self.history_cursor_on_excluded
+            && !(self.buffer_from_history && !self.editor.get_buffer().is_empty())
     }
 
     fn down_command(&mut self) {
@@ -3752,6 +3798,103 @@ mod tests {
         let _ = step_key(&mut rl, key(KeyCode::Esc)); // vi normal, caret on 'b'
         let _ = step_key(&mut rl, key(KeyCode::Enter)); // incomplete -> insert newline
         assert_eq!(rl.editor.get_buffer(), "ab\n");
+    }
+
+    // --- Harbor Patch D: Down on the live line is inapplicable ---
+    //
+    // Up and Down mean history wherever history is: on a recalled line,
+    // edited or not, until it is emptied. The live line at the bottom is the
+    // one place Down has nothing to do, and there it reports Inapplicable so
+    // a binding can fall through to something useful.
+
+    fn reedline_with_history(entries: &[&str]) -> Reedline {
+        let mut reedline = Reedline::create();
+        reedline.painter.force_prompt_anchored_for_test(0);
+        for entry in entries {
+            reedline
+                .history
+                .save(HistoryItem::from_command_line(*entry))
+                .expect("failed to save history");
+        }
+        reedline
+    }
+
+    #[test]
+    fn down_on_the_live_line_is_inapplicable() {
+        let mut rl = reedline_with_history(&["select 1", "select 2"]);
+        let prompt = DefaultPrompt::default();
+        // an empty fresh line, and a typed one
+        assert!(matches!(rl.handle_event(&prompt, ReedlineEvent::Down).unwrap(), EventStatus::Inapplicable));
+        set_buffer_at_end(&mut rl, "sel");
+        assert!(matches!(rl.handle_event(&prompt, ReedlineEvent::Down).unwrap(), EventStatus::Inapplicable));
+        assert_eq!(rl.editor.get_buffer(), "sel");
+    }
+
+    #[test]
+    fn down_walks_history_back_to_the_live_line_and_only_then_falls_through() {
+        let mut rl = reedline_with_history(&["select 1", "select 2"]);
+        let prompt = DefaultPrompt::default();
+        assert!(matches!(rl.handle_event(&prompt, ReedlineEvent::Up).unwrap(), EventStatus::Handled));
+        assert!(matches!(rl.handle_event(&prompt, ReedlineEvent::Up).unwrap(), EventStatus::Handled));
+        assert_eq!(rl.editor.get_buffer(), "select 1");
+        assert!(matches!(rl.handle_event(&prompt, ReedlineEvent::Down).unwrap(), EventStatus::Handled));
+        assert_eq!(rl.editor.get_buffer(), "select 2");
+        // back onto the live line: handled, buffer restored
+        assert!(matches!(rl.handle_event(&prompt, ReedlineEvent::Down).unwrap(), EventStatus::Handled));
+        assert_eq!(rl.editor.get_buffer(), "");
+        // and now there is nothing below
+        assert!(matches!(rl.handle_event(&prompt, ReedlineEvent::Down).unwrap(), EventStatus::Inapplicable));
+    }
+
+    #[test]
+    fn a_recalled_line_keeps_down_as_history_even_after_an_edit() {
+        let mut rl = reedline_with_history(&["select 1", "select 2"]);
+        let prompt = DefaultPrompt::default();
+        rl.handle_event(&prompt, ReedlineEvent::Up).unwrap();
+        rl.handle_event(&prompt, ReedlineEvent::Up).unwrap();
+        assert_eq!(rl.editor.get_buffer(), "select 1");
+        // edit the recalled line: it is still a line that came from history
+        rl.handle_event(&prompt, ReedlineEvent::Edit(vec![EditCommand::InsertChar('0')])).unwrap();
+        assert_eq!(rl.editor.get_buffer(), "select 10");
+        // Down, and Down again: the walk that finds nothing newer lands back
+        // on the edited line, which is still the recalled one
+        assert!(matches!(rl.handle_event(&prompt, ReedlineEvent::Down).unwrap(), EventStatus::Handled));
+        assert!(matches!(rl.handle_event(&prompt, ReedlineEvent::Down).unwrap(), EventStatus::Handled));
+        assert_eq!(rl.editor.get_buffer(), "select 10");
+        // Up from it walks history again, and Down comes back to it, still recalled
+        assert!(matches!(rl.handle_event(&prompt, ReedlineEvent::Up).unwrap(), EventStatus::Handled));
+        assert!(matches!(rl.handle_event(&prompt, ReedlineEvent::Down).unwrap(), EventStatus::Handled));
+        assert_eq!(rl.editor.get_buffer(), "select 10");
+        assert!(matches!(rl.handle_event(&prompt, ReedlineEvent::Down).unwrap(), EventStatus::Handled));
+        // emptied, it is a live line again
+        rl.handle_event(&prompt, ReedlineEvent::Edit(vec![EditCommand::Clear])).unwrap();
+        assert_eq!(rl.editor.get_buffer(), "");
+        assert!(matches!(rl.handle_event(&prompt, ReedlineEvent::Down).unwrap(), EventStatus::Inapplicable));
+    }
+
+    #[test]
+    fn down_inside_a_multiline_buffer_moves_the_cursor() {
+        let mut rl = reedline_with_history(&["select 1"]);
+        let prompt = DefaultPrompt::default();
+        set_buffer_at_end(&mut rl, "select\n1");
+        rl.editor.run_edit_command(&EditCommand::MoveToStart { select: false });
+        assert!(matches!(rl.handle_event(&prompt, ReedlineEvent::Down).unwrap(), EventStatus::Handled));
+        assert!(rl.editor.is_cursor_at_last_line());
+        assert!(matches!(rl.handle_event(&prompt, ReedlineEvent::Down).unwrap(), EventStatus::Inapplicable));
+    }
+
+    #[test]
+    fn a_new_line_after_a_recalled_one_is_live() {
+        let mut rl = reedline_with_history(&["select 1"]);
+        let prompt = DefaultPrompt::default();
+        rl.handle_event(&prompt, ReedlineEvent::Up).unwrap();
+        assert_eq!(rl.editor.get_buffer(), "select 1");
+        assert!(matches!(rl.handle_event(&prompt, ReedlineEvent::Down).unwrap(), EventStatus::Handled));
+        // the next read_line begins with a fresh flag, whatever the last line was
+        rl.buffer_from_history = true;
+        rl.read_line_reset_for_test();
+        set_buffer_at_end(&mut rl, "sel");
+        assert!(matches!(rl.handle_event(&prompt, ReedlineEvent::Down).unwrap(), EventStatus::Inapplicable));
     }
 
     #[cfg(feature = "bashisms")]

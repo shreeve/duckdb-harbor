@@ -1,12 +1,17 @@
 # Harbor's vendored reedline
 
 This is reedline 0.50.0, vendored here and wired via `[patch.crates-io]` in
-the workspace `Cargo.toml`, carrying three patches in `src/engine.rs`. Each is
+the workspace `Cargo.toml`, carrying four patches in `src/engine.rs`. Each is
 covered by tests in this copy (`enter_with_an_empty_menu_submits_the_line`,
 `typing_past_a_completion_then_enter_runs_the_line`,
 `a_word_boundary_closes_the_menu`, `a_word_ends_inside_a_burst_of_typing`,
 `statement_punctuation_defuses_an_always_suggesting_menu`,
-`menu_accept_only_accepts_an_active_selection`):
+`menu_accept_only_accepts_an_active_selection`,
+`down_on_the_live_line_is_inapplicable`,
+`down_walks_history_back_to_the_live_line_and_only_then_falls_through`,
+`a_recalled_line_keeps_down_as_history_even_after_an_edit`,
+`down_inside_a_multiline_buffer_moves_the_cursor`,
+`a_new_line_after_a_recalled_one_is_live`):
 
 - **Patch A** — a completion menu whose filtered suggestions are EMPTY does
   not swallow Enter: the Enter/Submit guard skips valueless menus so the
@@ -30,6 +35,18 @@ covered by tests in this copy (`enter_with_an_empty_menu_submits_the_line`,
   without submitting, so a binding can take a completion and leave Enter to
   the line. Reports `Inapplicable` when no menu is active or the active one
   has no values, so it composes under `UntilFound`.
+- **Patch D** — `ReedlineEvent::Down` reports `Inapplicable` on the live
+  line: the cursor on the buffer's last line, the buffer not recalled from
+  history (or emptied since), and no traversal in progress. Upstream always
+  reports it handled, even when it does nothing, so no binding could ever
+  fall through Down to something else. A `buffer_from_history` flag is set
+  when a history item is painted into the buffer, cleared when a walk that
+  began on the live line lands back on it (a walk from an edited recalled
+  line lands back on that line, which stays recalled) and at the start of
+  every `read_line`, and ignored once the buffer is empty. A recalled line therefore keeps Up
+  and Down as history even after an edit — the keys never change meaning
+  under a user's hands — and Down opens harbor's completion panel only
+  where history has nothing below.
 
 Harbor registers one menu, `ReedlineMenu::EngineCompleter`
 (`crates/harbor/src/repl/interactive.rs`). Patch B's boundary is therefore
@@ -52,6 +69,9 @@ Upstream status (`gh pr view <n> --repo nushell/reedline`):
   rest of the line.
 - **Patch C: merged** — https://github.com/nushell/reedline/pull/1203, landed
   upstream independently of this copy.
+- **Patch D: not filed.** It changes what `Down` reports, which upstream may
+  see as a behavior change for every binding built on it; harbor's binding
+  needs it, so it stays here until there is an upstream conversation.
 
 Also open: https://github.com/nushell/reedline/pull/1210, collapsing the
 duplicated menu-accept rule Patch A and Patch C each state separately.
@@ -59,7 +79,8 @@ duplicated menu-accept rule Patch A and Patch C each state separately.
 crates.io is at 0.51.0, which predates all three, so the earliest release
 carrying them is 0.52.
 
-When every patch is upstream AND released: delete `reedline` from
+When every patch is upstream AND released (Patch D included, or re-applied
+on top of the release): delete `reedline` from
 `[patch.crates-io]` and the `exclude` list in `harbor/Cargo.toml`,
 `rm -rf vendor/reedline`, bump the reedline version in
 `crates/harbor/Cargo.toml`, add the `with_word_chars` call to the completion

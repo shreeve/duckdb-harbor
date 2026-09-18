@@ -4,6 +4,18 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.40.1 — 2026-09-18
+
+- **Down is history until there is no history below.** Up and Down walk
+  history wherever history is: on a recalled line, edited or not, until it
+  is emptied. On the live line at the bottom — what was typed before any
+  Up, or a fresh line — Down has nothing to move to, and there it opens the
+  completion panel; open, Down moves through it and Tab accepts. Ctrl-Space
+  opens the panel anywhere. Before, Down opened the panel whenever it could,
+  which took the key away from history navigation. Reedline reports Down as
+  inapplicable on the live line (vendored Patch D) so the binding can fall
+  through to the panel.
+
 ## 0.40.0 — 2026-09-18
 
 - **Brace expansion.** A statement can carry the shell's `{a,b}`, expanded

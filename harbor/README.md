@@ -416,8 +416,9 @@ that prefix where needed for long paths.
 ### The two lifetimes
 
 **`harbor <db.duckdb>` — the server is everyone's.** On a terminal it is the
-REPL — highlighting, Tab completion, the duckdb-shell dot commands. With `-c`
-or stdin it runs statements and exits. Either way, if nothing serves the file
+REPL — highlighting, completion (Down on the live line or Ctrl-Space lists,
+Tab accepts; Up and Down are history everywhere else), the duckdb-shell dot
+commands. With `-c` or stdin it runs statements and exits. Either way, if nothing serves the file
 yet, a server is spawned behind the scenes: detached, refcounted, alive while
 anyone is connected. Every client holds one silent connection for its
 lifetime, so a human thinking at a prompt counts as presence; when the last
