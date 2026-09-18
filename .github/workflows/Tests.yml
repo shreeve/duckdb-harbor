@@ -28,6 +28,10 @@ jobs:
   quick:
     name: quick gate
     runs-on: ubuntu-latest
+    env:
+      # A harbor release whose archive supplies the engine, or empty for
+      # the channel's current build (see scripts/fetch-duckdb.sh).
+      DUCKDB_ENGINE_RELEASE: ${{ vars.DUCKDB_ENGINE_RELEASE }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
