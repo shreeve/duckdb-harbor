@@ -274,6 +274,56 @@ touching the same row do not queue, the second is refused the moment it writes.
 The answer is to run the transaction again, which is what `rip/db` does for
 you.
 
+## Brace expansion
+
+A statement can carry the shell's `{a,b}`, and Harbor expands it before the
+engine sees it. It was made for reaching into a `VARIANT` several fields at
+a time without repeating the path:
+
+```sql
+select
+  id,
+  raw_request.{
+    requisitionNumber,
+    visitDate,
+    patient.{
+      lastName,
+      firstName,
+    },
+  },
+from
+  orders
+where
+  raw_request.patient.lastName ilike 'morel'
+;
+```
+
+is what the engine runs as
+
+```sql
+select id, raw_request.requisitionNumber, raw_request.visitDate,
+           raw_request.patient.lastName, raw_request.patient.firstName,
+  from orders where raw_request.patient.lastName ilike 'morel';
+```
+
+Items are separated by commas. Whitespace alone separates them too, so the
+comma is never required, only clearer. A group nests. It can sit
+anywhere in a term — `orders_{2025,2026}`, `{first,last}Name`,
+`r.{a,b}::VARCHAR` — and two groups in one term multiply, as in a shell:
+`r.{a,b}.{x,y}` is four paths. The alternatives are joined with `, `, which is
+what a select list, a `FROM` list and an argument list all take.
+
+A struct literal is DuckDB's own use of braces, and it always carries a lone
+`:` at its top level — never the `::` of a cast — so `{'a': 1}` is left as it
+came, and so is an empty `{}`. Strings, quoted identifiers, dollar quotes and
+comments are never touched. A brace that never closes leaves the statement as
+it came, and the engine reports the syntax error at it.
+
+The expansion happens in the server, once, for every client: the REPL,
+`curl`, a Rip app. `EXPLAIN` and the engine's error messages show the
+expanded statement. DuckDB itself is untouched; it only ever receives plain
+SQL.
+
 ## The whole database, one call
 
 `GET /catalog` answers what a client would otherwise ask in a dozen queries:
