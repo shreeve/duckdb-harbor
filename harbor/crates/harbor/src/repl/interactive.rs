@@ -154,18 +154,41 @@ fn bind_completion_keys(kb: &mut Keybindings) {
         ]),
     );
 
-    // The panel is visually below the prompt, so Down opens it and subsequent
-    // Down presses move through it. If no menu is installed, retain Reedline's
-    // normal next-line/history behavior as the final fallback.
+    // Up and Down mean history wherever history is: on a recalled line,
+    // edited or not, until it is emptied. The live line at the bottom is the
+    // one place Down has nothing to do — nothing newer sits below the
+    // present — and there it opens the completion panel, which sits below
+    // the prompt where Down points. With the panel open, Down moves through
+    // it. Reedline's Down reports itself inapplicable on the live line
+    // (vendor/reedline, Patch D), which is what lets the fallback fire.
     kb.add_binding(
         KeyModifiers::NONE,
         KeyCode::Down,
         ReedlineEvent::UntilFound(vec![
             ReedlineEvent::MenuDown,
-            ReedlineEvent::Menu("completion_menu".to_string()),
             ReedlineEvent::Down,
+            ReedlineEvent::Menu("completion_menu".to_string()),
         ]),
     );
+
+    // Ctrl-Space opens the panel anywhere, history or not, the way an editor
+    // does; open, it steps to the next entry. Terminals disagree on how they
+    // send the chord — a control-modified space, or the NUL it maps to — so
+    // both spellings are bound.
+    for (modifiers, code) in [
+        (KeyModifiers::CONTROL, KeyCode::Char(' ')),
+        (KeyModifiers::CONTROL, KeyCode::Null),
+        (KeyModifiers::NONE, KeyCode::Null),
+    ] {
+        kb.add_binding(
+            modifiers,
+            code,
+            ReedlineEvent::UntilFound(vec![
+                ReedlineEvent::MenuNext,
+                ReedlineEvent::Menu("completion_menu".to_string()),
+            ]),
+        );
+    }
 
     // Right navigates an open panel first. With no panel, it accepts the inline
     // history suggestion when one exists, then falls back to cursor movement.
@@ -400,6 +423,7 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
                 println!("  {:<18} {what}", format!(".{name} {args}"));
             }
             println!("  statements end with ;   Ctrl-C clears the line");
+            println!("  Up/Down walk history; Down on the live line, or Ctrl-Space anywhere, lists completions; Tab accepts one");
         }
         other => {
             eprintln!("harbor: no such command .{other} (.help lists them)");
@@ -429,10 +453,23 @@ mod tests {
             kb.find_binding(KeyModifiers::NONE, KeyCode::Down),
             Some(ReedlineEvent::UntilFound(vec![
                 ReedlineEvent::MenuDown,
-                ReedlineEvent::Menu("completion_menu".to_string()),
                 ReedlineEvent::Down,
+                ReedlineEvent::Menu("completion_menu".to_string()),
             ]))
         );
+        for (modifiers, code) in [
+            (KeyModifiers::CONTROL, KeyCode::Char(' ')),
+            (KeyModifiers::CONTROL, KeyCode::Null),
+            (KeyModifiers::NONE, KeyCode::Null),
+        ] {
+            assert_eq!(
+                kb.find_binding(modifiers, code),
+                Some(ReedlineEvent::UntilFound(vec![
+                    ReedlineEvent::MenuNext,
+                    ReedlineEvent::Menu("completion_menu".to_string()),
+                ]))
+            );
+        }
         assert_eq!(
             kb.find_binding(KeyModifiers::NONE, KeyCode::Right),
             Some(ReedlineEvent::UntilFound(vec![
