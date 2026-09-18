@@ -744,5 +744,8 @@ mod wire {
         // could not; a JSON document round-trips byte for byte.
         row(eng, "SELECT '42'::VARIANT, '{\"n\":42,\"s\":\"42\",\"l\":[1,null]}'::JSON::VARIANT", r#""\"42\"","{\"n\":42,\"s\":\"42\",\"l\":[1,null]}""#);
         schema(eng, "SELECT 42::VARIANT AS v", r#"{"name":"v","duckdbType":"VARIANT","lossless":false,"encoding":"json"}"#);
+        // A JSON column is text that is JSON: the alias name is what the
+        // schema says, and the CLI's json modes splice such a cell by it.
+        schema(eng, "SELECT '{\"a\":1}'::JSON AS j", r#"{"name":"j","duckdbType":"JSON","lossless":true}"#);
     }
 }
