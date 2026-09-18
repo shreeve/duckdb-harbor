@@ -102,6 +102,9 @@ pub struct Renderer<'a> {
     broken: Option<std::io::ErrorKind>,
     columns: Vec<String>,
     types: Vec<String>,
+    /// Per column: the wire carries the cell as JSON text (a VARIANT), so
+    /// a display mode shows a string's content rather than its JSON.
+    unwrap: Vec<bool>,
     head: Vec<Vec<String>>,
     tail: std::collections::VecDeque<Vec<String>>,
     total: u64,
@@ -116,6 +119,7 @@ impl<'a> Renderer<'a> {
             broken: None,
             columns: Vec::new(),
             types: Vec::new(),
+            unwrap: Vec::new(),
             head: Vec::new(),
             tail: std::collections::VecDeque::new(),
             total: 0,
@@ -146,6 +150,7 @@ impl<'a> Renderer<'a> {
         // Lowercased for the type row, duckbox-style: quieter under the
         // headers, and how DuckDB's own CLI prints them.
         self.types = cols.iter().map(|c| c.duckdb_type.to_lowercase()).collect();
+        self.unwrap = cols.iter().map(|c| c.encoding.as_deref() == Some("json")).collect();
         match self.opts.mode {
             Mode::Csv => {
                 let hdr = self
@@ -198,9 +203,10 @@ impl<'a> Renderer<'a> {
                     .columns
                     .iter()
                     .zip(values.iter())
-                    .map(|(c, v)| {
+                    .enumerate()
+                    .map(|(i, (c, v))| {
                         let pad = " ".repeat(w.saturating_sub(display_width(c)));
-                        format!("{pad}{} = {}", shown_safe(c), shown_safe(&self.render(v)))
+                        format!("{pad}{} = {}", shown_safe(c), shown_safe(&self.shown(i, v)))
                     })
                     .collect();
                 self.emit(format_args!("{}\n\n", lines.join("\n")));
@@ -208,7 +214,8 @@ impl<'a> Renderer<'a> {
             Mode::List => {
                 let line = values
                     .iter()
-                    .map(|v| shown_safe(&self.render(v)))
+                    .enumerate()
+                    .map(|(i, v)| shown_safe(&self.shown(i, v)))
                     .collect::<Vec<_>>()
                     .join("|");
                 self.emit(format_args!("{line}\n"));
@@ -216,7 +223,8 @@ impl<'a> Renderer<'a> {
             Mode::Duckbox | Mode::Duckboxy | Mode::Markdown => {
                 // boxed_safe: a value with an embedded newline/tab must not
                 // shatter the frame; escape it for display only.
-                let cells: Vec<String> = values.iter().map(|v| boxed_safe(&self.render(v))).collect();
+                let cells: Vec<String> =
+                    values.iter().enumerate().map(|(i, v)| boxed_safe(&self.shown(i, v))).collect();
                 if self.head.len() < self.opts.max_rows {
                     self.head.push(cells);
                 } else {
@@ -259,6 +267,24 @@ impl<'a> Renderer<'a> {
             Value::String(s) => s.clone(),
             other => other.to_string(),
         }
+    }
+
+    /// A cell as a display mode shows it. A column the wire encodes as JSON
+    /// (a VARIANT) holds JSON text in each cell; when that text is a JSON
+    /// string, the table shows the string's content — `L2605106156`, not
+    /// `"L2605106156"` — the way a VARCHAR column has always shown a string.
+    /// A number, a boolean, a null, an object or an array keeps its JSON
+    /// text, so 42 and "42" print alike here, as they do from a VARCHAR;
+    /// csv and json stay raw and keep them apart. A SQL NULL is still the
+    /// NULL marker, and text that is not JSON shows as it came.
+    fn shown(&self, i: usize, v: &Value) -> String {
+        if self.unwrap.get(i).copied().unwrap_or(false)
+            && let Value::String(s) = v
+            && let Ok(text) = serde_json::from_str::<String>(s)
+        {
+            return text;
+        }
+        self.render(v)
     }
 
     /// The boxed layout. Rows shown: all of head when nothing spilled, else
@@ -672,6 +698,27 @@ mod tests {
         assert_eq!(csv_cell("plain"), "plain");
         assert_eq!(csv_cell("a,b"), "\"a,b\"");
         assert_eq!(csv_cell("say \"hi\""), "\"say \"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn a_variant_string_shows_its_content_in_display_modes() {
+        let opts = RenderOpts { mode: Mode::Duckbox, max_rows: 10, null: "NULL".into(), timer: false, tty: false };
+        let mut r = Renderer::new(&opts);
+        let variant = Column { encoding: Some("json".into()), duckdb_type: "VARIANT".into(), ..Column::default() };
+        let plain = Column { duckdb_type: "VARCHAR".into(), ..Column::default() };
+        r.schema(&[variant, plain]);
+        // the JSON-encoded column: a string sheds its quotes, nothing else changes
+        assert_eq!(r.shown(0, &json!("\"L2605106156\"")), "L2605106156");
+        assert_eq!(r.shown(0, &json!("\"42\"")), "42");
+        assert_eq!(r.shown(0, &json!("42")), "42");
+        assert_eq!(r.shown(0, &json!("true")), "true");
+        assert_eq!(r.shown(0, &json!("null")), "null");
+        assert_eq!(r.shown(0, &json!("{\"a\":1}")), "{\"a\":1}");
+        assert_eq!(r.shown(0, &json!("\"a\\nb\"")), "a\nb");
+        assert_eq!(r.shown(0, &Value::Null), "NULL");
+        assert_eq!(r.shown(0, &json!("not json")), "not json");
+        // a plain column is untouched, quotes and all
+        assert_eq!(r.shown(1, &json!("\"quoted\"")), "\"quoted\"");
     }
 
     #[test]
