@@ -4,6 +4,18 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.39.1 — unreleased
+
+- **The engine can be pinned to a harbor release.** `DUCKDB_ENGINE_RELEASE`
+  names a release (`v0.39.0`) whose archive supplies `libduckdb` to
+  `scripts/fetch-duckdb.sh`, CI and `Release.yml`, in place of the channel's
+  current build; the CLI and headers still come from the channel. The
+  channel is a moving pointer with no way to ask for an older build, and on
+  2026-09-17 it moved to an engine whose v2 C API had been reworked
+  (duckdb/duckdb#25751) and which this harbor cannot load. The repository
+  variable of the same name holds the pin; clearing it returns to the
+  channel.
+
 ## 0.39.0 — 2026-09-17
 
 - **A `VARIANT` column arrives over HTTP as JSON text.** It used to arrive

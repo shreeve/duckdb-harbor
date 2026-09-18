@@ -20,12 +20,21 @@
 # got exports the v2 C API, because for a month in 2026 the channel shipped
 # one that did not, and harbor refuses such an engine at dlopen.
 #
+# DUCKDB_ENGINE_RELEASE names a harbor release (`v0.39.0`) whose archive
+# supplies the library instead of the channel: every release bundles the
+# exact engine it was built and tested with, so a release is the one
+# place an older engine can be had. The CLI and the headers still come
+# from the channel, so the headers may run ahead of the library — they
+# are reference only. CI and Release.yml read the same name from the
+# repository variable of that name; clearing it returns to the channel.
+#
 # Override DEST to install elsewhere.
 
 set -euo pipefail
 
 dest=${DEST:-$HOME/.duckdb/cli/2.0.0}
 channel=${DUCKDB_CHANNEL:-v2.0-cyanoptera}
+pin=${DUCKDB_ENGINE_RELEASE:-}
 
 duck_plat=${DUCKDB_PLATFORM:-}
 if [ -z "$duck_plat" ]; then
@@ -65,6 +74,31 @@ for kind in shared-libs cli; do
   curl -fsSL -o "$work/$kind.tar.gz" "$url"
   tar -xzf "$work/$kind.tar.gz" -C "$work"
 done
+
+# ---- a pinned engine: the library from a harbor release's archive --------
+# The channel's library is discarded and the release's takes its place in
+# the work tree, so the placing and the v2 check below see one library.
+if [ -n "$pin" ]; then
+  case "$duck_plat" in
+    osx-arm64|linux-amd64|linux-arm64) ext=tar.gz ;;
+    windows-amd64|windows-arm64)       ext=zip ;;
+    *) echo "fetch-duckdb: no harbor release archive exists for $duck_plat — unset DUCKDB_ENGINE_RELEASE" >&2; exit 2 ;;
+  esac
+  url="https://github.com/shreeve/duckdb-harbor/releases/download/$pin/harbor-$pin-$duck_plat.$ext"
+  say "pinned engine: fetching $url"
+  rm -f "$work"/libduckdb.dylib "$work"/libduckdb.so "$work"/duckdb.dll "$work"/duckdb.lib
+  mkdir -p "$work/pin"
+  curl -fsSL -o "$work/pin/archive.$ext" "$url"
+  if [ "$ext" = zip ]; then
+    if command -v unzip >/dev/null; then unzip -q "$work/pin/archive.$ext" -d "$work/pin"
+    else 7z x -y -o"$work/pin" "$work/pin/archive.$ext" >/dev/null; fi
+  else
+    tar -xzf "$work/pin/archive.$ext" -C "$work/pin"
+  fi
+  [ -n "$(grab libduckdb.dylib)$(grab libduckdb.so)$(grab duckdb.dll)" ] \
+    || { echo "fetch-duckdb: $url carried no libduckdb" >&2; exit 1; }
+fi
+
 mkdir -p "$dest"
 place libduckdb.dylib    0755
 place libduckdb.so       0755
@@ -105,4 +139,4 @@ for f in "$dest"/libduckdb.dylib "$dest"/libduckdb.so "$dest"/duckdb.dll; do
   fi
   break
 done
-echo "fetch-duckdb: ready in $dest"
+echo "fetch-duckdb: ready in $dest${pin:+ (engine pinned to harbor $pin)}"

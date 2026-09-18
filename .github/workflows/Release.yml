@@ -50,6 +50,10 @@ jobs:
       # release, and its name records which (see the smoke step).
       - name: Fetch DuckDB engine
         shell: bash
+        env:
+          # A harbor release whose archive supplies the engine, or empty for
+          # the channel's current build (see scripts/fetch-duckdb.sh).
+          DUCKDB_ENGINE_RELEASE: ${{ vars.DUCKDB_ENGINE_RELEASE }}
         run: DEST="$DUCKDB_LIB" DUCKDB_PLATFORM=${{ matrix.duck_plat }} scripts/fetch-duckdb.sh
 
       # Fail FAST if the fetched library cannot serve this harbor — grep the
