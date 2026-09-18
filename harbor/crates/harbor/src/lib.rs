@@ -26,6 +26,9 @@ use crate::engine::conn::{Conn as Connection, Interrupt as InterruptHandle, Para
 mod encode;
 use encode::*;
 
+// Brace expansion, applied to every statement before the engine sees it.
+mod unbrace;
+
 /// The client half — REPL, renderer, transports. Lives in the same
 /// crate so both halves of `harbor` are one codebase with one version;
 /// the server half above never calls into it.
@@ -3308,7 +3311,7 @@ fn run_sql(
     state: &Arc<SlotState>,
     body: &str,
 ) -> (bool, u16) {
-    let parsed = match parse_request(body) {
+    let mut parsed = match parse_request(body) {
         Ok(p) => p,
         Err(e) => {
             let _ = req.respond(error_response(400, "bad_request", &e));
@@ -3319,6 +3322,13 @@ fn run_sql(
     if let Err(e) = ensure_single_statement(&parsed.sql) {
         let _ = req.respond(error_response(400, "bad_request", &e));
         return (true, 400);
+    }
+
+    // `r.{a,b}` becomes `r.a, r.b` here, once, for every client. After the
+    // statement count, which the expansion cannot change, and before the
+    // guards below, which read the statement the engine will run.
+    if let std::borrow::Cow::Owned(expanded) = unbrace::expand(&parsed.sql) {
+        parsed.sql = expanded;
     }
 
     if let Some(setting) = fenced_setting(&parsed.sql) {

@@ -4,6 +4,19 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.40.0 — 2026-09-18
+
+- **Brace expansion.** A statement can carry the shell's `{a,b}`, expanded
+  in the server before the engine sees it: `raw_request.{requisitionNumber,
+  visitDate, patient.{lastName, firstName}}` is four path expressions,
+  joined with `, `. Items are separated by commas, or by whitespace alone;
+  a group nests; it can sit anywhere in a term (`orders_{2025,2026}`,
+  `r.{a,b}::VARCHAR`) and two groups in one term multiply. A struct literal
+  — a group with a lone `:` at its top level — is left as it came, as are
+  strings, quoted identifiers, dollar quotes, comments, an empty `{}` and
+  any statement with a brace that never closes. Every client gets it, and
+  DuckDB is untouched.
+
 ## 0.39.2 — 2026-09-18
 
 - **The json modes emit a `VARIANT` or `JSON` cell as JSON.** The wire
