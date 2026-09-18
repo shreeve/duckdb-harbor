@@ -245,6 +245,7 @@ dependencies = [
  "libloading",
  "nu-ansi-term",
  "reedline",
+ "serde",
  "serde_json",
  "signal-hook 0.4.4",
  "unicode-width",

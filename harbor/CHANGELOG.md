@@ -4,6 +4,26 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.39.2 — 2026-09-18
+
+- **The json modes emit a `VARIANT` or `JSON` cell as JSON.** The wire
+  carries such a cell as JSON text, and `--mode json` / `--mode jsonlines`
+  used to quote that text as a string, so `doc.patient.age` came out as
+  `"43"` and a document as `"{\"a\":1}"` — JSON inside JSON, parsed twice
+  on the other end. The text is now spliced in as the JSON it is: `43`, an
+  object, an array, `true`, `null`. This is what `duckdb -json` does with a
+  `JSON` column. A SQL NULL and a JSON null are both `null`; the wire and
+  csv still tell them apart. The text is checked first, so a row is always
+  well-formed: `NaN` and `Infinity`, which the engine's cast writes bare and
+  JSON cannot say, stay the strings `"NaN"` and `"Infinity"`, and so does a
+  document nested more than 128 levels deep. A pretty-printed `JSON` column
+  keeps its newlines in the engine; jsonlines is one record per line, so
+  between tokens they become spaces. JSON nested inside a struct, list or
+  map column is a string, as the wire holds it. The display modes are
+  unchanged: a `VARIANT` string shows bare, a `JSON` column shows its text
+  with the quotes, as DuckDB's own table does. csv and the wire are
+  unchanged.
+
 ## 0.39.1 — 2026-09-18
 
 - **A `VARIANT` string shows without its quotes in a table.** The wire

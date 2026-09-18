@@ -15,6 +15,9 @@ libloading = "0.8"
 justhttp = { path = "../justhttp" }
 # preserve_order: --json rows must keep column order, not alphabetize it
 serde_json = { version = "1", features = ["preserve_order"] }
+# IgnoredAny: the json modes check that a JSON-text cell is JSON before
+# splicing it in, without building a tree for it
+serde = "1"
 # --- the client half (src/repl/) ---------------------------------------------
 # Pure protocol client: it never touches DuckDB. HTTP/1.1 over
 # UnixStream/TcpStream is hand-rolled because dragging an async stack in

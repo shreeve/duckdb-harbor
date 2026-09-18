@@ -89,6 +89,38 @@ impl Default for RenderOpts {
     }
 }
 
+/// What the wire put in a column's cells.
+///
+/// A `Variant` column's schema says `encoding: json`: the engine cast each
+/// value to JSON text, minified. A `JsonColumn` is the `JSON` type, whose
+/// cast to text is the JSON itself — validated, but exactly as written, so
+/// it may be pretty-printed. Both are JSON text, and the json modes splice
+/// them in as JSON. Only a VARIANT string sheds its quotes in a display
+/// mode: a JSON column is text that is JSON, its quotes are part of the
+/// value, and DuckDB's own table shows them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Cell {
+    Plain,
+    JsonColumn,
+    Variant,
+}
+
+impl Cell {
+    fn of(c: &Column) -> Cell {
+        if c.encoding.as_deref() == Some("json") {
+            Cell::Variant
+        } else if c.duckdb_type.eq_ignore_ascii_case("JSON") {
+            Cell::JsonColumn
+        } else {
+            Cell::Plain
+        }
+    }
+
+    fn is_json_text(self) -> bool {
+        self != Cell::Plain
+    }
+}
+
 /// Streaming renderer: fed one event at a time, finishes on `end`.
 ///
 /// Pipe modes write through one BufWriter — a large export costs pages, not
@@ -102,9 +134,8 @@ pub struct Renderer<'a> {
     broken: Option<std::io::ErrorKind>,
     columns: Vec<String>,
     types: Vec<String>,
-    /// Per column: the wire carries the cell as JSON text (a VARIANT), so
-    /// a display mode shows a string's content rather than its JSON.
-    unwrap: Vec<bool>,
+    /// Per column, what the wire put in the cell.
+    cells: Vec<Cell>,
     head: Vec<Vec<String>>,
     tail: std::collections::VecDeque<Vec<String>>,
     total: u64,
@@ -119,7 +150,7 @@ impl<'a> Renderer<'a> {
             broken: None,
             columns: Vec::new(),
             types: Vec::new(),
-            unwrap: Vec::new(),
+            cells: Vec::new(),
             head: Vec::new(),
             tail: std::collections::VecDeque::new(),
             total: 0,
@@ -150,7 +181,7 @@ impl<'a> Renderer<'a> {
         // Lowercased for the type row, duckbox-style: quieter under the
         // headers, and how DuckDB's own CLI prints them.
         self.types = cols.iter().map(|c| c.duckdb_type.to_lowercase()).collect();
-        self.unwrap = cols.iter().map(|c| c.encoding.as_deref() == Some("json")).collect();
+        self.cells = cols.iter().map(Cell::of).collect();
         match self.opts.mode {
             Mode::Csv => {
                 let hdr = self
@@ -181,11 +212,11 @@ impl<'a> Renderer<'a> {
                 self.emit(format_args!("{line}\n"));
             }
             Mode::JsonLines => {
-                let obj = json_row(&self.columns, &values);
+                let obj = json_row(&self.columns, &self.cells, &values);
                 self.emit(format_args!("{obj}\n"));
             }
             Mode::Json => {
-                let obj = json_row(&self.columns, &values);
+                let obj = json_row(&self.columns, &self.cells, &values);
                 let sep = if self.emitted_first_json { "," } else { "" };
                 self.emitted_first_json = true;
                 self.emit(format_args!("{sep}\n{obj}"));
@@ -278,7 +309,7 @@ impl<'a> Renderer<'a> {
     /// csv and json stay raw and keep them apart. A SQL NULL is still the
     /// NULL marker, and text that is not JSON shows as it came.
     fn shown(&self, i: usize, v: &Value) -> String {
-        if self.unwrap.get(i).copied().unwrap_or(false)
+        if self.cells.get(i) == Some(&Cell::Variant)
             && let Value::String(s) = v
             && let Ok(text) = serde_json::from_str::<String>(s)
         {
@@ -607,7 +638,28 @@ fn boxed_safe(s: &str) -> String {
 /// `{"a":1,"a":2}` is what `duckdb -json` emits too; syntactically valid,
 /// and the consumer's parser picks its own policy. serde_json::Map would
 /// silently collapse them, so the object is assembled by hand.
-fn json_row(columns: &[String], values: &[Value]) -> String {
+///
+/// A top-level column the wire carries as JSON text (a VARIANT or a JSON
+/// column) is spliced in as that JSON, so `doc.patient.age` reads as `43`
+/// and a document as an object, the way `duckdb -json` emits a JSON
+/// column. Quoting the text as a string would be JSON inside JSON, and the
+/// reader would have to parse twice. A SQL NULL and a JSON null both come
+/// out as `null` — the consumer's `JSON.parse` gives the same value either
+/// way; the wire and csv still tell them apart. JSON nested inside a
+/// STRUCT, LIST or MAP column stays a string, as the wire holds it.
+///
+/// The text is checked before it goes in, so a row is always well-formed.
+/// What fails the check stays a string: `NaN` and `Infinity`, which the
+/// engine's JSON cast writes bare and JSON has no word for; a document
+/// nested more than 128 levels deep, serde_json's limit. A wide integer
+/// (a HUGEINT put inside a VARIANT) passes and is spliced as a bare number,
+/// where the same value in its own column is the envelope's JSON-safe
+/// string; that is what `duckdb -json` does, and a consumer wanting the
+/// digits reads csv. A JSON column keeps its text as written, so a
+/// pretty-printed document carries newlines between its tokens; valid JSON
+/// has no raw newline anywhere else, and jsonlines is one record per line,
+/// so they become spaces.
+fn json_row(columns: &[String], cells: &[Cell], values: &[Value]) -> String {
     let mut s = String::from("{");
     for (i, (c, v)) in columns.iter().zip(values.iter()).enumerate() {
         if i > 0 {
@@ -615,7 +667,19 @@ fn json_row(columns: &[String], values: &[Value]) -> String {
         }
         s.push_str(&serde_json::to_string(c).expect("strings serialize"));
         s.push(':');
-        s.push_str(&v.to_string());
+        match v {
+            Value::String(text)
+                if cells.get(i).is_some_and(|c| c.is_json_text())
+                    && serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok() =>
+            {
+                if text.contains(['\n', '\r']) {
+                    s.extend(text.chars().map(|ch| if ch == '\n' || ch == '\r' { ' ' } else { ch }));
+                } else {
+                    s.push_str(text);
+                }
+            }
+            _ => s.push_str(&v.to_string()),
+        }
     }
     s.push('}');
     s
@@ -725,8 +789,53 @@ mod tests {
     fn json_rows_keep_duplicate_keys() {
         let cols = vec!["a".to_string(), "a".to_string(), "b\"q".to_string()];
         let vals = vec![json!(1), json!(2), json!(null)];
-        assert_eq!(json_row(&cols, &vals), r#"{"a":1,"a":2,"b\"q":null}"#);
-        assert_eq!(json_row(&[], &[]), "{}");
+        assert_eq!(json_row(&cols, &[Cell::Plain; 3], &vals), r#"{"a":1,"a":2,"b\"q":null}"#);
+        assert_eq!(json_row(&[], &[], &[]), "{}");
+    }
+
+    #[test]
+    fn json_rows_splice_json_text_cells() {
+        let cols = vec!["v".to_string(), "s".to_string()];
+        let flags = [Cell::Variant, Cell::Plain];
+        // a VARIANT string, number, object, array and JSON null go in as JSON
+        assert_eq!(json_row(&cols, &flags, &[json!("\"Steve\""), json!("x")]), r#"{"v":"Steve","s":"x"}"#);
+        assert_eq!(json_row(&cols, &flags, &[json!("43"), json!("43")]), r#"{"v":43,"s":"43"}"#);
+        assert_eq!(json_row(&cols, &flags, &[json!("{\"a\":[1,\"2\",null]}"), json!(null)]), r#"{"v":{"a":[1,"2",null]},"s":null}"#);
+        assert_eq!(json_row(&cols, &flags, &[json!("null"), json!("null")]), r#"{"v":null,"s":"null"}"#);
+        assert_eq!(json_row(&cols, &flags, &[json!("true"), json!(true)]), r#"{"v":true,"s":true}"#);
+        // a SQL NULL is null, as it always was
+        assert_eq!(json_row(&cols, &flags, &[Value::Null, Value::Null]), r#"{"v":null,"s":null}"#);
+        // text that is not JSON stays a string: the object is never malformed
+        assert_eq!(json_row(&cols, &flags, &[json!("not json"), json!("x")]), r#"{"v":"not json","s":"x"}"#);
+        assert_eq!(json_row(&cols, &flags, &[json!("1 2"), json!("x")]), r#"{"v":"1 2","s":"x"}"#);
+        // a plain column holding JSON-looking text is a string, untouched
+        assert_eq!(json_row(&cols, &flags, &[json!("1"), json!("{\"a\":1}")]), r#"{"v":1,"s":"{\"a\":1}"}"#);
+        // what the engine's cast writes that JSON cannot say stays a string
+        assert_eq!(json_row(&cols, &flags, &[json!("NaN"), json!("x")]), r#"{"v":"NaN","s":"x"}"#);
+        assert_eq!(json_row(&cols, &flags, &[json!("-Infinity"), json!("x")]), r#"{"v":"-Infinity","s":"x"}"#);
+        // a wide integer and duplicate keys go in as they are
+        assert_eq!(json_row(&cols, &flags, &[json!("170141183460469231731687303715884105727"), json!("x")]), r#"{"v":170141183460469231731687303715884105727,"s":"x"}"#);
+        assert_eq!(json_row(&cols, &flags, &[json!("{\"a\":1,\"a\":2}"), json!("x")]), r#"{"v":{"a":1,"a":2},"s":"x"}"#);
+        // a JSON column is spliced too, and a pretty-printed one stays on one line
+        let json = [Cell::JsonColumn, Cell::Plain];
+        assert_eq!(json_row(&cols, &json, &[json!("{\n  \"a\": 1\r\n}"), json!("x")]), "{\"v\":{   \"a\": 1  },\"s\":\"x\"}");
+        assert_eq!(json_row(&cols, &json, &[json!("\"line\\nbreak\""), json!("x")]), r#"{"v":"line\nbreak","s":"x"}"#);
+    }
+
+    #[test]
+    fn a_column_is_classed_by_what_the_wire_put_in_it() {
+        let opts = RenderOpts { mode: Mode::Json, max_rows: 10, null: "NULL".into(), timer: false, tty: false };
+        let mut r = Renderer::new(&opts);
+        let variant = Column { encoding: Some("json".into()), duckdb_type: "VARIANT".into(), ..Column::default() };
+        let json = Column { duckdb_type: "JSON".into(), ..Column::default() };
+        let plain = Column { duckdb_type: "VARCHAR".into(), ..Column::default() };
+        r.schema(&[variant, json, plain]);
+        assert_eq!(r.cells, vec![Cell::Variant, Cell::JsonColumn, Cell::Plain]);
+        // only a VARIANT string sheds its quotes in a display mode; a JSON
+        // column's quotes are part of its text, as DuckDB's own table shows them
+        assert_eq!(r.shown(0, &json!("\"abc\"")), "abc");
+        assert_eq!(r.shown(1, &json!("\"abc\"")), "\"abc\"");
+        assert_eq!(r.shown(2, &json!("\"abc\"")), "\"abc\"");
     }
 
     #[test]
