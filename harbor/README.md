@@ -377,6 +377,16 @@ release archives below bundle the engine they were built with, so a release
 is reproducible; a local fetch is deliberately current. The script refuses a
 library that lacks the v2 C API, since harbor would refuse it at dlopen.
 
+`DUCKDB_ENGINE_RELEASE=v0.39.0` names a harbor release whose archive supplies
+`libduckdb` in place of the channel's current build; the CLI and headers still
+come from the channel. Every release bundles the exact engine it was built and
+tested with, so a release is the one place an older engine can be had when the
+channel moves to one harbor cannot load — as it did when the v2 C API was
+reworked (duckdb/duckdb#25751). The repository variable of the same name pins
+CI and the release builds; clearing it returns to the channel. Set it locally
+to match while the variable is set, or `make fetch-duckdb` hands harbor an
+engine it refuses.
+
 No toolchain? One command installs the latest release — it picks the right
 archive for the platform, verifies its sha256 against the published checksums,
 and installs `harbor` into `~/.local/bin` with `libduckdb` in `~/.local/lib`
@@ -412,6 +422,15 @@ archives carry `bin/`, `lib/` and `install.sh`; Windows archives put
 On Windows, banners and fleet displays omit the `\\?\` prefix for readability.
 File access, configuration, and `/info` keep native canonical paths, including
 that prefix where needed for long paths.
+
+Linux archives are built on Ubuntu 24.04 and need glibc 2.39 or newer; on an
+older distribution, build from source with `cargo build --release`.
+
+cmd.exe does not treat single quotes as quoting, so a curl example written for
+a Unix shell sends its body starting with a literal `'` there. Put the JSON in
+a file and pass `-d @query.json`, which reads the same in every shell, or
+double-quote the body and escape the quotes inside it. In PowerShell, `curl`
+is an alias for Invoke-WebRequest; call `curl.exe`.
 
 ### The two lifetimes
 
@@ -509,6 +528,33 @@ A socket nothing answers on is a leftover from a `kill -9`, and the list
 unlinks it. Set `HARBOR_HOME` (absolute path) to collapse configuration and
 runtime state — sockets, logs, and history — into one directory; the test
 suites use it to keep their servers out of the real fleet view.
+
+### Output modes
+
+`--mode <m>` picks how results are rendered, and `.mode <m>` changes it at the
+prompt. The display modes — `duckbox` (the default at a terminal), `duckboxy`
+(the same without the type row), `markdown`, `line` and `list` — are for eyes.
+The data modes — `csv`, `json` and `jsonlines` (`--json` is shorthand) — are
+for programs, and boxed output on a pipe gets a hint to pick one. `trash`
+discards results and reports only errors.
+
+The modes differ in how they treat a `VARIANT` or `JSON` cell, which the wire
+carries as JSON text. A display mode shows a `VARIANT` string bare — a value
+read by path, `raw_request.requisitionNumber`, shows as `L2605106156`, the way
+a `VARCHAR` always has — while a number, a boolean, a null, an object or an
+array shows as its JSON; a `JSON` column shows its text with the quotes, as
+DuckDB's own table does. Cast a path to `JSON` to see the quotes in a table.
+`csv` carries the JSON text CSV-escaped, so `42` and `"42"` stay apart for the
+program on the other end. `json` and `jsonlines` splice the cell in as the JSON
+it is — `43`, not `"43"`; a document, not a string holding one — for both
+column types; a SQL `NULL` and a JSON null are both `null` there. The text is
+checked before it is spliced, so a record is always well-formed: `NaN` and
+`Infinity`, which the engine writes bare and JSON cannot say, stay the strings
+`"NaN"` and `"Infinity"`, as does a document nested more than 128 levels deep.
+A pretty-printed `JSON` column keeps its newlines in the engine; `jsonlines` is
+one record per line, so between tokens they become spaces. JSON nested inside a
+struct, list or map column is a string, as the wire holds it. The wire itself
+is untouched by any mode.
 
 ### Backup and restore
 
@@ -951,14 +997,13 @@ The server implements its protocol shapes directly rather than depending on
 compile error. Nothing links `libduckdb` — the engine loads on demand — so no
 DuckDB source tree, library, or header is required to build: `make harbor`
 works on a bare machine, and `make fetch-duckdb` fetches the duckdb CLI plus
-a library (see the GA caveat under "Get it running" — until then a serving
-engine is built at CI's pin). The crate ships pregenerated bindings, so
-there is no bindgen.
+a library (honoring `DUCKDB_ENGINE_RELEASE`, under "Get it running"). The
+crate ships pregenerated bindings, so there is no bindgen.
 
 `make unit` runs the fast Rust tests and `make test` runs the full suite. The
 full suite expects `sample.duckdb`; create it with
 `test/scripts/fixture.sh sample.duckdb` when it is absent. CI performs that
-fixture step explicitly. The twelve suites use independent oracles where answers
+fixture step explicitly. The thirteen suites use independent oracles where answers
 need comparison — values read from the database file before the server takes
 the lock, and Python's own `datetime` and `base64` for fuzzed values. An oracle
 that shares an implementation with the thing it checks confirms only that the
