@@ -82,8 +82,9 @@ and unix sockets; a first-party fork).
 Facts that shape everything:
 
 - **Nothing links `libduckdb`.** The engine is loaded at runtime:
-  `HARBOR_LIBDUCKDB` first, then `../lib` beside the binary, `~/.local/lib`,
-  then `~/.duckdb/cli/*`. The client half runs with no engine at all.
+  `HARBOR_LIBDUCKDB` first, then `../lib` beside the binary and the binary's
+  own directory, `~/.local/lib`, `~/.duckdb/cli/latest`, then the newest
+  `~/.duckdb/cli/<version>`. The client half runs with no engine at all.
 - **One process per database file.** DuckDB's own file lock is the mutex.
   There is no registry; the listening unix socket is the registration.
   `harbor <db>` on a terminal is the REPL and spawns a server behind the
@@ -109,7 +110,7 @@ Facts that shape everything:
 cd harbor
 make harbor            # cargo build -p harbor --release → target/release/harbor
 make unit              # cargo test --release --workspace --all-features
-make test              # test/scripts/check.sh: the twelve integration suites
+make test              # test/scripts/check.sh: unit plus the thirteen integration suites
 make test SUITES="regressions spec"      # a subset
 make fetch-duckdb      # engine + CLI + headers into ~/.duckdb/cli/2.0.0
 make install           # copy the binary to ~/.local/bin
@@ -119,7 +120,8 @@ The suites live in `test/scripts/` and each file's header says what it
 proves. The ones to reach for: `regressions` (request isolation, settings,
 limits), `spec` (the wire encoding, spelled out), `types` (every DuckDB
 type), `hostile` (adversarial HTTP input, statement smuggling), `roundtrip`
-(backup/restore fidelity), `sessions`, `cancel`, `catalog`, `lifecycle`,
+(backup/restore fidelity), `asserts` (answers checked against an independent
+oracle, curl in and NDJSON out), `sessions`, `cancel`, `catalog`, `lifecycle`,
 `stress`, `fuzz`, `deployment`. CI's quick gate runs
 `unit lifecycle types spec catalog sessions cancel`; `FullSuite.yml` runs
 all of them on every push to main and nightly at 23:41 UTC.
@@ -189,7 +191,22 @@ separate PR. The flow, which the last three releases followed exactly:
 6. Install and prove it: the one-liner, `harbor --version`, one real query.
 
 Patch versions are for fixes and refinements; a new capability is a minor
-bump (brace expansion was 0.40.0).
+bump (brace expansion was 0.40.0). A documentation-only change needs no
+version and no changelog entry.
+
+DuckTable releases are one commit on main titled "DuckTable X.Y.Z": bump
+`version` in `ducktable/Cargo.toml`, run `cargo update -w` there (the
+lockfile also records harbor-common and wire, so release harbor first when
+both ship), add the changelog entry, and bump the Sparkle pin — every
+DuckTable release ships the latest stable Sparkle, never a beta: set
+`sparkle_version` and `sparkle_sha256` together in `scripts/sparkle.sh`,
+the path in `docs/UPDATES.md`, and say so in the changelog. Prove the bundle
+with `scripts/macos-app.sh release` (check the embedded
+`Sparkle.framework` version), then push an annotated `ducktable-vX.Y.Z` tag.
+`DuckTableRelease.yml` publishes `DuckTable.zip` on the versioned release and
+rewrites the `ducktable-updates` feed; confirm `appcast.xml` lists the new
+version first. That feed release stays a prerelease so `/releases/latest`
+remains harbor's.
 
 The install one-liner, everywhere:
 
@@ -279,6 +296,12 @@ usable end to end.
   `ducktable/docs/`. Its Sparkle signing keys live in the gitignored,
   untracked `notes.txt` at the repo root and in the `SPARKLE_PRIVATE_KEY`
   repository secret. Never commit that file.
+- **Linux glibc floor.** Release archives are built on Ubuntu 24.04 and
+  need glibc 2.39; the README and the release notes say so. Building on an
+  older baseline (a manylinux container or cargo-zigbuild) would run on
+  older distributions without changing harbor, and is deliberately not
+  scheduled; issue #56 was closed with an offer to revisit if it blocks
+  someone.
 - **Optional polish:** a distinct color for braces in the highlighter; the
   brace expander could take aliases inside a group if a syntax that does
   not collide with the struct-literal colon is chosen.

@@ -230,7 +230,10 @@ nothing is patched, and nothing is built here: `make fetch-duckdb`, CI and
 the release workflow all pull the same two tarballs per platform through one
 script. The channel is the latest green build and cannot be asked for an
 older one, so CI runs against DuckDB's current main and a release archive
-is what pins an engine — it bundles the build it was made with. (For a
+is what pins an engine — it bundles the build it was made with, and
+`DUCKDB_ENGINE_RELEASE` names a release whose archive supplies the library
+in place of the channel, for the local fetch, CI and the release builds
+alike, when the channel moves to an engine harbor cannot load. (For a
 month in 2026 the channel shipped a library without the v2 C API and harbor
 built its own from source at a pinned commit; that scaffolding is gone, and
 the fetch script refuses such a library should it recur.) Verified: one
