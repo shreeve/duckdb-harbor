@@ -155,15 +155,24 @@ of the 2.0 branch (`artifacts.duckdb.org/v2.0-cyanoptera`) via
 API (duckdb/duckdb#25751: `open` → `database_create` + `database_attach`,
 `connect` → `connection_create`, options by name, seventeen renames) and
 harbor's loader refuses it ("engine has no v2 C API"). The repository
-variable `DUCKDB_ENGINE_RELEASE=v0.39.0` makes the fetch script take
-`libduckdb` from that harbor release's archive (engine build alpha42289)
-while the CLI and headers still come from the channel. `Tests.yml`,
-`FullSuite.yml` and `Release.yml` all honor it. Every release from 0.39.0
-through 0.40.1 carries alpha42289 on all five platforms.
+variable `DUCKDB_LIB_BUILD=alpha42289` makes the fetch script take
+`libduckdb` from the `engine-alpha42289` release of this repository (one
+`libduckdb-<plat>.tar.gz` per platform, a pre-release so `/releases/latest`
+never points at it) while the CLI and headers still come from the channel.
+`Tests.yml`, `FullSuite.yml` and `Release.yml` all honor it, and so does a
+local `DUCKDB_LIB_BUILD=alpha42289 make fetch-duckdb`; without it a local
+fetch refuses the channel's engine. `latest`, or no value, is the channel.
+Every release from 0.39.0 through 0.40.1 carries alpha42289 on all five
+platforms, and the engine release holds those same libraries byte for byte.
+
+The fetch script and `Release.yml` decide "can this engine serve harbor" by
+looking for `duckdb_v2_create_environment`, the symbol the loader gates on
+in `engine/mod.rs`. The port to the reworked API changes what the loader
+gates on, and those two greps change with it.
 
 The way forward is to port to the reworked API once DuckDB's naming settles
 (re-run `gen-v2-ffi.rb` against the new spec, fix the seventeen call sites),
-then clear the variable. DuckDB 2.0 GA is expected in the second half of
+then set the variable to `latest`. DuckDB 2.0 GA is expected in the second half of
 October 2026. Upstream issues harbor has filed and watches: duckdb#25282
 (nap race), duckdb#25301 (prepare cost), duckdb-rs#841. A DuckDB VARIANT
 cast bug we hit is duckdb#25873.
@@ -274,6 +283,7 @@ stored as a string and every path into it is NULL, silently.
 | 0.39.2 | 09-18 | json/jsonlines emit VARIANT and JSON cells as JSON |
 | 0.40.0 | 09-18 | brace expansion in the server |
 | 0.40.1 | 09-18 | Down is history until there is no history below; Ctrl-Space lists |
+| 0.40.2 | 09-20 | engine named by DuckDB build, `DUCKDB_LIB_BUILD`; fetch checks before it installs |
 
 Older milestones the code still reflects: 0.20 collapsed everything into
 one binary with the refcounted lifetime; 0.21 moved to the direct v2 C API
@@ -283,8 +293,8 @@ usable end to end.
 
 ## Open items
 
-- **Port to DuckDB's reworked v2 C API**, then clear the
-  `DUCKDB_ENGINE_RELEASE` repository variable. Wait for the naming to
+- **Port to DuckDB's reworked v2 C API**, then set the
+  `DUCKDB_LIB_BUILD` repository variable to `latest`. Wait for the naming to
   settle; there was reviewer discussion upstream about instance-versus-
   database option scope.
 - **Un-vendor reedline** when 0.52 ships with patches A–C, re-applying D on
