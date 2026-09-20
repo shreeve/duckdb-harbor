@@ -229,7 +229,7 @@ impl<'a> Text<'a> {
         let mut depth = 0usize;
         let mut start = from;
         let mut i = from;
-        let mut push = |items: &mut Vec<&'a str>, s: usize, e: usize| {
+        let push = |items: &mut Vec<&'a str>, s: usize, e: usize| {
             if e > s {
                 items.push(&self.src[s..e]);
             }
