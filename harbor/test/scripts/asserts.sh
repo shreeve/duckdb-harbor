@@ -498,8 +498,35 @@ eq "a string param that spells JSON is a string" "VARCHAR" \
    "$(post "$aimed" '["{\"a\":1}"]' | nd 'rows[0][0]')"
 eq "an object param aimed nowhere is its text" "VARCHAR" \
    "$(post 'SELECT typeof(?) AS t' '[{"a":1}]' | nd 'rows[0][0]')"
-eq "a param nested past the body's depth is refused" "400" \
-   "$(raw "{\"sql\":\"SELECT ?\",\"params\":[$(printf '[%.0s' $(seq 200))$(printf ']%.0s' $(seq 200))]}" | tail -1)"
+# Into a real column and back out, one row and several. The column lives in
+# an attached in-memory database: the fixture's storage version predates
+# VARIANT columns, and an attachment is the whole server's, every worker's.
+post "ATTACH ':memory:' AS scratch" > /dev/null
+post 'CREATE TABLE scratch.docs(id INTEGER PRIMARY KEY, doc VARIANT)' > /dev/null
+post 'INSERT INTO scratch.docs VALUES (1, ?)' '[{"a":{"b":7},"tags":["x","y"]}]' > /dev/null
+eq "an object param stored in a VARIANT column is the document" "OBJECT(a, tags)|7|x" \
+   "$(post 'SELECT variant_typeof(doc), doc.a.b::INTEGER, doc.tags[1]::VARCHAR FROM scratch.docs WHERE id = 1' \
+      | nd '"|".join(str(v) for v in rows[0])')"
+post 'INSERT INTO scratch.docs VALUES (2, ?), (3, ?)' '[{"k":2},[3,4]]' > /dev/null
+eq "each document of a multi-row VALUES is one" "OBJECT(k)|ARRAY(2)" \
+   "$(post 'SELECT variant_typeof(doc) FROM scratch.docs WHERE id IN (2, 3) ORDER BY id' | nd '"|".join(r[0] for r in rows)')"
+eq "IN (?, ?) finds the documents" "2|3" \
+   "$(post 'SELECT id FROM scratch.docs WHERE doc IN (?, ?) ORDER BY id' '[{"k":2},[3,4]]' | nd '"|".join(str(r[0]) for r in rows)')"
+eq "IS NOT DISTINCT FROM ? finds one" "2" \
+   "$(post 'SELECT id FROM scratch.docs WHERE doc IS NOT DISTINCT FROM ?' '[{"k":2}]' | nd '"|".join(str(r[0]) for r in rows)')"
+post 'INSERT INTO scratch.docs VALUES (4, ?), (5, ?)' '[{},[]]' > /dev/null
+eq "an empty object and an empty array are documents too" "OBJECT()|ARRAY(0)" \
+   "$(post 'SELECT variant_typeof(doc) FROM scratch.docs WHERE id IN (4, 5) ORDER BY id' | nd '"|".join(r[0] for r in rows)')"
+# The request parser reads 127 levels and the body's own { "params": [ … ] }
+# is two of them, so a document param nests 125 levels and no further.
+nested() { printf '{"sql":"INSERT INTO scratch.docs VALUES (%d, ?)","params":[%s%s]}' \
+             "$1" "$(printf '[%.0s' $(seq "$1"))" "$(printf ']%.0s' $(seq "$1"))"; }
+eq "a param nested 125 levels binds" "200" "$(raw "$(nested 125)" | tail -1)"
+eq "and is stored at that depth" "250" \
+   "$(scalar 'SELECT length(doc::JSON::VARCHAR) FROM scratch.docs WHERE id = 125')"
+eq "a param nested 126 levels is refused" "400" "$(raw "$(nested 126)" | tail -1)"
+eq "and nothing was stored" "0" "$(scalar 'SELECT count(*) FROM scratch.docs WHERE id = 126')"
+post 'DETACH scratch' > /dev/null
 
 # ---------------------------------------------------------------------------
 section "One statement per request"

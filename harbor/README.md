@@ -199,7 +199,11 @@ Cancelling a statement inside a transaction aborts that transaction, exactly as
 it does in Postgres. Harbor does not paper over it — the next statement gets
 `Current transaction is aborted (please ROLLBACK)` until you do. Rolling back
 silently would let the statement after a cancellation commit in autocommit
-under a client that still believed it was in a transaction.
+under a client that still believed it was in a transaction. A cancel that
+lands before the statement has begun to execute — while an object or array
+parameter is still being bound, or before an executor has picked the statement
+up — answers the same 499 and leaves the transaction as it was, open and
+holding its writes, because nothing ran.
 
 ## Transactions
 
@@ -555,7 +559,9 @@ it is — `43`, not `"43"`; a document, not a string holding one — for both
 column types; a SQL `NULL` and a JSON null are both `null` there. The text is
 checked before it is spliced, so a record is always well-formed: `NaN` and
 `Infinity`, which the engine writes bare and JSON cannot say, stay the strings
-`"NaN"` and `"Infinity"`, as does a document nested more than 128 levels deep.
+`"NaN"` and `"Infinity"`. The check does not recurse and has no depth limit, so
+a document is spliced whole however deep it nests, and a consumer whose parser
+stops at some depth meets that in its own parser.
 A pretty-printed `JSON` column keeps its newlines in the engine; `jsonlines` is
 one record per line, so between tokens they become spaces. JSON nested inside a
 struct, list or map column is a string, as the wire holds it. The wire itself
@@ -630,7 +636,7 @@ means and is not reported. `--strict` refuses instead of writing the note.
 | | tsv | parquet |
 | --- | --- | --- |
 | `UNION` | loses its tag — the restore refuses | ✅ |
-| `VARIANT` nested in a `STRUCT`, `LIST` or `MAP` | contents come back retyped, *silently* | ✅ |
+| `VARIANT` nested in a `STRUCT`, `LIST` or `MAP` | would come back retyped — refused | no writer for it — refused |
 | `VARIANT` holding a `DATE`, `DECIMAL`, `BLOB`, … | JSON's nearest type, *said out loud* | ✅ |
 | `VARIANT` holding an `INTERVAL`, `BIGNUM`, `BIT`, … | JSON's nearest type, *said out loud* | refused outright |
 | negative `INTERVAL` | ✅ | refused outright |
@@ -641,7 +647,7 @@ that format can preserve all its types, and the change is reported:
 
 ```console
 $ harbor mydata.duckdb backup
-harbor: settings is parquet, not text — a VARIANT nested inside another type comes back retyped
+harbor: settings is parquet, not text — a UNION loses its tag
 harbor: backed up 14 tables to ~/db/mydata.backups/20260909051315 (612K)
 ```
 
@@ -651,8 +657,20 @@ throughout — with the same swap running the other way for a `TIMETZ` column �
 and `--strict` refuses rather than swapping, for a backup that has to be one
 format or nothing. What no mode will do is write something that will not come
 back without saying so: a negative interval under `--format parquet` is an
-error. A table combining UNION or a nested VARIANT with TIMETZ is refused
-because neither whole-table format preserves it.
+error. A table combining UNION with TIMETZ is refused because neither
+whole-table format preserves it. So is a table holding a `VARIANT[]`, a
+`STRUCT(v VARIANT)` or a `MAP(VARCHAR, VARIANT)`, in either format: text
+reaches only a plain `VARIANT` column and parquet has no writer for one below
+the root. The whole backup stops there and no directory is written —
+
+```console
+$ harbor mydata.duckdb backup
+harbor: settings cannot round-trip in either backup format: parquet has no writer for a VARIANT nested inside another type
+```
+
+— and under `--format parquet` the refusal is the engine's own `Not
+implemented Error`. Keep a `VARIANT` a plain column, or hold the nested shape
+inside one `VARIANT` document, and the table backs up.
 
 The whole of this is a test suite rather than a claim: `test/scripts/roundtrip.py`
 backs up and restores every type in the shared corpus, a schema of constraints
@@ -883,8 +901,12 @@ and scale for `DECIMAL` and nested `child`/`fields` for `LIST` and `STRUCT`, so
 a typed client can reconstruct exactly what DuckDB had rather than a lossy JSON
 approximation. Values JSON cannot hold exactly are quoted rather than emitted
 as bare numbers, so an integer past 2^53 does not silently reprecision in a
-JavaScript client. Where something genuinely cannot survive, the column says so
-with `"lossless": false` instead of returning a plausible wrong answer.
+JavaScript client. Where something genuinely cannot survive, the schema says so
+with `"lossless": false` instead of returning a plausible wrong answer. The
+flag sits on the type that loses: for a `VARIANT[]`, a `STRUCT(v VARIANT)` or a
+`MAP(VARCHAR, VARIANT)` that is the `child`, the field or the `valueType`, and
+the column's own entry still reads `"lossless": true`, so a client that wants
+the answer for a nested column reads the nested entries too.
 
 ## Where it fits
 
@@ -931,10 +953,22 @@ bits, nested nulls — with these known edges, all measured on the engine:
   parameter, is stored as a string, not parsed: `'{"a":1}'` lands as the text
   `{"a":1}`, a client gets `"{\"a\":1}"` back, and every path into it is NULL.
   Write `'{"a":1}'::JSON`, or `$1::JSON` for a parameter, and it lands as an
-  object. `'…'::VARIANT` does not parse either. A
-  `CHECK (v IS NULL OR variant_typeof(v) LIKE 'OBJECT%')` refuses the mistake
-  at write time. The same applies to a column conversion: use
+  object. `'…'::VARIANT` does not parse either. The same applies to a column
+  conversion: use
   `ALTER TABLE t ALTER COLUMN c SET DATA TYPE VARIANT USING c::JSON::VARIANT`.
+  harbor's object and array parameters, Rip's ORM and DuckTable's editor all
+  write a document as a document, so the mistake is one hand-written SQL makes.
+- *A `CHECK` on `variant_typeof` blocks a tsv restore.*
+  `CHECK (v IS NULL OR variant_typeof(v) LIKE 'OBJECT%')` does refuse the
+  unparsed string at write time, and with it every array, every scalar and
+  every JSON string, which are documents too. It also breaks the default
+  backup: `harbor backup` writes the table without complaint and `harbor
+  restore` then fails with `Constraint Error: CHECK constraint failed`, because
+  `load.sql` lands each `VARIANT` cell as a string and `after.sql` decodes it
+  only afterwards, and the constraint is checked in between. `--format parquet`
+  carries the column as itself and restores the same table. A table with such
+  a constraint is backed up with `--format parquet`, and the constraint is not
+  a general guard.
 - *An object or array parameter is a document.* `"params": [{"a":1}]` aimed at
   a `VARIANT` — a column in `SET` or `VALUES`, a comparison against one, a
   `coalesce` with one — is bound as the document, so `SET doc = ?` stores an
@@ -946,7 +980,10 @@ bits, nested nulls — with these known edges, all measured on the engine:
   `STRUCT` holding one. A string parameter is a string wherever it goes,
   whatever it spells: a parameter that looks like JSON is data, as one that
   looks like SQL is. A client holding JSON *text* — a grid cell, a file —
-  says so with `?::JSON`.
+  says so with `?::JSON`. An object or array parameter nests at most 125
+  levels: the request parser reads 127, and the body's own
+  `{ "params": [ … ] }` is two of them; one level more is a 400. A string
+  through `?::JSON` has no such limit.
 - *Integers beyond 64 bits become doubles* and lose digits past the 17th;
   numbers past the range of a double come back as `Infinity`, which is not
   JSON. Integers within `INT64`/`UINT64` are exact.
@@ -957,7 +994,11 @@ bits, nested nulls — with these known edges, all measured on the engine:
   or signs the body text must keep the original text.
 - *Normalization*, the same as DuckDB's `json()`: whitespace and `\u`
   escapes are dropped, `-0` is `0`, `1.50` is `1.5`, `1e10` is
-  `10000000000.0`.
+  `10000000000.0`. An object or array parameter is read by harbor's request
+  parser first, and two numbers differ there: `-0` is stored as the `DOUBLE`
+  `-0.0`, where the `?::JSON` text path stores the integer `0`, and `1e400`
+  fails the request with a 400, `number out of range`, where the text path
+  stores `Infinity`.
 - *Fields are typed.* `v.status = 500` finds rows; `v.status = '500'` finds
   none, without an error. `v.tests.price` through an array is `NULL`, not
   an error.

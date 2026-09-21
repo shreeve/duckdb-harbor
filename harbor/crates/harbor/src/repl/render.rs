@@ -650,8 +650,9 @@ fn boxed_safe(s: &str) -> String {
 ///
 /// The text is checked before it goes in, so a row is always well-formed.
 /// What fails the check stays a string: `NaN` and `Infinity`, which the
-/// engine's JSON cast writes bare and JSON has no word for; a document
-/// nested more than 128 levels deep, serde_json's limit. A wide integer
+/// engine's JSON cast writes bare and JSON has no word for. The check is
+/// serde_json skipping a value, which does not recurse and has no depth
+/// limit, so a document is spliced whole however deep it nests. A wide integer
 /// (a HUGEINT put inside a VARIANT) passes and is spliced as a bare number,
 /// where the same value in its own column is the envelope's JSON-safe
 /// string; that is what `duckdb -json` does, and a consumer wanting the
@@ -813,6 +814,11 @@ mod tests {
         // what the engine's cast writes that JSON cannot say stays a string
         assert_eq!(json_row(&cols, &flags, &[json!("NaN"), json!("x")]), r#"{"v":"NaN","s":"x"}"#);
         assert_eq!(json_row(&cols, &flags, &[json!("-Infinity"), json!("x")]), r#"{"v":"-Infinity","s":"x"}"#);
+        // so does a document of any depth: the check skips, it does not recurse
+        let deep = format!("{}{}", "[".repeat(100_000), "]".repeat(100_000));
+        assert_eq!(json_row(&cols, &flags, &[json!(deep), json!("x")]), format!(r#"{{"v":{deep},"s":"x"}}"#));
+        let torn = "[".repeat(200);
+        assert_eq!(json_row(&cols, &flags, &[json!(torn), json!("x")]), format!(r#"{{"v":"{torn}","s":"x"}}"#));
         // a wide integer and duplicate keys go in as they are
         assert_eq!(json_row(&cols, &flags, &[json!("170141183460469231731687303715884105727"), json!("x")]), r#"{"v":170141183460469231731687303715884105727,"s":"x"}"#);
         assert_eq!(json_row(&cols, &flags, &[json!("{\"a\":1,\"a\":2}"), json!("x")]), r#"{"v":{"a":1,"a":2},"s":"x"}"#);

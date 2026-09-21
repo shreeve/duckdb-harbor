@@ -4,6 +4,58 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.41.1 — 2026-09-21
+
+- **A document parameter costs its casts, not the making of two types.** An
+  object or array parameter aimed at a VARIANT is cast through JSON to
+  VARIANT, and 0.41.0 made both logical types from their names for every
+  such parameter, about 1.2 ms apiece, where the casts themselves take
+  microseconds. The connection now makes the two types once, on the first
+  document it binds, keeps them beside its VARIANT-to-JSON caster and
+  releases them with it, across a reset included. Over 500 keep-alive
+  requests, `UPDATE t SET doc = ? WHERE id = 1` with an object parameter went
+  from a median of 2.73 ms to 0.44 ms, against 0.37 ms for the same statement
+  with a string; a 100-row `INSERT` of object parameters went from 232 ms to
+  1.5 ms, against 1.4 ms with strings. A type the engine refuses to make, as
+  inside an aborted transaction, is not kept: the text is bound, the
+  statement reports the abort, and the next request asks again.
+- **A cancel that lands while parameters are being bound is kept.** The
+  engine drops an interrupt that arrives before a statement starts
+  executing, and 0.41.0 asked its slot about a cancel after the bind pass but
+  before the casts, so `DELETE /sql/queries/<id>` could answer
+  `{"cancelled":true}` and the statement then ran to its deadline: with 300
+  object parameters that stretch was 0.9 s, and a cancel 0.4 s in left a
+  7-second statement running its full 7 seconds. Binding is now its own step
+  (`Conn::bind`), and the slot is asked once the values are built and before
+  anything runs. The same request answers 499 at 0.4 s; with one 7 MB
+  document, whose cast alone takes a third of a second, a cancel at any
+  moment of it answers 499 when the cast returns, and inside a transaction
+  leaves the transaction open with its writes, since nothing ran. The cancel
+  suite holds the 7 MB case, outside a transaction and inside one.
+- **The README no longer recommends a `CHECK` on `variant_typeof`.**
+  `CHECK (v IS NULL OR variant_typeof(v) LIKE 'OBJECT%')` refuses arrays,
+  scalars and JSON strings along with the unparsed string it was offered
+  against, and it breaks the default backup: the tsv backup succeeds and the
+  restore fails with `CHECK constraint failed`, because `load.sql` lands each
+  VARIANT cell as a string and `after.sql` decodes it afterwards.
+  `--format parquet` backs up and restores such a table.
+- **A `VARIANT` nested in a `LIST`, `STRUCT` or `MAP` is not backed up by
+  either format**, and the README now says so where it said parquet carried
+  it: the backup is refused whole, naming the table, and nothing is written.
+- **A document parameter nests at most 125 levels.** The request parser reads
+  127 and the body's `{ "params": [ … ] }` uses two; the README, this file and
+  the suite said 128. Level 125 binds and stores, 126 is a 400, and the suite
+  measures both. A string through `?::JSON` has no such limit. Rip's ORM and
+  DuckTable's editor refuse a document past 100 levels, so nothing a
+  first-party client writes reaches it.
+- Also corrected in the README: a cancel that lands before a statement begins
+  leaves its transaction as it was; through an object parameter `-0` stores
+  as the DOUBLE `-0.0` and `1e400` is a 400 at the body parse, where the
+  `?::JSON` text path stores `0` and `Infinity`; for a VARIANT inside a list,
+  struct or map it is the nested schema entry that reads `"lossless": false`,
+  not the column's; and the REPL's json modes splice a document of any depth,
+  because the well-formedness check does not recurse.
+
 ## 0.41.0 — 2026-09-20
 
 - **An object or array parameter aimed at a VARIANT is the document.**
@@ -24,7 +76,9 @@ Harbor releases, and are not included here.
   Reading a string as JSON was considered and measured out: JSON text nested
   tens of thousands deep, cast to VARIANT, recurses inside the engine until
   the process dies, and no string parameter should be able to reach that.
-  An object or array cannot, because the request parser stops at 128 levels.
+  An object or array cannot: the request parser reads 127 levels, the body's
+  own `{ "params": [ … ] }` is two of them, and a document parameter nested
+  past 125 is a 400.
 
 ## 0.40.2 — 2026-09-20
 
@@ -82,8 +136,9 @@ Harbor releases, and are not included here.
   `JSON` column. A SQL NULL and a JSON null are both `null`; the wire and
   csv still tell them apart. The text is checked first, so a row is always
   well-formed: `NaN` and `Infinity`, which the engine's cast writes bare and
-  JSON cannot say, stay the strings `"NaN"` and `"Infinity"`, and so does a
-  document nested more than 128 levels deep. A pretty-printed `JSON` column
+  JSON cannot say, stay the strings `"NaN"` and `"Infinity"`. The check does
+  not recurse, so a document is spliced whole at any depth. A pretty-printed
+  `JSON` column
   keeps its newlines in the engine; jsonlines is one record per line, so
   between tokens they become spaces. JSON nested inside a struct, list or
   map column is a string, as the wire holds it. The display modes are
