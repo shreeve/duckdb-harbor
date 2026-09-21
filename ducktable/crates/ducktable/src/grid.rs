@@ -2455,10 +2455,14 @@ impl Grid {
                                 edits::StatementExpectation::ReturnedOne => {
                                     // Only a duplicate selects its row, from the
                                     // row it copies: none back means that row is
-                                    // gone. Nothing lands.
+                                    // gone. Nothing lands, and no refresh brings
+                                    // it back: the draft names that row until it
+                                    // is discarded.
                                     if r.rows.is_empty() {
                                         return Err(
-                                            "the duplicated row is gone — refresh and retry".to_string()
+                                            "a duplicated row's source is gone — discard \
+                                             that duplicate (⌘Z, or the review popover)"
+                                                .to_string()
                                         );
                                     }
                                     if r.rows.len() != 1 {
