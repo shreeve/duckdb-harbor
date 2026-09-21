@@ -149,6 +149,26 @@ impl Edits {
             && self.types == other.types
     }
 
+    /// How the review popover names the row a duplicate copies: every key
+    /// column with the value the WHERE binds, `copy of id = 5`, and `rowid`
+    /// for a table keyed by it. None for a draft that copies nothing.
+    pub fn source_label(&self, identity: &[Value]) -> Option<String> {
+        if identity.is_empty() {
+            return None;
+        }
+        let named = self
+            .pk_cols
+            .iter()
+            .zip(identity)
+            .map(|(col, value)| match value {
+                Value::String(s) => format!("{col} = {s}"),
+                other => format!("{col} = {other}"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!("copy of {named}"))
+    }
+
     /// (inserts, updates, deletes) — the verb-split status line.
     pub fn counts(&self) -> (usize, usize, usize) {
         let inserts = self
@@ -1788,5 +1808,39 @@ mod tests {
             stage(" a", json!(" a"))
         );
         assert_eq!(confirm(" 5", &draft("VARCHAR", Some(Some("5")), Some(Some("5")))), stage(" 5", json!(" 5")));
+    }
+
+    #[test]
+    fn the_review_names_the_row_a_duplicate_copies() {
+        let e = edits();
+        assert_eq!(e.source_label(&[json!(5)]).as_deref(), Some("copy of id = 5"));
+        assert_eq!(e.source_label(&[json!("a b")]).as_deref(), Some("copy of id = a b"));
+        // A draft that copies nothing has no source to name.
+        assert_eq!(e.source_label(&[]), None);
+
+        let composite = Edits::new(
+            "\"main\".\"t\"".into(),
+            vec!["a".into(), "b".into()],
+            vec!["a".into(), "b".into(), "name".into()],
+            vec!["INTEGER".into(), "BLOB".into(), "VARCHAR".into()],
+        );
+        assert_eq!(
+            composite.source_label(&[json!(1), json!("qg==")]).as_deref(),
+            Some("copy of a = 1, b = qg==")
+        );
+        let keyless = Edits::new(
+            "\"main\".\"t\"".into(),
+            vec!["rowid".into()],
+            vec!["rowid".into(), "name".into()],
+            vec!["BIGINT".into(), "VARCHAR".into()],
+        );
+        assert_eq!(keyless.source_label(&[json!(3)]).as_deref(), Some("copy of rowid = 3"));
+
+        // The entries the popover walks carry exactly that identity.
+        let mut e = edits();
+        e.stage_insert();
+        e.stage_duplicate(vec![json!(5)], vec![(1, txt("Ada"), Bind::Source)]);
+        let labels: Vec<_> = e.entries().iter().map(|(_, identity, _)| e.source_label(identity)).collect();
+        assert_eq!(labels, vec![None, Some("copy of id = 5".to_string())]);
     }
 }

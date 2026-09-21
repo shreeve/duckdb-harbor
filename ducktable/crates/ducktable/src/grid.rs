@@ -1248,24 +1248,47 @@ impl Grid {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A read-only table and a commit in flight say so in the footer,
+        // and the Edit menu's gate (`accepts_row_commands`) stops both first.
         if self.committing || self.edits.is_none() {
             return;
         }
         if self.editor.is_some() && !self.confirm_and_move(0, 0, cx) {
             return;
         }
-        let (identity, fetched, first_schema, pk_ix) = {
+        let source = {
             let d = self.table.read(cx).delegate();
             let row = d.selection.lead.or(d.active_cell.map(|(row, _)| row));
-            let Some(row) = row else { return };
-            // A draft is already an INSERT. Duplicate Row deliberately
-            // targets persisted rows, which the INSERT can read from.
-            if d.draft_key(row).is_some() || d.deleted.contains(&row) {
+            let lead = row.map(|row| {
+                if d.draft_key(row).is_some() {
+                    Lead::Draft
+                } else if d.deleted.contains(&row) {
+                    Lead::Deleted
+                } else {
+                    Lead::Persisted
+                }
+            });
+            match duplicate_refusal(lead) {
+                Some(reason) => Err(reason),
+                None => Ok(row.and_then(|row| {
+                    Some((
+                        d.identities.get(row).cloned()?,
+                        d.rows.get(row).cloned()?,
+                        d.identity as usize,
+                        d.pk_ix.clone(),
+                    ))
+                })),
+            }
+        };
+        let (identity, fetched, first_schema, pk_ix) = match source {
+            Ok(Some(source)) => source,
+            // A persisted row always has its cells and its identity.
+            Ok(None) => return,
+            Err(reason) => {
+                self.error = Some(reason.to_string());
+                cx.notify();
                 return;
             }
-            let Some(fetched) = d.rows.get(row).cloned() else { return };
-            let Some(identity) = d.identities.get(row).cloned() else { return };
-            (identity, fetched, d.identity as usize, d.pk_ix.clone())
         };
 
         let source_key = edits::key_of(&identity);
@@ -3869,6 +3892,34 @@ fn insert_metadata(
     (not_null, defaults, generated, hints)
 }
 
+/// The row ⌘D would copy.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Lead {
+    /// A fetched row, with or without staged updates.
+    Persisted,
+    /// A staged INSERT.
+    Draft,
+    /// A row staged for DELETE.
+    Deleted,
+}
+
+/// Why ⌘D copies nothing, when it copies nothing. A duplicate's INSERT
+/// reads its cells from the source row in the database, and a draft has no
+/// row there to read.
+fn duplicate_refusal(lead: Option<Lead>) -> Option<&'static str> {
+    match lead {
+        Some(Lead::Persisted) => None,
+        None => Some("select a row to duplicate"),
+        Some(Lead::Draft) => Some(
+            "a new row is not in the database yet, so there is nothing to copy it from — \
+             commit it (⌘S), then duplicate it",
+        ),
+        Some(Lead::Deleted) => {
+            Some("this row is staged for deletion — discard the delete to duplicate it")
+        }
+    }
+}
+
 /// Wire values -> render-ready cell text (None = NULL), once per page.
 /// Render never performs conversion or allocation.
 fn display_rows(rows: &[Vec<Value>]) -> Vec<Vec<Option<SharedString>>> {
@@ -3997,8 +4048,8 @@ fn should_reconcile_selection(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClickKind, RowSelection, conditional_hint_min_width, draft_hint_min_width,
-        duplicate_cells, should_reconcile_selection, wrapped_step,
+        ClickKind, Lead, RowSelection, conditional_hint_min_width, draft_hint_min_width,
+        duplicate_cells, duplicate_refusal, should_reconcile_selection, wrapped_step,
     };
     use crate::edits::{Bind, CellEdit};
     use gpui::{Modifiers, SharedString};
@@ -4149,5 +4200,15 @@ mod tests {
             &[false, false, false],
         );
         assert_eq!(cells.iter().map(|(col, _, _)| *col).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[test]
+    fn command_d_says_why_it_copied_nothing() {
+        assert_eq!(duplicate_refusal(Some(Lead::Persisted)), None);
+        let draft = duplicate_refusal(Some(Lead::Draft)).expect("a reason");
+        assert!(draft.contains("not in the database yet") && draft.contains("\u{2318}S"), "{draft}");
+        let deleted = duplicate_refusal(Some(Lead::Deleted)).expect("a reason");
+        assert!(deleted.contains("staged for deletion"), "{deleted}");
+        assert_eq!(duplicate_refusal(None), Some("select a row to duplicate"));
     }
 }

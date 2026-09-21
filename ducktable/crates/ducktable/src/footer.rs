@@ -465,9 +465,13 @@ impl Grid {
                                     .collect::<Vec<_>>()
                                     .join(", ");
                                 match change {
+                                    // A duplicate says which row it copies.
                                     crate::edits::RowChange::Insert(cells) => (
                                         key.to_string(),
-                                        "new row".to_string(),
+                                        match e.source_label(identity) {
+                                            Some(copy) => format!("new row \u{00b7} {copy}"),
+                                            None => "new row".to_string(),
+                                        },
                                         if cells.is_empty() {
                                             vec!["all columns: DEFAULT".to_string()]
                                         } else {
