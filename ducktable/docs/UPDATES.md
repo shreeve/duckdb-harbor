@@ -59,10 +59,38 @@ because an app only trusts the key it shipped with.
 
 ### 2. Nothing else
 
-No Developer ID, no notarization. The bundle is ad-hoc signed, as it was;
+No Developer ID, no notarization. The bundle is ad-hoc signed;
 Sparkle verifies that an update's signature is valid and its EdDSA signature
-matches, and both hold for an ad-hoc bundle. The installer still avoids
-Gatekeeper the same way, by never being quarantined.
+matches, and both hold for an ad-hoc bundle. The installer avoids
+Gatekeeper by never being quarantined.
+
+## The bundle's identity
+
+`scripts/macos-app.sh` signs the app with `--identifier com.shreeve.ducktable`,
+the same string as `CFBundleIdentifier`, and fails the build unless
+`codesign -dv` reports it for both `DuckTable.app` and
+`Contents/MacOS/ducktable`; the release workflow's smoke test asserts it
+again. Sparkle's nested code is signed first and keeps Sparkle's own
+identifiers. The identifier is a label, not a credential. macOS files privacy
+decisions under it — Local Network above all, which DuckTable needs for SSH
+tunnels to hosts on the LAN — so holding it fixed keeps one row in System
+Settings attached to the app through every update. The bundle's
+`NSLocalNetworkUsageDescription` is the sentence macOS shows when it asks.
+
+An ad-hoc signature's designated requirement is its own code hash, so no two
+versions ever match each other by code signing, whatever they are named.
+Sparkle therefore trusts an update by its EdDSA signature against the public
+key in the installed copy, and separately requires that the update's code
+signature be valid; the identifier takes no part in either check.
+
+Two rules keep an installed copy's identity intact: never re-sign or rename
+it, and never copy over it in place, since macOS caches an executable's
+signature by inode and kills the next launch of a file overwritten under it.
+`scripts/install.sh` and `scripts/install-local.sh` stage the bundle beside
+the destination, rename the installed app aside, rename the staged one in,
+remove the old one last (putting it back if the rename fails), and register
+the result with Launch Services (`lsregister -f`). Sparkle replaces the
+bundle whole on update, which is the same kind of swap.
 
 ## Cutting a release
 

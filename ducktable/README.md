@@ -48,6 +48,12 @@ One command, Apple Silicon, no Gatekeeper dialog — the script drops
 the zip in a browser instead will trip Gatekeeper's quarantine; if you go
 that way, allow it under System Settings → Privacy & Security → Open Anyway.)
 
+An installed copy is replaced by rename: the old app steps aside, the new one
+takes its name, and the old one is removed last, so an install that fails
+leaves the DuckTable you had. The installer then registers the bundle with
+Launch Services, so Finder, Spotlight and System Settings know it at once.
+`... | DUCKTABLE_DEST=dir bash` installs into another directory.
+
 Uninstall with `... | bash -s -- --uninstall` — the app goes; your settings
 (`~/.config/ducktable`) and your databases stay.
 
@@ -56,7 +62,12 @@ or say yes to the first-launch prompt and it checks once a day
 ([docs/UPDATES.md](docs/UPDATES.md)).
 
 On Intel, or to build from source: clone the repo and run
-`ducktable/scripts/macos-app.sh release`.
+`ducktable/scripts/macos-app.sh release`; `scripts/install-local.sh` builds
+and installs in one step, with the same swap.
+
+Every build is signed ad hoc under one identifier, `com.shreeve.ducktable`,
+and the build fails if the app or its executable reports any other. macOS
+files an app's privacy decisions under that name, so it never changes.
 
 ## Databases by port
 
@@ -75,6 +86,16 @@ loopback port to `127.0.0.1:9494` as seen from `foo.bar.com`, then speaks Harbor
 through that local port. SSH runs unattended and honors `~/.ssh/config`, keys,
 certificates, ProxyJump, ssh-agent, and the macOS Keychain. Run `ssh
 foo.bar.com` once in Terminal if a host key or login still needs confirmation.
+
+macOS 15 and later gate each app's traffic to the local network, and the `ssh`
+DuckTable starts counts as DuckTable. For a host on your LAN, macOS decides
+per app and, when it asks, shows the reason the bundle gives
+(`NSLocalNetworkUsageDescription`: SSH tunnels to Harbor servers on the hosts
+you add). The answer lives under System Settings → Privacy & Security → Local
+Network, in one DuckTable row that follows the app across updates because its
+signing identifier is fixed. Terminal is exempt from that gate and an app is
+not, so when `ssh host` works in Terminal and DuckTable's tunnel to the same
+LAN host does not, look at that row first.
 
 The SSH process belongs to that database connection. It uses protocol
 keepalives, stays alive while queries still hold the connection, and is closed
