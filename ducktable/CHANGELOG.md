@@ -27,7 +27,7 @@ date, newest first.
   re-applies file system compression correctly when a delta update lands on
   macOS 27, stops leaking temporary files when a delta fails to apply, and
   needs macOS 12.0, which is already DuckTable's floor.
-- Updates the shared `harbor-common` and `wire` lockfile entries to 0.40.2.
+- Updates the shared `harbor-common` and `wire` lockfile entries to 0.41.0.
   DuckTable reads nothing that changed in them: a VARIANT cell, which Harbor
   has delivered as JSON text since 0.39.0, arrives as text either way and
   now shows as the JSON it is.
