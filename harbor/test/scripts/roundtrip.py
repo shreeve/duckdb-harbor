@@ -547,6 +547,111 @@ def variant_as_json(work):
         bad("parquet did not keep what the note promised", (held, same))
 
 
+# A GENERATED column is the table's to compute: no COPY takes one back, so no
+# file in a backup holds one, whichever statement wrote the file. One table
+# for each way a file gets written: the JSON route a VARIANT column takes
+# (the generated column between two stored ones, then three of them reading
+# the document under names that have to be quoted), EXPORT's own COPY, the
+# swap to parquet a UNION forces, and the requote a blank record forces. A
+# VARIANT under a CHECK with no generated column rides along.
+GENERATED_BUILD = [
+    "CREATE TABLE o(id INTEGER PRIMARY KEY, doc VARIANT, qty INTEGER, "
+    "doubled INTEGER GENERATED ALWAYS AS (qty * 2) VIRTUAL, note VARCHAR)",
+    "INSERT INTO o VALUES (1, '{\"a\":\"x\",\"n\":1}'::JSON, 3, 'first'), (2, NULL, NULL, NULL), "
+    "(3, '[1,\"two\",null]'::JSON, 7, ''), (4, '\"42\"'::JSON, 0, 'NULL'), (5, '42'::JSON, -2, 'fifth')",
+    'CREATE TABLE "odd gen"(id INTEGER PRIMARY KEY, "the a" VARCHAR GENERATED ALWAYS AS ("the doc"[\'a\']::VARCHAR), '
+    '"the doc" VARIANT, "quo""ted" INTEGER GENERATED ALWAYS AS (id + 100), '
+    'same VARIANT GENERATED ALWAYS AS ("the doc"::VARIANT), kind VARCHAR GENERATED ALWAYS AS (variant_typeof("the doc")), '
+    'tail VARCHAR)',
+    'INSERT INTO "odd gen" VALUES (1, \'{"a":"x","n":1}\'::JSON, \'t1\'), (2, NULL, NULL), '
+    '(3, \'{"a":5}\'::JSON, \'t3\'), (4, \'{"b":true}\'::JSON, \'\')',
+    "CREATE TABLE p(id INTEGER PRIMARY KEY, price DECIMAL(10,2), qty INTEGER, "
+    "total DECIMAL(12,2) GENERATED ALWAYS AS (price * qty) VIRTUAL)",
+    "INSERT INTO p VALUES (1, 9.99, 3), (2, NULL, 4), (3, 0.50, NULL)",
+    "CREATE TABLE tagged(id INTEGER, x UNION(num INTEGER, str VARCHAR), twice INTEGER GENERATED ALWAYS AS (id * 2))",
+    "INSERT INTO tagged VALUES (1, 5), (2, 'five'), (3, NULL)",
+    "CREATE TABLE blank(s VARCHAR, len BIGINT GENERATED ALWAYS AS (length(s)))",
+    "INSERT INTO blank VALUES (''), ('x'), (NULL)",
+    "CREATE TABLE c(id INTEGER PRIMARY KEY, v VARIANT CHECK (v IS NULL OR variant_typeof(v) LIKE 'OBJECT%'), n INTEGER)",
+    "INSERT INTO c VALUES (1, '{\"k\":[1,2]}'::JSON, 1), (2, NULL, NULL), (3, '{}'::JSON, 3)",
+]
+
+
+def generated_columns(work):
+    """A generated column is computed by the restored table, not loaded.
+
+    `EXPORT DATABASE` leaves one out of the file it writes, and so does every
+    file harbor writes in that one's place: a `SELECT *` or a `COPY <table>
+    TO` would write it, and then nothing reads the file back. The values are
+    compared all the same, generated ones included, since the comparison is
+    `SELECT *` on both sides.
+    """
+    src = work / "gen.duckdb"
+    dst = work / "gen_restored.duckdb"
+    backup = work / "gen.backup"
+    tables = ["blank", "c", "o", "odd gen", "p", "tagged"]
+    for statement in GENERATED_BUILD:
+        quiet(src, statement)
+    shape = ("SELECT (SELECT string_agg(variant_typeof(doc) || ':' || (doc IS NULL) || ':' || coalesce(doubled::VARCHAR, '-'), ',' ORDER BY id) FROM o) "
+             "|| ' / ' || (SELECT string_agg(concat_ws(':', variant_typeof(\"the doc\"), coalesce(\"the a\", '-'), \"quo\"\"ted\", "
+             "variant_typeof(same), kind), ',' ORDER BY id) FROM \"odd gen\") AS t")
+    computed = ("SELECT string_agg(table_name || '.' || column_name || '=' || generation_expression, '; ' "
+                "ORDER BY table_name, column_index) AS t FROM duckdb_columns() "
+                "WHERE database_name = current_database() AND is_generated")
+    before = sql(src, shape)[0]["t"], sql(src, computed)[0]["t"]
+    run(src, "stop")
+    said = run(src, "backup", backup).stderr
+    run(src, "stop")
+
+    names = sorted(f.name for f in backup.iterdir())
+    heads = {f.name: f.read_text().splitlines()[0] for f in backup.glob("*.csv")}
+    want = {"blank.csv": '"s"', "c.csv": "id\tv\tn", "o.csv": "id\tdoc\tqty\tnote",
+            "odd_gen.csv": "id\tthe doc\ttail", "p.csv": "id\tprice\tqty"}
+    if names != sorted(["after.sql", "load.sql", "schema.sql", "tagged.parquet", *want]):
+        bad("the backup directory is not the shape these tables call for", f"{names}\n{said}")
+    elif heads != want:
+        bad("a file holds a column no COPY will take back", heads)
+    else:
+        ok("no file holds a generated column, whichever statement wrote it")
+
+    restored = run(dst, "restore", backup, expect=None)
+    if restored.returncode != 0:
+        bad("tables with generated columns did not restore", restored.stderr)
+        return
+    same = diff(src, dst, tables)
+    after = sql(dst, shape)[0]["t"], sql(dst, computed)[0]["t"]
+    left = sql(dst, "SELECT count(*) AS n FROM duckdb_tables() WHERE database_name = current_database()")[0]["n"]
+    run(dst, "stop")
+    if same:
+        bad("a generated column changed what came back", same)
+    elif after != before or "VARIANT_NULL:true:-" not in after[0] or "OBJECT(a):5:103:OBJECT(a):OBJECT(a)" not in after[0]:
+        bad("the restored tables do not compute what the originals do", f"{before}\n{after}")
+    elif left != len(tables):
+        bad("the restore left a table of its own behind", left)
+    else:
+        ok("it restores: every generated value computed again, from the document too")
+
+    # A text file that does hold the generated columns, as a `SELECT *` of the
+    # table writes it, says so in its header. The restore stages it whole and
+    # leaves those fields behind, with a VARIANT beside them or without.
+    whole = work / "gen.whole"
+    shutil.copytree(backup, whole)
+    for table, file, select in (("o", "o.csv", 'SELECT * REPLACE (doc::JSON AS doc) FROM o'),
+                                ("odd gen", "odd_gen.csv", 'SELECT * REPLACE ("the doc"::JSON AS "the doc") FROM "odd gen"'),
+                                ("p", "p.csv", "SELECT * FROM p")):
+        quiet(src, f"COPY ({select}) TO {literal(str(whole / file))} (FORMAT csv, DELIMITER '\t', NULLSTR 'NULL')")
+    run(src, "stop")
+    if (whole / "o.csv").read_text().splitlines()[0] != "id\tdoc\tqty\tdoubled\tnote":
+        bad("the file written whole is not the one this test means to restore", (whole / "o.csv").read_text())
+    whole_dst = work / "gen_whole.duckdb"
+    restored = run(whole_dst, "restore", whole, expect=None)
+    same = diff(src, whole_dst, tables) if restored.returncode == 0 else restored.stderr
+    if not same:
+        ok("a file that holds the generated columns restores too, without them")
+    else:
+        bad("a file that holds the generated columns did not restore", same)
+
+
 SCHEMA_BUILD = [
     # Constraints and defaults, which live in schema.sql rather than the data.
     """CREATE TABLE constrained (
@@ -763,6 +868,9 @@ def main():
               types_build(without=NEGATIVE_INTERVAL), work, fmt="parquet")
         text_gives_way_to_parquet(work)
         variant_as_json(work)
+        generated_columns(work)
+        check("generated columns again, through --format parquet", "gen_pq",
+              GENERATED_BUILD, work, fmt="parquet")
     finally:
         if args.keep:
             print(f"\n{DIM}roundtrip: kept {work}{OFF}")

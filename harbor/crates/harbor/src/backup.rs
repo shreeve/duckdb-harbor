@@ -60,6 +60,12 @@
 //! loads such a table as documents (see [`restore_plan`]), so a CHECK on a
 //! VARIANT column is only ever shown the document.
 //!
+//! A `GENERATED` column does not travel at all. No COPY takes one back, so
+//! `EXPORT DATABASE` leaves it out of the file it writes, and every file
+//! harbor writes in that one's place leaves it out the same way (see
+//! [`outgoing`]). `schema.sql` carries the expression, and the restored table
+//! computes the column from the rows it is given.
+//!
 //! One type text cannot hold at all — `UNION`, which loses its tag — is
 //! written as parquet instead, one file, beside the others. `load.sql` names
 //! the format per table, so the directory stays self-describing and the
@@ -177,7 +183,7 @@ impl Format {
     ///
     /// A VARIANT nested inside another type is in BOTH lists, and that is
     /// the point: text retypes it (the JSON route reaches only a plain
-    /// column, see [`json_out`]) and parquet has no writer for a variant
+    /// column, see [`outgoing`]) and parquet has no writer for a variant
     /// below the root, so a table holding one is refused whichever format
     /// was asked for. A plain VARIANT column is in neither: it travels as
     /// JSON under text and as itself under parquet.
@@ -382,6 +388,14 @@ pub fn restore(db: &Path, args: &[String]) -> Result<(), String> {
 /// [`json_in`] wrote for the table is in `after.sql`. A table without one,
 /// such as one written as parquet or a directory with no `after.sql` at
 /// all, is loaded by its COPY as written.
+///
+/// A GENERATED column is the table's to compute and no COPY fills one, so
+/// the staging table holds what the file holds and the INSERT hands over the
+/// stored columns, in the order the table declares them. A text file says
+/// what it holds in its header (see [`header_fields`]): one with a field for
+/// every stored column is staged without the generated ones, and one with a
+/// field for every column is staged whole, by this route whether or not it
+/// holds a VARIANT, with the generated values left behind by the INSERT.
 fn restore_plan(dir: &Path, schema_sql: &str, load_sql: &str, after_sql: &str) -> Result<Vec<String>, String> {
     let schema = schema_types(schema_sql);
     let mut decode: Vec<String> = split_statements(after_sql).iter().map(|s| uncommented(s).to_string()).collect();
@@ -394,30 +408,86 @@ fn restore_plan(dir: &Path, schema_sql: &str, load_sql: &str, after_sql: &str) -
         let copy_into = |target: &str| {
             format!("COPY {target} FROM {}{}", quote(&dir.join(file)), &line[literal.end..])
         };
-        let variants = schema.get(table).map_or(&[][..], |t| &t.variants[..]);
+        let declared = schema.get(table);
+        let variants = declared.map_or(&[][..], |t| &t.variants[..]);
+        let generated = declared.map_or(&[][..], |t| &t.generated[..]);
         let decoded = (!variants.is_empty())
             .then(|| json_in(table, variants))
             .and_then(|expected| decode.iter().position(|s| *s == expected));
-        match decoded {
+        let carried = !generated.is_empty()
+            && Path::new(file).extension().is_some_and(|e| e == "csv")
+            && fs::File::open(dir.join(file)).ok()
+                .and_then(|input| header_fields(BufReader::new(input)).ok())
+                == declared.map(|t| t.columns);
+        if decoded.is_none() && !carried {
+            plan.push(copy_into(table));
+            continue;
+        }
+        let documents = match decoded {
             Some(at) => {
                 decode.remove(at);
-                plan.push(format!("CREATE TABLE {stage} AS SELECT * REPLACE ({}) FROM {table} LIMIT 0", cast_each(variants, "VARCHAR")));
-                plan.push(copy_into(&stage));
-                plan.push(format!("INSERT INTO {table} SELECT * REPLACE ({}) FROM {stage}", cast_each(variants, "JSON::VARIANT")));
-                plan.push(format!("DROP TABLE {stage}"));
+                variants
             }
-            None => plan.push(copy_into(table)),
-        }
+            None => &[][..],
+        };
+        let (not_in_file, not_stored) = if carried { (&[][..], generated) } else { (generated, &[][..]) };
+        plan.push(format!(
+            "CREATE TABLE {stage} AS SELECT *{}{} FROM {table} LIMIT 0",
+            exclude(not_in_file), replace(documents, "VARCHAR")
+        ));
+        plan.push(copy_into(&stage));
+        plan.push(format!(
+            "INSERT INTO {table} SELECT *{}{} FROM {stage}",
+            exclude(not_stored), replace(documents, "JSON::VARIANT")
+        ));
+        plan.push(format!("DROP TABLE {stage}"));
     }
     plan.extend(decode);
     Ok(plan)
 }
 
-/// `"a"::TYPE AS "a", "b"::TYPE AS "b"` — the body of a `SELECT * REPLACE`.
-fn cast_each(columns: &[String], to: &str) -> String {
-    columns.iter()
+/// ` REPLACE ("a"::TYPE AS "a", "b"::TYPE AS "b")`, to follow a `SELECT *` —
+/// or nothing at all, for no columns.
+fn replace(columns: &[String], to: &str) -> String {
+    if columns.is_empty() {
+        return String::new();
+    }
+    let casts = columns.iter()
         .map(|c| format!("{}::{to} AS {}", ident(c), ident(c)))
-        .collect::<Vec<_>>().join(", ")
+        .collect::<Vec<_>>().join(", ");
+    format!(" REPLACE ({casts})")
+}
+
+/// ` EXCLUDE ("a", "b")`, to follow a `SELECT *` and come before its REPLACE —
+/// or nothing at all, for no columns.
+fn exclude(columns: &[String]) -> String {
+    if columns.is_empty() {
+        return String::new();
+    }
+    format!(" EXCLUDE ({})", columns.iter().map(|c| ident(c)).collect::<Vec<_>>().join(", "))
+}
+
+/// How many fields the first record of a text file holds, which is its
+/// header: one per column written. The quotes are walked as the reader walks
+/// them, since a quoted name can hold a tab or a newline of its own.
+fn header_fields(mut input: impl BufRead) -> std::io::Result<usize> {
+    let (mut quoted, mut fields) = (false, 1);
+    loop {
+        let chunk = input.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(fields);
+        }
+        for &ch in chunk {
+            match ch {
+                b'"' => quoted = !quoted,
+                b'\t' if !quoted => fields += 1,
+                b'\n' if !quoted => return Ok(fields),
+                _ => {}
+            }
+        }
+        let n = chunk.len();
+        input.consume(n);
+    }
 }
 
 /// A table name the schema does not mention anywhere, for a load to be staged
@@ -482,7 +552,7 @@ struct Reformat {
 ///
 /// A plain VARIANT column is the fourth edit, and the one that runs NOW
 /// rather than being handed back: the table's file is written again with
-/// the column cast to JSON (see [`json_out`]), because the blank-record
+/// the column cast to JSON (see [`outgoing`]), because the blank-record
 /// check below has to look at the file that will actually be restored, not
 /// the one EXPORT wrote. The decode goes to `after.sql`.
 fn patch_loader(
@@ -530,11 +600,9 @@ fn patch_loader(
             // format — so it is checked here, on the file itself.
             None => {
                 if format == Format::Tsv {
-                    let variants = &schema[table].variants;
-                    let source = if variants.is_empty() {
-                        table.to_string()
-                    } else {
-                        let source = json_out(table, variants);
+                    let TableSchema { variants, generated, .. } = &schema[table];
+                    let source = outgoing(table, generated, variants);
+                    if !variants.is_empty() {
                         execute(&format!("COPY {source} TO {} ({DIALECT})", quote(Path::new(&name))))?;
                         for (column, held) in json_check(execute, dir, table, variants)? {
                             if strict {
@@ -552,8 +620,7 @@ fn patch_loader(
                             ));
                         }
                         after.push(json_in(table, variants));
-                        source
-                    };
+                    }
                     if let Some((statement, note)) = requote(dir, &line, &source)? {
                         again.statements.push(statement);
                         again.notes.push(note);
@@ -578,11 +645,18 @@ fn patch_loader(
     Ok(again)
 }
 
-/// The table as it goes OUT when some of its columns are plain VARIANT: every
-/// column as it is, those cast to JSON. `SELECT *` with a REPLACE keeps the
-/// column order and never has to spell the others.
-fn json_out(table: &str, variants: &[String]) -> String {
-    format!("(SELECT * REPLACE ({}) FROM {table})", cast_each(variants, "JSON"))
+/// The table as it goes OUT, for a `COPY … TO`: its stored columns in order,
+/// the plain VARIANT ones named in `as_json` cast to JSON. The generated
+/// columns are left out, as `EXPORT DATABASE` leaves them out of the file it
+/// writes: a `COPY <table> TO` or a `SELECT *` writes them, and no COPY takes
+/// them back. `SELECT *` keeps the column order and never has to spell the
+/// others, and a table with nothing to leave out or to cast goes out under
+/// its own name.
+fn outgoing(table: &str, generated: &[String], as_json: &[String]) -> String {
+    if generated.is_empty() && as_json.is_empty() {
+        return table.to_string();
+    }
+    format!("(SELECT *{}{} FROM {table})", exclude(generated), replace(as_json, "JSON"))
 }
 
 /// The decode that brings those columns back IN. The COPY in `load.sql`
@@ -660,7 +734,8 @@ fn reformat(
     format: Format,
 ) -> Result<Option<TableRewrite>, String> {
     let (table, _, path) = copy_parts(line).ok_or("invalid backup COPY path")?;
-    let types = &schema.get(table).ok_or_else(|| format!("no schema for backup table {table}"))?.types;
+    let TableSchema { types, generated, .. } = schema.get(table)
+        .ok_or_else(|| format!("no schema for backup table {table}"))?;
     let Some((_, why)) = format.cannot_hold().iter().find(|(ty, _)| types.contains(ty)) else {
         return Ok(None);
     };
@@ -680,7 +755,8 @@ fn reformat(
             instead.loader()
         ),
         statement: format!(
-            "COPY {table} TO {} ({})",
+            "COPY {} TO {} ({})",
+            outgoing(table, generated, &[]),
             quote(&dir.join(format!("{name}.{}", instead.extension()))),
             instead.options()
         ),
@@ -788,28 +864,43 @@ fn unquoted_code(sql: &str) -> String {
 /// One table as `schema.sql` declares it, reduced to what decides how it
 /// travels.
 struct TableSchema {
-    /// Every definition except the plain VARIANT columns, as code with the
-    /// strings and identifiers blanked: what the chosen format has to hold
-    /// on its own, searched for the type names it cannot.
+    /// Every definition except the plain VARIANT and the generated columns,
+    /// as code with the strings and identifiers blanked: what the chosen
+    /// format has to hold on its own, searched for the type names it cannot.
     types: String,
     /// The plain VARIANT columns, unquoted, in declaration order. These are
     /// not the format's problem: they travel as JSON whatever it is.
     variants: Vec<String>,
+    /// The GENERATED columns, unquoted, in declaration order, whatever their
+    /// type. These are no format's problem: they are not written.
+    generated: Vec<String>,
+    /// How many columns the table declares, generated ones included.
+    columns: usize,
 }
 
 /// Index the schema once, rather than rescanning every CREATE for each table.
 fn schema_types(sql: &str) -> HashMap<String, TableSchema> {
     split_statements(sql).iter().filter_map(|create| {
         let table = table_of(create)?.to_string();
-        let (mut types, mut variants) = (Vec::new(), Vec::new());
+        let (mut types, mut variants, mut generated) = (Vec::new(), Vec::new(), Vec::new());
+        let mut columns = 0;
         for (name, code) in definitions(create) {
+            columns += usize::from(name.is_some());
             match name {
+                Some(name) if is_generated(&code) => generated.push(name),
                 Some(name) if is_plain_variant(&code) => variants.push(name),
                 _ => types.push(code),
             }
         }
-        Some((table, TableSchema { types: types.join(", "), variants }))
+        Some((table, TableSchema { types: types.join(", "), variants, generated, columns }))
     }).collect()
+}
+
+/// A column the table computes: `schema.sql` spells every one of them
+/// `<type> GENERATED ALWAYS AS(<expression>)`, and with the strings and quoted
+/// names blanked those three words can be nothing else.
+fn is_generated(code: &str) -> bool {
+    code.to_ascii_uppercase().contains("GENERATED ALWAYS AS")
 }
 
 /// `VARIANT` and nothing else for a type, whatever constraints follow it. A
@@ -1007,7 +1098,7 @@ mod tests {
         assert!(named.variants.is_empty());
         assert!(!named.types.contains("UNION("));
         assert_eq!(
-            json_out("t", &odd.variants),
+            outgoing("t", &odd.generated, &odd.variants),
             "(SELECT * REPLACE (\"v\"::JSON AS \"v\", \"quoted \"\"col\"\"\"::JSON AS \"quoted \"\"col\"\"\") FROM t)"
         );
         assert_eq!(
@@ -1046,6 +1137,84 @@ mod tests {
         let plan = restore_plan(dir, schema, load, "").unwrap();
         assert_eq!(plan[4], "COPY g FROM '/it''s here/g.csv' (FORMAT 'csv', header 1, nullstr 'NULL')");
         assert_eq!(plan.len(), 7);
+    }
+
+    #[test]
+    fn generated_columns_are_found_and_left_out_of_what_is_written() {
+        let schema = schema_types(
+            "CREATE TABLE o(id INTEGER PRIMARY KEY, \"a \"\"b\"\"\" VARCHAR GENERATED ALWAYS AS(CAST(doc['a'] AS VARCHAR)), \
+             doc VARIANT, twice INTEGER GENERATED ALWAYS AS((id * 2)), same VARIANT GENERATED ALWAYS AS(CAST(doc AS VARIANT)), \
+             note VARCHAR DEFAULT 'x GENERATED ALWAYS AS(1)', \"GENERATED ALWAYS AS\" INTEGER, CHECK((id > 0)));\n\
+             CREATE TABLE u(id INTEGER, x UNION(num INTEGER, str VARCHAR), twice INTEGER GENERATED ALWAYS AS((id * 2)));\n\
+             CREATE TABLE plain(id INTEGER);",
+        );
+        let o = &schema["o"];
+        assert_eq!(o.generated, vec!["a \"b\"".to_string(), "twice".to_string(), "same".to_string()]);
+        // A generated VARIANT is not written, so it is not one to cast, and
+        // the VARIANT its expression names is not the format's to hold.
+        assert_eq!(o.variants, vec!["doc".to_string()]);
+        assert!(!o.types.contains("VARIANT"), "{}", o.types);
+        assert_eq!(o.columns, 7);
+        assert_eq!(
+            outgoing("o", &o.generated, &o.variants),
+            "(SELECT * EXCLUDE (\"a \"\"b\"\"\", \"twice\", \"same\") REPLACE (\"doc\"::JSON AS \"doc\") FROM o)"
+        );
+        // The table that changes format goes out the same way.
+        let swap = reformat(Path::new("/tmp"), "COPY u FROM 'u.csv'", &schema, Format::Tsv).unwrap().unwrap();
+        assert_eq!(swap.statement, "COPY (SELECT * EXCLUDE (\"twice\") FROM u) TO '/tmp/u.parquet' (FORMAT parquet)");
+        assert_eq!(outgoing("plain", &schema["plain"].generated, &schema["plain"].variants), "plain");
+    }
+
+    #[test]
+    fn a_header_is_counted_through_its_quotes() {
+        for (text, expected) in [
+            ("id\tdoc\tqty\n1\tx\t2\t3\t4\n", 3), ("only\n", 1), ("a\tb", 2),
+            ("\"a\tb\"\t\"c\"\"\td\"\t\"e\nf\"\tg\nrow\n", 4),
+        ] {
+            for capacity in 1..8 {
+                let input = BufReader::with_capacity(capacity, text.as_bytes());
+                assert_eq!(header_fields(input).unwrap(), expected, "{text:?}, {capacity}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_restore_hands_a_table_its_stored_columns() {
+        let dir = std::env::temp_dir().join(format!("harbor-backup-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let schema = "CREATE TABLE o(id INTEGER, doc VARIANT, qty INTEGER, twice INTEGER GENERATED ALWAYS AS((qty * 2)), note VARCHAR);\n\
+                      CREATE TABLE whole(id INTEGER, doc VARIANT, twice INTEGER GENERATED ALWAYS AS((id * 2)));\n\
+                      CREATE TABLE b(s VARCHAR, len BIGINT GENERATED ALWAYS AS(length(s)));\n\
+                      CREATE TABLE p(id INTEGER, twice INTEGER GENERATED ALWAYS AS((id * 2)));\n";
+        fs::write(dir.join("o.csv"), "id\tdoc\tqty\tnote\n").unwrap();
+        fs::write(dir.join("whole.csv"), "id\tdoc\ttwice\n").unwrap();
+        fs::write(dir.join("b.csv"), "\"s\"\t\"len\"\n").unwrap();
+        fs::write(dir.join("p.csv"), "id\n").unwrap();
+        let load = "COPY o FROM 'o.csv' (FORMAT 'csv');\nCOPY whole FROM 'whole.csv' (FORMAT 'csv');\n\
+                    COPY b FROM 'b.csv' (FORMAT 'csv');\nCOPY p FROM 'p.csv' (FORMAT 'csv');\n";
+        let after = format!("{};\n{};\n", json_in("o", &["doc".to_string()]), json_in("whole", &["doc".to_string()]));
+        let plan = restore_plan(&dir, schema, load, &after);
+        fs::remove_dir_all(&dir).unwrap();
+        let at = |name: &str| format!("'{}'", dir.join(name).display());
+        assert_eq!(plan.unwrap()[4..], [
+            // The file holds the stored columns: so does the staging table.
+            "CREATE TABLE harbor_restore_0 AS SELECT * EXCLUDE (\"twice\") REPLACE (\"doc\"::VARCHAR AS \"doc\") FROM o LIMIT 0".to_string(),
+            format!("COPY harbor_restore_0 FROM {} (FORMAT 'csv')", at("o.csv")),
+            "INSERT INTO o SELECT * REPLACE (\"doc\"::JSON::VARIANT AS \"doc\") FROM harbor_restore_0".to_string(),
+            "DROP TABLE harbor_restore_0".to_string(),
+            // The file holds every column: the generated one stays behind.
+            "CREATE TABLE harbor_restore_0 AS SELECT * REPLACE (\"doc\"::VARCHAR AS \"doc\") FROM whole LIMIT 0".to_string(),
+            format!("COPY harbor_restore_0 FROM {} (FORMAT 'csv')", at("whole.csv")),
+            "INSERT INTO whole SELECT * EXCLUDE (\"twice\") REPLACE (\"doc\"::JSON::VARIANT AS \"doc\") FROM harbor_restore_0".to_string(),
+            "DROP TABLE harbor_restore_0".to_string(),
+            // The same, for a table with no VARIANT in it.
+            "CREATE TABLE harbor_restore_0 AS SELECT * FROM b LIMIT 0".to_string(),
+            format!("COPY harbor_restore_0 FROM {} (FORMAT 'csv')", at("b.csv")),
+            "INSERT INTO b SELECT * EXCLUDE (\"len\") FROM harbor_restore_0".to_string(),
+            "DROP TABLE harbor_restore_0".to_string(),
+            // And a file of stored columns alone is the COPY's to load.
+            format!("COPY p FROM {} (FORMAT 'csv')", at("p.csv")),
+        ]);
     }
 
     #[test]
