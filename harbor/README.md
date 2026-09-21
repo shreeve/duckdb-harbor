@@ -616,11 +616,18 @@ back — the number 42 and the string `"42"` both print as `42`, and the reader
 hands every cell back as a string — but JSON tells them apart, and a value
 that entered as JSON returns exactly as it entered, every inner type and
 every nesting. So the column is written as JSON text (`42` for the number,
-`"42"` for the string, still greppable) and decoded on restore. The decode is
-an `UPDATE`, and DuckDB's `IMPORT DATABASE` takes nothing but `COPY`, so it
-lives in `after.sql` beside `load.sql`: `restore` runs both, and a stock
-`duckdb` importing the directory by hand gets the JSON text and can run the
-second file itself. What JSON has no word for — a `DATE`, a `DECIMAL`, a
+`"42"` for the string, still greppable) and decoded on restore. For a stock
+`duckdb` the decode is an `UPDATE`, and DuckDB's `IMPORT DATABASE` takes
+nothing but `COPY`, so it lives in `after.sql` beside `load.sql`: importing
+the directory by hand gives the JSON text, and running the second file turns
+it back into documents. `harbor restore` needs no second pass. It runs
+`schema.sql` and each `COPY` of `load.sql` itself, which is all `IMPORT
+DATABASE` does, and loads a table with `VARIANT` columns as documents: the
+table's own `COPY`, options and all, fills a staging table that holds those
+columns as text, one `INSERT` moves the rows across with the text cast through
+JSON, and the staging table is dropped. The table never holds the JSON text,
+so a `CHECK` on a `VARIANT` column is shown documents and nothing else. What
+JSON has no word for — a `DATE`, a `DECIMAL`, a
 `BLOB`, a `TIMESTAMP` put inside a variant from SQL — comes back as JSON's
 nearest type, and the backup says so, once per column:
 
@@ -961,17 +968,18 @@ bits, nested nulls — with these known edges, all measured on the engine:
   `ALTER TABLE t ALTER COLUMN c SET DATA TYPE VARIANT USING c::JSON::VARIANT`.
   harbor's object and array parameters, Rip's ORM and DuckTable's editor all
   write a document as a document, so the mistake is one hand-written SQL makes.
-- *A `CHECK` on `variant_typeof` blocks a tsv restore.*
+- *A `CHECK` on a `VARIANT` column restores.*
   `CHECK (v IS NULL OR variant_typeof(v) LIKE 'OBJECT%')` does refuse the
   unparsed string at write time, and with it every array, every scalar and
-  every JSON string, which are documents too. It also breaks the default
-  backup: `harbor backup` writes the table without complaint and `harbor
-  restore` then fails with `Constraint Error: CHECK constraint failed`, because
-  `load.sql` lands each `VARIANT` cell as a string and `after.sql` decodes it
-  only afterwards, and the constraint is checked in between. `--format parquet`
-  carries the column as itself and restores the same table. A table with such
-  a constraint is backed up with `--format parquet`, and the constraint is not
-  a general guard.
+  every JSON string, which are documents too, so it is not a general guard.
+  `harbor backup` writes such a table as text like any other and `harbor
+  restore` brings it back, SQL `NULL` included, because it loads documents
+  as documents and the constraint is never shown the JSON text they
+  travelled as. A stock `duckdb` cannot restore that table from the same
+  directory: `IMPORT DATABASE` lands each cell as a `VARIANT` string for
+  `after.sql` to decode, and the constraint refuses the strings first, with
+  `Constraint Error: CHECK constraint failed`. `--format parquet` carries the
+  column as itself, and stock `duckdb` imports that directory.
 - *An object or array parameter is a document.* `"params": [{"a":1}]` aimed at
   a `VARIANT` — a column in `SET` or `VALUES`, a comparison against one, a
   `coalesce` with one — is bound as the document, so `SET doc = ?` stores an

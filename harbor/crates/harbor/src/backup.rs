@@ -54,9 +54,11 @@
 //! comes back as JSON's nearest type, and the backup says so, once per
 //! column, when it happens; `--format parquet` keeps those. The decode is
 //! an UPDATE, and `IMPORT DATABASE` takes nothing but COPY, so it lives in
-//! `after.sql` beside `load.sql`: restore runs both, and a stock `duckdb`
-//! importing the directory by hand gets the JSON text and can run the
-//! second file itself.
+//! `after.sql` beside `load.sql`: a stock `duckdb` importing the directory by
+//! hand gets the JSON text and can run the second file itself. `restore`
+//! does not need the UPDATE. It runs the directory's statements itself and
+//! loads such a table as documents (see [`restore_plan`]), so a CHECK on a
+//! VARIANT column is only ever shown the document.
 //!
 //! One type text cannot hold at all — `UNION`, which loses its tag — is
 //! written as parquet instead, one file, beside the others. `load.sql` names
@@ -319,15 +321,14 @@ pub fn restore(db: &Path, args: &[String]) -> Result<(), String> {
         None => Vec::new(),
     };
     let target = db.display().to_string();
-    let import = format!("IMPORT DATABASE {}", quote(&dir));
-    // IMPORT DATABASE runs schema.sql and load.sql; after.sql, when the
-    // backup wrote one, is ours to run — the decode of every VARIANT column
-    // that travelled as JSON. An older backup has no such file and needs
-    // nothing after the import.
     let after = dir.join(AFTER);
-    let decode = if after.exists() { split_statements(&read(&after)?) } else { Vec::new() };
-    let mut sql: Vec<&str> = vec![&import];
-    sql.extend(decode.iter().map(String::as_str));
+    let plan = restore_plan(
+        &dir,
+        &read(&dir.join("schema.sql"))?,
+        &read(&dir.join("load.sql"))?,
+        &if after.exists() { read(&after)? } else { String::new() },
+    )?;
+    let mut sql: Vec<&str> = plan.iter().map(String::as_str).collect();
     sql.push("CHECKPOINT");
     if let Err(e) = harbor::repl::exec_quiet(&target, &sql, &spawn) {
         // A half-written database is worse than none: it exists, so the next
@@ -358,6 +359,88 @@ pub fn restore(db: &Path, args: &[String]) -> Result<(), String> {
     eprintln!("harbor: it is a FILE, not a berth — put it in service by hand:");
     eprintln!("  harbor <berth> stop && mv {} <the database it replaces>", db.display());
     Ok(())
+}
+
+/// Every statement a restore runs, in order: `schema.sql` as written, each
+/// table's load, then whatever of `after.sql` the loads have not already done.
+///
+/// This is `IMPORT DATABASE` spelled out. That statement is the two files run
+/// in order, each COPY's file joined to the directory, and nothing more; it
+/// is spelled out because one kind of load has to differ. A plain VARIANT
+/// column travels as JSON text. A COPY straight into the table lands each
+/// cell as a VARIANT *string* for `after.sql` to decode, and a CHECK on the
+/// column is tested in between, against the string: `variant_typeof(v) LIKE
+/// 'OBJECT%'` refuses every row. So a table `after.sql` would decode is
+/// loaded as documents instead. The COPY from `load.sql`, options and all,
+/// fills a staging table that differs from the real one only in holding
+/// those columns as VARCHAR, so every other column is parsed exactly as it
+/// would have been; one INSERT then moves the rows across with the text cast
+/// through JSON, and the staging table is dropped. The table never holds a
+/// VARIANT string, and its decode is left out of what runs afterwards.
+///
+/// Which tables those are is the backup's own record: the decode statement
+/// [`json_in`] wrote for the table is in `after.sql`. A table without one,
+/// such as one written as parquet or a directory with no `after.sql` at
+/// all, is loaded by its COPY as written.
+fn restore_plan(dir: &Path, schema_sql: &str, load_sql: &str, after_sql: &str) -> Result<Vec<String>, String> {
+    let schema = schema_types(schema_sql);
+    let mut decode: Vec<String> = split_statements(after_sql).iter().map(|s| uncommented(s).to_string()).collect();
+    let stage = stage_name(schema_sql);
+    let mut plan = split_statements(schema_sql);
+    for line in split_statements(load_sql) {
+        let (table, literal, name) = copy_parts(&line)
+            .ok_or_else(|| format!("unrecognized backup COPY statement: {line}"))?;
+        let file = Path::new(&name).file_name().ok_or_else(|| format!("invalid backup path: {name}"))?;
+        let copy_into = |target: &str| {
+            format!("COPY {target} FROM {}{}", quote(&dir.join(file)), &line[literal.end..])
+        };
+        let variants = schema.get(table).map_or(&[][..], |t| &t.variants[..]);
+        let decoded = (!variants.is_empty())
+            .then(|| json_in(table, variants))
+            .and_then(|expected| decode.iter().position(|s| *s == expected));
+        match decoded {
+            Some(at) => {
+                decode.remove(at);
+                plan.push(format!("CREATE TABLE {stage} AS SELECT * REPLACE ({}) FROM {table} LIMIT 0", cast_each(variants, "VARCHAR")));
+                plan.push(copy_into(&stage));
+                plan.push(format!("INSERT INTO {table} SELECT * REPLACE ({}) FROM {stage}", cast_each(variants, "JSON::VARIANT")));
+                plan.push(format!("DROP TABLE {stage}"));
+            }
+            None => plan.push(copy_into(table)),
+        }
+    }
+    plan.extend(decode);
+    Ok(plan)
+}
+
+/// `"a"::TYPE AS "a", "b"::TYPE AS "b"` — the body of a `SELECT * REPLACE`.
+fn cast_each(columns: &[String], to: &str) -> String {
+    columns.iter()
+        .map(|c| format!("{}::{to} AS {}", ident(c), ident(c)))
+        .collect::<Vec<_>>().join(", ")
+}
+
+/// A table name the schema does not mention anywhere, for a load to be staged
+/// in. Identifiers fold case, so the search does too.
+fn stage_name(schema_sql: &str) -> String {
+    let taken = schema_sql.to_ascii_lowercase();
+    (0..).map(|n| format!("harbor_restore_{n}"))
+        .find(|name| !taken.contains(name.as_str()))
+        .expect("an unbounded search")
+}
+
+/// A statement without the comments written above it.
+fn uncommented(statement: &str) -> &str {
+    let code = scan(statement).into_iter().find(|span| match span.kind {
+        Kind::LineComment | Kind::BlockComment => false,
+        Kind::Code => !statement[span.start..span.end].trim().is_empty(),
+        _ => true,
+    });
+    match code {
+        Some(span) if span.kind == Kind::Code => statement[span.start..].trim_start(),
+        Some(span) => &statement[span.start..],
+        None => "",
+    }
 }
 
 /// What a rewritten `load.sql` still needs doing to it.
@@ -499,10 +582,7 @@ fn patch_loader(
 /// column as it is, those cast to JSON. `SELECT *` with a REPLACE keeps the
 /// column order and never has to spell the others.
 fn json_out(table: &str, variants: &[String]) -> String {
-    let replaced = variants.iter()
-        .map(|c| format!("{}::JSON AS {}", ident(c), ident(c)))
-        .collect::<Vec<_>>().join(", ");
-    format!("(SELECT * REPLACE ({replaced}) FROM {table})")
+    format!("(SELECT * REPLACE ({}) FROM {table})", cast_each(variants, "JSON"))
 }
 
 /// The decode that brings those columns back IN. The COPY in `load.sql`
@@ -934,6 +1014,38 @@ mod tests {
             json_in("t", &["v".to_string()]),
             "UPDATE t SET \"v\" = \"v\"::VARCHAR::JSON::VARIANT"
         );
+    }
+
+    #[test]
+    fn a_restore_loads_documents_as_documents() {
+        let schema = "CREATE TABLE g(id INTEGER, v VARIANT, \"w w\" VARIANT NOT NULL, CHECK((variant_typeof(v) ~~ 'OBJECT%')));\n\
+                      CREATE TABLE plain(id INTEGER);\n\
+                      CREATE TABLE u(v VARIANT, x UNION(a INTEGER));\n\
+                      CREATE VIEW Harbor_Restore_0 AS SELECT 1;\n";
+        let load = "COPY g FROM 'g.csv' (FORMAT 'csv', header 1, nullstr 'NULL');\n\
+                    COPY plain FROM '/somewhere/else/plain.csv' (FORMAT 'csv');\n\
+                    COPY u FROM 'u.parquet' (FORMAT 'parquet');\n";
+        let decode = json_in("g", &["v".to_string(), "w w".to_string()]);
+        let after = format!("-- Run after load.sql.\n-- Two lines of it.\n{decode};\nUPDATE elsewhere SET x = 1;\n");
+        let dir = Path::new("/it's here");
+        assert_eq!(restore_plan(dir, schema, load, &after).unwrap(), [
+            "CREATE TABLE g(id INTEGER, v VARIANT, \"w w\" VARIANT NOT NULL, CHECK((variant_typeof(v) ~~ 'OBJECT%')))",
+            "CREATE TABLE plain(id INTEGER)",
+            "CREATE TABLE u(v VARIANT, x UNION(a INTEGER))",
+            "CREATE VIEW Harbor_Restore_0 AS SELECT 1",
+            "CREATE TABLE harbor_restore_1 AS SELECT * REPLACE (\"v\"::VARCHAR AS \"v\", \"w w\"::VARCHAR AS \"w w\") FROM g LIMIT 0",
+            "COPY harbor_restore_1 FROM '/it''s here/g.csv' (FORMAT 'csv', header 1, nullstr 'NULL')",
+            "INSERT INTO g SELECT * REPLACE (\"v\"::JSON::VARIANT AS \"v\", \"w w\"::JSON::VARIANT AS \"w w\") FROM harbor_restore_1",
+            "DROP TABLE harbor_restore_1",
+            "COPY plain FROM '/it''s here/plain.csv' (FORMAT 'csv')",
+            "COPY u FROM '/it''s here/u.parquet' (FORMAT 'parquet')",
+            "UPDATE elsewhere SET x = 1",
+        ]);
+        // A directory with no after.sql holds no JSON text: every table is
+        // loaded by its COPY.
+        let plan = restore_plan(dir, schema, load, "").unwrap();
+        assert_eq!(plan[4], "COPY g FROM '/it''s here/g.csv' (FORMAT 'csv', header 1, nullstr 'NULL')");
+        assert_eq!(plan.len(), 7);
     }
 
     #[test]
