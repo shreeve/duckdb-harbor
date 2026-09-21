@@ -205,8 +205,8 @@ mod conn {
         for stmt in stmts.iter() {
             // As the server does: a document aimed at a VARIANT is marked.
             let mut params = params.to_vec();
-            c.aim_documents(stmt, &mut params);
-            let mut stream = c.execute(stmt, &params)?;
+            let bound = c.bind(stmt, &mut params)?;
+            let mut stream = c.execute(stmt, bound)?;
             // Encode through the shared cell encoder so this test exercises
             // the same path the server will.
             let columns = std::mem::take(&mut stream.columns);
@@ -281,6 +281,43 @@ mod conn {
         assert!(err.to_string().contains("aborted"), "{err}");
         c.execute_batch("ROLLBACK").unwrap();
         assert_eq!(rows(&mut c, "SELECT variant_typeof(doc) FROM t WHERE id = 1", &[]).unwrap(), [r#""OBJECT(a)""#]);
+    }
+
+    /// The types a document is cast through are the connection's own: a
+    /// connection that first meets a document inside an aborted transaction
+    /// keeps nothing of the refusal, and a reset connection makes its own.
+    #[test]
+    fn document_types_belong_to_the_connection() {
+        let Some(_) = v2_engine() else { return };
+        let mut c = conn::open(Path::new(":memory:"), &[]).expect("open");
+        let doc = |text: &str| Param::Document { text: text.into(), variant: false };
+        let insert = "INSERT INTO t VALUES (?)";
+        let typed = "SELECT variant_typeof(doc) FROM t";
+        c.execute_batch("CREATE TABLE t(doc VARIANT); BEGIN").unwrap();
+        assert!(c.execute_batch("SELECT no_such_column FROM t").is_err());
+        let stmts = c.statements(insert).unwrap();
+        let bound = c.bind(&stmts[0], &mut [doc(r#"{"a":1}"#)]).unwrap();
+        let err = c.execute(&stmts[0], bound).err().expect("aborted").to_string();
+        assert!(err.contains("aborted"), "{err}");
+        c.execute_batch("ROLLBACK").unwrap();
+
+        rows(&mut c, insert, &[doc(r#"{"a":1}"#)]).unwrap();
+        assert_eq!(rows(&mut c, typed, &[]).unwrap(), [r#""OBJECT(a)""#]);
+        c.reset().unwrap();
+        rows(&mut c, insert, &[doc("[1,2]")]).unwrap();
+        assert_eq!(rows(&mut c, &format!("{typed} ORDER BY 1"), &[]).unwrap(), [
+            r#""ARRAY(2)""#,
+            r#""OBJECT(a)""#,
+        ]);
+
+        // A document costs its two casts, microseconds, and not the making of
+        // two types, which is over two milliseconds: 300 documents bind and
+        // run in about 10 ms, and would take most of a second otherwise.
+        let many = format!("SELECT count(*) FROM t WHERE doc IN ({})", vec!["?"; 300].join(", "));
+        let began = Instant::now();
+        assert_eq!(rows(&mut c, &many, &vec![doc(r#"{"a":1}"#); 300]).unwrap(), ["1"]);
+        let took = began.elapsed();
+        assert!(took < Duration::from_millis(300), "300 documents took {took:?}");
     }
 
     #[test]

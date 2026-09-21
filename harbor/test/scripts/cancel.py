@@ -125,8 +125,10 @@ class Harbor:
             raw = e.read()
             return e.code, (json.loads(raw) if raw else {}), dict(e.headers)
 
-    def sql(self, statement, session=None, query=None, timeout_ms=None, timeout=120):
+    def sql(self, statement, session=None, query=None, timeout_ms=None, timeout=120, params=None):
         body = {"sql": statement}
+        if params is not None:
+            body["params"] = params
         if session:
             body["sessionId"] = session
         if query:
@@ -383,6 +385,55 @@ def run_tests(h, db):
     eq("ROLLBACK is accepted", 200, h.sql("ROLLBACK", session=sid)[0])
     eq("and the session works again", 1, h.value("SELECT 1", session=sid))
     eq("the cancelled write did not land", None, h.value("SELECT n FROM marks WHERE n = 99"))
+    eq("release", True, h.release(sid)[1].get("released"))
+
+    # -----------------------------------------------------------------------
+    section("A cancel that lands while the params are being built")
+
+    # An object param aimed at a VARIANT is cast to the document before the
+    # statement runs, and the engine drops an interrupt that lands during the
+    # cast. A 7 MB document makes that stretch a third of a second on an
+    # M-series laptop — from about a twentieth to two fifths of the way through
+    # a trivial statement that binds it — so a cancel a fifth of the way in
+    # lands inside it. The statement has to notice once the values are built,
+    # or it runs to its deadline having answered the cancel with a yes.
+    big = {"k": list(range(900_000))}
+    endless = "SELECT count(*) FROM range(100000000000) r(i) WHERE i::VARIANT = ?"
+    started = time.monotonic()
+    st, doc, _ = h.sql("SELECT variant_typeof(coalesce(NULL::VARIANT, ?)) AS t", params=[big])
+    whole = time.monotonic() - started
+    eq("a 7 MB object param binds as the document", (200, "OBJECT(k)"), (st, (doc.get("data") or [[None]])[0][0]))
+
+    def cancel_during_cast(job, qid):
+        """Cancel a fifth of the way into the bind; the seconds until accepted."""
+        started = time.monotonic()
+        time.sleep(whole * 0.2)
+        while job.thread.is_alive() and time.monotonic() - started < 5:
+            if h.cancel(qid)[1].get("cancelled"):
+                return time.monotonic() - started
+        return None
+
+    job = Background(h, statement=endless, params=[big], query="bind1", timeout_ms=8000)
+    accepted = cancel_during_cast(job, "bind1")
+    job.wait()
+    yes("the cancel is accepted while the document is being cast", accepted is not None,
+        f"{accepted or 0:.2f}s")
+    eq("the statement reports cancelled", 499, job.status)
+    yes("when its values are built, not at its deadline", job.seconds < 4.0, f"{job.seconds:.2f}s")
+
+    # Nothing ran, so a transaction is as it was: still open, its writes intact.
+    st, doc, _ = h.open()
+    sid = doc["sessionId"]
+    eq("BEGIN", 200, h.sql("BEGIN", session=sid)[0])
+    eq("a write inside the transaction", 200, h.sql("INSERT INTO marks VALUES (98)", session=sid)[0])
+    job = Background(h, statement=endless, params=[big], session=sid, query="bind2", timeout_ms=8000)
+    cancel_during_cast(job, "bind2")
+    job.wait()
+    eq("cancelled before it began, inside a transaction", 499, job.status)
+    eq("the transaction is still open and holds its write", 98,
+       h.value("SELECT n FROM marks WHERE n = 98", session=sid))
+    eq("COMMIT", 200, h.sql("COMMIT", session=sid)[0])
+    eq("and the write landed", 98, h.value("SELECT n FROM marks WHERE n = 98"))
     eq("release", True, h.release(sid)[1].get("released"))
 
     # -----------------------------------------------------------------------

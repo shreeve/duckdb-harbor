@@ -269,6 +269,31 @@ def run_all(h, leases, proc, db, port):
         h.release(s["sessionId"])
 
     # -----------------------------------------------------------------------
+    section("A document param inside a transaction")
+    # -----------------------------------------------------------------------
+    # An object param aimed at a VARIANT is bound as the document on a lease's
+    # connection as on a worker's, and commits or rolls back with the rest.
+    h.sql("CREATE OR REPLACE TABLE docs(id INTEGER PRIMARY KEY, doc VARIANT)")
+    typed = "SELECT variant_typeof(doc) || ' ' || doc.a.b::VARCHAR FROM docs WHERE id = 1"
+    sid = h.open()[1]["sessionId"]
+    h.sql("BEGIN", sid)
+    eq("an object param binds inside a transaction", 200,
+       h.sql("INSERT INTO docs VALUES (1, ?)", sid, params=[{"a": {"b": 1}}])[0])
+    eq("the session reads it back as the document", "OBJECT(a) 1", h.value(typed, sid))
+    eq("nobody else sees it yet", None, h.value(typed))
+    h.sql("COMMIT", sid)
+    eq("committed, it is the document for everyone", "OBJECT(a) 1", h.value(typed))
+
+    h.sql("BEGIN", sid)
+    eq("an update with an object param", 200,
+       h.sql("UPDATE docs SET doc = ? WHERE id = 1", sid, params=[{"a": {"b": 2}}])[0])
+    eq("is the document inside the transaction", "OBJECT(a) 2", h.value(typed, sid))
+    h.sql("ROLLBACK", sid)
+    eq("and rolled back, the committed document stands", "OBJECT(a) 1", h.value(typed))
+    h.release(sid)
+    h.sql("DROP TABLE docs")
+
+    # -----------------------------------------------------------------------
     section("Exhaustion is a refusal, not a hang")
     # -----------------------------------------------------------------------
     held = [h.open()[1]["sessionId"] for _ in range(leases)]

@@ -2043,7 +2043,7 @@ fn json_to_duckdb(v: &serde_json::Value) -> Result<Param, String> {
             }
         }
         // An object or an array is a document. Aimed at a VARIANT it is bound
-        // as one (`Conn::aim_documents`); everywhere else it has no SQL type of
+        // as one (`Conn::bind`); everywhere else it has no SQL type of
         // its own and goes as its JSON text, for the statement to cast. A
         // string is never read this way, whatever it spells: a param that
         // looks like JSON is data, as one that looks like SQL is.
@@ -3815,16 +3815,23 @@ fn run_statement(
         return needs_reset;
     }
     // A document aimed at a VARIANT is bound as one. Finding that out is a
-    // bind pass, and an interrupt that lands during it is dropped by the
-    // engine, so the slot is asked again before anything runs.
+    // bind pass and making it one is a cast, and an interrupt that lands
+    // during either is dropped by the engine. So the values are built first
+    // and the slot is asked again once they are, before anything runs.
     let mut params = params;
-    conn.aim_documents(last, &mut params);
+    let bound = match conn.bind(last, &mut params) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = ready.send(Err(refusal_for(on_slot.finish(), e.into_text())));
+            return true;
+        }
+    };
     if on_slot.slot.cancelled() {
         on_slot.finish();
         let _ = ready.send(Err(Refusal::cancelled()));
         return needs_reset;
     }
-    let mut stream = match conn.execute(last, &params) {
+    let mut stream = match conn.execute(last, bound) {
         Ok(s) => s,
         Err(e) => {
             let _ = ready.send(Err(refusal_for(on_slot.finish(), e.into_text())));
