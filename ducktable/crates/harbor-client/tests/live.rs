@@ -284,3 +284,209 @@ fn document_and_blob_cells_bind_as_what_they_are() {
     run("DROP TABLE _dt_typed_probe", None);
     run("DROP TABLE _dt_blobkey_probe", None);
 }
+
+/// The statement Duplicate Row commits (ducktable's `edits.rs`): untouched
+/// cells are selected from the source row, a typed-over cell is bound, and
+/// the WHERE names the source by its key or its rowid. The wire is narrower
+/// than the engine — a VARIANT crosses it as JSON, a BLOB[] as base64 text,
+/// an INTERVAL as an object, a MAP as pairs — so a copy that rebinds what
+/// was fetched is a different value; this is the proof that the copy made
+/// in SQL is not, in the session transaction a commit runs in.
+#[test]
+#[ignore]
+fn a_duplicate_row_copies_in_sql_what_the_wire_cannot_carry() {
+    use serde_json::json;
+    let Some(row) = connectable() else {
+        println!("no berth to test against; skipping");
+        return;
+    };
+    let conn = connect(&row.name).expect("connect");
+    let sid = harbor_client::session_new(&conn).expect("session");
+    let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
+        harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
+    };
+    run("DROP TABLE IF EXISTS _dt_dup_probe", None);
+    run("DROP TABLE IF EXISTS _dt_dup_keyless_probe", None);
+    run("DROP SEQUENCE IF EXISTS _dt_dup_seq", None);
+    run("CREATE TEMP SEQUENCE _dt_dup_seq START 100", None);
+    run(
+        "CREATE TEMP TABLE _dt_dup_probe(id INTEGER PRIMARY KEY DEFAULT nextval('_dt_dup_seq'), \
+         name VARCHAR, doc VARIANT, bl BLOB[], iv INTERVAL, m MAP(VARCHAR, INTEGER), \
+         u UNION(n INTEGER, s VARCHAR), docs VARIANT[])",
+        None,
+    );
+    run(
+        "INSERT INTO _dt_dup_probe VALUES (1, 'source', \
+         {'day': DATE '2024-02-29', 'big': 170141183460469231731687303715884105727::HUGEINT}::VARIANT, \
+         ['hi'::BLOB, '\\xFF'::BLOB], INTERVAL '14 months 2 days 3 seconds', MAP {'a': 1, 'b': 2}, \
+         union_value(s := '7'), [DATE '2024-02-29'::VARIANT, 12.340::DECIMAL(10,3)::VARIANT])",
+        None,
+    );
+
+    // What the grid fetched, and what rebinding it makes of the document.
+    let wire = run("SELECT doc, bl, iv, m, u, docs FROM _dt_dup_probe WHERE id = 1", None);
+    println!("the source row on the wire: {:?}", wire.rows[0]);
+
+    run("BEGIN", None);
+    let rebound = run(
+        "INSERT INTO _dt_dup_probe (\"name\", \"doc\") VALUES (?, ?::JSON) RETURNING id",
+        Some(vec![json!("rebound"), wire.rows[0][0].clone()]),
+    );
+    // The duplicate: `name` typed over, everything else read from the source.
+    let copied = run(
+        "INSERT INTO _dt_dup_probe (\"name\", \"doc\", \"bl\", \"iv\", \"m\", \"u\", \"docs\") \
+         SELECT ?, \"doc\", \"bl\", \"iv\", \"m\", \"u\", \"docs\" FROM _dt_dup_probe WHERE \"id\" = ? RETURNING *",
+        Some(vec![json!("copy"), json!(1)]),
+    );
+    assert_eq!(copied.rows.len(), 1, "RETURNING answers the one row");
+    assert_eq!(copied.rows[0][1], json!("copy"), "the bound cell is the typed one");
+    // A source row that is gone returns nothing, which commit refuses; a
+    // scalar subquery in VALUES would insert a row of NULLs instead.
+    let gone = run(
+        "INSERT INTO _dt_dup_probe (\"name\", \"doc\") SELECT ?, \"doc\" FROM _dt_dup_probe WHERE \"id\" = ? RETURNING *",
+        Some(vec![json!("orphan"), json!(999)]),
+    );
+    assert!(gone.rows.is_empty(), "no source row, no insert");
+    let nulls = run(
+        "INSERT INTO _dt_dup_probe (\"name\", \"doc\") VALUES (?, (SELECT \"doc\" FROM _dt_dup_probe WHERE \"id\" = ?)) RETURNING doc IS NULL",
+        Some(vec![json!("orphan"), json!(999)]),
+    );
+    println!("a gone source: selected from, {:?}; as a scalar subquery, {:?}", gone.rows, nulls.rows);
+    assert_eq!(nulls.rows, vec![vec![json!(true)]], "the shape not used lands a NULL and says nothing");
+
+    let compare = |id: &serde_json::Value| {
+        run(
+            "SELECT c.name, c.doc = s.doc, variant_typeof(c.doc.day), variant_typeof(c.doc.big), \
+             c.bl IS NOT DISTINCT FROM s.bl, c.iv IS NOT DISTINCT FROM s.iv, \
+             c.m IS NOT DISTINCT FROM s.m, c.u IS NOT DISTINCT FROM s.u, \
+             c.docs IS NOT DISTINCT FROM s.docs, variant_typeof(c.docs[1]), variant_typeof(c.docs[2]) \
+             FROM _dt_dup_probe c, _dt_dup_probe s WHERE s.id = 1 AND c.id = ?",
+            Some(vec![id.clone()]),
+        )
+        .rows
+        .remove(0)
+    };
+    let source = compare(&json!(1));
+    let rebound = compare(&rebound.rows[0][0]);
+    let copy = compare(&copied.rows[0][0]);
+    println!("source:  {source:?}");
+    println!("rebound: {rebound:?}");
+    println!("copy:    {copy:?}");
+    assert_eq!(source[2], json!("DATE"));
+    assert_eq!(source[3], json!("INT128"));
+    assert_eq!(rebound[2], json!("VARCHAR"), "JSON has no DATE, so the wire's copy is a string");
+    assert_ne!(rebound[3], source[3], "nor a 128-bit integer");
+    assert_eq!(copy[1..], source[1..], "the copy made in SQL is the source, type for type");
+    assert!(copy[1..].iter().all(|v| v.as_bool() != Some(false)));
+
+    // The source row is deleted in the same transaction, after the insert
+    // read it: deletes run last.
+    let hit = run("DELETE FROM _dt_dup_probe WHERE \"id\" = ?", Some(vec![json!(1)]));
+    assert_eq!(hit.rows[0][0].as_u64(), Some(1));
+    run("COMMIT", None);
+    let kept = run(
+        "SELECT name, variant_typeof(doc.day), doc.big::VARCHAR, iv::VARCHAR, m::VARCHAR, \
+         union_tag(u)::VARCHAR, octet_length(bl[2]) FROM _dt_dup_probe WHERE name = 'copy'",
+        None,
+    );
+    println!("the copy, its source deleted: {:?}", kept.rows);
+    assert_eq!(
+        kept.rows,
+        vec![vec![
+            json!("copy"),
+            json!("DATE"),
+            json!("170141183460469231731687303715884105727"),
+            json!("1 year 2 months 2 days 00:00:03"),
+            json!("{a=1, b=2}"),
+            json!("s"),
+            json!(1),
+        ]]
+    );
+
+    // A keyless table names the source by its rowid.
+    run("CREATE TEMP TABLE _dt_dup_keyless_probe(name VARCHAR, doc VARIANT)", None);
+    run("INSERT INTO _dt_dup_keyless_probe VALUES ('a', DATE '2020-01-01'::VARIANT)", None);
+    let source_rowid = run("SELECT rowid FROM _dt_dup_keyless_probe", None).rows.remove(0).remove(0);
+    let copied = run(
+        "INSERT INTO _dt_dup_keyless_probe (\"name\", \"doc\") SELECT \"name\", \"doc\" \
+         FROM _dt_dup_keyless_probe WHERE \"rowid\" = ? RETURNING *",
+        Some(vec![source_rowid]),
+    );
+    assert_eq!(copied.rows.len(), 1);
+    let types = run("SELECT name, variant_typeof(doc) FROM _dt_dup_keyless_probe ORDER BY rowid", None);
+    println!("keyless, by rowid: {:?}", types.rows);
+    assert_eq!(types.rows[0], types.rows[1]);
+    assert_eq!(types.rows[1][1], json!("DATE"));
+
+    run("DROP TABLE _dt_dup_probe", None);
+    run("DROP TABLE _dt_dup_keyless_probe", None);
+    run("DROP SEQUENCE _dt_dup_seq", None);
+}
+
+/// What DuckTable's `parse_value` binds for a number JSON cannot carry: an
+/// integer past 64 bits as its digits, a DOUBLE that is not finite by name.
+/// The engine casts both exactly, and refuses `''` for an ENUM and a UUID,
+/// which is why neither clears to the empty string.
+#[test]
+#[ignore]
+fn wide_integers_and_non_finite_doubles_bind_as_text() {
+    use serde_json::json;
+    let Some(row) = connectable() else {
+        println!("no berth to test against; skipping");
+        return;
+    };
+    let conn = connect(&row.name).expect("connect");
+    let sid = harbor_client::session_new(&conn).expect("session");
+    let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
+        harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
+    };
+    run("DROP TABLE IF EXISTS _dt_number_probe", None);
+    run(
+        "CREATE TEMP TABLE _dt_number_probe(k INTEGER, h HUGEINT, ub UBIGINT, uh UHUGEINT, \
+         d DOUBLE, f FLOAT, e ENUM('POINT', 'LINE'), u UUID)",
+        None,
+    );
+    let wide = [
+        "170141183460469231731687303715884105727",
+        "18446744073709551615",
+        "340282366920938463463374607431768211455",
+    ];
+    let stored = run(
+        "INSERT INTO _dt_number_probe (k, h, ub, uh) VALUES (?, ?, ?, ?) \
+         RETURNING h::VARCHAR, ub::VARCHAR, uh::VARCHAR",
+        Some(vec![json!(1), json!(wide[0]), json!(wide[1]), json!(wide[2])]),
+    );
+    println!("wide integers bound as text: {:?}", stored.rows[0]);
+    assert_eq!(stored.rows[0], wide.map(|w| json!(w)).to_vec());
+    let low = run(
+        "UPDATE _dt_number_probe SET \"h\" = ? WHERE \"k\" = ?",
+        Some(vec![json!("-170141183460469231731687303715884105728"), json!(1)]),
+    );
+    assert_eq!(low.rows[0][0].as_u64(), Some(1));
+
+    for (name, shown, nan, inf) in [
+        ("nan", "NaN", true, false),
+        ("NaN", "NaN", true, false),
+        ("inf", "Infinity", false, true),
+        ("+inf", "Infinity", false, true),
+        ("-inf", "-Infinity", false, true),
+        ("Infinity", "Infinity", false, true),
+        ("-Infinity", "-Infinity", false, true),
+        ("infinity", "Infinity", false, true),
+    ] {
+        let r = run(
+            "INSERT INTO _dt_number_probe (k, d, f) VALUES (?, ?, ?) RETURNING d, f, isnan(d), isinf(d), d IS NULL",
+            Some(vec![json!(2), json!(name), json!(name)]),
+        );
+        println!("{name:?} into DOUBLE and FLOAT: {:?}", r.rows[0]);
+        assert_eq!(r.rows[0], vec![json!(shown), json!(shown), json!(nan), json!(inf), json!(false)]);
+    }
+
+    for (col, ty) in [("e", "ENUM"), ("u", "UUID")] {
+        let sql = format!("INSERT INTO _dt_number_probe (k, {col}) VALUES (?, ?)");
+        let refused = harbor_client::exec(&conn, &sql, Some(vec![json!(3), json!("")]), Some(&sid));
+        println!("'' into {ty}: {:?}", refused.as_ref().err());
+        assert!(refused.is_err(), "'' is not a value of {ty}");
+    }
+    run("DROP TABLE _dt_number_probe", None);
+}

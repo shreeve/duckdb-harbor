@@ -15,17 +15,30 @@ use gpui::SharedString;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
-/// One cell's staged change. Display text and bind value are both kept:
-/// the text is what render shows and what auto-clean compares; the value
-/// is what the statement binds (Null for NULL).
+/// One cell's staged change. Display text and what the statement supplies
+/// are both kept: the text is what render shows and what auto-clean
+/// compares; the bind is what reaches the engine.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CellEdit {
     /// The fetched display text this edit replaces (None = NULL).
     pub original: Option<SharedString>,
     /// The staged display text (None = NULL).
     pub text: Option<SharedString>,
-    /// The value the UPDATE binds.
-    pub value: Value,
+    /// What the statement puts in the column.
+    pub bind: Bind,
+}
+
+/// Where a staged cell's value comes from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Bind {
+    /// A value bound through the column's placeholder (Null for NULL).
+    Value(Value),
+    /// The column as the entry's source row holds it in the database, read
+    /// in SQL and never bound: a duplicate's untouched cell. The wire is
+    /// narrower than the engine — a VARIANT crosses it as JSON, a MAP as
+    /// pairs, an INTERVAL as an object — so a value that went out and came
+    /// back would not be the value that was there.
+    Source,
 }
 
 /// One row's staged fate.
@@ -67,6 +80,9 @@ struct Op {
 }
 
 struct Entry {
+    /// The persisted row the statement names in its WHERE: the row an
+    /// UPDATE or DELETE changes, the row a duplicate INSERT reads its
+    /// `Bind::Source` cells from. Empty for a draft that copies nothing.
     identity: Vec<Value>,
     change: RowChange,
 }
@@ -200,27 +216,29 @@ impl Edits {
     /// Add an intentional all-DEFAULT draft. It is staged immediately:
     /// DEFAULT VALUES can itself be a valid insert, and one undo removes it.
     pub fn stage_insert(&mut self) -> String {
-        self.stage_insert_values(Vec::new())
+        self.stage_duplicate(Vec::new(), Vec::new())
     }
 
-    /// Add a draft whose supplied cells are already known. This is the
-    /// duplicate-row path: the whole copied row is one undo step, just as
-    /// an empty New Row is one undo step.
-    pub fn stage_insert_values(
+    /// Add a draft copied from the persisted row `source`. Each cell shows
+    /// `text`; a `Bind::Source` cell is read from that row when the INSERT
+    /// runs, and a `Bind::Value` cell is bound like any typed one. The
+    /// whole copied row is one undo step, just as an empty New Row is.
+    pub fn stage_duplicate(
         &mut self,
-        values: Vec<(usize, Option<SharedString>, Value)>,
+        source: Vec<Value>,
+        cells: Vec<(usize, Option<SharedString>, Bind)>,
     ) -> String {
         let key = format!("draft:{:020}", self.next_draft);
         self.next_draft += 1;
-        let cells = values
+        let cells = cells
             .into_iter()
-            .map(|(col, text, value)| {
-                (col, CellEdit { original: None, text, value })
+            .map(|(col, text, bind)| {
+                (col, CellEdit { original: None, text, bind })
             })
             .collect();
         self.apply(Op {
             key: key.clone(),
-            identity: Vec::new(),
+            identity: source,
             prev: None,
             next: Some(RowChange::Insert(cells)),
         });
@@ -239,12 +257,12 @@ impl Edits {
         let Some(entry) = self.changes.get(key) else { return };
         let RowChange::Insert(mut cells) = entry.change.clone() else { return };
         let prev = Some(entry.change.clone());
-        cells.insert(col, CellEdit { original: None, text, value });
+        cells.insert(col, CellEdit { original: None, text, bind: Bind::Value(value) });
         let next = Some(RowChange::Insert(cells));
         if prev == next {
             return;
         }
-        self.apply(Op { key: key.to_string(), identity: Vec::new(), prev, next });
+        self.apply(Op { key: key.to_string(), identity: entry.identity.clone(), prev, next });
     }
 
     /// Restore a draft cell to DEFAULT by omitting it from INSERT.
@@ -257,7 +275,7 @@ impl Edits {
         }
         self.apply(Op {
             key: key.to_string(),
-            identity: Vec::new(),
+            identity: entry.identity.clone(),
             prev,
             next: Some(RowChange::Insert(cells)),
         });
@@ -313,7 +331,7 @@ impl Edits {
         if text == original {
             cells.remove(&col);
         } else {
-            cells.insert(col, CellEdit { original, text, value });
+            cells.insert(col, CellEdit { original, text, bind: Bind::Value(value) });
         }
         let next = (!cells.is_empty()).then_some(RowChange::Update(cells));
         if prev == next {
@@ -392,6 +410,12 @@ impl Edits {
     /// deletes, deterministic within each verb. Missing insert columns
     /// stay out of the statement so DuckDB supplies DEFAULT. The WHERE
     /// binds the ORIGINAL key values for existing rows.
+    ///
+    /// A duplicate with `Bind::Source` cells selects them from its source
+    /// row, so the engine copies what the wire could not carry. Inserts
+    /// run before any update or delete, so that row is read as the
+    /// database holds it, whatever else is staged on it; and a source row
+    /// that is gone returns no row, which commit refuses.
     pub fn statements(&self) -> Vec<Statement> {
         let mut out = Vec::new();
         let where_clause = self
@@ -400,21 +424,31 @@ impl Edits {
             .map(|c| format!("{} = {}", qident(c), self.placeholder_named(c)))
             .collect::<Vec<_>>()
             .join(" AND ");
-        for (_, _, change) in self.entries() {
+        for (_, identity, change) in self.entries() {
             if let RowChange::Insert(cells) = change {
-                let (sql, params) = if cells.is_empty() {
-                    (format!("INSERT INTO {} DEFAULT VALUES RETURNING *", self.source), Vec::new())
+                let mut params = Vec::new();
+                let sql = if cells.is_empty() {
+                    format!("INSERT INTO {} DEFAULT VALUES RETURNING *", self.source)
                 } else {
                     let names = cells
                         .keys()
                         .map(|ix| qident(self.column_name(*ix)))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    let marks = cells.keys().map(|ix| self.placeholder(*ix)).collect::<Vec<_>>().join(", ");
-                    (
-                        format!("INSERT INTO {} ({names}) VALUES ({marks}) RETURNING *", self.source),
-                        cells.values().map(|c| c.value.clone()).collect(),
-                    )
+                    let supplied = cells
+                        .iter()
+                        .map(|(ix, cell)| self.supply(*ix, cell, &mut params))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if cells.values().any(|c| c.bind == Bind::Source) {
+                        params.extend(identity.iter().cloned());
+                        format!(
+                            "INSERT INTO {} ({names}) SELECT {supplied} FROM {} WHERE {where_clause} RETURNING *",
+                            self.source, self.source
+                        )
+                    } else {
+                        format!("INSERT INTO {} ({names}) VALUES ({supplied}) RETURNING *", self.source)
+                    }
                 };
                 out.push(Statement {
                     sql,
@@ -425,13 +459,14 @@ impl Edits {
         }
         for (_, identity, change) in self.entries() {
             if let RowChange::Update(cells) = change {
+                let mut params = Vec::new();
                 let set = cells
-                    .keys()
-                    .map(|ix| format!("{} = {}", qident(self.column_name(*ix)), self.placeholder(*ix)))
+                    .iter()
+                    .map(|(ix, cell)| {
+                        format!("{} = {}", qident(self.column_name(*ix)), self.supply(*ix, cell, &mut params))
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
-                let mut params: Vec<Value> =
-                    cells.values().map(|c| c.value.clone()).collect();
                 params.extend(identity.iter().cloned());
                 out.push(Statement {
                     sql: format!("UPDATE {} SET {} WHERE {}", self.source, set, where_clause),
@@ -450,6 +485,19 @@ impl Edits {
             }
         }
         out
+    }
+
+    /// The SQL that supplies column `ix` from `cell`, pushing what it
+    /// binds: the column's placeholder for a value, the column itself for
+    /// a cell read from the row the statement's WHERE names.
+    fn supply(&self, ix: usize, cell: &CellEdit, params: &mut Vec<Value>) -> String {
+        match &cell.bind {
+            Bind::Value(value) => {
+                params.push(value.clone());
+                self.placeholder(ix).to_string()
+            }
+            Bind::Source => qident(self.column_name(ix)),
+        }
     }
 
     /// How column `ix`'s value is bound.
@@ -487,11 +535,71 @@ fn qident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// Text-ish columns are where `''` is a value in its own right; clearing
-/// any other type means NULL (docs/EDITING.md, "type-honest clear").
+/// Text columns are where `''` is a value in its own right; clearing any
+/// other type means NULL (docs/EDITING.md, "type-honest clear"). An ENUM
+/// and a UUID read like text and are not: the engine refuses `''` for
+/// both, so clearing one is NULL. Nor is a container of text — a
+/// `VARCHAR[]`, a `STRUCT(name VARCHAR)` — whose cleared cell is NULL too.
 pub fn is_text_type(duck_type: &str) -> bool {
     let ty = duck_type.to_uppercase();
-    ty.contains("VARCHAR") || ty.contains("CHAR") || ty == "UUID" || ty == "ENUM"
+    matches!(type_head(&ty), "VARCHAR" | "NVARCHAR" | "CHAR" | "BPCHAR" | "TEXT" | "STRING")
+}
+
+/// A scalar type's own name, without its parameters: `DECIMAL(10,2)` is
+/// `DECIMAL`, `ENUM('a', 'b')` is `ENUM`. A container is never the name of
+/// what it contains: `STRUCT(a INTEGER)` is `STRUCT`, and `INTEGER[]` and
+/// `DECIMAL(10,2)[]` stay whole, matching no scalar. Harbor sends `VARCHAR`,
+/// `INTEGER`, `DOUBLE` and the like (its `type_name`); the aliases matched
+/// beside them cost nothing.
+fn type_head(ty: &str) -> &str {
+    match ty.find('(') {
+        Some(at) if ty.ends_with(')') => ty[..at].trim_end(),
+        _ => ty,
+    }
+}
+
+/// An integer type's range, lowest and highest. The highest is a u128
+/// because UHUGEINT's is past i128.
+fn integer_bounds(name: &str) -> Option<(i128, u128)> {
+    Some(match name {
+        "TINYINT" | "INT1" => (i8::MIN as i128, i8::MAX as u128),
+        "SMALLINT" | "INT2" | "INT16" | "SHORT" => (i16::MIN as i128, i16::MAX as u128),
+        "INTEGER" | "INT4" | "INT32" | "INT" | "SIGNED" => (i32::MIN as i128, i32::MAX as u128),
+        "BIGINT" | "INT8" | "INT64" | "LONG" => (i64::MIN as i128, i64::MAX as u128),
+        "HUGEINT" | "INT128" => (i128::MIN, i128::MAX as u128),
+        "UTINYINT" | "UINT8" => (0, u8::MAX as u128),
+        "USMALLINT" | "UINT16" => (0, u16::MAX as u128),
+        "UINTEGER" | "UINT32" => (0, u32::MAX as u128),
+        "UBIGINT" | "UINT64" => (0, u64::MAX as u128),
+        "UHUGEINT" | "UINT128" => (0, u128::MAX),
+        _ => return None,
+    })
+}
+
+/// Integer text -> its bind value, refused when it is not an integer or
+/// not in the type's range. One that fits an i64 is a JSON number. A wider
+/// one is bound as its digits, which the engine casts exactly: a JSON
+/// number that wide is a double before it arrives.
+fn parse_integer(text: &str, duck_type: &str, (min, max): (i128, u128)) -> Result<Value, String> {
+    let t = text.trim();
+    let (negative, digits) = match t.strip_prefix('-') {
+        Some(digits) => (true, digits),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("{text:?} is not {duck_type}"));
+    }
+    // Digits that overflow a u128 are past every type's range.
+    let in_range = digits
+        .parse::<u128>()
+        .is_ok_and(|n| if negative { n <= min.unsigned_abs() } else { n <= max });
+    if !in_range {
+        return Err(format!("{text:?} is out of range for {duck_type}"));
+    }
+    Ok(match t.parse::<i64>() {
+        Ok(n) => Value::from(n),
+        Err(_) => Value::String(format!("{}{digits}", if negative { "-" } else { "" })),
+    })
 }
 
 /// Stage-time validation: user text -> the value the statement binds.
@@ -520,36 +628,44 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
         check_json(text)?;
         return Ok(Value::String(text.to_string()));
     }
-    if ty.contains("INT") {
-        return text
-            .trim()
-            .parse::<i64>()
-            .map(Value::from)
-            .map_err(|_| format!("{text:?} is not {duck_type}"));
+    // Every test below is on the scalar's own name, so a nested type —
+    // `INTEGER[]`, `STRUCT(a INTEGER)`, `MAP(VARCHAR, INTEGER)` — and a
+    // type whose spelling happens to hold another's — INTERVAL, an
+    // `ENUM('POINT')` — fall through to the engine's cast at the end.
+    let head = type_head(&ty);
+    if let Some(bounds) = integer_bounds(head) {
+        return parse_integer(text, duck_type, bounds);
     }
-    if ty.starts_with("DOUBLE") || ty.starts_with("FLOAT") || ty.starts_with("REAL") {
-        return text
-            .trim()
-            .parse::<f64>()
-            .map(Value::from)
-            .map_err(|_| format!("{text:?} is not {duck_type}"));
-    }
-    if ty.starts_with("DECIMAL") || ty.starts_with("NUMERIC") {
-        // Bound as text so precision survives JSON; DuckDB casts.
-        return match text.trim().parse::<f64>() {
-            Ok(_) => Ok(Value::String(text.trim().to_string())),
+    if matches!(head, "DOUBLE" | "FLOAT8" | "FLOAT" | "FLOAT4" | "REAL") {
+        let t = text.trim();
+        return match t.parse::<f64>() {
+            Ok(v) if v.is_finite() => Ok(Value::from(v)),
+            // NaN and the infinities have no JSON number — serde makes
+            // null of them — and the engine reads their names, so the name
+            // is what is bound. Without a digit, the text is such a name.
+            Ok(_) if !t.bytes().any(|b| b.is_ascii_digit()) => Ok(Value::String(t.to_string())),
+            // Digits that parse to infinity are a number too large.
+            Ok(_) => Err(format!("{text:?} is out of range for {duck_type}")),
             Err(_) => Err(format!("{text:?} is not {duck_type}")),
         };
     }
-    if ty == "BOOLEAN" {
+    if matches!(head, "DECIMAL" | "NUMERIC") {
+        // Bound as text so precision survives JSON; DuckDB casts.
+        return match text.trim().parse::<f64>() {
+            Ok(v) if v.is_finite() => Ok(Value::String(text.trim().to_string())),
+            _ => Err(format!("{text:?} is not {duck_type}")),
+        };
+    }
+    if head == "BOOLEAN" {
         return match text.trim().to_ascii_lowercase().as_str() {
             "true" | "t" | "1" | "yes" => Ok(Value::Bool(true)),
             "false" | "f" | "0" | "no" => Ok(Value::Bool(false)),
             _ => Err(format!("{text:?} is not BOOLEAN")),
         };
     }
-    // Dates, timestamps, blobs, nested types: bind the text and let the
-    // engine cast — its error comes back atomically at commit.
+    // Dates, timestamps, intervals, enums, blobs, nested types: bind the
+    // text and let the engine cast — its error comes back atomically at
+    // commit.
     Ok(Value::String(text.to_string()))
 }
 
@@ -719,7 +835,108 @@ mod tests {
         assert_eq!(parse_value("null", "INTEGER").unwrap(), Value::Null);
         assert_eq!(parse_value("null", "VARCHAR").unwrap(), json!("null"));
         assert_eq!(parse_value("19.99", "DECIMAL(10,2)").unwrap(), json!("19.99"));
+        assert!(parse_value("nan", "DECIMAL(10,2)").is_err());
         assert_eq!(parse_value("true", "BOOLEAN").unwrap(), json!(true));
+    }
+
+    #[test]
+    fn a_type_is_matched_by_its_own_name_not_by_what_it_contains() {
+        // None of these is an integer, a float, a decimal or text: the text
+        // is bound and the engine casts it.
+        for (text, ty) in [
+            ("3 days", "INTERVAL"),
+            ("[1, 2]", "INTEGER[]"),
+            ("[1, 2, 3]", "INTEGER[3]"),
+            ("{'a': 1, 'b': x}", "STRUCT(a INTEGER, b VARCHAR)"),
+            ("{a=1}", "MAP(VARCHAR, INTEGER)"),
+            ("POINT", "ENUM('POINT', 'LINE')"),
+            ("[1.5, nan]", "DOUBLE[]"),
+            ("[19.99]", "DECIMAL(10,2)[]"),
+            ("[a, b]", "VARCHAR[]"),
+            ("7", "UNION(n INTEGER, s VARCHAR)"),
+        ] {
+            assert_eq!(parse_value(text, ty), Ok(json!(text)), "{ty}");
+            assert!(!is_text_type(ty), "{ty}");
+            // Not text, so `null` is SQL NULL, and a cleared cell is NULL.
+            assert_eq!(parse_value("null", ty), Ok(Value::Null), "{ty}");
+        }
+        for ty in ["VARCHAR", "varchar", "VARCHAR(10)", "CHAR(3)", "TEXT"] {
+            assert!(is_text_type(ty), "{ty}");
+            assert_eq!(parse_value("null", ty), Ok(json!("null")), "{ty}");
+        }
+        // The engine refuses '' for both, so neither clears to ''.
+        assert!(!is_text_type("UUID"));
+        assert!(!is_text_type("ENUM('a', 'b')"));
+    }
+
+    #[test]
+    fn an_integer_is_held_to_its_range_and_bound_as_text_past_i64() {
+        for ty in ["TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "INT", "int8"] {
+            assert_eq!(parse_value(" -7 ", ty), Ok(json!(-7)), "{ty}");
+            assert_eq!(parse_value("+7", ty), Ok(json!(7)), "{ty}");
+        }
+        for ty in ["UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT"] {
+            assert_eq!(parse_value("7", ty), Ok(json!(7)), "{ty}");
+            assert_eq!(parse_value("-0", ty), Ok(json!(0)), "{ty}");
+            let err = parse_value("-1", ty).unwrap_err();
+            assert!(err.contains("out of range"), "{ty}: {err}");
+        }
+        for (ty, low, high) in [
+            ("TINYINT", "-128", "127"),
+            ("UTINYINT", "0", "255"),
+            ("SMALLINT", "-32768", "32767"),
+            ("INTEGER", "-2147483648", "2147483647"),
+            ("UINTEGER", "0", "4294967295"),
+            ("BIGINT", "-9223372036854775808", "9223372036854775807"),
+        ] {
+            assert_eq!(parse_value(low, ty), Ok(json!(low.parse::<i64>().unwrap())), "{ty}");
+            assert_eq!(parse_value(high, ty), Ok(json!(high.parse::<i64>().unwrap())), "{ty}");
+        }
+        assert!(parse_value("128", "TINYINT").unwrap_err().contains("out of range"));
+        assert!(parse_value("-129", "TINYINT").unwrap_err().contains("out of range"));
+        assert!(parse_value("9223372036854775808", "BIGINT").unwrap_err().contains("out of range"));
+
+        // Past i64 the digits are bound as text, which the engine casts
+        // exactly; a JSON number that wide would arrive as a double.
+        assert_eq!(parse_value("9223372036854775807", "UBIGINT"), Ok(json!(9223372036854775807i64)));
+        assert_eq!(parse_value("9223372036854775808", "UBIGINT"), Ok(json!("9223372036854775808")));
+        assert_eq!(parse_value("18446744073709551615", "UBIGINT"), Ok(json!("18446744073709551615")));
+        assert!(parse_value("18446744073709551616", "UBIGINT").unwrap_err().contains("out of range"));
+        let huge = "170141183460469231731687303715884105727";
+        assert_eq!(parse_value(huge, "HUGEINT"), Ok(json!(huge)));
+        assert_eq!(parse_value(&format!("+{huge}"), "HUGEINT"), Ok(json!(huge)));
+        assert_eq!(
+            parse_value("-170141183460469231731687303715884105728", "HUGEINT"),
+            Ok(json!("-170141183460469231731687303715884105728"))
+        );
+        assert!(parse_value("170141183460469231731687303715884105728", "HUGEINT").is_err());
+        let uhuge = "340282366920938463463374607431768211455";
+        assert_eq!(parse_value(uhuge, "UHUGEINT"), Ok(json!(uhuge)));
+        assert!(parse_value("340282366920938463463374607431768211456", "UHUGEINT").is_err());
+        assert!(parse_value(&"9".repeat(60), "UHUGEINT").unwrap_err().contains("out of range"));
+
+        for text in ["", "-", "+", "1.5", "1e3", "0x10", "1_000", "12a", "--1"] {
+            let err = parse_value(text, "HUGEINT").unwrap_err();
+            assert!(err.contains("is not HUGEINT"), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_double_that_is_not_finite_is_bound_by_name_and_never_as_null() {
+        for ty in ["DOUBLE", "FLOAT", "REAL"] {
+            assert_eq!(parse_value("1.5", ty), Ok(json!(1.5)), "{ty}");
+            assert_eq!(parse_value(" -2e10 ", ty), Ok(json!(-2e10)), "{ty}");
+            for name in ["nan", "NaN", "inf", "-inf", "+inf", "Infinity", "-Infinity", "infinity"] {
+                assert_eq!(parse_value(name, ty), Ok(json!(name)), "{ty} {name}");
+            }
+            assert_eq!(parse_value(" -inf ", ty), Ok(json!("-inf")), "{ty}");
+            for text in ["1e999", "-1e999"] {
+                let err = parse_value(text, ty).unwrap_err();
+                assert!(err.contains("out of range"), "{ty} {text}: {err}");
+            }
+            assert!(parse_value("abc", ty).unwrap_err().contains("is not"));
+            assert_eq!(parse_value("null", ty), Ok(Value::Null));
+        }
     }
 
     /// A table whose columns are the three types a bare `?` gets wrong.
@@ -838,20 +1055,162 @@ mod tests {
     }
 
     #[test]
-    fn a_prefilled_duplicate_is_one_insert_and_one_undo_step() {
+    fn a_duplicate_is_one_insert_and_one_undo_step() {
         let mut e = edits();
-        let key = e.stage_insert_values(vec![
-            (1, txt("Ada"), json!("Ada")),
-            (2, None, Value::Null),
-        ]);
+        let key = e.stage_duplicate(
+            vec![json!(5)],
+            vec![(1, txt("Ada"), Bind::Source), (2, None, Bind::Source)],
+        );
         assert_eq!(e.counts(), (1, 0, 0));
         assert_eq!(e.staged_text(&key, 1), Some(txt("Ada")));
-        assert_eq!(
-            e.statements()[0].sql,
-            "INSERT INTO \"main\".\"t\" (\"name\", \"qty\") VALUES (?, ?) RETURNING *"
-        );
+        assert_eq!(e.staged_text(&key, 2), Some(None));
         assert!(e.undo());
         assert!(e.is_empty(), "the whole duplicate must undo at once");
+        assert!(e.redo());
+        assert_eq!(e.statements()[0].params, vec![json!(5)], "and comes back with its source");
+    }
+
+    #[test]
+    fn a_duplicate_reads_untouched_cells_from_its_source_row() {
+        let mut e = typed();
+        // The source row carries a staged update on `j`, which the database
+        // does not hold yet: that cell is bound, the others are read.
+        let key = e.stage_duplicate(
+            vec![json!(5)],
+            vec![
+                (1, txt("{\"when\":\"2024-02-29\"}"), Bind::Source),
+                (2, txt("[2]"), Bind::Value(json!("[2]"))),
+                (3, txt("qg=="), Bind::Source),
+            ],
+        );
+        let stmts = e.statements();
+        assert_eq!(
+            stmts[0].sql,
+            "INSERT INTO \"main\".\"t\" (\"doc\", \"j\", \"b\") \
+             SELECT \"doc\", ?::JSON, \"b\" FROM \"main\".\"t\" WHERE \"id\" = ? RETURNING *"
+        );
+        assert_eq!(stmts[0].params, vec![json!("[2]"), json!(5)]);
+        assert_eq!(stmts[0].expectation, StatementExpectation::ReturnedOne);
+
+        // Typing into a copied cell makes it an ordinary typed value, and
+        // the source keeps supplying the rest, through undo and redo.
+        e.stage_insert_cell(&key, 3, txt("qrs="), json!("qrs="));
+        let typed_over = e.statements();
+        assert_eq!(
+            typed_over[0].sql,
+            "INSERT INTO \"main\".\"t\" (\"doc\", \"j\", \"b\") \
+             SELECT \"doc\", ?::JSON, from_base64(?::VARCHAR) FROM \"main\".\"t\" WHERE \"id\" = ? RETURNING *"
+        );
+        assert_eq!(typed_over[0].params, vec![json!("[2]"), json!("qrs="), json!(5)]);
+        assert!(e.undo());
+        assert_eq!(e.statements(), stmts);
+        assert!(e.redo());
+        assert_eq!(e.statements(), typed_over);
+
+        // A cell restored to DEFAULT leaves the statement; the rest stay.
+        e.stage_insert_default(&key, 3);
+        assert_eq!(
+            e.statements()[0].sql,
+            "INSERT INTO \"main\".\"t\" (\"doc\", \"j\") \
+             SELECT \"doc\", ?::JSON FROM \"main\".\"t\" WHERE \"id\" = ? RETURNING *"
+        );
+        assert_eq!(e.statements()[0].params, vec![json!("[2]"), json!(5)]);
+
+        // With every copied cell typed over, nothing is read from the source.
+        e.stage_insert_cell(&key, 1, None, Value::Null);
+        assert_eq!(
+            e.statements()[0].sql,
+            "INSERT INTO \"main\".\"t\" (\"doc\", \"j\") VALUES (?::JSON, ?::JSON) RETURNING *"
+        );
+        assert_eq!(e.statements()[0].params, vec![Value::Null, json!("[2]")]);
+    }
+
+    #[test]
+    fn a_duplicate_names_its_source_by_the_original_identity() {
+        // The source row is both re-keyed and deleted in the same staged
+        // set: the insert runs first and names the key the database holds.
+        let mut e = edits();
+        e.stage_cell(vec![json!(5)], 0, txt("5"), txt("7"), json!(7));
+        e.stage_duplicate(vec![json!(5)], vec![(1, txt("Ada"), Bind::Source)]);
+        e.stage_delete(vec![json!(9)]);
+        e.stage_duplicate(vec![json!(9)], vec![(1, txt("Bo"), Bind::Source)]);
+        let stmts = e.statements();
+        let copy = "INSERT INTO \"main\".\"t\" (\"name\") SELECT \"name\" FROM \"main\".\"t\" WHERE \"id\" = ? RETURNING *";
+        assert_eq!(stmts.len(), 4);
+        assert_eq!((stmts[0].sql.as_str(), &stmts[0].params), (copy, &vec![json!(5)]));
+        assert_eq!((stmts[1].sql.as_str(), &stmts[1].params), (copy, &vec![json!(9)]));
+        assert!(stmts[2].sql.starts_with("UPDATE"));
+        assert_eq!(stmts[2].params, vec![json!(7), json!(5)]);
+        assert!(stmts[3].sql.starts_with("DELETE"));
+
+        // A BLOB key is decoded in the duplicate's WHERE as in any other.
+        let mut blob_keyed = Edits::new(
+            "\"main\".\"t\"".into(),
+            vec!["k".into()],
+            vec!["k".into(), "name".into()],
+            vec!["BLOB".into(), "VARCHAR".into()],
+        );
+        blob_keyed.stage_duplicate(vec![json!("AAE=")], vec![(1, txt("a"), Bind::Source)]);
+        let stmts = blob_keyed.statements();
+        assert_eq!(
+            stmts[0].sql,
+            "INSERT INTO \"main\".\"t\" (\"name\") SELECT \"name\" FROM \"main\".\"t\" \
+             WHERE \"k\" = from_base64(?::VARCHAR) RETURNING *"
+        );
+        assert_eq!(stmts[0].params, vec![json!("AAE=")]);
+
+        // A keyless table names the source by its hidden rowid, and a
+        // composite key by every column of it.
+        let mut keyless = Edits::new(
+            "\"main\".\"t\"".into(),
+            vec!["rowid".into()],
+            vec!["rowid".into(), "name".into(), "doc".into()],
+            vec!["BIGINT".into(), "VARCHAR".into(), "VARIANT".into()],
+        );
+        keyless.stage_duplicate(
+            vec![json!(3)],
+            vec![(1, txt("a"), Bind::Value(json!("b"))), (2, txt("1"), Bind::Source)],
+        );
+        let stmts = keyless.statements();
+        assert_eq!(
+            stmts[0].sql,
+            "INSERT INTO \"main\".\"t\" (\"name\", \"doc\") SELECT ?, \"doc\" FROM \"main\".\"t\" \
+             WHERE \"rowid\" = ? RETURNING *"
+        );
+        assert_eq!(stmts[0].params, vec![json!("b"), json!(3)]);
+
+        let mut composite = Edits::new(
+            "\"main\".\"t\"".into(),
+            vec!["a".into(), "b".into()],
+            vec!["a".into(), "b".into(), "name".into()],
+            vec!["INTEGER".into(), "BLOB".into(), "VARCHAR".into()],
+        );
+        composite.stage_duplicate(vec![json!(1), json!("qg==")], vec![(2, txt("x"), Bind::Source)]);
+        let stmts = composite.statements();
+        assert_eq!(
+            stmts[0].sql,
+            "INSERT INTO \"main\".\"t\" (\"name\") SELECT \"name\" FROM \"main\".\"t\" \
+             WHERE \"a\" = ? AND \"b\" = from_base64(?::VARCHAR) RETURNING *"
+        );
+        assert_eq!(stmts[0].params, vec![json!(1), json!("qg==")]);
+    }
+
+    #[test]
+    fn a_duplicate_is_reviewed_discarded_and_validated_like_any_draft() {
+        let mut e = edits();
+        let key = e.stage_duplicate(vec![json!(5)], vec![(2, txt("3"), Bind::Source)]);
+        // `name` is NOT NULL with no default and was not copied.
+        let required = |e: &Edits| e.first_missing_required(&[true, true, false], &[None, None, None], &[true, false, false]);
+        assert_eq!(required(&e), Some((key.clone(), 1)));
+        e.stage_insert_cell(&key, 1, txt("Ada"), json!("Ada"));
+        assert_eq!(required(&e), None, "a copied cell counts as supplied");
+        let entries = e.entries();
+        let RowChange::Insert(cells) = entries[0].2 else { panic!("an insert") };
+        assert_eq!(cells[&2].text, txt("3"), "review shows the source's text");
+        e.discard(&key);
+        assert!(e.is_empty());
+        assert!(e.undo());
+        assert_eq!(e.statements()[0].params, vec![json!("Ada"), json!(5)]);
     }
 
     #[test]

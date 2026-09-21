@@ -51,16 +51,20 @@ switches, and the all-or-nothing commit. Discarding/deleting a draft removes
 the pending INSERT; it never emits a DELETE.
 
 **Duplicate Row** (⌘D) copies the selected persisted row into a new staged
-INSERT. It copies wire values rather than formatted cell text, each bound the
-way its column's type asks (below), includes
-any staged updates already visible on the source row, and omits primary-key and
-generated columns so DuckDB can supply the new identity and derived values. A
-natural key without a default therefore remains `REQUIRED`. The entire copied
-row is one undo step and is not written until ⌘S. The copy is as exact as the
-wire: a `VARIANT` crosses it as JSON, so a value JSON has no type for — a
-DATE, a DECIMAL, an integer past 64 bits, written into the document from SQL —
-arrives in the copy as the string or the double JSON made of it. A document
-that came from JSON copies exactly.
+INSERT. The engine makes the copy, not the wire: the INSERT selects each copied
+column from the source row, named by its original key or its rowid, so every
+value arrives as the value it was — a DATE or a DECIMAL inside a `VARIANT`, an
+integer past 64 bits, the bytes in a `BLOB[]`, an INTERVAL, a MAP, a UNION, none
+of which survive a trip out as JSON and back. The draft shows the source row's
+text. A cell with a staged update on the source row is copied as staged, and a
+cell typed over in the draft is an ordinary typed cell; both are bound the way
+their column's type asks (below). Primary-key and generated columns are omitted
+so DuckDB can supply the new identity and derived values. A natural key without
+a default therefore remains `REQUIRED`. The entire copied row is one undo step
+and is not written until ⌘S. Inserts run first in the transaction, so the source
+row is read as the database holds it at ⌘S, even when the same commit updates or
+deletes it; a source row that is gone by then fails the commit, and nothing
+lands.
 
 ## The grammar
 
@@ -214,6 +218,16 @@ not change, and printable exotica (AltGr, IME) already land on rung 6.
     `from_base64(?::VARCHAR)`. Bound bare, the base64 characters themselves
     become the bytes. A `BLOB` key in the WHERE is decoded the same way, so
     the row named is the row changed.
+- A number is bound as a JSON number where JSON can carry it and as text where
+  it cannot. An integer past 64 bits — a `UBIGINT`, a `HUGEINT`, a `UHUGEINT` —
+  goes as its digits, and `nan`, `inf`, `-inf`, `Infinity` into a `DOUBLE` or a
+  `FLOAT` go by name; the engine casts both exactly, and a typed number is never
+  staged as NULL. An integer outside its type's range, and digits too large for
+  a `DOUBLE`, are refused in the editor with the reason.
+- The editor judges a scalar by its own type name. A nested type (`INTEGER[]`,
+  `STRUCT(a INTEGER)`, a `MAP`), an `INTERVAL` and an `ENUM` are bound as their
+  text for the engine to cast. They clear to NULL, as a `UUID` does: the engine
+  takes `''` for none of them.
 - Confirming a cell with the text it already holds stages nothing and is never
   validated, so a value the engine accepted is never one the editor refuses to
   leave: a `VARIANT` holding a DATE, a DOUBLE that is NaN, an integer wider
