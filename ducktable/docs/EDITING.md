@@ -218,6 +218,16 @@ not change, and printable exotica (AltGr, IME) already land on rung 6.
     `from_base64(?::VARCHAR)`. Bound bare, the base64 characters themselves
     become the bytes. A `BLOB` key in the WHERE is decoded the same way, so
     the row named is the row changed.
+- A number is bound as a JSON number where JSON can carry it and as text where
+  it cannot. An integer past 64 bits — a `UBIGINT`, a `HUGEINT`, a `UHUGEINT` —
+  goes as its digits, and `nan`, `inf`, `-inf`, `Infinity` into a `DOUBLE` or a
+  `FLOAT` go by name; the engine casts both exactly, and a typed number is never
+  staged as NULL. An integer outside its type's range, and digits too large for
+  a `DOUBLE`, are refused in the editor with the reason.
+- The editor judges a scalar by its own type name. A nested type (`INTEGER[]`,
+  `STRUCT(a INTEGER)`, a `MAP`), an `INTERVAL` and an `ENUM` are bound as their
+  text for the engine to cast. They clear to NULL, as a `UUID` does: the engine
+  takes `''` for none of them.
 - Confirming a cell with the text it already holds stages nothing and is never
   validated, so a value the engine accepted is never one the editor refuses to
   leave: a `VARIANT` holding a DATE, a DOUBLE that is NaN, an integer wider

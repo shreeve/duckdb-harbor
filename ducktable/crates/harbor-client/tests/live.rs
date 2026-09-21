@@ -422,3 +422,71 @@ fn a_duplicate_row_copies_in_sql_what_the_wire_cannot_carry() {
     run("DROP TABLE _dt_dup_keyless_probe", None);
     run("DROP SEQUENCE _dt_dup_seq", None);
 }
+
+/// What DuckTable's `parse_value` binds for a number JSON cannot carry: an
+/// integer past 64 bits as its digits, a DOUBLE that is not finite by name.
+/// The engine casts both exactly, and refuses `''` for an ENUM and a UUID,
+/// which is why neither clears to the empty string.
+#[test]
+#[ignore]
+fn wide_integers_and_non_finite_doubles_bind_as_text() {
+    use serde_json::json;
+    let Some(row) = connectable() else {
+        println!("no berth to test against; skipping");
+        return;
+    };
+    let conn = connect(&row.name).expect("connect");
+    let sid = harbor_client::session_new(&conn).expect("session");
+    let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
+        harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
+    };
+    run("DROP TABLE IF EXISTS _dt_number_probe", None);
+    run(
+        "CREATE TEMP TABLE _dt_number_probe(k INTEGER, h HUGEINT, ub UBIGINT, uh UHUGEINT, \
+         d DOUBLE, f FLOAT, e ENUM('POINT', 'LINE'), u UUID)",
+        None,
+    );
+    let wide = [
+        "170141183460469231731687303715884105727",
+        "18446744073709551615",
+        "340282366920938463463374607431768211455",
+    ];
+    let stored = run(
+        "INSERT INTO _dt_number_probe (k, h, ub, uh) VALUES (?, ?, ?, ?) \
+         RETURNING h::VARCHAR, ub::VARCHAR, uh::VARCHAR",
+        Some(vec![json!(1), json!(wide[0]), json!(wide[1]), json!(wide[2])]),
+    );
+    println!("wide integers bound as text: {:?}", stored.rows[0]);
+    assert_eq!(stored.rows[0], wide.map(|w| json!(w)).to_vec());
+    let low = run(
+        "UPDATE _dt_number_probe SET \"h\" = ? WHERE \"k\" = ?",
+        Some(vec![json!("-170141183460469231731687303715884105728"), json!(1)]),
+    );
+    assert_eq!(low.rows[0][0].as_u64(), Some(1));
+
+    for (name, shown, nan, inf) in [
+        ("nan", "NaN", true, false),
+        ("NaN", "NaN", true, false),
+        ("inf", "Infinity", false, true),
+        ("+inf", "Infinity", false, true),
+        ("-inf", "-Infinity", false, true),
+        ("Infinity", "Infinity", false, true),
+        ("-Infinity", "-Infinity", false, true),
+        ("infinity", "Infinity", false, true),
+    ] {
+        let r = run(
+            "INSERT INTO _dt_number_probe (k, d, f) VALUES (?, ?, ?) RETURNING d, f, isnan(d), isinf(d), d IS NULL",
+            Some(vec![json!(2), json!(name), json!(name)]),
+        );
+        println!("{name:?} into DOUBLE and FLOAT: {:?}", r.rows[0]);
+        assert_eq!(r.rows[0], vec![json!(shown), json!(shown), json!(nan), json!(inf), json!(false)]);
+    }
+
+    for (col, ty) in [("e", "ENUM"), ("u", "UUID")] {
+        let sql = format!("INSERT INTO _dt_number_probe (k, {col}) VALUES (?, ?)");
+        let refused = harbor_client::exec(&conn, &sql, Some(vec![json!(3), json!("")]), Some(&sid));
+        println!("'' into {ty}: {:?}", refused.as_ref().err());
+        assert!(refused.is_err(), "'' is not a value of {ty}");
+    }
+    run("DROP TABLE _dt_number_probe", None);
+}

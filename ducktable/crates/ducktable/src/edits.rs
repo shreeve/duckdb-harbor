@@ -535,11 +535,71 @@ fn qident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// Text-ish columns are where `''` is a value in its own right; clearing
-/// any other type means NULL (docs/EDITING.md, "type-honest clear").
+/// Text columns are where `''` is a value in its own right; clearing any
+/// other type means NULL (docs/EDITING.md, "type-honest clear"). An ENUM
+/// and a UUID read like text and are not: the engine refuses `''` for
+/// both, so clearing one is NULL. Nor is a container of text — a
+/// `VARCHAR[]`, a `STRUCT(name VARCHAR)` — whose cleared cell is NULL too.
 pub fn is_text_type(duck_type: &str) -> bool {
     let ty = duck_type.to_uppercase();
-    ty.contains("VARCHAR") || ty.contains("CHAR") || ty == "UUID" || ty == "ENUM"
+    matches!(type_head(&ty), "VARCHAR" | "NVARCHAR" | "CHAR" | "BPCHAR" | "TEXT" | "STRING")
+}
+
+/// A scalar type's own name, without its parameters: `DECIMAL(10,2)` is
+/// `DECIMAL`, `ENUM('a', 'b')` is `ENUM`. A container is never the name of
+/// what it contains: `STRUCT(a INTEGER)` is `STRUCT`, and `INTEGER[]` and
+/// `DECIMAL(10,2)[]` stay whole, matching no scalar. Harbor sends `VARCHAR`,
+/// `INTEGER`, `DOUBLE` and the like (its `type_name`); the aliases matched
+/// beside them cost nothing.
+fn type_head(ty: &str) -> &str {
+    match ty.find('(') {
+        Some(at) if ty.ends_with(')') => ty[..at].trim_end(),
+        _ => ty,
+    }
+}
+
+/// An integer type's range, lowest and highest. The highest is a u128
+/// because UHUGEINT's is past i128.
+fn integer_bounds(name: &str) -> Option<(i128, u128)> {
+    Some(match name {
+        "TINYINT" | "INT1" => (i8::MIN as i128, i8::MAX as u128),
+        "SMALLINT" | "INT2" | "INT16" | "SHORT" => (i16::MIN as i128, i16::MAX as u128),
+        "INTEGER" | "INT4" | "INT32" | "INT" | "SIGNED" => (i32::MIN as i128, i32::MAX as u128),
+        "BIGINT" | "INT8" | "INT64" | "LONG" => (i64::MIN as i128, i64::MAX as u128),
+        "HUGEINT" | "INT128" => (i128::MIN, i128::MAX as u128),
+        "UTINYINT" | "UINT8" => (0, u8::MAX as u128),
+        "USMALLINT" | "UINT16" => (0, u16::MAX as u128),
+        "UINTEGER" | "UINT32" => (0, u32::MAX as u128),
+        "UBIGINT" | "UINT64" => (0, u64::MAX as u128),
+        "UHUGEINT" | "UINT128" => (0, u128::MAX),
+        _ => return None,
+    })
+}
+
+/// Integer text -> its bind value, refused when it is not an integer or
+/// not in the type's range. One that fits an i64 is a JSON number. A wider
+/// one is bound as its digits, which the engine casts exactly: a JSON
+/// number that wide is a double before it arrives.
+fn parse_integer(text: &str, duck_type: &str, (min, max): (i128, u128)) -> Result<Value, String> {
+    let t = text.trim();
+    let (negative, digits) = match t.strip_prefix('-') {
+        Some(digits) => (true, digits),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("{text:?} is not {duck_type}"));
+    }
+    // Digits that overflow a u128 are past every type's range.
+    let in_range = digits
+        .parse::<u128>()
+        .is_ok_and(|n| if negative { n <= min.unsigned_abs() } else { n <= max });
+    if !in_range {
+        return Err(format!("{text:?} is out of range for {duck_type}"));
+    }
+    Ok(match t.parse::<i64>() {
+        Ok(n) => Value::from(n),
+        Err(_) => Value::String(format!("{}{digits}", if negative { "-" } else { "" })),
+    })
 }
 
 /// Stage-time validation: user text -> the value the statement binds.
@@ -568,36 +628,44 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
         check_json(text)?;
         return Ok(Value::String(text.to_string()));
     }
-    if ty.contains("INT") {
-        return text
-            .trim()
-            .parse::<i64>()
-            .map(Value::from)
-            .map_err(|_| format!("{text:?} is not {duck_type}"));
+    // Every test below is on the scalar's own name, so a nested type —
+    // `INTEGER[]`, `STRUCT(a INTEGER)`, `MAP(VARCHAR, INTEGER)` — and a
+    // type whose spelling happens to hold another's — INTERVAL, an
+    // `ENUM('POINT')` — fall through to the engine's cast at the end.
+    let head = type_head(&ty);
+    if let Some(bounds) = integer_bounds(head) {
+        return parse_integer(text, duck_type, bounds);
     }
-    if ty.starts_with("DOUBLE") || ty.starts_with("FLOAT") || ty.starts_with("REAL") {
-        return text
-            .trim()
-            .parse::<f64>()
-            .map(Value::from)
-            .map_err(|_| format!("{text:?} is not {duck_type}"));
-    }
-    if ty.starts_with("DECIMAL") || ty.starts_with("NUMERIC") {
-        // Bound as text so precision survives JSON; DuckDB casts.
-        return match text.trim().parse::<f64>() {
-            Ok(_) => Ok(Value::String(text.trim().to_string())),
+    if matches!(head, "DOUBLE" | "FLOAT8" | "FLOAT" | "FLOAT4" | "REAL") {
+        let t = text.trim();
+        return match t.parse::<f64>() {
+            Ok(v) if v.is_finite() => Ok(Value::from(v)),
+            // NaN and the infinities have no JSON number — serde makes
+            // null of them — and the engine reads their names, so the name
+            // is what is bound. Without a digit, the text is such a name.
+            Ok(_) if !t.bytes().any(|b| b.is_ascii_digit()) => Ok(Value::String(t.to_string())),
+            // Digits that parse to infinity are a number too large.
+            Ok(_) => Err(format!("{text:?} is out of range for {duck_type}")),
             Err(_) => Err(format!("{text:?} is not {duck_type}")),
         };
     }
-    if ty == "BOOLEAN" {
+    if matches!(head, "DECIMAL" | "NUMERIC") {
+        // Bound as text so precision survives JSON; DuckDB casts.
+        return match text.trim().parse::<f64>() {
+            Ok(v) if v.is_finite() => Ok(Value::String(text.trim().to_string())),
+            _ => Err(format!("{text:?} is not {duck_type}")),
+        };
+    }
+    if head == "BOOLEAN" {
         return match text.trim().to_ascii_lowercase().as_str() {
             "true" | "t" | "1" | "yes" => Ok(Value::Bool(true)),
             "false" | "f" | "0" | "no" => Ok(Value::Bool(false)),
             _ => Err(format!("{text:?} is not BOOLEAN")),
         };
     }
-    // Dates, timestamps, blobs, nested types: bind the text and let the
-    // engine cast — its error comes back atomically at commit.
+    // Dates, timestamps, intervals, enums, blobs, nested types: bind the
+    // text and let the engine cast — its error comes back atomically at
+    // commit.
     Ok(Value::String(text.to_string()))
 }
 
@@ -767,7 +835,108 @@ mod tests {
         assert_eq!(parse_value("null", "INTEGER").unwrap(), Value::Null);
         assert_eq!(parse_value("null", "VARCHAR").unwrap(), json!("null"));
         assert_eq!(parse_value("19.99", "DECIMAL(10,2)").unwrap(), json!("19.99"));
+        assert!(parse_value("nan", "DECIMAL(10,2)").is_err());
         assert_eq!(parse_value("true", "BOOLEAN").unwrap(), json!(true));
+    }
+
+    #[test]
+    fn a_type_is_matched_by_its_own_name_not_by_what_it_contains() {
+        // None of these is an integer, a float, a decimal or text: the text
+        // is bound and the engine casts it.
+        for (text, ty) in [
+            ("3 days", "INTERVAL"),
+            ("[1, 2]", "INTEGER[]"),
+            ("[1, 2, 3]", "INTEGER[3]"),
+            ("{'a': 1, 'b': x}", "STRUCT(a INTEGER, b VARCHAR)"),
+            ("{a=1}", "MAP(VARCHAR, INTEGER)"),
+            ("POINT", "ENUM('POINT', 'LINE')"),
+            ("[1.5, nan]", "DOUBLE[]"),
+            ("[19.99]", "DECIMAL(10,2)[]"),
+            ("[a, b]", "VARCHAR[]"),
+            ("7", "UNION(n INTEGER, s VARCHAR)"),
+        ] {
+            assert_eq!(parse_value(text, ty), Ok(json!(text)), "{ty}");
+            assert!(!is_text_type(ty), "{ty}");
+            // Not text, so `null` is SQL NULL, and a cleared cell is NULL.
+            assert_eq!(parse_value("null", ty), Ok(Value::Null), "{ty}");
+        }
+        for ty in ["VARCHAR", "varchar", "VARCHAR(10)", "CHAR(3)", "TEXT"] {
+            assert!(is_text_type(ty), "{ty}");
+            assert_eq!(parse_value("null", ty), Ok(json!("null")), "{ty}");
+        }
+        // The engine refuses '' for both, so neither clears to ''.
+        assert!(!is_text_type("UUID"));
+        assert!(!is_text_type("ENUM('a', 'b')"));
+    }
+
+    #[test]
+    fn an_integer_is_held_to_its_range_and_bound_as_text_past_i64() {
+        for ty in ["TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "INT", "int8"] {
+            assert_eq!(parse_value(" -7 ", ty), Ok(json!(-7)), "{ty}");
+            assert_eq!(parse_value("+7", ty), Ok(json!(7)), "{ty}");
+        }
+        for ty in ["UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT"] {
+            assert_eq!(parse_value("7", ty), Ok(json!(7)), "{ty}");
+            assert_eq!(parse_value("-0", ty), Ok(json!(0)), "{ty}");
+            let err = parse_value("-1", ty).unwrap_err();
+            assert!(err.contains("out of range"), "{ty}: {err}");
+        }
+        for (ty, low, high) in [
+            ("TINYINT", "-128", "127"),
+            ("UTINYINT", "0", "255"),
+            ("SMALLINT", "-32768", "32767"),
+            ("INTEGER", "-2147483648", "2147483647"),
+            ("UINTEGER", "0", "4294967295"),
+            ("BIGINT", "-9223372036854775808", "9223372036854775807"),
+        ] {
+            assert_eq!(parse_value(low, ty), Ok(json!(low.parse::<i64>().unwrap())), "{ty}");
+            assert_eq!(parse_value(high, ty), Ok(json!(high.parse::<i64>().unwrap())), "{ty}");
+        }
+        assert!(parse_value("128", "TINYINT").unwrap_err().contains("out of range"));
+        assert!(parse_value("-129", "TINYINT").unwrap_err().contains("out of range"));
+        assert!(parse_value("9223372036854775808", "BIGINT").unwrap_err().contains("out of range"));
+
+        // Past i64 the digits are bound as text, which the engine casts
+        // exactly; a JSON number that wide would arrive as a double.
+        assert_eq!(parse_value("9223372036854775807", "UBIGINT"), Ok(json!(9223372036854775807i64)));
+        assert_eq!(parse_value("9223372036854775808", "UBIGINT"), Ok(json!("9223372036854775808")));
+        assert_eq!(parse_value("18446744073709551615", "UBIGINT"), Ok(json!("18446744073709551615")));
+        assert!(parse_value("18446744073709551616", "UBIGINT").unwrap_err().contains("out of range"));
+        let huge = "170141183460469231731687303715884105727";
+        assert_eq!(parse_value(huge, "HUGEINT"), Ok(json!(huge)));
+        assert_eq!(parse_value(&format!("+{huge}"), "HUGEINT"), Ok(json!(huge)));
+        assert_eq!(
+            parse_value("-170141183460469231731687303715884105728", "HUGEINT"),
+            Ok(json!("-170141183460469231731687303715884105728"))
+        );
+        assert!(parse_value("170141183460469231731687303715884105728", "HUGEINT").is_err());
+        let uhuge = "340282366920938463463374607431768211455";
+        assert_eq!(parse_value(uhuge, "UHUGEINT"), Ok(json!(uhuge)));
+        assert!(parse_value("340282366920938463463374607431768211456", "UHUGEINT").is_err());
+        assert!(parse_value(&"9".repeat(60), "UHUGEINT").unwrap_err().contains("out of range"));
+
+        for text in ["", "-", "+", "1.5", "1e3", "0x10", "1_000", "12a", "--1"] {
+            let err = parse_value(text, "HUGEINT").unwrap_err();
+            assert!(err.contains("is not HUGEINT"), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_double_that_is_not_finite_is_bound_by_name_and_never_as_null() {
+        for ty in ["DOUBLE", "FLOAT", "REAL"] {
+            assert_eq!(parse_value("1.5", ty), Ok(json!(1.5)), "{ty}");
+            assert_eq!(parse_value(" -2e10 ", ty), Ok(json!(-2e10)), "{ty}");
+            for name in ["nan", "NaN", "inf", "-inf", "+inf", "Infinity", "-Infinity", "infinity"] {
+                assert_eq!(parse_value(name, ty), Ok(json!(name)), "{ty} {name}");
+            }
+            assert_eq!(parse_value(" -inf ", ty), Ok(json!("-inf")), "{ty}");
+            for text in ["1e999", "-1e999"] {
+                let err = parse_value(text, ty).unwrap_err();
+                assert!(err.contains("out of range"), "{ty} {text}: {err}");
+            }
+            assert!(parse_value("abc", ty).unwrap_err().contains("is not"));
+            assert_eq!(parse_value("null", ty), Ok(Value::Null));
+        }
     }
 
     /// A table whose columns are the three types a bare `?` gets wrong.
