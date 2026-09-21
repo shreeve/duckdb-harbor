@@ -926,14 +926,27 @@ trip JSON → `VARIANT` → JSON is exact for real documents — any string, any
 Unicode, key order, `1` versus `1.0`, `"42"` versus `42`, integers up to 64
 bits, nested nulls — with these known edges, all measured on the engine:
 
-- *Writes need `::JSON`.* A plain string written into a `VARIANT` column,
-  whether a literal, an `UPDATE`, or a bound parameter, is stored as a
-  string, not parsed: `'{"a":1}'` lands as the text `{"a":1}`, and a client
-  gets `"{\"a\":1}"` back. Write `'{"a":1}'::JSON`, or `$1::JSON` for a
-  parameter, and it lands as an object. `'…'::VARIANT` does not parse either.
-  A `CHECK (v IS NULL OR variant_typeof(v) LIKE 'OBJECT%')` refuses the
-  mistake at write time. The same applies to a column conversion: use
+- *Text written into a `VARIANT` needs `::JSON`.* A plain string written
+  into a `VARIANT` column, whether a literal, an `UPDATE`, or a string
+  parameter, is stored as a string, not parsed: `'{"a":1}'` lands as the text
+  `{"a":1}`, a client gets `"{\"a\":1}"` back, and every path into it is NULL.
+  Write `'{"a":1}'::JSON`, or `$1::JSON` for a parameter, and it lands as an
+  object. `'…'::VARIANT` does not parse either. A
+  `CHECK (v IS NULL OR variant_typeof(v) LIKE 'OBJECT%')` refuses the mistake
+  at write time. The same applies to a column conversion: use
   `ALTER TABLE t ALTER COLUMN c SET DATA TYPE VARIANT USING c::JSON::VARIANT`.
+- *An object or array parameter is a document.* `"params": [{"a":1}]` aimed at
+  a `VARIANT` — a column in `SET` or `VALUES`, a comparison against one, a
+  `coalesce` with one — is bound as the document, so `SET doc = ?` stores an
+  object and `WHERE doc = ?` finds one. harbor asks the engine what each
+  parameter expects, once, and only for a request that carries an object or
+  an array. Aimed anywhere else it is its JSON text, a VARCHAR, for the
+  statement to cast: an untyped slot (`SELECT ?`, `INSERT … SELECT ?`), a
+  `VARCHAR` column, a `$1` used against two types, a `VARIANT[]` or a
+  `STRUCT` holding one. A string parameter is a string wherever it goes,
+  whatever it spells: a parameter that looks like JSON is data, as one that
+  looks like SQL is. A client holding JSON *text* — a grid cell, a file —
+  says so with `?::JSON`.
 - *Integers beyond 64 bits become doubles* and lose digits past the 17th;
   numbers past the range of a double come back as `Infinity`, which is not
   JSON. Integers within `INT64`/`UINT64` are exact.

@@ -4,6 +4,28 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.41.0 — 2026-09-20
+
+- **An object or array parameter aimed at a VARIANT is the document.**
+  `"params": [{"a":1}]` went to the engine as its JSON text, a VARCHAR, and
+  text cast to VARIANT is a VARIANT *string*: `SET doc = ?` stored a value
+  that read back as JSON while every path into it was NULL, and
+  `WHERE doc = ?` never found a document. harbor now asks the engine what
+  each parameter expects — one bind pass, made only when a request carries
+  an object or an array — and binds such a parameter as the document where
+  the answer is VARIANT. Aimed anywhere else it is its JSON text as before:
+  an untyped slot, a `VARCHAR` column, a `$1` used against two types, a
+  `VARIANT[]`. A string parameter is a string wherever it goes, whatever it
+  spells; a client holding JSON text still writes `?::JSON`, and statements
+  that already cast are untouched, since the parameter then expects JSON.
+  The bind pass drops an interrupt that lands during it, so the slot is asked
+  again before the statement runs; a cast the engine refuses, as inside an
+  aborted transaction, leaves the text and the statement reports the error.
+  Reading a string as JSON was considered and measured out: JSON text nested
+  tens of thousands deep, cast to VARIANT, recurses inside the engine until
+  the process dies, and no string parameter should be able to reach that.
+  An object or array cannot, because the request parser stops at 128 levels.
+
 ## 0.40.2 — 2026-09-20
 
 - **The engine is named by its DuckDB build.** `DUCKDB_LIB_BUILD=alpha42289`

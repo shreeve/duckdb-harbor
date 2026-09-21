@@ -330,6 +330,11 @@ impl SlotState {
         self.run.lock().unwrap().end()
     }
 
+    /// Whether a canceller has reached the statement now running.
+    fn cancelled(&self) -> bool {
+        self.run.lock().unwrap().cancelled
+    }
+
     /// Interrupt the running statement if it is still `job` — or whatever is
     /// running, when `job` is None. Returns whether the cancel was accepted.
     fn cancel(&self, job: Option<u64>) -> bool {
@@ -2037,9 +2042,12 @@ fn json_to_duckdb(v: &serde_json::Value) -> Result<Param, String> {
                 return Err("unrepresentable number in \"params\"".to_string());
             }
         }
-        // Arrays and objects have no unambiguous SQL type. Send them as JSON
-        // text and cast on the SQL side, where the intent is explicit.
-        other => Param::Text(other.to_string()),
+        // An object or an array is a document. Aimed at a VARIANT it is bound
+        // as one (`Conn::aim_documents`); everywhere else it has no SQL type of
+        // its own and goes as its JSON text, for the statement to cast. A
+        // string is never read this way, whatever it spells: a param that
+        // looks like JSON is data, as one that looks like SQL is.
+        other => Param::Document { text: other.to_string(), variant: false },
     })
 }
 
@@ -3804,6 +3812,16 @@ fn run_statement(
             code: "bad_request",
             message: "exactly one SQL statement is allowed per request".into(),
         }));
+        return needs_reset;
+    }
+    // A document aimed at a VARIANT is bound as one. Finding that out is a
+    // bind pass, and an interrupt that lands during it is dropped by the
+    // engine, so the slot is asked again before anything runs.
+    let mut params = params;
+    conn.aim_documents(last, &mut params);
+    if on_slot.slot.cancelled() {
+        on_slot.finish();
+        let _ = ready.send(Err(Refusal::cancelled()));
         return needs_reset;
     }
     let mut stream = match conn.execute(last, &params) {

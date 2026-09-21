@@ -272,7 +272,15 @@ The canonical reference for reading and writing VARIANT from SQL, Rip and
 the REPL is `rip/docs/VARIANTS.md` in the rip repository, measured against
 the engine build live runs. Read it before probing. The rule that explains
 the rest: objects in, values out; a bare string written without `::JSON` is
-stored as a string and every path into it is NULL, silently.
+stored as a string and every path into it is NULL, silently. harbor closes
+that for one case only: an object or array in `params` aimed at a VARIANT is
+bound as the document (`Conn::aim_documents`, one bind pass, skipped unless a
+param is an object or array). A string param is never read as JSON — a client
+holding JSON text casts it, which is what Rip's ORM and DuckTable do. JSON
+text nested tens of thousands deep and cast to VARIANT recurses inside the
+engine: 20,000 levels ran past a minute and about 70,000 killed the process
+on the 16 MiB executor stack (measured on alpha42289). harbor's own request
+parser stops at 128 levels, so only a SQL-side cast of a string reaches it.
 
 ## Recent history, for orientation
 
@@ -284,6 +292,7 @@ stored as a string and every path into it is NULL, silently.
 | 0.40.0 | 09-18 | brace expansion in the server |
 | 0.40.1 | 09-18 | Down is history until there is no history below; Ctrl-Space lists |
 | 0.40.2 | 09-20 | engine named by DuckDB build, `DUCKDB_LIB_BUILD`; fetch checks before it installs |
+| 0.41.0 | 09-20 | an object or array param aimed at a VARIANT is bound as the document |
 
 Older milestones the code still reflects: 0.20 collapsed everything into
 one binary with the refcounted lifetime; 0.21 moved to the direct v2 C API
