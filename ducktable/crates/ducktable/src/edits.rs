@@ -108,6 +108,30 @@ pub struct Edits {
     next_draft: u64,
 }
 
+/// What a grid does with the staged set parked for its table.
+#[derive(Debug, PartialEq)]
+pub enum Handoff {
+    /// The grid's own set has the stash's shape: the stash takes its place.
+    Adopt,
+    /// The grid has no columns yet — its first fetch failed — so there is
+    /// no shape to compare. The stash waits for the fetch that brings them.
+    Hold,
+    /// The table has another shape than the one the edits were staged
+    /// against. Rebinding them would mis-key or mis-type them, so they are
+    /// dropped.
+    Orphan,
+}
+
+/// Decide a parked stash's fate. `mine` is the grid's own staging set, None
+/// while it has none; `has_columns` is whether a page has reached the grid.
+pub fn handoff(mine: Option<&Edits>, has_columns: bool, stash: &Edits) -> Handoff {
+    match mine {
+        Some(mine) if mine.same_shape(stash) => Handoff::Adopt,
+        None if !has_columns => Handoff::Hold,
+        _ => Handoff::Orphan,
+    }
+}
+
 /// A row identity's map key: its canonical JSON. Values compare by
 /// serialization, which is exactly the equality the wire speaks.
 pub fn key_of(identity: &[Value]) -> String {
@@ -147,6 +171,11 @@ impl Edits {
             && self.pk_cols == other.pk_cols
             && self.columns == other.columns
             && self.types == other.types
+    }
+
+    /// Whether anything is staged.
+    pub fn any_staged(&self) -> bool {
+        !self.changes.is_empty()
     }
 
     /// How the review popover names the row a duplicate copies: every key
@@ -1842,5 +1871,20 @@ mod tests {
         e.stage_duplicate(vec![json!(5)], vec![(1, txt("Ada"), Bind::Source)]);
         let labels: Vec<_> = e.entries().iter().map(|(_, identity, _)| e.source_label(identity)).collect();
         assert_eq!(labels, vec![None, Some("copy of id = 5".to_string())]);
+    }
+
+    #[test]
+    fn a_parked_stash_is_adopted_held_or_orphaned() {
+        let mut stash = edits();
+        stash.stage_cell(vec![json!(1)], 1, txt("a"), txt("b"), json!("b"));
+        // The table as it was: the stash takes the grid's empty set's place.
+        assert_eq!(handoff(Some(&edits()), true, &stash), Handoff::Adopt);
+        // A grid whose first fetch failed has no columns and no set: the
+        // stash waits, and is judged when they arrive.
+        assert_eq!(handoff(None, false, &stash), Handoff::Hold);
+        // A table that changed shape, or lost its key, orphans the stash.
+        assert_eq!(handoff(Some(&typed()), true, &stash), Handoff::Orphan);
+        assert_eq!(handoff(None, true, &stash), Handoff::Orphan);
+        assert!(stash.any_staged() && !edits().any_staged());
     }
 }

@@ -881,3 +881,58 @@ fn padding_is_part_of_a_value_only_for_text_json_and_enum() {
     }
     run("DROP TABLE _dt_padding_probe", None);
 }
+
+/// How a grid notices a table altered elsewhere (ducktable's `grid.rs`,
+/// `same_columns`). One client pages a table; another alters a column's type
+/// and adds a column; the first client's next page of the same SQL carries
+/// the new names and types, which is all the signal there is. The stale type
+/// matters: base64 text bound through the placeholder of the VARCHAR the
+/// column was is stored in the BLOB it became as the characters themselves.
+#[test]
+#[ignore]
+fn a_table_altered_elsewhere_shows_in_the_next_page() {
+    use serde_json::json;
+    let Some(row) = connectable() else {
+        println!("no berth to test against; skipping");
+        return;
+    };
+    println!("berth: {}", row.name);
+    let grid = connect(&row.name).expect("connect");
+    let other = connect(&row.name).expect("connect again");
+    let elsewhere = harbor_client::session_new(&other).expect("session");
+    let alter = |sql: &str| harbor_client::exec(&other, sql, None, Some(&elsewhere)).expect(sql);
+    let shape = |r: &harbor_client::QueryResult| -> Vec<(String, String)> {
+        r.columns.iter().map(|c| (c.name.clone().unwrap_or_default(), c.duckdb_type.clone())).collect()
+    };
+    alter("DROP TABLE IF EXISTS main._dt_reshape_probe");
+    alter("CREATE TABLE main._dt_reshape_probe(id INTEGER PRIMARY KEY, payload VARCHAR)");
+    alter("INSERT INTO main._dt_reshape_probe VALUES (1, 'qg==')");
+
+    let page = "SELECT * FROM \"main\".\"_dt_reshape_probe\" LIMIT 500 OFFSET 0";
+    let born = harbor_client::query(&grid, page).expect("first page");
+    println!("the grid's birth: {:?}", shape(&born));
+    assert_eq!(shape(&born), vec![("id".into(), "INTEGER".into()), ("payload".into(), "VARCHAR".into())]);
+
+    alter("ALTER TABLE main._dt_reshape_probe ALTER payload TYPE BLOB");
+    alter("ALTER TABLE main._dt_reshape_probe ADD COLUMN note VARCHAR DEFAULT 'n'");
+    let next = harbor_client::query(&grid, page).expect("next page");
+    println!("the next page:    {:?}", shape(&next));
+    assert_eq!(
+        shape(&next),
+        vec![("id".into(), "INTEGER".into()), ("payload".into(), "BLOB".into()), ("note".into(), "VARCHAR".into())]
+    );
+    assert_ne!(shape(&born), shape(&next));
+
+    // What the stale VARCHAR placeholder does to the BLOB, and what the
+    // BLOB's own placeholder does.
+    for (id, placeholder) in [(2, "?"), (3, "from_base64(?::VARCHAR)")] {
+        let sql = format!("INSERT INTO main._dt_reshape_probe (id, payload) VALUES (?, {placeholder}) RETURNING hex(payload)");
+        let kept = harbor_client::exec(&grid, &sql, Some(vec![json!(id), json!("qrs=")]), None).expect("insert");
+        println!("'qrs=' through `{placeholder}`: bytes {}", kept.rows[0][0]);
+    }
+    let stored = harbor_client::query(&grid, "SELECT hex(payload) FROM main._dt_reshape_probe WHERE id > 1 ORDER BY id")
+        .expect("read back");
+    assert_eq!(stored.rows, vec![vec![json!("7172733D")], vec![json!("AABB")]]);
+    alter("DROP TABLE main._dt_reshape_probe");
+    harbor_client::session_release(&other, &elsewhere);
+}
