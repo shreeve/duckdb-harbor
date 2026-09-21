@@ -89,4 +89,8 @@ jobs:
           gh release download "$feed" --repo "$GITHUB_REPOSITORY" --dir target/updates --clobber || true
           cp target/DuckTable.zip "target/updates/DuckTable-$ver.zip"
           scripts/appcast.sh target/updates
-          gh release upload "$feed" target/updates/* --repo "$GITHUB_REPOSITORY" --clobber
+          # Files only: generate_appcast sets the archives it prunes from the
+          # feed aside in target/updates/old_updates, and a directory is not
+          # an asset. What it set aside stays on the feed release, unlisted.
+          find target/updates -maxdepth 1 -type f -exec \
+            gh release upload "$feed" --repo "$GITHUB_REPOSITORY" --clobber {} +
