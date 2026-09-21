@@ -17,16 +17,20 @@
 # what it fetched yesterday. The release archives bundle the engine they
 # were built with, which is what makes a release reproducible; a local
 # fetch is deliberately current. The script checks that the library it
-# got exports the v2 C API, because for a month in 2026 the channel shipped
-# one that did not, and harbor refuses such an engine at dlopen.
+# got exports the v2 C API harbor binds, because the channel has shipped
+# ones that did not, and harbor refuses such an engine at dlopen.
 #
-# DUCKDB_ENGINE_RELEASE names a harbor release (`v0.39.0`) whose archive
-# supplies the library instead of the channel: every release bundles the
-# exact engine it was built and tested with, so a release is the one
-# place an older engine can be had. The CLI and the headers still come
-# from the channel, so the headers may run ahead of the library — they
-# are reference only. CI and Release.yml read the same name from the
-# repository variable of that name; clearing it returns to the channel.
+# DUCKDB_LIB_BUILD names the build of the library: `latest`, the default,
+# is the channel's; anything else is a DuckDB build by name (`alpha42289`,
+# the tail of `v2.0.0-alpha42289`), fetched from the `engine-<build>`
+# release of this repository, which holds one `libduckdb-<plat>.tar.gz` per
+# platform. The channel cannot serve a build by name, so an engine that has
+# to stay fixed is published there. The library says which build it is, and
+# the script refuses one that is not the build it was asked for. The CLI
+# and the headers still come from the channel, so they may run ahead of a
+# named library — the headers are reference only. CI and Release.yml read
+# the same name from the repository variable of that name; `latest`, or
+# clearing it, returns to the channel.
 #
 # Override DEST to install elsewhere.
 
@@ -34,7 +38,8 @@ set -euo pipefail
 
 dest=${DEST:-$HOME/.duckdb/cli/2.0.0}
 channel=${DUCKDB_CHANNEL:-v2.0-cyanoptera}
-pin=${DUCKDB_ENGINE_RELEASE:-}
+build=${DUCKDB_LIB_BUILD:-latest}
+[ -n "$build" ] || build=latest
 
 duck_plat=${DUCKDB_PLATFORM:-}
 if [ -z "$duck_plat" ]; then
@@ -75,28 +80,52 @@ for kind in shared-libs cli; do
   tar -xzf "$work/$kind.tar.gz" -C "$work"
 done
 
-# ---- a pinned engine: the library from a harbor release's archive --------
-# The channel's library is discarded and the release's takes its place in
-# the work tree, so the placing and the v2 check below see one library.
-if [ -n "$pin" ]; then
+# ---- a named build: the library from this repository's engine release -----
+# The channel's library is discarded and the named one takes its place in
+# the work tree, so the placing and the checks below see one library.
+if [ "$build" != latest ]; then
   case "$duck_plat" in
-    osx-arm64|linux-amd64|linux-arm64) ext=tar.gz ;;
-    windows-amd64|windows-arm64)       ext=zip ;;
-    *) echo "fetch-duckdb: no harbor release archive exists for $duck_plat — unset DUCKDB_ENGINE_RELEASE" >&2; exit 2 ;;
+    osx-arm64|linux-amd64|linux-arm64|windows-amd64|windows-arm64) ;;
+    *) echo "fetch-duckdb: no engine release carries $duck_plat — use DUCKDB_LIB_BUILD=latest" >&2; exit 2 ;;
   esac
-  url="https://github.com/shreeve/duckdb-harbor/releases/download/$pin/harbor-$pin-$duck_plat.$ext"
-  say "pinned engine: fetching $url"
-  rm -f "$work"/libduckdb.dylib "$work"/libduckdb.so "$work"/duckdb.dll "$work"/duckdb.lib
-  mkdir -p "$work/pin"
-  curl -fsSL -o "$work/pin/archive.$ext" "$url"
-  if [ "$ext" = zip ]; then
-    if command -v unzip >/dev/null; then unzip -q "$work/pin/archive.$ext" -d "$work/pin"
-    else 7z x -y -o"$work/pin" "$work/pin/archive.$ext" >/dev/null; fi
-  else
-    tar -xzf "$work/pin/archive.$ext" -C "$work/pin"
+  url="https://github.com/shreeve/duckdb-harbor/releases/download/engine-$build/libduckdb-$duck_plat.tar.gz"
+  say "build $build: fetching $url"
+  /usr/bin/find "$work" -type f \( -name libduckdb.dylib -o -name libduckdb.so \
+    -o -name duckdb.dll -o -name duckdb.lib \) -delete
+  curl -fsSL -o "$work/libduckdb.tar.gz" "$url" \
+    || { echo "fetch-duckdb: no engine-$build release, or none for $duck_plat" >&2; exit 1; }
+  tar -xzf "$work/libduckdb.tar.gz" -C "$work"
+fi
+
+# ---- is this the engine asked for, and can it serve harbor? ----------------
+# Both questions are put to the library in the work tree, so one that fails
+# either never lands in $dest. grep reads the names straight out of the
+# binary — present on every platform, no nm/objdump dependency.
+lib=
+for name in libduckdb.dylib libduckdb.so duckdb.dll; do
+  lib=$(grab "$name")
+  [ -z "$lib" ] || break
+done
+# A fetch that carried no engine is a failure, not a quiet success — the
+# same rule package-release.sh enforces.
+[ -n "$lib" ] || { echo "fetch-duckdb: the archives contained no libduckdb" >&2; exit 1; }
+
+# harbor binds the v2 C API and refuses a library without it at dlopen,
+# later and less clearly than here. The name asked for is the one harbor's
+# loader gates on (engine/mod.rs, `boot`), whole: it is no prefix of another
+# symbol, so a library with a different v2 surface does not pass by accident.
+if ! grep -q duckdb_v2_create_environment "$lib" 2>/dev/null; then
+  echo "fetch-duckdb: this libduckdb lacks the v2 C API harbor binds — harbor cannot serve with it." >&2
+  if [ "$build" = latest ]; then
+    echo "  The $channel channel has moved past this harbor; name a build it loads with DUCKDB_LIB_BUILD." >&2
   fi
-  [ -n "$(grab libduckdb.dylib)$(grab libduckdb.so)$(grab duckdb.dll)" ] \
-    || { echo "fetch-duckdb: $url carried no libduckdb" >&2; exit 1; }
+  exit 1
+fi
+
+# A library carries its version string, `v2.0.0-<build>`.
+if [ "$build" != latest ] && ! grep -q -- "-$build" "$lib" 2>/dev/null; then
+  echo "fetch-duckdb: the library in engine-$build does not say it is build $build." >&2
+  exit 1
 fi
 
 mkdir -p "$dest"
@@ -111,12 +140,6 @@ place duckdb_v2.h        0644
 place duckdb_extension.h 0644
 place duckdb_extension_v2.h 0644
 
-# A fetch that placed no engine is a failure, not a quiet success — the
-# same rule package-release.sh enforces. Without this, a malformed or
-# empty archive would sail through to "ready" with nothing installed.
-[ -f "$dest/libduckdb.dylib" ] || [ -f "$dest/libduckdb.so" ] || [ -f "$dest/duckdb.dll" ] \
-  || { echo "fetch-duckdb: the archive contained no libduckdb" >&2; exit 1; }
-
 # ---- point cli/latest at what we just refreshed ----------------------------
 # Only when we filled the canonical dir — a throwaway DEST elsewhere (a scratch
 # test, a one-off build root) has no business owning `latest`.
@@ -125,18 +148,4 @@ if [ "$dest" = "$HOME/.duckdb/cli/2.0.0" ]; then
   say "cli/latest -> $dest"
 fi
 
-# ---- can this engine actually serve harbor? --------------------------------
-# harbor binds the v2 C API. grep the dynamic symbol names straight out of
-# the binary — present on every platform, no nm/objdump dependency — and
-# refuse a library without them: harbor would refuse it at dlopen anyway,
-# later and less clearly.
-for f in "$dest"/libduckdb.dylib "$dest"/libduckdb.so "$dest"/duckdb.dll; do
-  [ -f "$f" ] || continue
-  if ! grep -q duckdb_v2_connect "$f" 2>/dev/null; then
-    echo "fetch-duckdb: $f exports no v2 C API symbols — harbor cannot serve with it." >&2
-    echo "  The $channel channel shipped a pre-v2 build; try again later, or another DUCKDB_CHANNEL." >&2
-    exit 1
-  fi
-  break
-done
-echo "fetch-duckdb: ready in $dest${pin:+ (engine pinned to harbor $pin)}"
+echo "fetch-duckdb: ready in $dest (libduckdb build: $build)"

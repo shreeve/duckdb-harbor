@@ -375,17 +375,22 @@ The engine `fetch-duckdb` pulls is DuckDB's official nightly of the 2.0
 branch — the latest green build, which is a moving target by design. The
 release archives below bundle the engine they were built with, so a release
 is reproducible; a local fetch is deliberately current. The script refuses a
-library that lacks the v2 C API, since harbor would refuse it at dlopen.
+library that lacks the v2 C API harbor binds, before it installs anything,
+since harbor would refuse it at dlopen.
 
-`DUCKDB_ENGINE_RELEASE=v0.39.0` names a harbor release whose archive supplies
-`libduckdb` in place of the channel's current build; the CLI and headers still
-come from the channel. Every release bundles the exact engine it was built and
-tested with, so a release is the one place an older engine can be had when the
-channel moves to one harbor cannot load — as it did when the v2 C API was
-reworked (duckdb/duckdb#25751). The repository variable of the same name pins
-CI and the release builds; clearing it returns to the channel. Set it locally
-to match while the variable is set, or `make fetch-duckdb` hands harbor an
-engine it refuses.
+`DUCKDB_LIB_BUILD` names the build of `libduckdb` to fetch. `latest`, the
+default, is the channel's current build. Anything else is a DuckDB build by
+name — `DUCKDB_LIB_BUILD=alpha42289 make fetch-duckdb` for
+`v2.0.0-alpha42289` — taken from the `engine-<build>` release of this
+repository, which holds that one library for each platform; the CLI and
+headers still come from the channel. The channel cannot serve a build by
+name, so an engine release is where a fixed one lives when the channel moves
+to an engine harbor cannot load — as it did when the v2 C API was reworked
+(duckdb/duckdb#25751). The script checks that the library it got says it is
+the build it was asked for. The repository variable of the same name sets the
+build for CI and the release builds; `latest`, or clearing it, returns to the
+channel. Set it locally to match while the variable names a build, or
+`make fetch-duckdb` refuses the channel's engine and installs nothing.
 
 No toolchain? One command installs the latest release — it picks the right
 archive for the platform, verifies its sha256 against the published checksums,
@@ -997,7 +1002,7 @@ The server implements its protocol shapes directly rather than depending on
 compile error. Nothing links `libduckdb` — the engine loads on demand — so no
 DuckDB source tree, library, or header is required to build: `make harbor`
 works on a bare machine, and `make fetch-duckdb` fetches the duckdb CLI plus
-a library (honoring `DUCKDB_ENGINE_RELEASE`, under "Get it running"). The
+a library (honoring `DUCKDB_LIB_BUILD`, under "Get it running"). The
 crate ships pregenerated bindings, so there is no bindgen.
 
 `make unit` runs the fast Rust tests and `make test` runs the full suite. The

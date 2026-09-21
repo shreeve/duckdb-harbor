@@ -51,9 +51,9 @@ jobs:
       - name: Fetch DuckDB engine
         shell: bash
         env:
-          # A harbor release whose archive supplies the engine, or empty for
+          # The libduckdb build by name (`alpha42289`), or `latest` or empty for
           # the channel's current build (see scripts/fetch-duckdb.sh).
-          DUCKDB_ENGINE_RELEASE: ${{ vars.DUCKDB_ENGINE_RELEASE }}
+          DUCKDB_LIB_BUILD: ${{ vars.DUCKDB_LIB_BUILD }}
         run: DEST="$DUCKDB_LIB" DUCKDB_PLATFORM=${{ matrix.duck_plat }} scripts/fetch-duckdb.sh
 
       # Fail FAST if the fetched library cannot serve this harbor — grep the
@@ -74,7 +74,7 @@ jobs:
             if [ -f "$f" ]; then lib=$f; break; fi
           done
           [ -n "$lib" ] || { echo "no libduckdb found in $DUCKDB_LIB"; exit 1; }
-          if ! grep -qc duckdb_v2_connect "$lib"; then
+          if ! grep -qc duckdb_v2_create_environment "$lib"; then
             echo "::error::$lib exports no v2 C API symbols — harbor $(grep -m1 '^version' Cargo.toml) cannot serve with it."
             exit 1
           fi

@@ -4,6 +4,26 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.40.2 — 2026-09-20
+
+- **The engine is named by its DuckDB build.** `DUCKDB_LIB_BUILD=alpha42289`
+  tells `scripts/fetch-duckdb.sh`, CI and `Release.yml` to take `libduckdb`
+  build `v2.0.0-alpha42289` from the `engine-alpha42289` release of this
+  repository, which holds that one library for each of the five platforms;
+  `latest`, the default, is the channel's current build. It takes the place
+  of `DUCKDB_ENGINE_RELEASE`, which named a harbor release to lift the
+  library out of: what has to stay fixed is a DuckDB build, and the name now
+  says which one. The script checks that the library it fetched says it is
+  that build.
+- **A fetch checks the engine before it installs it.** The script looked for
+  the v2 C API after the library was already in place, and looked for
+  `duckdb_v2_connect`, which is also the start of `duckdb_v2_connection_create`
+  in the reworked API — so the channel's current engine passed, and harbor
+  then refused it at dlopen. The check now runs on the downloaded library,
+  asks for `duckdb_v2_create_environment`, the symbol harbor's loader gates
+  on, and a library that fails it never lands. `Release.yml` asks for the
+  same symbol.
+
 ## 0.40.1 — 2026-09-18
 
 - **Down is history until there is no history below.** Up and Down walk
