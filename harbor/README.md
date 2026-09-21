@@ -980,10 +980,13 @@ bits, nested nulls — with these known edges, all measured on the engine:
   `STRUCT` holding one. A string parameter is a string wherever it goes,
   whatever it spells: a parameter that looks like JSON is data, as one that
   looks like SQL is. A client holding JSON *text* — a grid cell, a file —
-  says so with `?::JSON`. An object or array parameter nests at most 125
-  levels: the request parser reads 127, and the body's own
-  `{ "params": [ … ] }` is two of them; one level more is a 400. A string
-  through `?::JSON` has no such limit.
+  says so with `?::JSON`. An object or array parameter nests at most 100
+  levels, its own levels counted: `{}` is one and `[[1]]` is two. One level
+  more is a 400 `bad_request` that says `a document param nests at most 100
+  levels`, and nothing is bound. Rip's ORM and DuckTable's editor keep the
+  same number, so a document is refused at the same depth whichever layer
+  meets it first. A string parameter is never inspected: what it spells is
+  data, and one cast through `?::JSON` nests as deep as the engine reads.
 - *Integers beyond 64 bits become doubles* and lose digits past the 17th;
   numbers past the range of a double come back as `Infinity`, which is not
   JSON. Integers within `INT64`/`UINT64` are exact.

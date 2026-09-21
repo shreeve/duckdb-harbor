@@ -1972,7 +1972,14 @@ struct SqlRequest {
 }
 
 fn parse_request(body: &str) -> Result<SqlRequest, String> {
-    let mut v: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let mut v: serde_json::Value = serde_json::from_str(body).map_err(|e| match e.to_string() {
+        // The parser stops reading at 127 levels, and nothing in a request
+        // nests but a document param, so its refusal is the one below in
+        // other words. Should the wording ever differ, the parser's own
+        // message goes out instead.
+        deep if deep.starts_with("recursion limit exceeded") => too_deep(),
+        other => other,
+    })?;
     // take() moves the String serde already built instead of copying it
     let sql = match v.get_mut("sql").map(serde_json::Value::take) {
         Some(serde_json::Value::String(s)) => s,
@@ -2047,8 +2054,33 @@ fn json_to_duckdb(v: &serde_json::Value) -> Result<Param, String> {
         // its own and goes as its JSON text, for the statement to cast. A
         // string is never read this way, whatever it spells: a param that
         // looks like JSON is data, as one that looks like SQL is.
-        other => Param::Document { text: other.to_string(), variant: false },
+        other if nests_within(other, DOCUMENT_LEVELS) => {
+            Param::Document { text: other.to_string(), variant: false }
+        }
+        _ => return Err(too_deep()),
     })
+}
+
+fn too_deep() -> String {
+    format!("a document param nests at most {DOCUMENT_LEVELS} levels")
+}
+
+/// How deep an object or array param may nest, counting its own levels: `{}`
+/// is one, `[[1]]` is two. Rip's ORM and DuckTable's editor keep the same
+/// number, so a document is refused at the same depth whichever layer meets it
+/// first. The engine is why there is a number at all: an `UPDATE` of a VARIANT
+/// column costs the square of the nesting depth (duckdb#25967).
+const DOCUMENT_LEVELS: usize = 100;
+
+/// Whether `v` nests no deeper than `levels`. It descends `levels` deep and
+/// stops, so its own recursion is bounded by the limit it checks and not by
+/// the document.
+fn nests_within(v: &serde_json::Value, levels: usize) -> bool {
+    match v {
+        serde_json::Value::Array(a) => levels > 0 && a.iter().all(|c| nests_within(c, levels - 1)),
+        serde_json::Value::Object(o) => levels > 0 && o.values().all(|c| nests_within(c, levels - 1)),
+        _ => true,
+    }
 }
 
 /// A byte that can appear inside a DuckDB identifier. `$` is one of them,
@@ -4381,6 +4413,31 @@ mod tests {
             super::Shape::Json, ready, body, Instant::now());
         assert_eq!(result.recv().unwrap().err().unwrap().status, 400);
         assert!(conn.execute_batch("SELECT * FROM must_not_exist").is_err());
+    }
+
+    #[test]
+    fn a_document_param_nests_at_most_100_levels() {
+        let request = |param: String| {
+            super::parse_request(&format!(r#"{{"sql":"SELECT ?","params":[{param}]}}"#))
+        };
+        for (open, close) in [("[", "]"), (r#"{"a":"#, "}")] {
+            let nested = |n: usize| format!("{}1{}", open.repeat(n), close.repeat(n));
+            let fits = request(nested(100)).unwrap();
+            assert!(matches!(fits.params[..], [super::Param::Document { .. }]), "{open}");
+            let err = request(nested(101)).err().unwrap();
+            assert_eq!(err, "a document param nests at most 100 levels", "{open}");
+            // Past 125 the body parser refuses first, in the same words.
+            for n in [125, 126, 5000] {
+                assert_eq!(request(nested(n)).err().unwrap(), err, "{open} {n}");
+            }
+            // The deep branch need not be the first one.
+            let err = request(format!(r#"[1, {{"k": {}}}, 2]"#, nested(99))).err().unwrap();
+            assert_eq!(err, "a document param nests at most 100 levels", "{open}");
+            assert!(request(format!(r#"[1, {{"k": {}}}, 2]"#, nested(98))).is_ok(), "{open}");
+        }
+        // A string is data, however deep the JSON it spells.
+        let text = request(format!("\"{}{}\"", "[".repeat(150), "]".repeat(150))).unwrap();
+        assert!(matches!(text.params[..], [super::Param::Text(_)]));
     }
 
     #[test]

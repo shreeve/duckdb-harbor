@@ -517,15 +517,33 @@ eq "IS NOT DISTINCT FROM ? finds one" "2" \
 post 'INSERT INTO scratch.docs VALUES (4, ?), (5, ?)' '[{},[]]' > /dev/null
 eq "an empty object and an empty array are documents too" "OBJECT()|ARRAY(0)" \
    "$(post 'SELECT variant_typeof(doc) FROM scratch.docs WHERE id IN (4, 5) ORDER BY id' | nd '"|".join(r[0] for r in rows)')"
-# The request parser reads 127 levels and the body's own { "params": [ … ] }
-# is two of them, so a document param nests 125 levels and no further.
-nested() { printf '{"sql":"INSERT INTO scratch.docs VALUES (%d, ?)","params":[%s%s]}' \
-             "$1" "$(printf '[%.0s' $(seq "$1"))" "$(printf ']%.0s' $(seq "$1"))"; }
-eq "a param nested 125 levels binds" "200" "$(raw "$(nested 125)" | tail -1)"
-eq "and is stored at that depth" "250" \
-   "$(scalar 'SELECT length(doc::JSON::VARCHAR) FROM scratch.docs WHERE id = 125')"
-eq "a param nested 126 levels is refused" "400" "$(raw "$(nested 126)" | tail -1)"
-eq "and nothing was stored" "0" "$(scalar 'SELECT count(*) FROM scratch.docs WHERE id = 126')"
+# A document param nests at most 100 levels, its own levels counted: the
+# number Rip's ORM and DuckTable's editor keep too. Past 125 it is the body
+# parser that refuses, in the same words. A string is never inspected.
+brackets() { printf '%s%s' "$(printf '[%.0s' $(seq "$1"))" "$(printf ']%.0s' $(seq "$1"))"; }
+nested() { printf '{"sql":"INSERT INTO scratch.docs VALUES (%d, ?)","params":[%s]}' "$1" "$(brackets "$1")"; }
+too_deep='a document param nests at most 100 levels'
+eq "a param nested 100 levels binds" "200" "$(raw "$(nested 100)" | tail -1)"
+eq "and is stored at that depth" "ARRAY(1)|200" \
+   "$(post 'SELECT variant_typeof(doc), length(doc::JSON::VARCHAR) FROM scratch.docs WHERE id = 100' \
+      | nd '"|".join(str(v) for v in rows[0])')"
+eq "and reads back as sent" "$(brackets 100)" \
+   "$(post 'SELECT doc FROM scratch.docs WHERE id = 100' | nd 'rows[0][0]')"
+for n in 101 126; do
+  answer=$(raw "$(nested $n)")
+  eq "a param nested $n levels is refused" "400" "$(tail -1 <<<"$answer")"
+  eq "and told why" "bad_request|$too_deep" \
+     "$(sed '$d' <<<"$answer" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["code"] + "|" + d["message"])')"
+  eq "and nothing was stored" "0" "$(scalar "SELECT count(*) FROM scratch.docs WHERE id = $n")"
+done
+braces() { printf '{"sql":"SELECT ?","params":[%s1%s]}' "$(printf '{"a":%.0s' $(seq "$1"))" "$(printf '}%.0s' $(seq "$1"))"; }
+eq "an object param counts its levels the same way" "200|400" \
+   "$(raw "$(braces 100)" | tail -1)|$(raw "$(braces 101)" | tail -1)"
+deep=$(printf '{"sql":"INSERT INTO scratch.docs VALUES (150, ?::JSON)","params":["%s"]}' "$(brackets 150)")
+eq "a string of 150 levels through ?::JSON binds" "200" "$(raw "$deep" | tail -1)"
+eq "and is stored at that depth" "ARRAY(1)|300" \
+   "$(post 'SELECT variant_typeof(doc), length(doc::JSON::VARCHAR) FROM scratch.docs WHERE id = 150' \
+      | nd '"|".join(str(v) for v in rows[0])')"
 post 'DETACH scratch' > /dev/null
 
 # ---------------------------------------------------------------------------
