@@ -103,6 +103,16 @@ pub(crate) struct Grid {
     /// Generated columns are visible but never writable. DuckDB computes
     /// them from the supplied columns and INSERT RETURNING exposes them.
     generated: Vec<bool>,
+    /// The staged set parked for this table, handed over while the grid had
+    /// no columns to judge it by (its first fetch failed). The fetch that
+    /// brings a schema adopts it, and a grid replaced before then gives it
+    /// back (`take_edits`), so a failed fetch never costs the staged edits.
+    parked: Option<Edits>,
+    /// A fetch found the table with other columns than this grid's while
+    /// edits were staged against these. The page on screen stays, nothing
+    /// more is staged and nothing commits until the staged set is empty;
+    /// the fetch that follows adopts the table as it is.
+    reshaped: bool,
     /// A commit is in flight; ⌘S is a no-op until it resolves.
     pub(crate) committing: bool,
     /// Focus should return to the table on the next frame — set by paths
@@ -674,6 +684,8 @@ impl Grid {
             not_null,
             defaults,
             generated,
+            parked: None,
+            reshaped: false,
             committing: false,
             needs_focus: false,
             ring_keep: None,
@@ -731,8 +743,24 @@ impl Grid {
                 if grid.fetch_seq != fence {
                     return;
                 }
+                // The page's columns against the grid's: another client may
+                // have altered the table since this grid took its schema.
+                let reshaped = outcome.as_ref().is_ok_and(|(result, _)| {
+                    let d = grid.table.read(cx).delegate();
+                    !d.schema_cols.is_empty() && !same_columns(&d.schema_cols, &result.columns)
+                });
                 let result = match outcome {
+                    // Edits staged against the columns on screen are keyed
+                    // and typed by them. They are not rebound to the table's
+                    // present shape, and its rows do not fit the view they
+                    // live in: the page is dropped and the view stays.
+                    Ok(_) if reshaped && grid.edits.as_ref().is_some_and(Edits::any_staged) => {
+                        grid.reshaped = true;
+                        grid.error = Some(RESHAPED.to_string());
+                        None
+                    }
                     Ok((result, total)) => {
+                        grid.reshaped = false;
                         grid.error = None;
                         grid.page = page;
                         grid.page_size = size;
@@ -759,18 +787,20 @@ impl Grid {
                 // Taken unconditionally: a failed flip must not park a
                 // stale seat for some later, unrelated fetch to restore.
                 let ring_keep = grid.ring_keep.take();
+                let mut born = false;
                 grid.table.update(cx, |state, cx| {
                     state.delegate_mut().loading = false;
                     if let Some(result) = result {
                         {
                             let d = state.delegate_mut();
-                            if d.schema_cols.is_empty() {
+                            if d.schema_cols.is_empty() || reshaped {
                                 // An error-born grid (first page failed)
-                                // has no schema yet; adopt it from the
-                                // first fetch that succeeds — the same
-                                // birth Grid::new gives a healthy first
-                                // page.
+                                // has no schema yet, and a reshaped table's
+                                // is not this one: adopt the page's — the
+                                // same birth Grid::new gives a healthy
+                                // first page.
                                 d.commit_schema(result, base, zoom, &pk_cols);
+                                born = true;
                             } else {
                                 d.adopt_rows(result.rows, base);
                             }
@@ -816,51 +846,76 @@ impl Grid {
                         cx.notify();
                     });
                 }
-                // An error-born grid earns its staging layer the moment
-                // a schema lands and turns out fully keyed.
-                if grid.edits.is_none() && !grid.pk_cols.is_empty() {
-                    let (keyed, names, types) = {
-                        let d = grid.table.read(cx).delegate();
-                        (
-                            !d.pk_ix.is_empty(),
-                            d.names.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
-                            d.schema_cols.iter().map(|c| c.duckdb_type.clone()).collect::<Vec<_>>(),
-                        )
-                    };
-                    if keyed {
-                        grid.edits = Some(Edits::new(
-                            grid.source.clone(),
-                            grid.pk_cols.clone(),
-                            names,
-                            types,
-                        ));
-                    }
+                // A schema just landed: everything build() derives from one
+                // is derived again, from this one.
+                if born {
+                    grid.settle_schema(cx);
                 }
-                // A grid born from a failed first fetch had no result
-                // columns when build() derived these arrays. Populate them
-                // alongside the first schema that eventually succeeds.
-                let names = grid.table.read(cx).delegate().names.clone();
-                if grid.not_null.len() != names.len() {
-                    let (not_null, defaults, generated, hints) =
-                        insert_metadata(&names, grid.structure.as_ref());
-                    grid.not_null = not_null;
-                    grid.defaults = defaults;
-                    grid.generated = generated;
-                    grid.table.update(cx, |state, cx| {
-                        let d = state.delegate_mut();
-                        d.draft_hints = hints;
-                        d.rebuild_cols();
-                        state.refresh(cx);
-                    });
+                if reshaped && born {
+                    // The catalog the sidebar and the next grid read from
+                    // describes the table as it was.
+                    cx.emit(crate::app::CatalogRefreshRequested);
                 }
                 // Staged changes are identity-keyed; the new page gets
                 // them projected wherever (and whether) its rows match.
-                grid.sync_staged(cx);
+                // A projection only: a fetch never answers itself with
+                // another (`sync_staged`).
+                grid.project_staged(cx);
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// What `build` derives from a schema, derived from the one a fetch just
+    /// committed: the staging layer, when the schema is fully keyed, and the
+    /// per-column insert metadata. Nothing is staged when this runs — an
+    /// error-born grid has no staging layer yet, and a reshaped table is
+    /// adopted only with none — so the set built here is empty, and the
+    /// stash parked for this table is judged against it.
+    fn settle_schema(&mut self, cx: &mut Context<Self>) {
+        let (keyed, names, types) = {
+            let d = self.table.read(cx).delegate();
+            (
+                !d.pk_ix.is_empty(),
+                d.names.clone(),
+                d.schema_cols.iter().map(|c| c.duckdb_type.clone()).collect::<Vec<_>>(),
+            )
+        };
+        self.edits = keyed.then(|| {
+            Edits::new(
+                self.source.clone(),
+                self.pk_cols.clone(),
+                names.iter().map(|n| n.to_string()).collect(),
+                types,
+            )
+        });
+        let (not_null, defaults, generated, hints) =
+            insert_metadata(&names, self.structure.as_ref());
+        self.not_null = not_null;
+        self.defaults = defaults;
+        self.generated = generated;
+        self.table.update(cx, |state, cx| {
+            let d = state.delegate_mut();
+            d.draft_hints = hints;
+            d.rebuild_cols();
+            state.refresh(cx);
+        });
+        if let Some(stash) = self.parked.take() {
+            self.adopt_edits(stash, cx);
+        }
+    }
+
+    /// While the table has other columns than the ones on screen, every
+    /// gesture that stages or commits is refused with the reason. Undo and
+    /// discard stay open: they are the way out.
+    fn refuse_reshaped(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.reshaped {
+            self.error = Some(RESHAPED.to_string());
+            cx.notify();
+        }
+        self.reshaped
     }
 
     /// Navigate to a page at the current size and filter.
@@ -1226,7 +1281,7 @@ impl Grid {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.committing || self.edits.is_none() {
+        if self.committing || self.edits.is_none() || self.refuse_reshaped(cx) {
             return;
         }
         if self.editor.is_some() && !self.confirm_and_move(0, 0, cx) {
@@ -1248,24 +1303,47 @@ impl Grid {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.committing || self.edits.is_none() {
+        // A read-only table and a commit in flight say so in the footer,
+        // and the Edit menu's gate (`accepts_row_commands`) stops both first.
+        if self.committing || self.edits.is_none() || self.refuse_reshaped(cx) {
             return;
         }
         if self.editor.is_some() && !self.confirm_and_move(0, 0, cx) {
             return;
         }
-        let (identity, fetched, first_schema, pk_ix) = {
+        let source = {
             let d = self.table.read(cx).delegate();
             let row = d.selection.lead.or(d.active_cell.map(|(row, _)| row));
-            let Some(row) = row else { return };
-            // A draft is already an INSERT. Duplicate Row deliberately
-            // targets persisted rows, which the INSERT can read from.
-            if d.draft_key(row).is_some() || d.deleted.contains(&row) {
+            let lead = row.map(|row| {
+                if d.draft_key(row).is_some() {
+                    Lead::Draft
+                } else if d.deleted.contains(&row) {
+                    Lead::Deleted
+                } else {
+                    Lead::Persisted
+                }
+            });
+            match duplicate_refusal(lead) {
+                Some(reason) => Err(reason),
+                None => Ok(row.and_then(|row| {
+                    Some((
+                        d.identities.get(row).cloned()?,
+                        d.rows.get(row).cloned()?,
+                        d.identity as usize,
+                        d.pk_ix.clone(),
+                    ))
+                })),
+            }
+        };
+        let (identity, fetched, first_schema, pk_ix) = match source {
+            Ok(Some(source)) => source,
+            // A persisted row always has its cells and its identity.
+            Ok(None) => return,
+            Err(reason) => {
+                self.error = Some(reason.to_string());
+                cx.notify();
                 return;
             }
-            let Some(fetched) = d.rows.get(row).cloned() else { return };
-            let Some(identity) = d.identities.get(row).cloned() else { return };
-            (identity, fetched, d.identity as usize, d.pk_ix.clone())
         };
 
         let source_key = edits::key_of(&identity);
@@ -1685,6 +1763,9 @@ impl Grid {
         if self.edits.is_none() || self.committing {
             return; // read-only says why in the footer, not with a beep
         }
+        if self.refuse_reshaped(cx) {
+            return;
+        }
         if self.generated.get(col).copied().unwrap_or(false) {
             let name = self.table.read(cx).delegate().names[col].clone();
             self.error = Some(format!("{name} is generated by DuckDB"));
@@ -1933,6 +2014,9 @@ impl Grid {
     /// Delete on a cell: clear it, type-honestly — '' for text columns,
     /// NULL for everything else. Never touches the row.
     fn stage_clear(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
+        if self.edits.is_some() && self.refuse_reshaped(cx) {
+            return;
+        }
         if self.generated.get(col).copied().unwrap_or(false) {
             let name = self.table.read(cx).delegate().names[col].clone();
             self.error = Some(format!("{name} is generated by DuckDB"));
@@ -1974,6 +2058,9 @@ impl Grid {
     /// ⌃⇧N: SQL NULL, deliberately, any column type.
     fn stage_null(&mut self, cx: &mut Context<Self>) {
         let Some((row, col)) = self.table.read(cx).delegate().active_cell else { return };
+        if self.edits.is_some() && self.refuse_reshaped(cx) {
+            return;
+        }
         if self.generated.get(col).copied().unwrap_or(false) {
             let name = self.table.read(cx).delegate().names[col].clone();
             self.error = Some(format!("{name} is generated by DuckDB"));
@@ -2023,16 +2110,20 @@ impl Grid {
                 .map(|row| (d.identities.get(row).cloned(), d.draft_key(row).map(str::to_string)))
                 .collect()
         };
+        // Removing a draft is a discard, which a reshaped table allows;
+        // staging a DELETE is not.
+        let reshaped = self.reshaped;
         let Some(edits) = &mut self.edits else { return };
         edits.grouped(|edits| {
             for (identity, draft_key) in targets {
                 if let Some(key) = draft_key {
                     edits.discard(&key);
-                } else if let Some(identity) = identity {
+                } else if let (Some(identity), false) = (identity, reshaped) {
                     edits.stage_delete(identity);
                 }
             }
         });
+        self.refuse_reshaped(cx);
         self.sync_staged(cx);
     }
 
@@ -2202,10 +2293,23 @@ impl Grid {
         cx.notify();
     }
 
+    /// Show the staging model after a gesture changed it. When that gesture
+    /// removed the last edit staged against columns the table does not have
+    /// (`reshaped`), the table is fetched as it is, and this time adopted.
+    /// The flag outlives a fetch that fails, so nothing is staged or
+    /// committed against the old columns while the retry is pending; only
+    /// the fetch that succeeds lowers it.
+    fn sync_staged(&mut self, cx: &mut Context<Self>) {
+        self.project_staged(cx);
+        if self.reshaped && !self.edits.as_ref().is_some_and(Edits::any_staged) {
+            self.fetch_page_now(self.page, cx);
+        }
+    }
+
     /// Project the staging model into the grid. INSERT drafts are
     /// synthetic rows before the fetched page; existing-row changes land
     /// by identity wherever (and whether) their rows currently appear.
-    fn sync_staged(&mut self, cx: &mut Context<Self>) {
+    fn project_staged(&mut self, cx: &mut Context<Self>) {
         let changes: Vec<(String, Vec<Value>, edits::RowChange)> = self
             .edits
             .as_ref()
@@ -2308,8 +2412,12 @@ impl Grid {
     }
 
     /// Surrender the staged layer when this grid is being replaced —
-    /// only if there is actually something staged to carry.
+    /// only if there is actually something staged to carry. A stash still
+    /// parked here was never adopted, and goes back as it came.
     pub(crate) fn take_edits(&mut self) -> Option<Edits> {
+        if let Some(parked) = self.parked.take() {
+            return Some(parked);
+        }
         let e = self.edits.take()?;
         let (inserts, updates, deletes) = e.counts();
         if inserts + updates + deletes == 0 {
@@ -2320,13 +2428,24 @@ impl Grid {
     }
 
     /// Receive a stashed staging set from a previous visit to this
-    /// table. Adopted only when the table still has the same identity
-    /// and columns — a changed schema orphans the stash rather than
-    /// mis-keying it.
+    /// table (`edits::handoff`). Adopted only when the table still has the
+    /// same identity and columns — a changed schema orphans the stash rather
+    /// than mis-keying it, and says so. A grid whose first fetch failed has
+    /// no columns to compare: it keeps the stash until a fetch brings them
+    /// (`settle_schema`), or until it is replaced (`take_edits`).
     pub(crate) fn adopt_edits(&mut self, stash: Edits, cx: &mut Context<Self>) {
-        if self.edits.as_ref().is_some_and(|mine| mine.same_shape(&stash)) {
-            self.edits = Some(stash);
-            self.sync_staged(cx);
+        let has_columns = !self.table.read(cx).delegate().schema_cols.is_empty();
+        match edits::handoff(self.edits.as_ref(), has_columns, &stash) {
+            edits::Handoff::Adopt => {
+                self.edits = Some(stash);
+                self.sync_staged(cx);
+            }
+            edits::Handoff::Hold => self.parked = Some(stash),
+            edits::Handoff::Orphan => {
+                let (inserts, updates, deletes) = stash.counts();
+                self.error = Some(orphaned(inserts + updates + deletes));
+                cx.notify();
+            }
         }
     }
 
@@ -2360,6 +2479,9 @@ impl Grid {
     /// rolls back — and the release itself rolls back on any failure.
     pub(crate) fn commit(&mut self, cx: &mut Context<Self>) {
         if self.committing {
+            return;
+        }
+        if self.edits.is_some() && self.refuse_reshaped(cx) {
             return;
         }
         let Some(edits) = &self.edits else { return };
@@ -2776,6 +2898,9 @@ impl GridDelegate {
             self.pk_ix.clear();
         }
         self.schema_cols = page.columns;
+        // Both are keyed by schema index, which means these columns only.
+        self.hidden.clear();
+        self.widths.clear();
         self.adopt_rows(page.rows, base);
         // The first page sizes the columns to their content; from here on
         // widths hold still (pages replace, fits don't).
@@ -3869,6 +3994,59 @@ fn insert_metadata(
     (not_null, defaults, generated, hints)
 }
 
+/// The status line while edits are staged against columns the table does
+/// not have.
+const RESHAPED: &str = "this table’s columns changed in the database · review the staged edits, \
+                        then discard them (⌘⇧⌫) to load the table as it is";
+
+/// The status line of a grid handed a stash its table has outgrown.
+fn orphaned(staged: usize) -> String {
+    format!(
+        "this table’s columns changed in the database · {staged} staged {} dropped",
+        if staged == 1 { "edit was" } else { "edits were" }
+    )
+}
+
+/// Whether a fetched page has the columns a grid was built with: the same
+/// names and the same DuckDB types, in the same order. The types decide how
+/// every staged value is bound (`edits::placeholder_for`) and the names
+/// decide where, so a page that differs in either is another table's.
+fn same_columns(have: &[wire::Column], page: &[wire::Column]) -> bool {
+    have.len() == page.len()
+        && have
+            .iter()
+            .zip(page)
+            .all(|(a, b)| a.name == b.name && a.duckdb_type == b.duckdb_type)
+}
+
+/// The row ⌘D would copy.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Lead {
+    /// A fetched row, with or without staged updates.
+    Persisted,
+    /// A staged INSERT.
+    Draft,
+    /// A row staged for DELETE.
+    Deleted,
+}
+
+/// Why ⌘D copies nothing, when it copies nothing. A duplicate's INSERT
+/// reads its cells from the source row in the database, and a draft has no
+/// row there to read.
+fn duplicate_refusal(lead: Option<Lead>) -> Option<&'static str> {
+    match lead {
+        Some(Lead::Persisted) => None,
+        None => Some("select a row to duplicate"),
+        Some(Lead::Draft) => Some(
+            "a new row is not in the database yet, so there is nothing to copy it from — \
+             commit it (⌘S), then duplicate it",
+        ),
+        Some(Lead::Deleted) => {
+            Some("this row is staged for deletion — discard the delete to duplicate it")
+        }
+    }
+}
+
 /// Wire values -> render-ready cell text (None = NULL), once per page.
 /// Render never performs conversion or allocation.
 fn display_rows(rows: &[Vec<Value>]) -> Vec<Vec<Option<SharedString>>> {
@@ -3997,8 +4175,9 @@ fn should_reconcile_selection(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClickKind, RowSelection, conditional_hint_min_width, draft_hint_min_width,
-        duplicate_cells, should_reconcile_selection, wrapped_step,
+        ClickKind, Lead, RowSelection, conditional_hint_min_width, draft_hint_min_width,
+        duplicate_cells, duplicate_refusal, orphaned, same_columns, should_reconcile_selection,
+        wrapped_step,
     };
     use crate::edits::{Bind, CellEdit};
     use gpui::{Modifiers, SharedString};
@@ -4149,5 +4328,46 @@ mod tests {
             &[false, false, false],
         );
         assert_eq!(cells.iter().map(|(col, _, _)| *col).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    fn col(name: &str, ty: &str) -> wire::Column {
+        wire::Column { name: Some(name.to_string()), duckdb_type: ty.to_string(), ..Default::default() }
+    }
+
+    #[test]
+    fn a_page_with_other_names_or_types_is_another_tables() {
+        let have = [col("id", "INTEGER"), col("name", "VARCHAR"), col("b", "BLOB")];
+        assert!(same_columns(&have, &have.clone()));
+        assert!(same_columns(&[], &[]));
+        // ALTER … TYPE: the placeholder a value binds through changes.
+        assert!(!same_columns(&have, &[col("id", "INTEGER"), col("name", "VARCHAR"), col("b", "VARCHAR")]));
+        assert!(!same_columns(&have, &[col("id", "BIGINT"), col("name", "VARCHAR"), col("b", "BLOB")]));
+        // A parameter is part of the type.
+        assert!(!same_columns(&[col("d", "DECIMAL(10,2)")], &[col("d", "DECIMAL(12,2)")]));
+        // ADD, DROP and RENAME COLUMN, and columns that traded places.
+        assert!(!same_columns(&have, &have[..2]));
+        assert!(!same_columns(&have[..2], &have));
+        assert!(!same_columns(&have, &[col("id", "INTEGER"), col("title", "VARCHAR"), col("b", "BLOB")]));
+        assert!(!same_columns(&have, &[col("id", "INTEGER"), col("b", "BLOB"), col("name", "VARCHAR")]));
+        // What a type implies on the wire is not compared apart from it.
+        let mut lossy = col("id", "INTEGER");
+        lossy.lossless = !lossy.lossless;
+        assert!(same_columns(&have[..1], &[lossy]));
+    }
+
+    #[test]
+    fn command_d_says_why_it_copied_nothing() {
+        assert_eq!(duplicate_refusal(Some(Lead::Persisted)), None);
+        let draft = duplicate_refusal(Some(Lead::Draft)).expect("a reason");
+        assert!(draft.contains("not in the database yet") && draft.contains("\u{2318}S"), "{draft}");
+        let deleted = duplicate_refusal(Some(Lead::Deleted)).expect("a reason");
+        assert!(deleted.contains("staged for deletion"), "{deleted}");
+        assert_eq!(duplicate_refusal(None), Some("select a row to duplicate"));
+    }
+
+    #[test]
+    fn an_orphaned_stash_is_counted_in_the_status_line() {
+        assert!(orphaned(1).ends_with("1 staged edit was dropped"));
+        assert!(orphaned(3).ends_with("3 staged edits were dropped"));
     }
 }

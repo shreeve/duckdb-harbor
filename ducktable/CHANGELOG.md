@@ -3,6 +3,59 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by release
 date, newest first.
 
+## 0.22.5 — 2026-09-21
+
+- **A FLOAT cell takes a number a FLOAT can hold.** The editor held integers
+  to their type's range and refused `1e309` for a DOUBLE, but let `3.5e38` and
+  `1e39` into a FLOAT, where the engine refused them at commit and the whole
+  transaction went with them. The editor applies the engine's own rule: the
+  number is rounded to the nearest FLOAT, and one that rounds past the largest
+  is out of range. `3.40282356e38` still rounds to the largest FLOAT and is
+  taken; `3.4028236e38` is refused. `nan` and `inf` are taken as before.
+- **Text typed into a BLOB cell is base64, always.** The literal `null` typed
+  into any cell that is not text means SQL NULL, and a BLOB cell followed the
+  rule; but `null`, `NULL` and `Null` are each four base64 characters — the
+  bytes `9EE965`, `3542CB` and `36E965` — so a cell showing one of them could
+  not be typed again, and typing it set NULL. A BLOB cell's text is never
+  NULL; NULL is entered with ⌃⇧N, Delete, or by emptying the cell. Every other
+  type keeps the rule, a `BLOB[]` among them.
+- **Whitespace around a number is not a change.** ` 5` typed over an INTEGER
+  that holds `5` was staged as an update of `5` to `5`. For every type but
+  text, `JSON` and `ENUM`, text that differs from what the cell holds only by
+  the whitespace around it is that cell unchanged, and against the fetched
+  value (or what a duplicate copied) it drops the staged edit. The engine
+  agrees for each of them: a padded number, date, list or `VARIANT` is the
+  bare value, and a padded `UUID`, `BIT` or base64 is refused. Text, a `JSON`
+  column and an `ENUM` store the padding, and are compared exactly.
+- **⌘D says why it did nothing.** On a draft row, on a row staged for deletion,
+  and with no row selected, Duplicate Row returned silently. The status line
+  gives the reason: a new row is not in the database yet, so there is nothing
+  to copy it from; the delete has to be discarded first; a row has to be
+  selected.
+- **The review popover names a duplicate's source.** A duplicate was listed as
+  `new row`, like a row made with ⌘N. It reads `new row · copy of id = 5`, with
+  every column of a composite key, and `rowid` for a table without a key.
+- **A table altered elsewhere is noticed.** A grid took its columns and types
+  from its first page and kept them, so after another client ran `ALTER TABLE
+  … ALTER col TYPE`, or added or dropped a column, later pages were laid into
+  the old columns and staged values were bound through the placeholders of
+  the old types: base64 into a column that had become a BLOB went in bare, as
+  its characters. Every fetched page's column names and types are compared
+  with the grid's. With nothing staged the grid adopts the table as it is, as
+  a first page would, and refetches the catalog. With edits staged they are
+  not rebound: the page on screen stays, staging and ⌘S are refused, and the
+  status line says the columns changed and the staged edits have to be
+  discarded; when the last one is, the table loads as it is. A stash parked
+  for a table that changed shape while off-screen is still dropped, and the
+  status line now says so and how many.
+- **Staged edits survive a failed fetch.** Returning to a table removed its
+  parked edits and handed them to the new grid, and a grid whose first page
+  failed to load has no staging layer to take them: they were gone. Such a
+  grid keeps the stash, adopts it when a refresh brings the page, and hands it
+  back to be parked again if another table is chosen first.
+- EDITING.md states each of these, and gains a section on a table altered
+  elsewhere.
+
 ## 0.22.4 — 2026-09-21
 
 - **A table keyed by a FLOAT can be edited.** Harbor sends a FLOAT as the

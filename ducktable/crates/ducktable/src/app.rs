@@ -289,6 +289,10 @@ impl DuckTable {
                 })
                 .detach();
                 // And returning to a table hands its parked edits back.
+                // The grid owns them from here: one whose first fetch
+                // failed has no columns to judge them by, keeps them until
+                // a fetch brings some, and surrenders them again through
+                // `take_edits` if it is replaced first.
                 let source = crate::sql::source(&schema, &name);
                 if let Some(stash) = state.staged.remove(&source) {
                     grid.update(cx, |g, cx| g.adopt_edits(stash, cx));

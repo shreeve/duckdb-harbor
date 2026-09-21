@@ -70,6 +70,11 @@ fails the commit, and nothing lands. A refresh does not help, because the draft
 still names that row: discard the duplicate (⌘Z, or the review popover) and the
 rest commits.
 
+⌘D copies a row the database holds. On a draft it copies nothing and the status
+line says why: a new row is not in the database yet, so the INSERT has nothing
+to read; commit it, then duplicate it. On a row staged for deletion it says to
+discard the delete first, and with no row selected it says to select one.
+
 ## The grammar
 
 One meaning per key. No contextual double-agents.
@@ -178,9 +183,44 @@ not change, and printable exotica (AltGr, IME) already land on rung 6.
   `1 insert · 2 updates · 1 delete · ⌘S to commit`
   with the delete in the danger color. Clicking the count opens a
   popover listing every staged change (`column: old → new`, per-change
-  discard) — audit is pull-based, never pushed.
+  discard) — audit is pull-based, never pushed. A duplicate is listed as a
+  new row with the row it copies, every key column named: `new row · copy of
+  id = 5`, `copy of a = 1, b = 2` for a composite key, `copy of rowid = 3`
+  for a table without one.
 - Every staging operation — including a discard — is one entry on the
   ⌘Z stack. Nothing is ever more than one keystroke from recovery.
+- Staged changes parked by a table switch wait for a grid that can take them.
+  Returning to the table while its first page fails to load leaves them
+  parked: the grid has no columns to check them against, keeps them until a
+  refresh brings the page, and hands them back if another table is chosen
+  first. A failed fetch never costs a staged change.
+
+## A table altered elsewhere
+
+A grid takes its columns — names, types, key — from its first page, and every
+staged value is bound the way its column's type asks. Another client can
+`ALTER TABLE` while the grid is open, so every fetched page is checked: its
+column names and DuckDB types, in order, against the grid's.
+
+- With nothing staged, the grid adopts the table as it is — columns, types,
+  key, placeholders, a fresh staging set — exactly as a first page does, and
+  asks for the catalog again. Hidden columns and dragged widths belong to the
+  old columns and are reset. The Structure view still shows the catalog the
+  grid was opened with; selecting the table again shows the present one.
+- With edits staged, they are not rebound: they were typed and keyed against
+  the old columns. The page on screen stays, the fetched page is dropped, and
+  the status line says the table's columns changed. Until the staged set is
+  empty nothing more can be staged and ⌘S is refused with the same message;
+  the review popover, ⌘Z and discard work as always. When the last staged
+  change is discarded or undone, the grid fetches the table as it is and
+  adopts it.
+- Staged changes parked for a table that changed shape while it was off-screen
+  cannot be shown against the old columns. They are dropped when the table is
+  opened again, and the status line says how many.
+
+A grid learns of the change only from a page. Between the `ALTER` and the next
+fetch, a commit binds through the old types; the engine's casts and the
+affected-exactly-one check are the backstop there, as everywhere.
 
 ## Identity and capability
 
@@ -236,7 +276,11 @@ not change, and printable exotica (AltGr, IME) already land on rung 6.
   - A `BLOB` cell is base64 both ways, and binds through
     `from_base64(?::VARCHAR)`. Bound bare, the base64 characters themselves
     become the bytes. A `BLOB` key in the WHERE is decoded the same way, so
-    the row named is the row changed.
+    the row named is the row changed. Text typed into a `BLOB` cell is always
+    base64, `null` included: `null`, `NULL` and `Null` are four base64
+    characters each, three bytes (`9EE965`, `3542CB`, `36E965`) that a cell
+    can hold and show. A `BLOB`'s NULL is entered with ⌃⇧N, with Delete, or by
+    emptying the cell.
 - A `FLOAT` key binds through `?::FLOAT` in the WHERE. A FLOAT crosses the
   wire as the shortest decimal that names it and a JSON number binds as a
   DOUBLE; compared bare, the column is widened and 1.1 the FLOAT is not 1.1
@@ -247,7 +291,15 @@ not change, and printable exotica (AltGr, IME) already land on rung 6.
   goes as its digits, and `nan`, `inf`, `-inf`, `Infinity` into a `DOUBLE` or a
   `FLOAT` go by name; the engine casts both exactly, and a typed number is never
   staged as NULL. An integer outside its type's range, and digits too large for
-  a `DOUBLE`, are refused in the editor with the reason.
+  a `DOUBLE`, are refused in the editor with the reason. So is a number a
+  `FLOAT` cannot hold: the engine rounds the DOUBLE it is handed to the nearest
+  FLOAT and refuses one that rounds past the largest, so `3.40282356e38` is
+  taken (it is the largest FLOAT, 3.4028235e38) and `3.4028236e38`, `3.5e38` and
+  `1e39` are refused, where a `DOUBLE` cell takes all three. The names have no
+  range.
+- The literal `null`, in any case, typed into a cell that is not text is SQL
+  NULL — it was never a number or a date. In a text cell it is those four
+  characters, in a `JSON` cell the JSON value, and in a `BLOB` cell base64.
 - The editor judges a scalar by its own type name. A nested type (`INTEGER[]`,
   `STRUCT(a INTEGER)`, a `MAP`), an `INTERVAL` and an `ENUM` are bound as their
   text for the engine to cast. They clear to NULL, as a `UUID` does: the engine
@@ -263,6 +315,15 @@ not change, and printable exotica (AltGr, IME) already land on rung 6.
 - Text typed back to what the cell had is not validated either: on a fetched
   row the staged edit is dropped, and on a duplicate the cell is read from its
   source row again.
+- Whitespace around a value that is not text is not a change. ` 5` or `5 ` over
+  an INTEGER that holds `5` stages nothing, and over a staged `7` it is the
+  fetched `5` again: the engine reads a padded number, date, time, interval,
+  list, struct or `VARIANT` as it reads the bare one, and refuses a padded
+  `UUID`, `BIT` or base64 outright, so padding never names another value.
+  Where it does, the comparison is exact: text (` 5` is another string), a
+  `JSON` column, which stores its text character for character, and an `ENUM`,
+  whose values are strings. Text that differs by more than its padding is
+  staged as typed.
 - A container that holds a `VARIANT`, a `JSON` or a `BLOB` — `BLOB[]`,
   `VARIANT[]`, `JSON[]`, `STRUCT(v VARIANT, …)`, `MAP(VARCHAR, BLOB)` — takes
   no typed text. It would be bound as the container's text, which the engine

@@ -714,3 +714,225 @@ fn a_document_cell_takes_strict_json_a_hundred_levels_deep() {
     assert!(document(&nan.rows[0][0]).is_err(), "and what comes back is not JSON");
     run("DROP TABLE _dt_depth_probe", None);
 }
+
+/// Why DuckTable's `parse_value` holds a FLOAT cell to a FLOAT's range. A
+/// typed number is bound as a JSON number, a DOUBLE, and assigned to the
+/// column: the engine rounds it to the nearest FLOAT, and refuses one that
+/// rounds past the largest — at commit, where the whole transaction goes
+/// with it. A DOUBLE column takes the same numbers.
+#[test]
+#[ignore]
+fn a_float_cell_holds_what_rounds_to_a_float() {
+    use serde_json::json;
+    let Some(row) = connectable() else {
+        println!("no berth to test against; skipping");
+        return;
+    };
+    println!("berth: {}", row.name);
+    let conn = connect(&row.name).expect("connect");
+    let sid = harbor_client::session_new(&conn).expect("session");
+    let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
+        harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
+    };
+    run("DROP TABLE IF EXISTS _dt_floatrange_probe", None);
+    run("CREATE TEMP TABLE _dt_floatrange_probe(k INTEGER, f FLOAT, d DOUBLE)", None);
+    let typed = run("SELECT f, d FROM _dt_floatrange_probe", None);
+    println!("column types {:?}", typed.columns.iter().map(|c| &c.duckdb_type).collect::<Vec<_>>());
+    assert_eq!(typed.columns[0].duckdb_type, "FLOAT");
+
+    // The largest FLOAT, and a DOUBLE past it that still rounds to it.
+    for text in ["3.4028235e38", "-3.4028235e38", "3.40282356e38", "1e-50"] {
+        let v: f64 = text.parse().unwrap();
+        let kept = run(
+            "INSERT INTO _dt_floatrange_probe (k, f) VALUES (?, ?) RETURNING f",
+            Some(vec![json!(1), json!(v)]),
+        );
+        println!("{text} into FLOAT: {}", kept.rows[0][0]);
+        // The wire names the FLOAT by its shortest decimal.
+        assert_eq!(kept.rows[0][0].as_f64().map(|k| k as f32), Some(v as f32), "{text}");
+        assert!((v as f32).is_finite(), "{text}: the editor's test agrees");
+    }
+    // Halfway to the next power of two, and everything beyond it.
+    for text in ["3.4028235677973366e38", "3.4028236e38", "3.5e38", "-3.5e38", "1e39"] {
+        let v: f64 = text.parse().unwrap();
+        let refused = harbor_client::exec(
+            &conn,
+            "INSERT INTO _dt_floatrange_probe (k, f) VALUES (?, ?)",
+            Some(vec![json!(2), json!(v)]),
+            Some(&sid),
+        );
+        println!("{text} into FLOAT: {:?}", refused.as_ref().err());
+        assert!(refused.is_err(), "{text} is past a FLOAT");
+        assert!(!(v as f32).is_finite(), "{text}: the editor's test agrees");
+        let kept = run(
+            "INSERT INTO _dt_floatrange_probe (k, d) VALUES (?, ?) RETURNING d",
+            Some(vec![json!(3), json!(v)]),
+        );
+        assert_eq!(kept.rows[0][0].as_f64(), Some(v), "{text} is a DOUBLE");
+    }
+    run("DROP TABLE _dt_floatrange_probe", None);
+}
+
+/// Why text typed into a BLOB cell is never SQL NULL (ducktable's
+/// `parse_value`). `null`, in any case, is four base64 characters, and
+/// through the BLOB placeholder each spelling is three bytes a cell can hold
+/// and show. NULL reaches the column as a NULL param, which is what ⌃⇧N and
+/// Delete bind.
+#[test]
+#[ignore]
+fn null_typed_into_a_blob_cell_is_three_bytes() {
+    use serde_json::json;
+    let Some(row) = connectable() else {
+        println!("no berth to test against; skipping");
+        return;
+    };
+    println!("berth: {}", row.name);
+    let conn = connect(&row.name).expect("connect");
+    let sid = harbor_client::session_new(&conn).expect("session");
+    let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
+        harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
+    };
+    run("DROP TABLE IF EXISTS _dt_blobnull_probe", None);
+    run("CREATE TEMP TABLE _dt_blobnull_probe(k INTEGER, b BLOB)", None);
+    for (text, bytes) in [("null", "9EE965"), ("NULL", "3542CB"), ("Null", "36E965")] {
+        let kept = run(
+            "INSERT INTO _dt_blobnull_probe (k, b) VALUES (?, from_base64(?::VARCHAR)) \
+             RETURNING hex(b), b, b IS NULL",
+            Some(vec![json!(1), json!(text)]),
+        );
+        println!("{text:?} through from_base64(?::VARCHAR): {:?}", kept.rows[0]);
+        assert_eq!(kept.rows[0], vec![json!(bytes), json!(text), json!(false)]);
+    }
+    let null = run(
+        "INSERT INTO _dt_blobnull_probe (k, b) VALUES (?, from_base64(?::VARCHAR)) RETURNING b IS NULL",
+        Some(vec![json!(2), serde_json::Value::Null]),
+    );
+    println!("a NULL param through it: b IS NULL = {}", null.rows[0][0]);
+    assert_eq!(null.rows[0][0], json!(true));
+    run("DROP TABLE _dt_blobnull_probe", None);
+}
+
+/// Which types keep the whitespace around their text (ducktable's
+/// `edits.rs`, `keeps_whitespace`). Padded text bound into a number, a date,
+/// a list or a VARIANT is the value the bare text names, and a UUID, a BIT
+/// and base64 refuse it; so padding alone is never a change to such a cell.
+/// A VARCHAR, a JSON column and an ENUM store it: there it is another value.
+#[test]
+#[ignore]
+fn padding_is_part_of_a_value_only_for_text_json_and_enum() {
+    use serde_json::json;
+    let Some(row) = connectable() else {
+        println!("no berth to test against; skipping");
+        return;
+    };
+    println!("berth: {}", row.name);
+    let conn = connect(&row.name).expect("connect");
+    let sid = harbor_client::session_new(&conn).expect("session");
+    let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
+        harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
+    };
+    run("DROP TABLE IF EXISTS _dt_padding_probe", None);
+    for (ty, bare, placeholder) in [
+        ("INTEGER", "5", "?"),
+        ("HUGEINT", "170141183460469231731687303715884105727", "?"),
+        ("DOUBLE", "1.5", "?"),
+        ("DECIMAL(10,2)", "1.50", "?"),
+        ("DATE", "2024-02-29", "?"),
+        ("TIMESTAMP", "2024-02-29 01:02:03", "?"),
+        ("TIME", "01:02:03", "?"),
+        ("INTERVAL", "3 days", "?"),
+        ("INTEGER[]", "[1, 2]", "?"),
+        ("STRUCT(a INTEGER)", "{'a': 1}", "?"),
+        ("VARIANT", "{\"a\":1}", "?::JSON"),
+    ] {
+        run(&format!("CREATE OR REPLACE TEMP TABLE _dt_padding_probe(k INTEGER, v {ty})"), None);
+        let insert = format!("INSERT INTO _dt_padding_probe VALUES (?, {placeholder})");
+        run(&insert, Some(vec![json!(1), json!(bare)]));
+        run(&insert, Some(vec![json!(2), json!(format!(" {bare} "))]));
+        let same = run("SELECT count(DISTINCT v::VARCHAR), min(v::VARCHAR) FROM _dt_padding_probe", None);
+        println!("{ty}: padded and bare are {} value(s), {}", same.rows[0][0], same.rows[0][1]);
+        assert_eq!(same.rows[0][0].as_u64(), Some(1), "{ty}");
+    }
+    for (ty, bare, placeholder) in [
+        ("UUID", "6f9619ff-8b86-d011-b42d-00c04fc964ff", "?"),
+        ("BIT", "101", "?"),
+        ("BLOB", "qg==", "from_base64(?::VARCHAR)"),
+    ] {
+        run(&format!("CREATE OR REPLACE TEMP TABLE _dt_padding_probe(k INTEGER, v {ty})"), None);
+        let insert = format!("INSERT INTO _dt_padding_probe VALUES (?, {placeholder})");
+        run(&insert, Some(vec![json!(1), json!(bare)]));
+        let refused =
+            harbor_client::exec(&conn, &insert, Some(vec![json!(2), json!(format!(" {bare} "))]), Some(&sid));
+        println!("{ty}: padded text is refused: {:?}", refused.as_ref().err().map(|e| e.lines().next().unwrap_or("").to_string()));
+        assert!(refused.is_err(), "{ty}");
+    }
+    for (ty, bare, placeholder) in [
+        ("VARCHAR", "5", "?"),
+        ("JSON", "{\"a\":1}", "?::JSON"),
+        ("ENUM('a', ' a ')", "a", "?"),
+    ] {
+        run(&format!("CREATE OR REPLACE TEMP TABLE _dt_padding_probe(k INTEGER, v {ty})"), None);
+        let insert = format!("INSERT INTO _dt_padding_probe VALUES (?, {placeholder})");
+        run(&insert, Some(vec![json!(1), json!(bare)]));
+        run(&insert, Some(vec![json!(2), json!(format!(" {bare} "))]));
+        let kept = run("SELECT v::VARCHAR FROM _dt_padding_probe ORDER BY k", None);
+        println!("{ty}: stored {:?}", kept.rows);
+        assert_eq!(kept.rows, vec![vec![json!(bare)], vec![json!(format!(" {bare} "))]], "{ty}");
+    }
+    run("DROP TABLE _dt_padding_probe", None);
+}
+
+/// How a grid notices a table altered elsewhere (ducktable's `grid.rs`,
+/// `same_columns`). One client pages a table; another alters a column's type
+/// and adds a column; the first client's next page of the same SQL carries
+/// the new names and types, which is all the signal there is. The stale type
+/// matters: base64 text bound through the placeholder of the VARCHAR the
+/// column was is stored in the BLOB it became as the characters themselves.
+#[test]
+#[ignore]
+fn a_table_altered_elsewhere_shows_in_the_next_page() {
+    use serde_json::json;
+    let Some(row) = connectable() else {
+        println!("no berth to test against; skipping");
+        return;
+    };
+    println!("berth: {}", row.name);
+    let grid = connect(&row.name).expect("connect");
+    let other = connect(&row.name).expect("connect again");
+    let elsewhere = harbor_client::session_new(&other).expect("session");
+    let alter = |sql: &str| harbor_client::exec(&other, sql, None, Some(&elsewhere)).expect(sql);
+    let shape = |r: &harbor_client::QueryResult| -> Vec<(String, String)> {
+        r.columns.iter().map(|c| (c.name.clone().unwrap_or_default(), c.duckdb_type.clone())).collect()
+    };
+    alter("DROP TABLE IF EXISTS main._dt_reshape_probe");
+    alter("CREATE TABLE main._dt_reshape_probe(id INTEGER PRIMARY KEY, payload VARCHAR)");
+    alter("INSERT INTO main._dt_reshape_probe VALUES (1, 'qg==')");
+
+    let page = "SELECT * FROM \"main\".\"_dt_reshape_probe\" LIMIT 500 OFFSET 0";
+    let born = harbor_client::query(&grid, page).expect("first page");
+    println!("the grid's birth: {:?}", shape(&born));
+    assert_eq!(shape(&born), vec![("id".into(), "INTEGER".into()), ("payload".into(), "VARCHAR".into())]);
+
+    alter("ALTER TABLE main._dt_reshape_probe ALTER payload TYPE BLOB");
+    alter("ALTER TABLE main._dt_reshape_probe ADD COLUMN note VARCHAR DEFAULT 'n'");
+    let next = harbor_client::query(&grid, page).expect("next page");
+    println!("the next page:    {:?}", shape(&next));
+    assert_eq!(
+        shape(&next),
+        vec![("id".into(), "INTEGER".into()), ("payload".into(), "BLOB".into()), ("note".into(), "VARCHAR".into())]
+    );
+    assert_ne!(shape(&born), shape(&next));
+
+    // What the stale VARCHAR placeholder does to the BLOB, and what the
+    // BLOB's own placeholder does.
+    for (id, placeholder) in [(2, "?"), (3, "from_base64(?::VARCHAR)")] {
+        let sql = format!("INSERT INTO main._dt_reshape_probe (id, payload) VALUES (?, {placeholder}) RETURNING hex(payload)");
+        let kept = harbor_client::exec(&grid, &sql, Some(vec![json!(id), json!("qrs=")]), None).expect("insert");
+        println!("'qrs=' through `{placeholder}`: bytes {}", kept.rows[0][0]);
+    }
+    let stored = harbor_client::query(&grid, "SELECT hex(payload) FROM main._dt_reshape_probe WHERE id > 1 ORDER BY id")
+        .expect("read back");
+    assert_eq!(stored.rows, vec![vec![json!("7172733D")], vec![json!("AABB")]]);
+    alter("DROP TABLE main._dt_reshape_probe");
+    harbor_client::session_release(&other, &elsewhere);
+}
