@@ -4,11 +4,13 @@
 
 use harbor_client::{connect, fleet, info};
 
-/// Any berth will do — a name is a service that starts on use, so a stopped
-/// configured berth is as connectable as a live one. Live still wins, to
-/// avoid churning starts when something is already up.
+/// Any LOCAL berth will do — a name is a service that starts on use, so a
+/// stopped configured berth is as connectable as a live one. Live still wins,
+/// to avoid churning starts when something is already up. A remote is never
+/// chosen: it has no local database file, connecting to it opens an SSH
+/// tunnel to another machine, and these probes create and drop tables.
 fn connectable() -> Option<fleet::Survey> {
-    let mut rows = fleet::survey().rows;
+    let mut rows: Vec<_> = fleet::survey().rows.into_iter().filter(|r| r.path.is_some()).collect();
     rows.sort_by_key(|r| !r.state.is_live());
     rows.into_iter().next()
 }
