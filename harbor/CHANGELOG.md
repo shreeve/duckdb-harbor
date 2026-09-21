@@ -67,7 +67,17 @@ Harbor releases, and are not included here.
   A table written as parquet, and a directory with no `after.sql`, load by
   their `COPY` as before. A stock `duckdb` still cannot restore a table whose
   CHECK refuses strings from a text backup; the README says so, and the
-  roundtrip suite holds both halves.
+  roundtrip suite holds both halves. Running the files itself, restore sends
+  each statement of `schema.sql` as a request of its own, so each one meets
+  harbor's one-statement rule and its 8 MiB request cap, where
+  `IMPORT DATABASE` took the file whole.
+- **Known, and not changed here:** a table that holds both a `VARIANT` and a
+  `GENERATED` column backs up and does not restore, in this release as in
+  0.41.1. The VARIANT export is a `SELECT *`, which writes the generated
+  column into the data file, and no `COPY` takes it back: 0.41.1 fails at the
+  CSV sniff, 0.41.2 with `table "o" has 4 columns but 5 values were supplied`.
+  A table with a generated column and no VARIANT exports without it and
+  restores on both.
 
 ## 0.41.1 — 2026-09-21
 

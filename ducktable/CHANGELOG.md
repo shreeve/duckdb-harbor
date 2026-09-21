@@ -31,11 +31,13 @@ date, newest first.
   first-party client, and one that is deeper is told so; it was told "is not
   JSON — text needs quotes".
 - **A container of documents or blobs refuses typed text.** A typed edit of a
-  `BLOB[]`, `BLOB[2]`, `VARIANT[]`, `JSON[]`, `STRUCT(v VARIANT, …)` or
-  `MAP(VARCHAR, BLOB)` cell bound the displayed text bare, and the commit
-  succeeded with the inner value corrupted: base64 characters stored as the
-  bytes, documents stored as strings. The editor refuses the text and names
-  the Query tab. Opening and leaving such a cell, clearing it to NULL, and ⌘D
+  `BLOB[]`, `BLOB[2]`, `VARIANT[]`, `JSON[]` or `STRUCT(v VARIANT, …)` cell
+  bound the displayed text bare, and the commit succeeded with the inner value
+  corrupted: base64 characters stored as the bytes, documents stored as
+  strings. A `MAP(VARCHAR, BLOB)` cell's displayed text was refused by the
+  engine, loudly, but text typed in the engine's own syntax (`{k=aGk=}`)
+  corrupted it the same way. The editor refuses the text for all of them and
+  names the Query tab. Opening and leaving such a cell, clearing it to NULL, and ⌘D
   work as before.
 - **A duplicate whose source row is gone says to discard it.** The message
   said "refresh and retry", and no refresh helps: the draft keeps naming the
@@ -46,6 +48,13 @@ date, newest first.
   typed edit of a `VARIANT` retypes SQL-written values through JSON; that a
   duplicate carries its source row's identity; and that a failed commit
   reports in the status line only, marking no row.
+- **The live probes choose a local database, never a remote.** The ignored
+  tests in `harbor-client/tests/live.rs` took the first row of the fleet
+  survey, and a remote configured by url surveys as stopped and sorts first
+  when no local server is up: on a Mac whose harbor config names a production
+  host, `cargo test -- --ignored` would have tunnelled to it and run the
+  probes' `DROP TABLE IF EXISTS` and `CREATE TEMP TABLE` there. The probes
+  consider only rows with a local database file, and skip when there is none.
 - The lockfile records `harbor-common` and `wire` at 0.41.1.
 
 ## 0.22.3 — 2026-09-20
@@ -87,6 +96,12 @@ date, newest first.
   between its renames is put right on the next run. `install.sh` verifies the
   download's signature before it swaps, registers the bundle with Launch
   Services, and takes `DUCKTABLE_DEST`.
+- **The release's feed upload sends files, not the pruned folder.** Sparkle
+  2.10.0's `generate_appcast` sets the archives it prunes from the feed aside
+  in `old_updates/`, and the workflow uploaded `target/updates/*`: the 0.22.2
+  run published the release, the signed feed and every archive, then met that
+  directory and ended red. The upload takes the files only; 0.22.3 is the
+  first release it ran green on.
 - Ships Sparkle 2.10.0, the current stable. The lockfile records
   `harbor-common` and `wire` at 0.41.0.
 
