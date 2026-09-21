@@ -4,6 +4,74 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.41.3 — 2026-09-21
+
+- **A `GENERATED` column is computed by the restored table, and no backup
+  file holds one.** `CREATE TABLE o (id INTEGER PRIMARY KEY, doc VARIANT, qty
+  INTEGER, doubled INTEGER GENERATED ALWAYS AS (qty * 2), note VARCHAR)`
+  backed up without a word and did not restore: `table "o" has 4 columns but
+  5 values were supplied`. `EXPORT DATABASE` leaves a generated column out of
+  the file it writes, since no `COPY` takes one back, and harbor writes some
+  files again in its own words, where a `SELECT *` or a `COPY <table> TO`
+  puts the column back in. Measured on 0.41.2, that was four routes and not
+  only the VARIANT one: the JSON export of a table with a `VARIANT` column
+  (header `id doc qty doubled note`); the file quoted throughout for a blank
+  record, with no VARIANT in sight (`CREATE TABLE b (s VARCHAR, len BIGINT
+  GENERATED ALWAYS AS (length(s)))` holding an empty string wrote `"s" "len"`
+  and failed at the CSV sniff); the swap to parquet for a `UNION` (`column
+  count mismatch: expected 2 columns but found 3`); and the swap to text for
+  a `TIMETZ` under `--format parquet`. All four now write the table as
+  `SELECT * EXCLUDE (<generated>) …`, the names read from `schema.sql`, so
+  every file matches what `EXPORT` writes for such a table: `id doc qty
+  note`. Restore stages a VARIANT table with the same `EXCLUDE`, so the
+  staging table holds what the file holds and the `INSERT` lines up with the
+  table's stored columns in declared order. A whole-database `--format
+  parquet` never had the defect, since those files are `EXPORT`'s own, and a
+  generated column beside no VARIANT, no blank record and no swap restored
+  all along.
+- **A generated column's definition is no longer the format's concern.** A
+  table with `e VARCHAR GENERATED ALWAYS AS (CAST(d AS VARIANT)::VARCHAR)`
+  was refused outright, `cannot round-trip in either backup format: parquet
+  has no writer for a VARIANT nested inside another type`, because the word
+  in the expression was read as a type to be held. A generated `VARIANT`
+  column was cast to JSON and named in `after.sql`'s `UPDATE`, which no
+  generated column accepts. Neither is written, so neither is looked at.
+- **A text file that does hold the generated columns restores too.** A
+  directory written by 0.41.2 or before carries them, and its header says so:
+  restore counts the fields of the first record, quotes walked, and a file
+  with a field for every column is staged whole and the generated ones are
+  left out of the `INSERT`, with a VARIANT beside them or without. A
+  directory written by 0.41.1 and one by 0.41.2, each holding `o`, a table
+  whose generated columns read the document, the blank-record table, an
+  ordinary generated column and a VARIANT under a `CHECK`, restored with
+  every row equal; so did 0.41.2's `TIMETZ` text file and its directory of a
+  quoted schema, a quoted table and a column with a tab in its name. The one
+  that does not is the parquet file a `UNION` table with a generated column
+  was swapped to: a parquet header is not harbor's to read, the engine's own
+  message names both column lists, and the backup wants taking again.
+- Measured with this build, default format and `--strict`: `o`; a table whose
+  generated columns read the document (`"the doc"['a']::VARCHAR`,
+  `variant_typeof("the doc")`, a generated `VARIANT`) under quoted names and
+  sitting before, between and after the stored ones; an ordinary generated
+  `DECIMAL`; the `UNION`, blank-record and `TIMETZ` tables; and a VARIANT
+  under a `CHECK` with no generated column. Every row `IS NOT DISTINCT FROM`
+  its source, the generated values and `variant_typeof` included, the SQL
+  NULL rows too, `duckdb_columns().generation_expression` the same on both
+  sides and no staging table left. The restored table computes from the
+  loaded document: `{"a":5}` gives `5` and `OBJECT(a)`. A stock `IMPORT
+  DATABASE` of the directory, then `after.sql`, gives the same table, where
+  it failed at the sniff. The fidelity note is unchanged: a `DATE` inside the
+  VARIANT of such a table is still named, and `--strict` still refuses it.
+  Under `--format parquet` the same database restores with every value and
+  every generated value equal, the `TIMETZ` table swapped to text included;
+  the one difference is parquet's own, the number 42 relabelled from `UINT64`
+  to `INT64` inside the VARIANT, as it is without a generated column.
+  The engine (alpha42289) has only `VIRTUAL` generated columns, `Can not
+  create a STORED generated column!`, and refuses `doc.a` inside one
+  (`Qualified (tbl.name) column references are not allowed`), so a generated
+  column reaches into a document with `doc['a']`. The roundtrip suite holds
+  all of it, under text and again under `--format parquet`.
+
 ## 0.41.2 — 2026-09-21
 
 - **A document parameter nests at most 100 levels.** Rip's ORM and

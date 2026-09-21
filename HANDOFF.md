@@ -313,6 +313,7 @@ document before it is sent. Only a string the statement casts through
 | 0.41.0 | 09-20 | an object or array param aimed at a VARIANT is bound as the document |
 | 0.41.1 | 09-21 | a document param costs its casts, not two type lookups; a cancel during the bind is kept |
 | 0.41.2 | 09-21 | a document param nests at most 100 levels; a cancel always aborts its transaction; restore loads VARIANT columns as documents, past a CHECK |
+| 0.41.3 | 09-21 | no backup file holds a GENERATED column; the restored table computes it |
 
 Older milestones the code still reflects: 0.20 collapsed everything into
 one binary with the refcounted lifetime; 0.21 moved to the direct v2 C API
@@ -326,12 +327,6 @@ usable end to end.
   `DUCKDB_LIB_BUILD` repository variable to `latest`. Wait for the naming to
   settle; there was reviewer discussion upstream about instance-versus-
   database option scope.
-- **A table with both a VARIANT and a GENERATED column backs up and does not
-  restore.** The VARIANT export is `SELECT * REPLACE (…)`, which writes the
-  generated column into the data file; no `COPY` takes it back, and restore's
-  staging `SELECT *` carries it too. Both want the generated columns left out
-  (`duckdb_columns().generated`, or `EXCLUDE`). A generated column without a
-  VARIANT exports without it and restores. MedLabs has neither.
 - **Un-vendor reedline** when 0.52 ships with patches A–C, re-applying D on
   top (or filing it). `HARBOR.md` has the exact checklist.
 - **A binary wire mode** is parked until DuckDB GA.
