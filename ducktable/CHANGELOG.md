@@ -3,6 +3,48 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by release
 date, newest first.
 
+## 0.22.3 — 2026-09-20
+
+- **Duplicate Row is an exact copy.** ⌘D rebound the source row's wire values,
+  and the wire is narrower than the engine: a `VARIANT` crosses it as JSON, so
+  a DATE written into a document from SQL came back a string, a DECIMAL a
+  double, a HUGEINT short of digits; a `BLOB[]` came back as base64 text
+  re-encoded; an INTERVAL, a MAP and a UNION failed or landed in the wrong
+  member. A duplicate's untouched cell is no longer bound at all: the INSERT
+  reads it from the source row in SQL
+  (`INSERT INTO t (…) SELECT ?, "c2", "c3" FROM t WHERE <key> = ? RETURNING *`),
+  so the copy is the value that was there, whatever its type. A cell typed
+  into the draft, or one carrying a staged update from the source row, is
+  bound as before. If the source row is gone at ⌘S the commit stops and says
+  so, rather than inserting a row of NULLs.
+- **The editor judges a type by its own name.** A test for `INT` anywhere in
+  the type sent `INTERVAL`, `INTEGER[]`, `STRUCT(a INTEGER, …)` and an ENUM
+  holding `'POINT'` down the integer path, where every edit was refused; the
+  same looseness caught `DOUBLE[]`, `DECIMAL(10,2)[]` and `VARCHAR[]`. Types
+  match by exact name. Integers are checked against their own range and bound
+  as text past 64 bits, so `UBIGINT`, `HUGEINT` and `UHUGEINT` take their full
+  width exactly.
+- **A number is never staged as NULL.** `nan`, `inf`, `-inf` and their
+  spellings typed into a DOUBLE or FLOAT cell were staged as SQL NULL with no
+  word; they bind as the values they name. A number past a double's range is
+  refused in the editor.
+- **Clearing an ENUM or a UUID means NULL.** Both were treated as text, so
+  Delete staged `''`, which is no value of either and could not commit.
+- **The bundle signs as one name, and says why it wants the local network.**
+  macOS files an app's Local Network decision under its signing identifier,
+  and DuckTable's SSH tunnels count as DuckTable. Every build signs as
+  `com.shreeve.ducktable`, the build and the release smoke test fail on any
+  other, and the bundle carries an `NSLocalNetworkUsageDescription` for the
+  consent prompt.
+- **Installs swap by rename.** Both installers stage the new bundle beside the
+  old one, rename the old aside and the new in, and remove the old one last,
+  so a failed install leaves the DuckTable that was there; a swap interrupted
+  between its renames is put right on the next run. `install.sh` verifies the
+  download's signature before it swaps, registers the bundle with Launch
+  Services, and takes `DUCKTABLE_DEST`.
+- Ships Sparkle 2.10.0, the current stable. The lockfile records
+  `harbor-common` and `wire` at 0.41.0.
+
 ## 0.22.2 — 2026-09-20
 
 - **Editing a `VARIANT` cell keeps it a document.** The cell's JSON text was
