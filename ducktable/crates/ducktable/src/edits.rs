@@ -567,6 +567,17 @@ pub fn is_text_type(duck_type: &str) -> bool {
     matches!(type_head(&ty), "VARCHAR" | "NVARCHAR" | "CHAR" | "BPCHAR" | "TEXT" | "STRING")
 }
 
+/// Whether whitespace around a cell's text is part of its value. It is for
+/// text; for a JSON column, which keeps its text character for character;
+/// and for an ENUM, whose values are strings (`ENUM('a', ' a')` has two).
+/// For every other type the engine's cast reads ` 5 `, ` 2024-02-29 ` and
+/// ` [1, 2] ` as it reads them bare, or refuses the padded text outright (a
+/// UUID, a BIT, base64), so padding never names a different value.
+fn keeps_whitespace(duck_type: &str) -> bool {
+    let ty = duck_type.to_uppercase();
+    is_text_type(&ty) || matches!(type_head(&ty), "JSON" | "ENUM")
+}
+
 /// A scalar type's own name, without its parameters: `DECIMAL(10,2)` is
 /// `DECIMAL`, `ENUM('a', 'b')` is `ENUM`. A container is never the name of
 /// what it contains: `STRUCT(a INTEGER)` is `STRUCT`, and `INTEGER[]` and
@@ -662,8 +673,16 @@ pub enum Confirm {
 /// cell that holds NULL, or over a draft's DEFAULT, is that cell unchanged:
 /// NULL in, nothing typed, NULL out. `''` is entered by emptying a text cell
 /// that held something, or with Delete.
+///
+/// Whitespace around the text is compared only where it is part of the value
+/// (`keeps_whitespace`): ` 5` over an INTEGER that holds `5` is that cell
+/// unchanged, and ` 5` over a VARCHAR that holds `5` is another string.
 pub fn confirm(text: &str, cell: &Held) -> Confirm {
-    let same = |held: Option<&str>| held.unwrap_or("") == text;
+    let exact = keeps_whitespace(cell.ty);
+    let same = |held: Option<&str>| {
+        let held = held.unwrap_or("");
+        if exact { held == text } else { held.trim() == text.trim() }
+    };
     if same(cell.staged.unwrap_or(cell.fetched)) {
         return Confirm::Keep;
     }
@@ -701,8 +720,11 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
     }
     // Typing the literal `null` into a non-text column means SQL NULL —
     // it was never a valid INTEGER anyway (DataGrip precedent). In text
-    // columns it stores the four characters.
-    if !is_text && text.eq_ignore_ascii_case("null") {
+    // columns it stores the four characters. In a BLOB cell it is base64
+    // like any other text there: `null`, `NULL` and `Null` each decode to
+    // three bytes (9EE965, 3542CB, 36E965), and bytes a cell can show are
+    // bytes it can take. A BLOB's NULL is entered with ⌃⇧N or Delete.
+    if !is_text && ty != "BLOB" && text.eq_ignore_ascii_case("null") {
         return Ok(Value::Null);
     }
     // A VARIANT cell is JSON text both ways (`placeholder_for`). Its
@@ -735,7 +757,15 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
     }
     if matches!(head, "DOUBLE" | "FLOAT8" | "FLOAT" | "FLOAT4" | "REAL") {
         let t = text.trim();
+        // A FLOAT is 32 bits. The engine rounds the DOUBLE it is handed to
+        // the nearest FLOAT and refuses one that rounds past the largest,
+        // which is what this cast does: 3.40282356e38 is still the largest
+        // FLOAT, 3.4028236e38 is out of range.
+        let single = head != "DOUBLE" && head != "FLOAT8";
         return match t.parse::<f64>() {
+            Ok(v) if v.is_finite() && single && !(v as f32).is_finite() => {
+                Err(format!("{text:?} is out of range for {duck_type}"))
+            }
             Ok(v) if v.is_finite() => Ok(Value::from(v)),
             // NaN and the infinities have no JSON number — serde makes
             // null of them — and the engine reads their names, so the name
@@ -1644,5 +1674,119 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_float_takes_a_number_a_float_can_hold() {
+        for ty in ["FLOAT", "float", "REAL", "FLOAT4"] {
+            // The largest FLOAT, and a DOUBLE that rounds to it.
+            for text in ["3.4028235e38", "-3.4028235e38", "3.40282356e38", "1e-50", "0"] {
+                assert!(parse_value(text, ty).is_ok(), "{ty} {text}");
+            }
+            // Halfway to the next power of two and beyond rounds past it.
+            for text in ["3.4028235677973366e38", "3.4028236e38", "3.5e38", "-3.5e38", "1e39", "1e308"] {
+                let err = parse_value(text, ty).unwrap_err();
+                assert!(err.contains("out of range for") && err.contains(ty), "{ty} {text}: {err}");
+            }
+            // The names are not numbers and have no range.
+            for name in ["nan", "inf", "-inf", "Infinity"] {
+                assert_eq!(parse_value(name, ty), Ok(json!(name)), "{ty} {name}");
+            }
+        }
+        for ty in ["DOUBLE", "FLOAT8"] {
+            assert_eq!(parse_value("3.5e38", ty), Ok(json!(3.5e38)), "{ty}");
+            assert_eq!(parse_value("1e308", ty), Ok(json!(1e308)), "{ty}");
+            assert!(parse_value("1e309", ty).unwrap_err().contains("out of range"), "{ty}");
+        }
+        // A container of FLOATs is the engine's to judge.
+        assert_eq!(parse_value("[1e39]", "FLOAT[]"), Ok(json!("[1e39]")));
+    }
+
+    #[test]
+    fn text_typed_into_a_blob_cell_is_base64_and_never_null() {
+        // Four base64 characters, three bytes: 9EE965, 3542CB, 36E965.
+        for text in ["null", "NULL", "Null", "nUlL"] {
+            assert_eq!(parse_value(text, "BLOB"), Ok(json!(text)), "{text}");
+            assert_eq!(parse_value(text, "blob"), Ok(json!(text)), "{text}");
+            assert_eq!(
+                confirm(text, &persisted("BLOB", Some("qg=="), None)),
+                stage(text, json!(text)),
+                "{text}"
+            );
+            assert_eq!(confirm(text, &draft("BLOB", None, None)), stage(text, json!(text)), "{text}");
+        }
+        // A cell that shows those bytes is left as it is.
+        assert_eq!(confirm("NULL", &persisted("BLOB", Some("NULL"), None)), Confirm::Keep);
+        // An emptied BLOB cell is NULL, as Delete and ⌃⇧N make it.
+        assert_eq!(confirm("", &persisted("BLOB", Some("qg=="), None)), Confirm::Stage(None, Value::Null));
+        // Every other type that is not text keeps the rule, a container of
+        // BLOBs among them.
+        for ty in ["INTEGER", "DOUBLE", "DATE", "UUID", "VARIANT", "BLOB[]", "MAP(VARCHAR, BLOB)"] {
+            assert_eq!(parse_value("NULL", ty), Ok(Value::Null), "{ty}");
+        }
+    }
+
+    #[test]
+    fn whitespace_around_a_value_that_is_not_text_is_not_a_change() {
+        for (ty, held) in [
+            ("INTEGER", "5"),
+            ("DOUBLE", "1.5"),
+            ("DECIMAL(10,2)", "1.50"),
+            ("DATE", "2024-02-29"),
+            ("BOOLEAN", "true"),
+            ("UUID", "6f9619ff-8b86-d011-b42d-00c04fc964ff"),
+            ("INTEGER[]", "[1, 2]"),
+            ("VARIANT", "{\"a\":1}"),
+            ("BLOB", "qg=="),
+        ] {
+            for typed in [format!(" {held}"), format!("{held} "), format!("\t{held} \n")] {
+                // Over the fetched value, and over the same value staged.
+                assert_eq!(confirm(&typed, &persisted(ty, Some(held), None)), Confirm::Keep, "{ty} {typed:?}");
+                assert_eq!(
+                    confirm(&typed, &persisted(ty, Some("0"), Some(Some(held)))),
+                    Confirm::Keep,
+                    "{ty} {typed:?}"
+                );
+                // Over another staged value it is the fetched one again.
+                assert_eq!(
+                    confirm(&typed, &persisted(ty, Some(held), Some(Some("0")))),
+                    Confirm::Revert,
+                    "{ty} {typed:?}"
+                );
+                assert_eq!(confirm(&typed, &persisted(ty, Some(held), Some(None))), Confirm::Revert, "{ty}");
+                // A draft's cell, and what a duplicate copied.
+                assert_eq!(confirm(&typed, &draft(ty, Some(Some(held)), None)), Confirm::Keep, "{ty}");
+                assert_eq!(
+                    confirm(&typed, &draft(ty, Some(Some("0")), Some(Some(held)))),
+                    Confirm::Revert,
+                    "{ty} {typed:?}"
+                );
+            }
+        }
+        // Staged with its padding, the bare value is that cell unchanged too.
+        assert_eq!(confirm("6", &persisted("INTEGER", Some("5"), Some(Some(" 6")))), Confirm::Keep);
+        // Spaces over NULL are NULL still; over a value they are judged.
+        assert_eq!(confirm("  ", &persisted("INTEGER", None, None)), Confirm::Keep);
+        assert!(matches!(confirm("  ", &persisted("INTEGER", Some("5"), None)), Confirm::Refuse(_)));
+        // Whitespace inside the value is the value's own business.
+        assert_eq!(
+            confirm("[1,2]", &persisted("INTEGER[]", Some("[1, 2]"), None)),
+            stage("[1,2]", json!("[1,2]"))
+        );
+        // A different value is staged as typed.
+        assert_eq!(confirm(" 6", &persisted("INTEGER", Some("5"), None)), stage(" 6", json!(6)));
+
+        // Where the padding is part of the value, the comparison is exact:
+        // text, a JSON column's text, an ENUM's strings.
+        assert_eq!(confirm(" 5", &persisted("VARCHAR", Some("5"), None)), stage(" 5", json!(" 5")));
+        assert_eq!(confirm("5 ", &persisted("CHAR(3)", Some("5"), None)), stage("5 ", json!("5 ")));
+        assert_eq!(confirm(" ", &persisted("VARCHAR", None, None)), stage(" ", json!(" ")));
+        assert_eq!(confirm(" 5", &persisted("VARCHAR", Some(" 5"), Some(Some("5")))), Confirm::Revert);
+        assert_eq!(confirm(" {}", &persisted("JSON", Some("{}"), None)), stage(" {}", json!(" {}")));
+        assert_eq!(
+            confirm(" a", &persisted("ENUM('a', ' a')", Some("a"), None)),
+            stage(" a", json!(" a"))
+        );
+        assert_eq!(confirm(" 5", &draft("VARCHAR", Some(Some("5")), Some(Some("5")))), stage(" 5", json!(" 5")));
     }
 }
