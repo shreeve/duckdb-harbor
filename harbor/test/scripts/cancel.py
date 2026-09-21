@@ -421,7 +421,10 @@ def run_tests(h, db):
     eq("the statement reports cancelled", 499, job.status)
     yes("when its values are built, not at its deadline", job.seconds < 4.0, f"{job.seconds:.2f}s")
 
-    # Nothing ran, so a transaction is as it was: still open, its writes intact.
+    # Nothing ran, and the transaction is over all the same: a 499 inside a
+    # transaction means one thing, whenever the cancel landed. A client that
+    # carried on and committed would otherwise commit a transaction with a
+    # statement missing.
     st, doc, _ = h.open()
     sid = doc["sessionId"]
     eq("BEGIN", 200, h.sql("BEGIN", session=sid)[0])
@@ -430,10 +433,43 @@ def run_tests(h, db):
     cancel_during_cast(job, "bind2")
     job.wait()
     eq("cancelled before it began, inside a transaction", 499, job.status)
-    eq("the transaction is still open and holds its write", 98,
-       h.value("SELECT n FROM marks WHERE n = 98", session=sid))
-    eq("COMMIT", 200, h.sql("COMMIT", session=sid)[0])
-    eq("and the write landed", 98, h.value("SELECT n FROM marks WHERE n = 98"))
+    yes("when its values are built, not at its deadline", job.seconds < 4.0, f"{job.seconds:.2f}s")
+    st, doc, _ = h.sql("SELECT n FROM marks WHERE n = 98", session=sid)
+    eq("the transaction is aborted, as by a cancel that lands later", 400, st)
+    yes(
+        "and says so",
+        "current transaction is aborted" in (doc.get("message") or "").lower(),
+        doc.get("message", "")[:80],
+    )
+    eq("a write is refused too", 400, h.sql("INSERT INTO marks VALUES (97)", session=sid)[0])
+    eq("ROLLBACK is accepted", 200, h.sql("ROLLBACK", session=sid)[0])
+    eq("and the session works again", 1, h.value("SELECT 1", session=sid))
+    eq("the write before the cancel is gone", None, h.value("SELECT n FROM marks WHERE n = 98"))
+    eq("release", True, h.release(sid)[1].get("released"))
+
+    # The client this rule is for: it ignores the 499 and commits. The engine
+    # rolls an aborted transaction back on COMMIT, so nothing partial lands.
+    st, doc, _ = h.open()
+    sid = doc["sessionId"]
+    eq("BEGIN", 200, h.sql("BEGIN", session=sid)[0])
+    eq("a write inside the transaction", 200, h.sql("INSERT INTO marks VALUES (95)", session=sid)[0])
+    job = Background(h, statement=endless, params=[big], session=sid, query="bind4", timeout_ms=8000)
+    cancel_during_cast(job, "bind4")
+    job.wait()
+    eq("cancelled before it began", 499, job.status)
+    eq("a COMMIT that ignores it is accepted", 200, h.sql("COMMIT", session=sid)[0])
+    eq("and commits nothing", None, h.value("SELECT n FROM marks WHERE n = 95"))
+    eq("release", True, h.release(sid)[1].get("released"))
+
+    # Outside a transaction the same cancel leaves the session as it was.
+    st, doc, _ = h.open()
+    sid = doc["sessionId"]
+    job = Background(h, statement=endless, params=[big], session=sid, query="bind3", timeout_ms=8000)
+    cancel_during_cast(job, "bind3")
+    job.wait()
+    eq("cancelled before it began, in autocommit", 499, job.status)
+    eq("the next statement runs", 200, h.sql("INSERT INTO marks VALUES (96)", session=sid)[0])
+    eq("and commits by itself", 96, h.value("SELECT n FROM marks WHERE n = 96"))
     eq("release", True, h.release(sid)[1].get("released"))
 
     # -----------------------------------------------------------------------

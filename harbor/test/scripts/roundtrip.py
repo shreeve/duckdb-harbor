@@ -433,6 +433,86 @@ def variant_as_json(work):
     else:
         bad("the directory does not import by hand the way it says", (before, after))
 
+    # A CHECK on a VARIANT column. A plain COPY lands each cell as a VARIANT
+    # string for after.sql to decode, and `variant_typeof(v) LIKE 'OBJECT%'`
+    # refuses every one of those; harbor's restore loads the documents as
+    # documents, so the table never holds the string. One CHECK is the
+    # table's and one a column's, under a name that has to be quoted; a NOT
+    # NULL VARIANT, a SQL NULL and a child table that references its parent
+    # ride along, beside a table with no VARIANT at all.
+    checked = work / "checked.duckdb"
+    checked_dst = work / "checked_restored.duckdb"
+    checked_backup = work / "checked.backup"
+    quiet(checked, "CREATE TABLE g(id INTEGER PRIMARY KEY, v VARIANT, note VARCHAR, "
+                   "CHECK (v IS NULL OR variant_typeof(v) LIKE 'OBJECT%'))")
+    quiet(checked, "INSERT INTO g VALUES "
+                   "(1, '{\"a\":{\"b\":[1,2,{\"c\":null}]},\"t\":\"tab\\there\",\"n\":null}'::JSON, 'first'), "
+                   "(2, NULL, NULL), "
+                   "(3, '{\"q\":\"say \\\"hi\\\"\",\"big\":18446744073709551615}'::JSON, 'third')")
+    quiet(checked, 'CREATE TABLE "odd child"(id INTEGER, gid INTEGER REFERENCES g(id), '
+                   '"the doc" VARIANT CHECK (variant_typeof("the doc") LIKE \'OBJECT%\'), extra VARIANT NOT NULL)')
+    quiet(checked, 'INSERT INTO "odd child" VALUES (10, 1, \'{"k":[]}\'::JSON, \'[1,"two"]\'::JSON), '
+                   '(11, 3, \'{}\'::JSON, \'"a string"\'::JSON)')
+    quiet(checked, "CREATE TABLE ordinary(id INTEGER, name VARCHAR)")
+    quiet(checked, "INSERT INTO ordinary VALUES (1, 'one'), (2, NULL), (3, '')")
+    shape = ("SELECT (SELECT string_agg(coalesce(variant_typeof(v), '-') || ':' || (v IS NULL), ',' ORDER BY id) FROM g) "
+             "|| ' / ' || (SELECT string_agg(variant_typeof(\"the doc\") || ':' || variant_typeof(extra), ',' ORDER BY id) "
+             "FROM \"odd child\") AS t")
+    before = sql(checked, shape)[0]["t"]
+    run(checked, "stop")
+    said = run(checked, "backup", checked_backup).stderr
+    run(checked, "stop")
+    names = sorted(f.name for f in checked_backup.iterdir())
+    if "parquet" in said or names != ["after.sql", "g.csv", "load.sql", "odd_child.csv", "ordinary.csv", "schema.sql"]:
+        bad("a CHECK on a VARIANT column changed how the table is written", f"{names}\n{said}")
+    else:
+        ok("a table with a CHECK on its VARIANT column is written as text like any other")
+    restored = run(checked_dst, "restore", checked_backup, expect=None)
+    if restored.returncode != 0:
+        bad("a table with a CHECK on its VARIANT column did not restore", restored.stderr)
+    else:
+        same = diff(checked, checked_dst, ["g", "odd child", "ordinary"])
+        after = sql(checked_dst, shape)[0]["t"]
+        left = sql(checked_dst, "SELECT count(*) AS n FROM duckdb_tables() WHERE database_name = current_database()")[0]["n"]
+        refused = run(checked_dst, "--mode", "trash", stdin="INSERT INTO g VALUES (4, '[1]'::JSON, 'an array')", expect=None)
+        run(checked_dst, "stop")
+        if same:
+            bad("the restore through a CHECK changed a value", same)
+        elif after != before or "VARIANT_NULL:true" not in after:
+            bad("the documents under a CHECK did not come back as they were", f"{before}\n{after}")
+        elif left != 3:
+            bad("the restore left a table of its own behind", left)
+        elif refused.returncode == 0 or "CHECK constraint failed" not in refused.stderr:
+            bad("the restored CHECK does not check", refused.stderr)
+        else:
+            ok("it restores: every document a document, the SQL NULL a NULL, the CHECK in force")
+    # The engine writes a SQL NULL VARIANT as the JSON text `null`
+    # (duckdb#25873). A file that holds the null marker there instead, as one
+    # written once that is fixed would, restores to the same NULL.
+    marked = work / "checked.marked"
+    shutil.copytree(checked_backup, marked)
+    text = (marked / "g.csv").read_text()
+    if "2\tnull\tNULL\n" not in text:
+        bad("the SQL NULL VARIANT is not written the way this test assumes", text)
+    (marked / "g.csv").write_text(text.replace("2\tnull\tNULL\n", "2\tNULL\tNULL\n"))
+    marked_dst = work / "checked_marked.duckdb"
+    remarked = run(marked_dst, "restore", marked, expect=None)
+    after = sql(marked_dst, shape)[0]["t"] if remarked.returncode == 0 else remarked.stderr
+    run(marked_dst, "stop")
+    if after == before:
+        ok("a SQL NULL VARIANT written as the null marker restores to the same NULL")
+    else:
+        bad("the null marker in a VARIANT column did not restore to NULL", f"{before}\n{after}")
+    # Stock DuckDB cannot do this: IMPORT DATABASE lands the strings, and the
+    # CHECK refuses them before after.sql has its turn.
+    plain = work / "checked_plain.duckdb"
+    stock = run(plain, "--mode", "trash", stdin=f"IMPORT DATABASE {literal(str(checked_backup))}", expect=None)
+    run(plain, "stop")
+    if stock.returncode != 0 and "CHECK constraint failed" in stock.stderr:
+        ok("IMPORT DATABASE by hand is refused by that CHECK, as the README says")
+    else:
+        bad("IMPORT DATABASE by hand was not refused by the CHECK — the README says it is", stock.stderr)
+
     # What JSON has no word for: said out loud, written anyway, refused
     # under --strict, and kept by parquet.
     dated = work / "dated.duckdb"

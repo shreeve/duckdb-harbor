@@ -1972,7 +1972,14 @@ struct SqlRequest {
 }
 
 fn parse_request(body: &str) -> Result<SqlRequest, String> {
-    let mut v: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let mut v: serde_json::Value = serde_json::from_str(body).map_err(|e| match e.to_string() {
+        // The parser stops reading at 127 levels, and nothing in a request
+        // nests but a document param, so its refusal is the one below in
+        // other words. Should the wording ever differ, the parser's own
+        // message goes out instead.
+        deep if deep.starts_with("recursion limit exceeded") => too_deep(),
+        other => other,
+    })?;
     // take() moves the String serde already built instead of copying it
     let sql = match v.get_mut("sql").map(serde_json::Value::take) {
         Some(serde_json::Value::String(s)) => s,
@@ -2047,8 +2054,33 @@ fn json_to_duckdb(v: &serde_json::Value) -> Result<Param, String> {
         // its own and goes as its JSON text, for the statement to cast. A
         // string is never read this way, whatever it spells: a param that
         // looks like JSON is data, as one that looks like SQL is.
-        other => Param::Document { text: other.to_string(), variant: false },
+        other if nests_within(other, DOCUMENT_LEVELS) => {
+            Param::Document { text: other.to_string(), variant: false }
+        }
+        _ => return Err(too_deep()),
     })
+}
+
+fn too_deep() -> String {
+    format!("a document param nests at most {DOCUMENT_LEVELS} levels")
+}
+
+/// How deep an object or array param may nest, counting its own levels: `{}`
+/// is one, `[[1]]` is two. Rip's ORM and DuckTable's editor keep the same
+/// number, so a document is refused at the same depth whichever layer meets it
+/// first. The engine is why there is a number at all: an `UPDATE` of a VARIANT
+/// column costs the square of the nesting depth (duckdb#25967).
+const DOCUMENT_LEVELS: usize = 100;
+
+/// Whether `v` nests no deeper than `levels`. It descends `levels` deep and
+/// stops, so its own recursion is bounded by the limit it checks and not by
+/// the document.
+fn nests_within(v: &serde_json::Value, levels: usize) -> bool {
+    match v {
+        serde_json::Value::Array(a) => levels > 0 && a.iter().all(|c| nests_within(c, levels - 1)),
+        serde_json::Value::Object(o) => levels > 0 && o.values().all(|c| nests_within(c, levels - 1)),
+        _ => true,
+    }
 }
 
 /// A byte that can appear inside a DuckDB identifier. `$` is one of them,
@@ -3817,7 +3849,11 @@ fn run_statement(
     // A document aimed at a VARIANT is bound as one. Finding that out is a
     // bind pass and making it one is a cast, and an interrupt that lands
     // during either is dropped by the engine. So the values are built first
-    // and the slot is asked again once they are, before anything runs.
+    // and the slot is asked again once they are, before anything runs. A
+    // cancel found here leaves the transaction aborted, as one that lands
+    // during execution does: a 499 inside a transaction means the transaction
+    // is over, whenever the cancel arrived. The slot is retired first, so no
+    // interrupt is aimed at the statement that does the aborting.
     let mut params = params;
     let bound = match conn.bind(last, &mut params) {
         Ok(b) => b,
@@ -3828,6 +3864,7 @@ fn run_statement(
     };
     if on_slot.slot.cancelled() {
         on_slot.finish();
+        conn.abort_transaction();
         let _ = ready.send(Err(Refusal::cancelled()));
         return needs_reset;
     }
@@ -4119,8 +4156,10 @@ fn execute_jobs(
         let mut on_slot = OnSlot { slot: &state, done: false };
         if pre_cancelled {
             // Cancelled between being registered and being picked up. Nothing
-            // has touched the connection, so there is nothing to roll back.
+            // ran, and the transaction it would have run in is left aborted,
+            // as a cancel that lands at any later moment leaves it.
             on_slot.finish();
+            conn.abort_transaction();
             let _ = ready.send(Err(Refusal::cancelled()));
             continue;
         }
@@ -4381,6 +4420,101 @@ mod tests {
             super::Shape::Json, ready, body, Instant::now());
         assert_eq!(result.recv().unwrap().err().unwrap().status, 400);
         assert!(conn.execute_batch("SELECT * FROM must_not_exist").is_err());
+    }
+
+    /// A 499 inside a transaction means the transaction is over, whenever the
+    /// cancel arrived: while the statement's params were being built, or
+    /// before an executor had picked the statement up.
+    #[test]
+    fn an_early_cancel_aborts_the_transaction_it_lands_in() {
+        use std::sync::{Arc, mpsc::sync_channel};
+        if crate::engine::engine().is_err() { return; }
+        let open = || {
+            let mut conn = crate::engine::conn::open(std::path::Path::new(":memory:"), &[]).unwrap();
+            conn.execute_batch("CREATE TABLE m(n INTEGER); BEGIN; INSERT INTO m VALUES (1)").unwrap();
+            let state = Arc::new(super::SlotState {
+                interrupt: conn.interrupt_handle(), run: std::sync::Mutex::new(idle()),
+            });
+            (conn, state)
+        };
+        let count = |conn: &mut super::Connection| {
+            conn.query_strings("SELECT count(*)::VARCHAR FROM m").unwrap().join(",")
+        };
+
+        // The cancel fires once the slot holds the statement and before the
+        // statement runs, which is where one that lands during the bind is
+        // found. The engine drops the interrupt itself.
+        let (mut conn, state) = open();
+        let cancelled = |conn: &mut super::Connection, id: u64, sql: &str| {
+            state.begin(id, None);
+            assert!(state.cancel(Some(id)));
+            let mut slot = super::OnSlot { slot: &state, done: false };
+            let (ready, result) = sync_channel(1);
+            let (body, _output) = sync_channel(1);
+            super::run_statement(conn, &mut slot, sql.into(), vec![], super::Shape::Json,
+                ready, body, Instant::now());
+            result.recv().unwrap().err().unwrap().status
+        };
+        assert_eq!(cancelled(&mut conn, 1, "INSERT INTO m VALUES (2)"), 499);
+        let err = conn.execute_batch("SELECT 1").unwrap_err().to_string();
+        assert!(err.contains("Current transaction is aborted"), "{err}");
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(count(&mut conn), "0");
+        // In autocommit the same cancel leaves nothing behind.
+        assert_eq!(cancelled(&mut conn, 2, "INSERT INTO m VALUES (3)"), 499);
+        conn.execute_batch("INSERT INTO m VALUES (4)").unwrap();
+        assert_eq!(count(&mut conn), "1");
+
+        // The cancel is held for a statement no executor has begun.
+        let (conn, state) = open();
+        assert!(state.cancel(Some(7)));
+        let (jobs, queue) = sync_channel(4);
+        let mut answers = Vec::new();
+        for (id, sql) in [(7, "INSERT INTO m VALUES (2)"), (8, "SELECT 1"), (9, "ROLLBACK"),
+            (10, "SELECT count(*) FROM m")] {
+            let (ready, result) = sync_channel(1);
+            let (body, output) = sync_channel(4);
+            jobs.send(super::Job { sql: sql.into(), params: vec![], shape: super::Shape::Json, id,
+                deadline: None, reset: false, ready, body }).unwrap();
+            answers.push((result, output));
+        }
+        drop(jobs);
+        drop(super::execute_jobs(conn, queue, true, state));
+        let mut answers = answers.into_iter().map(|(result, output)| {
+            let body = output.try_iter().flatten().collect::<Vec<u8>>();
+            (result.recv().unwrap().map_err(|r| (r.status, r.message)), String::from_utf8(body).unwrap())
+        });
+        assert_eq!(answers.next().unwrap().0.unwrap_err().0, 499);
+        let (status, message) = answers.next().unwrap().0.unwrap_err();
+        assert!(status == 400 && message.contains("Current transaction is aborted"), "{status} {message}");
+        assert!(answers.next().unwrap().0.is_ok());
+        let (answer, body) = answers.next().unwrap();
+        assert!(answer.is_ok() && body.contains(r#""data":[[0]]"#), "{body}");
+    }
+
+    #[test]
+    fn a_document_param_nests_at_most_100_levels() {
+        let request = |param: String| {
+            super::parse_request(&format!(r#"{{"sql":"SELECT ?","params":[{param}]}}"#))
+        };
+        for (open, close) in [("[", "]"), (r#"{"a":"#, "}")] {
+            let nested = |n: usize| format!("{}1{}", open.repeat(n), close.repeat(n));
+            let fits = request(nested(100)).unwrap();
+            assert!(matches!(fits.params[..], [super::Param::Document { .. }]), "{open}");
+            let err = request(nested(101)).err().unwrap();
+            assert_eq!(err, "a document param nests at most 100 levels", "{open}");
+            // Past 125 the body parser refuses first, in the same words.
+            for n in [125, 126, 5000] {
+                assert_eq!(request(nested(n)).err().unwrap(), err, "{open} {n}");
+            }
+            // The deep branch need not be the first one.
+            let err = request(format!(r#"[1, {{"k": {}}}, 2]"#, nested(99))).err().unwrap();
+            assert_eq!(err, "a document param nests at most 100 levels", "{open}");
+            assert!(request(format!(r#"[1, {{"k": {}}}, 2]"#, nested(98))).is_ok(), "{open}");
+        }
+        // A string is data, however deep the JSON it spells.
+        let text = request(format!("\"{}{}\"", "[".repeat(150), "]".repeat(150))).unwrap();
+        assert!(matches!(text.params[..], [super::Param::Text(_)]));
     }
 
     #[test]

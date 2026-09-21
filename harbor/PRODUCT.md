@@ -174,9 +174,10 @@ it was meant to protect, so putting the result into place stays a human act.
 It is also where `--block-size` is applied, block size being fixed at
 creation.
 
-A `VARIANT` column travels as JSON text, decoded on restore by `after.sql`
-(DuckDB's `IMPORT DATABASE` takes only `COPY`, so the decode is a file of its
-own beside `load.sql`). A value that entered as JSON — which is how a variant
+A `VARIANT` column travels as JSON text. `harbor restore` loads it back as
+documents, so a `CHECK` on the column sees nothing else; for a stock `duckdb`
+the decode is `after.sql` (DuckDB's `IMPORT DATABASE` takes only `COPY`, so it
+is a file of its own beside `load.sql`). A value that entered as JSON — which is how a variant
 is populated in practice — returns exactly; what JSON has no word for, a
 `DATE` or `DECIMAL` put inside a variant from SQL, returns as JSON's nearest
 type and is named out loud, once per column; `--format parquet` keeps it.

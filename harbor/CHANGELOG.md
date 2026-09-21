@@ -4,6 +4,71 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.41.2 — 2026-09-21
+
+- **A document parameter nests at most 100 levels.** Rip's ORM and
+  DuckTable's editor each refuse a document nested past 100 levels, and
+  harbor stopped only where its request parser happened to: 125 levels bound
+  and 126 was a 400 that said `recursion limit exceeded at line 1 column 178`.
+  Every layer now keeps the one number. An object or array parameter is
+  measured by its own levels (`{}` is one, `[[1]]` is two) where parameters
+  are read, before anything is bound: 100 levels bind, store and read back,
+  and 101 is a 400 `bad_request` saying `a document param nests at most 100
+  levels`, with nothing stored. The parser's own refusal past 125 levels says
+  the same words. A string parameter is never inspected: 150 levels of
+  brackets through `?::JSON` bind and store as before. The unit tests and the
+  asserts suite hold the boundary for arrays and objects, a deep branch that
+  is not the first, and the string.
+- **A cancel always aborts the transaction it lands in.** A cancel that landed
+  while a statement executed left its transaction aborted, the engine's doing;
+  one that landed earlier, while an object or array parameter was being bound
+  or before an executor had picked the statement up, answered the same 499
+  and left the transaction open, so a client that carried on and committed
+  would commit a transaction with a statement missing. A 499 inside a
+  transaction now means one thing. On both early paths harbor retires the
+  statement's slot and then runs `SELECT error('cancelled')` on the
+  connection, dropping the error: measured on the engine, inside a
+  transaction that leaves `Current transaction is aborted (please ROLLBACK)`
+  for every statement until the ROLLBACK, and a `COMMIT` sent instead rolls
+  back; in autocommit it leaves nothing, and the next statement runs and
+  commits; an interrupt still pending from the cancel does not reach it,
+  since the engine clears that as a statement starts, and it fails with its
+  own error; it costs about 80 µs, on the cancel path only. The connection
+  needs no more resetting than it did, since a lease is replaced at release
+  and a worker holds no transaction between requests. The cancel suite binds
+  a 7 MB document inside a transaction, cancels during the cast, and finds
+  the next statement refused, the earlier write gone after ROLLBACK, a
+  careless `COMMIT` committing nothing, and a session in autocommit
+  untouched; a unit test drives both early paths on a connection.
+- **`harbor restore` loads a `VARIANT` column as documents, so a `CHECK` on
+  one restores.** A table such as `CREATE TABLE g (id INT, v VARIANT CHECK (v
+  IS NULL OR variant_typeof(v) LIKE 'OBJECT%'))` backed up without a word and
+  could not be restored: `load.sql` landed each cell as a VARIANT string,
+  `after.sql` decoded it afterwards, and the constraint was tested in
+  between. The backup is unchanged, byte for byte: text files, `COPY` lines in
+  `load.sql`, the decode in `after.sql`, so a stock `duckdb` imports the
+  directory as before. What changed is the restore. `IMPORT DATABASE` is
+  `schema.sql` and then each `COPY` of `load.sql` with its file joined to the
+  directory, and nothing more, so harbor runs those statements itself and
+  loads a table whose decode is in `after.sql` another way: the table's own
+  `COPY`, options untouched, fills a staging table that differs only in
+  holding the `VARIANT` columns as `VARCHAR`, one `INSERT … SELECT * REPLACE
+  (v::JSON::VARIANT AS v)` moves the rows across, and the staging table is
+  dropped. Every other column is parsed exactly as it was, and the table
+  never holds a VARIANT string. Measured with a table-level and a column-level
+  CHECK, a `NOT NULL` VARIANT, a quoted schema and table name, a child table
+  with a foreign key, and DECIMAL, TIMESTAMPTZ, BLOB, LIST, STRUCT, MAP, ENUM,
+  HUGEINT, UUID, INTERVAL and DOUBLE columns beside the VARIANT: every row
+  `IS NOT DISTINCT FROM` its source with `variant_typeof` equal, the SQL NULL
+  row included. That row travels as the JSON text `null` (duckdb#25873), and
+  a file edited to hold the null marker there instead restores to the same
+  NULL. It is also faster: a 300,000-row table of small documents restored in
+  1.0 s where the COPY and the UPDATE took 9.2 s, to a file of the same size.
+  A table written as parquet, and a directory with no `after.sql`, load by
+  their `COPY` as before. A stock `duckdb` still cannot restore a table whose
+  CHECK refuses strings from a text backup; the README says so, and the
+  roundtrip suite holds both halves.
+
 ## 0.41.1 — 2026-09-21
 
 - **A document parameter costs its casts, not the making of two types.** An

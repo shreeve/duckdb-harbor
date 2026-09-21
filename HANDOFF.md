@@ -284,7 +284,8 @@ bound as the document (`Conn::bind`: one bind pass, skipped unless a param is
 an object or array, then two casts through JSON and VARIANT types the
 connection makes once; `run_statement` asks its slot for a cancel between
 `bind` and `execute`, because the engine drops an interrupt that lands during
-either). A string param is never read as JSON — a client
+either, and a cancel found there leaves the transaction aborted as a later
+one would: `Conn::abort_transaction`). A string param is never read as JSON — a client
 holding JSON text casts it, which is what Rip's ORM and DuckTable do. Deeply
 nested JSON is the one input that hurts the engine through a VARIANT
 (duckdb#25967, measured on the alpha42779 CLI): an `UPDATE` of a VARIANT
@@ -292,13 +293,12 @@ column costs the square of the nesting depth, 0.6 s at 1,000 levels and 15 s
 at 5,000, where an `INSERT` of the same value takes 10 ms; and the cast
 segfaults at about 40,000 levels, the `UPDATE` at 20,000. On alpha42289 a
 SQL-side `doc::JSON` over a stored 5,000-level document ends the harbor
-process, while returning the VARIANT cell itself is fine. harbor's request
-parser reads 127 levels in all and the body's own `{ "params": [ … ] }` is
-two of them, so an object or array param nests at most 125 levels and one
-more is a 400; only a string the statement casts through `?::JSON`, which has
-no such limit, reaches any of this. Rip's ORM and DuckTable's editor each
-refuse a document past 100 levels before it is sent, so nothing a first-party
-client writes reaches harbor's limit.
+process, while returning the VARIANT cell itself is fine. Every layer keeps
+one number: an object or array param nests at most 100 levels, its own levels
+counted, and harbor answers one more with a 400 before anything is bound
+(`json_to_duckdb`), as Rip's ORM and DuckTable's editor refuse the same
+document before it is sent. Only a string the statement casts through
+`?::JSON`, which no layer inspects, reaches any of this.
 
 ## Recent history, for orientation
 
@@ -312,6 +312,7 @@ client writes reaches harbor's limit.
 | 0.40.2 | 09-20 | engine named by DuckDB build, `DUCKDB_LIB_BUILD`; fetch checks before it installs |
 | 0.41.0 | 09-20 | an object or array param aimed at a VARIANT is bound as the document |
 | 0.41.1 | 09-21 | a document param costs its casts, not two type lookups; a cancel during the bind is kept |
+| 0.41.2 | 09-21 | a document param nests at most 100 levels; a cancel always aborts its transaction; restore loads VARIANT columns as documents, past a CHECK |
 
 Older milestones the code still reflects: 0.20 collapsed everything into
 one binary with the refcounted lifetime; 0.21 moved to the direct v2 C API
