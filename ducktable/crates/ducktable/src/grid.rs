@@ -274,10 +274,6 @@ pub(crate) struct GridDelegate {
     /// commit — render_td runs per visible cell per frame and must not
     /// allocate, so it only bumps these SharedStrings.
     rows: Vec<Vec<Option<SharedString>>>,
-    /// Raw wire values aligned with `rows`. INSERT drafts carry empty
-    /// placeholders; fetched rows retain exact values so Duplicate Row
-    /// never round-trips through display formatting.
-    raw_rows: Vec<Vec<Value>>,
     /// Every selected row, and the one that leads them (docs/EDITING.md
     /// "Selecting rows"). The lead mirrors the table's own selected row
     /// (synced from TableEvent) — the delegate cannot read the TableState
@@ -432,7 +428,6 @@ impl Grid {
             visible: Vec::new(),
             gutter,
             rows: Vec::new(),
-            raw_rows: Vec::new(),
             selection: RowSelection::default(),
             all_selected: false,
             active_cell: None,
@@ -1249,7 +1244,8 @@ impl Grid {
     /// Stage a new INSERT copied from the selected fetched row. Generated
     /// columns and primary-key columns are omitted so DuckDB can compute
     /// them; a natural key without a default therefore appears REQUIRED.
-    /// Exact raw values are copied, with any staged updates overlaid.
+    /// The INSERT reads each cell from the source row in SQL; a cell with a
+    /// staged update, which the database does not hold, is bound instead.
     pub(crate) fn duplicate_row(
         &mut self,
         window: &mut Window,
@@ -1261,41 +1257,33 @@ impl Grid {
         if self.editor.is_some() && !self.confirm_and_move(0, 0, cx) {
             return;
         }
-        let (identity, mut raw, first_schema, pk_ix) = {
+        let (identity, fetched, first_schema, pk_ix) = {
             let d = self.table.read(cx).delegate();
             let row = d.selection.lead.or(d.active_cell.map(|(row, _)| row));
             let Some(row) = row else { return };
             // A draft is already an INSERT. Duplicate Row deliberately
-            // targets persisted rows so it always has exact source values.
+            // targets persisted rows, which the INSERT can read from.
             if d.draft_key(row).is_some() || d.deleted.contains(&row) {
                 return;
             }
-            let Some(raw) = d.raw_rows.get(row).cloned() else { return };
+            let Some(fetched) = d.rows.get(row).cloned() else { return };
             let Some(identity) = d.identities.get(row).cloned() else { return };
-            (identity, raw, d.identity as usize, d.pk_ix.clone())
+            (identity, fetched, d.identity as usize, d.pk_ix.clone())
         };
 
         let source_key = edits::key_of(&identity);
-        if let Some(edits::RowChange::Update(cells)) = self.edits.as_ref().and_then(|edits| {
-            edits
-                .entries()
-                .into_iter()
-                .find(|(key, _, _)| *key == source_key)
-                .map(|(_, _, change)| change)
-        }) {
-            for (col, cell) in cells {
-                if let Some(value) = raw.get_mut(*col) {
-                    *value = cell.value.clone();
-                }
-            }
-        }
-
-        let values = duplicate_values(raw, first_schema, &pk_ix, &self.generated);
-        let key = self
-            .edits
-            .as_mut()
-            .expect("checked above")
-            .stage_insert_values(values);
+        let edits = self.edits.as_mut().expect("checked above");
+        let staged = edits
+            .entries()
+            .into_iter()
+            .find(|(key, _, _)| *key == source_key)
+            .and_then(|(_, _, change)| match change {
+                edits::RowChange::Update(cells) => Some(cells.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let cells = duplicate_cells(fetched, &staged, first_schema, &pk_ix, &self.generated);
+        let key = edits.stage_duplicate(identity, cells);
         self.error = None;
         self.sync_staged(cx);
         self.focus_draft(&key, window, cx);
@@ -2292,9 +2280,6 @@ impl Grid {
             let draft_count = draft_rows.len();
             draft_rows.append(&mut d.rows);
             d.rows = draft_rows;
-            let mut raw_drafts = vec![Vec::new(); draft_count];
-            raw_drafts.append(&mut d.raw_rows);
-            d.raw_rows = raw_drafts;
             let mut identities = vec![Vec::new(); draft_count];
             identities.append(&mut d.identities);
             d.identities = identities;
@@ -2468,6 +2453,14 @@ impl Grid {
                                     }
                                 }
                                 edits::StatementExpectation::ReturnedOne => {
+                                    // Only a duplicate selects its row, from the
+                                    // row it copies: none back means that row is
+                                    // gone. Nothing lands.
+                                    if r.rows.is_empty() {
+                                        return Err(
+                                            "the duplicated row is gone — refresh and retry".to_string()
+                                        );
+                                    }
                                     if r.rows.len() != 1 {
                                         return Err(format!(
                                             "insert returned {} rows instead of 1",
@@ -2744,7 +2737,6 @@ impl GridDelegate {
             return;
         }
         self.rows.drain(..count.min(self.rows.len()));
-        self.raw_rows.drain(..count.min(self.raw_rows.len()));
         self.identities.drain(..count.min(self.identities.len()));
         self.row_labels.drain(..count.min(self.row_labels.len()));
         self.draft_keys.clear();
@@ -2840,9 +2832,6 @@ impl GridDelegate {
             .map(|(ix, id)| (edits::key_of(id), ix))
             .collect();
         self.rows = display_rows(&rows);
-        // Read-only result grids never offer Duplicate Row, so retaining a
-        // second copy of a potentially large query page would buy nothing.
-        self.raw_rows = if self.pk_ix.is_empty() { Vec::new() } else { rows };
         self.relabel(base);
     }
 
@@ -3904,8 +3893,7 @@ fn insert_metadata(
 }
 
 /// Wire values -> render-ready cell text (None = NULL), once per page.
-/// Raw values remain beside these strings for exact duplication; render
-/// never performs conversion or allocation.
+/// Render never performs conversion or allocation.
 fn display_rows(rows: &[Vec<Value>]) -> Vec<Vec<Option<SharedString>>> {
     rows.iter()
         .map(|row| {
@@ -3924,22 +3912,30 @@ fn display_value(value: &Value) -> Option<SharedString> {
     }
 }
 
-/// Build one duplicate-row INSERT payload from exact fetched values.
-/// Hidden rowid, declared primary keys, and generated expressions stay
-/// absent so DuckDB supplies the new row's identity and derived values.
-fn duplicate_values(
-    raw: Vec<Value>,
+/// Build one duplicate-row INSERT's cells from the source row's fetched
+/// text. A cell reads its value from the source row in SQL, so the copy is
+/// the engine's own; a cell with a staged update carries that update's
+/// text and bound value, which the database does not hold yet. Hidden
+/// rowid, declared primary keys, and generated expressions stay absent so
+/// DuckDB supplies the new row's identity and derived values.
+fn duplicate_cells(
+    fetched: Vec<Option<SharedString>>,
+    staged: &std::collections::BTreeMap<usize, edits::CellEdit>,
     first_schema: usize,
     pk_ix: &[usize],
     generated: &[bool],
-) -> Vec<(usize, Option<SharedString>, Value)> {
-    raw.into_iter()
+) -> Vec<(usize, Option<SharedString>, edits::Bind)> {
+    fetched
+        .into_iter()
         .enumerate()
         .skip(first_schema)
         .filter(|(col, _)| {
             !pk_ix.contains(col) && !generated.get(*col).copied().unwrap_or(false)
         })
-        .map(|(col, value)| (col, display_value(&value), value))
+        .map(|(col, text)| match staged.get(&col) {
+            Some(cell) => (col, cell.text.clone(), cell.bind.clone()),
+            None => (col, text, edits::Bind::Source),
+        })
         .collect()
 }
 
@@ -4025,10 +4021,12 @@ fn should_reconcile_selection(
 mod tests {
     use super::{
         ClickKind, RowSelection, conditional_hint_min_width, draft_hint_min_width,
-        duplicate_values, should_reconcile_selection, wrapped_step,
+        duplicate_cells, should_reconcile_selection, wrapped_step,
     };
-    use gpui::Modifiers;
-    use serde_json::{Value, json};
+    use crate::edits::{Bind, CellEdit};
+    use gpui::{Modifiers, SharedString};
+    use serde_json::json;
+    use std::collections::BTreeMap;
 
     #[test]
     fn draft_hint_floors_fit_each_pill_and_scale_with_zoom() {
@@ -4129,32 +4127,50 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_uses_raw_values_and_omits_identity_and_generated_columns() {
-        let values = duplicate_values(
-            vec![json!(99), json!(7), json!("00123"), Value::Null, json!(14)],
+    fn duplicate_reads_from_the_source_and_omits_identity_and_generated_columns() {
+        let txt = |s: &str| Some(SharedString::from(s.to_string()));
+        let cells = duplicate_cells(
+            vec![txt("99"), txt("7"), txt("00123"), None, txt("14")],
+            &BTreeMap::new(),
             0,
             &[0],
             &[false, false, false, false, true],
         );
         assert_eq!(
-            values.iter().map(|(col, _, _)| *col).collect::<Vec<_>>(),
-            vec![1, 2, 3]
+            cells,
+            vec![
+                (1, txt("7"), Bind::Source),
+                (2, txt("00123"), Bind::Source),
+                (3, None, Bind::Source),
+            ]
         );
-        assert_eq!(values[1].1.as_ref().map(ToString::to_string), Some("00123".into()));
-        assert_eq!(values[1].2, json!("00123"));
-        assert_eq!(values[2].1, None);
-        assert_eq!(values[2].2, Value::Null);
 
-        // A keyless table's hidden rowid occupies schema column zero.
-        let values = duplicate_values(
-            vec![json!(99), json!(7), json!("Ada")],
-            1,
+        // A staged update is not in the database yet: its cell is bound,
+        // showing the staged text. A staged key cell is still omitted.
+        let staged = BTreeMap::from([
+            (0, CellEdit { original: txt("99"), text: txt("100"), bind: Bind::Value(json!(100)) }),
+            (2, CellEdit { original: txt("00123"), text: None, bind: Bind::Value(json!(null)) }),
+        ]);
+        let cells = duplicate_cells(
+            vec![txt("99"), txt("7"), txt("00123")],
+            &staged,
+            0,
             &[0],
             &[false, false, false],
         );
         assert_eq!(
-            values.iter().map(|(col, _, _)| *col).collect::<Vec<_>>(),
-            vec![1, 2]
+            cells,
+            vec![(1, txt("7"), Bind::Source), (2, None, Bind::Value(json!(null)))]
         );
+
+        // A keyless table's hidden rowid occupies schema column zero.
+        let cells = duplicate_cells(
+            vec![txt("99"), txt("7"), txt("Ada")],
+            &BTreeMap::new(),
+            1,
+            &[0],
+            &[false, false, false],
+        );
+        assert_eq!(cells.iter().map(|(col, _, _)| *col).collect::<Vec<_>>(), vec![1, 2]);
     }
 }

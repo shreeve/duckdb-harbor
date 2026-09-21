@@ -15,17 +15,30 @@ use gpui::SharedString;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
-/// One cell's staged change. Display text and bind value are both kept:
-/// the text is what render shows and what auto-clean compares; the value
-/// is what the statement binds (Null for NULL).
+/// One cell's staged change. Display text and what the statement supplies
+/// are both kept: the text is what render shows and what auto-clean
+/// compares; the bind is what reaches the engine.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CellEdit {
     /// The fetched display text this edit replaces (None = NULL).
     pub original: Option<SharedString>,
     /// The staged display text (None = NULL).
     pub text: Option<SharedString>,
-    /// The value the UPDATE binds.
-    pub value: Value,
+    /// What the statement puts in the column.
+    pub bind: Bind,
+}
+
+/// Where a staged cell's value comes from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Bind {
+    /// A value bound through the column's placeholder (Null for NULL).
+    Value(Value),
+    /// The column as the entry's source row holds it in the database, read
+    /// in SQL and never bound: a duplicate's untouched cell. The wire is
+    /// narrower than the engine — a VARIANT crosses it as JSON, a MAP as
+    /// pairs, an INTERVAL as an object — so a value that went out and came
+    /// back would not be the value that was there.
+    Source,
 }
 
 /// One row's staged fate.
@@ -67,6 +80,9 @@ struct Op {
 }
 
 struct Entry {
+    /// The persisted row the statement names in its WHERE: the row an
+    /// UPDATE or DELETE changes, the row a duplicate INSERT reads its
+    /// `Bind::Source` cells from. Empty for a draft that copies nothing.
     identity: Vec<Value>,
     change: RowChange,
 }
@@ -200,27 +216,29 @@ impl Edits {
     /// Add an intentional all-DEFAULT draft. It is staged immediately:
     /// DEFAULT VALUES can itself be a valid insert, and one undo removes it.
     pub fn stage_insert(&mut self) -> String {
-        self.stage_insert_values(Vec::new())
+        self.stage_duplicate(Vec::new(), Vec::new())
     }
 
-    /// Add a draft whose supplied cells are already known. This is the
-    /// duplicate-row path: the whole copied row is one undo step, just as
-    /// an empty New Row is one undo step.
-    pub fn stage_insert_values(
+    /// Add a draft copied from the persisted row `source`. Each cell shows
+    /// `text`; a `Bind::Source` cell is read from that row when the INSERT
+    /// runs, and a `Bind::Value` cell is bound like any typed one. The
+    /// whole copied row is one undo step, just as an empty New Row is.
+    pub fn stage_duplicate(
         &mut self,
-        values: Vec<(usize, Option<SharedString>, Value)>,
+        source: Vec<Value>,
+        cells: Vec<(usize, Option<SharedString>, Bind)>,
     ) -> String {
         let key = format!("draft:{:020}", self.next_draft);
         self.next_draft += 1;
-        let cells = values
+        let cells = cells
             .into_iter()
-            .map(|(col, text, value)| {
-                (col, CellEdit { original: None, text, value })
+            .map(|(col, text, bind)| {
+                (col, CellEdit { original: None, text, bind })
             })
             .collect();
         self.apply(Op {
             key: key.clone(),
-            identity: Vec::new(),
+            identity: source,
             prev: None,
             next: Some(RowChange::Insert(cells)),
         });
@@ -239,12 +257,12 @@ impl Edits {
         let Some(entry) = self.changes.get(key) else { return };
         let RowChange::Insert(mut cells) = entry.change.clone() else { return };
         let prev = Some(entry.change.clone());
-        cells.insert(col, CellEdit { original: None, text, value });
+        cells.insert(col, CellEdit { original: None, text, bind: Bind::Value(value) });
         let next = Some(RowChange::Insert(cells));
         if prev == next {
             return;
         }
-        self.apply(Op { key: key.to_string(), identity: Vec::new(), prev, next });
+        self.apply(Op { key: key.to_string(), identity: entry.identity.clone(), prev, next });
     }
 
     /// Restore a draft cell to DEFAULT by omitting it from INSERT.
@@ -257,7 +275,7 @@ impl Edits {
         }
         self.apply(Op {
             key: key.to_string(),
-            identity: Vec::new(),
+            identity: entry.identity.clone(),
             prev,
             next: Some(RowChange::Insert(cells)),
         });
@@ -313,7 +331,7 @@ impl Edits {
         if text == original {
             cells.remove(&col);
         } else {
-            cells.insert(col, CellEdit { original, text, value });
+            cells.insert(col, CellEdit { original, text, bind: Bind::Value(value) });
         }
         let next = (!cells.is_empty()).then_some(RowChange::Update(cells));
         if prev == next {
@@ -392,6 +410,12 @@ impl Edits {
     /// deletes, deterministic within each verb. Missing insert columns
     /// stay out of the statement so DuckDB supplies DEFAULT. The WHERE
     /// binds the ORIGINAL key values for existing rows.
+    ///
+    /// A duplicate with `Bind::Source` cells selects them from its source
+    /// row, so the engine copies what the wire could not carry. Inserts
+    /// run before any update or delete, so that row is read as the
+    /// database holds it, whatever else is staged on it; and a source row
+    /// that is gone returns no row, which commit refuses.
     pub fn statements(&self) -> Vec<Statement> {
         let mut out = Vec::new();
         let where_clause = self
@@ -400,21 +424,31 @@ impl Edits {
             .map(|c| format!("{} = {}", qident(c), self.placeholder_named(c)))
             .collect::<Vec<_>>()
             .join(" AND ");
-        for (_, _, change) in self.entries() {
+        for (_, identity, change) in self.entries() {
             if let RowChange::Insert(cells) = change {
-                let (sql, params) = if cells.is_empty() {
-                    (format!("INSERT INTO {} DEFAULT VALUES RETURNING *", self.source), Vec::new())
+                let mut params = Vec::new();
+                let sql = if cells.is_empty() {
+                    format!("INSERT INTO {} DEFAULT VALUES RETURNING *", self.source)
                 } else {
                     let names = cells
                         .keys()
                         .map(|ix| qident(self.column_name(*ix)))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    let marks = cells.keys().map(|ix| self.placeholder(*ix)).collect::<Vec<_>>().join(", ");
-                    (
-                        format!("INSERT INTO {} ({names}) VALUES ({marks}) RETURNING *", self.source),
-                        cells.values().map(|c| c.value.clone()).collect(),
-                    )
+                    let supplied = cells
+                        .iter()
+                        .map(|(ix, cell)| self.supply(*ix, cell, &mut params))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if cells.values().any(|c| c.bind == Bind::Source) {
+                        params.extend(identity.iter().cloned());
+                        format!(
+                            "INSERT INTO {} ({names}) SELECT {supplied} FROM {} WHERE {where_clause} RETURNING *",
+                            self.source, self.source
+                        )
+                    } else {
+                        format!("INSERT INTO {} ({names}) VALUES ({supplied}) RETURNING *", self.source)
+                    }
                 };
                 out.push(Statement {
                     sql,
@@ -425,13 +459,14 @@ impl Edits {
         }
         for (_, identity, change) in self.entries() {
             if let RowChange::Update(cells) = change {
+                let mut params = Vec::new();
                 let set = cells
-                    .keys()
-                    .map(|ix| format!("{} = {}", qident(self.column_name(*ix)), self.placeholder(*ix)))
+                    .iter()
+                    .map(|(ix, cell)| {
+                        format!("{} = {}", qident(self.column_name(*ix)), self.supply(*ix, cell, &mut params))
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
-                let mut params: Vec<Value> =
-                    cells.values().map(|c| c.value.clone()).collect();
                 params.extend(identity.iter().cloned());
                 out.push(Statement {
                     sql: format!("UPDATE {} SET {} WHERE {}", self.source, set, where_clause),
@@ -450,6 +485,19 @@ impl Edits {
             }
         }
         out
+    }
+
+    /// The SQL that supplies column `ix` from `cell`, pushing what it
+    /// binds: the column's placeholder for a value, the column itself for
+    /// a cell read from the row the statement's WHERE names.
+    fn supply(&self, ix: usize, cell: &CellEdit, params: &mut Vec<Value>) -> String {
+        match &cell.bind {
+            Bind::Value(value) => {
+                params.push(value.clone());
+                self.placeholder(ix).to_string()
+            }
+            Bind::Source => qident(self.column_name(ix)),
+        }
     }
 
     /// How column `ix`'s value is bound.
@@ -838,20 +886,162 @@ mod tests {
     }
 
     #[test]
-    fn a_prefilled_duplicate_is_one_insert_and_one_undo_step() {
+    fn a_duplicate_is_one_insert_and_one_undo_step() {
         let mut e = edits();
-        let key = e.stage_insert_values(vec![
-            (1, txt("Ada"), json!("Ada")),
-            (2, None, Value::Null),
-        ]);
+        let key = e.stage_duplicate(
+            vec![json!(5)],
+            vec![(1, txt("Ada"), Bind::Source), (2, None, Bind::Source)],
+        );
         assert_eq!(e.counts(), (1, 0, 0));
         assert_eq!(e.staged_text(&key, 1), Some(txt("Ada")));
-        assert_eq!(
-            e.statements()[0].sql,
-            "INSERT INTO \"main\".\"t\" (\"name\", \"qty\") VALUES (?, ?) RETURNING *"
-        );
+        assert_eq!(e.staged_text(&key, 2), Some(None));
         assert!(e.undo());
         assert!(e.is_empty(), "the whole duplicate must undo at once");
+        assert!(e.redo());
+        assert_eq!(e.statements()[0].params, vec![json!(5)], "and comes back with its source");
+    }
+
+    #[test]
+    fn a_duplicate_reads_untouched_cells_from_its_source_row() {
+        let mut e = typed();
+        // The source row carries a staged update on `j`, which the database
+        // does not hold yet: that cell is bound, the others are read.
+        let key = e.stage_duplicate(
+            vec![json!(5)],
+            vec![
+                (1, txt("{\"when\":\"2024-02-29\"}"), Bind::Source),
+                (2, txt("[2]"), Bind::Value(json!("[2]"))),
+                (3, txt("qg=="), Bind::Source),
+            ],
+        );
+        let stmts = e.statements();
+        assert_eq!(
+            stmts[0].sql,
+            "INSERT INTO \"main\".\"t\" (\"doc\", \"j\", \"b\") \
+             SELECT \"doc\", ?::JSON, \"b\" FROM \"main\".\"t\" WHERE \"id\" = ? RETURNING *"
+        );
+        assert_eq!(stmts[0].params, vec![json!("[2]"), json!(5)]);
+        assert_eq!(stmts[0].expectation, StatementExpectation::ReturnedOne);
+
+        // Typing into a copied cell makes it an ordinary typed value, and
+        // the source keeps supplying the rest, through undo and redo.
+        e.stage_insert_cell(&key, 3, txt("qrs="), json!("qrs="));
+        let typed_over = e.statements();
+        assert_eq!(
+            typed_over[0].sql,
+            "INSERT INTO \"main\".\"t\" (\"doc\", \"j\", \"b\") \
+             SELECT \"doc\", ?::JSON, from_base64(?::VARCHAR) FROM \"main\".\"t\" WHERE \"id\" = ? RETURNING *"
+        );
+        assert_eq!(typed_over[0].params, vec![json!("[2]"), json!("qrs="), json!(5)]);
+        assert!(e.undo());
+        assert_eq!(e.statements(), stmts);
+        assert!(e.redo());
+        assert_eq!(e.statements(), typed_over);
+
+        // A cell restored to DEFAULT leaves the statement; the rest stay.
+        e.stage_insert_default(&key, 3);
+        assert_eq!(
+            e.statements()[0].sql,
+            "INSERT INTO \"main\".\"t\" (\"doc\", \"j\") \
+             SELECT \"doc\", ?::JSON FROM \"main\".\"t\" WHERE \"id\" = ? RETURNING *"
+        );
+        assert_eq!(e.statements()[0].params, vec![json!("[2]"), json!(5)]);
+
+        // With every copied cell typed over, nothing is read from the source.
+        e.stage_insert_cell(&key, 1, None, Value::Null);
+        assert_eq!(
+            e.statements()[0].sql,
+            "INSERT INTO \"main\".\"t\" (\"doc\", \"j\") VALUES (?::JSON, ?::JSON) RETURNING *"
+        );
+        assert_eq!(e.statements()[0].params, vec![Value::Null, json!("[2]")]);
+    }
+
+    #[test]
+    fn a_duplicate_names_its_source_by_the_original_identity() {
+        // The source row is both re-keyed and deleted in the same staged
+        // set: the insert runs first and names the key the database holds.
+        let mut e = edits();
+        e.stage_cell(vec![json!(5)], 0, txt("5"), txt("7"), json!(7));
+        e.stage_duplicate(vec![json!(5)], vec![(1, txt("Ada"), Bind::Source)]);
+        e.stage_delete(vec![json!(9)]);
+        e.stage_duplicate(vec![json!(9)], vec![(1, txt("Bo"), Bind::Source)]);
+        let stmts = e.statements();
+        let copy = "INSERT INTO \"main\".\"t\" (\"name\") SELECT \"name\" FROM \"main\".\"t\" WHERE \"id\" = ? RETURNING *";
+        assert_eq!(stmts.len(), 4);
+        assert_eq!((stmts[0].sql.as_str(), &stmts[0].params), (copy, &vec![json!(5)]));
+        assert_eq!((stmts[1].sql.as_str(), &stmts[1].params), (copy, &vec![json!(9)]));
+        assert!(stmts[2].sql.starts_with("UPDATE"));
+        assert_eq!(stmts[2].params, vec![json!(7), json!(5)]);
+        assert!(stmts[3].sql.starts_with("DELETE"));
+
+        // A BLOB key is decoded in the duplicate's WHERE as in any other.
+        let mut blob_keyed = Edits::new(
+            "\"main\".\"t\"".into(),
+            vec!["k".into()],
+            vec!["k".into(), "name".into()],
+            vec!["BLOB".into(), "VARCHAR".into()],
+        );
+        blob_keyed.stage_duplicate(vec![json!("AAE=")], vec![(1, txt("a"), Bind::Source)]);
+        let stmts = blob_keyed.statements();
+        assert_eq!(
+            stmts[0].sql,
+            "INSERT INTO \"main\".\"t\" (\"name\") SELECT \"name\" FROM \"main\".\"t\" \
+             WHERE \"k\" = from_base64(?::VARCHAR) RETURNING *"
+        );
+        assert_eq!(stmts[0].params, vec![json!("AAE=")]);
+
+        // A keyless table names the source by its hidden rowid, and a
+        // composite key by every column of it.
+        let mut keyless = Edits::new(
+            "\"main\".\"t\"".into(),
+            vec!["rowid".into()],
+            vec!["rowid".into(), "name".into(), "doc".into()],
+            vec!["BIGINT".into(), "VARCHAR".into(), "VARIANT".into()],
+        );
+        keyless.stage_duplicate(
+            vec![json!(3)],
+            vec![(1, txt("a"), Bind::Value(json!("b"))), (2, txt("1"), Bind::Source)],
+        );
+        let stmts = keyless.statements();
+        assert_eq!(
+            stmts[0].sql,
+            "INSERT INTO \"main\".\"t\" (\"name\", \"doc\") SELECT ?, \"doc\" FROM \"main\".\"t\" \
+             WHERE \"rowid\" = ? RETURNING *"
+        );
+        assert_eq!(stmts[0].params, vec![json!("b"), json!(3)]);
+
+        let mut composite = Edits::new(
+            "\"main\".\"t\"".into(),
+            vec!["a".into(), "b".into()],
+            vec!["a".into(), "b".into(), "name".into()],
+            vec!["INTEGER".into(), "BLOB".into(), "VARCHAR".into()],
+        );
+        composite.stage_duplicate(vec![json!(1), json!("qg==")], vec![(2, txt("x"), Bind::Source)]);
+        let stmts = composite.statements();
+        assert_eq!(
+            stmts[0].sql,
+            "INSERT INTO \"main\".\"t\" (\"name\") SELECT \"name\" FROM \"main\".\"t\" \
+             WHERE \"a\" = ? AND \"b\" = from_base64(?::VARCHAR) RETURNING *"
+        );
+        assert_eq!(stmts[0].params, vec![json!(1), json!("qg==")]);
+    }
+
+    #[test]
+    fn a_duplicate_is_reviewed_discarded_and_validated_like_any_draft() {
+        let mut e = edits();
+        let key = e.stage_duplicate(vec![json!(5)], vec![(2, txt("3"), Bind::Source)]);
+        // `name` is NOT NULL with no default and was not copied.
+        let required = |e: &Edits| e.first_missing_required(&[true, true, false], &[None, None, None], &[true, false, false]);
+        assert_eq!(required(&e), Some((key.clone(), 1)));
+        e.stage_insert_cell(&key, 1, txt("Ada"), json!("Ada"));
+        assert_eq!(required(&e), None, "a copied cell counts as supplied");
+        let entries = e.entries();
+        let RowChange::Insert(cells) = entries[0].2 else { panic!("an insert") };
+        assert_eq!(cells[&2].text, txt("3"), "review shows the source's text");
+        e.discard(&key);
+        assert!(e.is_empty());
+        assert!(e.undo());
+        assert_eq!(e.statements()[0].params, vec![json!("Ada"), json!(5)]);
     }
 
     #[test]
