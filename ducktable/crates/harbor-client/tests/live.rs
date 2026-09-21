@@ -691,11 +691,16 @@ fn a_document_cell_takes_strict_json_a_hundred_levels_deep() {
     // character; a VARIANT keeps its values.
     let typed = "{ \"p\": 100.00,  \"a\": 1, \"a\": 2 }";
     let kept = run(
-        "INSERT INTO _dt_depth_probe (\"id\", \"doc\", \"j\") VALUES (?, ?::JSON, ?::JSON) RETURNING doc, j",
+        "INSERT INTO _dt_depth_probe (\"id\", \"doc\", \"j\") VALUES (?, ?::JSON, ?::JSON) \
+         RETURNING doc, j, variant_typeof(doc.p)",
         Some(vec![json!(3), json!(typed), json!(typed)]),
     );
-    println!("typed {typed:?}: the VARIANT reads back {}, the JSON column {}", kept.rows[0][0], kept.rows[0][1]);
+    println!(
+        "typed {typed:?}: the VARIANT reads back {} with p a {}, the JSON column {}",
+        kept.rows[0][0], kept.rows[0][2], kept.rows[0][1]
+    );
     assert_eq!(kept.rows[0][1], json!(typed), "a JSON column stores the text as typed");
+    assert_eq!(kept.rows[0][2], json!("DOUBLE"), "and a JSON decimal is a DOUBLE in a VARIANT");
     assert_eq!(kept.rows[0][0], json!("{\"p\":100.0,\"a\":2}"), "a VARIANT reads back compact");
 
     let nan = run(

@@ -58,13 +58,17 @@ integer past 64 bits, the bytes in a `BLOB[]`, an INTERVAL, a MAP, a UNION, none
 of which survive a trip out as JSON and back. The draft shows the source row's
 text. A cell with a staged update on the source row is copied as staged, and a
 cell typed over in the draft is an ordinary typed cell; both are bound the way
-their column's type asks (below). Primary-key and generated columns are omitted
-so DuckDB can supply the new identity and derived values. A natural key without
-a default therefore remains `REQUIRED`. The entire copied row is one undo step
-and is not written until ⌘S. Inserts run first in the transaction, so the source
-row is read as the database holds it at ⌘S, even when the same commit updates or
-deletes it; a source row that is gone by then fails the commit, and nothing
-lands.
+their column's type asks (below). A copied cell typed back to the text it was
+copied with is read from the source row again, so a DATE inside a `VARIANT`
+that was typed over and restored is still a DATE. Primary-key and generated
+columns are omitted so DuckDB can supply the new identity and derived values. A
+natural key without a default therefore remains `REQUIRED`. The entire copied
+row is one undo step and is not written until ⌘S. Inserts run first in the
+transaction, so the source row is read as the database holds it at ⌘S, even
+when the same commit updates or deletes it; a source row that is gone by then
+fails the commit, and nothing lands. A refresh does not help, because the draft
+still names that row: discard the duplicate (⌘Z, or the review popover) and the
+rest commits.
 
 ## The grammar
 
@@ -197,9 +201,11 @@ not change, and printable exotica (AltGr, IME) already land on rung 6.
   someday.)
 - Primary-key cells are editable like any other — the WHERE holds the
   original, so `SET id = 7 WHERE id = 5` is just an update.
-- Draft inserts need no fetched identity. Each carries a private local key
+- A draft insert has no identity of its own. Each carries a private local key
   until commit; `INSERT … RETURNING *` verifies that exactly one row landed,
-  and the post-commit refetch acquires its real primary key or rowid.
+  and the post-commit refetch acquires its real primary key or rowid. A
+  duplicate also carries the identity of the row it copies, which its INSERT
+  names in a WHERE like any other.
 - Statements are parameterized (`?` + bound params), never assembled
   from strings. Identifiers are quoted.
 - A value is bound as what it is. Harbor binds text as VARCHAR, and for most
@@ -211,13 +217,31 @@ not change, and printable exotica (AltGr, IME) already land on rung 6.
     `[1, 2]`, `42`, `true`, and a string in its quotes, `"Morel"`, as the cell
     shows it. Text that is not JSON is refused in the editor with the reason.
     `null` is SQL NULL in a `VARIANT`, where the engine knows no other, and a
-    JSON value in a `JSON` column. The text is bound as typed; the engine
-    stores the values, so whitespace is not kept and the cell reads back
-    compact after the refetch.
+    JSON value in a `JSON` column. The text is bound as typed. A `VARIANT`
+    stores the values, so whitespace is not kept, the last of a repeated key
+    wins, `100.00` is `100.0`, and the cell reads back compact after the
+    refetch. A `JSON` column stores the text, character for character.
+  - The JSON is strict: `NaN`, `Infinity` and `-Infinity` are refused. The
+    engine reads them in a document and a `VARIANT` stores them, but Harbor
+    then sends `{"x":NaN}`, which is not JSON, and a client reads the whole
+    document back as a string. A cell that already holds one can be opened
+    and left, since unchanged text is never validated.
+  - A document nests at most 100 levels, the limit every first-party client
+    keeps; deeper text is refused in the editor, which says so.
+  - A typed edit of a `VARIANT` retypes it through JSON. Values written from
+    SQL that JSON cannot name — a DATE, a DECIMAL, a HUGEINT inside the
+    document — come back as a string, a DOUBLE, a DOUBLE: the cell shows JSON,
+    and the JSON shown is what gets bound. To change one path and keep the
+    rest as typed, use the Query tab.
   - A `BLOB` cell is base64 both ways, and binds through
     `from_base64(?::VARCHAR)`. Bound bare, the base64 characters themselves
     become the bytes. A `BLOB` key in the WHERE is decoded the same way, so
     the row named is the row changed.
+- A `FLOAT` key binds through `?::FLOAT` in the WHERE. A FLOAT crosses the
+  wire as the shortest decimal that names it and a JSON number binds as a
+  DOUBLE; compared bare, the column is widened and 1.1 the FLOAT is not 1.1
+  the DOUBLE, so the statement names no row. A FLOAT value in a SET or VALUES
+  list needs no cast: assignment rounds it to the same FLOAT.
 - A number is bound as a JSON number where JSON can carry it and as text where
   it cannot. An integer past 64 bits — a `UBIGINT`, a `HUGEINT`, a `UHUGEINT` —
   goes as its digits, and `nan`, `inf`, `-inf`, `Infinity` into a `DOUBLE` or a
@@ -230,11 +254,23 @@ not change, and printable exotica (AltGr, IME) already land on rung 6.
   takes `''` for none of them.
 - Confirming a cell with the text it already holds stages nothing and is never
   validated, so a value the engine accepted is never one the editor refuses to
-  leave: a `VARIANT` holding a DATE, a DOUBLE that is NaN, an integer wider
-  than 64 bits.
-- A `VARIANT`, `JSON` or `BLOB` nested inside a LIST or STRUCT column is bound
-  as that column's text and is not covered by the above. Edit those through
-  the Query tab.
+  leave: a `VARIANT` holding NaN, a DOUBLE that is NaN, an integer wider
+  than 64 bits. NULL and `''` both open an empty editor, so an empty editor
+  confirmed over a cell that holds NULL — fetched, staged with ⌃⇧N, or copied
+  by ⌘D — leaves it NULL, and over a draft's untouched cell leaves it
+  `DEFAULT`. `''` is entered by emptying a text cell that held something, or
+  with Delete.
+- Text typed back to what the cell had is not validated either: on a fetched
+  row the staged edit is dropped, and on a duplicate the cell is read from its
+  source row again.
+- A container that holds a `VARIANT`, a `JSON` or a `BLOB` — `BLOB[]`,
+  `VARIANT[]`, `JSON[]`, `STRUCT(v VARIANT, …)`, `MAP(VARCHAR, BLOB)` — takes
+  no typed text. It would be bound as the container's text, which the engine
+  casts without reaching the inner value: a `BLOB[]` stores the base64
+  characters as the bytes, and the elements of a `VARIANT[]` or a `JSON[]`
+  become strings, with no error. The editor refuses the text and names the
+  Query tab. Such a cell can still be opened and left, cleared to NULL, and
+  copied by ⌘D, which reads it in SQL.
 
 ## Commit
 
@@ -245,8 +281,9 @@ the session, DuckTable refuses a draft missing a `NOT NULL` column with no
 default. Any failure — SQL error,
 constraint, or a row that no longer matches its original values — rolls
 the whole transaction back: nothing landed, every staged change is kept
-and still visible, the offender is marked, and the status line says why,
-ending with "edits kept."
+and still visible, and the status line says why, ending with "edits kept."
+The status line is the whole report: no row or cell is marked as the one
+that failed.
 
 After a successful commit the page refetches so the grid shows the
 database's truth, and Refresh Tables refetches `/catalog` so every sidebar
