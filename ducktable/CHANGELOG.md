@@ -46,6 +46,7 @@ date, newest first.
   typed edit of a `VARIANT` retypes SQL-written values through JSON; that a
   duplicate carries its source row's identity; and that a failed commit
   reports in the status line only, marking no row.
+- The lockfile records `harbor-common` and `wire` at 0.41.1.
 
 ## 0.22.3 — 2026-09-20
 
