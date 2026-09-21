@@ -326,6 +326,12 @@ usable end to end.
   `DUCKDB_LIB_BUILD` repository variable to `latest`. Wait for the naming to
   settle; there was reviewer discussion upstream about instance-versus-
   database option scope.
+- **A table with both a VARIANT and a GENERATED column backs up and does not
+  restore.** The VARIANT export is `SELECT * REPLACE (…)`, which writes the
+  generated column into the data file; no `COPY` takes it back, and restore's
+  staging `SELECT *` carries it too. Both want the generated columns left out
+  (`duckdb_columns().generated`, or `EXCLUDE`). A generated column without a
+  VARIANT exports without it and restores. MedLabs has neither.
 - **Un-vendor reedline** when 0.52 ships with patches A–C, re-applying D on
   top (or filing it). `HARBOR.md` has the exact checklist.
 - **A binary wire mode** is parked until DuckDB GA.
