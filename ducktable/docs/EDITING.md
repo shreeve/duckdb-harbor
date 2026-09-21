@@ -51,11 +51,16 @@ switches, and the all-or-nothing commit. Discarding/deleting a draft removes
 the pending INSERT; it never emits a DELETE.
 
 **Duplicate Row** (⌘D) copies the selected persisted row into a new staged
-INSERT. It copies exact wire values rather than formatted cell text, includes
+INSERT. It copies wire values rather than formatted cell text, each bound the
+way its column's type asks (below), includes
 any staged updates already visible on the source row, and omits primary-key and
 generated columns so DuckDB can supply the new identity and derived values. A
 natural key without a default therefore remains `REQUIRED`. The entire copied
-row is one undo step and is not written until ⌘S.
+row is one undo step and is not written until ⌘S. The copy is as exact as the
+wire: a `VARIANT` crosses it as JSON, so a value JSON has no type for — a
+DATE, a DECIMAL, an integer past 64 bits, written into the document from SQL —
+arrives in the copy as the string or the double JSON made of it. A document
+that came from JSON copies exactly.
 
 ## The grammar
 
@@ -193,6 +198,29 @@ not change, and printable exotica (AltGr, IME) already land on rung 6.
   and the post-commit refetch acquires its real primary key or rowid.
 - Statements are parameterized (`?` + bound params), never assembled
   from strings. Identifiers are quoted.
+- A value is bound as what it is. Harbor binds text as VARCHAR, and for most
+  types the engine's cast from there is the right one. Two are not, and their
+  placeholder says so, in the SET list, the VALUES list and the WHERE alike:
+  - A `VARIANT` or `JSON` cell is JSON text both ways, and binds through
+    `?::JSON`. JSON text bound bare into a `VARIANT` is stored as a string —
+    every path into it NULL, nothing said. So the cell takes JSON: `{"a": 1}`,
+    `[1, 2]`, `42`, `true`, and a string in its quotes, `"Morel"`, as the cell
+    shows it. Text that is not JSON is refused in the editor with the reason.
+    `null` is SQL NULL in a `VARIANT`, where the engine knows no other, and a
+    JSON value in a `JSON` column. The text is bound as typed; the engine
+    stores the values, so whitespace is not kept and the cell reads back
+    compact after the refetch.
+  - A `BLOB` cell is base64 both ways, and binds through
+    `from_base64(?::VARCHAR)`. Bound bare, the base64 characters themselves
+    become the bytes. A `BLOB` key in the WHERE is decoded the same way, so
+    the row named is the row changed.
+- Confirming a cell with the text it already holds stages nothing and is never
+  validated, so a value the engine accepted is never one the editor refuses to
+  leave: a `VARIANT` holding a DATE, a DOUBLE that is NaN, an integer wider
+  than 64 bits.
+- A `VARIANT`, `JSON` or `BLOB` nested inside a LIST or STRUCT column is bound
+  as that column's text and is not covered by the above. Edit those through
+  the Query tab.
 
 ## Commit
 

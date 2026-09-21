@@ -5,6 +5,24 @@ date, newest first.
 
 ## 0.22.2 — 2026-09-20
 
+- **Editing a `VARIANT` cell keeps it a document.** The cell's JSON text was
+  bound through a bare `?`, which the engine stores as a VARIANT *string*:
+  the cell still looked like JSON, and every path into it read NULL, with no
+  error. A typed edit, a new row and ⌘D all did it. `VARIANT` and `JSON`
+  cells now bind through `?::JSON`, the same way Harbor sends them out and
+  the way Rip writes them, and text that is not JSON is refused in the editor
+  — a string wants its quotes, `"Morel"`, as the cell shows it. A row already
+  damaged is repaired by
+  `UPDATE t SET doc = doc::VARCHAR::JSON::VARIANT WHERE variant_typeof(doc) = 'VARCHAR' AND json_valid(doc::VARCHAR) AND json_type(doc::VARCHAR) IN ('OBJECT', 'ARRAY')`.
+- **Editing a `BLOB` cell keeps its bytes.** A BLOB shows as base64, and the
+  base64 characters went back as the bytes. It now binds through
+  `from_base64(?::VARCHAR)`, in the WHERE as well: on a table keyed by a BLOB,
+  an edit could miss its row or, where another key's bytes spelled the first
+  one's base64, change the wrong one.
+- **Enter on an unchanged cell stages nothing.** Confirming the text a cell
+  already holds skipped no validation, so tabbing through a DOUBLE holding NaN
+  or a `JSON` cell holding `null` staged a NULL, and an integer wider than 64
+  bits stopped a Tab run with an error.
 - Ships Sparkle 2.10.0, up from 2.9.6, so the updater itself is current. It
   re-applies file system compression correctly when a delta update lands on
   macOS 27, stops leaking temporary files when a delta fails to apply, and

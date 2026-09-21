@@ -207,3 +207,80 @@ fn keyless_base_tables_expose_rowid() {
     let count = harbor_client::query(&conn, &sql).expect("quoted rowid in WHERE");
     println!("  quoted-WHERE count row: {:?}", count.rows.first());
 }
+
+/// The placeholders DuckTable binds a VARIANT, a JSON and a BLOB cell
+/// through (ducktable's `edits.rs`), against the engine, in the session
+/// transaction a commit runs in. A bare `?` stores a VARIANT string whose
+/// every path is NULL, and stores a BLOB's base64 characters as its bytes;
+/// this is the proof that the typed forms do not.
+#[test]
+#[ignore]
+fn document_and_blob_cells_bind_as_what_they_are() {
+    use serde_json::json;
+    let Some(row) = connectable() else {
+        println!("no berth to test against; skipping");
+        return;
+    };
+    let conn = connect(&row.name).expect("connect");
+    let sid = harbor_client::session_new(&conn).expect("session");
+    let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
+        harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
+    };
+    run("DROP TABLE IF EXISTS _dt_typed_probe", None);
+    run("DROP TABLE IF EXISTS _dt_blobkey_probe", None);
+    run("CREATE TEMP TABLE _dt_typed_probe(id INTEGER PRIMARY KEY, doc VARIANT, j JSON, b BLOB)", None);
+    run("INSERT INTO _dt_typed_probe VALUES (1, '{\"a\":{\"b\":1}}'::JSON, '[1]', '\\xAA\\xBB'::BLOB)", None);
+
+    run("BEGIN", None);
+    let hit = run(
+        "UPDATE _dt_typed_probe SET \"doc\" = ?::JSON, \"j\" = ?::JSON, \"b\" = from_base64(?::VARCHAR) WHERE \"id\" = ?",
+        Some(vec![json!("{\"a\":{\"b\":2}}"), json!("{\"k\": null}"), json!("AAECAw=="), json!(1)]),
+    );
+    assert_eq!(hit.rows[0][0].as_u64(), Some(1), "one row, exactly");
+    // The draft-row shape, with the NULLs a cleared cell binds.
+    let made = run(
+        "INSERT INTO _dt_typed_probe (\"id\", \"doc\", \"j\", \"b\") VALUES (?, ?::JSON, ?::JSON, from_base64(?::VARCHAR)) RETURNING *",
+        Some(vec![json!(2), serde_json::Value::Null, serde_json::Value::Null, serde_json::Value::Null]),
+    );
+    assert_eq!(made.rows.len(), 1, "RETURNING answers the one row");
+    // A quoted string is a string, a bare number a number.
+    run(
+        "INSERT INTO _dt_typed_probe (\"id\", \"doc\") VALUES (?, ?::JSON), (?, ?::JSON)",
+        Some(vec![json!(3), json!("\"Morel\""), json!(4), json!("42")]),
+    );
+    run("COMMIT", None);
+
+    let after = run(
+        "SELECT id, variant_typeof(doc), doc.a.b::VARCHAR, doc IS NULL, j, j IS NULL, \
+         octet_length(b), b = '\\x00\\x01\\x02\\x03'::BLOB, b IS NULL \
+         FROM _dt_typed_probe ORDER BY id",
+        None,
+    );
+    println!("typed cells: {:?}", after.rows);
+    assert_eq!(after.rows[0][1], json!("OBJECT(a)"), "a document, not a string");
+    assert_eq!(after.rows[0][2], json!("2"), "and its paths read");
+    assert_eq!(after.rows[0][4], json!("{\"k\": null}"), "a JSON column keeps its text");
+    assert_eq!(after.rows[0][6].as_u64(), Some(4), "four bytes, not eight base64 characters");
+    assert_eq!(after.rows[0][7], json!(true));
+    assert_eq!(after.rows[1][3], json!(true), "a NULL param through ?::JSON is SQL NULL");
+    assert_eq!(after.rows[1][5], json!(true));
+    assert_eq!(after.rows[1][8], json!(true), "and through from_base64(?::VARCHAR)");
+    assert_eq!(after.rows[2][1], json!("VARCHAR"));
+    assert_eq!(after.rows[3][1], json!("UINT64"));
+
+    // A BLOB key: the WHERE decodes it too, so the row named is the row hit.
+    // Row B's bytes are the characters of row A's base64.
+    run("CREATE TEMP TABLE _dt_blobkey_probe(k BLOB PRIMARY KEY, name VARCHAR)", None);
+    run("INSERT INTO _dt_blobkey_probe VALUES ('\\x00\\x01'::BLOB, 'A'), ('AAE='::BLOB, 'B')", None);
+    let hit = run(
+        "UPDATE _dt_blobkey_probe SET \"name\" = ? WHERE \"k\" = from_base64(?::VARCHAR)",
+        Some(vec![json!("hit"), json!("AAE=")]),
+    );
+    assert_eq!(hit.rows[0][0].as_u64(), Some(1));
+    let names = run("SELECT name FROM _dt_blobkey_probe ORDER BY octet_length(k)", None);
+    assert_eq!(names.rows[0][0], json!("hit"), "row A, the two bytes");
+    assert_eq!(names.rows[1][0], json!("B"), "row B untouched");
+
+    run("DROP TABLE _dt_typed_probe", None);
+    run("DROP TABLE _dt_blobkey_probe", None);
+}

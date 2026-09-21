@@ -451,6 +451,7 @@ impl Grid {
                 source.clone(),
                 pk_cols.clone(),
                 delegate.names.iter().map(|n| n.to_string()).collect(),
+                delegate.schema_cols.iter().map(|c| c.duckdb_type.clone()).collect(),
             )
         });
         let (not_null, defaults, generated, hints) =
@@ -826,11 +827,12 @@ impl Grid {
                 // An error-born grid earns its staging layer the moment
                 // a schema lands and turns out fully keyed.
                 if grid.edits.is_none() && !grid.pk_cols.is_empty() {
-                    let (keyed, names) = {
+                    let (keyed, names, types) = {
                         let d = grid.table.read(cx).delegate();
                         (
                             !d.pk_ix.is_empty(),
                             d.names.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+                            d.schema_cols.iter().map(|c| c.duckdb_type.clone()).collect::<Vec<_>>(),
                         )
                     };
                     if keyed {
@@ -838,6 +840,7 @@ impl Grid {
                             grid.source.clone(),
                             grid.pk_cols.clone(),
                             names,
+                            types,
                         ));
                     }
                 }
@@ -1859,63 +1862,85 @@ impl Grid {
                 d.identities.get(ed.row).cloned(),
             )
         };
-        let leave_default = ed.draft_key.is_some() && !ed.draft_explicit && text.is_empty();
-        let staged = if leave_default {
-            None
-        } else if text.is_empty() {
-            if fetched.is_none() && ed.draft_key.is_none() {
-                // NULL in, nothing typed, NULL out: confirming an empty
-                // editor over NULL is a no-op (stage_cell auto-cleans),
-                // not a NULL→'' edit.
-                Some((None, Value::Null))
-            } else if fetched.is_none() {
-                // Reconfirming an explicit NULL draft keeps it NULL.
-                Some((None, Value::Null))
-            } else if edits::is_text_type(&ty) {
-                // An emptied editor: '' for text (the one honest way to
-                // enter it), NULL for everything else — docs/EDITING.md.
-                Some((Some(SharedString::from("")), Value::String(String::new())))
+        // What the cell holds now: its staged or draft text, else what was
+        // fetched. Confirming that same text changes nothing, so it stages
+        // nothing and is never validated — a cell the engine accepted must
+        // not become a cell Enter cannot leave (a VARIANT holding a DATE, a
+        // DOUBLE that is NaN, an integer wider than i64).
+        let unchanged = {
+            let d = self.table.read(cx).delegate();
+            let held = if ed.draft_key.is_some() {
+                d.draft_cells.get(&(ed.row, ed.col)).cloned()
             } else {
-                None // NULL path, checked below
-            }
-        } else {
-            match edits::parse_value(&text, &ty) {
-                Ok(Value::Null) => None,
-                Ok(v) => Some((Some(SharedString::from(text.clone())), v)),
-                Err(msg) => {
-                    // Validation informs, never imprisons: the editor
-                    // stays open with the reason; Esc still works.
-                    self.error = Some(msg);
-                    self.editor = Some(ed);
-                    cx.notify();
-                    return false;
-                }
-            }
+                d.staged.get(&(ed.row, ed.col)).cloned()
+            };
+            held.unwrap_or_else(|| fetched.clone()).is_some_and(|h| h.as_ref() == text.as_str())
         };
-        let staged_value = match staged {
-            Some(pair) => pair,
-            None => {
-                if leave_default {
-                    (None, Value::Null)
+        if unchanged {
+            self.error = None;
+        } else {
+            let leave_default = ed.draft_key.is_some() && !ed.draft_explicit && text.is_empty();
+            let staged = if leave_default {
+                None
+            } else if text.is_empty() {
+                if fetched.is_none() && ed.draft_key.is_none() {
+                    // NULL in, nothing typed, NULL out: confirming an empty
+                    // editor over NULL is a no-op (stage_cell auto-cleans),
+                    // not a NULL→'' edit.
+                    Some((None, Value::Null))
+                } else if fetched.is_none() {
+                    // Reconfirming an explicit NULL draft keeps it NULL.
+                    Some((None, Value::Null))
+                } else if edits::is_text_type(&ty) {
+                    // An emptied editor: '' for text (the one honest way to
+                    // enter it), NULL for everything else — docs/EDITING.md.
+                    Some((Some(SharedString::from("")), Value::String(String::new())))
                 } else {
-                    if !self.stageable_null(ed.col, cx) {
+                    None // NULL path, checked below
+                }
+            } else if ed.draft_key.is_none() && fetched.as_ref().is_some_and(|f| f.as_ref() == text.as_str()) {
+                // Typed back to what was fetched: stage_cell sees no change and
+                // drops the staged edit, so this text needs no verdict.
+                Some((Some(SharedString::from(text.clone())), Value::String(text.clone())))
+            } else {
+                match edits::parse_value(&text, &ty) {
+                    Ok(Value::Null) => None,
+                    Ok(v) => Some((Some(SharedString::from(text.clone())), v)),
+                    Err(msg) => {
+                        // Validation informs, never imprisons: the editor
+                        // stays open with the reason; Esc still works.
+                        self.error = Some(msg);
                         self.editor = Some(ed);
+                        cx.notify();
                         return false;
                     }
-                    (None, Value::Null)
                 }
-            }
-        };
-        if let Some(edits) = &mut self.edits {
-            self.error = None;
-            if let Some(key) = &ed.draft_key {
-                if leave_default {
-                    edits.stage_insert_default(key, ed.col);
-                } else {
-                    edits.stage_insert_cell(key, ed.col, staged_value.0, staged_value.1);
+            };
+            let staged_value = match staged {
+                Some(pair) => pair,
+                None => {
+                    if leave_default {
+                        (None, Value::Null)
+                    } else {
+                        if !self.stageable_null(ed.col, cx) {
+                            self.editor = Some(ed);
+                            return false;
+                        }
+                        (None, Value::Null)
+                    }
                 }
-            } else if let Some(identity) = identity {
-                edits.stage_cell(identity, ed.col, fetched, staged_value.0, staged_value.1);
+            };
+            if let Some(edits) = &mut self.edits {
+                self.error = None;
+                if let Some(key) = &ed.draft_key {
+                    if leave_default {
+                        edits.stage_insert_default(key, ed.col);
+                    } else {
+                        edits.stage_insert_cell(key, ed.col, staged_value.0, staged_value.1);
+                    }
+                } else if let Some(identity) = identity {
+                    edits.stage_cell(identity, ed.col, fetched, staged_value.0, staged_value.1);
+                }
             }
         }
         self.close_editor_cell(cx);

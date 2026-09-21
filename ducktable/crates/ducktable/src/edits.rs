@@ -79,6 +79,9 @@ pub struct Edits {
     pk_cols: Vec<String>,
     /// All schema column names, in result order (for SET clauses).
     columns: Vec<String>,
+    /// Each column's DuckDB type, parallel to `columns`: what decides how
+    /// its value is bound (`placeholder`).
+    types: Vec<String>,
     changes: HashMap<String, Entry>,
     undo: Vec<Vec<Op>>,
     redo: Vec<Vec<Op>>,
@@ -92,11 +95,12 @@ pub fn key_of(identity: &[Value]) -> String {
 }
 
 impl Edits {
-    pub fn new(source: String, pk_cols: Vec<String>, columns: Vec<String>) -> Self {
+    pub fn new(source: String, pk_cols: Vec<String>, columns: Vec<String>, types: Vec<String>) -> Self {
         Self {
             source,
             pk_cols,
             columns,
+            types,
             changes: HashMap::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -122,6 +126,7 @@ impl Edits {
         self.source == other.source
             && self.pk_cols == other.pk_cols
             && self.columns == other.columns
+            && self.types == other.types
     }
 
     /// (inserts, updates, deletes) — the verb-split status line.
@@ -392,7 +397,7 @@ impl Edits {
         let where_clause = self
             .pk_cols
             .iter()
-            .map(|c| format!("{} = ?", qident(c)))
+            .map(|c| format!("{} = {}", qident(c), self.placeholder_named(c)))
             .collect::<Vec<_>>()
             .join(" AND ");
         for (_, _, change) in self.entries() {
@@ -405,7 +410,7 @@ impl Edits {
                         .map(|ix| qident(self.column_name(*ix)))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    let marks = std::iter::repeat_n("?", cells.len()).collect::<Vec<_>>().join(", ");
+                    let marks = cells.keys().map(|ix| self.placeholder(*ix)).collect::<Vec<_>>().join(", ");
                     (
                         format!("INSERT INTO {} ({names}) VALUES ({marks}) RETURNING *", self.source),
                         cells.values().map(|c| c.value.clone()).collect(),
@@ -422,7 +427,7 @@ impl Edits {
             if let RowChange::Update(cells) = change {
                 let set = cells
                     .keys()
-                    .map(|ix| format!("{} = ?", qident(self.column_name(*ix))))
+                    .map(|ix| format!("{} = {}", qident(self.column_name(*ix)), self.placeholder(*ix)))
                     .collect::<Vec<_>>()
                     .join(", ");
                 let mut params: Vec<Value> =
@@ -446,6 +451,35 @@ impl Edits {
         }
         out
     }
+
+    /// How column `ix`'s value is bound.
+    fn placeholder(&self, ix: usize) -> &'static str {
+        placeholder_for(self.types.get(ix).map(String::as_str).unwrap_or(""))
+    }
+
+    /// The same for a column known by name — the key columns of a WHERE.
+    fn placeholder_named(&self, name: &str) -> &'static str {
+        match self.columns.iter().position(|c| c == name) {
+            Some(ix) => self.placeholder(ix),
+            None => "?",
+        }
+    }
+}
+
+/// The placeholder that carries a value of this type to the engine as the
+/// value it is. Harbor binds text as VARCHAR, and for most types the
+/// engine's cast from VARCHAR is the right one. Two are not. JSON text cast
+/// to VARIANT is a VARIANT *string* — every path into it NULL, nothing said
+/// — so a document goes in through JSON, which is also how Harbor sent it
+/// out. A BLOB arrives as base64, and its characters cast to BLOB are those
+/// characters' bytes, so it is decoded on the way back; the inner cast
+/// gives a NULL a type `from_base64` accepts.
+fn placeholder_for(duck_type: &str) -> &'static str {
+    match duck_type.to_uppercase().as_str() {
+        "VARIANT" | "JSON" => "?::JSON",
+        "BLOB" => "from_base64(?::VARCHAR)",
+        _ => "?",
+    }
 }
 
 /// Quote an identifier the DuckDB way.
@@ -466,11 +500,25 @@ pub fn is_text_type(duck_type: &str) -> bool {
 pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
     let ty = duck_type.to_uppercase();
     let is_text = is_text_type(&ty);
+    // A JSON column holds JSON text, and `null` is a JSON value there,
+    // distinct from SQL NULL — so this comes before the `null` rule below.
+    if ty == "JSON" {
+        check_json(text)?;
+        return Ok(Value::String(text.to_string()));
+    }
     // Typing the literal `null` into a non-text column means SQL NULL —
     // it was never a valid INTEGER anyway (DataGrip precedent). In text
     // columns it stores the four characters.
     if !is_text && text.eq_ignore_ascii_case("null") {
         return Ok(Value::Null);
+    }
+    // A VARIANT cell is JSON text both ways (`placeholder_for`). Its
+    // top-level `null` is SQL NULL to the engine, which the rule above
+    // already said. The text is bound as typed, never re-serialized: a
+    // round trip through serde would rewrite 12.340 and any wide integer.
+    if ty == "VARIANT" {
+        check_json(text)?;
+        return Ok(Value::String(text.to_string()));
     }
     if ty.contains("INT") {
         return text
@@ -505,6 +553,47 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
     Ok(Value::String(text.to_string()))
 }
 
+/// Refuse text the engine's JSON cast would refuse, at the fingers. The
+/// engine reads NaN and Infinity as numbers and a VARIANT can hold them, so
+/// they pass here too; everything else is serde's verdict, including its
+/// nesting limit.
+fn check_json(text: &str) -> Result<(), String> {
+    let strict = strict_json(text);
+    match serde_json::from_str::<Value>(&strict) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(format!("{text:?} is not JSON \u{2014} text needs quotes, like \"Morel\"")),
+    }
+}
+
+/// `text` with the bare tokens NaN and Infinity, outside any string, written
+/// as 0 — the one place the engine's JSON is wider than serde's.
+fn strict_json(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+        } else if let Some(token) = ["NaN", "Infinity"].iter().find(|t| rest.starts_with(**t)) {
+            out.push('0');
+            rest = &rest[token.len()..];
+            continue;
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +604,7 @@ mod tests {
             "\"main\".\"t\"".into(),
             vec!["id".into()],
             vec!["id".into(), "name".into(), "qty".into()],
+            vec!["INTEGER".into(), "VARCHAR".into(), "INTEGER".into()],
         )
     }
 
@@ -630,6 +720,96 @@ mod tests {
         assert_eq!(parse_value("null", "VARCHAR").unwrap(), json!("null"));
         assert_eq!(parse_value("19.99", "DECIMAL(10,2)").unwrap(), json!("19.99"));
         assert_eq!(parse_value("true", "BOOLEAN").unwrap(), json!(true));
+    }
+
+    /// A table whose columns are the three types a bare `?` gets wrong.
+    fn typed() -> Edits {
+        Edits::new(
+            "\"main\".\"t\"".into(),
+            vec!["id".into()],
+            vec!["id".into(), "doc".into(), "j".into(), "b".into()],
+            vec!["INTEGER".into(), "VARIANT".into(), "JSON".into(), "BLOB".into()],
+        )
+    }
+
+    #[test]
+    fn a_document_binds_through_json_and_a_blob_through_base64() {
+        let mut e = typed();
+        e.stage_cell(vec![json!(1)], 1, txt("{}"), txt("{\"a\":1}"), json!("{\"a\":1}"));
+        e.stage_cell(vec![json!(1)], 2, txt("[]"), txt("[1]"), json!("[1]"));
+        e.stage_cell(vec![json!(1)], 3, txt("qg=="), txt("qrs="), json!("qrs="));
+        let draft = e.stage_insert();
+        e.stage_insert_cell(&draft, 1, txt("{\"a\":1}"), json!("{\"a\":1}"));
+        e.stage_insert_cell(&draft, 3, None, Value::Null);
+
+        let stmts = e.statements();
+        assert_eq!(
+            stmts[0].sql,
+            "INSERT INTO \"main\".\"t\" (\"doc\", \"b\") VALUES (?::JSON, from_base64(?::VARCHAR)) RETURNING *"
+        );
+        assert_eq!(stmts[0].params, vec![json!("{\"a\":1}"), Value::Null]);
+        assert_eq!(
+            stmts[1].sql,
+            "UPDATE \"main\".\"t\" SET \"doc\" = ?::JSON, \"j\" = ?::JSON, \"b\" = from_base64(?::VARCHAR) WHERE \"id\" = ?"
+        );
+        // The text goes as typed: the cast reads it, nothing re-serializes it.
+        assert_eq!(stmts[1].params, vec![json!("{\"a\":1}"), json!("[1]"), json!("qrs="), json!(1)]);
+    }
+
+    #[test]
+    fn a_blob_key_is_decoded_in_the_where_too() {
+        let mut e = Edits::new(
+            "\"main\".\"t\"".into(),
+            vec!["k".into()],
+            vec!["k".into(), "name".into()],
+            vec!["BLOB".into(), "VARCHAR".into()],
+        );
+        e.stage_cell(vec![json!("AAE=")], 1, txt("a"), txt("b"), json!("b"));
+        e.stage_delete(vec![json!("qg==")]);
+        let stmts = e.statements();
+        assert_eq!(
+            stmts[0].sql,
+            "UPDATE \"main\".\"t\" SET \"name\" = ? WHERE \"k\" = from_base64(?::VARCHAR)"
+        );
+        assert_eq!(stmts[1].sql, "DELETE FROM \"main\".\"t\" WHERE \"k\" = from_base64(?::VARCHAR)");
+    }
+
+    #[test]
+    fn a_column_that_changed_type_is_a_different_shape() {
+        let as_text = Edits::new(
+            "\"main\".\"t\"".into(),
+            vec!["id".into()],
+            vec!["id".into(), "doc".into(), "j".into(), "b".into()],
+            vec!["INTEGER".into(), "VARCHAR".into(), "JSON".into(), "BLOB".into()],
+        );
+        assert!(typed().same_shape(&typed()));
+        assert!(!typed().same_shape(&as_text));
+    }
+
+    #[test]
+    fn document_cells_take_json_text_and_keep_it_as_typed() {
+        for ty in ["VARIANT", "JSON", "variant"] {
+            for text in ["{\"a\": 1}", "[1, 2]", "\"Morel\"", "42", "12.340", "true", "18446744073709551616"] {
+                assert_eq!(parse_value(text, ty), Ok(json!(text)), "{ty} {text}");
+            }
+            // What the engine's JSON reads and serde's does not.
+            for text in ["NaN", "{\"x\": NaN, \"y\": [Infinity, -Infinity]}"] {
+                assert_eq!(parse_value(text, ty), Ok(json!(text)), "{ty} {text}");
+            }
+            for text in ["Morel", "{oops", "[1, 2", "{'a': 1}", "\"NaN"] {
+                let err = parse_value(text, ty).unwrap_err();
+                assert!(err.contains("is not JSON"), "{ty} {text}: {err}");
+            }
+            // A token inside a string is the string's own business.
+            assert_eq!(parse_value("\"NaN and Infinity\"", ty), Ok(json!("\"NaN and Infinity\"")));
+            // Deeper than serde reads is deeper than the engine survives.
+            assert!(parse_value(&"[".repeat(200), ty).is_err());
+        }
+        // `null` is SQL NULL in a VARIANT and a JSON value in a JSON column.
+        assert_eq!(parse_value("null", "VARIANT"), Ok(Value::Null));
+        assert_eq!(parse_value("null", "JSON"), Ok(json!("null")));
+        // A BLOB cell is base64 text, decoded by its placeholder.
+        assert_eq!(parse_value("qrs=", "BLOB"), Ok(json!("qrs=")));
     }
 
     #[test]
