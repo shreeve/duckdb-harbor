@@ -641,6 +641,13 @@ An integer stored from SQL as a narrow type comes back as JSON's wide one —
 the same value, a different width label — which is what "written as JSON"
 means and is not reported. `--strict` refuses instead of writing the note.
 
+**A `GENERATED` column is computed, not carried.** `schema.sql` holds its
+expression and no data file holds its values, in either format, since no
+`COPY` takes one back. The restored table computes it from the rows it is
+given, a column that reads a `VARIANT` document (`doc['a']::VARCHAR`) from
+the restored document. A text file that does hold the generated columns says
+so in its header, and restores the same way with those fields left behind.
+
 **Neither format holds every shape**, and that is why `--format` exists:
 
 | | tsv | parquet |
