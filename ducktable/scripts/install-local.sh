@@ -86,13 +86,43 @@ fi
 # the copy is whole, so a ditto that dies partway leaves the Mac with the
 # version it already had rather than none at all.
 staged="$dest/.DuckTable.app.incoming"
+aside="$dest/.DuckTable.app.outgoing"
 trap 'rm -rf "$staged"' EXIT
 rm -rf "$staged"
 ditto "$app" "$staged"
+
+# A swap that died between its two renames left the only copy set aside;
+# it goes back before anything else, so it is never mistaken for debris.
+if [ -e "$aside" ]; then
+    [ -e "$installed" ] || mv "$aside" "$installed"
+    rm -rf "$aside"
+fi
+
 # Replace, never merge: copying onto a bundle leaves the old version's
-# orphans inside the new one. ditto carries bundle metadata that cp drops.
-rm -rf "$installed"
-mv "$staged" "$installed"
+# orphans inside the new one, and writing over an executable macOS has
+# already run gets the next launch killed. ditto carries bundle metadata
+# that cp drops. The swap is two renames: the installed app steps aside,
+# the staged one takes its name, and only then is the old one removed, so
+# a rename that fails puts back the app that was there.
+if [ -e "$installed" ]; then
+    mv "$installed" "$aside"
+    if ! mv "$staged" "$installed"; then
+        mv "$aside" "$installed"
+        echo "Could not move the build into $dest; the installed DuckTable is untouched." >&2
+        exit 1
+    fi
+    rm -rf "$aside"
+else
+    mv "$staged" "$installed"
+fi
+
+# Launch Services learns of the bundle at this path at once, so Finder,
+# Spotlight and System Settings show its name and icon without waiting for
+# a rescan. Best effort: the app runs the same without it.
+lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+if [ -x "$lsregister" ]; then
+    "$lsregister" -f "$installed" >/dev/null 2>&1 || true
+fi
 
 echo "Installed $installed ($profile)"
 

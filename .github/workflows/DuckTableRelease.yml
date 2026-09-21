@@ -49,6 +49,16 @@ jobs:
           # A release without the public key would ship a bundle that can never update.
           plutil -extract SUPublicEDKey raw target/DuckTable.app/Contents/Info.plist >/dev/null \
             || { echo "bundle has no SUPublicEDKey: commit assets/sparkle-public-key.txt (docs/UPDATES.md)"; exit 1; }
+          # macOS files the app's Local Network permission under its signing
+          # identifier, so every release signs as the same one, and the consent
+          # prompt has a sentence to show.
+          codesign --verify --deep --strict target/DuckTable.app
+          for signed in target/DuckTable.app target/DuckTable.app/Contents/MacOS/ducktable; do
+            id=$( (codesign -dv "$signed" 2>&1 || true) | sed -n 's/^Identifier=//p')
+            [ "$id" = "com.shreeve.ducktable" ] || { echo "$signed is signed as '$id', not com.shreeve.ducktable"; exit 1; }
+          done
+          plutil -extract NSLocalNetworkUsageDescription raw target/DuckTable.app/Contents/Info.plist >/dev/null \
+            || { echo "bundle has no NSLocalNetworkUsageDescription"; exit 1; }
 
       # refs/tags/ducktable-v, not refs/tags/: a workflow_dispatch aimed at
       # a harbor v* tag must not mint a DuckTable release. (Mirror of the

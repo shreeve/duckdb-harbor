@@ -40,6 +40,12 @@ fi
 . scripts/sparkle.sh
 ensure_sparkle
 
+# One name in the plist and in the signature. macOS files an app's privacy
+# decisions — Local Network among them — under its signing identifier, so
+# the identifier is the same on every build and one row in System Settings
+# follows DuckTable across updates.
+bundle_id="com.shreeve.ducktable"
+
 app="target/DuckTable.app"
 frameworks="$app/Contents/Frameworks"
 framework="$frameworks/Sparkle.framework"
@@ -62,7 +68,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <dict>
     <key>CFBundleName</key><string>DuckTable</string>
     <key>CFBundleDisplayName</key><string>DuckTable</string>
-    <key>CFBundleIdentifier</key><string>com.shreeve.ducktable</string>
+    <key>CFBundleIdentifier</key><string>$bundle_id</string>
     <key>CFBundleExecutable</key><string>ducktable</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
@@ -70,20 +76,35 @@ cat > "$app/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key><string>$version</string>
     <key>LSMinimumSystemVersion</key><string>12.0</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSLocalNetworkUsageDescription</key><string>DuckTable opens SSH tunnels to Harbor database servers on the hosts you add, which can be on your local network.</string>
 $sparkle_keys
 </dict>
 </plist>
 PLIST
+plutil -lint "$app/Contents/Info.plist" >/dev/null
 
 # Finder info and resource forks on copied files make codesign reject the
 # bundle as "detritus"; strip extended attributes before signing. Sparkle's
 # nested executables sign first, then the framework, then the app, all
 # ad-hoc: Sparkle verifies an update's signature is valid, and ad-hoc is.
+# Sparkle's code keeps Sparkle's identifiers; only the app is named here,
+# and signing the app is what signs Contents/MacOS/ducktable.
 xattr -cr "$app"
 codesign --force --sign - "$framework/Versions/B/Autoupdate"
 codesign --force --sign - "$framework/Versions/B/Updater.app"
 codesign --force --sign - "$framework"
-codesign --force --sign - "$app"
+codesign --force --sign - --identifier "$bundle_id" "$app"
 codesign --verify --deep --strict "$app"
+
+# The build fails rather than ship under another name: a bare executable
+# signed without an identifier takes a hash-suffixed one, and macOS would
+# treat that as a different app asking for the local network again.
+for signed in "$app" "$app/Contents/MacOS/ducktable"; do
+    got=$( (codesign -dv "$signed" 2>&1 || true) | sed -n 's/^Identifier=//p')
+    [ "$got" = "$bundle_id" ] || {
+        echo "error: $signed is signed as '${got:-nothing}', not $bundle_id" >&2
+        exit 1
+    }
+done
 
 echo "$app"

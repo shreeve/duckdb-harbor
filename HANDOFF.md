@@ -212,6 +212,10 @@ DuckTable release ships the latest stable Sparkle, never a beta: set
 the path in `docs/UPDATES.md`, and say so in the changelog. Prove the bundle
 with `scripts/macos-app.sh release` (check the embedded
 `Sparkle.framework` version), then push an annotated `ducktable-vX.Y.Z` tag.
+The script fails unless the app and its executable sign as
+`com.shreeve.ducktable`, the name macOS keys Local Network permission to;
+never re-sign, rename or copy over an installed copy — both installers swap
+the bundle in by rename (`docs/UPDATES.md`, "The bundle's identity").
 `DuckTableRelease.yml` publishes `DuckTable.zip` on the versioned release and
 rewrites the `ducktable-updates` feed; confirm `appcast.xml` lists the new
 version first. That feed release stays a prerelease so `/releases/latest`
