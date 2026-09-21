@@ -403,6 +403,56 @@ impl Conn {
         }
     }
 
+    /// Mark each [`Param::Document`] the statement aims at a VARIANT. One bind
+    /// pass asks the engine what type every parameter expects; its answer is
+    /// keyed by parameter number, and a number used against two types
+    /// expects none. Nothing is asked when no parameter is a document, which
+    /// is nearly every statement, and nothing is kept: the answer follows the
+    /// catalog, and the statement cache holds parses only. A bind that fails
+    /// marks nothing, and the statement reports the failure itself.
+    ///
+    /// The bind pass drops an interrupt that lands during it, so a caller
+    /// that can be cancelled looks again before it executes.
+    pub fn aim_documents(&self, stmt: &Stmt, params: &mut [Param]) {
+        if !params.iter().any(|p| matches!(p, Param::Document { .. })) {
+            return;
+        }
+        let api = &self.eng.api;
+        let mut schema: ffi::schema_handle = std::ptr::null_mut();
+        let mut expects: ffi::schema_handle = std::ptr::null_mut();
+        let _ = (|| -> Result<(), Error> {
+            call!(api, statement_bind(self.conn, stmt.raw, &mut schema, &mut expects));
+            if expects.is_null() {
+                return Ok(());
+            }
+            let mut count: ffi::idx_t = 0;
+            call!(api, schema_get_count(expects, &mut count));
+            for i in 0..count {
+                let mut name = ffi::identifier_t { ptr: std::ptr::null(), len: 0 };
+                let mut ty: ffi::logical_type_handle = std::ptr::null_mut();
+                call!(api, schema_get_field(expects, i, &mut name, &mut ty));
+                let mut id: ffi::LOGICAL_TYPE_ID = 0;
+                call!(api, logical_type_get_id(ty, &mut id));
+                if id != ffi::LOGICAL_TYPE_ID_VARIANT {
+                    continue;
+                }
+                // "1", "2", …: a named parameter is none of ours.
+                let Ok(n) = unsafe { super::str_view(&name) }.parse::<usize>() else { continue };
+                if let Some(Param::Document { variant, .. }) = n.checked_sub(1).and_then(|at| params.get_mut(at)) {
+                    *variant = true;
+                }
+            }
+            Ok(())
+        })();
+        if let Some(d) = api.schema_destroy {
+            for s in [&mut schema, &mut expects] {
+                if !s.is_null() {
+                    unsafe { d(s) };
+                }
+            }
+        }
+    }
+
     /// Execute one parsed statement as a pipelined stream. The statement is
     /// borrowed, not consumed.
     pub fn execute(&self, stmt: &Stmt, params: &[Param]) -> Result<Stream, Error> {
@@ -831,6 +881,10 @@ pub enum Param {
     U64(u64),
     F64(f64),
     Text(String),
+    /// An object or an array, as its JSON text. `variant` says the statement
+    /// aims it at a VARIANT ([`Conn::aim_documents`]), where it is bound as
+    /// the document; anywhere else it is bound as the text, a VARCHAR.
+    Document { text: String, variant: bool },
 }
 
 impl Param {
@@ -869,7 +923,58 @@ impl Param {
             Param::Text(s) => {
                 call!(api, value_create_varchar_with_connection(conn, str_of(s), &mut out))
             }
+            Param::Document { text, variant } => {
+                call!(api, value_create_varchar_with_connection(conn, str_of(text), &mut out));
+                if *variant {
+                    // The text is a document, and the engine reads text cast
+                    // to VARIANT as a string; read through JSON it is the
+                    // document. A cast that fails — an aborted transaction
+                    // refuses every one — leaves the text, and the statement
+                    // reports what is wrong.
+                    if let Ok(doc) = cast_through(api, conn, out, &["JSON", "VARIANT"]) {
+                        destroy_value(api, out);
+                        out = doc;
+                    }
+                }
+            }
         }
         Ok(out)
     }
+}
+
+fn destroy_value(api: &ffi::Api, mut v: ffi::value_handle) {
+    if let Some(f) = api.value_destroy {
+        unsafe { f(&mut v) };
+    }
+}
+
+/// `value` cast to each named type in turn, as a value of its own; `value`
+/// itself is borrowed. The types are made on `conn` and released here.
+fn cast_through(
+    api: &ffi::Api,
+    conn: ffi::connection_handle,
+    value: ffi::value_handle,
+    types: &[&str],
+) -> Result<ffi::value_handle, Error> {
+    let mut held = value;
+    for name in types {
+        let mut ty: ffi::logical_type_handle = std::ptr::null_mut();
+        let mut next: ffi::value_handle = std::ptr::null_mut();
+        let cast = (|| -> Result<(), Error> {
+            call!(api, connection_create_type_from_text(conn, str_of(name), &mut ty));
+            call!(api, value_cast_with_connection(conn, held, ty, &mut next));
+            Ok(())
+        })();
+        if let Some(f) = api.logical_type_destroy {
+            if !ty.is_null() {
+                unsafe { f(&mut ty) };
+            }
+        }
+        if held != value {
+            destroy_value(api, held);
+        }
+        cast?;
+        held = next;
+    }
+    Ok(held)
 }

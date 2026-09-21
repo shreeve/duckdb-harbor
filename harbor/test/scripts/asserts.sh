@@ -487,6 +487,19 @@ eq "a param that looks like SQL is data, not SQL" "0" \
    "$(post 'SELECT count(*) AS n FROM sites WHERE client = ?' "[\"' OR 1=1 --\"]" | nd 'rows[0][0]')"
 eq "params must be an array" "400" \
    "$(raw '{"sql":"SELECT 1","params":{"a":1}}' | tail -1)"
+# An object or an array is a document: aimed at a VARIANT it is bound as
+# one, and everywhere else it is its JSON text. A string is a string wherever
+# it goes — one that spells JSON is data too.
+aimed='SELECT variant_typeof(coalesce(NULL::VARIANT, ?)) AS t'
+eq "an object param aimed at a VARIANT is the document" "OBJECT(a)" \
+   "$(post "$aimed" '[{"a":1}]' | nd 'rows[0][0]')"
+eq "an array param too" "ARRAY(2)" "$(post "$aimed" '[[1,2]]' | nd 'rows[0][0]')"
+eq "a string param that spells JSON is a string" "VARCHAR" \
+   "$(post "$aimed" '["{\"a\":1}"]' | nd 'rows[0][0]')"
+eq "an object param aimed nowhere is its text" "VARCHAR" \
+   "$(post 'SELECT typeof(?) AS t' '[{"a":1}]' | nd 'rows[0][0]')"
+eq "a param nested past the body's depth is refused" "400" \
+   "$(raw "{\"sql\":\"SELECT ?\",\"params\":[$(printf '[%.0s' $(seq 200))$(printf ']%.0s' $(seq 200))]}" | tail -1)"
 
 # ---------------------------------------------------------------------------
 section "One statement per request"

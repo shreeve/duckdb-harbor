@@ -203,7 +203,10 @@ mod conn {
         let stmts = c.statements(sql)?;
         let mut out = Vec::new();
         for stmt in stmts.iter() {
-            let mut stream = c.execute(stmt, params)?;
+            // As the server does: a document aimed at a VARIANT is marked.
+            let mut params = params.to_vec();
+            c.aim_documents(stmt, &mut params);
+            let mut stream = c.execute(stmt, &params)?;
             // Encode through the shared cell encoder so this test exercises
             // the same path the server will.
             let columns = std::mem::take(&mut stream.columns);
@@ -223,6 +226,61 @@ mod conn {
             }
         }
         Ok(out)
+    }
+
+    /// An object or array param aimed at a VARIANT is the document. Bound as
+    /// its text it would be a VARIANT string, every path into it NULL. A
+    /// string param is a string wherever it goes, whatever it spells.
+    #[test]
+    fn a_document_param_aimed_at_a_variant_is_the_document() {
+        let Some(_) = v2_engine() else { return };
+        let mut c = conn::open(Path::new(":memory:"), &[]).expect("open");
+        let doc = |text: &str| Param::Document { text: text.into(), variant: false };
+        rows(&mut c, "CREATE TABLE t(id INTEGER PRIMARY KEY, doc VARIANT, note VARCHAR)", &[]).unwrap();
+        rows(&mut c, "INSERT INTO t VALUES (1, ?, ?), (2, ?, ?), (3, ?, ?)", &[
+            doc(r#"{"a":{"b":1}}"#),
+            Param::Text("object".into()),
+            doc("[1,2,3]"),
+            Param::Text("array".into()),
+            Param::Text(r#"{"a":{"b":9}}"#.into()),
+            Param::Text("string".into()),
+        ])
+        .unwrap();
+        let typed = "SELECT variant_typeof(doc), doc.a.b::VARCHAR FROM t ORDER BY id";
+        assert_eq!(rows(&mut c, typed, &[]).unwrap(), [
+            r#""OBJECT(a)","1""#,
+            r#""ARRAY(3)",null"#,
+            r#""VARCHAR",null"#,
+        ]);
+
+        // Reads follow the same line: a document finds the document, and a
+        // string still finds the string.
+        let find = "SELECT id FROM t WHERE doc = ?";
+        assert_eq!(rows(&mut c, find, &[doc(r#"{"a":{"b":1}}"#)]).unwrap(), ["1"]);
+        assert_eq!(rows(&mut c, find, &[Param::Text(r#"{"a":{"b":9}}"#.into())]).unwrap(), ["3"]);
+
+        // Aimed anywhere else it is its text: an untyped slot, a VARCHAR
+        // column, a cast the statement wrote, a number used against two types.
+        assert_eq!(rows(&mut c, "SELECT typeof(?), ?", &[doc(r#"{"k":1}"#), doc(r#"{"k":1}"#)]).unwrap(), [
+            r#""VARCHAR","{\"k\":1}""#
+        ]);
+        rows(&mut c, "UPDATE t SET note = ? WHERE id = 1", &[doc(r#"{"k":1}"#)]).unwrap();
+        rows(&mut c, "UPDATE t SET doc = ?::JSON WHERE id = 3", &[doc(r#"{"cast":true}"#)]).unwrap();
+        rows(&mut c, "UPDATE t SET doc = $1, note = $1 WHERE id = 2", &[doc(r#"{"two":"types"}"#)]).unwrap();
+        assert_eq!(rows(&mut c, "SELECT note, variant_typeof(doc) FROM t ORDER BY id", &[]).unwrap(), [
+            r#""{\"k\":1}","OBJECT(a)""#,
+            r#""{\"two\":\"types\"}","VARCHAR""#,
+            r#""string","OBJECT(cast)""#,
+        ]);
+
+        // A transaction that has aborted refuses the cast; the text goes in
+        // its place and the statement says what is wrong.
+        c.execute_batch("BEGIN").unwrap();
+        assert!(rows(&mut c, "SELECT no_such_column FROM t", &[]).is_err());
+        let err = rows(&mut c, "UPDATE t SET doc = ? WHERE id = 1", &[doc(r#"{"a":1}"#)]).unwrap_err();
+        assert!(err.to_string().contains("aborted"), "{err}");
+        c.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(rows(&mut c, "SELECT variant_typeof(doc) FROM t WHERE id = 1", &[]).unwrap(), [r#""OBJECT(a)""#]);
     }
 
     #[test]
