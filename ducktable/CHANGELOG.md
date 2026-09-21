@@ -3,6 +3,17 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by release
 date, newest first.
 
+## 0.22.2 — 2026-09-20
+
+- Ships Sparkle 2.10.0, up from 2.9.6, so the updater itself is current. It
+  re-applies file system compression correctly when a delta update lands on
+  macOS 27, stops leaking temporary files when a delta fails to apply, and
+  needs macOS 12.0, which is already DuckTable's floor.
+- Updates the shared `harbor-common` and `wire` lockfile entries to 0.40.2.
+  DuckTable reads nothing that changed in them: a VARIANT cell, which Harbor
+  has delivered as JSON text since 0.39.0, arrives as text either way and
+  now shows as the JSON it is.
+
 ## 0.22.1 — 2026-09-11
 
 - Uses Harbor's corrected shared path handling: native canonical paths remain
