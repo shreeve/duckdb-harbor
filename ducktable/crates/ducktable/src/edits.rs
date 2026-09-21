@@ -639,6 +639,18 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
         check_json(text)?;
         return Ok(Value::String(text.to_string()));
     }
+    // A container that holds a VARIANT, a JSON or a BLOB is bound as the
+    // container's text, and no cast of that text reaches the inner value: a
+    // `BLOB[]` stores the base64 characters as the bytes, and the elements of
+    // a `VARIANT[]` or a `JSON[]` become strings. Nothing is said, so the edit
+    // is refused here; `null` above, and NULL from an emptied cell, are safe.
+    if ty != "BLOB" {
+        if let Some(inner) = document_or_blob_within(&ty) {
+            return Err(format!(
+                "typed text cannot carry the {inner} inside {duck_type} \u{2014} edit this cell in the Query tab"
+            ));
+        }
+    }
     // Every test below is on the scalar's own name, so a nested type —
     // `INTEGER[]`, `STRUCT(a INTEGER)`, `MAP(VARCHAR, INTEGER)` — and a
     // type whose spelling happens to hold another's — INTERVAL, an
@@ -680,26 +692,31 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
     Ok(Value::String(text.to_string()))
 }
 
-/// Refuse text the engine's JSON cast would refuse, at the fingers. The
-/// engine reads NaN and Infinity as numbers and a VARIANT can hold them, so
-/// they pass here too; everything else is serde's verdict, including its
-/// nesting limit.
+/// The deepest a document nests, the limit every first-party client keeps.
+/// Harbor's request parser refuses an object param a little past it, and deep
+/// nesting is the one input that hurts the engine through a VARIANT.
+const JSON_DEPTH: usize = 100;
+
+/// A VARIANT or JSON cell takes strict JSON. The engine's own JSON also reads
+/// NaN and Infinity as numbers, and a VARIANT stores them; Harbor then sends
+/// `{"x":NaN}`, which no JSON reader accepts, and the whole document reaches
+/// a client as a string. So serde's verdict is the verdict. Depth is
+/// measured first, so that a document refused for its depth is told so.
 fn check_json(text: &str) -> Result<(), String> {
-    let strict = strict_json(text);
-    match serde_json::from_str::<Value>(&strict) {
+    if json_depth(text) > JSON_DEPTH {
+        return Err(format!("this JSON nests deeper than {JSON_DEPTH} levels"));
+    }
+    match serde_json::from_str::<Value>(text) {
         Ok(_) => Ok(()),
         Err(_) => Err(format!("{text:?} is not JSON \u{2014} text needs quotes, like \"Morel\"")),
     }
 }
 
-/// `text` with the bare tokens NaN and Infinity, outside any string, written
-/// as 0 — the one place the engine's JSON is wider than serde's.
-fn strict_json(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut rest = text;
-    while let Some(c) = rest.chars().next() {
+/// The most brackets open at once in `text`, outside any string.
+fn json_depth(text: &str) -> usize {
+    let (mut depth, mut deepest) = (0usize, 0usize);
+    let (mut in_string, mut escaped) = (false, false);
+    for c in text.chars() {
         if in_string {
             if escaped {
                 escaped = false;
@@ -708,17 +725,70 @@ fn strict_json(text: &str) -> String {
             } else if c == '"' {
                 in_string = false;
             }
-        } else if c == '"' {
-            in_string = true;
-        } else if let Some(token) = ["NaN", "Infinity"].iter().find(|t| rest.starts_with(**t)) {
-            out.push('0');
-            rest = &rest[token.len()..];
             continue;
         }
-        out.push(c);
-        rest = &rest[c.len_utf8()..];
+        match c {
+            '"' => in_string = true,
+            '[' | '{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
     }
-    out
+    deepest
+}
+
+/// The VARIANT, JSON or BLOB a container type holds — `BLOB[]`,
+/// `STRUCT(v VARIANT)`, `MAP(VARCHAR, JSON)` — if it holds one. A word of the
+/// type counts unless it is quoted (an ENUM's values, a quoted field name) or
+/// is the field name that opens a STRUCT or UNION member.
+fn document_or_blob_within(duck_type: &str) -> Option<&'static str> {
+    let ty = duck_type.to_uppercase();
+    // Per open parenthesis: whether its members are written `name TYPE`.
+    let mut named = Vec::new();
+    let mut expect_name = false;
+    let mut word = String::new();
+    let mut last_word = String::new();
+    let mut quote = None;
+    for c in ty.chars().chain(std::iter::once(' ')) {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        if c.is_alphanumeric() || c == '_' {
+            word.push(c);
+            continue;
+        }
+        if !word.is_empty() {
+            if expect_name {
+                expect_name = false;
+            } else if let Some(found) = ["VARIANT", "JSON", "BLOB"].into_iter().find(|t| *t == word) {
+                return Some(found);
+            }
+            last_word = std::mem::take(&mut word);
+        }
+        match c {
+            '"' | '\'' => {
+                quote = Some(c);
+                // A quoted run here is the member's name.
+                expect_name = false;
+            }
+            '(' => {
+                named.push(matches!(last_word.as_str(), "STRUCT" | "UNION"));
+                expect_name = named.last().copied().unwrap_or(false);
+            }
+            ')' => {
+                named.pop();
+            }
+            ',' => expect_name = named.last().copied().unwrap_or(false),
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1055,18 +1125,38 @@ mod tests {
             for text in ["{\"a\": 1}", "[1, 2]", "\"Morel\"", "42", "12.340", "true", "18446744073709551616"] {
                 assert_eq!(parse_value(text, ty), Ok(json!(text)), "{ty} {text}");
             }
-            // What the engine's JSON reads and serde's does not.
-            for text in ["NaN", "{\"x\": NaN, \"y\": [Infinity, -Infinity]}"] {
-                assert_eq!(parse_value(text, ty), Ok(json!(text)), "{ty} {text}");
-            }
-            for text in ["Morel", "{oops", "[1, 2", "{'a': 1}", "\"NaN"] {
+            // The engine's JSON reads NaN and Infinity; JSON has neither, and
+            // a document holding one reaches a client as a string.
+            for text in [
+                "Morel", "{oops", "[1, 2", "{'a': 1}", "\"NaN",
+                "NaN", "-Infinity", "{\"x\": NaN, \"y\": [Infinity, -Infinity]}",
+            ] {
                 let err = parse_value(text, ty).unwrap_err();
                 assert!(err.contains("is not JSON"), "{ty} {text}: {err}");
             }
-            // A token inside a string is the string's own business.
+            // Inside a string they are the string's own business.
             assert_eq!(parse_value("\"NaN and Infinity\"", ty), Ok(json!("\"NaN and Infinity\"")));
-            // Deeper than serde reads is deeper than the engine survives.
-            assert!(parse_value(&"[".repeat(200), ty).is_err());
+
+            // A document nests 100 levels and no deeper, and says so.
+            let nested = |depth: usize, open: &str, close: &str| {
+                format!("{}1{}", open.repeat(depth), close.repeat(depth))
+            };
+            for (open, close, levels) in [("[", "]", 1), ("{\"a\":", "}", 1), ("[{\"a\":", "}]", 2)] {
+                let fits = nested(100 / levels, open, close);
+                assert_eq!(parse_value(&fits, ty), Ok(json!(fits)), "{ty} {open}");
+                let err = parse_value(&nested(100 / levels + 1, open, close), ty).unwrap_err();
+                assert!(err.contains("nests deeper than 100 levels"), "{ty} {open}: {err}");
+                assert!(!err.contains("is not JSON"), "{ty} {open}: {err}");
+            }
+            // Brackets inside a string open nothing, escaped quotes and all.
+            let brackets = format!("[\"{} \\\" {}\"]", "[{".repeat(150), "[".repeat(150));
+            assert_eq!(parse_value(&brackets, ty), Ok(json!(brackets)), "{ty}");
+            // Siblings are not depth.
+            let wide = format!("[{}]", vec!["[[1]]"; 200].join(","));
+            assert_eq!(parse_value(&wide, ty), Ok(json!(wide)), "{ty}");
+            // Unclosed text that deep is refused for its depth; shallower, as not JSON.
+            assert!(parse_value(&"[".repeat(200), ty).unwrap_err().contains("nests deeper"));
+            assert!(parse_value(&"[".repeat(50), ty).unwrap_err().contains("is not JSON"));
         }
         // `null` is SQL NULL in a VARIANT and a JSON value in a JSON column.
         assert_eq!(parse_value("null", "VARIANT"), Ok(Value::Null));
@@ -1269,6 +1359,46 @@ mod tests {
             e.statements()[0].sql,
             "INSERT INTO \"main\".\"t\" DEFAULT VALUES RETURNING *"
         );
+    }
+
+    #[test]
+    fn a_container_of_documents_or_blobs_refuses_typed_text() {
+        for (ty, inner) in [
+            ("BLOB[]", "BLOB"),
+            ("BLOB[2]", "BLOB"),
+            ("VARIANT[]", "VARIANT"),
+            ("JSON[]", "JSON"),
+            ("json[]", "JSON"),
+            ("STRUCT(v VARIANT, n INTEGER)", "VARIANT"),
+            ("STRUCT(n INTEGER, \"B\" BLOB)", "BLOB"),
+            ("STRUCT(json JSON)", "JSON"),
+            ("MAP(VARCHAR, BLOB)", "BLOB"),
+            ("MAP(BLOB, VARCHAR)", "BLOB"),
+            ("UNION(n INTEGER, doc VARIANT)", "VARIANT"),
+            ("STRUCT(a STRUCT(b DECIMAL(10,2), c JSON[])[])", "JSON"),
+        ] {
+            let err = parse_value("[]", ty).unwrap_err();
+            assert!(err.contains("Query tab") && err.contains(&format!("the {inner} inside {ty}")), "{ty}: {err}");
+            // NULL is a value of every one of them.
+            assert_eq!(parse_value("null", ty), Ok(Value::Null), "{ty}");
+        }
+        // A name is not a type: a field, an ENUM's value, a quoted identifier.
+        for ty in [
+            "STRUCT(json INTEGER, blob VARCHAR, variant DATE)",
+            "UNION(blob INTEGER, json VARCHAR)",
+            "STRUCT(\"JSON\" INTEGER, \"a \"\"BLOB\"\" b\" VARCHAR)",
+            "ENUM('BLOB', 'JSON', 'it''s a VARIANT')",
+            "STRUCT(a DECIMAL(10,2), json INTEGER)",
+            "INTEGER[]",
+            "MAP(VARCHAR, INTEGER)",
+        ] {
+            assert_eq!(document_or_blob_within(ty), None, "{ty}");
+            assert_eq!(parse_value("x", ty), Ok(json!("x")), "{ty}");
+        }
+        // The three themselves are not containers of themselves.
+        assert_eq!(parse_value("qrs=", "BLOB"), Ok(json!("qrs=")));
+        assert_eq!(parse_value("[]", "VARIANT"), Ok(json!("[]")));
+        assert_eq!(parse_value("[]", "JSON"), Ok(json!("[]")));
     }
 
     #[test]
