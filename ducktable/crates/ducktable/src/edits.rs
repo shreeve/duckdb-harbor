@@ -26,6 +26,10 @@ pub struct CellEdit {
     pub text: Option<SharedString>,
     /// What the statement puts in the column.
     pub bind: Bind,
+    /// The text a duplicate's cell was copied with (inner None = NULL), kept
+    /// while the cell is typed over: a cell that holds this text again is
+    /// read from the source row again. None on a cell that copies nothing.
+    pub copied: Option<Option<SharedString>>,
 }
 
 /// Where a staged cell's value comes from.
@@ -233,7 +237,8 @@ impl Edits {
         let cells = cells
             .into_iter()
             .map(|(col, text, bind)| {
-                (col, CellEdit { original: None, text, bind })
+                let copied = (bind == Bind::Source).then(|| text.clone());
+                (col, CellEdit { original: None, text, bind, copied })
             })
             .collect();
         self.apply(Op {
@@ -246,7 +251,10 @@ impl Edits {
     }
 
     /// Supply one draft cell. `text = None` is explicit SQL NULL; an
-    /// untouched/removed cell is DEFAULT and is absent from the map.
+    /// untouched cell is DEFAULT and is absent from the map. A duplicate's
+    /// cell given the text it was copied with is read from the source row,
+    /// not bound: the text is all the wire kept of a DATE inside a VARIANT
+    /// or an integer past 64 bits, and the source row still holds the value.
     pub fn stage_insert_cell(
         &mut self,
         key: &str,
@@ -257,7 +265,9 @@ impl Edits {
         let Some(entry) = self.changes.get(key) else { return };
         let RowChange::Insert(mut cells) = entry.change.clone() else { return };
         let prev = Some(entry.change.clone());
-        cells.insert(col, CellEdit { original: None, text, bind: Bind::Value(value) });
+        let copied = cells.get(&col).and_then(|c| c.copied.clone());
+        let bind = if copied.as_ref() == Some(&text) { Bind::Source } else { Bind::Value(value) };
+        cells.insert(col, CellEdit { original: None, text, bind, copied });
         let next = Some(RowChange::Insert(cells));
         if prev == next {
             return;
@@ -265,20 +275,21 @@ impl Edits {
         self.apply(Op { key: key.to_string(), identity: entry.identity.clone(), prev, next });
     }
 
-    /// Restore a draft cell to DEFAULT by omitting it from INSERT.
-    pub fn stage_insert_default(&mut self, key: &str, col: usize) {
-        let Some(entry) = self.changes.get(key) else { return };
-        let RowChange::Insert(mut cells) = entry.change.clone() else { return };
-        let prev = Some(entry.change.clone());
-        if cells.remove(&col).is_none() {
-            return;
+    /// The text a duplicate's cell was copied with, for a cell that was
+    /// (`Some(None)` = copied NULL).
+    pub fn copied_text(&self, key: &str, col: usize) -> Option<Option<SharedString>> {
+        match &self.changes.get(key)?.change {
+            RowChange::Insert(cells) => cells.get(&col)?.copied.clone(),
+            _ => None,
         }
-        self.apply(Op {
-            key: key.to_string(),
-            identity: entry.identity.clone(),
-            prev,
-            next: Some(RowChange::Insert(cells)),
-        });
+    }
+
+    /// Put a duplicate's cell back to the text it was copied with, read
+    /// from the source row.
+    pub fn stage_insert_copied(&mut self, key: &str, col: usize) {
+        if let Some(text) = self.copied_text(key, col) {
+            self.stage_insert_cell(key, col, text, Value::Null);
+        }
     }
 
     fn apply(&mut self, op: Op) {
@@ -331,7 +342,7 @@ impl Edits {
         if text == original {
             cells.remove(&col);
         } else {
-            cells.insert(col, CellEdit { original, text, bind: Bind::Value(value) });
+            cells.insert(col, CellEdit { original, text, bind: Bind::Value(value), copied: None });
         }
         let next = (!cells.is_empty()).then_some(RowChange::Update(cells));
         if prev == next {
@@ -611,6 +622,69 @@ fn parse_integer(text: &str, duck_type: &str, (min, max): (i128, u128)) -> Resul
         Ok(n) => Value::from(n),
         Err(_) => Value::String(format!("{}{digits}", if negative { "-" } else { "" })),
     })
+}
+
+/// A cell as the editor finds it when it confirms. `None` text is NULL.
+pub struct Held<'a> {
+    /// The column's DuckDB type.
+    pub ty: &'a str,
+    /// A draft row's cell, not a persisted row's.
+    pub draft: bool,
+    /// What the database holds. A draft has nothing fetched.
+    pub fetched: Option<&'a str>,
+    /// The staged cell, or the draft's cell, when there is one. A draft
+    /// without one is DEFAULT.
+    pub staged: Option<Option<&'a str>>,
+    /// The text a duplicate's cell was copied with (`CellEdit::copied`).
+    pub copied: Option<Option<&'a str>>,
+}
+
+/// What confirming an editor does to its cell.
+#[derive(Debug, PartialEq)]
+pub enum Confirm {
+    /// The cell already holds this text. Nothing is staged and nothing is
+    /// validated, so a value the engine accepted is never one the editor
+    /// refuses to leave.
+    Keep,
+    /// The text the cell had before anyone typed in it: what was fetched,
+    /// or what a duplicate copied. The staged edit is dropped, or the cell
+    /// is read from its source row again; neither needs a verdict.
+    Revert,
+    /// Stage this text and bind this value. `None` is NULL, which a NOT
+    /// NULL column refuses.
+    Stage(Option<SharedString>, Value),
+    /// The text is not a value of the column's type; the reason.
+    Refuse(String),
+}
+
+/// Decide what confirming `text` over `cell` does. An editor cannot tell
+/// NULL from the empty string — both open empty — so an empty editor over a
+/// cell that holds NULL, or over a draft's DEFAULT, is that cell unchanged:
+/// NULL in, nothing typed, NULL out. `''` is entered by emptying a text cell
+/// that held something, or with Delete.
+pub fn confirm(text: &str, cell: &Held) -> Confirm {
+    let same = |held: Option<&str>| held.unwrap_or("") == text;
+    if same(cell.staged.unwrap_or(cell.fetched)) {
+        return Confirm::Keep;
+    }
+    let before = if cell.draft { cell.copied } else { Some(cell.fetched) };
+    if before.is_some_and(same) {
+        return Confirm::Revert;
+    }
+    if text.is_empty() {
+        // An emptied editor: '' for text (the one honest way to enter it),
+        // NULL for everything else — docs/EDITING.md.
+        return if is_text_type(cell.ty) {
+            Confirm::Stage(Some(SharedString::from("")), Value::String(String::new()))
+        } else {
+            Confirm::Stage(None, Value::Null)
+        };
+    }
+    match parse_value(text, cell.ty) {
+        Ok(Value::Null) => Confirm::Stage(None, Value::Null),
+        Ok(value) => Confirm::Stage(Some(SharedString::from(text.to_string())), value),
+        Err(reason) => Confirm::Refuse(reason),
+    }
 }
 
 /// Stage-time validation: user text -> the value the statement binds.
@@ -1243,22 +1317,83 @@ mod tests {
         assert!(e.redo());
         assert_eq!(e.statements(), typed_over);
 
-        // A cell restored to DEFAULT leaves the statement; the rest stay.
-        e.stage_insert_default(&key, 3);
-        assert_eq!(
-            e.statements()[0].sql,
-            "INSERT INTO \"main\".\"t\" (\"doc\", \"j\") \
-             SELECT \"doc\", ?::JSON FROM \"main\".\"t\" WHERE \"id\" = ? RETURNING *"
-        );
-        assert_eq!(e.statements()[0].params, vec![json!("[2]"), json!(5)]);
-
         // With every copied cell typed over, nothing is read from the source.
         e.stage_insert_cell(&key, 1, None, Value::Null);
         assert_eq!(
             e.statements()[0].sql,
-            "INSERT INTO \"main\".\"t\" (\"doc\", \"j\") VALUES (?::JSON, ?::JSON) RETURNING *"
+            "INSERT INTO \"main\".\"t\" (\"doc\", \"j\", \"b\") \
+             VALUES (?::JSON, ?::JSON, from_base64(?::VARCHAR)) RETURNING *"
         );
-        assert_eq!(e.statements()[0].params, vec![Value::Null, json!("[2]")]);
+        assert_eq!(e.statements()[0].params, vec![Value::Null, json!("[2]"), json!("qrs=")]);
+    }
+
+    #[test]
+    fn a_copied_cell_typed_back_to_its_source_text_is_read_from_the_source_again() {
+        let mut e = typed();
+        let key = e.stage_duplicate(
+            vec![json!(5)],
+            vec![
+                (1, txt("{\"when\":\"2024-02-29\"}"), Bind::Source),
+                (2, txt("[2]"), Bind::Value(json!("[2]"))),
+                (3, None, Bind::Source),
+            ],
+        );
+        let copied = e.statements();
+        assert_eq!(e.copied_text(&key, 1), Some(txt("{\"when\":\"2024-02-29\"}")));
+        assert_eq!(e.copied_text(&key, 3), Some(None), "a copied NULL is remembered as one");
+        assert_eq!(e.copied_text(&key, 2), None, "a bound cell copies nothing");
+        assert_eq!(e.copied_text(&key, 0), None);
+
+        // Typed over, the document is bound, and what it copied is kept.
+        e.stage_insert_cell(&key, 1, txt("{}"), json!("{}"));
+        assert_eq!(e.statements()[0].params, vec![json!("{}"), json!("[2]"), json!(5)]);
+        assert_eq!(e.copied_text(&key, 1), Some(txt("{\"when\":\"2024-02-29\"}")));
+        // Typed back, by value or by name, it is read from the source: the
+        // DATE in it stays a DATE.
+        e.stage_insert_cell(&key, 1, txt("{\"when\":\"2024-02-29\"}"), json!("{\"when\":\"2024-02-29\"}"));
+        assert_eq!(e.statements(), copied);
+        e.stage_insert_cell(&key, 1, txt("[]"), json!("[]"));
+        e.stage_insert_copied(&key, 1);
+        assert_eq!(e.statements(), copied);
+
+        // Each of those was a step: undo walks back through them, redo forward.
+        assert!(e.undo());
+        assert_eq!(e.statements()[0].params, vec![json!("[]"), json!("[2]"), json!(5)]);
+        assert!(e.undo());
+        assert_eq!(e.statements(), copied);
+        assert!(e.undo());
+        assert_eq!(e.statements()[0].params, vec![json!("{}"), json!("[2]"), json!(5)]);
+        assert!(e.undo());
+        assert_eq!(e.statements(), copied);
+        for _ in 0..4 {
+            assert!(e.redo());
+        }
+        assert_eq!(e.statements(), copied);
+        for _ in 0..4 {
+            assert!(e.undo());
+        }
+
+        // A cell that already reads from the source is not staged again: the
+        // whole duplicate is still one undo step.
+        e.stage_insert_cell(&key, 3, None, Value::Null);
+        e.stage_insert_copied(&key, 3);
+        e.stage_insert_copied(&key, 1);
+        e.stage_insert_copied(&key, 2);
+        assert_eq!(e.statements(), copied);
+        assert!(e.undo());
+        assert!(e.is_empty(), "one ⌘Z removes the duplicate");
+
+        // A cell bound from the start has no source text to return to, and
+        // a draft that copies nothing has none at all.
+        assert!(e.redo());
+        e.stage_insert_cell(&key, 2, txt("[3]"), json!("[3]"));
+        e.stage_insert_cell(&key, 2, txt("[2]"), json!("[2]"));
+        assert_eq!(e.statements(), copied, "bound again, as it was");
+        let fresh = e.stage_insert();
+        e.stage_insert_cell(&fresh, 1, txt("1"), json!("1"));
+        e.stage_insert_copied(&fresh, 1);
+        assert_eq!(e.copied_text(&fresh, 1), None);
+        assert_eq!(e.statements()[1].params, vec![json!("1")]);
     }
 
     #[test]
@@ -1349,16 +1484,102 @@ mod tests {
         assert_eq!(e.statements()[0].params, vec![json!("Ada"), json!(5)]);
     }
 
+    fn persisted<'a>(ty: &'a str, fetched: Option<&'a str>, staged: Option<Option<&'a str>>) -> Held<'a> {
+        Held { ty, draft: false, fetched, staged, copied: None }
+    }
+
+    fn draft<'a>(ty: &'a str, staged: Option<Option<&'a str>>, copied: Option<Option<&'a str>>) -> Held<'a> {
+        Held { ty, draft: true, fetched: None, staged, copied }
+    }
+
+    fn stage(text: &str, value: Value) -> Confirm {
+        Confirm::Stage(txt(text), value)
+    }
+
     #[test]
-    fn restoring_a_draft_cell_to_default_removes_it_from_insert() {
-        let mut e = edits();
-        let key = e.stage_insert();
-        e.stage_insert_cell(&key, 0, txt("7"), json!(7));
-        e.stage_insert_default(&key, 0);
-        assert_eq!(
-            e.statements()[0].sql,
-            "INSERT INTO \"main\".\"t\" DEFAULT VALUES RETURNING *"
-        );
+    fn confirming_a_persisted_cell_keeps_reverts_stages_or_refuses() {
+        // An empty editor over NULL is NULL still — fetched or staged (⌃⇧N,
+        // then Enter, Enter; or a Tab run through the cell), text or not.
+        for ty in ["VARCHAR", "INTEGER", "VARIANT"] {
+            assert_eq!(confirm("", &persisted(ty, None, None)), Confirm::Keep, "{ty}");
+            assert_eq!(confirm("", &persisted(ty, Some("abc"), Some(None))), Confirm::Keep, "{ty}");
+            assert_eq!(confirm("", &persisted(ty, Some(""), Some(None))), Confirm::Keep, "{ty}");
+        }
+        // And over '' it is '' still.
+        assert_eq!(confirm("", &persisted("VARCHAR", Some(""), None)), Confirm::Keep);
+        assert_eq!(confirm("", &persisted("VARCHAR", Some("abc"), Some(Some("")))), Confirm::Keep);
+        assert_eq!(confirm("", &persisted("VARCHAR", None, Some(Some("")))), Confirm::Keep);
+
+        // The text the cell holds, fetched or staged, is kept unjudged: none
+        // of these is a value `parse_value` takes.
+        for (ty, held) in [("VARIANT", "NaN"), ("INTEGER", "1e3"), ("VARIANT[]", "[1]"), ("DOUBLE", "x")] {
+            assert_eq!(confirm(held, &persisted(ty, Some(held), None)), Confirm::Keep, "{ty}");
+            assert_eq!(confirm(held, &persisted(ty, Some("0"), Some(Some(held)))), Confirm::Keep, "{ty}");
+            assert_eq!(confirm(held, &persisted(ty, None, Some(Some(held)))), Confirm::Keep, "{ty}");
+        }
+        // Type-to-edit whose keystroke spells the value is the same confirm.
+        assert_eq!(confirm("5", &persisted("INTEGER", Some("5"), None)), Confirm::Keep);
+
+        // Staged text typed back to what was fetched reaches stage_cell, which
+        // drops the edit; it is not judged either.
+        assert_eq!(confirm("NaN", &persisted("VARIANT", Some("NaN"), Some(Some("1")))), Confirm::Revert);
+        assert_eq!(confirm("NaN", &persisted("VARIANT", Some("NaN"), Some(None))), Confirm::Revert);
+        assert_eq!(confirm("", &persisted("VARCHAR", Some(""), Some(Some("x")))), Confirm::Revert);
+        // Emptied over a fetched NULL: NULL in, nothing typed, NULL out.
+        assert_eq!(confirm("", &persisted("VARCHAR", None, Some(Some("x")))), Confirm::Revert);
+        assert_eq!(confirm("", &persisted("INTEGER", None, Some(Some("7")))), Confirm::Revert);
+
+        // An emptied cell that held something: '' for text, NULL otherwise.
+        assert_eq!(confirm("", &persisted("VARCHAR", Some("abc"), None)), stage("", json!("")));
+        assert_eq!(confirm("", &persisted("VARCHAR", Some("abc"), Some(Some("x")))), stage("", json!("")));
+        assert_eq!(confirm("", &persisted("INTEGER", Some("7"), None)), Confirm::Stage(None, Value::Null));
+        assert_eq!(confirm("", &persisted("VARCHAR[]", Some("[a]"), None)), Confirm::Stage(None, Value::Null));
+
+        // Anything else is a typed value, judged by its type.
+        assert_eq!(confirm("8", &persisted("INTEGER", Some("7"), None)), stage("8", json!(8)));
+        assert_eq!(confirm("8", &persisted("INTEGER", None, None)), stage("8", json!(8)));
+        assert_eq!(confirm("x", &persisted("VARCHAR", None, Some(None))), stage("x", json!("x")));
+        assert_eq!(confirm("null", &persisted("INTEGER", Some("7"), None)), Confirm::Stage(None, Value::Null));
+        assert_eq!(confirm("null", &persisted("VARCHAR", Some("7"), None)), stage("null", json!("null")));
+        assert!(matches!(confirm("abc", &persisted("INTEGER", Some("7"), None)), Confirm::Refuse(_)));
+        assert!(matches!(confirm("NaN", &persisted("VARIANT", Some("1"), None)), Confirm::Refuse(_)));
+        assert!(matches!(confirm("NaN", &persisted("VARIANT", None, Some(Some("1")))), Confirm::Refuse(_)));
+    }
+
+    #[test]
+    fn confirming_a_draft_cell_keeps_default_null_and_what_was_copied() {
+        // Untouched, a draft cell stays DEFAULT: absent, not NULL, not ''.
+        for ty in ["VARCHAR", "INTEGER"] {
+            assert_eq!(confirm("", &draft(ty, None, None)), Confirm::Keep, "{ty}");
+            // An explicit NULL stays the NULL it is, typed or copied, so a
+            // Tab run through a duplicate adds no undo step.
+            assert_eq!(confirm("", &draft(ty, Some(None), None)), Confirm::Keep, "{ty}");
+            assert_eq!(confirm("", &draft(ty, Some(None), Some(None))), Confirm::Keep, "{ty}");
+        }
+        assert_eq!(confirm("", &draft("VARCHAR", Some(Some("")), None)), Confirm::Keep);
+        assert_eq!(confirm("x", &draft("VARCHAR", None, None)), stage("x", json!("x")));
+        assert!(matches!(confirm("x", &draft("INTEGER", None, None)), Confirm::Refuse(_)));
+        assert_eq!(confirm("", &draft("VARCHAR", Some(Some("x")), None)), stage("", json!("")));
+        assert_eq!(confirm("", &draft("INTEGER", Some(Some("7")), None)), Confirm::Stage(None, Value::Null));
+        assert_eq!(confirm("7", &draft("INTEGER", Some(Some("7")), None)), Confirm::Keep);
+
+        // A copied cell confirmed as it is: kept, unjudged. The digits are a
+        // HUGEINT inside a VARIANT, the container one `parse_value` refuses.
+        let big = "170141183460469231731687303715884105727";
+        assert_eq!(confirm(big, &draft("VARIANT", Some(Some(big)), Some(Some(big)))), Confirm::Keep);
+        assert_eq!(confirm("[1]", &draft("VARIANT[]", Some(Some("[1]")), Some(Some("[1]")))), Confirm::Keep);
+        // Typed over and typed back, it reads from its source row again,
+        // unjudged; so does a copied NULL emptied again, text column or not.
+        assert_eq!(confirm(big, &draft("VARIANT", Some(Some("1")), Some(Some(big)))), Confirm::Revert);
+        assert_eq!(confirm("NaN", &draft("VARIANT", Some(None), Some(Some("NaN")))), Confirm::Revert);
+        assert_eq!(confirm("[1]", &draft("VARIANT[]", Some(None), Some(Some("[1]")))), Confirm::Revert);
+        assert_eq!(confirm("", &draft("VARCHAR", Some(Some("x")), Some(None))), Confirm::Revert);
+        assert_eq!(confirm("", &draft("VARCHAR", Some(Some("x")), Some(Some("")))), Confirm::Revert);
+        // Typed to anything else, a copied cell is an ordinary typed cell.
+        assert_eq!(confirm("2", &draft("VARIANT", Some(Some(big)), Some(Some(big)))), stage("2", json!("2")));
+        assert!(matches!(confirm("[2]", &draft("VARIANT[]", Some(Some("[1]")), Some(Some("[1]")))), Confirm::Refuse(_)));
+        // What a bound cell showed when it was duplicated is not a source text.
+        assert!(matches!(confirm("NaN", &draft("VARIANT", Some(Some("1")), None)), Confirm::Refuse(_)));
     }
 
     #[test]
@@ -1381,6 +1602,7 @@ mod tests {
             assert!(err.contains("Query tab") && err.contains(&format!("the {inner} inside {ty}")), "{ty}: {err}");
             // NULL is a value of every one of them.
             assert_eq!(parse_value("null", ty), Ok(Value::Null), "{ty}");
+            assert_eq!(confirm("", &persisted(ty, Some("[]"), None)), Confirm::Stage(None, Value::Null), "{ty}");
         }
         // A name is not a type: a field, an ENUM's value, a quoted identifier.
         for ty in [
