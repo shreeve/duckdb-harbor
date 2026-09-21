@@ -199,11 +199,14 @@ Cancelling a statement inside a transaction aborts that transaction, exactly as
 it does in Postgres. Harbor does not paper over it — the next statement gets
 `Current transaction is aborted (please ROLLBACK)` until you do. Rolling back
 silently would let the statement after a cancellation commit in autocommit
-under a client that still believed it was in a transaction. A cancel that
-lands before the statement has begun to execute — while an object or array
-parameter is still being bound, or before an executor has picked the statement
-up — answers the same 499 and leaves the transaction as it was, open and
-holding its writes, because nothing ran.
+under a client that still believed it was in a transaction. The rule has no
+exceptions: a 499 inside a transaction means that transaction is over. A
+cancel that lands before the statement has begun to execute — while an object
+or array parameter is still being bound, or before an executor has picked the
+statement up — answers the same 499 and harbor leaves the transaction aborted
+itself, so a client that carries on cannot commit a transaction with a
+statement missing. A `COMMIT` sent to an aborted transaction rolls it back. In
+autocommit there is no transaction to abort, and the next statement runs.
 
 ## Transactions
 

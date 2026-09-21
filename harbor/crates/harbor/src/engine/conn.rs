@@ -516,6 +516,17 @@ impl Conn {
         }
         Ok(())
     }
+
+    /// Leave the open transaction aborted, as the engine leaves one whose
+    /// statement it interrupted: every statement after this one fails with
+    /// "Current transaction is aborted (please ROLLBACK)" until a ROLLBACK.
+    /// A statement that fails is what aborts a transaction, so one is run and
+    /// its error dropped. In autocommit it leaves nothing behind, and an
+    /// interrupt still pending from before it does not reach it: the engine
+    /// clears that as the statement starts.
+    pub fn abort_transaction(&mut self) {
+        let _ = self.execute_batch("SELECT error('cancelled')");
+    }
 }
 
 impl Drop for Conn {
