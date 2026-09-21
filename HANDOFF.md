@@ -2,8 +2,8 @@
 
 Read this first. It says what the repo is, how its owner works, how the
 pieces fit, how to build, test and release, and what is open. Everything
-here was true on 2026-09-18 at harbor v0.40.1; the changelog and git history
-are the record after that.
+here was true on 2026-09-21 at harbor v0.41.1 and DuckTable v0.22.4; the
+changelog and git history are the record after that.
 
 ## What this is
 
@@ -268,8 +268,9 @@ string bare; a JSON column shows its text with quotes, as DuckDB's own table
 does. csv carries the JSON text CSV-escaped, so `42` and `"42"` stay apart
 for a program. json and jsonlines splice a VARIANT or JSON cell in as JSON,
 with newlines in a pretty-printed JSON column folded to spaces so jsonlines
-stays one record per line. `NaN`, `Infinity` and documents deeper than 128
-levels stay strings. The wire is untouched by any of this.
+stays one record per line. `NaN` and `Infinity` stay strings; a document is
+spliced whole however deep it nests, since the well-formedness check skips
+the value without recursing. The wire is untouched by any of this.
 
 ## VARIANT, in one line
 
@@ -279,8 +280,11 @@ the engine build live runs. Read it before probing. The rule that explains
 the rest: objects in, values out; a bare string written without `::JSON` is
 stored as a string and every path into it is NULL, silently. harbor closes
 that for one case only: an object or array in `params` aimed at a VARIANT is
-bound as the document (`Conn::aim_documents`, one bind pass, skipped unless a
-param is an object or array). A string param is never read as JSON — a client
+bound as the document (`Conn::bind`: one bind pass, skipped unless a param is
+an object or array, then two casts through JSON and VARIANT types the
+connection makes once; `run_statement` asks its slot for a cancel between
+`bind` and `execute`, because the engine drops an interrupt that lands during
+either). A string param is never read as JSON — a client
 holding JSON text casts it, which is what Rip's ORM and DuckTable do. Deeply
 nested JSON is the one input that hurts the engine through a VARIANT
 (duckdb#25967, measured on the alpha42779 CLI): an `UPDATE` of a VARIANT
@@ -289,9 +293,12 @@ at 5,000, where an `INSERT` of the same value takes 10 ms; and the cast
 segfaults at about 40,000 levels, the `UPDATE` at 20,000. On alpha42289 a
 SQL-side `doc::JSON` over a stored 5,000-level document ends the harbor
 process, while returning the VARIANT cell itself is fine. harbor's request
-parser stops an object or array param at 128 levels, so only a string the
-statement casts reaches any of this; Rip's ORM refuses a document past 128
-levels before it is sent.
+parser reads 127 levels in all and the body's own `{ "params": [ … ] }` is
+two of them, so an object or array param nests at most 125 levels and one
+more is a 400; only a string the statement casts through `?::JSON`, which has
+no such limit, reaches any of this. Rip's ORM and DuckTable's editor each
+refuse a document past 100 levels before it is sent, so nothing a first-party
+client writes reaches harbor's limit.
 
 ## Recent history, for orientation
 
@@ -304,6 +311,7 @@ levels before it is sent.
 | 0.40.1 | 09-18 | Down is history until there is no history below; Ctrl-Space lists |
 | 0.40.2 | 09-20 | engine named by DuckDB build, `DUCKDB_LIB_BUILD`; fetch checks before it installs |
 | 0.41.0 | 09-20 | an object or array param aimed at a VARIANT is bound as the document |
+| 0.41.1 | 09-21 | a document param costs its casts, not two type lookups; a cancel during the bind is kept |
 
 Older milestones the code still reflects: 0.20 collapsed everything into
 one binary with the refcounted lifetime; 0.21 moved to the direct v2 C API
@@ -322,7 +330,7 @@ usable end to end.
 - **A binary wire mode** is parked until DuckDB GA.
 - **The deployment runbook** (`duckdb-harbor-runbook`) is deferred to GA;
   four decisions were recorded so they are not re-derived.
-- **DuckTable** is at 0.22.1, early and moving fast; its own docs are under
+- **DuckTable** is at 0.22.4, early and moving fast; its own docs are under
   `ducktable/docs/`. Its Sparkle signing keys live in the gitignored,
   untracked `notes.txt` at the repo root and in the `SPARKLE_PRIVATE_KEY`
   repository secret. Never commit that file.
