@@ -174,8 +174,9 @@ The way forward is to port to the reworked API once DuckDB's naming settles
 (re-run `gen-v2-ffi.rb` against the new spec, fix the seventeen call sites),
 then set the variable to `latest`. DuckDB 2.0 GA is expected in the second half of
 October 2026. Upstream issues harbor has filed and watches: duckdb#25282
-(nap race), duckdb#25301 (prepare cost), duckdb-rs#841. A DuckDB VARIANT
-cast bug we hit is duckdb#25873.
+(nap race), duckdb#25301 (prepare cost), duckdb#25967 (deeply nested
+VARIANT: quadratic `UPDATE`, segfault in the cast), duckdb-rs#841. A DuckDB
+VARIANT cast bug we hit is duckdb#25873.
 
 ## Releasing
 
@@ -280,11 +281,17 @@ stored as a string and every path into it is NULL, silently. harbor closes
 that for one case only: an object or array in `params` aimed at a VARIANT is
 bound as the document (`Conn::aim_documents`, one bind pass, skipped unless a
 param is an object or array). A string param is never read as JSON — a client
-holding JSON text casts it, which is what Rip's ORM and DuckTable do. JSON
-text nested tens of thousands deep and cast to VARIANT recurses inside the
-engine: 20,000 levels ran past a minute and about 70,000 killed the process
-on the 16 MiB executor stack (measured on alpha42289). harbor's own request
-parser stops at 128 levels, so only a SQL-side cast of a string reaches it.
+holding JSON text casts it, which is what Rip's ORM and DuckTable do. Deeply
+nested JSON is the one input that hurts the engine through a VARIANT
+(duckdb#25967, measured on the alpha42779 CLI): an `UPDATE` of a VARIANT
+column costs the square of the nesting depth, 0.6 s at 1,000 levels and 15 s
+at 5,000, where an `INSERT` of the same value takes 10 ms; and the cast
+segfaults at about 40,000 levels, the `UPDATE` at 20,000. On alpha42289 a
+SQL-side `doc::JSON` over a stored 5,000-level document ends the harbor
+process, while returning the VARIANT cell itself is fine. harbor's request
+parser stops an object or array param at 128 levels, so only a string the
+statement casts reaches any of this; Rip's ORM refuses a document past 128
+levels before it is sent.
 
 ## Recent history, for orientation
 
@@ -339,5 +346,7 @@ usable end to end.
   `result_jsons.json`, `orders.raw_request`/`raw_response` and `events.data`
   are VARIANT columns as of 09-17. Patient data never enters that repo.
 - **live**: `ssh live`. `~/src/medlabs`, `~/src/rip`, harbor in
-  `~/.local/bin`, engine in `~/.local/lib`. Put `$HOME/.bun/bin` and
-  `$HOME/.local/bin` on PATH in a non-interactive ssh command.
+  `~/.local/bin`, engine in `~/.local/lib`. Its `~/.zshenv` puts
+  `~/.local/bin` and `~/.bun/bin` on PATH for a non-interactive
+  `ssh live '…'`, which reads no other rc file. It is a Google Cloud host,
+  not on the LAN.
