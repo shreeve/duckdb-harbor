@@ -421,7 +421,7 @@ impl Edits {
         let where_clause = self
             .pk_cols
             .iter()
-            .map(|c| format!("{} = {}", qident(c), self.placeholder_named(c)))
+            .map(|c| format!("{} = {}", qident(c), self.key_placeholder(c)))
             .collect::<Vec<_>>()
             .join(" AND ");
         for (_, identity, change) in self.entries() {
@@ -505,12 +505,10 @@ impl Edits {
         placeholder_for(self.types.get(ix).map(String::as_str).unwrap_or(""))
     }
 
-    /// The same for a column known by name — the key columns of a WHERE.
-    fn placeholder_named(&self, name: &str) -> &'static str {
-        match self.columns.iter().position(|c| c == name) {
-            Some(ix) => self.placeholder(ix),
-            None => "?",
-        }
+    /// How a key column, known by name, is bound in a WHERE.
+    fn key_placeholder(&self, name: &str) -> &'static str {
+        let ty = self.columns.iter().position(|c| c == name).and_then(|ix| self.types.get(ix));
+        key_placeholder_for(ty.map(String::as_str).unwrap_or(""))
     }
 }
 
@@ -527,6 +525,19 @@ fn placeholder_for(duck_type: &str) -> &'static str {
         "VARIANT" | "JSON" => "?::JSON",
         "BLOB" => "from_base64(?::VARCHAR)",
         _ => "?",
+    }
+}
+
+/// The placeholder that compares a key column with its fetched value. A
+/// FLOAT crosses the wire as the shortest decimal that names it, and a JSON
+/// number binds as a DOUBLE. Compared bare, the column is widened to meet
+/// it, and 1.1 the FLOAT is not 1.1 the DOUBLE: the WHERE names no row. Cast
+/// to FLOAT, the param rounds to the key it came from. A SET or VALUES list
+/// needs no such cast, because assignment does that rounding itself.
+fn key_placeholder_for(duck_type: &str) -> &'static str {
+    match type_head(&duck_type.to_uppercase()) {
+        "FLOAT" | "FLOAT4" | "REAL" => "?::FLOAT",
+        _ => placeholder_for(duck_type),
     }
 }
 
@@ -989,6 +1000,41 @@ mod tests {
             "UPDATE \"main\".\"t\" SET \"name\" = ? WHERE \"k\" = from_base64(?::VARCHAR)"
         );
         assert_eq!(stmts[1].sql, "DELETE FROM \"main\".\"t\" WHERE \"k\" = from_base64(?::VARCHAR)");
+    }
+
+    #[test]
+    fn a_float_key_is_cast_in_the_where_and_bound_bare_as_a_value() {
+        let mut e = Edits::new(
+            "\"main\".\"t\"".into(),
+            vec!["k".into(), "d".into()],
+            vec!["k".into(), "d".into(), "f".into(), "name".into()],
+            vec!["FLOAT".into(), "DOUBLE".into(), "FLOAT".into(), "VARCHAR".into()],
+        );
+        // The key itself is edited: the SET binds bare, the WHERE casts.
+        e.stage_cell(vec![json!(1.1), json!(1.1)], 0, txt("1.1"), txt("2.2"), json!(2.2));
+        e.stage_cell(vec![json!(1.1), json!(1.1)], 2, txt("0.1"), txt("0.2"), json!(0.2));
+        e.stage_delete(vec![json!(0.1), json!(0.1)]);
+        e.stage_duplicate(vec![json!(0.5), json!(0.5)], vec![(3, txt("a"), Bind::Source)]);
+        let stmts = e.statements();
+        let key = "WHERE \"k\" = ?::FLOAT AND \"d\" = ?";
+        assert_eq!(
+            stmts[0].sql,
+            format!("INSERT INTO \"main\".\"t\" (\"name\") SELECT \"name\" FROM \"main\".\"t\" {key} RETURNING *")
+        );
+        assert_eq!(stmts[0].params, vec![json!(0.5), json!(0.5)]);
+        assert_eq!(stmts[1].sql, format!("UPDATE \"main\".\"t\" SET \"k\" = ?, \"f\" = ? {key}"));
+        assert_eq!(stmts[1].params, vec![json!(2.2), json!(0.2), json!(1.1), json!(1.1)]);
+        assert_eq!(stmts[2].sql, format!("DELETE FROM \"main\".\"t\" {key}"));
+
+        for ty in ["FLOAT", "float", "REAL", "FLOAT4"] {
+            assert_eq!(key_placeholder_for(ty), "?::FLOAT", "{ty}");
+        }
+        // Only a FLOAT's own name: a DOUBLE round-trips the wire exactly, and
+        // a container of FLOATs is no FLOAT.
+        for ty in ["DOUBLE", "FLOAT[]", "STRUCT(f FLOAT)", "INTEGER", "VARCHAR", ""] {
+            assert_eq!(key_placeholder_for(ty), "?", "{ty}");
+        }
+        assert_eq!(key_placeholder_for("BLOB"), "from_base64(?::VARCHAR)");
     }
 
     #[test]

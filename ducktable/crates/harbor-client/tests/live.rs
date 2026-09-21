@@ -490,3 +490,82 @@ fn wide_integers_and_non_finite_doubles_bind_as_text() {
     }
     run("DROP TABLE _dt_number_probe", None);
 }
+
+/// A FLOAT key in the WHERE (ducktable's `edits.rs`, `key_placeholder_for`).
+/// The wire carries a FLOAT as the shortest decimal that names it, and a JSON
+/// number binds as a DOUBLE: compared bare, the key is widened and 1.1 the
+/// FLOAT is not 1.1 the DOUBLE, so the statement names no row. Cast to FLOAT,
+/// the param is the key. The UPDATE, the DELETE and the duplicate's INSERT
+/// each name exactly one row, in the session transaction a commit runs in.
+#[test]
+#[ignore]
+fn a_float_key_names_its_row_through_a_cast() {
+    use serde_json::json;
+    let Some(row) = connectable() else {
+        println!("no berth to test against; skipping");
+        return;
+    };
+    let conn = connect(&row.name).expect("connect");
+    let sid = harbor_client::session_new(&conn).expect("session");
+    let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
+        harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
+    };
+    run("DROP TABLE IF EXISTS _dt_floatkey_probe", None);
+    run("CREATE TEMP TABLE _dt_floatkey_probe(k FLOAT PRIMARY KEY, name VARCHAR, f FLOAT)", None);
+    run("INSERT INTO _dt_floatkey_probe VALUES (0.1, 'a', 0.1), (1.1, 'b', 1.1), (0.5, 'c', 0.5)", None);
+
+    // The keys as the grid fetches them: the identity a statement binds.
+    let fetched = run("SELECT k FROM _dt_floatkey_probe ORDER BY name", None);
+    println!(
+        "column type {:?}, keys on the wire {:?}",
+        fetched.columns[0].duckdb_type, fetched.rows
+    );
+    assert_eq!(fetched.columns[0].duckdb_type, "FLOAT");
+    assert_eq!(fetched.rows, vec![vec![json!(0.1)], vec![json!(1.1)], vec![json!(0.5)]]);
+
+    run("BEGIN", None);
+    for key in fetched.rows.iter().map(|r| r[0].clone()) {
+        let bare = run(
+            "SELECT count(*) FROM _dt_floatkey_probe WHERE \"k\" = ?",
+            Some(vec![key.clone()]),
+        );
+        let hit = run(
+            "UPDATE _dt_floatkey_probe SET \"name\" = ?, \"f\" = ? WHERE \"k\" = ?::FLOAT",
+            Some(vec![json!("hit"), json!(2.2), key.clone()]),
+        );
+        let copied = run(
+            "INSERT INTO _dt_floatkey_probe (\"k\", \"name\", \"f\") SELECT ?, \"name\", \"f\" \
+             FROM _dt_floatkey_probe WHERE \"k\" = ?::FLOAT RETURNING k, f",
+            Some(vec![json!(key.as_f64().unwrap() + 10.0), key.clone()]),
+        );
+        println!(
+            "key {key}: bare `?` matches {}, `?::FLOAT` updates {}, the duplicate returns {:?}",
+            bare.rows[0][0], hit.rows[0][0], copied.rows
+        );
+        // 0.5 is the same number in both widths; 0.1 and 1.1 are not.
+        let exact = key == json!(0.5);
+        assert_eq!(bare.rows[0][0].as_u64(), Some(exact as u64), "{key} compared as a DOUBLE");
+        assert_eq!(hit.rows[0][0].as_u64(), Some(1), "{key}: one row, exactly");
+        assert_eq!(copied.rows.len(), 1, "{key}: the duplicate finds its source");
+        let gone = run(
+            "DELETE FROM _dt_floatkey_probe WHERE \"k\" = ?::FLOAT",
+            Some(vec![key.clone()]),
+        );
+        assert_eq!(gone.rows[0][0].as_u64(), Some(1), "{key}: one row deleted");
+    }
+    run("COMMIT", None);
+
+    // A FLOAT value needs no cast in the SET or VALUES list: assignment
+    // rounds the DOUBLE to the FLOAT the cast would have made.
+    let stored = run("SELECT k, f, f = 2.2::FLOAT FROM _dt_floatkey_probe ORDER BY k", None);
+    println!("the copies, keyed and set through a bare `?`: {:?}", stored.rows);
+    assert_eq!(
+        stored.rows,
+        vec![
+            vec![json!(10.1), json!(2.2), json!(true)],
+            vec![json!(10.5), json!(2.2), json!(true)],
+            vec![json!(11.1), json!(2.2), json!(true)],
+        ]
+    );
+    run("DROP TABLE _dt_floatkey_probe", None);
+}
