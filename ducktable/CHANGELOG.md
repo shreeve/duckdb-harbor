@@ -3,6 +3,50 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by release
 date, newest first.
 
+## 0.22.4 — 2026-09-21
+
+- **A table keyed by a FLOAT can be edited.** Harbor sends a FLOAT as the
+  shortest decimal that names it, and a JSON number binds as a DOUBLE. In
+  `WHERE "k" = ?` the column was widened to meet it, and 1.1 the FLOAT is not
+  1.1 the DOUBLE: the UPDATE and the DELETE matched no row and the commit
+  rolled back, and ⌘D reported its source row gone. Only a key both widths
+  hold exactly, such as 0.5, worked. A FLOAT key binds through `?::FLOAT`.
+- **An empty editor over NULL leaves NULL.** A text cell staged to NULL with
+  ⌃⇧N and then confirmed — Enter, Enter, or a Tab run passing through — was
+  staged as `''`. NULL and `''` both open an empty editor, so confirming one
+  over a cell that holds NULL changes nothing. On a duplicate the same confirm
+  rebound a copied NULL by value and pushed an undo step nobody could see, so
+  one ⌘Z did not remove the row; a duplicate is one undo step again.
+- **A copied cell typed back is the copy again.** A duplicate's cell that was
+  typed over and then typed back to the text it showed was bound by value, so
+  a DATE or a HUGEINT inside a `VARIANT` became a string or a DOUBLE under
+  identical text. The cell remembers what it copied, and holding that text
+  again it is read from the source row, unvalidated, like a cell never
+  touched.
+- **Document cells take strict JSON, 100 levels deep.** `NaN` and `Infinity`
+  were let through because the engine reads them; but Harbor then sends
+  `{"x":NaN}`, which is not JSON, and a client reads the whole document back
+  as a string. They are refused. A cell that already holds one can still be
+  opened and left. A document nests at most 100 levels, as in every
+  first-party client, and one that is deeper is told so; it was told "is not
+  JSON — text needs quotes".
+- **A container of documents or blobs refuses typed text.** A typed edit of a
+  `BLOB[]`, `BLOB[2]`, `VARIANT[]`, `JSON[]`, `STRUCT(v VARIANT, …)` or
+  `MAP(VARCHAR, BLOB)` cell bound the displayed text bare, and the commit
+  succeeded with the inner value corrupted: base64 characters stored as the
+  bytes, documents stored as strings. The editor refuses the text and names
+  the Query tab. Opening and leaving such a cell, clearing it to NULL, and ⌘D
+  work as before.
+- **A duplicate whose source row is gone says to discard it.** The message
+  said "refresh and retry", and no refresh helps: the draft keeps naming the
+  row it copies. It says to discard that duplicate, with ⌘Z or from the
+  review popover.
+- EDITING.md says what a `JSON` column keeps (the text, character for
+  character) apart from what a `VARIANT` keeps (the values, compact); that a
+  typed edit of a `VARIANT` retypes SQL-written values through JSON; that a
+  duplicate carries its source row's identity; and that a failed commit
+  reports in the status line only, marking no row.
+
 ## 0.22.3 — 2026-09-20
 
 - **Duplicate Row is an exact copy.** ⌘D rebound the source row's wire values,
@@ -52,7 +96,8 @@ date, newest first.
   the cell still looked like JSON, and every path into it read NULL, with no
   error. A typed edit, a new row and ⌘D all did it. `VARIANT` and `JSON`
   cells now bind through `?::JSON`, the same way Harbor sends them out and
-  the way Rip writes them, and text that is not JSON is refused in the editor
+  the way Rip writes a `VARIANT` (Rip binds a `JSON` column through a bare
+  `?`), and text that is not JSON is refused in the editor
   — a string wants its quotes, `"Morel"`, as the cell shows it. A row already
   damaged is repaired by
   `UPDATE t SET doc = doc::VARCHAR::JSON::VARIANT WHERE variant_typeof(doc) = 'VARCHAR' AND json_valid(doc::VARCHAR) AND json_type(doc::VARCHAR) IN ('OBJECT', 'ARRAY')`.

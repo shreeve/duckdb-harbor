@@ -492,3 +492,225 @@ fn wide_integers_and_non_finite_doubles_bind_as_text() {
     }
     run("DROP TABLE _dt_number_probe", None);
 }
+
+/// A FLOAT key in the WHERE (ducktable's `edits.rs`, `key_placeholder_for`).
+/// The wire carries a FLOAT as the shortest decimal that names it, and a JSON
+/// number binds as a DOUBLE: compared bare, the key is widened and 1.1 the
+/// FLOAT is not 1.1 the DOUBLE, so the statement names no row. Cast to FLOAT,
+/// the param is the key. The UPDATE, the DELETE and the duplicate's INSERT
+/// each name exactly one row, in the session transaction a commit runs in.
+#[test]
+#[ignore]
+fn a_float_key_names_its_row_through_a_cast() {
+    use serde_json::json;
+    let Some(row) = connectable() else {
+        println!("no berth to test against; skipping");
+        return;
+    };
+    let conn = connect(&row.name).expect("connect");
+    let sid = harbor_client::session_new(&conn).expect("session");
+    let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
+        harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
+    };
+    run("DROP TABLE IF EXISTS _dt_floatkey_probe", None);
+    run("CREATE TEMP TABLE _dt_floatkey_probe(k FLOAT PRIMARY KEY, name VARCHAR, f FLOAT)", None);
+    run("INSERT INTO _dt_floatkey_probe VALUES (0.1, 'a', 0.1), (1.1, 'b', 1.1), (0.5, 'c', 0.5)", None);
+
+    // The keys as the grid fetches them: the identity a statement binds.
+    let fetched = run("SELECT k FROM _dt_floatkey_probe ORDER BY name", None);
+    println!(
+        "column type {:?}, keys on the wire {:?}",
+        fetched.columns[0].duckdb_type, fetched.rows
+    );
+    assert_eq!(fetched.columns[0].duckdb_type, "FLOAT");
+    assert_eq!(fetched.rows, vec![vec![json!(0.1)], vec![json!(1.1)], vec![json!(0.5)]]);
+
+    run("BEGIN", None);
+    for key in fetched.rows.iter().map(|r| r[0].clone()) {
+        let bare = run(
+            "SELECT count(*) FROM _dt_floatkey_probe WHERE \"k\" = ?",
+            Some(vec![key.clone()]),
+        );
+        let hit = run(
+            "UPDATE _dt_floatkey_probe SET \"name\" = ?, \"f\" = ? WHERE \"k\" = ?::FLOAT",
+            Some(vec![json!("hit"), json!(2.2), key.clone()]),
+        );
+        let copied = run(
+            "INSERT INTO _dt_floatkey_probe (\"k\", \"name\", \"f\") SELECT ?, \"name\", \"f\" \
+             FROM _dt_floatkey_probe WHERE \"k\" = ?::FLOAT RETURNING k, f",
+            Some(vec![json!(key.as_f64().unwrap() + 10.0), key.clone()]),
+        );
+        println!(
+            "key {key}: bare `?` matches {}, `?::FLOAT` updates {}, the duplicate returns {:?}",
+            bare.rows[0][0], hit.rows[0][0], copied.rows
+        );
+        // 0.5 is the same number in both widths; 0.1 and 1.1 are not.
+        let exact = key == json!(0.5);
+        assert_eq!(bare.rows[0][0].as_u64(), Some(exact as u64), "{key} compared as a DOUBLE");
+        assert_eq!(hit.rows[0][0].as_u64(), Some(1), "{key}: one row, exactly");
+        assert_eq!(copied.rows.len(), 1, "{key}: the duplicate finds its source");
+        let gone = run(
+            "DELETE FROM _dt_floatkey_probe WHERE \"k\" = ?::FLOAT",
+            Some(vec![key.clone()]),
+        );
+        assert_eq!(gone.rows[0][0].as_u64(), Some(1), "{key}: one row deleted");
+    }
+    run("COMMIT", None);
+
+    // A FLOAT value needs no cast in the SET or VALUES list: assignment
+    // rounds the DOUBLE to the FLOAT the cast would have made.
+    let stored = run("SELECT k, f, f = 2.2::FLOAT FROM _dt_floatkey_probe ORDER BY k", None);
+    println!("the copies, keyed and set through a bare `?`: {:?}", stored.rows);
+    assert_eq!(
+        stored.rows,
+        vec![
+            vec![json!(10.1), json!(2.2), json!(true)],
+            vec![json!(10.5), json!(2.2), json!(true)],
+            vec![json!(11.1), json!(2.2), json!(true)],
+        ]
+    );
+    run("DROP TABLE _dt_floatkey_probe", None);
+}
+
+/// Why DuckTable's `parse_value` refuses typed text for a container that
+/// holds a VARIANT, a JSON or a BLOB. Such a cell is bound as the container's
+/// displayed text through a bare `?`, and the engine's cast of that text
+/// never reaches the inner value: the statement succeeds, and what is stored
+/// is not what was shown.
+#[test]
+#[ignore]
+fn a_container_of_documents_or_blobs_is_corrupted_by_its_own_text() {
+    use serde_json::json;
+    let Some(row) = connectable() else {
+        println!("no berth to test against; skipping");
+        return;
+    };
+    let conn = connect(&row.name).expect("connect");
+    let sid = harbor_client::session_new(&conn).expect("session");
+    let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
+        harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
+    };
+    run("DROP TABLE IF EXISTS _dt_container_probe", None);
+    run(
+        "CREATE TEMP TABLE _dt_container_probe(id INTEGER PRIMARY KEY, bl BLOB[], fixed BLOB[2], \
+         docs VARIANT[], js JSON[], s STRUCT(v VARIANT, n INTEGER), m MAP(VARCHAR, BLOB))",
+        None,
+    );
+    run(
+        "INSERT INTO _dt_container_probe VALUES (1, ['hi'::BLOB], ['hi'::BLOB, '\\xFF'::BLOB], \
+         [{'a': 1}::VARIANT], ['{\"a\":1}'::JSON], {'v': {'a': 1}::VARIANT, 'n': 1}, MAP {'k': 'hi'::BLOB})",
+        None,
+    );
+    let shown = run("SELECT bl, fixed, docs, js, s, m FROM _dt_container_probe", None);
+    let columns: Vec<&str> = shown.columns.iter().map(|c| c.duckdb_type.as_str()).collect();
+    println!("types: {columns:?}");
+    assert_eq!(
+        columns,
+        ["BLOB[]", "BLOB[2]", "VARIANT[]", "JSON[]", "STRUCT(v VARIANT, n INTEGER)", "MAP(VARCHAR, BLOB)"]
+    );
+
+    // The text the grid shows for each cell, bound back the way a typed edit
+    // of a nested type is: bare, for the engine to cast. Each column is
+    // probed in its own transaction and rolled back.
+    let text = |v: &serde_json::Value| match v {
+        serde_json::Value::String(s) => json!(s),
+        other => json!(other.to_string()),
+    };
+    // A MAP's pairs are not text the engine casts to a MAP, so its cell is
+    // retyped the way the engine writes one, with the same base64.
+    for (ix, (col, inner, typed)) in [
+        ("bl", "bl[1]::VARCHAR", None),
+        ("fixed", "fixed[1]::VARCHAR", None),
+        ("docs", "variant_typeof(docs[1])", None),
+        ("js", "json_type(js[1])", None),
+        ("s", "variant_typeof(s.v)", None),
+        ("m", "m['k']::VARCHAR", Some("{k=aGk=}")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let read = format!("SELECT {inner} FROM _dt_container_probe");
+        let before = run(&read, None).rows.remove(0).remove(0);
+        let bound = typed.map(|t| json!(t)).unwrap_or_else(|| text(&shown.rows[0][ix]));
+        run("BEGIN", None);
+        let sql = format!("UPDATE _dt_container_probe SET \"{col}\" = ? WHERE \"id\" = ?");
+        let hit = harbor_client::exec(&conn, &sql, Some(vec![bound.clone(), json!(1)]), Some(&sid));
+        let hit = hit.unwrap_or_else(|e| panic!("{col} = {bound}: {e}"));
+        assert_eq!(hit.rows[0][0].as_u64(), Some(1), "{col}: the statement succeeds");
+        let after = run(&read, None).rows.remove(0).remove(0);
+        println!("{col} = {bound}: {inner} was {before}, is {after}");
+        assert_ne!(before, after, "{col}: the same text is not the same value");
+        run("ROLLBACK", None);
+    }
+    run("DROP TABLE _dt_container_probe", None);
+}
+
+/// The JSON a document cell takes (ducktable's `check_json`): strict, and at
+/// most 100 levels deep. A 100-level document binds through `?::JSON` into a
+/// VARIANT and a JSON column and reads back whole. The engine's JSON also
+/// reads NaN, which JSON does not have; the cell that comes back is then not
+/// JSON, which is why the editor refuses it.
+#[test]
+#[ignore]
+fn a_document_cell_takes_strict_json_a_hundred_levels_deep() {
+    use serde_json::json;
+    let Some(row) = connectable() else {
+        println!("no berth to test against; skipping");
+        return;
+    };
+    let conn = connect(&row.name).expect("connect");
+    let sid = harbor_client::session_new(&conn).expect("session");
+    let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
+        harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
+    };
+    run("DROP TABLE IF EXISTS _dt_depth_probe", None);
+    run("CREATE TEMP TABLE _dt_depth_probe(id INTEGER PRIMARY KEY, doc VARIANT, j JSON)", None);
+    let deep = format!("{}1{}", "[{\"a\":".repeat(50), "}]".repeat(50));
+    run("BEGIN", None);
+    let made = run(
+        "INSERT INTO _dt_depth_probe (\"id\", \"doc\", \"j\") VALUES (?, ?::JSON, ?::JSON) RETURNING id",
+        Some(vec![json!(1), json!(deep), json!(deep)]),
+    );
+    assert_eq!(made.rows.len(), 1);
+    let hit = run(
+        "UPDATE _dt_depth_probe SET \"doc\" = ?::JSON, \"j\" = ?::JSON WHERE \"id\" = ?",
+        Some(vec![json!(deep), json!(deep), json!(1)]),
+    );
+    assert_eq!(hit.rows[0][0].as_u64(), Some(1));
+    run("COMMIT", None);
+    let back = run("SELECT doc, j, variant_typeof(doc) FROM _dt_depth_probe", None);
+    // A document cell reaches this client as its JSON text.
+    let document = |cell: &serde_json::Value| -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::from_str(cell.as_str().expect("JSON text"))
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&deep).unwrap();
+    println!("100 levels: variant_typeof {}, {} bytes back", back.rows[0][2], back.rows[0][0].as_str().unwrap().len());
+    assert_eq!(back.rows[0][2], json!("ARRAY(1)"));
+    assert_eq!(document(&back.rows[0][0]).unwrap(), parsed, "the VARIANT reads back whole");
+    assert_eq!(document(&back.rows[0][1]).unwrap(), parsed, "and so does the JSON column");
+
+    // The same text into both: a JSON column keeps it, character for
+    // character; a VARIANT keeps its values.
+    let typed = "{ \"p\": 100.00,  \"a\": 1, \"a\": 2 }";
+    let kept = run(
+        "INSERT INTO _dt_depth_probe (\"id\", \"doc\", \"j\") VALUES (?, ?::JSON, ?::JSON) \
+         RETURNING doc, j, variant_typeof(doc.p)",
+        Some(vec![json!(3), json!(typed), json!(typed)]),
+    );
+    println!(
+        "typed {typed:?}: the VARIANT reads back {} with p a {}, the JSON column {}",
+        kept.rows[0][0], kept.rows[0][2], kept.rows[0][1]
+    );
+    assert_eq!(kept.rows[0][1], json!(typed), "a JSON column stores the text as typed");
+    assert_eq!(kept.rows[0][2], json!("DOUBLE"), "and a JSON decimal is a DOUBLE in a VARIANT");
+    assert_eq!(kept.rows[0][0], json!("{\"p\":100.0,\"a\":2}"), "a VARIANT reads back compact");
+
+    let nan = run(
+        "INSERT INTO _dt_depth_probe (\"id\", \"doc\") VALUES (?, ?::JSON) RETURNING doc, variant_typeof(doc.x)",
+        Some(vec![json!(2), json!("{\"x\": NaN}")]),
+    );
+    println!("NaN through ?::JSON: {:?}", nan.rows[0]);
+    assert_eq!(nan.rows[0][1], json!("DOUBLE"), "the engine takes NaN in a document");
+    assert!(document(&nan.rows[0][0]).is_err(), "and what comes back is not JSON");
+    run("DROP TABLE _dt_depth_probe", None);
+}

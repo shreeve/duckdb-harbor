@@ -185,9 +185,6 @@ struct CellEditor {
     /// Present for a synthetic INSERT row; existing rows resolve through
     /// their fetched identity instead.
     draft_key: Option<String>,
-    /// Distinguishes an untouched DEFAULT cell from explicit NULL; both
-    /// render without ordinary text.
-    draft_explicit: bool,
     input: Entity<gpui_component::input::InputState>,
     replace: bool,
 }
@@ -1694,7 +1691,7 @@ impl Grid {
             cx.notify();
             return;
         }
-        let (original, deleted, draft_key, draft_explicit) = {
+        let (original, deleted, draft_key) = {
             let d = self.table.read(cx).delegate();
             if row >= d.rows.len() {
                 return;
@@ -1710,7 +1707,6 @@ impl Grid {
                 staged.unwrap_or(base),
                 d.deleted.contains(&row),
                 draft_key,
-                d.draft_cells.contains_key(&(row, col)),
             )
         };
         if deleted {
@@ -1757,7 +1753,6 @@ impl Grid {
             row,
             col,
             draft_key,
-            draft_explicit,
             input: input.clone(),
             replace,
         });
@@ -1829,8 +1824,8 @@ impl Grid {
         cx.notify();
     }
 
-    /// Confirm the open editor: validate, stage (auto-clean if equal to
-    /// the fetched original), close, move the ring. A vertical confirm
+    /// Confirm the open editor: decide what the text does to the cell
+    /// (`edits::confirm`), stage it, close, move the ring. A vertical confirm
     /// during a Tab run sweeps back to the anchor column (Sheets' carriage
     /// return). Returns false when validation refused — the editor stays
     /// open with the reason.
@@ -1842,92 +1837,70 @@ impl Grid {
     ) -> bool {
         let Some(ed) = self.editor.take() else { return true };
         let text = ed.input.read(cx).value().to_string();
-        let (ty, fetched, identity) = {
+        let (ty, fetched, staged, identity) = {
             let d = self.table.read(cx).delegate();
-            (
-                d.schema_cols.get(ed.col).map(|c| c.duckdb_type.clone()).unwrap_or_default(),
-                d.rows.get(ed.row).and_then(|r| r.get(ed.col)).cloned().flatten(),
-                d.identities.get(ed.row).cloned(),
-            )
-        };
-        // What the cell holds now: its staged or draft text, else what was
-        // fetched. Confirming that same text changes nothing, so it stages
-        // nothing and is never validated — a cell the engine accepted must
-        // not become a cell Enter cannot leave (a VARIANT holding a DATE, a
-        // DOUBLE that is NaN, an integer wider than i64).
-        let unchanged = {
-            let d = self.table.read(cx).delegate();
-            let held = if ed.draft_key.is_some() {
-                d.draft_cells.get(&(ed.row, ed.col)).cloned()
+            let at = (ed.row, ed.col);
+            let ty = d.schema_cols.get(ed.col).map(|c| c.duckdb_type.clone()).unwrap_or_default();
+            // A draft's row is its own cells: nothing in it was fetched.
+            if ed.draft_key.is_some() {
+                (ty, None, d.draft_cells.get(&at).cloned(), None)
             } else {
-                d.staged.get(&(ed.row, ed.col)).cloned()
-            };
-            held.unwrap_or_else(|| fetched.clone()).is_some_and(|h| h.as_ref() == text.as_str())
+                (
+                    ty,
+                    d.rows.get(ed.row).and_then(|r| r.get(ed.col)).cloned().flatten(),
+                    d.staged.get(&at).cloned(),
+                    d.identities.get(ed.row).cloned(),
+                )
+            }
         };
-        if unchanged {
-            self.error = None;
-        } else {
-            let leave_default = ed.draft_key.is_some() && !ed.draft_explicit && text.is_empty();
-            let staged = if leave_default {
-                None
-            } else if text.is_empty() {
-                if fetched.is_none() && ed.draft_key.is_none() {
-                    // NULL in, nothing typed, NULL out: confirming an empty
-                    // editor over NULL is a no-op (stage_cell auto-cleans),
-                    // not a NULL→'' edit.
-                    Some((None, Value::Null))
-                } else if fetched.is_none() {
-                    // Reconfirming an explicit NULL draft keeps it NULL.
-                    Some((None, Value::Null))
-                } else if edits::is_text_type(&ty) {
-                    // An emptied editor: '' for text (the one honest way to
-                    // enter it), NULL for everything else — docs/EDITING.md.
-                    Some((Some(SharedString::from("")), Value::String(String::new())))
-                } else {
-                    None // NULL path, checked below
-                }
-            } else if ed.draft_key.is_none() && fetched.as_ref().is_some_and(|f| f.as_ref() == text.as_str()) {
-                // Typed back to what was fetched: stage_cell sees no change and
-                // drops the staged edit, so this text needs no verdict.
-                Some((Some(SharedString::from(text.clone())), Value::String(text.clone())))
-            } else {
-                match edits::parse_value(&text, &ty) {
-                    Ok(Value::Null) => None,
-                    Ok(v) => Some((Some(SharedString::from(text.clone())), v)),
-                    Err(msg) => {
-                        // Validation informs, never imprisons: the editor
-                        // stays open with the reason; Esc still works.
-                        self.error = Some(msg);
-                        self.editor = Some(ed);
-                        cx.notify();
-                        return false;
-                    }
-                }
-            };
-            let staged_value = match staged {
-                Some(pair) => pair,
-                None => {
-                    if leave_default {
-                        (None, Value::Null)
-                    } else {
-                        if !self.stageable_null(ed.col, cx) {
-                            self.editor = Some(ed);
-                            return false;
+        let copied = match (&self.edits, &ed.draft_key) {
+            (Some(edits), Some(key)) => edits.copied_text(key, ed.col),
+            _ => None,
+        };
+        fn shown(text: &Option<SharedString>) -> Option<&str> {
+            text.as_ref().map(|t| t.as_ref())
+        }
+        let verdict = edits::confirm(
+            &text,
+            &edits::Held {
+                ty: &ty,
+                draft: ed.draft_key.is_some(),
+                fetched: shown(&fetched),
+                staged: staged.as_ref().map(shown),
+                copied: copied.as_ref().map(shown),
+            },
+        );
+        match verdict {
+            edits::Confirm::Keep => self.error = None,
+            edits::Confirm::Refuse(reason) => {
+                // Validation informs, never imprisons: the editor stays
+                // open with the reason; Esc still works.
+                self.error = Some(reason);
+                self.editor = Some(ed);
+                cx.notify();
+                return false;
+            }
+            edits::Confirm::Stage(None, _) if !self.stageable_null(ed.col, cx) => {
+                self.editor = Some(ed);
+                return false;
+            }
+            edits::Confirm::Revert | edits::Confirm::Stage(..) => {
+                if let Some(edits) = &mut self.edits {
+                    self.error = None;
+                    match (verdict, &ed.draft_key, identity) {
+                        (edits::Confirm::Stage(text, value), Some(key), _) => {
+                            edits.stage_insert_cell(key, ed.col, text, value)
                         }
-                        (None, Value::Null)
+                        (edits::Confirm::Stage(text, value), None, Some(identity)) => {
+                            edits.stage_cell(identity, ed.col, fetched, text, value)
+                        }
+                        (edits::Confirm::Revert, Some(key), _) => edits.stage_insert_copied(key, ed.col),
+                        // Staging what was fetched is what drops a staged edit.
+                        (edits::Confirm::Revert, None, Some(identity)) => {
+                            edits.stage_cell(identity, ed.col, fetched.clone(), fetched, Value::Null)
+                        }
+                        _ => {}
                     }
-                }
-            };
-            if let Some(edits) = &mut self.edits {
-                self.error = None;
-                if let Some(key) = &ed.draft_key {
-                    if leave_default {
-                        edits.stage_insert_default(key, ed.col);
-                    } else {
-                        edits.stage_insert_cell(key, ed.col, staged_value.0, staged_value.1);
-                    }
-                } else if let Some(identity) = identity {
-                    edits.stage_cell(identity, ed.col, fetched, staged_value.0, staged_value.1);
                 }
             }
         }
@@ -2455,10 +2428,14 @@ impl Grid {
                                 edits::StatementExpectation::ReturnedOne => {
                                     // Only a duplicate selects its row, from the
                                     // row it copies: none back means that row is
-                                    // gone. Nothing lands.
+                                    // gone. Nothing lands, and no refresh brings
+                                    // it back: the draft names that row until it
+                                    // is discarded.
                                     if r.rows.is_empty() {
                                         return Err(
-                                            "the duplicated row is gone — refresh and retry".to_string()
+                                            "a duplicated row's source is gone — discard \
+                                             that duplicate (⌘Z, or the review popover)"
+                                                .to_string()
                                         );
                                     }
                                     if r.rows.len() != 1 {
@@ -4148,8 +4125,8 @@ mod tests {
         // A staged update is not in the database yet: its cell is bound,
         // showing the staged text. A staged key cell is still omitted.
         let staged = BTreeMap::from([
-            (0, CellEdit { original: txt("99"), text: txt("100"), bind: Bind::Value(json!(100)) }),
-            (2, CellEdit { original: txt("00123"), text: None, bind: Bind::Value(json!(null)) }),
+            (0, CellEdit { original: txt("99"), text: txt("100"), bind: Bind::Value(json!(100)), copied: None }),
+            (2, CellEdit { original: txt("00123"), text: None, bind: Bind::Value(json!(null)), copied: None }),
         ]);
         let cells = duplicate_cells(
             vec![txt("99"), txt("7"), txt("00123")],

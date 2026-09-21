@@ -26,6 +26,10 @@ pub struct CellEdit {
     pub text: Option<SharedString>,
     /// What the statement puts in the column.
     pub bind: Bind,
+    /// The text a duplicate's cell was copied with (inner None = NULL), kept
+    /// while the cell is typed over: a cell that holds this text again is
+    /// read from the source row again. None on a cell that copies nothing.
+    pub copied: Option<Option<SharedString>>,
 }
 
 /// Where a staged cell's value comes from.
@@ -233,7 +237,8 @@ impl Edits {
         let cells = cells
             .into_iter()
             .map(|(col, text, bind)| {
-                (col, CellEdit { original: None, text, bind })
+                let copied = (bind == Bind::Source).then(|| text.clone());
+                (col, CellEdit { original: None, text, bind, copied })
             })
             .collect();
         self.apply(Op {
@@ -246,7 +251,10 @@ impl Edits {
     }
 
     /// Supply one draft cell. `text = None` is explicit SQL NULL; an
-    /// untouched/removed cell is DEFAULT and is absent from the map.
+    /// untouched cell is DEFAULT and is absent from the map. A duplicate's
+    /// cell given the text it was copied with is read from the source row,
+    /// not bound: the text is all the wire kept of a DATE inside a VARIANT
+    /// or an integer past 64 bits, and the source row still holds the value.
     pub fn stage_insert_cell(
         &mut self,
         key: &str,
@@ -257,7 +265,9 @@ impl Edits {
         let Some(entry) = self.changes.get(key) else { return };
         let RowChange::Insert(mut cells) = entry.change.clone() else { return };
         let prev = Some(entry.change.clone());
-        cells.insert(col, CellEdit { original: None, text, bind: Bind::Value(value) });
+        let copied = cells.get(&col).and_then(|c| c.copied.clone());
+        let bind = if copied.as_ref() == Some(&text) { Bind::Source } else { Bind::Value(value) };
+        cells.insert(col, CellEdit { original: None, text, bind, copied });
         let next = Some(RowChange::Insert(cells));
         if prev == next {
             return;
@@ -265,20 +275,21 @@ impl Edits {
         self.apply(Op { key: key.to_string(), identity: entry.identity.clone(), prev, next });
     }
 
-    /// Restore a draft cell to DEFAULT by omitting it from INSERT.
-    pub fn stage_insert_default(&mut self, key: &str, col: usize) {
-        let Some(entry) = self.changes.get(key) else { return };
-        let RowChange::Insert(mut cells) = entry.change.clone() else { return };
-        let prev = Some(entry.change.clone());
-        if cells.remove(&col).is_none() {
-            return;
+    /// The text a duplicate's cell was copied with, for a cell that was
+    /// (`Some(None)` = copied NULL).
+    pub fn copied_text(&self, key: &str, col: usize) -> Option<Option<SharedString>> {
+        match &self.changes.get(key)?.change {
+            RowChange::Insert(cells) => cells.get(&col)?.copied.clone(),
+            _ => None,
         }
-        self.apply(Op {
-            key: key.to_string(),
-            identity: entry.identity.clone(),
-            prev,
-            next: Some(RowChange::Insert(cells)),
-        });
+    }
+
+    /// Put a duplicate's cell back to the text it was copied with, read
+    /// from the source row.
+    pub fn stage_insert_copied(&mut self, key: &str, col: usize) {
+        if let Some(text) = self.copied_text(key, col) {
+            self.stage_insert_cell(key, col, text, Value::Null);
+        }
     }
 
     fn apply(&mut self, op: Op) {
@@ -331,7 +342,7 @@ impl Edits {
         if text == original {
             cells.remove(&col);
         } else {
-            cells.insert(col, CellEdit { original, text, bind: Bind::Value(value) });
+            cells.insert(col, CellEdit { original, text, bind: Bind::Value(value), copied: None });
         }
         let next = (!cells.is_empty()).then_some(RowChange::Update(cells));
         if prev == next {
@@ -421,7 +432,7 @@ impl Edits {
         let where_clause = self
             .pk_cols
             .iter()
-            .map(|c| format!("{} = {}", qident(c), self.placeholder_named(c)))
+            .map(|c| format!("{} = {}", qident(c), self.key_placeholder(c)))
             .collect::<Vec<_>>()
             .join(" AND ");
         for (_, identity, change) in self.entries() {
@@ -505,12 +516,10 @@ impl Edits {
         placeholder_for(self.types.get(ix).map(String::as_str).unwrap_or(""))
     }
 
-    /// The same for a column known by name — the key columns of a WHERE.
-    fn placeholder_named(&self, name: &str) -> &'static str {
-        match self.columns.iter().position(|c| c == name) {
-            Some(ix) => self.placeholder(ix),
-            None => "?",
-        }
+    /// How a key column, known by name, is bound in a WHERE.
+    fn key_placeholder(&self, name: &str) -> &'static str {
+        let ty = self.columns.iter().position(|c| c == name).and_then(|ix| self.types.get(ix));
+        key_placeholder_for(ty.map(String::as_str).unwrap_or(""))
     }
 }
 
@@ -527,6 +536,19 @@ fn placeholder_for(duck_type: &str) -> &'static str {
         "VARIANT" | "JSON" => "?::JSON",
         "BLOB" => "from_base64(?::VARCHAR)",
         _ => "?",
+    }
+}
+
+/// The placeholder that compares a key column with its fetched value. A
+/// FLOAT crosses the wire as the shortest decimal that names it, and a JSON
+/// number binds as a DOUBLE. Compared bare, the column is widened to meet
+/// it, and 1.1 the FLOAT is not 1.1 the DOUBLE: the WHERE names no row. Cast
+/// to FLOAT, the param rounds to the key it came from. A SET or VALUES list
+/// needs no such cast, because assignment does that rounding itself.
+fn key_placeholder_for(duck_type: &str) -> &'static str {
+    match type_head(&duck_type.to_uppercase()) {
+        "FLOAT" | "FLOAT4" | "REAL" => "?::FLOAT",
+        _ => placeholder_for(duck_type),
     }
 }
 
@@ -602,6 +624,69 @@ fn parse_integer(text: &str, duck_type: &str, (min, max): (i128, u128)) -> Resul
     })
 }
 
+/// A cell as the editor finds it when it confirms. `None` text is NULL.
+pub struct Held<'a> {
+    /// The column's DuckDB type.
+    pub ty: &'a str,
+    /// A draft row's cell, not a persisted row's.
+    pub draft: bool,
+    /// What the database holds. A draft has nothing fetched.
+    pub fetched: Option<&'a str>,
+    /// The staged cell, or the draft's cell, when there is one. A draft
+    /// without one is DEFAULT.
+    pub staged: Option<Option<&'a str>>,
+    /// The text a duplicate's cell was copied with (`CellEdit::copied`).
+    pub copied: Option<Option<&'a str>>,
+}
+
+/// What confirming an editor does to its cell.
+#[derive(Debug, PartialEq)]
+pub enum Confirm {
+    /// The cell already holds this text. Nothing is staged and nothing is
+    /// validated, so a value the engine accepted is never one the editor
+    /// refuses to leave.
+    Keep,
+    /// The text the cell had before anyone typed in it: what was fetched,
+    /// or what a duplicate copied. The staged edit is dropped, or the cell
+    /// is read from its source row again; neither needs a verdict.
+    Revert,
+    /// Stage this text and bind this value. `None` is NULL, which a NOT
+    /// NULL column refuses.
+    Stage(Option<SharedString>, Value),
+    /// The text is not a value of the column's type; the reason.
+    Refuse(String),
+}
+
+/// Decide what confirming `text` over `cell` does. An editor cannot tell
+/// NULL from the empty string — both open empty — so an empty editor over a
+/// cell that holds NULL, or over a draft's DEFAULT, is that cell unchanged:
+/// NULL in, nothing typed, NULL out. `''` is entered by emptying a text cell
+/// that held something, or with Delete.
+pub fn confirm(text: &str, cell: &Held) -> Confirm {
+    let same = |held: Option<&str>| held.unwrap_or("") == text;
+    if same(cell.staged.unwrap_or(cell.fetched)) {
+        return Confirm::Keep;
+    }
+    let before = if cell.draft { cell.copied } else { Some(cell.fetched) };
+    if before.is_some_and(same) {
+        return Confirm::Revert;
+    }
+    if text.is_empty() {
+        // An emptied editor: '' for text (the one honest way to enter it),
+        // NULL for everything else — docs/EDITING.md.
+        return if is_text_type(cell.ty) {
+            Confirm::Stage(Some(SharedString::from("")), Value::String(String::new()))
+        } else {
+            Confirm::Stage(None, Value::Null)
+        };
+    }
+    match parse_value(text, cell.ty) {
+        Ok(Value::Null) => Confirm::Stage(None, Value::Null),
+        Ok(value) => Confirm::Stage(Some(SharedString::from(text.to_string())), value),
+        Err(reason) => Confirm::Refuse(reason),
+    }
+}
+
 /// Stage-time validation: user text -> the value the statement binds.
 /// Cheap errors die closest to the fingers; CHECK/FK/UNIQUE stay the
 /// server's verdict at commit. `None` text means NULL.
@@ -627,6 +712,18 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
     if ty == "VARIANT" {
         check_json(text)?;
         return Ok(Value::String(text.to_string()));
+    }
+    // A container that holds a VARIANT, a JSON or a BLOB is bound as the
+    // container's text, and no cast of that text reaches the inner value: a
+    // `BLOB[]` stores the base64 characters as the bytes, and the elements of
+    // a `VARIANT[]` or a `JSON[]` become strings. Nothing is said, so the edit
+    // is refused here; `null` above, and NULL from an emptied cell, are safe.
+    if ty != "BLOB" {
+        if let Some(inner) = document_or_blob_within(&ty) {
+            return Err(format!(
+                "typed text cannot carry the {inner} inside {duck_type} \u{2014} edit this cell in the Query tab"
+            ));
+        }
     }
     // Every test below is on the scalar's own name, so a nested type —
     // `INTEGER[]`, `STRUCT(a INTEGER)`, `MAP(VARCHAR, INTEGER)` — and a
@@ -669,26 +766,31 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
     Ok(Value::String(text.to_string()))
 }
 
-/// Refuse text the engine's JSON cast would refuse, at the fingers. The
-/// engine reads NaN and Infinity as numbers and a VARIANT can hold them, so
-/// they pass here too; everything else is serde's verdict, including its
-/// nesting limit.
+/// The deepest a document nests, the limit every first-party client keeps.
+/// Harbor's request parser refuses an object param a little past it, and deep
+/// nesting is the one input that hurts the engine through a VARIANT.
+const JSON_DEPTH: usize = 100;
+
+/// A VARIANT or JSON cell takes strict JSON. The engine's own JSON also reads
+/// NaN and Infinity as numbers, and a VARIANT stores them; Harbor then sends
+/// `{"x":NaN}`, which no JSON reader accepts, and the whole document reaches
+/// a client as a string. So serde's verdict is the verdict. Depth is
+/// measured first, so that a document refused for its depth is told so.
 fn check_json(text: &str) -> Result<(), String> {
-    let strict = strict_json(text);
-    match serde_json::from_str::<Value>(&strict) {
+    if json_depth(text) > JSON_DEPTH {
+        return Err(format!("this JSON nests deeper than {JSON_DEPTH} levels"));
+    }
+    match serde_json::from_str::<Value>(text) {
         Ok(_) => Ok(()),
         Err(_) => Err(format!("{text:?} is not JSON \u{2014} text needs quotes, like \"Morel\"")),
     }
 }
 
-/// `text` with the bare tokens NaN and Infinity, outside any string, written
-/// as 0 — the one place the engine's JSON is wider than serde's.
-fn strict_json(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut rest = text;
-    while let Some(c) = rest.chars().next() {
+/// The most brackets open at once in `text`, outside any string.
+fn json_depth(text: &str) -> usize {
+    let (mut depth, mut deepest) = (0usize, 0usize);
+    let (mut in_string, mut escaped) = (false, false);
+    for c in text.chars() {
         if in_string {
             if escaped {
                 escaped = false;
@@ -697,17 +799,70 @@ fn strict_json(text: &str) -> String {
             } else if c == '"' {
                 in_string = false;
             }
-        } else if c == '"' {
-            in_string = true;
-        } else if let Some(token) = ["NaN", "Infinity"].iter().find(|t| rest.starts_with(**t)) {
-            out.push('0');
-            rest = &rest[token.len()..];
             continue;
         }
-        out.push(c);
-        rest = &rest[c.len_utf8()..];
+        match c {
+            '"' => in_string = true,
+            '[' | '{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
     }
-    out
+    deepest
+}
+
+/// The VARIANT, JSON or BLOB a container type holds — `BLOB[]`,
+/// `STRUCT(v VARIANT)`, `MAP(VARCHAR, JSON)` — if it holds one. A word of the
+/// type counts unless it is quoted (an ENUM's values, a quoted field name) or
+/// is the field name that opens a STRUCT or UNION member.
+fn document_or_blob_within(duck_type: &str) -> Option<&'static str> {
+    let ty = duck_type.to_uppercase();
+    // Per open parenthesis: whether its members are written `name TYPE`.
+    let mut named = Vec::new();
+    let mut expect_name = false;
+    let mut word = String::new();
+    let mut last_word = String::new();
+    let mut quote = None;
+    for c in ty.chars().chain(std::iter::once(' ')) {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        if c.is_alphanumeric() || c == '_' {
+            word.push(c);
+            continue;
+        }
+        if !word.is_empty() {
+            if expect_name {
+                expect_name = false;
+            } else if let Some(found) = ["VARIANT", "JSON", "BLOB"].into_iter().find(|t| *t == word) {
+                return Some(found);
+            }
+            last_word = std::mem::take(&mut word);
+        }
+        match c {
+            '"' | '\'' => {
+                quote = Some(c);
+                // A quoted run here is the member's name.
+                expect_name = false;
+            }
+            '(' => {
+                named.push(matches!(last_word.as_str(), "STRUCT" | "UNION"));
+                expect_name = named.last().copied().unwrap_or(false);
+            }
+            ')' => {
+                named.pop();
+            }
+            ',' => expect_name = named.last().copied().unwrap_or(false),
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -992,6 +1147,41 @@ mod tests {
     }
 
     #[test]
+    fn a_float_key_is_cast_in_the_where_and_bound_bare_as_a_value() {
+        let mut e = Edits::new(
+            "\"main\".\"t\"".into(),
+            vec!["k".into(), "d".into()],
+            vec!["k".into(), "d".into(), "f".into(), "name".into()],
+            vec!["FLOAT".into(), "DOUBLE".into(), "FLOAT".into(), "VARCHAR".into()],
+        );
+        // The key itself is edited: the SET binds bare, the WHERE casts.
+        e.stage_cell(vec![json!(1.1), json!(1.1)], 0, txt("1.1"), txt("2.2"), json!(2.2));
+        e.stage_cell(vec![json!(1.1), json!(1.1)], 2, txt("0.1"), txt("0.2"), json!(0.2));
+        e.stage_delete(vec![json!(0.1), json!(0.1)]);
+        e.stage_duplicate(vec![json!(0.5), json!(0.5)], vec![(3, txt("a"), Bind::Source)]);
+        let stmts = e.statements();
+        let key = "WHERE \"k\" = ?::FLOAT AND \"d\" = ?";
+        assert_eq!(
+            stmts[0].sql,
+            format!("INSERT INTO \"main\".\"t\" (\"name\") SELECT \"name\" FROM \"main\".\"t\" {key} RETURNING *")
+        );
+        assert_eq!(stmts[0].params, vec![json!(0.5), json!(0.5)]);
+        assert_eq!(stmts[1].sql, format!("UPDATE \"main\".\"t\" SET \"k\" = ?, \"f\" = ? {key}"));
+        assert_eq!(stmts[1].params, vec![json!(2.2), json!(0.2), json!(1.1), json!(1.1)]);
+        assert_eq!(stmts[2].sql, format!("DELETE FROM \"main\".\"t\" {key}"));
+
+        for ty in ["FLOAT", "float", "REAL", "FLOAT4"] {
+            assert_eq!(key_placeholder_for(ty), "?::FLOAT", "{ty}");
+        }
+        // Only a FLOAT's own name: a DOUBLE round-trips the wire exactly, and
+        // a container of FLOATs is no FLOAT.
+        for ty in ["DOUBLE", "FLOAT[]", "STRUCT(f FLOAT)", "INTEGER", "VARCHAR", ""] {
+            assert_eq!(key_placeholder_for(ty), "?", "{ty}");
+        }
+        assert_eq!(key_placeholder_for("BLOB"), "from_base64(?::VARCHAR)");
+    }
+
+    #[test]
     fn a_column_that_changed_type_is_a_different_shape() {
         let as_text = Edits::new(
             "\"main\".\"t\"".into(),
@@ -1009,18 +1199,38 @@ mod tests {
             for text in ["{\"a\": 1}", "[1, 2]", "\"Morel\"", "42", "12.340", "true", "18446744073709551616"] {
                 assert_eq!(parse_value(text, ty), Ok(json!(text)), "{ty} {text}");
             }
-            // What the engine's JSON reads and serde's does not.
-            for text in ["NaN", "{\"x\": NaN, \"y\": [Infinity, -Infinity]}"] {
-                assert_eq!(parse_value(text, ty), Ok(json!(text)), "{ty} {text}");
-            }
-            for text in ["Morel", "{oops", "[1, 2", "{'a': 1}", "\"NaN"] {
+            // The engine's JSON reads NaN and Infinity; JSON has neither, and
+            // a document holding one reaches a client as a string.
+            for text in [
+                "Morel", "{oops", "[1, 2", "{'a': 1}", "\"NaN",
+                "NaN", "-Infinity", "{\"x\": NaN, \"y\": [Infinity, -Infinity]}",
+            ] {
                 let err = parse_value(text, ty).unwrap_err();
                 assert!(err.contains("is not JSON"), "{ty} {text}: {err}");
             }
-            // A token inside a string is the string's own business.
+            // Inside a string they are the string's own business.
             assert_eq!(parse_value("\"NaN and Infinity\"", ty), Ok(json!("\"NaN and Infinity\"")));
-            // Deeper than serde reads is deeper than the engine survives.
-            assert!(parse_value(&"[".repeat(200), ty).is_err());
+
+            // A document nests 100 levels and no deeper, and says so.
+            let nested = |depth: usize, open: &str, close: &str| {
+                format!("{}1{}", open.repeat(depth), close.repeat(depth))
+            };
+            for (open, close, levels) in [("[", "]", 1), ("{\"a\":", "}", 1), ("[{\"a\":", "}]", 2)] {
+                let fits = nested(100 / levels, open, close);
+                assert_eq!(parse_value(&fits, ty), Ok(json!(fits)), "{ty} {open}");
+                let err = parse_value(&nested(100 / levels + 1, open, close), ty).unwrap_err();
+                assert!(err.contains("nests deeper than 100 levels"), "{ty} {open}: {err}");
+                assert!(!err.contains("is not JSON"), "{ty} {open}: {err}");
+            }
+            // Brackets inside a string open nothing, escaped quotes and all.
+            let brackets = format!("[\"{} \\\" {}\"]", "[{".repeat(150), "[".repeat(150));
+            assert_eq!(parse_value(&brackets, ty), Ok(json!(brackets)), "{ty}");
+            // Siblings are not depth.
+            let wide = format!("[{}]", vec!["[[1]]"; 200].join(","));
+            assert_eq!(parse_value(&wide, ty), Ok(json!(wide)), "{ty}");
+            // Unclosed text that deep is refused for its depth; shallower, as not JSON.
+            assert!(parse_value(&"[".repeat(200), ty).unwrap_err().contains("nests deeper"));
+            assert!(parse_value(&"[".repeat(50), ty).unwrap_err().contains("is not JSON"));
         }
         // `null` is SQL NULL in a VARIANT and a JSON value in a JSON column.
         assert_eq!(parse_value("null", "VARIANT"), Ok(Value::Null));
@@ -1107,22 +1317,83 @@ mod tests {
         assert!(e.redo());
         assert_eq!(e.statements(), typed_over);
 
-        // A cell restored to DEFAULT leaves the statement; the rest stay.
-        e.stage_insert_default(&key, 3);
-        assert_eq!(
-            e.statements()[0].sql,
-            "INSERT INTO \"main\".\"t\" (\"doc\", \"j\") \
-             SELECT \"doc\", ?::JSON FROM \"main\".\"t\" WHERE \"id\" = ? RETURNING *"
-        );
-        assert_eq!(e.statements()[0].params, vec![json!("[2]"), json!(5)]);
-
         // With every copied cell typed over, nothing is read from the source.
         e.stage_insert_cell(&key, 1, None, Value::Null);
         assert_eq!(
             e.statements()[0].sql,
-            "INSERT INTO \"main\".\"t\" (\"doc\", \"j\") VALUES (?::JSON, ?::JSON) RETURNING *"
+            "INSERT INTO \"main\".\"t\" (\"doc\", \"j\", \"b\") \
+             VALUES (?::JSON, ?::JSON, from_base64(?::VARCHAR)) RETURNING *"
         );
-        assert_eq!(e.statements()[0].params, vec![Value::Null, json!("[2]")]);
+        assert_eq!(e.statements()[0].params, vec![Value::Null, json!("[2]"), json!("qrs=")]);
+    }
+
+    #[test]
+    fn a_copied_cell_typed_back_to_its_source_text_is_read_from_the_source_again() {
+        let mut e = typed();
+        let key = e.stage_duplicate(
+            vec![json!(5)],
+            vec![
+                (1, txt("{\"when\":\"2024-02-29\"}"), Bind::Source),
+                (2, txt("[2]"), Bind::Value(json!("[2]"))),
+                (3, None, Bind::Source),
+            ],
+        );
+        let copied = e.statements();
+        assert_eq!(e.copied_text(&key, 1), Some(txt("{\"when\":\"2024-02-29\"}")));
+        assert_eq!(e.copied_text(&key, 3), Some(None), "a copied NULL is remembered as one");
+        assert_eq!(e.copied_text(&key, 2), None, "a bound cell copies nothing");
+        assert_eq!(e.copied_text(&key, 0), None);
+
+        // Typed over, the document is bound, and what it copied is kept.
+        e.stage_insert_cell(&key, 1, txt("{}"), json!("{}"));
+        assert_eq!(e.statements()[0].params, vec![json!("{}"), json!("[2]"), json!(5)]);
+        assert_eq!(e.copied_text(&key, 1), Some(txt("{\"when\":\"2024-02-29\"}")));
+        // Typed back, by value or by name, it is read from the source: the
+        // DATE in it stays a DATE.
+        e.stage_insert_cell(&key, 1, txt("{\"when\":\"2024-02-29\"}"), json!("{\"when\":\"2024-02-29\"}"));
+        assert_eq!(e.statements(), copied);
+        e.stage_insert_cell(&key, 1, txt("[]"), json!("[]"));
+        e.stage_insert_copied(&key, 1);
+        assert_eq!(e.statements(), copied);
+
+        // Each of those was a step: undo walks back through them, redo forward.
+        assert!(e.undo());
+        assert_eq!(e.statements()[0].params, vec![json!("[]"), json!("[2]"), json!(5)]);
+        assert!(e.undo());
+        assert_eq!(e.statements(), copied);
+        assert!(e.undo());
+        assert_eq!(e.statements()[0].params, vec![json!("{}"), json!("[2]"), json!(5)]);
+        assert!(e.undo());
+        assert_eq!(e.statements(), copied);
+        for _ in 0..4 {
+            assert!(e.redo());
+        }
+        assert_eq!(e.statements(), copied);
+        for _ in 0..4 {
+            assert!(e.undo());
+        }
+
+        // A cell that already reads from the source is not staged again: the
+        // whole duplicate is still one undo step.
+        e.stage_insert_cell(&key, 3, None, Value::Null);
+        e.stage_insert_copied(&key, 3);
+        e.stage_insert_copied(&key, 1);
+        e.stage_insert_copied(&key, 2);
+        assert_eq!(e.statements(), copied);
+        assert!(e.undo());
+        assert!(e.is_empty(), "one ⌘Z removes the duplicate");
+
+        // A cell bound from the start has no source text to return to, and
+        // a draft that copies nothing has none at all.
+        assert!(e.redo());
+        e.stage_insert_cell(&key, 2, txt("[3]"), json!("[3]"));
+        e.stage_insert_cell(&key, 2, txt("[2]"), json!("[2]"));
+        assert_eq!(e.statements(), copied, "bound again, as it was");
+        let fresh = e.stage_insert();
+        e.stage_insert_cell(&fresh, 1, txt("1"), json!("1"));
+        e.stage_insert_copied(&fresh, 1);
+        assert_eq!(e.copied_text(&fresh, 1), None);
+        assert_eq!(e.statements()[1].params, vec![json!("1")]);
     }
 
     #[test]
@@ -1213,16 +1484,143 @@ mod tests {
         assert_eq!(e.statements()[0].params, vec![json!("Ada"), json!(5)]);
     }
 
+    fn persisted<'a>(ty: &'a str, fetched: Option<&'a str>, staged: Option<Option<&'a str>>) -> Held<'a> {
+        Held { ty, draft: false, fetched, staged, copied: None }
+    }
+
+    fn draft<'a>(ty: &'a str, staged: Option<Option<&'a str>>, copied: Option<Option<&'a str>>) -> Held<'a> {
+        Held { ty, draft: true, fetched: None, staged, copied }
+    }
+
+    fn stage(text: &str, value: Value) -> Confirm {
+        Confirm::Stage(txt(text), value)
+    }
+
     #[test]
-    fn restoring_a_draft_cell_to_default_removes_it_from_insert() {
-        let mut e = edits();
-        let key = e.stage_insert();
-        e.stage_insert_cell(&key, 0, txt("7"), json!(7));
-        e.stage_insert_default(&key, 0);
-        assert_eq!(
-            e.statements()[0].sql,
-            "INSERT INTO \"main\".\"t\" DEFAULT VALUES RETURNING *"
-        );
+    fn confirming_a_persisted_cell_keeps_reverts_stages_or_refuses() {
+        // An empty editor over NULL is NULL still — fetched or staged (⌃⇧N,
+        // then Enter, Enter; or a Tab run through the cell), text or not.
+        for ty in ["VARCHAR", "INTEGER", "VARIANT"] {
+            assert_eq!(confirm("", &persisted(ty, None, None)), Confirm::Keep, "{ty}");
+            assert_eq!(confirm("", &persisted(ty, Some("abc"), Some(None))), Confirm::Keep, "{ty}");
+            assert_eq!(confirm("", &persisted(ty, Some(""), Some(None))), Confirm::Keep, "{ty}");
+        }
+        // And over '' it is '' still.
+        assert_eq!(confirm("", &persisted("VARCHAR", Some(""), None)), Confirm::Keep);
+        assert_eq!(confirm("", &persisted("VARCHAR", Some("abc"), Some(Some("")))), Confirm::Keep);
+        assert_eq!(confirm("", &persisted("VARCHAR", None, Some(Some("")))), Confirm::Keep);
+
+        // The text the cell holds, fetched or staged, is kept unjudged: none
+        // of these is a value `parse_value` takes.
+        for (ty, held) in [("VARIANT", "NaN"), ("INTEGER", "1e3"), ("VARIANT[]", "[1]"), ("DOUBLE", "x")] {
+            assert_eq!(confirm(held, &persisted(ty, Some(held), None)), Confirm::Keep, "{ty}");
+            assert_eq!(confirm(held, &persisted(ty, Some("0"), Some(Some(held)))), Confirm::Keep, "{ty}");
+            assert_eq!(confirm(held, &persisted(ty, None, Some(Some(held)))), Confirm::Keep, "{ty}");
+        }
+        // Type-to-edit whose keystroke spells the value is the same confirm.
+        assert_eq!(confirm("5", &persisted("INTEGER", Some("5"), None)), Confirm::Keep);
+
+        // Staged text typed back to what was fetched reaches stage_cell, which
+        // drops the edit; it is not judged either.
+        assert_eq!(confirm("NaN", &persisted("VARIANT", Some("NaN"), Some(Some("1")))), Confirm::Revert);
+        assert_eq!(confirm("NaN", &persisted("VARIANT", Some("NaN"), Some(None))), Confirm::Revert);
+        assert_eq!(confirm("", &persisted("VARCHAR", Some(""), Some(Some("x")))), Confirm::Revert);
+        // Emptied over a fetched NULL: NULL in, nothing typed, NULL out.
+        assert_eq!(confirm("", &persisted("VARCHAR", None, Some(Some("x")))), Confirm::Revert);
+        assert_eq!(confirm("", &persisted("INTEGER", None, Some(Some("7")))), Confirm::Revert);
+
+        // An emptied cell that held something: '' for text, NULL otherwise.
+        assert_eq!(confirm("", &persisted("VARCHAR", Some("abc"), None)), stage("", json!("")));
+        assert_eq!(confirm("", &persisted("VARCHAR", Some("abc"), Some(Some("x")))), stage("", json!("")));
+        assert_eq!(confirm("", &persisted("INTEGER", Some("7"), None)), Confirm::Stage(None, Value::Null));
+        assert_eq!(confirm("", &persisted("VARCHAR[]", Some("[a]"), None)), Confirm::Stage(None, Value::Null));
+
+        // Anything else is a typed value, judged by its type.
+        assert_eq!(confirm("8", &persisted("INTEGER", Some("7"), None)), stage("8", json!(8)));
+        assert_eq!(confirm("8", &persisted("INTEGER", None, None)), stage("8", json!(8)));
+        assert_eq!(confirm("x", &persisted("VARCHAR", None, Some(None))), stage("x", json!("x")));
+        assert_eq!(confirm("null", &persisted("INTEGER", Some("7"), None)), Confirm::Stage(None, Value::Null));
+        assert_eq!(confirm("null", &persisted("VARCHAR", Some("7"), None)), stage("null", json!("null")));
+        assert!(matches!(confirm("abc", &persisted("INTEGER", Some("7"), None)), Confirm::Refuse(_)));
+        assert!(matches!(confirm("NaN", &persisted("VARIANT", Some("1"), None)), Confirm::Refuse(_)));
+        assert!(matches!(confirm("NaN", &persisted("VARIANT", None, Some(Some("1")))), Confirm::Refuse(_)));
+    }
+
+    #[test]
+    fn confirming_a_draft_cell_keeps_default_null_and_what_was_copied() {
+        // Untouched, a draft cell stays DEFAULT: absent, not NULL, not ''.
+        for ty in ["VARCHAR", "INTEGER"] {
+            assert_eq!(confirm("", &draft(ty, None, None)), Confirm::Keep, "{ty}");
+            // An explicit NULL stays the NULL it is, typed or copied, so a
+            // Tab run through a duplicate adds no undo step.
+            assert_eq!(confirm("", &draft(ty, Some(None), None)), Confirm::Keep, "{ty}");
+            assert_eq!(confirm("", &draft(ty, Some(None), Some(None))), Confirm::Keep, "{ty}");
+        }
+        assert_eq!(confirm("", &draft("VARCHAR", Some(Some("")), None)), Confirm::Keep);
+        assert_eq!(confirm("x", &draft("VARCHAR", None, None)), stage("x", json!("x")));
+        assert!(matches!(confirm("x", &draft("INTEGER", None, None)), Confirm::Refuse(_)));
+        assert_eq!(confirm("", &draft("VARCHAR", Some(Some("x")), None)), stage("", json!("")));
+        assert_eq!(confirm("", &draft("INTEGER", Some(Some("7")), None)), Confirm::Stage(None, Value::Null));
+        assert_eq!(confirm("7", &draft("INTEGER", Some(Some("7")), None)), Confirm::Keep);
+
+        // A copied cell confirmed as it is: kept, unjudged. The digits are a
+        // HUGEINT inside a VARIANT, the container one `parse_value` refuses.
+        let big = "170141183460469231731687303715884105727";
+        assert_eq!(confirm(big, &draft("VARIANT", Some(Some(big)), Some(Some(big)))), Confirm::Keep);
+        assert_eq!(confirm("[1]", &draft("VARIANT[]", Some(Some("[1]")), Some(Some("[1]")))), Confirm::Keep);
+        // Typed over and typed back, it reads from its source row again,
+        // unjudged; so does a copied NULL emptied again, text column or not.
+        assert_eq!(confirm(big, &draft("VARIANT", Some(Some("1")), Some(Some(big)))), Confirm::Revert);
+        assert_eq!(confirm("NaN", &draft("VARIANT", Some(None), Some(Some("NaN")))), Confirm::Revert);
+        assert_eq!(confirm("[1]", &draft("VARIANT[]", Some(None), Some(Some("[1]")))), Confirm::Revert);
+        assert_eq!(confirm("", &draft("VARCHAR", Some(Some("x")), Some(None))), Confirm::Revert);
+        assert_eq!(confirm("", &draft("VARCHAR", Some(Some("x")), Some(Some("")))), Confirm::Revert);
+        // Typed to anything else, a copied cell is an ordinary typed cell.
+        assert_eq!(confirm("2", &draft("VARIANT", Some(Some(big)), Some(Some(big)))), stage("2", json!("2")));
+        assert!(matches!(confirm("[2]", &draft("VARIANT[]", Some(Some("[1]")), Some(Some("[1]")))), Confirm::Refuse(_)));
+        // What a bound cell showed when it was duplicated is not a source text.
+        assert!(matches!(confirm("NaN", &draft("VARIANT", Some(Some("1")), None)), Confirm::Refuse(_)));
+    }
+
+    #[test]
+    fn a_container_of_documents_or_blobs_refuses_typed_text() {
+        for (ty, inner) in [
+            ("BLOB[]", "BLOB"),
+            ("BLOB[2]", "BLOB"),
+            ("VARIANT[]", "VARIANT"),
+            ("JSON[]", "JSON"),
+            ("json[]", "JSON"),
+            ("STRUCT(v VARIANT, n INTEGER)", "VARIANT"),
+            ("STRUCT(n INTEGER, \"B\" BLOB)", "BLOB"),
+            ("STRUCT(json JSON)", "JSON"),
+            ("MAP(VARCHAR, BLOB)", "BLOB"),
+            ("MAP(BLOB, VARCHAR)", "BLOB"),
+            ("UNION(n INTEGER, doc VARIANT)", "VARIANT"),
+            ("STRUCT(a STRUCT(b DECIMAL(10,2), c JSON[])[])", "JSON"),
+        ] {
+            let err = parse_value("[]", ty).unwrap_err();
+            assert!(err.contains("Query tab") && err.contains(&format!("the {inner} inside {ty}")), "{ty}: {err}");
+            // NULL is a value of every one of them.
+            assert_eq!(parse_value("null", ty), Ok(Value::Null), "{ty}");
+            assert_eq!(confirm("", &persisted(ty, Some("[]"), None)), Confirm::Stage(None, Value::Null), "{ty}");
+        }
+        // A name is not a type: a field, an ENUM's value, a quoted identifier.
+        for ty in [
+            "STRUCT(json INTEGER, blob VARCHAR, variant DATE)",
+            "UNION(blob INTEGER, json VARCHAR)",
+            "STRUCT(\"JSON\" INTEGER, \"a \"\"BLOB\"\" b\" VARCHAR)",
+            "ENUM('BLOB', 'JSON', 'it''s a VARIANT')",
+            "STRUCT(a DECIMAL(10,2), json INTEGER)",
+            "INTEGER[]",
+            "MAP(VARCHAR, INTEGER)",
+        ] {
+            assert_eq!(document_or_blob_within(ty), None, "{ty}");
+            assert_eq!(parse_value("x", ty), Ok(json!("x")), "{ty}");
+        }
+        // The three themselves are not containers of themselves.
+        assert_eq!(parse_value("qrs=", "BLOB"), Ok(json!("qrs=")));
+        assert_eq!(parse_value("[]", "VARIANT"), Ok(json!("[]")));
+        assert_eq!(parse_value("[]", "JSON"), Ok(json!("[]")));
     }
 
     #[test]
