@@ -1,10 +1,9 @@
 # Editing
 
-The editing grammar, as settled by comparative research (Sheets, Excel,
-TablePlus, DataGrip, Postico, Sequel Ace, Airtable, Beekeeper, DBeaver)
-and a three-way adversarial design panel (Sheets purist, data guardian,
-ruthless minimalist). Where this document and older notes in UI.md
-disagree, this document wins.
+The editing grammar, drawn from the spreadsheets and database clients people
+already know (Sheets, Excel, TablePlus, DataGrip, Postico, Sequel Ace,
+Airtable, Beekeeper, DBeaver). On editing, this document is the authority over
+DESIGN.md.
 
 ## The five laws
 
@@ -98,7 +97,7 @@ One meaning per key. No contextual double-agents.
 | ⌘Z / ⌘⇧Z | un-stages / re-stages the most recent change | text undo / redo |
 | ⌘S | commits all staged changes — one transaction, all or nothing | confirms the cell, then commits (⌘Enter is its equal) |
 | ⌥Enter | — | newline (the Sheets-hand twin of ⇧Enter) |
-| ⌘Enter | commits all staged changes | confirms the cell, then commits — "send it," the AI-composer universal (Steve's ruling, 2026: the world's ⌘Enter now means send, and ⇧Enter means newline; the older Sheets ⌘Enter-newline reflex keeps ⌥Enter) |
+| ⌘Enter | commits all staged changes | confirms the cell, then commits: ⌘Enter means send, as it does in a chat composer, and ⇧Enter or ⌥Enter mean newline |
 
 The replace-vs-kept-value arrow split is Sheets' own physics, unnamed:
 the entry gesture *is* the state, your finger chose it a second ago. No
@@ -127,7 +126,7 @@ combination has a deliberate answer:
 | F2 | opens the kept-value editor (the third door, with Enter and double-click — and the one that works mid-Tab-run) |
 | PageUp / PageDown | one screenful up / down within the loaded page (Sheets' meaning), a row of overlap, clamped at the page edge |
 | ⌥↑ / ⌥↓ | previous / next DATABASE page (the pager) — the ring keeps its seat (same column, row clamped); when multiple grid tabs exist someday, these migrate to tab switching (Sheets' worksheet keys) |
-| ⌥← / ⌥→ | step the view switcher's segments left / right, rolling over at the ends (Data / Structure today; a carousel, ready for more segments) |
+| ⌥← / ⌥→ | step the view switcher's segments left / right, rolling over at the ends (Structure / Data / Query) |
 | ⌘⇧⌫ | discard all staged changes (TablePlus's chord; one undo step, so even this is reversible) |
 | ⇧ + arrows | deliberately inert — range selection's seat, reserved until ranges ship; a ring that moved when you expected a range to grow would lie |
 | ⌃ + arrows | never bound — macOS owns them (Mission Control, Spaces) |
@@ -226,19 +225,19 @@ affected-exactly-one check are the backstop there, as everywhere.
 
 - Editing binds a row identity in the WHERE clause: the **original
   fetched values** of the primary-key columns when the catalog has a
-  key — and DuckDB's implicit **rowid** when it doesn't. Every base
-  table has a rowid, so keyless tables edit like any other: pages fetch
-  `rowid, *`, the column stays hidden from every surface, and only the
-  WHERE clauses see it. This beats the all-columns-WHERE fallback other
-  tools use — duplicate rows each keep their own rowid (all-columns
-  matching refuses to edit either copy), and NULL comparison never
-  enters the picture. The physical-id caveat: a vacuum after heavy
-  deletes can renumber rows; the affected-exactly-one check at commit
-  is the backstop, and the fetch-to-⌘S window is seconds. (The original
-  panel ruling — keyless means read-only — predates noticing the engine
-  hands us an identity for free; Steve overruled it with rowid in
-  hand. A read-only fallback remains for anything without one, views
-  someday.)
+  key, and DuckDB's implicit **rowid** paired with a **hash of the whole
+  row** when it doesn't. Every base table has a rowid, so keyless tables edit
+  like any other: pages fetch the pair as one hidden column, and only the
+  WHERE clauses see it, as `rowid = ? AND hash(row) = ?`. A rowid alone
+  names a position, not a row: a checkpoint that compacts deleted rows
+  renumbers the rest, and a rowid then names another row that the
+  exactly-one check would pass. With the hash, a row that moved or changed
+  since the fetch matches nothing, and the commit refuses. This beats the
+  all-columns WHERE other tools use: duplicate rows each keep their own
+  rowid, where all-columns matching refuses to edit either copy, and NULL
+  comparison never enters the picture. Anything without an identity is
+  read-only: a view, and a keyless table with a column of its own called
+  `rowid`, which shadows DuckDB's in every query.
 - Primary-key cells are editable like any other — the WHERE holds the
   original, so `SET id = 7 WHERE id = 5` is just an update.
 - A draft insert has no identity of its own. Each carries a private local key
@@ -303,7 +302,10 @@ affected-exactly-one check are the backstop there, as everywhere.
 - The editor judges a scalar by its own type name. A nested type (`INTEGER[]`,
   `STRUCT(a INTEGER)`, a `MAP`), an `INTERVAL` and an `ENUM` are bound as their
   text for the engine to cast. They clear to NULL, as a `UUID` does: the engine
-  takes `''` for none of them.
+  takes `''` for none of them. An `INTERVAL` cell shows its months, days and
+  microseconds as JSON and a `MAP` its key/value pairs, and neither is text the
+  engine reads back, so type the value in DuckDB's own form instead:
+  `3 days`, `{a=1}`.
 - Confirming a cell with the text it already holds stages nothing and is never
   validated, so a value the engine accepted is never one the editor refuses to
   leave: a `VARIANT` holding NaN, a DOUBLE that is NaN, an integer wider
@@ -339,12 +341,21 @@ affected-exactly-one check are the backstop there, as everywhere.
 `BEGIN` → parameterized inserts, updates, and deletes, each verified to have
 affected or returned **exactly one row** → `COMMIT` → release. Before opening
 the session, DuckTable refuses a draft missing a `NOT NULL` column with no
-default. Any failure — SQL error,
-constraint, or a row that no longer matches its original values — rolls
-the whole transaction back: nothing landed, every staged change is kept
-and still visible, and the status line says why, ending with "edits kept."
-The status line is the whole report: no row or cell is marked as the one
-that failed.
+default. Any failure rolls the whole transaction back: an SQL error, a
+constraint, or a row its identity no longer names, because the row is gone,
+its key changed, or on a keyless table it moved or changed. Nothing lands,
+every staged change is kept and still visible, and the status line says why,
+ending with "edits kept." The status line is the whole report: no row or cell
+is marked as the one that failed.
+
+The WHERE compares the identity, not every value. On a keyed table, a cell
+another client changed since the fetch is overwritten by the staged value
+without a conflict; only a keyless row's hash notices other columns.
+
+While a commit is in flight, nothing stages, undoes or discards: its
+statements were built at ⌘S, and a change made now would be shown undone while
+the commit writes it anyway, or erased when the commit succeeds. A table
+switch waits for the commit to settle, then runs.
 
 After a successful commit the page refetches so the grid shows the
 database's truth, and Refresh Tables refetches `/catalog` so every sidebar
@@ -360,8 +371,8 @@ only at ⌘S. Reversibility replaces confirmation.
 
 ## Deferred, deliberately
 
-- **Live mode** (write-per-edit): designed in UI.md, deferred until it
-  re-clears an adversarial review. If it ships, type-to-edit turns off
+- **Live mode** (write-per-edit, DESIGN.md's Planned): deferred until it
+  clears an adversarial review. If it ships, type-to-edit turns off
   in it — the two are certified only as a pair with staging.
 - Value popout editor for long/nested values, range selection and
   TSV paste-spread, crash-recovery journal for staged edits.
