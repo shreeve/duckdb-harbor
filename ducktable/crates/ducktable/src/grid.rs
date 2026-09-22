@@ -88,7 +88,8 @@ pub(crate) struct Grid {
     /// becomes a staged change only on confirm.
     editor: Option<CellEditor>,
     /// The identity is DuckDB's implicit rowid (no catalog key): pages
-    /// fetch `rowid, *` and the delegate hides schema column 0.
+    /// fetch it paired with the row's hash, and the delegate hides schema
+    /// column 0.
     rowid: bool,
     /// Primary-key column names from the catalog — kept so an error-born
     /// grid can build its Edits when its first schema finally lands.
@@ -113,7 +114,9 @@ pub(crate) struct Grid {
     /// more is staged and nothing commits until the staged set is empty;
     /// the fetch that follows adopts the table as it is.
     reshaped: bool,
-    /// A commit is in flight; ⌘S is a no-op until it resolves.
+    /// A commit is in flight. Until it resolves, ⌘S is a no-op, nothing is
+    /// staged, undone or discarded (its statements were built at ⌘S), and a
+    /// table switch waits for it (`app::CommitSettled`).
     pub(crate) committing: bool,
     /// Focus should return to the table on the next frame — set by paths
     /// that lack a Window (subscriptions), consumed by render.
@@ -141,11 +144,11 @@ pub(crate) struct Grid {
     /// table's own schema in an embedded, read-only Grid — one grid,
     /// many sources, applied to the catalog itself.
     pub(crate) structure_grid: Option<Entity<Grid>>,
-    /// The Structure view's columns/DDL divider (UI.md: divider
+    /// The Structure view's columns/DDL divider (DESIGN.md: divider
     /// positions persist). None when there is no DDL below the columns
     /// — one pane needs no divider.
     pub(crate) structure_split: Option<Entity<ResizableState>>,
-    /// The table/inspector divider (UI.md: divider positions persist —
+    /// The table/inspector divider (DESIGN.md: divider positions persist —
     /// the width saves at the end of each drag).
     resize: Entity<ResizableState>,
     /// The Columns popover's search box — persistent so the query
@@ -173,6 +176,7 @@ pub(crate) struct Grid {
 }
 
 impl EventEmitter<crate::app::CatalogRefreshRequested> for Grid {}
+impl EventEmitter<crate::app::CommitSettled> for Grid {}
 
 /// Everything a fetch commits along with its rows. The delegate is not
 /// touched until the data arrives — the footer, funnel, and gutter always
@@ -401,13 +405,14 @@ impl Grid {
         // Editability follows capability (docs/EDITING.md): a primary key
         // from the catalog when there is one — and DuckDB's implicit
         // rowid when there isn't. Every base table has a rowid, so a
-        // keyless table edits like any other: pages fetch `rowid, *`,
-        // the column stays hidden, and only the WHERE clauses see it.
+        // keyless table edits like any other: pages fetch the rowid paired
+        // with the row's hash (`sql::page_sql`), the column stays hidden,
+        // and only the WHERE clauses see it.
         let pk_cols: Vec<String> = structure
             .as_ref()
             .map(|s| s.cols.iter().filter(|c| c.pk).map(|c| c.name.clone()).collect())
             .unwrap_or_default();
-        let rowid = structure.is_some() && pk_cols.is_empty();
+        let rowid = structure.as_ref().is_some_and(|s| s.keyed_by_rowid());
         let pk_cols = if rowid { vec!["rowid".to_string()] } else { pk_cols };
         let mut delegate = GridDelegate {
             cols: Vec::new(),
@@ -455,7 +460,8 @@ impl Grid {
                 delegate.names.iter().map(|n| n.to_string()).collect(),
                 delegate.schema_cols.iter().map(|c| c.duckdb_type.clone()).collect(),
             )
-        });
+        })
+        .map(|e| if rowid { e.keyed_by_rowid() } else { e });
         let (not_null, defaults, generated, hints) =
             insert_metadata(&delegate.names, structure.as_ref());
         delegate.draft_hints = hints;
@@ -884,12 +890,13 @@ impl Grid {
             )
         };
         self.edits = keyed.then(|| {
-            Edits::new(
+            let edits = Edits::new(
                 self.source.clone(),
                 self.pk_cols.clone(),
                 names.iter().map(|n| n.to_string()).collect(),
                 types,
-            )
+            );
+            if self.rowid { edits.keyed_by_rowid() } else { edits }
         });
         let (not_null, defaults, generated, hints) =
             insert_metadata(&names, self.structure.as_ref());
@@ -1500,6 +1507,9 @@ impl Grid {
         }
         if m.platform && ks.key == "z" {
             let did = match &mut self.edits {
+                // The statements were built at ⌘S; an undo now would show
+                // the edit gone while the commit writes it anyway.
+                _ if self.committing => false,
                 Some(e) if m.shift => e.redo(),
                 Some(e) => e.undo(),
                 None => false,
@@ -1916,6 +1926,11 @@ impl Grid {
         dc: i32,
         cx: &mut Context<Self>,
     ) -> bool {
+        // Staging now would land in a set the commit clears when it succeeds.
+        // The editor stays open, and Enter works once the commit settles.
+        if self.committing {
+            return false;
+        }
         let Some(ed) = self.editor.take() else { return true };
         let text = ed.input.read(cx).value().to_string();
         let (ty, fetched, staged, identity) = {
@@ -2014,7 +2029,7 @@ impl Grid {
     /// Delete on a cell: clear it, type-honestly — '' for text columns,
     /// NULL for everything else. Never touches the row.
     fn stage_clear(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
-        if self.edits.is_some() && self.refuse_reshaped(cx) {
+        if self.committing || self.edits.is_some() && self.refuse_reshaped(cx) {
             return;
         }
         if self.generated.get(col).copied().unwrap_or(false) {
@@ -2058,7 +2073,7 @@ impl Grid {
     /// ⌃⇧N: SQL NULL, deliberately, any column type.
     fn stage_null(&mut self, cx: &mut Context<Self>) {
         let Some((row, col)) = self.table.read(cx).delegate().active_cell else { return };
-        if self.edits.is_some() && self.refuse_reshaped(cx) {
+        if self.committing || self.edits.is_some() && self.refuse_reshaped(cx) {
             return;
         }
         if self.generated.get(col).copied().unwrap_or(false) {
@@ -2099,6 +2114,9 @@ impl Grid {
     /// confirmation model. Each row is its own staged change for the
     /// review popover; the gesture is one ⌘Z.
     fn stage_delete_row(&mut self, cx: &mut Context<Self>) {
+        if self.committing {
+            return;
+        }
         let targets: Vec<(Option<Vec<Value>>, Option<String>)> = {
             let d = self.table.read(cx).delegate();
             let rows: Vec<usize> = if d.selection.rows.is_empty() {
@@ -2452,6 +2470,9 @@ impl Grid {
     /// Discard one staged row change (the review popover's per-entry ✕).
     /// Itself undoable — nothing is more than one ⌘Z from recovery.
     pub(crate) fn discard_change(&mut self, key: &str, cx: &mut Context<Self>) {
+        if self.committing {
+            return;
+        }
         if let Some(e) = &mut self.edits {
             e.discard(key);
         }
@@ -2461,6 +2482,9 @@ impl Grid {
     /// Discard everything staged — one gesture, one undo step, so ⌘Z
     /// brings all of it back at once.
     pub(crate) fn discard_all(&mut self, cx: &mut Context<Self>) {
+        if self.committing {
+            return;
+        }
         if let Some(e) = &mut self.edits {
             let keys: Vec<String> =
                 e.entries().iter().map(|(k, _, _)| k.to_string()).collect();
@@ -2636,6 +2660,7 @@ impl Grid {
                         grid.error = Some(format!("{message} · edits kept"));
                     }
                 }
+                cx.emit(crate::app::CommitSettled);
                 cx.notify();
             })
             .ok();
@@ -3852,7 +3877,7 @@ impl Render for Grid {
                     )),
             )
             .when(view == ViewMode::Data, |d| {
-                // The raw-SQL filter strip (UI.md "filters", v1): one
+                // The raw-SQL filter strip (DESIGN.md "Bottom bar"): one
                 // WHERE input, applied on Enter through the same
                 // fetch-first swap as everything else.
                 d.when_some(self.filter_input.clone(), |d, input| {

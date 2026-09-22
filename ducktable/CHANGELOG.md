@@ -3,6 +3,28 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by release
 date, newest first.
 
+## 0.22.6 — 2026-09-22
+
+- **An edit to a keyless table cannot land on another row.** A table without a
+  primary key is edited by DuckDB's rowid, and a rowid names a position, not a
+  row: a checkpoint that compacts deleted rows renumbers the rest. Measured: the
+  row with id 212880 was fetched at rowid 212880; after another client deleted
+  a batch and checkpointed, rowid 212880 held the row with id 290000, so a
+  staged UPDATE or DELETE hit that row and still passed the exactly-one check.
+  A keyless page now fetches the rowid paired with a hash of the whole row,
+  and every statement's WHERE checks both. A row that moved or changed since
+  the fetch matches nothing, and the commit refuses with the edits kept.
+- **A table switch during a commit waits for it.** Switching tables while a
+  commit was in flight parked the staged set whose statements were already
+  running. The commit landed, but coming back to the table brought those edits
+  back as staged, and a second ⌘S inserted every new row twice. The switch now
+  runs once the commit settles.
+- **Nothing stages, undoes or discards during a commit.** ⌘Z right after ⌘S
+  showed the edit undone while the commit wrote it anyway, and anything staged
+  during the commit was erased when it succeeded. Undo and redo, delete, clear,
+  ⌃⇧N, the discards and the open editor's Enter all wait for the commit to
+  settle.
+
 ## 0.22.5 — 2026-09-21
 
 - **A FLOAT cell takes a number a FLOAT can hold.** The editor held integers

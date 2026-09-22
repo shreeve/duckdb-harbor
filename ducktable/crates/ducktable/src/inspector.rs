@@ -1,12 +1,11 @@
-//! The inspector: the grid's right panel (design/main-window.html, UI.md
+//! The inspector: the grid's right panel (design/main-window.html, DESIGN.md
 //! "Inspector"). It lives INSIDE the grid, below the header strip — the
 //! title/toggles row keeps the full width and nothing shifts when the
 //! panel opens. It shows ROW-LEVEL data only: the selected row's values,
 //! vertically. Berth facts (versions, size) live on the identity card and
 //! row counts in the grid's status line — different data urgency levels
-//! never share this pane. Read-only for now: the grid already edits through
-//! the staged/live pipeline (edits.rs), and this pane's row editor will join
-//! it — one editing session, one owner.
+//! never share this pane. Read-only: a row editor here is planned (DESIGN.md),
+//! and would share the grid's one editing session (edits.rs).
 
 use crate::grid::Grid;
 use crate::theme::{pal, value_font, Pal, CELL_TEXT, HEADER_TEXT};

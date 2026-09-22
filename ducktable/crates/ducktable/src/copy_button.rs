@@ -22,7 +22,7 @@ enum Phase {
 }
 
 // How long the green check DWELLS before reverting — a readability budget,
-// not a motion one (see docs/UI.md, Motion). You initiated the copy and are
+// not a motion one (see docs/DESIGN.md, Motion). You initiated the copy and are
 // looking right at it, so you register the check in <100ms; ~1.2s is
 // un-missable without overstaying (1.6s + the fade read as "stuck").
 const HOLD_MS: u64 = 1200;
