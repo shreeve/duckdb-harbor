@@ -62,28 +62,34 @@ buries the three patches in noise.
 Upstream status (`gh pr view <n> --repo nushell/reedline`):
 
 - **Patch A: merged** — https://github.com/nushell/reedline/pull/1175
-- **Patch B: open** — https://github.com/nushell/reedline/pull/1209, tracking
-  https://github.com/nushell/reedline/issues/1176. Upstream scopes the
-  boundary to the menu via `MenuBuilder::with_word_chars(Some("_."))`, which
-  harbor must call once un-vendored; the default keeps a menu open for the
-  rest of the line.
+- **Patch B: merged** — https://github.com/nushell/reedline/pull/1209, which
+  closed https://github.com/nushell/reedline/issues/1176. Upstream scopes the
+  boundary to the menu: harbor must call `.with_word_chars("_.")` on its
+  completion menu once un-vendored (the builder takes `impl Into<String>`),
+  since the default keeps a menu open for the rest of the line. Upstream
+  also counts `InsertNewline` as ending the word, which this copy does not.
 - **Patch C: merged** — https://github.com/nushell/reedline/pull/1203, landed
   upstream independently of this copy.
-- **Patch D: not filed.** It changes what `Down` reports, which upstream may
-  see as a behavior change for every binding built on it; harbor's binding
-  needs it, so it stays here until there is an upstream conversation.
+- **Patch D: filed as https://github.com/nushell/reedline/pull/1226, open.**
+  The upstream form is narrower than this copy's: `Up` and `Down` report
+  `Inapplicable` when they moved nothing (buffer and cursor unchanged), the
+  way `Left` and `Right` already do at the edges of the line. It does not
+  carry this copy's `buffer_from_history` rule, under which an edited
+  recalled line keeps `Down` as history. That rule is harbor's product
+  choice; when un-vendoring, try the plain rule in the REPL first and keep
+  the edited-line behavior on harbor's side only if it is missed.
 
-Also open: https://github.com/nushell/reedline/pull/1210, collapsing the
+Also merged: https://github.com/nushell/reedline/pull/1210, collapsing the
 duplicated menu-accept rule Patch A and Patch C each state separately.
 
-crates.io is at 0.51.0, which predates all three, so the earliest release
+crates.io is at 0.51.0, which predates all of them, so the earliest release
 carrying them is 0.52.
 
 When every patch is upstream AND released (Patch D included, or re-applied
 on top of the release): delete `reedline` from
 `[patch.crates-io]` and the `exclude` list in `harbor/Cargo.toml`,
 `rm -rf vendor/reedline`, bump the reedline version in
-`crates/harbor/Cargo.toml`, add the `with_word_chars` call to the completion
+`crates/harbor/Cargo.toml`, add `.with_word_chars("_.")` to the completion
 menu, then `cargo test -p harbor && make test SUITES="unit types spec catalog
 sessions cancel"` and re-run the repro: `create or replace ta`, Tab, keep
 typing, Enter — the statement must run with no stray word appended. Type the

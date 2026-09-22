@@ -327,8 +327,10 @@ usable end to end.
   `DUCKDB_LIB_BUILD` repository variable to `latest`. Wait for the naming to
   settle; there was reviewer discussion upstream about instance-versus-
   database option scope.
-- **Un-vendor reedline** when 0.52 ships with patches A–C, re-applying D on
-  top (or filing it). `HARBOR.md` has the exact checklist.
+- **Un-vendor reedline** when 0.52 ships. Patches A, B and C are merged
+  upstream; D is filed as nushell/reedline#1226 and open. `HARBOR.md` has
+  the exact checklist, including the one behavior D's upstream form leaves
+  to harbor.
 - **A binary wire mode** is parked until DuckDB GA.
 - **The deployment runbook** (`duckdb-harbor-runbook`) is deferred to GA;
   four decisions were recorded so they are not re-derived.
