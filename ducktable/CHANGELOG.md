@@ -55,6 +55,7 @@ date, newest first.
   back to be parked again if another table is chosen first.
 - EDITING.md states each of these, and gains a section on a table altered
   elsewhere.
+- The lockfile records `harbor-common` and `wire` at 0.41.3.
 
 ## 0.22.4 — 2026-09-21
 
