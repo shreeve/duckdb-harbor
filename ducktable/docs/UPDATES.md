@@ -39,9 +39,11 @@ delta.
 
 ### 1. The signing key
 
-Updates are signed with an ed25519 key. The private half lives in the login
-keychain under the account `ducktable` and, for CI, in a repository secret; the
-public half ships in the bundle. The tools land in
+Updates are signed with an ed25519 key. The private half lives in three
+places: the login keychain under the account `ducktable`, the
+`SPARKLE_PRIVATE_KEY` repository secret for CI, and the gitignored `notes.txt`
+at the repository root, which is never committed. The public half ships in the
+bundle. The tools land in
 `.ducktable-cache/sparkle/<version>/bin` after any `scripts/macos-app.sh` run.
 
 ```sh
@@ -94,10 +96,13 @@ bundle whole on update, which is the same kind of swap.
 
 ## Cutting a release
 
-Unchanged: bump `version` in `Cargo.toml`, note it in `CHANGELOG.md`, push a
-`ducktable-vX.Y.Z` tag. The workflow builds the bundle, creates the versioned
-release, then downloads the feed release, adds `DuckTable-X.Y.Z.zip`, runs
-`scripts/appcast.sh`, and uploads the result back with `--clobber`. Installed
+The steps are in the repository's `HANDOFF.md`, under Releasing: bump `version`
+in `Cargo.toml` and run `cargo update -w`, add the changelog entry, bump the
+Sparkle pin, prove the bundle with `scripts/macos-app.sh release`, and push an
+annotated `ducktable-vX.Y.Z` tag. The workflow builds the bundle, creates the
+versioned release, then downloads the feed release, adds
+`DuckTable-X.Y.Z.zip`, runs `scripts/appcast.sh`, and uploads the result back
+with `--clobber`. Installed
 copies pick it up on their next scheduled check, once a day, or on Check for
 Updates.
 

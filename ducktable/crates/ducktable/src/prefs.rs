@@ -25,9 +25,9 @@ pub struct Prefs {
     pub right_align: bool,
     pub null_tags: bool,
     pub view: ViewMode,
-    /// The inspector pane's open state (UI.md: persists per window).
+    /// The inspector pane's open state (DESIGN.md: persists).
     pub inspector: bool,
-    /// The inspector pane's width (UI.md: divider positions persist).
+    /// The inspector pane's width (DESIGN.md: divider positions persist).
     pub inspector_width: f32,
     /// The sidebar's table ordering. Plain sort puts `order_items` above
     /// `orders` (`_` < `s` bytewise); family sort collates `_` after the
@@ -37,7 +37,7 @@ pub struct Prefs {
     pub page_size: usize,
     /// Index into [`ZOOMS`].
     pub zoom: usize,
-    /// The sidebar's width (UI.md: divider positions persist).
+    /// The sidebar's width (DESIGN.md: divider positions persist).
     pub sidebar_width: f32,
     /// The Query pane's editor height — the editor/results divider
     /// position (docs/QUERY.md: the split persists).

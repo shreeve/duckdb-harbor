@@ -29,16 +29,31 @@
 //! never touched: the scanner that splits statements marks them. A brace
 //! that never closes leaves the whole statement as it came, and the engine
 //! reports the syntax error at it.
+//!
+//! Each group multiplies, so a short statement can stand for an enormous one:
+//! thirty two-item groups in a term are a billion alternatives. Expansion
+//! therefore has a budget, [`BUDGET`] bytes of text written or re-read, and a
+//! statement that would spend more is refused rather than expanded.
 
 use std::borrow::Cow;
 
 use crate::repl::scan::{Kind, scan};
 
+/// How much text one statement's expansion may write or re-read: twice the
+/// 8 MiB a request body may be, so what it produces is never much larger
+/// than what a client could send outright. A select list of hundreds of paths
+/// spends a few hundred KiB. Reaching the budget takes under a tenth of a
+/// second; what the engine then makes of a statement that size is its own
+/// cost, the same as if it had arrived unexpanded.
+pub const BUDGET: usize = 16 << 20;
+
 /// The expanded statement, or the input itself when there was nothing to do.
-pub fn expand(sql: &str) -> Cow<'_, str> {
+/// An error when the expansion would outrun [`BUDGET`].
+pub fn expand(sql: &str) -> Result<Cow<'_, str>, String> {
     if !sql.contains('{') {
-        return Cow::Borrowed(sql);
+        return Ok(Cow::Borrowed(sql));
     }
+    let mut budget = BUDGET;
     let text = Text::of(sql);
     let mut out = String::with_capacity(sql.len() + 64);
     let mut term_start = 0;
@@ -58,12 +73,12 @@ pub fn expand(sql: &str) -> Cow<'_, str> {
             }
             b'}' => {
                 if depth == 0 {
-                    return Cow::Borrowed(sql);
+                    return Ok(Cow::Borrowed(sql));
                 }
                 depth -= 1;
             }
             _ if depth == 0 && is_boundary(c) => {
-                push_term(&mut out, &sql[term_start..i], braced);
+                push_term(&mut out, &sql[term_start..i], braced, &mut budget)?;
                 out.push(c as char);
                 term_start = i + 1;
                 braced = false;
@@ -73,49 +88,71 @@ pub fn expand(sql: &str) -> Cow<'_, str> {
         i += 1;
     }
     if depth != 0 {
-        return Cow::Borrowed(sql);
+        return Ok(Cow::Borrowed(sql));
     }
-    push_term(&mut out, &sql[term_start..], braced);
-    if out == sql { Cow::Borrowed(sql) } else { Cow::Owned(out) }
+    push_term(&mut out, &sql[term_start..], braced, &mut budget)?;
+    Ok(if out == sql { Cow::Borrowed(sql) } else { Cow::Owned(out) })
 }
 
 fn is_boundary(c: u8) -> bool {
     c.is_ascii_whitespace() || matches!(c, b',' | b'(' | b')' | b';')
 }
 
-fn push_term(out: &mut String, term: &str, braced: bool) {
+fn push_term(out: &mut String, term: &str, braced: bool, budget: &mut usize) -> Result<(), String> {
     if !braced {
         out.push_str(term);
-        return;
+        return Ok(());
     }
     let mut first = true;
-    for alt in alternatives(term) {
+    for alt in alternatives(term, budget)? {
         if !first {
             out.push_str(", ");
         }
         first = false;
         out.push_str(&alt);
     }
+    Ok(())
 }
 
-/// Every string a term stands for. A term with no group stands for itself.
-fn alternatives(term: &str) -> Vec<String> {
-    let text = Text::of(term);
-    let Some((lbrace, rbrace)) = text.first_group() else {
-        return vec![term.to_string()];
+/// Every string a term stands for, in order. A term with no group stands for
+/// itself. One group is resolved at a time, depth first, from a stack rather
+/// than by recursion: a term can hold thousands of groups, one item each,
+/// that multiply nothing and would each be a frame. Each string is charged
+/// its length before it is built, since it is built once, scanned once and
+/// written at most once: a group of many items behind a long prefix is
+/// refused before its alternatives take any memory.
+fn alternatives(term: &str, budget: &mut usize) -> Result<Vec<String>, String> {
+    let mut spend = |cost: usize| {
+        *budget = budget.checked_sub(cost).ok_or_else(|| {
+            format!(
+                "brace expansion refused: this statement would expand past {} MiB",
+                BUDGET >> 20
+            )
+        })?;
+        Ok::<(), String>(())
     };
-    let items = text.items(lbrace + 1, rbrace);
-    if items.is_empty() {
-        // `x.{}` stands for nothing; the engine can say so.
-        return vec![term.to_string()];
-    }
-    let prefix = &term[..lbrace];
-    let suffix = &term[rbrace + 1..];
+    spend(term.len())?;
     let mut out = Vec::new();
-    for item in items {
-        out.extend(alternatives(&format!("{prefix}{item}{suffix}")));
+    let mut pending = vec![term.to_string()];
+    while let Some(term) = pending.pop() {
+        let text = Text::of(&term);
+        let Some((lbrace, rbrace)) = text.first_group() else {
+            out.push(term);
+            continue;
+        };
+        let items = text.items(lbrace + 1, rbrace);
+        if items.is_empty() {
+            // `x.{}` stands for nothing; the engine can say so.
+            out.push(term);
+            continue;
+        }
+        let (prefix, suffix) = (&term[..lbrace], &term[rbrace + 1..]);
+        let each = prefix.len() + suffix.len();
+        spend(items.iter().fold(0usize, |sum, item| sum.saturating_add(each + item.len())))?;
+        let next: Vec<String> = items.iter().rev().map(|item| format!("{prefix}{item}{suffix}")).collect();
+        pending.extend(next);
     }
-    out
+    Ok(out)
 }
 
 /// A piece of SQL with its opaque spans — strings, quoted identifiers, dollar
@@ -260,7 +297,7 @@ mod tests {
     use super::*;
 
     fn x(sql: &str) -> String {
-        expand(sql).into_owned()
+        expand(sql).unwrap().into_owned()
     }
 
     #[test]
@@ -304,7 +341,7 @@ mod tests {
             "select {}",
             "select r.{}",
         ] {
-            assert!(matches!(expand(sql), Cow::Borrowed(_)), "{sql}");
+            assert!(matches!(expand(sql), Ok(Cow::Borrowed(_))), "{sql}");
         }
         // a struct literal inside a group item travels whole
         assert_eq!(x("select r.{a {'k': 1}} from t"), "select r.a, r.{'k': 1} from t");
@@ -321,7 +358,7 @@ mod tests {
             "select /* r.{a,b} */ 1",
             "select \"weird{name}\" from t",
         ] {
-            assert!(matches!(expand(sql), Cow::Borrowed(_)), "{sql}");
+            assert!(matches!(expand(sql), Ok(Cow::Borrowed(_))), "{sql}");
         }
         assert_eq!(x("select r.{a \"first-name\"} from t"), "select r.a, r.\"first-name\" from t");
         assert_eq!(x("select \"my col\".{a,b} from t"), "select \"my col\".a, \"my col\".b from t");
@@ -331,13 +368,31 @@ mod tests {
     #[test]
     fn an_unbalanced_brace_leaves_the_statement_as_it_came() {
         for sql in ["select r.{a,b from t", "select r.a} from t", "select r.{a,{b} from t", "select r.{a 'b} from t"] {
-            assert!(matches!(expand(sql), Cow::Borrowed(_)), "{sql}");
+            assert!(matches!(expand(sql), Ok(Cow::Borrowed(_))), "{sql}");
         }
     }
 
     #[test]
+    fn an_expansion_past_the_budget_is_refused_not_run() {
+        // Thirty groups of two: a billion alternatives from 150 bytes.
+        let doubling = format!("select 1 as x{}", "{a,b}".repeat(30));
+        assert!(expand(&doubling).unwrap_err().contains("brace expansion refused"));
+        // Groups that multiply nothing still cost a scan each, and would
+        // each have been a stack frame.
+        let chained = format!("select x{} from t", "{a}".repeat(100_000));
+        assert!(expand(&chained).is_err());
+        // One group of many items behind a long prefix is refused before
+        // its alternatives are built: 70 KB that would have asked for 500 MB.
+        let wide_prefix = format!("select 1 as {}{{{}}}", "x".repeat(50_000), vec!["a"; 10_000].join(","));
+        assert!(expand(&wide_prefix).is_err());
+        // Well inside it, a wide select list expands as ever.
+        let wide = format!("select r.{{{}}} from t", (0..2000).map(|i| format!("c{i}")).collect::<Vec<_>>().join(","));
+        assert_eq!(x(&wide).matches("r.c").count(), 2000);
+    }
+
+    #[test]
     fn nothing_to_do_borrows() {
-        assert!(matches!(expand("select 1"), Cow::Borrowed(_)));
-        assert!(matches!(expand("select a.b, a.c from t"), Cow::Borrowed(_)));
+        assert!(matches!(expand("select 1"), Ok(Cow::Borrowed(_))));
+        assert!(matches!(expand("select a.b, a.c from t"), Ok(Cow::Borrowed(_))));
     }
 }

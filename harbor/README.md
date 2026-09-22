@@ -331,6 +331,11 @@ The expansion happens in the server, once, for every client: the REPL,
 expanded statement. DuckDB itself is untouched; it only ever receives plain
 SQL.
 
+Groups multiply, so a short statement can stand for an enormous one: thirty
+two-item groups are a billion alternatives. An expansion that would write or
+re-read more than 16 MiB of text is refused with a `400` before anything
+runs.
+
 ## The whole database, one call
 
 `GET /catalog` answers what a client would otherwise ask in a dozen queries:
@@ -670,7 +675,8 @@ harbor: backed up 14 tables to ~/db/mydata.backups/20260909051315 (612K)
 
 `load.sql` names the format per table, so the directory stays self-describing
 and the choice is visible in `ls`. `--format parquet` asks for one format
-throughout — with the same swap running the other way for a `TIMETZ` column —
+throughout — with the same swap running the other way for a `TIMETZ` column,
+whose table is then text in every respect, a `VARIANT` beside it included —
 and `--strict` refuses rather than swapping, for a backup that has to be one
 format or nothing. What no mode will do is write something that will not come
 back without saying so: a negative interval under `--format parquet` is an
@@ -1036,8 +1042,17 @@ Need more fidelity than that? Back the table up with `--format parquet`,
 which keeps the `VARIANT` as itself.
 
 **Bodies are capped at 8 MiB**, declared or delivered; over that is a `413`.
-There is no rate limiting and no CORS — defensible for a service behind a proxy,
-worth knowing before it faces a browser. Request logging is available with
+There is no rate limiting and no CORS. **A web page cannot reach the TCP
+listener**: a request carrying an `Origin` header, or a `Host` that is a hostname
+rather than `localhost` or an IP address, is refused with `403 forbidden` before
+anything runs. That shuts out a page on the same machine posting SQL to
+loopback, and DNS rebinding reading the answer. Harbor's own clients, Rip and
+curl send no `Origin`, and their `Host` is whatever address they were given:
+`http://127.0.0.1:9495` or `http://localhost:9495` passes, including through
+an SSH tunnel, but a name that only `/etc/hosts` maps to loopback does not. A browser client belongs behind an edge proxy that enforces
+its own policy, drops `Origin`, and sends the upstream's address as `Host`
+(Caddy: `header_up -Origin` and `header_up Host {upstream_hostport}`). The unix
+socket is out of a browser's reach and skips the check. Request logging is available with
 `--log`, off by default.
 
 **Windows serves over loopback TCP only.** Unix sockets — and with them

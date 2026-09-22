@@ -1762,6 +1762,9 @@ fn handle(
             &format!("body is {n} bytes; the limit is {MAX_BODY}"),
         ));
         (true, 413)
+    } else if let Some(why) = from_a_browser(&req) {
+        let _ = req.respond(error_response(403, "forbidden", why));
+        (true, 403)
     } else {
         match (&method, path.as_str()) {
             // Workers answer readiness down the full query path; the probe thread —
@@ -1892,6 +1895,43 @@ fn handle(
         );
     }
     keep_going
+}
+
+/// Why a TCP request came from a web page, or `None` when it did not.
+///
+/// Loopback is exactly where a browser on the same machine sends a page's
+/// requests. A page can POST a text/plain body without a CORS preflight, and
+/// DNS rebinding lets it read the answers under a hostname it controls. Every
+/// browser request that carries a body names its page in `Origin`, and a
+/// rebound one names the page's hostname in `Host`. Harbor's own clients send
+/// no `Origin`, and their `Host` is the address they dialled, which passes
+/// whenever that is `localhost` or an IP address. The unix socket is out of a browser's reach and skips both checks.
+/// A browser client behind an edge proxy is that proxy's policy: it drops
+/// `Origin` and sends the upstream's own `Host`.
+fn from_a_browser(req: &Request) -> Option<&'static str> {
+    fn header<'r>(req: &'r Request, name: &'static str) -> Option<&'r str> {
+        req.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str())
+    }
+    req.remote_addr()?;
+    if header(req, "Origin").is_some() {
+        return Some("a web page may not reach harbor: the request carries an Origin");
+    }
+    match header(req, "Host") {
+        Some(host) if !loopback_host(host) => {
+            Some("Host must be localhost or an IP address, not a hostname a web page controls")
+        }
+        _ => None,
+    }
+}
+
+/// `localhost` or an IP literal, with or without a port. A hostname is what
+/// DNS rebinding needs; an address cannot be rebound.
+fn loopback_host(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or(""),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    };
+    name.eq_ignore_ascii_case("localhost") || name.parse::<std::net::IpAddr>().is_ok()
 }
 
 /// Marks this worker's slot occupied for the life of one request, so the
@@ -3367,8 +3407,13 @@ fn run_sql(
     // `r.{a,b}` becomes `r.a, r.b` here, once, for every client. After the
     // statement count, which the expansion cannot change, and before the
     // guards below, which read the statement the engine will run.
-    if let std::borrow::Cow::Owned(expanded) = unbrace::expand(&parsed.sql) {
-        parsed.sql = expanded;
+    match unbrace::expand(&parsed.sql) {
+        Ok(std::borrow::Cow::Owned(expanded)) => parsed.sql = expanded,
+        Ok(std::borrow::Cow::Borrowed(_)) => {}
+        Err(e) => {
+            let _ = req.respond(error_response(400, "bad_request", &e));
+            return (true, 400);
+        }
     }
 
     if let Some(setting) = fenced_setting(&parsed.sql) {
@@ -4964,6 +5009,16 @@ UNION ALL SELECT 1::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FRO
         assert!(interactive.expired(start + LEASE_MAX_TTL, start, true, LEASE_IDLE_TTL));
         assert!(interactive.expired(start + LEASE_IDLE_TTL, start, false, LEASE_IDLE_TTL));
         assert!(!interactive.expired(start + LEASE_IDLE_TTL, start, true, LEASE_IDLE_TTL));
+    }
+
+    #[test]
+    fn only_addresses_and_localhost_are_loopback_hosts() {
+        for host in ["127.0.0.1:9495", "127.0.0.1", "localhost:80", "LOCALHOST", "[::1]:9495", "10.0.0.7:1"] {
+            assert!(super::loopback_host(host), "{host}");
+        }
+        for host in ["attacker.example:9495", "live", "localhost.attacker.example", ""] {
+            assert!(!super::loopback_host(host), "{host}");
+        }
     }
 
     #[test]

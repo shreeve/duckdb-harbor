@@ -4,6 +4,47 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.42.0 — 2026-09-22
+
+- **A web page cannot reach the TCP listener.** Harbor binds TCP to loopback,
+  and loopback is where a browser on the same machine sends a page's requests.
+  A page could `POST` a `text/plain` body to `/sql` with no CORS preflight and
+  run any statement, and through DNS rebinding it could read the answer under
+  a hostname it controls. Measured on 0.41.3: a foreign-origin form post
+  created a table, and a request with `Host: attacker.example` read it back.
+  While DuckTable holds an SSH tunnel to a remote Harbor, that remote is on
+  the Mac's loopback too. A TCP request carrying an `Origin` header, or a
+  `Host` that is a hostname rather than `localhost` or an IP address, is now
+  refused with `403 forbidden` before anything runs. Harbor's own clients,
+  Rip and curl send no `Origin`, and pass whenever they dial `localhost` or an
+  IP address, an SSH tunnel's local end included. A hostname that only
+  `/etc/hosts` points at loopback is refused. A browser client belongs behind an edge proxy
+  that drops `Origin` and sends the upstream's own `Host`. The unix socket is
+  out of a browser's reach and is not checked.
+- **A `--format parquet` backup keeps a `VARIANT` beside a `TIMETZ`.** Parquet
+  normalises a `TIMETZ` to UTC, so such a table is written as text instead,
+  but the move skipped everything text does for a `VARIANT`: the column went
+  out as its display text, `{'a': 1, 'b': [2, 3]}`, with no decode in
+  `after.sql`, and every document restored as a string. A table moved to text
+  is now written exactly as one that is text by default: the `VARIANT` as
+  JSON, decoded after the load, with what JSON cannot carry named and a file
+  holding a blank record quoted throughout.
+- **An infinite date or timestamp is `"infinity"`, not a date.** DuckDB stores
+  one as a sentinel, the type's largest value or its negation, and harbor
+  formatted the sentinel as a date: `'infinity'::TIMESTAMP` crossed the wire as
+  `"294247-01-10T04:00:54.775807"`, which DuckDB itself cannot parse,
+  `TIMESTAMP_NS` as a plausible `"2262-04-11T23:47:16.854775807"`, and
+  `-infinity` as a DATE as `"-5877641-06-24"`, all marked lossless. Every DATE
+  and TIMESTAMP flavour now sends `"infinity"` or `"-infinity"`, the words
+  DuckDB prints and parses back.
+- **Brace expansion has a budget.** Each group multiplies the statement, so 80
+  bytes of `x{a,b}{a,b}…` held a server thread for seconds and thirty groups
+  asked for a billion alternatives. A term of one-item groups, which
+  multiplies nothing, recursed once per group and could overflow the stack.
+  Expansion now works from an explicit stack, and one that would write or
+  re-read more than 16 MiB of text is refused with a `400` before anything
+  runs. Reaching the budget takes under a tenth of a second.
+
 ## 0.41.3 — 2026-09-21
 
 - **A `GENERATED` column is computed by the restored table, and no backup

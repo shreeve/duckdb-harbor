@@ -200,10 +200,17 @@ Unix sockets live in a `0700` runtime directory. TCP binds IPv4 loopback only â€
 clients arrive through SSH or an edge proxy;
 Harbor itself does not expose a non-loopback listener.
 
+Loopback is not the same as trusted: a browser on the machine sends a web
+page's requests there too. So the TCP listener refuses any request with an
+`Origin` header, or with a `Host` that is a hostname rather than `localhost` or
+an address. A page cannot post SQL, and DNS rebinding cannot read the answer.
+
 ## Caddy is the optional edge; UDS is the default face
 
 Local security = filesystem perms. Remote = Caddy terminates TLS/HTTP3,
-enforces edge policy, and proxies to the socket. The client deliberately speaks UDS and
+enforces edge policy, and proxies to the socket. A proxy to the TCP port
+instead drops `Origin` and sends the upstream's own `Host`, since the browser
+check is its job there. The client deliberately speaks UDS and
 plain `http://` only. A human reaches a remote server through SSH; browser
 and application clients go through Caddy.
 

@@ -262,12 +262,12 @@ def one_response_per_request(port, rng):
     """
     s = socket.create_connection(("127.0.0.1", port), timeout=15)
     try:
-        s.sendall(b"POST /sql HTTP/1.1\r\nHost: x\r\nContent-Length: 4000000\r\n\r\n")
+        s.sendall(b"POST /sql HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4000000\r\n\r\n")
         for _ in range(rng.randint(3, 10)):
             try:
                 # DELETE is the legacy shutdown verb — using it here also
                 # proves the alias stays served beside canonical POST.
-                s.sendall(b"DELETE /shutdown HTTP/1.1\r\nHost: x\r\n\r\n")
+                s.sendall(b"DELETE /shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
             except OSError:
                 break
             time.sleep(0.2)
@@ -343,7 +343,7 @@ def case_dripping_body(port, n):
         try:
             s = socket.create_connection(("127.0.0.1", port), timeout=60)
             socks.append(s)
-            s.sendall(b"POST /sql HTTP/1.1\r\nHost: x\r\n"
+            s.sendall(b"POST /sql HTTP/1.1\r\nHost: 127.0.0.1\r\n"
                       b"Content-Length: 8000000\r\n\r\n")
             while not stop[0]:
                 s.sendall(b'{"sql":')
@@ -393,7 +393,7 @@ def case_held_connections(port, n):
     for _ in range(n):
         try:
             s = socket.create_connection(("127.0.0.1", port), timeout=10)
-            s.sendall(b"GET /ready HTTP/1.1\r\nHost: x\r\n\r\n")
+            s.sendall(b"GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
             s.recv(4096)
             socks.append(s)
         except OSError:

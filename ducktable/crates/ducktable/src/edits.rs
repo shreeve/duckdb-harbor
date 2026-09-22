@@ -97,6 +97,13 @@ pub struct Edits {
     source: String,
     /// Primary-key column names, in key order.
     pk_cols: Vec<String>,
+    /// Keyed by DuckDB's implicit rowid: the table has no key of its own.
+    /// A rowid only names a position, and a checkpoint that compacts
+    /// deleted rows renumbers the rest, so the one identity cell is the
+    /// pair `[rowid, hash of the whole row]` (`sql::page_sql`) and every
+    /// WHERE checks both. A row moved or changed since the fetch is named
+    /// by nothing, and commit refuses instead of writing to its neighbor.
+    by_rowid: bool,
     /// All schema column names, in result order (for SET clauses).
     columns: Vec<String>,
     /// Each column's DuckDB type, parallel to `columns`: what decides how
@@ -143,6 +150,7 @@ impl Edits {
         Self {
             source,
             pk_cols,
+            by_rowid: false,
             columns,
             types,
             changes: HashMap::new(),
@@ -150,6 +158,13 @@ impl Edits {
             redo: Vec::new(),
             next_draft: 1,
         }
+    }
+
+    /// Key this set by the rowid-and-hash pair a keyless page fetches.
+    pub fn keyed_by_rowid(mut self) -> Self {
+        self.pk_cols = vec!["rowid".to_string()];
+        self.by_rowid = true;
+        self
     }
 
     #[cfg(test)]
@@ -169,6 +184,7 @@ impl Edits {
     pub fn same_shape(&self, other: &Edits) -> bool {
         self.source == other.source
             && self.pk_cols == other.pk_cols
+            && self.by_rowid == other.by_rowid
             && self.columns == other.columns
             && self.types == other.types
     }
@@ -184,6 +200,9 @@ impl Edits {
     pub fn source_label(&self, identity: &[Value]) -> Option<String> {
         if identity.is_empty() {
             return None;
+        }
+        if self.by_rowid {
+            return Some(format!("copy of rowid = {}", self.bound_identity(identity).first()?));
         }
         let named = self
             .pk_cols
@@ -478,12 +497,24 @@ impl Edits {
     /// that is gone returns no row, which commit refuses.
     pub fn statements(&self) -> Vec<Statement> {
         let mut out = Vec::new();
-        let where_clause = self
-            .pk_cols
-            .iter()
-            .map(|c| format!("{} = {}", qident(c), self.key_placeholder(c)))
-            .collect::<Vec<_>>()
-            .join(" AND ");
+        // The table as the WHERE sees it: aliased when the row itself is
+        // hashed, since `hash("t")` names a column if the table has one
+        // called `t`, and an alias no column shares cannot.
+        let (target, where_clause) = if self.by_rowid {
+            let alias = qident(&self.row_alias());
+            (
+                format!("{} AS {alias}", self.source),
+                format!("\"rowid\" = ? AND hash({alias}) = ?::UBIGINT"),
+            )
+        } else {
+            let clause = self
+                .pk_cols
+                .iter()
+                .map(|c| format!("{} = {}", qident(c), self.key_placeholder(c)))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            (self.source.clone(), clause)
+        };
         for (_, identity, change) in self.entries() {
             if let RowChange::Insert(cells) = change {
                 let mut params = Vec::new();
@@ -501,10 +532,10 @@ impl Edits {
                         .collect::<Vec<_>>()
                         .join(", ");
                     if cells.values().any(|c| c.bind == Bind::Source) {
-                        params.extend(identity.iter().cloned());
+                        params.extend(self.bound_identity(identity));
                         format!(
-                            "INSERT INTO {} ({names}) SELECT {supplied} FROM {} WHERE {where_clause} RETURNING *",
-                            self.source, self.source
+                            "INSERT INTO {} ({names}) SELECT {supplied} FROM {target} WHERE {where_clause} RETURNING *",
+                            self.source
                         )
                     } else {
                         format!("INSERT INTO {} ({names}) VALUES ({supplied}) RETURNING *", self.source)
@@ -527,9 +558,9 @@ impl Edits {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                params.extend(identity.iter().cloned());
+                params.extend(self.bound_identity(identity));
                 out.push(Statement {
-                    sql: format!("UPDATE {} SET {} WHERE {}", self.source, set, where_clause),
+                    sql: format!("UPDATE {target} SET {set} WHERE {where_clause}"),
                     params,
                     expectation: StatementExpectation::AffectedOne,
                 });
@@ -538,13 +569,31 @@ impl Edits {
         for (_, identity, change) in self.entries() {
             if matches!(change, RowChange::Delete) {
                 out.push(Statement {
-                    sql: format!("DELETE FROM {} WHERE {}", self.source, where_clause),
-                    params: identity.to_vec(),
+                    sql: format!("DELETE FROM {target} WHERE {where_clause}"),
+                    params: self.bound_identity(identity),
                     expectation: StatementExpectation::AffectedOne,
                 });
             }
         }
         out
+    }
+
+    /// What a WHERE binds for `identity`: the key values, or the rowid and
+    /// the row's hash unpacked from the pair a keyless page fetched.
+    fn bound_identity(&self, identity: &[Value]) -> Vec<Value> {
+        match identity {
+            [Value::Array(pair)] if self.by_rowid => pair.clone(),
+            _ => identity.to_vec(),
+        }
+    }
+
+    /// An alias for the target that no column name shadows.
+    fn row_alias(&self) -> String {
+        let mut alias = "row".to_string();
+        while self.columns.iter().any(|c| c.eq_ignore_ascii_case(&alias)) {
+            alias.push('_');
+        }
+        alias
     }
 
     /// The SQL that supplies column `ix` from `cell`, pushing what it
@@ -995,6 +1044,31 @@ mod tests {
         assert!(e.is_empty());
         assert!(e.undo(), "nothing is more than one keystroke from recovery");
         assert_eq!(e.staged_text(&key, 1), Some(txt("b")));
+    }
+
+    #[test]
+    fn a_keyless_row_is_named_by_its_rowid_and_its_hash() {
+        // A column called `row` shadows the alias, so the alias steps aside.
+        let mut e = Edits::new(
+            "\"main\".\"t\"".into(),
+            vec![],
+            vec!["rowid".into(), "row".into()],
+            vec!["UBIGINT[]".into(), "VARCHAR".into()],
+        )
+        .keyed_by_rowid();
+        e.stage_cell(vec![json!([5, 77])], 1, txt("a"), txt("b"), json!("b"));
+        e.stage_delete(vec![json!([6, "18446744073709551615"])]);
+        let stmts = e.statements();
+        assert_eq!(
+            stmts[0].sql,
+            "UPDATE \"main\".\"t\" AS \"row_\" SET \"row\" = ? WHERE \"rowid\" = ? AND hash(\"row_\") = ?::UBIGINT"
+        );
+        assert_eq!(stmts[0].params, vec![json!("b"), json!(5), json!(77)]);
+        assert_eq!(
+            stmts[1].sql,
+            "DELETE FROM \"main\".\"t\" AS \"row_\" WHERE \"rowid\" = ? AND hash(\"row_\") = ?::UBIGINT"
+        );
+        assert_eq!(stmts[1].params, vec![json!(6), json!("18446744073709551615")]);
     }
 
     #[test]
@@ -1509,25 +1583,27 @@ mod tests {
         );
         assert_eq!(stmts[0].params, vec![json!("AAE=")]);
 
-        // A keyless table names the source by its hidden rowid, and a
-        // composite key by every column of it.
+        // A keyless table names the source by its hidden rowid and the
+        // row's hash, and a composite key by every column of it.
         let mut keyless = Edits::new(
             "\"main\".\"t\"".into(),
-            vec!["rowid".into()],
+            vec![],
             vec!["rowid".into(), "name".into(), "doc".into()],
-            vec!["BIGINT".into(), "VARCHAR".into(), "VARIANT".into()],
-        );
+            vec!["UBIGINT[]".into(), "VARCHAR".into(), "VARIANT".into()],
+        )
+        .keyed_by_rowid();
+        let pair = json!([3, "12016465711393625096"]);
         keyless.stage_duplicate(
-            vec![json!(3)],
+            vec![pair.clone()],
             vec![(1, txt("a"), Bind::Value(json!("b"))), (2, txt("1"), Bind::Source)],
         );
         let stmts = keyless.statements();
         assert_eq!(
             stmts[0].sql,
-            "INSERT INTO \"main\".\"t\" (\"name\", \"doc\") SELECT ?, \"doc\" FROM \"main\".\"t\" \
-             WHERE \"rowid\" = ? RETURNING *"
+            "INSERT INTO \"main\".\"t\" (\"name\", \"doc\") SELECT ?, \"doc\" FROM \"main\".\"t\" AS \"row\" \
+             WHERE \"rowid\" = ? AND hash(\"row\") = ?::UBIGINT RETURNING *"
         );
-        assert_eq!(stmts[0].params, vec![json!("b"), json!(3)]);
+        assert_eq!(stmts[0].params, vec![json!("b"), json!(3), json!("12016465711393625096")]);
 
         let mut composite = Edits::new(
             "\"main\".\"t\"".into(),
@@ -1859,11 +1935,12 @@ mod tests {
         );
         let keyless = Edits::new(
             "\"main\".\"t\"".into(),
-            vec!["rowid".into()],
+            vec![],
             vec!["rowid".into(), "name".into()],
-            vec!["BIGINT".into(), "VARCHAR".into()],
-        );
-        assert_eq!(keyless.source_label(&[json!(3)]).as_deref(), Some("copy of rowid = 3"));
+            vec!["UBIGINT[]".into(), "VARCHAR".into()],
+        )
+        .keyed_by_rowid();
+        assert_eq!(keyless.source_label(&[json!([3, 99])]).as_deref(), Some("copy of rowid = 3"));
 
         // The entries the popover walks carry exactly that identity.
         let mut e = edits();

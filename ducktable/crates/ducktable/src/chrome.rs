@@ -144,7 +144,7 @@ pub(crate) fn seg_sep(t: Pal) -> Div {
 
 /// The one duration for an in-place micro-fade — an icon swap, a small
 /// element breathing in or out. ~150ms: above the ~100ms motion floor,
-/// below the ~250ms where a tiny element feels slow (see docs/UI.md,
+/// below the ~250ms where a tiny element feels slow (see docs/DESIGN.md,
 /// Motion). Shared so the copy tile's crossfade and the stop spinner's
 /// fade-in can't drift apart. NOT for structural enter/leave (a whole row
 /// departing runs a hair longer), loops (a spinner's turn), or dwell

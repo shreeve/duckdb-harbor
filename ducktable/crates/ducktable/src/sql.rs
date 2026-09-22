@@ -30,9 +30,12 @@ pub(crate) fn query_source(sql: &str) -> String {
 /// surface and the berth is the user's own database — the author of the
 /// WHERE clause is the person it could affect.
 ///
-/// `rowid` prepends DuckDB's implicit row identifier — the editing
-/// identity for tables without a primary key (docs/EDITING.md). The
-/// grid hides that column; only the WHERE clauses ever see it.
+/// `rowid` prepends the editing identity for a table without a primary
+/// key (docs/EDITING.md): DuckDB's implicit rowid paired with a hash of
+/// the whole row, in one column named `rowid`. A rowid alone only names a
+/// position, and a checkpoint that compacts deleted rows renumbers the
+/// rest; the hash is what tells the row at that position is still the one
+/// fetched. The grid hides the column; only the WHERE clauses see it.
 pub(crate) fn page_sql(
     source: &str,
     rowid: bool,
@@ -40,7 +43,7 @@ pub(crate) fn page_sql(
     page: usize,
     size: usize,
 ) -> String {
-    let cols = if rowid { "rowid, *" } else { "*" };
+    let cols = if rowid { "[rowid::UBIGINT, hash(*COLUMNS(*))] AS rowid, *" } else { "*" };
     format!(
         "SELECT {cols} FROM {source}{} LIMIT {size} OFFSET {}",
         where_part(filter),

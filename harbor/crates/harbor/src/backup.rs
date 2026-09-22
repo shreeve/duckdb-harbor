@@ -528,7 +528,7 @@ struct Reformat {
 /// Rewrite the generated `load.sql` into one that will still work later, and
 /// report the tables that have to leave the text format behind.
 ///
-/// Three edits, each for its own reason.
+/// Four edits, each for its own reason.
 ///
 /// The paths come out absolute, because that is what `EXPORT DATABASE` was
 /// handed, and an absolute path nails the directory to the machine that
@@ -550,11 +550,12 @@ struct Reformat {
 /// instead. `schema.sql` and `load.sql` spell a table the same way, quotes
 /// and all, which is what lets one be looked up in the other.
 ///
-/// A plain VARIANT column is the fourth edit, and the one that runs NOW
-/// rather than being handed back: the table's file is written again with
-/// the column cast to JSON (see [`outgoing`]), because the blank-record
-/// check below has to look at the file that will actually be restored, not
-/// the one EXPORT wrote. The decode goes to `after.sql`.
+/// A plain VARIANT column in a table written as text is the fourth edit,
+/// whether the table is text by default or because parquet cannot hold it.
+/// It runs NOW rather than being handed back: the table's file is written
+/// with the column cast to JSON (see [`outgoing`]), because the blank-record
+/// check has to look at the file that will actually be restored, not the
+/// one EXPORT wrote. The decode goes to `after.sql`.
 fn patch_loader(
     dir: &Path,
     format: Format,
@@ -577,10 +578,19 @@ fn patch_loader(
         let swap = reformat(dir, &line, &schema, format)?;
         match swap {
             Some(TableRewrite { loader, statement, stale, note }) if !strict => {
-                lines.push(loader);
-                again.statements.push(statement);
                 again.replaced.push(stale);
                 again.notes.push(note);
+                if format.other() == Format::Tsv {
+                    // Written now rather than handed back, so the text checks
+                    // below read the file that will be restored.
+                    execute(&statement)?;
+                    let TableSchema { variants, generated, .. } = &schema[table];
+                    let source = outgoing(table, generated, variants);
+                    text_checks(dir, execute, table, variants, &loader, &source, strict, &mut again, &mut after)?;
+                } else {
+                    again.statements.push(statement);
+                }
+                lines.push(loader);
             }
             // --strict: the answer to "text cannot hold this" is an error
             // rather than a change of format, however well announced.
@@ -604,27 +614,8 @@ fn patch_loader(
                     let source = outgoing(table, generated, variants);
                     if !variants.is_empty() {
                         execute(&format!("COPY {source} TO {} ({DIALECT})", quote(Path::new(&name))))?;
-                        for (column, held) in json_check(execute, dir, table, variants)? {
-                            if strict {
-                                return Err(format!(
-                                    "{table}.{} holds {held} — a VARIANT is written as JSON, which has \
-                                     no such type. Drop --strict to write it as JSON anyway, or \
-                                     --format parquet to keep it",
-                                    ident(&column)
-                                ));
-                            }
-                            again.notes.push(format!(
-                                "{table}.{} holds {held} — written as JSON, which has no such type; \
-                                 --format parquet keeps it",
-                                ident(&column)
-                            ));
-                        }
-                        after.push(json_in(table, variants));
                     }
-                    if let Some((statement, note)) = requote(dir, &line, &source)? {
-                        again.statements.push(statement);
-                        again.notes.push(note);
-                    }
+                    text_checks(dir, execute, table, variants, &line, &source, strict, &mut again, &mut after)?;
                 }
                 lines.push(line.to_string());
             }
@@ -643,6 +634,47 @@ fn patch_loader(
         fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(again)
+}
+
+/// What every table written as text needs once its file is on disk, however
+/// it came to be text. Its VARIANT columns travelled as JSON: say what JSON
+/// could not carry, and queue the decode for `after.sql`. And a file holding
+/// a blank record is written again quoted, since a reader skips that line.
+#[allow(clippy::too_many_arguments)]
+fn text_checks(
+    dir: &Path,
+    execute: &dyn Fn(&str) -> Result<(), String>,
+    table: &str,
+    variants: &[String],
+    line: &str,
+    source: &str,
+    strict: bool,
+    again: &mut Reformat,
+    after: &mut Vec<String>,
+) -> Result<(), String> {
+    if !variants.is_empty() {
+        for (column, held) in json_check(execute, dir, table, variants)? {
+            if strict {
+                return Err(format!(
+                    "{table}.{} holds {held} — a VARIANT is written as JSON, which has \
+                     no such type. Drop --strict to write it as JSON anyway, or \
+                     --format parquet to keep it",
+                    ident(&column)
+                ));
+            }
+            again.notes.push(format!(
+                "{table}.{} holds {held} — written as JSON, which has no such type; \
+                 --format parquet keeps it",
+                ident(&column)
+            ));
+        }
+        after.push(json_in(table, variants));
+    }
+    if let Some((statement, note)) = requote(dir, line, source)? {
+        again.statements.push(statement);
+        again.notes.push(note);
+    }
+    Ok(())
 }
 
 /// The table as it goes OUT, for a `COPY … TO`: its stored columns in order,
@@ -734,7 +766,7 @@ fn reformat(
     format: Format,
 ) -> Result<Option<TableRewrite>, String> {
     let (table, _, path) = copy_parts(line).ok_or("invalid backup COPY path")?;
-    let TableSchema { types, generated, .. } = schema.get(table)
+    let TableSchema { types, generated, variants, .. } = schema.get(table)
         .ok_or_else(|| format!("no schema for backup table {table}"))?;
     let Some((_, why)) = format.cannot_hold().iter().find(|(ty, _)| types.contains(ty)) else {
         return Ok(None);
@@ -756,7 +788,7 @@ fn reformat(
         ),
         statement: format!(
             "COPY {} TO {} ({})",
-            outgoing(table, generated, &[]),
+            outgoing(table, generated, if instead == Format::Tsv { variants } else { &[] }),
             quote(&dir.join(format!("{name}.{}", instead.extension()))),
             instead.options()
         ),

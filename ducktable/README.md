@@ -117,8 +117,8 @@ starting from a DuckDB filename instead of a port.
 ## Why Harbor-only
 
 - One wire protocol, one type system, one EXPLAIN dialect.
-- No C++ FFI, no bundled DuckDB, no engine version lock. The client is a
-  single static binary per platform.
+- No C++ FFI, no bundled DuckDB, no engine version lock. The client is one
+  app bundle with no DuckDB inside it.
 - DuckDB's ATTACH and scanner ecosystem (SQLite, Postgres, MySQL, Parquet,
   CSV, JSON, Iceberg, DuckLake) means one engine already reads most of your
   data. DuckTable inherits all of it without a driver matrix.
@@ -142,8 +142,8 @@ built from the sibling `harbor/` tree in this repository.
 Early releases, moving fast. Working today: the fleet sidebar, the paged
 data grid with filters and column control, the Structure view with DDL,
 staged cell editing with a Sheets-style keyboard grammar, and the Query
-scratchpad with per-statement send. Requires Harbor 0.20+. See
-`docs/DESIGN.md` for the architecture and roadmap.
+scratchpad with per-statement send. Requires Harbor 0.39 or later. See
+`docs/DESIGN.md` for the architecture, the interface and what is planned.
 
 ## License
 

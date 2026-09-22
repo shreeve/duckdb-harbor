@@ -247,7 +247,7 @@ impl DuckTable {
                         // this animation has played. A whole row LEAVING is a
                         // structural motion, so it runs a touch longer than an
                         // in-place micro-fade (QUICK_FADE_MS) on purpose — the
-                        // eye needs to track the departure (docs/UI.md, Motion).
+                        // eye needs to track the departure (docs/DESIGN.md, Motion).
                         return base
                             .with_animation(
                                 SharedString::from(format!("berth-leaving-{}", row.name)),

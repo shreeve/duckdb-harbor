@@ -23,6 +23,10 @@ fn catalog_refresh_is_current(
 /// instead of trying to update sidebar counts themselves.
 pub(crate) struct CatalogRefreshRequested;
 
+/// A grid's commit has landed or failed: its staged set is now either empty
+/// or kept, and a table switch that waited on it can run.
+pub(crate) struct CommitSettled;
+
 pub(crate) struct RowVm {
     pub(crate) name: String,
     pub(crate) state: State,
@@ -91,6 +95,11 @@ pub struct DuckTable {
     /// Fence for table selection: a first-page fetch that finishes after a
     /// newer click discards itself instead of swapping in a stale grid.
     select_seq: u64,
+    /// A table chosen while the current grid was committing. Swapping then
+    /// would park a staged set whose statements are already running: back
+    /// on the table, it would come back staged, and ⌘S would write it twice.
+    /// The switch runs when the commit settles (`CommitSettled`).
+    deferred_select: Option<(String, String)>,
     /// Fence for the berth-list refresh: overlapping sweeps (a manual
     /// click racing the one connect fires) commit newest-wins instead of
     /// arbitrary order.
@@ -112,7 +121,7 @@ pub struct DuckTable {
     /// view). Keyed by source; handed back when the table's grid is
     /// rebuilt, cleared on disconnect (a new berth is a new world).
     staged: std::collections::HashMap<String, crate::edits::Edits>,
-    /// The sidebar/content divider (UI.md: divider positions persist —
+    /// The sidebar/content divider (DESIGN.md: divider positions persist —
     /// the width saves at the end of each drag).
     pub(crate) sidebar_resize: Entity<gpui_component::resizable::ResizableState>,
     /// Berths with a Stop in flight: the row keeps its slot but swaps its
@@ -192,6 +201,7 @@ impl DuckTable {
             table_filter: None,
             berth_filter: None,
             select_seq: 0,
+            deferred_select: None,
             refresh_seq: 0,
             catalog_seq: 0,
             warning: None,
@@ -248,9 +258,7 @@ impl DuckTable {
             // failed page drops the count unawaited.
             // Keyless tables fetch DuckDB's implicit rowid as their
             // editing identity — the same predicate Grid::new applies.
-            let rowid = structure
-                .as_ref()
-                .is_some_and(|s| !s.cols.iter().any(|c| c.pk));
+            let rowid = structure.as_ref().is_some_and(|s| s.keyed_by_rowid());
             let page_task = cx.background_executor().spawn({
                 let (conn, schema, name) = (conn.clone(), clone_str(&schema), clone_str(&name));
                 async move { crate::sql::first_page(&conn, &schema, &name, rowid, page_size) }
@@ -266,6 +274,10 @@ impl DuckTable {
                     return;
                 }
                 if !matches!(state.phase, Phase::Connected { .. }) {
+                    return;
+                }
+                if state.grid.as_ref().is_some_and(|g| g.read(cx).committing) {
+                    state.deferred_select = Some((clone_str(&schema), clone_str(&name)));
                     return;
                 }
                 // Staged edits outlive the grid that collected them (Law
@@ -286,6 +298,12 @@ impl DuckTable {
                 });
                 cx.subscribe(&grid, |state, _, _: &CatalogRefreshRequested, cx| {
                     state.refresh_catalog(cx)
+                })
+                .detach();
+                cx.subscribe_in(&grid, window, |state, _, _: &CommitSettled, window, cx| {
+                    if let Some((schema, name)) = state.deferred_select.take() {
+                        state.select_table(schema, name, window, cx);
+                    }
                 })
                 .detach();
                 // And returning to a table hands its parked edits back.
@@ -725,6 +743,7 @@ impl DuckTable {
                 state.grid = None;
                 state.query = None;
                 state.staged.clear();
+                state.deferred_select = None;
                 state.select_seq += 1;
                 state.phase = match outcome {
                     Ok((conn, info, catalog)) => Phase::Connected { conn, info, catalog },
@@ -788,6 +807,9 @@ impl DuckTable {
         self.grid = None;
         self.query = None;
         self.staged.clear();
+        // A switch that waited on this berth's commit belongs to it too: the
+        // grid it waited on is gone, and no CommitSettled will come for it.
+        self.deferred_select = None;
         self.select_seq += 1;
         self.sync_path_copy(cx);
     }

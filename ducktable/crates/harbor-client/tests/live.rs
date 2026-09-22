@@ -196,7 +196,9 @@ fn keyless_base_tables_expose_rowid() {
         return;
     };
     let (schema, name) = (t[0].as_str().unwrap(), t[1].as_str().unwrap());
-    let sql = format!("SELECT rowid, * FROM \"{schema}\".\"{name}\" LIMIT 3");
+    let sql = format!(
+        "SELECT [rowid::UBIGINT, hash(*COLUMNS(*))] AS rowid, * FROM \"{schema}\".\"{name}\" LIMIT 3"
+    );
     let result = harbor_client::query(&conn, &sql).expect("rowid probe");
     println!("rowid probe on {schema}.{name}:");
     println!("  columns: {:?}", result.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>());
@@ -204,9 +206,12 @@ fn keyless_base_tables_expose_rowid() {
         println!("  {:?}", r.first());
     }
     assert!(result.columns.first().and_then(|c| c.name.as_deref()) == Some("rowid"));
-    // And the shape an UPDATE would use: quoted pseudocolumn in WHERE.
-    let sql = format!("SELECT count(*) FROM \"{schema}\".\"{name}\" WHERE \"rowid\" = 0");
-    let count = harbor_client::query(&conn, &sql).expect("quoted rowid in WHERE");
+    // And the shape an UPDATE would use: the rowid and the aliased row's
+    // hash in the WHERE.
+    let sql = format!(
+        "SELECT count(*) FROM \"{schema}\".\"{name}\" AS \"row\" WHERE \"rowid\" = 0 AND hash(\"row\") = 0::UBIGINT"
+    );
+    let count = harbor_client::query(&conn, &sql).expect("rowid and hash in WHERE");
     println!("  quoted-WHERE count row: {:?}", count.rows.first());
 }
 

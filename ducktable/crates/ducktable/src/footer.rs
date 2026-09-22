@@ -1,4 +1,4 @@
-//! The grid's bottom bar (UI.md "Bottom bar", design.css `.bbar`):
+//! The grid's bottom bar (DESIGN.md "Bottom bar", design.css `.bbar`):
 //! view switcher, filter toggle, Columns popover, pager, and the
 //! right-anchored status line. An `impl Grid` satellite, the same shape
 //! as `inspector.rs` and `structure.rs` — per-table controls, a

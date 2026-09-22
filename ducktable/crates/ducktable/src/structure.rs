@@ -1,9 +1,8 @@
-//! The Structure view: the table's columns and DDL (UI.md "Bottom bar"),
+//! The Structure view: the table's columns and DDL (DESIGN.md "Grid"),
 //! swapped in for the data grid via the footer's view switcher. Viewing
 //! data and viewing schema are exclusive by design — a schema change
-//! reshapes the data view, so the two never render side by side. Read-only
-//! for now: the grid already edits through the staged/live pipeline
-//! (edits.rs), and the schema editor will join it.
+//! reshapes the data view, so the two never render side by side. Read-only:
+//! a schema editor is planned (DESIGN.md).
 //!
 //! Everything shown here is a projection of the `/catalog` document —
 //! columns, constraints, and the engine's own CREATE TABLE text — so opening
@@ -28,6 +27,16 @@ pub(crate) struct StructCol {
 pub(crate) struct TableStructure {
     pub(crate) cols: Vec<StructCol>,
     pub(crate) ddl: Option<String>,
+}
+
+impl TableStructure {
+    /// Whether rows are named by DuckDB's implicit rowid (docs/EDITING.md):
+    /// the table has no key of its own. A column of its own called `rowid`
+    /// shadows the implicit one in every query, so such a table has no
+    /// identity at all and is read-only.
+    pub(crate) fn keyed_by_rowid(&self) -> bool {
+        !self.cols.iter().any(|c| c.pk || c.name.eq_ignore_ascii_case("rowid"))
+    }
 }
 
 /// A table's structure, read straight out of the catalog snapshot the

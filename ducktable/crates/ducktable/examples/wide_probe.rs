@@ -1,5 +1,5 @@
 //! Wide-table probe: 500 columns x 100,000 rows through gpui-component's
-//! Table (COMPONENTS.md mandates measuring before trusting it). The window
+//! Table (DESIGN.md, Components: measured, not assumed). The window
 //! drives itself: six scroll patterns, frame deltas recorded via an
 //! `on_next_frame` chain, report printed to stdout, then the app quits.
 //!
