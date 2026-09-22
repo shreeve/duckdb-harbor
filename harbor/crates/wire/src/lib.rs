@@ -113,6 +113,7 @@ pub mod code {
     pub const BAD_REQUEST: &str = "bad_request";
     pub const SQL_ERROR: &str = "sql_error";
     pub const NOT_FOUND: &str = "not_found";
+    pub const FORBIDDEN: &str = "forbidden";
     pub const BODY_TOO_LARGE: &str = "body_too_large";
     pub const RESPONSE_TOO_LARGE: &str = "response_too_large";
     pub const CANCELLED: &str = "cancelled";

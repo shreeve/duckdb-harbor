@@ -597,8 +597,11 @@ fn emit(
                 out.push('"');
             }
             LOGICAL_TYPE_ID_DATE => {
+                let days = r.get::<i32>(phys);
                 out.push('"');
-                push_date(out, r.get::<i32>(phys));
+                if !push_infinity(out, days as i64, i32::MAX as i64) {
+                    push_date(out, days);
+                }
                 out.push('"');
             }
             LOGICAL_TYPE_ID_TIME => {
@@ -624,33 +627,51 @@ fn emit(
                 out.push('"');
             }
             LOGICAL_TYPE_ID_TIMESTAMP_SEC => {
+                let raw = r.get::<i64>(phys);
                 out.push('"');
-                push_ts(out, r.get::<i64>(phys) as i128 * 1_000_000_000, true, false);
+                if !push_infinity(out, raw, i64::MAX) {
+                    push_ts(out, raw as i128 * 1_000_000_000, true, false);
+                }
                 out.push('"');
             }
             LOGICAL_TYPE_ID_TIMESTAMP_MS => {
+                let raw = r.get::<i64>(phys);
                 out.push('"');
-                push_ts(out, r.get::<i64>(phys) as i128 * 1_000_000, false, false);
+                if !push_infinity(out, raw, i64::MAX) {
+                    push_ts(out, raw as i128 * 1_000_000, false, false);
+                }
                 out.push('"');
             }
             LOGICAL_TYPE_ID_TIMESTAMP => {
+                let raw = r.get::<i64>(phys);
                 out.push('"');
-                push_ts(out, r.get::<i64>(phys) as i128 * 1_000, false, false);
+                if !push_infinity(out, raw, i64::MAX) {
+                    push_ts(out, raw as i128 * 1_000, false, false);
+                }
                 out.push('"');
             }
             LOGICAL_TYPE_ID_TIMESTAMP_NS => {
+                let raw = r.get::<i64>(phys);
                 out.push('"');
-                push_ts(out, r.get::<i64>(phys) as i128, false, false);
+                if !push_infinity(out, raw, i64::MAX) {
+                    push_ts(out, raw as i128, false, false);
+                }
                 out.push('"');
             }
             LOGICAL_TYPE_ID_TIMESTAMP_TZ => {
+                let raw = r.get::<i64>(phys);
                 out.push('"');
-                push_ts(out, r.get::<i64>(phys) as i128 * 1_000, false, true);
+                if !push_infinity(out, raw, i64::MAX) {
+                    push_ts(out, raw as i128 * 1_000, false, true);
+                }
                 out.push('"');
             }
             LOGICAL_TYPE_ID_TIMESTAMP_TZ_NS => {
+                let raw = r.get::<i64>(phys);
                 out.push('"');
-                push_ts(out, r.get::<i64>(phys) as i128, false, true);
+                if !push_infinity(out, raw, i64::MAX) {
+                    push_ts(out, raw as i128, false, true);
+                }
                 out.push('"');
             }
             LOGICAL_TYPE_ID_INTERVAL => {
@@ -848,6 +869,19 @@ fn push_decimal(out: &mut String, v: i128, scale: u8) {
     let start = buf.len() - scale as usize;
     // Safety: the slice holds only ASCII digits.
     out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[start..]) });
+}
+
+/// An infinite DATE or TIMESTAMP, which the engine stores as a sentinel:
+/// the type's largest value, or its negation. Formatted as a date, either
+/// reads as a real moment thousands of years out. They go out as the words
+/// DuckDB itself prints and parses back, and false means `raw` is a date.
+fn push_infinity(out: &mut String, raw: i64, max: i64) -> bool {
+    match raw {
+        r if r == max => out.push_str("infinity"),
+        r if r == -max => out.push_str("-infinity"),
+        _ => return false,
+    }
+    true
 }
 
 /// Format a timestamp from nanoseconds: `seconds_only` suppresses the

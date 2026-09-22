@@ -58,9 +58,9 @@ class Regressions(unittest.TestCase):
         cls.work.cleanup()
 
     @classmethod
-    def request(cls, method, path, data=None, chunked=False):
+    def request(cls, method, path, data=None, chunked=False, extra=None):
         body = json.dumps(data).encode() if isinstance(data, dict) else data
-        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        headers = {"Content-Type": "application/json", "Accept": "application/json", **(extra or {})}
         if chunked:
             headers["Transfer-Encoding"] = "chunked"
             body = [body]
@@ -195,6 +195,22 @@ class Regressions(unittest.TestCase):
         self.assertEqual(self.sql("SELECT current_setting('threads')")["data"], before)
         self.sql("SET default_order='DESC'")
         self.sql("RESET default_order")
+
+    def test_a_web_page_cannot_reach_the_tcp_listener(self):
+        # A page's form POST needs no preflight; DNS rebinding reads the answer
+        # under a hostname the page controls. Both are refused before routing.
+        probe = {"sql": "CREATE TABLE from_a_page AS SELECT 1"}
+        for extra in ({"Origin": "https://attacker.example", "Content-Type": "text/plain"},
+                      {"Origin": "null"},
+                      {"Host": f"attacker.example:{self.port}"}):
+            status, doc = self.request("POST", "/sql", probe, extra=extra)
+            self.assertEqual((status, doc["code"]), (403, "forbidden"), extra)
+        status, _ = self.request("GET", "/info", extra={"Host": f"rebound.example:{self.port}"})
+        self.assertEqual(status, 403)
+        for host in (f"localhost:{self.port}", f"127.0.0.1:{self.port}"):
+            self.assertEqual(self.request("GET", "/info", extra={"Host": host})[0], 200)
+        doc = self.sql("SELECT count(*) AS n FROM duckdb_tables() WHERE table_name = 'from_a_page'")
+        self.assertEqual(doc["data"], [[0]])
 
     def test_chunked_limit_applies_to_both_body_endpoints(self):
         for path, data in [("/sql", {"sql": "CREATE TABLE oversized(x INTEGER)"}),

@@ -306,28 +306,32 @@ def text_gives_way_to_parquet(work):
     # The mirror image, and the reason the swap is a rule rather than a
     # special case: parquet normalises a TIMETZ to UTC — 12:00:00+02:30 comes
     # back 09:30:00+00, the same instant, a different value, and nothing said.
-    # Under --format parquet that table goes to TEXT.
+    # Under --format parquet that table goes to TEXT, and a VARIANT beside it
+    # goes as JSON and is decoded after, exactly as it would under text.
     zone = work / "zoned.duckdb"
     zone_bk = work / "zoned.backup"
     zone_rs = work / "zoned_restored.duckdb"
-    quiet(zone, "CREATE TABLE zoned AS SELECT '12:00:00+02:30'::TIMETZ AS v")
+    quiet(zone, "CREATE TABLE zoned AS SELECT '12:00:00+02:30'::TIMETZ AS v, {'a': [1, 2]}::VARIANT AS doc")
     quiet(zone, "CREATE TABLE plain(x INTEGER)")
     run(zone, "stop")
     said = run(zone, "backup", zone_bk, "--format", "parquet").stderr
     run(zone, "stop")
     files = sorted(f.name for f in zone_bk.iterdir())
     run(zone_rs, "restore", zone_bk)
-    kept = sql(zone_rs, "SELECT v::VARCHAR AS v FROM zoned")[0]["v"]
+    kept, doc = (lambda r: (r["v"], r["doc"]))(
+        sql(zone_rs, "SELECT v::VARCHAR AS v, variant_typeof(doc) AS doc FROM zoned")[0])
     run(zone_rs, "stop")
     if "zoned is text, not parquet" not in said:
         bad("--format parquet said nothing about its TIMETZ column", said)
-    elif files != ["load.sql", "plain.parquet", "schema.sql", "zoned.csv"]:
+    elif files != ["after.sql", "load.sql", "plain.parquet", "schema.sql", "zoned.csv"]:
         bad("the swap did not go the other way", files)
     elif kept != "12:00:00+02:30":
         bad(f"the TIMETZ offset was lost anyway ({kept})")
+    elif not doc.startswith("OBJECT"):
+        bad(f"the VARIANT beside it came back as {doc}")
     else:
-        ok("under --format parquet a TIMETZ table goes to text — the swap "
-           "runs both ways")
+        ok("under --format parquet a TIMETZ table goes to text, its VARIANT "
+           "still a document — the swap runs both ways")
 
     # Parquet's own hole, and the shape of every format failure: loud, named
     # by DuckDB, and leaving nothing that could be mistaken for a backup.

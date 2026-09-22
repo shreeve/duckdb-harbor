@@ -123,6 +123,16 @@ CASES = [
     ("date-leap-2024", "SELECT '2024-02-29'::DATE AS v",              "DATE", True, "2024-02-29"),
     ("date-year-1",    "SELECT '0001-01-01'::DATE AS v",              "DATE", True, "0001-01-01"),
     ("date-year-9999", "SELECT '9999-12-31'::DATE AS v",              "DATE", True, "9999-12-31"),
+    # An infinite date is a sentinel in storage, the type's largest value.
+    # Formatted as a date it reads as a real one millennia out, so it goes
+    # out as the word the engine prints and parses back.
+    ("date-inf",       "SELECT 'infinity'::DATE AS v",                "DATE", True, "infinity"),
+    ("date-ninf",      "SELECT '-infinity'::DATE AS v",               "DATE", True, "-infinity"),
+    ("ts-inf",         "SELECT 'infinity'::TIMESTAMP AS v",           "TIMESTAMP", True, "infinity"),
+    ("ts-ninf",        "SELECT '-infinity'::TIMESTAMP AS v",          "TIMESTAMP", True, "-infinity"),
+    ("ts-ns-inf",      "SELECT 'infinity'::TIMESTAMP_NS AS v",        "TIMESTAMP_NS", True, "infinity"),
+    ("ts-s-inf",       "SELECT 'infinity'::TIMESTAMP_S AS v",         "TIMESTAMP_S", True, "infinity"),
+    ("tstz-ninf",      "SELECT '-infinity'::TIMESTAMPTZ AS v",        "TIMESTAMP WITH TIME ZONE", True, "-infinity"),
 
     # -- times: a fraction appears only when there is one -------------------
     ("time-midnight",  "SELECT '00:00:00'::TIME AS v",                "TIME", True, "00:00:00"),
