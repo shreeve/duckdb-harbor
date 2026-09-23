@@ -4,6 +4,22 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.42.1 — 2026-09-23
+
+- **The vendored reedline is upstream `main`, unpatched.** Every fix the REPL
+  carried as a local patch is merged upstream, the last of them on
+  2026-09-23 (nushell/reedline#1226: `Up` and `Down` report whether they
+  moved anything). `vendor/reedline` is a verbatim `git archive` of upstream
+  at that point, since crates.io still serves 0.51.0, and it goes when 0.52
+  ships. The completion menu is built `.with_word_chars("_.")`, upstream's
+  spelling of the rule that a menu closes at the end of the word it was
+  opened for. One behavior follows upstream's plainer rule: `Down` on a
+  recalled line that has been edited opens the completion panel rather than
+  walking history back to the live line, because reedline's history walk
+  ends at the first edit. A recalled line left as it came still walks. The
+  binary loses reedline's `crossbeam`, `fd-lock`, `itertools`, `thiserror`
+  and `unicase` dependencies along the way.
+
 ## 0.42.0 — 2026-09-22
 
 - **A web page cannot reach the TCP listener.** Harbor binds TCP to loopback,

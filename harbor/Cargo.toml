@@ -47,10 +47,8 @@ opt-level = "s"
 [profile.release.package.nu-ansi-term]
 opt-level = "s"
 
-# vendor/reedline is 0.50.0 verbatim except three patches in src/engine.rs
-# (see vendor/reedline/HARBOR.md): a completion menu with zero suggestions does
-# not swallow Enter, typing a word boundary closes the menu, and MenuAccept
-# takes a completion without submitting. The first two stop a stale menu from
-# inserting a stray word instead of submitting.
+# vendor/reedline is upstream main, verbatim and unpatched (the commit is in
+# vendor/reedline/HARBOR.md): it carries four merged fixes the REPL relies on
+# that no crates.io release holds yet. It goes when reedline 0.52 ships.
 [patch.crates-io]
 reedline = { path = "vendor/reedline" }

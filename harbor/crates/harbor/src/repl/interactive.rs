@@ -8,6 +8,7 @@ use reedline::{
     Keybindings, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline,
     ReedlineEvent, ReedlineMenu, Signal, ValidationResult, Validator, Vi,
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
+    default_vi_visual_keybindings,
 };
 use std::borrow::Cow;
 
@@ -159,8 +160,8 @@ fn bind_completion_keys(kb: &mut Keybindings) {
     // one place Down has nothing to do — nothing newer sits below the
     // present — and there it opens the completion panel, which sits below
     // the prompt where Down points. With the panel open, Down moves through
-    // it. Reedline's Down reports itself inapplicable on the live line
-    // (vendor/reedline, Patch D), which is what lets the fallback fire.
+    // it. Reedline's Down reports itself inapplicable when it moved nothing,
+    // which is what lets the fallback fire.
     kb.add_binding(
         KeyModifiers::NONE,
         KeyCode::Down,
@@ -207,13 +208,16 @@ fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
     let edit_mode: Box<dyn reedline::EditMode> = if vi {
         let mut insert = default_vi_insert_keybindings();
         bind_completion_keys(&mut insert);
-        Box::new(Vi::new(insert, default_vi_normal_keybindings()))
+        Box::new(Vi::new(insert, default_vi_normal_keybindings(), default_vi_visual_keybindings()))
     } else {
         let mut kb = default_emacs_keybindings();
         bind_completion_keys(&mut kb);
         Box::new(Emacs::new(kb))
     };
-    let menu = ColumnarMenu::default().with_name("completion_menu");
+    // The menu closes at the end of the word it was opened for: any character
+    // that cannot extend an identifier or a qualified name ends it, so a
+    // stale menu never intercepts a later Enter. `_` and `.` keep it open.
+    let menu = ColumnarMenu::default().with_name("completion_menu").with_word_chars("_.");
     let history = harbor_common::history_file().ok();
     Reedline::create()
         .with_validator(Box::new(SqlValidator))

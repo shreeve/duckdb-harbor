@@ -1,101 +1,78 @@
 # Harbor's vendored reedline
 
-This is reedline 0.50.0, vendored here and wired via `[patch.crates-io]` in
-the workspace `Cargo.toml`, carrying four patches in `src/engine.rs`. Each is
-covered by tests in this copy (`enter_with_an_empty_menu_submits_the_line`,
-`typing_past_a_completion_then_enter_runs_the_line`,
-`a_word_boundary_closes_the_menu`, `a_word_ends_inside_a_burst_of_typing`,
-`statement_punctuation_defuses_an_always_suggesting_menu`,
-`menu_accept_only_accepts_an_active_selection`,
-`down_on_the_live_line_is_inapplicable`,
-`down_walks_history_back_to_the_live_line_and_only_then_falls_through`,
-`a_recalled_line_keeps_down_as_history_even_after_an_edit`,
-`down_inside_a_multiline_buffer_moves_the_cursor`,
-`a_new_line_after_a_recalled_one_is_live`):
+This is reedline's `main` at commit
+`db34d84222a94686be30c638b4c629f58a97a6be` (2026-09-23, version 0.51.0 in
+its `Cargo.toml`), taken with `git archive` and wired via
+`[patch.crates-io]` in the workspace `Cargo.toml`. It carries no patches of
+harbor's own: everything harbor needed is upstream. The copy exists only
+because crates.io still serves 0.51.0 (2026-08-22), which predates all of it.
 
-- **Patch A** — a completion menu whose filtered suggestions are EMPTY does
-  not swallow Enter: the Enter/Submit guard skips valueless menus so the
-  event falls through to submit, and `submit_buffer` deactivates straggler
-  menus. (The bug: Tab opened the menu, it stayed active for the whole rest
-  of the line, and Enter was routed to it — inserting the highlighted word
-  at end of line, or dying on an empty menu.)
-- **Patch B** — typing a word boundary deactivates the menu, fish/zsh-style,
-  so a stale menu can't linger to intercept a later Enter. Boundary = any
-  char that can't extend a completable word (whitespace, `;`, `)`, quotes…);
-  only word chars and `.` (qualified names) keep it. Whitespace-only proved
-  insufficient in the field: after `;` DuckDB's grammar completer suggests
-  next-statement keywords, so the menu was non-empty and Patch A couldn't
-  save the Enter (`show tab` Tab `les;` Enter appended "table").
+What harbor relies on, and where each landed:
 
-  Every `InsertChar` in the batch is examined, not just the first.
-  `process_input_batch` fuses consecutive edits into one `ReedlineEvent::Edit`,
-  so a burst of typing delivers `les;` as a single event and the boundary can
-  sit anywhere in it.
-- **Patch C** — `ReedlineEvent::MenuAccept` accepts an active menu's selection
-  without submitting, so a binding can take a completion and leave Enter to
-  the line. Reports `Inapplicable` when no menu is active or the active one
-  has no values, so it composes under `UntilFound`.
-- **Patch D** — `ReedlineEvent::Down` reports `Inapplicable` on the live
-  line: the cursor on the buffer's last line, the buffer not recalled from
-  history (or emptied since), and no traversal in progress. Upstream always
-  reports it handled, even when it does nothing, so no binding could ever
-  fall through Down to something else. A `buffer_from_history` flag is set
-  when a history item is painted into the buffer, cleared when a walk that
-  began on the live line lands back on it (a walk from an edited recalled
-  line lands back on that line, which stays recalled) and at the start of
-  every `read_line`, and ignored once the buffer is empty. A recalled line therefore keeps Up
-  and Down as history even after an edit — the keys never change meaning
-  under a user's hands — and Down opens harbor's completion panel only
-  where history has nothing below.
+- **A completion menu with no suggestions does not swallow Enter**
+  (https://github.com/nushell/reedline/pull/1175). Enter falls through to
+  submit instead of inserting a highlighted word at the end of the line.
+- **A menu closes at the end of the word it was opened for**
+  (https://github.com/nushell/reedline/pull/1209). Upstream scopes the
+  boundary to the menu: harbor's completion menu is built
+  `.with_word_chars("_.")` in `crates/harbor/src/repl/interactive.rs`, so a
+  `.` keeps it open for a qualified name and anything else that cannot extend
+  an identifier closes it. Every `InsertChar` in a batch is examined, so a
+  burst of typing that arrives as one event still closes it. Upstream also
+  counts `InsertNewline` as ending the word.
+- **`ReedlineEvent::MenuAccept` takes a completion without submitting**
+  (https://github.com/nushell/reedline/pull/1203), and reports
+  `Inapplicable` with no active menu so it composes under `UntilFound`.
+- **`Up` and `Down` report whether they moved anything**
+  (https://github.com/nushell/reedline/pull/1226). `Down` on the live line
+  is `Inapplicable`, which is what lets harbor's binding fall through to
+  opening the completion panel. Upstream's rule is the plain one: a `Down`
+  that changes neither the buffer nor the cursor is inapplicable. So `Down`
+  on a recalled line that has been edited opens the panel rather than walking
+  history back to the live line, since reedline's history walk ends at the
+  first edit. A recalled line left as it came still walks.
 
-Harbor registers one menu, `ReedlineMenu::EngineCompleter`
-(`crates/harbor/src/repl/interactive.rs`). Patch B's boundary is therefore
-engine-wide here without consequence; a menu that filters on whole command
-lines, such as a history menu, would need the boundary scoped to the menu.
+Also in this snapshot and relevant to harbor: `Vi::new` takes the visual-mode
+keybindings as a third argument
+(https://github.com/nushell/reedline/pull/1214), and the `helix` feature
+is no longer a default.
 
-The 0.50.0 sources carry CRLF line endings and are not rustfmt-clean, both
-inherited from the crates.io tarball. Leave them as they are — reformatting
-buries the three patches in noise.
+Tests that prove the four behaviors live in this copy's `src/engine.rs`
+(`enter_with_an_empty_menu_submits_the_line`, `a_word_boundary_closes_the_menu`,
+`menu_accept_only_accepts_an_active_selection`, and the `down_*` and `up_*`
+history-walk tests). The suite runs in place: `cd vendor/reedline && cargo
+test -- --test-threads=1`. Multi-threaded `--all-features` runs on macOS
+segfault intermittently in the system-clipboard tests (parallel pasteboard
+access); they do so on clean upstream too.
 
-## Un-vendor when upstream lands
+Leave the sources exactly as `git archive` produced them. A local change
+here is a patch harbor has to carry, and the point of this copy is that it
+carries none.
 
-Upstream status (`gh pr view <n> --repo nushell/reedline`):
+## Un-vendor when 0.52 ships
 
-- **Patch A: merged** — https://github.com/nushell/reedline/pull/1175
-- **Patch B: merged** — https://github.com/nushell/reedline/pull/1209, which
-  closed https://github.com/nushell/reedline/issues/1176. Upstream scopes the
-  boundary to the menu: harbor must call `.with_word_chars("_.")` on its
-  completion menu once un-vendored (the builder takes `impl Into<String>`),
-  since the default keeps a menu open for the rest of the line. Upstream
-  also counts `InsertNewline` as ending the word, which this copy does not.
-- **Patch C: merged** — https://github.com/nushell/reedline/pull/1203, landed
-  upstream independently of this copy.
-- **Patch D: filed as https://github.com/nushell/reedline/pull/1226, open.**
-  The upstream form is narrower than this copy's: `Up` and `Down` report
-  `Inapplicable` when they moved nothing (buffer and cursor unchanged), the
-  way `Left` and `Right` already do at the edges of the line. It does not
-  carry this copy's `buffer_from_history` rule, under which an edited
-  recalled line keeps `Down` as history. That rule is harbor's product
-  choice; when un-vendoring, try the plain rule in the REPL first and keep
-  the edited-line behavior on harbor's side only if it is missed.
+When crates.io serves a reedline release at or past this commit: delete
+`reedline` from `[patch.crates-io]` and the `exclude` list in
+`harbor/Cargo.toml`, `rm -rf vendor/reedline`, set the reedline version in
+`crates/harbor/Cargo.toml` to that release, then `cargo test -p harbor &&
+make test SUITES="unit lifecycle types spec catalog sessions cancel"` and
+re-run the repro: `create or replace ta`, Tab, keep typing, Enter. The
+statement must run with no stray word appended; type the tail fast enough
+to arrive as one batch, or the boundary scan goes untested. A pty driver for
+exactly this sits in `test/scripts/lifecycle.sh` (the mooring check), and
+answers the two terminal probes the REPL makes on startup.
 
-Also merged: https://github.com/nushell/reedline/pull/1210, collapsing the
-duplicated menu-accept rule Patch A and Patch C each state separately.
+## Refreshing this snapshot before then
 
-crates.io is at 0.51.0, which predates all of them, so the earliest release
-carrying them is 0.52.
+From a checkout of nushell/reedline with `upstream` pointing at it:
 
-When every patch is upstream AND released (Patch D included, or re-applied
-on top of the release): delete `reedline` from
-`[patch.crates-io]` and the `exclude` list in `harbor/Cargo.toml`,
-`rm -rf vendor/reedline`, bump the reedline version in
-`crates/harbor/Cargo.toml`, add `.with_word_chars("_.")` to the completion
-menu, then `cargo test -p harbor && make test SUITES="unit types spec catalog
-sessions cancel"` and re-run the repro: `create or replace ta`, Tab, keep
-typing, Enter — the statement must run with no stray word appended. Type the
-tail fast enough to arrive as one batch, or the boundary scan goes untested.
+```bash
+cd harbor && cp vendor/reedline/HARBOR.md /tmp/HARBOR.md && rm -rf vendor/reedline
+mkdir vendor/reedline && git -C ~/Data/Code/reedline archive upstream/main | tar -x -C vendor/reedline
+rm -rf vendor/reedline/.github vendor/reedline/.gitignore vendor/reedline/.typos.toml
+cp /tmp/HARBOR.md vendor/reedline/HARBOR.md
+```
 
-Known upstream flake, not ours: `cargo test --all-features` on macOS
-segfaults intermittently in the system-clipboard tests (parallel pasteboard
-access) — it does so on clean upstream main too; default-feature and
-single-threaded runs are green.
+Then update the commit hash above, and the reedline version in
+`crates/harbor/Cargo.toml` if the snapshot's `Cargo.toml` moved past it: the
+`[patch]` only applies when the copy's version satisfies that requirement.

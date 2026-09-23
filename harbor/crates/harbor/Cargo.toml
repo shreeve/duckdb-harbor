@@ -26,7 +26,7 @@ serde = "1"
 wire = { path = "../wire" }
 crossterm = "0.29.0"
 nu-ansi-term = "0.50.3"
-reedline = "0.50.0"
+reedline = "0.51.0"
 signal-hook = { version = "0.4", default-features = false }
 # already in reedline's tree: terminal-cell widths for duckbox alignment
 unicode-width = "0.2"
