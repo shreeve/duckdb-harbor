@@ -9,8 +9,8 @@ pub use helix_keybindings::{
 use super::{is_plain_char, is_text_char, parse_non_key_event};
 
 use crate::{
-    Direction, EditCommand, EditMode, FindStop, Granularity, Keybindings, MotionTarget,
-    PromptEditMode, PromptHelixMode, ReedlineEvent, WordEdge, WordKind,
+    enums::EventStatus, Direction, EditCommand, EditMode, FindStop, Granularity, Keybindings,
+    MotionTarget, PromptEditMode, PromptHelixMode, ReedlineEvent, WordEdge, WordKind,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +19,17 @@ enum HelixMode {
     Insert,
     Select,
 }
+
+impl From<PromptHelixMode> for HelixMode {
+    fn from(mode: PromptHelixMode) -> Self {
+        match mode {
+            PromptHelixMode::Normal => HelixMode::Normal,
+            PromptHelixMode::Insert => HelixMode::Insert,
+            PromptHelixMode::Select => HelixMode::Select,
+        }
+    }
+}
+
 /// A prefix key waiting for its argument.
 ///
 /// `Find` and `Replace` take an arbitrary char as data, so no finite key
@@ -154,6 +165,20 @@ impl EditMode for Helix {
             HelixMode::Select => PromptEditMode::Helix(PromptHelixMode::Select),
         }
     }
+    fn handle_mode_specific_event(&mut self, event: ReedlineEvent) -> EventStatus {
+        match event {
+            ReedlineEvent::SwitchMode(PromptEditMode::Helix(target)) => {
+                // `dispatch` drops the sequence before a bound chord fires, so
+                // no binding gets here with one armed. Reset anyway, rather
+                // than lean on that guarantee from over here.
+                self.pending = None;
+                self.count = None;
+                self.mode = HelixMode::from(target);
+                EventStatus::Handled
+            }
+            _ => EventStatus::Inapplicable,
+        }
+    }
 }
 
 impl Helix {
@@ -193,9 +218,41 @@ impl Helix {
         self
     }
 
+    /// The keybinding table `dispatch` reads, so normal or select.
+    fn keybindings(&self) -> &Keybindings {
+        match self.mode {
+            HelixMode::Select => &self.select_keybindings,
+            _ => &self.normal_keybindings,
+        }
+    }
+
     fn dispatch(&mut self, key: KeyEvent) -> ReedlineEvent {
         // Insert should never use this code-path.
         debug_assert!(self.mode != HelixMode::Insert);
+
+        // The table comes first, except for a key the machine claims:
+        // - `Esc` always reaches it, otherwise modes get stranded;
+        // - a plain `1`-`9` starts or continues a count;
+        // - a half-typed sequence takes any character, which is its next count
+        //   digit or its pending argument, so a binding cannot steal it.
+        // Anything else mid-sequence would only be rejected, so a chord bound
+        // in the table fires instead of being eaten and abandons the sequence,
+        // which is how vi treats its own `cache`.
+        let mid_sequence = self.pending.is_some() || self.count.is_some();
+        let claimed = match key.code {
+            KeyCode::Esc => true,
+            KeyCode::Char('1'..='9') if key.modifiers == KeyModifiers::NONE => true,
+            KeyCode::Char(_) => mid_sequence && is_text_char(key.modifiers),
+            _ => false,
+        };
+        if !claimed {
+            if let Some(event) = self.keybindings().find_binding(key.modifiers, key.code) {
+                self.pending = None;
+                self.count = None;
+                return event;
+            }
+        }
+
         let outcome = match (self.pending.take(), key.code) {
             // Handle a pending key event
             (Some(pending), _) => complete_pending(pending, self.count.unwrap_or(1), key),
@@ -214,21 +271,8 @@ impl Helix {
                 );
                 return ReedlineEvent::None;
             }
-            // Do a table lookup, else use the helix machine,
-            // we don't handle insert mode in dispatch.
-            // Esc must always reach the machine, otherwise modes get stranded.
-            (None, code) => {
-                if self.count.is_none() && code != KeyCode::Esc {
-                    let table = match self.mode {
-                        HelixMode::Select => &self.select_keybindings,
-                        _ => &self.normal_keybindings,
-                    };
-                    if let Some(event) = table.find_binding(key.modifiers, code) {
-                        return event;
-                    }
-                }
-                interpret(self.mode, self.count, key)
-            }
+            // Unbound or claimed, so the helix machine reads it.
+            (None, _) => interpret(self.mode, self.count, key),
         };
 
         match outcome {
@@ -768,15 +812,17 @@ mod test {
     }
 
     #[test]
-    fn live_count_suppresses_table_bindings() {
-        // rule from #693: live sequence state wins over the lookup table
+    fn a_bound_chord_ends_a_live_count() {
+        // #693 lets live sequence state win over the table so a binding cannot
+        // hijack an argument. A `Ctrl` chord is no argument, so it fires, and
+        // `Ctrl-C` after a count is not swallowed.
         let mut helix = normal();
         let _ = helix.parse_event(chr('3'));
         assert_eq!(
             helix.parse_event(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            ReedlineEvent::None
+            ReedlineEvent::CtrlC
         );
-        // the rejected chord killed the count
+        // the chord killed the count
         assert_eq!(
             helix.parse_event(chr('w')),
             ReedlineEvent::Edit(vec![EditCommand::Select(w())])
@@ -1452,5 +1498,113 @@ mod test {
             ])
         );
         assert_eq!(helix.count, None);
+    }
+
+    // ---- switch mode event ----
+
+    #[rstest]
+    #[case(PromptHelixMode::Insert, HelixMode::Insert)]
+    #[case(PromptHelixMode::Select, HelixMode::Select)]
+    #[case(PromptHelixMode::Normal, HelixMode::Normal)]
+    fn switch_mode_event_switches_the_machine(
+        #[case] target: PromptHelixMode,
+        #[case] expected: HelixMode,
+    ) {
+        let mut helix = normal();
+        let status = helix
+            .handle_mode_specific_event(ReedlineEvent::SwitchMode(PromptEditMode::Helix(target)));
+        assert!(matches!(status, EventStatus::Handled));
+        assert_eq!(helix.mode, expected);
+    }
+
+    #[test]
+    fn switch_mode_event_declines_another_machine() {
+        let mut helix = normal();
+        let status =
+            helix.handle_mode_specific_event(ReedlineEvent::SwitchMode(PromptEditMode::Emacs));
+        assert!(matches!(status, EventStatus::Inapplicable));
+        assert_eq!(helix.mode, HelixMode::Normal);
+    }
+
+    // ---- bindings during a half-typed sequence ----
+
+    /// A key that can be neither part of a count nor a pending argument goes
+    /// to the table even mid-sequence, as it does in vi, so a chord like the
+    /// demo's F5 is never eaten. The abandoned sequence must not leak into
+    /// the next key.
+    #[rstest]
+    #[case::after_a_count(&['3'])]
+    #[case::after_a_pending_find(&['f'])]
+    #[case::after_a_pending_goto(&['g'])]
+    #[case::after_a_count_and_a_pending_find(&['3', 'f'])]
+    fn a_bound_chord_fires_during_a_half_typed_sequence(
+        #[case] prefix: &[char],
+        #[values(
+            (KeyCode::F(5), KeyModifiers::NONE, ReedlineEvent::ClearScreen),
+            (KeyCode::Char('t'), KeyModifiers::CONTROL, ReedlineEvent::ClearScrollback),
+            (KeyCode::Char('d'), KeyModifiers::ALT, ReedlineEvent::ClearScreen)
+        )]
+        chord: (KeyCode, KeyModifiers, ReedlineEvent),
+    ) {
+        let (code, modifiers, bound) = chord;
+        let mut bindings = default_helix_normal_keybindings();
+        bindings.add_binding(modifiers, code, bound.clone());
+        let mut helix = normal().with_normal_keybindings(bindings);
+        for c in prefix {
+            helix.parse_event(chr(*c));
+        }
+
+        assert_eq!(helix.parse_event(key(code, modifiers)), bound);
+        assert_eq!(helix.pending, None);
+        assert_eq!(helix.count, None);
+    }
+
+    /// A character key still belongs to the sequence: a binding on a letter
+    /// must not steal the argument of `f`.
+    #[test]
+    fn a_bound_character_does_not_steal_a_pending_argument() {
+        let mut bindings = default_helix_normal_keybindings();
+        bindings.add_binding(
+            KeyModifiers::NONE,
+            KeyCode::Char('x'),
+            ReedlineEvent::ClearScreen,
+        );
+        let mut helix = normal().with_normal_keybindings(bindings);
+
+        helix.parse_event(chr('f'));
+        assert_ne!(helix.parse_event(chr('x')), ReedlineEvent::ClearScreen);
+    }
+
+    /// An unbound chord mid-sequence stays what it was: the sequence is
+    /// rejected and nothing fires.
+    #[test]
+    fn an_unbound_chord_still_rejects_a_half_typed_sequence() {
+        let mut helix = normal();
+        helix.parse_event(chr('3'));
+        helix.parse_event(chr('f'));
+
+        assert_eq!(
+            helix.parse_event(key(KeyCode::F(9), KeyModifiers::NONE)),
+            ReedlineEvent::None
+        );
+        assert_eq!(helix.pending, None);
+        assert_eq!(helix.count, None);
+    }
+
+    #[test]
+    fn switch_mode_event_abandons_a_half_typed_sequence() {
+        let mut helix = normal();
+        // Arm a count and a pending find; the switch must clear both so the
+        // next key is not eaten as the find argument in the new mode.
+        helix.parse_event(chr('3'));
+        helix.parse_event(chr('f'));
+        assert!(helix.pending.is_some(), "setup: find is armed");
+
+        helix.handle_mode_specific_event(ReedlineEvent::SwitchMode(PromptEditMode::Helix(
+            PromptHelixMode::Insert,
+        )));
+        assert_eq!(helix.pending, None);
+        assert_eq!(helix.count, None);
+        assert_eq!(helix.mode, HelixMode::Insert);
     }
 }

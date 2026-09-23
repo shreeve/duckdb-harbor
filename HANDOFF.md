@@ -2,7 +2,7 @@
 
 Read this first. It says what the repo is, how its owner works, how the
 pieces fit, how to build, test and release, and what is open. Everything
-here was true on 2026-09-21 at harbor v0.41.3 and DuckTable v0.22.5; the
+here was true on 2026-09-23 at harbor v0.42.0 and DuckTable v0.22.6; the
 changelog and git history are the record after that.
 
 ## What this is
@@ -242,15 +242,16 @@ it. The MedLabs app rides through a harbor restart. Check afterwards:
 
 ## The vendored reedline
 
-`harbor/vendor/reedline` is reedline 0.50.0 wired through
-`[patch.crates-io]`, carrying four patches in `src/engine.rs`, each with
-tests and each described in `vendor/reedline/HARBOR.md` with its upstream
-status. Patch D (Down reports itself inapplicable on the live line, so the
-completion panel can open there and nowhere else) is not filed upstream.
-The file is CRLF throughout; edit it with CRLF preserved and do not
-reformat it. Its own suite: `cd vendor/reedline && cargo test --lib --
---test-threads=1` (1498 tests; the clipboard tests flake in parallel on
-macOS, upstream's problem).
+`harbor/vendor/reedline` is a verbatim `git archive` of reedline's upstream
+`main`, wired through `[patch.crates-io]` and carrying no patches of
+harbor's own: the four REPL fixes harbor needed are all merged upstream,
+and the copy exists only because no crates.io release holds them yet.
+`vendor/reedline/HARBOR.md` names the commit, says what each fix does and
+where it landed, and holds the un-vendor checklist for when 0.52 ships and
+the recipe for refreshing the snapshot before then. Do not edit the
+sources: a local change is a patch to carry. Its own suite: `cd
+vendor/reedline && cargo test -- --test-threads=1` (about 1,900 tests; the
+clipboard tests flake in parallel on macOS, upstream's problem).
 
 ## REPL key rules, as settled
 
@@ -327,14 +328,14 @@ usable end to end.
   `DUCKDB_LIB_BUILD` repository variable to `latest`. Wait for the naming to
   settle; there was reviewer discussion upstream about instance-versus-
   database option scope.
-- **Un-vendor reedline** when 0.52 ships. Patches A, B and C are merged
-  upstream; D is filed as nushell/reedline#1226 and open. `HARBOR.md` has
-  the exact checklist, including the one behavior D's upstream form leaves
-  to harbor.
+- **Un-vendor reedline** when 0.52 ships. Every fix harbor needed is
+  merged upstream (the last, nushell/reedline#1226, on 2026-09-23) and the
+  vendored copy is upstream `main` unpatched. `vendor/reedline/HARBOR.md`
+  has the checklist.
 - **A binary wire mode** is parked until DuckDB GA.
 - **The deployment runbook** (`duckdb-harbor-runbook`) is deferred to GA;
   four decisions were recorded so they are not re-derived.
-- **DuckTable** is at 0.22.4, early and moving fast; its own docs are under
+- **DuckTable** is at 0.22.6, early and moving fast; its own docs are under
   `ducktable/docs/`. Its Sparkle signing keys live in the gitignored,
   untracked `notes.txt` at the repo root and in the `SPARKLE_PRIVATE_KEY`
   repository secret. Never commit that file.
