@@ -4,6 +4,23 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.43.0 — 2026-09-23
+
+- **`harbor update` installs the newest release over the binary that ran
+  it.** It is the install one-liner, run from inside harbor and pointed at
+  the directories this binary lives in, so a copy outside `~/.local` updates
+  in place; `harbor update 0.42.0` picks a release, older or newer, and
+  `--check` only says whether a newer one exists. An update to the version
+  already installed downloads nothing. A running server keeps the file it
+  opened until it is restarted, so the update ends by naming every server
+  still on the old code and the `harbor <db> restart` each needs; `--restart`
+  runs those, and nothing restarts otherwise, since a restart drops that
+  server's clients mid-request.
+- **The archive's installer replaces files by rename.** It wrote nothing
+  until it had deleted the old binary and engine, so a failure between the
+  two left no harbor installed. Each file is now written beside the old one
+  and renamed over it.
+
 ## 0.42.1 — 2026-09-23
 
 - **The vendored reedline is upstream `main`, unpatched.** Every fix the REPL

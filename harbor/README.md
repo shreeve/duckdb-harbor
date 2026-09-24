@@ -420,6 +420,16 @@ irm https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.ps1 | i
 Uninstall with `... | bash -s -- --uninstall` — the binary and `libduckdb`
 go; your databases, state, and config stay.
 
+Installed, it updates itself. `harbor update` runs that same installer over
+the binary that ran it, so a copy outside `~/.local` updates in place (with
+`sudo` in front when it is system-wide), and `harbor update 0.42.0` picks a
+release, older or newer. A running server keeps the code it started with
+until it is restarted, so the update ends by naming every server still on the
+old version and the `restart` that brings each forward; `--restart` runs
+them, and `--check` only says whether a newer release exists. Headless, as
+from cron, `--restart` restarts only servers with a login item, since a
+hand-started server's restart would serve in place, as `start` does there.
+
 Nothing there asks for root. `~/.local/bin` is where the XDG base directory
 spec puts user executables; Debian and Fedora already have it on `PATH`, macOS
 does not, and the installer says so rather than putting binaries somewhere you

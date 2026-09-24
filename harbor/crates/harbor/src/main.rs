@@ -33,6 +33,7 @@ use harbor_common::membership::{self, Attached};
 use harbor_common::perms::chmod;
 
 mod backup;
+mod update;
 mod verbs;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -49,6 +50,7 @@ fn main() -> ExitCode {
             println!("harbor {VERSION}");
             return ExitCode::SUCCESS;
         }
+        Some("update") => return update::main(&args[1..]),
         // A verb with no database in front of it: the noun comes first. The
         // attached names are the short way to say it, so name them.
         Some(v) if verbs::Verb::is_verb(v) => {
@@ -443,6 +445,13 @@ usage:
                                drop the login item; a running server is left
                                alone (`autostart off stop` takes both down)
   harbor version               print this binary's version (also -V)
+  harbor update [version]      install the newest release over this binary,
+                               or the one named (0.42.0): the install
+                               one-liner, run from here. Ends by naming the
+                               servers still on the old code and the restart
+                               each needs; --restart runs those (a hand-
+                               started server only from a terminal), --check
+                               only says what is newest
 
 backup and restore stand alone: they act on a database's contents rather than
 its lifetime, so they take no other verb. The rest combine, in any order:

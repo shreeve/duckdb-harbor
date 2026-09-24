@@ -45,10 +45,18 @@ done
 # rm first, install second: macOS caches a binary's code signature per inode,
 # and overwriting in place leaves every later exec SIGKILL'd against the stale
 # cache. A fresh inode gets a fresh verdict; upgrades stay safe.
-rm -f "$BIN/harbor"
-rm -f "$LIB"/libduckdb.dylib "$LIB"/libduckdb.so
-install -m 0755 bin/harbor "$BIN"
-install -m 0755 lib/libduckdb.* "$LIB"
+# Each file is written beside the old one and renamed over it, so there is
+# never a moment with no harbor installed, and a running server keeps the
+# file it opened until it is restarted. The other platform's engine name, if
+# a copy from elsewhere left one, goes.
+install -m 0755 bin/harbor "$BIN/harbor.new" && mv -f "$BIN/harbor.new" "$BIN/harbor"
+for lib in lib/libduckdb.*; do
+  name=$(basename "$lib")
+  install -m 0755 "$lib" "$LIB/$name.new" && mv -f "$LIB/$name.new" "$LIB/$name"
+  for stale in "$LIB"/libduckdb.dylib "$LIB"/libduckdb.so; do
+    [ "$(basename "$stale")" = "$name" ] || rm -f "$stale"
+  done
+done
 
 # Sockets and logs live in the runtime dir. harbor heals these permissions on
 # every run; doing it here covers a fleet that is currently stopped.
