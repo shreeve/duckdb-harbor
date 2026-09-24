@@ -714,6 +714,23 @@ fn survey() -> Result<Vec<SurveyRow>, String> {
     Ok(rows)
 }
 
+/// Every server that answered `/info`: its name, the file it serves, and the
+/// harbor version it runs. What `update` reads to name the servers still on
+/// the code they started with.
+pub fn running() -> Result<Vec<(String, PathBuf, String)>, String> {
+    Ok(survey()?
+        .into_iter()
+        .filter_map(|r| {
+            let v = r.info?;
+            Some((
+                v["name"].as_str()?.to_string(),
+                PathBuf::from(v["database"].as_str()?),
+                v["harborVersion"].as_str().unwrap_or("").to_string(),
+            ))
+        })
+        .collect())
+}
+
 /// The TCP door as one pasteable string, when /info advertises one. The door
 /// is always loopback, so the port alone spells it.
 fn url_of(info: &serde_json::Value) -> Option<String> {
