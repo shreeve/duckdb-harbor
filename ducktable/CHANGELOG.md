@@ -3,6 +3,13 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by release
 date, newest first.
 
+## 0.22.7 — 2026-09-25
+
+- **Closing the window quits the app.** DuckTable has one window, and its
+  menus act on that window, so after it closed the app lived on as a bare
+  menu bar holding a Dock slot until ⌘Q. Now the last window closing is the
+  quit.
+
 ## 0.22.6 — 2026-09-22
 
 - **An edit to a keyless table cannot land on another row.** A table without a

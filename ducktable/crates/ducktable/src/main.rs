@@ -572,6 +572,16 @@ fn main() {
         cx.on_action(|_: &View2, cx| go_view(view_order()[1], cx));
         cx.on_action(|_: &View3, cx| go_view(view_order()[2], cx));
         cx.on_action(|_: &Quit, cx| cx.quit());
+        // One window, so closing it is quitting. macOS lets an app outlive
+        // its windows, which suits a document app whose File menu can open
+        // another; DuckTable's menus act on the window that is gone, so a
+        // bare menu bar would be a dead app still holding the Dock.
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
         cx.on_action(|_: &ZoomIn, cx| {
             prefs::toggle(cx, |p| p.zoom = (p.zoom + 1).min(prefs::ZOOMS.len() - 1));
         });
