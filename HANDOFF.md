@@ -240,18 +240,31 @@ it. The MedLabs app rides through a harbor restart. Check afterwards:
 `harbor` (the listing), `systemctl --user is-active harbor-medlabs`, and
 `cd ~/src/medlabs && rip sites status medlabs --json`.
 
-## The vendored reedline
+## Reedline
 
-`harbor/vendor/reedline` is a verbatim `git archive` of reedline's upstream
-`main`, wired through `[patch.crates-io]` and carrying no patches of
-harbor's own: the four REPL fixes harbor needed are all merged upstream,
-and the copy exists only because no crates.io release holds them yet.
-`vendor/reedline/HARBOR.md` names the commit, says what each fix does and
-where it landed, and holds the un-vendor checklist for when 0.52 ships and
-the recipe for refreshing the snapshot before then. Do not edit the
-sources: a local change is a patch to carry. Its own suite: `cd
-vendor/reedline && cargo test -- --test-threads=1` (about 1,900 tests; the
-clipboard tests flake in parallel on macOS, upstream's problem).
+The REPL's line editor is reedline from crates.io, 0.52 or later, used as
+published. Four upstream behaviors hold the REPL's key rules up, and a
+reedline upgrade is checked against them:
+
+- A completion menu with no suggestions does not swallow Enter
+  (nushell/reedline#1175).
+- A menu closes at the end of the word it was opened for
+  (nushell/reedline#1209). The boundary belongs to the menu, so harbor's
+  completion menu is built `.with_word_chars("_.")` in `interactive.rs`: a
+  `.` keeps it open for a qualified name, and anything else that cannot
+  extend an identifier closes it.
+- `ReedlineEvent::MenuAccept` takes a completion without submitting, and
+  reports `Inapplicable` with no active menu, so it composes under
+  `UntilFound` (nushell/reedline#1203). Tab is bound to it.
+- `Up` and `Down` report `Inapplicable` when they moved nothing
+  (nushell/reedline#1226). That is what lets Down on the live line fall
+  through to opening the completion panel.
+
+The proof after any upgrade is the repro: `create or replace ta`, Tab, keep
+typing, Enter. The statement must run with no stray word appended; type the
+tail fast enough to arrive as one batch. The pty driver in
+`test/scripts/lifecycle.sh` (the mooring check) answers the two terminal
+probes the REPL makes on startup and is the pattern for scripting it.
 
 ## REPL key rules, as settled
 
@@ -328,10 +341,6 @@ usable end to end.
   `DUCKDB_LIB_BUILD` repository variable to `latest`. Wait for the naming to
   settle; there was reviewer discussion upstream about instance-versus-
   database option scope.
-- **Un-vendor reedline** when 0.52 ships. Every fix harbor needed is
-  merged upstream (the last, nushell/reedline#1226, on 2026-09-23) and the
-  vendored copy is upstream `main` unpatched. `vendor/reedline/HARBOR.md`
-  has the checklist.
 - **A binary wire mode** is parked until DuckDB GA.
 - **The deployment runbook** (`duckdb-harbor-runbook`) is deferred to GA;
   four decisions were recorded so they are not re-derived.
