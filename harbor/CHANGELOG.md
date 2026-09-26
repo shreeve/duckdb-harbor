@@ -4,6 +4,14 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.43.1 — 2026-09-26
+
+- **The REPL's line editor is reedline 0.52 from crates.io.** The copy
+  harbor carried in `vendor/reedline` is gone: 0.52.0 is the same source,
+  every file identical, and it holds all four fixes the REPL relies on
+  (nushell/reedline#1175, #1203, #1209 and #1226). Nothing about the REPL
+  changes.
+
 ## 0.43.0 — 2026-09-23
 
 - **`harbor update` installs the newest release over the binary that ran

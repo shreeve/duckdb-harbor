@@ -8,9 +8,6 @@
 [workspace]
 members = ["crates/*"]
 default-members = ["crates/wire", "crates/harbor"]
-# Vendored crates are patch sources, not members — excluded so their own
-# test suites can run in place (cd vendor/<crate> && cargo test).
-exclude = ["vendor/reedline"]
 resolver = "2"
 
 # One version for everything the release archive contains. These crates ship
@@ -46,9 +43,3 @@ opt-level = "s"
 
 [profile.release.package.nu-ansi-term]
 opt-level = "s"
-
-# vendor/reedline is upstream main, verbatim and unpatched (the commit is in
-# vendor/reedline/HARBOR.md): it carries four merged fixes the REPL relies on
-# that no crates.io release holds yet. It goes when reedline 0.52 ships.
-[patch.crates-io]
-reedline = { path = "vendor/reedline" }

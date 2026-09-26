@@ -1,6 +1,5 @@
 /target
 crates/*/target
-vendor/*/target
 /test/bin
 .venv/
 .idea
