@@ -8,7 +8,7 @@
 //! (grid.rs) it renders with, plus the copy/check icon assets.
 
 use crate::theme::pal;
-use gpui::*;
+use gpui_kit::*;
 
 /// The confirmation's life: the check lands same-frame (feedback is
 /// content, it snaps), holds, then CROSSFADES home — check breathing out
@@ -55,7 +55,7 @@ impl Render for CopyButton {
         let copy = || svg().path("icons/copy.svg").size_3().text_color(t.muted);
         crate::chrome::icon_tile("copy", 20., true, t)
             .tooltip(move |window, cx| {
-                gpui_component::tooltip::Tooltip::new(if phase == Phase::Rest {
+                gpui_kit::component::tooltip::Tooltip::new(if phase == Phase::Rest {
                     label
                 } else {
                     "Copied"

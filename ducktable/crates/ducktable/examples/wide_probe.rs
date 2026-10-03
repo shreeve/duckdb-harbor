@@ -1,5 +1,5 @@
 //! Wide-table probe: 500 columns x 100,000 rows through gpui-component's
-//! Table (DESIGN.md, Components: measured, not assumed). The window
+//! DataTable (DESIGN.md, Components: measured, not assumed). The window
 //! drives itself: six scroll patterns, frame deltas recorded via an
 //! `on_next_frame` chain, report printed to stdout, then the app quits.
 //!
@@ -7,9 +7,8 @@
 
 use std::time::Instant;
 
-use gpui::*;
-use gpui_component::table::{Column, Table, TableDelegate, TableState};
-use gpui_component::Root;
+use gpui_kit::*;
+use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableState};
 
 const COLS: usize = 500;
 const ROWS: usize = 100_000;
@@ -55,8 +54,8 @@ impl TableDelegate for Probe {
         ROWS
     }
 
-    fn column(&self, col_ix: usize, _: &App) -> &Column {
-        &self.cols[col_ix]
+    fn column(&self, col_ix: usize, _: &App) -> Column {
+        self.cols[col_ix].clone()
     }
 
     fn render_td(
@@ -151,7 +150,7 @@ impl ProbeApp {
 
     fn report(&self) {
         println!();
-        println!("wide_probe: {COLS} cols x {ROWS} rows, gpui-component Table");
+        println!("wide_probe: {COLS} cols x {ROWS} rows, gpui-component DataTable");
         println!(
             "{:<10} {:>7} {:>8} {:>8} {:>8} {:>8} {:>7} {:>7}",
             "phase", "frames", "mean", "p50", "p95", "max", ">17ms", ">33ms"
@@ -206,42 +205,42 @@ impl Render for ProbeApp {
                 this.update(cx, |view, cx| view.tick(window, cx));
             });
         }
-        div().size_full().child(Table::new(&self.table))
+        div().size_full().child(DataTable::new(&self.table))
     }
 }
 
 fn main() {
-    let app = Application::new();
+    let app = gpui_kit::application();
 
     app.run(move |cx| {
-        gpui_component::init(cx);
+        gpui_kit::init(cx);
+        // Measure the window a person scrolls: in front and focused. GPUI
+        // caps an inactive window's frame rate to save energy, and a probe
+        // launched from a terminal would otherwise open behind it.
+        cx.activate(true);
 
-        cx.spawn(async move |cx| {
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                        point(px(80.), px(80.)),
-                        size(px(1280.), px(800.)),
-                    ))),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    let table = cx.new(|cx| TableState::new(Probe::new(), window, cx));
-                    let view = cx.new(|_| ProbeApp {
-                        table,
-                        started: false,
-                        phase: 0,
-                        step: 0,
-                        last: None,
-                        frames: Vec::new(),
-                        seed: 0x5eed_5eed_5eed_5eed,
-                    });
-                    cx.new(|cx| Root::new(view, window, cx))
-                },
-            )?;
-
-            Ok::<_, anyhow::Error>(())
-        })
-        .detach();
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(80.), px(80.)),
+                    size(px(1280.), px(800.)),
+                ))),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                let table = cx.new(|cx| TableState::new(Probe::new(), window, cx));
+                cx.new(|_| ProbeApp {
+                    table,
+                    started: false,
+                    phase: 0,
+                    step: 0,
+                    last: None,
+                    frames: Vec::new(),
+                    seed: 0x5eed_5eed_5eed_5eed,
+                })
+            },
+        )
+        .expect("failed to open the probe window");
     });
 }

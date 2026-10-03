@@ -15,7 +15,11 @@ DESIGN.md.
    mode in v1; staging is the load-bearing wall that makes every other
    liberty here safe.
 3. **Esc is a panic key, so it is lossless.** It cancels what you are
-   typing; it never touches a staged change. Single level, no exceptions.
+   typing and never discards anything you typed: a staged change stays
+   staged. The one thing it removes is a new row nothing has been entered
+   into, which holds nothing to lose, and ⌘Z brings it back. One Esc takes
+   one thing: text typed into the open cell goes first, the empty row on
+   the next Esc.
 4. **Staged changes are keyed by row identity, owned by the table,
    untouchable by the view.** Sort, filter, page, switch tables — nothing
    is lost, no dialog needed, and the count never lies.
@@ -34,15 +38,21 @@ loss disguised as navigation.
 
 An untouched draft cell means SQL `DEFAULT`, not NULL. DuckTable omits it from
 the INSERT so DuckDB can apply declared defaults, sequences, and generated
-expressions. The placeholder says what will happen: `REQUIRED`, `DEFAULT`,
-`NULL`, or `GENERATED`. Generated cells are read-only. Delete/Backspace keeps
-the grid's type-honest meaning — empty string for text, explicit NULL for
-other nullable types — and ⌃⇧N is always explicit NULL.
+expressions, so the cell stays blank. The one mark is a soft red `REQUIRED`
+tag where the row cannot commit without a value, holding only `!` where the
+column is too narrow for the word. A generated cell, which takes no typing, is
+faintly dimmed. Generated cells are read-only. Delete/Backspace keeps the
+grid's type-honest meaning — empty string for text, explicit NULL for other
+nullable types — and ⌃⇧N is always explicit NULL.
 
-Ordinary viewing keeps columns at their compact content-fit widths. While a
-cell editor or draft row is present, columns expand only as needed to fit these
-placeholder pills; they return to their compact widths when editing ends and no
-draft remains.
+Hovering an untouched draft cell shows the column card: the column's name and
+type, what an untouched cell becomes, and an ENUM's values. The same card
+floats under any cell while it is edited, in a draft row or a fetched one, and
+there clicking an ENUM value fills the cell and confirms it, as a dropdown does.
+⌘T (View → Column Tooltips) turns the card off and on; it starts on.
+
+Columns keep their content-fit widths while a cell is edited or a draft row is
+present: nothing a draft row shows needs more room than its column has.
 
 Moving out of a draft never writes it. The row joins the same staged set as
 updates and deletes immediately, including undo, review, discard, table
@@ -58,16 +68,16 @@ of which survive a trip out as JSON and back. The draft shows the source row's
 text. A cell with a staged update on the source row is copied as staged, and a
 cell typed over in the draft is an ordinary typed cell; both are bound the way
 their column's type asks (below). A copied cell typed back to the text it was
-copied with is read from the source row again, so a DATE inside a `VARIANT`
-that was typed over and restored is still a DATE. Primary-key and generated
-columns are omitted so DuckDB can supply the new identity and derived values. A
-natural key without a default therefore remains `REQUIRED`. The entire copied
+copied with is read from the source row again, so a DATE inside a `VARIANT` that
+was typed over and restored is still a DATE. Primary-key and generated columns
+are omitted so DuckDB can supply the new identity and derived values. A natural
+key without a default therefore stays `required`. The entire copied
 row is one undo step and is not written until ⌘S. Inserts run first in the
-transaction, so the source row is read as the database holds it at ⌘S, even
-when the same commit updates or deletes it; a source row that is gone by then
-fails the commit, and nothing lands. A refresh does not help, because the draft
-still names that row: discard the duplicate (⌘Z, or the review popover) and the
-rest commits.
+transaction, so the source row is read as the database holds it at ⌘S, even when
+the same commit updates or deletes it; a source row that is gone by then fails
+the commit, and nothing lands. A refresh does not help, because the draft still
+names that row: discard the duplicate (⌘Z, or the review popover) and the rest
+commits.
 
 ⌘D copies a row the database holds. On a draft it copies nothing and the status
 line says why: a new row is not in the database yet, so the INSERT has nothing
@@ -88,12 +98,12 @@ One meaning per key. No contextual double-agents.
 | double-click | opens the editor keeping the value, caret at the click | — |
 | ⌘-click | adds the row to the selection, or removes it | — |
 | ⇧-click | selects every row from the anchor through this one, replacing the selection | — |
-| Esc | clears the selection | cancels the edit, restores what was there, ring stays |
+| Esc | clears the selection; dismisses a new row nothing has been entered into | cancels the edit, restores what was there, ring stays; on a new row nothing has been entered into, dismisses the row |
 | Delete / ⌫ | clears the cell: text → `''`, everything else → NULL (NOT NULL columns refuse, with the reason in the status line) | deletes text |
 | ⌃⇧N | stages NULL explicitly, any type | — |
 | ⌘N | creates a new all-DEFAULT row and opens its first useful writable cell | — |
 | ⌘D | duplicates the lead selected persisted row as one staged INSERT | — |
-| ⌘⌫ | stages a DELETE for every selected row (ghost strikethrough; one undo step, each row its own entry for review; reversible until commit) | — |
+| ⌘⌫ | stages a DELETE for every selected row (ghost strikethrough; one undo step, each row its own entry for review; reversible until commit); a selected new row is discarded instead, since it never existed | — |
 | ⌘Z / ⌘⇧Z | un-stages / re-stages the most recent change | text undo / redo |
 | ⌘S | commits all staged changes — one transaction, all or nothing | confirms the cell, then commits (⌘Enter is its equal) |
 | ⌥Enter | — | newline (the Sheets-hand twin of ⇧Enter) |

@@ -3,6 +3,33 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by release
 date, newest first.
 
+## 0.22.8 — 2026-10-03
+
+- **DuckTable runs on GPUI Kit 0.7.** The UI stack moves from GPUI 0.2.2 and
+  gpui-component 0.5.1 to `gpui-kit` 0.7.0, which pins one weekly snapshot of
+  Zed's GPUI and carries the component library with it. Several behaviors
+  DuckTable had patched in are upstream now (selection painting, Shift-arrow
+  keeping its column, the SQL highlighter's merge), so the vendored patches
+  shrink from 51 marked sites in one crate to 26 in two, listed in the
+  workspace `Cargo.toml`. The wide-table probe holds the 16.7ms frame on every
+  phase, as before.
+- **Starting an edit never moves a column.** Opening a cell editor or adding a
+  row widened columns to fit their draft hints, pushing the whole row sideways.
+  A new row's untouched cells are blank now, because the database fills them;
+  the one mark is a soft red `REQUIRED` tag, holding only `!` in a column too
+  narrow for the word.
+- **The column card.** Hovering a new row's cell, or editing any cell, shows
+  the column's type, its default or generation, whether it is required, and an
+  ENUM's values. While editing, clicking a value picks it. ⌘T (View → Column
+  Tooltips) turns the card off and on.
+- **Esc dismisses an empty new row.** ⌘N then Esc leaves nothing behind; a row
+  with a value entered stays, and ⌘⌫ discards a new row either way. ⌘Z brings
+  a dismissed row back.
+- **Refreshing an empty table holds still.** The loading placeholder no longer
+  flashes over a table that is already on screen.
+- **Both dividers look alike.** The inspector's divider drops its gripper and
+  matches the sidebar's plain hairline.
+
 ## 0.22.7 — 2026-09-25
 
 - **Closing the window quits the app.** DuckTable has one window, and its

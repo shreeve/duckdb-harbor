@@ -1,16 +1,22 @@
+use std::ops::Range;
+
 use crate::{
     IconName, Sizable, Size, StyledExt,
     group_box::GroupBoxVariant,
+    h_resizable,
     input::{Input, InputState},
-    resizable::{h_resizable, resizable_panel},
-    setting::{SettingGroup, SettingPage},
+    resizable_panel,
+    setting::SettingPage,
     sidebar::{Sidebar, SidebarMenu, SidebarMenuItem},
 };
 use gpui::{
     App, AppContext as _, Axis, ElementId, Entity, IntoElement, ParentElement as _, Pixels,
-    RenderOnce, StyleRefinement, Styled, Window, div, prelude::FluentBuilder as _, px, relative,
+    RenderOnce, StyleRefinement, Styled, Window, container_query, div, prelude::FluentBuilder as _,
+    px, relative,
 };
 use rust_i18n::t;
+
+const STACKED_LAYOUT_MAX_WIDTH: Pixels = px(480.);
 
 /// The settings structure containing multiple pages for app settings.
 ///
@@ -31,7 +37,10 @@ pub struct Settings {
     group_variant: GroupBoxVariant,
     size: Size,
     sidebar_width: Pixels,
+    sidebar_size_range: Range<Pixels>,
     sidebar_style: StyleRefinement,
+    default_selected_index: SelectIndex,
+    header_style: StyleRefinement,
 }
 
 impl Settings {
@@ -43,13 +52,22 @@ impl Settings {
             group_variant: GroupBoxVariant::default(),
             size: Size::default(),
             sidebar_width: px(250.0),
+            sidebar_size_range: px(160.0)..px(360.0),
             sidebar_style: StyleRefinement::default(),
+            default_selected_index: SelectIndex::default(),
+            header_style: StyleRefinement::default(),
         }
     }
 
     /// Set the width of the sidebar, default is `250px`.
     pub fn sidebar_width(mut self, width: impl Into<Pixels>) -> Self {
         self.sidebar_width = width.into();
+        self
+    }
+
+    /// Set the resize range of the sidebar, default is `160px..360px`.
+    pub fn sidebar_size_range(mut self, range: impl Into<Range<Pixels>>) -> Self {
+        self.sidebar_size_range = range.into();
         self
     }
 
@@ -79,85 +97,69 @@ impl Settings {
         self
     }
 
-    fn filtered_pages(&self, query: &str) -> Vec<SettingPage> {
-        self.pages
-            .iter()
-            .filter_map(|page| {
-                let filtered_groups: Vec<SettingGroup> = page
-                    .groups
-                    .iter()
-                    .filter_map(|group| {
-                        let mut group = group.clone();
-                        group.items = group
-                            .items
-                            .iter()
-                            .filter(|item| item.is_match(&query))
-                            .cloned()
-                            .collect();
-                        if group.items.is_empty() {
-                            None
-                        } else {
-                            Some(group)
-                        }
-                    })
-                    .collect();
-                let mut page = page.clone();
-                page.groups = filtered_groups;
-                if page.groups.is_empty() {
-                    None
-                } else {
-                    Some(page)
-                }
-            })
-            .collect()
+    /// Set the default index of the page to be selected.
+    pub fn default_selected_index(mut self, index: SelectIndex) -> Self {
+        self.default_selected_index = index;
+        self
+    }
+
+    /// Set the style refinement for the header.
+    pub fn header_style(mut self, style: &StyleRefinement) -> Self {
+        self.header_style = style.clone();
+        self
     }
 
     fn render_active_page(
         &self,
         state: &Entity<SettingsState>,
-        pages: &Vec<SettingPage>,
+        filter: &SettingsFilter,
         options: &RenderOptions,
         window: &mut Window,
         cx: &mut App,
-    ) -> impl IntoElement {
-        let selected_index = state.read(cx).selected_index;
-
-        for (ix, page) in pages.into_iter().enumerate() {
-            if selected_index.page_ix == ix {
-                return page
-                    .render(ix, state, &options, window, cx)
-                    .into_any_element();
-            }
+    ) -> gpui::AnyElement {
+        let page_ix = state.read(cx).selected_index.page_ix;
+        if let Some(page) = self.pages.get(page_ix)
+            && !filter.groups[page_ix].is_empty()
+        {
+            return page
+                .render(page_ix, &filter.groups[page_ix], state, options, window, cx)
+                .into_any_element();
         }
 
-        return div().into_any_element();
+        div().into_any_element()
     }
 
     fn render_sidebar(
         &self,
         state: &Entity<SettingsState>,
-        pages: &Vec<SettingPage>,
+        filter: &SettingsFilter,
         _: &mut Window,
         cx: &mut App,
     ) -> impl IntoElement {
         let selected_index = state.read(cx).selected_index;
         let search_input = state.read(cx).search_input.clone();
 
-        Sidebar::left()
+        Sidebar::new("settings-sidebar")
             .w(relative(1.))
             .border_0()
             .refine_style(&self.sidebar_style)
+            .collapsible(false)
             .collapsed(false)
             .header(
                 div()
                     .w_full()
+                    .refine_style(&self.header_style)
                     .child(Input::new(&search_input).prefix(IconName::Search)),
             )
             .child(
-                SidebarMenu::new().children(pages.iter().enumerate().map(|(page_ix, page)| {
-                    let is_page_active =
-                        selected_index.page_ix == page_ix && selected_index.group_ix.is_none();
+                SidebarMenu::new().children(filter.visible_pages().map(|page_ix| {
+                    let page = &self.pages[page_ix];
+                    let groups = &filter.groups[page_ix];
+                    let is_page_active = selected_index.page_ix == page_ix
+                        && (selected_index.group_ix.is_none() || groups.len() == 1);
                     SidebarMenuItem::new(page.title.clone())
+                        .click_to_open(true)
+                        .when_some(page.icon.clone(), |this, icon| this.icon(icon))
                         .default_open(page.default_open)
                         .active(is_page_active)
                         .on_click({
@@ -168,17 +170,19 @@ impl Settings {
                                         page_ix,
                                         ..Default::default()
                                     };
+                                    state.deferred_scroll_group_ix = None;
                                     cx.notify();
                                 })
                             }
                         })
-                        .when(page.groups.len() > 1, |this| {
+                        .when(groups.len() > 1, |this| {
                             this.children(
-                                page.groups
+                                groups
                                     .iter()
-                                    .filter(|g| g.title.is_some())
-                                    .enumerate()
-                                    .map(|(group_ix, group)| {
+                                    .copied()
+                                    .filter(|&ix| page.groups[ix].title.is_some())
+                                    .map(|group_ix| {
+                                        let group = &page.groups[group_ix];
                                         let is_active = selected_index.page_ix == page_ix
                                             && selected_index.group_ix == Some(group_ix);
                                         let title = group.title.clone().unwrap_or_default();
@@ -211,6 +215,54 @@ impl Sizable for Settings {
     }
 }
 
+/// Visible groups in each original page. Filtering never renumbers source data.
+struct SettingsFilter {
+    groups: Vec<Vec<usize>>,
+}
+
+impl SettingsFilter {
+    fn new(pages: &[SettingPage], query: &str, cx: &App) -> Self {
+        Self {
+            groups: pages
+                .iter()
+                .map(|page| {
+                    page.groups
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(ix, group)| group.is_match(query, cx).then_some(ix))
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+
+    fn visible_pages(&self) -> impl Iterator<Item = usize> + '_ {
+        self.groups
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, groups)| (!groups.is_empty()).then_some(ix))
+    }
+
+    fn selected_index(&self, selected: SelectIndex) -> SelectIndex {
+        let page_ix = self
+            .visible_pages()
+            .find(|&ix| ix == selected.page_ix)
+            .or_else(|| self.visible_pages().next());
+        let Some(page_ix) = page_ix else {
+            // Keep the selection while there are no results so clearing the query
+            // can restore it. The empty filter prevents rendering a stale page.
+            return selected;
+        };
+
+        SelectIndex {
+            page_ix,
+            group_ix: selected
+                .group_ix
+                .filter(|ix| page_ix == selected.page_ix && self.groups[page_ix].contains(ix)),
+        }
+    }
+}
+
 pub(super) struct SettingsState {
     pub(super) selected_index: SelectIndex,
     /// If set, defer scrolling to this group index after rendering.
@@ -219,20 +271,112 @@ pub(super) struct SettingsState {
 }
 
 /// Options for rendering setting item.
+///
+/// The fields are private and reached through the methods below, so that a new
+/// one can be added without breaking the item renderers. The setters take
+/// `self` by value, so a nested renderer narrows a copy of its parent options:
+///
+/// ```ignore
+/// item.render_item(&options.with_item_ix(item_ix), window, cx)
+/// ```
 #[derive(Clone, Copy)]
 pub struct RenderOptions {
-    pub page_ix: usize,
-    pub group_ix: usize,
-    pub item_ix: usize,
-    pub size: Size,
-    pub group_variant: GroupBoxVariant,
-    pub layout: Axis,
+    page_ix: usize,
+    group_ix: usize,
+    item_ix: usize,
+    size: Size,
+    group_variant: GroupBoxVariant,
+    layout: Axis,
+    disabled: bool,
+}
+
+impl RenderOptions {
+    pub fn new() -> Self {
+        Self {
+            page_ix: 0,
+            group_ix: 0,
+            item_ix: 0,
+            size: Size::default(),
+            group_variant: GroupBoxVariant::default(),
+            layout: Axis::Horizontal,
+            disabled: false,
+        }
+    }
+
+    pub fn with_page_ix(mut self, page_ix: usize) -> Self {
+        self.page_ix = page_ix;
+        self
+    }
+
+    pub fn with_group_ix(mut self, group_ix: usize) -> Self {
+        self.group_ix = group_ix;
+        self
+    }
+
+    pub fn with_item_ix(mut self, item_ix: usize) -> Self {
+        self.item_ix = item_ix;
+        self
+    }
+
+    pub fn with_size(mut self, size: Size) -> Self {
+        self.size = size;
+        self
+    }
+
+    pub fn with_group_variant(mut self, group_variant: GroupBoxVariant) -> Self {
+        self.group_variant = group_variant;
+        self
+    }
+
+    pub fn with_layout(mut self, layout: Axis) -> Self {
+        self.layout = layout;
+        self
+    }
+
+    pub fn with_disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    pub fn page_ix(&self) -> usize {
+        self.page_ix
+    }
+
+    pub fn group_ix(&self) -> usize {
+        self.group_ix
+    }
+
+    pub fn item_ix(&self) -> usize {
+        self.item_ix
+    }
+
+    pub fn size(&self) -> Size {
+        self.size
+    }
+
+    pub fn group_variant(&self) -> GroupBoxVariant {
+        self.group_variant
+    }
+
+    pub fn layout(&self) -> Axis {
+        self.layout
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        self.disabled
+    }
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone, Copy, Default)]
-pub(super) struct SelectIndex {
-    page_ix: usize,
-    group_ix: Option<usize>,
+pub struct SelectIndex {
+    pub page_ix: usize,
+    pub group_ix: Option<usize>,
 }
 
 impl RenderOnce for Settings {
@@ -246,34 +390,49 @@ impl RenderOnce for Settings {
 
             SettingsState {
                 search_input,
-                selected_index: SelectIndex::default(),
+                selected_index: self.default_selected_index,
                 deferred_scroll_group_ix: None,
             }
         });
 
         let query = state.read(cx).search_input.read(cx).value();
-        let filtered_pages = self.filtered_pages(&query);
-        let options = RenderOptions {
-            page_ix: 0,
-            group_ix: 0,
-            item_ix: 0,
-            size: self.size,
-            group_variant: self.group_variant,
-            layout: Axis::Horizontal,
-        };
+        let filter = SettingsFilter::new(&self.pages, &query, cx);
+        let previous = state.read(cx).selected_index;
+        let selected = filter.selected_index(previous);
+        if selected.page_ix != previous.page_ix || selected.group_ix != previous.group_ix {
+            state.update(cx, |state, _| {
+                state.selected_index = selected;
+                state.deferred_scroll_group_ix = None;
+            });
+        }
+        let options = RenderOptions::new()
+            .with_size(self.size)
+            .with_group_variant(self.group_variant);
+        let sidebar_size_range = self.sidebar_size_range.clone();
+        let sidebar = self
+            .render_sidebar(&state, &filter, window, cx)
+            .into_any_element();
 
         h_resizable(self.id.clone())
             .child(
                 resizable_panel()
                     .size(self.sidebar_width)
-                    .child(self.render_sidebar(&state, &filtered_pages, window, cx)),
+                    .size_range(sidebar_size_range)
+                    .child(sidebar),
             )
-            .child(resizable_panel().child(self.render_active_page(
-                &state,
-                &filtered_pages,
-                &options,
-                window,
-                cx,
-            )))
+            .child(
+                resizable_panel().child(container_query(move |size, window, cx| {
+                    let options = options.with_layout(if size.width <= STACKED_LAYOUT_MAX_WIDTH {
+                        Axis::Vertical
+                    } else {
+                        Axis::Horizontal
+                    });
+                    self.render_active_page(&state, &filter, &options, window, cx)
+                })),
+            )
     }
 }
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

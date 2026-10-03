@@ -21,15 +21,16 @@ mod updater;
 mod util;
 
 use app::DuckTable;
-use gpui::*;
-use gpui_component::{Root, StyledExt as _};
+use gpui_kit::*;
+use gpui_kit::component::StyledExt as _;
 
 actions!(
     ducktable,
     [
         ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset, FitColumns, RefreshTables,
         AddRow, DuplicateRow, DeleteRow, TablePrev, TableNext, View1, View2, View3, ToggleFullScreen,
-        ToggleRowNumbers, ToggleRightAlign, ToggleNullTags, OpenDatabase, OpenDatabaseUrl,
+        ToggleRowNumbers, ToggleRightAlign, ToggleNullTags, ToggleColumnCards, OpenDatabase,
+        OpenDatabaseUrl,
         CheckForUpdates
     ]
 );
@@ -192,64 +193,53 @@ fn app_menus(can_update: bool) -> Vec<Menu> {
     app_menu.push(MenuItem::separator());
     app_menu.push(MenuItem::action("Quit DuckTable", Quit));
     vec![
-        Menu {
-            name: "DuckTable".into(),
-            items: app_menu,
-        },
-        Menu {
-            name: "File".into(),
-            items: vec![
-                // The platform picker, then the same door a drop uses.
-                // ⌘O advertises itself from the keymap binding.
-                MenuItem::action("Open Database File…", OpenDatabase),
-                MenuItem::action("Open Database URL…", OpenDatabaseUrl),
-            ],
-        },
-        Menu {
-            name: "Edit".into(),
-            items: vec![
-                MenuItem::action("New Row", AddRow),
-                MenuItem::action("Duplicate Row", DuplicateRow),
-                MenuItem::action("Delete Row", DeleteRow),
-            ],
-        },
+        Menu::new("DuckTable").items(app_menu),
+        Menu::new("File").items([
+            // The platform picker, then the same door a drop uses.
+            // ⌘O advertises itself from the keymap binding.
+            MenuItem::action("Open Database File…", OpenDatabase),
+            MenuItem::action("Open Database URL…", OpenDatabaseUrl),
+        ]),
+        Menu::new("Edit").items([
+            MenuItem::action("New Row", AddRow),
+            MenuItem::action("Duplicate Row", DuplicateRow),
+            MenuItem::action("Delete Row", DeleteRow),
+        ]),
         // macOS shows each item's key equivalent from the keymap, so this
         // menu is also where the zoom shortcuts advertise themselves.
-        Menu {
-            name: "View".into(),
-            items: vec![
-                // macOS renders the ⌘1/⌘2/⌘3 and ⌥←/⌥→ key
-                // equivalents from the keymap bindings.
-                MenuItem::action("Structure", View1),
-                MenuItem::action("Data", View2),
-                MenuItem::action("Query", View3),
-                MenuItem::separator(),
-                MenuItem::action("Refresh Tables", RefreshTables),
-                MenuItem::separator(),
-                MenuItem::action("Previous Table", TablePrev),
-                MenuItem::action("Next Table", TableNext),
-                MenuItem::separator(),
-                // The header strip's toggles, together and in its own
-                // order: the lozenge's three (⌥7/8/9 and ⌘7/8/9 both
-                // fire; the menu shows one form — macOS allows a menu
-                // item a single key equivalent), then the inspector
-                // glyph beside them.
-                MenuItem::action("Row Numbers", ToggleRowNumbers),
-                MenuItem::action("Right-Align Numbers", ToggleRightAlign),
-                MenuItem::action("NULL Tags", ToggleNullTags),
-                MenuItem::action("Toggle Inspector", ToggleInspector),
-                MenuItem::separator(),
-                MenuItem::action("Zoom In", ZoomIn),
-                MenuItem::action("Zoom Out", ZoomOut),
-                MenuItem::action("Actual Size", ZoomReset),
-                MenuItem::separator(),
-                MenuItem::action("Fit Column Widths", FitColumns),
-                MenuItem::separator(),
-                // Ours, not AppKit's injected one (suppressed above for
-                // its icon and forced indent) — plain text, same slot.
-                MenuItem::action("Toggle Full Screen", ToggleFullScreen),
-            ],
-        },
+        Menu::new("View").items([
+            // macOS renders the ⌘1/⌘2/⌘3 and ⌥←/⌥→ key
+            // equivalents from the keymap bindings.
+            MenuItem::action("Structure", View1),
+            MenuItem::action("Data", View2),
+            MenuItem::action("Query", View3),
+            MenuItem::separator(),
+            MenuItem::action("Refresh Tables", RefreshTables),
+            MenuItem::separator(),
+            MenuItem::action("Previous Table", TablePrev),
+            MenuItem::action("Next Table", TableNext),
+            MenuItem::separator(),
+            // The header strip's toggles, together and in its own
+            // order: the lozenge's three (⌥7/8/9 and ⌘7/8/9 both
+            // fire; the menu shows one form — macOS allows a menu
+            // item a single key equivalent), then the inspector
+            // glyph beside them.
+            MenuItem::action("Row Numbers", ToggleRowNumbers),
+            MenuItem::action("Right-Align Numbers", ToggleRightAlign),
+            MenuItem::action("NULL Tags", ToggleNullTags),
+            MenuItem::action("Column Tooltips", ToggleColumnCards),
+            MenuItem::action("Toggle Inspector", ToggleInspector),
+            MenuItem::separator(),
+            MenuItem::action("Zoom In", ZoomIn),
+            MenuItem::action("Zoom Out", ZoomOut),
+            MenuItem::action("Actual Size", ZoomReset),
+            MenuItem::separator(),
+            MenuItem::action("Fit Column Widths", FitColumns),
+            MenuItem::separator(),
+            // Ours, not AppKit's injected one (suppressed above for
+            // its icon and forced indent) — plain text, same slot.
+            MenuItem::action("Toggle Full Screen", ToggleFullScreen),
+        ]),
     ]
 }
 
@@ -267,16 +257,18 @@ fn about(window: &mut Window, cx: &mut App) {
     );
     cx.spawn(async move |cx| {
         if answer.await == Ok(1) {
-            cx.update(|cx| cx.open_url("https://github.com/shreeve/duckdb-harbor")).ok();
+            cx.update(|cx| cx.open_url("https://github.com/shreeve/duckdb-harbor"));
         }
     })
     .detach();
 }
 
-/// gpui-component's `IconName` resolves to `icons/*.svg` asset paths but
-/// ships no files — the app serves them. Each icon used gets an embedded
-/// entry here (Lucide, the set those names come from); a missing entry
-/// renders as an invisible-but-clickable control.
+/// `IconName` resolves to `icons/*.svg` asset paths, and the app serves
+/// them. DuckTable's own icons are embedded here (Lucide, the set those
+/// names come from) and answer first; any other path falls through to the
+/// kit's default icon set, which holds the icons the components draw for
+/// themselves (an input's clear button, a dialog's close). A path neither
+/// has renders as an invisible-but-clickable control.
 struct Assets;
 
 macro_rules! icon {
@@ -303,7 +295,10 @@ const ICONS: [(&str, &[u8]); 13] = [
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<std::borrow::Cow<'static, [u8]>>> {
-        Ok(ICONS.iter().find(|(p, _)| *p == path).map(|(_, bytes)| (*bytes).into()))
+        if let Some((_, bytes)) = ICONS.iter().find(|(p, _)| *p == path) {
+            return Ok(Some((*bytes).into()));
+        }
+        Ok(gpui_kit::assets::Assets.load(path).ok().flatten())
     }
 
     fn list(&self, _: &str) -> anyhow::Result<Vec<SharedString>> {
@@ -338,10 +333,10 @@ impl Render for DuckTable {
             // divider only grants more room — and persists like the
             // inspector's does.
             .child(
-                gpui_component::resizable::h_resizable("root-split")
+                gpui_kit::base::h_resizable("root-split")
                     .with_state(&self.sidebar_resize)
                     .child(
-                        gpui_component::resizable::resizable_panel()
+                        gpui_kit::component::resizable::resizable_panel()
                             .size(px(prefs::get(cx).sidebar_width))
                             .size_range(px(prefs::SIDEBAR_MIN)..px(prefs::SIDEBAR_MAX))
                             // Furniture: only the user's drag changes
@@ -351,7 +346,7 @@ impl Render for DuckTable {
                             .child(self.sidebar(cx)),
                     )
                     .child(
-                        gpui_component::resizable::resizable_panel()
+                        gpui_kit::component::resizable::resizable_panel()
                             .child(self.content(cx)),
                     ),
             )
@@ -386,15 +381,16 @@ fn suppress_fullscreen_menu_item() {
 fn main() {
     #[cfg(target_os = "macos")]
     suppress_fullscreen_menu_item();
-    let app = Application::new().with_assets(Assets);
+    let app = gpui_kit::application().with_assets(Assets);
 
     app.run(move |cx| {
-        gpui_component::init(cx);
+        gpui_kit::init(cx);
+        grid::init(cx);
         // The DuckDB grammar (crates/duckdb-lang), registered before any
         // editor renders: the Query view asks for language "duckdb".
-        gpui_component::highlighter::LanguageRegistry::singleton().register(
+        gpui_kit::component::highlighter::LanguageRegistry::singleton().register(
             "duckdb",
-            &gpui_component::highlighter::LanguageConfig::new(
+            &gpui_kit::component::highlighter::LanguageConfig::new(
                 "duckdb",
                 duckdb_lang::LANGUAGE.into(),
                 vec![],
@@ -448,6 +444,7 @@ fn main() {
             KeyBinding::new("cmd-7", ToggleRowNumbers, None),
             KeyBinding::new("cmd-8", ToggleRightAlign, None),
             KeyBinding::new("cmd-9", ToggleNullTags, None),
+            KeyBinding::new("cmd-t", ToggleColumnCards, None),
         ]);
         // File→Open: the platform picker, then app.open_path — the same
         // door a drag-drop uses. .duckdb is what it speaks today; the
@@ -472,8 +469,7 @@ fn main() {
                         {
                             view.update(cx, |this, cx| this.open_path(path, cx));
                         }
-                    })
-                    .ok();
+                    });
                 }
             })
             .detach();
@@ -576,7 +572,7 @@ fn main() {
         // its windows, which suits a document app whose File menu can open
         // another; DuckTable's menus act on the window that is gone, so a
         // bare menu bar would be a dead app still holding the Dock.
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
@@ -611,6 +607,11 @@ fn main() {
         });
         cx.on_action(|_: &ToggleNullTags, cx| {
             prefs::toggle(cx, |p| p.null_tags = !p.null_tags);
+        });
+        // The column card under an edited cell and on a draft
+        // placeholder (grid.rs column_card).
+        cx.on_action(|_: &ToggleColumnCards, cx| {
+            prefs::toggle(cx, |p| p.column_cards = !p.column_cards);
         });
         // FitColumns needs the window's grid, which this handler reaches
         // through the app-view handle — directly, never by re-dispatching
@@ -656,49 +657,46 @@ fn main() {
                 size(px(w), px(h)),
             ))
         });
-        cx.spawn(async move |cx| {
-            cx.open_window(
-                WindowOptions {
-                    window_min_size: Some(size(px(720.), px(420.))),
-                    window_bounds: remembered,
-                    ..Default::default()
-                },
-                |window, cx| {
-                    let view = cx.new(DuckTable::new);
-                    // The one window's view, reachable from App-level
-                    // action handlers (FitColumns above).
-                    cx.set_global(AppView(view.downgrade()));
-                    view.update(cx, |_, cx| {
-                        // Fires on move and resize both; fullscreen
-                        // frames are the display's, not the user's, so
-                        // they don't overwrite the remembered one. The
-                        // SIZE saved is the content's (viewport), not
-                        // the outer frame's: macOS restores through
-                        // initWithContentRect, so an outer-frame size
-                        // would regrow by one titlebar every launch.
-                        cx.observe_window_bounds(window, |_, window, cx| {
-                            if window.is_fullscreen() {
-                                return;
-                            }
-                            let origin = window.bounds().origin;
-                            let content = window.viewport_size();
-                            prefs::save(cx, |p| {
-                                p.win = Some((
-                                    f32::from(origin.x),
-                                    f32::from(origin.y),
-                                    f32::from(content.width),
-                                    f32::from(content.height),
-                                ));
-                            });
-                        })
-                        .detach();
-                    });
-                    cx.new(|cx| Root::new(view, window, cx))
-                },
-            )?;
-
-            Ok::<_, anyhow::Error>(())
-        })
-        .detach();
+        gpui_kit::open_window(
+            WindowOptions {
+                window_min_size: Some(size(px(720.), px(420.))),
+                window_bounds: remembered,
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                let view = cx.new(DuckTable::new);
+                // The one window's view, reachable from App-level
+                // action handlers (FitColumns above).
+                cx.set_global(AppView(view.downgrade()));
+                view.update(cx, |_, cx| {
+                    // Fires on move and resize both; fullscreen
+                    // frames are the display's, not the user's, so
+                    // they don't overwrite the remembered one. The
+                    // SIZE saved is the content's (viewport), not
+                    // the outer frame's: macOS restores through
+                    // initWithContentRect, so an outer-frame size
+                    // would regrow by one titlebar every launch.
+                    cx.observe_window_bounds(window, |_, window, cx| {
+                        if window.is_fullscreen() {
+                            return;
+                        }
+                        let origin = window.bounds().origin;
+                        let content = window.viewport_size();
+                        prefs::save(cx, |p| {
+                            p.win = Some((
+                                f32::from(origin.x),
+                                f32::from(origin.y),
+                                f32::from(content.width),
+                                f32::from(content.height),
+                            ));
+                        });
+                    })
+                    .detach();
+                });
+                view
+            },
+        )
+        .expect("failed to open the DuckTable window");
     });
 }

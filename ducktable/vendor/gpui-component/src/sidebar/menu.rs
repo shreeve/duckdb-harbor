@@ -1,16 +1,22 @@
 use crate::{
+    ActiveTheme as _, Collapsible, Icon, IconName, Placement, Sizable as _, StyledExt,
     button::{Button, ButtonVariants as _},
-    h_flex, v_flex, ActiveTheme as _, Collapsible, Icon, IconName, Sizable as _, StyledExt,
+    h_flex,
+    menu::{ContextMenuExt, PopupMenu},
+    sidebar::SidebarItem,
+    tooltip::{ManagedTooltipExt as _, Tooltip},
+    v_flex,
 };
 use gpui::{
-    div, percentage, prelude::FluentBuilder as _, AnyElement, App, ClickEvent, ElementId,
-    InteractiveElement as _, IntoElement, ParentElement as _, RenderOnce, SharedString,
-    StatefulInteractiveElement as _, StyleRefinement, Styled, Window,
+    AnyElement, App, ClickEvent, ElementId, InteractiveElement as _, IntoElement,
+    ParentElement as _, Role, SharedString, StatefulInteractiveElement as _, StyleRefinement,
+    Styled, Window, div, percentage, prelude::FluentBuilder,
 };
+use gpui_base::TestSupportExt as _;
 use std::rc::Rc;
 
 /// Menu for the [`super::Sidebar`]
-#[derive(IntoElement)]
+#[derive(Clone)]
 pub struct SidebarMenu {
     style: StyleRefinement,
     collapsed: bool,
@@ -56,60 +62,92 @@ impl Collapsible for SidebarMenu {
     }
 }
 
+impl SidebarItem for SidebarMenu {
+    fn render(
+        self,
+        id: impl Into<ElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> impl IntoElement {
+        let id = id.into();
+
+        v_flex()
+            .gap_2()
+            .refine_style(&self.style)
+            .children(self.items.into_iter().enumerate().map(|(ix, item)| {
+                let id = SharedString::from(format!("{}-{}", id, ix));
+                item.collapsed(self.collapsed)
+                    .render(id, window, cx)
+                    .into_any_element()
+            }))
+    }
+}
+
 impl Styled for SidebarMenu {
     fn style(&mut self) -> &mut StyleRefinement {
         &mut self.style
     }
 }
 
-impl RenderOnce for SidebarMenu {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        v_flex().gap_2().refine_style(&self.style).children(
-            self.items
-                .into_iter()
-                .enumerate()
-                .map(|(ix, item)| item.id(ix).collapsed(self.collapsed)),
-        )
-    }
-}
-
 /// Menu item for the [`SidebarMenu`]
-#[derive(IntoElement)]
+#[derive(Clone)]
 pub struct SidebarMenuItem {
-    id: ElementId,
     icon: Option<Icon>,
     label: SharedString,
+    accessibility_label: Option<SharedString>,
+    label_style: StyleRefinement,
+    style: StyleRefinement,
     handler: Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
     active: bool,
     default_open: bool,
     click_to_open: bool,
     collapsed: bool,
+    click_to_toggle: bool,
     children: Vec<Self>,
-    suffix: Option<AnyElement>,
+    suffix: Option<Rc<dyn Fn(&mut Window, &mut App) -> AnyElement + 'static>>,
     disabled: bool,
+    context_menu: Option<Rc<dyn Fn(PopupMenu, &mut Window, &mut App) -> PopupMenu + 'static>>,
 }
 
 impl SidebarMenuItem {
     /// Create a new [`SidebarMenuItem`] with a label.
     pub fn new(label: impl Into<SharedString>) -> Self {
         Self {
-            id: ElementId::Integer(0),
             icon: None,
             label: label.into(),
+            accessibility_label: None,
+            label_style: StyleRefinement::default(),
+            style: StyleRefinement::default(),
             handler: Rc::new(|_, _, _| {}),
             active: false,
             collapsed: false,
             default_open: false,
             click_to_open: false,
+            click_to_toggle: false,
             children: Vec::new(),
             suffix: None,
             disabled: false,
+            context_menu: None,
         }
     }
 
     /// Set the icon for the menu item
     pub fn icon(mut self, icon: impl Into<Icon>) -> Self {
         self.icon = Some(icon.into());
+        self
+    }
+
+    /// Set the style for the label
+    pub fn label_style(mut self, style: StyleRefinement) -> Self {
+        self.label_style = style;
+        self
+    }
+
+    /// Set the accessibility label of the item row.
+    ///
+    /// Defaults to the visible label text.
+    pub fn accessibility_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.accessibility_label = Some(label.into());
         self
     }
 
@@ -152,14 +190,30 @@ impl SidebarMenuItem {
         self
     }
 
+    /// Set whether clicking the menu item toggles the submenu.
+    ///
+    /// If click_to_open is `true`, this has no effect.
+    ///
+    /// Default is `false`.
+    pub fn click_to_toggle(mut self, click_to_toggle: bool) -> Self {
+        self.click_to_toggle = click_to_toggle;
+        self
+    }
+
     pub fn children(mut self, children: impl IntoIterator<Item = impl Into<Self>>) -> Self {
         self.children = children.into_iter().map(Into::into).collect();
         self
     }
 
     /// Set the suffix for the menu item.
-    pub fn suffix(mut self, suffix: impl IntoElement) -> Self {
-        self.suffix = Some(suffix.into_any_element());
+    pub fn suffix<F, E>(mut self, builder: F) -> Self
+    where
+        F: Fn(&mut Window, &mut App) -> E + 'static,
+        E: IntoElement,
+    {
+        self.suffix = Some(Rc::new(move |window, cx| {
+            builder(window, cx).into_any_element()
+        }));
         self
     }
 
@@ -169,44 +223,84 @@ impl SidebarMenuItem {
         self
     }
 
-    /// Set id to the menu item.
-    fn id(mut self, id: impl Into<ElementId>) -> Self {
-        self.id = id.into();
-        self
-    }
-
     fn is_submenu(&self) -> bool {
         self.children.len() > 0
     }
+
+    fn collapsed_tooltip(&self) -> Option<SharedString> {
+        (self.collapsed && self.icon.is_some()).then(|| self.label.clone())
+    }
+
+    /// Set the context menu for the menu item.
+    pub fn context_menu(
+        mut self,
+        f: impl Fn(PopupMenu, &mut Window, &mut App) -> PopupMenu + 'static,
+    ) -> Self {
+        self.context_menu = Some(Rc::new(f));
+        self
+    }
 }
 
-impl RenderOnce for SidebarMenuItem {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let click_to_open = self.click_to_open;
-        let default_open = self.default_open;
-        let open_state = window.use_keyed_state(self.id.clone(), cx, |_, _| default_open);
+impl FluentBuilder for SidebarMenuItem {}
 
+impl Collapsible for SidebarMenuItem {
+    fn is_collapsed(&self) -> bool {
+        self.collapsed
+    }
+
+    fn collapsed(mut self, collapsed: bool) -> Self {
+        self.collapsed = collapsed;
+        self
+    }
+}
+
+impl SidebarItem for SidebarMenuItem {
+    fn render(
+        self,
+        id: impl Into<ElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> impl IntoElement {
+        let click_to_open = self.click_to_open;
+        let click_to_toggle = self.click_to_toggle;
+        let default_open = self.default_open;
+        let collapsed_tooltip = self.collapsed_tooltip();
+        let id = id.into();
+        let label_text = self.label.clone();
+        let accessibility_label = self.accessibility_label.clone();
+        let is_submenu = self.is_submenu();
+        let open_state = if is_submenu {
+            Some(window.use_keyed_state(id.clone(), cx, |_, _| default_open))
+        } else {
+            None
+        };
         let handler = self.handler.clone();
         let is_collapsed = self.collapsed;
         let is_active = self.active;
         let is_hoverable = !is_active && !self.disabled;
         let is_disabled = self.disabled;
-        let is_submenu = self.is_submenu();
-        let is_open = is_submenu && !is_collapsed && *open_state.read(cx);
+        let is_open = open_state
+            .as_ref()
+            .map_or(false, |s| !is_collapsed && *s.read(cx));
 
         div()
-            .id(self.id.clone())
+            .id(id.clone())
+            .test_support()
             .w_full()
             .child(
                 h_flex()
                     .size_full()
                     .id("item")
+                    .role(Role::TreeItem)
+                    .aria_label(accessibility_label.unwrap_or_else(|| label_text.clone()))
+                    .aria_selected(is_active)
                     .overflow_x_hidden()
                     .flex_shrink_0()
                     .p_2()
                     .gap_x_2()
                     .rounded(cx.theme().radius)
                     .text_sm()
+                    .refine_style(&self.style)
                     .when(is_hoverable, |this| {
                         this.hover(|this| {
                             this.bg(cx.theme().sidebar_accent.opacity(0.8))
@@ -215,13 +309,13 @@ impl RenderOnce for SidebarMenuItem {
                     })
                     .when(is_active, |this| {
                         this.font_medium()
-                            .bg(cx.theme().sidebar_accent)
+                            .bg(cx.theme().tokens.sidebar_accent)
                             .text_color(cx.theme().sidebar_accent_foreground)
                     })
                     .when_some(self.icon.clone(), |this, icon| this.child(icon))
                     .when(is_collapsed, |this| {
                         this.justify_center().when(is_active, |this| {
-                            this.bg(cx.theme().sidebar_accent)
+                            this.bg(cx.theme().tokens.sidebar_accent)
                                 .text_color(cx.theme().sidebar_accent_foreground)
                         })
                     })
@@ -237,11 +331,14 @@ impl RenderOnce for SidebarMenuItem {
                                         h_flex()
                                             .flex_1()
                                             .overflow_x_hidden()
+                                            .refine_style(&self.label_style)
                                             .child(self.label.clone()),
                                     )
-                                    .when_some(self.suffix, |this, suffix| this.child(suffix)),
+                                    .when_some(self.suffix.clone(), |this, suffix| {
+                                        this.child(suffix(window, cx).into_any_element())
+                                    }),
                             )
-                            .when(is_submenu, |this| {
+                            .when_some(open_state.clone(), |this, open_state| {
                                 this.child(
                                     Button::new("caret")
                                         .xsmall()
@@ -254,7 +351,6 @@ impl RenderOnce for SidebarMenuItem {
                                                 }),
                                         )
                                         .on_click({
-                                            let open_state = open_state.clone();
                                             move |_, _, cx| {
                                                 // Avoid trigger item click, just expand/collapse submenu
                                                 cx.stop_propagation();
@@ -275,15 +371,42 @@ impl RenderOnce for SidebarMenuItem {
                             let open_state = open_state.clone();
                             move |ev, window, cx| {
                                 if click_to_open {
-                                    open_state.update(cx, |is_open, cx| {
-                                        *is_open = true;
-                                        cx.notify();
-                                    });
+                                    if let Some(ref s) = open_state {
+                                        s.update(cx, |is_open: &mut bool, cx| {
+                                            *is_open = true;
+                                            cx.notify();
+                                        });
+                                    }
+                                } else if click_to_toggle {
+                                    if let Some(ref s) = open_state {
+                                        s.update(cx, |is_open: &mut bool, cx| {
+                                            *is_open = !*is_open;
+                                            cx.notify();
+                                        });
+                                    }
                                 }
-
                                 handler(ev, window, cx)
                             }
                         })
+                    })
+                    .map(|this| {
+                        if let Some(tooltip) = collapsed_tooltip {
+                            this.managed_tooltip_at(Placement::Right, move |window, cx| {
+                                Tooltip::new(tooltip.clone()).build(window, cx)
+                            })
+                        } else {
+                            this
+                        }
+                    })
+                    .map(|this| {
+                        if let Some(context_menu) = self.context_menu {
+                            this.context_menu(move |menu, window, cx| {
+                                context_menu(menu, window, cx)
+                            })
+                            .into_any_element()
+                        } else {
+                            this.into_any_element()
+                        }
                     }),
             )
             .when(is_open, |this| {
@@ -296,13 +419,40 @@ impl RenderOnce for SidebarMenuItem {
                         .ml_3p5()
                         .pl_2p5()
                         .py_0p5()
-                        .children(
-                            self.children
-                                .into_iter()
-                                .enumerate()
-                                .map(|(ix, item)| item.id(ix)),
-                        ),
+                        .children(self.children.into_iter().enumerate().map(|(ix, item)| {
+                            let id = format!("{}-{}", id, ix);
+                            item.render(id, window, cx).into_any_element()
+                        })),
                 )
             })
+    }
+}
+
+impl Styled for SidebarMenuItem {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collapsed_icon_item_uses_label_as_tooltip() {
+        let item = SidebarMenuItem::new("Projects")
+            .icon(Icon::default())
+            .collapsed(true);
+
+        assert_eq!(item.collapsed_tooltip().as_deref(), Some("Projects"));
+    }
+
+    #[test]
+    fn expanded_or_iconless_item_has_no_collapsed_tooltip() {
+        let expanded = SidebarMenuItem::new("Projects").icon(Icon::default());
+        let iconless = SidebarMenuItem::new("Projects").collapsed(true);
+
+        assert!(expanded.collapsed_tooltip().is_none());
+        assert!(iconless.collapsed_tooltip().is_none());
     }
 }

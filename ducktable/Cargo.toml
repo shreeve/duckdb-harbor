@@ -1,10 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/ducktable", "crates/duckdb-lang", "crates/harbor-client"]
-# The vendored patch source is not a member — excluded so its own test
-# suite can run in place (cd vendor/gpui-component && cargo test) before
-# re-carrying the "DuckTable patch:" marks on a pin bump.
-exclude = ["vendor/gpui-component"]
+# The vendored patch sources are not members, so each builds and tests on
+# its own (cd vendor/gpui-base && cargo test --lib).
+exclude = ["vendor/gpui-base", "vendor/gpui-component"]
 
 [workspace.package]
 version = "0.22.7"
@@ -13,8 +12,10 @@ license = "MIT"
 repository = "https://github.com/shreeve/duckdb-harbor"
 
 [workspace.dependencies]
-gpui = "0.2.2"
-gpui-component = "0.5.1"
+# One dependency for GPUI and its component library. The kit pins an exact
+# gpui-pre snapshot of Zed's GPUI, and the vendored crates below are its
+# exact versions, so the kit is pinned exactly too.
+gpui-kit = { version = "=0.7.0", features = ["tree-sitter"] }
 anyhow = "1"
 
 [profile.dev]
@@ -24,11 +25,28 @@ debug = "limited"
 lto = "thin"
 strip = true
 
-# The one seam where a pinned widget fights us: vendor/gpui-component is
-# the crates.io 0.5.1 source with a surgical patch — a DISABLED editor
-# never scrolls itself (no scroll-past-end room, no cursor-track
-# nudges), which is what lets the Structure view's DDL card sit
-# content-sized and perfectly still. Each patch site is marked
-# "DuckTable patch:". Upgrading the pin means re-carrying those marks.
+# The seams where a pinned widget fights us. vendor/gpui-base and
+# vendor/gpui-component are the crates.io 0.7.0 sources gpui-kit 0.7.0
+# depends on, with surgical patches, each site marked "DuckTable patch:":
+#
+# - gpui-base input: the Query editor's line-number rail — host-imposed
+#   width and number size, per-row labels, the send mark, statement
+#   hairlines — and the helpers that size the Structure view's DDL card
+#   to its wrapped content (prewrap, wrapped_line_count), plus
+#   set_line_number_visible for an observer with no Window.
+# - gpui-base resizable: ResizablePanel::fixed, furniture that keeps its
+#   width when the window resizes.
+# - gpui-component input: Editor takes a size, as Textarea does, so the
+#   Query editor can sit flush with no vertical insets.
+# - gpui-component table: a ⌘- or ⇧-click leaves the grid's own
+#   multi-row selection alone, and no fixed-region edge line.
+#
+# Cargo's [patch] replaces a whole crate, so each patched crate is vendored
+# whole; GPUI itself (gpui-pre) comes from crates.io untouched. Upgrading the
+# pin means copying the new crates.io sources in and re-carrying those marks.
+# gpui-base's own tests run in place (cd vendor/gpui-base && cargo test
+# --lib); gpui-component's read files outside the published package, so run
+# them in an upstream checkout with the patched files copied in.
 [patch.crates-io]
+gpui-base = { path = "vendor/gpui-base" }
 gpui-component = { path = "vendor/gpui-component" }

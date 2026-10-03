@@ -1,29 +1,34 @@
 use std::rc::Rc;
 
 use gpui::{
-    prelude::FluentBuilder as _, AnyElement, App, Corner, IntoElement, SharedString,
-    StyleRefinement, Styled, Window,
+    Anchor, AnyElement, App, IntoElement, SharedString, StyleRefinement, Styled, Window,
+    prelude::FluentBuilder as _,
 };
 
 use crate::{
+    AxisExt, Disableable, Sizable, StyledExt,
     button::Button,
     menu::{DropdownMenu, PopupMenuItem},
     setting::{
-        fields::{get_value, set_value, SettingFieldRender},
         AnySettingField, RenderOptions,
+        fields::{SettingFieldRender, get_value, set_value},
     },
-    AxisExt, Sizable, StyledExt,
 };
 
 pub(crate) struct DropdownField<T> {
     options: Vec<(SharedString, SharedString)>,
+    scrollable: bool,
     _marker: std::marker::PhantomData<T>,
 }
 
 impl<T> DropdownField<T> {
-    pub(crate) fn new(options: Option<&Vec<(SharedString, SharedString)>>) -> Self {
+    pub(crate) fn new(
+        options: Option<&Vec<(SharedString, SharedString)>>,
+        scrollable: bool,
+    ) -> Self {
         Self {
-            options: options.cloned().unwrap_or(vec![]),
+            options: options.cloned().unwrap_or_default(),
+            scrollable,
             _marker: std::marker::PhantomData,
         }
     }
@@ -44,6 +49,7 @@ where
         let old_value = get_value::<T>(&field, cx);
         let set_value = set_value::<T>(&field, cx);
         let dropdown_options = self.options.clone();
+        let scrollable = self.scrollable;
 
         let old_label = dropdown_options
             .iter()
@@ -52,13 +58,14 @@ where
             .unwrap_or_else(|| old_value.clone().into());
 
         Button::new("btn")
-            .when(options.layout.is_vertical(), |this| this.w_full())
+            .when(options.layout().is_vertical(), |this| this.w_full())
             .label(old_label)
             .dropdown_caret(true)
             .outline()
-            .with_size(options.size)
+            .disabled(options.is_disabled())
+            .with_size(options.size())
             .refine_style(style)
-            .dropdown_menu_with_anchor(Corner::TopRight, move |menu, _, _| {
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                 let set_value = set_value.clone();
                 let menu = dropdown_options.iter().fold(menu, |menu, (value, label)| {
                     let old_value: SharedString = old_value.clone().into();
@@ -75,8 +82,7 @@ where
                             }),
                     )
                 });
-
-                menu
+                menu.scrollable(scrollable)
             })
             .into_any_element()
     }

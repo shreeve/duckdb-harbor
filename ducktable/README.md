@@ -130,12 +130,12 @@ feature.
 
 ## Stack
 
-Rust, [GPUI](https://crates.io/crates/gpui) (Zed's GPU-accelerated UI
-framework), and [gpui-component](https://github.com/longbridge/gpui-component)
-for the virtualized data table and code editor. Dependencies are pinned to
-crates.io releases, not git — with one surgical local patch to
-gpui-component (`vendor/gpui-component`), and Harbor's protocol crates
-built from the sibling `harbor/` tree in this repository.
+Rust and [gpui-kit](https://github.com/longbridge/gpui-kit): GPUI (Zed's
+GPU-accelerated UI framework) with its component library, which supplies the
+virtualized data table and code editor. Dependencies are pinned to crates.io
+releases, not git — with surgical local patches to gpui-base and
+gpui-component (`vendor/`), and Harbor's protocol crates built from the
+sibling `harbor/` tree in this repository.
 
 ## Status
 

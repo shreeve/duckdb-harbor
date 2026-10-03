@@ -9,11 +9,11 @@ use crate::grid::Grid;
 use crate::prefs::ViewMode;
 use crate::theme::{pal, PANE_INSET};
 use crate::util::commas;
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::button::ButtonVariants as _;
-use gpui_component::tooltip::Tooltip;
-use gpui_component::{Disableable as _, Sizable as _, StyledExt as _};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use gpui_kit::component::button::ButtonVariants as _;
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{Disableable as _, Sizable as _, StyledExt as _};
 
 /// A key value as the review popover shows it: strings bare, everything
 /// else in its JSON spelling.
@@ -251,8 +251,8 @@ impl Grid {
             })
             .when(view == ViewMode::Data && self.edits.is_some(), |d| {
                 d.child(
-                    gpui_component::button::Button::new("add-row")
-                        .icon(gpui_component::IconName::Plus)
+                    gpui_kit::component::button::Button::new("add-row")
+                        .icon(gpui_kit::component::IconName::Plus)
                         .ghost()
                         .xsmall()
                         .disabled(self.committing)
@@ -323,7 +323,7 @@ impl Grid {
                                 } else {
                                     t.muted.opacity(0.4)
                                 })
-                                .child(gpui_component::Icon::empty().path(path).size_4())
+                                .child(gpui_kit::component::Icon::empty().path(path).size_4())
                         };
                         d.child(div().child("\u{00b7}"))
                             .child(
@@ -440,10 +440,10 @@ impl Grid {
         }
         label = label
             .child(div().text_color(t.muted).child("\u{00b7} \u{2318}S to commit"));
-        gpui_component::popover::Popover::new("staged-popover")
-            .anchor(Corner::BottomLeft)
+        gpui_kit::component::popover::Popover::new("staged-popover")
+            .anchor(Anchor::BottomLeft)
             .trigger(
-                gpui_component::button::Button::new("staged-btn")
+                gpui_kit::component::button::Button::new("staged-btn")
                     .ghost()
                     .xsmall()
                     .child(label),
@@ -602,7 +602,7 @@ impl Grid {
                 };
                 let commit = {
                     let grid = grid.clone();
-                    gpui_component::button::Button::new("staged-commit")
+                    gpui_kit::component::button::Button::new("staged-commit")
                         .primary()
                         .xsmall()
                         .label("Commit (\u{2318}S)")
@@ -650,11 +650,11 @@ impl Grid {
     /// Column show/hide, in a popover that stays open across toggles.
     fn columns_popover(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let grid = cx.entity();
-        gpui_component::popover::Popover::new("columns-popover")
-            .anchor(Corner::BottomLeft)
+        gpui_kit::component::popover::Popover::new("columns-popover")
+            .anchor(Anchor::BottomLeft)
             .trigger(
-                gpui_component::button::Button::new("columns-btn")
-                    .icon(gpui_component::IconName::Eye)
+                gpui_kit::component::button::Button::new("columns-btn")
+                    .icon(gpui_kit::component::IconName::Eye)
                     .ghost()
                     .xsmall()
                     .tooltip("Show or hide columns"),
@@ -701,7 +701,7 @@ impl Grid {
                             .cursor_pointer()
                             .hover(|d| d.bg(t.row_hover))
                             .child(
-                                gpui_component::checkbox::Checkbox::new(("col", ix))
+                                gpui_kit::component::checkbox::Checkbox::new(("col", ix))
                                     .checked(!hidden)
                                     .small(),
                             )
@@ -798,7 +798,7 @@ impl Grid {
                     .when(searchable, |d| {
                         d.child(
                             div().px(px(8.)).pt(px(8.)).child(
-                                gpui_component::input::Input::new(&search)
+                                gpui_kit::component::input::Input::new(&search)
                                     .xsmall()
                                     .cleanable(true),
                             ),

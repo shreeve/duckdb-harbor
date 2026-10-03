@@ -1,14 +1,14 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _, Stateful,
-    Styled as _, Window, div,
+    App, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
+    SharedString, Stateful, Styled as _, Window, div,
 };
 
 use crate::{
     ActiveTheme as _, Icon, IconName, Size, h_flex,
     menu::PopupMenu,
-    table::{Column, ColumnSort, TableState, loading::Loading},
+    table::{Column, ColumnGroup, ColumnSort, TableState, loading::Loading},
 };
 
 /// A delegate trait for providing data and rendering for a table.
@@ -23,7 +23,7 @@ pub trait TableDelegate: Sized + 'static {
     /// Returns the table column at the given index.
     ///
     /// This only call on Table prepare or refresh.
-    fn column(&self, col_ix: usize, cx: &App) -> &Column;
+    fn column(&self, col_ix: usize, cx: &App) -> Column;
 
     /// Perform sort on the column at the given index.
     fn perform_sort(
@@ -44,6 +44,35 @@ pub trait TableDelegate: Sized + 'static {
         div().id("header")
     }
 
+    /// Return the group headers definitions (can be multi-level).
+    ///
+    /// By default, it returns None, meaning no group headers.
+    fn group_headers(&self, cx: &App) -> Option<Vec<Vec<ColumnGroup>>> {
+        None
+    }
+
+    /// Custom render for a group header cell.
+    /// Receives the group label, the logical col_span, and the pixel width.
+    fn render_group_th(
+        &mut self,
+        label: &SharedString,
+        _col_span: usize,
+        width: Pixels,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        div()
+            .w(width)
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .child(label.clone())
+    }
+
     /// Render the header cell at the given column index, default to the column name.
     fn render_th(
         &mut self,
@@ -54,14 +83,6 @@ pub trait TableDelegate: Sized + 'static {
         div()
             .size_full()
             .child(self.column(col_ix, cx).name.clone())
-    }
-
-    /// DuckTable patch: whether the delegate counts this row as selected.
-    /// The table knows one selected row; a delegate keeping a multi-row
-    /// selection answers here so the hover wash stays off every selected
-    /// row, not only the table's own.
-    fn row_selected(&self, _row_ix: usize, _cx: &App) -> bool {
-        false
     }
 
     /// Render the row at the given row and column.
@@ -96,7 +117,9 @@ pub trait TableDelegate: Sized + 'static {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement;
 
-    /// Move the column at the given `col_ix` to insert before the column at the given `to_ix`.
+    /// Move the column at the given `col_ix` so that it ends up at the index `to_ix`.
+    ///
+    /// e.g.: `let col = self.columns.remove(col_ix); self.columns.insert(to_ix, col);`
     fn move_column(
         &mut self,
         col_ix: usize,
@@ -139,9 +162,9 @@ pub trait TableDelegate: Sized + 'static {
 
     /// Return true to enable load more data when scrolling to the bottom.
     ///
-    /// Default: true
-    fn is_eof(&self, cx: &App) -> bool {
-        true
+    /// Default: false
+    fn has_more(&self, cx: &App) -> bool {
+        false
     }
 
     /// Returns a threshold value (n rows), of course, when scrolling to the bottom,
@@ -196,5 +219,13 @@ pub trait TableDelegate: Sized + 'static {
         window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) {
+    }
+
+    /// Get the text representation of a cell for export purposes (e.g., CSV export).
+    ///
+    /// Returns an empty string by default. Implement this method to support export.
+    /// The text should be formatted as it should appear in the exported data.
+    fn cell_text(&self, row_ix: usize, col_ix: usize, cx: &App) -> String {
+        String::new()
     }
 }

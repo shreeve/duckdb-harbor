@@ -2,14 +2,15 @@
 //! Localhost connects directly; any other host is reached through SSH.
 
 use crate::app::DuckTable;
-use gpui::{
+use gpui_kit::{
     App, AppContext as _, ParentElement as _, Styled as _, WeakEntity, Window, div,
     prelude::FluentBuilder as _,
 };
-use gpui_component::dialog::DialogButtonProps;
-use gpui_component::form::{field, v_form};
-use gpui_component::input::{Input, InputState};
-use gpui_component::{ActiveTheme as _, WindowExt as _};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
+use gpui_kit::component::form::{field, v_form};
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::{ActiveTheme as _, WindowExt as _};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -48,10 +49,19 @@ pub(crate) fn open(view: WeakEntity<DuckTable>, window: &mut Window, cx: &mut Ap
                         .child(Input::new(&port)),
                 );
 
+            // A confirm dialog: Cancel and the action, nothing behind the
+            // overlay or in a corner closes it by accident.
             dialog
                 .title("Open Database URL")
-                .confirm()
-                .button_props(DialogButtonProps::default().ok_text("Open Database"))
+                .overlay_closable(false)
+                .close_button(false)
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().child(Button::new("cancel").label("Cancel")))
+                        .child(DialogAction::new().child(
+                            Button::new("ok").label("Open Database").primary(),
+                        )),
+                )
                 .child(form)
                 .when_some(error.borrow().clone(), |dialog, message| {
                     dialog.child(div().text_sm().text_color(cx.theme().danger).child(message))

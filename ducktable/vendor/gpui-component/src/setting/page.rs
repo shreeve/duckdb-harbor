@@ -1,11 +1,14 @@
+use std::rc::Rc;
+
 use gpui::{
-    App, Entity, InteractiveElement as _, IntoElement, ListAlignment, ListState,
-    ParentElement as _, SharedString, Styled, Window, div, list, prelude::FluentBuilder as _, px,
+    AnyElement, App, Entity, InteractiveElement as _, IntoElement, ListAlignment, ListOffset,
+    ListState, ParentElement as _, SharedString, StyleRefinement, Styled, Window, div, list,
+    prelude::FluentBuilder as _, px,
 };
 use rust_i18n::t;
 
 use crate::{
-    ActiveTheme, IconName, Sizable,
+    ActiveTheme, Icon, IconName, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
     label::Label,
@@ -17,27 +20,53 @@ use crate::{
 /// A setting page that can contain multiple setting groups.
 #[derive(Clone)]
 pub struct SettingPage {
+    pub(super) icon: Option<Icon>,
     resettable: bool,
     pub(super) default_open: bool,
     pub(super) title: SharedString,
+    pub(super) title_suffix: Option<Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>>,
     pub(super) description: Option<SharedString>,
     pub(super) groups: Vec<SettingGroup>,
+    pub(super) header_style: StyleRefinement,
 }
 
 impl SettingPage {
     pub fn new(title: impl Into<SharedString>) -> Self {
         Self {
+            icon: None,
             resettable: true,
             default_open: false,
             title: title.into(),
+            title_suffix: None,
             description: None,
             groups: Vec::new(),
+            header_style: StyleRefinement::default(),
         }
     }
 
     /// Set the title of the setting page.
     pub fn title(mut self, title: impl Into<SharedString>) -> Self {
         self.title = title.into();
+        self
+    }
+
+    /// Set a custom element to render after the title in the page header.
+    ///
+    /// For example, an info icon button that opens the help documentation.
+    pub fn title_suffix<F, E>(mut self, suffix: F) -> Self
+    where
+        E: IntoElement,
+        F: Fn(&mut Window, &mut App) -> E + 'static,
+    {
+        self.title_suffix = Some(Rc::new(move |window, cx| {
+            suffix(window, cx).into_any_element()
+        }));
+        self
+    }
+
+    /// Set the icon of the setting page.
+    pub fn icon(mut self, icon: impl Into<Icon>) -> Self {
+        self.icon = Some(icon.into());
         self
     }
 
@@ -73,19 +102,30 @@ impl SettingPage {
         self
     }
 
-    fn is_resettable(&self, cx: &App) -> bool {
-        self.resettable && self.groups.iter().any(|group| group.is_resettable(cx))
+    /// Set the style refinement for the header of the setting page.
+    pub fn header_style(mut self, style: &StyleRefinement) -> Self {
+        self.header_style = style.clone();
+        self
     }
 
-    fn reset_all(&self, window: &mut Window, cx: &mut App) {
+    fn is_resettable(&self, query: &str, cx: &App) -> bool {
+        self.resettable
+            && self
+                .groups
+                .iter()
+                .any(|group| group.is_resettable(query, cx))
+    }
+
+    fn reset_all(&self, query: &str, window: &mut Window, cx: &mut App) {
         for group in &self.groups {
-            group.reset(window, cx);
+            group.reset(query, window, cx);
         }
     }
 
     pub(super) fn render(
         &self,
         ix: usize,
+        group_indices: &[usize],
         state: &Entity<SettingsState>,
         options: &RenderOptions,
         window: &mut Window,
@@ -93,33 +133,50 @@ impl SettingPage {
     ) -> impl IntoElement {
         let search_input = state.read(cx).search_input.clone();
         let query = search_input.read(cx).value();
-        let groups = self
-            .groups
+        let groups = group_indices
             .iter()
-            .filter(|group| group.is_match(&query))
-            .cloned()
+            .map(|&ix| (ix, self.groups[ix].clone()))
             .collect::<Vec<_>>();
         let groups_count = groups.len();
 
-        let list_state = window
-            .use_keyed_state(
-                SharedString::from(format!("list-state:{}", ix)),
-                cx,
-                |_, _| ListState::new(groups_count, ListAlignment::Top, px(100.)),
-            )
-            .read(cx)
-            .clone();
-
-        if list_state.item_count() != groups_count {
-            list_state.reset(groups_count);
+        let page_state = window.use_keyed_state(
+            SharedString::from(format!("list-state:{}", ix)),
+            cx,
+            |_, _| PageState {
+                list: ListState::new(groups_count, ListAlignment::Top, px(100.)),
+                query: query.clone(),
+                groups: group_indices.to_vec(),
+            },
+        );
+        let changed =
+            page_state.read(cx).query != query || page_state.read(cx).groups != group_indices;
+        let list_state = page_state.read(cx).list.clone();
+        if changed {
+            page_state.update(cx, |state, _| {
+                state.list.reset(groups_count);
+                state.query = query.clone();
+                state.groups = group_indices.to_vec();
+            });
         }
 
         let deferred_scroll_group_ix = state.read(cx).deferred_scroll_group_ix;
-        if let Some(ix) = deferred_scroll_group_ix {
-            state.update(cx, |state, _| {
-                state.deferred_scroll_group_ix = None;
+        let scroll_group_ix = deferred_scroll_group_ix.or_else(|| {
+            changed
+                .then_some(state.read(cx).selected_index.group_ix)
+                .flatten()
+        });
+        if deferred_scroll_group_ix.is_some() {
+            state.update(cx, |state, _| state.deferred_scroll_group_ix = None);
+        }
+        if let Some(group_ix) = scroll_group_ix
+            && let Some(visible_ix) = group_indices.iter().position(|&ix| ix == group_ix)
+        {
+            // Scroll by index: after a page switch the list is rebuilt unmeasured,
+            // and `scroll_to_reveal_item` would resolve to the top.
+            list_state.scroll_to(ListOffset {
+                item_ix: visible_ix,
+                offset_in_item: px(0.),
             });
-            list_state.scroll_to_reveal_item(ix);
         }
 
         v_flex()
@@ -131,24 +188,35 @@ impl SettingPage {
                     .gap_3()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(h_flex().justify_between().child(self.title.clone()).when(
-                        self.is_resettable(cx),
-                        |this| {
-                            this.child(
-                                Button::new("reset")
-                                    .icon(IconName::Undo2)
-                                    .ghost()
-                                    .small()
-                                    .tooltip(t!("Settings.Reset All"))
-                                    .on_click({
-                                        let page = self.clone();
-                                        move |_, window, cx| {
-                                            page.reset_all(window, cx);
-                                        }
+                    .refine_style(&self.header_style)
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(self.title.clone())
+                                    .when_some(self.title_suffix.clone(), |this, suffix| {
+                                        this.child(suffix(window, cx))
                                     }),
                             )
-                        },
-                    ))
+                            .when(self.is_resettable(&query, cx), |this| {
+                                this.child(
+                                    Button::new("reset")
+                                        .icon(IconName::Undo2)
+                                        .ghost()
+                                        .small()
+                                        .tooltip(t!("Settings.Reset All"))
+                                        .on_click({
+                                            let page = self.clone();
+                                            let query = query.clone();
+                                            move |_, window, cx| {
+                                                page.reset_all(&query, window, cx);
+                                            }
+                                        }),
+                                )
+                            }),
+                    )
                     .when_some(self.description.clone(), |this, description| {
                         this.child(
                             Label::new(description)
@@ -167,17 +235,13 @@ impl SettingPage {
                         list(list_state.clone(), {
                             let query = query.clone();
                             let options = *options;
-                            move |group_ix, window, cx| {
-                                let group = groups[group_ix].clone();
+                            move |visible_ix, window, cx| {
+                                let (group_ix, group) = groups[visible_ix].clone();
                                 group
                                     .py_4()
                                     .render(
                                         &query,
-                                        &RenderOptions {
-                                            page_ix: ix,
-                                            group_ix,
-                                            ..options
-                                        },
+                                        &options.with_page_ix(ix).with_group_ix(group_ix),
                                         window,
                                         cx,
                                     )
@@ -189,4 +253,10 @@ impl SettingPage {
                     .vertical_scrollbar(&list_state),
             )
     }
+}
+
+struct PageState {
+    list: ListState,
+    query: SharedString,
+    groups: Vec<usize>,
 }

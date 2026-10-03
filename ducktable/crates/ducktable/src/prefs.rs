@@ -4,7 +4,7 @@
 //! app, saved to `~/.config/ducktable/prefs.json`, applied by whichever
 //! surface cares (today: the grid).
 
-use gpui::{App, Global};
+use gpui_kit::{App, Global};
 use serde_json::{json, Value};
 
 /// Which view of the table the footer has selected — a browsing mode,
@@ -24,6 +24,9 @@ pub struct Prefs {
     pub row_numbers: bool,
     pub right_align: bool,
     pub null_tags: bool,
+    /// The column card under an edited cell and on a draft placeholder
+    /// (⌘T).
+    pub column_cards: bool,
     pub view: ViewMode,
     /// The inspector pane's open state (DESIGN.md: persists).
     pub inspector: bool,
@@ -59,7 +62,7 @@ impl Prefs {
     }
 
     /// The table chrome size matched to the current zoom.
-    pub fn table_size(&self) -> gpui_component::Size {
+    pub fn table_size(&self) -> gpui_kit::component::Size {
         ZOOMS[self.zoom].1
     }
 }
@@ -72,13 +75,13 @@ pub const PAGE_SIZES: [usize; 3] = [500, 5_000, 50_000];
 /// multiplier paired with the table chrome size whose row height fits it,
 /// so zoomed text never clips its row. Chrome (sidebar, footer, labels)
 /// stays put; the data is what zooms.
-pub const ZOOMS: [(f32, gpui_component::Size); 6] = [
-    (0.7, gpui_component::Size::XSmall),
-    (0.85, gpui_component::Size::XSmall),
-    (1.0, gpui_component::Size::XSmall),
-    (1.15, gpui_component::Size::Small),
-    (1.3, gpui_component::Size::Medium),
-    (1.5, gpui_component::Size::Large),
+pub const ZOOMS: [(f32, gpui_kit::component::Size); 6] = [
+    (0.7, gpui_kit::component::Size::XSmall),
+    (0.85, gpui_kit::component::Size::XSmall),
+    (1.0, gpui_kit::component::Size::XSmall),
+    (1.15, gpui_kit::component::Size::Small),
+    (1.3, gpui_kit::component::Size::Medium),
+    (1.5, gpui_kit::component::Size::Large),
 ];
 pub const DEFAULT_ZOOM: usize = 2;
 
@@ -109,6 +112,7 @@ impl Default for Prefs {
             row_numbers: true,
             right_align: false,
             null_tags: true,
+            column_cards: true,
             view: ViewMode::Data,
             inspector: false,
             inspector_width: 290.,
@@ -140,6 +144,7 @@ pub fn init(cx: &mut App) {
         prefs.row_numbers = read("row_numbers", prefs.row_numbers);
         prefs.right_align = read("right_align", prefs.right_align);
         prefs.null_tags = read("null_tags", prefs.null_tags);
+        prefs.column_cards = read("column_cards", prefs.column_cards);
         match v.get("view").and_then(Value::as_str) {
             Some("structure") => prefs.view = ViewMode::Structure,
             Some("query") => prefs.view = ViewMode::Query,
@@ -217,6 +222,7 @@ pub fn save(cx: &mut App, change: impl FnOnce(&mut Prefs)) {
         "row_numbers": prefs.row_numbers,
         "right_align": prefs.right_align,
         "null_tags": prefs.null_tags,
+        "column_cards": prefs.column_cards,
         "view": match prefs.view {
             ViewMode::Data => "data",
             ViewMode::Structure => "structure",

@@ -1,10 +1,12 @@
-use crate::{h_flex, ActiveTheme, Disableable, Icon, Selectable, Sizable as _, StyledExt};
+use crate::{ActiveTheme, Disableable, Icon, Selectable, Sizable as _, StyledExt, h_flex};
 use gpui::{
-    div, prelude::FluentBuilder as _, AnyElement, App, ClickEvent, Div, ElementId,
-    InteractiveElement, IntoElement, MouseMoveEvent, ParentElement, RenderOnce, Stateful,
-    StatefulInteractiveElement as _, StyleRefinement, Styled, Window,
+    AnyElement, App, ClickEvent, Div, ElementId, InteractiveElement, Interactivity, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, RenderOnce, SharedString, Stateful,
+    StatefulInteractiveElement, StyleRefinement, Styled, Window, div, prelude::FluentBuilder as _,
 };
+use gpui_base::TestSupportExt as _;
 use smallvec::SmallVec;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ListItemMode {
@@ -31,9 +33,12 @@ pub struct ListItem {
     confirmed: bool,
     check_icon: Option<Icon>,
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+    on_mouse_down:
+        HashMap<MouseButton, Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>>,
     on_mouse_enter: Option<Box<dyn Fn(&MouseMoveEvent, &mut Window, &mut App) + 'static>>,
     suffix: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyElement + 'static>>,
     children: SmallVec<[AnyElement; 2]>,
+    accessibility_label: Option<SharedString>,
 }
 
 impl ListItem {
@@ -48,10 +53,12 @@ impl ListItem {
             secondary_selected: false,
             confirmed: false,
             on_click: None,
+            on_mouse_down: HashMap::new(),
             on_mouse_enter: None,
             check_icon: None,
             suffix: None,
             children: SmallVec::new(),
+            accessibility_label: None,
         }
     }
 
@@ -79,6 +86,15 @@ impl ListItem {
         self
     }
 
+    /// Set the accessibility label of the list item.
+    ///
+    /// Without this, list rows are exposed to assistive technology without a
+    /// name — the visible children do not become the item's accessible name.
+    pub fn accessibility_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.accessibility_label = Some(label.into());
+        self
+    }
+
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
         self
@@ -101,6 +117,15 @@ impl ListItem {
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_click = Some(Box::new(handler));
+        self
+    }
+
+    pub fn on_mouse_down(
+        mut self,
+        button: MouseButton,
+        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_mouse_down.insert(button, Box::new(handler));
         self
     }
 
@@ -148,18 +173,30 @@ impl ParentElement for ListItem {
     }
 }
 
+/// Note: Listeners registered via these traits are not gated by
+/// `disabled`/`separator`. The hover style is managed internally, use
+/// `on_hover` instead of `.hover()`.
+impl InteractiveElement for ListItem {
+    fn interactivity(&mut self) -> &mut Interactivity {
+        self.base.interactivity()
+    }
+}
+
+impl StatefulInteractiveElement for ListItem {}
+
 impl RenderOnce for ListItem {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let is_active = self.confirmed || self.selected;
-
-        let corner_radii = self.style.corner_radii.clone();
-
-        let mut selected_style = StyleRefinement::default();
-        selected_style.corner_radii = corner_radii;
+        let accessibility_label = self.accessibility_label;
+        let is_active = self.confirmed || self.selected || self.secondary_selected;
 
         let is_selectable = !(self.disabled || self.mode.is_separator());
 
+        // The outline is an absolute child, so it has to repeat the item's own radius.
+        let mut outline_style = StyleRefinement::default();
+        outline_style.corner_radii = self.style.corner_radii.clone();
+
         self.base
+            .test_support()
             .relative()
             .gap_x_1()
             .py_1()
@@ -170,13 +207,29 @@ impl RenderOnce for ListItem {
             .items_center()
             .justify_between()
             .refine_style(&self.style)
+            .when_some(accessibility_label, |this, label| this.aria_label(label))
             .when(is_selectable, |this| {
                 this.when_some(self.on_click, |this, on_click| this.on_click(on_click))
                     .when_some(self.on_mouse_enter, |this, on_mouse_enter| {
                         this.on_mouse_move(move |ev, window, cx| (on_mouse_enter)(ev, window, cx))
                     })
-                    .when(!is_active, |this| {
-                        this.hover(|this| this.bg(cx.theme().list_hover))
+                    .map(|this| {
+                        self.on_mouse_down
+                            .into_iter()
+                            .fold(this, |this, (button, handler)| {
+                                this.on_mouse_down(button, move |ev, window, cx| {
+                                    handler(ev, window, cx)
+                                })
+                            })
+                    })
+                    // Register `hover` unconditionally, a conditional registration
+                    // leaves a stale hover style behind when the item turns active.
+                    .hover(|this| {
+                        if is_active {
+                            this
+                        } else {
+                            this.bg(cx.theme().tokens.list_hover)
+                        }
                     })
             })
             .when(!is_selectable, |this| {
@@ -201,28 +254,49 @@ impl RenderOnce for ListItem {
                     }),
             )
             .when_some(self.suffix, |this, suffix| this.child(suffix(window, cx)))
-            .map(|this| {
-                if is_selectable && (self.selected || self.secondary_selected) {
-                    let bg = if self.selected {
-                        cx.theme().list_active
-                    } else {
-                        cx.theme().accent
-                    };
-
-                    this.bg(bg).child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .right_0()
-                            .bottom_0()
-                            .border_1()
-                            .border_color(cx.theme().list_active_border)
-                            .refine_style(&selected_style),
-                    )
+            .when(is_selectable && self.selected, |this| {
+                let bg = if cx.theme().list.active_highlight {
+                    cx.theme().list_active
                 } else {
-                    this
-                }
+                    cx.theme().accent
+                };
+
+                this.bg(bg)
             })
+            .when(is_selectable && self.secondary_selected, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .border_1()
+                        .border_color(cx.theme().selection)
+                        .refine_style(&outline_style),
+                )
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{AppContext as _, Context, Render};
+
+    struct DragPreview;
+
+    impl Render for DragPreview {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn test_list_item_interactivity(_cx: &mut gpui::TestAppContext) {
+        let mut item = ListItem::new("item")
+            .on_drag(DragPreview, |_, _, _, cx| cx.new(|_| DragPreview))
+            .drag_over::<DragPreview>(|style, _, _, _| style)
+            .on_drop(|_: &DragPreview, _, _| {})
+            .on_hover(|_, _, _| {});
+
+        assert_eq!(item.interactivity().element_id, Some("item".into()));
     }
 }

@@ -6,8 +6,8 @@ use gpui::{
 };
 
 use crate::{
-    AxisExt, Sizable, StyledExt,
-    input::{InputEvent, InputState, NumberInput, NumberInputEvent, StepAction},
+    AxisExt, Disableable, Sizable, StyledExt,
+    input::{InputEvent, InputState, NumberInput},
     setting::{
         AnySettingField, RenderOptions,
         fields::{SettingFieldRender, get_value, set_value},
@@ -65,81 +65,83 @@ impl SettingFieldRender for NumberField {
         let set_value = set_value::<f64>(&field, cx);
         let num_options = self.options.clone();
 
-        let state = window
-            .use_keyed_state(
-                SharedString::from(format!(
-                    "number-state-{}-{}-{}",
-                    options.page_ix, options.group_ix, options.item_ix
-                )),
-                cx,
-                |window, cx| {
-                    let input =
-                        cx.new(|cx| InputState::new(window, cx).default_value(value.to_string()));
-                    let _subscriptions = vec![
-                        cx.subscribe_in(&input, window, {
-                            move |_, input, event: &NumberInputEvent, window, cx| match event {
-                                NumberInputEvent::Step(action) => input.update(cx, |input, cx| {
-                                    let value = input.value();
-                                    if let Ok(value) = value.parse::<f64>() {
-                                        let new_value = if *action == StepAction::Increment {
-                                            value + num_options.step
-                                        } else {
-                                            value - num_options.step
-                                        };
-                                        input.set_value(
-                                            SharedString::from(new_value.to_string()),
-                                            window,
-                                            cx,
-                                        );
-                                    }
-                                }),
-                            }
-                        }),
-                        cx.subscribe_in(&input, window, {
-                            move |state: &mut State, input, event: &InputEvent, window, cx| {
-                                match event {
-                                    InputEvent::Change => {
-                                        input.update(cx, |input, cx| {
-                                            let value = input.value();
-                                            if value == state.initial_value.to_string() {
-                                                return;
-                                            }
-
-                                            if let Ok(value) = value.parse::<f64>() {
-                                                let clamp_value =
-                                                    value.clamp(num_options.min, num_options.max);
-
-                                                set_value(clamp_value, cx);
-                                                state.initial_value = clamp_value;
-                                                if clamp_value != value {
-                                                    input.set_value(
-                                                        SharedString::from(clamp_value.to_string()),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                }
-                                            }
-                                        });
-                                    }
-                                    _ => {}
+        let state_entity = window.use_keyed_state(
+            SharedString::from(format!(
+                "number-state-{}-{}-{}",
+                options.page_ix(),
+                options.group_ix(),
+                options.item_ix()
+            )),
+            cx,
+            |window, cx| {
+                // Configure stepping and bounds on the engine itself: `+`/`-`
+                // and Up/Down step by `step` with precision handling, and
+                // out-of-range text is tolerated while typing and clamped on
+                // blur. Re-implementing either on `Change` breaks both.
+                let input = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .default_value(value.to_string())
+                        .step(num_options.step)
+                        .min(num_options.min)
+                        .max(num_options.max)
+                });
+                let _subscriptions = vec![cx.subscribe_in(&input, window, {
+                    move |state: &mut State, input, event: &InputEvent, _window, cx| match event {
+                        InputEvent::Change => {
+                            input.update(cx, |input, cx| {
+                                let text = input.value();
+                                if text == state.initial_value.to_string() {
+                                    return;
                                 }
-                            }
-                        }),
-                    ];
 
-                    State {
-                        input,
-                        initial_value: value,
-                        _subscriptions,
+                                // Unparsable intermediates ("-", "", "1.") are
+                                // left alone so the next keystroke can complete
+                                // them. Out-of-range text stays too (the engine
+                                // clamps it on blur), but the setting only ever
+                                // receives a value inside `min..=max`.
+                                if let Ok(parsed) = text.parse::<f64>() {
+                                    let clamped = parsed.clamp(num_options.min, num_options.max);
+                                    set_value(clamped, cx);
+                                    state.initial_value = clamped;
+                                }
+                            });
+                        }
+                        _ => {}
                     }
-                },
-            )
-            .read(cx);
+                })];
+
+                State {
+                    input,
+                    initial_value: value,
+                    _subscriptions,
+                }
+            },
+        );
+
+        // Sync engine config and displayed value when options or the
+        // underlying setting changed externally.
+        let sync_options = self.options.clone();
+        state_entity.update(cx, |state, cx| {
+            state.input.update(cx, |input, cx| {
+                input.set_step(Some(sync_options.step.into()), window, cx);
+                input.set_min(Some(sync_options.min), window, cx);
+                input.set_max(Some(sync_options.max), window, cx);
+            });
+            if state.initial_value != value {
+                state.initial_value = value;
+                state.input.update(cx, |input, cx| {
+                    input.set_value(SharedString::from(value.to_string()), window, cx);
+                });
+            }
+        });
+
+        let state = state_entity.read(cx);
 
         NumberInput::new(&state.input)
-            .with_size(options.size)
+            .disabled(options.is_disabled())
+            .with_size(options.size())
             .map(|this| {
-                if options.layout.is_horizontal() {
+                if options.layout().is_horizontal() {
                     this.w_32()
                 } else {
                     this.w_full()

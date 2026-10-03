@@ -1,5 +1,5 @@
+use instant::Duration;
 use std::ops::Range;
-use std::time::Duration;
 
 use crate::actions::{Cancel, Confirm, SelectDown, SelectUp};
 use crate::input::InputState;
@@ -14,7 +14,7 @@ use crate::{Icon, IndexPath, Selectable, Sizable, StyledExt};
 use crate::{VirtualListScrollHandle, list::ListDelegate, v_virtual_list};
 use gpui::{
     App, AvailableSpace, ClickEvent, Context, DefiniteLength, EdgesRefinement, EventEmitter,
-    ListSizingBehavior, RenderOnce, ScrollStrategy, SharedString, StatefulInteractiveElement,
+    ListSizingBehavior, RenderOnce, Role, ScrollStrategy, SharedString, StatefulInteractiveElement,
     StyleRefinement, Subscription, px, size,
 };
 use gpui::{
@@ -22,7 +22,6 @@ use gpui::{
     Length, MouseButton, ParentElement, Render, Styled, Task, Window, div, prelude::FluentBuilder,
 };
 use rust_i18n::t;
-use smol::Timer;
 
 pub(crate) fn init(cx: &mut App) {
     let context: Option<&str> = Some("List");
@@ -155,7 +154,7 @@ where
 
     /// Focus the list, if the list is searchable, focus the search input.
     pub fn focus(&mut self, window: &mut Window, cx: &mut App) {
-        self.focus_handle(cx).focus(window);
+        self.focus_handle(cx).focus(window, cx);
     }
 
     /// Return true if either the list or the search input is focused.
@@ -196,7 +195,36 @@ where
         self.selected_index
     }
 
+    /// Set the index of the item that has been right clicked.
+    pub fn set_right_clicked_index(
+        &mut self,
+        ix: Option<IndexPath>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.mouse_right_clicked_index = ix;
+        self.delegate.set_right_clicked_index(ix, window, cx);
+    }
+
+    /// Returns the index of the item that has been right clicked.
+    pub fn right_clicked_index(&self) -> Option<IndexPath> {
+        self.mouse_right_clicked_index
+    }
+
+    /// Set the query text of the search input, this will trigger a search.
+    pub fn set_query(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let query = query.to_string();
+        self.query_input.update(cx, |input, cx| {
+            input.set_value(query.clone(), window, cx);
+        });
+
+        // `set_value` does not emit `InputEvent::Change`, so start the search here.
+        self.start_search(query.trim().to_string(), window, cx);
+    }
+
     /// Set a specific list item for measurement.
+    ///
+    /// If the item is absent, measure the first item in the first non-empty section.
     pub fn set_item_to_measure_index(
         &mut self,
         ix: IndexPath,
@@ -254,39 +282,39 @@ where
                     return;
                 }
 
-                self.set_searching(true, window, cx);
-                let search = self.delegate.perform_search(&text, window, cx);
-
-                if self.rows_cache.len() > 0 {
-                    self._set_selected_index(Some(IndexPath::default()), window, cx);
-                } else {
-                    self._set_selected_index(None, window, cx);
-                }
-
-                self._search_task = cx.spawn_in(window, async move |this, window| {
-                    search.await;
-
-                    _ = this.update_in(window, |this, _, _| {
-                        this.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
-                        this.last_query = Some(text);
-                    });
-
-                    // Always wait 100ms to avoid flicker
-                    Timer::after(Duration::from_millis(100)).await;
-                    _ = this.update_in(window, |this, window, cx| {
-                        this.set_searching(false, window, cx);
-                    });
-                });
+                self.start_search(text, window, cx);
             }
-            InputEvent::PressEnter { secondary } => self.on_action_confirm(
-                &Confirm {
-                    secondary: *secondary,
-                },
-                window,
-                cx,
-            ),
             _ => {}
         }
+    }
+
+    fn start_search(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_searching(true, window, cx);
+        let search = self.delegate.perform_search(&query, window, cx);
+
+        if self.rows_cache.len() > 0 {
+            self._set_selected_index(Some(IndexPath::default()), window, cx);
+        } else {
+            self._set_selected_index(None, window, cx);
+        }
+
+        self._search_task = cx.spawn_in(window, async move |this, window| {
+            search.await;
+
+            _ = this.update_in(window, |this, _, _| {
+                this.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
+                this.last_query = Some(query);
+            });
+
+            // Always wait 100ms to avoid flicker
+            window
+                .background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
+            _ = this.update_in(window, |this, window, cx| {
+                this.set_searching(false, window, cx);
+            });
+        });
     }
 
     fn set_searching(&mut self, searching: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -309,7 +337,7 @@ where
         // Securely handle subtract logic to prevent attempt
         // to subtract with overflow
         if visible_end >= entities_count.saturating_sub(threshold) {
-            if !self.delegate.is_eof(cx) {
+            if !self.delegate.has_more(cx) {
                 return;
             }
 
@@ -399,16 +427,28 @@ where
     }
 
     fn prepare_items_if_needed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let sections_count = self.delegate.sections_count(cx);
-
+        let sections_count = self.delegate.sections_count(cx).max(1);
         let mut measured_size = MeasuredEntrySize::default();
 
         // Measure the item_height and section header/footer height.
         let available_space = size(AvailableSpace::MinContent, AvailableSpace::MinContent);
-        measured_size.item_size = self
-            .render_list_item(self.item_to_measure_index, window, cx)
-            .into_any_element()
-            .layout_as_root(available_space, window, cx);
+        // Use the fallback for this measurement without overwriting the caller's configured index.
+        let requested = self.item_to_measure_index;
+        let item_to_measure = if requested.section < sections_count
+            && requested.row < self.delegate.items_count(requested.section, cx)
+        {
+            Some(requested)
+        } else {
+            (0..sections_count)
+                .find(|section| self.delegate.items_count(*section, cx) > 0)
+                .map(|section| IndexPath::default().section(section))
+        };
+        if let Some(index) = item_to_measure {
+            measured_size.item_size = self
+                .render_list_item(index, window, cx)
+                .into_any_element()
+                .layout_as_root(available_space, window, cx);
+        }
 
         if let Some(mut el) = self
             .delegate
@@ -445,8 +485,14 @@ where
             .unwrap_or(false);
         let id = SharedString::from(format!("list-item-{}", ix));
 
+        let total_items = self.rows_cache.items_count();
+
         div()
             .id(id)
+            .role(Role::ListItem)
+            .aria_position_in_set(ix.row + 1)
+            .aria_size_of_set(total_items)
+            .aria_selected(selected)
             .w_full()
             .relative()
             .overflow_hidden()
@@ -456,7 +502,7 @@ where
             }))
             .when(selectable, |this| {
                 this.on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
-                    this.mouse_right_clicked_index = None;
+                    this.set_right_clicked_index(None, window, cx);
                     this.selected_index = Some(ix);
                     this.on_action_confirm(
                         &Confirm {
@@ -468,8 +514,8 @@ where
                 }))
                 .on_mouse_down(
                     MouseButton::Right,
-                    cx.listener(move |this, _, _, cx| {
-                        this.mouse_right_clicked_index = Some(ix);
+                    cx.listener(move |this, _, window, cx| {
+                        this.set_right_clicked_index(Some(ix), window, cx);
                         cx.notify();
                     }),
                 )
@@ -486,9 +532,13 @@ where
         let rows_cache = self.rows_cache.clone();
         let scrollbar_visible = self.options.scrollbar_visible;
         let scroll_handle = self.scroll_handle.clone();
+        let item_to_measure_index = rows_cache
+            .position_of(&self.item_to_measure_index)
+            .or_else(|| rows_cache.first_entry_position())
+            .unwrap_or(0);
 
         v_flex()
-            .flex_grow()
+            .flex_grow_1()
             .relative()
             .size_full()
             .when_some(self.options.max_height, |this, h| this.max_h(h))
@@ -539,6 +589,7 @@ where
                                     .collect::<Vec<_>>()
                             },
                         )
+                        .with_item_to_measure_index(item_to_measure_index)
                         .paddings(self.options.paddings.clone())
                         .when(self.options.max_height.is_some(), |this| {
                             this.with_sizing_behavior(ListSizingBehavior::Infer)
@@ -616,6 +667,7 @@ where
             .key_context("List")
             .id("list-state")
             .track_focus(&self.focus_handle)
+            .role(Role::List)
             .size_full()
             .relative()
             .overflow_hidden()
@@ -655,8 +707,8 @@ where
                     })
                     // Click out to cancel right clicked row
                     .when(mouse_right_clicked_index.is_some(), |this| {
-                        this.on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                            this.mouse_right_clicked_index = None;
+                        this.on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                            this.set_right_clicked_index(None, window, cx);
                             cx.notify();
                         }))
                     })
@@ -739,5 +791,117 @@ where
             .size_full()
             .refine_style(&self.style)
             .child(self.state.clone())
+    }
+}
+
+#[cfg(test)]
+mod measurement_tests {
+    use super::*;
+    use crate::list::ListItem;
+    use gpui::{Element, TestAppContext};
+
+    struct Delegate {
+        counts: Vec<usize>,
+    }
+
+    impl ListDelegate for Delegate {
+        type Item = ListItem;
+        fn sections_count(&self, _: &App) -> usize {
+            self.counts.len()
+        }
+        fn items_count(&self, section: usize, _: &App) -> usize {
+            self.counts[section]
+        }
+        fn set_selected_index(
+            &mut self,
+            _: Option<IndexPath>,
+            _: &mut Window,
+            _: &mut Context<ListState<Self>>,
+        ) {
+        }
+        fn render_item(
+            &mut self,
+            index: IndexPath,
+            _: &mut Window,
+            _: &mut Context<ListState<Self>>,
+        ) -> Option<ListItem> {
+            (index.row < *self.counts.get(index.section)?)
+                .then(|| ListItem::new(index.row).h(px(if index.row == 0 { 36. } else { 48. })))
+        }
+    }
+
+    #[gpui::test]
+    fn measures_an_existing_row_when_the_requested_item_is_absent(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let window = cx.add_empty_window();
+        window.draw(
+            gpui::point(px(0.), px(0.)),
+            size(px(300.), px(300.)),
+            |window, cx| {
+                let list = cx.new(|cx| ListState::new(Delegate { counts: vec![0, 2] }, window, cx));
+                list.update(cx, |list, cx| {
+                    for (requested, expected_height) in [
+                        (IndexPath::default(), 36.),
+                        (IndexPath::new(1).section(1), 48.),
+                        (IndexPath::new(99).section(1), 36.),
+                        (IndexPath::new(0).section(99), 36.),
+                    ] {
+                        list.set_item_to_measure_index(requested, window, cx);
+                        list.prepare_items_if_needed(window, cx);
+                        let position = list
+                            .rows_cache
+                            .position_of(&IndexPath::new(0).section(1))
+                            .unwrap();
+                        assert_eq!(
+                            list.rows_cache.entries_sizes[position].height,
+                            px(expected_height)
+                        );
+                        assert_eq!(list.item_to_measure_index, requested);
+                    }
+                    let requested = IndexPath::new(1).section(1);
+                    list.set_item_to_measure_index(requested, window, cx);
+                    // Filtering removes the requested row, then all rows, before restoring it.
+                    for (counts, expected_height) in [
+                        (vec![0, 2], Some(48.)),
+                        (vec![0, 1], Some(36.)),
+                        (vec![0, 0], None),
+                        (vec![0, 2], Some(48.)),
+                    ] {
+                        list.delegate.counts = counts;
+                        list.prepare_items_if_needed(window, cx);
+                        if let Some(height) = expected_height {
+                            let position = list
+                                .rows_cache
+                                .position_of(&IndexPath::new(0).section(1))
+                                .unwrap();
+                            assert_eq!(list.rows_cache.entries_sizes[position].height, px(height));
+                        } else {
+                            assert_eq!(list.rows_cache.items_count(), 0);
+                            assert!(list.rows_cache.entries_sizes.is_empty());
+                        }
+                        assert_eq!(list.item_to_measure_index, requested);
+                    }
+                });
+                div()
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn list_state_has_list_role(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let window = cx.add_empty_window();
+        window.draw(
+            gpui::point(px(0.), px(0.)),
+            size(px(300.), px(300.)),
+            |window, cx| {
+                let list = cx.new(|cx| ListState::new(Delegate { counts: vec![2] }, window, cx));
+                list.update(cx, |list, cx| {
+                    let element = list.render(window, cx).into_element();
+                    assert_eq!(element.a11y_role(), Some(Role::List));
+                });
+                div()
+            },
+        );
     }
 }

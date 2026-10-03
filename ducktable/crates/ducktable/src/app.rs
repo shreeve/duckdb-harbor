@@ -6,7 +6,7 @@
 //! fence: a late completion compares its fence and discards itself.
 
 use crate::util::clone_str;
-use gpui::*;
+use gpui_kit::*;
 use harbor_client::{fleet, Conn, State};
 
 fn catalog_refresh_is_current(
@@ -89,9 +89,9 @@ pub struct DuckTable {
     /// until the outcome lands — a berth click never blanks the pane.
     pub(crate) connecting: Option<String>,
     /// The sidebar's table-name filter; Some = the field is open.
-    pub(crate) table_filter: Option<Entity<gpui_component::input::InputState>>,
+    pub(crate) table_filter: Option<Entity<gpui_kit::component::input::InputState>>,
     /// The sidebar's database-name filter; Some = the field is open.
-    pub(crate) berth_filter: Option<Entity<gpui_component::input::InputState>>,
+    pub(crate) berth_filter: Option<Entity<gpui_kit::component::input::InputState>>,
     /// Fence for table selection: a first-page fetch that finishes after a
     /// newer click discards itself instead of swapping in a stale grid.
     select_seq: u64,
@@ -123,7 +123,7 @@ pub struct DuckTable {
     staged: std::collections::HashMap<String, crate::edits::Edits>,
     /// The sidebar/content divider (DESIGN.md: divider positions persist —
     /// the width saves at the end of each drag).
-    pub(crate) sidebar_resize: Entity<gpui_component::resizable::ResizableState>,
+    pub(crate) sidebar_resize: Entity<gpui_kit::component::resizable::ResizableState>,
     /// Berths with a Stop in flight: the row keeps its slot but swaps its
     /// dot for a spinner and stops taking clicks until the shutdown lands.
     pub(crate) stopping: std::collections::HashSet<String>,
@@ -146,10 +146,10 @@ pub struct DuckTable {
 impl DuckTable {
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
         let sidebar_resize =
-            cx.new(|_| gpui_component::resizable::ResizableState::default());
+            cx.new(|_| gpui_kit::component::resizable::ResizableState::default());
         cx.subscribe(
             &sidebar_resize,
-            |_, state, _: &gpui_component::resizable::ResizablePanelEvent, cx| {
+            |_, state, _: &gpui_kit::component::resizable::ResizablePanelEvent, cx| {
                 if let Some(width) = state.read(cx).sizes().first().copied() {
                     crate::prefs::save(cx, |p| {
                         p.sidebar_width = f32::from(width)
@@ -361,11 +361,11 @@ impl DuckTable {
         placeholder: &'static str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Entity<gpui_component::input::InputState> {
+    ) -> Entity<gpui_kit::component::input::InputState> {
         let input = cx.new(|cx| {
-            gpui_component::input::InputState::new(window, cx).placeholder(placeholder)
+            gpui_kit::component::input::InputState::new(window, cx).placeholder(placeholder)
         });
-        cx.subscribe(&input, |_, _, _: &gpui_component::input::InputEvent, cx| {
+        cx.subscribe(&input, |_, _, _: &gpui_kit::component::input::InputEvent, cx| {
             cx.notify();
         })
         .detach();
@@ -942,7 +942,7 @@ impl DuckTable {
 impl DuckTable {
     /// The carousel landed on Query: hand focus to the editor (the
     /// symmetry of landing on Data focusing the grid).
-    pub(crate) fn focus_query(&self, cx: &mut gpui::App) {
+    pub(crate) fn focus_query(&self, cx: &mut gpui_kit::App) {
         if let Some(q) = &self.query {
             q.update(cx, |q, cx| q.request_focus(cx));
         }

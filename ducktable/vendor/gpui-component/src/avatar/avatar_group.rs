@@ -1,9 +1,9 @@
 use gpui::{
-    div, prelude::FluentBuilder as _, Div, InteractiveElement, Interactivity, IntoElement,
-    ParentElement as _, RenderOnce, StyleRefinement, Styled,
+    Div, InteractiveElement, Interactivity, IntoElement, ParentElement as _, RenderOnce,
+    StyleRefinement, Styled, div, prelude::FluentBuilder as _,
 };
 
-use crate::{avatar::Avatar, ActiveTheme, Sizable, Size, StyledExt as _};
+use crate::{ActiveTheme, Sizable, Size, StyledExt as _, avatar::Avatar};
 
 /// A grouped avatars to display in a compact layout.
 #[derive(IntoElement)]
@@ -86,7 +86,7 @@ impl RenderOnce for AvatarGroup {
                 Some(
                     Avatar::new()
                         .name("⋯")
-                        .bg(cx.theme().secondary)
+                        .bg(cx.theme().tokens.secondary)
                         .text_color(cx.theme().muted_foreground)
                         .with_size(self.size)
                         .ml_1(),
@@ -105,5 +105,27 @@ impl RenderOnce for AvatarGroup {
                             .when(ix > 0, |this| this.ml(item_ml))
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn test_avatar_group_builder(_cx: &mut gpui::TestAppContext) {
+        let group = AvatarGroup::new()
+            .child(Avatar::new().name("Alice"))
+            .child(Avatar::new().name("Bob"))
+            .child(Avatar::new().name("Charlie"))
+            .child(Avatar::new().name("David"))
+            .large()
+            .limit(3)
+            .ellipsis();
+
+        assert_eq!(group.avatars.len(), 4);
+        assert_eq!(group.size, Size::Large);
+        assert_eq!(group.limit, 3);
+        assert!(group.ellipsis);
     }
 }
