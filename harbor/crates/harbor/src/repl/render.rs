@@ -286,8 +286,14 @@ impl<'a> Renderer<'a> {
             let rows: Vec<Vec<String>> = std::mem::take(&mut self.head);
             if let Some(text) = plan_text(&self.columns, &rows) {
                 let fenced = self.opts.mode == Mode::Markdown;
-                let out = if fenced { format!("```\n{text}```\n") } else { text };
-                let width = out.lines().map(display_width).max().unwrap_or(0);
+                let width = text.lines().map(display_width).max().unwrap_or(0);
+                let out = if fenced {
+                    format!("```\n{text}```\n")
+                } else if harbor_common::ui::Style::stdout().color {
+                    plan_colored(&text)
+                } else {
+                    text
+                };
                 deliver(out, width);
                 return match self.broken {
                     None => Ok(()),
@@ -702,6 +708,268 @@ fn plan_text(columns: &[String], rows: &[Vec<String>]) -> Option<String> {
     Some(out)
 }
 
+/// What a character of a plan drawing is, as the engine's tree renderer
+/// tags it (`TreeRenderType` in DuckDB's text_tree_renderer.cpp). DuckDB's
+/// shell runs inside the engine and is handed these tags; a harbor client is
+/// handed the finished drawing, so `plan_colored` reads them back out of it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Ink {
+    /// The frame and the routing between boxes.
+    Layout,
+    /// An operator's name, by the family the engine sorts it into.
+    Name(Operator),
+    /// A detail's key, an estimated row count, and the `·` between metrics.
+    Key,
+    /// A detail's value, a measured row count, and a timing of ordinary weight.
+    Plain,
+    /// A timing that is a quarter of the query or more.
+    Critical,
+    /// A timing that is a tenth of the query or more.
+    High,
+    /// A timing under a hundredth of the query.
+    Low,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Operator {
+    Other,
+    Scan,
+    Join,
+    Aggregate,
+    Order,
+}
+
+impl Ink {
+    /// The SGR parameters DuckDB's shell gives each tag by default: a gray
+    /// frame and gray keys, bold operator names, and a color per family.
+    fn sgr(self) -> &'static str {
+        match self {
+            Ink::Layout | Ink::Key | Ink::Low => "90",
+            Ink::Name(Operator::Other) => "1",
+            Ink::Name(Operator::Scan) => "1;32",
+            Ink::Name(Operator::Join) => "1;36",
+            Ink::Name(Operator::Aggregate) => "1;35",
+            Ink::Name(Operator::Order) => "1;33",
+            Ink::Critical => "1;31",
+            Ink::High => "33",
+            Ink::Plain => "",
+        }
+    }
+}
+
+fn is_frame(c: char) -> bool {
+    ('\u{2500}'..='\u{257F}').contains(&c)
+}
+
+/// The family of an operator, from its name as the plan shows it. The engine
+/// decides this on the raw name (`HASH_JOIN`), and the shown name is that
+/// name title-cased with spaces, so the test is the same one.
+fn operator_of(name: &str) -> Operator {
+    let raw = name.to_uppercase().replace(' ', "_");
+    let has = |word: &str| raw.contains(word);
+    if has("SCAN") || has("GET") {
+        Operator::Scan
+    } else if has("JOIN") || raw == "CROSS_PRODUCT" {
+        Operator::Join
+    } else if has("AGGREGATE") || has("GROUP_BY") || has("DISTINCT") || has("WINDOW") {
+        Operator::Aggregate
+    } else if has("ORDER_BY") || has("TOP_N") {
+        Operator::Order
+    } else {
+        Operator::Other
+    }
+}
+
+/// `1.5ms`, `12µs`, `0.25s` as seconds; None for anything else.
+fn timing(text: &str) -> Option<f64> {
+    let (number, scale) = if let Some(n) = text.strip_suffix("µs") {
+        (n, 1e-6)
+    } else if let Some(n) = text.strip_suffix("ms") {
+        (n, 1e-3)
+    } else {
+        (text.strip_suffix('s')?, 1.0)
+    };
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    number.parse::<f64>().ok().map(|n| n * scale)
+}
+
+/// `~1,000 rows` is an estimate (Some(true)), `714 rows` a measured count
+/// (Some(false)); anything else is not a row count.
+fn row_count(text: &str) -> Option<bool> {
+    let estimate = text.starts_with('~');
+    let rest = text.strip_prefix('~').unwrap_or(text);
+    let digits = rest.strip_suffix(" rows").or_else(|| rest.strip_suffix(" row"))?;
+    (!digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit() || c == ','))
+        .then_some(estimate)
+}
+
+/// How many characters of a detail are its key: `Join Type:` of
+/// `Join Type: INNER`. A key is the engine's own word or words, capitalized,
+/// so a value that merely holds a colon is not split.
+fn key_len(phrase: &[char]) -> Option<usize> {
+    if !phrase.first()?.is_ascii_uppercase() {
+        return None;
+    }
+    let colon = phrase.iter().position(|&c| c == ':')?;
+    let named = phrase[..colon]
+        .iter()
+        .all(|&c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '/' | '#' | '-' | '.'));
+    let ends = phrase.get(colon + 1).is_none_or(|&c| c == ' ');
+    (named && ends).then_some(colon + 1)
+}
+
+/// Whether the box whose top-left corner is at `(line, left)` is a leaf that
+/// names a `Table` or a `Function`: the engine counts that as a scan
+/// whatever the operator is called (`Range`, `Read Csv`). A box with a child
+/// carries a junction in its bottom border; a leaf's is plain rule.
+fn leaf_source(lines: &[Vec<char>], line: usize, left: usize) -> bool {
+    let top = &lines[line];
+    let Some(right) = (left + 1..top.len()).find(|&i| top[i] == '╮') else { return false };
+    let mut named = false;
+    for row in &lines[line + 1..] {
+        match row.get(left) {
+            Some('│') => {
+                let inner: String = row[left + 1..right.min(row.len())].iter().collect();
+                let inner = inner.trim_start();
+                named |= inner.starts_with("Table:") || inner.starts_with("Function:");
+            }
+            Some('╰') => {
+                let border = &row[left..(right + 1).min(row.len())];
+                return named && border.iter().all(|c| matches!(c, '╰' | '─' | '╯'));
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// A plan with the colors DuckDB's shell gives one: gray frame and keys,
+/// bold operator names colored by family, and timings heated by their share
+/// of the query. The text is unchanged under the escapes.
+///
+/// The engine draws a plan from typed pieces and this reads the types back
+/// from the drawing. A box's title follows `╭─`; inside a box, phrases are
+/// separated by runs of spaces; a phrase is a row count, a timing, a
+/// `Key: value`, or a value. In a box that folds several operators into
+/// rows, a name followed by its metrics is an operator name too.
+fn plan_colored(text: &str) -> String {
+    let lines: Vec<Vec<char>> = text.lines().map(|l| l.chars().collect()).collect();
+    let total = text
+        .lines()
+        .find_map(|l| l.split_once("Total Time: "))
+        .and_then(|(_, rest)| timing(rest.trim_end_matches(['│', ' '])));
+    let heat = |seconds: f64| match total {
+        Some(total) if total > 0.0 => match seconds / total {
+            f if f >= 0.25 => Ink::Critical,
+            f if f >= 0.10 => Ink::High,
+            f if f >= 0.01 => Ink::Plain,
+            _ => Ink::Low,
+        },
+        _ => Ink::Plain,
+    };
+
+    let mut out = String::with_capacity(text.len() * 2);
+    for (n, line) in lines.iter().enumerate() {
+        let mut ink = vec![Ink::Layout; line.len()];
+        if !line.iter().any(|&c| is_frame(c)) {
+            // A label between plans, not part of any drawing.
+            ink.iter_mut().for_each(|i| *i = Ink::Name(Operator::Other));
+        }
+        let mut at = 0;
+        while at < line.len() {
+            if is_frame(line[at]) {
+                at += 1;
+                continue;
+            }
+            // One stretch between frame characters: a title, or a box's row.
+            let end = (at..line.len()).find(|&i| is_frame(line[i])).unwrap_or(line.len());
+            let title = at >= 2 && line[at - 1] == '─' && line[at - 2] == '╭';
+            // Its phrases: runs of text, single spaces inside, split on wider gaps.
+            let mut phrases: Vec<(usize, usize)> = Vec::new();
+            let mut i = at;
+            while i < end {
+                if line[i] == ' ' {
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                if line[i] == '·' {
+                    // The separator between a row count and a timing is a
+                    // piece of its own, whatever the spacing around it.
+                    i += 1;
+                    phrases.push((start, i));
+                    continue;
+                }
+                while i < end
+                    && !(line[i] == ' '
+                        && line.get(i + 1).is_none_or(|&c| c == ' ' || c == '·' || is_frame(c)))
+                {
+                    i += 1;
+                }
+                phrases.push((start, i));
+            }
+            let word = |&(a, b): &(usize, usize)| line[a..b].iter().collect::<String>();
+            let metric = |p: &(usize, usize)| {
+                let w = word(p);
+                w == "·" || row_count(&w).is_some() || timing(&w).is_some()
+            };
+            let folded = phrases.len() > 1 && phrases[1..].iter().all(metric);
+            for (k, p) in phrases.iter().enumerate() {
+                let w = word(p);
+                let (a, b) = *p;
+                if title {
+                    let family = match operator_of(&w) {
+                        Operator::Other if leaf_source(&lines, n, at - 2) => Operator::Scan,
+                        family => family,
+                    };
+                    ink[a..b].fill(Ink::Name(family));
+                } else if w == "·" {
+                    ink[a..b].fill(Ink::Key);
+                } else if let Some(estimate) = row_count(&w) {
+                    ink[a..b].fill(if estimate { Ink::Key } else { Ink::Plain });
+                } else if let Some(seconds) = timing(&w) {
+                    ink[a..b].fill(heat(seconds));
+                } else if let Some(key) = key_len(&line[a..b]) {
+                    ink[a..a + key].fill(Ink::Key);
+                    ink[a + key..b].fill(Ink::Plain);
+                } else if k == 0 && folded {
+                    ink[a..b].fill(Ink::Name(operator_of(&w)));
+                } else {
+                    ink[a..b].fill(Ink::Plain);
+                }
+            }
+            at = end;
+        }
+        // Spaces carry no ink of their own; they ride the run they follow,
+        // so a line costs a handful of escapes rather than one per gap.
+        let mut run = "";
+        let mut open = false;
+        for (i, &c) in line.iter().enumerate() {
+            let code = if c == ' ' && i > 0 { run } else { ink[i].sgr() };
+            if code != run || i == 0 {
+                if open {
+                    out.push_str("\x1b[0m");
+                }
+                open = !code.is_empty();
+                if open {
+                    out.push_str("\x1b[");
+                    out.push_str(code);
+                    out.push('m');
+                }
+                run = code;
+            }
+            out.push(c);
+        }
+        if open {
+            out.push_str("\x1b[0m");
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// Control characters would shatter the boxed frame; show them escaped.
 fn boxed_safe(s: &str) -> String {
     if !s.chars().any(|c| c.is_control()) {
@@ -960,6 +1228,135 @@ mod tests {
         // Any other two-column result is a table, whatever it holds.
         assert!(plan_text(&["k".to_string(), "v".to_string()], &[vec!["a".into(), "b\nc".into()]]).is_some());
         assert_eq!(plan_safe("a\nb\tc\re\u{1b}"), "a\nb\tc\\re\u{FFFD}");
+    }
+
+    /// The escapes taken back out: what `plan_colored` must leave unchanged.
+    fn uncolored(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for d in chars.by_ref() {
+                    if d == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    const PLAN: &str = "\
+╭─ Top N ───────────────────────────╮
+│ Top: 5                            │
+│ Order By: n DESC                  │
+│ ~5 rows                           │
+╰─────────────────┬─────────────────╯
+╭─ Perfect Hash Group By ───────────╮
+│ Groups: #0                        │
+│ Aggregates: count_star(), max(#1) │
+│ ~7 rows                           │
+╰─────────────────┬─────────────────╯
+╭─ Projection ────┴─────────────────╮
+│ Projections: CAST(#0 AS TINYINT), │
+│              #1                   │
+│ ~263 rows                         │
+╰─────────────────┬─────────────────╯
+╭─ Hash Join ─────┴─────────────────╮
+│ Join Type: INNER                  │
+│ Conditions: id = id               │
+│ ~263 rows                         │
+╰─────────────────┬─────────────────╯
+                  ├────────────────────────────────╮
+╭─ Filter ────────┴─────────────────╮  ╭─ Seq Scan ┴───────────╮
+│ Expression: id <= 999             │  │ Table: x.main.b       │
+│ ~10,000 rows                      │  │ Type: Sequential Scan │
+╰─────────────────┬─────────────────╯  │ ~1,000 rows           │
+╭─ Range ─────────┴─────────────────╮  ╰───────────────────────╯
+│ Function: RANGE                   │
+│ ~10,000 rows                      │
+╰───────────────────────────────────╯
+";
+
+    #[test]
+    fn a_plan_is_colored_as_the_shell_colors_it_and_reads_the_same() {
+        let colored = plan_colored(PLAN);
+        assert_eq!(uncolored(&colored), PLAN, "the text under the escapes is the plan");
+        // Operator names: bold, and a color per family.
+        for (name, sgr) in [
+            ("Top N", "1;33"),
+            ("Perfect Hash Group By", "1;35"),
+            ("Projection", "1"),
+            ("Hash Join", "1;36"),
+            ("Filter", "1"),
+            ("Seq Scan", "1;32"),
+            // No SCAN in its name: a leaf that names a Function is a scan.
+            ("Range", "1;32"),
+        ] {
+            assert!(colored.contains(&format!("\x1b[{sgr}m{name}")), "{name} as {sgr}:\n{colored}");
+        }
+        // Frame and keys gray; a value and its continuation line plain.
+        assert!(colored.contains("\x1b[90m│ Join Type: \x1b[0mINNER"), "{colored}");
+        assert!(colored.contains("\x1b[90m│ Projections: \x1b[0mCAST(#0 AS TINYINT),"), "{colored}");
+        assert!(colored.contains("\x1b[90m│              \x1b[0m#1"), "{colored}");
+        // An estimate is a key, so it is gray with the frame around it.
+        assert!(colored.contains("\x1b[90m│ ~263 rows"), "{colored}");
+    }
+
+    #[test]
+    fn an_analyzed_plan_heats_its_timings_and_keeps_measured_rows_plain() {
+        let plan = "\
+╭─ Summary ───────────╮
+│ Total Time: 0.0100s │
+╰─────────────────────╯
+╭─ Hash Join ─────────────────╮
+│ 714 rows              5.0ms │
+╰─────────────┰┰──────────────╯
+╭─ Table Scan ┚┖──────────────╮
+│ Table: x.main.a             │
+│ 714 rows              1.5ms │
+╰─────────────────────────────╯
+╭─ Filter ────────────────────╮
+│ Projection   5 rows     0µs │
+│ 9 rows · 200µs              │
+╰─────────────────────────────╯
+";
+        let colored = plan_colored(plan);
+        assert_eq!(uncolored(&colored), plan);
+        // Half the query: critical. Fifteen percent: high. Two percent: plain. None: low.
+        assert!(colored.contains("\x1b[1;31m5.0ms"), "{colored}");
+        assert!(colored.contains("\x1b[33m1.5ms"), "{colored}");
+        assert!(colored.contains("\x1b[90m0µs"), "{colored}");
+        assert!(colored.contains("\x1b[90m│ \x1b[0m9 rows \x1b[90m· \x1b[0m200µs"), "{colored}");
+        // A measured count is plain, where an estimate would be gray.
+        assert!(colored.contains("\x1b[90m│ \x1b[0m714 rows"), "{colored}");
+        // A name followed by its metrics, in a box that folds operators into rows.
+        assert!(colored.contains("\x1b[1mProjection"), "{colored}");
+        assert!(colored.contains("\x1b[1;32mTable Scan"), "{colored}");
+    }
+
+    #[test]
+    fn plan_phrases_are_read_as_the_engine_writes_them() {
+        assert_eq!(row_count("~1,000 rows"), Some(true));
+        assert_eq!(row_count("1 row"), Some(false));
+        assert_eq!(row_count("rows"), None);
+        assert_eq!(timing("0µs"), Some(0.0));
+        assert_eq!(timing("1.5ms"), Some(0.0015));
+        assert_eq!(timing("2.00s"), Some(2.0));
+        assert_eq!(timing("DESC"), None);
+        let chars = |s: &str| s.chars().collect::<Vec<_>>();
+        assert_eq!(key_len(&chars("Join Type: INNER")), Some(10));
+        assert_eq!(key_len(&chars("Dynamic Filters: optional: id IN PRF(id)")), Some(16));
+        assert_eq!(key_len(&chars("Groups:")), Some(7));
+        // A value that holds a colon is not a key and a value.
+        assert_eq!(key_len(&chars("'a: b' = x")), None);
+        assert_eq!(key_len(&chars("id::INT > 3")), None);
+        assert_eq!(operator_of("Cross Product"), Operator::Join);
+        assert_eq!(operator_of("Window"), Operator::Aggregate);
+        assert_eq!(operator_of("Order By"), Operator::Order);
+        assert_eq!(operator_of("Column Data Get"), Operator::Scan);
     }
 
     #[test]
