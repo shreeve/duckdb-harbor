@@ -4,6 +4,19 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.43.3 — 2026-10-03
+
+- **`EXPLAIN` prints the plan.** The boxed modes showed a plan as a cell:
+  its newlines escaped to `\n`, the rest cut off at the column edge, one
+  line of `╭─ Projection ───╮\n│ Projections: a │\n…` where a drawing should
+  be (#80). A result with the two columns the engine names `explain_key` and
+  `explain_value`, which nothing but EXPLAIN produces, prints each plan as
+  the engine drew it, the way DuckDB's own shell does, with no row count
+  after it. A single plan prints bare; several, as under
+  `explain_output = 'all'` or beside an analyzed plan, each carry a one-line
+  label. Markdown fences the text; csv, json and line keep the raw value, as
+  a script reading a plan wants.
+
 ## 0.43.2 — 2026-10-03
 
 - **On Windows, `harbor` says why a running server is not listed.** The list

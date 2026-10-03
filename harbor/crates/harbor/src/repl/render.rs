@@ -253,9 +253,18 @@ impl<'a> Renderer<'a> {
             }
             Mode::Duckbox | Mode::Duckboxy | Mode::Markdown => {
                 // boxed_safe: a value with an embedded newline/tab must not
-                // shatter the frame; escape it for display only.
-                let cells: Vec<String> =
-                    values.iter().enumerate().map(|(i, v)| boxed_safe(&self.shown(i, v))).collect();
+                // shatter the frame; escape it for display only. A plan is
+                // the one value whose newlines are its content: it is kept
+                // whole here and printed as text at `end`, never boxed.
+                let plan = self.is_plan();
+                let cells: Vec<String> = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let s = self.shown(i, v);
+                        if plan { plan_safe(&s) } else { boxed_safe(&s) }
+                    })
+                    .collect();
                 if self.head.len() < self.opts.max_rows {
                     self.head.push(cells);
                 } else {
@@ -269,6 +278,23 @@ impl<'a> Renderer<'a> {
     }
 
     pub fn end(mut self, row_count: u64, time_ms: u64, wall_ms: u128) -> std::io::Result<()> {
+        // EXPLAIN's answer is a drawing, and a drawing in a cell is a row of
+        // `\n`s cut off at the column edge. The boxed modes print it as the
+        // engine drew it, the way DuckDB's own shell does, and say nothing
+        // after it: a row count means nothing for a plan.
+        if self.is_plan() && !self.opts.mode.is_streaming() {
+            let rows: Vec<Vec<String>> = std::mem::take(&mut self.head);
+            if let Some(text) = plan_text(&self.columns, &rows) {
+                let fenced = self.opts.mode == Mode::Markdown;
+                let out = if fenced { format!("```\n{text}```\n") } else { text };
+                let width = out.lines().map(display_width).max().unwrap_or(0);
+                deliver(out, width);
+                return match self.broken {
+                    None => Ok(()),
+                    Some(kind) => Err(kind.into()),
+                };
+            }
+        }
         match self.opts.mode {
             Mode::Json => self.emit(format_args!("\n]\n")),
             Mode::Duckbox => self.boxed(row_count, glyphs_duckbox()),
@@ -308,6 +334,16 @@ impl<'a> Renderer<'a> {
     /// text, so 42 and "42" print alike here, as they do from a VARCHAR;
     /// csv and json stay raw and keep them apart. A SQL NULL is still the
     /// NULL marker, and text that is not JSON shows as it came.
+    /// Whether this result is an EXPLAIN: exactly the two text columns the
+    /// engine names `explain_key` and `explain_value`, which nothing else
+    /// produces. The client never sees the statement, only its schema, and
+    /// the schema is signature enough.
+    fn is_plan(&self) -> bool {
+        self.columns.len() == 2
+            && self.columns[0].eq_ignore_ascii_case("explain_key")
+            && self.columns[1].eq_ignore_ascii_case("explain_value")
+    }
+
     fn shown(&self, i: usize, v: &Value) -> String {
         if self.cells.get(i) == Some(&Cell::Variant)
             && let Value::String(s) = v
@@ -618,6 +654,54 @@ fn shown_safe(s: &str) -> String {
     boxed_safe(s)
 }
 
+/// A plan's text as the terminal may see it: its newlines and tabs are its
+/// layout and stay, every other control character is shown escaped, the
+/// same rule as `boxed_safe` for everything the frame is not the reason for.
+fn plan_safe(s: &str) -> String {
+    if !s.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+        return s.to_string();
+    }
+    s.chars()
+        .map(|c| match c {
+            '\n' | '\t' => c.to_string(),
+            '\r' => "\\r".to_string(),
+            c if c.is_control() => '\u{FFFD}'.to_string(),
+            c => c.to_string(),
+        })
+        .collect()
+}
+
+/// The text an EXPLAIN result prints as: each plan verbatim, ending in a
+/// newline. One plan prints bare, as DuckDB's shell prints it. Several — the
+/// logical and physical plans under `explain_output = 'all'`, or an analyzed
+/// plan beside its physical one — each get a one-line label in the shell's
+/// words, since the drawings do not say which is which. None when the rows
+/// are not plans.
+fn plan_text(columns: &[String], rows: &[Vec<String>]) -> Option<String> {
+    if columns.len() != 2 || rows.is_empty() || rows.iter().any(|r| r.len() != 2) {
+        return None;
+    }
+    let mut out = String::new();
+    for row in rows {
+        if rows.len() > 1 {
+            let label = match row[0].as_str() {
+                "logical_plan" => "Unoptimized Logical Plan",
+                "logical_opt" => "Optimized Logical Plan",
+                "physical_plan" => "Physical Plan",
+                "analyzed_plan" => "Analyzed Plan",
+                other => other,
+            };
+            out.push_str(label);
+            out.push('\n');
+        }
+        out.push_str(&row[1]);
+        if !row[1].ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    Some(out)
+}
+
 /// Control characters would shatter the boxed frame; show them escaped.
 fn boxed_safe(s: &str) -> String {
     if !s.chars().any(|c| c.is_control()) {
@@ -857,6 +941,25 @@ mod tests {
         // exact fit: 3 cols of 10 = 30 + 2 gaps (6) + edges (4) = 40
         assert_eq!(plan_columns(&[10, 10, 10], 40), vec![Some(0), Some(1), Some(2)]);
         assert_eq!(plan_columns(&[10, 10, 10], 39), vec![Some(0), None, Some(2)]);
+    }
+
+    #[test]
+    fn a_plan_prints_whole_and_labels_only_a_set() {
+        let cols = vec!["explain_key".to_string(), "explain_value".to_string()];
+        let plan = "╭─ Projection ───╮\n│ Projections: a │\n╰────────────────╯".to_string();
+        let one = plan_text(&cols, &[vec!["physical_plan".into(), plan.clone()]]).unwrap();
+        assert_eq!(one, format!("{plan}\n"));
+        let two = plan_text(
+            &cols,
+            &[vec!["logical_opt".into(), "L".into()], vec!["physical_plan".into(), "P\n".into()]],
+        )
+        .unwrap();
+        assert!(two.contains("Optimized Logical Plan"), "{two}");
+        assert!(two.contains("Physical Plan"), "{two}");
+        assert!(two.ends_with("P\n"), "{two}");
+        // Any other two-column result is a table, whatever it holds.
+        assert!(plan_text(&["k".to_string(), "v".to_string()], &[vec!["a".into(), "b\nc".into()]]).is_some());
+        assert_eq!(plan_safe("a\nb\tc\re\u{1b}"), "a\nb\tc\\re\u{FFFD}");
     }
 
     #[test]

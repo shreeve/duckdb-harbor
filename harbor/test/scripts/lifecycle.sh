@@ -118,6 +118,14 @@ pid2=$(server_pid)
 [[ -n $pid1 && $pid1 == "$pid2" ]] && ok "same server both times (pid $pid1)" \
                                    || bad "the second client raised a second server ($pid1 vs $pid2)"
 check "the list shows the database" 0 "x.duckdb" "$harbor"
+# EXPLAIN's answer is a drawing: the boxed mode prints it as the engine drew
+# it, never as a cell with `\n` in it cut off at the column edge.
+plan=$("$harbor" "$work/x.duckdb" -c "EXPLAIN SELECT 42 AS answer" 2>/dev/null)
+if [[ $plan == *"Projection"* && $plan != *'\n'* && $plan != *"explain_value"* ]]; then
+  ok "explain prints the plan itself, not a table of it"
+else
+  bad "explain came out boxed or escaped: $plan"
+fi
 check "a bare word is refused, never served" 1 "names nothing running" \
   "$harbor" nosuchname -c "SELECT 1"
 if [[ -f $work/nosuchname ]]; then bad "a bare word conjured a file"; else ok "no file conjured for a bare word"; fi
