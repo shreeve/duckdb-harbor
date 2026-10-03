@@ -199,6 +199,13 @@ separate PR. The flow, which the last three releases followed exactly:
    amd64/arm64) plus checksums and smoke-tests each; `/releases/latest`
    then points at it.
 6. Install and prove it: the one-liner, `harbor --version`, one real query.
+7. Point the Homebrew formula at it: `scripts/update-formula.sh X.Y.Z` opens
+   the pull request on `shreeve/homebrew-tap` (the checkout beside this
+   repository, or `TAP=`); land it. `brew upgrade duckdb-harbor` then
+   installs the version. The formula keeps the binary and its `libduckdb`
+   under `libexec` and launches through `opt`, so a login item survives an
+   upgrade; `harbor update` refuses on a Homebrew copy and names `brew
+   upgrade`.
 
 Patch versions are for fixes and refinements; a new capability is a minor
 bump (brace expansion was 0.40.0). A documentation-only change needs no

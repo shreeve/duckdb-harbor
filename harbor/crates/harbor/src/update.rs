@@ -47,6 +47,20 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         }
     }
     let installed = env!("CARGO_PKG_VERSION");
+    let exe = std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .map_err(|e| format!("cannot find this binary: {e}"))?;
+    // A copy under a Homebrew cellar is Homebrew's to upgrade: it keeps its
+    // own record of the version there, and the installer writing over the
+    // files would leave that record wrong.
+    let formula = harbor::repl::installs::formula_of(&exe);
+    let upgrade = match &formula {
+        Some(formula) => format!("brew upgrade {formula}"),
+        None => "harbor update".to_string(),
+    };
+    if let Some(note) = harbor::repl::installs::note() {
+        eprintln!("{note}");
+    }
 
     // What is newest is one HTTP HEAD away, and it decides whether there is
     // anything to do: an update to the version already here is a no-op, not
@@ -57,7 +71,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         if newest == installed {
             println!("harbor {installed} is the newest release");
         } else {
-            println!("harbor {installed} is installed; {newest} is the newest release — harbor update");
+            println!("harbor {installed} is installed; {newest} is the newest release — {upgrade}");
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -65,10 +79,11 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         eprintln!("harbor {installed} is the newest release");
         return report(installed, restart);
     }
-
-    let exe = std::env::current_exe()
-        .and_then(|p| p.canonicalize())
-        .map_err(|e| format!("cannot find this binary: {e}"))?;
+    if formula.is_some() {
+        return Err(format!(
+            "this copy of harbor was installed by Homebrew, which keeps its own record of the version — upgrade it with `{upgrade}`"
+        ));
+    }
     eprintln!("harbor: {installed} -> {target}, over {}", harbor_common::paths::shorten(&exe));
     let status = installer(&exe, &target)
         .status()

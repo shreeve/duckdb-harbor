@@ -420,6 +420,19 @@ irm https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.ps1 | i
 Uninstall with `... | bash -s -- --uninstall` — the binary and `libduckdb`
 go; your databases, state, and config stay.
 
+Homebrew has it too, as `duckdb-harbor`, which installs the `harbor` command:
+
+```bash
+brew install shreeve/tap/duckdb-harbor
+```
+
+Use one or the other on a machine, not both. Each keeps its own copy and
+upgrades only its own, `harbor update` for the script's and `brew upgrade
+duckdb-harbor` for Homebrew's, so two copies drift apart and the version you
+get depends on which one PATH reaches first. Config and state are shared, in
+your home directory, so nothing is lost by changing over. `harbor` says so
+when it finds a second copy, names it, and gives the command that removes it.
+
 Installed, it updates itself. `harbor update` runs that same installer over
 the binary that ran it, so a copy outside `~/.local` updates in place (with
 `sudo` in front when it is system-wide), and `harbor update 0.42.0` picks a

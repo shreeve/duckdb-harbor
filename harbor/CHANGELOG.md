@@ -4,6 +4,27 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.43.5 — 2026-10-03
+
+- **`harbor` says when a second copy of it is on the machine.** install.sh
+  and Homebrew each keep their own copy and upgrade only their own, so a
+  machine with both runs whichever PATH reaches first while the other falls
+  behind, and the version depends on how a thing was launched: a shell, a
+  login item, DuckTable. The list and `harbor update` now name the other
+  copy, its version and how it was installed, give the command that removes
+  it, and say which copy a bare `harbor` runs. Homebrew's launcher and the
+  binary behind it count as one copy, as do two paths to the same file. With
+  one copy there is nothing said, and the note goes to stderr, so a piped
+  list stays a list.
+- **`harbor update` leaves a Homebrew copy to Homebrew.** Run from a copy in
+  a Homebrew cellar, it would have written the installer's files over
+  Homebrew's and left Homebrew's record of the version wrong. It refuses and
+  names `brew upgrade duckdb-harbor`; `--check` and the report of servers on
+  old code work as before.
+- **Homebrew installs harbor**, as `brew install shreeve/tap/duckdb-harbor`,
+  beside install.sh. `scripts/update-formula.sh` points the formula at a
+  release, and is the last step of one.
+
 ## 0.43.4 — 2026-10-03
 
 - **A plan is colored the way DuckDB's shell colors it.** The frame, the
