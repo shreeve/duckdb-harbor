@@ -65,6 +65,8 @@ cask "ducktable" do
 
   caveats <<~EOS
     DuckTable speaks to DuckDB Harbor servers. Install harbor with:
+      brew install shreeve/tap/duckdb-harbor
+    or with its one-line installer:
       curl -fsSL https://raw.githubusercontent.com/$repo/main/install.sh | bash
   EOS
 end
