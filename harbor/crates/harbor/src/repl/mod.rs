@@ -738,6 +738,15 @@ fn url_of(info: &serde_json::Value) -> Option<String> {
     Some(format!("http://127.0.0.1:{port}"))
 }
 
+/// What the list has to say on Windows, where it cannot see a running server.
+/// The registry is the listening unix socket, and Windows has none: a server
+/// there listens on loopback TCP only, which nothing enumerates. An attached
+/// database is still listed, and reads as stopped whether or not it runs.
+#[cfg(windows)]
+const WINDOWS_LISTING: &str = "  Running servers are not listed on Windows: the list reads unix sockets,\n  \
+which Windows lacks. A server started with `harbor <db.duckdb> start --port <p>`\n  \
+is reached by its URL:\n\n  harbor http://127.0.0.1:<p>\n\n";
+
 /// Bare `harbor`: what's running, straight from the filesystem and the
 /// servers themselves. Readdir the runtime dir for sockets, ask each for
 /// /info, and unlink the ones nothing answers on — the registry IS the
@@ -816,6 +825,11 @@ fn list() -> Result<(), String> {
         let mut t = Table::new(["DATABASE", "VERSION", "PID", "CLIENTS", "UPTIME"]);
         t.caption(format!("harbor {}", env!("CARGO_PKG_VERSION")));
         println!("{}", t.render(&Style::stdout()));
+        #[cfg(windows)]
+        {
+            print!("{WINDOWS_LISTING}");
+            return Ok(());
+        }
         println!("  Nothing running\n");
         println!("  harbor <db.duckdb>   open a database — served while anyone is connected");
         return Ok(());
@@ -880,6 +894,8 @@ fn list() -> Result<(), String> {
         parts.push(format!("{stopped} stopped"));
     }
     println!("  {}\n", parts.join(", "));
+    #[cfg(windows)]
+    print!("\n{WINDOWS_LISTING}");
     Ok(())
 }
 

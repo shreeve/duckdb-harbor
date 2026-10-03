@@ -1066,9 +1066,11 @@ socket is out of a browser's reach and skips the check. Request logging is avail
 `--log`, off by default.
 
 **Windows serves over loopback TCP only.** Unix sockets — and with them
-spawn-on-use and the list — are a unix feature. On Windows, serving is
-explicit (`harbor <db> start --port <p>`) and the client half
-works the same everywhere.
+spawn-on-use, the list and joining a server by its file or name — are a unix
+feature. On Windows, serving is explicit (`harbor <db> start --port <p>`),
+a bare `harbor` says so instead of listing the server, and a client reaches it
+by URL: `harbor http://127.0.0.1:<p>`. Everything past the connection is the
+same everywhere.
 
 **The engine is the loaded `libduckdb`, not the binary.** Nothing is linked:
 harbor loads the engine on demand (`HARBOR_LIBDUCKDB`, then `../lib` beside
