@@ -1,56 +1,30 @@
 mod code_action_menu;
 mod completion_menu;
-mod context_menu;
 mod diagnostic_popover;
 mod hover_popover;
 
 pub(crate) use code_action_menu::*;
 pub(crate) use completion_menu::*;
-pub(crate) use context_menu::*;
 pub(crate) use diagnostic_popover::*;
 pub(crate) use hover_popover::*;
 
 use gpui::{
-    App, Div, ElementId, Entity, InteractiveElement as _, IntoElement, SharedString, Stateful,
-    StyleRefinement, Styled as _, Window, div, px, rems,
+    App, Div, ElementId, InteractiveElement as _, SharedString, Stateful, StyleRefinement,
+    Styled as _, Window, div, px, rems,
 };
 
 use crate::{
-    ActiveTheme, StyledExt as _,
+    ActiveTheme, ThemeStyled as _,
     text::{TextView, TextViewStyle},
 };
-
-pub(crate) enum ContextMenu {
-    Completion(Entity<CompletionMenu>),
-    CodeAction(Entity<CodeActionMenu>),
-    MouseContext(Entity<MouseContextMenu>),
-}
-
-impl ContextMenu {
-    pub(crate) fn is_open(&self, cx: &App) -> bool {
-        match self {
-            ContextMenu::Completion(menu) => menu.read(cx).is_open(),
-            ContextMenu::CodeAction(menu) => menu.read(cx).is_open(),
-            ContextMenu::MouseContext(menu) => menu.read(cx).is_open(),
-        }
-    }
-
-    pub(crate) fn render(&self) -> impl IntoElement {
-        match self {
-            ContextMenu::Completion(menu) => menu.clone().into_any_element(),
-            ContextMenu::CodeAction(menu) => menu.clone().into_any_element(),
-            ContextMenu::MouseContext(menu) => menu.clone().into_any_element(),
-        }
-    }
-}
 
 pub(super) fn render_markdown(
     id: impl Into<ElementId>,
     markdown: impl Into<SharedString>,
-    window: &mut Window,
+    _: &mut Window,
     cx: &mut App,
 ) -> TextView {
-    TextView::markdown(id, markdown, window, cx)
+    TextView::markdown(id, markdown)
         .style(
             TextViewStyle::default()
                 .paragraph_gap(rems(0.5))

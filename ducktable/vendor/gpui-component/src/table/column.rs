@@ -1,6 +1,6 @@
 use gpui::{
-    div, prelude::FluentBuilder, px, Bounds, Context, Edges, Empty, EntityId, IntoElement,
-    ParentElement as _, Pixels, Render, SharedString, Styled as _, TextAlign, Window,
+    Bounds, Context, Edges, Empty, EntityId, IntoElement, ParentElement as _, Pixels, Render,
+    SharedString, Styled as _, TextAlign, Window, div, prelude::FluentBuilder, px,
 };
 
 use crate::ActiveTheme as _;
@@ -26,18 +26,42 @@ pub struct Column {
     pub paddings: Option<Edges<Pixels>>,
     /// The width of the column.
     pub width: Pixels,
-    /// DuckTable patch: the smallest width this column may be fitted or
-    /// manually resized to. Upstream has only a table-wide 10px floor,
-    /// which cannot account for per-column content such as draft pills.
-    pub min_width: Pixels,
     /// Whether the column is fixed, the fixed column will pin at the left side when scrolling horizontally.
     pub fixed: Option<ColumnFixed>,
     /// Whether the column is resizable.
     pub resizable: bool,
     /// Whether the column is movable.
     pub movable: bool,
-    /// Whether the column is selectable, if true this column's cells can be selected in column selection mode.
+    /// Whether the column is selectable.
+    ///
+    /// When `true`:
+    /// - In column selection mode: The entire column can be selected
+    /// - In cell selection mode: Individual cells in this column can be selected
+    ///
+    /// When `false`:
+    /// - The column and its cells cannot be selected
+    /// - Useful for action columns (e.g., buttons, checkboxes) that shouldn't participate in selection
     pub selectable: bool,
+    /// The minimum width of the column.
+    pub min_width: Pixels,
+    /// The maximum width of the column.
+    pub max_width: Pixels,
+}
+
+/// A column group can be used to group multiple columns under a single header.
+#[derive(Debug, Clone)]
+pub struct ColumnGroup {
+    pub label: SharedString,
+    pub span: usize,
+}
+
+impl ColumnGroup {
+    pub fn new(label: impl Into<SharedString>, span: usize) -> Self {
+        Self {
+            label: label.into(),
+            span,
+        }
+    }
 }
 
 impl Default for Column {
@@ -49,11 +73,12 @@ impl Default for Column {
             sort: None,
             paddings: None,
             width: px(100.),
-            min_width: px(10.),
             fixed: None,
             resizable: true,
             movable: true,
             selectable: true,
+            min_width: px(20.0),
+            max_width: px(f32::MAX),
         }
     }
 }
@@ -96,6 +121,12 @@ impl Column {
         self
     }
 
+    /// Set the text alignment of the column to center.
+    pub fn text_center(mut self) -> Self {
+        self.align = TextAlign::Center;
+        self
+    }
+
     /// Set the alignment of the column text, default is left.
     ///
     /// Only `text_left`, `text_right` is supported.
@@ -119,12 +150,6 @@ impl Column {
     /// Set the width of the column, default is 100px.
     pub fn width(mut self, width: impl Into<Pixels>) -> Self {
         self.width = width.into();
-        self
-    }
-
-    /// DuckTable patch: set this column's resize floor.
-    pub fn min_width(mut self, min_width: impl Into<Pixels>) -> Self {
-        self.min_width = min_width.into();
         self
     }
 
@@ -153,8 +178,49 @@ impl Column {
     }
 
     /// Set whether the column is selectable, default is true.
+    ///
+    /// When `false`, this column and its cells will not participate in selection:
+    /// - In column selection mode: The column header cannot be clicked to select
+    /// - In cell selection mode: Cells in this column cannot be selected
+    ///
+    /// This is useful for action columns (e.g., with buttons or checkboxes) that
+    /// should not be part of the selection system.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// Column::new("actions", "Actions")
+    ///     .width(px(100.))
+    ///     .selectable(false)  // Prevent selection of action buttons
+    /// ```
     pub fn selectable(mut self, selectable: bool) -> Self {
         self.selectable = selectable;
+        self
+    }
+
+    /// Set the minimum width of the column, default is 20px
+    pub fn min_width(mut self, min_width: impl Into<Pixels>) -> Self {
+        let min_width = min_width.into();
+        self.min_width = min_width;
+
+        // If the current width is smaller than the new minimum,
+        // bump the width up to match the minimum.
+        if self.width < min_width {
+            self.width = min_width;
+        }
+        self
+    }
+
+    /// Set the minimum width of the column, default is 1200px
+    pub fn max_width(mut self, max_width: impl Into<Pixels>) -> Self {
+        let max_width = max_width.into();
+        self.max_width = max_width;
+
+        // If the current width is larger than the new maximum,
+        // pull the width down to match the maximum.
+        if self.width > max_width {
+            self.width = max_width;
+        }
         self
     }
 }
@@ -209,7 +275,7 @@ impl Render for DragColumn {
         div()
             .px_4()
             .py_1()
-            .bg(cx.theme().table_head)
+            .bg(cx.theme().tokens.table_head)
             .text_color(cx.theme().muted_foreground)
             .opacity(0.9)
             .border_1()

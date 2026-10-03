@@ -11,7 +11,7 @@
 //! selection, discard-all) is one entry too: the rows stay separate
 //! changes for review, and one ⌘Z takes the whole gesture back.
 
-use gpui::SharedString;
+use gpui_kit::SharedString;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
@@ -429,6 +429,15 @@ impl Edits {
         self.apply(Op { key, identity, prev, next: Some(RowChange::Delete) });
     }
 
+    /// Whether `key` names a draft row nothing has been entered into: an
+    /// INSERT with no cells, every column left to the database.
+    pub fn is_untouched_insert(&self, key: &str) -> bool {
+        matches!(
+            self.changes.get(key).map(|e| &e.change),
+            Some(RowChange::Insert(cells)) if cells.is_empty()
+        )
+    }
+
     /// Discard one row's staged change (the review popover's per-entry
     /// action). Itself undoable.
     pub fn discard(&mut self, key: &str) {
@@ -663,6 +672,41 @@ fn qident(name: &str) -> String {
 pub fn is_text_type(duck_type: &str) -> bool {
     let ty = duck_type.to_uppercase();
     matches!(type_head(&ty), "VARCHAR" | "NVARCHAR" | "CHAR" | "BPCHAR" | "TEXT" | "STRING")
+}
+
+/// An ENUM's values, in declaration order: `ENUM('admin', 'user')` is
+/// `admin`, `user`. A doubled quote is one quote, and a comma inside the
+/// quotes belongs to the value. None for any other type, and for a
+/// declaration that does not read as one.
+pub(crate) fn enum_values(duck_type: &str) -> Option<Vec<String>> {
+    let ty = duck_type.trim();
+    let head = ty.get(..5)?;
+    if !head.eq_ignore_ascii_case("ENUM(") || !ty.ends_with(')') {
+        return None;
+    }
+    let mut values = Vec::new();
+    let mut chars = ty[5..ty.len() - 1].chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        if chars.next()? != '\'' {
+            return None;
+        }
+        let mut value = String::new();
+        loop {
+            match chars.next()? {
+                '\'' if chars.next_if_eq(&'\'').is_some() => value.push('\''),
+                '\'' => break,
+                c => value.push(c),
+            }
+        }
+        values.push(value);
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        match chars.next() {
+            None => return Some(values),
+            Some(',') => {}
+            Some(_) => return None,
+        }
+    }
 }
 
 /// Whether whitespace around a cell's text is part of its value. It is for
@@ -1178,6 +1222,21 @@ mod tests {
     }
 
     #[test]
+    fn enum_values_read_the_declaration() {
+        assert_eq!(
+            enum_values("ENUM('admin', 'user')"),
+            Some(vec!["admin".to_string(), "user".to_string()])
+        );
+        assert_eq!(
+            enum_values("enum('it''s', 'a, b',' padded ')"),
+            Some(vec!["it's".to_string(), "a, b".to_string(), " padded ".to_string()])
+        );
+        assert_eq!(enum_values("VARCHAR"), None);
+        assert_eq!(enum_values("ENUM('open"), None);
+        assert_eq!(enum_values("ENUM('a' 'b')"), None);
+    }
+
+    #[test]
     fn an_integer_is_held_to_its_range_and_bound_as_text_past_i64() {
         for ty in ["TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "INT", "int8"] {
             assert_eq!(parse_value(" -7 ", ty), Ok(json!(-7)), "{ty}");
@@ -1619,6 +1678,18 @@ mod tests {
              WHERE \"a\" = ? AND \"b\" = from_base64(?::VARCHAR) RETURNING *"
         );
         assert_eq!(stmts[0].params, vec![json!(1), json!("qg==")]);
+    }
+
+    #[test]
+    fn only_a_draft_with_nothing_entered_is_untouched() {
+        let mut e = edits();
+        let blank = e.stage_insert();
+        assert!(e.is_untouched_insert(&blank));
+        e.stage_insert_cell(&blank, 1, None, Value::Null);
+        assert!(!e.is_untouched_insert(&blank), "an explicit NULL was entered");
+        let copy = e.stage_duplicate(vec![json!(5)], vec![(2, txt("3"), Bind::Source)]);
+        assert!(!e.is_untouched_insert(&copy), "a duplicate carries its copied cells");
+        assert!(!e.is_untouched_insert("draft:missing"));
     }
 
     #[test]

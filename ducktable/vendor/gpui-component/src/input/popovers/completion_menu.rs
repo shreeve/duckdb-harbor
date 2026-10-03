@@ -1,21 +1,20 @@
 use std::rc::Rc;
 
 use gpui::{
-    Action, AnyElement, App, AppContext, Bounds, Context, DismissEvent, Empty, Entity,
-    EventEmitter, HighlightStyle, InteractiveElement as _, IntoElement, ParentElement, Pixels,
-    Point, Render, RenderOnce, SharedString, Styled, StyledText, Subscription, Window, canvas,
+    Action, AnyElement, App, AppContext, Context, DismissEvent, Empty, Entity, EventEmitter,
+    Half as _, HighlightStyle, InteractiveElement as _, IntoElement, ParentElement, Pixels, Point,
+    Render, RenderOnce, SharedString, Styled, StyledText, Subscription, WeakEntity, Window,
     deferred, div, prelude::FluentBuilder, px, relative,
 };
-use lsp_types::{CompletionItem, CompletionTextEdit};
+use lsp_types::CompletionItem;
 
-const MAX_MENU_WIDTH: Pixels = px(320.);
 const MAX_MENU_HEIGHT: Pixels = px(240.);
 const POPOVER_GAP: Pixels = px(4.);
 
 use crate::{
     ActiveTheme, IndexPath, Selectable, actions, h_flex,
     input::{
-        self, InputState, RopeExt,
+        self, EditorState,
         popovers::{editor_popover, render_markdown},
     },
     label::Label,
@@ -90,7 +89,8 @@ impl RenderOnce for CompletionMenuItem {
             .filter_text
             .as_ref()
             .map(|s| s.len())
-            .unwrap_or(self.highlight_prefix.len());
+            .unwrap_or(self.highlight_prefix.len())
+            .min(item.label.len());
 
         let highlights = vec![(
             0..matched_len,
@@ -106,11 +106,11 @@ impl RenderOnce for CompletionMenuItem {
             .p_1()
             .text_xs()
             .line_height(relative(1.))
-            .rounded_sm()
+            .rounded(cx.theme().radius.half())
             .when(item.deprecated.unwrap_or(false), |this| this.line_through())
             .hover(|this| this.bg(cx.theme().accent.opacity(0.8)))
             .when(self.selected, |this| {
-                this.bg(cx.theme().accent)
+                this.bg(cx.theme().tokens.accent)
                     .text_color(cx.theme().accent_foreground)
             })
             .child(div().child(StyledText::new(item.label.clone()).with_highlights(highlights)))
@@ -169,10 +169,9 @@ impl ListDelegate for ContextMenuDelegate {
 /// A context menu for code completions and code actions.
 pub struct CompletionMenu {
     offset: usize,
-    editor: Entity<InputState>,
+    editor: WeakEntity<EditorState>,
     list: Entity<ListState<ContextMenuDelegate>>,
     open: bool,
-    bounds: Bounds<Pixels>,
 
     /// The offset of the first character that triggered the completion.
     pub(crate) trigger_start_offset: Option<usize>,
@@ -183,9 +182,9 @@ pub struct CompletionMenu {
 impl CompletionMenu {
     /// Creates a new `CompletionMenu` with the given offset and completion items.
     ///
-    /// NOTE: This element should not call from InputState::new, unless that will stack overflow.
+    /// NOTE: This element should not call from EditorState::new, unless that will stack overflow.
     pub(crate) fn new(
-        editor: Entity<InputState>,
+        editor: Entity<EditorState>,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
@@ -215,56 +214,25 @@ impl CompletionMenu {
 
             Self {
                 offset: 0,
-                editor,
+                editor: editor.downgrade(),
                 list,
                 open: false,
                 trigger_start_offset: None,
                 query: SharedString::default(),
-                bounds: Bounds::default(),
                 _subscriptions,
             }
         })
     }
 
     fn select_item(&mut self, item: &CompletionItem, window: &mut Window, cx: &mut Context<Self>) {
-        let offset = self.offset;
         let item = item.clone();
-        let mut range = self.trigger_start_offset.unwrap_or(self.offset)..self.offset;
+        let range = self.trigger_start_offset.unwrap_or(self.offset)..self.offset;
 
         let editor = self.editor.clone();
 
         cx.spawn_in(window, async move |_, cx| {
             editor.update_in(cx, |editor, window, cx| {
-                editor.completion_inserting = true;
-
-                let mut new_text = item.label.clone();
-                if let Some(text_edit) = item.text_edit.as_ref() {
-                    match text_edit {
-                        CompletionTextEdit::Edit(edit) => {
-                            new_text = edit.new_text.clone();
-                            range.start = editor.text.position_to_offset(&edit.range.start);
-                            range.end = editor.text.position_to_offset(&edit.range.end);
-                        }
-                        CompletionTextEdit::InsertAndReplace(edit) => {
-                            new_text = edit.new_text.clone();
-                            range.start = editor.text.position_to_offset(&edit.replace.start);
-                            range.end = editor.text.position_to_offset(&edit.replace.end);
-                        }
-                    }
-                } else if let Some(insert_text) = item.insert_text.clone() {
-                    new_text = insert_text;
-                    range = offset..offset;
-                }
-
-                editor.replace_text_in_range_silent(
-                    Some(editor.range_to_utf16(&range)),
-                    &new_text,
-                    window,
-                    cx,
-                );
-                editor.completion_inserting = false;
-                // FIXME: Input not get the focus
-                editor.focus(window, cx);
+                editor.insert_completion(&item, range, window, cx);
             })
         })
         .detach();
@@ -283,7 +251,7 @@ impl CompletionMenu {
         }
 
         cx.propagate();
-        if action.partial_eq(&input::Enter { secondary: false }) {
+        if input::Enter::is_primary(&*action) {
             self.on_action_enter(window, cx);
         } else if action.partial_eq(&input::Escape) {
             self.on_action_escape(window, cx);
@@ -321,14 +289,15 @@ impl CompletionMenu {
         });
     }
 
-    pub(crate) fn is_open(&self) -> bool {
-        self.open
-    }
-
     /// Hide the completion menu and reset the trigger start offset.
     pub(crate) fn hide(&mut self, cx: &mut Context<Self>) {
         self.open = false;
         self.trigger_start_offset = None;
+        let editor = self.editor.clone();
+        cx.spawn(async move |_, cx| {
+            let _ = editor.update(cx, |editor, cx| editor.dismiss_completion_overlay(cx));
+        })
+        .detach();
         cx.notify();
     }
 
@@ -370,19 +339,18 @@ impl CompletionMenu {
     }
 
     fn origin(&self, cx: &App) -> Option<Point<Pixels>> {
-        let editor = self.editor.read(cx);
-        let Some(last_layout) = editor.last_layout.as_ref() else {
+        let editor = self.editor.upgrade()?;
+        let editor = editor.read(cx);
+        let Some((cursor_bounds, line_height)) = editor.cursor_layout() else {
             return None;
         };
-        let Some(cursor_origin) = last_layout.cursor_bounds.map(|b| b.origin) else {
-            return None;
-        };
+        let cursor_origin = cursor_bounds.origin;
 
-        let scroll_origin = self.editor.read(cx).scroll_handle.offset();
+        let scroll_origin = editor.scroll_offset();
 
         Some(
-            scroll_origin + cursor_origin - editor.input_bounds.origin
-                + Point::new(-px(4.), last_layout.line_height + px(4.)),
+            scroll_origin + cursor_origin - editor.input_bounds().origin
+                + Point::new(-px(4.), line_height + px(4.)),
         )
     }
 }
@@ -398,8 +366,6 @@ impl Render for CompletionMenu {
             return Empty.into_any_element();
         }
 
-        let view = cx.entity();
-
         let Some(pos) = self.origin(cx) else {
             return Empty.into_any_element();
         };
@@ -411,10 +377,14 @@ impl Render for CompletionMenu {
             .selected_item()
             .and_then(|item| item.documentation.clone());
 
-        let max_width = MAX_MENU_WIDTH.min(window.bounds().size.width - pos.x);
-        let abs_pos = self.editor.read(cx).input_bounds.origin + pos;
+        let Some(editor) = self.editor.upgrade() else {
+            return Empty.into_any_element();
+        };
+        let configured_max = editor.read(cx).lsp().completion_menu.max_width;
+        let max_width = configured_max.min(window.bounds().size.width - pos.x);
+        let abs_pos = editor.read(cx).input_bounds().origin + pos;
         let vertical_layout =
-            abs_pos.x + MAX_MENU_WIDTH + POPOVER_GAP + MAX_MENU_WIDTH + POPOVER_GAP
+            abs_pos.x + configured_max + POPOVER_GAP + configured_max + POPOVER_GAP
                 > window.bounds().size.width;
 
         deferred(
@@ -431,15 +401,7 @@ impl Render for CompletionMenu {
                     editor_popover("completion-menu", cx)
                         .max_w(max_width)
                         .min_w(px(120.))
-                        .child(List::new(&self.list).max_h(MAX_MENU_HEIGHT))
-                        .child(
-                            canvas(
-                                move |bounds, _, cx| view.update(cx, |r, _| r.bounds = bounds),
-                                |_, _, _, _| {},
-                            )
-                            .absolute()
-                            .size_full(),
-                        ),
+                        .child(List::new(&self.list).max_h(MAX_MENU_HEIGHT)),
                 )
                 .when_some(selected_documentation, |this, documentation| {
                     let mut doc = match documentation {
@@ -453,7 +415,7 @@ impl Render for CompletionMenu {
                     this.child(
                         div().child(
                             editor_popover("completion-menu", cx)
-                                .w(MAX_MENU_WIDTH)
+                                .w(configured_max)
                                 .px_2()
                                 .child(render_markdown("doc", doc, window, cx)),
                         ),

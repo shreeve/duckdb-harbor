@@ -21,9 +21,9 @@ pub const HEADER_TEXT: f32 = 11.5;
 pub const GUTTER_TEXT: f32 = 11.;
 pub const TAG_TEXT: f32 = 10.;
 
-use gpui::{App, Global, Hsla, SharedString};
-use gpui_component::theme::{Theme, ThemeConfig, ThemeSet};
-use gpui_component::ActiveTheme as _;
+use gpui_kit::{App, Global, Hsla, SharedString};
+use gpui_kit::component::theme::{Theme, ThemeConfig, ThemeSet};
+use gpui_kit::component::ActiveTheme as _;
 use harbor_client::Level;
 use std::rc::Rc;
 
@@ -63,7 +63,7 @@ pub struct Pal {
     pub pill: Hsla,
 }
 
-impl gpui::Global for Pal {}
+impl gpui_kit::Global for Pal {}
 
 /// The derived palette. Cached as a global by `apply` — pal() runs per
 /// cell per frame, so it must be a plain global read, not a re-derive.
@@ -148,7 +148,7 @@ fn choice_file() -> Option<std::path::PathBuf> {
 
 /// Load the bundled themes, apply the persisted choice (or the set's
 /// default for the system's light/dark mode), and install the cycler's
-/// state. Call once at startup, after `gpui_component::init`.
+/// state. Call once at startup, after `gpui_kit::init`.
 pub fn init(cx: &mut App) {
     let set: ThemeSet =
         serde_json::from_str(include_str!("../../../assets/themes/ducktable.json"))
@@ -161,8 +161,8 @@ pub fn init(cx: &mut App) {
         .iter()
         .position(|c| Some(c.name.as_ref()) == saved)
         .unwrap_or_else(|| {
-            let dark = cx.window_appearance() == gpui::WindowAppearance::Dark
-                || cx.window_appearance() == gpui::WindowAppearance::VibrantDark;
+            let dark = cx.window_appearance() == gpui_kit::WindowAppearance::Dark
+                || cx.window_appearance() == gpui_kit::WindowAppearance::VibrantDark;
             configs
                 .iter()
                 .position(|c| c.is_default && (c.mode.is_dark() == dark))
@@ -174,21 +174,31 @@ pub fn init(cx: &mut App) {
 }
 
 fn apply(config: &Rc<ThemeConfig>, cx: &mut App) {
-    let theme = Theme::global_mut(cx);
-    if config.mode.is_dark() {
-        theme.dark_theme = config.clone();
-    } else {
-        theme.light_theme = config.clone();
-    }
-    theme.mode = config.mode;
-    theme.apply_config(config);
+    // Theme::update, not a direct write: the theme keeps its colors twice
+    // (solid colors and the tokens components paint from) plus a copy for
+    // the scrollbars and resize handles, and update keeps all three in
+    // step. apply_config installs the file and switches to its mode.
+    Theme::update(cx, |theme| theme.apply_config(config));
     cx.set_global(compute_pal(cx));
-    // The vendored Table paints its own row separators from
-    // table_row_border, ON TOP of the grid's cell borders — the actual
-    // source of the old two-tone mesh. One hairline color means the
-    // component reads the same slot the grid does. Overridden AFTER
-    // compute_pal captured the original for the pills' soft fill.
-    Theme::global_mut(cx).colors.table_row_border = pal(cx).grid_line;
+    // The Table paints its own row separators from table_row_border, ON
+    // TOP of the grid's cell borders — the source of a two-tone mesh. One
+    // hairline color means the component reads the same slot the grid
+    // does. Overridden AFTER compute_pal captured the original for the
+    // pills' soft fill.
+    let grid_line = pal(cx).grid_line;
+    Theme::update(cx, |theme| theme.colors.table_row_border = grid_line);
+    // A scroll in progress shows ONLY the floating thumb, never an opaque
+    // track blotting out the content beneath it until the fade finishes —
+    // the way native macOS overlay scrollbars work. Hover and drag keep
+    // the theme's track. Every Theme::update rebuilds the scrollbar's
+    // styles, so this follows the last one.
+    let scrollbar = &mut gpui_kit::base::Theme::global_mut(cx).scrollbar;
+    *scrollbar = scrollbar.clone().with_styles(
+        scrollbar
+            .styles()
+            .clone()
+            .track(|track| track.bg(gpui_kit::transparent_black())),
+    );
 }
 
 pub fn current_name(cx: &App) -> String {

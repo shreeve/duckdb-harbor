@@ -10,9 +10,16 @@
 
 use crate::grid::Grid;
 use crate::theme::{pal, value_font, CELL_TEXT, PANE_INSET};
-use gpui::*;
-use gpui_component::scroll::ScrollableElement as _;
-use gpui_component::StyledExt as _;
+use gpui_kit::*;
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::StyledExt as _;
+
+/// What the DDL card spends beside its text, horizontally: its border
+/// (1 + 1), the editor's insets (6 left, 10 right), the code editor's
+/// numberless gutter (6), and the margin the editor keeps right of the
+/// wrap (10). The card is the longest line plus this; the wrap width is
+/// the card minus this.
+const DDL_CHROME: f32 = 34.;
 
 pub(crate) struct StructCol {
     pub(crate) name: String,
@@ -307,15 +314,14 @@ impl Grid {
                     // clipboard) — see copy_button.rs.
                     .child(copy.clone()),
             );
-            // A disabled Input keeps native text selection (drag, Cmd+C)
-            // while gating off every mutation — read-only selectable
-            // text, which gpui divs cannot give. The card sits EXACTLY
+            // A read-only editor keeps native text selection (drag,
+            // Cmd+C) while gating off every mutation — selectable text,
+            // which gpui divs cannot give. The card sits EXACTLY
             // content-sized and cannot scroll: line height is pinned ON
-            // the input so rows × line height IS the content height,
-            // and the vendored gpui-component carries the "a disabled
-            // editor never scrolls itself" patch (no scroll-past-end
-            // room, no cursor-track nudges — see vendor/, Cargo.toml
-            // [patch]). The wheel falls through to the pane naturally.
+            // the editor so rows × line height plus the editor's own
+            // vertical insets (8 above, 8 below) IS its height, and the
+            // state allows no room past the last line (grid.rs). The
+            // wheel falls through to the pane naturally.
             let line_h = 20. * z;
             // Shrink-wrapped: the card is as wide as its longest line
             // (7/11 is Menlo's advance-to-size ratio, the constant the
@@ -329,14 +335,14 @@ impl Grid {
                 .max()
                 .unwrap_or(0)
                 .max(8);
-            let mut card_w = max_chars as f32 * (CELL_TEXT * z * 7. / 11.) + 28.;
+            let mut card_w = max_chars as f32 * (CELL_TEXT * z * 7. / 11.) + DDL_CHROME;
             // Cap at the pane width recorded LAST frame (the title
             // strip's canvas — present in every view, so it is already
             // known before the Structure view's first paint), and seed
             // the editor's wrap width with the exact value its layout
-            // will derive: card − borders(2) − input_px(16) −
-            // RIGHT_MARGIN(10). The wrapper re-wraps synchronously, so
-            // the row count read below is FIRST-FRAME correct — drawn
+            // will derive: card − DDL_CHROME. The wrapper re-wraps
+            // synchronously, so the row count read below is
+            // FIRST-FRAME correct — drawn
             // right, not repainted right (Steve's ruling). A cold start
             // straight into Structure has no recorded width yet and
             // settles via the editor observer instead.
@@ -352,7 +358,7 @@ impl Grid {
                     s.prewrap(
                         font(value_font()),
                         px(CELL_TEXT * z),
-                        px(card_w - 28.),
+                        px(card_w - DDL_CHROME),
                         cx,
                     );
                 });
@@ -381,10 +387,10 @@ impl Grid {
                     .w(px(card_w))
                     .max_w_full()
                     .child(
-                        gpui_component::input::Input::new(state)
-                            .disabled(true)
+                        gpui_kit::component::input::Editor::new(state)
+                            .readonly(true)
                             .appearance(false)
-                            .h(px(rows as f32 * line_h + 14.))
+                            .h(px(rows as f32 * line_h + 16.))
                             .text_size(px(CELL_TEXT * z))
                             .line_height(px(line_h))
                             .font_family(value_font()),
@@ -417,10 +423,10 @@ impl Grid {
             let lo = crate::prefs::STRUCTURE_SPLIT_MIN.min(content_h - 1.);
             let h = want.min(content_h - 1.).max(lo);
             pane.child(
-                gpui_component::resizable::v_resizable("structure-split")
+                gpui_kit::base::v_resizable("structure-split")
                     .with_state(split)
                     .child(
-                        gpui_component::resizable::resizable_panel()
+                        gpui_kit::component::resizable::resizable_panel()
                             .size(px(h))
                             .size_range(px(lo)..px(crate::prefs::STRUCTURE_SPLIT_MAX))
                             // Furniture: only the user's drag moves the
@@ -430,7 +436,7 @@ impl Grid {
                             .child(div().size_full().min_h_0().child(grid)),
                     )
                     .child(
-                        gpui_component::resizable::resizable_panel().child(
+                        gpui_kit::component::resizable::resizable_panel().child(
                             // overflow_y_scrollbar, not overflow_y_scroll:
                             // the pane wears the scrollbar the bare
                             // gpui scroll never draws.

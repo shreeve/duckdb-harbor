@@ -1,9 +1,9 @@
 use gpui::{
-    prelude::FluentBuilder as _, Div, InteractiveElement, IntoElement, ParentElement, RenderOnce,
-    Styled,
+    Div, InteractiveElement, IntoElement, ParentElement, RenderOnce, Styled,
+    prelude::FluentBuilder as _,
 };
 
-use crate::{h_flex, menu::DropdownMenu, ActiveTheme as _, Collapsible, Selectable};
+use crate::{ActiveTheme as _, Collapsible, Selectable, h_flex, menu::DropdownMenu};
 
 /// Footer for the [`super::Sidebar`].
 #[derive(IntoElement)]
@@ -76,11 +76,11 @@ impl RenderOnce for SidebarFooter {
             .justify_between()
             .rounded(cx.theme().radius)
             .hover(|this| {
-                this.bg(cx.theme().sidebar_accent)
+                this.bg(cx.theme().tokens.sidebar_accent)
                     .text_color(cx.theme().sidebar_accent_foreground)
             })
             .when(self.selected, |this| {
-                this.bg(cx.theme().sidebar_accent)
+                this.bg(cx.theme().tokens.sidebar_accent)
                     .text_color(cx.theme().sidebar_accent_foreground)
             })
             .child(self.base)

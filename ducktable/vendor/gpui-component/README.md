@@ -1,41 +1,139 @@
-# GPUI Component
+<p align="center">
+  <img src="https://raw.githubusercontent.com/longbridge/gpui-kit/main/website/public/logo.svg" width="112" alt="GPUI Kit logo" />
+  <br>
+  <strong>GPUI Kit</strong>
+</p>
 
-[![Build Status](https://github.com/longbridge/gpui-component/actions/workflows/ci.yml/badge.svg)](https://github.com/longbridge/gpui-component/actions/workflows/ci.yml) [![Docs](https://docs.rs/gpui-component/badge.svg)](https://docs.rs/gpui-component/) [![Crates.io](https://img.shields.io/crates/v/gpui-component.svg)](https://crates.io/crates/gpui-component)
+[English](./README.md) | [简体中文](./README.zh-CN.md)
 
-UI components for building fantastic desktop applications using [GPUI](https://gpui.rs).
+[![Build Status](https://github.com/longbridge/gpui-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/longbridge/gpui-kit/actions/workflows/ci.yml) [![Docs](https://docs.rs/gpui-kit/badge.svg)](https://docs.rs/gpui-kit/) [![Crates.io](https://img.shields.io/crates/v/gpui-kit.svg)](https://crates.io/crates/gpui-kit)
+
+Build fantastic, high-performance desktop apps with Rust and GPUI.
+
+GPUI Kit is a comprehensive Rust desktop application framework. It combines a
+production-ready UI system with application-grade data, layout, and editing
+capabilities, all built on a reusable foundation of behavior, state, and
+infrastructure. GPUI Kit ships 75+ documented components and primitives,
+WebAssembly support, AccessKit accessibility, UI integration testing, and an
+optional JavaScript extension runtime.
+
+Documentation: <https://gpui-kit.com>
+
+```text
+gpui-kit             The one crate applications depend on
+├── gpui-base        Unstyled behavior, state, and infrastructure
+└── gpui-component   GPUI Component: the complete styled UI system
+```
+
+`gpui-kit` pins the matching GPUI release and re-exports GPUI, base, component,
+and assets, so a Rust application lists a single dependency. JavaScript extension
+hosts add `gpui-shell` separately; `gpui-component-shell` supplies the styled catalog.
+
+See the [executable application recipe and AI-assisted development acceptance checks](examples/ai_recipes/README.md) for a tested starting point and verification commands.
 
 ## Features
 
-- **Richness**: 60+ cross-platform desktop UI components.
-- **Native**: Inspired by macOS and Windows controls, combined with shadcn/ui design for a modern experience.
-- **Ease of Use**: Stateless `RenderOnce` components, simple and user-friendly.
-- **Customizable**: Built-in `Theme` and `ThemeColor`, supporting multi-theme and variable-based configurations.
-- **Versatile**: Supports sizes like `xs`, `sm`, `md`, and `lg`.
-- **Flexible Layout**: Dock layout for panel arrangements, resizing, and freeform (Tiles) layouts.
-- **High Performance**: Virtualized Table and List components for smooth large-data rendering.
-- **Content Rendering**: Native support for Markdown and simple HTML.
-- **Charting**: Built-in charts for visualizing your data.
-- **Editor**: High performance code editor (support up to 200K lines) with LSP (diagnostics, completion, hover, etc).
-- **Syntax Highlighting**: Syntax highlighting for editor and markdown components using Tree Sitter.
+- **75+ Components and Primitives**: Forms, navigation, overlays, data display, editing, feedback, and layout, with polished interactions and productive defaults.
+- **Production Ready**: Used to build Longbridge Pro from day one and continuously refined in a publicly shipped commercial desktop application.
+- **WebAssembly**: Run applications and the same component showcases on the web with `wasm32-unknown-unknown`.
+- **Accessibility**: AccessKit roles, names, states, relationships, and actions are built into the interaction layer and covered by tests.
+- **UI Integration Testing**: Render real components in headless windows, drive pointer and keyboard input, and assert state, focus, layout, and accessibility.
+- **Native Feel**: Modern controls inspired by macOS and Windows, backed by semantic themes and multiple sizes.
+- **120 FPS**: GPU-accelerated interfaces that remain smooth under load.
+- **Data Tables**: Virtual scrolling, fixed and resizable columns, sorting, and cell selection across hundreds of thousands of rows.
+- **Virtual Lists**: Render only the visible range, including lists whose items have different sizes.
+- **Code Editor**: Stable performance at 200K lines with Tree-sitter highlighting and LSP diagnostics, completion, and hover.
+- **Dock Layout**: Resizable panels, draggable tabs, nested splits, and edge docks — all serializable.
+- **Rich Content**: Native Markdown and HTML rendering, syntax highlighting, and built-in charts.
+- **Design Freedom**: Use the complete visual system or build your own on the behavior and infrastructure in `gpui-base`.
+- **JavaScript Extensions**: `gpui-shell` lets a shipped Rust host load panels and business logic as scripts, with every capability granted explicitly.
+- **Cross Platform**: Ship one Rust codebase to macOS, Windows, and Linux.
+
+## Framework Architecture
+
+### Three layers. One ecosystem.
+
+Use `gpui-component` to keep the application coherent with one complete visual
+and interaction system. Use `gpui-base` when your product needs to create and
+own that system itself. Use `gpui-shell` when the application should be
+extensible in JavaScript after it ships.
+
+| **`gpui-component`**             | **`gpui-base`**                               | **`gpui-shell`**                           |
+| -------------------------------- | --------------------------------------------- | ------------------------------------------ |
+| Complete, styled components      | Unstyled behavior and infrastructure          | JavaScript runtime hosted by Rust          |
+| Productive defaults with theming | Full control over structure and visual design | Capabilities granted one at a time         |
+| Best for building applications   | Best for building design systems              | Best for plugins and scripted applications |
+
+```text
+                             APPLICATION
+                                  │
+              ┌───────────────────┼───────────────────┐
+              │                   │                   │
+              ▼                   ▼                   ▼
+    ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+    │  gpui-component  │ │ Your Design      │ │    gpui-shell    │
+    │    Styled UI     │ │ System           │ │  JS extensions   │
+    └────────┬─────────┘ └────────┬─────────┘ └────────┬─────────┘
+             │                    │                    │
+             └────────────────────┼────────────────────┘
+                                  ▼
+                        ┌──────────────────┐
+                        │    gpui-base     │
+                        │ Behavior · State │
+                        │ Infrastructure   │
+                        └────────┬─────────┘
+                                 ▼
+                               GPUI
+```
+
+> **Behavior belongs to the foundation. Presentation belongs to the application.**
+
+Use **`gpui-component`** when you want polished controls ready to ship. Build on
+**`gpui-base`** when your application should own its component source, layout,
+styling, and motion while reusing difficult interaction behavior. Add
+**`gpui-shell`** when contributors should extend the product without a fork or
+a release.
+
+The layering follows the same separation that makes the
+[shadcn](https://ui.shadcn.com) ecosystem flexible:
+
+| GPUI Kit ecosystem                   | Web ecosystem                   |
+| ------------------------------------ | ------------------------------- |
+| GPUI                                 | HTML + Tailwind CSS             |
+| [`gpui-base`](crates/base/README.md) | [Base UI](https://base-ui.com)  |
+| `gpui-component`                     | shadcn's styled component layer |
+
+[Explore the architecture →](docs/ARCHITECTURE.md)
 
 ## Showcase
 
-Here is the first application: [Longbridge Pro](https://longbridge.com/desktop), built using GPUI Component.
+GPUI Kit has powered [Longbridge Pro](https://longbridge.com/desktop)
+from day one. The framework is extracted from the demands of a publicly shipped
+commercial desktop application rather than designed in isolation.
+
+> **GPUI provides the rendering foundation. Longbridge provides the production foundation.**
 
 <img width="1763" alt="Image" src="https://github.com/user-attachments/assets/e1ecb9c3-2dd3-431e-bd97-5a819c30e551" />
 
 ## Usage
 
 ```toml
-gpui = "0.2.2"
-gpui-component = "0.5.1"
+[dependencies]
+gpui-kit = "0.6"
 ```
+
+`gpui-kit` always brings in GPUI and `gpui-base`; `gpui-component` and the
+default icon set are on by default. Turn default
+features off to keep only the layers you use. The `gpui-component` features (`inspector`, `decimal`,
+`tree-sitter`, and each `tree-sitter-<language>`) are available under the same
+names.
 
 ### Basic Example
 
 ```rs
-use gpui::*;
-use gpui_component::{button::*, *};
+use gpui_kit::component::button::*;
+use gpui_kit::component::*;
+use gpui_kit::*;
 
 pub struct HelloWorld;
 impl Render for HelloWorld {
@@ -57,107 +155,94 @@ impl Render for HelloWorld {
 }
 
 fn main() {
-    let app = Application::new();
-
-    app.run(move |cx| {
+    gpui_kit::application().run(move |cx| {
         // This must be called before using any GPUI Component features.
-        gpui_component::init(cx);
+        gpui_kit::init(cx);
 
-        cx.spawn(async move |cx| {
-            cx.open_window(WindowOptions::default(), |window, cx| {
-                let view = cx.new(|_| HelloWorld);
-                // This first level on the window, should be a Root.
-                cx.new(|cx| Root::new(view, window, cx))
-            })?;
-
-            Ok::<_, anyhow::Error>(())
+        gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
+            cx.new(|_| HelloWorld)
         })
-        .detach();
+        .expect("Failed to open window");
     });
 }
 ```
 
-### WebView
-
-> Still early and experimental; there are a lot of limitations.
-
-GPUI Component has a `WebView` element based on [Wry](https://github.com/tauri-apps/wry). This is an optional feature, which you can enable with a feature flag.
-
-```toml
-gpui-component = { version = "0.4.0", features = ["webview"] }
-wry = { version = "0.53.3, package = "lb-wry" }
-```
-
-More usage examples can be found in the [story](https://github.com/longbridge/gpui-component/tree/main/crates/story) directory.
+`gpui_kit::open_window` is the application window entry point and always mounts a Base `Root`. Component initialization registers styled window facilities; Cargo features do not select a different root type.
 
 ### Icons
 
-GPUI Component has an `Icon` element, but it does not include SVG files by default.
+The default `assets` feature bundles the [Lucide](https://lucide.dev) icon set
+as `gpui-kit-assets`; pass it to the application with
+`gpui_kit::application().with_assets(gpui_kit::assets::Assets)`. To ship your
+own icons instead, leave that feature out and name the SVG files as defined in
+[IconName](https://github.com/longbridge/gpui-kit/blob/main/crates/component/src/icon.rs#L86).
 
-The example uses [Lucide](https://lucide.dev) icons, but you can use any icons you like. Just name the SVG files as defined in [IconName](https://github.com/longbridge/gpui-component/blob/main/crates/ui/src/icon.rs#L86). You can add any icons you need to your project.
+## Skills for AI Coding Agents
+
+Install the GPUI Kit skills for your AI coding agent (Cursor, Claude Code, Gemini CLI, Codex, etc.):
+
+```bash
+npx skills add longbridge/gpui-kit
+```
+
+| Skill                    | Description                                                                                                                         |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `gpui-kit`               | Setup, component catalog, usage patterns, GPUI mechanics (elements, entities, async, focus, actions, tests), and the Coding Guides. |
+| `gpui-kit-design-guides` | The Design Guides: layout, spacing, hierarchy, interaction states, overlays, and interface copy.                                    |
 
 ## Development
 
-We have a gallery of applications built with GPUI Component.
+### Desktop Gallery (Story)
+
+The `story` crate is a gallery application that showcases all available components. Run it with:
 
 ```bash
 cargo run
 ```
 
-More examples can be found in the `examples` directory. You can run them with `cargo run --example <example_name>`.
+### Examples
+
+Some larger examples reuse the `story` gallery components and run as standalone packages:
+
+```bash
+# Dock layout system (panels, split views, tabs)
+cargo run -p example-dock
+
+# Markdown rendering
+cargo run -p example-markdown
+
+# HTML rendering
+cargo run -p example-html
+```
+
+The `examples` directory also contains standalone examples, each focused on a single feature. Each example is a separate crate, run them with `cargo run -p <name>`:
+
+```bash
+# Code editor with LSP support and syntax highlighting
+cargo run -p example-editor
+
+# Basic hello world
+cargo run -p hello_world
+
+# System monitor (real-time charts with CPU/memory data)
+cargo run -p system_monitor
+
+# Window title customization
+cargo run -p window_title
+```
 
 Check out [CONTRIBUTING.md](CONTRIBUTING.md) for more details.
 
 ## Compare to others
 
-| Features              | GPUI Component                 | [Iced]             | [egui]                | [Qt 6]                                            |
-| --------------------- | ------------------------------ | ------------------ | --------------------- | ------------------------------------------------- |
-| Language              | Rust                           | Rust               | Rust                  | C++/QML                                           |
-| Core Render           | GPUI                           | wgpu               | wgpu                  | QT                                                |
-| License               | Apache 2.0                     | MIT                | MIT/Apache 2.0        | [Commercial/LGPL](https://www.qt.io/qt-licensing) |
-| Min Binary Size [^1]  | 12MB                           | 11MB               | 5M                    | 20MB [^2]                                         |
-| Cross-Platform        | Yes                            | Yes                | Yes                   | Yes                                               |
-| Documentation         | Simple                         | Simple             | Simple                | Good                                              |
-| Web                   | No                             | Yes                | Yes                   | Yes                                               |
-| UI Style              | Modern                         | Basic              | Basic                 | Basic                                             |
-| CJK Support           | Yes                            | Yes                | Bad                   | Yes                                               |
-| Chart                 | Yes                            | No                 | No                    | Yes                                               |
-| Table (Large dataset) | Yes<br>(Virtual Rows, Columns) | No                 | Yes<br>(Virtual Rows) | Yes<br>(Virtual Rows, Columns)                    |
-| Table Column Resize   | Yes                            | No                 | Yes                   | Yes                                               |
-| Text base             | Rope                           | [COSMIC Text] [^3] | trait TextBuffer [^4] | [QTextDocument]                                   |
-| CodeEditor            | Simple                         | Simple             | Simple                | Basic API                                         |
-| Dock Layout           | Yes                            | Yes                | Yes                   | Yes                                               |
-| Syntax Highlight      | [Tree Sitter]                  | [Syntect]          | [Syntect]             | [QSyntaxHighlighter]                              |
-| Markdown Rendering    | Yes                            | Yes                | Basic                 | No                                                |
-| Markdown mix HTML     | Yes                            | No                 | No                    | No                                                |
-| HTML Rendering        | Basic                          | No                 | No                    | Basic                                             |
-| Text Selection        | TextView                       | No                 | Any Label             | Yes                                               |
-| Custom Theme          | Yes                            | Yes                | Yes                   | Yes                                               |
-| Built Themes          | Yes                            | No                 | No                    | No                                                |
-| I18n                  | Yes                            | Yes                | Yes                   | Yes                                               |
-
-> Please submit an issue or PR if any mistakes or outdated are found.
-
-[Iced]: https://github.com/iced-rs/iced
-[egui]: https://github.com/emilk/egui
-[QT 6]: https://www.qt.io/product/qt6
-[Tree Sitter]: https://tree-sitter.github.io/tree-sitter/
-[Syntect]: https://github.com/trishume/syntect
-[QSyntaxHighlighter]: https://doc.qt.io/qt-6/qsyntaxhighlighter.html
-[QTextDocument]: https://doc.qt.io/qt-6/qtextdocument.html
-[COSMIC Text]: https://github.com/pop-os/cosmic-text
-
-[^1]: Release builds by use simple hello world example.
-
-[^2]: [Reducing Binary Size of Qt Applications](https://www.qt.io/blog/reducing-binary-size-of-qt-applications-part-3-more-platforms)
-
-[^3]: Iced Editor: https://github.com/iced-rs/iced/blob/db5a1f6353b9f8520c4f9633d1cdc90242c2afe1/graphics/src/text/editor.rs#L65-L68
-
-[^4]: egui TextBuffer: https://github.com/emilk/egui/blob/0a81372cfd3a4deda640acdecbbaf24bf78bb6a2/crates/egui/src/widgets/text_edit/text_buffer.rs#L20
+See the [comparison with Iced, egui and Qt 6](https://gpui-kit.com/docs/comparison) on the site.
 
 ## License
 
-Apache-2.0
+Software source and documentation code examples: [Apache-2.0](LICENSE-APACHE).
 
-- UI design based on [shadcn/ui](https://ui.shadcn.com).
+Documentation prose and original illustrations in the Docs, Base, Component, and Shell sections (including Chinese translations) for which GPUI Kit holds licensing rights are also offered under [CC BY 4.0](LICENSE-DOCS.md). When copying or adapting that material, credit **GPUI Kit**, link to the source page and [CC BY 4.0 license](https://creativecommons.org/licenses/by/4.0/), and indicate changes. Existing Apache-2.0 permissions remain; earlier revisions retain their prior terms, and third-party contributions keep their own licenses unless separately authorized. Using facts or ideas without copying protected expression does not require attribution under CC BY 4.0.
+
+- Built on [GPUI](https://github.com/zed-industries/zed), the UI framework from Zed Industries, also Apache-2.0. The `gpui-pre-*` crates are snapshots of it, published with Zed's license and notices intact.
+- UI design based on [shadcn/ui](https://ui.shadcn.com), some from [Reui](https://reui.io).
 - Icons from [Lucide](https://lucide.dev).

@@ -1,13 +1,16 @@
+use gpui::Corners;
+use gpui::InteractiveElement;
+use gpui::ParentElement;
+use gpui::{App, Axis, Edges, ElementId, IntoElement, Window};
 use gpui::{
-    div, prelude::FluentBuilder as _, App, Axis, Corners, Edges, ElementId, InteractiveElement,
-    IntoElement, ParentElement, RenderOnce, StatefulInteractiveElement as _, StyleRefinement,
-    Styled, Window,
+    RenderOnce, StatefulInteractiveElement as _, StyleRefinement, Styled, div,
+    prelude::FluentBuilder as _,
 };
 use std::{cell::Cell, rc::Rc};
 
 use crate::{
-    button::{Button, ButtonVariant, ButtonVariants},
     Disableable, Sizable, Size, StyledExt,
+    button::{Button, ButtonVariant, ButtonVariants},
 };
 
 /// A ButtonGroup element, to wrap multiple buttons in a group.
@@ -172,6 +175,10 @@ impl RenderOnce for ButtonGroup {
                     .enumerate()
                     .map(|(child_index, child)| {
                         let state = Rc::clone(&state);
+                        // The group as a whole is a toggle control, so every
+                        // child advertises its pressed state.
+                        let selected = child.selected;
+                        let child = child.toggled(selected);
                         let child = if children_len == 1 {
                             child
                         } else if child_index == 0 {
@@ -207,7 +214,12 @@ impl RenderOnce for ButtonGroup {
                         } else {
                             // Middle
                             child
-                                .border_corners(Corners::all(false))
+                                .border_corners(Corners {
+                                    top_left: false,
+                                    top_right: false,
+                                    bottom_left: false,
+                                    bottom_right: false,
+                                })
                                 .border_edges(Edges {
                                     left: vertical,
                                     top: !vertical,
@@ -250,5 +262,189 @@ impl RenderOnce for ButtonGroup {
                     })
                 },
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Selectable as _;
+    use gpui::{
+        Axis, Context, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, Render, TestAppContext,
+        VisualTestContext, point, px,
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    struct GroupHarness {
+        multiple: bool,
+        install_group_callback: bool,
+        child_clicks: Rc<Cell<usize>>,
+        group_changes: Rc<std::cell::RefCell<Vec<Vec<usize>>>>,
+    }
+
+    impl Render for GroupHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let child_clicks = self.child_clicks.clone();
+            let mut group = ButtonGroup::new("group")
+                .multiple(self.multiple)
+                .size(px(120.))
+                .child(
+                    Button::new("one")
+                        .label("One")
+                        .on_click(move |_, _, _| child_clicks.set(child_clicks.get() + 1)),
+                )
+                .child(Button::new("two").label("Two").selected(true));
+            if self.install_group_callback {
+                let changes = self.group_changes.clone();
+                group = group.on_click(move |next, _, _| changes.borrow_mut().push(next.clone()));
+            }
+            group
+        }
+    }
+
+    fn group_harness(
+        cx: &mut TestAppContext,
+        multiple: bool,
+        install_group_callback: bool,
+    ) -> (
+        &mut VisualTestContext,
+        Rc<Cell<usize>>,
+        Rc<std::cell::RefCell<Vec<Vec<usize>>>>,
+    ) {
+        cx.update(crate::init);
+        let child_clicks = Rc::new(Cell::new(0));
+        let changes = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (_, cx) = cx.add_window_view({
+            let child_clicks = child_clicks.clone();
+            let group_changes = changes.clone();
+            move |_, _| GroupHarness {
+                multiple,
+                install_group_callback,
+                child_clicks,
+                group_changes,
+            }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        (cx, child_clicks, changes)
+    }
+
+    fn activate_key(cx: &mut VisualTestContext, key: &str) {
+        let keystroke = Keystroke::parse(key).unwrap();
+        cx.simulate_event(KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(KeyUpEvent { keystroke });
+    }
+
+    fn click_first(cx: &mut VisualTestContext) {
+        cx.simulate_click(point(px(10.), px(60.)), Modifiers::default());
+    }
+
+    #[gpui::test]
+    fn legacy_group_callback_overrides_the_child_callback(cx: &mut TestAppContext) {
+        let (cx, child_clicks, changes) = group_harness(cx, false, true);
+        click_first(cx);
+        assert_eq!(child_clicks.get(), 0);
+        assert_eq!(changes.borrow().as_slice(), &[vec![0]]);
+    }
+
+    #[gpui::test]
+    fn legacy_child_callback_survives_without_a_group_callback(cx: &mut TestAppContext) {
+        let (cx, child_clicks, changes) = group_harness(cx, false, false);
+        click_first(cx);
+        assert_eq!(child_clicks.get(), 1);
+        assert!(changes.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    fn legacy_single_and_multiple_results_use_the_rendered_selection(cx: &mut TestAppContext) {
+        let (cx, _, single) = group_harness(cx, false, true);
+        click_first(cx);
+        assert_eq!(single.borrow().as_slice(), &[vec![0]]);
+
+        let (cx, _, multiple) = group_harness(cx, true, true);
+        click_first(cx);
+        assert_eq!(multiple.borrow().as_slice(), &[vec![1, 0]]);
+    }
+
+    #[gpui::test]
+    fn legacy_keyboard_click_does_not_reach_the_group_callback(cx: &mut TestAppContext) {
+        let (cx, _, changes) = group_harness(cx, false, true);
+        cx.update(|window, cx| window.focus_next(cx));
+        activate_key(cx, "enter");
+        assert!(changes.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    fn legacy_disabled_state_depends_on_builder_order(cx: &mut TestAppContext) {
+        struct DisabledOrderHarness(Rc<Cell<usize>>);
+
+        impl Render for DisabledOrderHarness {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let first = self.0.clone();
+                let second = self.0.clone();
+                crate::v_flex()
+                    .child(
+                        ButtonGroup::new("disabled-before-child")
+                            .size(px(120.))
+                            .disabled(true)
+                            .child(
+                                Button::new("first")
+                                    .label("First")
+                                    .on_click(move |_, _, _| first.set(first.get() + 1)),
+                            ),
+                    )
+                    .child(
+                        ButtonGroup::new("disabled-after-child")
+                            .size(px(120.))
+                            .child(
+                                Button::new("second")
+                                    .label("Second")
+                                    .on_click(move |_, _, _| second.set(second.get() + 1)),
+                            )
+                            .disabled(true),
+                    )
+            }
+        }
+
+        cx.update(crate::init);
+        let clicks = Rc::new(Cell::new(0));
+        let (_, cx) = cx.add_window_view({
+            let clicks = clicks.clone();
+            move |_, _| DisabledOrderHarness(clicks)
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_click(point(px(10.), px(60.)), Modifiers::default());
+        assert_eq!(clicks.get(), 0);
+        cx.simulate_click(point(px(10.), px(180.)), Modifiers::default());
+        assert_eq!(clicks.get(), 1);
+    }
+
+    #[gpui::test]
+    fn test_button_group_builder(_cx: &mut gpui::TestAppContext) {
+        let group = ButtonGroup::new("complex-group")
+            .child(Button::new("btn1").label("One"))
+            .child(Button::new("btn2").label("Two"))
+            .child(Button::new("btn3").label("Three"))
+            .primary()
+            .large()
+            .outline()
+            .compact()
+            .multiple(true)
+            .layout(Axis::Vertical)
+            .disabled(false)
+            .on_click(|_, _, _| {});
+
+        assert_eq!(group.children.len(), 3);
+        assert_eq!(group.variant, Some(ButtonVariant::Primary));
+        assert_eq!(group.size, Some(Size::Large));
+        assert!(group.outline);
+        assert!(group.compact);
+        assert!(group.multiple);
+        assert_eq!(group.layout, Axis::Vertical);
+        assert!(!group.disabled);
+        assert!(group.on_click.is_some());
     }
 }

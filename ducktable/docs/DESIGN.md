@@ -51,11 +51,12 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
   verb, two lifetimes. A plain start is persistent and runs until stopped; an
   ephemeral start (the way opening a database summons one) leaves once its last
   client disconnects.
-- **UI stack.** GPUI 0.2.2 with gpui-component 0.5.1 supplying the virtualized
-  table and the code editor, carrying one local patch in
-  `vendor/gpui-component`. Both are pre-1.0 and PINNED: an upgrade is a
-  deliberate, review-everything event, not a routine bump. View code uses
-  gpui-component directly. A widget that fights us is replaced by first-party
+- **UI stack.** gpui-kit 0.7.0: GPUI (an exact `gpui-pre` snapshot of
+  Zed's) with gpui-base and gpui-component supplying the virtualized table
+  and the code editor, both carrying local patches in `vendor/` (listed in
+  the workspace `Cargo.toml`). All are pre-1.0 and PINNED exactly: an
+  upgrade is a deliberate, review-everything event, not a routine bump.
+  View code reaches everything through `gpui_kit`. A widget that fights us is replaced by first-party
   drawing at that call site, the way the grid owns its selection painting and
   cell borders.
 
@@ -174,8 +175,9 @@ Menus:
 - **Edit:** New Row, Duplicate Row, Delete Row, which act on the Data grid
   (EDITING.md).
 - **View:** Structure, Data, Query; Refresh Tables; Previous and Next Table;
-  Row Numbers, Right-Align Numbers, NULL Tags; Toggle Inspector; Zoom In, Zoom
-  Out, Actual Size; Fit Column Widths; Toggle Full Screen.
+  Row Numbers, Right-Align Numbers, NULL Tags, Column Tooltips; Toggle
+  Inspector; Zoom In, Zoom Out, Actual Size; Fit Column Widths; Toggle Full
+  Screen.
 
 ### Sizing
 
@@ -201,11 +203,10 @@ and what happens when content overflows?" from these rules, in order:
    chain, never a free-standing number. When space runs out, the response is a
    deliberate state change (a pane collapses), not gradual squeezing.
 
-Grid columns add one floor to content fitting: a column fits the draft hint it
-can display, pill and cell insets included, so `DEFAULT`, `REQUIRED`,
-`GENERATED` and `NULL` stay whole at every zoom and cannot be clipped by
-dragging a divider. The floor comes from catalog metadata before a draft
-appears, so adding a row never moves columns.
+Grid columns are as wide as their content or the user's drag, never a draft
+hint's: a draft row's one mark, its red `REQUIRED` tag, shows only `!` where
+the column is too narrow for the word, so starting an edit or adding a row
+never moves a column.
 
 ### Sidebar
 
@@ -303,6 +304,7 @@ arrows, ⌘S, ⌘Z, ⌘⌫, ⌃⇧N, ⌘⇧⌫) is EDITING.md's; the Query view'
 | ⌘N / ⌘D | New Row / Duplicate Row |
 | ⌘I | toggle the inspector |
 | ⌘7 / ⌘8 / ⌘9 (or ⌥7 / ⌥8 / ⌥9) | row numbers / right-aligned numbers / NULL tags |
+| ⌘T | column tooltips: the column card under an edited cell and on a draft placeholder |
 | ⌘= / ⌘- / ⌘0 | zoom in / out / actual size |
 | ⌘⇧F | fit column widths |
 | ⌃⌘F | full screen |
@@ -375,7 +377,8 @@ What we own on top of it:
 through `uniform_list`, columns through `virtual_list`, with `render_td` called
 only for visible cells. The probe, `crates/ducktable/examples/wide_probe.rs`,
 is a self-driving 500-column by 100,000-row table that sweeps six scroll
-patterns and prints frame-time statistics. Re-run it on every gpui-component
+patterns and prints frame-time statistics. It brings its window to the front,
+since GPUI caps an inactive window's frame rate. Re-run it on every gpui-kit
 upgrade:
 
 ```
@@ -383,9 +386,9 @@ cargo run --release -p ducktable --example wide_probe
 ```
 
 On an M-series Mac at 60 Hz, release build, every phase held the 16.7ms vsync
-interval: p50 16.7ms, p95 no worse than 17.6ms, and no frame over 33ms in any
-phase, random jumps on both axes at once included. RSS was 128.9 MB with no row
-data stored, the framework-plus-window baseline. The table is the grid's
+interval: p50 16.7ms, p95 no worse than 17.0ms, and after the first frame no
+frame over 17.7ms in any phase, random jumps on both axes at once included. RSS
+was 134.6 MB with no row data stored, the framework-plus-window baseline. The table is the grid's
 display and scroll foundation, and no column-windowing wrapper is needed.
 
 ## DuckDB facts (measured)

@@ -1,11 +1,11 @@
-use std::{cell::OnceCell, collections::HashMap, fmt::Write as _, rc::Rc, sync::OnceLock};
+use std::{collections::HashMap, fmt::Write as _, rc::Rc, sync::OnceLock};
 
 use anyhow::Result;
 use gpui::{
-    actions, div, inspector_reflection::FunctionReflection, prelude::FluentBuilder, px, AnyElement,
-    App, AppContext, Context, DivInspectorState, Entity, Inspector, InspectorElementId,
+    AnyElement, App, AppContext, Context, DivInspectorState, Entity, Inspector, InspectorElementId,
     InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Refineable as _, Render,
-    SharedString, StyleRefinement, Styled, Subscription, Task, Window,
+    SharedString, StyleRefinement, Styled, Subscription, Task, Window, actions, div,
+    inspector_reflection::FunctionReflection, prelude::FluentBuilder, px,
 };
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit, Diagnostic,
@@ -14,14 +14,15 @@ use lsp_types::{
 use ropey::Rope;
 
 use crate::{
+    ActiveTheme, IconName, Selectable, Sizable, TITLE_BAR_HEIGHT,
     alert::Alert,
     button::{Button, ButtonVariants},
     clipboard::Clipboard,
     description_list::DescriptionList,
     h_flex,
-    input::{CompletionProvider, Input, InputEvent, InputState, RopeExt, TabSize},
+    input::{CompletionProvider, Editor, EditorState, InputEvent, RopeExt, TabSize},
     link::Link,
-    v_flex, ActiveTheme, IconName, Selectable, Sizable, TITLE_BAR_HEIGHT,
+    v_flex,
 };
 
 actions!(inspector, [ToggleInspector]);
@@ -47,21 +48,22 @@ pub(crate) fn init(cx: &mut App) {
         });
     });
 
-    let inspector_el = OnceCell::new();
-    cx.register_inspector_element(move |id, state: &DivInspectorState, window, cx| {
-        let el = inspector_el.get_or_init(|| cx.new(|cx| DivInspector::new(window, cx)));
-        el.update(cx, |this, cx| {
-            this.update_inspected_element(id, state.clone(), window, cx);
-            this.render(window, cx).into_any_element()
-        })
+    cx.register_inspector_element(|window, cx| {
+        let div_inspector = cx.new(|cx| DivInspector::new(window, cx));
+        move |id, state: &DivInspectorState, window: &mut Window, cx: &mut App| {
+            div_inspector.update(cx, |this, cx| {
+                this.update_inspected_element(id, state.clone(), window, cx);
+                this.render(window, cx).into_any_element()
+            })
+        }
     });
 
     cx.set_inspector_renderer(Box::new(render_inspector));
 }
 
-struct EditorState {
+struct InspectorEditor {
     /// The input state for the editor.
-    state: Entity<InputState>,
+    state: Entity<EditorState>,
     /// Error to display from parsing the input, or if serialization errors somehow occur.
     error: Option<SharedString>,
     /// Whether the editor is currently being edited.
@@ -71,8 +73,8 @@ struct EditorState {
 pub struct DivInspector {
     inspector_id: Option<InspectorElementId>,
     inspector_state: Option<DivInspectorState>,
-    rust_state: EditorState,
-    json_state: EditorState,
+    rust_state: InspectorEditor,
+    json_state: InspectorEditor,
     /// Initial style before any edits
     initial_style: StyleRefinement,
     /// Part of the initial style that could not be converted to Rust code
@@ -85,22 +87,23 @@ impl DivInspector {
         let lsp_provider = Rc::new(LspProvider {});
 
         let json_input_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .code_editor("json")
+            EditorState::new(window, cx)
+                .language("json")
                 .line_number(false)
         });
 
         let rust_input_state = cx.new(|cx| {
-            let mut editor = InputState::new(window, cx)
-                .code_editor("rust")
+            EditorState::new(window, cx)
+                .language("rust")
                 .line_number(false)
                 .tab_size(TabSize {
                     tab_size: 4,
                     hard_tabs: false,
-                });
-
-            editor.lsp.completion_provider = Some(lsp_provider.clone());
-            editor
+                })
+        });
+        rust_input_state.update(cx, |state, cx| {
+            state.lsp_mut().completion_provider = Some(lsp_provider.clone());
+            cx.notify();
         });
 
         let _subscriptions = vec![
@@ -128,13 +131,13 @@ impl DivInspector {
             ),
         ];
 
-        let rust_state = EditorState {
+        let rust_state = InspectorEditor {
             state: rust_input_state,
             error: None,
             editing: false,
         };
 
-        let json_state = EditorState {
+        let json_state = InspectorEditor {
             state: json_input_state,
             error: None,
             editing: false,
@@ -285,7 +288,7 @@ impl StyleMethods {
         static STYLE_METHODS: OnceLock<StyleMethods> = OnceLock::new();
         STYLE_METHODS.get_or_init(|| {
             let table: Vec<_> = [
-                crate::styled_ext_reflection::methods::<StyleRefinement>(),
+                gpui_base::styled_ext_reflection_methods::<StyleRefinement>(),
                 gpui::styled_reflection::methods::<StyleRefinement>(),
             ]
             .into_iter()
@@ -436,7 +439,7 @@ impl Render for DivInspector {
                                 .gap_y_1()
                                 .font_family(cx.theme().mono_font_family.clone())
                                 .text_size(cx.theme().mono_font_size)
-                                .child(Input::new(&self.rust_state.state).h_full())
+                                .child(Editor::new(&self.rust_state.state).h(gpui::relative(1.)))
                                 .when_some(self.rust_state.error.clone(), |this, err| {
                                     this.child(Alert::error("rust-error", err).text_xs())
                                 }),
@@ -464,7 +467,7 @@ impl Render for DivInspector {
                                 .gap_y_1()
                                 .font_family(cx.theme().mono_font_family.clone())
                                 .text_size(cx.theme().mono_font_size)
-                                .child(Input::new(&self.json_state.state).h_full())
+                                .child(Editor::new(&self.json_state.state).h(gpui::relative(1.)))
                                 .when_some(self.json_state.error.clone(), |this, err| {
                                     this.child(Alert::error("json-error", err).text_xs())
                                 }),
@@ -489,7 +492,7 @@ fn render_inspector(
         .id("inspector")
         .font_family(cx.theme().font_family.clone())
         .size_full()
-        .bg(cx.theme().background)
+        .bg(cx.theme().tokens.background)
         .border_l_1()
         .border_color(cx.theme().border)
         .text_color(cx.theme().foreground)
@@ -504,7 +507,7 @@ fn render_inspector(
                 .px_2()
                 .border_b_1()
                 .border_color(cx.theme().title_bar_border)
-                .bg(cx.theme().title_bar)
+                .bg(cx.theme().tokens.title_bar)
                 .child(
                     h_flex()
                         .gap_2()
@@ -513,6 +516,7 @@ fn render_inspector(
                             Button::new("inspect")
                                 .icon(IconName::Inspector)
                                 .selected(inspector.is_picking())
+                                .toggled(inspector.is_picking())
                                 .small()
                                 .ghost()
                                 .on_click(cx.listener(|this, _, window, _| {
@@ -568,7 +572,7 @@ impl CompletionProvider for LspProvider {
         offset: usize,
         _: lsp_types::CompletionContext,
         _: &mut Window,
-        cx: &mut Context<InputState>,
+        cx: &mut App,
     ) -> Task<Result<CompletionResponse>> {
         let mut left_offset = 0;
         while left_offset < 100 {
@@ -625,14 +629,14 @@ impl CompletionProvider for LspProvider {
         })
     }
 
-    fn is_completion_trigger(&self, _: usize, _: &str, _: &mut Context<InputState>) -> bool {
+    fn is_completion_trigger(&self, _: usize, _: &str, _: &mut App) -> bool {
         true
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use gpui::{rems, AbsoluteLength, DefiniteLength, Length};
+    use gpui::{AbsoluteLength, DefiniteLength, Length, rems};
     use indoc::indoc;
     use lsp_types::Position;
 

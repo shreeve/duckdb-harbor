@@ -1,12 +1,12 @@
 use std::rc::Rc;
 
 use gpui::{
-    div, prelude::FluentBuilder as _, px, AlignItems, AnyElement, AnyView, App, Axis, Div, Element,
-    ElementId, InteractiveElement as _, IntoElement, ParentElement, Pixels, Rems, RenderOnce,
-    SharedString, Styled, Window,
+    AlignItems, AnyElement, AnyView, App, Axis, Div, ElementId, InteractiveElement as _,
+    IntoElement, ParentElement, Pixels, Rems, RenderOnce, SharedString, StyleRefinement, Styled,
+    Window, div, prelude::FluentBuilder as _, px,
 };
 
-use crate::{h_flex, v_flex, ActiveTheme as _, AxisExt, Size, StyledExt};
+use crate::{ActiveTheme as _, AxisExt, Size, StyledExt, h_flex, v_flex};
 
 #[derive(Clone, Copy)]
 pub(super) struct FieldProps {
@@ -53,7 +53,7 @@ impl RenderOnce for FieldBuilder {
         match self {
             FieldBuilder::String(value) => value.into_any_element(),
             FieldBuilder::Element(builder) => builder(window, cx),
-            FieldBuilder::View(view) => view.into_any(),
+            FieldBuilder::View(view) => view.into_any_element(),
         }
     }
 }
@@ -81,6 +81,7 @@ impl From<SharedString> for FieldBuilder {
 pub struct Field {
     id: ElementId,
     props: FieldProps,
+    style: StyleRefinement,
     label: Option<FieldBuilder>,
     label_indent: bool,
     description: Option<FieldBuilder>,
@@ -99,6 +100,8 @@ impl Field {
     pub fn new() -> Self {
         Self {
             id: 0.into(),
+            props: FieldProps::default(),
+            style: StyleRefinement::default(),
             label: None,
             description: None,
             children: Vec::new(),
@@ -106,7 +109,6 @@ impl Field {
             required: false,
             label_indent: true,
             align_items: None,
-            props: FieldProps::default(),
             col_span: 1,
             col_start: None,
             col_end: None,
@@ -163,6 +165,11 @@ impl Field {
     pub fn visible(mut self, visible: bool) -> Self {
         self.visible = visible;
         self
+    }
+
+    /// Returns whether the form field is visible.
+    pub(super) fn is_visible(&self) -> bool {
+        self.visible
     }
 
     /// Set the required status of the form field, default is `false`.
@@ -225,6 +232,12 @@ impl ParentElement for Field {
     }
 }
 
+impl Styled for Field {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
 impl RenderOnce for Field {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let layout = self.props.layout;
@@ -267,6 +280,8 @@ impl RenderOnce for Field {
             .col_span(self.col_span)
             .when_some(self.col_start, |this, start| this.col_start(start))
             .when_some(self.col_end, |this, end| this.col_end(end))
+            .refine_style(&self.style)
+            .when(!self.visible, |this| this.hidden())
             .child(
                 // This warp for aligning the Label + Input
                 wrap_div(layout)
@@ -310,13 +325,7 @@ impl RenderOnce for Field {
                                 }),
                         )
                     })
-                    .child(
-                        div()
-                            .w_full()
-                            .flex_1()
-                            .overflow_x_hidden()
-                            .children(self.children),
-                    ),
+                    .child(div().w_full().flex_1().children(self.children)),
             )
             .child(
                 // Other

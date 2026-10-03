@@ -3,11 +3,11 @@
 
 use crate::app::{DuckTable, Phase};
 use crate::theme::{pal, Pal};
-use gpui::prelude::FluentBuilder as _;
+use gpui_kit::prelude::FluentBuilder as _;
 use crate::util::clone_str;
-use gpui::*;
-use gpui_component::button::*;
-use gpui_component::*;
+use gpui_kit::*;
+use gpui_kit::component::button::*;
+use gpui_kit::component::*;
 use harbor_client::Level;
 
 impl DuckTable {

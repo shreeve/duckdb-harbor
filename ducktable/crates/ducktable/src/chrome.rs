@@ -4,10 +4,10 @@
 //! own the geometry and hover grammar.
 
 use crate::theme::Pal;
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::tooltip::Tooltip;
-use gpui_component::StyledExt as _;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::StyledExt as _;
 
 /// A square hover-highlight icon tile — the chassis every header/footer
 /// glyph shares. Callers layer their own colors (state tints, disabled
@@ -111,7 +111,7 @@ pub(crate) fn seg_tile(
                 .child(
                     div()
                         .font_weight(active_weight)
-                        .text_color(gpui::transparent_black())
+                        .text_color(gpui_kit::transparent_black())
                         .child(label),
                 )
                 .child(

@@ -5,11 +5,11 @@ use crate::chrome::head_glyph;
 use crate::theme::{pal, Pal};
 use crate::util::clone_str;
 use crate::{AttachBerth, DetachBerth, SetTheme, StartBerth, StopBerth, ToggleAutostart};
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
-use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_component::*;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::*;
 use harbor_client::Level;
 
 /// The theme picker's menu: every bundled theme, grouped under its mode
@@ -127,13 +127,13 @@ impl DuckTable {
                         d.child(
                             head_glyph("filter-berths", self.berth_filter.is_some(), t)
                                 .child(
-                                    gpui_component::Icon::new(
-                                        gpui_component::IconName::Search,
+                                    gpui_kit::component::Icon::new(
+                                        gpui_kit::component::IconName::Search,
                                     )
                                     .size_3p5(),
                                 )
                                 .tooltip(move |window, cx| {
-                                    gpui_component::tooltip::Tooltip::new("Filter databases")
+                                    gpui_kit::component::tooltip::Tooltip::new("Filter databases")
                                         .build(window, cx)
                                 })
                                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -158,7 +158,7 @@ impl DuckTable {
                                 .px_1()
                                 .rounded_full()
                                 .bg(t.bad)
-                                .text_color(gpui::white())
+                                .text_color(gpui_kit::white())
                                 .text_xs()
                                 .font_weight(FontWeight::BOLD)
                                 .cursor_pointer()
@@ -169,7 +169,7 @@ impl DuckTable {
                                     } else {
                                         format!("{n} databases on an old harbor — click to upgrade")
                                     };
-                                    gpui_component::tooltip::Tooltip::new(what).build(window, cx)
+                                    gpui_kit::component::tooltip::Tooltip::new(what).build(window, cx)
                                 })
                                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                     this.prompt_upgrade(window, cx);
@@ -185,7 +185,7 @@ impl DuckTable {
                                     .text_color(t.muted),
                             )
                             .tooltip(move |window, cx| {
-                                gpui_component::tooltip::Tooltip::new("Refresh databases")
+                                gpui_kit::component::tooltip::Tooltip::new("Refresh databases")
                                     .build(window, cx)
                             })
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -237,7 +237,7 @@ impl DuckTable {
                             // a survey note rides the row as a tooltip: an
                             // unusual dot explains itself.
                             d.tooltip(move |window, cx| {
-                                gpui_component::tooltip::Tooltip::new(clone_str(&note))
+                                gpui_kit::component::tooltip::Tooltip::new(clone_str(&note))
                                     .build(window, cx)
                             })
                         });
@@ -345,7 +345,7 @@ impl DuckTable {
                             )
                             .compact()
                             .xsmall()
-                            .dropdown_menu_with_anchor(Corner::BottomLeft, theme_menu),
+                            .dropdown_menu_with_anchor(Anchor::BottomLeft, theme_menu),
                     )
                     .child(div().flex_1()),
             )
@@ -393,7 +393,7 @@ impl DuckTable {
                             if family_sort { t.accent } else { t.muted },
                         ))
                         .tooltip(move |window, cx| {
-                            gpui_component::tooltip::Tooltip::new("Sort objects")
+                            gpui_kit::component::tooltip::Tooltip::new("Sort objects")
                                 .build(window, cx)
                         })
                         .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
@@ -406,11 +406,11 @@ impl DuckTable {
                     d.child(
                         head_glyph("filter-tables", filter_open, t)
                             .child(
-                                gpui_component::Icon::new(gpui_component::IconName::Search)
+                                gpui_kit::component::Icon::new(gpui_kit::component::IconName::Search)
                                     .size_3p5(),
                             )
                             .tooltip(move |window, cx| {
-                                gpui_component::tooltip::Tooltip::new("Filter tables")
+                                gpui_kit::component::tooltip::Tooltip::new("Filter tables")
                                     .build(window, cx)
                             })
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -424,7 +424,7 @@ impl DuckTable {
                         // sets it explicitly); without this it's invisible.
                         .child(svg().path("icons/refresh-cw.svg").size_3p5().text_color(t.muted))
                         .tooltip(move |window, cx| {
-                            gpui_component::tooltip::Tooltip::new("Refresh Tables (⌘R)")
+                            gpui_kit::component::tooltip::Tooltip::new("Refresh Tables (⌘R)")
                                 .build(window, cx)
                         })
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -611,8 +611,8 @@ fn dim(t: Pal, text: String) -> Div {
 }
 
 /// The open filter's input row, shared by both lists.
-fn filter_row(input: &Entity<gpui_component::input::InputState>) -> Div {
-    div().px_2().pb_1().child(gpui_component::input::Input::new(input).xsmall().cleanable(true))
+fn filter_row(input: &Entity<gpui_kit::component::input::InputState>) -> Div {
+    div().px_2().pb_1().child(gpui_kit::component::input::Input::new(input).xsmall().cleanable(true))
 }
 
 /// What a filter says when it filtered everything away — without this a

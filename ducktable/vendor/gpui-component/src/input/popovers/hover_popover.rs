@@ -1,19 +1,19 @@
 use std::{ops::Range, rc::Rc};
 
 use gpui::{
-    deferred, div, point, prelude::FluentBuilder as _, px, AnyElement, App, AppContext as _,
-    AvailableSpace, Bounds, Element, ElementId, Entity, InteractiveElement, IntoElement,
-    MouseDownEvent, ParentElement as _, Pixels, Render, StatefulInteractiveElement as _,
-    StyleRefinement, Styled, Window,
+    AnyElement, App, AppContext as _, AvailableSpace, Bounds, Element, ElementId, Entity,
+    InteractiveElement, IntoElement, MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels,
+    Render, StatefulInteractiveElement as _, StyleRefinement, Styled, Window, deferred, div, point,
+    px,
 };
 
 use crate::{
-    input::{popovers::render_markdown, InputState},
-    StyledExt,
+    StyledExt, ThemeStyled as _,
+    input::{EditorState, popovers::render_markdown},
 };
 
 pub struct HoverPopover {
-    editor: Entity<InputState>,
+    editor: Entity<EditorState>,
     /// The symbol range byte of the hover trigger.
     pub(crate) symbol_range: Range<usize>,
     pub(crate) hover: Rc<lsp_types::Hover>,
@@ -21,7 +21,7 @@ pub struct HoverPopover {
 
 impl HoverPopover {
     pub fn new(
-        editor: Entity<InputState>,
+        editor: Entity<EditorState>,
         symbol_range: Range<usize>,
         hover: &lsp_types::Hover,
         cx: &mut App,
@@ -33,10 +33,6 @@ impl HoverPopover {
             symbol_range,
             hover,
         })
-    }
-
-    pub(crate) fn is_same(&self, offset: usize) -> bool {
-        self.symbol_range.contains(&offset)
     }
 }
 
@@ -71,7 +67,7 @@ impl Render for HoverPopover {
 pub(crate) struct Popover {
     id: ElementId,
     style: StyleRefinement,
-    editor: Entity<InputState>,
+    editor: Entity<EditorState>,
     range: Range<usize>,
     width_limit: Range<Pixels>,
     content_builder: Box<dyn Fn(&mut Window, &mut App) -> AnyElement>,
@@ -86,7 +82,7 @@ impl Styled for Popover {
 impl Popover {
     pub fn new<F, E>(
         id: impl Into<ElementId>,
-        editor: Entity<InputState>,
+        editor: Entity<EditorState>,
         range: Range<usize>,
         f: F,
     ) -> Self
@@ -107,28 +103,7 @@ impl Popover {
     /// Get the bounds of the range in the editor, if it is visible.
     fn trigger_bounds(&self, cx: &App) -> Option<Bounds<Pixels>> {
         let editor = self.editor.read(cx);
-        let Some(last_layout) = editor.last_layout.as_ref() else {
-            return None;
-        };
-
-        let Some(last_bounds) = editor.last_bounds else {
-            return None;
-        };
-
-        let (_, _, start_pos) = editor.line_and_position_for_offset(self.range.start);
-        let (_, _, end_pos) = editor.line_and_position_for_offset(self.range.end);
-
-        let Some(start_pos) = start_pos else {
-            return None;
-        };
-        let Some(end_pos) = end_pos else {
-            return None;
-        };
-
-        Some(Bounds::from_corners(
-            last_bounds.origin + start_pos,
-            last_bounds.origin + end_pos + point(px(0.), last_layout.line_height),
-        ))
+        editor.range_to_bounds(&self.range)
     }
 }
 
@@ -141,7 +116,6 @@ impl IntoElement for Popover {
 }
 
 pub(crate) struct PopoverLayoutState {
-    state: Entity<bool>,
     bounds: Bounds<Pixels>,
     element: Option<AnyElement>,
 }
@@ -165,7 +139,6 @@ impl Element for Popover {
         window: &mut Window,
         cx: &mut App,
     ) -> (gpui::LayoutId, Self::RequestLayoutState) {
-        let open_state = window.use_keyed_state("popover-open", cx, |_, _| true);
         let trigger_bounds = match self.trigger_bounds(cx) {
             Some(bounds) => bounds,
             None => {
@@ -174,9 +147,8 @@ impl Element for Popover {
                     PopoverLayoutState {
                         bounds: Bounds::default(),
                         element: None,
-                        state: open_state,
                     },
-                )
+                );
             }
         };
 
@@ -187,12 +159,9 @@ impl Element for Popover {
             .max(px(200.));
         let max_height = (window.bounds().size.height - SNAP_TO_EDGE * 2).min(px(320.));
 
-        let is_open = *open_state.read(cx);
-
         let mut popover = deferred(
             div()
                 .id("hover-popover-content")
-                .when(!is_open, |s| s.invisible())
                 .flex_none()
                 .occlude()
                 .p_1()
@@ -233,7 +202,6 @@ impl Element for Popover {
                     size: popover_size,
                 },
                 element: Some(popover),
-                state: open_state,
             },
         )
     }
@@ -274,14 +242,25 @@ impl Element for Popover {
 
         popover.paint(window, cx);
 
-        let open_state = request_layout.state.clone();
+        let editor = self.editor.clone();
         // Mouse down out to hide.
         window.on_mouse_event(move |event: &MouseDownEvent, _, _, cx| {
             if !bounds.contains(&event.position) {
-                open_state.update(cx, |open, cx| {
-                    *open = false;
-                    cx.notify();
-                })
+                let _ = editor.update(cx, |editor, cx| {
+                    editor.clear_hover_state(cx);
+                });
+            }
+        });
+
+        // Mouse out of trigger + popover bounds
+        let editor = self.editor.clone();
+        let trigger_bounds = self.trigger_bounds(cx).unwrap_or(bounds);
+        let keep_open_region = trigger_bounds.union(&bounds);
+        window.on_mouse_event(move |event: &MouseMoveEvent, _, _, cx| {
+            if !keep_open_region.contains(&event.position) {
+                let _ = editor.update(cx, |editor, cx| {
+                    editor.clear_hover_state(cx);
+                });
             }
         })
     }

@@ -9,9 +9,9 @@
 
 use crate::grid::Grid;
 use crate::theme::{pal, value_font, Pal, CELL_TEXT, HEADER_TEXT};
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::StyledExt as _;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use gpui_kit::component::StyledExt as _;
 
 impl Grid {
     pub(crate) fn inspector(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -48,28 +48,12 @@ impl Grid {
 
         div()
             .size_full()
-            .relative()
             // Raised, like the proof's inspector pane — not another white
             // panel against the white grid.
             .bg(t.raised)
             .border_l_1()
             .border_color(t.border)
             .child(list)
-            .child(
-                // The gripper: a small centered bar on the divider,
-                // signalling the edge drags. It sits OUTSIDE the scroll
-                // container so it never scrolls away; the actual drag
-                // target is the resizable panel's handle on this edge.
-                div()
-                    .absolute()
-                    .left(px(1.))
-                    .top(relative(0.5))
-                    .mt(px(-14.))
-                    .w(px(3.))
-                    .h(px(28.))
-                    .rounded(px(2.))
-                    .bg(t.border),
-            )
     }
 }
 

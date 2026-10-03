@@ -19,22 +19,35 @@ use crate::prefs::{self, ViewMode};
 use crate::theme::{
     pal, ui_font, value_font, CELL_TEXT, GUTTER_TEXT, HEADER_TEXT, PANE_INSET, TAG_TEXT,
 };
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::input::{IndentInline, OutdentInline};
-use gpui_component::table::{Column as TableColumn, Table, TableDelegate, TableState};
-use gpui_component::tooltip::Tooltip;
-use gpui_component::resizable::{
-    h_resizable, resizable_panel, ResizablePanelEvent, ResizableState,
-};
-use gpui_component::{Sizable as _, StyledExt as _};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use gpui_kit::component::input::{IndentInline, OutdentInline};
+use gpui_kit::component::table::{Column as TableColumn, DataTable, TableDelegate, TableState};
+use gpui_kit::component::tooltip::Tooltip;
+// Base's splitters: a plain hairline that takes the drag color while held.
+// The component library's own add a pill that grows on hover.
+use gpui_kit::base::h_resizable;
+use gpui_kit::component::resizable::{resizable_panel, ResizablePanelEvent, ResizableState};
+use gpui_kit::component::{Sizable as _, StyledExt as _};
 use harbor_client::Conn;
 use serde_json::Value;
+use std::rc::Rc;
 
 // Page sizes live in prefs::PAGE_SIZES (default 500); explicit pages give
 // ordinary tables a boundary-free read and huge tables honest jumps,
 // constant memory, and consistent snapshots — infinite append would
 // silently stitch separately-queried chunks together.
+
+/// The DataTable binds home, end, page up/down and tab to its own
+/// selection actions, and bindings dispatch before the grid's key
+/// listener, which owns those keys (ring moves and Sheets' tab walk). A
+/// NoAction binding in the same context leaves them to the listener.
+pub(crate) fn init(cx: &mut App) {
+    cx.bind_keys(
+        ["home", "end", "pageup", "pagedown", "tab", "shift-tab"]
+            .map(|key| KeyBinding::new(key, NoAction {}, Some("DataTable"))),
+    );
+}
 
 // 7 is Menlo's digit advance at GUTTER_TEXT (11px); 16 is the gutter's
 // horizontal padding. Both move if the value font or size does. The
@@ -134,7 +147,7 @@ pub(crate) struct Grid {
     /// it unregisters when this grid drops.
     _intercept: Subscription,
     /// The filter strip's input; Some = the strip is open.
-    pub(crate) filter_input: Option<Entity<gpui_component::input::InputState>>,
+    pub(crate) filter_input: Option<Entity<gpui_kit::component::input::InputState>>,
     /// Escape interceptor for the open filter strip (clear, then
     /// dismiss) — dropped with the strip so closed strips cost nothing.
     filter_esc: Option<Subscription>,
@@ -153,16 +166,15 @@ pub(crate) struct Grid {
     resize: Entity<ResizableState>,
     /// The Columns popover's search box — persistent so the query
     /// survives re-renders while the popover is open.
-    pub(crate) col_search: Entity<gpui_component::input::InputState>,
-    /// The Structure view's DDL block: a DISABLED multi-line Input, so
-    /// the text is natively selectable (mouse drag, Cmd+C) while every
-    /// mutation stays gated off. None when the table has no DDL. It
-    /// holds perfectly still because the vendored gpui-component rules
-    /// that a disabled editor never scrolls itself (vendor/, Cargo.toml
-    /// [patch]); a first-party StyledText replacement was tried and
-    /// rolled back — it lost the editor's font metrics, no-wrap layout,
-    /// and native selection.
-    pub(crate) ddl_input: Option<Entity<gpui_component::input::InputState>>,
+    pub(crate) col_search: Entity<gpui_kit::component::input::InputState>,
+    /// The Structure view's DDL block: a READ-ONLY code editor, so the
+    /// text is natively selectable (mouse drag, Cmd+C) while every
+    /// mutation stays gated off. None when the table has no DDL. It holds
+    /// perfectly still: sized to its content, with no room past the last
+    /// line and no caret margin to chase. A first-party StyledText block
+    /// cannot replace it — it would lose the editor's font metrics,
+    /// wrapping layout, and native selection.
+    pub(crate) ddl_input: Option<Entity<gpui_kit::component::input::EditorState>>,
     /// The DDL block's copy tile, a self-confirming widget (copy_button.rs).
     pub(crate) ddl_copy: Option<Entity<crate::copy_button::CopyButton>>,
     /// Fence for page fetches: a newer fetch supersedes an older one in
@@ -199,7 +211,7 @@ struct CellEditor {
     /// Present for a synthetic INSERT row; existing rows resolve through
     /// their fetched identity instead.
     draft_key: Option<String>,
-    input: Entity<gpui_component::input::InputState>,
+    input: Entity<gpui_kit::component::input::InputState>,
     replace: bool,
 }
 
@@ -246,9 +258,12 @@ pub(crate) struct GridDelegate {
     /// Explicit draft values. Absence means DEFAULT, distinct from a
     /// present None which means explicit SQL NULL.
     draft_cells: std::collections::HashMap<(usize, usize), Option<SharedString>>,
-    /// Placeholder for an untouched draft cell: REQUIRED, DEFAULT, NULL,
-    /// or GENERATED. Derived once from catalog metadata.
-    draft_hints: Vec<SharedString>,
+    /// What an untouched draft cell becomes on commit, per schema column.
+    /// Derived once from catalog metadata.
+    draft_hints: Vec<DraftHint>,
+    /// Each schema column's declared type, the catalog's where it has one
+    /// (an ENUM's carries its values), for the column card.
+    col_types: Vec<SharedString>,
     /// Rows staged for DELETE — ghosted with strikethrough until commit.
     deleted: std::collections::HashSet<usize>,
     /// The cell whose editor is open, and the editor to render there.
@@ -257,7 +272,10 @@ pub(crate) struct GridDelegate {
     /// anchor. Enter during a run sweeps back to it, one row on; any
     /// arrow, click, or Esc ends the run.
     tab_anchor: Option<usize>,
-    editor_input: Option<Entity<gpui_component::input::InputState>>,
+    editor_input: Option<Entity<gpui_kit::component::input::InputState>>,
+    /// Picking an ENUM value on the open editor's column card: fills the
+    /// editor and confirms the cell in place, as a dropdown does.
+    pick: Option<PickValue>,
     numeric: Vec<bool>,
     /// Schema indices hidden via the Columns popover.
     hidden: std::collections::HashSet<usize>,
@@ -326,6 +344,7 @@ impl Grid {
             if d.gutter && d.cols.first().is_some_and(|col| col.width != want) {
                 d.cols[0].width = want;
                 state.refresh(cx);
+                cx.notify();
             }
         });
     }
@@ -427,10 +446,12 @@ impl Grid {
             draft_keys: Vec::new(),
             draft_cells: std::collections::HashMap::new(),
             draft_hints: Vec::new(),
+            col_types: Vec::new(),
             deleted: std::collections::HashSet::new(),
             editing: None,
             tab_anchor: None,
             editor_input: None,
+            pick: None,
             numeric: Vec::new(),
             hidden: std::collections::HashSet::new(),
             pill_cols: std::collections::HashSet::new(),
@@ -462,14 +483,21 @@ impl Grid {
             )
         })
         .map(|e| if rowid { e.keyed_by_rowid() } else { e });
-        let (not_null, defaults, generated, hints) =
+        let (not_null, defaults, generated, hints, types) =
             insert_metadata(&delegate.names, structure.as_ref());
         delegate.draft_hints = hints;
+        delegate.col_types = col_types(types, &delegate.schema_cols);
         // Header dragging stays off until move_column permutes the
         // visible map for real — the library default half-enables it
         // (widths reorder, contents don't).
-        let table =
-            cx.new(|cx| TableState::new(delegate, window, cx).col_movable(false));
+        // Column selection stays off too: a header click would switch
+        // the Table into column mode, where it reports no selected row
+        // and the observer below would clear the grid's selection.
+        let table = cx.new(|cx| {
+            TableState::new(delegate, window, cx)
+                .col_movable(false)
+                .col_selectable(false)
+        });
         // The table binds plain up/down/left/right/escape to its own
         // selection actions, and gpui dispatches BINDINGS before raw key
         // listeners — so the wash moved by the table's action and the
@@ -515,14 +543,14 @@ impl Grid {
                     "down" => g.move_ring(1, 0, cx),
                     "left" => g.move_ring(0, -1, cx),
                     "right" => g.move_ring(0, 1, cx),
-                    _ => g.clear_ring(cx),
+                    _ => g.escape_ring(cx),
                 }
             });
             cx.stop_propagation();
         });
-        cx.subscribe(&table, |_, table, event: &gpui_component::table::TableEvent, cx| {
+        cx.subscribe(&table, |_, table, event: &gpui_kit::component::table::TableEvent, cx| {
             match event {
-                gpui_component::table::TableEvent::SelectRow(ix) => {
+                gpui_kit::component::table::TableEvent::SelectRow(ix) => {
                     let ix = *ix;
                     table.update(cx, |state, cx| {
                         let d = state.delegate_mut();
@@ -537,7 +565,7 @@ impl Grid {
                     });
                     cx.notify();
                 }
-                gpui_component::table::TableEvent::ColumnWidthsChanged(widths) => {
+                gpui_kit::component::table::TableEvent::ColumnWidthsChanged(widths) => {
                     // Mirror drag-resizes into the delegate, keyed by
                     // schema column — otherwise any refresh rebuilds the
                     // layout from the delegate's original widths and the
@@ -579,12 +607,11 @@ impl Grid {
             }
         })
         .detach();
-        // The Table clears its selection on Escape with NO event (its
-        // Cancel action calls clear_selection, which never emits), so
-        // SelectRow alone lets the mirror drift: ghost tint and ring on
-        // a row the table considers deselected. Reconcile on every
-        // table notify instead; the comparison makes it a no-op when
-        // already in sync.
+        // SelectRow alone would let the mirror drift — ghost tint and
+        // ring on a row the table considers deselected — since the Table
+        // also clears and moves its selection on its own (Escape, a
+        // header click). Reconcile on every table notify instead; the
+        // comparison makes it a no-op when already in sync.
         cx.observe(&table, |_, table, cx| {
             table.update(cx, |state, cx| {
                 let real = state.selected_row();
@@ -616,7 +643,7 @@ impl Grid {
         })
         .detach();
         let col_search = cx.new(|cx| {
-            gpui_component::input::InputState::new(window, cx)
+            gpui_kit::component::input::InputState::new(window, cx)
                 .placeholder("Search columns\u{2026}")
         });
         let ddl = structure.as_ref().and_then(|s| s.ddl.clone());
@@ -626,16 +653,21 @@ impl Grid {
         let ddl_input = ddl.map(|ddl| {
             // A code editor (language "duckdb"), so the DDL wears the
             // same tree-sitter highlighting as the Query view — but
-            // numberless, with its height pinned at render time
-            // (structure.rs).
+            // numberless and unfolded, with its height pinned at render
+            // time (structure.rs). The card is content-sized and never
+            // scrolls: no room past the last line, and the caret never
+            // pulls the text toward a margin.
             cx.new(|cx| {
-                gpui_component::input::InputState::new(window, cx)
-                    .code_editor("duckdb")
+                gpui_kit::component::input::EditorState::new(window, cx)
+                    .language("duckdb")
                     .line_number(false)
+                    .folding(false)
+                    .scroll_beyond_last_line(Some(0))
+                    .cursor_surrounding_lines(Some(0))
                     .default_value(ddl)
             })
         });
-        cx.subscribe(&col_search, |_, _, _: &gpui_component::input::InputEvent, cx| {
+        cx.subscribe(&col_search, |_, _, _: &gpui_kit::component::input::InputEvent, cx| {
             cx.notify();
         })
         .detach();
@@ -656,7 +688,7 @@ impl Grid {
             let state = cx.new(|_| ResizableState::default());
             cx.subscribe(
                 &state,
-                |_, state, _: &gpui_component::resizable::ResizablePanelEvent, cx| {
+                |_, state, _: &gpui_kit::component::resizable::ResizablePanelEvent, cx| {
                     if let Some(h) = state.read(cx).sizes().first().copied() {
                         crate::prefs::save(cx, |p| {
                             p.structure_split = f32::from(h)
@@ -814,6 +846,7 @@ impl Grid {
                             d.active_cell = None;
                             d.editing = None;
                             d.editor_input = None;
+                            d.pick = None;
                             d.tab_anchor = None;
                         }
                         let d = state.delegate();
@@ -898,7 +931,7 @@ impl Grid {
             );
             if self.rowid { edits.keyed_by_rowid() } else { edits }
         });
-        let (not_null, defaults, generated, hints) =
+        let (not_null, defaults, generated, hints, types) =
             insert_metadata(&names, self.structure.as_ref());
         self.not_null = not_null;
         self.defaults = defaults;
@@ -906,6 +939,7 @@ impl Grid {
         self.table.update(cx, |state, cx| {
             let d = state.delegate_mut();
             d.draft_hints = hints;
+            d.col_types = col_types(types, &d.schema_cols);
             d.rebuild_cols();
             state.refresh(cx);
         });
@@ -1033,11 +1067,11 @@ impl Grid {
             return;
         }
         let input = cx.new(|cx| {
-            gpui_component::input::InputState::new(window, cx)
+            gpui_kit::component::input::InputState::new(window, cx)
                 .placeholder("e.g. price > 100 AND name LIKE '%panel%'")
         });
-        cx.subscribe(&input, |grid, input, event: &gpui_component::input::InputEvent, cx| {
-            if matches!(event, gpui_component::input::InputEvent::PressEnter { .. }) {
+        cx.subscribe(&input, |grid, input, event: &gpui_kit::component::input::InputEvent, cx| {
+            if matches!(event, gpui_kit::component::input::InputEvent::PressEnter { .. }) {
                 let text = input.read(cx).value().trim().to_string();
                 let size = grid.page_size;
                 grid.fetch(
@@ -1174,6 +1208,7 @@ impl Grid {
                         d.fit_one(schema_ix, zoom);
                     }
                     state.refresh(cx);
+                    cx.notify();
                     return;
                 }
             }
@@ -1257,14 +1292,8 @@ impl Grid {
                 .skip(d.identity as usize)
                 .map(|(i, name)| {
                     if is_draft && !d.draft_cells.contains_key(&(row_ix, i)) {
-                        return (
-                            name.clone(),
-                            d.draft_hints
-                                .get(i)
-                                .cloned()
-                                .unwrap_or_else(|| SharedString::from("DEFAULT")),
-                            false,
-                        );
+                        let hint = d.draft_hints.get(i).cloned().unwrap_or(DraftHint::Null);
+                        return (name.clone(), hint.describe(), true);
                     }
                     match row.get(i) {
                         None | Some(None) => (name.clone(), SharedString::from("NULL"), true),
@@ -1448,7 +1477,21 @@ impl Grid {
                 return;
             }
             match ks.key.as_str() {
-                "escape" => self.cancel_edit(cx),
+                "escape" => {
+                    // One Esc right after ⌘N, nothing typed: the new row
+                    // goes with the editor. With text typed, this Esc
+                    // discards only the text — one Esc never takes two
+                    // things — and the next one dismisses the row.
+                    let row = self
+                        .editor
+                        .as_ref()
+                        .filter(|ed| ed.input.read(cx).value().is_empty())
+                        .map(|ed| ed.row);
+                    self.cancel_edit(cx);
+                    if row.is_some_and(|row| self.dismiss_untouched_draft(row, cx)) {
+                        self.clear_ring(cx);
+                    }
+                }
                 // The newline family (Steve's ruling): ⇧Enter first —
                 // the chat-composer convention every hand knows — with
                 // ⌥Enter as the Sheets twin. They belong to the text.
@@ -1677,7 +1720,7 @@ impl Grid {
                 cx.stop_propagation();
             }
             "escape" => {
-                self.clear_ring(cx);
+                self.escape_ring(cx);
                 cx.stop_propagation();
             }
             _ => {
@@ -1811,14 +1854,14 @@ impl Grid {
         let text = seed
             .unwrap_or_else(|| original.as_ref().map(|s| s.to_string()).unwrap_or_default());
         let input = cx.new(|cx| {
-            gpui_component::input::InputState::new(window, cx).default_value(text)
+            gpui_kit::component::input::InputState::new(window, cx).default_value(text)
         });
         input.update(cx, |state, cx| {
             // Caret at the end (set_cursor_position also focuses):
             // replace entry keeps typing past its seed; kept-value entry
             // lands where Sheets puts it. The column clamps to the line.
             state.set_cursor_position(
-                gpui_component::input::Position::new(0, u32::MAX),
+                gpui_kit::component::input::Position::new(0, u32::MAX),
                 window,
                 cx,
             );
@@ -1826,8 +1869,8 @@ impl Grid {
         // Enter may be consumed by the input before it bubbles; the event
         // subscription is the belt to on_key's suspenders. Idempotent:
         // whoever runs first takes the editor.
-        cx.subscribe(&input, |grid, _, ev: &gpui_component::input::InputEvent, cx| {
-            if let gpui_component::input::InputEvent::PressEnter { secondary } = ev {
+        cx.subscribe(&input, |grid, _, ev: &gpui_kit::component::input::InputEvent, cx| {
+            if let gpui_kit::component::input::InputEvent::PressEnter { secondary, .. } = ev {
                 if *secondary {
                     // ⌘Enter — "send it", the AI-era universal: confirm
                     // this cell, then commit everything staged.
@@ -1847,10 +1890,20 @@ impl Grid {
             input: input.clone(),
             replace,
         });
+        let grid = cx.entity().downgrade();
         self.table.update(cx, |state, cx| {
             let d = state.delegate_mut();
             d.editing = Some((row, col));
-            d.editor_input = Some(input);
+            d.editor_input = Some(input.clone());
+            d.pick = Some(Rc::new({
+                let grid = grid.clone();
+                move |value: SharedString, window: &mut Window, cx: &mut App| {
+                    input.update(cx, |state, cx| state.set_value(value, window, cx));
+                    if let Some(grid) = grid.upgrade() {
+                        grid.update(cx, |grid, cx| grid.confirm_and_move(0, 0, cx));
+                    }
+                }
+            }));
             d.rebuild_cols();
             state.refresh(cx);
             cx.notify();
@@ -1907,6 +1960,7 @@ impl Grid {
             let d = state.delegate_mut();
             d.editing = None;
             d.editor_input = None;
+            d.pick = None;
             d.rebuild_cols();
             state.refresh(cx);
             cx.notify();
@@ -2188,6 +2242,39 @@ impl Grid {
 
     /// Esc while navigating: clear the ring, the selection, and any Tab
     /// run — the same panic key, the same "nothing happened" result.
+    /// Esc while navigating: a draft row nothing has been entered into,
+    /// under the ring, is dismissed; then the ring and selection clear.
+    fn escape_ring(&mut self, cx: &mut Context<Self>) {
+        let row = {
+            let d = self.table.read(cx).delegate();
+            d.active_cell.map(|(row, _)| row).or(d.selection.lead)
+        };
+        if let Some(row) = row {
+            self.dismiss_untouched_draft(row, cx);
+        }
+        self.clear_ring(cx);
+    }
+
+    /// Remove `row` if it is a draft nothing has been entered into. It
+    /// holds nothing typed, so Esc loses nothing by it, and ⌘Z brings it
+    /// back. A draft with any entered value — a duplicate's copied cells
+    /// included — stays; ⌘⌫ discards it. Returns whether it went.
+    fn dismiss_untouched_draft(&mut self, row: usize, cx: &mut Context<Self>) -> bool {
+        if self.committing {
+            return false;
+        }
+        let Some(key) = self.table.read(cx).delegate().draft_key(row).map(str::to_string) else {
+            return false;
+        };
+        let Some(edits) = &mut self.edits else { return false };
+        if !edits.is_untouched_insert(&key) {
+            return false;
+        }
+        edits.grouped(|edits| edits.discard(&key));
+        self.sync_staged(cx);
+        true
+    }
+
     fn clear_ring(&mut self, cx: &mut Context<Self>) {
         self.table.update(cx, |state, cx| {
             let d = state.delegate_mut();
@@ -2409,6 +2496,7 @@ impl Grid {
                 d.active_cell = None;
                 d.editing = None;
                 d.editor_input = None;
+                d.pick = None;
                 d.tab_anchor = None;
             }
             // Draft hints need room only while a draft or editor is on
@@ -3042,25 +3130,14 @@ impl GridDelegate {
         self.visible = (self.identity as usize..self.schema_cols.len())
             .filter(|i| !self.hidden.contains(i))
             .collect();
-        let editing_widths = self.editing.is_some() || !self.draft_keys.is_empty();
-        let minimums: Vec<Pixels> = self
-            .visible
-            .iter()
-            .map(|&schema_ix| {
-                self.draft_hints
-                    .get(schema_ix)
-                    .map(|hint| conditional_hint_min_width(hint, editing_widths, self.zoom))
-                    .unwrap_or(px(10.))
-            })
-            .collect();
         self.cols = build_columns(&self.names, &self.visible, self.gutter);
         let g = self.gutter as usize;
-        for (disp, (schema_ix, minimum)) in
-            self.visible.iter().zip(minimums).enumerate()
-        {
-            self.cols[disp + g].min_width = minimum;
-            if let Some(&w) = self.widths.get(schema_ix) {
-                self.cols[disp + g].width = w.max(minimum);
+        // A column's width is its content's or the user's, never a draft
+        // hint's: hints fit the width they are given, so starting an edit
+        // or adding a row never moves a column.
+        for (disp, &schema_ix) in self.visible.iter().enumerate() {
+            if let Some(&w) = self.widths.get(&schema_ix) {
+                self.cols[disp + g].width = w;
             }
         }
         if self.gutter {
@@ -3079,8 +3156,8 @@ impl TableDelegate for GridDelegate {
         self.rows.len()
     }
 
-    fn column(&self, col_ix: usize, _: &App) -> &TableColumn {
-        &self.cols[col_ix]
+    fn column(&self, col_ix: usize, _: &App) -> TableColumn {
+        self.cols[col_ix].clone()
     }
 
     fn render_td(
@@ -3128,6 +3205,10 @@ impl TableDelegate for GridDelegate {
                     cx.listener(move |state, e: &MouseDownEvent, _, cx| {
                         state.delegate_mut().all_selected = false;
                         click_row(state, row_ix, ClickKind::of(&e.modifiers), cx);
+                        // The Table's row select stops the event; the
+                        // table's focus-on-click and the grid's body click
+                        // above still need it.
+                        cx.propagate();
                     }),
                 )
                 .child(
@@ -3142,12 +3223,10 @@ impl TableDelegate for GridDelegate {
                         .child(self.row_labels.get(row_ix).cloned().unwrap_or_default()),
                 )
                 // The gutter's divider strip, in the ONE grid-line
-                // color. The vendored Table used to draw its own
-                // fixed-region edge 1px beside this — the "two
-                // verticals" the red audit exposed (2026-09-01) — and
-                // half-occluded by the scrolling cells at that; the
-                // vendor edge is now silenced (state.rs patch) and this
-                // strip is the boundary's one owner.
+                // color, and the boundary's one owner: the vendored
+                // Table draws no fixed-region edge of its own (a
+                // state.rs patch), which would sit 1px beside this one,
+                // half-occluded by the scrolling cells.
                 .child(div().absolute().right_0().top_0().bottom_0().w(px(1.)).bg(t.grid_line))
                 .into_any_element();
         }
@@ -3182,7 +3261,7 @@ impl TableDelegate for GridDelegate {
                     )
                     .child(
                         div().w_full().child(
-                            gpui_component::input::Input::new(&input)
+                            gpui_kit::component::input::Input::new(&input)
                                 .appearance(false)
                                 // Zero the input's built-in insets, both
                                 // sides. Left pins the caret exactly on
@@ -3202,6 +3281,36 @@ impl TableDelegate for GridDelegate {
                                 .font_family(value_font()),
                         ),
                     )
+                    // The column card (⌘T), floating just under the cell for as
+                    // long as it is edited, so the value being edited stays
+                    // in view: a zero-size box seats it below the cell's
+                    // bottom edge, and it is deferred so it paints over the
+                    // rows below and escapes the table's clip, snapped to
+                    // stay inside the window.
+                    .when(p.column_cards, |d| d.child(
+                        div().absolute().left(px(-PANE_INSET)).top(row_h + px(4.)).child(
+                            deferred(
+                                anchored()
+                                    .snap_to_window_with_margin(px(8.))
+                                    .child(
+                                        column_card(
+                                            t,
+                                            p.zoom_factor(),
+                                            self.names.get(data_col).cloned().unwrap_or_default(),
+                                            self.col_types.get(data_col).cloned().unwrap_or_default(),
+                                            &self
+                                                .draft_hints
+                                                .get(data_col)
+                                                .cloned()
+                                                .unwrap_or(DraftHint::Null),
+                                            self.pick.clone(),
+                                        )
+                                        .occlude(),
+                                    ),
+                            )
+                            .with_priority(1),
+                        ),
+                    ))
                     .into_any_element();
             }
         }
@@ -3307,6 +3416,10 @@ impl TableDelegate for GridDelegate {
                         state.delegate_mut().active_cell = Some((row_ix, data_col));
                     }
                     cx.notify();
+                    // The Table's row select stops the event; the table's
+                    // focus-on-click and the grid's body click above (the
+                    // double-click that opens the editor) still need it.
+                    cx.propagate();
                 }),
             )
             .when(active, |d| {
@@ -3325,29 +3438,51 @@ impl TableDelegate for GridDelegate {
                 )
             });
         if is_draft && !draft_explicit {
-            let hint = self
-                .draft_hints
-                .get(data_col)
-                .cloned()
-                .unwrap_or_else(|| SharedString::from("DEFAULT"));
-            let required = hint.as_ref() == "REQUIRED";
+            // An untouched draft cell is blank: the database fills it — a
+            // default, a sequence, a generated value, or NULL — and the
+            // column card on hover says which. Only a value the row cannot
+            // commit without shows: a soft red REQUIRED tag, in the NULL
+            // tag's style, or the same tag holding only "!" where the
+            // column is too narrow for the word. A generated cell, which
+            // takes no typing, is faintly dimmed.
+            let hint = self.draft_hints.get(data_col).cloned().unwrap_or(DraftHint::Null);
+            let z = p.zoom_factor();
+            let room = self.cols.get(col_ix).map_or(px(0.), |c| c.width) - px(PANE_INSET + 8.);
+            let required = (hint == DraftHint::Required).then(|| {
+                div()
+                    .flex_none()
+                    .px(px(5.))
+                    .rounded(px(4.))
+                    .bg(t.bad.opacity(0.12))
+                    .text_size(px(TAG_TEXT * z))
+                    .font_family(ui_font())
+                    .text_color(t.bad)
+                    .child(if tag_width("REQUIRED", z) <= room { "REQUIRED" } else { "!" })
+            });
+            let generated = matches!(hint, DraftHint::Generated(_));
+            let name = self.names.get(data_col).cloned().unwrap_or_default();
+            let ty = self.col_types.get(data_col).cloned().unwrap_or_default();
+            let cards = p.column_cards;
             return cell
+                .id(SharedString::from(format!("draft-hint-{row_ix}-{data_col}")))
                 .when(right, |d| d.justify_end())
-                .child(
-                    div()
-                        .flex_none()
-                        .px(px(5.))
-                        .rounded(px(4.))
-                        .bg(if required {
-                            t.warn.opacity(0.18)
-                        } else {
-                            t.pill.opacity(0.45)
-                        })
-                        .text_size(px(TAG_TEXT * p.zoom_factor()))
-                        .font_family(ui_font())
-                        .text_color(if required { t.warn } else { t.muted.opacity(0.7) })
-                        .child(hint),
-                )
+                .when(generated, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .left(px(-PANE_INSET))
+                            .right_0()
+                            .top_0()
+                            .bottom_0()
+                            .bg(t.muted.opacity(0.08)),
+                    )
+                })
+                .children(required)
+                .when(cards, |d| d.tooltip(move |window, cx| {
+                    let (name, ty, hint) = (name.clone(), ty.clone(), hint.clone());
+                    Tooltip::element(move |_, _| column_card(t, z, name.clone(), ty.clone(), &hint, None))
+                        .build(window, cx)
+                }))
                 .into_any_element();
         }
         match value {
@@ -3510,39 +3645,29 @@ impl TableDelegate for GridDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> Stateful<Div> {
         let t = pal(cx);
-        // The selection tint paints here, UNDER the cell borders, so both
-        // edges of the selected row are ordinary dividers. The Table's own
-        // overlay is 1px-outset (heavier top edge, missing bottom) and the
-        // themes zero it out.
+        // The selection tint paints here, UNDER the cells and inside the
+        // row's own bottom border, so both edges of the selected row are
+        // ordinary dividers. It is a child, not the row's background: the
+        // Table paints its hover wash and its lead-row highlight on the
+        // row itself, after this element is built, and a child sits above
+        // both — every selected row keeps one tint under the pointer, the
+        // lead included.
         div()
             .id(("row", row_ix))
             .relative()
             .when(self.selection.contains(row_ix), |d| {
-                d.bg(t.row_active).child(
-                    // The Table makes the selected row's own bottom border
-                    // transparent (expecting its overlay border, which the
-                    // themes zero). Repaint the divider on that exact
-                    // pixel — bottom(-1) lands on the border-box pixel.
-                    div()
-                        .absolute()
-                        .left_0()
-                        .right_0()
-                        .bottom(px(-1.))
-                        .h(px(1.))
-                        .bg(t.grid_line),
-                )
+                d.child(div().absolute().inset_0().bg(t.row_active))
             })
     }
 
+    /// The Table's loading placeholder is for a grid with nothing to show
+    /// yet: no schema, no rows. A refresh of a grid on screen — an empty
+    /// table included — keeps showing what it has until the new page
+    /// lands, so the refresh never flashes the placeholder.
     fn loading(&self, _: &App) -> bool {
-        self.loading && self.rows.is_empty()
+        self.loading && self.rows.is_empty() && self.schema_cols.is_empty()
     }
 
-    /// Keeps the Table's hover wash off every selected row, not only the
-    /// lead it knows about.
-    fn row_selected(&self, row_ix: usize, _: &App) -> bool {
-        self.selection.contains(row_ix)
-    }
 }
 
 impl Grid {
@@ -3554,8 +3679,9 @@ impl Grid {
         // records each frame: double-clicks anywhere in the header row
         // hit-test against the column boundaries geometrically (widths +
         // horizontal scroll), so the fit gesture works ON the divider
-        // line itself — the 2px the library's drag handle occludes
-        // included, because ancestors still hear what it doesn't consume.
+        // line itself — the 4px either side the library's drag handle
+        // occludes included, because ancestors still hear what it doesn't
+        // consume.
         let bounds_store = self.table_bounds.clone();
         let header_h = prefs::get(cx).table_size().table_row_height();
         div()
@@ -3582,7 +3708,7 @@ impl Grid {
                     .right_0()
                     .bottom(px(-1.))
                     .child(
-                        Table::new(&self.table)
+                        DataTable::new(&self.table)
                             .bordered(false)
                             .with_size(prefs::get(cx).table_size()),
                     ),
@@ -3632,7 +3758,7 @@ impl Render for Grid {
         // none), so the flag set at close time is consumed one frame on.
         if self.needs_focus {
             self.needs_focus = false;
-            window.focus(&self.table.focus_handle(cx));
+            window.focus(&self.table.focus_handle(cx), cx);
         }
         // The header chase: this frame's body paint will apply the
         // pending horizontal scroll AFTER the header has painted, so
@@ -3869,8 +3995,8 @@ impl Render for Grid {
                                 prefs::toggle(cx, |p| p.inspector = !p.inspector);
                             }))
                             .child(
-                                gpui_component::Icon::new(
-                                    gpui_component::IconName::PanelRight,
+                                gpui_kit::component::Icon::new(
+                                    gpui_kit::component::IconName::PanelRight,
                                 )
                                 .size_4(),
                             ),
@@ -3903,7 +4029,7 @@ impl Render for Grid {
                             )
                             .child(
                                 div().flex_1().child(
-                                    gpui_component::input::Input::new(&input)
+                                    gpui_kit::component::input::Input::new(&input)
                                         .xsmall()
                                         .cleanable(true),
                                 ),
@@ -3983,7 +4109,8 @@ type InsertMetadata = (
     Vec<bool>,
     Vec<Option<String>>,
     Vec<bool>,
-    Vec<SharedString>,
+    Vec<DraftHint>,
+    Vec<Option<String>>,
 );
 
 /// Align catalog insert capabilities to the result schema. The hidden
@@ -4003,20 +4130,123 @@ fn insert_metadata(
     let defaults: Vec<Option<String>> =
         cols.iter().map(|c| c.and_then(|c| c.dflt.clone())).collect();
     let generated: Vec<bool> = cols.iter().map(|c| c.is_some_and(|c| c.generated)).collect();
-    let hints = (0..names.len())
-        .map(|col| {
-            SharedString::from(if generated[col] {
-                "GENERATED"
-            } else if defaults[col].is_some() {
-                "DEFAULT"
+    let hints = cols
+        .iter()
+        .enumerate()
+        .map(|(col, c)| {
+            if generated[col] {
+                DraftHint::Generated(
+                    c.and_then(|c| c.generation_expression.clone()).unwrap_or_default().into(),
+                )
+            } else if let Some(expr) = &defaults[col] {
+                DraftHint::Default(expr.clone().into())
             } else if not_null[col] {
-                "REQUIRED"
+                DraftHint::Required
             } else {
-                "NULL"
-            })
+                DraftHint::Null
+            }
         })
         .collect();
-    (not_null, defaults, generated, hints)
+    let types = cols.iter().map(|c| c.map(|c| c.ty.clone())).collect();
+    (not_null, defaults, generated, hints, types)
+}
+
+/// The column card's types: the catalog's declaration where it has one,
+/// else the type the result schema carries.
+fn col_types(catalog: Vec<Option<String>>, schema: &[wire::Column]) -> Vec<SharedString> {
+    catalog
+        .into_iter()
+        .zip(schema)
+        .map(|(ty, col)| ty.unwrap_or_else(|| col.duckdb_type.clone()).into())
+        .collect()
+}
+
+/// A column's rules at a glance: its name and type, what an untouched
+/// cell becomes (its default, its generation, `required`, or nullable),
+/// and an ENUM's values. Shown under a cell while it is edited, where
+/// `pick` makes each value a click that fills the editor, and as the
+/// tooltip of a draft row's placeholder.
+fn column_card(
+    t: crate::theme::Pal,
+    z: f32,
+    name: SharedString,
+    ty: SharedString,
+    hint: &DraftHint,
+    pick: Option<PickValue>,
+) -> Div {
+    let choices = edits::enum_values(&ty);
+    let ty_label: SharedString = if choices.is_some() { "ENUM".into() } else { ty };
+    let small = px(TAG_TEXT * z + 1.);
+    let rule = match hint {
+        DraftHint::Generated(expr) if !expr.is_empty() => {
+            div().text_color(t.muted).child(SharedString::from(format!("generated = {expr}")))
+        }
+        DraftHint::Generated(_) => div().text_color(t.muted).child("generated"),
+        DraftHint::Default(expr) => {
+            div().text_color(t.muted).child(SharedString::from(format!("default {expr}")))
+        }
+        DraftHint::Required => div()
+            .h_flex()
+            .gap_1()
+            .child(div().text_color(t.bad).child("required"))
+            .child(div().text_color(t.muted).child("· NOT NULL, no default")),
+        DraftHint::Null => div().text_color(t.muted).child("nullable"),
+    };
+    div()
+        .v_flex()
+        .gap(px(3.))
+        .max_w(px(340. * z))
+        .px(px(8.))
+        .py(px(6.))
+        .rounded(px(6.))
+        .border_1()
+        .border_color(t.border)
+        .bg(t.surface)
+        .shadow_md()
+        .text_size(small)
+        .font_family(value_font())
+        .child(
+            div()
+                .h_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .font_family(ui_font())
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(t.text)
+                        .child(name),
+                )
+                .child(div().text_color(t.muted).child(ty_label)),
+        )
+        .child(rule)
+        .when_some(choices, |card, choices| {
+            card.child(
+                div()
+                    .h_flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(div().text_color(t.muted).child("one of"))
+                    .children(choices.into_iter().enumerate().map(|(ix, value)| {
+                        let chip = div()
+                            .id(("enum-choice", ix))
+                            .px(px(5.))
+                            .rounded(px(4.))
+                            .bg(t.pill.opacity(0.55))
+                            .text_color(t.text)
+                            .child(value.clone());
+                        match pick.clone() {
+                            Some(pick) => chip
+                                .cursor_pointer()
+                                .hover(|d| d.bg(t.accent.opacity(0.18)))
+                                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    pick(value.clone().into(), window, cx);
+                                }),
+                            None => chip,
+                        }
+                    })),
+            )
+        })
 }
 
 /// The status line while edits are staged against columns the table does
@@ -4119,21 +4349,40 @@ fn duplicate_cells(
         .collect()
 }
 
-/// The full horizontal footprint of an untouched draft hint: estimated
-/// proportional UI-font advance, the pill's 5px padding on both sides,
-/// the cell's left inset, and its 8px trailing breathing room. The
-/// estimate is deliberately a little generous so rounded ends never
-/// disappear at a theme or rasterization boundary.
-fn draft_hint_min_width(hint: &str, zoom: f32) -> Pixels {
-    const UI_ADVANCE_EM: f32 = 0.7;
-    const PILL_PADDING: f32 = 10.;
-    const TRAILING: f32 = 8.;
-    let text = hint.chars().count() as f32 * TAG_TEXT * UI_ADVANCE_EM * zoom;
-    px(text + PILL_PADDING + PANE_INSET + TRAILING)
+/// How wide a tag is: its text in the UI font at the tag size (an
+/// estimate, a little generous) plus the pill's 5px padding a side.
+fn tag_width(tag: &str, zoom: f32) -> Pixels {
+    px(tag.chars().count() as f32 * TAG_TEXT * 0.7 * zoom + 10.)
 }
 
-fn conditional_hint_min_width(hint: &str, editing: bool, zoom: f32) -> Pixels {
-    if editing { draft_hint_min_width(hint, zoom) } else { px(10.) }
+/// Fills the open cell editor with a value and confirms it.
+type PickValue = Rc<dyn Fn(SharedString, &mut Window, &mut App)>;
+
+/// What an untouched cell of a draft row becomes when the row commits —
+/// the cell is left out of the INSERT, so the database decides.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DraftHint {
+    /// The column computes itself from this expression.
+    Generated(SharedString),
+    /// The column's default expression fills it.
+    Default(SharedString),
+    /// NOT NULL with no default: the row cannot commit without a value.
+    Required,
+    /// Left blank, it stores NULL.
+    Null,
+}
+
+impl DraftHint {
+    /// What the cell becomes, for the inspector.
+    fn describe(&self) -> SharedString {
+        match self {
+            DraftHint::Generated(expr) if !expr.is_empty() => format!("generated: {expr}").into(),
+            DraftHint::Generated(_) => "generated".into(),
+            DraftHint::Default(expr) => format!("default: {expr}").into(),
+            DraftHint::Required => "required: NOT NULL, no default".into(),
+            DraftHint::Null => "NULL".into(),
+        }
+    }
 }
 
 fn build_columns(
@@ -4163,6 +4412,11 @@ fn build_columns(
             // first paint.
             TableColumn::new(format!("c{i}"), names[i].clone())
                 .width(px(100.))
+                // A drag narrows a column to 10px and widens it to
+                // 1200px, the widest a column grows by hand; a fit to
+                // content may set it wider.
+                .min_width(px(10.))
+                .max_width(px(1200.))
                 .paddings(Edges {
                     left: px(PANE_INSET),
                     right: px(0.),
@@ -4200,24 +4454,64 @@ fn should_reconcile_selection(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClickKind, Lead, RowSelection, conditional_hint_min_width, draft_hint_min_width,
-        duplicate_cells, duplicate_refusal, orphaned, same_columns, should_reconcile_selection,
+        ClickKind, DraftHint, Lead, RowSelection, duplicate_cells, tag_width, duplicate_refusal, orphaned, same_columns, should_reconcile_selection,
         wrapped_step,
     };
     use crate::edits::{Bind, CellEdit};
-    use gpui::{Modifiers, SharedString};
+    use gpui_kit::{Modifiers, SharedString};
     use serde_json::json;
     use std::collections::BTreeMap;
 
     #[test]
-    fn draft_hint_floors_fit_each_pill_and_scale_with_zoom() {
-        assert_eq!(f32::from(draft_hint_min_width("NULL", 1.)), 58.);
-        assert_eq!(f32::from(draft_hint_min_width("DEFAULT", 1.)), 79.);
-        assert_eq!(f32::from(draft_hint_min_width("REQUIRED", 1.)), 86.);
-        assert_eq!(f32::from(draft_hint_min_width("GENERATED", 1.)), 93.);
-        assert_eq!(f32::from(draft_hint_min_width("DEFAULT", 2.)), 128.);
-        assert_eq!(f32::from(conditional_hint_min_width("GENERATED", false, 1.)), 10.);
-        assert_eq!(f32::from(conditional_hint_min_width("GENERATED", true, 1.)), 93.);
+    fn required_tag_width_scales_with_zoom() {
+        assert_eq!(f32::from(tag_width("REQUIRED", 1.)), 66.);
+        assert_eq!(f32::from(tag_width("REQUIRED", 1.5)), 94.);
+    }
+
+    #[test]
+    fn draft_hints_describe_what_the_cell_becomes() {
+        let sequence = DraftHint::Default("nextval('id')".into());
+        assert_eq!(sequence.describe().as_ref(), "default: nextval('id')");
+        assert_eq!(DraftHint::Required.describe().as_ref(), "required: NOT NULL, no default");
+        assert_eq!(DraftHint::Null.describe().as_ref(), "NULL");
+        let generated = DraftHint::Generated("a + b".into());
+        assert_eq!(generated.describe().as_ref(), "generated: a + b");
+        assert_eq!(DraftHint::Generated("".into()).describe().as_ref(), "generated");
+    }
+
+    #[test]
+    fn insert_metadata_ranks_generated_then_default_then_required() {
+        let col = |name: &str, notnull, dflt: Option<&str>, generated| crate::structure::StructCol {
+            name: name.into(),
+            ty: "INTEGER".into(),
+            notnull,
+            dflt: dflt.map(Into::into),
+            generated,
+            generation_expression: generated.then(|| "a + 1".into()),
+            pk: false,
+        };
+        let structure = crate::structure::TableStructure {
+            cols: vec![
+                col("g", true, None, true),
+                col("d", true, Some("nextval('id')"), false),
+                col("r", true, None, false),
+                col("n", false, None, false),
+            ],
+            ddl: None,
+        };
+        let names: Vec<SharedString> = ["g", "d", "r", "n", "rowid"].map(Into::into).into();
+        let (_, _, _, hints, types) = super::insert_metadata(&names, Some(&structure));
+        assert_eq!(types[4], None);
+        assert_eq!(
+            hints,
+            vec![
+                DraftHint::Generated("a + 1".into()),
+                DraftHint::Default("nextval('id')".into()),
+                DraftHint::Required,
+                DraftHint::Null,
+                DraftHint::Null,
+            ]
+        );
     }
 
     #[test]

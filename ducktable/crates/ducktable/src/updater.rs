@@ -13,7 +13,7 @@
 //! flow from one. A bare `cargo run` binary has no embedded framework and
 //! stays dormant too, in which case the menu item is omitted.
 
-use gpui::Global;
+use gpui_kit::Global;
 
 /// App-wide handle to the updater, if this build can update itself.
 pub struct UpdaterState(pub Option<Updater>);

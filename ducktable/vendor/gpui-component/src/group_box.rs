@@ -1,10 +1,10 @@
 use gpui::{
-    div, prelude::FluentBuilder, relative, AnyElement, App, ElementId, InteractiveElement as _,
-    IntoElement, ParentElement, RenderOnce, StyleRefinement, Styled, Window,
+    AnyElement, App, Background, ElementId, InteractiveElement as _, IntoElement, ParentElement,
+    RenderOnce, StyleRefinement, Styled, Window, div, prelude::FluentBuilder, relative,
 };
 use smallvec::SmallVec;
 
-use crate::{v_flex, ActiveTheme, StyledExt as _};
+use crate::{ActiveTheme, StyledExt as _, v_flex};
 
 /// The variant of the GroupBox.
 #[derive(Debug, Clone, Default, Copy, PartialEq, Eq, Hash)]
@@ -67,6 +67,7 @@ pub struct GroupBox {
     title: Option<AnyElement>,
     content_style: StyleRefinement,
     children: SmallVec<[AnyElement; 1]>,
+    footer: Option<AnyElement>,
 }
 
 impl GroupBox {
@@ -80,6 +81,7 @@ impl GroupBox {
             content_style: StyleRefinement::default(),
             title: None,
             children: SmallVec::new(),
+            footer: None,
         }
     }
 
@@ -106,6 +108,15 @@ impl GroupBox {
         self.content_style = style;
         self
     }
+
+    /// Set supporting content below the group's filled or outlined surface.
+    ///
+    /// The footer shares the title's leading edge, sits 8 px under the
+    /// surface, and renders as small muted text like a description.
+    pub fn footer(mut self, footer: impl IntoElement) -> Self {
+        self.footer = Some(footer.into_any_element());
+        self
+    }
 }
 
 impl ParentElement for GroupBox {
@@ -129,9 +140,9 @@ impl GroupBoxVariants for GroupBox {
 
 impl RenderOnce for GroupBox {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let (bg, border, has_paddings) = match self.variant {
+        let (bg, border, has_paddings): (Option<Background>, _, _) = match self.variant {
             GroupBoxVariant::Normal => (None, None, false),
-            GroupBoxVariant::Fill => (Some(cx.theme().group_box), None, true),
+            GroupBoxVariant::Fill => (Some(cx.theme().tokens.group_box.into()), None, true),
             GroupBoxVariant::Outline => (None, Some(cx.theme().border), true),
         };
 
@@ -145,21 +156,35 @@ impl RenderOnce for GroupBox {
                 this.child(
                     div()
                         .text_color(cx.theme().muted_foreground)
-                        .line_height(relative(1.))
+                        .line_height(relative(1.25))
                         .refine_style(&self.title_style)
                         .child(title),
                 )
             })
             .child(
+                // The footer sits inside the surface's slot so its 8 px gap is
+                // independent of the root gap between the title and surface.
                 v_flex()
-                    .when_some(bg, |this, bg| this.bg(bg))
-                    .when_some(border, |this, border| this.border_color(border).border_1())
-                    .text_color(cx.theme().group_box_foreground)
-                    .when(has_paddings, |this| this.p_4())
-                    .gap_4()
-                    .rounded(cx.theme().radius)
-                    .refine_style(&self.content_style)
-                    .children(self.children),
+                    .gap_2()
+                    .child(
+                        v_flex()
+                            .when_some(bg, |this, bg| this.bg(bg))
+                            .when_some(border, |this, border| this.border_color(border).border_1())
+                            .text_color(cx.theme().group_box_foreground)
+                            .when(has_paddings, |this| this.p_4())
+                            .gap_4()
+                            .rounded(cx.theme().radius)
+                            .refine_style(&self.content_style)
+                            .children(self.children),
+                    )
+                    .when_some(self.footer, |this, footer| {
+                        this.child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(footer),
+                        )
+                    }),
             )
     }
 }

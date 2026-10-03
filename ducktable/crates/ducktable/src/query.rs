@@ -8,16 +8,16 @@
 //! subquery wrap (probe row + on-demand count).
 
 use crate::theme::{pal, value_font, CELL_TEXT};
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::StyledExt as _;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use gpui_kit::component::input::{Editor, EditorState, InputEvent};
+use gpui_kit::component::{Sizable as _, StyledExt as _};
 use harbor_client::Conn;
 
 pub(crate) struct QueryView {
     conn: Conn,
     berth: String,
-    editor: Entity<InputState>,
+    editor: Entity<EditorState>,
     /// The results pane: a REAL Grid, embedded — "a Data window with a
     /// custom query preceding it". It pages, selects, and honors the
     /// display toggles exactly like the Data view, and it is read-only
@@ -46,7 +46,7 @@ pub(crate) struct QueryView {
     needs_focus: bool,
     /// The editor/results divider — user-draggable, position persisted
     /// (docs/QUERY.md's split, finally honored).
-    split: Entity<gpui_component::resizable::ResizableState>,
+    split: Entity<gpui_kit::component::resizable::ResizableState>,
     _subscription: Subscription,
     /// Keystroke interceptor for ⌘Enter: it must run BEFORE the input's
     /// own binding, which would insert a newline first (send means send,
@@ -64,9 +64,10 @@ impl QueryView {
         cx: &mut Context<Self>,
     ) -> Self {
         let editor = cx.new(|cx| {
-            let mut state = InputState::new(window, cx)
-                .code_editor("duckdb")
+            let mut state = EditorState::new(window, cx)
+                .language("duckdb")
                 .line_number(true)
+                .folding(false)
                 .placeholder("Type SQL. \u{2318}Enter runs the statement under the caret.");
             if let Some(text) = load_scratch(berth) {
                 state = state.default_value(text);
@@ -107,10 +108,10 @@ impl QueryView {
         cx.observe(&editor, Self::sync_send_mark).detach();
         // The editor/results divider persists like every other divider
         // (sidebar, inspector): only the user's drag writes it.
-        let split = cx.new(|_| gpui_component::resizable::ResizableState::default());
+        let split = cx.new(|_| gpui_kit::component::resizable::ResizableState::default());
         cx.subscribe(
             &split,
-            |_, state, _: &gpui_component::resizable::ResizablePanelEvent, cx| {
+            |_, state, _: &gpui_kit::component::resizable::ResizablePanelEvent, cx| {
                 if let Some(h) = state.read(cx).sizes().first().copied() {
                     crate::prefs::save(cx, |p| {
                         p.query_split = f32::from(h)
@@ -151,7 +152,7 @@ impl QueryView {
     /// they match the engine's own "LINE n" in error messages — and
     /// pins the gutter to the grids' exact rail geometry, so the "1"
     /// never moves when ⌘1/2/3 switches views.
-    fn sync_send_mark(&mut self, editor: Entity<InputState>, cx: &mut Context<Self>) {
+    fn sync_send_mark(&mut self, editor: Entity<EditorState>, cx: &mut Context<Self>) {
         // value() already materializes the rope into a SharedString;
         // it derefs to &str, so no second copy is taken (this runs at
         // blink frequency — allocations here are pure heat).
@@ -175,7 +176,7 @@ impl QueryView {
             let start = text[..s.span.start].matches('\n').count();
             let end = text[..s.span.end].matches('\n').count();
             let shade = {
-                use gpui_component::ActiveTheme as _;
+                use gpui_kit::component::ActiveTheme as _;
                 cx.theme().table_head
             };
             (start..end + 1, shade)
@@ -227,14 +228,11 @@ impl QueryView {
         if let Some(results) = results {
             results.update(cx, |grid, cx| grid.set_gutter_max(shared_max, cx));
         }
-        // The Input's own padding is zeroed at the source (.p_0() in
-        // render), so the text element — where the gutter begins —
-        // already sits at the pane's left edge: the rail width is used
-        // verbatim and left_inset stays 0.
+        // The rail's measures count from the editor's outer left edge —
+        // the pane's own — so the rail width is used verbatim.
         let t = crate::theme::pal(cx);
-        let style = gpui_component::input::GutterStyle {
+        let style = gpui_kit::base::input::GutterStyle {
             width: px(rail),
-            left_inset: px(0.),
             right_inset: px(6.),
             text_gap: px(12.),
             text_size: px(crate::theme::GUTTER_TEXT),
@@ -273,13 +271,13 @@ impl QueryView {
 
     fn on_editor_event(
         &mut self,
-        _: &Entity<InputState>,
+        _: &Entity<EditorState>,
         event: &InputEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
-            InputEvent::PressEnter { secondary: true } => self.run(window, cx),
+            InputEvent::PressEnter { secondary: true, .. } => self.run(window, cx),
             InputEvent::Change { .. } => {
                 // Autosave rides the change event; a debounce can come
                 // later — scratch writes are tiny.
@@ -507,7 +505,7 @@ impl Render for QueryView {
         let t = pal(cx);
         if self.needs_focus {
             self.needs_focus = false;
-            self.editor.read(cx).focus_handle(cx).focus(window);
+            self.editor.read(cx).focus_handle(cx).focus(window, cx);
         }
         // Results arriving can widen the shared rail; the guarded write
         // makes this free on every other frame.
@@ -521,16 +519,14 @@ impl Render for QueryView {
                 // paint, a "#" on the number rail — so ⌘1/2/3 keeps
                 // the chrome still and only the content changes.
                 let row_h = crate::prefs::get(cx).table_size().table_row_height();
-                // The rail's visible width: the style's width minus
-                // left_inset (0 here — the Input's padding is zeroed,
-                // not inset-compensated), so "#" lands on the numbers'
-                // right edge exactly like the grids'.
+                // The rail's width, so "#" lands on the numbers' right
+                // edge exactly like the grids'.
                 let gw = self
                     .editor
                     .read(cx)
                     .gutter_style
                     .as_ref()
-                    .map(|g| g.width - g.left_inset)
+                    .map(|g| g.width)
                     .unwrap_or(px(crate::grid::gutter_width(1)));
                 div()
                     .flex_none()
@@ -541,17 +537,15 @@ impl Render for QueryView {
                     // The band OWNS its bottom border, exactly like the
                     // grids' header row — border inside row_h, so the
                     // "#" centers in row_h minus the border px and the
-                    // line is full height by construction. (The editor
-                    // used to paint this boundary at its viewport top,
-                    // but that paint clips to the editor's half-pixel
-                    // content bounds — the audit's half-height band
-                    // line. The vendored fixed-top paint is retired;
-                    // the editor's row-0 top hairline stays suppressed,
-                    // so it is still one line, never two.)
+                    // line is full height by construction. The editor
+                    // paints no boundary of its own at its top: a paint
+                    // there clips to its half-pixel content bounds and
+                    // renders half height, and row 0 opens with no
+                    // hairline, so the boundary is one line, never two.
                     .border_b_1()
                     .border_color(t.grid_line)
                     .bg({
-                        use gpui_component::ActiveTheme as _;
+                        use gpui_kit::component::ActiveTheme as _;
                         cx.theme().table_head
                     })
                     // The "#" cell is the rail's header: with the rail
@@ -591,9 +585,9 @@ impl Render for QueryView {
                 // The editor pane: the scratchpad, in the value font.
                 // Flush at the pane's left so the imposed gutter
                 // (sync_send_mark) sits exactly on the grids' number
-                // rail; the Input's built-in padding is killed outright
-                // with .p_0() below. Line height is the grids' row
-                // height, so line 1 sits where row 1 sits.
+                // rail; the editor takes its smallest insets (.xsmall()
+                // below), none above or below. Line height is the grids'
+                // row height, so line 1 sits where row 1 sits.
                 let editor_pane = div()
                     .flex_1()
                     .min_h_0()
@@ -614,16 +608,15 @@ impl Render for QueryView {
                     // text_sm before refining with caller styles, so a
                     // wrapper cascade never reaches the editor text.
                     .child(
-                        Input::new(&self.editor)
+                        Editor::new(&self.editor)
                             .h_full()
-                            // Kill the Input's own padding outright
-                            // (caller styles refine): the rail starts
-                            // at the pane's true left edge, hairlines
-                            // reach its true right edge, and the rail
-                            // runs to the footer — no dead strips on
-                            // any side. The gutter and the editor's
-                            // internal margins supply all the space.
-                            .p_0()
+                            // The smallest insets: none above or below,
+                            // so the rail runs from the header band to
+                            // the footer with no dead strips. The rail
+                            // paints from the editor's outer edge and
+                            // its hairlines reach the outer right edge;
+                            // the gutter supplies the text's inset.
+                            .xsmall()
                             // No border, no focus ring: the pane inset is
                             // the frame; the editor is just text.
                             .appearance(false)
@@ -659,10 +652,10 @@ impl Render for QueryView {
                     // (docs/QUERY.md's split), the handle's own line
                     // standing in for the old border_t.
                     Some(grid) => d.child(
-                        gpui_component::resizable::v_resizable("query-split")
+                        gpui_kit::base::v_resizable("query-split")
                             .with_state(&self.split)
                             .child(
-                                gpui_component::resizable::resizable_panel()
+                                gpui_kit::component::resizable::resizable_panel()
                                     .size(px(crate::prefs::get(cx).query_split))
                                     .size_range(
                                         px(crate::prefs::QUERY_SPLIT_MIN)
@@ -683,7 +676,7 @@ impl Render for QueryView {
                                     ),
                             )
                             .child(
-                                gpui_component::resizable::resizable_panel().child(
+                                gpui_kit::component::resizable::resizable_panel().child(
                                     div()
                                         .size_full()
                                         .min_h_0()
