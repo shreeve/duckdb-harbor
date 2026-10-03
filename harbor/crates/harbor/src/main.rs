@@ -451,7 +451,9 @@ usage:
                                servers still on the old code and the restart
                                each needs; --restart runs those (a hand-
                                started server only from a terminal), --check
-                               only says what is newest
+                               only says what is newest. A copy installed by
+                               Homebrew is upgraded by `brew upgrade` and
+                               says so
 
 backup and restore stand alone: they act on a database's contents rather than
 its lifetime, so they take no other verb. The rest combine, in any order:

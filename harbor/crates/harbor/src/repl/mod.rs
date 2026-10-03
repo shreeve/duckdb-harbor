@@ -18,6 +18,7 @@ mod complete;
 mod render;
 mod highlight;
 mod http;
+pub mod installs;
 mod interactive;
 mod keywords;
 pub mod scan;
@@ -753,7 +754,15 @@ is reached by its URL:\n\n  harbor http://127.0.0.1:<p>\n\n";
 /// listening socket, so a stale file is litter, not state.
 pub fn list_main() -> ExitCode {
     match list() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            // A second copy of harbor on the machine: said here, where
+            // versions are already being read, whether or not anything is
+            // running, and on stderr so a piped list stays a list.
+            if let Some(note) = installs::note() {
+                eprintln!("{note}\n");
+            }
+            ExitCode::SUCCESS
+        }
         Err(e) => fail(&e),
     }
 }
