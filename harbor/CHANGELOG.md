@@ -4,6 +4,20 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.43.4 — 2026-10-03
+
+- **A plan is colored the way DuckDB's shell colors it.** The frame, the
+  detail keys and an estimated row count are gray; an operator's name is
+  bold, green for a scan, cyan for a join, magenta for an aggregate, yellow
+  for a sort; and under `EXPLAIN ANALYZE` a timing is bold red at a quarter
+  of the query, yellow at a tenth, and gray under a hundredth. DuckDB's shell
+  gets those roles from the engine, which draws a plan from typed pieces;
+  a harbor client is handed the finished drawing, so it reads the roles back
+  from the text by the engine's own rules: a title follows `╭─`, a leaf that
+  names a `Table` or a `Function` is a scan whatever it is called, `~7 rows`
+  is an estimate and `7 rows` a count. The text under the colors is
+  unchanged, and output to a pipe or under `NO_COLOR` carries none.
+
 ## 0.43.3 — 2026-10-03
 
 - **`EXPLAIN` prints the plan.** The boxed modes showed a plan as a cell:
