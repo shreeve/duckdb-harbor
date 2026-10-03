@@ -4,6 +4,18 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.43.2 — 2026-10-03
+
+- **On Windows, `harbor` says why a running server is not listed.** The list
+  finds servers by their unix sockets, and Windows has none, so a server
+  started with `--port` was running while `harbor` drew an empty table and
+  said "Nothing running", then suggested `harbor <db.duckdb>`, which on
+  Windows cannot join it either (#80). The Windows listing now says that
+  running servers are not shown there and gives the form that reaches one,
+  `harbor http://127.0.0.1:<p>`, after the empty frame and after a table of
+  attached databases alike. The README's claim that the client half works the
+  same everywhere is narrowed to what is true: past the connection, it does.
+
 ## 0.43.1 — 2026-09-26
 
 - **The REPL's line editor is reedline 0.52 from crates.io.** The copy

@@ -54,3 +54,57 @@ jobs:
       - name: Server log on failure
         if: failure()
         run: cat /tmp/harbor-check.*/server.log 2>/dev/null || true
+
+  # Windows has no unix sockets, so the list, spawn-on-use and joining by
+  # name all have nothing to read there. This job proves what Windows does
+  # instead: a bare `harbor` says so and gives the URL form, `start --port`
+  # serves, and a client reaches the server by URL. The engine is fetched the
+  # way Release.yml fetches it for the Windows archives.
+  windows:
+    name: windows
+    runs-on: windows-2025
+    env:
+      DUCKDB_LIB_BUILD: ${{ vars.DUCKDB_LIB_BUILD }}
+      DUCKDB_LIB: ${{ github.workspace }}/.duckdb-engine
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: harbor
+
+      - name: Fetch DuckDB engine
+        run: DEST="$DUCKDB_LIB" DUCKDB_PLATFORM=windows-amd64 scripts/fetch-duckdb.sh
+
+      - name: Build harbor
+        run: cargo build -p harbor --release
+
+      - name: The list says what Windows cannot show, and the URL form works
+        run: |
+          set -euo pipefail
+          export HARBOR_LIBDUCKDB="$DUCKDB_LIB/duckdb.dll"
+          export HARBOR_HOME="$RUNNER_TEMP/harbor-home"
+          harbor=target/release/harbor.exe
+
+          out=$("$harbor")
+          echo "$out"
+          grep -q "not listed on Windows" <<<"$out"
+          ! grep -q "Nothing running" <<<"$out"
+          grep -q "harbor http://127.0.0.1:<p>" <<<"$out"
+
+          "$harbor" "$RUNNER_TEMP/w.duckdb" start --port 9495 &
+          srv=$!
+          for _ in $(seq 1 50); do
+            curl -sf http://127.0.0.1:9495/ready >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+          curl -sf http://127.0.0.1:9495/ready | grep -q ready
+
+          # With a server up, the list still says so, and does not claim it is running.
+          out=$("$harbor")
+          echo "$out"
+          grep -q "not listed on Windows" <<<"$out"
+
+          "$harbor" http://127.0.0.1:9495 -c "SELECT 42 AS ok" --mode csv | grep -q 42
+          kill "$srv"
+          echo "windows: the list is honest, start --port serves, the URL form reaches it"
