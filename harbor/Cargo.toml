@@ -16,7 +16,7 @@ resolver = "2"
 # archive would have shipped a `pilot --version` that disagreed with its own
 # filename. Inheriting removes the chance to forget one.
 [workspace.package]
-version = "0.43.2"
+version = "0.43.3"
 repository = "https://github.com/shreeve/duckdb-harbor"
 
 [profile.release]
