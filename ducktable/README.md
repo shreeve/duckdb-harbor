@@ -39,14 +39,22 @@ caret. *(Midnight theme.)*
 
 ## Install
 
+With Homebrew:
+
+```console
+$ brew install --cask shreeve/tap/ducktable
+```
+
+Or with one command, which drops `DuckTable.app` into `/Applications` from
+the latest release:
+
 ```console
 $ curl -fsSL https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/ducktable/scripts/install.sh | bash
 ```
 
-One command, Apple Silicon, no Gatekeeper dialog — the script drops
-`DuckTable.app` into `/Applications` from the latest release. (Downloading
-the zip in a browser instead will trip Gatekeeper's quarantine; if you go
-that way, allow it under System Settings → Privacy & Security → Open Anyway.)
+Apple Silicon. The app is signed with a Developer ID and notarized by Apple,
+so it opens on first launch however it was downloaded, the release's zip from
+a browser included.
 
 An installed copy is replaced by rename: the old app steps aside, the new one
 takes its name, and the old one is removed last, so an install that fails
@@ -65,9 +73,11 @@ On Intel, or to build from source: clone the repo and run
 `ducktable/scripts/macos-app.sh release`; `scripts/install-local.sh` builds
 and installs in one step, with the same swap.
 
-Every build is signed ad hoc under one identifier, `com.shreeve.ducktable`,
-and the build fails if the app or its executable reports any other. macOS
-files an app's privacy decisions under that name, so it never changes.
+Every build is signed with the Developer ID under one identifier,
+`com.shreeve.ducktable`, and the build fails if the app or its executable
+reports any other. macOS files an app's privacy decisions under that name, so
+it never changes. Without the certificate, `SIGN=- scripts/macos-app.sh`
+builds ad hoc ([docs/UPDATES.md](docs/UPDATES.md)).
 
 ## Databases by port
 

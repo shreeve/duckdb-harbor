@@ -29,6 +29,14 @@ date, newest first.
   flashes over a table that is already on screen.
 - **Both dividers look alike.** The inspector's divider drops its gripper and
   matches the sidebar's plain hairline.
+- **Signed with a Developer ID, notarized, and on Homebrew.** DuckTable
+  releases the way Shotts and Transfer do: built, signed and notarized
+  locally by `scripts/release.sh`, so Gatekeeper opens it however it was
+  downloaded, and installable with `brew install --cask shreeve/tap/ducktable`.
+  Updates still arrive through the same feed. If macOS asks once more for Local
+  Network access, that is the new signature; allow it as before.
+- Ships Sparkle 2.10.0, the current stable. The lockfile records
+  `harbor-common` and `wire` at harbor's version.
 
 ## 0.22.7 — 2026-09-25
 

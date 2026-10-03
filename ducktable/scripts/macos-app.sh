@@ -1,9 +1,14 @@
 #!/bin/sh
 # Assembles DuckTable.app so macOS gives the app its own icon and identity
 # instead of attributing the bare binary to whatever terminal launched it,
-# embeds Sparkle for in-app updates (docs/UPDATES.md), and ad-hoc signs the
-# result so Sparkle can verify what it installs.
+# embeds Sparkle for in-app updates (docs/UPDATES.md), and signs it.
 # Usage: scripts/macos-app.sh [debug|release]   (default: debug)
+#
+# Every build, local ones included, is signed with the Developer ID (SIGN
+# names another identity; SIGN=- signs ad hoc, for a Mac without the
+# certificate), with the hardened runtime that notarization requires. A
+# release build also signs with a secure timestamp, which notarization
+# requires and which needs the network. scripts/release.sh notarizes it.
 set -e
 cd "$(dirname "$0")/.."
 
@@ -85,15 +90,21 @@ plutil -lint "$app/Contents/Info.plist" >/dev/null
 
 # Finder info and resource forks on copied files make codesign reject the
 # bundle as "detritus"; strip extended attributes before signing. Sparkle's
-# nested executables sign first, then the framework, then the app, all
-# ad-hoc: Sparkle verifies an update's signature is valid, and ad-hoc is.
-# Sparkle's code keeps Sparkle's identifiers; only the app is named here,
-# and signing the app is what signs Contents/MacOS/ducktable.
+# nested executables sign first, then the framework, then the app, all with
+# one identity: the hardened runtime's library validation loads the
+# framework only from the app's own team. Ad-hoc signatures have no team,
+# so they go without the hardened runtime. Sparkle's code keeps Sparkle's
+# identifiers; only the app is named here, and signing the app is what
+# signs Contents/MacOS/ducktable.
+sign="${SIGN:-Developer ID Application: Steve Shreeve (SD6N7Z8P9P)}"
+set -- --force --sign "$sign"
+[ "$sign" = "-" ] || set -- "$@" --options=runtime
+[ "$sign" = "-" ] || [ "$profile" != "release" ] || set -- "$@" --timestamp
 xattr -cr "$app"
-codesign --force --sign - "$framework/Versions/B/Autoupdate"
-codesign --force --sign - "$framework/Versions/B/Updater.app"
-codesign --force --sign - "$framework"
-codesign --force --sign - --identifier "$bundle_id" "$app"
+codesign "$@" "$framework/Versions/B/Autoupdate"
+codesign "$@" "$framework/Versions/B/Updater.app"
+codesign "$@" "$framework"
+codesign "$@" --identifier "$bundle_id" "$app"
 codesign --verify --deep --strict "$app"
 
 # The build fails rather than ship under another name: a bare executable

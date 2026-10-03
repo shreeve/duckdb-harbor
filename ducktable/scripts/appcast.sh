@@ -9,11 +9,12 @@
 # <updates-dir> holds DuckTable-<version>.zip for the new release plus any
 # older archives already on the feed release, so Sparkle can build binary
 # deltas against them and keep their items. Every enclosure URL is the feed
-# release's download URL for that file name.
+# release's download URL for that file name. A DuckTable-<version>.md beside
+# an archive is its release notes, embedded in the feed.
 #
-# The private EdDSA key comes from SPARKLE_PRIVATE_KEY (CI, fed on stdin so
-# it never lands on disk), otherwise from the login keychain account
-# "ducktable" that `generate_keys --account ducktable` created.
+# The private EdDSA key comes from the login keychain account "ducktable"
+# that `generate_keys --account ducktable` created. scripts/release.sh runs
+# this; run it by hand only to rehearse a feed.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -30,13 +31,10 @@ args=(
     --download-url-prefix "$feed_prefix"
     --link "https://github.com/shreeve/duckdb-harbor"
     --maximum-deltas 2
+    --embed-release-notes
+    --account ducktable
 )
-
-if [ -n "${SPARKLE_PRIVATE_KEY:-}" ]; then
-    printf '%s\n' "$SPARKLE_PRIVATE_KEY" | "$generator" "${args[@]}" --ed-key-file - "$updates_dir"
-else
-    "$generator" "${args[@]}" --account ducktable "$updates_dir"
-fi
+"$generator" "${args[@]}" "$updates_dir"
 
 # generate_appcast exits 0 after writing an *unsigned* feed when its key does
 # not match the bundle's SUPublicEDKey, and Sparkle rejects an unsigned
