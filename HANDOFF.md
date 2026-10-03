@@ -204,23 +204,25 @@ Patch versions are for fixes and refinements; a new capability is a minor
 bump (brace expansion was 0.40.0). A documentation-only change needs no
 version and no changelog entry.
 
-DuckTable releases are one commit on main titled "DuckTable X.Y.Z": bump
-`version` in `ducktable/Cargo.toml`, run `cargo update -w` there (the
-lockfile also records harbor-common and wire, so release harbor first when
-both ship), add the changelog entry, and bump the Sparkle pin — every
-DuckTable release ships the latest stable Sparkle, never a beta: set
-`sparkle_version` and `sparkle_sha256` together in `scripts/sparkle.sh`,
-the path in `docs/UPDATES.md`, and say so in the changelog. Prove the bundle
-with `scripts/macos-app.sh release` (check the embedded
-`Sparkle.framework` version), then push an annotated `ducktable-vX.Y.Z` tag.
-The script fails unless the app and its executable sign as
+DuckTable releases run locally, signed with the Developer ID and notarized,
+the way Shotts and Transfer release (`ducktable/docs/UPDATES.md`, "Cutting a
+release"). Land the changelog entry first, and the Sparkle pin when Sparkle
+has a newer stable release — every DuckTable release ships the latest stable
+Sparkle, never a beta: set `sparkle_version` and `sparkle_sha256` together
+in `scripts/sparkle.sh`, the path in `docs/UPDATES.md`, and say so in the
+changelog. Release harbor first when both ship, since the lockfile records
+harbor-common and wire. Then, from a clean `main` in step with origin, in
+`ducktable/`: `scripts/release.sh X.Y.Z --dry-run`, `scripts/release.sh
+X.Y.Z`, and `scripts/update-cask.sh X.Y.Z`, and merge the tap's pull
+request. The release script sets the version and runs `cargo update -w`,
+commits "DuckTable X.Y.Z" straight to `main` with an annotated
+`ducktable-vX.Y.Z` tag, publishes the versioned release (never `--latest`)
+and rewrites the `ducktable-updates` feed; confirm `appcast.xml` lists the
+new version first. That feed release stays a prerelease so
+`/releases/latest` remains harbor's. The bundle signs as
 `com.shreeve.ducktable`, the name macOS keys Local Network permission to;
 never re-sign, rename or copy over an installed copy — both installers swap
 the bundle in by rename (`docs/UPDATES.md`, "The bundle's identity").
-`DuckTableRelease.yml` publishes `DuckTable.zip` on the versioned release and
-rewrites the `ducktable-updates` feed; confirm `appcast.xml` lists the new
-version first. That feed release stays a prerelease so `/releases/latest`
-remains harbor's.
 
 The install one-liner, everywhere:
 
@@ -345,9 +347,9 @@ usable end to end.
 - **The deployment runbook** (`duckdb-harbor-runbook`) is deferred to GA;
   four decisions were recorded so they are not re-derived.
 - **DuckTable** is at 0.22.6, early and moving fast; its own docs are under
-  `ducktable/docs/`. Its Sparkle signing keys live in the gitignored,
-  untracked `notes.txt` at the repo root and in the `SPARKLE_PRIVATE_KEY`
-  repository secret. Never commit that file.
+  `ducktable/docs/`. Its Sparkle signing key lives in the login keychain
+  under the account `ducktable`, with a backup in the gitignored, untracked
+  `notes.txt` at the repo root. Never commit that file.
 - **Linux glibc floor.** Release archives are built on Ubuntu 24.04 and
   need glibc 2.39; the README and the release notes say so. Building on an
   older baseline (a manylinux container or cargo-zigbuild) would run on

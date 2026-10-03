@@ -4,9 +4,9 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/ducktable/scripts/install.sh | bash
 #
-# Installs from the newest ducktable-v* GitHub release — no signing, no
-# ceremony. curl never sets macOS's quarantine attribute, so the app opens on
-# first launch, and the bundle is ad-hoc signed as com.shreeve.ducktable.
+# Installs from the newest ducktable-v* GitHub release. The bundle is signed
+# with a Developer ID as com.shreeve.ducktable and notarized by Apple, so it
+# opens on first launch.
 #
 # The app lands in /Applications, or ~/Applications where that is not
 # writable; DUCKTABLE_DEST names another directory (... | DUCKTABLE_DEST=dir bash).
@@ -104,10 +104,6 @@ main() {
     # copy: nothing is written into an app once it is in place.
     rm -rf "$staged"
     mv "$tmp/DuckTable.app" "$staged"
-    # Belt and suspenders: if anything tagged the download, untag it. This
-    # script only ever installs the zip it fetched itself, and curl sets no
-    # quarantine, so there is no browser-downloaded bundle to refuse here.
-    xattr -dr com.apple.quarantine "$staged" 2>/dev/null || true
     # A damaged download stops here, with the installed app still standing.
     codesign --verify --deep --strict "$staged" 2>/dev/null \
         || fail "the downloaded DuckTable.app does not verify; nothing was changed"

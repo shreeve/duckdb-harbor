@@ -32,9 +32,10 @@ Install harbor:
 curl -fsSL https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.sh | bash
 ```
 
-Install DuckTable (macOS, Apple Silicon):
+Install DuckTable (macOS, Apple Silicon) with Homebrew or one command:
 
 ```sh
+brew install --cask shreeve/tap/ducktable
 curl -fsSL https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/ducktable/scripts/install.sh | bash
 ```
 
