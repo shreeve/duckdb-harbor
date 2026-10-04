@@ -28,9 +28,11 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
 - **Harbor is required, not optional.** The client never links DuckDB and
   never sees a database file's contents. FFI, engine version lock, WAL
   handling and checkpoint hazards are Harbor's job, not the client's.
-- **Berths are addressed by name.** Connection works the way `harbor`'s own
-  does: a name resolves to a database, opening a local file spawns Harbor for
-  it on demand, and Harbor's socket discovery replaces any registry. DuckTable
+- **A berth is a file on this machine or a named remote.** Connection works
+  the way `harbor`'s own does: a local database is dialed by its file, whose
+  server Harbor's socket discovery finds and opening it spawns on demand, and
+  a remote is dialed by its config name. No registry exists, and a name alone
+  never decides which database a connection reaches. DuckTable
   consumes Harbor's `wire` protocol crate and `harbor-common` (features
   `config` and `membership`) as path dependencies on the sibling
   `../../../harbor/crates/*`, so the wire contract is checked on both sides of
@@ -220,7 +222,14 @@ databases on the list, and saved remotes. Each row has a status dot, the table
 count in parentheses when it is running, and its size on disk right-justified
 in decimal units (MB, GB). A filter field appears once the list passes ten
 rows. Clicking a row opens the berth; the attempt is fenced, so a late
-completion discards itself and a cancel works at once. Right-click offers,
+completion discards itself and a cancel works at once. A row connects to the
+database it shows, never to its name looked up again: a local row to its
+file, a remote row to the config entry of its name. A file on this machine
+and a remote can carry one name; both are then listed, the file first, each
+row's tooltip says which it is, and the warning line says the name repeats.
+Everything that tells rows apart goes by the database and not the name: the
+highlight, the row's spinner and fade, and Stop, which shuts down the server
+of the row's own file and no other. Right-click offers,
 per axis, only the move that applies: **Start** or **Stop**, **Attach** or
 **Detach**, and the **Autostart** checkmark. A tunneled row says "Connects
 over SSH to <host>" in its tooltip, and its menu offers **Remove Database**.
@@ -311,7 +320,7 @@ arrows, ⌘S, ⌘Z, ⌘⌫, ⌃⇧N, ⌘⇧⌫) is EDITING.md's; the Query view'
 | ⌘= / ⌘- / ⌘0 | zoom in / out / actual size |
 | ⌘⇧F | fit column widths |
 | ⌃⌘F | full screen |
-| ⌘Q | quit |
+| ⌘Q | quit, asking first when staged changes, a commit in flight or an open transaction would be lost |
 
 ### Appearance
 

@@ -3,6 +3,109 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by release
 date, newest first.
 
+## 0.22.9 — 2026-10-03
+
+- **Quitting asks before it loses anything.** EDITING.md promised one dialog,
+  on quitting with staged changes, and none existed: ⌘Q quit outright and the
+  close button dropped every staged edit. ⌘Q, DuckTable → Quit and the close
+  button now ask when changes are staged, in the table on screen or parked for
+  another, when a cell editor is open, when a commit or a Query statement is
+  still in flight, or when the Query view holds a transaction open, and say
+  which. Cancel is the default: Return and Esc go back. The button that quits
+  is not a tab stop, so no key reaches it and only a click on it quits. The
+  dialog is the app's own because the platform alert cannot do that.
+  Measured: with Cancel first it has no default button, and Space presses the
+  button that discards. Quitting releases every session the window holds, a
+  commit's and an opening `BEGIN`'s among them, so the server rolls back at
+  once what would otherwise wait for a timeout. While the dialog is up,
+  opening or stopping a database and switching tables are ignored, so Cancel
+  finds everything as it was.
+- **The Query view holds a transaction.** Each run was its own request, so
+  `BEGIN` answered and did nothing, the statements after it committed one by
+  one, and `ROLLBACK` failed. A statement that begins a transaction now gets a
+  Harbor session and every later run goes through it until `COMMIT`, `END`,
+  `ROLLBACK` or `ABORT`, when the session goes back. The header band shows a
+  transaction is open and how long the server will keep it: five minutes from
+  `BEGIN`. The view touches the session every ten seconds so Harbor's
+  thirty-second idle timeout does not take it between statements, releases it
+  when the connection drops, another database is chosen or the app quits, and
+  says so when the server has reclaimed it: the statement run next is refused
+  once, since on its own it would commit on its own. The statement is read
+  by the reader Harbor's server and its own client use (`wire::statement`),
+  past the spaces the engine skips and no others, and through `EXPLAIN
+  ANALYZE`, which measured runs the `COMMIT` it explains. Only the engine's answer ends a
+  transaction: a `COMMIT` Harbor turns away because the session is still busy
+  leaves it open. It works with a Harbor that refuses a `BEGIN` sent outside a
+  session and with one that does not: the view never sends one.
+- **A row connects to the database it shows.** A database file whose name
+  matched a remote in the config showed one row with the local path, and a
+  click on it looked the name up again, found the remote, and opened SSH: the
+  grid and its edits went to the other host. A local row now connects by its
+  file and a remote row by its config entry, the two are listed as two rows
+  with a tooltip saying which is which, Retry dials what failed and not its
+  name, and the sidebar's table counts join a running server without ever
+  starting one or opening a tunnel. Rows are told apart by database and not
+  by name throughout, two files with one stem included: the highlight, the
+  spinner, and Stop, which shuts down the server of the row's own file where
+  it used to stop whichever server answered to the name. A socket named for a
+  database is joined only when the server behind it reports that file.
+- **A commit whose answer is lost is not called a failure.** A timeout or a
+  dropped tunnel on the `COMMIT` request was reported as "edits kept", though
+  the server may have committed, and a second ⌘S then inserted every new row
+  again. Now the commit's session is ended and seen to be over before the page
+  is read, so the page is the commit's outcome, and the staged set is held: it
+  is taken off the page, whose rows its old keys may no longer name, and
+  nothing sends it, stages into it or undoes it. The count opens the review,
+  where each change the page shows has landed is discarded for good, and
+  Stage again puts the rest back. A `COMMIT` that could not be sent at all is
+  an ordinary failure, edits kept.
+- **A COMMIT that rolled back says so.** In the Query view an error aborts the
+  transaction, and a `COMMIT` after it answers like any other while rolling
+  everything back: the view showed `ok` and the work was gone. That included
+  errors the user never saw, such as the count behind a paged result. The
+  band now reads `transaction aborted by an error`, the view asks the session
+  before it sends a `COMMIT`, and a `COMMIT` of an aborted transaction reports
+  the rollback. A `ROLLBACK` the engine answers with "no transaction is
+  active" is reported as that, not as a rollback.
+- **Nothing is staged against a page from before the commit.** Between a
+  commit and its refetch the grid showed the new values under the old row
+  identities, so an edit staged then could name a row by a key the commit had
+  just changed. The grid stays committing until the page lands; if the fetch
+  fails it says so, keeps the ghosts of the rows the commit deleted, and takes
+  no edits until a refresh.
+- **A list or struct cell refuses an escape the engine does not read back.**
+  The cell shows a newline as `\n`; typed back, the engine's cast stored the
+  letter n, with no error. Measured: `'["line\nbreak"]'::VARCHAR[]` is
+  `linenbreak`. Typed text for a container can escape only a quote and a
+  backslash, and anything else is refused with a pointer to the Query tab.
+- **A UNION cell takes no typed text.** `8` typed over `{"tag":"n","value":7}`
+  in a `UNION(n INTEGER, s VARCHAR)` was stored as the string `8` under `s`.
+- **A DECIMAL is held to its width in the editor.** `12345.6` into a
+  `DECIMAL(5,2)` passed the editor and failed at commit, taking the whole
+  transaction with it. The editor now refuses what the engine would, rounding
+  as the engine rounds: `999.994` is taken and `999.995` is not.
+- **⌃⇧N leaves a row staged for deletion alone.** It replaced the staged
+  DELETE with an UPDATE to NULL.
+- **A page change keeps what was being typed.** A pager click, a page-size
+  change, a filter or a switch to another table confirmed nothing and dropped
+  an open editor's text. They now confirm it first, as a refresh does, and ⌘S
+  from the review popover does too.
+- **A result cut short is not a result.** An answer that ended before its
+  closing line, because the server or the connection died mid-stream, was
+  taken as complete with the rows that had arrived. It is now a failure that
+  says so.
+- **More results page.** A statement behind a block comment, and `DESCRIBE`,
+  `SUMMARIZE`, `SHOW`, `PIVOT` and `UNPIVOT`, ran unpaged and fetched their
+  whole result. Numbers right-align by their own type name, so an INTERVAL and
+  an `INTEGER[]` no longer do.
+- The live probes in `harbor-client/tests/live.rs` run only against the
+  database file `HARBOR_LIVE_DB` names. They create and drop tables, and
+  picking any running database could have picked the wrong one.
+- **A release uploads the feed last.** `scripts/release.sh` sends the update
+  feed's archives and deltas first and `appcast.xml` after them. A feed that
+  was up before the archive it names sent every client that checked in
+  between to a 404.
+
 ## 0.22.8 — 2026-10-03
 
 - **DuckTable runs on GPUI Kit 0.7.** The UI stack moves from GPUI 0.2.2 and

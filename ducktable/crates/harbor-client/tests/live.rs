@@ -1,23 +1,88 @@
-//! Probes against the machine's real fleet. Ignored by default: they need a
-//! live Harbor and say nothing in CI. Run explicitly:
-//! `cargo test -p harbor-client --test live -- --ignored --nocapture`
+//! Probes against a live Harbor. Ignored by default: they need a server and
+//! say nothing in CI. They create and drop tables, so they run only against
+//! the database file `HARBOR_LIVE_DB` names, and skip without it; nothing is
+//! ever chosen from the machine's fleet. Run explicitly:
+//! `HARBOR_LIVE_DB=/tmp/scratch.duckdb cargo test -p harbor-client --test live -- --ignored --nocapture`
+//!
+//! They share one server, its handful of session connections and a few
+//! tables, so each probe takes its turn (`scratch`), whatever
+//! `--test-threads` says. The two that read the fleet run only under a
+//! `HARBOR_HOME` of their own, so they never survey the machine's databases.
 
-use harbor_client::{connect, fleet, info};
+use harbor_client::{fleet, info, Conn};
 
-/// Any LOCAL berth will do — a name is a service that starts on use, so a
-/// stopped configured berth is as connectable as a live one. Live still wins,
-/// to avoid churning starts when something is already up. A remote is never
-/// chosen: it has no local database file, connecting to it opens an SSH
-/// tunnel to another machine, and these probes create and drop tables.
-fn connectable() -> Option<fleet::Survey> {
-    let mut rows: Vec<_> = fleet::survey().rows.into_iter().filter(|r| r.path.is_some()).collect();
-    rows.sort_by_key(|r| !r.state.is_live());
-    rows.into_iter().next()
+/// One probe at a time on the scratch server.
+static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+thread_local! {
+    /// This test's thread holds the turn: a second connection in the same
+    /// probe does not wait for it.
+    static HOLDS_TURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A connection to the scratch database, and the probe's turn on it.
+struct Scratch {
+    conn: Conn,
+    turn: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = Conn;
+    fn deref(&self) -> &Conn {
+        &self.conn
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if self.turn.is_some() {
+            HOLDS_TURN.set(false);
+        }
+    }
+}
+
+/// The scratch database's file, when `HARBOR_LIVE_DB` names one.
+fn scratch_db() -> Option<std::path::PathBuf> {
+    let db = std::env::var_os("HARBOR_LIVE_DB").map(std::path::PathBuf::from);
+    if db.is_none() {
+        println!("set HARBOR_LIVE_DB to a scratch database file; skipping");
+    }
+    db
+}
+
+/// A connection to the scratch database `HARBOR_LIVE_DB` names, by its path:
+/// its server is joined, or started on demand. None, and the probe skips,
+/// when the variable is not set. The path is the whole choice: a probe that
+/// writes must never land on whatever database happens to be running.
+fn scratch() -> Option<Scratch> {
+    let db = scratch_db()?;
+    // A probe that failed while it held the turn leaves it poisoned, which
+    // says nothing about the next one.
+    let turn = (!HOLDS_TURN.replace(true)).then(|| TURN.lock().unwrap_or_else(|p| p.into_inner()));
+    let conn = fleet::connect_path(&db).expect("connect");
+    println!("database: {}", db.display());
+    Some(Scratch { conn, turn })
+}
+
+/// Whether the fleet may be surveyed: only under a `HARBOR_HOME` set for the
+/// probes, where the scratch servers are the whole fleet. Without it a
+/// survey would read every database this machine serves.
+fn own_fleet() -> bool {
+    let own = std::env::var_os("HARBOR_HOME").is_some();
+    if !own {
+        println!("set HARBOR_HOME to a scratch directory to survey the fleet; skipping");
+    }
+    own
 }
 
 #[test]
 #[ignore]
-fn the_real_fleet_lists_and_answers() {
+fn the_fleet_lists_the_scratch_database() {
+    if !own_fleet() {
+        return;
+    }
+    let Some(_conn) = scratch() else { return };
+    let db = fleet_path(&scratch_db().unwrap());
     let fleet = fleet::survey();
     if let Some(w) = &fleet.warning {
         println!("warning: {w}");
@@ -29,33 +94,33 @@ fn the_real_fleet_lists_and_answers() {
             println!("    note: {note}");
         }
     }
-    assert!(!fleet.rows.is_empty(), "no berths known to config or runtime");
+    let row = fleet.rows.iter().find(|r| r.path.as_deref().map(fleet_path) == Some(db.clone()));
+    assert!(row.is_some_and(|r| r.state.is_live()), "the scratch database is not a running row");
+}
+
+/// A database file's path as the fleet compares it: canonical.
+fn fleet_path(db: &std::path::Path) -> std::path::PathBuf {
+    harbor_client::paths::canonical_db(db).expect("a database path")
 }
 
 #[test]
 #[ignore]
 fn a_live_berth_yields_identity() {
-    let Some(row) = connectable() else {
-        println!("no berth to test against; skipping");
-        return;
-    };
-    let conn = connect(&row.name).expect("connect");
+    let Some(conn) = scratch() else { return };
     let identity = info(&conn).expect("info");
     println!(
         "{}: duckdb {} harbor {} db {}",
         identity.name, identity.duckdb_version, identity.harbor_version, identity.database
     );
-    assert_eq!(identity.name, row.name);
+    // The server is the one on the scratch file. Its name is its own to
+    // choose: the config's, when the file is attached under another.
+    assert_eq!(fleet_path(std::path::Path::new(&identity.database)), fleet_path(&scratch_db().unwrap()));
 }
 
 #[test]
 #[ignore]
 fn a_live_berth_answers_sql() {
-    let Some(row) = connectable() else {
-        println!("no berth to test against; skipping");
-        return;
-    };
-    let conn = connect(&row.name).expect("connect");
+    let Some(conn) = scratch() else { return };
     let result = harbor_client::query(&conn, "SELECT 1 AS one, 'two' AS two, NULL AS three")
         .expect("query");
     println!(
@@ -111,11 +176,7 @@ fn an_open_database_outlives_harbors_linger() {
 #[ignore]
 fn a_session_carries_a_transaction_with_bound_params() {
     use serde_json::json;
-    let Some(row) = connectable() else {
-        println!("no berth to test against; skipping");
-        return;
-    };
-    let conn = connect(&row.name).expect("connect");
+    let Some(conn) = scratch() else { return };
     let sid = harbor_client::session_new(&conn).expect("session");
     let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
         harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
@@ -179,11 +240,7 @@ fn a_session_carries_a_transaction_with_bound_params() {
 #[test]
 #[ignore]
 fn keyless_base_tables_expose_rowid() {
-    let Some(row) = connectable() else {
-        println!("no berth to test against; skipping");
-        return;
-    };
-    let conn = connect(&row.name).expect("connect");
+    let Some(conn) = scratch() else { return };
     // Find any base table, then probe the rowid pseudocolumn through
     // the same wire the grid would use.
     let tables = harbor_client::query(
@@ -224,11 +281,7 @@ fn keyless_base_tables_expose_rowid() {
 #[ignore]
 fn document_and_blob_cells_bind_as_what_they_are() {
     use serde_json::json;
-    let Some(row) = connectable() else {
-        println!("no berth to test against; skipping");
-        return;
-    };
-    let conn = connect(&row.name).expect("connect");
+    let Some(conn) = scratch() else { return };
     let sid = harbor_client::session_new(&conn).expect("session");
     let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
         harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
@@ -303,11 +356,7 @@ fn document_and_blob_cells_bind_as_what_they_are() {
 #[ignore]
 fn a_duplicate_row_copies_in_sql_what_the_wire_cannot_carry() {
     use serde_json::json;
-    let Some(row) = connectable() else {
-        println!("no berth to test against; skipping");
-        return;
-    };
-    let conn = connect(&row.name).expect("connect");
+    let Some(conn) = scratch() else { return };
     let sid = harbor_client::session_new(&conn).expect("session");
     let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
         harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
@@ -438,11 +487,7 @@ fn a_duplicate_row_copies_in_sql_what_the_wire_cannot_carry() {
 #[ignore]
 fn wide_integers_and_non_finite_doubles_bind_as_text() {
     use serde_json::json;
-    let Some(row) = connectable() else {
-        println!("no berth to test against; skipping");
-        return;
-    };
-    let conn = connect(&row.name).expect("connect");
+    let Some(conn) = scratch() else { return };
     let sid = harbor_client::session_new(&conn).expect("session");
     let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
         harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
@@ -508,11 +553,7 @@ fn wide_integers_and_non_finite_doubles_bind_as_text() {
 #[ignore]
 fn a_float_key_names_its_row_through_a_cast() {
     use serde_json::json;
-    let Some(row) = connectable() else {
-        println!("no berth to test against; skipping");
-        return;
-    };
-    let conn = connect(&row.name).expect("connect");
+    let Some(conn) = scratch() else { return };
     let sid = harbor_client::session_new(&conn).expect("session");
     let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
         harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
@@ -586,11 +627,7 @@ fn a_float_key_names_its_row_through_a_cast() {
 #[ignore]
 fn a_container_of_documents_or_blobs_is_corrupted_by_its_own_text() {
     use serde_json::json;
-    let Some(row) = connectable() else {
-        println!("no berth to test against; skipping");
-        return;
-    };
-    let conn = connect(&row.name).expect("connect");
+    let Some(conn) = scratch() else { return };
     let sid = harbor_client::session_new(&conn).expect("session");
     let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
         harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
@@ -659,11 +696,7 @@ fn a_container_of_documents_or_blobs_is_corrupted_by_its_own_text() {
 #[ignore]
 fn a_document_cell_takes_strict_json_a_hundred_levels_deep() {
     use serde_json::json;
-    let Some(row) = connectable() else {
-        println!("no berth to test against; skipping");
-        return;
-    };
-    let conn = connect(&row.name).expect("connect");
+    let Some(conn) = scratch() else { return };
     let sid = harbor_client::session_new(&conn).expect("session");
     let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
         harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
@@ -729,12 +762,7 @@ fn a_document_cell_takes_strict_json_a_hundred_levels_deep() {
 #[ignore]
 fn a_float_cell_holds_what_rounds_to_a_float() {
     use serde_json::json;
-    let Some(row) = connectable() else {
-        println!("no berth to test against; skipping");
-        return;
-    };
-    println!("berth: {}", row.name);
-    let conn = connect(&row.name).expect("connect");
+    let Some(conn) = scratch() else { return };
     let sid = harbor_client::session_new(&conn).expect("session");
     let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
         harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
@@ -787,12 +815,7 @@ fn a_float_cell_holds_what_rounds_to_a_float() {
 #[ignore]
 fn null_typed_into_a_blob_cell_is_three_bytes() {
     use serde_json::json;
-    let Some(row) = connectable() else {
-        println!("no berth to test against; skipping");
-        return;
-    };
-    println!("berth: {}", row.name);
-    let conn = connect(&row.name).expect("connect");
+    let Some(conn) = scratch() else { return };
     let sid = harbor_client::session_new(&conn).expect("session");
     let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
         harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
@@ -826,12 +849,7 @@ fn null_typed_into_a_blob_cell_is_three_bytes() {
 #[ignore]
 fn padding_is_part_of_a_value_only_for_text_json_and_enum() {
     use serde_json::json;
-    let Some(row) = connectable() else {
-        println!("no berth to test against; skipping");
-        return;
-    };
-    println!("berth: {}", row.name);
-    let conn = connect(&row.name).expect("connect");
+    let Some(conn) = scratch() else { return };
     let sid = harbor_client::session_new(&conn).expect("session");
     let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
         harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
@@ -897,13 +915,8 @@ fn padding_is_part_of_a_value_only_for_text_json_and_enum() {
 #[ignore]
 fn a_table_altered_elsewhere_shows_in_the_next_page() {
     use serde_json::json;
-    let Some(row) = connectable() else {
-        println!("no berth to test against; skipping");
-        return;
-    };
-    println!("berth: {}", row.name);
-    let grid = connect(&row.name).expect("connect");
-    let other = connect(&row.name).expect("connect again");
+    let Some(grid) = scratch() else { return };
+    let other = scratch().expect("connect again");
     let elsewhere = harbor_client::session_new(&other).expect("session");
     let alter = |sql: &str| harbor_client::exec(&other, sql, None, Some(&elsewhere)).expect(sql);
     let shape = |r: &harbor_client::QueryResult| -> Vec<(String, String)> {
@@ -940,4 +953,624 @@ fn a_table_altered_elsewhere_shows_in_the_next_page() {
     assert_eq!(stored.rows, vec![vec![json!("7172733D")], vec![json!("AABB")]]);
     alter("DROP TABLE main._dt_reshape_probe");
     harbor_client::session_release(&other, &elsewhere);
+}
+
+/// Why a list or struct cell refuses a backslash escape other than `\"` and
+/// `\\` (ducktable's `lossy_escape`). The grid shows a newline inside a list
+/// as `\n`, the JSON spelling; bound back bare, the engine's cast reads a
+/// backslash inside quotes as "take the next character as it is" and stores
+/// the letter. Outside quotes it keeps the backslash.
+#[test]
+#[ignore]
+fn a_container_cast_reads_an_escape_as_plain_characters() {
+    use serde_json::json;
+    let Some(conn) = scratch() else { return };
+    let sid = harbor_client::session_new(&conn).expect("session");
+    let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
+        harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
+    };
+    run("DROP TABLE IF EXISTS _dt_escape_probe", None);
+    run(
+        "CREATE TEMP TABLE _dt_escape_probe(id INTEGER PRIMARY KEY, l VARCHAR[], s STRUCT(b VARCHAR))",
+        None,
+    );
+    run(
+        "INSERT INTO _dt_escape_probe VALUES (1, ['line' || chr(10) || 'break', 'x'], {'b': 'tab' || chr(9) || 'here'})",
+        None,
+    );
+    let shown = run("SELECT l, s FROM _dt_escape_probe", None);
+    // What the cell shows: serde's text of the wire value.
+    let list = shown.rows[0][0].to_string();
+    let record = shown.rows[0][1].to_string();
+    println!("the cells show {list} and {record}");
+    assert_eq!(list, r#"["line\nbreak","x"]"#);
+    assert_eq!(record, r#"{"b":"tab\there"}"#);
+
+    // That text typed back, with only `x` changed to `y`: the statement
+    // succeeds and the first element has lost its newline.
+    run("BEGIN", None);
+    let hit = run(
+        "UPDATE _dt_escape_probe SET l = ?, s = ? WHERE id = ?",
+        Some(vec![json!(list.replace("\"x\"", "\"y\"")), json!(record), json!(1)]),
+    );
+    assert_eq!(hit.rows[0][0].as_u64(), Some(1));
+    let after = run("SELECT l[1], l[2], s.b FROM _dt_escape_probe", None);
+    println!("stored: {:?}", after.rows[0]);
+    assert_eq!(after.rows[0], vec![json!("linenbreak"), json!("y"), json!("tabthere")]);
+    run("ROLLBACK", None);
+
+    // Every escape but the quote and the backslash loses its meaning.
+    for (typed, stored) in [
+        (r#"["a\rb"]"#, "arb"),
+        (r#"["a\bb"]"#, "abb"),
+        (r#"["a\fb"]"#, "afb"),
+        (r#"["a\u0001b"]"#, "au0001b"),
+        (r#"["C:\dir"]"#, "C:dir"),
+        (r"['a\nb']", "anb"),
+        // The two the cast reads back as the character they name.
+        (r#"["q\"uote"]"#, "q\"uote"),
+        (r#"["back\\slash"]"#, "back\\slash"),
+        // Outside quotes a backslash is kept, except before a quote.
+        (r"[C:\dir]", r"C:\dir"),
+        (r"[a\nb]", r"a\nb"),
+        (r#"[a\"b]"#, "a\"b"),
+    ] {
+        let read = run("SELECT (?::VARCHAR[])[1]", Some(vec![json!(typed)]));
+        println!("{typed} -> {}", read.rows[0][0]);
+        assert_eq!(read.rows[0][0], json!(stored), "{typed}");
+    }
+    run("DROP TABLE _dt_escape_probe", None);
+    harbor_client::session_release(&conn, &sid);
+}
+
+/// Why a UNION cell refuses typed text. The text is bound as a VARCHAR, and
+/// the engine stores a VARCHAR under the member of that type whatever the
+/// cell showed; with no VARCHAR member the cast fails.
+#[test]
+#[ignore]
+fn a_union_stores_typed_text_under_its_varchar_member() {
+    use serde_json::json;
+    let Some(conn) = scratch() else { return };
+    let sid = harbor_client::session_new(&conn).expect("session");
+    let run = |sql: &str, params: Option<Vec<serde_json::Value>>| {
+        harbor_client::exec(&conn, sql, params, Some(&sid)).expect(sql)
+    };
+    run("DROP TABLE IF EXISTS _dt_union_probe", None);
+    run(
+        "CREATE TEMP TABLE _dt_union_probe(id INTEGER PRIMARY KEY, u UNION(n INTEGER, s VARCHAR), d UNION(n INTEGER, f DOUBLE))",
+        None,
+    );
+    run("INSERT INTO _dt_union_probe VALUES (1, union_value(n := 7), union_value(n := 7))", None);
+    let shown = run("SELECT u FROM _dt_union_probe", None);
+    let cell = shown.rows[0][0].to_string();
+    println!("the cell shows {cell}");
+    assert_eq!(cell, r#"{"tag":"n","value":7}"#);
+
+    for typed in ["8", cell.as_str()] {
+        run("BEGIN", None);
+        run("UPDATE _dt_union_probe SET u = ? WHERE id = ?", Some(vec![json!(typed), json!(1)]));
+        let after = run("SELECT union_tag(u)::VARCHAR, u.s FROM _dt_union_probe", None);
+        println!("{typed} -> {:?}", after.rows[0]);
+        assert_eq!(after.rows[0], vec![json!("s"), json!(typed)], "{typed}");
+        run("ROLLBACK", None);
+    }
+    // No VARCHAR member: the statement fails, which at ⌘S is the whole commit.
+    run("BEGIN", None);
+    let refused = harbor_client::exec(
+        &conn,
+        "UPDATE _dt_union_probe SET d = ? WHERE id = ?",
+        Some(vec![json!("8"), json!(1)]),
+        Some(&sid),
+    );
+    println!("without a VARCHAR member: {refused:?}", refused = refused.as_ref().err());
+    assert!(refused.is_err());
+    run("ROLLBACK", None);
+    run("DROP TABLE _dt_union_probe", None);
+    harbor_client::session_release(&conn, &sid);
+}
+
+/// What the engine does with decimal text, which the editor's range check
+/// mirrors (ducktable's `decimal_fits`): digits past the scale round half
+/// away from zero, the rounded value is held to `width - scale` integer
+/// digits, and the digits before an exponent are held to them too.
+#[test]
+#[ignore]
+fn a_decimal_cast_rounds_to_its_scale_and_refuses_past_its_width() {
+    use serde_json::json;
+    let Some(conn) = scratch() else { return };
+    let cast = |text: &str, ty: &str| {
+        harbor_client::exec(
+            &conn,
+            &format!("SELECT (?::VARCHAR)::{ty}"),
+            Some(vec![json!(text)]),
+            None,
+        )
+        .map(|r| r.rows[0][0].clone())
+    };
+    for (text, stored) in [
+        ("999.99", "999.99"),
+        ("999.994", "999.99"),
+        ("-999.994", "-999.99"),
+        ("123.456", "123.46"),
+        ("0.005", "0.01"),
+        ("0.004", "0.00"),
+        ("1e2", "100.00"),
+        ("100e-2", "1.00"),
+        ("0.001e3", "1.00"),
+        ("9.99994e2", "999.99"),
+        ("1e-1000", "0.00"),
+        (".5", "0.50"),
+        ("5.", "5.00"),
+        ("+1.5", "1.50"),
+        ("00012.5", "12.50"),
+        ("00999e-1", "99.90"),
+    ] {
+        assert_eq!(cast(text, "DECIMAL(5,2)"), Ok(json!(stored)), "{text}");
+    }
+    for text in [
+        "12345.6", "1000", "999.995", "-999.995", "999.999", "1e3", "9.99999e2", "0.1e4",
+        "99999e-2", "9999e-1", "1000e-1", "1234.5e-1", "1e40",
+    ] {
+        let refused = cast(text, "DECIMAL(5,2)");
+        assert!(refused.is_err(), "{text}: {refused:?}");
+    }
+    assert_eq!(cast("0.99994", "DECIMAL(4,4)"), Ok(json!("0.9999")));
+    assert!(cast("0.99995", "DECIMAL(4,4)").is_err());
+    assert!(cast("1", "DECIMAL(4,4)").is_err());
+    assert_eq!(cast("999999999999999999.4", "DECIMAL(18,0)"), Ok(json!("999999999999999999")));
+    assert!(cast("999999999999999999.5", "DECIMAL(18,0)").is_err());
+    assert_eq!(cast("999999999999999.9994", "DECIMAL"), Ok(json!("999999999999999.999")));
+    assert!(cast("1000000000000000", "DECIMAL").is_err());
+}
+
+/// What the Query view's transactions stand on (ducktable's `query.rs`): a
+/// session holds a transaction across requests, other connections do not see
+/// it until COMMIT, a statement that fails to parse leaves it as it was, any
+/// other error aborts it, a COMMIT of an aborted one answers and rolls back,
+/// and a released session is gone by name.
+#[test]
+#[ignore]
+fn a_session_holds_a_transaction_the_way_the_query_view_expects() {
+    use harbor_client::Failure;
+    use serde_json::json;
+    let Some(conn) = scratch() else { return };
+    let alone = |sql: &str| harbor_client::exec_checked(&conn, sql, None, None);
+    alone("CREATE OR REPLACE TABLE _dt_txn_probe(id INTEGER PRIMARY KEY, v VARCHAR)").expect("create");
+    alone("INSERT INTO _dt_txn_probe VALUES (1, 'a')").expect("insert");
+
+    // Alone, a BEGIN opens nothing a later request can join: Harbor either
+    // refuses it outright or answers and discards it. Either way a ROLLBACK
+    // sent alone finds no transaction, and the view never sends a BEGIN alone.
+    match alone("BEGIN") {
+        Ok(_) => println!("BEGIN alone: answered, and discarded with its connection"),
+        Err(Failure::Refused { code, message }) => {
+            println!("BEGIN alone: refused ({code}): {message}");
+            assert_eq!(code, "sql_error");
+        }
+        Err(other) => panic!("BEGIN alone: {other}"),
+    }
+    assert!(matches!(alone("ROLLBACK"), Err(Failure::Refused { .. })));
+
+    let session = harbor_client::session_open(&conn).expect("session");
+    println!("session: lives {:?}, idles out after {:?}", session.ttl, session.idle);
+    assert!(!session.ttl.is_zero() && !session.idle.is_zero());
+    let held = |sql: &str| harbor_client::exec_checked(&conn, sql, None, Some(&session.id));
+    let value = |r: Result<harbor_client::QueryResult, Failure>| r.expect("select").rows[0][0].clone();
+
+    held("BEGIN").expect("BEGIN");
+    held("UPDATE _dt_txn_probe SET v = 'b' WHERE id = 1").expect("update");
+    assert_eq!(value(held("SELECT v FROM _dt_txn_probe")), json!("b"), "the session sees its own write");
+    assert_eq!(value(alone("SELECT v FROM _dt_txn_probe")), json!("a"), "nobody else does");
+
+    // A statement that does not parse never ran: the transaction is as it was.
+    let parse = held("COMMIT foo").unwrap_err();
+    println!("COMMIT foo: {parse}");
+    assert!(matches!(&parse, Failure::Refused { message, .. } if message.starts_with("Parser Error")));
+    assert_eq!(value(held("SELECT v FROM _dt_txn_probe")), json!("b"));
+    held("ROLLBACK").expect("ROLLBACK");
+    assert_eq!(value(alone("SELECT v FROM _dt_txn_probe")), json!("a"), "rolled back");
+
+    // Any other error aborts it, and a second BEGIN is such an error.
+    held("BEGIN").expect("BEGIN");
+    held("UPDATE _dt_txn_probe SET v = 'c' WHERE id = 1").expect("update");
+    let again = held("BEGIN").unwrap_err();
+    println!("BEGIN inside one: {again}");
+    let aborted = held("SELECT 1").unwrap_err();
+    println!("then SELECT 1: {aborted}");
+    assert!(aborted.to_string().contains("aborted"));
+    // COMMIT answers, and what it does is roll back.
+    held("COMMIT").expect("COMMIT of an aborted transaction answers");
+    assert_eq!(value(alone("SELECT v FROM _dt_txn_probe")), json!("a"), "nothing landed");
+    assert!(matches!(held("ROLLBACK"), Err(Failure::Refused { .. })), "and the transaction is over");
+
+    // A COMMIT the engine refuses ends the transaction rolled back.
+    let other = harbor_client::session_open(&conn).expect("second session");
+    let rival = |sql: &str| harbor_client::exec_checked(&conn, sql, None, Some(&other.id));
+    held("BEGIN").expect("BEGIN");
+    held("INSERT INTO _dt_txn_probe VALUES (50, 'mine')").expect("insert");
+    rival("BEGIN").expect("BEGIN");
+    rival("INSERT INTO _dt_txn_probe VALUES (50, 'theirs')").expect("insert");
+    rival("COMMIT").expect("the first COMMIT lands");
+    let lost = held("COMMIT").unwrap_err();
+    println!("the second COMMIT: {lost}");
+    assert!(matches!(&lost, Failure::Refused { code, .. } if code == "sql_error"));
+    assert!(!lost.session_gone());
+    assert!(matches!(held("ROLLBACK"), Err(Failure::Refused { .. })), "no transaction is left");
+    assert_eq!(value(alone("SELECT v FROM _dt_txn_probe WHERE id = 50")), json!("theirs"));
+    harbor_client::session_release(&conn, &other.id);
+
+    // Released with a transaction open: rolled back, and gone by name.
+    held("BEGIN").expect("BEGIN");
+    held("UPDATE _dt_txn_probe SET v = 'd' WHERE id = 1").expect("update");
+    harbor_client::session_release(&conn, &session.id);
+    let gone = held("SELECT 1").unwrap_err();
+    println!("after release: {gone}");
+    assert!(gone.session_gone());
+    assert_eq!(value(alone("SELECT v FROM _dt_txn_probe WHERE id = 1")), json!("a"));
+    alone("DROP TABLE _dt_txn_probe").expect("drop");
+}
+
+/// A session left idle is reclaimed by Harbor with its transaction rolled
+/// back, and one touched inside its idle window is kept: the Query view's
+/// keepalive. Takes as long as the idle timeout the server grants, plus a
+/// few seconds.
+#[test]
+#[ignore]
+fn a_session_touched_in_time_outlives_its_idle_timeout() {
+    use serde_json::json;
+    let Some(conn) = scratch() else { return };
+    let alone = |sql: &str| harbor_client::exec_checked(&conn, sql, None, None);
+    alone("CREATE OR REPLACE TABLE _dt_idle_probe(v VARCHAR)").expect("create");
+    alone("INSERT INTO _dt_idle_probe VALUES ('a')").expect("insert");
+
+    let kept = harbor_client::session_open(&conn).expect("session");
+    let left = harbor_client::session_open(&conn).expect("session");
+    let on = |id: &str, sql: &str| harbor_client::exec_checked(&conn, sql, None, Some(id));
+    on(&kept.id, "BEGIN").expect("BEGIN");
+    on(&left.id, "BEGIN").expect("BEGIN");
+    on(&kept.id, "UPDATE _dt_idle_probe SET v = 'kept'").expect("update");
+
+    // Past the idle timeout, one session touched at a third of it.
+    let until = std::time::Instant::now() + kept.idle + std::time::Duration::from_secs(4);
+    while std::time::Instant::now() < until {
+        std::thread::sleep(kept.idle / 3);
+        on(&kept.id, "SELECT 1").expect("the touched session answers");
+    }
+    let reclaimed = on(&left.id, "SELECT 1").unwrap_err();
+    println!("the idle session: {reclaimed}");
+    assert!(reclaimed.session_gone());
+    on(&kept.id, "COMMIT").expect("the touched session still holds its transaction");
+    harbor_client::session_release(&conn, &kept.id);
+    let read = alone("SELECT v FROM _dt_idle_probe").expect("select");
+    assert_eq!(read.rows[0][0], json!("kept"));
+    alone("DROP TABLE _dt_idle_probe").expect("drop");
+}
+
+/// What `EXPLAIN ANALYZE` does to a transaction statement, which the Query
+/// view's reading of a statement's first word mirrors (ducktable's
+/// `txn_effect`): it runs it. `EXPLAIN ANALYZE COMMIT` commits, `EXPLAIN
+/// ANALYZE ROLLBACK` rolls back, `EXPLAIN ANALYZE BEGIN` opens a transaction,
+/// in every spelling of ANALYZE the engine takes; a plain `EXPLAIN` only
+/// plans; and a name that merely begins with a keyword is a name.
+#[test]
+#[ignore]
+fn explain_analyze_runs_the_transaction_statement_it_explains() {
+    use harbor_client::Failure;
+    use serde_json::json;
+    let Some(conn) = scratch() else { return };
+    let alone = |sql: &str| harbor_client::exec_checked(&conn, sql, None, None);
+    alone("CREATE OR REPLACE TABLE _dt_explain_probe(id INTEGER PRIMARY KEY, v VARCHAR)").expect("create");
+    alone("INSERT INTO _dt_explain_probe VALUES (1, 'a')").expect("insert");
+    let committed = || alone("SELECT v FROM _dt_explain_probe").expect("select").rows[0][0].clone();
+    // Run `statement` inside a transaction that has written 'z', and say
+    // whether a transaction is still open afterwards and what is committed.
+    let inside = |statement: &str| {
+        let session = harbor_client::session_open(&conn).expect("session");
+        let held = |sql: &str| harbor_client::exec_checked(&conn, sql, None, Some(&session.id));
+        held("BEGIN").expect("BEGIN");
+        held("UPDATE _dt_explain_probe SET v = 'z'").expect("update");
+        let answer = held(statement);
+        let open = held("ROLLBACK").is_ok();
+        harbor_client::session_release(&conn, &session.id);
+        let stored = committed();
+        alone("UPDATE _dt_explain_probe SET v = 'a'").expect("reset");
+        println!("{statement:?}: {}, transaction {}, committed {stored}",
+            if answer.is_ok() { "answered" } else { "refused" },
+            if open { "still open" } else { "ended" });
+        (answer, open, stored)
+    };
+
+    for statement in [
+        "EXPLAIN ANALYZE COMMIT", "explain analyze commit", "EXPLAIN ANALYSE COMMIT",
+        "EXPLAIN ANALYZE END", "EXPLAIN (ANALYZE) COMMIT", "EXPLAIN (ANALYZE, FORMAT JSON) COMMIT",
+        "EXPLAIN (FORMAT JSON, ANALYZE) COMMIT", "EXPLAIN (ANALYZE false) COMMIT",
+        "EXPLAIN ANALYZE (FORMAT JSON) COMMIT", "EXPLAIN /* c */ ANALYZE -- d\n COMMIT",
+        "COMMIT--x", "-- c\rCOMMIT",
+    ] {
+        let (answer, open, stored) = inside(statement);
+        assert!(answer.is_ok() && !open, "{statement}");
+        assert_eq!(stored, json!("z"), "{statement} committed");
+    }
+    for statement in ["EXPLAIN ANALYZE ROLLBACK", "EXPLAIN ANALYZE ABORT"] {
+        let (answer, open, stored) = inside(statement);
+        assert!(answer.is_ok() && !open, "{statement}");
+        assert_eq!(stored, json!("a"), "{statement} rolled back");
+    }
+    // A plain EXPLAIN plans and runs nothing.
+    for statement in ["EXPLAIN COMMIT", "EXPLAIN (FORMAT JSON) COMMIT"] {
+        let (answer, open, stored) = inside(statement);
+        assert!(answer.is_ok() && open, "{statement}");
+        assert_eq!(stored, json!("a"), "{statement}");
+    }
+    // A name is not the keyword it begins with, quoted or not: the engine
+    // looks for a table, and the transaction stays open, aborted.
+    for statement in ["COMMIT_X", "COMMIT1", "COMMIT$x", "COMMITé", "\"COMMIT\"", "(COMMIT)", "EXPLAIN (FORMAT JSON) ANALYZE COMMIT"] {
+        let (answer, open, stored) = inside(statement);
+        assert!(matches!(&answer, Err(Failure::Refused { message, .. }) if message.starts_with("Catalog Error")), "{statement}: {answer:?}");
+        assert!(open, "{statement}");
+        assert_eq!(stored, json!("a"), "{statement}");
+    }
+
+    // EXPLAIN ANALYZE BEGIN opens a transaction on its session.
+    for statement in ["EXPLAIN ANALYZE BEGIN", "EXPLAIN ANALYZE START TRANSACTION", "EXPLAIN (ANALYZE) BEGIN"] {
+        let session = harbor_client::session_open(&conn).expect("session");
+        let held = |sql: &str| harbor_client::exec_checked(&conn, sql, None, Some(&session.id));
+        held(statement).expect(statement);
+        held("UPDATE _dt_explain_probe SET v = 'y'").expect("update");
+        assert_eq!(committed(), json!("a"), "{statement}: the write is not committed");
+        held("ROLLBACK").expect("a transaction was open");
+        harbor_client::session_release(&conn, &session.id);
+        assert_eq!(committed(), json!("a"), "{statement}");
+        println!("{statement:?}: opened a transaction");
+    }
+    for statement in ["EXPLAIN BEGIN", "\"BEGIN\"", "BEGIN_X"] {
+        let session = harbor_client::session_open(&conn).expect("session");
+        let held = |sql: &str| harbor_client::exec_checked(&conn, sql, None, Some(&session.id));
+        let _ = held(statement);
+        assert!(held("ROLLBACK").is_err(), "{statement}: no transaction was opened");
+        harbor_client::session_release(&conn, &session.id);
+    }
+    alone("DROP TABLE _dt_explain_probe").expect("drop");
+}
+
+/// Which errors leave a transaction usable, which the Query view's `never_ran`
+/// and docs/QUERY.md state: only one the parser raises. After every other
+/// class the next statement answers that the transaction is aborted.
+#[test]
+#[ignore]
+fn only_a_parse_error_leaves_a_transaction_usable() {
+    use harbor_client::Failure;
+    use serde_json::json;
+    let Some(conn) = scratch() else { return };
+    let alone = |sql: &str| harbor_client::exec_checked(&conn, sql, None, None);
+    alone(
+        "CREATE OR REPLACE TABLE _dt_abort_probe(id INTEGER PRIMARY KEY, v VARCHAR, \
+         n INTEGER NOT NULL DEFAULT 0, CHECK (n >= 0))",
+    )
+    .expect("create");
+    alone("INSERT INTO _dt_abort_probe VALUES (1, 'a', 0)").expect("insert");
+    // Run `statement` inside a transaction that has written 'tx'; the class
+    // of its error, and whether the next statement still reads that write.
+    let after = |statement: &str, params: Option<Vec<serde_json::Value>>| {
+        let session = harbor_client::session_open(&conn).expect("session");
+        let held = |sql: &str| harbor_client::exec_checked(&conn, sql, None, Some(&session.id));
+        held("BEGIN").expect("BEGIN");
+        held("UPDATE _dt_abort_probe SET v = 'tx' WHERE id = 1").expect("update");
+        let failure = harbor_client::exec_checked(&conn, statement, params, Some(&session.id))
+            .expect_err(statement);
+        let Failure::Refused { code, message } = failure else { panic!("{statement}: no answer") };
+        assert_eq!(code, "sql_error", "{statement}");
+        let next = held("SELECT v FROM _dt_abort_probe WHERE id = 1");
+        let usable = match &next {
+            Ok(read) => read.rows[0][0] == json!("tx"),
+            Err(aborted) => {
+                assert!(aborted.to_string().contains("Current transaction is aborted"), "{statement}: {aborted}");
+                false
+            }
+        };
+        harbor_client::session_release(&conn, &session.id);
+        let class = message.split(':').next().unwrap_or_default().to_string();
+        println!("{class:<26} {statement:?}: {}", if usable { "usable" } else { "aborted" });
+        (class, usable)
+    };
+
+    for statement in ["SELEC 1", "COMMIT foo", "SELECT * FROM (\nUPDATE _dt_abort_probe SET v = 'w'\n) LIMIT 5 OFFSET 0"] {
+        assert_eq!(after(statement, None), ("Parser Error".to_string(), true), "{statement}");
+    }
+    for (statement, class) in [
+        ("SELECT * FROM _dt_nope", "Catalog Error"),
+        ("SELECT _dt_nofunc(1)", "Catalog Error"),
+        ("SELECT nocol FROM _dt_abort_probe", "Binder Error"),
+        ("SELECT 1 + DATE '2024-01-01' + TRUE", "Binder Error"),
+        ("INSERT INTO _dt_abort_probe VALUES (1, 'dup', 0)", "Constraint Error"),
+        ("INSERT INTO _dt_abort_probe VALUES (9, 'x', NULL)", "Constraint Error"),
+        ("INSERT INTO _dt_abort_probe VALUES (9, 'x', -1)", "Constraint Error"),
+        ("SELECT 'abc'::INTEGER", "Conversion Error"),
+        ("UPDATE _dt_abort_probe SET n = v::INTEGER WHERE id = 1", "Conversion Error"),
+        ("SELECT 2147483647::INTEGER + 1::INTEGER", "Out of Range Error"),
+        ("SELECT error('boom')", "Invalid Input Error"),
+        ("BEGIN", "TransactionContext Error"),
+        ("SELECT * FROM (\nSELECT * FROM _dt_nope\n) LIMIT 5 OFFSET 0", "Catalog Error"),
+    ] {
+        assert_eq!(after(statement, None), (class.to_string(), false), "{statement}");
+    }
+    // A parameter the request did not bring.
+    assert_eq!(after("SELECT ?::INTEGER", Some(vec![])), ("Invalid Input Error".to_string(), false));
+    alone("DROP TABLE _dt_abort_probe").expect("drop");
+}
+
+/// Stop reaches the server of one file and no other, though both report the
+/// same name: two files with one stem. A second database of the scratch
+/// one's file name is started in a directory beside it and stopped by its
+/// path; the scratch one keeps answering.
+#[test]
+#[ignore]
+fn a_stop_shuts_down_only_the_server_of_its_own_file() {
+    let Some(conn) = scratch() else { return };
+    let scratch_db = scratch_db().unwrap();
+    let dir = scratch_db.parent().expect("a directory").join("_dt_stop_probe");
+    std::fs::create_dir_all(&dir).expect("probe directory");
+    let twin = dir.join(scratch_db.file_name().expect("a file name"));
+
+    let other = fleet::connect_path(&twin).expect("the twin starts on demand");
+    let (mine, theirs) = (info(&conn).expect("info"), info(&other).expect("info"));
+    println!("two servers: {} on {}, {} on {}", mine.name, mine.database, theirs.name, theirs.database);
+    assert_ne!(fleet_path(std::path::Path::new(&mine.database)), fleet_path(std::path::Path::new(&theirs.database)));
+    harbor_client::query(&other, "SELECT 1").expect("the twin answers");
+
+    fleet::stop(&twin).expect("stop");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while harbor_client::query(&other, "SELECT 1").is_ok() {
+        assert!(std::time::Instant::now() < deadline, "the twin was not stopped");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    harbor_client::query(&conn, "SELECT 1").expect("the scratch database was not the one stopped");
+    // Stopping what is not running is no error.
+    fleet::stop(&twin).expect("stop again");
+    drop(other);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Two databases with one file name are two rows, and each row connects to
+/// its own file: the survey tells them apart by path, says which is which,
+/// and `connect_file` reaches the file it is given under the name they share.
+/// Needs a `HARBOR_HOME` of its own; no remote is involved, and no SSH.
+#[test]
+#[ignore]
+fn rows_of_one_name_each_connect_to_their_own_file() {
+    if !own_fleet() {
+        return;
+    }
+    let Some(conn) = scratch() else { return };
+    let scratch_db = scratch_db().unwrap();
+    let dir = scratch_db.parent().expect("a directory").join("_dt_rows_probe");
+    std::fs::create_dir_all(&dir).expect("probe directory");
+    let twin = dir.join(scratch_db.file_name().expect("a file name"));
+    let other = fleet::connect_path(&twin).expect("the twin starts on demand");
+
+    let (here, there) = (fleet_path(&scratch_db), fleet_path(&twin));
+    let rows = fleet::survey().rows;
+    let row_of = |db: &std::path::Path| {
+        rows.iter()
+            .find(|r| r.path.as_deref().map(fleet_path).as_deref() == Some(db))
+            .unwrap_or_else(|| panic!("no row for {}", db.display()))
+    };
+    let (mine, theirs) = (row_of(&here), row_of(&there));
+    println!("rows: {} at {:?}, {} at {:?}", mine.name, mine.path, theirs.name, theirs.path);
+    assert!(mine.state.is_live() && theirs.state.is_live());
+    if mine.name == theirs.name {
+        // One name, two rows: each says which file it is.
+        for row in [mine, theirs] {
+            let note = row.note.as_deref().unwrap_or_default();
+            assert!(note.starts_with("The file "), "{}: {note:?}", row.name);
+        }
+    }
+
+    // Each row dials its own file, though the name is the other's too.
+    for (row, db) in [(mine, &here), (theirs, &there)] {
+        let dialed = fleet::connect_file(&row.name, row.path.as_deref().unwrap()).expect("connect_file");
+        let serving = info(&dialed).expect("info").database;
+        assert_eq!(&fleet_path(std::path::Path::new(&serving)), db, "{} reached {serving}", row.name);
+        assert_eq!(dialed.db.as_deref(), Some(db.as_path()));
+        assert!(!dialed.summoned, "it was already running");
+    }
+    // A count never starts a server: a file nothing serves is not joined.
+    let absent = dir.join("_dt_absent.duckdb");
+    assert!(fleet::join_file(&mine.name, &absent).is_none());
+    assert!(!absent.exists(), "and none was created");
+
+    fleet::stop(&twin).expect("stop");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while harbor_client::query(&other, "SELECT 1").is_ok() {
+        assert!(std::time::Instant::now() < deadline, "the twin was not stopped");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    harbor_client::query(&conn, "SELECT 1").expect("the scratch database still answers");
+    drop(other);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// What a commit whose answer was lost does before it reads the page
+/// (ducktable's `Grid::commit`): it ends the commit's session and waits for
+/// it to be over. An idle session is rolled back before Harbor answers the
+/// release; one still running a statement is cancelled, and stays in
+/// Harbor's list until the statement returns.
+#[test]
+#[ignore]
+fn an_ended_session_is_over_before_the_page_is_read() {
+    use harbor_client::{session_end, Ended};
+    use serde_json::json;
+    let Some(conn) = scratch() else { return };
+    let patience = std::time::Duration::from_secs(15);
+    let alone = |sql: &str| harbor_client::exec_checked(&conn, sql, None, None);
+    alone("CREATE OR REPLACE TABLE _dt_end_probe(v VARCHAR)").expect("create");
+    alone("INSERT INTO _dt_end_probe VALUES ('a')").expect("insert");
+    let stored = || alone("SELECT v FROM _dt_end_probe").expect("select").rows[0][0].clone();
+
+    // Idle, with a write uncommitted: over at once, and rolled back.
+    let idle = harbor_client::session_open(&conn).expect("session");
+    let on = |id: &str, sql: &str| harbor_client::exec_checked(&conn, sql, None, Some(id));
+    on(&idle.id, "BEGIN").expect("BEGIN");
+    on(&idle.id, "UPDATE _dt_end_probe SET v = 'b'").expect("update");
+    assert_eq!(session_end(&conn, &idle.id, patience), Ended::Settled);
+    assert_eq!(stored(), json!("a"));
+    // The same write can be made at once: nothing of the session lingers.
+    alone("UPDATE _dt_end_probe SET v = v").expect("no conflict with an ended session");
+    // Ending what is already over, or never was, is settled too.
+    assert_eq!(session_end(&conn, &idle.id, patience), Ended::Settled);
+    assert_eq!(session_end(&conn, "no-such-session", patience), Ended::Settled);
+
+    // Busy with a statement that would run for a long time: the end cancels
+    // it and returns once Harbor has let the session go.
+    let busy = harbor_client::session_open(&conn).expect("session");
+    on(&busy.id, "BEGIN").expect("BEGIN");
+    on(&busy.id, "UPDATE _dt_end_probe SET v = 'c'").expect("update");
+    let (running, id) = (conn.clone(), busy.id.clone());
+    let statement = std::thread::spawn(move || {
+        harbor_client::exec_checked(
+            &running,
+            "SELECT count(*) FROM range(200000000000) t(i) WHERE i % 7 = 3",
+            None,
+            Some(&id),
+        )
+    });
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let began = std::time::Instant::now();
+    let ended = session_end(&conn, &busy.id, patience);
+    println!("a busy session ended as {ended:?} in {:?}", began.elapsed());
+    assert_eq!(ended, Ended::Settled);
+    let answer = statement.join().expect("the statement's thread");
+    println!("its statement: {:?}", answer.as_ref().err().map(ToString::to_string));
+    assert!(answer.is_err(), "the statement was cancelled");
+    assert_eq!(stored(), json!("a"), "and its transaction rolled back");
+    assert!(on(&busy.id, "SELECT 1").unwrap_err().session_gone());
+    alone("DROP TABLE _dt_end_probe").expect("drop");
+}
+
+/// A request that cannot be sent is told apart from one that got no answer
+/// (ducktable's `commit_verdict`): only the second leaves a COMMIT in doubt.
+#[test]
+#[ignore]
+fn a_statement_on_a_stopped_server_was_not_sent() {
+    use harbor_client::Failure;
+    let Some(_conn) = scratch() else { return };
+    let scratch_db = scratch_db().unwrap();
+    let dir = scratch_db.parent().expect("a directory").join("_dt_unsent_probe");
+    std::fs::create_dir_all(&dir).expect("probe directory");
+    let twin = dir.join("unsent.duckdb");
+    let other = fleet::connect_path(&twin).expect("the twin starts on demand");
+    harbor_client::exec_checked(&other, "SELECT 1", None, None).expect("it answers");
+    fleet::stop(&twin).expect("stop");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let failure = loop {
+        match harbor_client::exec_checked(&other, "COMMIT", None, None) {
+            Err(failure @ Failure::Unsent(_)) => break failure,
+            // Still draining: it answers, or hangs up mid-answer.
+            _ if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(100)),
+            other => panic!("the stopped server still answers: {other:?}"),
+        }
+    };
+    println!("on a stopped server: {failure:?}");
+    drop(other);
+    let _ = std::fs::remove_dir_all(dir);
 }

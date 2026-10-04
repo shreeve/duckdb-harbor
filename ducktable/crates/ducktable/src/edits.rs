@@ -1,7 +1,8 @@
 //! The staging layer (docs/EDITING.md): every change the user has made
 //! and not yet committed, keyed by row identity — the primary-key
-//! columns' original fetched values — never by grid position. The view
-//! can sort, filter, and page freely; nothing here moves.
+//! columns' original fetched values, or the rowid-and-hash pair of a table
+//! without a key — never by grid position. The view can sort, filter, and
+//! page freely; nothing here moves.
 //!
 //! This module is pure model: no GPUI, no HTTP. The grid projects it
 //! onto the current page for rendering; commit turns it into
@@ -113,6 +114,15 @@ pub struct Edits {
     undo: Vec<Vec<Op>>,
     redo: Vec<Vec<Op>>,
     next_draft: u64,
+    /// The COMMIT that sent this set got no answer, so the database may
+    /// already hold it. While the doubt stands the set is held: nothing is
+    /// staged into it, it yields no statements, and it has no undo history,
+    /// since every step of that history predates a commit that may have
+    /// landed. The user reviews it against the database, discards what
+    /// landed, which cannot then be brought back, and stages what is left
+    /// again (`resolve_in_doubt`). The flag stays with the set, which a
+    /// table switch parks and hands back.
+    in_doubt: bool,
 }
 
 /// What a grid does with the staged set parked for its table.
@@ -157,6 +167,7 @@ impl Edits {
             undo: Vec::new(),
             redo: Vec::new(),
             next_draft: 1,
+            in_doubt: false,
         }
     }
 
@@ -192,6 +203,35 @@ impl Edits {
     /// Whether anything is staged.
     pub fn any_staged(&self) -> bool {
         !self.changes.is_empty()
+    }
+
+    /// How many rows carry a staged change.
+    pub fn len(&self) -> usize {
+        self.changes.len()
+    }
+
+    /// Record that the COMMIT which sent this set got no answer. The undo
+    /// history goes with the certainty: a step back would restore a state
+    /// from before a commit that may have landed, and a discarded change
+    /// could come back to be sent a second time.
+    pub fn mark_in_doubt(&mut self) {
+        if self.changes.is_empty() {
+            return;
+        }
+        self.in_doubt = true;
+        self.undo.clear();
+        self.redo.clear();
+    }
+
+    /// Whether the set is held because the commit that sent it got no answer.
+    pub fn in_doubt(&self) -> bool {
+        self.in_doubt
+    }
+
+    /// The user has reviewed the held set against the database and stages
+    /// what is left of it again: it is an ordinary staged set from here.
+    pub fn resolve_in_doubt(&mut self) {
+        self.in_doubt = false;
     }
 
     /// How the review popover names the row a duplicate copies: every key
@@ -259,6 +299,17 @@ impl Edits {
             .collect();
         v.sort_by(|a, b| a.0.cmp(b.0));
         v
+    }
+
+    /// What the grid draws on its page: every staged change, or none while
+    /// the set is held (`in_doubt`). A held set may have landed, and its
+    /// identities were read before it did, so on the page fetched after the
+    /// commit they can name other rows: a staged DELETE of id 7 would ghost
+    /// the row a staged re-key of 3 to 7 made, and the re-key would show on
+    /// no row at all. The page shows the database, and the set is reviewed
+    /// in the popover, which lists `entries`.
+    pub fn projection(&self) -> Vec<(&str, &[Value], &RowChange)> {
+        if self.in_doubt { Vec::new() } else { self.entries() }
     }
 
     pub fn column_name(&self, ix: usize) -> &str {
@@ -361,6 +412,11 @@ impl Edits {
     }
 
     fn apply(&mut self, op: Op) {
+        // A held set takes no staging (`in_doubt`); `discard` is its one
+        // mutation, and does not come through here.
+        if self.in_doubt {
+            return;
+        }
         match &op.next {
             Some(change) => {
                 self.changes.insert(
@@ -390,9 +446,10 @@ impl Edits {
         }
     }
 
-    /// Stage one cell. Editing a value back to its original auto-cleans;
-    /// editing a cell on a staged-deleted row first un-stages the delete
-    /// (you cannot edit a ghost). One entry per cell, last wins.
+    /// Stage one cell. Editing a value back to its original auto-cleans.
+    /// A row staged for deletion takes no cell edit: the DELETE stands until
+    /// it is undone or discarded, and a cell staged over it would replace it
+    /// with an UPDATE. One entry per cell, last wins.
     pub fn stage_cell(
         &mut self,
         identity: Vec<Value>,
@@ -403,6 +460,9 @@ impl Edits {
     ) {
         let key = key_of(&identity);
         let prev = self.changes.get(&key).map(|e| e.change.clone());
+        if matches!(prev, Some(RowChange::Delete)) {
+            return;
+        }
         let mut cells = match &prev {
             Some(RowChange::Update(cells)) => cells.clone(),
             _ => BTreeMap::new(),
@@ -439,8 +499,16 @@ impl Edits {
     }
 
     /// Discard one row's staged change (the review popover's per-entry
-    /// action). Itself undoable.
+    /// action). Itself undoable, except from a held set (`in_doubt`): a
+    /// change discarded there is one the user found in the database, and
+    /// undo must not bring it back to be sent again. Discarding the last
+    /// one ends the doubt, with nothing left to doubt and nothing to undo.
     pub fn discard(&mut self, key: &str) {
+        if self.in_doubt {
+            self.changes.remove(key);
+            self.in_doubt = !self.changes.is_empty();
+            return;
+        }
         let Some(entry) = self.changes.get(key) else { return };
         let op = Op {
             key: key.to_string(),
@@ -492,6 +560,7 @@ impl Edits {
         self.changes.clear();
         self.undo.clear();
         self.redo.clear();
+        self.in_doubt = false;
     }
 
     /// The staged set as parameterized statements: inserts, updates,
@@ -504,8 +573,14 @@ impl Edits {
     /// run before any update or delete, so that row is read as the
     /// database holds it, whatever else is staged on it; and a source row
     /// that is gone returns no row, which commit refuses.
+    ///
+    /// A held set (`in_doubt`) yields none: it may already be in the
+    /// database, and is not sent again until it has been staged again.
     pub fn statements(&self) -> Vec<Statement> {
         let mut out = Vec::new();
+        if self.in_doubt {
+            return out;
+        }
         // The table as the WHERE sees it: aliased when the row itself is
         // hashed, since `hash("t")` names a column if the table has one
         // called `t`, and an alias no column shares cannot.
@@ -751,6 +826,20 @@ fn integer_bounds(name: &str) -> Option<(i128, u128)> {
     })
 }
 
+/// Whether a type is a number by its own name: an integer of any width
+/// (HUGEINT and UHUGEINT among them), the unbounded BIGNUM, a float or a
+/// decimal. A container of numbers, and a type whose spelling holds a
+/// number's — INTERVAL, `ENUM('POINT')` — is not.
+pub fn is_numeric_type(duck_type: &str) -> bool {
+    let ty = duck_type.to_uppercase();
+    let head = type_head(&ty);
+    integer_bounds(head).is_some()
+        || matches!(
+            head,
+            "BIGNUM" | "VARINT" | "DOUBLE" | "FLOAT8" | "FLOAT" | "FLOAT4" | "REAL" | "DECIMAL" | "NUMERIC"
+        )
+}
+
 /// Integer text -> its bind value, refused when it is not an integer or
 /// not in the type's range. One that fits an i64 is a JSON number. A wider
 /// one is bound as its digits, which the engine casts exactly: a JSON
@@ -850,7 +939,7 @@ pub fn confirm(text: &str, cell: &Held) -> Confirm {
 
 /// Stage-time validation: user text -> the value the statement binds.
 /// Cheap errors die closest to the fingers; CHECK/FK/UNIQUE stay the
-/// server's verdict at commit. `None` text means NULL.
+/// server's verdict at commit. `Value::Null` back means SQL NULL.
 pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
     let ty = duck_type.to_uppercase();
     let is_text = is_text_type(&ty);
@@ -889,6 +978,31 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
             ));
         }
     }
+    // A UNION's text names no member. It is bound as a VARCHAR, and the
+    // engine stores a VARCHAR under the member of that type: `8` typed over
+    // `{"tag":"n","value":7}` in a `UNION(n INTEGER, s VARCHAR)` is stored as
+    // the string '8' under `s`, and the displayed text typed back is stored
+    // whole as a string. Without a VARCHAR member the cast fails at commit.
+    if type_word_within(&ty, &["UNION"]).is_some() {
+        return Err(format!(
+            "typed text cannot say which member of {duck_type} it is \u{2014} edit this cell in the Query tab"
+        ));
+    }
+    // A container's text is cast by the engine, and inside a quoted string
+    // its cast reads a backslash as "take the next character as it is": `\"`,
+    // `\'` and `\\` come back as the quotes and the backslash, and every
+    // other escape loses its meaning. The cell shows a newline as `\n` and a tab
+    // as `\t`, so the text of `["line\nbreak"]` typed back would store
+    // `linenbreak`, with no error. Outside quotes the cast keeps a backslash
+    // as typed; the rule is one rule all the same, since any value can be
+    // written quoted.
+    if is_container(&ty) {
+        if let Some(escape) = lossy_escape(text) {
+            return Err(format!(
+                "typed text for {duck_type} can escape only a quote and a backslash: inside quotes the engine reads {escape} as plain characters \u{2014} edit this cell in the Query tab"
+            ));
+        }
+    }
     // Every test below is on the scalar's own name, so a nested type —
     // `INTEGER[]`, `STRUCT(a INTEGER)`, `MAP(VARCHAR, INTEGER)` — and a
     // type whose spelling happens to hold another's — INTERVAL, an
@@ -919,10 +1033,16 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
         };
     }
     if matches!(head, "DECIMAL" | "NUMERIC") {
-        // Bound as text so precision survives JSON; DuckDB casts.
-        return match text.trim().parse::<f64>() {
-            Ok(v) if v.is_finite() => Ok(Value::String(text.trim().to_string())),
-            _ => Err(format!("{text:?} is not {duck_type}")),
+        // Bound as text so precision survives JSON; DuckDB casts, rounding
+        // the digits past the scale. A number whose rounded value needs more
+        // integer digits than the type has is refused here: at commit it
+        // would fail the cast and take the whole transaction with it.
+        let t = text.trim();
+        let (width, scale) = decimal_shape(&ty);
+        return match decimal_fits(t, width, scale) {
+            Some(true) => Ok(Value::String(t.to_string())),
+            Some(false) => Err(format!("{text:?} is out of range for {duck_type}")),
+            None => Err(format!("{text:?} is not {duck_type}")),
         };
     }
     if head == "BOOLEAN" {
@@ -936,6 +1056,95 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
     // text and let the engine cast — its error comes back atomically at
     // commit.
     Ok(Value::String(text.to_string()))
+}
+
+/// A type whose text the engine casts element by element: a list or an
+/// array (`INTEGER[]`, `VARCHAR[3]`), a STRUCT, a MAP. `ty` is uppercase.
+fn is_container(ty: &str) -> bool {
+    ty.ends_with(']') || matches!(type_head(ty), "STRUCT" | "MAP")
+}
+
+/// The first backslash escape in `text` that the engine's cast to a container
+/// does not read back, inside quotes, as the character it names: any but
+/// `\"`, `\'` and `\\`. A backslash that ends the text escapes nothing and
+/// counts too.
+fn lossy_escape(text: &str) -> Option<String> {
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            continue;
+        }
+        match chars.next() {
+            Some('"') | Some('\'') | Some('\\') => {}
+            Some(next) => return Some(format!("\\{next}")),
+            None => return Some("\\".to_string()),
+        }
+    }
+    None
+}
+
+/// A DECIMAL's width and scale from its type, `DECIMAL(18,3)` when it names
+/// none, as the engine reads a bare `DECIMAL`. `ty` is uppercase.
+fn decimal_shape(ty: &str) -> (u32, u32) {
+    let inside = ty.find('(').and_then(|at| ty[at + 1..].strip_suffix(')'));
+    let mut parts = inside.into_iter().flat_map(|p| p.split(',')).map(|p| p.trim().parse::<u32>());
+    match (parts.next(), parts.next()) {
+        (Some(Ok(width)), Some(Ok(scale))) => (width, scale),
+        (Some(Ok(width)), None) => (width, 0),
+        _ => (18, 3),
+    }
+}
+
+/// Whether decimal text fits `DECIMAL(width, scale)` as the engine casts it:
+/// digits past the scale are rounded, half away from zero, and what is left
+/// may have `width - scale` integer digits. `999.994` fits `DECIMAL(5,2)` and
+/// `999.995` does not, because it rounds to 1000.00. Before an exponent the
+/// engine holds the digits to the same room, so `1000e-1` does not fit
+/// where `100.0` does. None when the text is not a decimal number: digits
+/// with at most one point, an optional sign and an optional exponent.
+fn decimal_fits(text: &str, width: u32, scale: u32) -> Option<bool> {
+    let unsigned = text.strip_prefix(['-', '+']).unwrap_or(text);
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => {
+            let digits = exponent.strip_prefix(['-', '+']).unwrap_or(exponent);
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            // An exponent too long to parse is far past any DECIMAL's 38
+            // digits either way; the clamp below treats it as one.
+            let size = digits.parse::<i64>().unwrap_or(i64::MAX).min(1_000);
+            (mantissa, if exponent.starts_with('-') { -size } else { size })
+        }
+        None => (unsigned, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty() && fraction.is_empty()
+        || !whole.bytes().chain(fraction.bytes()).all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    // The digits as one run, and where the point sits in it.
+    let digits: Vec<u8> = whole.bytes().chain(fraction.bytes()).map(|b| b - b'0').collect();
+    let point = whole.len() as i64 + exponent;
+    // The digit `place` positions right of the point's left neighbor: 0 is
+    // the ones digit, 1 the tens, -1 the first fractional digit.
+    let digit_at = |place: i64| {
+        usize::try_from(point - 1 - place).ok().and_then(|ix| digits.get(ix)).copied().unwrap_or(0)
+    };
+    let room = i64::from(width.saturating_sub(scale));
+    let scale = i64::from(scale);
+    if exponent != 0 && whole.trim_start_matches('0').len() as i64 > room {
+        return Some(false);
+    }
+    // Any digit at or above 10^room is too many integer digits already.
+    let leading = (point - room).clamp(0, digits.len() as i64) as usize;
+    if digits[..leading].iter().any(|d| *d != 0) {
+        return Some(false);
+    }
+    // Rounding carries past the last integer digit only when every kept
+    // digit is a 9 and the first dropped one rounds up.
+    let all_nines = (-scale..room).all(|place| digit_at(place) == 9);
+    Some(!(all_nines && digit_at(-scale - 1) >= 5))
 }
 
 /// The deepest a document nests, the limit every first-party client keeps.
@@ -987,10 +1196,16 @@ fn json_depth(text: &str) -> usize {
 }
 
 /// The VARIANT, JSON or BLOB a container type holds — `BLOB[]`,
-/// `STRUCT(v VARIANT)`, `MAP(VARCHAR, JSON)` — if it holds one. A word of the
-/// type counts unless it is quoted (an ENUM's values, a quoted field name) or
-/// is the field name that opens a STRUCT or UNION member.
+/// `STRUCT(v VARIANT)`, `MAP(VARCHAR, JSON)` — if it holds one.
 fn document_or_blob_within(duck_type: &str) -> Option<&'static str> {
+    type_word_within(duck_type, &["VARIANT", "JSON", "BLOB"])
+}
+
+/// The first of `wanted` that `duck_type` names as a type, itself or inside
+/// it. A word of the type counts unless it is quoted (an ENUM's values, a
+/// quoted field name) or is the field name that opens a STRUCT or UNION
+/// member.
+fn type_word_within(duck_type: &str, wanted: &[&'static str]) -> Option<&'static str> {
     let ty = duck_type.to_uppercase();
     // Per open parenthesis: whether its members are written `name TYPE`.
     let mut named = Vec::new();
@@ -1012,7 +1227,7 @@ fn document_or_blob_within(duck_type: &str) -> Option<&'static str> {
         if !word.is_empty() {
             if expect_name {
                 expect_name = false;
-            } else if let Some(found) = ["VARIANT", "JSON", "BLOB"].into_iter().find(|t| *t == word) {
+            } else if let Some(found) = wanted.iter().copied().find(|t| *t == word) {
                 return Some(found);
             }
             last_word = std::mem::take(&mut word);
@@ -1205,7 +1420,6 @@ mod tests {
             ("[1.5, nan]", "DOUBLE[]"),
             ("[19.99]", "DECIMAL(10,2)[]"),
             ("[a, b]", "VARCHAR[]"),
-            ("7", "UNION(n INTEGER, s VARCHAR)"),
         ] {
             assert_eq!(parse_value(text, ty), Ok(json!(text)), "{ty}");
             assert!(!is_text_type(ty), "{ty}");
@@ -1833,7 +2047,6 @@ mod tests {
         // A name is not a type: a field, an ENUM's value, a quoted identifier.
         for ty in [
             "STRUCT(json INTEGER, blob VARCHAR, variant DATE)",
-            "UNION(blob INTEGER, json VARCHAR)",
             "STRUCT(\"JSON\" INTEGER, \"a \"\"BLOB\"\" b\" VARCHAR)",
             "ENUM('BLOB', 'JSON', 'it''s a VARIANT')",
             "STRUCT(a DECIMAL(10,2), json INTEGER)",
@@ -1843,10 +2056,272 @@ mod tests {
             assert_eq!(document_or_blob_within(ty), None, "{ty}");
             assert_eq!(parse_value("x", ty), Ok(json!("x")), "{ty}");
         }
+        // A UNION's member names are names too; the UNION itself is refused
+        // for its own reason (`a_union_refuses_typed_text`).
+        assert_eq!(document_or_blob_within("UNION(blob INTEGER, json VARCHAR)"), None);
         // The three themselves are not containers of themselves.
         assert_eq!(parse_value("qrs=", "BLOB"), Ok(json!("qrs=")));
         assert_eq!(parse_value("[]", "VARIANT"), Ok(json!("[]")));
         assert_eq!(parse_value("[]", "JSON"), Ok(json!("[]")));
+    }
+
+    #[test]
+    fn a_union_refuses_typed_text() {
+        // Measured: `8` bound into `UNION(n INTEGER, s VARCHAR)` is stored
+        // under `s` as the string '8', whichever member the cell showed.
+        for ty in [
+            "UNION(n INTEGER, s VARCHAR)",
+            "union(n INTEGER, s VARCHAR)",
+            "UNION(n INTEGER, d DATE)",
+            "UNION(n INTEGER, s VARCHAR)[]",
+            "STRUCT(u UNION(n INTEGER, s VARCHAR), k INTEGER)",
+            "MAP(VARCHAR, UNION(a INTEGER, b DOUBLE))",
+        ] {
+            for text in ["8", "{\"tag\":\"n\",\"value\":8}", "x"] {
+                let err = parse_value(text, ty).unwrap_err();
+                assert!(err.contains("which member of") && err.contains(ty) && err.contains("Query tab"), "{ty}: {err}");
+                assert!(matches!(confirm(text, &persisted(ty, Some("{\"tag\":\"n\",\"value\":7}"), None)), Confirm::Refuse(_)));
+            }
+            // NULL is a value of a UNION, and the text the cell holds is kept.
+            assert_eq!(parse_value("null", ty), Ok(Value::Null), "{ty}");
+            assert_eq!(confirm("", &persisted(ty, Some("x"), None)), Confirm::Stage(None, Value::Null), "{ty}");
+            assert_eq!(confirm("x", &persisted(ty, Some("x"), None)), Confirm::Keep, "{ty}");
+        }
+        // A name is not a type: a field or an ENUM value called union.
+        for ty in ["STRUCT(\"union\" INTEGER)", "STRUCT(union INTEGER)", "ENUM('UNION', 'x')"] {
+            assert_eq!(parse_value("x", ty), Ok(json!("x")), "{ty}");
+        }
+    }
+
+    #[test]
+    fn a_container_refuses_an_escape_the_engine_does_not_read_back() {
+        // Measured: `'["line\nbreak"]'::VARCHAR[]` is `linenbreak`, and
+        // `{"b":"tab\there"}` as a STRUCT is `tabthere`; `\"` and `\\` are
+        // the quote and the backslash. Quoted, `"C:\dir"` is `C:dir`.
+        for ty in ["VARCHAR[]", "VARCHAR[2]", "STRUCT(b VARCHAR, n INTEGER)", "MAP(VARCHAR, VARCHAR)", "STRUCT(a VARCHAR[])[]"] {
+            for (text, escape) in [
+                (r#"["line\nbreak", "y"]"#, r"\n"),
+                (r#"{"b":"tab\there"}"#, r"\t"),
+                (r#"["a\rb"]"#, r"\r"),
+                (r#"["a\u0001b"]"#, r"\u"),
+                (r#"["ok\\", "then\b"]"#, r"\b"),
+                (r#"["C:\dir"]"#, r"\d"),
+                (r"[a\", "\\"),
+            ] {
+                let err = parse_value(text, ty).unwrap_err();
+                assert!(
+                    err.contains(&format!("the engine reads {escape} as plain characters"))
+                        && err.contains(&format!("typed text for {ty} "))
+                        && err.contains("Query tab"),
+                    "{ty} {text}: {err}"
+                );
+                // A typed edit of a cell that holds one is refused; leaving it,
+                // clearing it and NULL are not.
+                assert!(matches!(confirm(text, &persisted(ty, Some("[]"), None)), Confirm::Refuse(_)), "{ty}");
+                assert_eq!(confirm(text, &persisted(ty, Some(text), None)), Confirm::Keep, "{ty}");
+                assert_eq!(confirm("", &persisted(ty, Some(text), None)), Confirm::Stage(None, Value::Null), "{ty}");
+            }
+            // The two escapes the cast reads back, and text with none.
+            for text in [r#"["q\"uote"]"#, r#"["back\\slash"]"#, r#"["a\\\"b"]"#, r#"["plain", "it's"]"#, "[a, b]", r"['it\'s']", r#"["it\'s"]"#] {
+                assert_eq!(parse_value(text, ty), Ok(json!(text)), "{ty} {text}");
+            }
+        }
+        // Text is not cast element by element: a backslash in a VARCHAR is
+        // a backslash, and a document goes through JSON, which reads `\n`.
+        assert_eq!(parse_value(r"a\nb", "VARCHAR"), Ok(json!(r"a\nb")));
+        assert_eq!(parse_value(r#"["a\nb"]"#, "VARIANT"), Ok(json!(r#"["a\nb"]"#)));
+        assert_eq!(parse_value(r#"["a\nb"]"#, "JSON"), Ok(json!(r#"["a\nb"]"#)));
+        assert_eq!(lossy_escape(r#"\\n \" \\\\"#), None);
+        assert_eq!(lossy_escape(r"\\\n").as_deref(), Some(r"\n"));
+    }
+
+    #[test]
+    fn a_decimal_is_held_to_its_width_and_rounded_to_its_scale() {
+        // Measured against the engine for DECIMAL(5,2): digits past the scale
+        // round half away from zero, and the rounded value has three integer
+        // digits or the cast fails.
+        for text in [
+            "999.99", "-999.99", "999.994", "-999.994", "123.456", "0.005", "0.004", "-0.0001",
+            "1e2", "12e0", "100e-2", "1e-3", ".5", "5.", "+1.5", " 12.5 ", "00012.5", "0", "999",
+            "0.001e3", "9.99994e2", "0.1e3", "-1e2", "1E+02", "1e-1000", "999.99e0", "00999e-1",
+            "0.0000000000000000000000000000000000000001",
+        ] {
+            assert_eq!(parse_value(text, "DECIMAL(5,2)"), Ok(json!(text.trim())), "{text}");
+        }
+        for text in [
+            "12345.6", "1000", "-1000", "999.995", "-999.995", "999.999", "1e3", "100000e-2",
+            "1e40", "1e999999999999999999999", "99999", "9.99999e2", "0.1e4", "-1e3",
+            // The digits before an exponent are held to the integer room too.
+            "99999e-2", "9999e-1", "1000e-1", "1234.5e-1",
+        ] {
+            let err = parse_value(text, "DECIMAL(5,2)").unwrap_err();
+            assert!(err.contains("out of range for DECIMAL(5,2)"), "{text}: {err}");
+        }
+        for text in ["abc", "nan", "inf", "-", "+", ".", "1e", "e5", "1.2.3", "0x10", "--1", "1 2"] {
+            let err = parse_value(text, "DECIMAL(5,2)").unwrap_err();
+            assert!(err.contains("is not DECIMAL(5,2)"), "{text}: {err}");
+        }
+        // The editor is stricter than the engine in one spelling: the engine
+        // reads an underscore between digits as a separator (measured,
+        // `'1_0'::DECIMAL(5,2)` is 10.00), and the editor takes digits only.
+        assert!(parse_value("1_0", "DECIMAL(5,2)").unwrap_err().contains("is not DECIMAL(5,2)"));
+        // No integer digits at all, none past the point, and the widest type.
+        assert!(parse_value("0.9999", "DECIMAL(4,4)").is_ok());
+        assert!(parse_value("0.99994", "DECIMAL(4,4)").is_ok());
+        assert!(parse_value("0.99995", "DECIMAL(4,4)").is_err());
+        assert!(parse_value("1", "DECIMAL(4,4)").is_err());
+        assert!(parse_value("999999999999999999", "DECIMAL(18,0)").is_ok());
+        assert!(parse_value("999999999999999999.4", "DECIMAL(18,0)").is_ok());
+        assert!(parse_value("999999999999999999.5", "DECIMAL(18,0)").is_err());
+        assert!(parse_value("1000000000000000000", "DECIMAL(18,0)").is_err());
+        assert!(parse_value(&"9".repeat(38), "DECIMAL(38,0)").is_ok());
+        assert!(parse_value(&"9".repeat(39), "DECIMAL(38,0)").is_err());
+        assert!(parse_value(&format!("{}.{}", "9".repeat(28), "9".repeat(10)), "DECIMAL(38,10)").is_ok());
+        // NUMERIC is the same type, and a bare DECIMAL is DECIMAL(18,3).
+        assert!(parse_value("12345.6", "NUMERIC(5,2)").is_err());
+        assert_eq!(decimal_shape("DECIMAL"), (18, 3));
+        assert_eq!(decimal_shape("DECIMAL(10)"), (10, 0));
+        assert_eq!(decimal_shape("NUMERIC(38, 10)"), (38, 10));
+        assert!(parse_value("999999999999999.9994", "DECIMAL").is_ok());
+        assert!(parse_value("1000000000000000", "DECIMAL").is_err());
+        // A container of DECIMALs is the engine's to judge.
+        assert_eq!(parse_value("[12345.6]", "DECIMAL(5,2)[]"), Ok(json!("[12345.6]")));
+    }
+
+    #[test]
+    fn a_set_whose_commit_got_no_answer_is_held_until_it_is_staged_again() {
+        let mut e = edits();
+        // Nothing staged, nothing in doubt.
+        e.mark_in_doubt();
+        assert!(!e.in_doubt());
+
+        let draft = e.stage_insert();
+        e.stage_cell(vec![json!(1)], 1, txt("a"), txt("b"), json!("b"));
+        e.stage_delete(vec![json!(7)]);
+        assert_eq!(e.statements().len(), 3);
+        e.mark_in_doubt();
+        assert!(e.in_doubt());
+        // Held, it is still the set, for review and for the count...
+        assert_eq!(e.counts(), (1, 1, 1));
+        assert_eq!(e.entries().len(), 3);
+        // ...but it yields nothing to send, takes no staging, and has no
+        // history: every step of it predates a commit that may have landed.
+        assert!(e.statements().is_empty());
+        e.stage_cell(vec![json!(2)], 1, txt("x"), txt("y"), json!("y"));
+        e.stage_delete(vec![json!(3)]);
+        e.stage_insert();
+        assert_eq!(e.counts(), (1, 1, 1));
+        assert!(!e.undo() && !e.redo());
+
+        // Staged again after review, it is an ordinary set.
+        e.resolve_in_doubt();
+        assert!(!e.in_doubt());
+        assert_eq!(e.statements().len(), 3);
+        e.discard(&draft);
+        assert!(e.undo(), "and its own gestures undo as ever");
+        assert_eq!(e.counts(), (1, 1, 1));
+
+        // A commit that lands clears the doubt with the set.
+        e.mark_in_doubt();
+        e.clear();
+        assert!(!e.in_doubt() && e.is_empty());
+    }
+
+    #[test]
+    fn a_held_set_is_reviewed_but_not_drawn_on_the_page() {
+        // A staged DELETE of id 7 and a re-key of 3 to 7. The commit lands
+        // and its answer is lost: the row keyed 7 on the refetched page is
+        // the one that was 3.
+        let mut e = edits();
+        e.stage_delete(vec![json!(7)]);
+        e.stage_cell(vec![json!(3)], 0, txt("3"), txt("7"), json!(7));
+        assert_eq!(e.projection().len(), 2);
+        e.mark_in_doubt();
+        // Nothing of it is drawn: no delete ghost on the row that is 7 at
+        // present, no edit shown on a row 3 that is gone.
+        assert!(e.projection().is_empty());
+        // All of it is listed for review, and none of it can be sent.
+        assert_eq!(e.entries().len(), 2);
+        assert!(e.statements().is_empty());
+        // Discarding the re-key, which the page shows has landed, does not
+        // make the DELETE sendable: the set is held until it is staged again,
+        // and then the page draws the ghost on the row it would delete.
+        e.discard(&key_of(&[json!(3)]));
+        assert!(e.in_doubt() && e.statements().is_empty() && e.projection().is_empty());
+        e.resolve_in_doubt();
+        assert_eq!(e.projection().len(), 1);
+        assert!(matches!(e.projection()[0].2, RowChange::Delete));
+        assert_eq!(e.statements().len(), 1);
+    }
+
+    #[test]
+    fn a_change_discarded_from_a_held_set_cannot_be_undone_back() {
+        // The double INSERT: the commit landed, its answer was lost, the
+        // user discards the draft the page shows is there, and then ⌘Z.
+        let mut e = edits();
+        let draft = e.stage_insert();
+        e.stage_insert_cell(&draft, 1, txt("Ada"), json!("Ada"));
+        e.stage_cell(vec![json!(1)], 1, txt("a"), txt("b"), json!("b"));
+        e.mark_in_doubt();
+
+        e.discard(&draft);
+        assert!(e.in_doubt(), "the rest is still in doubt");
+        assert_eq!(e.counts(), (0, 1, 0));
+        assert!(!e.undo(), "the discarded draft does not come back");
+        assert!(!e.redo());
+        assert_eq!(e.counts(), (0, 1, 0));
+
+        // Discard-all, the popover's gesture, is the same one grouped.
+        e.grouped(|e| e.discard(&key_of(&[json!(1)])));
+        assert!(e.is_empty());
+        assert!(!e.in_doubt(), "nothing left, nothing in doubt");
+        assert!(!e.undo() && !e.redo(), "and nothing to undo back into a second send");
+        assert!(e.statements().is_empty());
+
+        // What is staged afterwards is new work with its own history.
+        let fresh = e.stage_insert();
+        assert_eq!(e.statements().len(), 1);
+        assert!(e.undo());
+        assert!(e.is_empty());
+        assert!(!e.is_untouched_insert(&fresh));
+    }
+
+    #[test]
+    fn a_number_is_known_by_its_own_type_name() {
+        // Every numeric type name Harbor sends, measured from the engine, and
+        // the aliases beside them.
+        for ty in [
+            "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT",
+            "UINTEGER", "UBIGINT", "UHUGEINT", "FLOAT", "DOUBLE", "DECIMAL(5,2)", "BIGNUM",
+            "bigint", "VARINT", "REAL", "NUMERIC(5,0)",
+        ] {
+            assert!(is_numeric_type(ty), "{ty}");
+        }
+        for ty in ["INTERVAL", "INTEGER[]", "INTEGER[3]", "ENUM('POINT', 'INT')", "STRUCT(a INTEGER)", "VARCHAR", "POINT_2D", "DATE", ""] {
+            assert!(!is_numeric_type(ty), "{ty}");
+        }
+    }
+
+    #[test]
+    fn a_row_staged_for_deletion_takes_no_cell_edit() {
+        // ⌃⇧N, Delete and the editor all stage through `stage_cell`: on a
+        // row staged for deletion none of them may swap the DELETE for an
+        // UPDATE.
+        let mut e = edits();
+        let key = key_of(&[json!(1)]);
+        e.stage_delete(vec![json!(1)]);
+        e.stage_cell(vec![json!(1)], 2, txt("3"), None, Value::Null);
+        e.stage_cell(vec![json!(1)], 1, txt("a"), txt("b"), json!("b"));
+        assert!(e.is_deleted(&key));
+        assert_eq!(e.counts(), (0, 0, 1));
+        assert_eq!(e.statements().len(), 1);
+        assert!(e.statements()[0].sql.starts_with("DELETE"));
+        // The delete is still one undo step, and the row takes edits again
+        // once it is back.
+        assert!(e.undo());
+        assert!(e.is_empty());
+        e.stage_cell(vec![json!(1)], 2, txt("3"), None, Value::Null);
+        assert_eq!(e.counts(), (0, 1, 0));
     }
 
     #[test]

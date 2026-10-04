@@ -46,12 +46,16 @@ pub struct SetTheme {
 }
 
 /// Right-click → Stop on a sidebar berth: shut its server down. Carries the
-/// berth name as data, the way SetTheme carries its index, so one action
-/// serves every row the sidebar lists.
+/// row's database file as data, the way SetTheme carries its index, so one
+/// action serves every row the sidebar lists. The file is what is stopped;
+/// the name is only what a failure is reported under, since two databases
+/// can share one. The path is carried as the path it is, like every action
+/// below: a file name need not be UTF-8.
 #[derive(Clone, Default, PartialEq, Debug, Action)]
 #[action(namespace = ducktable, no_json)]
 pub struct StopBerth {
     pub name: String,
+    pub path: std::path::PathBuf,
 }
 
 /// Right-click → Start a stopped berth. The rest of the lifecycle menu carries
@@ -59,21 +63,21 @@ pub struct StopBerth {
 #[derive(Clone, Default, PartialEq, Debug, Action)]
 #[action(namespace = ducktable, no_json)]
 pub struct StartBerth {
-    pub path: String,
+    pub path: std::path::PathBuf,
 }
 
 /// Right-click → Attach: add the berth to config.toml.
 #[derive(Clone, Default, PartialEq, Debug, Action)]
 #[action(namespace = ducktable, no_json)]
 pub struct AttachBerth {
-    pub path: String,
+    pub path: std::path::PathBuf,
 }
 
 /// Right-click → Detach: remove the berth from config.toml.
 #[derive(Clone, Default, PartialEq, Debug, Action)]
 #[action(namespace = ducktable, no_json)]
 pub struct DetachBerth {
-    pub path: String,
+    pub path: std::path::PathBuf,
 }
 
 /// Right-click → Autostart: the checkmark item. `on` carries the side to flip
@@ -82,7 +86,7 @@ pub struct DetachBerth {
 #[derive(Clone, Default, PartialEq, Debug, Action)]
 #[action(namespace = ducktable, no_json)]
 pub struct ToggleAutostart {
-    pub path: String,
+    pub path: std::path::PathBuf,
     pub on: bool,
 }
 
@@ -241,6 +245,89 @@ fn app_menus(can_update: bool) -> Vec<Menu> {
             MenuItem::action("Toggle Full Screen", ToggleFullScreen),
         ]),
     ]
+}
+
+/// Quit, asking first when that would lose something (docs/EDITING.md,
+/// "Dialogs"): staged changes in any table, text in an open cell editor, a
+/// commit or a Query statement still in flight, a transaction open in the
+/// Query view. ⌘Q, the menu's Quit and the window's close button all come
+/// here.
+///
+/// The dialog is the app's own, not the platform's alert, because Cancel
+/// has to be its default. Measured on the alert GPUI builds: a first button
+/// titled Cancel takes Esc and gives up Return, so the alert has no default,
+/// and GPUI seats the keyboard focus on the other button, where Space
+/// presses it. Here Return and Esc both go back, and the button that
+/// discards and quits is no tab stop, so the keyboard cannot reach it: it
+/// answers only to a click.
+fn request_quit(window: &mut Window, cx: &mut App) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::dialog::{DialogClose, DialogFooter};
+
+    let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) else {
+        cx.quit();
+        return;
+    };
+    if view.read(cx).quit_risks(cx).question().is_none() {
+        cx.quit();
+        return;
+    }
+    if view.update(cx, |this, _| std::mem::replace(&mut this.asking_to_quit, true)) {
+        return;
+    }
+    window.open_dialog(cx, move |dialog, _, cx| {
+        // What is at risk is read each time the dialog is drawn, not once
+        // when it opened: a commit that settles under it has by then landed
+        // or kept its edits, and the text follows.
+        let question = view.read(cx).quit_risks(cx).question().unwrap_or(app::QuitQuestion {
+            message: "Quit DuckTable?".to_string(),
+            detail: "Nothing is left that quitting would lose.".to_string(),
+            confirm: "Quit",
+        });
+        // Going back, by Return, Esc or the Cancel button.
+        let stay = {
+            let view = view.clone();
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                view.update(cx, |this, _| this.asking_to_quit = false);
+                true
+            }
+        };
+        let quit = {
+            let view = view.clone();
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                view.update(cx, |this, cx| this.release_for_quit(cx));
+                cx.quit();
+            }
+        };
+        dialog
+            .title(question.message.clone())
+            .overlay_closable(false)
+            .close_button(false)
+            .child(div().text_sm().child(question.detail.clone()))
+            .footer(
+                DialogFooter::new()
+                    .child(
+                        Button::new("quit")
+                            .label(question.confirm)
+                            .danger()
+                            .tab_stop(false)
+                            .on_click(quit),
+                    )
+                    .child(DialogClose::new().child(Button::new("cancel").label("Cancel").primary())),
+            )
+            .on_ok(stay.clone())
+            .on_cancel(stay)
+    });
+}
+
+/// Whether the quit dialog is on screen. The menu bar and its keys still
+/// work under it, and the actions that would replace the connected database
+/// check this first.
+fn asking_to_quit(cx: &App) -> bool {
+    cx.try_global::<AppView>()
+        .and_then(|v| v.0.upgrade())
+        .is_some_and(|view| view.read(cx).asking_to_quit)
 }
 
 /// The About dialog: native, version-stamped, with a link out.
@@ -453,6 +540,11 @@ fn main() {
         // PathPromptOptions has none), and none is enforced here: a wrong
         // file fails honestly in the connect card with harbor's own error.
         cx.on_action(|_: &OpenDatabase, cx| {
+            // Under the quit dialog a database is not opened: Cancel must
+            // find everything as it was.
+            if asking_to_quit(cx) {
+                return;
+            }
             let rx = cx.prompt_for_paths(PathPromptOptions {
                 files: true,
                 directories: false,
@@ -475,6 +567,9 @@ fn main() {
             .detach();
         });
         cx.on_action(|_: &OpenDatabaseUrl, cx| {
+            if asking_to_quit(cx) {
+                return;
+            }
             let view = cx.try_global::<AppView>().map(|v| v.0.clone());
             cx.defer(move |cx| {
                 let Some(view) = view else { return };
@@ -490,14 +585,15 @@ fn main() {
         // on the next tick, not re-entrantly.
         cx.on_action(|a: &StopBerth, cx| {
             let name = a.name.clone();
+            let path = a.path.clone();
             if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
                 cx.defer(move |cx| {
-                    view.update(cx, |this, cx| this.stop_berth(name, cx));
+                    view.update(cx, |this, cx| this.stop_berth(name, path, cx));
                 });
             }
         });
         cx.on_action(|a: &StartBerth, cx| {
-            let path = std::path::PathBuf::from(&a.path);
+            let path = a.path.clone();
             if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
                 cx.defer(move |cx| {
                     view.update(cx, |this, cx| this.start_berth(path, cx));
@@ -505,7 +601,7 @@ fn main() {
             }
         });
         cx.on_action(|a: &AttachBerth, cx| {
-            let path = std::path::PathBuf::from(&a.path);
+            let path = a.path.clone();
             if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
                 cx.defer(move |cx| {
                     view.update(cx, |this, cx| this.attach_berth(path, cx));
@@ -513,7 +609,7 @@ fn main() {
             }
         });
         cx.on_action(|a: &DetachBerth, cx| {
-            let path = std::path::PathBuf::from(&a.path);
+            let path = a.path.clone();
             if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
                 cx.defer(move |cx| {
                     view.update(cx, |this, cx| this.detach_berth(path, cx));
@@ -521,7 +617,7 @@ fn main() {
             }
         });
         cx.on_action(|a: &ToggleAutostart, cx| {
-            let path = std::path::PathBuf::from(&a.path);
+            let path = a.path.clone();
             let on = a.on;
             if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
                 cx.defer(move |cx| {
@@ -567,11 +663,25 @@ fn main() {
         cx.on_action(|_: &View1, cx| go_view(view_order()[0], cx));
         cx.on_action(|_: &View2, cx| go_view(view_order()[1], cx));
         cx.on_action(|_: &View3, cx| go_view(view_order()[2], cx));
-        cx.on_action(|_: &Quit, cx| cx.quit());
+        // Deferred, like every action that touches the window: a key or
+        // menu action arrives inside the window's own update.
+        cx.on_action(|_: &Quit, cx| {
+            cx.defer(|cx| {
+                let window = cx.active_window().or_else(|| cx.windows().first().copied());
+                match window {
+                    Some(w) => {
+                        w.update(cx, |_, window, cx| request_quit(window, cx)).ok();
+                    }
+                    None => cx.quit(),
+                }
+            });
+        });
         // One window, so closing it is quitting. macOS lets an app outlive
         // its windows, which suits a document app whose File menu can open
         // another; DuckTable's menus act on the window that is gone, so a
-        // bare menu bar would be a dead app still holding the Dock.
+        // bare menu bar would be a dead app still holding the Dock. The
+        // close button asks what Quit asks (`on_window_should_close` below)
+        // before the window goes.
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -669,6 +779,19 @@ fn main() {
                 // The one window's view, reachable from App-level
                 // action handlers (FitColumns above).
                 cx.set_global(AppView(view.downgrade()));
+                // Closing the window is quitting, so it asks the same
+                // question: with something to lose the window stays, and
+                // the dialog's answer decides.
+                window.on_window_should_close(cx, |window, cx| {
+                    let at_risk = cx
+                        .try_global::<AppView>()
+                        .and_then(|v| v.0.upgrade())
+                        .is_some_and(|view| view.read(cx).quit_risks(cx).question().is_some());
+                    if at_risk {
+                        request_quit(window, cx);
+                    }
+                    !at_risk
+                });
                 view.update(cx, |_, cx| {
                     // Fires on move and resize both; fullscreen
                     // frames are the display's, not the user's, so

@@ -438,8 +438,14 @@ impl Grid {
         if deletes > 0 {
             label = label.child(div().text_color(t.bad).child(plural(deletes, "delete")));
         }
-        label = label
-            .child(div().text_color(t.muted).child("\u{00b7} \u{2318}S to commit"));
+        // A set held after a commit that got no answer is not sent by ⌘S:
+        // the count says so, and opens the review that is the way out.
+        let held = self.in_doubt();
+        label = label.child(if held {
+            div().text_color(t.bad).child("\u{00b7} held: may have landed \u{00b7} review")
+        } else {
+            div().text_color(t.muted).child("\u{00b7} \u{2318}S to commit")
+        });
         gpui_kit::component::popover::Popover::new("staged-popover")
             .anchor(Anchor::BottomLeft)
             .trigger(
@@ -450,6 +456,7 @@ impl Grid {
             )
             .content(move |_, _, cx| {
                 let t = pal(cx);
+                let held = grid.read(cx).in_doubt();
                 // Snapshot the entries: (key, row title, diff lines, is_delete).
                 let items: Vec<(String, String, Vec<String>, bool)> = {
                     let g = grid.read(cx);
@@ -575,8 +582,13 @@ impl Grid {
                                     .text_xs()
                                     .text_color(t.muted)
                                     .hover(|d| d.bg(t.row_hover).text_color(t.bad))
-                                    .tooltip(|window, cx| {
-                                        Tooltip::new("Discard this change").build(window, cx)
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(if held {
+                                            "Discard this change: it landed. This cannot be undone"
+                                        } else {
+                                            "Discard this change"
+                                        })
+                                        .build(window, cx)
                                     })
                                     .child("\u{2715}")
                                     .on_click(move |_, _, cx| {
@@ -600,14 +612,19 @@ impl Grid {
                             grid.update(cx, |g, cx| g.discard_all(cx));
                         })
                 };
+                // A held set is not committed from here: what the user has
+                // not discarded is staged again, onto the page, and ⌘S sends
+                // it from there.
                 let commit = {
                     let grid = grid.clone();
                     gpui_kit::component::button::Button::new("staged-commit")
                         .primary()
                         .xsmall()
-                        .label("Commit (\u{2318}S)")
+                        .label(if held { "Stage again" } else { "Commit (\u{2318}S)" })
                         .on_click(move |_, _, cx| {
-                            grid.update(cx, |g, cx| g.commit(cx));
+                            grid.update(cx, |g, cx| {
+                                if g.in_doubt() { g.stage_again(cx) } else { g.commit(cx) }
+                            });
                         })
                 };
                 div()
@@ -632,6 +649,24 @@ impl Grid {
                             .child(div().flex_1())
                             .child(discard_all),
                     )
+                    .when(held, |d| {
+                        d.child(
+                            div()
+                                .px(px(10.))
+                                .py(px(6.))
+                                .border_b_1()
+                                .border_color(t.border)
+                                .text_xs()
+                                .text_color(t.bad)
+                                .child(
+                                    "The commit that sent these got no answer, so they may \
+                                     already be in the database. They are off the page, which \
+                                     shows the database. Discard each one the page shows has \
+                                     landed; a discard here cannot be undone. Then Stage again \
+                                     to put the rest back on the page.",
+                                ),
+                        )
+                    })
                     .child(rows)
                     .child(
                         div()

@@ -37,11 +37,13 @@ pub struct Survey {
     /// A login item exists for this berth — the menu's Autostart checkmark.
     pub autostart: bool,
     /// The database file, when this row is a local berth (not a remote). What
-    /// the lifecycle verbs target.
+    /// the lifecycle verbs target, and what a click on the row connects to
+    /// (`connect_file`): a row is dialed as what it shows, never by looking
+    /// its name up again. `None` is a configured remote, dialed by name
+    /// (`connect_remote`).
     pub path: Option<PathBuf>,
-    /// A human-readable note for an unusual row (kept for future use; the
-    /// socket-scan world has far fewer ways to be unhealthy than the
-    /// sidecar world did).
+    /// A human-readable note for a row that needs one: where a remote
+    /// connects, and which database a row is when another shares its name.
     pub note: Option<String>,
     /// Size on disk (data file + WAL) — knowable without a connection,
     /// so stopped databases answer too.
@@ -149,10 +151,66 @@ fn load_config() -> Result<config::FileConfig, String> {
     }
 }
 
-/// Every database a live socket or the config knows, sorted by name. A
-/// live server's own `/info` name wins; config entries contribute the
-/// stopped rows and the remotes. An unreadable config contributes a
-/// warning instead of silently contributing nothing.
+/// One row before anything is probed: what it is, and so what a click on
+/// it connects to.
+#[derive(Debug, PartialEq)]
+enum Planned<'a> {
+    /// A live server, by its place in the discovered list. `attached` when a
+    /// config berth names the file it serves.
+    Live { ix: usize, attached: bool },
+    /// A config berth no live server answers for.
+    Berth { name: &'a str, db: PathBuf },
+    /// A config remote.
+    Remote { name: &'a str },
+}
+
+/// Which rows a config and the live servers make. A row is the database it
+/// shows, and names do not decide that: a live server is the file it serves
+/// whatever the config calls by its name, a config berth is hidden only
+/// when a live server serves that same file, and a remote always has its
+/// row. So a local `medlabs.duckdb` and a remote named `medlabs` are two
+/// rows, each connecting to itself. `sock_of` maps a database file to the
+/// socket its server listens on, which is how a file is recognized under
+/// any spelling of its path.
+fn plan<'a>(
+    cfg: &'a config::FileConfig,
+    live: &[Live],
+    sock_of: &dyn Fn(&Path) -> Option<PathBuf>,
+) -> Vec<Planned<'a>> {
+    let berths: Vec<(&str, PathBuf, Option<PathBuf>)> = cfg
+        .berths()
+        .into_iter()
+        .filter_map(|(name, entry)| {
+            let db = entry.database()?;
+            let sock = sock_of(&db);
+            Some((name, db, sock))
+        })
+        .collect();
+    let serves = |l: &Live, db: &Path, sock: &Option<PathBuf>| {
+        l.db == db || sock.as_ref().is_some_and(|s| *s == l.sock)
+    };
+    let mut out: Vec<Planned> = live
+        .iter()
+        .enumerate()
+        .map(|(ix, l)| Planned::Live {
+            ix,
+            attached: berths.iter().any(|(_, db, sock)| serves(l, db, sock)),
+        })
+        .collect();
+    for (name, db, sock) in &berths {
+        if !live.iter().any(|l| serves(l, db, sock)) {
+            out.push(Planned::Berth { name, db: db.clone() });
+        }
+    }
+    out.extend(cfg.remotes().into_iter().map(|(name, _)| Planned::Remote { name }));
+    out
+}
+
+/// Every database a live socket or the config knows, sorted by name, a
+/// local row ahead of a remote that shares its name. Live servers carry
+/// their own `/info` name; config entries contribute the stopped rows and
+/// the remotes. An unreadable config contributes a warning instead of
+/// silently contributing nothing.
 pub fn survey() -> Fleet {
     let (cfg, mut warning) = match load_config() {
         Ok(c) => (c, None),
@@ -169,94 +227,129 @@ pub fn survey() -> Fleet {
     }
 
     let live = discover();
-    let mut out: Vec<Survey> = live
-        .iter()
-        .map(|l| Survey {
-            name: l.name.clone(),
-            state: State::Running,
-            attached: cfg.get(&l.name).is_some(),
-            autostart: harbor_common::autostart::installed(&l.name),
-            path: Some(l.db.clone()),
-            note: None,
-            size: disk_size(&l.db),
-            version: Some(l.version.clone()),
-            ephemeral: l.ephemeral,
-        })
-        .collect();
-
-    // Config entries with a local path: a row each, unless a live server
-    // already owns the name (its own /info name) or the file's socket.
-    // A server /info could not identify still answers /ready — probe both
-    // socket generations so a running database is never shown stopped.
-    if let Ok(home) = runtime_dir() {
-        for (name, entry) in cfg.berths() {
-            let Some(db) = entry.database() else { continue };
-            let sock21 = paths::socket_for(&home, &db).ok();
-            let claimed = out.iter().any(|s| s.name == name)
-                || sock21.as_ref().is_some_and(|s| live.iter().any(|l| &l.sock == s));
-            if claimed {
-                continue;
+    let home = runtime_dir().ok();
+    let sock_of =
+        |db: &Path| home.as_ref().and_then(|home| paths::socket_for(home, db).ok());
+    let mut out: Vec<Survey> = Vec::new();
+    for row in plan(&cfg, &live, &sock_of) {
+        out.push(match row {
+            Planned::Live { ix, attached } => {
+                let l = &live[ix];
+                Survey {
+                    name: l.name.clone(),
+                    state: State::Running,
+                    attached,
+                    // A login item is kept by name. When the config gives
+                    // this name to another database, the item is that one's.
+                    autostart: (attached || cfg.get(&l.name).is_none())
+                        && harbor_common::autostart::installed(&l.name),
+                    path: Some(l.db.clone()),
+                    note: None,
+                    size: disk_size(&l.db),
+                    version: Some(l.version.clone()),
+                    ephemeral: l.ephemeral,
+                }
             }
-            let running = [sock21, Some(paths::sock_file(&home, name))]
-                .into_iter()
-                .flatten()
-                .any(|s| sock_ready(&s));
-            out.push(Survey {
-                name: name.to_string(),
-                state: if running { State::Running } else { State::Stopped },
-                attached: true,
-                autostart: harbor_common::autostart::installed(name),
-                path: Some(db.clone()),
-                note: None,
-                size: disk_size(&db),
-                // A server we found only by its ready socket (not `/info`)
-                // reports no version — treat it as unknown, never outdated.
-                version: None,
-                ephemeral: false,
-            });
-        }
-    }
-
-    // Remotes have no local state at all; a probe answers for them.
-    for (name, entry) in cfg.remotes() {
-        if out.iter().any(|s| s.name == name) {
-            continue;
-        }
-        // Surveying must never open SSH sessions. A tunneled database is
-        // dialed only when the user selects it; while selected, app.rs folds
-        // the already-connected phase back into this row as Running.
-        let target = entry.url.as_deref().and_then(|url| http_target(url).ok());
-        let transport = target
-            .as_ref()
-            .filter(|target| target.is_local())
-            .map(|target| Transport::Tcp(target.addr()));
-        let alive = transport.as_ref().is_some_and(probe);
-        // Best-effort version, so the card can note a remote running behind
-        // your own binary. Informational only — you cannot restart a remote
-        // from here, so this never counts toward the upgrade badge.
-        let version = alive
-            .then(|| transport.as_ref().and_then(info_of))
-            .flatten()
-            .map(|i| i.harbor_version);
-        out.push(Survey {
-            name: name.to_string(),
-            state: if alive { State::Running } else { State::Stopped },
-            attached: true,
-            autostart: false, // a remote has no local login item
-            path: None,
-            note: target
-                .as_ref()
-                .filter(|target| !target.is_local())
-                .map(|target| format!("Connects over SSH to {}", target.host)),
-            size: None,
-            version,
-            ephemeral: false,
+            // No live server named this file in its `/info`. It is running
+            // all the same if the socket derived from its path answers, or
+            // if the socket named for it does and serves this file
+            // (`file_socket`).
+            Planned::Berth { name, db } => {
+                let named = home.as_ref().map(|home| paths::sock_file(home, name));
+                let running = file_socket(&db, sock_of(&db), named).is_some();
+                Survey {
+                    name: name.to_string(),
+                    state: if running { State::Running } else { State::Stopped },
+                    attached: true,
+                    autostart: harbor_common::autostart::installed(name),
+                    size: disk_size(&db),
+                    path: Some(db),
+                    note: None,
+                    // A server we found only by its ready socket (not `/info`)
+                    // reports no version — treat it as unknown, never outdated.
+                    version: None,
+                    ephemeral: false,
+                }
+            }
+            // Remotes have no local state at all; a probe answers for them.
+            Planned::Remote { name } => {
+                // Surveying must never open SSH sessions. A tunneled database is
+                // dialed only when the user selects it; while selected, app.rs folds
+                // the already-connected phase back into this row as Running.
+                let target = cfg
+                    .get(name)
+                    .and_then(|entry| entry.url.as_deref())
+                    .and_then(|url| http_target(url).ok());
+                let transport = target
+                    .as_ref()
+                    .filter(|target| target.is_local())
+                    .map(|target| Transport::Tcp(target.addr()));
+                let alive = transport.as_ref().is_some_and(probe);
+                // Best-effort version, so the card can note a remote running behind
+                // your own binary. Informational only — you cannot restart a remote
+                // from here, so this never counts toward the upgrade badge.
+                let version = alive
+                    .then(|| transport.as_ref().and_then(info_of))
+                    .flatten()
+                    .map(|i| i.harbor_version);
+                Survey {
+                    name: name.to_string(),
+                    state: if alive { State::Running } else { State::Stopped },
+                    attached: true,
+                    autostart: false, // a remote has no local login item
+                    path: None,
+                    note: target
+                        .as_ref()
+                        .filter(|target| !target.is_local())
+                        .map(|target| format!("Connects over SSH to {}", target.host)),
+                    size: None,
+                    version,
+                    ephemeral: false,
+                }
+            }
         });
     }
 
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.sort_by(|a, b| (&a.name, a.path.is_none()).cmp(&(&b.name, b.path.is_none())));
+    if let Some(clash) = name_clashes(&mut out)
+        && warning.is_none()
+    {
+        warning = Some(clash);
+    }
     Fleet { rows: out, warning }
 }
+
+/// Rows that share a name are different databases. Each says which it is in
+/// its note, and the sidebar's warning line says the names repeat. Takes
+/// rows sorted by name.
+fn name_clashes(rows: &mut [Survey]) -> Option<String> {
+    let mut repeated = Vec::new();
+    for ix in 0..rows.len() {
+        let before = ix > 0 && rows[ix - 1].name == rows[ix].name;
+        let after = rows.get(ix + 1).is_some_and(|next| next.name == rows[ix].name);
+        if !(before || after) {
+            continue;
+        }
+        if !before {
+            repeated.push(rows[ix].name.clone());
+        }
+        let which = match &rows[ix].path {
+            Some(path) => format!("The file {} on this machine", paths::shorten(path)),
+            None => "The remote database in your config".to_string(),
+        };
+        rows[ix].note = Some(match rows[ix].note.take() {
+            Some(note) => format!("{which}. {note}"),
+            None => which,
+        });
+    }
+    (!repeated.is_empty()).then(|| {
+        format!(
+            "more than one database is named {} — hover a row to see which it is",
+            repeated.join(", ")
+        )
+    })
+}
+
 
 /// `GET /ready` — the truth test.
 fn probe(transport: &Transport) -> bool {
@@ -278,10 +371,44 @@ fn sock_ready(sock: &Path) -> bool {
     }
 }
 
+/// The ready socket of the server on `db`: the one derived from the file's
+/// path, or else the one named for it, which is trusted only when the server
+/// behind it says in `/info` that this file is its database. A name is not a
+/// file: another database of the same name can be listening there, and a
+/// connection made to it would be labelled with this file's path, which
+/// every later Stop and comparison goes by.
+fn file_socket(db: &Path, own: Option<PathBuf>, named: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(own) = own.filter(|s| sock_ready(s)) {
+        return Some(own);
+    }
+    let named = named.filter(|s| sock_ready(s))?;
+    #[cfg(unix)]
+    let info = info_of(&Transport::Unix(named.clone()));
+    #[cfg(not(unix))]
+    let info: Option<wire::InfoResponse> = None;
+    names_file(info.as_ref().map(|i| i.database.as_str()), db).then_some(named)
+}
+
+/// Whether the database a server reports is the file `db`, under any
+/// spelling of either path. A server that reports none is not known to be.
+fn names_file(reported: Option<&str>, db: &Path) -> bool {
+    let Some(reported) = reported.filter(|r| !r.is_empty()) else { return false };
+    let reported = Path::new(reported);
+    reported == db
+        || match (paths::canonical_db(reported), paths::canonical_db(db)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+}
+
 /// A dialable connection to one database.
 #[derive(Clone)]
 pub struct Conn {
     pub name: String,
+    /// The database file this connection serves, when it is one on this
+    /// machine. `None` is a configured remote. A row and a connection are
+    /// the same database only when they agree on this as well as the name.
+    pub db: Option<PathBuf>,
     transport: Transport,
     /// Presence is shared with every clone, just like the tunnel. The final
     /// clone closes it, allowing an ephemeral Harbor server to retire.
@@ -303,7 +430,13 @@ impl Conn {
         let anchor = crate::http::hold(&transport)
             .map(Arc::new)
             .map_err(|e| format!("connecting to Harbor: {e}"))?;
-        Ok(Self { name, transport, anchor, summoned, tunnel: None })
+        Ok(Self { name, db: None, transport, anchor, summoned, tunnel: None })
+    }
+
+    /// This connection as the local database file it serves.
+    fn serving(mut self, db: &Path) -> Self {
+        self.db = Some(db.to_path_buf());
+        self
     }
 
     fn tunneled(name: String, transport: Transport, tunnel: SshTunnel) -> Result<Self, String> {
@@ -312,6 +445,7 @@ impl Conn {
             .map_err(|e| format!("connecting to Harbor through SSH: {e}"))?;
         Ok(Self {
             name,
+            db: None,
             transport,
             anchor,
             summoned: false,
@@ -327,129 +461,101 @@ impl Conn {
     }
 }
 
-/// Resolution: config entry (url, else spawn-or-join the path's server),
-/// else a live server by its own `/info` name.
-pub fn connect(name: &str) -> Result<Conn, String> {
+/// Connect to the configured remote called `name`, and to nothing else: a
+/// config berth or a live local server of that name is not it. There is no
+/// connecting by name alone. A name can belong to a local file and to a
+/// remote at once, so a caller says which it means: this, or `connect_file`.
+pub fn connect_remote(name: &str) -> Result<Conn, String> {
     // One name law for the whole fleet: harbor normalizes every name it
     // mints, so every lookup normalizes too.
     let name = harbor_common::normalize(name)?;
-    // A bare name is a question only the config can answer — a refused
-    // config must not be answered around, or a name the file defines as a
-    // remote silently joins a local server that happens to share it.
+    // A refused config must not be answered around.
     let cfg = load_config()?;
-
-    if let Some(entry) = cfg.get(&name) {
-        if entry.kind() == config::Kind::Malformed {
-            return Err(format!("config entry {name:?} needs exactly one of url or path"));
-        }
-        if let Some(url) = &entry.url {
-            let target = http_target(url)?;
-            if !target.is_local() {
-                validate_ssh_host(&target.host)?;
-                let (transport, tunnel) = open_tunnel(&target.host, target.port)?;
-                return Conn::tunneled(name, transport, tunnel);
-            }
-            return Conn::plain(name, Transport::Tcp(target.addr()), false);
-        }
-        let db = entry
-            .database()
-            .ok_or_else(|| format!("config entry {name:?} has neither url nor path"))?;
-        let home = runtime_dir()?;
-        // Join before summoning, and check both socket generations: the
-        // current derived name, and the 0.19-era name-keyed socket a
-        // mid-upgrade fleet still runs. Spawning over a live server would
-        // only lose DuckDB's file-lock race and read as a failure.
-        let sock21 = paths::socket_for(&home, &db)?;
-        let sock19 = paths::sock_file(&home, &name);
-        let join = |summoned: bool| {
-            [&sock21, &sock19].into_iter().find(|s| sock_ready(s)).and_then(|s| {
-                Conn::plain(
-                    name.clone(),
-                    #[cfg(unix)]
-                    Transport::Unix(s.clone()),
-                    #[cfg(not(unix))]
-                    Transport::Tcp(String::new()),
-                    summoned,
-                )
-                .ok()
-            })
-        };
-        if let Some(conn) = join(false) {
-            return Ok(conn);
-        }
-        // Nothing serves the file yet: summon an ephemeral server — it
-        // self-retires when this window's connection drops, since opening a
-        // database is not a request to keep it running. Two windows can race
-        // one summon; DuckDB's file lock lets exactly one server win and the
-        // loser exits nonzero, so the loser judges by the end state: if a
-        // socket comes ready anyway, its exit was noise.
-        let spawn_err = summon(&db, true).err();
-        let deadline = std::time::Instant::now() + Duration::from_secs(8);
-        loop {
-            if let Some(conn) = join(true) {
-                return Ok(conn);
-            }
-            if std::time::Instant::now() > deadline {
-                return Err(spawn_err
-                    .unwrap_or_else(|| format!("harbor never answered for {name:?}")));
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    // No config entry: a live server may still carry the name — its own
-    // `/info` name, the one bare `harbor` prints.
-    if let Some(l) = discover().into_iter().find(|l| l.name == name) {
-        #[cfg(unix)]
-        {
-            return Conn::plain(
-                name,
-                Transport::Unix(l.sock),
-                false,
-            );
-        }
-    }
-    Err(format!(
-        "no running database named {name:?} — open its file with `harbor <path>` \
-         or add it to the config"
-    ))
+    let entry = remote_entry(&cfg, &name)?;
+    dial_remote(name, entry)
 }
 
-/// Open a database FILE directly — the File→Open / drag-drop door. No
-/// config consulted: the path itself is the identity. Canonicalized first,
-/// so every spelling of one file meets the same server, then the named
-/// flow's exact discipline: join before summoning, both socket
-/// generations, and an ephemeral `start` when nothing answers.
-pub fn connect_path(db: &Path) -> Result<Conn, String> {
+/// The config's remote entry called `name`. A berth of that name is a file
+/// on this machine, and is refused: it is not what a remote row shows.
+fn remote_entry<'a>(
+    cfg: &'a config::FileConfig,
+    name: &str,
+) -> Result<&'a config::Connection, String> {
+    match cfg.get(name) {
+        Some(entry) if entry.kind() == config::Kind::Remote => Ok(entry),
+        _ => Err(format!("no remote database named {name:?} in the config")),
+    }
+}
+
+/// Dial a remote entry: directly when its url is this machine, through an
+/// SSH tunnel otherwise.
+fn dial_remote(name: String, entry: &config::Connection) -> Result<Conn, String> {
+    let url = entry
+        .url
+        .as_deref()
+        .ok_or_else(|| format!("config entry {name:?} has no url"))?;
+    let target = http_target(url)?;
+    if !target.is_local() {
+        validate_ssh_host(&target.host)?;
+        let (transport, tunnel) = open_tunnel(&target.host, target.port)?;
+        return Conn::tunneled(name, transport, tunnel);
+    }
+    Conn::plain(name, Transport::Tcp(target.addr()), false)
+}
+
+/// Connect to the server of one database file on this machine, under the
+/// name its row shows. The path is the whole identity: the config is not
+/// consulted, so no entry that shares the name can redirect the connection.
+/// A stopped database is started on demand, as an ephemeral server.
+pub fn connect_file(name: &str, db: &Path) -> Result<Conn, String> {
     let db = paths::canonical_db(db).map_err(|e| format!("{}: {e}", db.display()))?;
-    // The stem-derived name harbor itself would mint for this path — used
-    // only for the name-keyed socket lookup; the server's /info answers
-    // with its own truth on the next refresh.
-    let name = db
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| format!("no usable name in {}", db.display()))
-        .and_then(harbor_common::paths::normalize)?;
+    serve_file(name.to_string(), &db, true)
+}
+
+/// Connect to the server of one database file only if it is already
+/// running. For a caller that must never start a server, such as the
+/// sidebar's table counts.
+pub fn join_file(name: &str, db: &Path) -> Option<Conn> {
+    let db = paths::canonical_db(db).ok()?;
+    serve_file(name.to_string(), &db, false).ok()
+}
+
+/// Join the server on `db`, or summon one when `summon_it` and none answers.
+/// Join before summoning, and look on both sockets a server of this file can
+/// listen on: the one derived from the path, and the one named for it when
+/// the server there serves this file (`file_socket`). Spawning over a live
+/// server would only lose DuckDB's file-lock race and read as a failure.
+fn serve_file(name: String, db: &Path, summon_it: bool) -> Result<Conn, String> {
     let home = runtime_dir()?;
-    let sock21 = paths::socket_for(&home, &db)?;
+    let sock21 = paths::socket_for(&home, db)?;
     let sock19 = paths::sock_file(&home, &name);
     let join = |summoned: bool| {
-        [&sock21, &sock19].into_iter().find(|s| sock_ready(s)).and_then(|s| {
+        file_socket(db, Some(sock21.clone()), Some(sock19.clone())).and_then(|s| {
             Conn::plain(
                 name.clone(),
                 #[cfg(unix)]
-                Transport::Unix(s.clone()),
+                Transport::Unix(s),
                 #[cfg(not(unix))]
                 Transport::Tcp(String::new()),
                 summoned,
             )
             .ok()
+            .map(|conn| conn.serving(db))
         })
     };
     if let Some(conn) = join(false) {
         return Ok(conn);
     }
-    let spawn_err = summon(&db, true).err();
+    if !summon_it {
+        return Err(format!("{} is not running", db.display()));
+    }
+    // Nothing serves the file yet: summon an ephemeral server — it
+    // self-retires when this window's connection drops, since opening a
+    // database is not a request to keep it running. Two windows can race
+    // one summon; DuckDB's file lock lets exactly one server win and the
+    // loser exits nonzero, so the loser judges by the end state: if a
+    // socket comes ready anyway, its exit was noise.
+    let spawn_err = summon(db, true).err();
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
     loop {
         if let Some(conn) = join(true) {
@@ -463,31 +569,34 @@ pub fn connect_path(db: &Path) -> Result<Conn, String> {
     }
 }
 
-/// Stop a running server by name: POST /shutdown to its live socket, if one
-/// answers. The counterpart to spawn-on-open — the GUI can now close what it
-/// opened. Idempotent and never-spawning: a name with nothing running is
-/// Ok(()), the same as a Stop that raced the server's own departure. Probes
-/// both socket generations and any discovered server carrying the name, so a
-/// mixed-era fleet stops as cleanly as a current one.
-pub fn stop(name: &str) -> Result<(), String> {
-    let name = harbor_common::normalize(name)?;
+/// Open a database FILE directly — the File→Open / drag-drop door. No
+/// config consulted: the path itself is the identity. Canonicalized first,
+/// so every spelling of one file meets the same server, then joined or
+/// summoned like any file (`serve_file`).
+pub fn connect_path(db: &Path) -> Result<Conn, String> {
+    let db = paths::canonical_db(db).map_err(|e| format!("{}: {e}", db.display()))?;
+    // The stem-derived name harbor itself would mint for this path — used
+    // only for the name-keyed socket lookup; the server's /info answers
+    // with its own truth on the next refresh.
+    let name = db
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("no usable name in {}", db.display()))
+        .and_then(harbor_common::paths::normalize)?;
+    serve_file(name, &db, true)
+}
+
+/// Stop the server of one database file: POST /shutdown to its live socket,
+/// if one answers. The counterpart to spawn-on-open — the GUI can close what
+/// it opened. Idempotent and never-spawning: a file with nothing running is
+/// Ok(()), the same as a Stop that raced the server's own departure. The
+/// file is the whole target, as for `connect_file`: a name can belong to two
+/// databases, and stopping by name could shut down the other one.
+pub fn stop(db: &Path) -> Result<(), String> {
+    let db = paths::canonical_db(db).map_err(|e| format!("{}: {e}", db.display()))?;
     let home = runtime_dir()?;
-    let cfg = load_config().unwrap_or_default();
-
-    let mut socks: Vec<PathBuf> = Vec::new();
-    if let Some(db) = cfg.get(&name).and_then(|e| e.database())
-        && let Ok(s) = paths::socket_for(&home, &db)
-    {
-        socks.push(s);
-    }
-    socks.push(paths::sock_file(&home, &name));
-    for l in discover() {
-        if l.name == name {
-            socks.push(l.sock);
-        }
-    }
-
-    for s in socks {
+    let own = paths::socket_for(&home, &db).ok();
+    for s in stop_targets(&db, own, &discover()) {
         if sock_ready(&s) {
             #[cfg(unix)]
             let t = Transport::Unix(s);
@@ -496,11 +605,25 @@ pub fn stop(name: &str) -> Result<(), String> {
             // 202 {"stopping":true}, then the server drains and the socket
             // goes away — a refresh a beat later drops the row.
             request(&t, &wire::endpoint::SHUTDOWN, None, Some(Duration::from_secs(5)))
-                .map_err(|e| format!("stop {name:?}: {e}"))?;
+                .map_err(|e| format!("stop {}: {e}", db.display()))?;
             return Ok(());
         }
     }
     Ok(())
+}
+
+/// The sockets a Stop of `db` may send its shutdown to: the one derived from
+/// the file's path, and that of any live server whose `/info` names the same
+/// file, which covers a server listening on a socket named another way. A
+/// server on another file is never one of them, whatever it is called.
+fn stop_targets(db: &Path, own: Option<PathBuf>, live: &[Live]) -> Vec<PathBuf> {
+    let mut socks: Vec<PathBuf> = own.into_iter().collect();
+    for l in live {
+        if l.db == db && !socks.contains(&l.sock) {
+            socks.push(l.sock.clone());
+        }
+    }
+    socks
 }
 
 /// Start a persistent server for this database, if one is not already up:
@@ -1036,6 +1159,166 @@ mod tests {
             database_url("deploy@warehouse", "9494").unwrap(),
             "http://deploy@warehouse:9494"
         );
+    }
+
+    fn live(name: &str, db: &str) -> Live {
+        Live {
+            name: name.into(),
+            db: PathBuf::from(db),
+            sock: PathBuf::from(format!("/run{db}.sock")),
+            version: "0.43.5".into(),
+            ephemeral: false,
+        }
+    }
+
+    /// The socket a file's server listens on, as `plan` is told it.
+    fn sock_of(db: &Path) -> Option<PathBuf> {
+        Some(PathBuf::from(format!("/run{}.sock", db.display())))
+    }
+
+    fn row(name: &str, path: Option<&str>) -> Survey {
+        Survey {
+            name: name.into(),
+            state: State::Running,
+            attached: false,
+            autostart: false,
+            path: path.map(PathBuf::from),
+            note: None,
+            size: None,
+            version: None,
+            ephemeral: false,
+        }
+    }
+
+    #[test]
+    fn a_local_database_and_a_remote_of_the_same_name_are_two_rows() {
+        // The config knows `medlabs` as a remote on another host. A local
+        // file of that name is being served here.
+        let cfg = config::parse("[connection.medlabs]\nurl = \"http://deploy@prod:9495\"\n").unwrap();
+        let servers = [live("medlabs", "/tmp/medlabs.duckdb")];
+        assert_eq!(
+            plan(&cfg, &servers, &sock_of),
+            vec![
+                // The live server is the file it serves, and the remote's
+                // entry does not make it attached.
+                Planned::Live { ix: 0, attached: false },
+                Planned::Remote { name: "medlabs" },
+            ]
+        );
+        // With no local server, the remote is its own row all the same.
+        assert_eq!(plan(&cfg, &[], &sock_of), vec![Planned::Remote { name: "medlabs" }]);
+    }
+
+    #[test]
+    fn a_config_berth_is_hidden_only_by_the_server_of_its_own_file() {
+        let cfg = config::parse(
+            "[connection.a]\npath = \"/data/a.duckdb\"\n[connection.warehouse]\npath = \"/data/inventory.duckdb\"\n",
+        )
+        .unwrap();
+        // Another file with the stem `a` is running under that name: the
+        // config's `a` is a different database and keeps its row.
+        let other = [live("a", "/tmp/a.duckdb")];
+        assert_eq!(
+            plan(&cfg, &other, &sock_of),
+            vec![
+                Planned::Live { ix: 0, attached: false },
+                Planned::Berth { name: "a", db: "/data/a.duckdb".into() },
+                Planned::Berth { name: "warehouse", db: "/data/inventory.duckdb".into() },
+            ]
+        );
+        // The config's own files running: one row each, attached, whatever
+        // name the server reports and however its path is spelled.
+        let mut spelled = live("warehouse", "/private/data/inventory.duckdb");
+        spelled.sock = sock_of(Path::new("/data/inventory.duckdb")).unwrap();
+        let own = [live("a", "/data/a.duckdb"), spelled];
+        assert_eq!(
+            plan(&cfg, &own, &sock_of),
+            vec![Planned::Live { ix: 0, attached: true }, Planned::Live { ix: 1, attached: true }]
+        );
+        // A live server the config does not know is a row, unattached.
+        assert_eq!(
+            plan(&config::FileConfig::default(), &other, &sock_of),
+            vec![Planned::Live { ix: 0, attached: false }]
+        );
+    }
+
+    #[test]
+    fn a_remote_row_dials_only_a_remote_entry() {
+        let cfg = config::parse(
+            "[connection.prod]\nurl = \"http://deploy@prod:9495\"\n[connection.a]\npath = \"/data/a.duckdb\"\n",
+        )
+        .unwrap();
+        assert_eq!(remote_entry(&cfg, "prod").unwrap().url.as_deref(), Some("http://deploy@prod:9495"));
+        // A berth of that name is a local file, and no name at all is nothing.
+        assert!(remote_entry(&cfg, "a").unwrap_err().contains("no remote database named \"a\""));
+        assert!(remote_entry(&cfg, "missing").is_err());
+    }
+
+    #[test]
+    fn a_socket_named_for_a_database_is_trusted_only_for_its_own_file() {
+        let dir = std::env::temp_dir();
+        let db = dir.join("harbor-client-a.duckdb");
+        let same = dir.join(".").join("harbor-client-a.duckdb");
+        let other = dir.join("harbor-client-other").join("harbor-client-a.duckdb");
+        // The server says it serves this file, under either spelling.
+        assert!(names_file(Some(&db.to_string_lossy()), &db));
+        assert!(names_file(Some(&same.to_string_lossy()), &db));
+        // Another file of the same name, a server that reports no database,
+        // and one that did not answer `/info` at all are not this file's.
+        assert!(!names_file(Some(&other.to_string_lossy()), &db));
+        assert!(!names_file(Some(""), &db));
+        assert!(!names_file(None, &db));
+        // With neither socket answering there is none to join.
+        let missing = dir.join("harbor-client-no-such.sock");
+        assert_eq!(file_socket(&db, Some(missing.clone()), Some(missing)), None);
+        assert_eq!(file_socket(&db, None, None), None);
+    }
+
+    #[test]
+    fn a_stop_reaches_only_the_server_of_its_own_file() {
+        // Two servers report the name `a`: two files with the same stem.
+        let mine = live("a", "/data/a.duckdb");
+        let other = live("a", "/tmp/a.duckdb");
+        let mut renamed = live("a", "/data/a.duckdb");
+        renamed.sock = PathBuf::from("/run/a.sock");
+        let servers = [other, mine, renamed];
+        let db = Path::new("/data/a.duckdb");
+        assert_eq!(
+            stop_targets(db, sock_of(db), &servers),
+            vec![PathBuf::from("/run/data/a.duckdb.sock"), PathBuf::from("/run/a.sock")]
+        );
+        // With nothing running on the file there is still its own socket to
+        // try, and never the same-named server's.
+        assert_eq!(
+            stop_targets(db, sock_of(db), &servers[..1]),
+            vec![PathBuf::from("/run/data/a.duckdb.sock")]
+        );
+        assert!(stop_targets(db, None, &servers[..1]).is_empty());
+    }
+
+    #[test]
+    fn rows_that_share_a_name_say_which_database_each_is() {
+        let mut rows = vec![
+            row("alone", Some("/tmp/alone.duckdb")),
+            row("medlabs", Some("/tmp/medlabs.duckdb")),
+            row("medlabs", None),
+            row("zed", None),
+        ];
+        rows[2].note = Some("Connects over SSH to prod".into());
+        let warning = name_clashes(&mut rows).unwrap();
+        assert!(warning.contains("named medlabs"), "{warning}");
+        assert_eq!(rows[0].note, None);
+        assert!(rows[1].note.as_deref().unwrap().starts_with("The file "));
+        assert!(rows[1].note.as_deref().unwrap().contains("medlabs.duckdb"));
+        assert_eq!(
+            rows[2].note.as_deref(),
+            Some("The remote database in your config. Connects over SSH to prod")
+        );
+        assert_eq!(rows[3].note, None);
+        // Distinct names need no word.
+        let mut distinct = vec![row("a", Some("/tmp/a.duckdb")), row("b", None)];
+        assert_eq!(name_clashes(&mut distinct), None);
+        assert!(distinct.iter().all(|r| r.note.is_none()));
     }
 
     #[test]
