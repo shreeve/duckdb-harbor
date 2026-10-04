@@ -62,11 +62,7 @@ main() {
     esac
 
     [ "$(uname -s)" = "Darwin" ] || fail "DuckTable is a macOS app."
-    [ "$(uname -m)" = "arm64" ] || {
-        printf "${Red}error${Color_Off}: %s\n" "The prebuilt DuckTable is Apple Silicon only (this Mac is $(uname -m))." >&2
-        printf "${Dim}%s${Color_Off}\n" "Intel: clone the repo and run scripts/macos-app.sh release." >&2
-        exit 1
-    }
+    [ "$(uname -m)" = "arm64" ] || fail "DuckTable runs on Apple Silicon only (this Mac is $(uname -m))."
 
     # DuckTable shares its repo with harbor, and the repo's "latest" release is
     # harbor's — so resolve the highest ducktable-v* tag by version. sort -V,

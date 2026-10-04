@@ -36,7 +36,7 @@ date, newest first.
   Updates still arrive through the same feed. If macOS asks once more for Local
   Network access, that is the new signature; allow it as before.
 - Ships Sparkle 2.10.0, the current stable. The lockfile records
-  `harbor-common` and `wire` at harbor's version.
+  `harbor-common` and `wire` at 0.43.5.
 
 ## 0.22.7 — 2026-09-25
 
