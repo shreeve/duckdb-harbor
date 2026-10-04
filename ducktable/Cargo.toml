@@ -22,15 +22,16 @@ debug = "limited"
 lto = "thin"
 strip = true
 
-# The kit's crates come from the `patched` branch of shreeve/gpui-kit, a fork of longbridge/gpui-kit: the v0.7.0 release plus
-# one commit per change, each generic enough for any app and each a candidate
-# for upstream. DuckTable uses all of them: fixed resizable panels, a sizable
-# Editor, DataTable's select_on_modifier_click and fixed_cols_border, the
-# set_line_number guard, EditorState::wrap_row_count and prewrap, and the
-# host-styled line-number gutter. The rev is the commit tagged
-# v0.7.0-patched.1. Moving to a new gpui-kit release means rebasing the
-# branch onto its tag, dropping what upstream has taken, tagging the result,
-# and pinning that rev here with the same gpui-kit version.
+# The kit's crates come from shreeve/gpui-kit, a fork of longbridge/gpui-kit
+# shared by every app built on it. Its patched/0.7 branch is the v0.7.0
+# release plus general-purpose changes, one commit each and each a candidate
+# for upstream, tagged v0.7.0-patched.N. DuckTable relies on fixed resizable
+# panels, a sizable Editor, DataTable's select_on_modifier_click and
+# fixed_cols_border, the set_line_number guard, EditorState::wrap_row_count
+# and prewrap, and the host-styled line-number gutter. The rev is the commit
+# tagged v0.7.0-patched.1. Moving to a later tag, or to the next release
+# line's patched branch, means pinning that tag's commit here with the
+# matching gpui-kit version.
 # Every crate of the kit comes from the one rev, so they resolve together:
 # from a git source, a crate takes its siblings from that source too.
 [patch.crates-io]
