@@ -64,7 +64,8 @@ A rule with a decision in it belongs in a pure function, with a unit test.
 - `notes.txt` at the repository root is gitignored and holds the Sparkle
   private key's backup: never read it, never commit it.
 - Releases go through `scripts/release.sh` and `scripts/update-cask.sh`
-  only. Never re-sign, rename or copy over an installed copy: the bundle
+  only, and end with the checks `HANDOFF.md` lists for the feed, the
+  installer, notarization and the cask. Never re-sign, rename or copy over an installed copy: the bundle
   signs as `com.shreeve.ducktable`, the name macOS keys Local Network
   permission to.
 

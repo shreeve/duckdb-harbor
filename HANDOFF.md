@@ -286,12 +286,17 @@ wire. Then, from a clean `main` in step with origin, in `ducktable/`:
 (`Casks/ducktable.rb` on `shreeve/homebrew-tap`) once its checksum matches
 the release's `DuckTable-X.Y.Z.zip`. The release is the one job done in the
 shared checkout, since the script refuses anything but `main`: look first,
-as for any work there. The release script sets the version and runs `cargo update -w`,
-commits "DuckTable X.Y.Z" straight to `main` with an annotated
-`ducktable-vX.Y.Z` tag, publishes the versioned release (never `--latest`)
-and rewrites the `ducktable-updates` feed; confirm `appcast.xml` lists the
-new version first. That feed release stays a prerelease so
-`/releases/latest` remains harbor's. The bundle signs as
+as for any work there. The release script sets the version and runs
+`cargo update -w`, commits "DuckTable X.Y.Z" straight to `main` with an
+annotated `ducktable-vX.Y.Z` tag, publishes the versioned release (never
+`--latest`) and rewrites the `ducktable-updates` feed. That feed release
+stays a prerelease so `/releases/latest` remains harbor's. Afterwards, check
+each way in: `appcast.xml` on the feed release lists the version first; the
+installer's query (the highest `ducktable-v*` tag in the releases API) finds
+its tag; the release's `DuckTable.zip` unpacks to a bundle that `spctl -a
+-vv` calls "Notarized Developer ID" and `xcrun stapler validate` accepts;
+and after `brew update`, `brew info --cask shreeve/tap/ducktable` names the
+version. The bundle signs as
 `com.shreeve.ducktable`, the name macOS keys Local Network permission to;
 never re-sign, rename or copy over an installed copy — both installers swap
 the bundle in by rename (`docs/UPDATES.md`, "The bundle's identity").
