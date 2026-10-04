@@ -1,6 +1,5 @@
 /target
 crates/*/target
-vendor/*/target
 assets/AppIcon.iconset
 .claude/
 dist

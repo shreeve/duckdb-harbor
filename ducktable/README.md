@@ -143,9 +143,10 @@ feature.
 Rust and [gpui-kit](https://github.com/longbridge/gpui-kit): GPUI (Zed's
 GPU-accelerated UI framework) with its component library, which supplies the
 virtualized data table and code editor. Dependencies are pinned to crates.io
-releases, not git — with surgical local patches to gpui-base and
-gpui-component (`vendor/`), and Harbor's protocol crates built from the
-sibling `harbor/` tree in this repository.
+releases, except gpui-kit itself, which comes from a pinned commit of
+[a fork](https://github.com/shreeve/gpui-kit/tree/patched) carrying a few
+generic changes on top of the release; Harbor's protocol crates are built from
+the sibling `harbor/` tree in this repository.
 
 ## Status
 

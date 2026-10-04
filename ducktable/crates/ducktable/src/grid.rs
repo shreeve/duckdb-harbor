@@ -497,6 +497,10 @@ impl Grid {
             TableState::new(delegate, window, cx)
                 .col_movable(false)
                 .col_selectable(false)
+                // ⌘- and ⇧-clicks belong to the grid's own multi-row
+                // selection, decided on mouse down; the table re-selecting
+                // the row on the click would undo a ⌘-click that removed it.
+                .select_on_modifier_click(false)
         });
         // The table binds plain up/down/left/right/escape to its own
         // selection actions, and gpui dispatches BINDINGS before raw key
@@ -673,7 +677,7 @@ impl Grid {
         .detach();
         // The DDL editor re-wraps when it learns its real width — first
         // paint, pane resize, zoom — and notifies ITSELF. The card's
-        // height is OUR render's math (wrapped_line_count), so observe
+        // height is OUR render's math (wrap_row_count), so observe
         // the editor: the card resizes in the very next frame instead
         // of waiting for an incidental repaint (the first-display chop).
         if let Some(input) = &ddl_input {
@@ -3223,10 +3227,10 @@ impl TableDelegate for GridDelegate {
                         .child(self.row_labels.get(row_ix).cloned().unwrap_or_default()),
                 )
                 // The gutter's divider strip, in the ONE grid-line
-                // color, and the boundary's one owner: the vendored
-                // Table draws no fixed-region edge of its own (a
-                // state.rs patch), which would sit 1px beside this one,
-                // half-occluded by the scrolling cells.
+                // color, and the boundary's one owner: the Table draws
+                // no fixed-columns edge of its own (fixed_cols_border),
+                // which would sit 1px beside this one, half-occluded by
+                // the scrolling cells.
                 .child(div().absolute().right_0().top_0().bottom_0().w(px(1.)).bg(t.grid_line))
                 .into_any_element();
         }
@@ -3710,6 +3714,7 @@ impl Grid {
                     .child(
                         DataTable::new(&self.table)
                             .bordered(false)
+                            .fixed_cols_border(false)
                             .with_size(prefs::get(cx).table_size()),
                     ),
             )
