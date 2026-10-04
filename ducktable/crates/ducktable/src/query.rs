@@ -105,7 +105,10 @@ impl QueryView {
         // move, an edit, even the cursor blink — recomputes the marked
         // rows; the guarded write means an unchanged mark costs
         // nothing.
-        cx.observe(&editor, Self::sync_send_mark).detach();
+        cx.observe_in(&editor, window, |this, editor, window, cx| {
+            this.sync_send_mark(editor, window, cx)
+        })
+        .detach();
         // The editor/results divider persists like every other divider
         // (sidebar, inspector): only the user's drag writes it.
         let split = cx.new(|_| gpui_kit::component::resizable::ResizableState::default());
@@ -140,7 +143,7 @@ impl QueryView {
             _intercept: intercept,
         };
         // Seed the mark for the restored scratch before first paint.
-        this.sync_send_mark(this.editor.clone(), cx);
+        this.sync_send_mark(this.editor.clone(), window, cx);
         this
     }
 
@@ -152,7 +155,12 @@ impl QueryView {
     /// they match the engine's own "LINE n" in error messages — and
     /// pins the gutter to the grids' exact rail geometry, so the "1"
     /// never moves when ⌘1/2/3 switches views.
-    fn sync_send_mark(&mut self, editor: Entity<EditorState>, cx: &mut Context<Self>) {
+    fn sync_send_mark(
+        &mut self,
+        editor: Entity<EditorState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // value() already materializes the rope into a SharedString;
         // it derefs to &str, so no second copy is taken (this runs at
         // blink frequency — allocations here are pure heat).
@@ -211,7 +219,7 @@ impl QueryView {
         // The rail obeys ⌥7 exactly like the grids: hidden means GONE
         // (the boundary line above the pane is all that remains).
         let show = crate::prefs::get(cx).row_numbers;
-        editor.update(cx, |e, cx| e.set_line_number_visible(show, cx));
+        editor.update(cx, |e, cx| e.set_line_number(show, window, cx));
         // One rail for the whole pane: top and bottom both take the
         // wider of the editor's labels and the results' visible row
         // numbers — THIS pane's content, not the host table's (Steve's
@@ -245,18 +253,18 @@ impl QueryView {
         };
         let stale = {
             let e = editor.read(cx);
-            e.send_mark != mark
+            e.marked_rows != mark
                 || e.gutter_style.as_ref() != Some(&style)
-                || e.gutter_end_rows.as_deref().map(Vec::as_slice)
+                || e.section_end_rows.as_deref().map(Vec::as_slice)
                     != Some(end_rows.as_slice())
                 || e.line_labels.as_deref().map(Vec::as_slice)
                     != Some(labels.as_slice())
         };
         if stale {
             editor.update(cx, |e, cx| {
-                e.send_mark = mark;
+                e.marked_rows = mark;
                 e.gutter_style = Some(style);
-                e.gutter_end_rows = Some(std::rc::Rc::new(end_rows));
+                e.section_end_rows = Some(std::rc::Rc::new(end_rows));
                 e.line_labels = Some(std::rc::Rc::new(labels));
                 cx.notify();
             });
@@ -509,7 +517,7 @@ impl Render for QueryView {
         }
         // Results arriving can widen the shared rail; the guarded write
         // makes this free on every other frame.
-        self.sync_send_mark(self.editor.clone(), cx);
+        self.sync_send_mark(self.editor.clone(), window, cx);
         div()
             .size_full()
             .min_h_0()
@@ -597,8 +605,7 @@ impl Render for QueryView {
                     // the editor in the full line box — this is the
                     // difference, measured on screen. The editor's
                     // hairlines do NOT ride the half pixel with the
-                    // text: the vendored paint snaps them to the
-                    // integer grid (element.rs "hairline law"). No
+                    // text: the gutter paints them on whole pixels. No
                     // bottom padding: the rail runs all the way to the
                     // footer.
                     .mt(px(-0.5))

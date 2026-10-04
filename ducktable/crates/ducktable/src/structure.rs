@@ -363,12 +363,12 @@ impl Grid {
                     );
                 });
             }
-            // WRAPPED rows, from the editor's own wrapper (a vendored
-            // accessor): the card's height must count soft-wrapped rows
-            // — everything visible, nothing to scroll.
+            // WRAPPED rows, from the editor's own wrapper: the card's
+            // height must count soft-wrapped rows — everything visible,
+            // nothing to scroll.
             let rows = state
                 .read(cx)
-                .wrapped_line_count()
+                .wrap_row_count()
                 .max(state.read(cx).value().lines().count())
                 .max(2);
             // The frame is OURS, from the app palette — the component's

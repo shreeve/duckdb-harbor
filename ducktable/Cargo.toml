@@ -1,9 +1,6 @@
 [workspace]
 resolver = "2"
 members = ["crates/ducktable", "crates/duckdb-lang", "crates/harbor-client"]
-# The vendored patch sources are not members, so each builds and tests on
-# its own (cd vendor/gpui-base && cargo test --lib).
-exclude = ["vendor/gpui-base", "vendor/gpui-component"]
 
 [workspace.package]
 version = "0.22.8"
@@ -13,8 +10,8 @@ repository = "https://github.com/shreeve/duckdb-harbor"
 
 [workspace.dependencies]
 # One dependency for GPUI and its component library. The kit pins an exact
-# gpui-pre snapshot of Zed's GPUI, and the vendored crates below are its
-# exact versions, so the kit is pinned exactly too.
+# gpui-pre snapshot of Zed's GPUI, and the patched crates below are its exact
+# versions, so the kit is pinned exactly too.
 gpui-kit = { version = "=0.7.0", features = ["tree-sitter"] }
 anyhow = "1"
 
@@ -25,28 +22,20 @@ debug = "limited"
 lto = "thin"
 strip = true
 
-# The seams where a pinned widget fights us. vendor/gpui-base and
-# vendor/gpui-component are the crates.io 0.7.0 sources gpui-kit 0.7.0
-# depends on, with surgical patches, each site marked "DuckTable patch:":
-#
-# - gpui-base input: the Query editor's line-number rail — host-imposed
-#   width and number size, per-row labels, the send mark, statement
-#   hairlines — and the helpers that size the Structure view's DDL card
-#   to its wrapped content (prewrap, wrapped_line_count), plus
-#   set_line_number_visible for an observer with no Window.
-# - gpui-base resizable: ResizablePanel::fixed, furniture that keeps its
-#   width when the window resizes.
-# - gpui-component input: Editor takes a size, as Textarea does, so the
-#   Query editor can sit flush with no vertical insets.
-# - gpui-component table: a ⌘- or ⇧-click leaves the grid's own
-#   multi-row selection alone, and no fixed-region edge line.
-#
-# Cargo's [patch] replaces a whole crate, so each patched crate is vendored
-# whole; GPUI itself (gpui-pre) comes from crates.io untouched. Upgrading the
-# pin means copying the new crates.io sources in and re-carrying those marks.
-# gpui-base's own tests run in place (cd vendor/gpui-base && cargo test
-# --lib); gpui-component's read files outside the published package, so run
-# them in an upstream checkout with the patched files copied in.
+# The kit's crates come from the `patched` branch of shreeve/gpui-kit, a fork of longbridge/gpui-kit: the v0.7.0 release plus
+# one commit per change, each generic enough for any app and each a candidate
+# for upstream. DuckTable uses all of them: fixed resizable panels, a sizable
+# Editor, DataTable's select_on_modifier_click and fixed_cols_border, the
+# set_line_number guard, EditorState::wrap_row_count and prewrap, and the
+# host-styled line-number gutter. The rev is the commit tagged
+# v0.7.0-patched.1. Moving to a new gpui-kit release means rebasing the
+# branch onto its tag, dropping what upstream has taken, tagging the result,
+# and pinning that rev here with the same gpui-kit version.
+# Every crate of the kit comes from the one rev, so they resolve together:
+# from a git source, a crate takes its siblings from that source too.
 [patch.crates-io]
-gpui-base = { path = "vendor/gpui-base" }
-gpui-component = { path = "vendor/gpui-component" }
+gpui-kit = { git = "https://github.com/shreeve/gpui-kit", rev = "cb2f26f2bbd123eeec4a9441fc3449d3341b428a" }
+gpui-base = { git = "https://github.com/shreeve/gpui-kit", rev = "cb2f26f2bbd123eeec4a9441fc3449d3341b428a" }
+gpui-component = { git = "https://github.com/shreeve/gpui-kit", rev = "cb2f26f2bbd123eeec4a9441fc3449d3341b428a" }
+gpui-component-macros = { git = "https://github.com/shreeve/gpui-kit", rev = "cb2f26f2bbd123eeec4a9441fc3449d3341b428a" }
+gpui-kit-assets = { git = "https://github.com/shreeve/gpui-kit", rev = "cb2f26f2bbd123eeec4a9441fc3449d3341b428a" }
