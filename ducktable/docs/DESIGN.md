@@ -51,17 +51,17 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
   verb, two lifetimes. A plain start is persistent and runs until stopped; an
   ephemeral start (the way opening a database summons one) leaves once its last
   client disconnects.
-- **UI stack.** gpui-kit 0.7.0: GPUI (an exact `gpui-pre` snapshot of
-  Zed's) with gpui-base and gpui-component supplying the virtualized table
-  and the code editor. The kit comes from the `patched` branch of
-  [shreeve/gpui-kit](https://github.com/shreeve/gpui-kit), a fork that adds
-  generic changes DuckTable needs on top of the release, each a candidate
-  for upstream (listed in the workspace `Cargo.toml`). All are pre-1.0 and
-  PINNED exactly: an upgrade is a deliberate, review-everything event, not
-  a routine bump.
-  View code reaches everything through `gpui_kit`. A widget that fights us is replaced by first-party
-  drawing at that call site, the way the grid owns its selection painting and
-  cell borders.
+- **UI stack.** gpui-kit 0.7.0: GPUI (an exact `gpui-pre` snapshot of Zed's)
+  with gpui-base and gpui-component supplying the virtualized table and the
+  code editor. The kit comes from the `patched/0.7` branch of
+  [shreeve/gpui-kit](https://github.com/shreeve/gpui-kit), a fork shared by
+  every app built on it that adds general-purpose changes on top of the
+  release, each a candidate for upstream (DuckTable's are listed in the
+  workspace `Cargo.toml`). All are pre-1.0 and PINNED exactly: an upgrade is a
+  deliberate, review-everything event, not a routine bump. View code reaches
+  everything through `gpui_kit`. A widget that fights us is replaced by
+  first-party drawing at that call site, the way the grid owns its selection
+  painting and cell borders.
 
 ## Design rules
 
