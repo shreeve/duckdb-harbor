@@ -33,6 +33,27 @@ fn active_key<'a>(connecting: Option<&'a DbKey>, connected: Option<&'a DbKey>) -
     connecting.or(connected)
 }
 
+/// What runs when the quit dialog is cancelled.
+#[derive(Debug, PartialEq)]
+enum Resume {
+    /// The connect the dialog called off when it opened.
+    Dial(Aim),
+    /// The table switch that waited under it.
+    Select(String, String),
+    Nothing,
+}
+
+/// What the quit dialog held back, in the order it resumes. A connect that
+/// was called off comes first and alone: it replaces the grid a waiting
+/// table switch was for.
+fn after_quit_dialog(called_off: Option<Aim>, deferred: Option<(String, String)>) -> Resume {
+    match (called_off, deferred) {
+        (Some(aim), _) => Resume::Dial(aim),
+        (None, Some((schema, name))) => Resume::Select(schema, name),
+        (None, None) => Resume::Nothing,
+    }
+}
+
 /// What quitting would lose or leave unreported. Law 2 (docs/EDITING.md)
 /// makes staged changes the only place work lives before ⌘S, so a quit
 /// asks before it discards them.
@@ -265,6 +286,11 @@ pub struct DuckTable {
     /// Which database that connect is aimed at, for the sidebar's highlight:
     /// of two rows that share a name, only the one clicked lights up.
     pub(crate) connecting_key: Option<DbKey>,
+    /// What that connect is aimed at, kept so that one the quit dialog
+    /// calls off can be dialed again when the dialog is cancelled.
+    connecting_aim: Option<Aim>,
+    /// The connect the quit dialog called off when it opened.
+    called_off: Option<Aim>,
     /// The sidebar's table-name filter; Some = the field is open.
     pub(crate) table_filter: Option<Entity<gpui_kit::component::input::InputState>>,
     /// The sidebar's database-name filter; Some = the field is open.
@@ -379,6 +405,8 @@ impl DuckTable {
             grid: None,
             connecting: None,
             connecting_key: None,
+            connecting_aim: None,
+            called_off: None,
             table_filter: None,
             berth_filter: None,
             asking_to_quit: false,
@@ -431,21 +459,33 @@ impl DuckTable {
 
     /// The quit dialog opens. A connect still in flight is called off: its
     /// landing would replace the grid, the query and every staged edit
-    /// under the dialog, and Cancel must find them as they were.
+    /// under the dialog, and Cancel must find them as they were. What it
+    /// was aimed at is kept, and dialed again if the dialog is cancelled.
     pub(crate) fn quit_dialog_opened(&mut self, cx: &mut Context<Self>) {
         self.asking_to_quit = true;
+        self.called_off = self.connecting_aim.take();
         self.cancel(cx);
     }
 
-    /// The quit dialog was cancelled. What waited for it runs: a table
-    /// switch that landed under it, and the fleet's reconciliation, which
-    /// drops a connection whose server stopped meanwhile.
+    /// The quit dialog was cancelled. What waited for it runs
+    /// (`after_quit_dialog`), and the fleet is reconciled, which drops a
+    /// connection whose server stopped meanwhile.
     pub(crate) fn quit_dialog_cancelled(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.asking_to_quit = false;
-        if let Some((schema, name)) = self.deferred_select.take() {
-            self.select_table(schema, name, window, cx);
+        match after_quit_dialog(self.called_off.take(), self.deferred_select.take()) {
+            Resume::Dial(aim) => self.redial(aim, cx),
+            Resume::Select(schema, name) => self.select_table(schema, name, window, cx),
+            Resume::Nothing => {}
         }
         self.refresh(cx);
+    }
+
+    /// Dial what a connect was aimed at, as the click or the drop did.
+    fn redial(&mut self, aim: Aim, cx: &mut Context<Self>) {
+        match aim {
+            Aim::Row { name, path } => self.connect_row(name, path, cx),
+            Aim::File(path) => self.open_path(path, cx),
+        }
     }
 
     /// The key of the row called `name` with this `path`, as the fleet's
@@ -594,6 +634,13 @@ impl DuckTable {
                 })
                 .detach();
                 cx.subscribe_in(&grid, window, |state, _, _: &CommitSettled, window, cx| {
+                    // Under the quit dialog the switch keeps waiting: taken
+                    // here it would be refused by the dialog and lost, the
+                    // sidebar on one table and the grid on another. It runs
+                    // when the dialog is cancelled.
+                    if state.asking_to_quit {
+                        return;
+                    }
                     if let Some((schema, name)) = state.deferred_select.take() {
                         state.select_table(schema, name, window, cx);
                     }
@@ -1008,12 +1055,8 @@ impl DuckTable {
 
     /// Dial again what a failed connect was aimed at.
     pub(crate) fn retry(&mut self, cx: &mut Context<Self>) {
-        match &self.phase {
-            Phase::Failed { aim: Aim::Row { name, path }, .. } => {
-                self.connect_row(clone_str(name), path.clone(), cx)
-            }
-            Phase::Failed { aim: Aim::File(path), .. } => self.open_path(path.clone(), cx),
-            _ => {}
+        if let Phase::Failed { aim, .. } = &self.phase {
+            self.redial(aim.clone(), cx);
         }
     }
 
@@ -1093,8 +1136,26 @@ impl DuckTable {
             Aim::Row { name, path } => self.key_of(name, path.as_deref()),
             Aim::File(path) => self.key_of("", Some(path)),
         });
+        self.connecting_aim = Some(aim.clone());
+        // A file opened by one spelling of its path may have a row under
+        // another (/tmp and /private/tmp): the row to light is found by the
+        // canonical path, which is read off this thread.
+        let opened = match &aim {
+            Aim::File(path) => Some(path.clone()),
+            Aim::Row { .. } => None,
+        };
         cx.notify();
         cx.spawn(async move |this, cx| {
+            if let Some(path) = opened {
+                let key = cx.background_executor().spawn(async move { DbKey::of_file(&path) }).await;
+                this.update(cx, |state, cx| {
+                    if state.attempt == fence {
+                        state.connecting_key = Some(key);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
             let outcome = cx.background_executor().spawn(async move { dial() }).await;
             this.update(cx, |state, cx| {
                 if state.attempt != fence {
@@ -1102,6 +1163,7 @@ impl DuckTable {
                 }
                 state.connecting = None;
                 state.connecting_key = None;
+                state.connecting_aim = None;
                 state.selected_table = None;
                 state.grid = None;
                 state.query = None;
@@ -1313,6 +1375,7 @@ impl DuckTable {
         self.attempt += 1;
         self.connecting = None;
         self.connecting_key = None;
+        self.connecting_aim = None;
         cx.notify();
     }
 
@@ -1330,7 +1393,25 @@ impl DuckTable {
 
 #[cfg(test)]
 mod tests {
-    use super::{active_key, catalog_refresh_is_current, DbKey, QuitRisks};
+    use super::{active_key, after_quit_dialog, catalog_refresh_is_current, Aim, DbKey, QuitRisks, Resume};
+
+    #[test]
+    fn a_cancelled_quit_dialog_resumes_what_it_held_back() {
+        let row = Aim::Row { name: "a".into(), path: Some("/data/a.duckdb".into()) };
+        let switch = Some(("main".to_string(), "orders".to_string()));
+        // A connect the dialog called off is dialed again, to the same aim.
+        assert_eq!(after_quit_dialog(Some(row.clone()), None), Resume::Dial(row.clone()));
+        let file = Aim::File("/tmp/x.duckdb".into());
+        assert_eq!(after_quit_dialog(Some(file.clone()), None), Resume::Dial(file));
+        // A table switch that waited under it runs.
+        assert_eq!(
+            after_quit_dialog(None, switch.clone()),
+            Resume::Select("main".into(), "orders".into())
+        );
+        // With both, the connect: it replaces the grid the switch was for.
+        assert_eq!(after_quit_dialog(Some(row.clone()), switch), Resume::Dial(row));
+        assert_eq!(after_quit_dialog(None, None), Resume::Nothing);
+    }
     use std::path::Path;
 
     #[test]

@@ -238,7 +238,9 @@ column names and DuckDB types, in order, against the grid's.
   empty nothing more can be staged and ⌘S is refused with the same message;
   the review popover, ⌘Z and discard work as always. When the last staged
   change is discarded or undone, the grid fetches the table as it is and
-  adopts it.
+  adopts it. A set held after a commit that got no answer (Commit, below)
+  takes neither ⌘Z nor a discard; its status line says so, and names its own
+  way out, the popover's Discard all.
 - Staged changes parked for a table that changed shape while it was off-screen
   cannot be shown against the old columns. They are dropped when the table is
   opened again, and the status line says how many.
@@ -346,11 +348,11 @@ affected-exactly-one check are the backstop there, as everywhere.
   engine's cast reads a backslash as "take the next character as it is":
   `["line\nbreak"]` typed back is stored as `linenbreak`, and
   `{"b":"tab\there"}` as `tabthere`, with no error. So any other escape is
-  refused in the editor, which names the Query tab. A cell that holds one can still be opened and left, cleared to NULL,
-  and copied by ⌘D. Outside quotes the cast keeps a backslash as typed,
-  except before a quote, which it consumes: `[a\"b]` is stored as `a"b` and
-  `[C:\dir]` as `C:\dir`. The rule is one rule all the same, since any value
-  can be written quoted.
+  refused in the editor, which names the Query tab. A cell that holds one can
+  still be opened and left, cleared to NULL, and copied by ⌘D. Outside quotes
+  the cast keeps a backslash as typed, except before a quote, which it
+  consumes: `[a\"b]` is stored as `a"b` and `[C:\dir]` as `C:\dir`. The rule
+  is one rule all the same, since any value can be written quoted.
 - A `UNION` takes no typed text, nor does a container that holds one. The
   text names no member: it is bound as a VARCHAR, and the engine stores it
   under the member of that type. `8` typed over `{"tag":"n","value":7}` in a
@@ -449,13 +451,24 @@ After an unanswered `COMMIT`:
   The same holds while no page has been read since the commit ended. Each
   refresh (⌘R) asks after the commit's session again before it reads the
   page, and the first page read after the session is gone says so and opens
-  the verdicts. A set is not staged again against columns the table does not
-  have (A table altered elsewhere); dropping it is the way out there.
+  the verdicts.
+- **On a table altered since, the set can only be dropped.** It is not staged
+  again against columns the table does not have (A table altered elsewhere).
+  The page read after the commit has those other columns and is not shown,
+  but it was read, so the hold is not left waiting for a page that every
+  refresh would drop again. The status line says the columns changed and that
+  the held changes cannot be staged against them, and the popover offers the
+  one choice left, **Discard all**; the table then loads as it is. The Query
+  tab shows what the table holds, for whoever wants to know first whether the
+  commit landed.
 
 DuckTable does not decide for the user whether the commit landed. Nothing in
 the database says: another client may have written the same rows, and a new
 row with defaulted columns has no value to look for. The held set is parked
-and handed back across a table switch like any other, still held.
+and handed back across a table switch like any other, still held. Handed
+back, it is judged against the page its table was opened with just before;
+if its commit had not been seen to end, that page is read again first, which
+asks after the commit.
 
 The WHERE compares the identity, not every value. On a keyed table, a cell
 another client changed since the fetch is overwritten by the staged value
@@ -476,8 +489,9 @@ fetch fails, the status line says the commit landed and the page could not be
 read again. The page then shows, in its edited cells, what was typed and not
 what the database stored (a `123.456` in a `DECIMAL(5,2)` is stored as
 123.46), and the rows the commit deleted stay drawn as ghosts. Nothing is
-staged against it until a refresh (⌘R) brings a page. Refresh Tables refetches `/catalog` so every sidebar
-row count reflects the committed transaction. Manual Refresh Tables and a
+staged against it until a refresh (⌘R) brings a page. Refresh Tables
+refetches `/catalog` so every sidebar row count reflects the committed
+transaction. Manual Refresh Tables and a
 completed Query run also refetch the currently open Data page. NULL renders as
 the NULL tag, visually distinct from empty, always.
 
@@ -519,10 +533,14 @@ still reach the app, so these are ignored until the dialog is answered:
 opening a database (⌘O, Open Database URL, a dropped file), stopping or
 removing one, switching tables (⌥←/⌥→) or views (⌘1/⌘2/⌘3, which would hand
 the keyboard to the grid or the editor behind the dialog), Refresh Tables,
-and New Row, Duplicate Row and Delete Row. A connect still in flight when
-the dialog opens is called off. A table switch whose page arrives under the
-dialog, and a server that stops under it, wait for the answer: on Cancel the
-switch runs and the stopped connection is dropped, as they would have been.
+and New Row, Duplicate Row and Delete Row. Three things already under way
+wait for the answer. A connect still in flight when the dialog opens is
+called off, since landing it would replace everything behind the dialog; on
+Cancel it is dialed again. A table switch whose page arrives under the
+dialog, or that was waiting on a commit which settles under it, runs on
+Cancel. A server that stops under the dialog leaves its connection on screen
+until Cancel, which drops it. What a commit or a statement already in flight
+finishes meanwhile is finished: the dialog's text follows it.
 
 The dialog is the app's own rather than the platform's alert, which cannot
 make Cancel its default: there a first button titled Cancel takes Esc and

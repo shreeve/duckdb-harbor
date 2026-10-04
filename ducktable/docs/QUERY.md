@@ -125,8 +125,8 @@ transaction is open.
 - **It shows.** While a transaction is open the header band reads
   `transaction open · 4:32 left · COMMIT or ROLLBACK ends it`, and once the
   session has answered that an error aborted it, `transaction aborted by an
-  error · 4:32 left · ROLLBACK ends it`. These statements have no result set and report `ok`, as
-  any resultless statement does.
+  error · 4:32 left · ROLLBACK ends it`. These statements have no result set
+  and report `ok`, as any resultless statement does.
 - **Only this view sees it.** The Data view, the sidebar's counts and every
   other client read outside the transaction and show what is committed; the
   refresh after each run shows none of its changes until `COMMIT`. Committing

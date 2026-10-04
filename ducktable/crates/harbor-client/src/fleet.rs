@@ -400,9 +400,11 @@ fn file_socket(db: &Path, own: Option<PathBuf>, named: Option<PathBuf>) -> FileS
     let info = info_of(&Transport::Unix(named.clone()));
     #[cfg(not(unix))]
     let info: Option<wire::InfoResponse> = None;
-    match info {
+    // An answer that names no database says as little as no answer: the
+    // field is empty when the server left it out.
+    match info.as_ref().map(|info| info.database.as_str()).filter(|database| !database.is_empty()) {
         None => FileSocket::Unidentified(named),
-        Some(info) if names_file(Some(&info.database), db) => FileSocket::Found(named),
+        Some(database) if names_file(Some(database), db) => FileSocket::Found(named),
         Some(_) => FileSocket::Absent,
     }
 }
@@ -1370,6 +1372,13 @@ mod tests {
             );
             // The file's own socket is the file's whatever its name says.
             assert_eq!(file_socket(&db, Some(sock.clone()), None), FileSocket::Found(sock.clone()));
+            quit(&sock, server);
+            // It answers `/info` and names no database: as good as silence.
+            let server = serving(&sock, Some(info(Path::new(""))));
+            assert_eq!(
+                file_socket(&db, Some(missing.clone()), Some(sock.clone())),
+                FileSocket::Unidentified(sock.clone())
+            );
             quit(&sock, server);
         }
     }

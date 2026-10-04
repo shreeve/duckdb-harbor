@@ -25,10 +25,13 @@ date, newest first.
 - **Nothing moves behind the quit dialog.** The menu bar and its keys still
   reach the app while the dialog is up. Opening, stopping or removing a
   database, switching tables or views, refreshing and the row commands are
-  ignored until it is answered; a connect in flight is called off when it
-  opens, and a table switch or a stopped server that lands under it waits for
-  the answer. Cancel finds the grid, the query and the staged edits as they
-  were.
+  ignored until it is answered. What was already under way waits: a connect
+  in flight is called off when the dialog opens and dialed again on Cancel, a
+  table switch that lands under it, or that waited on a commit which settles
+  under it, runs on Cancel, and a server that stops under it leaves its
+  connection on screen until then. Cancel finds the grid, the query and the
+  staged edits as they were, apart from what a commit or a statement already
+  in flight finished meanwhile.
 - **The Query view holds a transaction.** Each run was its own request, so
   `BEGIN` answered and did nothing, the statements after it committed one by
   one, and `ROLLBACK` failed. A statement that begins a transaction now gets a
@@ -44,8 +47,9 @@ date, newest first.
   past the spaces the engine skips and no others, and through `EXPLAIN
   ANALYZE`, which measured runs the `COMMIT` it explains. Only the engine's
   answer ends a transaction: a `COMMIT` Harbor turns away because the session
-  is still busy leaves it open. It works with a Harbor that refuses a `BEGIN` sent outside a
-  session and with one that does not: the view never sends one.
+  is still busy leaves it open. It works with a Harbor that refuses a `BEGIN`
+  sent outside a session and with one that does not: the view never sends
+  one.
 - **A row connects to the database it shows.** A database file whose name
   matched a remote in the config showed one row with the local path, and a
   click on it looked the name up again, found the remote, and opened SSH: the
@@ -71,8 +75,9 @@ date, newest first.
   with a DELETE of 7 and a re-key of 3 to 7 held, dropping the re-key the page
   shows and sending the DELETE would delete the re-keyed row. No verdict is
   taken while the commit may still be running or before a page has been read
-  after it. A `COMMIT` that could not be sent at all is an ordinary failure,
-  edits kept.
+  after it. On a table altered since, the set cannot be staged again and the
+  one choice is to drop it. A `COMMIT` that could not be sent at all is an
+  ordinary failure, edits kept.
 - **A COMMIT that rolled back says so.** In the Query view an error aborts the
   transaction, and a `COMMIT` after it answers like any other while rolling
   everything back: the view showed `ok` and the work was gone. That included

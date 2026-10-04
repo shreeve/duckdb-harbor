@@ -457,6 +457,9 @@ impl Grid {
             .content(move |_, _, cx| {
                 let t = pal(cx);
                 let held = grid.read(cx).in_doubt();
+                // Held against columns the table does not have, the set
+                // cannot be staged again: one way out is left.
+                let reshaped = held && grid.read(cx).is_reshaped();
                 // Snapshot the entries: (key, row title, diff lines, is_delete).
                 let items: Vec<(String, String, Vec<String>, bool)> = {
                     let g = grid.read(cx);
@@ -626,8 +629,12 @@ impl Grid {
                         .h_flex()
                         .justify_end()
                         .gap_2()
-                        .child(verdict("held-landed", "It landed: discard all", true).danger())
-                        .child(verdict("held-not-landed", "It did not land: stage again", false).primary())
+                        .when(reshaped, |d| d.child(verdict("held-drop", "Discard all", true).danger()))
+                        .when(!reshaped, |d| {
+                            d.child(verdict("held-landed", "It landed: discard all", true).danger()).child(
+                                verdict("held-not-landed", "It did not land: stage again", false).primary(),
+                            )
+                        })
                 } else {
                     let grid = grid.clone();
                     div().h_flex().justify_end().child(
@@ -671,14 +678,20 @@ impl Grid {
                                 .border_color(t.border)
                                 .text_xs()
                                 .text_color(t.bad)
-                                .child(
+                                .child(if reshaped {
+                                    "The commit that sent these got no answer, and the table\u{2019}s \
+                                     columns have changed since, so they cannot be staged again. \
+                                     Whether the commit landed or not, dropping all of them is \
+                                     the way out, and the table then loads as it is. The Query \
+                                     tab shows what the table holds."
+                                } else {
                                     "The commit that sent these got no answer. A commit is all \
                                      or nothing: either every change below is in the database, \
                                      or none is. They are off the page, which shows the \
                                      database. Compare, then say which. If it landed, all of \
                                      them are dropped, for good. If it did not, all of them go \
-                                     back on the page, and \u{2318}S sends them.",
-                                ),
+                                     back on the page, and \u{2318}S sends them."
+                                }),
                         )
                     })
                     .child(rows)

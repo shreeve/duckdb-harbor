@@ -832,6 +832,9 @@ impl Grid {
                     let d = grid.table.read(cx).delegate();
                     !d.schema_cols.is_empty() && !same_columns(&d.schema_cols, &result.columns)
                 });
+                // The page query answered, whether its page is kept or
+                // dropped below: the database was read at this moment.
+                let read = outcome.is_ok();
                 let result = match outcome {
                     // Edits staged against the columns on screen are keyed
                     // and typed by them. They are not rebound to the table's
@@ -839,7 +842,7 @@ impl Grid {
                     // live in: the page is dropped and the view stays.
                     Ok(_) if reshaped && grid.edits.as_ref().is_some_and(Edits::any_staged) => {
                         grid.reshaped = true;
-                        grid.error = Some(RESHAPED.to_string());
+                        grid.error = stale_reason(true, false, grid.in_doubt()).map(str::to_string);
                         None
                     }
                     Ok((result, total)) => {
@@ -953,9 +956,13 @@ impl Grid {
                 // and not drawn, and a page that did not arrive after a
                 // commit that landed keeps what the commit folded into it.
                 let after = grid.post_commit.take();
-                // A page read with a held set waiting on one: if the commit
-                // is over by this read, the set can be judged against it.
-                let judgeable = fetched
+                // The database was read with a held set waiting on that: if
+                // the commit is over by this read, the set can be judged. A
+                // page dropped because the table has other columns counts
+                // too. It cannot be shown, and a set held against the
+                // columns it has not is only ever dropped, which needs no
+                // page; left out, such a set could never be judged at all.
+                let judgeable = read
                     && after.is_none()
                     && grid.edits.as_mut().is_some_and(|edits| {
                         let waiting = edits.unjudged().is_some();
@@ -963,14 +970,18 @@ impl Grid {
                         waiting && edits.unjudged().is_none()
                     });
                 if judgeable {
-                    grid.error = Some(format!("the commit is over, and this page was read after it \u{b7} {HELD}"));
+                    grid.error = Some(if grid.reshaped {
+                        HELD_RESHAPED.to_string()
+                    } else {
+                        format!("the commit is over, and this page was read after it \u{b7} {HELD}")
+                    });
                 }
-                if settle_fetch(after.as_ref(), fetched, grid.edits.as_mut()) {
+                if settle_fetch(after.as_ref(), read, grid.edits.as_mut()) {
                     grid.unrefreshed = true;
                 }
                 grid.project_staged(cx);
                 if let Some(after) = after {
-                    grid.settle_commit(after, fetched, cx);
+                    grid.settle_commit(after, fetched, read, cx);
                 }
                 cx.notify();
             })
@@ -983,11 +994,19 @@ impl Grid {
     /// again, and the status line says what the user needs to know. A page
     /// that did not arrive leaves the rows of before the commit on screen,
     /// so nothing is staged against them until one does (`unrefreshed`).
-    fn settle_commit(&mut self, after: PostCommit, fetched: bool, cx: &mut Context<Self>) {
+    /// `fetched` is whether a page arrived and is on screen, `read` whether
+    /// the page query answered: a page read and dropped, because the table
+    /// has other columns, is neither a failure nor a page to look at.
+    fn settle_commit(&mut self, after: PostCommit, fetched: bool, read: bool, cx: &mut Context<Self>) {
         self.committing = false;
         self.unrefreshed = !fetched && after == PostCommit::Landed;
-        let fetch_error = if fetched { None } else { self.error.take() };
-        self.error = commit_status(&after, fetch_error.as_deref());
+        let failure = if read { None } else { self.error.take() };
+        let page = match (fetched, read) {
+            (true, _) => Page::Read,
+            (false, true) => Page::Reshaped,
+            (false, false) => Page::Failed(failure.as_deref().unwrap_or("no answer")),
+        };
+        self.error = commit_status(&after, page);
         cx.emit(crate::app::CommitSettled);
     }
 
@@ -1039,15 +1058,7 @@ impl Grid {
     /// The way out of the first is to discard or undo, of the second a
     /// refresh, of the third the review popover.
     fn refuse_stale(&mut self, cx: &mut Context<Self>) -> bool {
-        let reason = if self.reshaped {
-            Some(RESHAPED)
-        } else if self.unrefreshed {
-            Some(UNREFRESHED)
-        } else if self.edits.as_ref().is_some_and(Edits::in_doubt) {
-            Some(IN_DOUBT)
-        } else {
-            None
-        };
+        let reason = stale_reason(self.reshaped, self.unrefreshed, self.in_doubt());
         if let Some(reason) = reason {
             self.error = Some(reason.to_string());
             cx.notify();
@@ -1675,7 +1686,7 @@ impl Grid {
                 _ if self.committing => false,
                 // A held set has no history to walk: the reason is said.
                 Some(e) if e.in_doubt() => {
-                    self.error = Some(IN_DOUBT.to_string());
+                    self.error = stale_reason(self.reshaped, false, true).map(str::to_string);
                     cx.notify();
                     false
                 }
@@ -2551,7 +2562,7 @@ impl Grid {
     /// may have landed, and its keys were read before it did: a staged
     /// DELETE of id 7 would ghost the row a staged re-key of 3 to 7 made,
     /// and that re-key would show on no row. The page shows the database,
-    /// and the set is reviewed in the popover (`stage_again`).
+    /// and the set is reviewed in the popover (`judge_held`).
     ///
     /// While the page predates a commit that landed (`unrefreshed`), the
     /// rows it deleted keep their ghosts: nothing is staged to redraw them
@@ -2670,6 +2681,11 @@ impl Grid {
         self.editor.is_some()
     }
 
+    /// Whether the table has other columns than the grid's (`reshaped`).
+    pub(crate) fn is_reshaped(&self) -> bool {
+        self.reshaped
+    }
+
     /// Whether the staged set is held because its commit got no answer.
     pub(crate) fn in_doubt(&self) -> bool {
         self.edits.as_ref().is_some_and(Edits::in_doubt)
@@ -2740,8 +2756,20 @@ impl Grid {
         let has_columns = !self.table.read(cx).delegate().schema_cols.is_empty();
         match edits::handoff(self.edits.as_ref(), has_columns, &stash) {
             edits::Handoff::Adopt => {
+                let mut stash = stash;
+                // A held set comes back to a grid whose page was read just
+                // before, outside `fetch`: with its commit over, that page is
+                // one to judge it by. With the commit perhaps still running,
+                // the page is read again, which asks after its session.
+                let running = stash.unsettled().is_some();
+                if !running {
+                    stash.fetched(None);
+                }
                 self.edits = Some(stash);
                 self.sync_staged(cx);
+                if running {
+                    self.fetch_page_now(self.page, cx);
+                }
             }
             edits::Handoff::Hold => self.parked = Some(stash),
             edits::Handoff::Orphan => {
@@ -2758,7 +2786,7 @@ impl Grid {
     fn refuse_held(&mut self, cx: &mut Context<Self>) -> bool {
         let held = self.in_doubt();
         if held {
-            self.error = Some(IN_DOUBT.to_string());
+            self.error = stale_reason(self.reshaped, false, true).map(str::to_string);
             cx.notify();
         }
         held
@@ -4543,26 +4571,26 @@ enum PostCommit {
 
 /// What the fetch a commit was waiting on settles before the page is drawn.
 /// A set whose commit got no answer is held, with the session it may still
-/// be running on and whether this page was read; held, it is not drawn
-/// (`Edits::projection`). Returns whether a commit that landed is left with
-/// a page that was not read after it.
-fn settle_fetch(after: Option<&PostCommit>, fetched: bool, edits: Option<&mut Edits>) -> bool {
+/// be running on and whether the database was `read` after it; held, it is
+/// not drawn (`Edits::projection`). Returns whether a commit that landed is
+/// left with a page that was not read after it.
+fn settle_fetch(after: Option<&PostCommit>, read: bool, edits: Option<&mut Edits>) -> bool {
     match (after, edits) {
         (Some(PostCommit::InDoubt { unsettled, .. }), Some(edits)) => {
-            edits.mark_in_doubt(unsettled.clone(), fetched);
+            edits.mark_in_doubt(unsettled.clone(), read);
             false
         }
-        (Some(PostCommit::Landed), _) => !fetched,
+        (Some(PostCommit::Landed), _) => !read,
         _ => false,
     }
 }
 
 /// Why a verdict on a held set is not taken, if it is not. Neither verdict
-/// is taken while the commit may still be running or no page has been read
-/// since it ended: the page is what the set is judged against, and a set
-/// staged again beside a commit still running could land twice. A set is
-/// not staged again against columns the table does not have; dropping it
-/// is the way out there.
+/// is taken while the commit may still be running or the database has not
+/// been read since it ended: the page is what the set is judged against, and
+/// a set staged again beside a commit still running could land twice. A set
+/// is not staged again against columns the table does not have; dropping it
+/// is the way out there, and is taken.
 fn verdict_refusal(landed: bool, reshaped: bool, unjudged: Option<edits::Unjudged>) -> Option<&'static str> {
     match unjudged {
         Some(edits::Unjudged::Running) => Some(
@@ -4572,9 +4600,35 @@ fn verdict_refusal(landed: bool, reshaped: bool, unjudged: Option<edits::Unjudge
         Some(edits::Unjudged::Unread) => Some(
             "this page was not read after the commit · refresh (⌘R), then say whether it landed",
         ),
-        None if reshaped && !landed => Some(RESHAPED),
+        None if reshaped && !landed => Some(HELD_RESHAPED),
         None => None,
     }
+}
+
+/// Why nothing is staged or committed, if nothing is, in the words that
+/// name the way out of that state. A set held on a table whose columns
+/// changed has its own: the discard the reshaped hint names is one a held
+/// set refuses, and its way out is the popover.
+fn stale_reason(reshaped: bool, unrefreshed: bool, held: bool) -> Option<&'static str> {
+    match (reshaped, unrefreshed, held) {
+        (true, _, true) => Some(HELD_RESHAPED),
+        (true, _, false) => Some(RESHAPED),
+        (false, true, _) => Some(UNREFRESHED),
+        (false, false, true) => Some(IN_DOUBT),
+        (false, false, false) => None,
+    }
+}
+
+/// What became of the page asked for after a commit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Page<'a> {
+    /// It arrived, and is on screen.
+    Read,
+    /// It arrived with other columns than the grid's, and was dropped
+    /// because edits are staged against these.
+    Reshaped,
+    /// It did not arrive. The reason.
+    Failed(&'a str),
 }
 
 /// Read the answer to the COMMIT request. An error Harbor reports is a
@@ -4594,25 +4648,36 @@ fn commit_verdict(answer: Result<harbor_client::QueryResult, harbor_client::Fail
     }
 }
 
-/// The status line once the page fetch after a commit has landed, or failed
-/// with `fetch_error`. None when the commit landed and the page shows it.
-fn commit_status(after: &PostCommit, fetch_error: Option<&str>) -> Option<String> {
-    match (after, fetch_error) {
-        (PostCommit::Landed, None) => None,
-        (PostCommit::Landed, Some(why)) => Some(format!(
+/// The status line once the page fetch after a commit has settled. None
+/// when the commit landed and the page shows it.
+fn commit_status(after: &PostCommit, page: Page) -> Option<String> {
+    match (after, page) {
+        // A commit that landed left nothing staged, so its page is adopted
+        // whatever its columns.
+        (PostCommit::Landed, Page::Read | Page::Reshaped) => None,
+        (PostCommit::Landed, Page::Failed(why)) => Some(format!(
             "committed, but this page could not be read again ({why}) · its edited cells show \
              what was typed, not what the database stored · refresh (⌘R) before editing"
         )),
-        (PostCommit::InDoubt { message, unsettled: None }, None) => Some(format!(
+        (PostCommit::InDoubt { message, unsettled: None }, Page::Read) => Some(format!(
             "COMMIT got no answer ({message}), so the changes may or may not have landed · the \
              commit is over, and this page was read after it · {HELD}"
         )),
-        (PostCommit::InDoubt { message, unsettled: Some(_) }, None) => Some(format!(
+        (PostCommit::InDoubt { message, unsettled: Some(_) }, Page::Read) => Some(format!(
             "COMMIT got no answer ({message}) and may still be running, so this page may not \
              show its outcome yet · the staged changes are held, off the page · refresh (⌘R) \
              until the commit is over"
         )),
-        (PostCommit::InDoubt { message, .. }, Some(why)) => Some(format!(
+        (PostCommit::InDoubt { message, unsettled: None }, Page::Reshaped) => Some(format!(
+            "COMMIT got no answer ({message}), so the changes may or may not have landed · \
+             {HELD_RESHAPED}"
+        )),
+        (PostCommit::InDoubt { message, unsettled: Some(_) }, Page::Reshaped) => Some(format!(
+            "COMMIT got no answer ({message}) and may still be running · this table’s columns \
+             changed in the database, so the staged changes are held and cannot be staged again \
+             · refresh (⌘R) until the commit is over, then click the count and discard them all"
+        )),
+        (PostCommit::InDoubt { message, .. }, Page::Failed(why)) => Some(format!(
             "COMMIT got no answer ({message}), so the changes may or may not have landed, and \
              this page could not be read again ({why}) · the staged changes are held, off the \
              page · refresh (⌘R)"
@@ -4629,6 +4694,15 @@ const HELD: &str = "the staged changes are held, off the page: click the count a
 const IN_DOUBT: &str = "the last commit got no answer and may have landed, so the staged changes \
                         are held · click the count and say whether it landed: all of them are \
                         dropped, or all of them staged again";
+
+/// A set held on a table whose columns changed since it was staged. It
+/// cannot be staged again against them, landed or not, so one way out is
+/// left, and this names it: the popover's discard, which a held set takes
+/// where it refuses the keyboard's.
+const HELD_RESHAPED: &str = "this table’s columns changed in the database, and the staged changes \
+                             are held after a commit that got no answer · they cannot be staged \
+                             against the changed columns: click the count and discard them all \
+                             to load the table as it is";
 
 /// The status line while the page on screen predates a commit that landed.
 const UNREFRESHED: &str = "the last commit landed, but this page was not read again: its edited \
@@ -4838,7 +4912,8 @@ fn should_reconcile_selection(
 mod tests {
     use super::{
         ClickKind, DraftHint, Lead, RowSelection, duplicate_cells, tag_width, duplicate_refusal, orphaned, same_columns, should_reconcile_selection,
-        wrapped_step, Committed, PostCommit, commit_status, commit_verdict, settle_fetch, verdict_refusal,
+        wrapped_step, Committed, Page, PostCommit, commit_status, commit_verdict, settle_fetch,
+        stale_reason, verdict_refusal,
     };
     use crate::edits::{self, Bind, CellEdit, Edits};
     use gpui_kit::{Modifiers, SharedString};
@@ -5095,8 +5170,9 @@ mod tests {
 
     #[test]
     fn the_status_after_a_commit_says_what_is_known() {
-        assert_eq!(commit_status(&PostCommit::Landed, None), None);
-        let stale = commit_status(&PostCommit::Landed, Some("query: refused")).unwrap();
+        assert_eq!(commit_status(&PostCommit::Landed, Page::Read), None);
+        assert_eq!(commit_status(&PostCommit::Landed, Page::Reshaped), None);
+        let stale = commit_status(&PostCommit::Landed, Page::Failed("query: refused")).unwrap();
         assert!(stale.starts_with("committed, but") && stale.contains("query: refused") && stale.contains("⌘R"));
         assert!(stale.contains("what was typed, not what the database stored"));
         assert!(!stale.contains("held"), "the staged set was cleared: {stale}");
@@ -5107,22 +5183,82 @@ mod tests {
         };
         // The commit's session was seen to end before the page was read: the
         // page is its outcome, and says so.
-        let settled = commit_status(&doubt(false), None).unwrap();
+        let settled = commit_status(&doubt(false), Page::Read).unwrap();
         assert!(settled.contains("no answer (query: timed out)") && settled.contains("may or may not have landed"));
         assert!(settled.contains("the commit is over, and this page was read after it"));
         assert!(settled.ends_with("say whether the commit landed"));
         // It was not: the page is not called the outcome, and no verdict is
         // invited yet.
-        let running = commit_status(&doubt(true), None).unwrap();
+        let running = commit_status(&doubt(true), Page::Read).unwrap();
         assert!(running.contains("may still be running") && running.contains("may not show its outcome yet"));
         assert!(!running.contains("read after it") && !running.contains("say whether"));
         assert!(running.ends_with("refresh (⌘R) until the commit is over"));
-        let unread = commit_status(&doubt(false), Some("HTTP 503")).unwrap();
+        let unread = commit_status(&doubt(false), Page::Failed("HTTP 503")).unwrap();
         assert!(unread.contains("could not be read again (HTTP 503)") && !unread.contains("read after it"));
         // Every one of them says the set is held.
         for status in [settled, running, unread] {
             assert!(status.contains("the staged changes are held, off the page"), "{status}");
         }
+        // The page came back with other columns: it is not called unread,
+        // and the way out named is one that works on a held set.
+        for running in [false, true] {
+            let reshaped = commit_status(&doubt(running), Page::Reshaped).unwrap();
+            assert!(reshaped.contains("columns changed in the database"), "{reshaped}");
+            assert!(reshaped.contains("click the count and discard them all"), "{reshaped}");
+            assert!(!reshaped.contains("could not be read") && !reshaped.contains("⌘⇧⌫"), "{reshaped}");
+            assert_eq!(reshaped.contains("refresh (⌘R) until the commit is over"), running);
+        }
+    }
+
+    #[test]
+    fn a_held_set_on_a_reshaped_table_can_be_judged_and_is_told_how() {
+        use edits::Unjudged::{Running, Unread};
+        // An unanswered COMMIT, then the table is altered: the fetch after
+        // the commit reads a page with other columns and drops it. The
+        // database was read all the same, so the set is not left Unread.
+        let doubt = |unsettled: Option<&str>| PostCommit::InDoubt {
+            message: "query: timed out".into(),
+            unsettled: unsettled.map(str::to_string),
+        };
+        let mut e = staged();
+        settle_fetch(Some(&doubt(None)), true, Some(&mut e));
+        assert_eq!(e.unjudged(), None);
+        // It cannot be staged again against the changed columns, and the
+        // refusal names the way out. It can be dropped, and is.
+        let refusal = verdict_refusal(false, true, e.unjudged()).unwrap();
+        assert!(refusal.contains("click the count and discard them all"), "{refusal}");
+        assert_eq!(verdict_refusal(true, true, e.unjudged()), None);
+        assert!(e.judge(true) && e.is_empty());
+
+        // The commit was still running when that page was read, and is over
+        // by a later refresh, whose page is dropped as reshaped again: each
+        // page query that answers is told to the set, kept or not.
+        let mut e = staged();
+        settle_fetch(Some(&doubt(Some("session-1"))), true, Some(&mut e));
+        assert_eq!(e.unjudged(), Some(Running));
+        e.fetched(Some(false));
+        assert_eq!(e.unjudged(), Some(Running), "still running at that refresh");
+        e.fetched(Some(true));
+        assert_eq!(e.unjudged(), None);
+        assert_eq!(verdict_refusal(true, true, e.unjudged()), None);
+        // The page after the commit failed outright, and a later one is read
+        // and dropped as reshaped.
+        let mut e = staged();
+        settle_fetch(Some(&doubt(None)), false, Some(&mut e));
+        assert_eq!(e.unjudged(), Some(Unread));
+        e.fetched(None);
+        assert_eq!(e.unjudged(), None);
+
+        // The hint in each state names an action that works there. A held
+        // set refuses the keyboard discard the reshaped hint names, so held
+        // and reshaped it is sent to the popover.
+        let hint = stale_reason(true, false, true).unwrap();
+        assert!(hint.contains("click the count and discard them all") && !hint.contains("⌘⇧⌫"), "{hint}");
+        assert_eq!(stale_reason(true, true, true), Some(hint));
+        assert!(stale_reason(true, false, false).unwrap().contains("⌘⇧⌫"));
+        assert!(stale_reason(false, true, false).unwrap().contains("refresh (⌘R)"));
+        assert!(stale_reason(false, false, true).unwrap().contains("click the count and say whether it landed"));
+        assert_eq!(stale_reason(false, false, false), None);
     }
 
     fn staged() -> Edits {
@@ -5157,7 +5293,7 @@ mod tests {
         settle_fetch(Some(&doubt(Some("session-1"))), true, Some(&mut e));
         assert!(e.in_doubt() && e.projection().is_empty());
         assert_eq!((e.unsettled(), e.unjudged()), (Some("session-1"), Some(edits::Unjudged::Running)));
-        // The page did not arrive: held, and no page to judge against.
+        // The page query got no answer: held, and nothing to judge against.
         let mut e = staged();
         assert!(!settle_fetch(Some(&doubt(None)), false, Some(&mut e)), "nothing landed for certain");
         assert_eq!(e.unjudged(), Some(edits::Unjudged::Unread));
@@ -5188,7 +5324,7 @@ mod tests {
         assert_eq!(verdict_refusal(false, false, None), None);
         // Against columns the table does not have, the set is not staged
         // again; dropping it is the way out.
-        assert_eq!(verdict_refusal(false, true, None), Some(super::RESHAPED));
+        assert_eq!(verdict_refusal(false, true, None), Some(super::HELD_RESHAPED));
         assert_eq!(verdict_refusal(true, true, None), None);
 
         // Staged again after the verdict, the set is drawn and sent whole;
