@@ -4,6 +4,10 @@
 //! ever chosen from the machine's fleet. Run explicitly:
 //! `HARBOR_LIVE_DB=/tmp/scratch.duckdb cargo test -p harbor-client --test live -- --ignored --nocapture`
 //!
+//! One probe takes another variable: `an_open_database_outlives_harbors_linger`
+//! starts a server of its own on a copy of the file `HARBOR_FIXTURE` names
+//! (its own comment has the command), and fails without it.
+//!
 //! They share one server, its handful of session connections and a few
 //! tables, so each probe takes its turn (`scratch`), whatever
 //! `--test-threads` says. The two that read the fleet run only under a

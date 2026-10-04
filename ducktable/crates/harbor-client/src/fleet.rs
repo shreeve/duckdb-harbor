@@ -187,7 +187,7 @@ fn plan<'a>(
         })
         .collect();
     let serves = |l: &Live, db: &Path, sock: &Option<PathBuf>| {
-        l.db == db || sock.as_ref().is_some_and(|s| *s == l.sock)
+        same_file(&l.db, db) || sock.as_ref().is_some_and(|s| *s == l.sock)
     };
     let mut out: Vec<Planned> = live
         .iter()
@@ -256,7 +256,7 @@ pub fn survey() -> Fleet {
             // (`file_socket`).
             Planned::Berth { name, db } => {
                 let named = home.as_ref().map(|home| paths::sock_file(home, name));
-                let running = file_socket(&db, sock_of(&db), named).is_some();
+                let running = matches!(file_socket(&db, sock_of(&db), named), FileSocket::Found(_));
                 Survey {
                     name: name.to_string(),
                     state: if running { State::Running } else { State::Stopped },
@@ -371,31 +371,52 @@ fn sock_ready(sock: &Path) -> bool {
     }
 }
 
+/// Where the server on a database file listens, if one does.
+#[derive(Debug, PartialEq)]
+enum FileSocket {
+    /// On this socket, ready.
+    Found(PathBuf),
+    /// Nowhere: no socket of the file's answers, or the one named for it
+    /// serves another file.
+    Absent,
+    /// A server answers on the socket named for the file and did not say
+    /// which database it serves. It may be this file's: starting another on
+    /// the file would only lose the file lock to it.
+    Unidentified(PathBuf),
+}
+
 /// The ready socket of the server on `db`: the one derived from the file's
 /// path, or else the one named for it, which is trusted only when the server
 /// behind it says in `/info` that this file is its database. A name is not a
 /// file: another database of the same name can be listening there, and a
 /// connection made to it would be labelled with this file's path, which
 /// every later Stop and comparison goes by.
-fn file_socket(db: &Path, own: Option<PathBuf>, named: Option<PathBuf>) -> Option<PathBuf> {
+fn file_socket(db: &Path, own: Option<PathBuf>, named: Option<PathBuf>) -> FileSocket {
     if let Some(own) = own.filter(|s| sock_ready(s)) {
-        return Some(own);
+        return FileSocket::Found(own);
     }
-    let named = named.filter(|s| sock_ready(s))?;
+    let Some(named) = named.filter(|s| sock_ready(s)) else { return FileSocket::Absent };
     #[cfg(unix)]
     let info = info_of(&Transport::Unix(named.clone()));
     #[cfg(not(unix))]
     let info: Option<wire::InfoResponse> = None;
-    names_file(info.as_ref().map(|i| i.database.as_str()), db).then_some(named)
+    match info {
+        None => FileSocket::Unidentified(named),
+        Some(info) if names_file(Some(&info.database), db) => FileSocket::Found(named),
+        Some(_) => FileSocket::Absent,
+    }
 }
 
 /// Whether the database a server reports is the file `db`, under any
 /// spelling of either path. A server that reports none is not known to be.
 fn names_file(reported: Option<&str>, db: &Path) -> bool {
-    let Some(reported) = reported.filter(|r| !r.is_empty()) else { return false };
-    let reported = Path::new(reported);
-    reported == db
-        || match (paths::canonical_db(reported), paths::canonical_db(db)) {
+    reported.filter(|r| !r.is_empty()).is_some_and(|reported| same_file(Path::new(reported), db))
+}
+
+/// Whether two paths name one database file, however each is spelled.
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b
+        || match (paths::canonical_db(a), paths::canonical_db(b)) {
             (Ok(a), Ok(b)) => a == b,
             _ => false,
         }
@@ -529,9 +550,9 @@ fn serve_file(name: String, db: &Path, summon_it: bool) -> Result<Conn, String> 
     let home = runtime_dir()?;
     let sock21 = paths::socket_for(&home, db)?;
     let sock19 = paths::sock_file(&home, &name);
-    let join = |summoned: bool| {
-        file_socket(db, Some(sock21.clone()), Some(sock19.clone())).and_then(|s| {
-            Conn::plain(
+    let join = |summoned: bool| -> Result<Option<Conn>, String> {
+        match file_socket(db, Some(sock21.clone()), Some(sock19.clone())) {
+            FileSocket::Found(s) => Ok(Conn::plain(
                 name.clone(),
                 #[cfg(unix)]
                 Transport::Unix(s),
@@ -540,10 +561,17 @@ fn serve_file(name: String, db: &Path, summon_it: bool) -> Result<Conn, String> 
                 summoned,
             )
             .ok()
-            .map(|conn| conn.serving(db))
-        })
+            .map(|conn| conn.serving(db))),
+            FileSocket::Absent => Ok(None),
+            // Not joined, since it may be another database's server, and
+            // not started over, since it may be this one's.
+            FileSocket::Unidentified(sock) => Err(format!(
+                "a server answers on {} and did not say which database it serves: try again",
+                sock.display()
+            )),
+        }
     };
-    if let Some(conn) = join(false) {
+    if let Some(conn) = join(false)? {
         return Ok(conn);
     }
     if !summon_it {
@@ -558,7 +586,7 @@ fn serve_file(name: String, db: &Path, summon_it: bool) -> Result<Conn, String> 
     let spawn_err = summon(db, true).err();
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
     loop {
-        if let Some(conn) = join(true) {
+        if let Ok(Some(conn)) = join(true) {
             return Ok(conn);
         }
         if std::time::Instant::now() > deadline {
@@ -619,7 +647,7 @@ pub fn stop(db: &Path) -> Result<(), String> {
 fn stop_targets(db: &Path, own: Option<PathBuf>, live: &[Live]) -> Vec<PathBuf> {
     let mut socks: Vec<PathBuf> = own.into_iter().collect();
     for l in live {
-        if l.db == db && !socks.contains(&l.sock) {
+        if same_file(&l.db, db) && !socks.contains(&l.sock) {
             socks.push(l.sock.clone());
         }
     }
@@ -1254,6 +1282,46 @@ mod tests {
         assert!(remote_entry(&cfg, "missing").is_err());
     }
 
+    /// A server on a unix socket that answers `/ready`, and `/info` with
+    /// `info`, or hangs up on `/info` when there is none.
+    #[cfg(unix)]
+    fn serving(sock: &Path, info: Option<String>) -> std::thread::JoinHandle<()> {
+        let _ = std::fs::remove_file(sock);
+        let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                    request.push(byte[0]);
+                }
+                let request = String::from_utf8_lossy(&request).into_owned();
+                let body = if request.starts_with("GET /ready") {
+                    Some("ok".to_string())
+                } else if request.starts_with("GET /info") {
+                    info.clone()
+                } else if request.starts_with("GET /quit") {
+                    break;
+                } else {
+                    None
+                };
+                if let Some(body) = body {
+                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                }
+            }
+        })
+    }
+
+    #[cfg(unix)]
+    fn quit(sock: &Path, server: std::thread::JoinHandle<()>) {
+        if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(sock) {
+            let _ = stream.write_all(b"GET /quit HTTP/1.1\r\n\r\n");
+        }
+        server.join().unwrap();
+        let _ = std::fs::remove_file(sock);
+    }
+
     #[test]
     fn a_socket_named_for_a_database_is_trusted_only_for_its_own_file() {
         let dir = std::env::temp_dir();
@@ -1263,6 +1331,7 @@ mod tests {
         // The server says it serves this file, under either spelling.
         assert!(names_file(Some(&db.to_string_lossy()), &db));
         assert!(names_file(Some(&same.to_string_lossy()), &db));
+        assert!(same_file(&same, &db) && !same_file(&other, &db));
         // Another file of the same name, a server that reports no database,
         // and one that did not answer `/info` at all are not this file's.
         assert!(!names_file(Some(&other.to_string_lossy()), &db));
@@ -1270,8 +1339,39 @@ mod tests {
         assert!(!names_file(None, &db));
         // With neither socket answering there is none to join.
         let missing = dir.join("harbor-client-no-such.sock");
-        assert_eq!(file_socket(&db, Some(missing.clone()), Some(missing)), None);
-        assert_eq!(file_socket(&db, None, None), None);
+        assert_eq!(file_socket(&db, Some(missing.clone()), Some(missing.clone())), FileSocket::Absent);
+        assert_eq!(file_socket(&db, None, None), FileSocket::Absent);
+
+        // A live socket named for the database, asked which file it serves.
+        #[cfg(unix)]
+        {
+            let info = |database: &Path| {
+                serde_json::to_string(&wire::InfoResponse {
+                    database: database.to_string_lossy().into_owned(),
+                    ..Default::default()
+                })
+                .unwrap()
+            };
+            let sock = dir.join(format!("hc-named-{}.sock", std::process::id()));
+            // It serves this file: joined.
+            let server = serving(&sock, Some(info(&same)));
+            assert_eq!(file_socket(&db, Some(missing.clone()), Some(sock.clone())), FileSocket::Found(sock.clone()));
+            quit(&sock, server);
+            // It serves another file of the same name: not this file's
+            // server, and this file may be started.
+            let server = serving(&sock, Some(info(&other)));
+            assert_eq!(file_socket(&db, Some(missing.clone()), Some(sock.clone())), FileSocket::Absent);
+            quit(&sock, server);
+            // It answers and does not say: neither joined nor started over.
+            let server = serving(&sock, None);
+            assert_eq!(
+                file_socket(&db, Some(missing.clone()), Some(sock.clone())),
+                FileSocket::Unidentified(sock.clone())
+            );
+            // The file's own socket is the file's whatever its name says.
+            assert_eq!(file_socket(&db, Some(sock.clone()), None), FileSocket::Found(sock.clone()));
+            quit(&sock, server);
+        }
     }
 
     #[test]

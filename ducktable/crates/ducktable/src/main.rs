@@ -134,6 +134,10 @@ fn run_row_action(
         active
             .update(cx, |_, window, cx| {
                 view.update(cx, |this, cx| {
+                    // Under the quit dialog no row is staged.
+                    if this.asking_to_quit {
+                        return;
+                    }
                     let Some(grid) = this.grid.clone() else { return };
                     if grid.read(cx).accepts_row_commands(window, cx) {
                         grid.update(cx, |grid, cx| action(grid, window, cx));
@@ -155,6 +159,12 @@ fn view_order() -> [prefs::ViewMode; 3] {
 /// Land on a view: select it and hand focus to its surface.
 fn go_view(next: prefs::ViewMode, cx: &mut App) {
     use prefs::ViewMode;
+    // Under the quit dialog the view stays: landing on one hands it the
+    // keyboard, and Return would then type into the editor behind the
+    // dialog, ⌘Enter run a statement there, and ⌘N stage a row.
+    if asking_to_quit(cx) {
+        return;
+    }
     prefs::toggle(cx, |p| p.view = next);
     // Landing on Data hands focus back to the table; landing on Query
     // hands it to the editor — the same symmetry (docs/QUERY.md).
@@ -273,9 +283,10 @@ fn request_quit(window: &mut Window, cx: &mut App) {
         cx.quit();
         return;
     }
-    if view.update(cx, |this, _| std::mem::replace(&mut this.asking_to_quit, true)) {
+    if view.read(cx).asking_to_quit {
         return;
     }
+    view.update(cx, |this, cx| this.quit_dialog_opened(cx));
     window.open_dialog(cx, move |dialog, _, cx| {
         // What is at risk is read each time the dialog is drawn, not once
         // when it opened: a commit that settles under it has by then landed
@@ -288,8 +299,8 @@ fn request_quit(window: &mut Window, cx: &mut App) {
         // Going back, by Return, Esc or the Cancel button.
         let stay = {
             let view = view.clone();
-            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                view.update(cx, |this, _| this.asking_to_quit = false);
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                view.update(cx, |this, cx| this.quit_dialog_cancelled(window, cx));
                 true
             }
         };

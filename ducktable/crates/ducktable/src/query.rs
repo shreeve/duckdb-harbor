@@ -426,15 +426,18 @@ impl QueryView {
                         Some(txn) => txn.exec(sql),
                         None => harbor_client::exec_checked(&conn, sql, None, None),
                     };
-                    // A COMMIT of an aborted transaction answers like any
-                    // other and rolls back. So the session is asked first:
-                    // an aborted transaction answers every statement with
-                    // the same error, and one that is not aborted answers.
-                    let aborted = match (&txn, route, effect) {
-                        (Some(txn), Route::Held, Some(TxnEffect::Commits)) => txn.ask_aborted(),
-                        _ => false,
-                    };
+                    let mut aborted = false;
                     let (outcome, total, paged) = 'run: {
+                        // A COMMIT of an aborted transaction answers like any
+                        // other and rolls back. So the session is asked
+                        // first, and the COMMIT follows in the same turn on
+                        // the session, with nothing between the two
+                        // (`Txn::commit`).
+                        if let (Some(txn), Route::Held, Some(TxnEffect::Commits)) = (&txn, route, effect) {
+                            let (was_aborted, answer) = txn.commit(&sql);
+                            aborted = was_aborted;
+                            break 'run (answer, None, false);
+                        }
                         if wrappable(&sql) {
                             let src = crate::sql::query_source(&sql);
                             let probe =
@@ -455,9 +458,11 @@ impl QueryView {
                                     // verdict instead: the count reads every
                                     // row, an error in a later one aborts the
                                     // transaction, and that must be said.
+                                    // A count that never ran changed nothing,
+                                    // and leaves the total unknown there too.
                                     let total = match exec(&crate::sql::count_sql(&src, &None)) {
                                         Ok(counted) => crate::sql::count_of(&counted),
-                                        Err(failure) if txn.is_some() => {
+                                        Err(failure) if txn.is_some() && !never_ran(&failure) => {
                                             break 'run (Err(failure), None, false);
                                         }
                                         Err(_) => None,
@@ -484,10 +489,12 @@ impl QueryView {
                     if let (Some(txn), false) = (&txn, fate == Fate::Open) {
                         txn.release();
                     }
-                    let outcome = match fate {
+                    let outcome = match (fate, outcome) {
                         // The COMMIT answered, and what it did was roll back.
-                        Fate::RolledBack => Err(ROLLED_BACK.to_string()),
-                        _ => outcome.map_err(|failure| failure.to_string()),
+                        (Fate::RolledBack, Ok(_)) => Err(ROLLED_BACK.to_string()),
+                        // It did not answer, and rolled back either way.
+                        (Fate::RolledBack, Err(failure)) => Err(format!("{failure}\n\n{ROLLED_BACK_UNANSWERED}")),
+                        (_, outcome) => outcome.map_err(|failure| failure.to_string()),
                     };
                     (outcome, total, paged, txn, fate)
                 })
@@ -675,9 +682,9 @@ impl QueryView {
 
     /// The transaction mark: that one is open, and how long the server
     /// will keep it. None between transactions.
-    fn transaction_mark(&self) -> Option<(String, bool)> {
+    fn transaction_mark(&self) -> Option<(String, Health)> {
         let txn = self.txn.as_ref()?;
-        Some((transaction_mark(txn.aborted(), txn.remaining()), txn.aborted()))
+        Some((transaction_mark(txn.health(), txn.remaining()), txn.health()))
     }
 
     /// The footer's transient voice, which outranks the results grid's
@@ -795,14 +802,14 @@ impl Render for QueryView {
                     // A transaction held open is state the user must not
                     // lose sight of: it sits in the band, above the text
                     // that will run inside it, for as long as it lasts.
-                    .when_some(self.transaction_mark(), |d, (mark, aborted)| {
+                    .when_some(self.transaction_mark(), |d, (mark, health)| {
                         d.child(
                             div()
                                 .flex_1()
                                 .px_3()
                                 .text_right()
                                 .text_xs()
-                                .text_color(if aborted { t.bad } else { t.warn })
+                                .text_color(if health == Health::Aborted { t.bad } else { t.warn })
                                 .child(mark),
                         )
                     })
@@ -939,12 +946,14 @@ fn wrappable(sql: &str) -> bool {
 
 /// The band's mark while a transaction is open: its state, how long the
 /// server will keep it, and what ends it.
-fn transaction_mark(aborted: bool, left: std::time::Duration) -> String {
+fn transaction_mark(health: Health, left: std::time::Duration) -> String {
     let left = left.as_secs();
-    let (state, ends) = if aborted {
-        ("transaction aborted by an error", "ROLLBACK ends it")
-    } else {
-        ("transaction open", "COMMIT or ROLLBACK ends it")
+    let (state, ends) = match health {
+        Health::Fine => ("transaction open", "COMMIT or ROLLBACK ends it"),
+        Health::Aborted => ("transaction aborted by an error", "ROLLBACK ends it"),
+        Health::Unknown => {
+            ("transaction open, its state unconfirmed after an error", "COMMIT asks first, ROLLBACK ends it")
+        }
     };
     format!("{state} \u{00b7} {}:{:02} left \u{00b7} {ends}", left / 60, left % 60)
 }
@@ -973,12 +982,69 @@ struct Held {
     gate: std::sync::Mutex<()>,
     /// Given back, or found gone. Nothing more runs on it.
     over: std::sync::atomic::AtomicBool,
-    /// An error has aborted the transaction: until ROLLBACK or COMMIT ends
-    /// it, the engine answers every statement with the same error, and a
-    /// COMMIT rolls back. Raised by any engine error on the session that is
-    /// not a parse error, and lowered by any statement that answers, which
-    /// an aborted transaction never does.
-    aborted: std::sync::atomic::AtomicBool,
+    /// Whether an error has aborted the transaction (`Health`), as the
+    /// session last said when asked. Asked after any statement on it that
+    /// may have run and failed, by every keepalive, and before a COMMIT.
+    health: std::sync::atomic::AtomicU8,
+}
+
+/// What is known of the transaction on a session. An aborted transaction
+/// stays open until ROLLBACK or COMMIT ends it, answers `SELECT 1` with
+/// "Current transaction is aborted", and a COMMIT of it rolls back. Only that
+/// question settles it: other statements can answer on an aborted
+/// transaction (PREPARE does), so a success proves nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Health {
+    /// The session answered `SELECT 1`.
+    Fine,
+    /// It answered that the transaction is aborted.
+    Aborted,
+    /// A statement may have run and failed, and the session could not be
+    /// asked since.
+    Unknown,
+}
+
+/// What asking the session found.
+#[derive(Debug, PartialEq)]
+enum Asked {
+    Is(Health),
+    /// Harbor no longer knows the session.
+    Gone(harbor_client::Failure),
+    /// No verdict: the session was busy, or the question got no answer.
+    /// The reason.
+    Unanswered(String),
+}
+
+/// Read the session's answer to `SELECT 1`.
+fn asked(answer: Result<harbor_client::QueryResult, harbor_client::Failure>) -> Asked {
+    use harbor_client::Failure;
+    match answer {
+        Ok(_) => Asked::Is(Health::Fine),
+        Err(failure) if failure.session_gone() => Asked::Gone(failure),
+        Err(Failure::Refused { code, message }) if code == "sql_error" && message.contains(ABORTED) => {
+            Asked::Is(Health::Aborted)
+        }
+        Err(failure) => Asked::Unanswered(failure.to_string()),
+    }
+}
+
+/// The engine's words for every statement on an aborted transaction.
+const ABORTED: &str = "transaction is aborted";
+
+/// Whether a COMMIT may be sent, given what the session said just before:
+/// `Ok(aborted)` to send it, knowing what it will do, or the failure to
+/// report in its place. A COMMIT whose transaction's state could not be
+/// confirmed is not sent: it might roll everything back and answer like one
+/// that committed, and a verdict resting on an earlier guess would be one.
+fn commit_gate(asked: Asked) -> Result<bool, harbor_client::Failure> {
+    match asked {
+        Asked::Is(health) => Ok(health == Health::Aborted),
+        Asked::Gone(failure) => Err(failure),
+        Asked::Unanswered(why) => Err(harbor_client::Failure::Unsent(format!(
+            "could not confirm the transaction's state ({why}), so the COMMIT was not sent: \
+             try again"
+        ))),
+    }
 }
 
 /// What a keepalive found.
@@ -1000,7 +1066,7 @@ impl Txn {
             opened: std::time::Instant::now(),
             gate: std::sync::Mutex::new(()),
             over: std::sync::atomic::AtomicBool::new(false),
-            aborted: std::sync::atomic::AtomicBool::new(false),
+            health: std::sync::atomic::AtomicU8::new(Health::Fine as u8),
         })))
     }
 
@@ -1022,27 +1088,45 @@ impl Txn {
         self.0.session.idle
     }
 
-    fn aborted(&self) -> bool {
-        self.0.aborted.load(std::sync::atomic::Ordering::Acquire)
+    fn health(&self) -> Health {
+        match self.0.health.load(std::sync::atomic::Ordering::Acquire) {
+            0 => Health::Fine,
+            1 => Health::Aborted,
+            _ => Health::Unknown,
+        }
+    }
+
+    fn set_health(&self, health: Health) {
+        self.0.health.store(health as u8, std::sync::atomic::Ordering::Release);
     }
 
     /// Run one statement on the session. Blocks while another is running.
     fn exec(&self, sql: &str) -> Result<harbor_client::QueryResult, harbor_client::Failure> {
         let _turn = self.0.gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let answer = harbor_client::exec_checked(&self.0.conn, sql, None, Some(&self.0.session.id));
-        self.learn(&answer);
-        answer
+        self.exec_in_turn(sql)
     }
 
-    /// What an answer on the session says about the transaction, kept for
-    /// the band and for the COMMIT that may follow.
-    fn learn(&self, answer: &Result<harbor_client::QueryResult, harbor_client::Failure>) {
-        use std::sync::atomic::Ordering::Release;
-        match aborted_after(answer.as_ref().err()) {
-            Some(aborted) => self.0.aborted.store(aborted, Release),
-            None if answer.as_ref().is_err_and(|failure| failure.session_gone()) => self.mark_over(),
-            None => {}
+    /// `exec`, with the gate held by the caller. A statement that may have
+    /// run and failed may have aborted the transaction, so the session is
+    /// asked at once, in the same turn: the band is then never a guess, and
+    /// never says aborted of a statement Harbor itself turned away.
+    fn exec_in_turn(&self, sql: &str) -> Result<harbor_client::QueryResult, harbor_client::Failure> {
+        let answer = harbor_client::exec_checked(&self.0.conn, sql, None, Some(&self.0.session.id));
+        match answer.as_ref().err().map(ran) {
+            _ if answer.as_ref().is_err_and(|failure| failure.session_gone()) => self.mark_over(),
+            None | Some(Ran::Never) => {}
+            // No answer: the statement may still be running there, and the
+            // session would only answer that it is busy.
+            Some(Ran::Unknown) if matches!(answer, Err(harbor_client::Failure::Unanswered(_))) => {
+                self.set_health(Health::Unknown)
+            }
+            Some(Ran::Failed | Ran::Unknown) => {
+                if let Asked::Unanswered(_) = self.ask() {
+                    self.set_health(Health::Unknown);
+                }
+            }
         }
+        answer
     }
 
     /// Run a statement for a results grid that pages inside the
@@ -1055,7 +1139,10 @@ impl Txn {
         match self.exec(sql) {
             // The server reclaimed the session since the last statement: the
             // transaction is over, and this page is read like any other.
-            Err(failure) if failure.session_gone() => harbor_client::query(&self.0.conn, sql),
+            Err(failure) if failure.session_gone() => {
+                self.mark_over();
+                harbor_client::query(&self.0.conn, sql)
+            }
             other => other.map_err(|failure| failure.to_string()),
         }
     }
@@ -1075,29 +1162,42 @@ impl Txn {
             return Touch::Gone;
         }
         let Ok(_turn) = self.0.gate.try_lock() else { return Touch::Alive };
-        self.learn(&self.ask());
+        self.ask();
         if self.over() { Touch::Gone } else { Touch::Alive }
     }
 
-    /// Ask the session whether its transaction is aborted, before a COMMIT
-    /// that would then roll back. An aborted transaction answers every
-    /// statement with the same error, and any other answers; with no answer
-    /// at all, what earlier answers said stands.
-    fn ask_aborted(&self) -> bool {
+    /// Send a COMMIT, knowing what it will do: ask the session whether its
+    /// transaction is aborted, and send the COMMIT in the same turn, so no
+    /// other statement on the session (a results grid's page, a keepalive)
+    /// comes between the question and the COMMIT and aborts what was just
+    /// found sound. Returns whether the transaction was aborted, and the
+    /// COMMIT's answer; when the session's state cannot be confirmed the
+    /// COMMIT is not sent (`commit_gate`).
+    fn commit(&self, sql: &str) -> (bool, Result<harbor_client::QueryResult, harbor_client::Failure>) {
         let _turn = self.0.gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.learn(&self.ask());
-        self.aborted()
+        match commit_gate(self.ask()) {
+            Ok(aborted) => (aborted, self.exec_in_turn(sql)),
+            Err(failure) => (false, Err(failure)),
+        }
     }
 
-    /// `SELECT 1` on the session, with the gate held by the caller.
-    fn ask(&self) -> Result<harbor_client::QueryResult, harbor_client::Failure> {
-        harbor_client::exec_within(
+    /// `SELECT 1` on the session, with the gate held by the caller, and
+    /// what it says of the transaction kept. A question that gets no
+    /// verdict changes nothing that was known.
+    fn ask(&self) -> Asked {
+        let found = asked(harbor_client::exec_within(
             &self.0.conn,
             "SELECT 1",
             None,
             Some(&self.0.session.id),
             std::time::Duration::from_secs(5),
-        )
+        ));
+        match &found {
+            Asked::Is(health) => self.set_health(*health),
+            Asked::Gone(_) => self.mark_over(),
+            Asked::Unanswered(_) => {}
+        }
+        found
     }
 
     /// Give the session back, once. Harbor rolls back whatever is open on
@@ -1210,7 +1310,7 @@ enum Fate {
 }
 
 /// `aborted` is what the session answered when asked just before a COMMIT
-/// (`Txn::ask_aborted`); it matters to no other statement.
+/// (`Txn::commit`); it matters to no other statement.
 fn fate(
     route: Route,
     effect: Option<TxnEffect>,
@@ -1219,6 +1319,7 @@ fn fate(
 ) -> Fate {
     use harbor_client::Failure;
     let ends = effect.is_some_and(TxnEffect::ends);
+    let doomed = aborted && effect == Some(TxnEffect::Commits);
     match (route, failure) {
         (Route::Alone | Route::Refused, _) => Fate::Closed,
         (Route::Opening, None) => Fate::Open,
@@ -1228,20 +1329,26 @@ fn fate(
         // have aborted it; the band says so, and ROLLBACK or COMMIT still
         // ends it.
         (Route::Held, _) if !ends => Fate::Open,
-        (Route::Held, None) if aborted && effect == Some(TxnEffect::Commits) => Fate::RolledBack,
+        (Route::Held, None) if doomed => Fate::RolledBack,
         (Route::Held, None) => Fate::Closed,
-        // A statement that never ran never reached the transaction: one the
-        // parser refused, one Harbor refused before the engine saw it, as it
-        // does while the session is still busy with the statement before
-        // (`session_busy`) or while it is not serving (`unavailable`), and
-        // one that could not be sent. The message is the verdict, and the
-        // transaction is as it was.
-        (Route::Held, Some(failure)) if never_ran(failure) => Fate::Open,
-        (Route::Held, Some(Failure::Refused { message, .. })) if message.contains(NONE_ACTIVE) => {
-            Fate::NoneActive
-        }
-        (Route::Held, Some(Failure::Refused { .. })) => Fate::Failed,
-        (Route::Held, Some(Failure::Unsent(_) | Failure::Unanswered(_))) => Fate::InDoubt,
+        (Route::Held, Some(failure)) => match ran(failure) {
+            // A statement that never ran never reached the transaction: one
+            // the parser refused, one Harbor refused before the engine saw
+            // it, as it does while the session is still busy with the
+            // statement before (`session_busy`) or while it is not serving
+            // (`unavailable`), and one that could not be sent. The message
+            // is the verdict, and the transaction is as it was.
+            Ran::Never => Fate::Open,
+            Ran::Failed => match failure {
+                Failure::Refused { message, .. } if message.contains(NONE_ACTIVE) => Fate::NoneActive,
+                _ => Fate::Failed,
+            },
+            // No verdict on a COMMIT of an aborted transaction leaves no
+            // doubt: it rolls back when it runs, and when its session is
+            // released if it did not.
+            Ran::Unknown if doomed => Fate::RolledBack,
+            Ran::Unknown => Fate::InDoubt,
+        },
     }
 }
 
@@ -1253,7 +1360,7 @@ impl Fate {
     /// alone would leave the transaction's state unsaid.
     fn note(self, effect: Option<TxnEffect>) -> Option<&'static str> {
         match self {
-            // RolledBack is its own message (`ROLLED_BACK`).
+            // RolledBack carries its own words (`ROLLED_BACK`).
             Fate::Open | Fate::Closed | Fate::RolledBack => None,
             Fate::Failed => Some(
                 "The transaction is over: its changes were rolled back.",
@@ -1285,6 +1392,11 @@ impl Fate {
 const ROLLED_BACK: &str = "COMMIT rolled back: an earlier error aborted the transaction, and \
                            nothing since BEGIN was kept.";
 
+/// A COMMIT that got no answer on a transaction an earlier error had aborted.
+const ROLLED_BACK_UNANSWERED: &str = "An earlier error had aborted the transaction, so it is rolled \
+                                      back either way: by the COMMIT if it ran, and by the release \
+                                      of its session if not. Nothing since BEGIN was kept.";
+
 /// The transaction's session is gone, found by the keepalive or by a
 /// statement that would have ended it.
 const LOST: &str = "The transaction is gone: the server reclaimed its session and rolled back \
@@ -1295,33 +1407,46 @@ const LOST_REFUSED: &str = "The transaction is gone: the server reclaimed its se
                             back everything since BEGIN. This statement was not sent: outside a \
                             transaction it commits on its own. \u{2318}Enter again runs it that way.";
 
-/// The statement did not run. It could not be sent, Harbor refused it before
-/// the engine saw it (any code but the engine's own `sql_error`), or the
-/// engine's parser did.
-/// Measured: a Parser Error inside a transaction leaves it as it was, where
-/// every other class of engine error aborts it: Catalog, Binder, Constraint,
-/// Conversion, Out of Range, Invalid Input and TransactionContext.
-fn never_ran(failure: &harbor_client::Failure) -> bool {
+/// Whether a failed statement ran.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Ran {
+    /// It did not: it could not be sent, Harbor refused it before the engine
+    /// saw it, or the engine's parser did. Measured: a Parser Error inside a
+    /// transaction leaves it as it was.
+    Never,
+    /// It ran, and the engine refused it (`sql_error`). Measured: inside a
+    /// transaction every class of engine error but the parser's aborts it:
+    /// Catalog, Binder, Constraint, Conversion, Out of Range, Invalid Input
+    /// and TransactionContext.
+    Failed,
+    /// It may have run. No answer came, or Harbor's answer is one it sends
+    /// about a statement the engine had begun: `cancelled`, when a deadline
+    /// or a cancel interrupts it, `internal`, and a result it could not
+    /// send. A code this client does not know is read the same way: nothing
+    /// is assumed not to have run.
+    Unknown,
+}
+
+fn ran(failure: &harbor_client::Failure) -> Ran {
+    use harbor_client::Failure;
     match failure {
-        harbor_client::Failure::Refused { code, message } => {
-            code != "sql_error" || message.starts_with("Parser Error")
-        }
-        harbor_client::Failure::Unsent(_) => true,
-        harbor_client::Failure::Unanswered(_) => false,
+        Failure::Unsent(_) => Ran::Never,
+        Failure::Unanswered(_) => Ran::Unknown,
+        Failure::Refused { code, message } => match code.as_str() {
+            "sql_error" if message.starts_with("Parser Error") => Ran::Never,
+            "sql_error" => Ran::Failed,
+            // What Harbor answers before the statement reaches the engine.
+            "bad_request" | "not_found" | "forbidden" | "body_too_large" | "no_such_session"
+            | "session_busy" | "query_id_in_use" | "no_lease_connections" | "no_lease_available"
+            | "unavailable" | "unready" => Ran::Never,
+            _ => Ran::Unknown,
+        },
     }
 }
 
-/// What a statement's answer on a session says about its transaction:
-/// `Some(true)`, an error aborted it (any the engine raised running the
-/// statement); `Some(false)`, the statement answered, which an aborted
-/// transaction lets none do; `None`, nothing either way (it never ran, or
-/// no answer came).
-fn aborted_after(failure: Option<&harbor_client::Failure>) -> Option<bool> {
-    match failure {
-        None => Some(false),
-        Some(refused @ harbor_client::Failure::Refused { .. }) if !never_ran(refused) => Some(true),
-        Some(_) => None,
-    }
+/// The statement did not run (`Ran::Never`).
+fn never_ran(failure: &harbor_client::Failure) -> bool {
+    ran(failure) == Ran::Never
 }
 
 // =========================== statement spans ==========================
@@ -1606,8 +1731,9 @@ mod tests {
     // attribute macro, which would shadow the built-in #[test] and
     // expand itself forever.
     use super::{
-        aborted_after, fate, never_ran, route, shared_gutter_max, split_statements, statement_at,
-        statement_span, transaction_mark, txn_effect, wrappable, Fate, Route, TxnEffect,
+        asked, commit_gate, fate, never_ran, ran, route, shared_gutter_max, split_statements,
+        statement_at, statement_span, transaction_mark, txn_effect, wrappable, Asked, Fate, Health,
+        Ran, Route, TxnEffect,
     };
     use harbor_client::Failure;
 
@@ -1804,9 +1930,13 @@ mod tests {
         Failure::Refused { code: "sql_error".into(), message: message.into() }
     }
 
+    fn harbor(code: &str) -> Failure {
+        Failure::Refused { code: code.into(), message: format!("harbor says {code}") }
+    }
+
     #[test]
-    fn an_error_aborts_the_transaction_and_an_answer_proves_it_is_not() {
-        // Every class of engine error but the parser's aborts (measured).
+    fn a_failed_statement_ran_did_not_or_may_have() {
+        // The engine ran it and refused it: every class but the parser's.
         for message in [
             "Catalog Error: Table with name nope does not exist!",
             "Binder Error: Referenced column \"nocol\" not found in FROM clause!",
@@ -1817,31 +1947,77 @@ mod tests {
             "TransactionContext Error: cannot start a transaction within a transaction",
             "TransactionContext Error: Current transaction is aborted (please ROLLBACK)",
         ] {
-            assert!(!never_ran(&refused(message)), "{message}");
-            assert_eq!(aborted_after(Some(&refused(message))), Some(true), "{message}");
+            assert_eq!(ran(&refused(message)), Ran::Failed, "{message}");
         }
-        // A statement that answers: an aborted transaction lets none.
-        assert_eq!(aborted_after(None), Some(false));
-        // What never ran says nothing, and neither does silence.
-        let busy = Failure::Refused { code: "session_busy".into(), message: "busy".into() };
-        let gone = Failure::Refused { code: "no_such_session".into(), message: "no such session".into() };
-        for failure in [
-            refused("Parser Error: syntax error at or near \"foo\""),
-            busy,
-            gone,
-            Failure::Unsent("query: Connection refused (os error 61)".into()),
+        // It never ran: the parser refused it, Harbor refused it before the
+        // engine saw it, or it could not be sent.
+        assert_eq!(ran(&refused("Parser Error: syntax error at or near \"foo\"")), Ran::Never);
+        for code in [
+            "bad_request", "not_found", "forbidden", "body_too_large", "no_such_session", "session_busy",
+            "query_id_in_use", "no_lease_connections", "no_lease_available", "unavailable", "unready",
         ] {
-            assert!(never_ran(&failure), "{failure:?}");
-            assert_eq!(aborted_after(Some(&failure)), None, "{failure:?}");
+            assert_eq!(ran(&harbor(code)), Ran::Never, "{code}");
         }
-        let silence = Failure::Unanswered("query: timed out".into());
-        assert!(!never_ran(&silence));
-        assert_eq!(aborted_after(Some(&silence)), None);
+        assert_eq!(ran(&Failure::Unsent("query: Connection refused (os error 61)".into())), Ran::Never);
+        // It may have run: Harbor's answers about a statement the engine had
+        // begun, a code this client does not know, and silence.
+        for code in ["cancelled", "internal", "response_too_large", "unsupported_type", "some_later_code"] {
+            assert_eq!(ran(&harbor(code)), Ran::Unknown, "{code}");
+            assert!(!never_ran(&harbor(code)), "{code}");
+        }
+        assert_eq!(ran(&Failure::Unanswered("query: timed out".into())), Ran::Unknown);
+    }
 
-        // The band says which.
+    #[test]
+    fn only_the_sessions_own_answer_says_whether_it_is_aborted() {
+        let ok = harbor_client::QueryResult { columns: vec![], rows: vec![], row_count: 1, time_ms: 0 };
+        assert_eq!(asked(Ok(ok)), Asked::Is(Health::Fine));
+        let aborted = refused("TransactionContext Error: Current transaction is aborted (please ROLLBACK)");
+        assert_eq!(asked(Err(aborted)), Asked::Is(Health::Aborted));
+        let gone = harbor("no_such_session");
+        assert_eq!(asked(Err(gone.clone())), Asked::Gone(gone));
+        // Busy with the statement before, or no answer within the wait: no
+        // verdict, and nothing known before is changed by it.
+        for failure in [
+            harbor("session_busy"),
+            Failure::Unanswered("query: Resource temporarily unavailable (os error 35)".into()),
+            Failure::Unsent("query: Connection refused (os error 61)".into()),
+            refused("Binder Error: something else entirely"),
+        ] {
+            assert!(matches!(asked(Err(failure.clone())), Asked::Unanswered(_)), "{failure:?}");
+        }
+
+        // The band says which of the three it is.
         let left = std::time::Duration::from_secs(272);
-        assert_eq!(transaction_mark(false, left), "transaction open \u{b7} 4:32 left \u{b7} COMMIT or ROLLBACK ends it");
-        assert_eq!(transaction_mark(true, left), "transaction aborted by an error \u{b7} 4:32 left \u{b7} ROLLBACK ends it");
+        assert_eq!(
+            transaction_mark(Health::Fine, left),
+            "transaction open \u{b7} 4:32 left \u{b7} COMMIT or ROLLBACK ends it"
+        );
+        assert_eq!(
+            transaction_mark(Health::Aborted, left),
+            "transaction aborted by an error \u{b7} 4:32 left \u{b7} ROLLBACK ends it"
+        );
+        assert!(transaction_mark(Health::Unknown, left).starts_with("transaction open, its state unconfirmed"));
+    }
+
+    #[test]
+    fn a_commit_is_sent_only_when_the_sessions_state_is_confirmed() {
+        // Confirmed sound, it is sent, and will commit.
+        assert_eq!(commit_gate(Asked::Is(Health::Fine)), Ok(false));
+        // Confirmed aborted, it is sent too, and its answer is read as the
+        // rollback it is.
+        assert_eq!(commit_gate(Asked::Is(Health::Aborted)), Ok(true));
+        // Unconfirmed, it is not sent: it could roll everything back and
+        // answer like a commit. The failure says so, and is one of a
+        // statement that never ran, so the transaction stays open.
+        let unconfirmed = commit_gate(Asked::Unanswered("session_busy: busy".into())).unwrap_err();
+        assert!(matches!(&unconfirmed, Failure::Unsent(why)
+            if why.starts_with("could not confirm the transaction's state (session_busy: busy)")
+                && why.ends_with("try again")));
+        assert_eq!(fate(Route::Held, Some(TxnEffect::Commits), false, Some(&unconfirmed)), Fate::Open);
+        // A session that is gone is reported as that.
+        let gone = commit_gate(Asked::Gone(harbor("no_such_session"))).unwrap_err();
+        assert_eq!(fate(Route::Held, Some(TxnEffect::Commits), false, Some(&gone)), Fate::Lost);
     }
 
     #[test]
@@ -1852,6 +2028,12 @@ mod tests {
         assert_eq!(fate(Route::Held, commits, true, None), Fate::RolledBack);
         // Not aborted, it committed.
         assert_eq!(fate(Route::Held, commits, false, None), Fate::Closed);
+        // With no verdict on the COMMIT there is still no doubt: aborted, it
+        // rolls back when it runs or when its session is released.
+        for failure in [Failure::Unanswered("query: timed out".into()), harbor("cancelled"), harbor("internal")] {
+            assert_eq!(fate(Route::Held, commits, true, Some(&failure)), Fate::RolledBack, "{failure:?}");
+            assert_eq!(fate(Route::Held, commits, false, Some(&failure)), Fate::InDoubt, "{failure:?}");
+        }
         // A ROLLBACK does what was asked either way, and says no more.
         assert_eq!(fate(Route::Held, rolls_back, true, None), Fate::Closed);
         assert_eq!(fate(Route::Held, rolls_back, false, None), Fate::Closed);
@@ -1860,6 +2042,7 @@ mod tests {
         // The view's own message stands in for "ok", and needs no note.
         assert_eq!(Fate::RolledBack.note(commits), None);
         assert!(super::ROLLED_BACK.contains("rolled back: an earlier error aborted the transaction"));
+        assert!(super::ROLLED_BACK_UNANSWERED.contains("rolled back either way"));
     }
 
     #[test]
@@ -1909,6 +2092,12 @@ mod tests {
             // and roll everything back.
             for failure in [&busy, &unavailable, &unsent] {
                 assert_eq!(fate(Route::Held, ends, false, Some(failure)), Fate::Open, "{failure:?}");
+            }
+            // One Harbor interrupted after the engine had it, at a deadline
+            // or a cancel, or failed on after it ran, has no verdict either:
+            // the transaction is not shown as open.
+            for code in ["cancelled", "internal"] {
+                assert_eq!(fate(Route::Held, ends, false, Some(&harbor(code))), Fate::InDoubt, "{code}");
             }
             // The engine found no transaction to end: the view's mark was
             // wrong, and nothing is claimed to have been rolled back.
@@ -2040,18 +2229,25 @@ mod tests {
         let txn = super::Txn::open(&conn).expect("session");
         txn.exec("BEGIN").expect("BEGIN");
         txn.exec("INSERT INTO _dt_aborted_probe VALUES (3, '3')").expect("insert");
-        assert!(!txn.aborted());
+        assert_eq!(txn.health(), Health::Fine);
         let page = "SELECT * FROM (\nSELECT v::INTEGER FROM _dt_aborted_probe ORDER BY id\n) LIMIT 1 OFFSET 0";
         txn.exec(page).expect("the first page reads one row, which converts");
-        assert!(!txn.aborted());
+        assert_eq!(txn.health(), Health::Fine);
         let count = "SELECT count(*) FROM (\nSELECT v::INTEGER AS n FROM _dt_aborted_probe ORDER BY id\n) WHERE n > 0";
         let failure = txn.exec(count).unwrap_err();
         println!("the count: {failure}");
-        assert!(txn.aborted(), "a Conversion Error aborts, and the band says so");
-        assert!(txn.ask_aborted(), "and the session, asked, says so too");
-        // The COMMIT answers like any other. What it did is roll back.
-        txn.exec("COMMIT").expect("COMMIT answers");
-        assert_eq!(fate(Route::Held, commits, true, None), Fate::RolledBack);
+        assert_eq!(txn.health(), Health::Aborted, "a Conversion Error aborts, and the band says so at once");
+        // A statement that answers on an aborted transaction proves nothing:
+        // the band still says aborted after it.
+        let prepared = txn.exec("PREPARE _dt_p AS SELECT 1");
+        println!("PREPARE on the aborted transaction: {:?}", prepared.as_ref().map(|_| "answered").map_err(ToString::to_string));
+        assert_eq!(txn.health(), Health::Aborted);
+        // The COMMIT is sent in the same turn as the question, answers like
+        // any other, and what it did is roll back.
+        let (aborted, answer) = txn.commit("COMMIT");
+        assert!(aborted);
+        answer.expect("COMMIT answers");
+        assert_eq!(fate(Route::Held, commits, aborted, None), Fate::RolledBack);
         txn.release();
         assert_eq!(rows(), serde_json::json!(2), "the INSERT is gone");
 
@@ -2060,37 +2256,67 @@ mod tests {
         txn.exec("BEGIN").expect("BEGIN");
         txn.exec("INSERT INTO _dt_aborted_probe VALUES (3, '3')").expect("insert");
         assert!(txn.page("SELECT * FROM _dt_no_such_table LIMIT 5 OFFSET 5").is_err());
-        assert!(txn.aborted());
+        assert_eq!(txn.health(), Health::Aborted);
         txn.exec("ROLLBACK").expect("ROLLBACK");
         txn.release();
 
-        // A parse error leaves it as it was, and so does an answer: the flag
-        // follows the last evidence. Harbor's own refusal of a protected
-        // setting reads as an engine error and raises it; the session, asked
-        // before the COMMIT, answers, and the COMMIT is known to have landed.
+        // A parse error leaves it as it was. Harbor's own refusal of a
+        // protected setting reads like an engine error, so the session is
+        // asked in the same turn and the band never says aborted of it; the
+        // COMMIT that follows is known to have landed.
         let txn = super::Txn::open(&conn).expect("session");
         txn.exec("BEGIN").expect("BEGIN");
         txn.exec("INSERT INTO _dt_aborted_probe VALUES (3, '3')").expect("insert");
         assert!(txn.exec("SELEC 1").is_err());
-        assert!(!txn.aborted());
+        assert_eq!(txn.health(), Health::Fine);
         let refused = txn.exec("SET memory_limit = '1GB'").unwrap_err();
         println!("a protected setting: {refused}");
-        assert!(txn.aborted(), "suspected");
-        assert!(!txn.ask_aborted(), "and found not to be");
-        txn.exec("COMMIT").expect("COMMIT");
-        assert_eq!(fate(Route::Held, commits, txn.aborted(), None), Fate::Closed);
+        assert_eq!(txn.health(), Health::Fine, "asked at once, and found sound");
+        let (aborted, answer) = txn.commit("COMMIT");
+        assert!(!aborted);
+        answer.expect("COMMIT");
+        assert_eq!(fate(Route::Held, commits, aborted, None), Fate::Closed);
         txn.release();
         assert_eq!(rows(), serde_json::json!(3), "this one committed");
+
+        // A COMMIT on a session still busy with another statement cannot be
+        // confirmed, and is not sent: the transaction stays as it was.
+        let txn = super::Txn::open(&conn).expect("session");
+        txn.exec("BEGIN").expect("BEGIN");
+        txn.exec("INSERT INTO _dt_aborted_probe VALUES (4, '4')").expect("insert");
+        let id = txn.0.session.id.clone();
+        let (busy_conn, busy_id) = (conn.clone(), id.clone());
+        let slow = std::thread::spawn(move || {
+            harbor_client::exec_checked(
+                &busy_conn,
+                "SELECT count(*) FROM range(3000000000) t(i) WHERE i % 7 = 3",
+                None,
+                Some(&busy_id),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let (aborted, answer) = txn.commit("COMMIT");
+        let unconfirmed = answer.unwrap_err();
+        println!("COMMIT on a busy session: {unconfirmed}");
+        assert!(!aborted && matches!(&unconfirmed, harbor_client::Failure::Unsent(_)));
+        assert_eq!(fate(Route::Held, commits, aborted, Some(&unconfirmed)), Fate::Open);
+        assert_eq!(rows(), serde_json::json!(3), "nothing was committed");
+        slow.join().expect("the slow statement's thread").expect("it finished");
+        let (aborted, answer) = txn.commit("COMMIT");
+        answer.expect("COMMIT, once the session is free");
+        assert!(!aborted);
+        txn.release();
+        assert_eq!(rows(), serde_json::json!(4));
 
         // The keepalive learns of an abort it did not cause, within its wait.
         let txn = super::Txn::open(&conn).expect("session");
         txn.exec("BEGIN").expect("BEGIN");
         let id = txn.0.session.id.clone();
         assert!(harbor_client::exec_checked(&conn, "SELECT * FROM _dt_no_such_table", None, Some(&id)).is_err());
-        assert!(!txn.aborted());
+        assert_eq!(txn.health(), Health::Fine);
         let began = std::time::Instant::now();
         assert_eq!(txn.touch(), super::Touch::Alive);
-        assert!(txn.aborted());
+        assert_eq!(txn.health(), Health::Aborted);
         assert!(began.elapsed() < std::time::Duration::from_secs(5));
         txn.release();
         alone("DROP TABLE _dt_aborted_probe").expect("drop");

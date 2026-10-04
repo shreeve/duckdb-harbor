@@ -116,13 +116,31 @@ pub struct Edits {
     next_draft: u64,
     /// The COMMIT that sent this set got no answer, so the database may
     /// already hold it. While the doubt stands the set is held: nothing is
-    /// staged into it, it yields no statements, and it has no undo history,
-    /// since every step of that history predates a commit that may have
-    /// landed. The user reviews it against the database, discards what
-    /// landed, which cannot then be brought back, and stages what is left
-    /// again (`resolve_in_doubt`). The flag stays with the set, which a
-    /// table switch parks and hands back.
+    /// staged into it or discarded from it, it yields no statements, and it
+    /// has no undo history, since every step of that history predates a
+    /// commit that may have landed. A commit is all or nothing, so the set
+    /// leaves the hold whole, by one of two verdicts the user gives after
+    /// comparing it with the database: it landed, and the set is dropped
+    /// or it did not, and the set is staged again (`judge`). The flag stays
+    /// with the set, which a table switch parks and hands back.
     in_doubt: bool,
+    /// The session of that commit, while it has not been seen to end: the
+    /// COMMIT may still be running there, and the database does not show its
+    /// outcome yet.
+    unsettled: Option<String>,
+    /// No page has been read since that commit ended, so there is nothing
+    /// to judge the set against. No verdict is taken while either stands;
+    /// the next page read after the commit is over lifts both (`fetched`).
+    unread: bool,
+}
+
+/// Why a held set cannot be judged yet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Unjudged {
+    /// The commit that sent it may still be running.
+    Running,
+    /// No page has been read since that commit ended.
+    Unread,
 }
 
 /// What a grid does with the staged set parked for its table.
@@ -168,6 +186,8 @@ impl Edits {
             redo: Vec::new(),
             next_draft: 1,
             in_doubt: false,
+            unsettled: None,
+            unread: false,
         }
     }
 
@@ -210,15 +230,18 @@ impl Edits {
         self.changes.len()
     }
 
-    /// Record that the COMMIT which sent this set got no answer. The undo
-    /// history goes with the certainty: a step back would restore a state
-    /// from before a commit that may have landed, and a discarded change
-    /// could come back to be sent a second time.
-    pub fn mark_in_doubt(&mut self) {
+    /// Record that the COMMIT which sent this set got no answer. `unsettled`
+    /// is the commit's session when it was not seen to end, and `read` is
+    /// whether a page was read after it. The undo history goes with the
+    /// certainty: a step back would restore a state from before a commit
+    /// that may have landed.
+    pub fn mark_in_doubt(&mut self, unsettled: Option<String>, read: bool) {
         if self.changes.is_empty() {
             return;
         }
         self.in_doubt = true;
+        self.unread = !read || unsettled.is_some();
+        self.unsettled = unsettled;
         self.undo.clear();
         self.redo.clear();
     }
@@ -228,10 +251,49 @@ impl Edits {
         self.in_doubt
     }
 
-    /// The user has reviewed the held set against the database and stages
-    /// what is left of it again: it is an ordinary staged set from here.
-    pub fn resolve_in_doubt(&mut self) {
-        self.in_doubt = false;
+    /// The session of the commit that sent the held set, while that commit
+    /// may still be running.
+    pub fn unsettled(&self) -> Option<&str> {
+        self.unsettled.as_deref()
+    }
+
+    /// Why no verdict can be taken on the held set yet, if one cannot.
+    pub fn unjudged(&self) -> Option<Unjudged> {
+        match (self.in_doubt, &self.unsettled, self.unread) {
+            (false, ..) => None,
+            (true, Some(_), _) => Some(Unjudged::Running),
+            (true, None, true) => Some(Unjudged::Unread),
+            (true, None, false) => None,
+        }
+    }
+
+    /// A page has been read. `over` is what was learned of the unsettled
+    /// commit's session just before that read: `Some(true)`, it has ended.
+    /// A page read after the commit is over is one the set can be judged
+    /// against; one read while it may still be running is not.
+    pub fn fetched(&mut self, over: Option<bool>) {
+        if self.unsettled.is_some() && over != Some(true) {
+            return;
+        }
+        self.unsettled = None;
+        self.unread = false;
+    }
+
+    /// The user's verdict on the held set, taken whole: `landed`, and the
+    /// set is dropped, history and all, so nothing of it is sent a second
+    /// time; or not, and all of it is staged again, an ordinary staged set
+    /// from here. Not taken, and false, while there is nothing to judge it
+    /// against (`unjudged`).
+    pub fn judge(&mut self, landed: bool) -> bool {
+        if !self.in_doubt || self.unjudged().is_some() {
+            return false;
+        }
+        if landed {
+            self.clear();
+        } else {
+            self.in_doubt = false;
+        }
+        true
     }
 
     /// How the review popover names the row a duplicate copies: every key
@@ -499,14 +561,12 @@ impl Edits {
     }
 
     /// Discard one row's staged change (the review popover's per-entry
-    /// action). Itself undoable, except from a held set (`in_doubt`): a
-    /// change discarded there is one the user found in the database, and
-    /// undo must not bring it back to be sent again. Discarding the last
-    /// one ends the doubt, with nothing left to doubt and nothing to undo.
+    /// action). Itself undoable. A held set (`in_doubt`) gives up no single
+    /// change: its commit was all or nothing, so either every change landed
+    /// or none did, and one discarded alone would leave the rest to be sent
+    /// against rows the others have already changed.
     pub fn discard(&mut self, key: &str) {
         if self.in_doubt {
-            self.changes.remove(key);
-            self.in_doubt = !self.changes.is_empty();
             return;
         }
         let Some(entry) = self.changes.get(key) else { return };
@@ -554,13 +614,16 @@ impl Edits {
     }
 
     /// Everything is committed or nothing is: clear after a successful
-    /// transaction. The undo stack clears with it — commit is the line
-    /// of no return, and the grammar says so out loud.
+    /// transaction, and on the user's verdict that a held set's commit
+    /// landed. The undo stack clears with it — commit is the line of no
+    /// return, and the grammar says so out loud.
     pub fn clear(&mut self) {
         self.changes.clear();
         self.undo.clear();
         self.redo.clear();
         self.in_doubt = false;
+        self.unsettled = None;
+        self.unread = false;
     }
 
     /// The staged set as parameterized statements: inserts, updates,
@@ -2189,46 +2252,93 @@ mod tests {
     }
 
     #[test]
-    fn a_set_whose_commit_got_no_answer_is_held_until_it_is_staged_again() {
+    fn a_set_whose_commit_got_no_answer_is_held_until_it_is_judged_whole() {
         let mut e = edits();
         // Nothing staged, nothing in doubt.
-        e.mark_in_doubt();
+        e.mark_in_doubt(None, true);
         assert!(!e.in_doubt());
 
         let draft = e.stage_insert();
         e.stage_cell(vec![json!(1)], 1, txt("a"), txt("b"), json!("b"));
         e.stage_delete(vec![json!(7)]);
         assert_eq!(e.statements().len(), 3);
-        e.mark_in_doubt();
+        e.mark_in_doubt(None, true);
         assert!(e.in_doubt());
         // Held, it is still the set, for review and for the count...
         assert_eq!(e.counts(), (1, 1, 1));
         assert_eq!(e.entries().len(), 3);
-        // ...but it yields nothing to send, takes no staging, and has no
-        // history: every step of it predates a commit that may have landed.
+        // ...but it yields nothing to send, takes no staging, gives up no
+        // single change, and has no history: every step of it predates a
+        // commit that may have landed.
         assert!(e.statements().is_empty());
         e.stage_cell(vec![json!(2)], 1, txt("x"), txt("y"), json!("y"));
         e.stage_delete(vec![json!(3)]);
         e.stage_insert();
+        e.discard(&draft);
+        e.discard(&key_of(&[json!(7)]));
+        e.grouped(|e| e.discard(&key_of(&[json!(1)])));
         assert_eq!(e.counts(), (1, 1, 1));
         assert!(!e.undo() && !e.redo());
 
-        // Staged again after review, it is an ordinary set.
-        e.resolve_in_doubt();
+        // The verdict that it did not land stages the whole set again.
+        assert!(e.judge(false));
         assert!(!e.in_doubt());
         assert_eq!(e.statements().len(), 3);
         e.discard(&draft);
         assert!(e.undo(), "and its own gestures undo as ever");
         assert_eq!(e.counts(), (1, 1, 1));
+        // A set that is not held takes no verdict.
+        assert!(!e.judge(true));
+        assert_eq!(e.counts(), (1, 1, 1));
 
-        // A commit that lands clears the doubt with the set.
-        e.mark_in_doubt();
-        e.clear();
+        // The verdict that it landed drops the whole set, history and all.
+        e.mark_in_doubt(None, true);
+        assert!(e.judge(true));
         assert!(!e.in_doubt() && e.is_empty());
+        assert!(!e.undo() && !e.redo(), "nothing comes back to be sent a second time");
     }
 
     #[test]
-    fn a_held_set_is_reviewed_but_not_drawn_on_the_page() {
+    fn a_held_set_takes_no_verdict_until_a_page_is_read_after_its_commit_is_over() {
+        let mut e = edits();
+        e.stage_insert();
+        // The commit's session was not seen to end: the COMMIT may still be
+        // running. Staged again now, a second transaction could insert the
+        // row the first is still inserting.
+        e.mark_in_doubt(Some("session-1".into()), true);
+        assert_eq!((e.unsettled(), e.unjudged()), (Some("session-1"), Some(Unjudged::Running)));
+        assert!(!e.judge(false) && !e.judge(true));
+        assert!(e.in_doubt() && e.len() == 1 && e.statements().is_empty());
+        // A page read while it may still be running changes nothing, whether
+        // the session was found busy or could not be asked about.
+        e.fetched(Some(false));
+        e.fetched(None);
+        assert_eq!(e.unjudged(), Some(Unjudged::Running));
+        // A page read after it was seen to end is one to judge against.
+        e.fetched(Some(true));
+        assert_eq!((e.unsettled(), e.unjudged()), (None, None));
+        assert!(e.judge(false));
+        assert_eq!(e.statements().len(), 1);
+
+        // The commit ended, and the page after it could not be read: the
+        // page on screen is from before it.
+        e.mark_in_doubt(None, false);
+        assert_eq!(e.unjudged(), Some(Unjudged::Unread));
+        assert!(!e.judge(true) && !e.judge(false));
+        e.fetched(None);
+        assert_eq!(e.unjudged(), None);
+        assert!(e.judge(true));
+        assert!(e.is_empty());
+
+        // A commit that lands forgets all of it.
+        e.stage_insert();
+        e.mark_in_doubt(Some("session-2".into()), false);
+        e.clear();
+        assert_eq!((e.in_doubt(), e.unsettled(), e.unjudged()), (false, None, None));
+    }
+
+    #[test]
+    fn a_held_set_is_reviewed_whole_and_not_drawn_on_the_page() {
         // A staged DELETE of id 7 and a re-key of 3 to 7. The commit lands
         // and its answer is lost: the row keyed 7 on the refetched page is
         // the one that was 3.
@@ -2236,54 +2346,23 @@ mod tests {
         e.stage_delete(vec![json!(7)]);
         e.stage_cell(vec![json!(3)], 0, txt("3"), txt("7"), json!(7));
         assert_eq!(e.projection().len(), 2);
-        e.mark_in_doubt();
+        e.mark_in_doubt(None, true);
         // Nothing of it is drawn: no delete ghost on the row that is 7 at
         // present, no edit shown on a row 3 that is gone.
         assert!(e.projection().is_empty());
         // All of it is listed for review, and none of it can be sent.
         assert_eq!(e.entries().len(), 2);
         assert!(e.statements().is_empty());
-        // Discarding the re-key, which the page shows has landed, does not
-        // make the DELETE sendable: the set is held until it is staged again,
-        // and then the page draws the ghost on the row it would delete.
+        // The page shows a row 7 and no row 3: the re-key looks landed and
+        // the DELETE does not. They landed or failed together, so the re-key
+        // cannot be discarded alone, leaving the DELETE to remove the row it
+        // made. The set stays whole.
         e.discard(&key_of(&[json!(3)]));
+        assert_eq!(e.entries().len(), 2);
         assert!(e.in_doubt() && e.statements().is_empty() && e.projection().is_empty());
-        e.resolve_in_doubt();
-        assert_eq!(e.projection().len(), 1);
-        assert!(matches!(e.projection()[0].2, RowChange::Delete));
-        assert_eq!(e.statements().len(), 1);
-    }
-
-    #[test]
-    fn a_change_discarded_from_a_held_set_cannot_be_undone_back() {
-        // The double INSERT: the commit landed, its answer was lost, the
-        // user discards the draft the page shows is there, and then ⌘Z.
-        let mut e = edits();
-        let draft = e.stage_insert();
-        e.stage_insert_cell(&draft, 1, txt("Ada"), json!("Ada"));
-        e.stage_cell(vec![json!(1)], 1, txt("a"), txt("b"), json!("b"));
-        e.mark_in_doubt();
-
-        e.discard(&draft);
-        assert!(e.in_doubt(), "the rest is still in doubt");
-        assert_eq!(e.counts(), (0, 1, 0));
-        assert!(!e.undo(), "the discarded draft does not come back");
-        assert!(!e.redo());
-        assert_eq!(e.counts(), (0, 1, 0));
-
-        // Discard-all, the popover's gesture, is the same one grouped.
-        e.grouped(|e| e.discard(&key_of(&[json!(1)])));
-        assert!(e.is_empty());
-        assert!(!e.in_doubt(), "nothing left, nothing in doubt");
-        assert!(!e.undo() && !e.redo(), "and nothing to undo back into a second send");
-        assert!(e.statements().is_empty());
-
-        // What is staged afterwards is new work with its own history.
-        let fresh = e.stage_insert();
-        assert_eq!(e.statements().len(), 1);
-        assert!(e.undo());
-        assert!(e.is_empty());
-        assert!(!e.is_untouched_insert(&fresh));
+        // It landed: all of it is dropped, the DELETE with the re-key.
+        assert!(e.judge(true));
+        assert!(e.is_empty() && e.statements().is_empty());
     }
 
     #[test]

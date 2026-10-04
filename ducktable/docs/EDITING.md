@@ -199,7 +199,7 @@ not change, and printable exotica (AltGr, IME) already land on rung 6.
 - Every staging operation — including a discard — is one entry on the
   ⌘Z stack. Nothing is ever more than one keystroke from recovery. The one
   exception is a set held after a commit that got no answer (Commit, below):
-  it has no history, and a discard from it is final.
+  it has no history, and the verdict that drops it is final.
 - A row staged for deletion takes no cell edit. Typing, Delete and ⌃⇧N leave
   it a ghost until the delete is undone or discarded: a cell staged over it
   would turn the DELETE into an UPDATE.
@@ -424,21 +424,38 @@ After an unanswered `COMMIT`:
   read before a commit that may have landed, and drawn on the page read after
   it they can name other rows. With a staged DELETE of id 7 and a re-key of 3
   to 7, the row keyed 7 is the re-keyed one, and the ghost would sit on it.
-- **Nothing sends, stages into or undoes a held set.** ⌘S, typing, Delete,
-  ⌘⌫, ⌘N, ⌘D and ⌘Z are refused with the reason. Its undo history is gone:
-  every step of it predates a commit that may have landed.
-- **The count is the way out.** It reads `held: may have landed · review`, and
-  its popover lists the set. Discard each change the page shows has landed; a
-  discard from a held set cannot be undone, so nothing discarded there can
-  come back to be sent a second time. Then **Stage again** puts what is left
-  back on the page as an ordinary staged set, and ⌘S sends it. Discarding
-  every change ends the hold with nothing staged.
+- **Nothing sends, stages into, discards from or undoes a held set.** ⌘S,
+  typing, Delete, ⌘⌫, ⌘N, ⌘D, ⌘Z and ⌘⇧⌫ are refused with the reason. Its
+  undo history is gone: every step of it predates a commit that may have
+  landed.
+- **The count is the way out, by one of two verdicts on the whole set.** It
+  reads `held: may have landed · review`, and its popover lists the set, with
+  no discard beside any change. A commit is all or nothing: either every
+  change listed is in the database, or none is. The user compares the list
+  with the page and says which:
+  - **It landed: discard all.** The set is dropped, for good, with nothing
+    left to undo back into a second send.
+  - **It did not land: stage again.** The whole set goes back on the page as
+    an ordinary staged set, and ⌘S sends it.
 
-DuckTable does not decide for the user which changes landed. The transaction
-is all or nothing, but nothing in the database says which: another client may
-have written the same rows, and a new row with defaulted columns has no value
-to look for. The held set is parked and handed back across a table switch
-like any other, still held.
+  No single change leaves a held set. In the example above the page shows a
+  row 7 and no row 3, so the re-key looks landed and the DELETE does not; with
+  the re-key dropped alone and the DELETE sent, the row it deletes is the
+  re-keyed one.
+- **No verdict before there is a page to judge by.** While the commit may
+  still be running, both verdicts are refused: staged again, the set could be
+  sent beside a commit that is still landing it, and its new rows inserted
+  twice; dropped as landed, it would be lost if that commit then rolled back.
+  The same holds while no page has been read since the commit ended. Each
+  refresh (⌘R) asks after the commit's session again before it reads the
+  page, and the first page read after the session is gone says so and opens
+  the verdicts. A set is not staged again against columns the table does not
+  have (A table altered elsewhere); dropping it is the way out there.
+
+DuckTable does not decide for the user whether the commit landed. Nothing in
+the database says: another client may have written the same rows, and a new
+row with defaulted columns has no value to look for. The held set is parked
+and handed back across a table switch like any other, still held.
 
 The WHERE compares the identity, not every value. On a keyed table, a cell
 another client changed since the fetch is overwritten by the staged value
@@ -466,15 +483,19 @@ the NULL tag, visually distinct from empty, always.
 
 ## Dialogs
 
-Exactly one: quitting with something to lose. ⌘Q, DuckTable → Quit and the
-window's close button ask first when any of these holds, and quit at once
-when none does:
+Exactly one: quitting with something to lose, by ⌘Q, DuckTable → Quit or the
+window's close button. Those three ask first when any of these holds, and
+quit at once when none does:
 
 - **Staged changes**, in the table on screen or parked for a table that is
   not. They are counted together: `Discard 5 staged changes and quit?`, and
   under it `5 staged changes in 2 tables have not been committed, and quitting
   discards them.` The changes of a commit in flight are not counted here:
   quitting does not simply discard them.
+- **Changes held after a commit that got no answer** (Commit, above). They
+  are not called uncommitted: `3 changes are held after a commit that got no
+  answer: they may already be in the database, and quitting drops the held
+  copy.`
 - **A cell editor open.** What is typed in it is staged only when it is
   confirmed, so quitting discards it.
 - **A commit in flight.** Quitting ends it unreported: its session is
@@ -493,23 +514,29 @@ no key presses it: it answers only to a click. A second ⌘Q while the dialog is
 up asks nothing more. The text is read from what is at risk each time the
 dialog is drawn, so a commit that settles under it stops being listed.
 
-Quitting gives back every session the window holds, waiting a second and a
-half for the server and no longer: the Query view's transaction, one whose
-`BEGIN` is still in flight, and the commit's. The server rolls back what was
-open on them at once, not at their timeouts.
-
-While the dialog is up nothing replaces what is behind it. The menu bar and
-its keys still reach the app, and opening a database (⌘O, Open Database URL,
-a dropped file), stopping or removing the connected one, and switching tables
-are ignored until the dialog is answered.
+While the dialog is up nothing moves behind it. The menu bar and its keys
+still reach the app, so these are ignored until the dialog is answered:
+opening a database (⌘O, Open Database URL, a dropped file), stopping or
+removing one, switching tables (⌥←/⌥→) or views (⌘1/⌘2/⌘3, which would hand
+the keyboard to the grid or the editor behind the dialog), Refresh Tables,
+and New Row, Duplicate Row and Delete Row. A connect still in flight when
+the dialog opens is called off. A table switch whose page arrives under the
+dialog, and a server that stops under it, wait for the answer: on Cancel the
+switch runs and the stopped connection is dropped, as they would have been.
 
 The dialog is the app's own rather than the platform's alert, which cannot
 make Cancel its default: there a first button titled Cancel takes Esc and
 gives up Return, and the keyboard focus sits on the other button.
 
-Three ways out end the app through macOS without passing through these, and
-are not asked about: Quit from the Dock's menu, a logout or shutdown, and the
-updater's Install and Relaunch.
+Three ways out end the app through macOS without passing through the dialog,
+and ask nothing: Quit from the Dock's menu, a logout, restart or shutdown,
+and the updater's Install and Relaunch. Staged changes and typed text are
+lost to them unasked.
+
+Every quit, asked or not, gives back the sessions the window holds, waiting
+a second and a half for the server and no longer: the Query view's
+transaction, one whose `BEGIN` is still in flight, and the commit's. The
+server rolls back what was open on them at once, not at their timeouts.
 
 Deletes never confirm — they stage, visibly, reversibly, and execute
 only at ⌘S. Reversibility replaces confirmation.

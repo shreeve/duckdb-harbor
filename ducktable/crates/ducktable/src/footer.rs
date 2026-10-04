@@ -572,7 +572,9 @@ impl Grid {
                                             .child(line)
                                     })),
                             )
-                            .child(
+                            // A held set gives up no single change: its
+                            // commit landed whole or not at all.
+                            .when(!held, |d| d.child(
                                 div()
                                     .id(("staged-discard", ix))
                                     .flex_none()
@@ -582,13 +584,8 @@ impl Grid {
                                     .text_xs()
                                     .text_color(t.muted)
                                     .hover(|d| d.bg(t.row_hover).text_color(t.bad))
-                                    .tooltip(move |window, cx| {
-                                        Tooltip::new(if held {
-                                            "Discard this change: it landed. This cannot be undone"
-                                        } else {
-                                            "Discard this change"
-                                        })
-                                        .build(window, cx)
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new("Discard this change").build(window, cx)
                                     })
                                     .child("\u{2715}")
                                     .on_click(move |_, _, cx| {
@@ -596,7 +593,7 @@ impl Grid {
                                             g.discard_change(&key, cx);
                                         });
                                     }),
-                            ),
+                            )),
                     );
                 }
                 let discard_all = {
@@ -612,24 +609,40 @@ impl Grid {
                             grid.update(cx, |g, cx| g.discard_all(cx));
                         })
                 };
-                // A held set is not committed from here: what the user has
-                // not discarded is staged again, onto the page, and ⌘S sends
-                // it from there.
-                let commit = {
+                // A held set is not committed from here. Its commit was all
+                // or nothing, so it leaves the hold by one of two verdicts on
+                // the whole set, and by nothing else.
+                let footer = if held {
+                    let verdict = |id: &'static str, label: &'static str, landed: bool| {
+                        let grid = grid.clone();
+                        gpui_kit::component::button::Button::new(id)
+                            .xsmall()
+                            .label(label)
+                            .on_click(move |_, _, cx| {
+                                grid.update(cx, |g, cx| g.judge_held(landed, cx));
+                            })
+                    };
+                    div()
+                        .h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(verdict("held-landed", "It landed: discard all", true).danger())
+                        .child(verdict("held-not-landed", "It did not land: stage again", false).primary())
+                } else {
                     let grid = grid.clone();
-                    gpui_kit::component::button::Button::new("staged-commit")
-                        .primary()
-                        .xsmall()
-                        .label(if held { "Stage again" } else { "Commit (\u{2318}S)" })
-                        .on_click(move |_, _, cx| {
-                            grid.update(cx, |g, cx| {
-                                if g.in_doubt() { g.stage_again(cx) } else { g.commit(cx) }
-                            });
-                        })
+                    div().h_flex().justify_end().child(
+                        gpui_kit::component::button::Button::new("staged-commit")
+                            .primary()
+                            .xsmall()
+                            .label("Commit (\u{2318}S)")
+                            .on_click(move |_, _, cx| {
+                                grid.update(cx, |g, cx| g.commit(cx));
+                            }),
+                    )
                 };
                 div()
                     .v_flex()
-                    .w(px(320.))
+                    .w(px(if held { 380. } else { 320. }))
                     .child(
                         div()
                             .h_flex()
@@ -644,10 +657,10 @@ impl Grid {
                                     .text_xs()
                                     .font_weight(FontWeight(560.))
                                     .text_color(t.muted)
-                                    .child("STAGED CHANGES"),
+                                    .child(if held { "HELD CHANGES" } else { "STAGED CHANGES" }),
                             )
                             .child(div().flex_1())
-                            .child(discard_all),
+                            .when(!held, |d| d.child(discard_all)),
                     )
                     .when(held, |d| {
                         d.child(
@@ -659,24 +672,23 @@ impl Grid {
                                 .text_xs()
                                 .text_color(t.bad)
                                 .child(
-                                    "The commit that sent these got no answer, so they may \
-                                     already be in the database. They are off the page, which \
-                                     shows the database. Discard each one the page shows has \
-                                     landed; a discard here cannot be undone. Then Stage again \
-                                     to put the rest back on the page.",
+                                    "The commit that sent these got no answer. A commit is all \
+                                     or nothing: either every change below is in the database, \
+                                     or none is. They are off the page, which shows the \
+                                     database. Compare, then say which. If it landed, all of \
+                                     them are dropped, for good. If it did not, all of them go \
+                                     back on the page, and \u{2318}S sends them.",
                                 ),
                         )
                     })
                     .child(rows)
                     .child(
                         div()
-                            .h_flex()
-                            .justify_end()
                             .px(px(10.))
                             .py(px(8.))
                             .border_t_1()
                             .border_color(t.border)
-                            .child(commit),
+                            .child(footer),
                     )
                     .into_any_element()
             })

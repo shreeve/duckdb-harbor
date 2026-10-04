@@ -5,21 +5,30 @@ date, newest first.
 
 ## 0.22.9 — 2026-10-03
 
-- **Quitting asks before it loses anything.** EDITING.md promised one dialog,
-  on quitting with staged changes, and none existed: ⌘Q quit outright and the
-  close button dropped every staged edit. ⌘Q, DuckTable → Quit and the close
-  button now ask when changes are staged, in the table on screen or parked for
-  another, when a cell editor is open, when a commit or a Query statement is
-  still in flight, or when the Query view holds a transaction open, and say
-  which. Cancel is the default: Return and Esc go back. The button that quits
-  is not a tab stop, so no key reaches it and only a click on it quits. The
-  dialog is the app's own because the platform alert cannot do that.
-  Measured: with Cancel first it has no default button, and Space presses the
-  button that discards. Quitting releases every session the window holds, a
-  commit's and an opening `BEGIN`'s among them, so the server rolls back at
-  once what would otherwise wait for a timeout. While the dialog is up,
-  opening or stopping a database and switching tables are ignored, so Cancel
-  finds everything as it was.
+- **⌘Q and the close button ask before they lose anything.** EDITING.md
+  promised one dialog, on quitting with staged changes, and none existed: ⌘Q
+  quit outright and the close button dropped every staged edit. ⌘Q, DuckTable
+  → Quit and the close button now ask when changes are staged, in the table on
+  screen or parked for another, when a cell editor is open, when a commit or a
+  Query statement is still in flight, or when the Query view holds a
+  transaction open, and say which. Cancel is the default: Return and Esc go
+  back. The button that quits is not a tab stop, so no key reaches it and only
+  a click on it quits. The dialog is the app's own because the platform alert
+  cannot do that. Measured: with Cancel first it has no default button, and
+  Space presses the button that discards. Three quits do not pass through the
+  dialog and ask nothing: Quit from the Dock's menu, a logout or restart, and
+  the updater's Install and Relaunch.
+- **Every quit gives its sessions back.** Whether it asked or not, a quit
+  releases the sessions the window holds, a commit's and an opening `BEGIN`'s
+  among them, so the server rolls back at once what would otherwise wait for
+  a timeout.
+- **Nothing moves behind the quit dialog.** The menu bar and its keys still
+  reach the app while the dialog is up. Opening, stopping or removing a
+  database, switching tables or views, refreshing and the row commands are
+  ignored until it is answered; a connect in flight is called off when it
+  opens, and a table switch or a stopped server that lands under it waits for
+  the answer. Cancel finds the grid, the query and the staged edits as they
+  were.
 - **The Query view holds a transaction.** Each run was its own request, so
   `BEGIN` answered and did nothing, the statements after it committed one by
   one, and `ROLLBACK` failed. A statement that begins a transaction now gets a
@@ -33,9 +42,9 @@ date, newest first.
   once, since on its own it would commit on its own. The statement is read
   by the reader Harbor's server and its own client use (`wire::statement`),
   past the spaces the engine skips and no others, and through `EXPLAIN
-  ANALYZE`, which measured runs the `COMMIT` it explains. Only the engine's answer ends a
-  transaction: a `COMMIT` Harbor turns away because the session is still busy
-  leaves it open. It works with a Harbor that refuses a `BEGIN` sent outside a
+  ANALYZE`, which measured runs the `COMMIT` it explains. Only the engine's
+  answer ends a transaction: a `COMMIT` Harbor turns away because the session
+  is still busy leaves it open. It works with a Harbor that refuses a `BEGIN` sent outside a
   session and with one that does not: the view never sends one.
 - **A row connects to the database it shows.** A database file whose name
   matched a remote in the config showed one row with the local path, and a
@@ -56,16 +65,25 @@ date, newest first.
   is read, so the page is the commit's outcome, and the staged set is held: it
   is taken off the page, whose rows its old keys may no longer name, and
   nothing sends it, stages into it or undoes it. The count opens the review,
-  where each change the page shows has landed is discarded for good, and
-  Stage again puts the rest back. A `COMMIT` that could not be sent at all is
-  an ordinary failure, edits kept.
+  where the whole set takes one of two verdicts, since a commit is all or
+  nothing: it landed, and all of it is dropped for good, or it did not, and
+  all of it is staged again. No single change is discarded from a held set:
+  with a DELETE of 7 and a re-key of 3 to 7 held, dropping the re-key the page
+  shows and sending the DELETE would delete the re-keyed row. No verdict is
+  taken while the commit may still be running or before a page has been read
+  after it. A `COMMIT` that could not be sent at all is an ordinary failure,
+  edits kept.
 - **A COMMIT that rolled back says so.** In the Query view an error aborts the
   transaction, and a `COMMIT` after it answers like any other while rolling
   everything back: the view showed `ok` and the work was gone. That included
   errors the user never saw, such as the count behind a paged result. The
-  band now reads `transaction aborted by an error`, the view asks the session
-  before it sends a `COMMIT`, and a `COMMIT` of an aborted transaction reports
-  the rollback. A `ROLLBACK` the engine answers with "no transaction is
+  band now reads `transaction aborted by an error`, from the session's own
+  answer to a question asked right after any statement that may have failed
+  there, so it is never a guess. The view asks again in the same turn as the
+  `COMMIT`, with nothing able to come between, and a `COMMIT` of an aborted
+  transaction reports the rollback; one whose state cannot be confirmed is not
+  sent. A `COMMIT` Harbor cancelled or failed on after the engine had it is in
+  doubt, not open. A `ROLLBACK` the engine answers with "no transaction is
   active" is reported as that, not as a rollback.
 - **Nothing is staged against a page from before the commit.** Between a
   commit and its refetch the grid showed the new values under the old row
@@ -98,9 +116,12 @@ date, newest first.
   `SUMMARIZE`, `SHOW`, `PIVOT` and `UNPIVOT`, ran unpaged and fetched their
   whole result. Numbers right-align by their own type name, so an INTERVAL and
   an `INTEGER[]` no longer do.
-- The live probes in `harbor-client/tests/live.rs` run only against the
-  database file `HARBOR_LIVE_DB` names. They create and drop tables, and
-  picking any running database could have picked the wrong one.
+- The live probes in `harbor-client/tests/live.rs` connect only to a
+  database file named for them: `HARBOR_LIVE_DB`, a scratch database, for all
+  but the linger probe, which starts its own copy of the file `HARBOR_FIXTURE`
+  names. They create and drop tables, and picking any running database could
+  have picked the wrong one. They take turns, so the suite passes at any
+  `--test-threads`.
 - **A release uploads the feed last.** `scripts/release.sh` sends the update
   feed's archives and deltas first and `appcast.xml` after them. A feed that
   was up before the archive it names sent every client that checked in

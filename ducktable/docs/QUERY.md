@@ -123,9 +123,9 @@ transaction is open.
   `(ANALYZE false)` included, which the engine also runs. A plain `EXPLAIN
   COMMIT` only plans, and changes nothing.
 - **It shows.** While a transaction is open the header band reads
-  `transaction open · 4:32 left · COMMIT or ROLLBACK ends it`, and once an
-  error has aborted it, `transaction aborted by an error · 4:32 left ·
-  ROLLBACK ends it`. These statements have no result set and report `ok`, as
+  `transaction open · 4:32 left · COMMIT or ROLLBACK ends it`, and once the
+  session has answered that an error aborted it, `transaction aborted by an
+  error · 4:32 left · ROLLBACK ends it`. These statements have no result set and report `ok`, as
   any resultless statement does.
 - **Only this view sees it.** The Data view, the sidebar's counts and every
   other client read outside the transaction and show what is committed; the
@@ -159,21 +159,32 @@ transaction is open.
   PRIMARY KEY, NOT NULL or CHECK violation (`Constraint Error`), a failed cast
   (`Conversion Error`), an overflow (`Out of Range Error`), `error()` and a
   missing parameter (`Invalid Input Error`), and a second `BEGIN`
-  (`TransactionContext Error`). After any of them every later statement
-  answers `Current transaction is aborted (please ROLLBACK)` until `ROLLBACK`
-  or `COMMIT` ends it, and a `COMMIT` then answers like any other and rolls
-  back.
-- **A `COMMIT` that rolled back says so.** The view keeps what the session's
-  answers say: an engine error other than a parse error marks the transaction
-  aborted, and a statement that answers proves it is not, since an aborted
-  transaction lets none answer. Before it sends a `COMMIT` it asks the session
-  once more with `SELECT 1`, so the verdict is the engine's and not a guess.
-  A `COMMIT` of an aborted transaction then reports `COMMIT rolled back: an
+  (`TransactionContext Error`). After any of them a statement that reads or
+  writes answers `Current transaction is aborted (please ROLLBACK)` until
+  `ROLLBACK` or `COMMIT` ends it, and a `COMMIT` then answers like any other
+  and rolls back.
+- **The view knows whether the transaction is aborted by asking it.** Only
+  one answer settles it: an aborted transaction answers `SELECT 1` with that
+  error, and a sound one answers it. Other statements prove nothing, since
+  some answer on an aborted transaction (measured: `PREPARE` does). So after
+  any statement on the session that may have run and failed, the view asks
+  `SELECT 1` at once, in the same turn on the session, and the band says what
+  came back. The keepalive asks too. The band is therefore not a guess, and
+  does not say aborted of a statement Harbor itself turned away, such as a
+  protected `SET`. When the question cannot be answered, the band reads
+  `transaction open, its state unconfirmed after an error`.
+- **A `COMMIT` that rolled back says so.** Before a `COMMIT` the view asks
+  once more, and sends the `COMMIT` in the same turn, so no results page or
+  keepalive can come between the two and abort what was just found sound. A
+  `COMMIT` of an aborted transaction then reports `COMMIT rolled back: an
   earlier error aborted the transaction, and nothing since BEGIN was kept.`
-  and never `ok`. This covers the errors the user did not see as a statement's
-  verdict: inside a transaction a failed count of a paged result is reported
-  as the run's error, where outside one it only leaves the total unknown, and
-  a results page that fails to read marks the band.
+  and never `ok`. If the question gets no answer, because the session is busy
+  or silent, the `COMMIT` is not sent: `could not confirm the transaction's
+  state (…), so the COMMIT was not sent: try again`, with the transaction as
+  it was. This covers the errors the user did not see as a statement's
+  verdict: inside a transaction a count of a paged result that ran and failed
+  is reported as the run's error, where outside one it only leaves the total
+  unknown, and a results page that fails to read turns the band.
 - **Only the engine's answer ends it.** A `COMMIT` the engine refuses (two
   transactions inserting the same key) ends the transaction rolled back, and
   the view adds `The transaction is over: its changes were rolled back.` A
@@ -181,17 +192,22 @@ transaction is open.
   session held, under the message it got: Harbor refused it before the engine
   saw it, because the session is still running the statement before it
   (`session_busy`, which a statement that outlived the view's two-minute wait
-  can cause) or the server is not serving, or it could not be sent at all. A
-  `COMMIT` that gets no answer may have gone either way; the view says so and
-  releases the session, which rolls back anything still open. A `ROLLBACK`
-  that gets no answer is rolled back either way, by the statement or by that
-  release. If the engine answers that no transaction is active, the view says
-  the session held none and that the statement changed nothing; it does not
-  claim a rollback.
+  can cause) or the server is not serving, or it could not be sent at all.
+- **An ending with no verdict is not shown as open.** That is a `COMMIT` or
+  `ROLLBACK` that got no answer, or that Harbor answered `cancelled` (a
+  deadline or a cancel interrupted it after the engine had it) or `internal`.
+  The view releases the session, which rolls back anything still open, and
+  says the transaction may have ended either way. Two cases leave no doubt and
+  say so: a `ROLLBACK` is rolled back either way, by the statement or by that
+  release, and so is a `COMMIT` of a transaction already found aborted. If the
+  engine answers that no transaction is active, the view says the session
+  held none and that the statement changed nothing; it does not claim a
+  rollback.
 - **Leaving ends it.** The session is released, and the transaction rolled
   back, when the view goes: the connection drops, another database is chosen,
-  or the app quits, which asks first (EDITING.md, "Dialogs"). A quit while
-  the `BEGIN` itself is still in flight releases that session too.
+  or the app quits. ⌘Q and the close button ask first (EDITING.md,
+  "Dialogs"); every quit releases the session, the ones that ask nothing
+  included, and so does one while the `BEGIN` itself is still in flight.
 
 ## Results
 

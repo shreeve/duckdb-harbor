@@ -45,6 +45,10 @@ pub(crate) struct QuitRisks {
     pub(crate) staged: usize,
     /// How many tables hold them.
     pub(crate) tables: usize,
+    /// Changes held after a commit that got no answer (docs/EDITING.md,
+    /// "Commit"): they may already be in the database, so they are not
+    /// called uncommitted.
+    pub(crate) held: usize,
     /// A cell editor is open: what is typed in it is staged only when it
     /// is confirmed.
     pub(crate) editing: bool,
@@ -83,6 +87,15 @@ impl QuitRisks {
                 "{changes}{place} {verb} not been committed, and quitting discards {them}."
             ));
         }
+        if self.held > 0 {
+            let (them, are, they) =
+                if self.held == 1 { ("1 change", "is", "it") } else { ("changes", "are", "they") };
+            let them = if self.held == 1 { them.to_string() } else { format!("{} {them}", self.held) };
+            detail.push(format!(
+                "{them} {are} held after a commit that got no answer: {they} may already be in \
+                 the database, and quitting drops the held copy."
+            ));
+        }
         if self.editing {
             detail.push(
                 "A cell editor is open: what is typed in it is not staged, and quitting discards it."
@@ -111,7 +124,8 @@ impl QuitRisks {
         }
         // Staged changes alone are the common case, and the question names
         // them; anything else is asked plainly, with the facts below it.
-        let only_staged = !(self.editing || self.committing || self.transaction || self.running);
+        let only_staged =
+            !(self.held > 0 || self.editing || self.committing || self.transaction || self.running);
         let message = match (&changes, only_staged) {
             (Some(changes), true) => format!("Discard {changes} and quit?"),
             _ => "Quit DuckTable?".to_string(),
@@ -381,6 +395,15 @@ impl DuckTable {
             path_copy: None,
             installed_version: None,
         };
+        // Every way out of the app gives its sessions back, the ones that
+        // ask nothing included: Quit from the Dock, a logout, the updater's
+        // relaunch. The release is the whole hook, so the future it hands
+        // back has nothing left to do.
+        cx.on_app_quit(|this, cx| {
+            this.release_for_quit(cx);
+            async {}
+        })
+        .detach();
         this.refresh(cx);
         this
     }
@@ -389,17 +412,55 @@ impl DuckTable {
     pub(crate) fn quit_risks(&self, cx: &App) -> QuitRisks {
         let grid = self.grid.as_ref().map(|g| g.read(cx));
         let committing = grid.is_some_and(|g| g.committing);
-        let on_screen = grid.filter(|_| !committing).map_or(0, |g| g.staged_count());
-        let parked = self.staged.values().map(crate::edits::Edits::len);
-        let held: Vec<usize> = parked.chain([on_screen]).filter(|n| *n > 0).collect();
+        // Every staged set the window holds: the grid's own, unless a
+        // commit has it in flight, and those parked by a table switch.
+        let on_screen = grid.filter(|_| !committing).into_iter().flat_map(|g| g.staged_sets());
+        let sets: Vec<&crate::edits::Edits> =
+            self.staged.values().chain(on_screen).filter(|e| e.any_staged()).collect();
+        let staged: Vec<usize> = sets.iter().filter(|e| !e.in_doubt()).map(|e| e.len()).collect();
         QuitRisks {
-            staged: held.iter().sum(),
-            tables: held.len(),
+            staged: staged.iter().sum(),
+            tables: staged.len(),
+            held: sets.iter().filter(|e| e.in_doubt()).map(|e| e.len()).sum(),
             editing: grid.is_some_and(|g| g.is_editing()),
             committing,
             transaction: self.query.as_ref().is_some_and(|q| q.read(cx).in_transaction()),
             running: self.query.as_ref().is_some_and(|q| q.read(cx).is_running()),
         }
+    }
+
+    /// The quit dialog opens. A connect still in flight is called off: its
+    /// landing would replace the grid, the query and every staged edit
+    /// under the dialog, and Cancel must find them as they were.
+    pub(crate) fn quit_dialog_opened(&mut self, cx: &mut Context<Self>) {
+        self.asking_to_quit = true;
+        self.cancel(cx);
+    }
+
+    /// The quit dialog was cancelled. What waited for it runs: a table
+    /// switch that landed under it, and the fleet's reconciliation, which
+    /// drops a connection whose server stopped meanwhile.
+    pub(crate) fn quit_dialog_cancelled(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.asking_to_quit = false;
+        if let Some((schema, name)) = self.deferred_select.take() {
+            self.select_table(schema, name, window, cx);
+        }
+        self.refresh(cx);
+    }
+
+    /// The key of the row called `name` with this `path`, as the fleet's
+    /// survey made it. A row's key is canonical, and making one reads the
+    /// filesystem, which this thread does not: a path no row has is keyed
+    /// as it is spelled.
+    fn key_of(&self, name: &str, path: Option<&std::path::Path>) -> DbKey {
+        self.rows
+            .iter()
+            .find(|r| r.path.as_deref() == path && (path.is_some() || r.name == name))
+            .map(|r| r.key.clone())
+            .unwrap_or_else(|| match path {
+                Some(path) => DbKey::File(path.to_path_buf()),
+                None => DbKey::Remote(name.to_string()),
+            })
     }
 
     /// The user chose to quit: give back every session this window holds,
@@ -506,7 +567,9 @@ impl DuckTable {
                 if !matches!(state.phase, Phase::Connected { .. }) {
                     return;
                 }
-                if state.grid.as_ref().is_some_and(|g| g.read(cx).committing) {
+                // A switch that would land during a commit, or under the
+                // quit dialog, waits for it.
+                if state.asking_to_quit || state.grid.as_ref().is_some_and(|g| g.read(cx).committing) {
                     state.deferred_select = Some((clone_str(&schema), clone_str(&name)));
                     return;
                 }
@@ -699,6 +762,11 @@ impl DuckTable {
     /// sidebar and the currently open Data page. Query results are an
     /// explicit SQL snapshot and are intentionally left unchanged.
     pub(crate) fn refresh_tables(&mut self, cx: &mut Context<Self>) {
+        // Under the quit dialog nothing behind it moves: a refresh would
+        // confirm an open editor and replace the page.
+        if self.asking_to_quit {
+            return;
+        }
         self.refresh_catalog(cx);
         if let Some(grid) = self.grid.clone() {
             grid.update(cx, |grid, cx| grid.refresh_current(cx));
@@ -821,7 +889,12 @@ impl DuckTable {
                     }
                     _ => None,
                 };
+                // Under the quit dialog the connection is left as it is:
+                // dropping it clears the grid and every staged edit, and
+                // Cancel must find them. The refresh that follows a cancel
+                // reconciles.
                 if let Some((name, key)) = connected
+                    && !state.asking_to_quit
                     && !state.rows.iter().any(|r| r.key == key && r.state.is_live())
                 {
                     state.drop_connection(cx);
@@ -1017,8 +1090,8 @@ impl DuckTable {
         let fence = self.attempt;
         self.connecting = Some(clone_str(&shown));
         self.connecting_key = Some(match &aim {
-            Aim::Row { name, path } => DbKey::of_row(name, path.as_deref()),
-            Aim::File(path) => DbKey::of_file(path),
+            Aim::Row { name, path } => self.key_of(name, path.as_deref()),
+            Aim::File(path) => self.key_of("", Some(path)),
         });
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -1121,7 +1194,7 @@ impl DuckTable {
         }
         // The file is the whole target: of two databases that share a
         // name, Stop reaches the one whose row was clicked and no other.
-        let key = DbKey::of_file(&path);
+        let key = self.key_of(&name, Some(&path));
         // Idempotent: a second Stop while one is already in flight (or the
         // row is already fading out) is a no-op.
         if self.stopping.contains(&key) || self.leaving.contains(&key) {
@@ -1152,8 +1225,10 @@ impl DuckTable {
                             // It departed: hold the row for one fade, then
                             // let refresh's survey drop it for real.
                             state.leaving.insert(key.clone());
-                            if connected_here {
-                                // The world we were showing just departed.
+                            // The world we were showing just departed.
+                            // Under the quit dialog it stays on screen until
+                            // the dialog is answered (`quit_dialog_cancelled`).
+                            if connected_here && !state.asking_to_quit {
                                 state.drop_connection(cx);
                             }
                             state.refresh(cx);
@@ -1328,6 +1403,7 @@ mod tests {
         let all = QuitRisks {
             staged: 3,
             tables: 1,
+            held: 0,
             editing: true,
             committing: true,
             transaction: true,
@@ -1342,6 +1418,19 @@ mod tests {
         assert!(all.detail.contains("The Query view holds a transaction open, and quitting rolls it back."));
         assert!(all.detail.ends_with("Quitting leaves its outcome unreported."));
         assert_eq!(all.confirm, "Quit Anyway");
+        // A set held after a commit that got no answer is not called
+        // uncommitted: it may have landed.
+        let held = QuitRisks { held: 3, ..Default::default() }.question().unwrap();
+        assert_eq!((held.message.as_str(), held.confirm), ("Quit DuckTable?", "Quit Anyway"));
+        assert_eq!(
+            held.detail,
+            "3 changes are held after a commit that got no answer: they may already be in the \
+             database, and quitting drops the held copy."
+        );
+        assert!(!held.detail.contains("not been committed"));
+        let one = QuitRisks { staged: 2, tables: 1, held: 1, ..Default::default() }.question().unwrap();
+        assert!(one.detail.starts_with("2 staged changes have not been committed, and quitting discards them."));
+        assert!(one.detail.contains("1 change is held after a commit that got no answer: it may already"));
         // Text in an open editor, and a statement in flight, are each
         // reason enough to ask.
         let typing = QuitRisks { editing: true, ..Default::default() }.question().unwrap();
