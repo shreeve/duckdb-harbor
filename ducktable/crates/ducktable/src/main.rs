@@ -261,7 +261,7 @@ fn app_menus(can_update: bool) -> Vec<Menu> {
 /// "Dialogs"): staged changes in any table, text in an open cell editor, a
 /// commit or a Query statement still in flight, a transaction open in the
 /// Query view. ⌘Q, the menu's Quit and the window's close button all come
-/// here.
+/// here, and so does the updater's Install and Relaunch, which quits too.
 ///
 /// The dialog is the app's own, not the platform's alert, because Cancel
 /// has to be its default. Measured on the alert GPUI builds: a first button
@@ -270,17 +270,17 @@ fn app_menus(can_update: bool) -> Vec<Menu> {
 /// presses it. Here Return and Esc both go back, and the button that
 /// discards and quits is no tab stop, so the keyboard cannot reach it: it
 /// answers only to a click.
-fn request_quit(window: &mut Window, cx: &mut App) {
+fn request_leave(leaving: app::Leaving, window: &mut Window, cx: &mut App) {
     use gpui_kit::component::WindowExt as _;
     use gpui_kit::component::button::{Button, ButtonVariants as _};
     use gpui_kit::component::dialog::{DialogClose, DialogFooter};
 
     let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) else {
-        cx.quit();
+        leave(leaving, cx);
         return;
     };
-    if view.read(cx).quit_risks(cx).question().is_none() {
-        cx.quit();
+    if view.read(cx).quit_risks(cx).question_for(leaving).is_none() {
+        leave(leaving, cx);
         return;
     }
     if view.read(cx).asking_to_quit {
@@ -291,10 +291,17 @@ fn request_quit(window: &mut Window, cx: &mut App) {
         // What is at risk is read each time the dialog is drawn, not once
         // when it opened: a commit that settles under it has by then landed
         // or kept its edits, and the text follows.
-        let question = view.read(cx).quit_risks(cx).question().unwrap_or(app::QuitQuestion {
-            message: "Quit DuckTable?".to_string(),
-            detail: "Nothing is left that quitting would lose.".to_string(),
-            confirm: "Quit",
+        let question = view.read(cx).quit_risks(cx).question_for(leaving).unwrap_or(match leaving {
+            app::Leaving::Quit => app::QuitQuestion {
+                message: "Quit DuckTable?".to_string(),
+                detail: "Nothing is left that quitting would lose.".to_string(),
+                confirm: "Quit",
+            },
+            app::Leaving::Relaunch => app::QuitQuestion {
+                message: "Install the update now?".to_string(),
+                detail: "Nothing is left that quitting would lose.".to_string(),
+                confirm: "Install",
+            },
         });
         // Going back, by Return, Esc or the Cancel button.
         let stay = {
@@ -308,7 +315,7 @@ fn request_quit(window: &mut Window, cx: &mut App) {
             let view = view.clone();
             move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
                 view.update(cx, |this, cx| this.release_for_quit(cx));
-                cx.quit();
+                leave(leaving, cx);
             }
         };
         dialog
@@ -325,10 +332,40 @@ fn request_quit(window: &mut Window, cx: &mut App) {
                             .tab_stop(false)
                             .on_click(quit),
                     )
-                    .child(DialogClose::new().child(Button::new("cancel").label("Cancel").primary())),
+                    // DialogClose fills the width it is given, so it sits in a
+                    // box of its own that is only as wide as the button.
+                    .child(div().child(DialogClose::new().child(Button::new("cancel").label("Cancel").primary()))),
             )
             .on_ok(stay.clone())
             .on_cancel(stay)
+    });
+}
+
+/// End the app the way it was asked to: quit, or let the updater install
+/// and relaunch. With no update waiting, a relaunch has nothing to do.
+fn leave(leaving: app::Leaving, cx: &mut App) {
+    match leaving {
+        app::Leaving::Quit => cx.quit(),
+        app::Leaving::Relaunch => {
+            if let Some(updater) = &cx.global::<updater::UpdaterState>().0 {
+                updater.install();
+            }
+        }
+    }
+}
+
+/// Ask through the window, from an App-level action or the updater.
+/// Deferred, like every action that touches the window: a key or menu
+/// action arrives inside the window's own update.
+fn leave_asking(leaving: app::Leaving, cx: &mut App) {
+    cx.defer(move |cx| {
+        let window = cx.active_window().or_else(|| cx.windows().first().copied());
+        match window {
+            Some(w) => {
+                w.update(cx, |_, window, cx| request_leave(leaving, window, cx)).ok();
+            }
+            None => leave(leaving, cx),
+        }
     });
 }
 
@@ -507,9 +544,26 @@ fn main() {
         cx.set_global(updater::UpdaterState(updater));
         cx.on_action(|_: &CheckForUpdates, cx| {
             if let Some(updater) = &cx.global::<updater::UpdaterState>().0 {
-                updater.check_for_updates();
+                // An update held from an earlier Install and Relaunch is
+                // offered again here: Sparkle would not hold it twice.
+                if updater.install_waiting() {
+                    leave_asking(app::Leaving::Relaunch, cx);
+                } else {
+                    updater.check_for_updates();
+                }
             }
         });
+        // Install and Relaunch quits the app, so it asks what ⌘Q asks
+        // before Sparkle goes on (`updater.rs`).
+        if let Some(updater) = &cx.global::<updater::UpdaterState>().0 {
+            let requests = updater.relaunch_requests();
+            cx.spawn(async move |cx| {
+                while requests.recv().await.is_ok() {
+                    cx.update(|cx| leave_asking(app::Leaving::Relaunch, cx));
+                }
+            })
+            .detach();
+        }
         cx.bind_keys([
             KeyBinding::new("cmd-i", ToggleInspector, None),
             KeyBinding::new("cmd-o", OpenDatabase, None),
@@ -674,19 +728,7 @@ fn main() {
         cx.on_action(|_: &View1, cx| go_view(view_order()[0], cx));
         cx.on_action(|_: &View2, cx| go_view(view_order()[1], cx));
         cx.on_action(|_: &View3, cx| go_view(view_order()[2], cx));
-        // Deferred, like every action that touches the window: a key or
-        // menu action arrives inside the window's own update.
-        cx.on_action(|_: &Quit, cx| {
-            cx.defer(|cx| {
-                let window = cx.active_window().or_else(|| cx.windows().first().copied());
-                match window {
-                    Some(w) => {
-                        w.update(cx, |_, window, cx| request_quit(window, cx)).ok();
-                    }
-                    None => cx.quit(),
-                }
-            });
-        });
+        cx.on_action(|_: &Quit, cx| leave_asking(app::Leaving::Quit, cx));
         // One window, so closing it is quitting. macOS lets an app outlive
         // its windows, which suits a document app whose File menu can open
         // another; DuckTable's menus act on the window that is gone, so a
@@ -799,7 +841,7 @@ fn main() {
                         .and_then(|v| v.0.upgrade())
                         .is_some_and(|view| view.read(cx).quit_risks(cx).question().is_some());
                     if at_risk {
-                        request_quit(window, cx);
+                        request_leave(app::Leaving::Quit, window, cx);
                     }
                     !at_risk
                 });

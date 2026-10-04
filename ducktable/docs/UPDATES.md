@@ -14,7 +14,7 @@ and Sparkle download release files without signing in.
 | Install | `shreeve/homebrew-tap` → `Casks/ducktable.rb`; `scripts/install.sh` | `brew install --cask shreeve/tap/ducktable` downloads the release's `DuckTable-X.Y.Z.zip`; `auto_updates true` leaves updating to Sparkle, and `livecheck` reads the same feed. The installer fetches the release's `DuckTable.zip` |
 | Build | `scripts/sparkle.sh`, `scripts/macos-app.sh` | Fetches a pinned Sparkle by checksum into `.ducktable-cache/`, embeds it at `Contents/Frameworks`, and signs the framework and the app with the Developer ID and the hardened runtime |
 | Plist keys | `scripts/macos-app.sh` | `SUFeedURL` (the feed below) and `SUPublicEDKey` (from `assets/sparkle-public-key.txt`); `CFBundleVersion` is the workspace version, which is what Sparkle orders updates by |
-| Runtime | `crates/ducktable/src/updater.rs` | Loads the embedded framework, starts `SPUUpdater` with Sparkle's standard user driver, forwards the menu item |
+| Runtime | `crates/ducktable/src/updater.rs` | Loads the embedded framework, starts `SPUUpdater` with Sparkle's standard user driver, forwards the menu item, and holds Install and Relaunch until the quit dialog has asked whatever ⌘Q would ask (EDITING.md, "Dialogs") |
 | Menu | `crates/ducktable/src/main.rs` | DuckTable → Check for Updates…, present only when the updater started |
 | Feed | `scripts/appcast.sh` | Signs the archives in a directory and writes its `appcast.xml`, embedding each version's notes |
 | Release | `scripts/release.sh` | Stamps the version, builds, notarizes and staples, zips, signs the feed, drafts the release, commits, tags, pushes, publishes, and refreshes the feed release; undoes itself when a step fails |

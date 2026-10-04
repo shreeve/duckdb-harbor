@@ -1457,6 +1457,8 @@ name = "ducktable"
 version = "0.22.8"
 dependencies = [
  "anyhow",
+ "async-channel",
+ "block2 0.6.2",
  "duckdb-lang",
  "gpui-kit",
  "harbor-client",
