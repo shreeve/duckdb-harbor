@@ -197,6 +197,44 @@ class Regressions(unittest.TestCase):
             self.release(sid)
         self.assertEqual(self.sql("SELECT x FROM kept")["data"], [[2]])
 
+    def test_a_cancelled_commit_kept_everything_or_nothing_and_says_which(self):
+        # A cancel raced against a healthy COMMIT. Whichever wins, the answer
+        # is true: 200 and the row is there, or 499 and it is not, with the
+        # transaction left aborted. Never 499 for a commit that landed.
+        import threading
+        self.sql("CREATE TABLE raced(x INTEGER)")
+        landed = cancelled = 0
+        for attempt in range(150):
+            sid = self.session()
+            try:
+                self.sql("BEGIN", sid)
+                self.sql(f"INSERT INTO raced VALUES ({attempt})", sid)
+                name, answer = f"race-{attempt}", {}
+
+                def commit():
+                    answer["commit"] = self.request(
+                        "POST", "/sql", {"sql": "COMMIT", "sessionId": sid, "queryId": name})
+
+                thread = threading.Thread(target=commit)
+                thread.start()
+                time.sleep((attempt % 8) * 0.0002)
+                self.request("DELETE", "/sql/queries/" + name)
+                thread.join()
+                status, doc = answer["commit"]
+                kept = self.sql(f"SELECT count(*) FROM raced WHERE x = {attempt}")["data"][0][0]
+                if status == 200:
+                    landed += 1
+                    self.assertEqual(kept, 1, (attempt, doc))
+                else:
+                    cancelled += 1
+                    self.assertEqual((status, doc.get("code")), (499, "cancelled"), (attempt, doc))
+                    self.assertEqual(kept, 0, (attempt, "answered cancelled, and the row is committed"))
+                    self.assertIn("aborted", self.sql("SELECT 1", sid, status=400)["message"])
+            finally:
+                self.release(sid)
+        self.assertEqual(landed + cancelled, 150)
+        self.assertEqual(self.sql("SELECT count(*) FROM raced")["data"], [[landed]])
+
     def test_a_statement_cut_short_in_a_transaction_aborts_it_every_time(self):
         self.sql("CREATE TABLE half(x INTEGER)")
         for attempt in range(12):

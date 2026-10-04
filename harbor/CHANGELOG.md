@@ -4,6 +4,17 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.44.2 — 2026-10-04
+
+- **A cancelled `COMMIT` is not answered `499` after it landed.** A cancel
+  that reached a `COMMIT` as it finished was reported by the engine on the
+  fetch that followed, after the transaction was durable: the client was
+  told cancelled for work that was kept, and one that retries on a cancel
+  would do it twice. Raced on purpose, 40 of 600 commits answered that way
+  (#138). A `COMMIT` now runs to its answer: a cancel or a deadline either
+  lands before it starts, a `499` with nothing kept and the transaction
+  aborted, or does not land at all, and the answer is the engine's own.
+
 ## 0.44.1 — 2026-10-04
 
 - **A `COMMIT` on an aborted transaction says it was rolled back.** Almost

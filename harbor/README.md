@@ -221,6 +221,12 @@ and answer success, and a client reading that answer would believe its work
 was kept. In autocommit there is no transaction to abort, and the next
 statement runs.
 
+A `COMMIT` is the one statement a cancel does not reach once it has begun. An
+interrupt that arrives as one finishes is reported by the engine after the
+transaction is durable, which would be a `499` for work that was kept. So a
+cancel, or a deadline, either lands before the `COMMIT` starts, which is a
+`499` with nothing kept, or does not land, and the answer is the engine's own.
+
 ## Transactions
 
 A transaction lives on a connection and HTTP requests do not, so one request
