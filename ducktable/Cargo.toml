@@ -6,7 +6,7 @@ members = ["crates/ducktable", "crates/duckdb-lang", "crates/harbor-client"]
 exclude = ["vendor/gpui-base", "vendor/gpui-component"]
 
 [workspace.package]
-version = "0.22.7"
+version = "0.22.8"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/shreeve/duckdb-harbor"
