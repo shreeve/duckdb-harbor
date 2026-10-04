@@ -497,9 +497,10 @@ the NULL tag, visually distinct from empty, always.
 
 ## Dialogs
 
-Exactly one: quitting with something to lose, by ⌘Q, DuckTable → Quit or the
-window's close button. Those three ask first when any of these holds, and
-quit at once when none does:
+Exactly one: quitting with something to lose, by ⌘Q, DuckTable → Quit, the
+window's close button or the updater's Install and Relaunch, which quits to
+install. Those four ask first when any of these holds, and quit at once when
+none does:
 
 - **Staged changes**, in the table on screen or parked for a table that is
   not. They are counted together: `Discard 5 staged changes and quit?`, and
@@ -547,10 +548,17 @@ The dialog is the app's own rather than the platform's alert, which cannot
 make Cancel its default: there a first button titled Cancel takes Esc and
 gives up Return, and the keyboard focus sits on the other button.
 
-Three ways out end the app through macOS without passing through the dialog,
-and ask nothing: Quit from the Dock's menu, a logout, restart or shutdown,
-and the updater's Install and Relaunch. Staged changes and typed text are
-lost to them unasked.
+Install and Relaunch asks the same question about the update: `Discard 1
+staged change and install the update?`, with `Discard and Install` or
+`Install Anyway` beside Cancel, and a last line saying that with Cancel the
+update installs when DuckTable next quits. Sparkle holds the relaunch until
+the dialog is answered. It holds it only once per update, so while an update
+waits, Check for Updates asks again rather than opening Sparkle's window,
+whose second Install and Relaunch would not wait.
+
+Two ways out end the app through macOS without passing through the dialog,
+and ask nothing: Quit from the Dock's menu, and a logout, restart or
+shutdown. Staged changes and typed text are lost to them unasked.
 
 Every quit, asked or not, gives back the sessions the window holds, waiting
 a second and a half for the server and no longer: the Query view's

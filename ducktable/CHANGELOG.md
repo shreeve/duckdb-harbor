@@ -15,9 +15,16 @@ date, newest first.
   back. The button that quits is not a tab stop, so no key reaches it and only
   a click on it quits. The dialog is the app's own because the platform alert
   cannot do that. Measured: with Cancel first it has no default button, and
-  Space presses the button that discards. Three quits do not pass through the
-  dialog and ask nothing: Quit from the Dock's menu, a logout or restart, and
-  the updater's Install and Relaunch.
+  Space presses the button that discards. Two quits do not pass through the
+  dialog and ask nothing: Quit from the Dock's menu, and a logout or restart.
+- **Install and Relaunch asks too.** Installing an update quits DuckTable, and
+  it did so without a word, staged changes or not. Sparkle now holds the
+  relaunch while the quit dialog asks the same question about the update,
+  with `Discard and Install` or `Install Anyway` beside Cancel. After Cancel
+  the update installs when DuckTable next quits, and Check for Updates asks
+  again, since Sparkle holds a relaunch only once.
+- **The quit dialog's buttons are sized to their labels.** Cancel filled the
+  width the footer left it.
 - **Every quit gives its sessions back.** Whether it asked or not, a quit
   releases the sessions the window holds, a commit's and an opening `BEGIN`'s
   among them, so the server rolls back at once what would otherwise wait for

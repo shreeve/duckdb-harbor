@@ -91,10 +91,26 @@ pub(crate) struct QuitQuestion {
     pub(crate) confirm: &'static str,
 }
 
+/// How the app is about to end: quitting, or the updater's Install and
+/// Relaunch, which quits to install and opens the new version.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Leaving {
+    Quit,
+    Relaunch,
+}
+
 impl QuitRisks {
     /// The question to ask before quitting, or None when quitting loses
     /// nothing.
     pub(crate) fn question(&self) -> Option<QuitQuestion> {
+        self.question_for(Leaving::Quit)
+    }
+
+    /// The same question, asked of the way the app is about to end.
+    /// Installing an update quits too, so the facts are the same; only the
+    /// question and its button name the relaunch, and Cancel's outcome is
+    /// said, since the update still waits.
+    pub(crate) fn question_for(&self, leaving: Leaving) -> Option<QuitQuestion> {
         let changes = match self.staged {
             0 => None,
             1 => Some("1 staged change".to_string()),
@@ -147,15 +163,30 @@ impl QuitRisks {
         // them; anything else is asked plainly, with the facts below it.
         let only_staged =
             !(self.held > 0 || self.editing || self.committing || self.transaction || self.running);
-        let message = match (&changes, only_staged) {
-            (Some(changes), true) => format!("Discard {changes} and quit?"),
-            _ => "Quit DuckTable?".to_string(),
+        let (message, confirm) = match leaving {
+            Leaving::Quit => (
+                match (&changes, only_staged) {
+                    (Some(changes), true) => format!("Discard {changes} and quit?"),
+                    _ => "Quit DuckTable?".to_string(),
+                },
+                if only_staged { "Discard and Quit" } else { "Quit Anyway" },
+            ),
+            Leaving::Relaunch => {
+                detail.push(
+                    "Installing the update quits DuckTable. With Cancel it installs when DuckTable \
+                     next quits."
+                        .to_string(),
+                );
+                (
+                    match (&changes, only_staged) {
+                        (Some(changes), true) => format!("Discard {changes} and install the update?"),
+                        _ => "Install the update now?".to_string(),
+                    },
+                    if only_staged { "Discard and Install" } else { "Install Anyway" },
+                )
+            }
         };
-        Some(QuitQuestion {
-            message,
-            detail: detail.join(" "),
-            confirm: if only_staged { "Discard and Quit" } else { "Quit Anyway" },
-        })
+        Some(QuitQuestion { message, detail: detail.join(" "), confirm })
     }
 }
 
@@ -1518,6 +1549,26 @@ mod tests {
         assert_eq!((typing.message.as_str(), typing.confirm), ("Quit DuckTable?", "Quit Anyway"));
         let running = QuitRisks { running: true, ..Default::default() }.question().unwrap();
         assert!(running.detail.starts_with("A statement is still running in the Query view."));
+    }
+
+    #[test]
+    fn installing_an_update_asks_what_quitting_asks() {
+        use super::Leaving::Relaunch;
+        // Nothing to lose, nothing asked: the relaunch goes ahead.
+        assert_eq!(QuitRisks::default().question_for(Relaunch), None);
+
+        let one = QuitRisks { staged: 1, tables: 1, ..Default::default() }.question_for(Relaunch).unwrap();
+        assert_eq!(one.message, "Discard 1 staged change and install the update?");
+        assert_eq!(
+            one.detail,
+            "1 staged change has not been committed, and quitting discards it. Installing the \
+             update quits DuckTable. With Cancel it installs when DuckTable next quits."
+        );
+        assert_eq!(one.confirm, "Discard and Install");
+
+        let open = QuitRisks { transaction: true, ..Default::default() }.question_for(Relaunch).unwrap();
+        assert_eq!((open.message.as_str(), open.confirm), ("Install the update now?", "Install Anyway"));
+        assert!(open.detail.starts_with("The Query view holds a transaction open, and quitting rolls it back."));
     }
 
     #[test]
