@@ -367,14 +367,12 @@ impl<'a> Renderer<'a> {
             return;
         }
         let spilled = !self.tail.is_empty();
-        let head: Vec<Vec<String>> = std::mem::take(&mut self.head);
-        let tail: Vec<Vec<String>> = std::mem::take(&mut self.tail).into();
-        let (top, bottom): (&[Vec<String>], &[Vec<String>]) = if spilled {
-            let keep = (self.opts.max_rows / 2).max(1);
-            (&head[..keep.min(head.len())], &tail[..])
-        } else {
-            (&head[..], &[])
-        };
+        let mut head: Vec<Vec<String>> = std::mem::take(&mut self.head);
+        let mut tail: Vec<Vec<String>> = std::mem::take(&mut self.tail).into();
+        if spilled {
+            halves(&mut head, &mut tail, self.opts.max_rows);
+        }
+        let (top, bottom): (&[Vec<String>], &[Vec<String>]) = (&head[..], &tail[..]);
 
         // Column widths from what will be shown: natural when the frame fits
         // the terminal, else the widest columns shrink first (fit_widths, to a
@@ -553,6 +551,21 @@ fn terminal_width() -> usize {
 /// The floor a column shrinks to before pruning takes over — and, on a narrow
 /// terminal, the effective cap a wide value is cut back to.
 const MAX_COL: usize = 40;
+
+/// Cut a spilled result down to the two halves it shows, in place: `head`
+/// becomes the first rows and `tail` the last. The ring holds only rows past
+/// the head, so a result just over the cap leaves it short; the end of the
+/// head fills what the ring lacks, and only rows that are not held are
+/// elided.
+fn halves(head: &mut Vec<Vec<String>>, tail: &mut Vec<Vec<String>>, max_rows: usize) {
+    let top = (max_rows / 2).max(1).min(head.len());
+    let want = max_rows.div_ceil(2).max(1);
+    let lent = want.saturating_sub(tail.len()).min(head.len() - top);
+    let mut bottom = head.split_off(head.len() - lent);
+    bottom.append(tail);
+    *tail = bottom;
+    head.truncate(top);
+}
 
 /// Fit natural column widths to the terminal. A frame that fits keeps every
 /// column at its natural width; one that doesn't shrinks the widest columns
@@ -1053,7 +1066,7 @@ fn csv_cell_for(s: &str, tty: bool) -> String {
         }
         false => s,
     };
-    if s.contains(',') || s.contains('"') || s.contains('\n') {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s.to_string()
@@ -1072,6 +1085,41 @@ mod tests {
 
     fn col(name: &str, ty: &str) -> Column {
         Column { name: Some(name.into()), duckdb_type: ty.into(), lossless: true, ..Default::default() }
+    }
+
+    /// A result just over the cap shows every row it holds: the bottom half
+    /// is the last rows of the result, not only the ones past the cap.
+    #[test]
+    fn a_result_just_over_the_cap_elides_only_what_is_not_held() {
+        let shown = |rows: usize, max_rows: usize| {
+            let opts = RenderOpts { max_rows, ..Default::default() };
+            let mut r = Renderer::new(&opts);
+            r.schema(&[col("n", "BIGINT")]);
+            for i in 1..=rows {
+                r.row(vec![json!(i)]);
+            }
+            let mut head = std::mem::take(&mut r.head);
+            let mut tail: Vec<Vec<String>> = std::mem::take(&mut r.tail).into();
+            halves(&mut head, &mut tail, max_rows);
+            let n = |rows: Vec<Vec<String>>| rows.iter().map(|r| r[0].parse().unwrap()).collect::<Vec<usize>>();
+            (n(head), n(tail))
+        };
+        // One row over: everything held is shown, and only row 21 is elided.
+        assert_eq!(shown(41, 40), ((1..=20).collect(), (22..=41).collect()));
+        // Far over: the first rows and the true last rows.
+        assert_eq!(shown(1000, 40), ((1..=20).collect(), (981..=1000).collect()));
+        // An odd cap gives the bottom the extra row, as the ring does.
+        assert_eq!(shown(6, 5), (vec![1, 2], vec![4, 5, 6]));
+        assert_eq!(shown(3, 1), (vec![1], vec![3]));
+    }
+
+    /// A bare carriage return ends a record for a CSV reader as a newline
+    /// does, so a field holding one is quoted.
+    #[test]
+    fn csv_quotes_a_carriage_return() {
+        assert_eq!(csv_cell("a\rb"), "\"a\rb\"");
+        assert_eq!(csv_cell("a\nb"), "\"a\nb\"");
+        assert_eq!(csv_cell("plain"), "plain");
     }
 
     #[test]

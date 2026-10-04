@@ -4,6 +4,95 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.44.0 — 2026-10-03
+
+- **A transaction holds together from the command line.** The client sent
+  each statement as its own request, so `BEGIN`, the work and the `ROLLBACK`
+  each landed on a different pooled connection: `BEGIN` answered success,
+  every statement after it committed alone, and the `ROLLBACK` failed with
+  nothing to undo. A migration whose second statement failed left its first
+  one committed. In the REPL, a `-c` string, a piped script and `.read`, a
+  `BEGIN` now opens a session, every statement after it runs there, and
+  the `COMMIT` or `ROLLBACK` that ends the transaction releases it; one the
+  parser refuses, or that never reached the server, ends nothing and the
+  session is kept. A script that fails or ends with its transaction open has
+  it rolled back and says so, and so does leaving the REPL or `.open`ing
+  another database. The session is an ordinary one, so
+  the server's limits on it (thirty seconds idle, five minutes in all) are
+  the transaction's; the REPL prints them when one opens, and a statement
+  sent after the server took the session back is told the transaction is
+  over.
+- **`BEGIN` without a session is a `400`.** The server answered success to a
+  transaction it could not hold, which is the silence the item above came
+  from, and any client could walk into it. `BEGIN` and `START TRANSACTION`
+  outside a session are refused the way `USE` is, with what to do instead.
+  `COMMIT` and `ROLLBACK` with nothing open were always the engine's to
+  refuse. The refusal, the client and the `inTransaction` flag in
+  `/sessions` read a statement by one rule, the engine's as measured: every
+  space the engine skips is skipped (a byte order mark, a no-break space, a
+  vertical tab, which also closes that gap in the `SET` fence), an analyzed
+  `EXPLAIN` in any of its spellings acts as the statement it runs, so
+  `EXPLAIN ANALYZE COMMIT` ends a transaction, and a quoted `"begin"` is a
+  table's name.
+- **`detach` removes the login item the database was filed under.** For a
+  database whose config name is not its file's stem, the name was asked for
+  again after the entry was gone, so the login item of the stem's name was
+  removed (some other database's, if one had it) and the real one kept
+  starting at every login with no command left that could reach it. Two
+  verb pairs the grammar accepts are carried out: `autostart off restart`
+  restarts, and `detach restart` comes back refcounted, as `detach start`
+  does.
+- **A config file that cannot be read is not taken for a missing one.** No
+  permission, a directory in its place, or one byte that is not UTF-8 made
+  harbor start as if there were no config, without `sealed`, the statement
+  ceiling or the memory limit, and say nothing. It is reported as invalid,
+  with the reason; a `statement-timeout` that does not parse is reported
+  too, where it was dropped.
+- **A client that leaves mid-stream has its statement interrupted.** A
+  failed write ended the response while the statement ran on until its next
+  flush. On a pooled connection it is interrupted when the write fails. A
+  session's statement is left to end at its flush, since an interrupt there
+  would decide by timing whether the transaction around it survived. A
+  statement that has sent nothing yet is still only noticed when it has rows
+  to write.
+- **The systemd unit escapes what systemd would expand.** Only `"` was
+  escaped, so a `%` in a path was read as a specifier and a `$` in the
+  database's path as a variable: a login item for `/data/50%off.duckdb`
+  served a new, empty database under the real one's name. `%`, `\` and `"`
+  now arrive as the bytes the filesystem holds, and so does `$` where
+  systemd substitutes one, which is in a command's arguments and not in the
+  program's path. A path with a control character in it is refused for a
+  login item on either platform, where a newline could have added a
+  directive. The item's log directory is private from the moment it exists.
+- **Tab does not install an extension.** The first Tab ran `INSTALL
+  autocomplete` on the server when `LOAD` failed: a download and a lasting
+  write on the server's host, asked for by a keypress. It loads the
+  extension if the server has it and completes from the catalog if not.
+- **Backup reads a column's type from the column.** A `CHECK` or `DEFAULT`
+  that named a type was read as the column's own, so a table with `s
+  VARCHAR CHECK (s::VARIANT IS NOT NULL)` was refused in both formats and
+  one whose default cast through `TIME WITH TIME ZONE` was moved to text
+  for nothing. And a restore finds a table's document decode by what it
+  does, so a directory whose decode also names a generated `VARIANT`
+  restores, where running that statement as written failed on the column
+  the table computes.
+- **Smaller things at the prompt.** CSV quotes a field holding a carriage
+  return, which ends a record for a reader as a newline does. A result one
+  row over the display cap showed its first twenty rows and its last one,
+  hiding nineteen it held; the bottom half is the last rows wherever they
+  were kept. Ctrl-C ends a client that is still reading its script from
+  stdin or waiting on a server it spawned, where it was held until stdin
+  closed; and one pressed in the pager no longer cancels the next `.read`.
+  A statement the server stopped on its own account, at a deadline or a
+  session's limit, says so and fails, where it printed `Interrupted.` as if
+  a key had been pressed.
+  `start` with options on a server that is already up says a restart
+  applies them, where it reported success and ignored them. The list
+  removes a socket only when two tries are refused, since a server with a
+  full listen queue refuses one. `attach` and `detach` write a config that
+  is a symbolic link where it is kept, where they replaced the link with a
+  file.
+
 ## 0.43.5 — 2026-10-03
 
 - **`harbor` says when a second copy of it is on the machine.** install.sh

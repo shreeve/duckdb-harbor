@@ -187,7 +187,14 @@ fn read() -> Result<String, String> {
 /// file from a killed writer from being overwritten or followed as a symlink.
 fn write(text: &str) -> Result<(), String> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let root = paths::config_root()?;
+    // A config kept elsewhere and linked into place is written where it is
+    // kept: a rename onto the link would replace the link itself and leave
+    // the file it pointed at behind, unchanged and unread. The
+    // temporary file goes beside the real one, since a rename cannot cross
+    // filesystems.
+    let dest = paths::config_file()?;
+    let dest = fs::canonicalize(&dest).unwrap_or(dest);
+    let root = dest.parent().map(Path::to_path_buf).ok_or("config.toml has no directory")?;
     let (tmp, mut out) = loop {
         let tmp = root.join(format!("config.toml.{}.{}.tmp",
             std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
@@ -208,7 +215,7 @@ fn write(text: &str) -> Result<(), String> {
         out.write_all(text.as_bytes())?;
         out.sync_all()?;
         drop(out);
-        fs::rename(&tmp, root.join("config.toml"))
+        fs::rename(&tmp, &dest)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);

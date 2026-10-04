@@ -48,12 +48,12 @@ impl SqlCompleter {
 impl Inner {
     fn setup(&mut self) {
         // Best-effort: sql_auto_complete lives in the autocomplete extension.
-        // LOAD first (usually already installed); INSTALL+LOAD as a second
-        // try. Failures are fine — lane C covers a berth without it.
-        if quiet_sql(&self.conn, "LOAD autocomplete").is_none() {
-            let _ = quiet_sql(&self.conn, "INSTALL autocomplete");
-            let _ = quiet_sql(&self.conn, "LOAD autocomplete");
-        }
+        // LOAD it if the server has it. Installing is a download and a
+        // lasting write on the server's host, and a Tab is no request for
+        // either: whether an extension may be fetched is the server's own
+        // setting to decide. Failures are fine — lane C covers a berth
+        // without it.
+        let _ = quiet_sql(&self.conn, "LOAD autocomplete");
         self.catalog = Some(fetch_catalog_names(&self.conn).unwrap_or_default());
     }
 

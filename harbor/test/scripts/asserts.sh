@@ -458,17 +458,18 @@ eq "an oversized Content-Length is refused" "413" \
 section "Pooled connections carry no transaction"
 # ---------------------------------------------------------------------------
 
-# A pooled connection is never pinned to a client, so a BEGIN can never be
-# committed and must not survive to the next request. is_autocommit() in
-# duckdb-rs is a stub that always returns true, so the reset used to fire only
-# for jobs that ended abnormally: one BEGIN per worker, and the next request on
-# each of those connections came back "cannot start a transaction within a
-# transaction".
-begin_failures=0
+# A pooled connection is never pinned to a client, so a BEGIN sent to one
+# could never be committed: the statements meant to follow it would each
+# commit alone. It is refused, in every spelling, and no worker is left
+# inside a transaction, which would answer the next request "cannot start a
+# transaction within a transaction".
+begin_admitted=0
 for _ in $(seq 1 16); do
-  [[ "$(status 'BEGIN TRANSACTION')" == "200" ]] || begin_failures=$((begin_failures+1))
+  [[ "$(status 'BEGIN TRANSACTION')" == "400" ]] || begin_admitted=$((begin_admitted+1))
 done
-eq "16 sequential BEGINs all succeed" "0" "$begin_failures"
+eq "16 sequential BEGINs are all refused" "0" "$begin_admitted"
+eq "START TRANSACTION is refused the same way" "400" "$(status 'START TRANSACTION')"
+eq "and so is one behind a comment" "400" "$(status '/* x */ begin')"
 eq "and the pool still answers afterwards" "$exp_n_sites" \
    "$(scalar 'SELECT count(*) AS n FROM sites')"
 

@@ -106,10 +106,11 @@ pub struct Plan {
 impl Plan {
     /// A running server is ephemeral exactly when it is being started while
     /// detached — membership carries the lifetime. (`attach start` and a bare
-    /// `start` are persistent; only `detach start` is ephemeral.) The dispatch
-    /// hands this to `start` as the server's refcounted-lifetime fact.
+    /// `start` are persistent; only `detach start` and `detach restart` are
+    /// ephemeral.) The dispatch hands this to `start` as the server's
+    /// refcounted-lifetime fact.
     pub fn ephemeral(&self) -> bool {
-        self.run == Some(Running::Start) && self.attach == Some(false)
+        matches!(self.run, Some(Running::Start | Running::Restart)) && self.attach == Some(false)
     }
 }
 
@@ -254,6 +255,8 @@ mod tests {
     #[test]
     fn membership_carries_the_lifetime() {
         assert!(ok("detach start").ephemeral(), "detach start is ephemeral");
+        assert!(ok("detach restart").ephemeral(), "detach restart comes back ephemeral");
+        assert!(!ok("restart").ephemeral(), "a bare restart is persistent");
         assert!(!ok("attach start").ephemeral(), "attach start is persistent");
         assert!(!ok("start").ephemeral(), "a bare start is persistent");
         assert!(!ok("detach stop").ephemeral(), "stopping is never 'ephemeral running'");

@@ -411,9 +411,33 @@ fn restore_plan(dir: &Path, schema_sql: &str, load_sql: &str, after_sql: &str) -
         let declared = schema.get(table);
         let variants = declared.map_or(&[][..], |t| &t.variants[..]);
         let generated = declared.map_or(&[][..], |t| &t.generated[..]);
-        let decoded = (!variants.is_empty())
-            .then(|| json_in(table, variants))
-            .and_then(|expected| decode.iter().position(|s| *s == expected));
+        // The table's decode, found by what it does and not by its exact
+        // text: an `UPDATE` of this table that casts each of its stored
+        // VARIANT columns back from JSON. One that names a generated VARIANT
+        // beside them is the same record, and running it as written would
+        // fail on the column the table computes.
+        // It is that record only when it casts every stored VARIANT and
+        // nothing but those and generated columns: an assignment to any
+        // other column is someone's statement, and is left to run.
+        let decoded = (!variants.is_empty()).then_some(()).and_then(|()| {
+            let update = format!("UPDATE {table} SET ");
+            let cast = |c: &String| format!("{} = {}::VARCHAR::JSON::VARIANT", ident(c), ident(c));
+            decode.iter().position(|s| {
+                s.strip_prefix(&update).is_some_and(|set| {
+                    let mut rest = set.to_string();
+                    let stored = variants.iter().all(|c| {
+                        let cast = cast(c);
+                        let found = rest.contains(&cast);
+                        rest = rest.replacen(&cast, "", 1);
+                        found
+                    });
+                    for c in generated {
+                        rest = rest.replacen(&cast(c), "", 1);
+                    }
+                    stored && rest.chars().all(|c| c == ',' || c.is_whitespace())
+                })
+            })
+        });
         let carried = !generated.is_empty()
             && Path::new(file).extension().is_some_and(|e| e == "csv")
             && fs::File::open(dir.join(file)).ok()
@@ -921,11 +945,46 @@ fn schema_types(sql: &str) -> HashMap<String, TableSchema> {
             match name {
                 Some(name) if is_generated(&code) => generated.push(name),
                 Some(name) if is_plain_variant(&code) => variants.push(name),
-                _ => types.push(code),
+                Some(_) => types.push(type_part(&code).to_string()),
+                // A constraint clause declares no column, and so no type.
+                None => {}
             }
         }
         Some((table, TableSchema { types: types.join(", "), variants, generated, columns }))
     }).collect()
+}
+
+/// The type a column definition declares, without the constraints after it:
+/// the code up to the first constraint word outside any parentheses. A CHECK
+/// or a DEFAULT can name a type the column does not have (`s VARCHAR CHECK
+/// (s::VARIANT IS NOT NULL)`), and a format is chosen by what the column
+/// holds, not by what an expression beside it mentions.
+fn type_part(code: &str) -> &str {
+    let b = code.as_bytes();
+    let (mut depth, mut i) = (0usize, 0usize);
+    while i < b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            c if depth == 0 && (c.is_ascii_alphabetic() || c == b'_') => {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                if matches!(
+                    code[start..i].to_ascii_uppercase().as_str(),
+                    "DEFAULT" | "CHECK" | "NOT" | "NULL" | "COLLATE" | "PRIMARY" | "UNIQUE"
+                        | "REFERENCES" | "CONSTRAINT" | "USING"
+                ) {
+                    return code[..start].trim_end();
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    code
 }
 
 /// A column the table computes: `schema.sql` spells every one of them
@@ -1122,7 +1181,8 @@ mod tests {
         let odd = &schema["\"odd name\""];
         assert_eq!(odd.variants, vec!["v".to_string(), "quoted \"col\"".to_string()]);
         assert!(!odd.types.contains("VARIANT"), "{}", odd.types);
-        assert!(odd.types.contains("INTEGER PRIMARY KEY"));
+        // The type, and none of what follows it or stands beside it.
+        assert_eq!(odd.types, "INTEGER, INTEGER, VARCHAR");
         let nested = &schema["x.t"];
         assert!(nested.variants.is_empty());
         assert!(nested.types.contains("STRUCT(a VARIANT)") && nested.types.contains("UNION("));
@@ -1171,6 +1231,27 @@ mod tests {
         assert_eq!(plan.len(), 7);
     }
 
+    /// A type named only by a constraint or a default is not the column's.
+    #[test]
+    fn a_type_is_read_from_the_column_and_not_from_its_constraints() {
+        for (code, expected) in [
+            ("VARCHAR CHECK((s IS NULL) OR (CAST(s AS VARIANT) IS NOT NULL))", "VARCHAR"),
+            ("VARCHAR DEFAULT(CAST(CAST(now() AS TIME WITH TIME ZONE) AS VARCHAR))", "VARCHAR"),
+            ("TIME WITH TIME ZONE NOT NULL", "TIME WITH TIME ZONE"),
+            ("DECIMAL(5, 2) DEFAULT(0)", "DECIMAL(5, 2)"),
+            ("STRUCT(a VARIANT, \"default\" INTEGER)[] PRIMARY KEY", "STRUCT(a VARIANT, \"default\" INTEGER)[]"),
+            ("UNION(num INTEGER, str VARCHAR)", "UNION(num INTEGER, str VARCHAR)"),
+            ("nullable_kind", "nullable_kind"),
+        ] {
+            assert_eq!(type_part(code), expected);
+        }
+        let schema = schema_types(
+            "CREATE TABLE t(id INTEGER, s VARCHAR CHECK(((s IS NULL) OR (CAST(s AS VARIANT) IS NOT NULL))), \
+             w VARCHAR DEFAULT(CAST(CAST('1' AS TIME WITH TIME ZONE) AS VARCHAR)), CHECK((CAST(id AS UNION(n INTEGER)) IS NOT NULL)))",
+        );
+        assert_eq!(schema["t"].types, "INTEGER, VARCHAR, VARCHAR");
+    }
+
     #[test]
     fn generated_columns_are_found_and_left_out_of_what_is_written() {
         let schema = schema_types(
@@ -1208,6 +1289,34 @@ mod tests {
                 assert_eq!(header_fields(input).unwrap(), expected, "{text:?}, {capacity}");
             }
         }
+    }
+
+    /// A directory whose decode names a generated VARIANT beside the stored
+    /// one restores like any other: the statement is the table's record that
+    /// its file holds JSON text, and it is not run as written, since the
+    /// table computes that column and an UPDATE of it is refused.
+    #[test]
+    fn a_decode_that_names_a_generated_variant_is_still_the_tables_record() {
+        let dir = std::env::temp_dir().join(format!("harbor-backup-generated-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let schema = "CREATE TABLE old(id INTEGER, doc VARIANT, same VARIANT GENERATED ALWAYS AS(CAST(doc AS VARIANT)));\n";
+        fs::write(dir.join("old.csv"), "id\tdoc\tsame\n").unwrap();
+        let load = "COPY old FROM 'old.csv' (FORMAT 'csv');\n";
+        let after = "UPDATE old SET \"doc\" = \"doc\"::VARCHAR::JSON::VARIANT, \"same\" = \"same\"::VARCHAR::JSON::VARIANT;\n\
+                     UPDATE old SET id = 0;\n\
+                     UPDATE old SET \"doc\" = \"doc\"::VARCHAR::JSON::VARIANT, id = 1;\n";
+        let plan = restore_plan(&dir, schema, load, after);
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(plan.unwrap()[1..], [
+            "CREATE TABLE harbor_restore_0 AS SELECT * REPLACE (\"doc\"::VARCHAR AS \"doc\") FROM old LIMIT 0".to_string(),
+            format!("COPY harbor_restore_0 FROM '{}' (FORMAT 'csv')", dir.join("old.csv").display()),
+            "INSERT INTO old SELECT * EXCLUDE (\"same\") REPLACE (\"doc\"::JSON::VARIANT AS \"doc\") FROM harbor_restore_0".to_string(),
+            "DROP TABLE harbor_restore_0".to_string(),
+            // An UPDATE of the table that is not its decode still runs, and
+            // so does one that sets a column the decode has no business with.
+            "UPDATE old SET id = 0".to_string(),
+            "UPDATE old SET \"doc\" = \"doc\"::VARCHAR::JSON::VARIANT, id = 1".to_string(),
+        ]);
     }
 
     #[test]
