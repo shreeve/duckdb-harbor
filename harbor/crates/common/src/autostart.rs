@@ -72,6 +72,22 @@ fn homes() -> Vec<(String, String)> {
         .collect()
 }
 
+/// Refuse a path a login item cannot carry. A newline in one would start a
+/// new line of a unit file, where a directive could follow it, and no control
+/// character is legal in a plist. Such a path is not something to quote
+/// around; the homes the item carries are held to the same rule.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn printable(paths: &[&Path]) -> Result<(), String> {
+    let homes = homes();
+    let carried = paths.iter().map(|p| p.to_string_lossy()).chain(homes.iter().map(|(_, v)| v.into()));
+    for text in carried {
+        if text.chars().any(char::is_control) {
+            return Err(format!("a login item cannot carry a path with a control character in it: {text:?}"));
+        }
+    }
+    Ok(())
+}
+
 /// Register the item: write the plist and clear any disable launchd may hold
 /// for the label from an earlier life. Does not load it.
 #[cfg(target_os = "macos")]
@@ -79,13 +95,16 @@ pub fn arm(db: &Path, name: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let canon = paths::canonical_db(db)?;
     let log = paths::log_file(&paths::runtime_dir()?, name);
+    // Private from the moment it exists: the log directory sits under the
+    // runtime directory, whose mode is what keeps other users off the sockets.
     if let Some(dir) = log.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        crate::perms::create_dir_private(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let plist = agent_path(name)?;
     if let Some(dir) = plist.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
+    printable(&[exe.as_path(), canon.as_path(), log.as_path()])?;
     std::fs::write(
         &plist,
         plist_body(name, &exe.display().to_string(), &canon.display().to_string(), &log.display().to_string(), &homes()),
@@ -277,13 +296,16 @@ pub fn arm(db: &Path, name: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let canon = paths::canonical_db(db)?;
     let log = paths::log_file(&paths::runtime_dir()?, name);
+    // Private from the moment it exists: the log directory sits under the
+    // runtime directory, whose mode is what keeps other users off the sockets.
     if let Some(dir) = log.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        crate::perms::create_dir_private(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let path = unit_path(name)?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
+    printable(&[exe.as_path(), canon.as_path(), log.as_path()])?;
     std::fs::write(
         &path,
         unit_body(name, &exe.display().to_string(), &canon.display().to_string(), &log.display().to_string(), &homes()),
@@ -347,14 +369,24 @@ fn unit_path(name: &str) -> Result<std::path::PathBuf, String> {
 // Restart=on-failure is KeepAlive's SuccessfulExit=false: back after a crash,
 // down after a clean exit. No After= on the target that wants this unit — a
 // target orders itself after everything it wants, so that would be a cycle
-// systemd breaks by dropping a job, usually this one. Paths are quoted so a
-// space survives systemd's word split.
+// systemd breaks by dropping a job, usually this one.
+//
+// A path goes in as the bytes the filesystem holds, so everything systemd
+// would read as its own syntax is escaped. Quotes keep a space through the
+// word split, and inside them a backslash starts an escape. `%` is a
+// specifier in every directive here (`/data/50%off.duckdb` would otherwise
+// name another file, and the login item would serve a fresh, empty database
+// under the real one's name). `$` is a variable in a command's arguments
+// and nowhere else: the program's own path is never substituted, so a `$`
+// there stays single, and doubled it would name a file that is not there.
 #[cfg(target_os = "linux")]
 fn unit_body(name: &str, exe: &str, db: &str, log: &str, env: &[(String, String)]) -> String {
-    let q = |s: &str| s.replace('"', "\\\"");
+    let bare = |s: &str| s.replace('%', "%%");
+    let quoted = |s: &str| bare(&s.replace('\\', "\\\\").replace('"', "\\\""));
+    let word = |s: &str| quoted(s).replace('$', "$$");
     let env: String = env
         .iter()
-        .map(|(k, v)| format!("Environment=\"{}={}\"\n", k, q(v)))
+        .map(|(k, v)| format!("Environment=\"{}={}\"\n", k, quoted(v)))
         .collect();
     format!(
         "[Unit]\n\
@@ -369,9 +401,10 @@ fn unit_body(name: &str, exe: &str, db: &str, log: &str, env: &[(String, String)
          RestartSec=10\n\n\
          [Install]\n\
          WantedBy=default.target\n",
-        exe = q(exe),
-        db = q(db),
-        log = log,
+        name = bare(name),
+        exe = quoted(exe),
+        db = word(db),
+        log = bare(log),
         env = env,
     )
 }
@@ -453,6 +486,38 @@ mod tests {
         assert!(body.contains("ExecStart=\"/opt/harbor/harbor\" \"/data/my db.duckdb\" start"));
         assert!(body.contains("WantedBy=default.target"));
         assert!(!body.contains("Environment="));
+    }
+
+    /// Everything systemd would read as its own syntax arrives as the bytes
+    /// the filesystem holds: a specifier, a variable, a backslash, a quote.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unit_escapes_what_systemd_would_expand() {
+        let body = super::unit_body(
+            "my-db",
+            "/opt/har$bor/harbor",
+            "/data/50%off \\ \"q\" $HOME.duckdb",
+            "/tmp/50%/my-db.log",
+            &[("HARBOR_HOME".into(), "/srv/50%\\h $x".into())],
+        );
+        assert!(body.contains(
+            "ExecStart=\"/opt/har$bor/harbor\" \"/data/50%%off \\\\ \\\"q\\\" $$HOME.duckdb\" start\n"
+        ), "{body}");
+        assert!(body.contains("StandardOutput=append:/tmp/50%%/my-db.log\n"), "{body}");
+        assert!(body.contains("StandardError=append:/tmp/50%%/my-db.log\n"), "{body}");
+        // No variable is substituted in the program's path or in
+        // Environment=, so `$` stays as it is in both.
+        assert!(body.contains("Environment=\"HARBOR_HOME=/srv/50%%\\\\h $x\"\n"), "{body}");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_login_item_refuses_a_path_with_a_control_character() {
+        use std::path::Path;
+        assert!(super::printable(&[Path::new("/data/my db.duckdb"), Path::new("/data/50%off.duckdb")]).is_ok());
+        let e = super::printable(&[Path::new("/data/a\nExecStartPre=/bin/x.duckdb")]).unwrap_err();
+        assert!(e.contains("control character"), "{e}");
+        assert!(super::printable(&[Path::new("/data/a\u{1}b.duckdb")]).is_err());
     }
 
     #[cfg(target_os = "linux")]

@@ -189,6 +189,15 @@ client disappears. If a deployment's worry is runaway queries rather than
 impatient users, set `HARBOR_STATEMENT_TIMEOUT_MS` or
 `--statement-timeout <duration>`.
 
+A client that goes away while its rows are being written has its statement
+interrupted without asking, on a pooled connection: the write to it fails and
+nobody is left to read the rest. That is noticed at a write. A statement
+still computing in silence, with no rows out yet, runs until it has some to
+send, so a deadline remains the backstop for a client that vanishes. In a
+session the abandoned statement ends at its next flush, and a client that
+stopped reading one inside a transaction should treat it as a cancelled one:
+roll back, and begin again.
+
 Two smaller things follow from the same machinery. Releasing a session whose
 statement is still running stops it — `{"released":false,"cancelling":true}`
 — and the connection comes back on a reaper tick after execution stops. And a
@@ -228,6 +237,22 @@ $ curl -s -X DELETE 127.0.0.1:9495/sql/sessions/$sid
 This is PgBouncer's transaction pooling, or ActiveRecord checking a connection
 out of its pool — with an HTTP request where they have a socket and a thread.
 The session rules are:
+
+**A transaction begins in a session, or not at all.** `BEGIN` or `START
+TRANSACTION` without a `sessionId` is a `400`, and so is one behind an
+analyzed `EXPLAIN`, which runs what it explains. The pooled connection it
+would run on goes back when the request ends, so it would answer success and
+hold nothing, and every statement meant to be inside it would commit on its
+own.
+
+**The command line opens the session for you.** In the REPL, a `-c` string, a
+piped script or `.read`, a `BEGIN` takes a session, every statement after it
+runs there, and the `COMMIT` or `ROLLBACK` that ends the transaction releases
+it. One that never reached the engine, a typo the parser refuses or a request
+that failed on the way, ends nothing, and the session is kept. A script that
+fails, or ends with its transaction still open, has it rolled back and says
+so. The session is an ordinary one, so its limits are the transaction's: the
+REPL prints them when one opens.
 
 **Sessions draw from their own connections.** `HARBOR_POOL_SIZE` (default 16)
 is opened at load and split: the workers take theirs, sessions get the rest. A
@@ -489,8 +514,8 @@ same path — joins the same server instead of reporting "database is locked".
 until you stop it. At a terminal the server comes up in the background and
 `start` returns — under the database's login item when it has one, so the
 session manager owns it from the first second, otherwise as a detached
-process that `harbor <db> stop` ends. Headless, meaning no terminal on
-stdin, it serves in place until `SIGTERM`, which is the shape launchd,
+process that `harbor <db> stop` ends. Headless, meaning stdin or stdout is
+not a terminal, it serves in place until `SIGTERM`, which is the shape launchd,
 systemd and a spawn want; `--foreground` asks for that shape at a terminal,
 to watch a server work. Either exit is clean — drain, `CHECKPOINT` so the
 next open never replays a WAL, socket swept.

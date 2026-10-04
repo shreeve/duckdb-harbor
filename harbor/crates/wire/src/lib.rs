@@ -10,6 +10,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod statement;
+
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Content types. NDJSON is the default `/sql` response; `application/json`
@@ -142,7 +144,8 @@ pub struct SqlRequest {
     /// execution so DELETE /sql/queries/<id> can never race the start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_id: Option<String>,
-    /// Absent = deployment default; 0 = explicitly unlimited.
+    /// Absent = the deployment's ceiling, if it has one; 0 = no limit of the
+    /// request's own, which a deployment ceiling still caps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
 }

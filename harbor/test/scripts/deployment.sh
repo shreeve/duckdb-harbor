@@ -353,10 +353,8 @@ fi
 
 # Read-only or writable is a deployment decision, not a defect either way, but
 # it should be the one that was intended. Asked as a setting rather than by
-# starting a transaction: BEGIN and ROLLBACK sent as two requests land on two
-# different pooled connections, so the BEGIN is never undone and the
-# connection that received it is left inside a transaction. A validator that
-# is safe to point at production cannot do that.
+# starting a transaction: a transaction needs a session, and a validator that
+# is safe to point at production opens none.
 mode=$(scalar "SELECT current_setting('access_mode') AS m")
 case "$mode" in
   # Either answer is a legitimate deployment, so this reports rather than

@@ -118,6 +118,43 @@ pid2=$(server_pid)
 [[ -n $pid1 && $pid1 == "$pid2" ]] && ok "same server both times (pid $pid1)" \
                                    || bad "the second client raised a second server ($pid1 vs $pid2)"
 check "the list shows the database" 0 "x.duckdb" "$harbor"
+# A transaction is one connection's, and the client sends a statement a
+# request: it holds a session from BEGIN to COMMIT or ROLLBACK, so the work
+# between them is undone or kept together, never committed a statement at a
+# time behind a BEGIN that held nothing.
+kept="SELECT 'kept=' || count(*) AS kept FROM txn"
+check "a rollback undoes everything since its begin" 0 "left=0" \
+  "$harbor" "$work/x.duckdb" --mode csv -c \
+  "CREATE TABLE txn(a INT); BEGIN; INSERT INTO txn VALUES (1); CREATE TABLE txn_inner(a INT); ROLLBACK; SELECT 'left=' || ((SELECT count(*) FROM txn) + (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'txn_inner')) AS left_behind"
+check "a commit keeps it" 0 "kept=2" \
+  "$harbor" "$work/x.duckdb" --mode csv -c "BEGIN; INSERT INTO txn VALUES (1), (2); COMMIT; $kept"
+check "a script that fails inside a transaction says it was rolled back" 1 "has been rolled back" \
+  "$harbor" "$work/x.duckdb" --mode csv -c \
+  "BEGIN; INSERT INTO txn VALUES (3); INSERT INTO no_such_table VALUES (1); COMMIT"
+check "and nothing of it stays" 0 "kept=2" "$harbor" "$work/x.duckdb" --mode csv -c "$kept"
+check "a script that ends with its transaction open is rolled back too" 0 "has been rolled back" \
+  "$harbor" "$work/x.duckdb" --mode csv -c "BEGIN; INSERT INTO txn VALUES (4)"
+check "leaving the count where it was" 0 "kept=2" "$harbor" "$work/x.duckdb" --mode csv -c "$kept"
+# A COMMIT the parser refuses never reached the engine: the transaction is
+# still open, and the script that stops there has it rolled back, out loud.
+check "a commit that does not parse leaves the transaction to be rolled back" 1 "has been rolled back" \
+  "$harbor" "$work/x.duckdb" --mode csv -c "BEGIN; INSERT INTO txn VALUES (5); COMMIT nonsense"
+check "and keeps nothing" 0 "kept=2" "$harbor" "$work/x.duckdb" --mode csv -c "$kept"
+# The same words behind a byte order mark, which an editor may put first.
+check "a transaction behind a byte order mark is a transaction" 0 "kept=2" \
+  bash -c "printf '\\xef\\xbb\\xbfBEGIN; INSERT INTO txn VALUES (6); ROLLBACK; %s' \"$kept\" | '$harbor' '$work/x.duckdb' --mode csv"
+# An analyzed EXPLAIN runs what it explains, so it ends the transaction too.
+check "an analyzed commit commits, and the session goes back" 0 "kept=3" \
+  "$harbor" "$work/x.duckdb" --mode csv -c "BEGIN; INSERT INTO txn VALUES (7); EXPLAIN ANALYZE COMMIT; $kept"
+# The release can reach the server a moment before the request that preceded
+# it has let the session go; the reaper takes it on its next pass.
+held=1
+for _ in $(seq 1 20); do
+  curl -s --unix-socket "$(live_sock)" http://harbor/sql/sessions | grep -q '"live":0' && { held=0; break; }
+  sleep 0.1
+done
+[[ $held -eq 0 ]] && ok "and no session is left held on the server" \
+                  || bad "a session is still held: $(curl -s --unix-socket "$(live_sock)" http://harbor/sql/sessions)"
 # EXPLAIN's answer is a drawing: the boxed mode prints it as the engine drew
 # it, never as a cell with `\n` in it cut off at the column edge.
 plan=$("$harbor" "$work/x.duckdb" -c "EXPLAIN SELECT 42 AS answer" 2>/dev/null)

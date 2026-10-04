@@ -20,6 +20,7 @@ use std::{
 };
 
 use justhttp::{Header, Method, Request, Response, Server};
+use wire::statement::{acting_keyword, skip_trivia, transaction_effect};
 
 use crate::engine::conn::{Conn as Connection, Interrupt as InterruptHandle, Param};
 
@@ -3433,23 +3434,23 @@ fn run_sql(
     // pool when this request ends. Since a request carries exactly one
     // statement (`ensure_single_statement`, just above), nothing can ever
     // follow it on that connection — so the USE reports success and is
-    // discarded, every time. There is no case where the old behaviour was
-    // useful, which is what makes refusing safe rather than merely stricter.
+    // discarded, every time. There is no case where running it is useful,
+    // which is what makes refusing safe rather than merely stricter.
     //
     // A session is the connection that persists, and inside one USE works
     // normally; qualifying names (`db.schema.table`) needs no session at all.
     // Other connection-local state — temp tables, PREPARE, session-scoped
     // SET — is silently lost the same way; USE is fenced because it is the
     // one whose whole purpose is to change what the NEXT statement sees.
-    if parsed.session.is_none() && lost_without_session(&parsed.sql) {
-        let _ = req.respond(error_response(
-            400,
-            "sql_error",
-            "USE has no effect outside a session: this connection returns to the pool when \
-             the request ends, and one request carries one statement, so nothing runs on it \
-             afterward. Open a session (POST /sql/sessions) and send USE on that, or qualify \
-             names instead — database.schema.table",
-        ));
+    //
+    // `BEGIN` is fenced for the same reason, with more at stake: it answers
+    // success, the transaction is gone when the request ends, and every
+    // statement the client believes is inside it commits on its own. The
+    // `ROLLBACK` that was meant to undo them finds nothing to undo.
+    if parsed.session.is_none()
+        && let Some(lost) = lost_without_session(&parsed.sql)
+    {
+        let _ = req.respond(error_response(400, "sql_error", lost));
         return (true, 400);
     }
 
@@ -3553,12 +3554,33 @@ fn run_sql(
                 Header::from_bytes(&b"Content-Type"[..], &b"application/x-ndjson"[..]).unwrap(),
                 Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..]).unwrap(),
             ];
+            // The response is written by reading the body channel to its end.
+            // A write that fails stops that early, with the executor still at
+            // work on rows nobody will read, and it would not learn so before
+            // its next flush. Whether the channel was read to its end is what
+            // tells a statement that finished from a client that left; the
+            // one that left has its statement interrupted here, by job id.
+            //
+            // On a pooled connection only. An interrupt that lands inside the
+            // engine aborts the transaction around it, and one that lands a
+            // moment later does not, so on a session it would decide by
+            // timing whether a client that stopped reading a SELECT early
+            // still has its transaction. A session's abandoned statement is
+            // left to end at its next flush.
+            let ended = Arc::new(AtomicBool::new(false));
+            let pooled = claim.is_none();
+            let abandon = |ended: &AtomicBool| {
+                if pooled && !ended.load(Ordering::Relaxed) {
+                    slot.cancel(Some(id));
+                }
+            };
             if wants_zstd(&req) {
-                if let Ok(reader) = ZstdReader::new(body_rx) {
+                if let Ok(reader) = ZstdReader::new(body_rx, Arc::clone(&ended)) {
                     headers.push(
                         Header::from_bytes(&b"Content-Encoding"[..], &b"zstd"[..]).unwrap(),
                     );
                     let _ = req.respond(Response::new(200.into(), headers, reader, None));
+                    abandon(&ended);
                     return (true, 200);
                 }
                 // Encoder setup failed (it does not, short of OOM): the
@@ -3568,7 +3590,9 @@ fn run_sql(
                 let _ = req.respond(error_response(500, "internal", "could not start encoder"));
                 return (true, 500);
             }
-            let _ = req.respond(Response::new(200.into(), headers, ChannelReader::new(body_rx), None));
+            let reader = ChannelReader::new(body_rx, Arc::clone(&ended));
+            let _ = req.respond(Response::new(200.into(), headers, reader, None));
+            abandon(&ended);
             (true, 200)
         }
         Ok(Err(refusal)) => {
@@ -3578,48 +3602,6 @@ fn run_sql(
         Err(_) => {
             let _ = req.respond(error_response(500, "internal", "the executor thread is gone"));
             (false, 500)
-        }
-    }
-}
-
-/// Advance `i` past ASCII whitespace and SQL comments — `--` to end of line,
-/// nested `/* */`. The one comment/whitespace skipper the token scanners
-/// share (first_keyword, fenced_setting). `ensure_single_statement` keeps its
-/// own inline scan: it is a full-byte security lexer, not a tokenizer, and is
-/// pinned by its own tests.
-fn skip_trivia(b: &[u8], i: &mut usize) {
-    loop {
-        while *i < b.len() && b[*i].is_ascii_whitespace() {
-            *i += 1;
-        }
-        if b[*i..].starts_with(b"--") {
-            // CR ends the comment too — see ensure_single_statement. The same
-            // one-byte gap defeated the fleet-safety fence from the other
-            // side: `SET --\r memory_limit='1TB'` looked like a bare `SET`
-            // with a trailing comment here, so `fenced_setting` never saw the
-            // key, while the engine set it. memory_limit is process-global,
-            // so that is every neighbor berth's ceiling raised by one caller
-            // — measured going from 1.8 GiB to 931.3 GiB.
-            *i = b[*i..]
-                .iter()
-                .position(|&c| c == b'\n' || c == b'\r')
-                .map_or(b.len(), |p| *i + p + 1);
-        } else if b[*i..].starts_with(b"/*") {
-            let mut depth = 1;
-            *i += 2;
-            while *i < b.len() && depth > 0 {
-                if b[*i..].starts_with(b"/*") {
-                    depth += 1;
-                    *i += 2;
-                } else if b[*i..].starts_with(b"*/") {
-                    depth -= 1;
-                    *i += 2;
-                } else {
-                    *i += 1;
-                }
-            }
-        } else {
-            break;
         }
     }
 }
@@ -3751,32 +3733,31 @@ fn fenced_setting(sql: &str) -> Option<&'static str> {
     FENCED.iter().find(|f| name.eq_ignore_ascii_case(f)).copied()
 }
 
-/// Refuse USE outside a session: it cannot affect a later one-shot request.
-/// Other local changes are discarded by connection replacement before reuse.
+/// Refuse, outside a session, the statements whose whole purpose is to change
+/// what the next statement sees: `USE` and the opening of a transaction. A
+/// pooled connection is replaced before reuse, so neither can reach a later
+/// one-shot request, and each would answer success for work that is already
+/// lost. The answer is what the client is told.
 ///
-/// `USE` is the list. Reads through comments and whitespace via
-/// `first_keyword`, so `/*x*/ USE d` is caught with the bare form.
-fn lost_without_session(sql: &str) -> bool {
-    first_keyword(sql) == "USE"
-}
-
-/// What a statement does to the surrounding transaction, when that is knowable
-/// from its first word: `Some(true)` opens one, `Some(false)` ends one, `None`
-/// leaves it as it was. Used to report whether a lease is holding a
-/// transaction open, which is the thing an operator most needs to see.
-fn transaction_effect(sql: &str) -> Option<bool> {
-    match {
-        let b = sql.as_bytes();
-        let mut i = 0;
-        let word = next_word(b, &mut i);
-        if word == "EXPLAIN" && next_word(b, &mut i) == "ANALYZE" {
-            next_word(b, &mut i)
-        } else {
-            word
-        }
-    }.as_str() {
-        "BEGIN" | "START" => Some(true),
-        "COMMIT" | "END" | "ROLLBACK" | "ABORT" => Some(false),
+/// Reads through comments, every space the engine skips and an analyzed
+/// `EXPLAIN` via `acting_keyword`, so `/*x*/ USE d` and `EXPLAIN ANALYZE
+/// BEGIN` are caught with the bare forms, and a table that happens to be
+/// named `"begin"` is not.
+fn lost_without_session(sql: &str) -> Option<&'static str> {
+    match acting_keyword(sql).as_str() {
+        "USE" => Some(
+            "USE has no effect outside a session: this connection returns to the pool when \
+             the request ends, and one request carries one statement, so nothing runs on it \
+             afterward. Open a session (POST /sql/sessions) and send USE on that, or qualify \
+             names instead — database.schema.table",
+        ),
+        "BEGIN" | "START" => Some(
+            "a transaction cannot begin outside a session: this connection returns to the \
+             pool when the request ends, so the transaction would end with it and every \
+             statement after it would commit on its own. Open a session (POST /sql/sessions), \
+             send BEGIN and the statements that follow with its sessionId, and release it \
+             when the transaction is over",
+        ),
         _ => None,
     }
 }
@@ -4253,11 +4234,13 @@ struct ChannelReader {
     rx: mpsc::Receiver<Vec<u8>>,
     current: Vec<u8>,
     pos: usize,
+    /// Set when the executor closed the channel: the statement is over.
+    ended: Arc<AtomicBool>,
 }
 
 impl ChannelReader {
-    fn new(rx: mpsc::Receiver<Vec<u8>>) -> Self {
-        Self { rx, current: Vec::new(), pos: 0 }
+    fn new(rx: mpsc::Receiver<Vec<u8>>, ended: Arc<AtomicBool>) -> Self {
+        Self { rx, current: Vec::new(), pos: 0, ended }
     }
 }
 
@@ -4269,7 +4252,10 @@ impl Read for ChannelReader {
                     self.current = next;
                     self.pos = 0;
                 }
-                Err(_) => return Ok(0),
+                Err(_) => {
+                    self.ended.store(true, Ordering::Relaxed);
+                    return Ok(0);
+                }
             }
         }
         let n = (self.current.len() - self.pos).min(out.len());
@@ -4314,15 +4300,17 @@ struct ZstdReader {
     enc: Option<zstd::stream::Encoder<'static, Vec<u8>>>,
     tail: Vec<u8>,
     pos: usize,
+    /// Set when the executor closed the channel: the statement is over.
+    ended: Arc<AtomicBool>,
 }
 
 impl ZstdReader {
-    fn new(rx: mpsc::Receiver<Vec<u8>>) -> std::io::Result<Self> {
+    fn new(rx: mpsc::Receiver<Vec<u8>>, ended: Arc<AtomicBool>) -> std::io::Result<Self> {
         // Level 1: the fast end. The stream is envelope-heavy NDJSON,
         // which crushes at any level; what matters is staying off the
         // encode critical path.
         let enc = zstd::stream::Encoder::new(Vec::new(), 1)?;
-        Ok(Self { rx, enc: Some(enc), tail: Vec::new(), pos: 0 })
+        Ok(Self { rx, enc: Some(enc), tail: Vec::new(), pos: 0, ended })
     }
 }
 
@@ -4352,7 +4340,10 @@ impl Read for ZstdReader {
                 }
                 // Sender gone: end the frame. finish() returns the buffer
                 // with the last block and frame footer appended.
-                Err(_) => self.tail = self.enc.take().expect("checked above").finish()?,
+                Err(_) => {
+                    self.ended.store(true, Ordering::Relaxed);
+                    self.tail = self.enc.take().expect("checked above").finish()?;
+                }
             }
         }
     }
@@ -4405,12 +4396,68 @@ mod tests {
     #[test]
     fn use_is_fenced_when_no_session_holds_the_connection() {
         for sql in ["USE mydb", "use mydb", "  USE  mydb ", "/*x*/ USE mydb", "--c\nUSE mydb"] {
-            assert!(lost_without_session(sql), "should be fenced: {sql:?}");
+            assert!(lost_without_session(sql).is_some_and(|m| m.starts_with("USE")), "should be fenced: {sql:?}");
         }
         // Statements that merely mention the word are untouched.
         for sql in ["SELECT 'USE'", "CREATE TABLE use_log(i INT)", "SELECT * FROM t"] {
-            assert!(!lost_without_session(sql), "should pass: {sql:?}");
+            assert!(lost_without_session(sql).is_none(), "should pass: {sql:?}");
         }
+    }
+
+    #[test]
+    fn a_transaction_cannot_begin_where_no_session_holds_the_connection() {
+        for sql in [
+            "BEGIN", "begin;", "BEGIN TRANSACTION", "START TRANSACTION", "  begin  transaction read only",
+            "/* x */ BEGIN", "--c\nSTART TRANSACTION",
+        ] {
+            assert!(
+                lost_without_session(sql).is_some_and(|m| m.starts_with("a transaction")),
+                "should be fenced: {sql:?}"
+            );
+        }
+        // Behind every space the engine skips, and behind an EXPLAIN that
+        // runs what it explains.
+        for sql in [
+            "\u{feff}BEGIN", "\u{a0}BEGIN", "\u{b}BEGIN", "\u{2003}\u{3000}begin", "BEGIN\u{a0}TRANSACTION",
+            "EXPLAIN ANALYZE BEGIN", "EXPLAIN ANALYSE BEGIN", "explain (analyze) begin",
+            "EXPLAIN (FORMAT JSON, ANALYZE) BEGIN", "EXPLAIN ANALYZE (FORMAT JSON) BEGIN", "EXPLAIN (ANALYZE false) BEGIN",
+        ] {
+            assert!(lost_without_session(sql).is_some(), "should be fenced: {sql:?}");
+        }
+        // The other end of a transaction is the engine's to answer: with none
+        // open it says so itself. A word that only starts the same is no
+        // keyword, a quoted one is a table's name, and an EXPLAIN that only
+        // plans begins nothing.
+        for sql in [
+            "COMMIT", "ROLLBACK", "END", "ABORT", "SELECT 'BEGIN'", "CREATE TABLE beginnings(i INT)", "FROM starts",
+            "\"begin\"", "\"start\"", "\"use\"", "BEGIN$x", "begin_x", "BEGIN\u{e9}", "EXPLAIN BEGIN",
+            "EXPLAIN (FORMAT JSON) BEGIN", "EXPLAIN (FORMAT JSON) ANALYZE BEGIN",
+        ] {
+            assert!(lost_without_session(sql).is_none(), "should pass: {sql:?}");
+        }
+    }
+
+    /// The effect is the engine's, measured: an analyzed EXPLAIN runs the
+    /// statement behind it, in each spelling the engine takes.
+    #[test]
+    fn a_transaction_ends_where_the_engine_ends_it() {
+        use super::transaction_effect;
+        for sql in [
+            "COMMIT", "commit;", "END", "ROLLBACK", "ABORT", "COMMIT--x", "COMMIT/**/", "-- c\rCOMMIT",
+            "EXPLAIN ANALYZE COMMIT", "EXPLAIN ANALYSE COMMIT", "EXPLAIN (ANALYZE) COMMIT",
+            "EXPLAIN (ANALYZE, FORMAT JSON) COMMIT", "EXPLAIN (FORMAT JSON, ANALYZE) COMMIT",
+            "EXPLAIN ANALYZE (FORMAT JSON) COMMIT", "EXPLAIN (ANALYZE false) COMMIT", "EXPLAIN ANALYZE ROLLBACK",
+        ] {
+            assert_eq!(transaction_effect(sql), Some(false), "{sql:?}");
+        }
+        for sql in [
+            "EXPLAIN COMMIT", "EXPLAIN (FORMAT JSON) COMMIT", "EXPLAIN (FORMAT JSON) ANALYZE COMMIT",
+            "COMMIT_X", "COMMIT1", "COMMIT$x", "COMMIT\u{e9}", "\"COMMIT\"", "(COMMIT)", "SELECT 'COMMIT'", "",
+        ] {
+            assert_eq!(transaction_effect(sql), None, "{sql:?}");
+        }
+        assert_eq!(transaction_effect("EXPLAIN ANALYZE BEGIN"), Some(true));
+        assert_eq!(transaction_effect("\u{feff}BEGIN"), Some(true));
     }
 
     use super::route_exists;
@@ -5092,7 +5139,15 @@ UNION ALL SELECT 1::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FRO
         drop(tx);
 
         let mut compressed = Vec::new();
-        super::ZstdReader::new(rx).unwrap().read_to_end(&mut compressed).unwrap();
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let ended = Arc::new(AtomicBool::new(false));
+        let mut reader = super::ZstdReader::new(rx, Arc::clone(&ended)).unwrap();
+        let mut first = [0u8; 16];
+        let n = reader.read(&mut first).unwrap();
+        compressed.extend_from_slice(&first[..n]);
+        assert!(!ended.load(Ordering::Relaxed), "a body still being read has not ended");
+        reader.read_to_end(&mut compressed).unwrap();
+        assert!(ended.load(Ordering::Relaxed), "reading to the end is what marks it ended");
         assert!(compressed.len() < expected.len() / 3, "row envelopes should crush");
 
         let mut recovered = Vec::new();

@@ -64,14 +64,21 @@ enum Outcome {
     Failed,
 }
 
+/// From here on Ctrl-C cancels the running statement (via its queryId), it
+/// does not kill the client. Called once there is a statement to cancel:
+/// until then — waiting on a server being spawned, reading a script from
+/// stdin — an interrupt ends the process, as it does for any command with
+/// nothing of its own to stop. At the REPL prompt reedline runs raw mode, so
+/// SIGINT only fires while a statement streams; a second Ctrl-C while the
+/// first cancel is still pending exits outright (the tick handler enforces
+/// it).
+fn cancel_on_interrupt() {
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, CANCEL.clone());
+}
+
 /// The client's whole CLI: everything except bare `harbor` (the list, which
 /// main dispatches straight to list_main) and `<db> start` (the server).
 pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
-    // Ctrl-C cancels the running statement (via its queryId), it does not
-    // kill the client. At the REPL prompt reedline runs raw mode, so SIGINT
-    // only fires while a statement streams; a second Ctrl-C while the first
-    // cancel is still pending exits outright (the tick handler enforces it).
-    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, CANCEL.clone());
     let mut args = args.into_iter();
     let mut target: Option<String> = None;
     let mut sql: Option<String> = None;
@@ -157,6 +164,7 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
                 // "auto" appearance queries the terminal (OSC 11), which needs
                 // an interactive stdin/stdout and must run before reedline does.
                 theme::init(None, None);
+                cancel_on_interrupt();
                 return interactive::run(&conn, &name, opts, anchor);
             }
             let mut s = String::new();
@@ -166,6 +174,7 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
             s
         }
     };
+    cancel_on_interrupt();
 
     if !std::io::stdout().is_terminal() && opts.mode == Mode::Duckbox {
         eprintln!("hint: boxed output on a pipe; consider --mode csv or --json");
@@ -174,12 +183,16 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
     // one per request, so split exactly the way the REPL and .read do,
     // stopping at the first failure or interrupt.
     let mut last = Outcome::Done;
+    let mut transaction = Transaction::new(&conn, false);
     for stmt in interactive::split_statements(&sql) {
-        last = run_sql(&conn, &stmt, &opts);
+        last = transaction.run(&stmt, &opts);
         if last != Outcome::Done {
             break;
         }
     }
+    // Released before the mooring: a transaction the script left open is
+    // rolled back while the server is still held up for it.
+    drop(transaction);
     drop(anchor);
     match last {
         Outcome::Done => ExitCode::SUCCESS,
@@ -667,9 +680,16 @@ fn survey() -> Result<Vec<SurveyRow>, String> {
             // Refused means nothing listens: a leftover from a kill -9 or a
             // crash. Anything else (a transient error, a permission oddity)
             // proves nothing, and an unlink on "proves nothing" is how a live
-            // server loses its front door.
+            // server loses its front door. A server whose listen queue is
+            // full refuses too, for a moment, so one refusal proves nothing
+            // either: the socket goes only when a second try, a beat later,
+            // is refused as well.
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                let _ = std::fs::remove_file(&sock);
+                std::thread::sleep(Duration::from_millis(200));
+                let again = http::request(&transport, &endpoint::INFO, None, Some(Duration::from_secs(2)));
+                if again.is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused) {
+                    let _ = std::fs::remove_file(&sock);
+                }
             }
             Err(_) => {}
         }
@@ -916,6 +936,151 @@ fn run_sql_in_session(
     conn: &Conn, sql: &str, opts: &RenderOpts, session: Option<&str>,
     health: Option<&snapshot::Health>,
 ) -> Outcome {
+    run_sql_reporting(conn, sql, opts, session, health, None)
+}
+
+/// `30s`, `5m`, `1h`: a server limit, as short as it reads.
+fn brief(ms: u64) -> String {
+    match ms / 1000 {
+        s if s >= 3600 && s % 3600 == 0 => format!("{}h", s / 3600),
+        s if s >= 60 && s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
+/// The transaction a run of statements may open, and the session it lives on.
+///
+/// A transaction lives on a connection and a request does not, so statements
+/// sent one request at a time land on whichever pooled connection is free and
+/// no two of them share a transaction. A session is the connection that
+/// stays: this opens one when a statement begins a transaction, sends every
+/// statement after it there, and releases it when the transaction ends. A
+/// script that stops early, a REPL that quits, and a statement the server no
+/// longer has a session for all end the same way, with the transaction rolled
+/// back by the server and a line saying so.
+struct Transaction {
+    conn: Conn,
+    session: Option<String>,
+    /// At a prompt, where a person can outwait the server's limits and
+    /// should be told them.
+    interactive: bool,
+}
+
+impl Transaction {
+    fn new(conn: &Conn, interactive: bool) -> Self {
+        Self { conn: conn.clone(), session: None, interactive }
+    }
+
+    fn open(&self) -> Result<wire::SessionNewResponse, String> {
+        let response = http::request(
+            &self.conn.transport,
+            &endpoint::SESSIONS_CREATE,
+            Some("{}"),
+            Some(Duration::from_secs(10)),
+        )
+        .map_err(|e| e.to_string())?;
+        let status = response.status;
+        let text = response.body_string().map_err(|e| e.to_string())?;
+        if status != 200 {
+            return Err(match Event::parse(text.trim()) {
+                Ok(Event::Error { message, .. }) => message,
+                _ => format!("HTTP {status}: {text}"),
+            });
+        }
+        serde_json::from_str(&text).map_err(|e| format!("invalid session response: {e}"))
+    }
+
+    fn release(&mut self) {
+        if let Some(id) = self.session.take() {
+            // DELETE rolls back whatever is still open.
+            let _ = http::request(
+                &self.conn.transport,
+                &endpoint::session(&id),
+                None,
+                Some(Duration::from_secs(5)),
+            );
+        }
+    }
+
+    fn run(&mut self, sql: &str, opts: &RenderOpts) -> Outcome {
+        // Read as the server reads it, by the same function: what opens and
+        // what ends a transaction is the engine's rule, kept in one place.
+        let effect = crate::transaction_effect(sql);
+        let mut opened = None;
+        if effect == Some(true) && self.session.is_none() {
+            match self.open() {
+                Ok(lease) => {
+                    self.session = Some(lease.session_id.clone());
+                    opened = Some(lease);
+                }
+                Err(e) => return err(&format!("cannot open a session for the transaction: {e}")),
+            }
+        }
+        let mut refused = None;
+        let outcome = run_sql_reporting(
+            &self.conn, sql, opts, self.session.as_deref(), None, Some(&mut refused),
+        );
+        if refused.as_ref().is_some_and(|(code, _)| code == wire::code::NO_SUCH_SESSION) {
+            // The server reaped it: idle too long, or open too long.
+            self.session = None;
+            eprintln!(
+                "harbor: the transaction is over: the server ended its session and rolled it \
+                 back, so this statement did not run"
+            );
+            return outcome;
+        }
+        match effect {
+            Some(false) if self.session.is_some() => {
+                // The session goes back when the engine has ended the
+                // transaction, and only then. It has when the statement ran:
+                // a COMMIT the engine refuses is rolled back by it. It has
+                // not when the statement never reached it (a parse error, a
+                // refusal of the server's own, a request that failed on the
+                // way) or was interrupted, and the transaction is still the
+                // session's to hold until a ROLLBACK that lands.
+                let ended = match outcome {
+                    Outcome::Done => true,
+                    Outcome::Cancelled => false,
+                    Outcome::Failed => refused.as_ref().is_some_and(|(code, message)| {
+                        code == wire::code::SQL_ERROR && !message.starts_with("Parser Error")
+                    }),
+                };
+                if ended {
+                    self.release();
+                    if outcome != Outcome::Done {
+                        eprintln!("harbor: the transaction has ended and was rolled back");
+                    }
+                }
+            }
+            Some(true) => match opened {
+                // A BEGIN that did not begin leaves nothing to hold.
+                Some(_) if outcome != Outcome::Done => self.release(),
+                Some(lease) if self.interactive => eprintln!(
+                    "harbor: transaction open; the server rolls it back after {} idle, or {} in all",
+                    brief(lease.idle_ttl_ms),
+                    brief(lease.ttl_ms)
+                ),
+                _ => {}
+            },
+            _ => {}
+        }
+        outcome
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        if self.session.is_some() {
+            self.release();
+            eprintln!("harbor: the transaction was still open and has been rolled back");
+        }
+    }
+}
+
+fn run_sql_reporting(
+    conn: &Conn, sql: &str, opts: &RenderOpts, session: Option<&str>,
+    health: Option<&snapshot::Health>, refused: Option<&mut Option<(String, String)>>,
+) -> Outcome {
     let wall = std::time::Instant::now();
     let qid = format!("cli-{}-{}", std::process::id(), QUERY_SEQ.fetch_add(1, Ordering::Relaxed));
     // A Ctrl-C that landed between statements (say, while the pager showed
@@ -934,8 +1099,13 @@ fn run_sql_in_session(
     // Runs on every 250ms socket tick: paints the spinner, and turns a
     // Ctrl-C into a DELETE on the query. A second Ctrl-C while the first
     // cancel is pending means the server is not honoring it — exit outright.
+    // Whether this client asked for the cancel. A statement the server
+    // stopped on its own account (a deadline, a session at its limit,
+    // another client's cancel) answers with the same code, and is not an
+    // interrupt.
+    let interrupted = AtomicBool::new(false);
     let on_tick = {
-        let fired = AtomicBool::new(false);
+        let fired = &interrupted;
         let spun = AtomicU64::new(0);
         let conn = conn.clone();
         let qid = qid.clone();
@@ -982,11 +1152,22 @@ fn run_sql_in_session(
         };
         clear_spinner();
         return match Event::parse(text.trim()) {
-            Ok(Event::Error { code, .. }) if code == wire::code::CANCELLED => {
-                eprintln!("Interrupted.");
-                Outcome::Cancelled
+            Ok(Event::Error { code, .. }) if code == wire::code::CANCELLED => stopped(&interrupted),
+            Ok(Event::Error { code, message }) => {
+                // A caller that asked for the refusal speaks for a lost
+                // session itself; the server's wording is about leases, not
+                // transactions.
+                let lost = refused.is_some() && code == wire::code::NO_SUCH_SESSION;
+                let outcome = if lost {
+                    Outcome::Failed
+                } else {
+                    err(&format!("harbor error ({code}): {message}"))
+                };
+                if let Some(refused) = refused {
+                    *refused = Some((code, message));
+                }
+                outcome
             }
-            Ok(Event::Error { code, message }) => err(&format!("harbor error ({code}): {message}")),
             _ => err(&format!("HTTP {status} from harbor: {text}")),
         };
     }
@@ -1067,8 +1248,7 @@ fn run_sql_in_session(
             }
             Event::Error { code, .. } if code == wire::code::CANCELLED => {
                 clear_spinner();
-                eprintln!("Interrupted.");
-                return Outcome::Cancelled;
+                return stopped(&interrupted);
             }
             Event::Error { code, message } => {
                 return err(&format!("harbor error ({code}): {message}"));
@@ -1111,6 +1291,16 @@ fn clear_spinner() {
     }
 }
 
+/// A statement the server reports cancelled: this client's own interrupt, or
+/// a stop it did not ask for, which is a failure with its likely causes named.
+fn stopped(interrupted: &AtomicBool) -> Outcome {
+    if interrupted.load(Ordering::Relaxed) {
+        eprintln!("Interrupted.");
+        return Outcome::Cancelled;
+    }
+    err("the server stopped this statement: its deadline passed, its session reached a limit, or another client cancelled it")
+}
+
 fn err(msg: &str) -> Outcome {
     clear_spinner();
     eprintln!("harbor: {msg}");
@@ -1124,7 +1314,29 @@ fn fail(msg: &str) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::pick;
+    use super::{brief, pick};
+    use crate::transaction_effect;
+
+    #[test]
+    fn a_statement_says_what_it_does_to_the_transaction() {
+        for sql in ["BEGIN", "begin transaction", "START TRANSACTION", "-- note\nBEGIN", "/* a */ /* b */ begin;"] {
+            assert_eq!(transaction_effect(sql), Some(true), "{sql:?} opens one");
+        }
+        for sql in ["COMMIT", "commit;", "END", "ROLLBACK", "abort", "/* undo */ ROLLBACK"] {
+            assert_eq!(transaction_effect(sql), Some(false), "{sql:?} ends one");
+        }
+        for sql in ["SELECT 'BEGIN'", "CREATE TABLE beginnings(i INT)", "FROM commits", "", "-- BEGIN", "$$BEGIN$$"] {
+            assert_eq!(transaction_effect(sql), None, "{sql:?} leaves it alone");
+        }
+    }
+
+    #[test]
+    fn a_server_limit_reads_short() {
+        assert_eq!(brief(30_000), "30s");
+        assert_eq!(brief(300_000), "5m");
+        assert_eq!(brief(90_000), "90s");
+        assert_eq!(brief(3_600_000), "1h");
+    }
 
     fn names(v: &[Option<&str>]) -> Vec<Option<String>> {
         v.iter().map(|n| n.map(str::to_string)).collect()

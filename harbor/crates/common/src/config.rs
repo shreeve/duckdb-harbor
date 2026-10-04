@@ -282,8 +282,14 @@ fn normalize_keys(mut cfg: FileConfig) -> Result<FileConfig, String> {
 pub fn load() -> Result<FileConfig, Error> {
     let root = crate::paths::config_root().map_err(Error::NoHome)?;
     let file = root.join("config.toml");
-    let Ok(text) = std::fs::read_to_string(&file) else {
-        return Err(Error::Missing(file));
+    // Only a file that is not there is the zero-config case. One that exists
+    // and will not read — no permission, a directory, bytes that are not
+    // UTF-8 — may hold `sealed` or a statement ceiling, and calling it absent
+    // would drop them without a word.
+    let text = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Error::Missing(file)),
+        Err(e) => return Err(Error::Invalid { file, why: format!("it cannot be read: {e}") }),
     };
     // Anyone who can rewrite this file is not editing settings, they are
     // writing a program: `init` runs SQL that can load native code, and

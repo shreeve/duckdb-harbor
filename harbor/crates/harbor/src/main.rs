@@ -138,6 +138,7 @@ fn main() -> ExitCode {
     // keys off: a listed database is persistent, an unlisted one ephemeral.
     // Detach also removes any login item, since one for a database you no
     // longer keep makes no sense.
+    let mut detached = None;
     match plan.attach {
         Some(true) => match membership::attach(&db) {
             Ok((name, Attached::Added)) => eprintln!("harbor: attached {name}"),
@@ -154,6 +155,7 @@ fn main() -> ExitCode {
                 } else {
                     eprintln!("harbor: {name} was not attached");
                 }
+                detached = Some(name);
             }
             Err(e) => {
                 eprintln!("harbor: {e}");
@@ -163,7 +165,10 @@ fn main() -> ExitCode {
         None => {}
     }
 
-    let name = match membership::name_for(&db) {
+    // A detach answers with the name the database was filed under, and that
+    // is the name its login item carries. Asking again once the entry is gone
+    // would give the file's stem, which can be some other database's name.
+    let name = match detached.map(Ok).unwrap_or_else(|| membership::name_for(&db)) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("harbor: {e}");
@@ -254,7 +259,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
-        if plan.run != Some(Running::Start) {
+        if !matches!(plan.run, Some(Running::Start | Running::Restart)) {
             return ExitCode::SUCCESS;
         }
     } else if plan.attach == Some(false) {
@@ -600,10 +605,11 @@ fn apply_berth_config(o: &mut Opts, canon: &Path, ephemeral: bool) {
              opened, so a SET cannot reach it; use the `block-size` key instead"
         );
     }
-    if let Some(v) = &c.statement_timeout
-        && let Ok(d) = parse_duration(v)
-    {
-        o.statement_timeout = Some(d);
+    if let Some(v) = &c.statement_timeout {
+        match parse_duration(v) {
+            Ok(d) => o.statement_timeout = Some(d),
+            Err(e) => eprintln!("harbor: ignoring statement-timeout — {e}"),
+        }
     }
     if c.sealed == Some(true) {
         o.sealed = true;
@@ -720,6 +726,14 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool) -> Result<(), String> 
         // Headless it stays a refusal: a manager or a spawn that asked for a
         // server and got none must not read a clean exit as one.
         if !o.foreground && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            // Options describe a server this start would have made. The one
+            // that is up was made without them, and only a restart remakes it.
+            if !typed.is_empty() {
+                return Err(format!(
+                    "{name} is already serving, and options take effect at a start — `harbor {name} restart {}`",
+                    typed.join(" ")
+                ));
+            }
             eprintln!("harbor: {name} is already serving on {} — `harbor {name}` connects to it", sock_path.display());
             return Ok(());
         }

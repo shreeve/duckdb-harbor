@@ -15,7 +15,7 @@ use std::borrow::Cow;
 use crate::repl::complete::SqlCompleter;
 use crate::repl::render::{Mode, RenderOpts};
 use crate::repl::scan::{Kind, scan};
-use crate::repl::{Conn, Outcome, run_sql};
+use crate::repl::{Conn, Outcome, Transaction};
 
 struct BerthPrompt {
     name: String,
@@ -259,6 +259,9 @@ pub fn run(
     // No greeting: the prompt appearing IS the connection confirmed, and
     // its name says to what. Discovery lives in .help; fanfare helps no one.
     let mut prompt = BerthPrompt { name: name.to_string() };
+    // One transaction for the prompt and for `.read`: a file may open what
+    // the next line typed commits.
+    let mut transaction = Transaction::new(&conn, true);
 
     loop {
         match line_editor.read_line(&prompt) {
@@ -267,8 +270,18 @@ pub fn run(
                 if stmt.is_empty() {
                     continue;
                 }
+                // A fresh submission starts with a clean cancel flag. The
+                // SIGINT handler sets CANCEL whenever the repl is in cooked mode,
+                // which includes the pager: a Ctrl-C aimed at `less` (or an
+                // external `kill -INT`) would otherwise linger and skip the
+                // next statement, typed or read by a dot command. Clearing
+                // here, once, drops that staleness while preserving the
+                // intra-buffer skip below (a Ctrl-C during `a; b; c` still
+                // aborts b and c — those checks are inside the loops, with no
+                // read_line between them).
+                crate::repl::CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
                 if let Some(cmd) = stmt.strip_prefix('.') {
-                    match dot_command(cmd, &conn, &mut opts) {
+                    match dot_command(cmd, &mut opts, &mut transaction) {
                         DotResult::Quit => return std::process::ExitCode::SUCCESS,
                         DotResult::Handled => continue,
                         DotResult::Open(target) => {
@@ -278,7 +291,13 @@ pub fn run(
                                     // the old mooring go: the switch must
                                     // never be the moment both lifetimes hit
                                     // zero clients.
-                                    _anchor = crate::repl::http::hold(&c.transport);
+                                    let moored = crate::repl::http::hold(&c.transport);
+                                    // A transaction belongs to the server it
+                                    // was opened on, and ends with the visit:
+                                    // released while that server is still
+                                    // held up, as at exit.
+                                    transaction = Transaction::new(&c, true);
+                                    _anchor = moored;
                                     conn = c;
                                     completer.reconnect(conn.clone());
                                     // The prompt changing name announces the switch.
@@ -296,21 +315,12 @@ pub fn run(
                         }
                     }
                 }
-                // A fresh submission starts with a clean cancel flag. The
-                // SIGINT handler sets CANCEL whenever the repl is in cooked mode,
-                // which includes the pager: a Ctrl-C aimed at `less` (or an
-                // external `kill -INT`) would otherwise linger and skip the
-                // next statement the user types. Clearing here, once, drops
-                // that staleness while preserving the intra-buffer skip below
-                // (a Ctrl-C during `a; b; c` still aborts b and c — those
-                // checks are inside this loop, with no read_line between them).
-                crate::repl::CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
                 // One statement per request is the protocol's rule; the
                 // trailing terminator is ours to strip. Multi-statement
                 // buffers split at terminators outside strings/comments,
                 // and stop at the first failure or Ctrl-C.
                 for stmt in split_statements(stmt) {
-                    if run_sql(&conn, &stmt, &opts) != Outcome::Done {
+                    if transaction.run(&stmt, &opts) != Outcome::Done {
                         break;
                     }
                 }
@@ -333,7 +343,7 @@ enum DotResult {
     Keymode(bool),
 }
 
-fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
+fn dot_command(cmd: &str, opts: &mut RenderOpts, transaction: &mut Transaction) -> DotResult {
     let mut parts = cmd.split_whitespace();
     // Short aliases (.q .exit .db .h) dispatch here but stay out of
     // DOT_COMMANDS on purpose: help and completion teach the long names.
@@ -375,7 +385,7 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
             Some(f) => match std::fs::read_to_string(harbor_common::paths::expand(f)) {
                 Ok(text) => {
                     for stmt in split_statements(&text) {
-                        if run_sql(conn, &stmt, opts) != Outcome::Done {
+                        if transaction.run(&stmt, opts) != Outcome::Done {
                             break; // a failure or a Ctrl-C aborts the script
                         }
                     }
@@ -410,7 +420,7 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
             _ => println!("timer: {}", if opts.timer { "on" } else { "off" }),
         },
         "tables" => {
-            let _ = run_sql(conn, "SHOW TABLES", opts);
+            let _ = transaction.run("SHOW TABLES", opts);
         }
         "schema" => {
             let sql = match parts.next() {
@@ -420,7 +430,7 @@ fn dot_command(cmd: &str, conn: &Conn, opts: &mut RenderOpts) -> DotResult {
                 ),
                 None => "SELECT sql FROM duckdb_tables()".to_string(),
             };
-            let _ = run_sql(conn, &sql, &RenderOpts { mode: Mode::List, ..opts.clone() });
+            let _ = transaction.run(&sql, &RenderOpts { mode: Mode::List, ..opts.clone() });
         }
         "help" | "h" => {
             for (name, args, what) in DOT_COMMANDS {

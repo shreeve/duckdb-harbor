@@ -153,7 +153,15 @@ class Regressions(unittest.TestCase):
 
     def test_wrapped_begin_cannot_capture_another_callers_write(self):
         self.sql("CREATE TABLE acknowledged(x INTEGER)")
-        self.sql("EXPLAIN ANALYZE BEGIN")
+        # An analyzed EXPLAIN runs what it explains, so a BEGIN behind one is
+        # a BEGIN: refused outside a session, in every spelling the engine
+        # takes, and behind every space it skips.
+        for wrapped in ("EXPLAIN ANALYZE BEGIN", "EXPLAIN (ANALYZE) BEGIN",
+                        "EXPLAIN ANALYSE BEGIN", "\ufeffBEGIN", "\u00a0BEGIN", "\x0bBEGIN"):
+            self.sql(wrapped, status=400)
+        # A table may be named for the word, and reading one begins nothing.
+        self.sql('CREATE TABLE "begin"(x INTEGER)')
+        self.sql('"begin"')
         self.sql("INSERT INTO acknowledged VALUES (42)")
         sid = self.session()
         try:
