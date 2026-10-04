@@ -527,6 +527,14 @@ impl Conn {
     pub fn abort_transaction(&mut self) {
         let _ = self.execute_batch("SELECT error('cancelled')");
     }
+
+    /// Whether the open transaction is aborted, asked the one way the engine
+    /// answers: an aborted transaction fails every statement, and nothing
+    /// else fails this one. The caller rules out its own interrupt, which
+    /// fails it too. With no transaction open, or a healthy one, it answers.
+    pub fn transaction_aborted(&mut self) -> bool {
+        self.execute_batch("SELECT 1").is_err()
+    }
 }
 
 impl Drop for Conn {

@@ -192,7 +192,8 @@ sock=$(live_sock)
 # connection which has never spoken), then a second statement. That second
 # one is where a berth which departed while its human was thinking says
 # "cannot reach harbor". Nothing shorter than the real clock can see it.
-if python3 - "$harbor" "$work/x.duckdb" <<'PY' >"$work/repl.log" 2>&1
+repl=0
+python3 - "$harbor" "$work/x.duckdb" <<'PY' >"$work/repl.log" 2>&1 || repl=$?
 import os, pty, select, sys, time
 harbor, db = sys.argv[1], sys.argv[2]
 pid, fd = pty.fork()
@@ -218,18 +219,30 @@ def drain(seconds):          # read, and answer the queries a terminal owes
         if b"\x1b[6n" in chunk:   os.write(fd, b"\x1b[1;1R")
 drain(5)
 os.write(fd, b"SELECT 1 AS early;\r"); drain(3)
+# A transaction left open across the pause: the prompt keeps its session past
+# the server's thirty-second idle limit, which would otherwise roll it back.
+os.write(fd, b"CREATE TABLE held(a INT);\r");     drain(2)
+os.write(fd, b"BEGIN;\r");                        drain(2)
+os.write(fd, b"INSERT INTO held VALUES (1);\r");  drain(2)
 drain(65)
 os.write(fd, b"SELECT 2 AS late;\r");  drain(5)
+os.write(fd, b"SELECT 'inside=' || count(*) AS seen FROM held;\r"); drain(3)
+os.write(fd, b"ROLLBACK;\r");                                      drain(2)
+os.write(fd, b"SELECT 'after=' || count(*) AS seen FROM held;\r");  drain(3)
 os.write(fd, b".quit\r");              drain(3)
 for close in (lambda: os.close(fd), lambda: os.waitpid(pid, 0)):
     try: close()
     except Exception: pass
 out = buf.decode("utf8", "replace")
-print(out[-2000:])
-sys.exit(1 if "cannot reach harbor" in out or "late" not in out else 0)
+print(out[-3000:])
+if "cannot reach harbor" in out or "late" not in out:
+    sys.exit(1)
+sys.exit(0 if "inside=1" in out and "after=0" in out and "transaction is over" not in out else 2)
 PY
-then ok "the repl's own anchor moors the berth across a 65s pause"
+if (( repl != 1 )); then ok "the repl's own anchor moors the berth across a 65s pause"
 else bad "the berth departed while the repl still held it (see $work/repl.log)"; fi
+if (( repl == 0 )); then ok "and its open transaction outlives the server's idle limit, then rolls back when told"
+else bad "the transaction did not survive the pause, or its rollback kept the row (see $work/repl.log)"; fi
 if wait_gone; then ok "the last departure ends the server"; else bad "the server outlived its last client"; fi
 if [[ ! -e $sock ]]; then ok "it swept its socket on the way out"; else bad "departure left the socket behind"; fi
 if [[ -f $work/x.duckdb && ! -e $work/x.duckdb.wal ]]; then
