@@ -4,6 +4,33 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.44.1 — 2026-10-03
+
+- **A `COMMIT` on an aborted transaction says it was rolled back.** Almost
+  any error inside a transaction aborts it, and so does a cancelled
+  statement. The engine answers the `COMMIT` that follows with success and
+  rolls back, so a client that carried on after an error was told its work
+  was kept when none of it was. A session's `COMMIT`, in any spelling the
+  engine runs as one, is now preceded by the question: an aborted
+  transaction is rolled back and answered `400`, `sql_error`, with what
+  happened, and a healthy one commits as before.
+- **A statement cut short inside a transaction aborts it, every time.** A
+  client that stopped reading a streaming result left its transaction
+  aborted or not by where the interrupt happened to land, about once in
+  eighty on a measured run, and the `COMMIT` after it answered success
+  either way. A statement that did not get to send its whole result leaves
+  the transaction aborted whenever that happens, as a cancel leaves it, and
+  with the item above the `COMMIT` is told. One whose result had all been
+  sent before the client left ran to its end, and its transaction stands.
+- **A transaction typed at the REPL is kept while the prompt waits.** The
+  server takes back a session idle for thirty seconds, which reclaims one
+  whose client is gone and also took a transaction from anyone who read a
+  result before typing the next statement. The REPL touches its session
+  every ten seconds while it waits at the prompt or shows a result in the
+  pager, so only the five-minute ceiling ends a transaction there, and it
+  says so when one opens. A client that dies
+  stops touching, and its session is reclaimed as before.
+
 ## 0.44.0 — 2026-10-03
 
 - **A transaction holds together from the command line.** The client sent

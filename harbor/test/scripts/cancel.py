@@ -447,8 +447,9 @@ def run_tests(h, db):
     eq("the write before the cancel is gone", None, h.value("SELECT n FROM marks WHERE n = 98"))
     eq("release", True, h.release(sid)[1].get("released"))
 
-    # The client this rule is for: it ignores the 499 and commits. The engine
-    # rolls an aborted transaction back on COMMIT, so nothing partial lands.
+    # The client this rule is for: it ignores the 499 and commits. Nothing
+    # partial lands, and the COMMIT is not answered as if something had: the
+    # engine alone would roll back and say success.
     st, doc, _ = h.open()
     sid = doc["sessionId"]
     eq("BEGIN", 200, h.sql("BEGIN", session=sid)[0])
@@ -457,8 +458,11 @@ def run_tests(h, db):
     cancel_during_cast(job, "bind4")
     job.wait()
     eq("cancelled before it began", 499, job.status)
-    eq("a COMMIT that ignores it is accepted", 200, h.sql("COMMIT", session=sid)[0])
-    eq("and commits nothing", None, h.value("SELECT n FROM marks WHERE n = 95"))
+    st, doc, _ = h.sql("COMMIT", session=sid)
+    eq("a COMMIT that ignores it is refused", 400, st)
+    yes("and told it was rolled back", "rolled back" in (doc.get("message") or ""), doc.get("message", "")[:80])
+    eq("it commits nothing", None, h.value("SELECT n FROM marks WHERE n = 95"))
+    eq("and leaves no transaction open behind it", 1, h.value("SELECT 1", session=sid))
     eq("release", True, h.release(sid)[1].get("released"))
 
     # Outside a transaction the same cancel leaves the session as it was.

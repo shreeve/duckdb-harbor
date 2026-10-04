@@ -171,6 +171,62 @@ class Regressions(unittest.TestCase):
         self.sql("ROLLBACK", status=400)
         self.assertEqual(self.sql("SELECT * FROM acknowledged")["data"], [[42]])
 
+    def test_commit_on_an_aborted_transaction_is_told_and_rolled_back(self):
+        self.sql("CREATE TABLE kept(x INTEGER PRIMARY KEY)")
+        sid = self.session()
+        try:
+            # An error aborts the transaction; the engine would answer the
+            # COMMIT with success and roll back. The answer is the rollback,
+            # in each spelling the engine runs as a commit.
+            for commit in ("COMMIT", "end", "EXPLAIN ANALYZE COMMIT", "EXPLAIN (ANALYZE) COMMIT"):
+                self.sql("BEGIN", sid)
+                self.sql("INSERT INTO kept VALUES (1)", sid)
+                self.sql("SELECT no_such_column FROM kept", sid, status=400)
+                doc = self.sql(commit, sid, status=400)
+                self.assertEqual(doc["code"], "sql_error", commit)
+                self.assertIn("rolled back", doc["message"], commit)
+                self.assertIn("nothing since BEGIN", doc["message"], commit)
+                # Nothing is left open behind it, and the session still serves.
+                self.assertIn("no transaction is active", self.sql("ROLLBACK", sid, status=400)["message"])
+                self.assertEqual(self.sql("SELECT count(*) FROM kept", sid)["data"], [[0]])
+            # A healthy transaction commits.
+            self.sql("BEGIN", sid)
+            self.sql("INSERT INTO kept VALUES (2)", sid)
+            self.sql("COMMIT", sid)
+        finally:
+            self.release(sid)
+        self.assertEqual(self.sql("SELECT x FROM kept")["data"], [[2]])
+
+    def test_a_statement_cut_short_in_a_transaction_aborts_it_every_time(self):
+        self.sql("CREATE TABLE half(x INTEGER)")
+        for attempt in range(12):
+            sid = self.session()
+            try:
+                self.sql("BEGIN", sid)
+                self.sql(f"INSERT INTO half VALUES ({attempt})", sid)
+                # Read the head of a long stream, then walk away from it.
+                conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
+                conn.request("POST", "/sql", json.dumps({
+                    "sql": "SELECT range, repeat('x', 200) FROM range(3000000)", "sessionId": sid,
+                }), {"Content-Type": "application/json"})
+                response = conn.getresponse()
+                self.assertEqual(response.status, 200)
+                response.read(1000 * (attempt + 1))
+                conn.close()
+                # The session is busy until the abandoned statement ends.
+                deadline = time.time() + 15
+                while True:
+                    status, doc = self.request("POST", "/sql", {"sql": "SELECT 1", "sessionId": sid})
+                    if status != 409 or time.time() > deadline:
+                        break
+                    time.sleep(.05)
+                self.assertEqual(status, 400, (attempt, doc))
+                self.assertIn("aborted", doc["message"])
+                self.assertIn("rolled back", self.sql("COMMIT", sid, status=400)["message"])
+            finally:
+                self.release(sid)
+        self.assertEqual(self.sql("SELECT count(*) FROM half")["data"], [[0]])
+
     def test_worker_discards_connection_local_state(self):
         self.sql("SET VARIABLE secret='previous caller'")
         self.assertEqual(self.sql("SELECT getvariable('secret')")["data"], [[None]])

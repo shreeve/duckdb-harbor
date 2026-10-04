@@ -194,9 +194,10 @@ interrupted without asking, on a pooled connection: the write to it fails and
 nobody is left to read the rest. That is noticed at a write. A statement
 still computing in silence, with no rows out yet, runs until it has some to
 send, so a deadline remains the backstop for a client that vanishes. In a
-session the abandoned statement ends at its next flush, and a client that
-stopped reading one inside a transaction should treat it as a cancelled one:
-roll back, and begin again.
+session a statement cut short this way ends at its next flush and leaves its
+transaction aborted, as a cancel does: a transaction with a statement missing
+does not commit. A result small enough to have been sent whole before the
+client left was not cut short, and its transaction stands.
 
 Two smaller things follow from the same machinery. Releasing a session whose
 statement is still running stops it — `{"released":false,"cancelling":true}`
@@ -214,8 +215,11 @@ cancel that lands before the statement has begun to execute — while an object
 or array parameter is still being bound, or before an executor has picked the
 statement up — answers the same 499 and harbor leaves the transaction aborted
 itself, so a client that carries on cannot commit a transaction with a
-statement missing. A `COMMIT` sent to an aborted transaction rolls it back. In
-autocommit there is no transaction to abort, and the next statement runs.
+statement missing. A `COMMIT` sent to an aborted transaction, whatever aborted
+it, is a `400` that says it was rolled back: the engine alone would roll back
+and answer success, and a client reading that answer would believe its work
+was kept. In autocommit there is no transaction to abort, and the next
+statement runs.
 
 ## Transactions
 
@@ -249,10 +253,16 @@ own.
 piped script or `.read`, a `BEGIN` takes a session, every statement after it
 runs there, and the `COMMIT` or `ROLLBACK` that ends the transaction releases
 it. One that never reached the engine, a typo the parser refuses or a request
-that failed on the way, ends nothing, and the session is kept. A script that
+that failed on the way, ends nothing, and the session is kept; on a
+transaction an error has already aborted, a `COMMIT` is rolled back by the
+server whatever follows the word. A script that
 fails, or ends with its transaction still open, has it rolled back and says
-so. The session is an ordinary one, so its limits are the transaction's: the
-REPL prints them when one opens.
+so. The session is an ordinary one. At the REPL it is kept alive while the
+prompt waits or a result is being read, so the thirty-second idle limit does
+not take a transaction from someone thinking; the five-minute ceiling still
+ends it, and the REPL says so when one opens. The keeping is a `SELECT 1` on
+the session every ten seconds, which the session counts as a statement. A script's statements follow one another and
+need no keeping.
 
 **Sessions draw from their own connections.** `HARBOR_POOL_SIZE` (default 16)
 is opened at load and split: the workers take theirs, sessions get the rest. A

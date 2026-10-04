@@ -936,7 +936,7 @@ fn run_sql_in_session(
     conn: &Conn, sql: &str, opts: &RenderOpts, session: Option<&str>,
     health: Option<&snapshot::Health>,
 ) -> Outcome {
-    run_sql_reporting(conn, sql, opts, session, health, None)
+    run_sql_reporting(conn, sql, opts, session, health, None, None)
 }
 
 /// `30s`, `5m`, `1h`: a server limit, as short as it reads.
@@ -961,14 +961,74 @@ fn brief(ms: u64) -> String {
 struct Transaction {
     conn: Conn,
     session: Option<String>,
-    /// At a prompt, where a person can outwait the server's limits and
-    /// should be told them.
+    /// At a prompt, where a person reads and thinks between statements for
+    /// longer than the server lets a session sit idle: the session is kept
+    /// alive there, and its remaining limit is said.
     interactive: bool,
+    /// Held while a statement of this client's is on the session, so the
+    /// keep-alive never sends one beside it: a session takes one at a time.
+    turn: std::sync::Arc<std::sync::Mutex<()>>,
+    alive: Option<KeepAlive>,
+}
+
+/// A session touched often enough that the server's idle limit never takes
+/// it while this client is alive. That limit is there to reclaim the session
+/// of a client that is gone; one waiting at a prompt is not, and says so by
+/// asking `SELECT 1` every third of the limit. When the client dies the
+/// touches stop and the server reclaims the session as it would any other.
+/// The session's fixed ceiling is untouched by this, and still ends it.
+struct KeepAlive {
+    stop: std::sync::mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl KeepAlive {
+    fn start(conn: &Conn, session: &str, idle: Duration, turn: &std::sync::Arc<std::sync::Mutex<()>>) -> Option<Self> {
+        if idle.is_zero() {
+            return None;
+        }
+        let body = serde_json::to_string(&SqlRequest {
+            sql: "SELECT 1".to_string(),
+            session_id: Some(session.to_string()),
+            ..Default::default()
+        })
+        .expect("request serializes");
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let (conn, turn) = (conn.clone(), std::sync::Arc::clone(turn));
+        let thread = std::thread::Builder::new()
+            .name("harbor-keepalive".into())
+            .spawn(move || {
+                use std::sync::mpsc::RecvTimeoutError;
+                while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(idle / 3) {
+                    // A statement on the session is its own sign of life, and
+                    // a second one beside it would be refused: skip the turn.
+                    let Ok(_turn) = turn.try_lock() else { continue };
+                    let answer = http::request(
+                        &conn.transport, &endpoint::SQL, Some(&body), Some(Duration::from_secs(5)),
+                    );
+                    // The session is gone from the server: nothing to keep.
+                    if answer.is_ok_and(|r| r.status == 404) {
+                        break;
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self { stop, thread: Some(thread) })
+    }
+}
+
+impl Drop for KeepAlive {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl Transaction {
     fn new(conn: &Conn, interactive: bool) -> Self {
-        Self { conn: conn.clone(), session: None, interactive }
+        Self { conn: conn.clone(), session: None, interactive, turn: Default::default(), alive: None }
     }
 
     fn open(&self) -> Result<wire::SessionNewResponse, String> {
@@ -991,6 +1051,8 @@ impl Transaction {
     }
 
     fn release(&mut self) {
+        // The keep-alive first: it must not touch a session being released.
+        self.alive = None;
         if let Some(id) = self.session.take() {
             // DELETE rolls back whatever is still open.
             let _ = http::request(
@@ -1017,11 +1079,16 @@ impl Transaction {
             }
         }
         let mut refused = None;
-        let outcome = run_sql_reporting(
-            &self.conn, sql, opts, self.session.as_deref(), None, Some(&mut refused),
-        );
+        let outcome = {
+            let turn = std::sync::Arc::clone(&self.turn);
+            let on_session = turn.lock().unwrap_or_else(|p| p.into_inner());
+            run_sql_reporting(
+                &self.conn, sql, opts, self.session.as_deref(), None, Some(&mut refused), Some(on_session),
+            )
+        };
         if refused.as_ref().is_some_and(|(code, _)| code == wire::code::NO_SUCH_SESSION) {
             // The server reaped it: idle too long, or open too long.
+            self.alive = None;
             self.session = None;
             eprintln!(
                 "harbor: the transaction is over: the server ended its session and rolled it \
@@ -1055,11 +1122,24 @@ impl Transaction {
             Some(true) => match opened {
                 // A BEGIN that did not begin leaves nothing to hold.
                 Some(_) if outcome != Outcome::Done => self.release(),
-                Some(lease) if self.interactive => eprintln!(
-                    "harbor: transaction open; the server rolls it back after {} idle, or {} in all",
-                    brief(lease.idle_ttl_ms),
-                    brief(lease.ttl_ms)
-                ),
+                Some(lease) if self.interactive => {
+                    if let Some(session) = &self.session {
+                        self.alive = KeepAlive::start(
+                            &self.conn, session, Duration::from_millis(lease.idle_ttl_ms), &self.turn,
+                        );
+                    }
+                    match self.alive {
+                        Some(_) => eprintln!(
+                            "harbor: transaction open, and held while this prompt is; the server \
+                             rolls it back {} after it began",
+                            brief(lease.ttl_ms)
+                        ),
+                        None => eprintln!(
+                            "harbor: transaction open; the server rolls it back {} after it began",
+                            brief(lease.ttl_ms)
+                        ),
+                    }
+                }
                 _ => {}
             },
             _ => {}
@@ -1080,7 +1160,13 @@ impl Drop for Transaction {
 fn run_sql_reporting(
     conn: &Conn, sql: &str, opts: &RenderOpts, session: Option<&str>,
     health: Option<&snapshot::Health>, refused: Option<&mut Option<(String, String)>>,
+    on_session: Option<std::sync::MutexGuard<'_, ()>>,
 ) -> Outcome {
+    // The session's turn, held while the statement is on it and let go when
+    // its answer has been read: drawing the result, and a reader paging
+    // through it, are not the session's business, and the keep-alive must
+    // have its turn while someone reads.
+    let mut on_session = on_session;
     let wall = std::time::Instant::now();
     let qid = format!("cli-{}-{}", std::process::id(), QUERY_SEQ.fetch_add(1, Ordering::Relaxed));
     // A Ctrl-C that landed between statements (say, while the pager showed
@@ -1240,6 +1326,7 @@ fn run_sql_reporting(
                 }
             }
             Event::End { row_count, time_ms } => {
+                drop(on_session.take());
                 return match renderer.end(row_count, time_ms, wall.elapsed().as_millis()) {
                     Ok(()) => Outcome::Done,
                     Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Outcome::Done,

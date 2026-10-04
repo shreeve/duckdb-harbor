@@ -3561,12 +3561,10 @@ fn run_sql(
             // tells a statement that finished from a client that left; the
             // one that left has its statement interrupted here, by job id.
             //
-            // On a pooled connection only. An interrupt that lands inside the
-            // engine aborts the transaction around it, and one that lands a
-            // moment later does not, so on a session it would decide by
-            // timing whether a client that stopped reading a SELECT early
-            // still has its transaction. A session's abandoned statement is
-            // left to end at its next flush.
+            // On a pooled connection only. A session's abandoned statement
+            // ends at its next flush, where its executor leaves the
+            // transaction aborted, slot retired first; an interrupt from
+            // here would race that.
             let ended = Arc::new(AtomicBool::new(false));
             let pooled = claim.is_none();
             let abandon = |ended: &AtomicBool| {
@@ -3832,6 +3830,7 @@ fn run_statement(
     ready: mpsc::SyncSender<Result<(), Refusal>>,
     body: mpsc::SyncSender<Vec<u8>>,
     started: Instant,
+    abandoned: &mut bool,
 ) -> bool {
     // Decided from the statement text before it runs, then widened below by
     // any path that ends the job early.
@@ -4053,6 +4052,7 @@ fn run_statement(
                         // computing a result nobody will read.
                         if body.send(std::mem::take(&mut buf).into_bytes()).is_err() {
                             gone = true;
+                            *abandoned = true;
                             break 'stream;
                         }
                         buf = String::with_capacity(FLUSH_AT + 8192);
@@ -4190,6 +4190,40 @@ fn execute_jobs(
             continue;
         }
 
+        // A COMMIT cannot keep what an aborted transaction held: the engine
+        // rolls it back and answers success, and the client that reads that
+        // answer believes its work was kept. So a session's COMMIT is
+        // preceded by the question, and an aborted transaction is rolled
+        // back here and answered as what happened. A cancel that lands on
+        // the question fails it too, and is left for the statement to
+        // report. The slot is retired before the ROLLBACK, so no interrupt is
+        // aimed at it; a cancel that arrived in between has had its effect,
+        // an aborted transaction, and is answered as a cancel.
+        if pinned
+            && matches!(acting_keyword(&sql).as_str(), "COMMIT" | "END")
+            && conn.transaction_aborted()
+            && !state.cancelled()
+        {
+            if on_slot.finish() {
+                let _ = ready.send(Err(Refusal::cancelled()));
+                continue;
+            }
+            let message = match conn.execute_batch("ROLLBACK") {
+                Ok(_) => "the transaction was aborted by an earlier error or a cancelled \
+                          statement, so there was nothing this COMMIT could keep: it has been \
+                          rolled back, and nothing since BEGIN was kept"
+                    .to_string(),
+                Err(e) => format!(
+                    "the transaction was aborted by an earlier error or a cancelled statement, \
+                     so there is nothing this COMMIT can keep, and rolling it back failed ({}): \
+                     send ROLLBACK, or release the session",
+                    e.into_text()
+                ),
+            };
+            let _ = ready.send(Err(Refusal { status: 400, code: "sql_error", message }));
+            continue;
+        }
+
         // A panic below — an encoder invariant tripping, an FFI metadata
         // assert (the v2 paths return Err rather than panic, so this is the
         // backstop, not the expectation) — used to unwind straight out of
@@ -4205,8 +4239,9 @@ fn execute_jobs(
         // job. The connection itself is intact (the panic was in Rust-side
         // encoding, not DuckDB's engine), so the next job resets first.
         let ready_guard = ready.clone();
+        let mut abandoned = false;
         needs_reset = match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            run_statement(&mut conn, &mut on_slot, sql, params, shape, ready, body, started)
+            run_statement(&mut conn, &mut on_slot, sql, params, shape, ready, body, started, &mut abandoned)
         })) {
             Ok(next_reset) => next_reset,
             Err(_) => {
@@ -4220,6 +4255,18 @@ fn execute_jobs(
                 true
             }
         };
+        // A statement its client stopped reading, inside a transaction, is a
+        // statement missing from it. The interrupt that ends the abandoned
+        // cursor aborts the transaction only when it lands inside the engine,
+        // which is a matter of timing; the transaction is left aborted
+        // whenever the statement was cut short, as a cancel leaves it, so
+        // the COMMIT that follows is told. The slot is retired first, so no
+        // interrupt is aimed at the statement that does the aborting. In
+        // autocommit this leaves nothing behind.
+        if pinned && abandoned {
+            on_slot.finish();
+            conn.abort_transaction();
+        }
     }
     // And once more on the way out, so a connection going back to the pool for
     // the next harbor_start is clean too. Unconditional here: this runs once
@@ -4509,9 +4556,94 @@ mod tests {
         let (body, _output) = std::sync::mpsc::sync_channel(1);
         super::run_statement(&mut conn, &mut slot,
             "CREATE TABLE must_not_exist(x INTEGER); SELECT 1".into(), vec![],
-            super::Shape::Json, ready, body, Instant::now());
+            super::Shape::Json, ready, body, Instant::now(), &mut false);
         assert_eq!(result.recv().unwrap().err().unwrap().status, 400);
         assert!(conn.execute_batch("SELECT * FROM must_not_exist").is_err());
+    }
+
+    /// A session's COMMIT on a transaction an error aborted is answered as
+    /// the rollback it is, and one on a healthy transaction commits. A
+    /// statement abandoned by its reader leaves the transaction aborted.
+    #[test]
+    fn a_commit_is_told_when_its_transaction_was_aborted() {
+        use std::sync::{Arc, mpsc::sync_channel};
+        if crate::engine::engine().is_err() { return; }
+        let conn = crate::engine::conn::open(std::path::Path::new(":memory:"), &[]).unwrap();
+        let state = Arc::new(super::SlotState {
+            interrupt: conn.interrupt_handle(), run: std::sync::Mutex::new(idle()),
+        });
+        let (jobs, queue) = sync_channel::<super::Job>(1);
+        let executor = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || super::execute_jobs(conn, queue, true, state))
+        };
+        // Send one statement; `read` says whether its rows are read or the
+        // reader walks away after the first flush.
+        let run = |sql: &str, read: bool| -> Result<String, (u16, String)> {
+            let (ready, answered) = sync_channel(1);
+            let (body, output) = sync_channel(super::BODY_QUEUE);
+            jobs.send(super::Job {
+                sql: sql.into(), params: vec![], shape: super::Shape::Ndjson, id: super::next_job_id(),
+                deadline: None, reset: false, ready, body,
+            }).unwrap();
+            match answered.recv().unwrap() {
+                Err(refusal) => Err((refusal.status, refusal.message)),
+                Ok(()) if !read => {
+                    let _ = output.recv();
+                    drop(output);
+                    Ok(String::new())
+                }
+                // A failure once the stream is open arrives in it.
+                Ok(()) => {
+                    let out: String = output.iter().map(|chunk| String::from_utf8(chunk).unwrap()).collect();
+                    if out.contains(r#"{"type":"error""#) { Err((200, out)) } else { Ok(out) }
+                }
+            }
+        };
+        let count = |run: &dyn Fn(&str, bool) -> Result<String, (u16, String)>| {
+            let out = run("SELECT count(*) FROM t", true).unwrap();
+            out.lines().find(|l| l.contains("\"row\"")).unwrap().to_string()
+        };
+        run("CREATE TABLE t(n INTEGER PRIMARY KEY)", true).unwrap();
+
+        // A healthy transaction commits.
+        for sql in ["BEGIN", "INSERT INTO t VALUES (1)", "COMMIT"] {
+            run(sql, true).unwrap();
+        }
+        assert!(count(&run).contains("[1]"));
+
+        // One an error aborted does not, and the COMMIT says so.
+        for sql in ["BEGIN", "INSERT INTO t VALUES (2)"] {
+            run(sql, true).unwrap();
+        }
+        assert!(run("INSERT INTO t VALUES (1)", true).is_err(), "the duplicate key is refused");
+        let (status, message) = run("COMMIT", true).unwrap_err();
+        assert_eq!(status, 400);
+        assert!(message.contains("rolled back") && message.contains("nothing since BEGIN"), "{message}");
+        // Rolled back, with no transaction left behind it.
+        assert!(count(&run).contains("[1]"));
+        assert!(run("ROLLBACK", true).is_err(), "no transaction is open after it");
+
+        // In every spelling the engine runs as a commit.
+        for commit in ["end", "/* c */ COMMIT;", "EXPLAIN ANALYZE COMMIT"] {
+            run("BEGIN", true).unwrap();
+            assert!(run("SELECT nope", true).is_err());
+            assert_eq!(run(commit, true).unwrap_err().0, 400, "{commit}");
+        }
+
+        // A statement whose reader left mid-stream is missing from its
+        // transaction, which is left aborted every time.
+        for sql in ["BEGIN", "INSERT INTO t VALUES (3)"] {
+            run(sql, true).unwrap();
+        }
+        run("SELECT range, repeat('x', 200) FROM range(200000)", false).unwrap();
+        let (_, message) = run("SELECT 1", true).unwrap_err();
+        assert!(message.contains("aborted"), "{message}");
+        assert_eq!(run("COMMIT", true).unwrap_err().0, 400);
+        assert!(count(&run).contains("[1]"));
+
+        drop(jobs);
+        executor.join().unwrap();
     }
 
     /// A 499 inside a transaction means the transaction is over, whenever the
@@ -4544,7 +4676,7 @@ mod tests {
             let (ready, result) = sync_channel(1);
             let (body, _output) = sync_channel(1);
             super::run_statement(conn, &mut slot, sql.into(), vec![], super::Shape::Json,
-                ready, body, Instant::now());
+                ready, body, Instant::now(), &mut false);
             result.recv().unwrap().err().unwrap().status
         };
         assert_eq!(cancelled(&mut conn, 1, "INSERT INTO m VALUES (2)"), 499);
