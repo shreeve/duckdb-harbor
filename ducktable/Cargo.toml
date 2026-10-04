@@ -29,14 +29,14 @@ strip = true
 # panels, a sizable Editor, DataTable's select_on_modifier_click and
 # fixed_cols_border, the set_line_number guard, EditorState::wrap_row_count
 # and prewrap, and the host-styled line-number gutter. The rev is the commit
-# tagged v0.7.0-patched.1. Moving to a later tag, or to the next release
+# tagged v0.7.0-patched.5. Moving to a later tag, or to the next release
 # line's patched branch, means pinning that tag's commit here with the
 # matching gpui-kit version.
 # Every crate of the kit comes from the one rev, so they resolve together:
 # from a git source, a crate takes its siblings from that source too.
 [patch.crates-io]
-gpui-kit = { git = "https://github.com/shreeve/gpui-kit", rev = "cb2f26f2bbd123eeec4a9441fc3449d3341b428a" }
-gpui-base = { git = "https://github.com/shreeve/gpui-kit", rev = "cb2f26f2bbd123eeec4a9441fc3449d3341b428a" }
-gpui-component = { git = "https://github.com/shreeve/gpui-kit", rev = "cb2f26f2bbd123eeec4a9441fc3449d3341b428a" }
-gpui-component-macros = { git = "https://github.com/shreeve/gpui-kit", rev = "cb2f26f2bbd123eeec4a9441fc3449d3341b428a" }
-gpui-kit-assets = { git = "https://github.com/shreeve/gpui-kit", rev = "cb2f26f2bbd123eeec4a9441fc3449d3341b428a" }
+gpui-kit = { git = "https://github.com/shreeve/gpui-kit", rev = "9eb0b2ebaf61b86587c9a9c877824fc0fe20b7b8" }
+gpui-base = { git = "https://github.com/shreeve/gpui-kit", rev = "9eb0b2ebaf61b86587c9a9c877824fc0fe20b7b8" }
+gpui-component = { git = "https://github.com/shreeve/gpui-kit", rev = "9eb0b2ebaf61b86587c9a9c877824fc0fe20b7b8" }
+gpui-component-macros = { git = "https://github.com/shreeve/gpui-kit", rev = "9eb0b2ebaf61b86587c9a9c877824fc0fe20b7b8" }
+gpui-kit-assets = { git = "https://github.com/shreeve/gpui-kit", rev = "9eb0b2ebaf61b86587c9a9c877824fc0fe20b7b8" }
