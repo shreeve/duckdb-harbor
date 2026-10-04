@@ -3893,6 +3893,18 @@ fn run_statement(
         let _ = ready.send(Err(Refusal::cancelled()));
         return needs_reset;
     }
+    // A COMMIT runs to its answer. An interrupt that reaches one as it
+    // finishes is reported by the engine on the fetch that follows, after
+    // the transaction is durable, and the client would be told 499 for work
+    // that was kept; told that, it may do the work again. So the slot is
+    // retired before a COMMIT starts and nothing is aimed at it: a cancel
+    // either arrived by now, and is answered as one with nothing kept, or
+    // finds no statement to stop. The answer is then the engine's own.
+    if matches!(acting_keyword(&sql).as_str(), "COMMIT" | "END") && on_slot.finish() {
+        conn.abort_transaction();
+        let _ = ready.send(Err(Refusal::cancelled()));
+        return needs_reset;
+    }
     let mut stream = match conn.execute(last, bound) {
         Ok(s) => s,
         Err(e) => {

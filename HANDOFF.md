@@ -363,6 +363,27 @@ usable end to end.
   older distributions without changing harbor, and is deliberately not
   scheduled; issue #56 was closed with an offer to revisit if it blocks
   someone.
+- **A cleanup pass, when there is a session for one.** The code review of
+  2026-09 closed its defects through 0.44.2; what it left is recorded here
+  and in the issues, none of it urgent.
+  - *A statement keeps running after its client disconnects before any rows
+    are sent* (#133). The server learns a client is gone only at a failed
+    write. The connection's reader already sees the close; the work is
+    carrying that to the request being answered without reading a half-close
+    or a pipelined request as a departure. A statement deadline bounds it
+    meanwhile.
+  - *The REPL's and DuckTable's keep-alive is a statement.* `SELECT 1` on
+    the session every ten seconds counts in `/sessions` and overwrites a
+    session's profiling output. A touch that runs nothing, a renew for an
+    ordinary session that resets its idle clock and leaves its ceiling
+    alone, would replace both.
+  - *Left by the review on purpose:* workflow actions pinned by tag, not
+    commit; the engine layer's types that can outlive what they point to,
+    which is why `cargo clippy` fails on harbor, and its slow VARIANT cell
+    path, both of which the port to the reworked v2 API rewrites; type names
+    built by hand beside the engine's; the `[defaults]` config section,
+    parsed and read by nothing; and era framing in older comments in
+    `lib.rs`, `wire` and `justhttp`.
 - **Optional polish:** a distinct color for braces in the highlighter; the
   brace expander could take aliases inside a group if a syntax that does
   not collide with the struct-literal colon is chosen.
