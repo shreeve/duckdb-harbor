@@ -159,11 +159,13 @@ undo() {
         pushed)
             echo "error: $tag is pushed, but its release is still a draft; publish it, then the feed, with:" >&2
             echo "  gh release edit $tag --repo $repo --draft=false --latest=false --verify-tag" >&2
-            echo "  find $out/feed -maxdepth 1 -type f -exec gh release upload $feed_release --repo $repo --clobber {} +" >&2
+            echo "  find $out/feed -maxdepth 1 -type f ! -name appcast.xml -exec gh release upload $feed_release --repo $repo --clobber {} +" >&2
+            echo "  gh release upload $feed_release --repo $repo --clobber $out/feed/appcast.xml" >&2
             ;;
         published)
             echo "error: $tag is published, but the update feed is not; finish it with:" >&2
-            echo "  find $out/feed -maxdepth 1 -type f -exec gh release upload $feed_release --repo $repo --clobber {} +" >&2
+            echo "  find $out/feed -maxdepth 1 -type f ! -name appcast.xml -exec gh release upload $feed_release --repo $repo --clobber {} +" >&2
+            echo "  gh release upload $feed_release --repo $repo --clobber $out/feed/appcast.xml" >&2
             ;;
     esac
     rm -rf "$backup"
@@ -251,7 +253,10 @@ stage=published
 gh release view "$feed_release" --repo "$repo" >/dev/null 2>&1 \
     || gh release create "$feed_release" --repo "$repo" --title "DuckTable update feed" --prerelease --latest=false \
         --notes "The Sparkle feed DuckTable checks for updates. Not a release: install from the newest DuckTable release." >/dev/null
-find "$out/feed" -maxdepth 1 -type f -exec gh release upload "$feed_release" --repo "$repo" --clobber {} +
+# The archives and deltas first, the feed that offers them last: an appcast that is up before the
+# archive it names sends every client that checks in between to a 404.
+find "$out/feed" -maxdepth 1 -type f ! -name appcast.xml -exec gh release upload "$feed_release" --repo "$repo" --clobber {} +
+gh release upload "$feed_release" --repo "$repo" --clobber "$out/feed/appcast.xml"
 stage=fed
 echo "Published $tag"
 echo "Next: scripts/update-cask.sh $version opens the Homebrew tap's pull request."

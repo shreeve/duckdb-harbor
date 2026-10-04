@@ -54,8 +54,8 @@ impl DuckTable {
     /// row's live color, faded in so the swap from dot is not a hard cut.
     /// Reuses the embedded refresh-cw.svg — the Spinner component defaults
     /// to a Loader icon this app does not embed, which would draw blank.
-    /// `seed` (the berth name) keys the animations so simultaneous stops
-    /// never share an element id.
+    /// `seed` (the row's element id) keys the animations so simultaneous
+    /// stops never share an element id.
     fn spin_dot(seed: &str, level: Level, t: Pal) -> impl IntoElement {
         let spin = svg()
             .path("icons/refresh-cw.svg")
@@ -82,13 +82,6 @@ impl DuckTable {
             .as_ref()
             .map(|i| i.read(cx).value().to_string().to_lowercase())
             .filter(|s| !s.is_empty());
-        // The clicked berth highlights the moment it is clicked (the
-        // in-flight name wins over the still-rendering old connection).
-        let active = match (&self.connecting, &self.phase) {
-            (Some(name), _) => Some(clone_str(name)),
-            (None, Phase::Connected { conn, .. }) => Some(clone_str(&conn.name)),
-            _ => None,
-        };
         // Width belongs to the resizable panel around this (main.rs
         // "root-split"); the sidebar just fills what it's granted.
         // No border of its own: the resize handle's 1px line IS the
@@ -215,13 +208,22 @@ impl DuckTable {
             .children(self.rows.iter().filter(|row| matches(&row.name, &berth_filter)).map(
                 |row| {
                     let name = clone_str(&row.name);
-                    let selected = active.as_deref() == Some(row.name.as_str());
-                    let stopping = self.stopping.contains(&row.name);
-                    let leaving = self.leaving.contains(&row.name);
-                    let base = list_row(SharedString::from(clone_str(&row.name)), selected, t)
+                    // The clicked berth highlights the moment it is clicked
+                    // (the in-flight one wins over the still-rendering old
+                    // connection), and of two rows that share a name only
+                    // the one that is the database lights up.
+                    let selected = self.is_active_row(row);
+                    // A Stop in flight belongs to one database: another
+                    // row of the same name neither spins nor fades with it.
+                    let stopping = self.stopping.contains(&row.key);
+                    let leaving = self.leaving.contains(&row.key);
+                    // Names can repeat, across two files and across a file
+                    // and a remote, and an element id cannot.
+                    let id = row.key.element_id();
+                    let base = list_row(SharedString::from(clone_str(&id)), selected, t)
                         .px_2()
                         .child(if stopping {
-                            Self::spin_dot(&row.name, row.state.level(), t).into_any_element()
+                            Self::spin_dot(&id, row.state.level(), t).into_any_element()
                         } else {
                             Self::dot(row.state.level(), t).into_any_element()
                         })
@@ -250,7 +252,7 @@ impl DuckTable {
                         // eye needs to track the departure (docs/DESIGN.md, Motion).
                         return base
                             .with_animation(
-                                SharedString::from(format!("berth-leaving-{}", row.name)),
+                                SharedString::from(format!("berth-leaving-{id}")),
                                 Animation::new(std::time::Duration::from_millis(220)),
                                 |el, delta| el.opacity(1.0 - delta),
                             )
@@ -262,9 +264,15 @@ impl DuckTable {
                         return base.into_any_element();
                     }
                     base
+                        // The row connects to what it shows: its file, or
+                        // the remote of its name. Never the name looked up
+                        // again, which a file and a remote can share.
                         .on_click(cx.listener({
                             let name = clone_str(&name);
-                            move |this, _: &ClickEvent, _, cx| this.connect(clone_str(&name), cx)
+                            let path = row.path.clone();
+                            move |this, _: &ClickEvent, _, cx| {
+                                this.connect_row(clone_str(&name), path.clone(), cx)
+                            }
                         }))
                         // Right-click → Stop: shut this berth's server down.
                         // Disabled (greyed) for a stopped row — nothing to
@@ -277,8 +285,7 @@ impl DuckTable {
                             let running = !matches!(row.state.level(), Level::Idle);
                             let attached = row.attached;
                             let autostart = row.autostart;
-                            let path =
-                                row.path.as_ref().map(|p| p.to_string_lossy().into_owned());
+                            let path = row.path.clone();
                             move |menu, _, _| {
                                 // A remote has no local server lifecycle. Its
                                 // one operation forgets the saved connection;
@@ -293,7 +300,13 @@ impl DuckTable {
                                 };
                                 // Running axis: exactly one of Start / Stop.
                                 let menu = if running {
-                                    menu.menu("Stop", Box::new(StopBerth { name: clone_str(&name) }))
+                                    menu.menu(
+                                        "Stop",
+                                        Box::new(StopBerth {
+                                            name: clone_str(&name),
+                                            path: path.clone(),
+                                        }),
+                                    )
                                 } else {
                                     menu.menu("Start", Box::new(StartBerth { path: path.clone() }))
                                 };

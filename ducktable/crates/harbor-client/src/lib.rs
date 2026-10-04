@@ -13,6 +13,9 @@ pub mod http;
 pub mod query;
 
 pub use catalog::{catalog, catalog_lite, Catalog, Table};
-pub use fleet::{connect, info, Conn};
-pub use query::{exec, query, session_new, session_release, QueryResult};
+pub use fleet::{connect_file, connect_remote, info, Conn};
+pub use query::{
+    exec, exec_checked, exec_within, query, session_end, session_new, session_open,
+    session_release, Ended, Failure, QueryResult, Session,
+};
 pub use harbor_common::{paths, Level, State};

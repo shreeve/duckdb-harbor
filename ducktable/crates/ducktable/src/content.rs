@@ -60,7 +60,7 @@ impl DuckTable {
                         .text_color(t.muted)
                         .child("Pick a database on the left. A stopped database starts on demand."),
                 ),
-            Phase::Failed { name, message } => div()
+            Phase::Failed { name, message, .. } => div()
                 .v_flex()
                 .gap_3()
                 .items_center()
@@ -71,12 +71,14 @@ impl DuckTable {
                         .child(format!("Couldn't connect to {name}")),
                 )
                 .child(div().text_xs().text_color(t.muted).child(clone_str(message)))
-                .child({
-                    let name = clone_str(name);
-                    Button::new("retry").label("Retry").primary().on_click(cx.listener(
-                        move |this, _, _, cx| this.connect(clone_str(&name), cx),
-                    ))
-                }),
+                // Retry dials what the failed connect was aimed at, not
+                // the name again: a name can belong to two databases.
+                .child(
+                    Button::new("retry")
+                        .label("Retry")
+                        .primary()
+                        .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
+                ),
             Phase::Connected { conn, info, catalog } => {
                 let installed = self.installed_version.clone();
                 let stale = installed.as_deref().is_some_and(|iv| {
@@ -84,11 +86,7 @@ impl DuckTable {
                 });
                 // A local server (its row carries a path) can be restarted from
                 // here; a remote one can only be noted as behind.
-                let is_local = self
-                    .rows
-                    .iter()
-                    .find(|r| r.name == info.name)
-                    .is_some_and(|r| r.path.is_some());
+                let is_local = conn.db.is_some();
                 div()
                 .v_flex()
                 .gap_1()

@@ -110,6 +110,32 @@ fn keepalive(transport: &Transport) -> io::Result<Response> {
     Ok(response)
 }
 
+/// Marks an error raised before the whole request was on the wire: the
+/// connection could not be made, or the request could not be written. The
+/// server acts on a request only once it has all of it, so such a request
+/// did nothing.
+#[derive(Debug)]
+struct NotSent(io::Error);
+
+impl std::fmt::Display for NotSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for NotSent {}
+
+fn not_sent(e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), NotSent(e))
+}
+
+/// Whether a `request` error means the request never reached the server
+/// whole, so it had no effect there. Any other error came while waiting for
+/// or reading the answer, and says nothing about what the server did.
+pub fn was_not_sent(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<NotSent>())
+}
+
 fn request_inner(
     transport: &Transport,
     route: &Route,
@@ -120,13 +146,13 @@ fn request_inner(
     let (stream, host): (Box<dyn Stream>, String) = match transport {
         #[cfg(unix)]
         Transport::Unix(p) => {
-            let s = UnixStream::connect(p)?;
-            s.set_read_timeout(timeout)?;
+            let s = UnixStream::connect(p).map_err(not_sent)?;
+            s.set_read_timeout(timeout).map_err(not_sent)?;
             (Box::new(s), "harbor".to_string())
         }
         Transport::Tcp(addr) => {
-            let s = TcpStream::connect(addr)?;
-            s.set_read_timeout(timeout)?;
+            let s = TcpStream::connect(addr).map_err(not_sent)?;
+            s.set_read_timeout(timeout).map_err(not_sent)?;
             (Box::new(s), addr.clone())
         }
     };
@@ -142,11 +168,11 @@ fn request_inner(
         ));
     }
     req.push_str("\r\n");
-    stream.write_all(req.as_bytes())?;
+    stream.write_all(req.as_bytes()).map_err(not_sent)?;
     if let Some(b) = body {
-        stream.write_all(b.as_bytes())?;
+        stream.write_all(b.as_bytes()).map_err(not_sent)?;
     }
-    stream.flush()?;
+    stream.flush().map_err(not_sent)?;
 
     let mut reader = BufReader::new(stream);
     // Headers may not arrive until the statement completes (the server
@@ -365,6 +391,41 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "{\"type\":\"row\",\"values\":[1]}\n{\"type\":\"end\"}\nxxxx"
         );
+    }
+
+    #[test]
+    fn a_request_that_cannot_connect_was_not_sent() {
+        // Nothing listens on a socket path that does not exist, nor on a
+        // port just closed: the request never left.
+        #[cfg(unix)]
+        {
+            let nowhere = Transport::Unix(std::env::temp_dir().join("harbor-client-no-such.sock"));
+            let e = request(&nowhere, &wire::endpoint::READY, None, None).err().unwrap();
+            assert!(was_not_sent(&e), "{e}");
+        }
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap();
+        let e = request(&Transport::Tcp(port.to_string()), &wire::endpoint::READY, None, None)
+            .err()
+            .unwrap();
+        assert!(was_not_sent(&e), "{e}");
+
+        // A server that takes the request and hangs up without a word: the
+        // request was sent, and what became of it is unknown.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut seen = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !seen.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap() == 1 {
+                seen.push(byte[0]);
+            }
+        });
+        let e = request(&Transport::Tcp(addr.to_string()), &wire::endpoint::READY, None, None)
+            .err()
+            .unwrap();
+        assert!(!was_not_sent(&e), "{e}");
+        server.join().unwrap();
     }
 
     #[test]

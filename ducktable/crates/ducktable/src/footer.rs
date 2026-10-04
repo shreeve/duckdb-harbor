@@ -438,8 +438,14 @@ impl Grid {
         if deletes > 0 {
             label = label.child(div().text_color(t.bad).child(plural(deletes, "delete")));
         }
-        label = label
-            .child(div().text_color(t.muted).child("\u{00b7} \u{2318}S to commit"));
+        // A set held after a commit that got no answer is not sent by ⌘S:
+        // the count says so, and opens the review that is the way out.
+        let held = self.in_doubt();
+        label = label.child(if held {
+            div().text_color(t.bad).child("\u{00b7} held: may have landed \u{00b7} review")
+        } else {
+            div().text_color(t.muted).child("\u{00b7} \u{2318}S to commit")
+        });
         gpui_kit::component::popover::Popover::new("staged-popover")
             .anchor(Anchor::BottomLeft)
             .trigger(
@@ -450,6 +456,10 @@ impl Grid {
             )
             .content(move |_, _, cx| {
                 let t = pal(cx);
+                let held = grid.read(cx).in_doubt();
+                // Held against columns the table does not have, the set
+                // cannot be staged again: one way out is left.
+                let reshaped = held && grid.read(cx).is_reshaped();
                 // Snapshot the entries: (key, row title, diff lines, is_delete).
                 let items: Vec<(String, String, Vec<String>, bool)> = {
                     let g = grid.read(cx);
@@ -565,7 +575,9 @@ impl Grid {
                                             .child(line)
                                     })),
                             )
-                            .child(
+                            // A held set gives up no single change: its
+                            // commit landed whole or not at all.
+                            .when(!held, |d| d.child(
                                 div()
                                     .id(("staged-discard", ix))
                                     .flex_none()
@@ -584,7 +596,7 @@ impl Grid {
                                             g.discard_change(&key, cx);
                                         });
                                     }),
-                            ),
+                            )),
                     );
                 }
                 let discard_all = {
@@ -600,19 +612,44 @@ impl Grid {
                             grid.update(cx, |g, cx| g.discard_all(cx));
                         })
                 };
-                let commit = {
-                    let grid = grid.clone();
-                    gpui_kit::component::button::Button::new("staged-commit")
-                        .primary()
-                        .xsmall()
-                        .label("Commit (\u{2318}S)")
-                        .on_click(move |_, _, cx| {
-                            grid.update(cx, |g, cx| g.commit(cx));
+                // A held set is not committed from here. Its commit was all
+                // or nothing, so it leaves the hold by one of two verdicts on
+                // the whole set, and by nothing else.
+                let footer = if held {
+                    let verdict = |id: &'static str, label: &'static str, landed: bool| {
+                        let grid = grid.clone();
+                        gpui_kit::component::button::Button::new(id)
+                            .xsmall()
+                            .label(label)
+                            .on_click(move |_, _, cx| {
+                                grid.update(cx, |g, cx| g.judge_held(landed, cx));
+                            })
+                    };
+                    div()
+                        .h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .when(reshaped, |d| d.child(verdict("held-drop", "Discard all", true).danger()))
+                        .when(!reshaped, |d| {
+                            d.child(verdict("held-landed", "It landed: discard all", true).danger()).child(
+                                verdict("held-not-landed", "It did not land: stage again", false).primary(),
+                            )
                         })
+                } else {
+                    let grid = grid.clone();
+                    div().h_flex().justify_end().child(
+                        gpui_kit::component::button::Button::new("staged-commit")
+                            .primary()
+                            .xsmall()
+                            .label("Commit (\u{2318}S)")
+                            .on_click(move |_, _, cx| {
+                                grid.update(cx, |g, cx| g.commit(cx));
+                            }),
+                    )
                 };
                 div()
                     .v_flex()
-                    .w(px(320.))
+                    .w(px(if held { 380. } else { 320. }))
                     .child(
                         div()
                             .h_flex()
@@ -627,21 +664,44 @@ impl Grid {
                                     .text_xs()
                                     .font_weight(FontWeight(560.))
                                     .text_color(t.muted)
-                                    .child("STAGED CHANGES"),
+                                    .child(if held { "HELD CHANGES" } else { "STAGED CHANGES" }),
                             )
                             .child(div().flex_1())
-                            .child(discard_all),
+                            .when(!held, |d| d.child(discard_all)),
                     )
+                    .when(held, |d| {
+                        d.child(
+                            div()
+                                .px(px(10.))
+                                .py(px(6.))
+                                .border_b_1()
+                                .border_color(t.border)
+                                .text_xs()
+                                .text_color(t.bad)
+                                .child(if reshaped {
+                                    "The commit that sent these got no answer, and the table\u{2019}s \
+                                     columns have changed since, so they cannot be staged again. \
+                                     Whether the commit landed or not, dropping all of them is \
+                                     the way out, and the table then loads as it is. The Query \
+                                     tab shows what the table holds."
+                                } else {
+                                    "The commit that sent these got no answer. A commit is all \
+                                     or nothing: either every change below is in the database, \
+                                     or none is. They are off the page, which shows the \
+                                     database. Compare, then say which. If it landed, all of \
+                                     them are dropped, for good. If it did not, all of them go \
+                                     back on the page, and \u{2318}S sends them."
+                                }),
+                        )
+                    })
                     .child(rows)
                     .child(
                         div()
-                            .h_flex()
-                            .justify_end()
                             .px(px(10.))
                             .py(px(8.))
                             .border_t_1()
                             .border_color(t.border)
-                            .child(commit),
+                            .child(footer),
                     )
                     .into_any_element()
             })

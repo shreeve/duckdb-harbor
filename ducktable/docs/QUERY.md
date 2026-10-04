@@ -10,10 +10,13 @@ end.
 
 ## The five laws
 
-1. **One scratchpad per database, and it is never lost.** The Query view is
-   the third segment of the view switcher, scoped to the berth, not the table.
-   Its text saves to disk on every change and comes back across restarts.
-   There is no unsaved state, so there is no save dialog and no dirty dot.
+1. **One scratchpad per database name, and it is never lost.** The Query view
+   is the third segment of the view switcher, scoped to the berth, not the
+   table. Its text saves to disk on every change and comes back across
+   restarts. There is no unsaved state, so there is no save dialog and no dirty
+   dot. The scratchpad and its history are files named for the database's name
+   (Persistence, below), so two databases that carry one name share them: a
+   file here and a remote called the same, or two files with the same stem.
 2. **⌘Enter sends; nothing else does.** In the grid, ⌘Enter and ⌘S both
    commit, because staged edits are local work and the send payload at once.
    In the editor, ⌘Enter runs the marked statement, and typing only ever edits
@@ -75,15 +78,13 @@ never divide: FROM-first syntax makes every keyword heuristic lie eventually,
 and a wrong split can leave a runnable prefix. The terminator belongs to its
 statement, and the payload sheds it along with any same-line trailing comment.
 
-**Each run stands alone.** A run is one request with no session, so it
-auto-commits on its own, as it would in the duckdb CLI. Nothing carries from
-one run to the next: `BEGIN` in one run and `ROLLBACK` in the next do nothing
-together, the `ROLLBACK` fails with "no transaction is active", and a temp
-table is gone by the next run. A transaction here has to be the one statement.
+**Each run stands alone, outside a transaction.** A run is one request on a
+pooled connection, so it commits on its own, as it would in the duckdb CLI,
+and nothing else carries to the next run: a temp table is gone by then. What
+does carry is a transaction, below.
 
 **One run at a time.** ⌘Enter during a run answers `already running…` rather
-than queueing. Results are fenced, so a late result can never replace a newer
-one.
+than queueing, so no result is ever in flight behind another.
 
 Every completed run refreshes the sidebar catalog and the open Data grid
 afterward, fetch first and swapped in one frame: arbitrary SQL can change
@@ -91,6 +92,122 @@ tables in ways no client can classify. The Query result itself stays the
 snapshot that run returned; DuckTable never reruns SQL on its own. ⌘R, Refresh
 Tables, does the same refresh without running anything or replacing the
 result.
+
+## Transactions
+
+One request carries one statement, and its connection goes back to Harbor's
+pool when the request ends, so a `BEGIN` sent on its own would open a
+transaction nothing could ever join: every statement after it would commit on
+its own, and `ROLLBACK` would find nothing to roll back. The view holds a
+Harbor session instead, a connection pinned to it, for exactly as long as a
+transaction is open.
+
+- **`BEGIN` or `START TRANSACTION` opens one.** The view opens a session,
+  runs the statement there, and from then on sends every run through that
+  session. The statement is never sent without one: if no session can be had,
+  the run fails with the reason and nothing is sent.
+- **`COMMIT`, `END`, `ROLLBACK` or `ABORT` ends it,** and the session goes
+  back. With no transaction open they run on their own, and the engine answers
+  that no transaction is active.
+- **The keyword the engine acts on decides,** read by the one reader the
+  view shares with the server and Harbor's own client (`wire::statement`),
+  measured against the engine. It skips the comments and the spaces the engine
+  skips and no others: a zero-width space pasted in front of `COMMIT` is
+  skipped, so that `COMMIT` commits and the view knows it, and a character the
+  engine does not skip makes the word a name. A word runs as far as an
+  identifier does, so `COMMIT_X`, `COMMIT1` and a quoted `"COMMIT"` are names
+  and end nothing: the engine looks for a table. `EXPLAIN ANALYZE` runs the
+  statement it explains, a real `BEGIN`, `COMMIT` or `ROLLBACK`: `EXPLAIN
+  ANALYZE COMMIT` commits. So the reader looks through `EXPLAIN` when
+  `ANALYZE` (or `ANALYSE`) follows it or stands anywhere in its option list,
+  `(ANALYZE false)` included, which the engine also runs. A plain `EXPLAIN
+  COMMIT` only plans, and changes nothing.
+- **It shows.** While a transaction is open the header band reads
+  `transaction open · 4:32 left · COMMIT or ROLLBACK ends it`, and once the
+  session has answered that an error aborted it, `transaction aborted by an
+  error · 4:32 left · ROLLBACK ends it`. These statements have no result set
+  and report `ok`, as any resultless statement does.
+- **Only this view sees it.** The Data view, the sidebar's counts and every
+  other client read outside the transaction and show what is committed; the
+  refresh after each run shows none of its changes until `COMMIT`. Committing
+  staged edits (⌘S in the Data view) to a row the transaction has written
+  fails with the engine's `Conflict on update!`, edits kept.
+- **The server bounds it.** A session lives five minutes from its `BEGIN`,
+  whatever runs on it, and the band counts that down. Harbor also reclaims a
+  session that sits thirty seconds between statements, which composing the
+  next statement easily takes, so while nothing is running the view sends
+  `SELECT 1` to the session at a third of that interval, waiting five seconds
+  for its answer and no longer. At the five-minute deadline the server rolls
+  the transaction back, and the view says so: `The transaction is gone: the
+  server reclaimed its session and rolled back everything since BEGIN.` The
+  view checks every second, so a loss a results page runs into shows within
+  one. The keepalive is a timer in the app, and whether macOS delays it while
+  the window is hidden (App Nap) is not measured: a transaction left open
+  behind a hidden window may be found gone on return, and is then reported as
+  any lost one is.
+- **A statement typed for a lost transaction never runs on its own
+  unannounced.** One sent to a session that is gone is not run outside it
+  instead; it fails with that message and `This statement did not run.` When
+  the view finds the loss between statements, the next ⌘Enter is refused once,
+  whatever it would send: `This statement was not sent: outside a transaction
+  it commits on its own. ⌘Enter again runs it that way.`
+- **Errors are the engine's.** Measured, by sending a statement after each
+  inside one session: a statement the parser refuses (`Parser Error`) leaves
+  the transaction as it was, and the next statement still reads its writes.
+  Every other class of engine error aborts it: a missing table or function
+  (`Catalog Error`), an unknown column or mismatched types (`Binder Error`), a
+  PRIMARY KEY, NOT NULL or CHECK violation (`Constraint Error`), a failed cast
+  (`Conversion Error`), an overflow (`Out of Range Error`), `error()` and a
+  missing parameter (`Invalid Input Error`), and a second `BEGIN`
+  (`TransactionContext Error`). After any of them a statement that reads or
+  writes answers `Current transaction is aborted (please ROLLBACK)` until
+  `ROLLBACK` or `COMMIT` ends it, and a `COMMIT` then answers like any other
+  and rolls back.
+- **The view knows whether the transaction is aborted by asking it.** Only
+  one answer settles it: an aborted transaction answers `SELECT 1` with that
+  error, and a sound one answers it. Other statements prove nothing, since
+  some answer on an aborted transaction (measured: `PREPARE` does). So after
+  any statement on the session that may have run and failed, the view asks
+  `SELECT 1` at once, in the same turn on the session, and the band says what
+  came back. The keepalive asks too. The band is therefore not a guess, and
+  does not say aborted of a statement Harbor itself turned away, such as a
+  protected `SET`. When the question cannot be answered, the band reads
+  `transaction open, its state unconfirmed after an error`.
+- **A `COMMIT` that rolled back says so.** Before a `COMMIT` the view asks
+  once more, and sends the `COMMIT` in the same turn, so no results page or
+  keepalive can come between the two and abort what was just found sound. A
+  `COMMIT` of an aborted transaction then reports `COMMIT rolled back: an
+  earlier error aborted the transaction, and nothing since BEGIN was kept.`
+  and never `ok`. If the question gets no answer, because the session is busy
+  or silent, the `COMMIT` is not sent: `could not confirm the transaction's
+  state (…), so the COMMIT was not sent: try again`, with the transaction as
+  it was. This covers the errors the user did not see as a statement's
+  verdict: inside a transaction a count of a paged result that ran and failed
+  is reported as the run's error, where outside one it only leaves the total
+  unknown, and a results page that fails to read turns the band.
+- **Only the engine's answer ends it.** A `COMMIT` the engine refuses (two
+  transactions inserting the same key) ends the transaction rolled back, and
+  the view adds `The transaction is over: its changes were rolled back.` A
+  `COMMIT` or `ROLLBACK` that never ran leaves the transaction open and the
+  session held, under the message it got: Harbor refused it before the engine
+  saw it, because the session is still running the statement before it
+  (`session_busy`, which a statement that outlived the view's two-minute wait
+  can cause) or the server is not serving, or it could not be sent at all.
+- **An ending with no verdict is not shown as open.** That is a `COMMIT` or
+  `ROLLBACK` that got no answer, or that Harbor answered `cancelled` (a
+  deadline or a cancel interrupted it after the engine had it) or `internal`.
+  The view releases the session, which rolls back anything still open, and
+  says the transaction may have ended either way. Two cases leave no doubt and
+  say so: a `ROLLBACK` is rolled back either way, by the statement or by that
+  release, and so is a `COMMIT` of a transaction already found aborted. If the
+  engine answers that no transaction is active, the view says the session
+  held none and that the statement changed nothing; it does not claim a
+  rollback.
+- **Leaving ends it.** The session is released, and the transaction rolled
+  back, when the view goes: the connection drops, another database is chosen,
+  or the app quits. ⌘Q and the close button ask first (EDITING.md,
+  "Dialogs"); every quit releases the session, the ones that ask nothing
+  included, and so does one while the `BEGIN` itself is still in flight.
 
 ## Results
 
@@ -101,7 +218,9 @@ and copy all carry over. Row numbers are result ordinals.
 **Paging.** A result pages like a table, because the grid's FROM target is the
 statement itself in parentheses: `SELECT * FROM (statement) LIMIT … OFFSET …`,
 for the SELECT-shaped family (select, with, from, values, table, or a
-parenthesized statement). The pager, size cycling and jump-to-last all work.
+parenthesized statement) and for the statements that answer with a table of
+their own (describe, summarize, show, pivot, unpivot), behind any leading
+comments. The pager, size cycling and jump-to-last all work.
 
 A run costs at most the two queries the Data view pays for a table, and usually
 one. Page 0 fetches `size + 1` rows, and a result that fits the page is its own
@@ -112,6 +231,13 @@ the statement runs bare, so an error always quotes the user's own SQL, never the
 wrapper's. A statement that cannot be wrapped keeps its whole result as one
 page, with the pager hidden. The costs are named: a big result runs its plan
 twice, and deep OFFSET pages re-skip rows, as table paging does.
+
+Inside a transaction every page of a result is read on the transaction's
+session, so later pages see what it has written, for as long as it is open.
+There the probe's failure is the verdict unless it failed to parse: any other
+error has aborted the transaction, and running the statement bare would only
+report that. Such an error quotes the wrapped statement, whose line numbers
+are one higher than the statement's own.
 
 **A statement with no result set** reports `ok · 2 ms` in the status line
 rather than showing an empty grid.
@@ -162,10 +288,11 @@ Designed, not built.
   runs every statement top to bottom and stops at the first error; ⌘. cancels
   through Harbor; ⌘L switches to Query from anywhere; ⌘Enter works from the
   results pane too.
-- **A held session.** One Harbor session opened at the first run and held while
-  the berth stays connected, so temp tables, macros and `BEGIN`…`COMMIT` carry
-  between runs. A dead session would reopen on the next run with a note that
-  its temporary state is gone.
+- **A session for the whole visit.** One Harbor session held while the berth
+  stays connected, so temp tables and macros carry between runs outside a
+  transaction too. It needs a session without the five-minute deadline. A dead
+  session would reopen on the next run with a note that its temporary state is
+  gone.
 - **Several results.** One result per completed statement of a run-all, as
   chips above the grid (`2 · SELECT · 500 rows · 12 ms`). An error would carry
   its statement and position, and clicking it would move the caret there.
