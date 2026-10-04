@@ -3,7 +3,7 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by release
 date, newest first.
 
-## 0.22.9 — 2026-10-03
+## 0.22.9 — 2026-10-04
 
 - **⌘Q and the close button ask before they lose anything.** EDITING.md
   promised one dialog, on quitting with staged changes, and none existed: ⌘Q
