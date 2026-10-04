@@ -2,7 +2,7 @@
 
 Read this first. It says what the repo is, how its owner works, how the
 pieces fit, how to build, test and release, and what is open. Everything
-here was true on 2026-09-23 at harbor v0.42.0 and DuckTable v0.22.6; the
+here was true on 2026-10-04 at harbor v0.44.2 and DuckTable v0.22.9; the
 changelog and git history are the record after that.
 
 ## What this is
@@ -12,10 +12,13 @@ version and release tags:
 
 - **`harbor/`** — DuckDB Harbor. One small binary that serves a DuckDB file
   over plain HTTP to any client, and is its own REPL. Tags are `v*`.
-- **`ducktable/`** — DuckTable. A native macOS client for Harbor servers
-  (Rust + GPUI). Tags are `ducktable-v*`. It builds Harbor's protocol crates
-  from the sibling tree, so the wire contract is checked on both sides of
-  every commit.
+- **`ducktable/`** — DuckTable. A native macOS client for Harbor servers,
+  for Apple silicon, in Rust on GPUI through gpui-kit (pinned to Steve's
+  fork; see "DuckTable and the gpui-kit fork"). Tags are `ducktable-v*`. It
+  builds Harbor's protocol crates from the sibling tree, so the wire
+  contract is checked on both sides of every commit. `ducktable/AGENTS.md`
+  holds its rules, and `ducktable/docs/` its design, editing, query and
+  update contracts.
 
 The root `README.md` is the front door to both. `harbor/README.md` is the
 product's full manual and is kept current; `harbor/PRODUCT.md` explains the
@@ -275,11 +278,15 @@ release"). Land the changelog entry first, and the Sparkle pin when Sparkle
 has a newer stable release — every DuckTable release ships the latest stable
 Sparkle, never a beta: set `sparkle_version` and `sparkle_sha256` together
 in `scripts/sparkle.sh`, the path in `docs/UPDATES.md`, and say so in the
-changelog. Release harbor first when both ship, since the lockfile records
-harbor-common and wire. Then, from a clean `main` in step with origin, in
-`ducktable/`: `scripts/release.sh X.Y.Z --dry-run`, `scripts/release.sh
-X.Y.Z`, and `scripts/update-cask.sh X.Y.Z`, and merge the tap's pull
-request. The release script sets the version and runs `cargo update -w`,
+changelog. The changelog heading carries the day the release ships. Release
+harbor first when both ship, since the lockfile records harbor-common and
+wire. Then, from a clean `main` in step with origin, in `ducktable/`:
+`scripts/release.sh X.Y.Z --dry-run`, `scripts/release.sh X.Y.Z`, and
+`scripts/update-cask.sh X.Y.Z`, and merge the tap's pull request
+(`Casks/ducktable.rb` on `shreeve/homebrew-tap`) once its checksum matches
+the release's `DuckTable-X.Y.Z.zip`. The release is the one job done in the
+shared checkout, since the script refuses anything but `main`: look first,
+as for any work there. The release script sets the version and runs `cargo update -w`,
 commits "DuckTable X.Y.Z" straight to `main` with an annotated
 `ducktable-vX.Y.Z` tag, publishes the versioned release (never `--latest`)
 and rewrites the `ducktable-updates` feed; confirm `appcast.xml` lists the
@@ -311,6 +318,40 @@ fifteen seconds later, so look after that, not at once: `harbor` (the
 listing, whose VERSION column is the running server's),
 `systemctl --user is-active harbor-medlabs`, and
 `cd ~/src/medlabs && rip sites status medlabs --json`.
+
+## DuckTable and the gpui-kit fork
+
+DuckTable draws its UI with gpui-kit (GPUI, gpui-pre 0.3.7, and Longbridge's
+component library), and never vendors it. It builds against Steve's fork,
+`shreeve/gpui-kit`: the branch `patched/0.7` is Longbridge's main with the
+fork's fixes on top, each tagged `v0.7.0-patched.N`. The fork's checkout,
+`~/Data/Code/gpui-kit`, belongs to the GPUI session, which owns the branch,
+its tags and the upstream pull requests, and tracks them in
+`.upstream/TRACKING.md` there. Other sessions read it and change nothing in
+it.
+
+- **One rev for five crates.** `ducktable/Cargo.toml` pins gpui-kit,
+  gpui-base, gpui-component, gpui-component-macros and gpui-kit-assets in
+  `[patch.crates-io]` to the commit of one tag. A crate from a git source
+  takes its siblings from that source, so a mixed set does not resolve.
+- **Moving the pin** is its own pull request: replace the rev in all five
+  lines and the tag named in the comment, `cargo update -p` the five
+  crates, confirm `Cargo.lock` names only that rev, then build, test and
+  look by hand at the Structure view's DDL card, ⌘- and ⇧-click selection,
+  Home and End, column widths, the Query editor's line numbers and send
+  mark, the sidebar's width on a window resize, and the inspector's
+  divider. A regression goes to the GPUI session as a repro against the tag
+  that showed it, and DuckTable stays on the tag it had.
+- **A change DuckTable needs from the kit is made in the fork**, generic
+  rather than DuckTable's, by the GPUI session, and reaches DuckTable as a
+  later tag. DuckTable does not patch around the kit.
+- **GPUI has no should-quit hook.** Its app delegate registers
+  `applicationWillTerminate:` and not `applicationShouldTerminate:`, so
+  Quit from the Dock's menu and a logout end DuckTable without its quit
+  dialog. Steve is raising it with Zed; the GPUI session tracks it as item
+  11 of `TRACKING.md`, with an Objective-C runtime fallback if Zed does not
+  add one. The updater's Install and Relaunch asks anyway, through
+  Sparkle's own delegate.
 
 ## Reedline
 
@@ -419,10 +460,22 @@ levels.
 - **A binary wire mode** is parked until DuckDB GA.
 - **The deployment runbook** (`duckdb-harbor-runbook`) is deferred to GA;
   four decisions were recorded so they are not re-derived.
-- **DuckTable** is at 0.22.6, early and moving fast; its own docs are under
+- **DuckTable** is at 0.22.9, early and moving fast; its own docs are under
   `ducktable/docs/`. Its Sparkle signing key lives in the login keychain
   under the account `ducktable`, with a backup in the gitignored, untracked
-  `notes.txt` at the repo root. Never commit that file.
+  `notes.txt` at the repo root. Never read or commit that file. Open:
+  - *EXPLAIN output* (#132): the grid shows a plan's first line, which is a
+    box border, and the inspector right-aligns the plan. It wants a
+    preformatted, full-width view.
+  - *A called-off Open Database URL* is dialed again on Cancel as a plain
+    remote connect, without the config entry being saved again. It wants an
+    `Aim` of its own.
+  - *A COMMIT answered 499* is read as in doubt. A session's COMMIT runs to
+    its answer (harbor 0.44.2), so a 499 there means nothing was kept, and
+    the held set's verdict could say so.
+  - *Paths reviewed and unit-tested but not yet watched on screen:* the held
+    set's two verdicts after a COMMIT that got no answer, and Install and
+    Relaunch held by the quit dialog against a real update.
 - **Windows cannot list its servers.** The list finds servers by unix
   socket and Windows has none; the list says so and gives the URL form.
 - **Linux glibc floor.** Release archives are built on Ubuntu 24.04 and

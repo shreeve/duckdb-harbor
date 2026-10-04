@@ -6,8 +6,9 @@ and what is open. This file is the short form of its rules; where the two
 differ, `HANDOFF.md` is right.
 
 - **Two products, one repository.** `harbor/` is DuckDB Harbor, the server
-  and its CLI. `ducktable/` is DuckTable, the macOS client. Each has its
-  own workspace, version, changelog and release tags.
+  and its CLI. `ducktable/` is DuckTable, the macOS client, with rules of
+  its own in `ducktable/AGENTS.md`. Each has its own workspace, version,
+  changelog and release tags.
 - **Work in a worktree** under `~/Data/Code/duckdb-harbor-wt/`, never by
   switching branches in the shared checkout, which may hold another
   session's uncommitted work.
