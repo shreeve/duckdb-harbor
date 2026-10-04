@@ -4593,6 +4593,11 @@ fn settle_fetch(after: Option<&PostCommit>, read: bool, edits: Option<&mut Edits
 /// is the way out there, and is taken.
 fn verdict_refusal(landed: bool, reshaped: bool, unjudged: Option<edits::Unjudged>) -> Option<&'static str> {
     match unjudged {
+        // On changed columns the one verdict offered is the discard.
+        Some(edits::Unjudged::Running) if reshaped => Some(
+            "the commit that sent these may still be running · refresh (⌘R) until it is over, \
+             then discard them all",
+        ),
         Some(edits::Unjudged::Running) => Some(
             "the commit that sent these may still be running · refresh (⌘R) until it is over, \
              then say whether it landed",
@@ -5317,7 +5322,9 @@ mod tests {
         for landed in [true, false] {
             assert!(verdict_refusal(landed, false, Some(Running)).unwrap().contains("may still be running"));
             assert!(verdict_refusal(landed, false, Some(Unread)).unwrap().contains("was not read after the commit"));
-            assert!(verdict_refusal(landed, true, Some(Running)).unwrap().contains("may still be running"));
+            let reshaped = verdict_refusal(landed, true, Some(Running)).unwrap();
+            assert!(reshaped.contains("may still be running") && reshaped.contains("discard them all"));
+            assert!(!reshaped.contains("say whether it landed"), "the reshaped popover offers no such choice");
         }
         // Judgeable, both verdicts are taken.
         assert_eq!(verdict_refusal(true, false, None), None);

@@ -28,7 +28,8 @@ date, newest first.
   ignored until it is answered. What was already under way waits: a connect
   in flight is called off when the dialog opens and dialed again on Cancel, a
   table switch that lands under it, or that waited on a commit which settles
-  under it, runs on Cancel, and a server that stops under it leaves its
+  under it, runs on Cancel unless a connect is dialed again, which replaces
+  the grid the switch was for, and a server that stops under it leaves its
   connection on screen until then. Cancel finds the grid, the query and the
   staged edits as they were, apart from what a commit or a statement already
   in flight finished meanwhile.

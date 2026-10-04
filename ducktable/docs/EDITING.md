@@ -538,7 +538,8 @@ wait for the answer. A connect still in flight when the dialog opens is
 called off, since landing it would replace everything behind the dialog; on
 Cancel it is dialed again. A table switch whose page arrives under the
 dialog, or that was waiting on a commit which settles under it, runs on
-Cancel. A server that stops under the dialog leaves its connection on screen
+Cancel; when a connect is dialed again the switch is dropped, since the
+connect replaces the grid it was for. A server that stops under the dialog leaves its connection on screen
 until Cancel, which drops it. What a commit or a statement already in flight
 finishes meanwhile is finished: the dialog's text follows it.
 
