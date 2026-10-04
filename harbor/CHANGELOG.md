@@ -4,7 +4,7 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
-## 0.44.1 — 2026-10-03
+## 0.44.1 — 2026-10-04
 
 - **A `COMMIT` on an aborted transaction says it was rolled back.** Almost
   any error inside a transaction aborts it, and so does a cancelled
