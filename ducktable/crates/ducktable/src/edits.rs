@@ -178,6 +178,90 @@ pub fn handoff(mine: Option<&Edits>, has_columns: bool, stash: &Edits) -> Handof
     }
 }
 
+/// Staged sets kept off screen, per database and per table (Law 4: staged
+/// changes belong to the table, not the view). A table switch parks the
+/// outgoing table's set; a connection that goes — the server stopped or
+/// gone, another database chosen — parks the grid's own with the rest.
+/// Each is handed back when its table is opened on its database again,
+/// and judged there (`handoff`). `K` is the database's key, app.rs's.
+#[cfg_attr(not(test), expect(dead_code, reason = "app.rs parks staged sets here, per database"))]
+pub struct Parked<K> {
+    sets: HashMap<K, HashMap<String, Edits>>,
+}
+
+impl<K> Default for Parked<K> {
+    fn default() -> Self {
+        Self { sets: HashMap::new() }
+    }
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "app.rs parks staged sets here, per database"))]
+impl<K: Eq + std::hash::Hash> Parked<K> {
+    /// Keep `edits` for its table on database `db`. A set with nothing in
+    /// it is not kept.
+    pub fn park(&mut self, db: K, edits: Edits) {
+        if edits.any_staged() {
+            self.sets.entry(db).or_default().insert(edits.source().to_string(), edits);
+        }
+    }
+
+    /// The set parked for table `source` on database `db`, given up to the
+    /// grid that opens that table.
+    pub fn take(&mut self, db: &K, source: &str) -> Option<Edits> {
+        let tables = self.sets.get_mut(db)?;
+        let edits = tables.remove(source);
+        if tables.is_empty() {
+            self.sets.remove(db);
+        }
+        edits
+    }
+
+    /// Every set parked for database `db`.
+    pub fn at(&self, db: &K) -> impl Iterator<Item = &Edits> {
+        self.sets.get(db).into_iter().flat_map(HashMap::values)
+    }
+
+    /// Every set parked, on every database: what a quit would lose.
+    pub fn sets(&self) -> impl Iterator<Item = &Edits> {
+        self.sets.values().flat_map(HashMap::values)
+    }
+
+    /// Drop every set parked for database `db`, which is being forgotten.
+    pub fn forget(&mut self, db: &K) {
+        self.sets.remove(db);
+    }
+}
+
+/// What staged sets hold, as the dialogs that would lose them count it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[cfg_attr(not(test), expect(dead_code, reason = "app.rs counts staged sets with this"))]
+pub struct Tally {
+    /// Changes staged and not sent.
+    pub staged: usize,
+    /// The tables those are in.
+    pub tables: usize,
+    /// Changes held after a commit that got no answer: they may already be
+    /// in the database, so they are not called uncommitted.
+    pub held: usize,
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "app.rs counts staged sets with this"))]
+impl Tally {
+    pub fn of<'a>(sets: impl IntoIterator<Item = &'a Edits>) -> Self {
+        sets.into_iter().filter(|e| e.any_staged()).fold(Self::default(), |t, e| {
+            if e.in_doubt() {
+                Self { held: t.held + e.len(), ..t }
+            } else {
+                Self { staged: t.staged + e.len(), tables: t.tables + 1, ..t }
+            }
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.staged == 0 && self.held == 0
+    }
+}
+
 /// What a COMMIT's answer says of its transaction.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CommitOutcome {
@@ -2926,6 +3010,66 @@ mod tests {
         for code in ["internal", "response_too_large", "some_later_code"] {
             assert_eq!(commit_outcome(Some(&refused(code))), CommitOutcome::InDoubt, "{code}");
         }
+    }
+
+    /// A set staged against `"main".<table>`, with `n` rows changed.
+    fn staged_on(table: &str, n: i64) -> Edits {
+        let mut e = Edits::new(
+            format!("\"main\".\"{table}\""),
+            vec!["id".into()],
+            vec!["id".into(), "name".into()],
+            vec!["INTEGER".into(), "VARCHAR".into()],
+        );
+        for id in 0..n {
+            e.stage_delete(vec![json!(id)]);
+        }
+        e
+    }
+
+    #[test]
+    fn staged_sets_are_parked_per_database_and_per_table() {
+        let mut parked = Parked::default();
+        parked.park("a.duckdb", staged_on("t", 2));
+        parked.park("a.duckdb", staged_on("u", 1));
+        parked.park("b.duckdb", staged_on("t", 3));
+        // An empty set is nothing to keep.
+        parked.park("b.duckdb", staged_on("v", 0));
+        assert_eq!(Tally::of(parked.sets()), Tally { staged: 6, tables: 3, held: 0 });
+        assert_eq!(Tally::of(parked.at(&"a.duckdb")), Tally { staged: 3, tables: 2, held: 0 });
+        // A table of one database is not the same-named table of another.
+        let t = parked.take(&"b.duckdb", "\"main\".\"t\"").unwrap();
+        assert_eq!(t.len(), 3);
+        assert!(parked.take(&"b.duckdb", "\"main\".\"t\"").is_none(), "given up once");
+        assert!(parked.take(&"b.duckdb", "\"main\".\"v\"").is_none());
+        assert_eq!(parked.at(&"b.duckdb").count(), 0);
+        assert_eq!(parked.take(&"a.duckdb", "\"main\".\"t\"").map(|e| e.len()), Some(2));
+        // Parking a table's set again replaces what was parked for it.
+        parked.park("a.duckdb", staged_on("u", 4));
+        assert_eq!(Tally::of(parked.sets()), Tally { staged: 4, tables: 1, held: 0 });
+        // A database forgotten takes its sets with it, and only its own.
+        parked.park("b.duckdb", t);
+        parked.forget(&"a.duckdb");
+        assert_eq!(Tally::of(parked.sets()), Tally { staged: 3, tables: 1, held: 0 });
+    }
+
+    #[test]
+    fn a_tally_counts_held_changes_apart_from_staged_ones() {
+        let mut held = staged_on("t", 2);
+        held.mark_in_doubt(None, false);
+        let sets = [staged_on("u", 3), held, staged_on("v", 0)];
+        let tally = Tally::of(&sets);
+        assert_eq!(tally, Tally { staged: 3, tables: 1, held: 2 });
+        assert!(!tally.is_empty());
+        assert!(Tally::of(&sets[2..]).is_empty());
+
+        // A held set parked and handed back is still held, and is judged
+        // against the page its table is opened with.
+        let mut parked = Parked::default();
+        let [_, held, _] = sets;
+        parked.park(1, held);
+        let back = parked.take(&1, "\"main\".\"t\"").unwrap();
+        assert!(back.in_doubt() && back.statements().is_empty());
+        assert_eq!(handoff(Some(&staged_on("t", 0)), true, &back), Handoff::Adopt);
     }
 
     #[test]

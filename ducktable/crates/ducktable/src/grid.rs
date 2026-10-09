@@ -2562,6 +2562,19 @@ impl Grid {
         Some(e)
     }
 
+    /// Surrender the staged set this grid holds when its connection goes:
+    /// the server stopped or gone, or another database chosen. A stash
+    /// parked here goes back as it came; a set of a commit in flight goes
+    /// held (`surrender`). None when nothing is staged.
+    #[expect(dead_code, reason = "app.rs parks this when a connection goes")]
+    pub(crate) fn surrender_edits(&mut self) -> Option<Edits> {
+        if let Some(parked) = self.parked.take() {
+            return Some(parked);
+        }
+        let session = self.commit_session.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        surrender(self.edits.take()?, self.committing, self.post_commit.as_ref(), session)
+    }
+
     /// Receive a stashed staging set from a previous visit to this
     /// table (`edits::handoff`). Adopted only when the table still has the
     /// same identity and columns — a changed schema orphans the stash rather
@@ -4394,6 +4407,21 @@ fn settle_fetch(after: Option<&PostCommit>, read: bool, edits: Option<&mut Edits
     }
 }
 
+/// The staged set a grid gives up when its connection goes. One whose
+/// commit is in flight may land with no answer seen here, so it goes held,
+/// to be judged whole when its table is opened again: with the commit's
+/// session while that may still be running, and with no page read after
+/// it. One whose commit got no answer goes as `settle_fetch` would have
+/// held it; one whose commit landed was cleared. None when nothing is left.
+fn surrender(mut edits: Edits, committing: bool, after: Option<&PostCommit>, session: Option<String>) -> Option<Edits> {
+    match after {
+        Some(PostCommit::InDoubt { unsettled, .. }) => edits.mark_in_doubt(unsettled.clone(), false),
+        None if committing => edits.mark_in_doubt(session, false),
+        _ => {}
+    }
+    edits.any_staged().then_some(edits)
+}
+
 /// Why a verdict on a held set is not taken, if it is not. Neither verdict
 /// is taken while the commit may still be running or the database has not
 /// been read since it ended: the page is what the set is judged against, and
@@ -5369,6 +5397,31 @@ mod tests {
         alone("DROP TABLE _dt_order");
         alone("DROP SEQUENCE _dt_order_seq");
         alone("DROP TABLE _dt_double");
+    }
+
+    #[test]
+    fn a_set_whose_commit_is_in_flight_goes_held_with_its_connection() {
+        use edits::Unjudged::{Running, Unread};
+        // Not committing: the set goes as it is, and an empty one not at all.
+        let e = super::surrender(staged(), false, None, None).unwrap();
+        assert!(!e.in_doubt() && e.statements().len() == 2);
+        let empty = Edits::new("\"main\".\"t\"".into(), vec!["id".into()], vec!["id".into()], vec!["INTEGER".into()]);
+        assert!(super::surrender(empty, false, None, None).is_none());
+        // The commit is running on its session: held, and asked after.
+        let e = super::surrender(staged(), true, None, Some("session-1".into())).unwrap();
+        assert!(e.in_doubt() && e.statements().is_empty());
+        assert_eq!((e.unsettled(), e.unjudged()), (Some("session-1"), Some(Running)));
+        // Its session not yet opened: held all the same, judged on a page.
+        let e = super::surrender(staged(), true, None, None).unwrap();
+        assert_eq!(e.unjudged(), Some(Unread));
+        // The COMMIT got no answer and its page has not landed.
+        let doubt = PostCommit::InDoubt { message: "x".into(), unsettled: Some("session-2".into()) };
+        let e = super::surrender(staged(), true, Some(&doubt), None).unwrap();
+        assert_eq!((e.unsettled(), e.unjudged()), (Some("session-2"), Some(Running)));
+        // The commit landed and cleared the set: nothing to keep.
+        let mut cleared = staged();
+        cleared.clear();
+        assert!(super::surrender(cleared, true, Some(&PostCommit::Landed), None).is_none());
     }
 
     #[test]
