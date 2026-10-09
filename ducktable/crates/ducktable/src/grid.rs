@@ -845,6 +845,11 @@ impl Grid {
                         grid.error = stale_reason(true, false, grid.in_doubt()).map(str::to_string);
                         None
                     }
+                    // Text typed while the page was on its way is confirmed
+                    // against the page it was typed on, whose identities the
+                    // delegate still holds. Text the column refuses keeps the
+                    // editor, the reason and that page.
+                    Ok(_) if !grid.settle_editor(cx) => None,
                     Ok((result, total)) => {
                         grid.reshaped = false;
                         grid.unrefreshed = false;
@@ -858,9 +863,6 @@ impl Grid {
                             grid.total_rows = t;
                         }
                         grid.last_time_ms = result.time_ms;
-                        // New rows displace old indexes; an editor left
-                        // open would be typing into a stranger's cell.
-                        grid.editor = None;
                         Some(result)
                     }
                     Err(message) => {
@@ -1283,8 +1285,13 @@ impl Grid {
         cx.notify();
     }
 
-    /// Show or hide one column (never the last visible one).
+    /// Show or hide one column (never the last visible one). Text in an open
+    /// editor is staged first, as for "Hide all": a hidden column cannot
+    /// show the editor typing into it.
     pub(crate) fn toggle_column(&mut self, schema_ix: usize, cx: &mut Context<Self>) {
+        if !self.settle_editor(cx) {
+            return;
+        }
         self.remap_columns(cx, |d| {
             if !d.hidden.remove(&schema_ix) {
                 if d.visible.len() <= 1 {
@@ -1373,6 +1380,9 @@ impl Grid {
     /// all" — the grid never goes to zero columns, so start-from-nothing
     /// keeps one anchor to build from).
     pub(crate) fn hide_all_columns(&mut self, cx: &mut Context<Self>) {
+        if !self.settle_editor(cx) {
+            return;
+        }
         self.remap_columns(cx, |d| {
             if d.visible.len() <= 1 {
                 return false;
@@ -2793,9 +2803,11 @@ impl Grid {
     }
 
     /// Discard one staged row change (the review popover's per-entry ✕).
-    /// Itself undoable — nothing is more than one ⌘Z from recovery.
+    /// Itself undoable — nothing is more than one ⌘Z from recovery. Text in
+    /// an open editor is staged first, here and in `discard_all`, so a
+    /// discard that removes its row never takes it unseen.
     pub(crate) fn discard_change(&mut self, key: &str, cx: &mut Context<Self>) {
-        if self.committing || self.refuse_held(cx) {
+        if self.committing || !self.settle_editor(cx) || self.refuse_held(cx) {
             return;
         }
         if let Some(e) = &mut self.edits {
@@ -2807,7 +2819,7 @@ impl Grid {
     /// Discard everything staged — one gesture, one undo step, so ⌘Z
     /// brings all of it back at once.
     pub(crate) fn discard_all(&mut self, cx: &mut Context<Self>) {
-        if self.committing || self.refuse_held(cx) {
+        if self.committing || !self.settle_editor(cx) || self.refuse_held(cx) {
             return;
         }
         if let Some(e) = &mut self.edits {
@@ -4023,13 +4035,6 @@ impl Render for Grid {
             window.on_next_frame(move |_, cx| {
                 table.update(cx, |_, cx| cx.notify());
             });
-        }
-        // An editor whose column just got hidden would be invisible but
-        // still focused — cancel it (lossless, like any Esc).
-        if let Some(ed) = &self.editor {
-            if !self.table.read(cx).delegate().visible.contains(&ed.col) {
-                self.cancel_edit(cx);
-            }
         }
         let view = p.view;
         // The title band names what fills the pane. Structure and Data

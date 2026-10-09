@@ -206,10 +206,14 @@ not change, and printable exotica (AltGr, IME) already land on rung 6.
 - A gesture that replaces the page, or the grid, confirms an open editor
   first: a pager click, a page-size change, a filter applied or cleared, the
   filter strip closed over an applied filter, a refresh, a switch to another
-  table, and ⌘S from the review popover. Text the column refuses keeps the
-  editor open with the reason, and the page, the strip and the table where
-  they are. ⌥↑/⌥↓ are not among them: with an editor open they are the
-  editor's keys and flip no page.
+  table, and ⌘S from the review popover. So do a discard from the review
+  popover and hiding columns, and a page that lands while an editor is open:
+  ⌥↓ keeps the ring seated, so a key typed before the next page arrives opens
+  an editor on the page it flips from, and the text is confirmed against that
+  page before the new one replaces it. Text the column refuses keeps the
+  editor open with the reason, and the page, the strip, the columns and the
+  table where they are. ⌥↑/⌥↓ are not among them: with an editor open they
+  are the editor's keys and flip no page.
 - Two things drop an open editor's text besides Esc. Choosing a database in
   the sidebar, the connected one included, leaves the connected one without
   asking: its staged changes, parked ones too, and any text being typed go
