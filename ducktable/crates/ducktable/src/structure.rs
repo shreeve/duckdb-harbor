@@ -21,18 +21,10 @@ use gpui_kit::component::StyledExt as _;
 /// the card minus this.
 const DDL_CHROME: f32 = 34.;
 
-pub(crate) struct StructCol {
-    pub(crate) name: String,
-    pub(crate) ty: String,
-    pub(crate) notnull: bool,
-    pub(crate) dflt: Option<String>,
-    pub(crate) generated: bool,
-    pub(crate) generation_expression: Option<String>,
-    pub(crate) pk: bool,
-}
-
 pub(crate) struct TableStructure {
-    pub(crate) cols: Vec<StructCol>,
+    pub(crate) cols: Vec<harbor_client::catalog::Column>,
+    /// The engine's own CREATE TABLE, as the catalog gives it: what Copy
+    /// DDL copies. The view shows it reformatted (`pretty_ddl`).
     pub(crate) ddl: Option<String>,
 }
 
@@ -42,7 +34,7 @@ impl TableStructure {
     /// shadows the implicit one in every query, so such a table has no
     /// identity at all and is read-only.
     pub(crate) fn keyed_by_rowid(&self) -> bool {
-        !self.cols.iter().any(|c| c.pk || c.name.eq_ignore_ascii_case("rowid"))
+        !self.cols.iter().any(|c| c.primary || c.name.eq_ignore_ascii_case("rowid"))
     }
 }
 
@@ -50,20 +42,7 @@ impl TableStructure {
 /// connection already holds — no query, so the Structure view is as
 /// current as the sidebar and never a frame behind it.
 pub(crate) fn table_structure(table: &harbor_client::Table) -> TableStructure {
-    let cols = table
-        .columns
-        .iter()
-        .map(|c| StructCol {
-            name: c.name.clone(),
-            ty: c.duck_type.clone(),
-            notnull: c.not_null,
-            dflt: c.default.clone(),
-            generated: c.generated,
-            generation_expression: c.generation_expression.clone(),
-            pk: c.primary,
-        })
-        .collect();
-    TableStructure { cols, ddl: table.ddl.as_deref().map(pretty_ddl) }
+    TableStructure { cols: table.columns.clone(), ddl: table.ddl.clone() }
 }
 
 /// Reformat DuckDB's one-line CREATE TABLE into an indented definition:
@@ -132,18 +111,28 @@ pub(crate) fn pretty_ddl(sql: &str) -> String {
     }
     let defs: Vec<String> = defs.iter().map(|d| d.trim().to_string()).collect();
     // Pad column names so the types line up; table-level constraints
-    // (PRIMARY KEY (...), UNIQUE (...), FOREIGN KEY ...) go unpadded.
+    // (PRIMARY KEY (...), UNIQUE (...), FOREIGN KEY ...) go unpadded. A
+    // quoted name ends at its first quote that is not doubled, and is as
+    // wide as its characters.
     let name_len = |d: &str| -> Option<usize> {
-        let n = if d.starts_with('"') {
-            d[1..].find('"').map(|e| e + 2)?
-        } else {
-            d.find(char::is_whitespace)?
+        let n = match d.strip_prefix('"') {
+            Some(quoted) => {
+                let mut chars = quoted.char_indices().peekable();
+                loop {
+                    match chars.next()? {
+                        (_, '"') if chars.next_if(|(_, c)| *c == '"').is_some() => {}
+                        (at, '"') => break at + 2,
+                        _ => {}
+                    }
+                }
+            }
+            None => d.find(char::is_whitespace)?,
         };
         const TABLE_LEVEL: [&str; 5] =
             ["PRIMARY", "UNIQUE", "FOREIGN", "CHECK", "CONSTRAINT"];
         (!TABLE_LEVEL.contains(&d[..n].to_uppercase().as_str())).then_some(n)
     };
-    let width = defs.iter().filter_map(|d| name_len(d)).max().unwrap_or(0);
+    let width = defs.iter().filter_map(|d| name_len(d).map(|n| d[..n].chars().count())).max().unwrap_or(0);
     let mut out = String::with_capacity(sql.len() + defs.len() * 4);
     out.push_str(head);
     out.push_str(" (\n");
@@ -152,7 +141,7 @@ pub(crate) fn pretty_ddl(sql: &str) -> String {
         match name_len(d) {
             Some(n) => {
                 out.push_str(&d[..n]);
-                for _ in n..width + 1 {
+                for _ in d[..n].chars().count()..width + 1 {
                     out.push(' ');
                 }
                 out.push_str(d[n..].trim_start());
@@ -222,10 +211,10 @@ pub(crate) fn columns_grid(
         .iter()
         .map(|c| {
             let mut attrs = Vec::new();
-            if c.pk {
+            if c.primary {
                 attrs.push("PK");
             }
-            if c.notnull {
+            if c.not_null {
                 attrs.push("NOT NULL");
             }
             if c.generated {
@@ -233,11 +222,11 @@ pub(crate) fn columns_grid(
             }
             vec![
                 c.name.clone().into(),
-                c.ty.clone().into(),
+                c.duck_type.clone().into(),
                 attrs.join(" \u{00b7} ").into(),
                 c.generation_expression
                     .clone()
-                    .or_else(|| c.dflt.clone())
+                    .or_else(|| c.default.clone())
                     .unwrap_or_default()
                     .into(),
             ]
@@ -264,8 +253,7 @@ pub(crate) fn columns_grid(
     });
     grid.update(cx, |g, cx| {
         g.mark_pill_column(2, cx);
-        // Sized to content, like the old fixed-width table — but
-        // resizable and fittable now, because it is a real grid.
+        // Sized to content, and resizable and fittable like any grid.
         g.fit_columns(cx);
     });
     grid
@@ -343,7 +331,7 @@ impl Grid {
             // will derive: card − DDL_CHROME. The wrapper re-wraps
             // synchronously, so the row count read below is
             // FIRST-FRAME correct — drawn
-            // right, not repainted right (Steve's ruling). A cold start
+            // right, not repainted right. A cold start
             // straight into Structure has no recorded width yet and
             // settles via the editor observer instead.
             let avail = pane_width() - PANE_INSET - 12.;
@@ -408,9 +396,9 @@ impl Grid {
             // DDL begins. The columns grid scrolls internally above it;
             // the DDL scrolls below it.
             let pref = crate::prefs::get(cx).structure_split;
-            // Auto (never dragged): the classic ~20-row cap (Steve's
-            // ruling, 2026-08-31), landing mid-row when clipped so a
-            // half-visible row 21 says "cut, not end".
+            // Auto (never dragged): a cap of about 20 rows, landing
+            // mid-row when clipped so a half-visible row 21 says "cut, not
+            // end".
             let auto = if n > 20 { row_h * 21.5 } else { content_h };
             let want = if pref > 0. { pref } else { auto };
             // Never taller than the grid's content — a small table
@@ -499,6 +487,17 @@ mod tests {
     fn ddl_leaves_table_level_constraints_unpadded() {
         let out = pretty_ddl("CREATE TABLE t(a INTEGER, PRIMARY KEY (a));");
         assert!(out.contains("\n  PRIMARY KEY (a)\n"));
+    }
+
+    #[test]
+    fn ddl_keeps_a_doubled_quote_in_a_name_and_pads_by_characters() {
+        // The catalog's own rendering of `CREATE TABLE qq("a""b" INTEGER,
+        // "é wide" VARCHAR, c INTEGER)`.
+        let out = pretty_ddl("CREATE TABLE qq(\"a\"\"b\" INTEGER, \"é wide\" VARCHAR, c INTEGER);");
+        assert_eq!(
+            out,
+            "CREATE TABLE qq (\n  \"a\"\"b\"   INTEGER,\n  \"é wide\" VARCHAR,\n  c        INTEGER\n);"
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@ DuckTable (Rust + GPUI, one macOS app bundle)
     |  HTTP over a local socket or IPv4 loopback TCP
     |  optional app-owned OpenSSH local forward
     v
-DuckDB Harbor 0.39 or later (required; owns engine, files, versions)
+DuckDB Harbor 0.44.2 or later (required; owns engine, files, versions)
     |
     v
 DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
@@ -28,6 +28,10 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
 - **Harbor is required, not optional.** The client never links DuckDB and
   never sees a database file's contents. FFI, engine version lock, WAL
   handling and checkpoint hazards are Harbor's job, not the client's.
+  DuckTable reads a `COMMIT`'s answer as Harbor 0.44.2 gives it: a `COMMIT`
+  of an aborted transaction is rolled back and answered `400` saying so, and
+  a `COMMIT` runs to its answer, so a `499` means nothing was kept. Older
+  servers answer neither way, and DuckTable requires that one or later.
 - **A berth is a file on this machine or a named remote.** Connection works
   the way `harbor`'s own does: a local database is dialed by its file, whose
   server Harbor's socket discovery finds and opening it spawns on demand, and
@@ -165,8 +169,9 @@ law is EDITING.md's "content snaps, chrome fades"; durations are under
 
 Three panes: the sidebar, the content, and the inspector. The content shows
 one of three views of the selected table, **Structure | Data | Query**, chosen
-by the switcher at the left of the bottom bar, by ⌘1/⌘2/⌘3, or by the ⌥←/⌥→
-carousel. Data is the default. The inspector opens beside the Data grid only.
+by the switcher at the left of the bottom bar or by ⌘1/⌘2/⌘3, and kept across
+a table switch; ⌥←/⌥→ step through the tables. Data is the default. The
+inspector opens beside the Data grid only.
 
 The sidebar width, the inspector's open state and width, the Structure view's
 columns/DDL divider and the Query view's editor/results split all persist.
@@ -312,7 +317,7 @@ arrows, ⌘S, ⌘Z, ⌘⌫, ⌃⇧N, ⌘⇧⌫) is EDITING.md's; the Query view'
 | ⌘O | Open Database File |
 | ⌘R | Refresh Tables: the catalog and the open Data page |
 | ⌘1 / ⌘2 / ⌘3 | Structure / Data / Query |
-| ⌥← / ⌥→ | previous / next view, rolling over at the ends |
+| ⌥← / ⌥→ | previous / next table in the sidebar, rolling over at the ends |
 | ⌘N / ⌘D | New Row / Duplicate Row |
 | ⌘I | toggle the inspector |
 | ⌘7 / ⌘8 / ⌘9 (or ⌥7 / ⌥8 / ⌥9) | row numbers / right-aligned numbers / NULL tags |
