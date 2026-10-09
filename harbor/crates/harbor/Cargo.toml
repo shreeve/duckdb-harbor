@@ -24,6 +24,8 @@ serde = "1"
 # for one request at a time buys nothing. TLS-free on purpose; remote
 # human access goes through SSH, while Caddy serves HTTPS app clients.
 wire = { path = "../wire" }
+# The transport, sessions and summon the client half shares with DuckTable.
+harbor-http = { path = "../http" }
 crossterm = "0.29.0"
 nu-ansi-term = "0.50.3"
 reedline = "0.52.0"

@@ -223,6 +223,7 @@ dependencies = [
  "crossterm",
  "getrandom 0.2.17",
  "harbor-common",
+ "harbor-http",
  "justhttp",
  "libc",
  "libloading",
@@ -246,6 +247,16 @@ dependencies = [
  "toml",
  "toml_edit",
  "unicode-width",
+]
+
+[[package]]
+name = "harbor-http"
+version = "0.44.2"
+dependencies = [
+ "harbor-common",
+ "serde",
+ "serde_json",
+ "wire",
 ]
 
 [[package]]

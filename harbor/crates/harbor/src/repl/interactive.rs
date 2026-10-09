@@ -291,7 +291,7 @@ pub fn run(
                                     // the old mooring go: the switch must
                                     // never be the moment both lifetimes hit
                                     // zero clients.
-                                    let moored = crate::repl::http::hold(&c.transport);
+                                    let moored = crate::repl::http::hold(&c.transport).ok();
                                     // A transaction belongs to the server it
                                     // was opened on, and ends with the visit:
                                     // released while that server is still
