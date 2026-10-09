@@ -422,6 +422,36 @@ mod conn {
         ]);
     }
 
+    /// A JSON number binds exactly, as the type a SQL literal of the same
+    /// digits takes, and never as a double that is a different number.
+    #[test]
+    fn a_number_param_binds_exactly() {
+        let number = |text: &str| Param::number(text).unwrap();
+        assert!(matches!(number("-9223372036854775808"), Param::I64(i64::MIN)));
+        assert!(matches!(number("18446744073709551615"), Param::U64(u64::MAX)));
+        assert!(matches!(number("-976.7280889488817"), Param::F64(f) if f == -976.7280889488817));
+        assert!(matches!(number("1.10"), Param::F64(f) if f == 1.1));
+        assert!(matches!(number("-0.0"), Param::F64(f) if f == 0.0));
+        assert!(matches!(number("1.2345678901234568e+23"), Param::F64(_)));
+        assert!(Param::number(&format!("0.{}", "1".repeat(39))).is_err());
+
+        let Some(_) = v2_engine() else { return };
+        let mut c = conn::open(Path::new(":memory:"), &[]).expect("open");
+        for (text, want) in [
+            ("123456789012345678901234", r#""HUGEINT","123456789012345678901234""#),
+            ("-170141183460469231731687303715884105728", r#""HUGEINT","-170141183460469231731687303715884105728""#),
+            ("170141183460469231731687303715884105728", r#""BIGNUM","170141183460469231731687303715884105728""#),
+            ("12345678901234567.89", r#""DECIMAL(19,2)","12345678901234567.89""#),
+            ("0.12345678901234567890123456789012345678", r#""DECIMAL(38,38)","0.12345678901234567890123456789012345678""#),
+            ("-976.7280889488817", r#""DOUBLE",-976.7280889488817"#),
+        ] {
+            let got = rows(&mut c, "SELECT typeof($1), $1", &[number(text)]).unwrap();
+            assert_eq!(got, [want], "for {text}");
+        }
+        let got = rows(&mut c, "SELECT ? + 1", &[number("123456789012345678901234")]).unwrap();
+        assert_eq!(got, [r#""123456789012345678901235""#]);
+    }
+
     #[test]
     fn set_option_reaches_the_engine() {
         let Some(_) = v2_engine() else { return };
