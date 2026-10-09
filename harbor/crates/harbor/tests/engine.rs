@@ -3,20 +3,22 @@
 //! parse -> execute -> fetch -> view, teardown in reverse, every fallible
 //! call checked. `conn` proves the connection layer: open, clone, cache,
 //! batch, params, and cross-thread cancellation. `wire` pins the encoder's
-//! bytes: real queries through the whole v2 path against the 0.20 wire
-//! contract, with v2's sanctioned upgrades (TIME_NS encodes instead of
-//! refusing) pinned as the new expectation.
+//! bytes: real queries through the whole v2 path against the wire contract.
 //!
-//! Every test skips (passes vacuously, with a note) when the resolvable
-//! engine predates the v2 C API, so the suite stays green on v1-era libs;
-//! point HARBOR_LIBDUCKDB at a v2-bearing build to make it bite.
+//! With no engine to load, every test skips with a note, so a machine
+//! without libduckdb can still run the workspace's tests. Where the run
+//! names its engine (HARBOR_LIBDUCKDB) or is CI, a missing engine fails
+//! every test instead: a suite that passed without one would prove nothing.
 
 use harbor::engine::{Engine, Error, engine, ffi};
 
-/// The engine, or a printed skip.
+/// The engine, or a printed skip where a skip is allowed.
 fn v2_engine() -> Option<&'static Engine> {
     match engine() {
         Ok(e) => Some(e),
+        Err(e) if ["HARBOR_LIBDUCKDB", "CI"].iter().any(|v| std::env::var_os(v).is_some()) => {
+            panic!("no engine: {e}")
+        }
         Err(e) => {
             eprintln!("v2: skipped — {e}");
             None
@@ -554,11 +556,30 @@ mod conn {
     const N: i64 = 5000; // > one 2048-row chunk, so the stream is multi-chunk
     const SUM: i64 = N * (N - 1) / 2;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("harbor-groups-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A scratch directory of this test's own, unique to the process so
+    /// concurrent runs never share one, and removed when the test ends.
+    /// Declared before the connections that use it, so it outlives them.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            let dir = std::env::temp_dir().join(format!("harbor-engine-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+    }
+
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// The guard that matters most: an ordinary multi-chunk SELECT must not
@@ -577,7 +598,7 @@ mod conn {
     #[test]
     fn copy_from_database_copies_every_row() {
         let Some(_) = v2_engine() else { return };
-        let dir = scratch("copy");
+        let dir = Scratch::new("copy");
         let mut c = conn::open(&dir.join("src.duckdb"), &[]).expect("open");
         c.execute_batch(&format!("CREATE TABLE t AS SELECT i FROM range({N}) r(i)")).unwrap();
         c.execute_batch(&format!("ATTACH '{}' AS dst", dir.join("dst.duckdb").display())).unwrap();
@@ -589,7 +610,7 @@ mod conn {
     #[test]
     fn import_database_restores_every_row() {
         let Some(_) = v2_engine() else { return };
-        let dir = scratch("import");
+        let dir = Scratch::new("import");
         let exp = dir.join("exp");
         let mut c = conn::open(&dir.join("src.duckdb"), &[]).expect("open");
         c.execute_batch(&format!("CREATE TABLE t AS SELECT i FROM range({N}) r(i)")).unwrap();
@@ -606,7 +627,7 @@ mod conn {
     #[test]
     fn a_failing_group_statement_reports_its_own_error() {
         let Some(_) = v2_engine() else { return };
-        let dir = scratch("err");
+        let dir = Scratch::new("err");
         let exp = dir.join("exp");
         let mut c = conn::open(&dir.join("src.duckdb"), &[]).expect("open");
         c.execute_batch("CREATE TABLE t AS SELECT 1 AS i").unwrap();
@@ -804,6 +825,14 @@ mod wire {
         row(eng, "SELECT DATE '0001-01-01 (BC)', DATE '0010-06-01 (BC)'", r#""0000-01-01","-0009-06-01""#);
         row(eng, "SELECT TIMESTAMP '0044-03-15 (BC) 12:00:00'", r#""-0043-03-15T12:00:00""#);
         row(eng, "SELECT DATE '5877642-06-25 (BC)'", r#""-5877641-06-25""#);
+        // An infinite date or timestamp is a sentinel in storage; it goes out
+        // as the word, at every unit.
+        row(
+            eng,
+            "SELECT 'infinity'::DATE, '-infinity'::DATE, 'infinity'::TIMESTAMP, '-infinity'::TIMESTAMP_S, \
+             'infinity'::TIMESTAMP_MS, '-infinity'::TIMESTAMP_NS, 'infinity'::TIMESTAMPTZ, '-infinity'::TIMESTAMPTZ_NS",
+            r#""infinity","-infinity","infinity","-infinity","infinity","-infinity","infinity","-infinity""#,
+        );
         // v1 refused TIME_NS outright; v2 encodes it.
         row(eng, "SELECT TIME_NS '14:30:00.123456789'", r#""14:30:00.123456789""#);
         // TIME WITH TIME ZONE: local time plus the ISO offset — v1 dropped
