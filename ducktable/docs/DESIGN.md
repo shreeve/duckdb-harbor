@@ -169,8 +169,9 @@ law is EDITING.md's "content snaps, chrome fades"; durations are under
 
 Three panes: the sidebar, the content, and the inspector. The content shows
 one of three views of the selected table, **Structure | Data | Query**, chosen
-by the switcher at the left of the bottom bar, by ⌘1/⌘2/⌘3, or by the ⌥←/⌥→
-carousel. Data is the default. The inspector opens beside the Data grid only.
+by the switcher at the left of the bottom bar or by ⌘1/⌘2/⌘3, and kept across
+a table switch; ⌥←/⌥→ step through the tables. Data is the default. The
+inspector opens beside the Data grid only.
 
 The sidebar width, the inspector's open state and width, the Structure view's
 columns/DDL divider and the Query view's editor/results split all persist.
@@ -316,7 +317,7 @@ arrows, ⌘S, ⌘Z, ⌘⌫, ⌃⇧N, ⌘⇧⌫) is EDITING.md's; the Query view'
 | ⌘O | Open Database File |
 | ⌘R | Refresh Tables: the catalog and the open Data page |
 | ⌘1 / ⌘2 / ⌘3 | Structure / Data / Query |
-| ⌥← / ⌥→ | previous / next view, rolling over at the ends |
+| ⌥← / ⌥→ | previous / next table in the sidebar, rolling over at the ends |
 | ⌘N / ⌘D | New Row / Duplicate Row |
 | ⌘I | toggle the inspector |
 | ⌘7 / ⌘8 / ⌘9 (or ⌥7 / ⌥8 / ⌥9) | row numbers / right-aligned numbers / NULL tags |

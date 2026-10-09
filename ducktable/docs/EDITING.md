@@ -12,8 +12,8 @@ DESIGN.md.
    same frame, first character never lost.
 2. **Nothing writes to the database until you say so.** ⌘S commits
    everything staged as one all-or-nothing transaction. There is no live
-   mode in v1; staging is the load-bearing wall that makes every other
-   liberty here safe.
+   mode; staging is the load-bearing wall that makes every other liberty
+   here safe.
 3. **Esc is a panic key, so it is lossless.** It cancels what you are
    typing and never discards anything you typed: a staged change stays
    staged. The one thing it removes is a new row nothing has been entered
@@ -92,7 +92,7 @@ One meaning per key. No contextual double-agents.
 |---|---|---|
 | typing | opens the editor **replacing** the value, seeded with the keystroke | inserts text |
 | Enter | opens the editor **keeping** the value, caret at end — but during a Tab run, sweeps to the run's anchor column one row down (the carriage return) | confirms the cell, ring moves down — or sweeps, if a Tab run is going |
-| ⇧Enter | (same as Enter, sweeping/moving up) | inserts a line break — the chat-composer convention (Slack, every message box); confirm-and-move-up retired in its favor |
+| ⇧Enter | (same as Enter, sweeping/moving up) | the line break of the chat-composer convention (Slack, every message box): the cell editor is one line, so it is reserved, and never confirms |
 | Tab / ⇧Tab | moves the ring right / left with row-local wraparound, arming the typewriter anchor | confirms, moves right / left with row-local wraparound, and immediately edits the destination cell; anchor kept |
 | arrows | move the ring | *replace entry:* confirm + move the ring · *kept-value entry:* move the caret |
 | double-click | opens the editor keeping the value, caret at the click | — |
@@ -106,7 +106,7 @@ One meaning per key. No contextual double-agents.
 | ⌘⌫ | stages a DELETE for every selected row (ghost strikethrough; one undo step, each row its own entry for review; reversible until commit); a selected new row is discarded instead, since it never existed | — |
 | ⌘Z / ⌘⇧Z | un-stages / re-stages the most recent change | text undo / redo |
 | ⌘S | commits all staged changes — one transaction, all or nothing | confirms the cell, then commits (⌘Enter is its equal) |
-| ⌥Enter | — | newline (the Sheets-hand twin of ⇧Enter) |
+| ⌥Enter | — | reserved for a line break, the Sheets-hand twin of ⇧Enter |
 | ⌘Enter | commits all staged changes | confirms the cell, then commits: ⌘Enter means send, as it does in a chat composer, and ⇧Enter or ⌥Enter mean newline |
 
 The replace-vs-kept-value arrow split is Sheets' own physics, unnamed:
@@ -136,7 +136,7 @@ combination has a deliberate answer:
 | F2 | opens the kept-value editor (the third door, with Enter and double-click — and the one that works mid-Tab-run) |
 | PageUp / PageDown | one screenful up / down within the loaded page (Sheets' meaning), a row of overlap, clamped at the page edge |
 | ⌥↑ / ⌥↓ | previous / next DATABASE page (the pager) — the ring keeps its seat (same column, row clamped); when multiple grid tabs exist someday, these migrate to tab switching (Sheets' worksheet keys) |
-| ⌥← / ⌥→ | step the view switcher's segments left / right, rolling over at the ends (Structure / Data / Query) |
+| ⌥← / ⌥→ | the previous / next table in the sidebar, rolling over at the ends; the views are ⌘1/⌘2/⌘3's |
 | ⌘⇧⌫ | discard all staged changes (TablePlus's chord; one undo step, so even this is reversible) |
 | ⇧ + arrows | deliberately inert — range selection's seat, reserved until ranges ship; a ring that moved when you expected a range to grow would lie |
 | ⌃ + arrows | never bound — macOS owns them (Mission Control, Spaces) |
