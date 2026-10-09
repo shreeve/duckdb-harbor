@@ -1671,6 +1671,25 @@ mod tests {
     }
 
     #[test]
+    fn a_full_precision_double_key_names_its_row() {
+        // 924.2100000029881 needs all seventeen digits. Read by serde_json's
+        // default float parser it is its neighbor, 924.210000002988, and an
+        // UPDATE keyed by that names no row.
+        let line = r#"{"type":"row","values":[924.2100000029881,"a"]}"#;
+        let wire::Event::Row { values } = wire::Event::parse(line).unwrap() else { panic!("a row") };
+        let mut e = Edits::new(
+            "\"main\".\"t\"".into(),
+            vec!["k".into()],
+            vec!["k".into(), "v".into()],
+            vec!["DOUBLE".into(), "VARCHAR".into()],
+        );
+        e.stage_cell(vec![values[0].clone()], 1, txt("a"), txt("b"), json!("b"));
+        let stmts = e.statements();
+        assert_eq!(stmts[0].sql, "UPDATE \"main\".\"t\" SET \"v\" = ? WHERE \"k\" = ?");
+        assert_eq!(serde_json::to_string(&stmts[0].params).unwrap(), r#"["b",924.2100000029881]"#);
+    }
+
+    #[test]
     fn a_column_that_changed_type_is_a_different_shape() {
         let as_text = Edits::new(
             "\"main\".\"t\"".into(),
