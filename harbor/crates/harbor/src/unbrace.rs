@@ -159,28 +159,27 @@ fn alternatives(term: &str, budget: &mut usize) -> Result<Vec<String>, String> {
 /// quotes, comments — marked, so a walk over it steps past them whole.
 struct Text<'a> {
     src: &'a str,
-    /// For a byte that begins an opaque span, the byte after the span.
-    ends: Vec<usize>,
+    /// Each opaque span as (start, end), in order: as many as there are
+    /// spans, not bytes, so a long statement costs no more than it is.
+    spans: Vec<(usize, usize)>,
 }
 
 impl<'a> Text<'a> {
     fn of(src: &'a str) -> Self {
-        let mut ends = vec![0; src.len()];
-        for sp in scan(src) {
-            if sp.kind != Kind::Code {
-                // An unterminated string runs to the end of the text, which
-                // hides any brace after it — as it hides everything else.
-                ends[sp.start] = sp.end.max(sp.start + 1);
-            }
-        }
-        Text { src, ends }
+        let spans = scan(src)
+            .into_iter()
+            .filter(|sp| sp.kind != Kind::Code)
+            // An unterminated string runs to the end of the text, which
+            // hides any brace after it — as it hides everything else.
+            .map(|sp| (sp.start, sp.end.max(sp.start + 1)))
+            .collect();
+        Text { src, spans }
     }
 
+    /// The byte after the opaque span that begins at `i`, if one does.
     fn opaque_end(&self, i: usize) -> Option<usize> {
-        match self.ends[i] {
-            0 => None,
-            end => Some(end),
-        }
+        let k = self.spans.binary_search_by_key(&i, |&(start, _)| start).ok()?;
+        Some(self.spans[k].1)
     }
 
     /// The first group that expands: `(lbrace, rbrace)`. A struct literal and
