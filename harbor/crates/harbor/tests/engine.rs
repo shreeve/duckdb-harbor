@@ -3,20 +3,22 @@
 //! parse -> execute -> fetch -> view, teardown in reverse, every fallible
 //! call checked. `conn` proves the connection layer: open, clone, cache,
 //! batch, params, and cross-thread cancellation. `wire` pins the encoder's
-//! bytes: real queries through the whole v2 path against the 0.20 wire
-//! contract, with v2's sanctioned upgrades (TIME_NS encodes instead of
-//! refusing) pinned as the new expectation.
+//! bytes: real queries through the whole v2 path against the wire contract.
 //!
-//! Every test skips (passes vacuously, with a note) when the resolvable
-//! engine predates the v2 C API, so the suite stays green on v1-era libs;
-//! point HARBOR_LIBDUCKDB at a v2-bearing build to make it bite.
+//! With no engine to load, every test skips with a note, so a machine
+//! without libduckdb can still run the workspace's tests. Where the run
+//! names its engine (HARBOR_LIBDUCKDB) or is CI, a missing engine fails
+//! every test instead: a suite that passed without one would prove nothing.
 
 use harbor::engine::{Engine, Error, engine, ffi};
 
-/// The engine, or a printed skip.
+/// The engine, or a printed skip where a skip is allowed.
 fn v2_engine() -> Option<&'static Engine> {
     match engine() {
         Ok(e) => Some(e),
+        Err(e) if ["HARBOR_LIBDUCKDB", "CI"].iter().any(|v| std::env::var_os(v).is_some()) => {
+            panic!("no engine: {e}")
+        }
         Err(e) => {
             eprintln!("v2: skipped — {e}");
             None
@@ -219,7 +221,9 @@ mod conn {
                         if i > 0 {
                             line.push(',');
                         }
-                        harbor::engine::encode::emit_cell(&mut line, api, Some(json), &readers[i], ty, row)?;
+                        if let Err(e) = harbor::engine::encode::emit_cell(&mut line, api, Some(json), &readers[i], ty, row) {
+                            return Err(stream.error_after(e));
+                        }
                     }
                     out.push(line);
                 }
@@ -283,6 +287,26 @@ mod conn {
         assert_eq!(rows(&mut c, "SELECT variant_typeof(doc) FROM t WHERE id = 1", &[]).unwrap(), [r#""OBJECT(a)""#]);
     }
 
+    /// A statement that fails mid-stream in a transaction reports its own
+    /// error, not the "transaction is aborted" a VARIANT cell's cast meets
+    /// after it: the failure aborts the transaction before the fetch thread
+    /// can say why.
+    #[test]
+    fn a_session_statement_failing_mid_stream_reports_its_own_error() {
+        let Some(_) = v2_engine() else { return };
+        // A small streaming buffer keeps the engine a few chunks ahead of
+        // the encoder, so the error lands mid-stream with casts to come.
+        let mut c = conn::open(Path::new(":memory:"), &[]).expect("open");
+        c.execute_batch("SET streaming_buffer_size = '1KB'").unwrap();
+        let sql = "SELECT i::VARIANT v, CASE WHEN i = 60000 THEN error('boom at ' || i) END FROM range(100000) r(i)";
+        for _ in 0..3 {
+            c.execute_batch("BEGIN").unwrap();
+            let err = rows(&mut c, sql, &[]).unwrap_err().to_string();
+            assert!(err.contains("boom at 60000"), "{err}");
+            c.execute_batch("ROLLBACK").unwrap();
+        }
+    }
+
     /// The types a document is cast through are the connection's own: a
     /// connection that first meets a document inside an aborted transaction
     /// keeps nothing of the refusal, and a reset connection makes its own.
@@ -326,7 +350,7 @@ mod conn {
         let mut c = conn::open(Path::new(":memory:"), &[]).expect("open");
         assert!(c.engine_version().starts_with("v2."));
 
-        // Params bind positionally; NULL binds as a typed null.
+        // Params bind positionally.
         let got = rows(&mut c, "SELECT $1 + 1, $2, $3", &[
             Param::I64(41),
             Param::Text("hi".into()),
@@ -352,6 +376,94 @@ mod conn {
         c.execute_batch("CREATE TABLE u(x INTEGER); INSERT INTO u VALUES (1),(2); CHECKPOINT")
             .unwrap();
         assert_eq!(rows(&mut c2, "SELECT sum(x)::INTEGER FROM u", &[]).unwrap(), ["3"]);
+    }
+
+    /// A float param binds as the double its text names. The text a client
+    /// sends is the shortest that round-trips, which needs every digit;
+    /// serde_json's default parser is not correctly rounded and lands about
+    /// one such text in ten a ULP off, silently.
+    #[test]
+    fn a_float_param_binds_the_double_its_text_names() {
+        let Some(_) = v2_engine() else { return };
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut floats = Vec::new();
+        while floats.len() < 4000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Half across every exponent, half at ordinary magnitudes.
+            let f = match floats.len() % 2 {
+                0 => f64::from_bits(state),
+                _ => (state >> 11) as f64 / (1u64 << 53) as f64 * 2000.0 - 1000.0,
+            };
+            if f.is_finite() {
+                floats.push(f);
+            }
+        }
+        let text = floats.iter().map(|f| format!("{f:e}")).collect::<Vec<_>>().join(",");
+        let parsed: Vec<f64> = serde_json::from_str(&format!("[{text}]")).unwrap();
+        let off = floats.iter().zip(&parsed).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        assert_eq!(off, 0, "{off} of {} doubles parsed to a neighbour", floats.len());
+
+        let mut c = conn::open(Path::new(":memory:"), &[]).expect("open");
+        for f in parsed.iter().take(200) {
+            let got = rows(&mut c, "SELECT ?::DOUBLE", &[Param::F64(*f)]).unwrap();
+            assert_eq!(got[0].parse::<f64>().unwrap().to_bits(), f.to_bits(), "{f:e} came back {}", got[0]);
+        }
+    }
+
+    /// A NULL param is untyped, as `EXECUTE p(NULL)` binds it, so the
+    /// statement's inference types it from its neighbours.
+    #[test]
+    fn a_null_param_takes_the_type_the_statement_infers() {
+        let Some(_) = v2_engine() else { return };
+        let mut c = conn::open(Path::new(":memory:"), &[]).expect("open");
+        let sql = "SELECT typeof(?), coalesce(?, 'x'), [?, 'a'], list_value(?, DATE '2020-01-01'), ? + 1";
+        assert_eq!(rows(&mut c, sql, &vec![Param::Null; 5]).unwrap(), [
+            r#""\"NULL\"","x",[null,"a"],[null,"2020-01-01"],null"#
+        ]);
+    }
+
+    /// A JSON number binds exactly, as the type a SQL literal of the same
+    /// digits takes, and never as a double that is a different number.
+    #[test]
+    fn a_number_param_binds_exactly() {
+        let number = |text: &str| Param::number(text).unwrap();
+        assert!(matches!(number("-9223372036854775808"), Param::I64(i64::MIN)));
+        assert!(matches!(number("18446744073709551615"), Param::U64(u64::MAX)));
+        assert!(matches!(number("-976.7280889488817"), Param::F64(f) if f == -976.7280889488817));
+        assert!(matches!(number("1.10"), Param::F64(f) if f == 1.1));
+        assert!(matches!(number("-0.0"), Param::F64(f) if f == 0.0));
+        assert!(matches!(number("1.2345678901234568e+23"), Param::F64(_)));
+        assert!(Param::number(&format!("0.{}", "1".repeat(39))).is_err());
+
+        let Some(_) = v2_engine() else { return };
+        let mut c = conn::open(Path::new(":memory:"), &[]).expect("open");
+        for (text, want) in [
+            ("123456789012345678901234", r#""HUGEINT","123456789012345678901234""#),
+            ("-170141183460469231731687303715884105728", r#""HUGEINT","-170141183460469231731687303715884105728""#),
+            ("170141183460469231731687303715884105728", r#""BIGNUM","170141183460469231731687303715884105728""#),
+            ("12345678901234567.89", r#""DECIMAL(19,2)","12345678901234567.89""#),
+            ("0.12345678901234567890123456789012345678", r#""DECIMAL(38,38)","0.12345678901234567890123456789012345678""#),
+            ("-976.7280889488817", r#""DOUBLE",-976.7280889488817"#),
+        ] {
+            let got = rows(&mut c, "SELECT typeof($1), $1", &[number(text)]).unwrap();
+            assert_eq!(got, [want], "for {text}");
+        }
+        let got = rows(&mut c, "SELECT ? + 1", &[number("123456789012345678901234")]).unwrap();
+        assert_eq!(got, [r#""123456789012345678901235""#]);
+    }
+
+    /// A database path that is not UTF-8 is refused, not opened as the
+    /// different file its lossy rendering would name.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_is_not_utf8_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let Some(_) = v2_engine() else { return };
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"/nonexistent/caf\xe9.duckdb"));
+        let err = conn::open(path, &[]).err().expect("refused").to_string();
+        assert!(err.contains("not UTF-8"), "{err}");
     }
 
     #[test]
@@ -444,15 +556,34 @@ mod conn {
     const N: i64 = 5000; // > one 2048-row chunk, so the stream is multi-chunk
     const SUM: i64 = N * (N - 1) / 2;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("harbor-groups-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A scratch directory of this test's own, unique to the process so
+    /// concurrent runs never share one, and removed when the test ends.
+    /// Declared before the connections that use it, so it outlives them.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            let dir = std::env::temp_dir().join(format!("harbor-engine-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+    }
+
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// The guard that matters most: an ordinary multi-chunk SELECT must not
-    /// lose or repeat its opening rows now that a chunk can arrive out of band.
+    /// lose or repeat its opening rows, though a chunk can arrive out of band.
     #[test]
     fn ordinary_statements_deliver_every_row_once() {
         let Some(_) = v2_engine() else { return };
@@ -467,7 +598,7 @@ mod conn {
     #[test]
     fn copy_from_database_copies_every_row() {
         let Some(_) = v2_engine() else { return };
-        let dir = scratch("copy");
+        let dir = Scratch::new("copy");
         let mut c = conn::open(&dir.join("src.duckdb"), &[]).expect("open");
         c.execute_batch(&format!("CREATE TABLE t AS SELECT i FROM range({N}) r(i)")).unwrap();
         c.execute_batch(&format!("ATTACH '{}' AS dst", dir.join("dst.duckdb").display())).unwrap();
@@ -479,7 +610,7 @@ mod conn {
     #[test]
     fn import_database_restores_every_row() {
         let Some(_) = v2_engine() else { return };
-        let dir = scratch("import");
+        let dir = Scratch::new("import");
         let exp = dir.join("exp");
         let mut c = conn::open(&dir.join("src.duckdb"), &[]).expect("open");
         c.execute_batch(&format!("CREATE TABLE t AS SELECT i FROM range({N}) r(i)")).unwrap();
@@ -496,7 +627,7 @@ mod conn {
     #[test]
     fn a_failing_group_statement_reports_its_own_error() {
         let Some(_) = v2_engine() else { return };
-        let dir = scratch("err");
+        let dir = Scratch::new("err");
         let exp = dir.join("exp");
         let mut c = conn::open(&dir.join("src.duckdb"), &[]).expect("open");
         c.execute_batch("CREATE TABLE t AS SELECT 1 AS i").unwrap();
@@ -549,7 +680,8 @@ mod wire {
         ));
         let mut conn: ffi::connection_handle = std::ptr::null_mut();
         ok!(connect(db, &mut conn));
-        let json = encode::Json::of(api, conn)?;
+        let mut json = encode::Json { conn, ty: std::ptr::null_mut() };
+        ok!(connection_create_type_from_text(conn, ffi::str_t { ptr: c"JSON".as_ptr(), len: 4 }, &mut json.ty));
 
         let sql_c = std::ffi::CString::new(sql).unwrap();
         let mut iter: ffi::statement_iterator_handle = std::ptr::null_mut();
@@ -607,7 +739,7 @@ mod wire {
             }
         }
 
-        json.destroy(api);
+        unsafe { (api.logical_type_destroy.unwrap())(&mut json.ty) };
         unsafe {
             (api.statement_iterator_destroy.unwrap())(&mut iter);
             (api.disconnect.unwrap())(&mut conn);
@@ -688,10 +820,23 @@ mod wire {
         row(eng, "SELECT TIMESTAMP_NS '2026-09-01 14:30:00.123456789'", r#""2026-09-01T14:30:00.123456789""#);
         row(eng, "SELECT TIMESTAMPTZ '2026-09-01 14:30:00+00'", r#""2026-09-01T14:30:00Z""#);
         row(eng, "SELECT DATE '1600-02-29'", r#""1600-02-29""#);
-        // v1 refused TIME_NS outright; v2 encodes it.
+        // Before 1 AD the year is ISO 8601's, signed with four digits: 1 BC
+        // is year 0, 44 BC is -0043.
+        row(eng, "SELECT DATE '0001-01-01 (BC)', DATE '0010-06-01 (BC)'", r#""0000-01-01","-0009-06-01""#);
+        row(eng, "SELECT TIMESTAMP '0044-03-15 (BC) 12:00:00'", r#""-0043-03-15T12:00:00""#);
+        row(eng, "SELECT DATE '5877642-06-25 (BC)'", r#""-5877641-06-25""#);
+        // An infinite date or timestamp is a sentinel in storage; it goes out
+        // as the word, at every unit.
+        row(
+            eng,
+            "SELECT 'infinity'::DATE, '-infinity'::DATE, 'infinity'::TIMESTAMP, '-infinity'::TIMESTAMP_S, \
+             'infinity'::TIMESTAMP_MS, '-infinity'::TIMESTAMP_NS, 'infinity'::TIMESTAMPTZ, '-infinity'::TIMESTAMPTZ_NS",
+            r#""infinity","-infinity","infinity","-infinity","infinity","-infinity","infinity","-infinity""#,
+        );
+        // TIME_NS keeps its nanoseconds.
         row(eng, "SELECT TIME_NS '14:30:00.123456789'", r#""14:30:00.123456789""#);
-        // TIME WITH TIME ZONE: local time plus the ISO offset — v1 dropped
-        // the offset; 0.22 keeps it, down to second precision.
+        // TIME WITH TIME ZONE: local time plus the ISO offset, down to
+        // second precision.
         row(eng, "SELECT TIMETZ '14:30:00+02'", r#""14:30:00+02:00""#);
         row(eng, "SELECT TIMETZ '14:30:00-08:15'", r#""14:30:00-08:15""#);
         row(eng, "SELECT TIMETZ '14:30:00+05:30:15'", r#""14:30:00+05:30:15""#);
@@ -699,9 +844,9 @@ mod wire {
         // The full offset range DuckDB accepts, at both extremes.
         row(eng, "SELECT TIMETZ '12:00:00+15:59:59'", r#""12:00:00+15:59:59""#);
         row(eng, "SELECT TIMETZ '12:00:00-15:59:59'", r#""12:00:00-15:59:59""#);
-        // 24:00:00 is end-of-day, a legal value distinct from midnight —
-        // the wraparound used to fold it onto 00:00:00, on all three time
-        // types, while the schema claimed lossless.
+        // 24:00:00 is end-of-day, a legal value distinct from midnight, and
+        // must not wrap onto 00:00:00 on any of the three time types while
+        // the schema claims lossless.
         row(eng, "SELECT TIME '24:00:00'", r#""24:00:00""#);
         row(eng, "SELECT TIME_NS '24:00:00'", r#""24:00:00""#);
         row(eng, "SELECT TIMETZ '24:00:00+00'", r#""24:00:00+00:00""#);
@@ -749,8 +894,8 @@ mod wire {
         let Some(eng) = v2_engine() else { return };
         row(eng, "SELECT union_value(a := 2)::UNION(a INTEGER, b VARCHAR)", r#"{"tag":"a","value":2}"#);
         row(eng, "SELECT union_value(b := 'x')::UNION(a INTEGER, b VARCHAR)", r#"{"tag":"b","value":"x"}"#);
-        // Nested too — v1 could only tag at the top of a column and sent the
-        // payload alone inside containers; 0.22 tags at every depth.
+        // Nested too: the tag goes out at every depth, never the payload
+        // alone.
         row(eng, "SELECT [union_value(a := 2)::UNION(a INTEGER, b VARCHAR)]", r#"[{"tag":"a","value":2}]"#);
         row(
             eng,
@@ -769,6 +914,10 @@ mod wire {
         // A keyword field name is quoted in the type string, as DuckDB itself
         // does.
         schema(eng, "SELECT {'name': 1} AS s", r#"{"name":"s","duckdbType":"STRUCT(\"name\" INTEGER)","lossless":true,"fields":[{"name":"name","duckdbType":"INTEGER","lossless":true}]}"#);
+        // The type string is the engine's own: a keyword it knows and a
+        // geometry's coordinate system come through as `typeof` spells them.
+        schema(eng, "SELECT {'tuple': 1} AS s", r#"{"name":"s","duckdbType":"STRUCT(\"tuple\" INTEGER)","lossless":true,"fields":[{"name":"tuple","duckdbType":"INTEGER","lossless":true}]}"#);
+        schema(eng, "SELECT 'POINT(1 2)'::GEOMETRY('OGC:CRS84') AS g", r#"{"name":"g","duckdbType":"GEOMETRY('OGC:CRS84')","lossless":false,"encoding":"varchar-cast"}"#);
         schema(eng, "SELECT MAP([1],['x']) AS m", r#"{"name":"m","duckdbType":"MAP(INTEGER, VARCHAR)","lossless":true,"keyType":{"duckdbType":"INTEGER","lossless":true},"valueType":{"duckdbType":"VARCHAR","lossless":true},"encoding":"pairs"}"#);
         schema(eng, "SELECT 'a'::ENUM('a','b') AS e", r#"{"name":"e","duckdbType":"ENUM('a', 'b')","lossless":true,"values":["a","b"]}"#);
         schema(eng, "SELECT TIMETZ '14:30:00+02' AS t", r#"{"name":"t","duckdbType":"TIME WITH TIME ZONE","lossless":true}"#);
@@ -838,7 +987,18 @@ mod wire {
         // JSON text tells the number from the string, which display text
         // could not; a JSON document round-trips byte for byte.
         row(eng, "SELECT '42'::VARIANT, '{\"n\":42,\"s\":\"42\",\"l\":[1,null]}'::JSON::VARIANT", r#""\"42\"","{\"n\":42,\"s\":\"42\",\"l\":[1,null]}""#);
+        // JSON has no NaN or Infinity: inside a VARIANT, at any depth, they
+        // go out as the strings a DOUBLE column sends, so the text parses.
+        row(
+            eng,
+            "SELECT 'nan'::DOUBLE::VARIANT, {'a': 'inf'::DOUBLE, 'b': '-inf'::DOUBLE, 'c': 'nan'::FLOAT, 's': 'NaN'}::VARIANT, [-('inf'::DOUBLE)]::VARIANT",
+            r#""\"NaN\"","{\"a\":\"Infinity\",\"b\":\"-Infinity\",\"c\":\"NaN\",\"s\":\"NaN\"}","[\"-Infinity\"]""#,
+        );
         schema(eng, "SELECT 42::VARIANT AS v", r#"{"name":"v","duckdbType":"VARIANT","lossless":false,"encoding":"json"}"#);
+        // A type with no view layout or JSON form of its own goes out as the
+        // engine's text, as its schema line's "varchar-cast" says.
+        row(eng, "SELECT 'POINT(1 2)'::GEOMETRY, get_type(1), make_type('LIST', make_type('VARCHAR'))", r#""POINT (1 2)","INTEGER","VARCHAR[]""#);
+        schema(eng, "SELECT get_type(1) AS t", r#"{"name":"t","duckdbType":"TYPE","lossless":false,"encoding":"varchar-cast"}"#);
         // A JSON column is text that is JSON: the alias name is what the
         // schema says, and the CLI's json modes splice such a cell by it.
         schema(eng, "SELECT '{\"a\":1}'::JSON AS j", r#"{"name":"j","duckdbType":"JSON","lossless":true}"#);

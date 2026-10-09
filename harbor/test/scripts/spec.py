@@ -123,6 +123,12 @@ CASES = [
     ("date-leap-2024", "SELECT '2024-02-29'::DATE AS v",              "DATE", True, "2024-02-29"),
     ("date-year-1",    "SELECT '0001-01-01'::DATE AS v",              "DATE", True, "0001-01-01"),
     ("date-year-9999", "SELECT '9999-12-31'::DATE AS v",              "DATE", True, "9999-12-31"),
+    # Before 1 AD the year is ISO 8601's astronomical one, signed and four
+    # digits: 1 BC is 0000, 44 BC is -0043, never the three-digit -043.
+    ("date-1-bc",      "SELECT '0001-01-01 (BC)'::DATE AS v",         "DATE", True, "0000-01-01"),
+    ("date-44-bc",     "SELECT '0044-03-15 (BC)'::DATE AS v",         "DATE", True, "-0043-03-15"),
+    ("ts-44-bc",       "SELECT '0044-03-15 (BC) 12:00:00'::TIMESTAMP AS v",
+                       "TIMESTAMP", True, "-0043-03-15T12:00:00"),
     # An infinite date is a sentinel in storage, the type's largest value.
     # Formatted as a date it reads as a real one millennia out, so it goes
     # out as the word the engine prints and parses back.
@@ -225,6 +231,13 @@ CASES = [
                        "VARIANT", False, "42"),
     ("variant-string", "SELECT '42'::VARIANT AS v",
                        "VARIANT", False, '"42"'),
+    # The engine writes a non-finite double in a VARIANT as a bare NaN or
+    # Infinity, which no JSON parser reads. It goes out as the string a
+    # DOUBLE column sends, at any depth, so the cell's text is JSON.
+    ("variant-nan",    "SELECT 'nan'::DOUBLE::VARIANT AS v",
+                       "VARIANT", False, '"NaN"'),
+    ("variant-inf-nested", "SELECT {'a': 'inf'::DOUBLE, 'b': ['-inf'::DOUBLE]}::VARIANT AS v",
+                       "VARIANT", False, '{"a":"Infinity","b":["-Infinity"]}'),
 
     # -- HUGEINT minimum ----------------------------------------------------
     # i128::MIN has no positive counterpart, so the "is this JSON-safe" test
@@ -246,6 +259,8 @@ SCHEMA_EXTRAS = {
     # value's properties it must not trust.
     "variant-lossy":  {"encoding": "json"},
     "variant-string": {"encoding": "json"},
+    "variant-nan":    {"encoding": "json"},
+    "variant-inf-nested": {"encoding": "json"},
 }
 
 

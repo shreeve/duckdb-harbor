@@ -2,23 +2,9 @@
 //!
 //! Stateless and engine-free — no FFI, no handles, no duckdb types. The
 //! JSON-safe integer rule, temporal formatting, varint decimals,
-//! bit/uuid/base64, string escaping, and the keyword table used to quote
-//! identifiers in type strings. The engine-facing emission (schema lines,
+//! bit/uuid/base64 and string escaping. The engine-facing emission (schema lines,
 //! cell values read from vector views) lives in src/engine/encode.rs and calls
 //! down into these; the wire bytes are pinned by tests/engine.rs.
-
-/// Render an identifier the way DuckDB does inside a type string: bare when it
-/// is a simple lowercase identifier and not a keyword, double-quoted
-/// otherwise, with embedded quotes doubled.
-pub(crate) fn quote_identifier(name: &str) -> String {
-    let simple = !name.is_empty()
-        && name.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
-        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-    if simple && KEYWORDS.binary_search(&name).is_err() {
-        return name.to_string();
-    }
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
 
 // ---------------------------------------------------------------------------
 // Scalar emission — the JSON-safe rules every encoder shares.
@@ -111,8 +97,8 @@ pub(crate) fn push_i64_raw(out: &mut String, v: i64) {
     push_u64_raw(out, v.unsigned_abs());
 }
 
-/// An integer zero-padded to `width` the way `format!("{v:0width$}")` pads:
-/// the sign first, then zeros, then the digits, sign counted toward the width.
+/// An integer with its digits zero-padded to `width`, the sign before them
+/// and not counted: ISO 8601's year 44 BC is `-0043`, four digits signed.
 pub(crate) fn push_int_pad(out: &mut String, v: i64, width: usize) {
     let neg = v < 0;
     if neg {
@@ -129,8 +115,7 @@ pub(crate) fn push_int_pad(out: &mut String, v: i64, width: usize) {
             break;
         }
     }
-    let written = (buf.len() - i) + neg as usize;
-    for _ in written..width {
+    for _ in buf.len() - i..width {
         out.push('0');
     }
     // Safety: the slice holds only ASCII digits.
@@ -139,11 +124,10 @@ pub(crate) fn push_int_pad(out: &mut String, v: i64, width: usize) {
 
 pub(crate) fn push_int(out: &mut String, i: i128) {
     // unsigned_abs, not abs: `i128::MIN` has no positive counterpart, so
-    // `abs()` overflows there. In release that wraps back to `i128::MIN`, which
-    // compares under the threshold, and the HUGEINT minimum went out as a bare
-    // JSON number — the exact silent-reprecision failure this function exists
-    // to prevent, on a value any `SELECT (-170141183460469231731687303715884105728)::HUGEINT`
-    // produces. In debug it panicked instead.
+    // `abs()` overflows there, and in release wraps back to `i128::MIN`, which
+    // compares under the threshold: the HUGEINT minimum would go out as a
+    // bare JSON number, the silent reprecision this function exists to
+    // prevent.
     if i.unsigned_abs() <= JSON_SAFE as u128 {
         // Under 2^53 always fits i64; stay on the 64-bit digit writer.
         push_i64_raw(out, i as i64);
@@ -169,21 +153,29 @@ pub(crate) fn push_uint(out: &mut String, v: u128) {
     }
 }
 
-pub(crate) fn push_float(out: &mut String, f: f64) {
+/// A DOUBLE or a FLOAT, as the shortest text that round-trips to the same
+/// value of its own width. A FLOAT widened to f64 first would read
+/// 0.10000000149011612 for `0.1::FLOAT`: the same number, but not the text
+/// DuckDB writes, and less precise to the eye than a DOUBLE beside it.
+pub(crate) fn push_float<F>(out: &mut String, f: F)
+where
+    F: Copy + Into<f64> + std::fmt::Display + std::fmt::LowerExp,
+{
+    // Widening is exact, so it classifies an f32 as well as an f64.
+    let wide: f64 = f.into();
     // JSON has no NaN or Infinity, but null is not the answer: it is
     // indistinguishable from SQL NULL, so a client cannot tell a missing value
     // from a division that overflowed. The names go out as strings instead.
-    if f.is_nan() {
+    if wide.is_nan() {
         return push_json_string(out, "NaN");
     }
-    if f.is_infinite() {
-        return push_json_string(out, if f > 0.0 { "Infinity" } else { "-Infinity" });
+    if wide.is_infinite() {
+        return push_json_string(out, if wide > 0.0 { "Infinity" } else { "-Infinity" });
     }
     // Rust's Display never switches to exponent notation for large magnitudes,
-    // so f64::MAX would go out as 309 digits. Switch at 1e21, which is where
-    // JavaScript's own number formatting switches, so the text a client reads
-    // is the text it would have produced itself.
-    if f != 0.0 && f.abs() >= 1e21 {
+    // so f64::MAX would go out as 309 digits (and f32::MAX as 39). Switch at
+    // 1e21, where JavaScript's own formatting switches for large magnitudes.
+    if wide.abs() >= 1e21 {
         push_exponent(out, &format!("{f:e}"));
     } else {
         // Display, written straight into the buffer: the same shortest
@@ -192,27 +184,40 @@ pub(crate) fn push_float(out: &mut String, f: f64) {
     }
 }
 
-/// A FLOAT, formatted as the f32 it is.
-///
-/// This used to widen to f64 first and format that, which is lossless but not
-/// faithful: `0.1::FLOAT` went out as 0.10000000149011612 — the same number,
-/// but not the text DuckDB writes, not the text an f32-aware client writes,
-/// and visibly *less* precise than the DOUBLE column holding the same literal
-/// right beside it. `f32::to_string` gives the shortest text that round-trips
-/// back to the same f32, which is what every other numeric type here does.
-pub(crate) fn push_float32(out: &mut String, f: f32) {
-    if f.is_nan() {
-        return push_json_string(out, "NaN");
+/// The engine's JSON text for a VARIANT writes a non-finite double as a bare
+/// `NaN`, `Infinity` or `-Infinity`, which is not JSON: a client's parser
+/// throws on the whole row. Each goes out as the string a DOUBLE column sends
+/// ([`push_float`]). Outside a string, JSON text holds no other capital
+/// letter, so the scan is skipped for text with no `N` or `I` at all.
+pub(crate) fn quote_nonfinite(json: &str) -> std::borrow::Cow<'_, str> {
+    let b = json.as_bytes();
+    if !b.iter().any(|&c| c == b'N' || c == b'I') {
+        return json.into();
     }
-    if f.is_infinite() {
-        return push_json_string(out, if f > 0.0 { "Infinity" } else { "-Infinity" });
+    let mut out = String::with_capacity(json.len() + 8);
+    let (mut start, mut i, mut in_string) = (0, 0, false);
+    while i < b.len() {
+        match b[i] {
+            b'\\' if in_string => i += 1,
+            b'"' => in_string = !in_string,
+            b'N' | b'I' | b'-' if !in_string => {
+                let word = ["NaN", "Infinity", "-Infinity"].into_iter().find(|w| json[i..].starts_with(w));
+                if let Some(word) = word {
+                    out.push_str(&json[start..i]);
+                    out.push('"');
+                    out.push_str(word);
+                    out.push('"');
+                    i += word.len();
+                    start = i;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
     }
-    // Same 1e21 switch as f64, and it is reachable: f32::MAX is ~3.4e38.
-    if f != 0.0 && f.abs() >= 1e21 {
-        push_exponent(out, &format!("{f:e}"));
-    } else {
-        let _ = std::fmt::Write::write_fmt(out, format_args!("{f}"));
-    }
+    out.push_str(&json[start..]);
+    out.into()
 }
 
 /// Rust writes `1e21`; JSON and JavaScript write `1e+21`. Only a positive
@@ -229,17 +234,16 @@ fn push_exponent(out: &mut String, formatted: &str) {
 }
 
 pub(crate) fn push_json_string(out: &mut String, s: &str) {
-    // One pass, byte-identical to what serde_json::to_string used to produce
-    // here (its escaping rules are reproduced below and pinned by a
-    // fuzz-comparison test), plus one rule serde_json correctly does not
-    // apply because it is about the container rather than the value: U+2028
-    // LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are legal inside a JSON
-    // string, but this is a newline-delimited format and they are line
-    // terminators to every Unicode-aware line splitter. Left raw, one row is
-    // read as two — and the half that is left over is not valid JSON, so a
-    // client sees a parse error whose cause is nowhere near where it
-    // happened. Writing straight into `out` drops the String serde_json
-    // allocated per cell and the two container scans over it.
+    // One pass, byte-identical to serde_json::to_string (its escaping rules
+    // are reproduced below and pinned by a fuzz-comparison test), plus one
+    // rule serde_json correctly does not apply because it is about the
+    // container rather than the value: U+2028 LINE SEPARATOR and U+2029
+    // PARAGRAPH SEPARATOR are legal inside a JSON string, but this is a
+    // newline-delimited format and they are line terminators to every
+    // Unicode-aware line splitter. Left raw, one row is read as two — and the
+    // half that is left over is not valid JSON, so a client sees a parse
+    // error whose cause is nowhere near where it happened. Writing straight
+    // into `out` saves a String per cell and the scans over it.
     out.push('"');
     let bytes = s.as_bytes();
     let mut start = 0;
@@ -429,7 +433,7 @@ pub(crate) fn push_fraction(out: &mut String, nanos: i64) {
     out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[..end]) });
 }
 
-/// DuckDB stores BIGNUM (formerly VARINT) as a three-byte header followed by
+/// DuckDB stores BIGNUM as a three-byte header followed by
 /// the magnitude, most significant byte first. Without this the value goes out
 /// base64-encoded — DuckDB's private storage layout, leaked onto the wire,
 /// where no client could read it and nothing would say it was wrong.
@@ -539,90 +543,12 @@ pub(crate) fn push_base64(out: &mut String, data: &[u8]) {
     }
 }
 
-// ==========================================================================
-//
-// DuckDB's reserved words, generated
-//
-// ==========================================================================
-
-
-// Generated from `SELECT keyword_name FROM duckdb_keywords()` on DuckDB v1.5.5.
-//
-// DuckDB quotes an identifier in a type string when it is any keyword at all,
-// reserved or not — which is why a STRUCT field called `name` comes back as
-// STRUCT("name" VARCHAR). Reproducing that keeps the duckdbType string valid
-// SQL, so a client can paste it back into a CREATE TABLE.
-
-/// Sorted, lowercase. Binary-searched, so it must stay sorted.
-pub(crate) static KEYWORDS: &[&str] = &[
-    "abort", "absolute", "access", "action", "add", "admin", "after", "aggregate", "all",
-    "also", "alter", "always", "analyse", "analyze", "and", "anti", "any", "array", "as",
-    "asc", "asof", "assertion", "assignment", "asymmetric", "at", "attach", "attribute",
-    "authorization", "backward", "before", "begin", "between", "bigint", "binary", "bit",
-    "boolean", "both", "by", "cache", "call", "called", "cascade", "cascaded", "case", "cast",
-    "catalog", "centuries", "century", "chain", "char", "character", "characteristics",
-    "check", "checkpoint", "class", "close", "cluster", "coalesce", "collate", "collation",
-    "column", "columns", "comment", "comments", "commit", "committed", "compression",
-    "concurrently", "configuration", "conflict", "connection", "constraint", "constraints",
-    "content", "continue", "conversion", "copy", "cost", "create", "cross", "csv", "cube",
-    "current", "cursor", "cycle", "data", "database", "day", "days", "deallocate", "dec",
-    "decade", "decades", "decimal", "declare", "default", "defaults", "deferrable", "deferred",
-    "definer", "delete", "delimiter", "delimiters", "depends", "desc", "describe", "detach",
-    "dictionary", "disable", "discard", "distinct", "do", "document", "domain", "double",
-    "drop", "each", "else", "enable", "encoding", "encrypted", "end", "enum", "error",
-    "escape", "event", "except", "exclude", "excluding", "exclusive", "execute", "exists",
-    "explain", "export", "export_state", "extension", "extensions", "external", "extract",
-    "false", "family", "fetch", "filter", "first", "float", "following", "for", "force",
-    "foreign", "forward", "freeze", "from", "full", "function", "functions", "generated",
-    "glob", "global", "grant", "granted", "group", "grouping", "grouping_id", "groups",
-    "handler", "having", "header", "hold", "hour", "hours", "identity", "if", "ignore",
-    "ilike", "immediate", "immutable", "implicit", "import", "in", "include", "including",
-    "increment", "index", "indexes", "inherit", "inherits", "initially", "inline", "inner",
-    "inout", "input", "insensitive", "insert", "install", "instead", "int", "integer",
-    "intersect", "interval", "into", "invoker", "is", "isnull", "isolation", "join", "json",
-    "key", "label", "lambda", "language", "large", "last", "lateral", "leading", "leakproof",
-    "left", "level", "like", "limit", "listen", "load", "local", "location", "lock", "locked",
-    "logged", "macro", "map", "mapping", "match", "matched", "materialized", "maxvalue",
-    "merge", "method", "microsecond", "microseconds", "millennia", "millennium", "millisecond",
-    "milliseconds", "minute", "minutes", "minvalue", "mode", "month", "months", "move", "name",
-    "names", "national", "natural", "nchar", "new", "next", "no", "none", "not", "nothing",
-    "notify", "notnull", "nowait", "null", "nullif", "nulls", "numeric", "object", "of", "off",
-    "offset", "oids", "old", "on", "only", "operator", "option", "options", "or", "order",
-    "ordinality", "others", "out", "outer", "over", "overlaps", "overlay", "overriding",
-    "owned", "owner", "parallel", "parser", "partial", "partition", "partitioned", "passing",
-    "password", "percent", "persistent", "pivot", "pivot_longer", "pivot_wider", "placing",
-    "plans", "policy", "position", "positional", "pragma", "preceding", "precision", "prepare",
-    "prepared", "preserve", "primary", "prior", "privileges", "procedural", "procedure",
-    "program", "publication", "qualify", "quarter", "quarters", "quote", "range", "read",
-    "real", "reassign", "recheck", "recursive", "ref", "references", "referencing", "refresh",
-    "reindex", "relative", "release", "rename", "repeatable", "replace", "replica", "reset",
-    "respect", "restart", "restrict", "returning", "returns", "revoke", "right", "role",
-    "rollback", "rollup", "row", "rows", "rule", "sample", "savepoint", "schema", "schemas",
-    "scope", "scroll", "search", "second", "seconds", "secret", "security", "select", "semi",
-    "sequence", "sequences", "serializable", "server", "session", "set", "setof", "sets",
-    "share", "show", "similar", "simple", "skip", "smallint", "snapshot", "some", "sorted",
-    "source", "sql", "stable", "standalone", "start", "statement", "statistics", "stdin",
-    "stdout", "storage", "stored", "strict", "strip", "struct", "subscription", "substring",
-    "summarize", "symmetric", "sysid", "system", "table", "tables", "tablesample",
-    "tablespace", "target", "temp", "template", "temporary", "text", "then", "ties", "time",
-    "timestamp", "to", "trailing", "transaction", "transform", "treat", "trigger", "trim",
-    "true", "truncate", "trusted", "try_cast", "type", "types", "unbounded", "uncommitted",
-    "unencrypted", "union", "unique", "unknown", "unlisten", "unlogged", "unpack", "unpivot",
-    "until", "update", "use", "user", "using", "vacuum", "valid", "validate", "validator",
-    "value", "values", "varchar", "variable", "variadic", "varying", "verbose", "version",
-    "view", "views", "virtual", "volatile", "week", "weeks", "when", "where", "whitespace",
-    "window", "with", "within", "without", "work", "wrapper", "write", "xml", "xmlattributes",
-    "xmlconcat", "xmlelement", "xmlexists", "xmlforest", "xmlnamespaces", "xmlparse", "xmlpi",
-    "xmlroot", "xmlserialize", "xmltable", "year", "years", "yes", "zone",
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// The reference bytes push_json_string must reproduce: serde_json's
-    /// escaping, then the U+2028/U+2029 post-pass — exactly the two-step
-    /// encoding this function replaced.
+    /// escaping, then a pass that escapes U+2028 and U+2029.
     fn reference(s: &str) -> String {
         let encoded = serde_json::to_string(s).unwrap();
         let mut out = String::new();
@@ -694,7 +620,23 @@ mod tests {
     }
 
     #[test]
-    fn int_pad_matches_format() {
+    fn nonfinite_words_become_strings_outside_strings_only() {
+        for (text, want) in [
+            ("42", "42"),
+            ("NaN", r#""NaN""#),
+            ("-Infinity", r#""-Infinity""#),
+            ("[NaN,1,Infinity]", r#"["NaN",1,"Infinity"]"#),
+            (r#"{"a":Infinity,"b":-Infinity,"c":NaN}"#, r#"{"a":"Infinity","b":"-Infinity","c":"NaN"}"#),
+            (r#"{"NaN":"Infinity","s":"x\"NaN","n":-1}"#, r#"{"NaN":"Infinity","s":"x\"NaN","n":-1}"#),
+            (r#"["\\",NaN,"é Infinity"]"#, r#"["\\","NaN","é Infinity"]"#),
+        ] {
+            assert_eq!(quote_nonfinite(text), want, "for {text}");
+            serde_json::from_str::<serde_json::Value>(&quote_nonfinite(text)).expect(text);
+        }
+    }
+
+    #[test]
+    fn int_pad_pads_the_digits_after_the_sign() {
         for &(v, w) in &[
             (0i64, 2usize),
             (0, 4),
@@ -715,7 +657,8 @@ mod tests {
         ] {
             let mut out = String::new();
             push_int_pad(&mut out, v, w);
-            assert_eq!(out, format!("{v:0w$}"), "for {v} width {w}");
+            let sign = if v < 0 { "-" } else { "" };
+            assert_eq!(out, format!("{sign}{:0w$}", v.unsigned_abs()), "for {v} width {w}");
         }
     }
 
