@@ -12,9 +12,11 @@
 //! - `peer`      — `Peer::closed`: a departed client is seen, a quiet or
 //!   pipelining one is not
 //! - `first_request` — the first-request idle clock, and that keep-alive is
-//!   exempt from it (`#[ignore]`, ~60s each)
-//! - `stall`     — the 10s write-timeout backstop (`#[ignore]`, ~35s by
-//!   design: `cargo test --test suite -- --ignored`)
+//!   exempt from it (~72 s: the clock under test is 60 s)
+//! - `stall`     — the 10 s write-timeout backstop (~35 s on macOS loopback)
+//!
+//! The two slow tests run beside the rest, so the binary takes about as long
+//! as `first_request`.
 //!
 //! `tests/drain.rs` stays a separate binary on purpose: it measures
 //! allocations with a global allocator, and any other test running in the
@@ -1142,55 +1144,54 @@ mod prompt {
     }
 }
 
-/// The first-request clock (~60s each, so `#[ignore]`d by design; run with
-/// `cargo test -p justhttp --test suite -- --ignored`). A connection that has
-/// never sent a byte is closed; one that has served a request idles on the far
-/// longer keep-alive clock instead. Both halves matter: the first bounds an
-/// anonymous caller holding sockets, the second is what a REPL at its prompt
-/// relies on.
+/// The first-request clock. A connection that has never sent a byte is
+/// closed; one that has served a request idles on the far longer keep-alive
+/// clock instead. Both halves matter: the first bounds an anonymous caller
+/// holding sockets, the second is what a REPL at its prompt relies on. Both
+/// run in one test, side by side, because each has to outwait the real 60 s
+/// clock.
 mod first_request {
     use super::support;
 
     use std::io::{Read, Write};
-    use std::time::Instant;
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
 
     #[test]
-    #[ignore = "~60s by design: exercises the first-request timeout"]
-    fn a_connection_that_never_speaks_is_closed() {
-        let (_server, mut client) = support::new_one_server_one_client();
+    fn only_a_connection_that_never_spoke_is_on_the_first_request_clock() {
+        let server = justhttp::Server::http("127.0.0.1:0").unwrap();
+        let addr = support::addr(&server);
+        let mut silent = TcpStream::connect(addr).unwrap();
         let t0 = Instant::now();
-        let mut content = String::new();
-        let _ = client.read_to_string(&mut content);
-        assert!(
-            content.starts_with("HTTP/1.1 408"),
-            "expected 408, got {:?}",
-            content.lines().next()
-        );
-        assert!(t0.elapsed().as_secs() >= 55, "closed too early: {:?}", t0.elapsed());
-    }
-
-    #[test]
-    #[ignore = "~75s by design: proves keep-alive is not on the first-request clock"]
-    fn a_served_connection_may_idle_past_the_first_request_timeout() {
-        let (server, mut client) = support::new_one_server_one_client();
+        let mut served = TcpStream::connect(addr).unwrap();
         std::thread::spawn(move || {
-            while let Ok(Some(rq)) = server.recv_timeout(std::time::Duration::from_secs(90)) {
-                let _ = rq.respond(justhttp::Response::from_string("ok".to_owned()));
+            while let Ok(Some(rq)) = server.recv_timeout(Duration::from_secs(120)) {
+                let _ = rq.respond(justhttp::Response::from_string("ok"));
             }
         });
 
         let req = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
-        write!(client, "{req}").unwrap();
-        let (headers, _) = support::read_response(&mut client);
+        write!(served, "{req}").unwrap();
+        let (headers, _) = support::read_response(&mut served);
         assert!(headers.starts_with("HTTP/1.1 200"), "first request: {headers}");
 
-        // Well past FIRST_REQUEST_TIMEOUT. This connection has served a
-        // request, so it is a keep-alive client and the clock does not apply.
-        std::thread::sleep(std::time::Duration::from_secs(75));
+        let watcher = std::thread::spawn(move || {
+            let mut content = String::new();
+            let _ = silent.read_to_string(&mut content);
+            (content, t0.elapsed())
+        });
 
-        write!(client, "{req}").expect("connection was closed during keep-alive idle");
-        let (headers, _) = support::read_response(&mut client);
+        // Past the first-request clock and the 5 s read tick it is checked
+        // on. The served connection is a keep-alive client: it is not on
+        // that clock.
+        std::thread::sleep(Duration::from_secs(72));
+        write!(served, "{req}").expect("the served connection was closed while idle");
+        let (headers, _) = support::read_response(&mut served);
         assert!(headers.starts_with("HTTP/1.1 200"), "second request: {headers}");
+
+        let (content, closed_after) = watcher.join().unwrap();
+        assert!(content.starts_with("HTTP/1.1 408"), "expected 408, got {:?}", content.lines().next());
+        assert!(closed_after >= Duration::from_secs(55), "closed too early: {closed_after:?}");
     }
 }
 
@@ -1400,14 +1401,13 @@ mod stall {
 
     // Regression test for the response write timeout carried in this crate: a
     // client that stops reading its response must not pin a server thread inside
-    // `write` forever. Slow by design (the timeout under test is 10s), so it is
-    // `#[ignore]`d: run with `cargo test --test suite -- --ignored`.
+    // `write` forever. Slow by design: the timeout under test is 10 s, and it
+    // fires only once the kernel's socket buffers stop taking bytes.
 
     use std::io::{Cursor, Write};
     use std::time::{Duration, Instant};
 
     #[test]
-    #[ignore = "~35s by design: exercises the 10s stalled-reader write timeout"]
     fn stalled_reader_reclaimed() {
         let (server, mut client) = support::new_one_server_one_client();
 

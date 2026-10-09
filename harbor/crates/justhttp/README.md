@@ -117,16 +117,15 @@ three tiny dependencies (`ascii`, `chunked_transfer`, `httpdate`):
 
 ## Tests
 
-`cargo test -p justhttp` (from `harbor/`) runs the default suite — green on
-macOS and Linux. Two files:
-`tests/suite.rs`, one module per property (`basic`, `input`, `network`,
-`keepalive` — connection reuse + chunked streaming, `buffering` —
-backpressure, `prompt` — latency properties, `unblock`, `unix`, and
-`stall` — the write-timeout test, `#[ignore]`d because it takes ~35 s by
-design: `cargo test -p justhttp --test suite -- --ignored`); and
-`tests/drain.rs`,
-the DoS regression, alone in its own binary because its measuring global
-allocator must not see other tests' allocations.
+`cargo test -p justhttp` (from `harbor/`) runs every test, the hardening
+regressions included, on macOS and Linux, in about 75 s: the slowest has to
+outwait the real 60 s first-request clock, and the rest run beside it. Two
+files: `tests/suite.rs`, one module per property (`basic`, `input`, `head`,
+`network`, `keepalive` — connection reuse + chunked streaming, `buffering`
+— backpressure, `prompt` — latency properties, `unblock`, `unix`, `peer`,
+`first_request` and `stall` — the write-timeout test); and `tests/drain.rs`,
+the drain regressions, alone in their own binary because its measuring
+global allocator must not see other tests' allocations.
 
 ## Lineage and license
 
