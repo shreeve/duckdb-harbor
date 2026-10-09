@@ -821,15 +821,16 @@ fn try_lease_claim(id: &str) -> Result<(mpsc::SyncSender<Job>, Arc<SlotState>), 
     Ok((lease.conn.jobs.clone(), Arc::clone(&lease.conn.state)))
 }
 
-/// Give a claim back, recording what the statement did to the transaction.
-fn lease_settle(id: &str, sql: &str) {
+/// Give a claim back, recording what the statement did to the transaction
+/// when it ran.
+fn lease_settle(id: &str, sql: &str, ran: bool) {
     let mut guard = LEASES.lock().unwrap();
     let Some(leases) = guard.as_mut() else { return };
     let Some(lease) = leases.live.get_mut(id) else { return };
     lease.busy = false;
     lease.last = Instant::now();
     lease.statements += 1;
-    if let Some(open) = transaction_effect(sql) {
+    if ran && let Some(open) = transaction_effect(sql) {
         lease.in_transaction = open;
     }
 }
@@ -842,11 +843,16 @@ struct Claim {
     sql: String,
     target: mpsc::SyncSender<Job>,
     state: Arc<SlotState>,
+    /// The engine ran the statement: it answered, or refused it as SQL once
+    /// past the parser. A statement that never ran (refused before the
+    /// engine, cancelled, unparsable) did nothing to the transaction, and a
+    /// `BEGIN` among them opened none.
+    ran: std::cell::Cell<bool>,
 }
 
 impl Drop for Claim {
     fn drop(&mut self) {
-        lease_settle(&self.id, &self.sql);
+        lease_settle(&self.id, &self.sql, self.ran.get());
     }
 }
 
@@ -3317,7 +3323,7 @@ fn run_sql(
         None => None,
         Some(id) => match lease_claim(id) {
             Ok((target, state)) => {
-                Some(Claim { id: id.to_string(), sql: parsed.sql.clone(), target, state })
+                Some(Claim { id: id.to_string(), sql: parsed.sql.clone(), target, state, ran: Default::default() })
             }
             Err(refusal) => {
                 let _ = req.respond(error_response(refusal.status, refusal.code, &refusal.message));
@@ -3376,7 +3382,14 @@ fn run_sql(
         return (false, 503);
     }
 
-    match ready_rx.recv() {
+    let answer = ready_rx.recv();
+    if let (Some(c), Ok(outcome)) = (&claim, &answer) {
+        c.ran.set(match outcome {
+            Ok(()) => true,
+            Err(refusal) => refusal.code == "sql_error" && !refusal.message.starts_with("Parser Error"),
+        });
+    }
+    match answer {
         Ok(Ok(())) => {
             if shape == Shape::Json {
                 // One message, because that is what the executor sends in this

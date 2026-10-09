@@ -391,6 +391,20 @@ def run_all(h, leases, proc, db, port):
     eq("nor one that never was", 404, h.call("POST", f"/sql/sessions/{'0' * 36}/renew")[0])
 
     # -----------------------------------------------------------------------
+    section("A session is in a transaction only when one is open")
+    # -----------------------------------------------------------------------
+    sid = h.open()[1]["sessionId"]
+    st, doc, _ = h.sql("BEGIN nonsense", sid)
+    eq("a BEGIN that does not parse is refused", 400, st)
+    eq("and opens nothing", False, lease(sid)["inTransaction"])
+    h.sql("BEGIN", sid)
+    h.sql("SELECT * FROM no_such_table", sid)
+    st, doc, _ = h.sql("COMMIT", sid)
+    eq("a COMMIT of an aborted transaction is refused", 400, st)
+    eq("and the transaction it rolled back is over", False, lease(sid)["inTransaction"])
+    h.release(sid)
+
+    # -----------------------------------------------------------------------
     section("The reaper reclaims what is abandoned")
     # -----------------------------------------------------------------------
     # A deadline the client asked for, rather than waiting out the idle
