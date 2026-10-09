@@ -72,7 +72,7 @@ copied with is read from the source row again, so a DATE inside a `VARIANT` that
 was typed over and restored is still a DATE. Primary-key and generated columns
 are omitted so DuckDB can supply the new identity and derived values. A natural
 key without a default therefore stays `required`. The entire copied
-row is one undo step and is not written until ⌘S. Inserts run first in the
+row is one undo step and is not written until ⌘S. Duplicates run first in the
 transaction, so the source row is read as the database holds it at ⌘S, even when
 the same commit updates or deletes it; a source row that is gone by then fails
 the commit, and nothing lands. A refresh does not help, because the draft still
@@ -393,8 +393,13 @@ affected-exactly-one check are the backstop there, as everywhere.
 ## Commit
 
 ⌘S opens a Harbor session (a pinned connection), then:
-`BEGIN` → parameterized inserts, updates, and deletes, each verified to have
-affected or returned **exactly one row** → `COMMIT` → release. Before opening
+`BEGIN` → parameterized statements, each verified to have affected or returned
+**exactly one row** → `COMMIT` → release. The engine checks a key as each
+statement runs, so they run in the order that frees a key before another row
+takes it: duplicates, then deletes, then updates, each after the one whose key
+it takes, then new rows. A DELETE of 7 beside a re-key of 3 to 7 commits, as
+does a new row keyed like a deleted one, or a chain of re-keys; a swap of two
+keys has no such order, and the engine refuses it. Before opening
 the session, DuckTable refuses a draft missing a `NOT NULL` column with no
 default. Any failure rolls the whole transaction back: an SQL error, a
 constraint, or a row its identity no longer names, because the row is gone,

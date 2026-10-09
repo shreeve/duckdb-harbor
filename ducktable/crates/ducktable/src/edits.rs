@@ -626,23 +626,26 @@ impl Edits {
         self.unread = false;
     }
 
-    /// The staged set as parameterized statements: inserts, updates,
-    /// deletes, deterministic within each verb. Missing insert columns
+    /// The staged set as parameterized statements. Missing insert columns
     /// stay out of the statement so DuckDB supplies DEFAULT. The WHERE
     /// binds the ORIGINAL key values for existing rows.
     ///
-    /// A duplicate with `Bind::Source` cells selects them from its source
-    /// row, so the engine copies what the wire could not carry. Inserts
-    /// run before any update or delete, so that row is read as the
-    /// database holds it, whatever else is staged on it; and a source row
-    /// that is gone returns no row, which commit refuses.
+    /// The order is what lets a set commit whatever keys it moves, since
+    /// the engine checks a key as each statement runs. Duplicates come
+    /// first: one with `Bind::Source` cells selects them from its source
+    /// row, so the engine copies what the wire could not carry, and that
+    /// row is read as the database holds it, whatever else is staged on it;
+    /// a source row that is gone returns no row, which commit refuses. Then
+    /// deletes, which free their keys; then updates, each after the one
+    /// whose key it takes (`claim_order`); then new rows, which may take a
+    /// key either of those freed. A delete of 7 and a re-key of 3 to 7 runs
+    /// in that order, and so does a new row keyed 5 beside a delete of 5.
     ///
     /// A held set (`in_doubt`) yields none: it may already be in the
     /// database, and is not sent again until it has been staged again.
     pub fn statements(&self) -> Vec<Statement> {
-        let mut out = Vec::new();
         if self.in_doubt {
-            return out;
+            return Vec::new();
         }
         // The table as the WHERE sees it: aliased when the row itself is
         // hashed, since `hash("t")` names a column if the table has one
@@ -662,12 +665,19 @@ impl Edits {
                 .join(" AND ");
             (self.source.clone(), clause)
         };
-        for (_, identity, change) in self.entries() {
-            if let RowChange::Insert(cells) = change {
-                let mut params = Vec::new();
-                let sql = if cells.is_empty() {
-                    format!("INSERT INTO {} DEFAULT VALUES RETURNING *", self.source)
-                } else {
+        let (mut duplicates, mut deletes, mut updates, mut inserts) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        // Each update's key before and after, for `claim_order`.
+        let mut moves = Vec::new();
+        for (key, identity, change) in self.entries() {
+            let mut params = Vec::new();
+            match change {
+                RowChange::Insert(cells) if cells.is_empty() => inserts.push(Statement {
+                    sql: format!("INSERT INTO {} DEFAULT VALUES RETURNING *", self.source),
+                    params,
+                    expectation: StatementExpectation::ReturnedOne,
+                }),
+                RowChange::Insert(cells) => {
                     let names = cells
                         .keys()
                         .map(|ix| qident(self.column_name(*ix)))
@@ -678,7 +688,8 @@ impl Edits {
                         .map(|(ix, cell)| self.supply(*ix, cell, &mut params))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    if cells.values().any(|c| c.bind == Bind::Source) {
+                    let copies = cells.values().any(|c| c.bind == Bind::Source);
+                    let sql = if copies {
                         params.extend(self.bound_identity(identity));
                         format!(
                             "INSERT INTO {} ({names}) SELECT {supplied} FROM {target} WHERE {where_clause} RETURNING *",
@@ -686,43 +697,53 @@ impl Edits {
                         )
                     } else {
                         format!("INSERT INTO {} ({names}) VALUES ({supplied}) RETURNING *", self.source)
-                    }
-                };
-                out.push(Statement {
-                    sql,
-                    params,
-                    expectation: StatementExpectation::ReturnedOne,
-                });
-            }
-        }
-        for (_, identity, change) in self.entries() {
-            if let RowChange::Update(cells) = change {
-                let mut params = Vec::new();
-                let set = cells
-                    .iter()
-                    .map(|(ix, cell)| {
-                        format!("{} = {}", qident(self.column_name(*ix)), self.supply(*ix, cell, &mut params))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                params.extend(self.bound_identity(identity));
-                out.push(Statement {
-                    sql: format!("UPDATE {target} SET {set} WHERE {where_clause}"),
-                    params,
-                    expectation: StatementExpectation::AffectedOne,
-                });
-            }
-        }
-        for (_, identity, change) in self.entries() {
-            if matches!(change, RowChange::Delete) {
-                out.push(Statement {
+                    };
+                    let stmt = Statement { sql, params, expectation: StatementExpectation::ReturnedOne };
+                    if copies { duplicates.push(stmt) } else { inserts.push(stmt) }
+                }
+                RowChange::Update(cells) => {
+                    let set = cells
+                        .iter()
+                        .map(|(ix, cell)| {
+                            format!("{} = {}", qident(self.column_name(*ix)), self.supply(*ix, cell, &mut params))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    params.extend(self.bound_identity(identity));
+                    moves.push((key.to_string(), self.moved_key(identity, cells)));
+                    updates.push(Statement {
+                        sql: format!("UPDATE {target} SET {set} WHERE {where_clause}"),
+                        params,
+                        expectation: StatementExpectation::AffectedOne,
+                    });
+                }
+                RowChange::Delete => deletes.push(Statement {
                     sql: format!("DELETE FROM {target} WHERE {where_clause}"),
                     params: self.bound_identity(identity),
                     expectation: StatementExpectation::AffectedOne,
-                });
+                }),
             }
         }
-        out
+        let mut updates: Vec<Option<Statement>> = updates.into_iter().map(Some).collect();
+        let updates = claim_order(&moves).into_iter().filter_map(|ix| updates[ix].take());
+        duplicates.into_iter().chain(deletes).chain(updates).chain(inserts).collect()
+    }
+
+    /// The key an update gives its row, as `key_of` spells it, when the
+    /// update changes a key column. A table keyed by rowid moves no key.
+    fn moved_key(&self, identity: &[Value], cells: &BTreeMap<usize, CellEdit>) -> Option<String> {
+        if self.by_rowid {
+            return None;
+        }
+        let mut moved = identity.to_vec();
+        for (slot, name) in moved.iter_mut().zip(&self.pk_cols) {
+            let ix = self.columns.iter().position(|c| c == name);
+            if let Some(Bind::Value(value)) = ix.and_then(|ix| cells.get(&ix)).map(|c| &c.bind) {
+                *slot = value.clone();
+            }
+        }
+        let moved = key_of(&moved);
+        (moved != key_of(identity)).then_some(moved)
     }
 
     /// What a WHERE binds for `identity`: the key values, or the rowid and
@@ -766,6 +787,37 @@ impl Edits {
         let ty = self.columns.iter().position(|c| c == name).and_then(|ix| self.types.get(ix));
         key_placeholder_for(ty.map(String::as_str).unwrap_or(""))
     }
+}
+
+/// The order to run updates in, as indices into `moves`: each update's key
+/// before, and after when it changes one. An update that takes the key
+/// another leaves runs after that one, so a chain of re-keys (2 to 4, then 1
+/// to 2) commits. Otherwise the updates keep their order. A cycle (a swap of
+/// two keys) has no order that commits, and the engine refuses it.
+fn claim_order(moves: &[(String, Option<String>)]) -> Vec<usize> {
+    let leaves: HashMap<&str, usize> =
+        moves.iter().enumerate().map(|(ix, (before, _))| (before.as_str(), ix)).collect();
+    // The update each one waits on: the one whose key it takes.
+    let waits_on: Vec<Option<usize>> = moves
+        .iter()
+        .enumerate()
+        .map(|(ix, (_, after))| after.as_deref().and_then(|k| leaves.get(k)).copied().filter(|&on| on != ix))
+        .collect();
+    let mut placed = vec![false; moves.len()];
+    let mut order = Vec::with_capacity(moves.len());
+    for start in 0..moves.len() {
+        // Walk back along what this update waits on, then run that chain
+        // from its far end.
+        let mut chain = Vec::new();
+        let mut at = Some(start);
+        while let Some(ix) = at.filter(|&ix| !placed[ix]) {
+            placed[ix] = true;
+            chain.push(ix);
+            at = waits_on[ix];
+        }
+        order.extend(chain.into_iter().rev());
+    }
+    order
 }
 
 /// The placeholder that carries a value of this type to the engine as the
@@ -1383,14 +1435,14 @@ mod tests {
         let stmts = e.statements();
         assert_eq!(
             stmts[0].sql,
-            "UPDATE \"main\".\"t\" AS \"row_\" SET \"row\" = ? WHERE \"rowid\" = ? AND hash(\"row_\") = ?::UBIGINT"
-        );
-        assert_eq!(stmts[0].params, vec![json!("b"), json!(5), json!(77)]);
-        assert_eq!(
-            stmts[1].sql,
             "DELETE FROM \"main\".\"t\" AS \"row_\" WHERE \"rowid\" = ? AND hash(\"row_\") = ?::UBIGINT"
         );
-        assert_eq!(stmts[1].params, vec![json!(6), json!("18446744073709551615")]);
+        assert_eq!(stmts[0].params, vec![json!(6), json!("18446744073709551615")]);
+        assert_eq!(
+            stmts[1].sql,
+            "UPDATE \"main\".\"t\" AS \"row_\" SET \"row\" = ? WHERE \"rowid\" = ? AND hash(\"row_\") = ?::UBIGINT"
+        );
+        assert_eq!(stmts[1].params, vec![json!("b"), json!(5), json!(77)]);
     }
 
     #[test]
@@ -1401,11 +1453,96 @@ mod tests {
         e.stage_delete(vec![json!(9)]);
         let stmts = e.statements();
         assert_eq!(stmts.len(), 2);
-        assert_eq!(stmts[0].sql, "UPDATE \"main\".\"t\" SET \"id\" = ?, \"qty\" = ? WHERE \"id\" = ?");
+        assert_eq!(stmts[0].sql, "DELETE FROM \"main\".\"t\" WHERE \"id\" = ?");
+        assert_eq!(stmts[0].params, vec![json!(9)]);
+        assert_eq!(stmts[1].sql, "UPDATE \"main\".\"t\" SET \"id\" = ?, \"qty\" = ? WHERE \"id\" = ?");
         // A PK edit is just an update: SET binds the new value, WHERE the original.
-        assert_eq!(stmts[0].params, vec![json!(7), Value::Null, json!(5)]);
-        assert_eq!(stmts[1].sql, "DELETE FROM \"main\".\"t\" WHERE \"id\" = ?");
-        assert_eq!(stmts[1].params, vec![json!(9)]);
+        assert_eq!(stmts[1].params, vec![json!(7), Value::Null, json!(5)]);
+    }
+
+    /// Each statement's verb and the key its WHERE or VALUES names.
+    fn plan(e: &Edits) -> Vec<(String, Value)> {
+        e.statements()
+            .into_iter()
+            .map(|s| (s.sql.split(' ').next().unwrap().to_string(), s.params.last().cloned().unwrap_or(Value::Null)))
+            .collect()
+    }
+
+    fn verb(name: &str, key: i64) -> (String, Value) {
+        (name.to_string(), json!(key))
+    }
+
+    #[test]
+    fn statements_free_a_key_before_another_row_takes_it() {
+        // EDITING.md's example: a DELETE of 7 and a re-key of 3 to 7.
+        let mut e = edits();
+        e.stage_delete(vec![json!(7)]);
+        e.stage_cell(vec![json!(3)], 0, txt("3"), txt("7"), json!(7));
+        assert_eq!(plan(&e), vec![verb("DELETE", 7), verb("UPDATE", 3)]);
+
+        // A new row keyed as a deleted one, and as one an update re-keys away.
+        let mut e = edits();
+        let draft = e.stage_insert();
+        e.stage_insert_cell(&draft, 0, txt("5"), json!(5));
+        let other = e.stage_insert();
+        e.stage_insert_cell(&other, 0, txt("6"), json!(6));
+        e.stage_delete(vec![json!(5)]);
+        e.stage_cell(vec![json!(6)], 0, txt("6"), txt("60"), json!(60));
+        assert_eq!(plan(&e), vec![verb("DELETE", 5), verb("UPDATE", 6), verb("INSERT", 5), verb("INSERT", 6)]);
+
+        // A chain: 3 takes 4, 2 takes 3, 1 takes 2. Each runs after the one
+        // whose key it takes, whatever order they were staged or sorted in.
+        let mut e = edits();
+        for (from, to) in [(1, 2), (2, 3), (3, 4)] {
+            e.stage_cell(vec![json!(from)], 0, txt(&from.to_string()), txt(&to.to_string()), json!(to));
+        }
+        assert_eq!(plan(&e), vec![verb("UPDATE", 3), verb("UPDATE", 2), verb("UPDATE", 1)]);
+        // A chain that ends in a deleted key: the delete comes first of all.
+        e.stage_delete(vec![json!(4)]);
+        assert_eq!(plan(&e)[0], verb("DELETE", 4));
+
+        // A duplicate reads its source before the set deletes or re-keys it.
+        let mut e = edits();
+        e.stage_cell(vec![json!(5)], 0, txt("5"), txt("9"), json!(9));
+        e.stage_delete(vec![json!(8)]);
+        e.stage_duplicate(vec![json!(8)], vec![(1, txt("Ada"), Bind::Source)]);
+        e.stage_duplicate(vec![json!(5)], vec![(1, txt("Bo"), Bind::Source)]);
+        assert_eq!(
+            plan(&e),
+            vec![verb("INSERT", 8), verb("INSERT", 5), verb("DELETE", 8), verb("UPDATE", 5)]
+        );
+
+        // A composite key moves when any of its columns does.
+        let mut e = Edits::new(
+            "\"main\".\"t\"".into(),
+            vec!["a".into(), "b".into()],
+            vec!["a".into(), "b".into(), "name".into()],
+            vec!["INTEGER".into(), "INTEGER".into(), "VARCHAR".into()],
+        );
+        e.stage_cell(vec![json!(1), json!(1)], 1, txt("1"), txt("2"), json!(2));
+        e.stage_cell(vec![json!(1), json!(2)], 1, txt("2"), txt("3"), json!(3));
+        let order: Vec<_> = e.statements().into_iter().map(|s| s.params).collect();
+        assert_eq!(order, vec![vec![json!(3), json!(1), json!(2)], vec![json!(2), json!(1), json!(1)]]);
+    }
+
+    #[test]
+    fn updates_run_after_the_ones_whose_keys_they_take() {
+        let moves = |m: &[(&str, Option<&str>)]| -> Vec<(String, Option<String>)> {
+            m.iter().map(|(a, b)| (a.to_string(), b.map(str::to_string))).collect()
+        };
+        // Nothing moves: the order stands.
+        assert_eq!(claim_order(&moves(&[("1", None), ("2", None)])), vec![0, 1]);
+        // 0 takes the key 1 leaves, and 1 the key 2 leaves.
+        assert_eq!(claim_order(&moves(&[("1", Some("2")), ("2", Some("3")), ("3", Some("4"))])), vec![2, 1, 0]);
+        // Two chains and a bystander keep their own places otherwise.
+        let order = claim_order(&moves(&[("a", Some("b")), ("x", None), ("b", Some("c")), ("y", Some("z"))]));
+        assert_eq!(order, vec![2, 0, 1, 3]);
+        // A swap has no order that commits; each runs once all the same.
+        let mut swap = claim_order(&moves(&[("1", Some("2")), ("2", Some("1"))]));
+        swap.sort();
+        assert_eq!(swap, vec![0, 1]);
+        // A key moved to itself waits on nothing.
+        assert_eq!(claim_order(&moves(&[("1", Some("1"))])), vec![0]);
     }
 
     #[test]
@@ -1606,15 +1743,15 @@ mod tests {
         let stmts = e.statements();
         assert_eq!(
             stmts[0].sql,
-            "INSERT INTO \"main\".\"t\" (\"doc\", \"b\") VALUES (?::JSON, from_base64(?::VARCHAR)) RETURNING *"
-        );
-        assert_eq!(stmts[0].params, vec![json!("{\"a\":1}"), Value::Null]);
-        assert_eq!(
-            stmts[1].sql,
             "UPDATE \"main\".\"t\" SET \"doc\" = ?::JSON, \"j\" = ?::JSON, \"b\" = from_base64(?::VARCHAR) WHERE \"id\" = ?"
         );
         // The text goes as typed: the cast reads it, nothing re-serializes it.
-        assert_eq!(stmts[1].params, vec![json!("{\"a\":1}"), json!("[1]"), json!("qrs="), json!(1)]);
+        assert_eq!(stmts[0].params, vec![json!("{\"a\":1}"), json!("[1]"), json!("qrs="), json!(1)]);
+        assert_eq!(
+            stmts[1].sql,
+            "INSERT INTO \"main\".\"t\" (\"doc\", \"b\") VALUES (?::JSON, from_base64(?::VARCHAR)) RETURNING *"
+        );
+        assert_eq!(stmts[1].params, vec![json!("{\"a\":1}"), Value::Null]);
     }
 
     #[test]
@@ -1628,11 +1765,11 @@ mod tests {
         e.stage_cell(vec![json!("AAE=")], 1, txt("a"), txt("b"), json!("b"));
         e.stage_delete(vec![json!("qg==")]);
         let stmts = e.statements();
+        assert_eq!(stmts[0].sql, "DELETE FROM \"main\".\"t\" WHERE \"k\" = from_base64(?::VARCHAR)");
         assert_eq!(
-            stmts[0].sql,
+            stmts[1].sql,
             "UPDATE \"main\".\"t\" SET \"name\" = ? WHERE \"k\" = from_base64(?::VARCHAR)"
         );
-        assert_eq!(stmts[1].sql, "DELETE FROM \"main\".\"t\" WHERE \"k\" = from_base64(?::VARCHAR)");
     }
 
     #[test]
@@ -1655,9 +1792,9 @@ mod tests {
             format!("INSERT INTO \"main\".\"t\" (\"name\") SELECT \"name\" FROM \"main\".\"t\" {key} RETURNING *")
         );
         assert_eq!(stmts[0].params, vec![json!(0.5), json!(0.5)]);
-        assert_eq!(stmts[1].sql, format!("UPDATE \"main\".\"t\" SET \"k\" = ?, \"f\" = ? {key}"));
-        assert_eq!(stmts[1].params, vec![json!(2.2), json!(0.2), json!(1.1), json!(1.1)]);
-        assert_eq!(stmts[2].sql, format!("DELETE FROM \"main\".\"t\" {key}"));
+        assert_eq!(stmts[1].sql, format!("DELETE FROM \"main\".\"t\" {key}"));
+        assert_eq!(stmts[2].sql, format!("UPDATE \"main\".\"t\" SET \"k\" = ?, \"f\" = ? {key}"));
+        assert_eq!(stmts[2].params, vec![json!(2.2), json!(0.2), json!(1.1), json!(1.1)]);
 
         for ty in ["FLOAT", "float", "REAL", "FLOAT4"] {
             assert_eq!(key_placeholder_for(ty), "?::FLOAT", "{ty}");
@@ -1906,8 +2043,8 @@ mod tests {
 
     #[test]
     fn a_duplicate_names_its_source_by_the_original_identity() {
-        // The source row is both re-keyed and deleted in the same staged
-        // set: the insert runs first and names the key the database holds.
+        // The source rows are re-keyed and deleted in the same staged set:
+        // the duplicates run first and name the keys the database holds.
         let mut e = edits();
         e.stage_cell(vec![json!(5)], 0, txt("5"), txt("7"), json!(7));
         e.stage_duplicate(vec![json!(5)], vec![(1, txt("Ada"), Bind::Source)]);
@@ -1918,9 +2055,9 @@ mod tests {
         assert_eq!(stmts.len(), 4);
         assert_eq!((stmts[0].sql.as_str(), &stmts[0].params), (copy, &vec![json!(5)]));
         assert_eq!((stmts[1].sql.as_str(), &stmts[1].params), (copy, &vec![json!(9)]));
-        assert!(stmts[2].sql.starts_with("UPDATE"));
-        assert_eq!(stmts[2].params, vec![json!(7), json!(5)]);
-        assert!(stmts[3].sql.starts_with("DELETE"));
+        assert!(stmts[2].sql.starts_with("DELETE"));
+        assert!(stmts[3].sql.starts_with("UPDATE"));
+        assert_eq!(stmts[3].params, vec![json!(7), json!(5)]);
 
         // A BLOB key is decoded in the duplicate's WHERE as in any other.
         let mut blob_keyed = Edits::new(

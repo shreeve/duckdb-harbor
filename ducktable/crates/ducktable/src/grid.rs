@@ -2888,58 +2888,12 @@ impl Grid {
                         Err(message) => return (Committed::Refused(message), None),
                     };
                     *held.lock().unwrap_or_else(|p| p.into_inner()) = Some(sid.clone());
-                    let run = || -> Result<(), String> {
-                        harbor_client::exec(&conn, "BEGIN", None, Some(&sid))?;
-                        for stmt in &stmts {
-                            let r = harbor_client::exec(
-                                &conn,
-                                &stmt.sql,
-                                Some(stmt.params.clone()),
-                                Some(&sid),
-                            )?;
-                            match stmt.expectation {
-                                edits::StatementExpectation::AffectedOne => {
-                                    // The engine answers UPDATE/DELETE with one
-                                    // count row; anything but exactly 1 means the
-                                    // row is not what we fetched. Nothing lands.
-                                    let affected = crate::sql::count_of(&r).unwrap_or(0);
-                                    if affected != 1 {
-                                        return Err(format!(
-                                            "a row changed since you read it \
-                                             ({affected} rows matched) — refresh and retry"
-                                        ));
-                                    }
-                                }
-                                edits::StatementExpectation::ReturnedOne => {
-                                    // Only a duplicate selects its row, from the
-                                    // row it copies: none back means that row is
-                                    // gone. Nothing lands, and no refresh brings
-                                    // it back: the draft names that row until it
-                                    // is discarded.
-                                    if r.rows.is_empty() {
-                                        return Err(
-                                            "a duplicated row's source is gone — discard \
-                                             that duplicate (⌘Z, or the review popover)"
-                                                .to_string()
-                                        );
-                                    }
-                                    if r.rows.len() != 1 {
-                                        return Err(format!(
-                                            "insert returned {} rows instead of 1",
-                                            r.rows.len()
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        Ok(())
-                    };
                     // Everything before COMMIT fails cleanly: the release
                     // below rolls the transaction back. COMMIT itself is
                     // the one request whose lost answer leaves the outcome
                     // unknown, since the server may have committed before the
                     // connection failed.
-                    let result = match run() {
+                    let result = match run_statements(&conn, &sid, &stmts) {
                         Err(message) => Committed::Refused(message),
                         Ok(()) => commit_verdict(harbor_client::exec_checked(
                             &conn,
@@ -4636,6 +4590,42 @@ enum Page<'a> {
     Failed(&'a str),
 }
 
+/// Open the transaction on session `sid` and run a staged set's statements
+/// in it, each checked for the one row it must touch. The first that fails
+/// stops the run with the reason, and nothing has landed: the caller's
+/// release of the session rolls the transaction back.
+fn run_statements(conn: &Conn, sid: &str, stmts: &[edits::Statement]) -> Result<(), String> {
+    harbor_client::exec(conn, "BEGIN", None, Some(sid))?;
+    for stmt in stmts {
+        let r = harbor_client::exec(conn, &stmt.sql, Some(stmt.params.clone()), Some(sid))?;
+        match stmt.expectation {
+            // The engine answers UPDATE/DELETE with one count row; anything
+            // but exactly 1 means the row is not what was fetched.
+            edits::StatementExpectation::AffectedOne => {
+                let affected = crate::sql::count_of(&r).unwrap_or(0);
+                if affected != 1 {
+                    return Err(format!(
+                        "a row changed since you read it ({affected} rows matched) — refresh and retry"
+                    ));
+                }
+            }
+            // Only a duplicate selects its row, from the row it copies: none
+            // back means that row is gone, and no refresh brings it back,
+            // since the draft names that row until it is discarded.
+            edits::StatementExpectation::ReturnedOne if r.rows.is_empty() => {
+                return Err("a duplicated row's source is gone — discard that duplicate \
+                            (⌘Z, or the review popover)"
+                    .to_string());
+            }
+            edits::StatementExpectation::ReturnedOne if r.rows.len() != 1 => {
+                return Err(format!("insert returned {} rows instead of 1", r.rows.len()));
+            }
+            edits::StatementExpectation::ReturnedOne => {}
+        }
+    }
+    Ok(())
+}
+
 /// Read the answer to the COMMIT request. An error Harbor reports is a
 /// verdict: the engine refused the commit, or the session was gone, and
 /// either way the transaction is rolled back. A request that could not be
@@ -5343,6 +5333,77 @@ mod tests {
         settle_fetch(Some(&PostCommit::InDoubt { message: "x".into(), unsettled: None }), true, Some(&mut e));
         assert!(e.judge(true));
         assert!(e.projection().is_empty() && e.statements().is_empty());
+    }
+
+    /// Run `e` as ⌘S does, in one session's transaction, and commit it.
+    fn commit_live(conn: &harbor_client::Conn, e: &Edits) -> Result<(), String> {
+        let sid = harbor_client::session_new(conn)?;
+        let run = super::run_statements(conn, &sid, &e.statements())
+            .and_then(|()| harbor_client::exec(conn, "COMMIT", None, Some(&sid)).map(drop));
+        harbor_client::session_release(conn, &sid);
+        run
+    }
+
+    /// Staged sets that move keys commit, and a full-precision DOUBLE key
+    /// names its row, which also needs a Harbor that reads the param as
+    /// exactly as DuckTable writes it. Live: needs `HARBOR_LIVE_DB`, a
+    /// scratch database file, as the probes in harbor-client's
+    /// `tests/live.rs` do.
+    #[test]
+    #[ignore]
+    fn staged_sets_that_move_keys_commit() {
+        let Some(db) = std::env::var_os("HARBOR_LIVE_DB") else {
+            println!("set HARBOR_LIVE_DB to a scratch database file; skipping");
+            return;
+        };
+        let conn = harbor_client::fleet::connect_path(std::path::Path::new(&db)).expect("connect");
+        let alone = |sql: &str| harbor_client::exec(&conn, sql, None, None).expect(sql);
+        let txt = |s: &str| Some(SharedString::from(s.to_string()));
+        alone("DROP TABLE IF EXISTS _dt_order");
+        alone("CREATE OR REPLACE SEQUENCE _dt_order_seq START 100");
+        alone("CREATE OR REPLACE TABLE _dt_order(id INTEGER PRIMARY KEY DEFAULT nextval('_dt_order_seq'), v VARCHAR)");
+        alone("INSERT INTO _dt_order VALUES (1, 'one'), (2, 'two'), (3, 'three'), (7, 'seven'), (9, 'nine')");
+        let mut e = Edits::new(
+            crate::sql::source("main", "_dt_order"),
+            vec!["id".into()],
+            vec!["id".into(), "v".into()],
+            vec!["INTEGER".into(), "VARCHAR".into()],
+        );
+        // EDITING.md's example: a DELETE of 7 and a re-key of 3 to 7.
+        e.stage_delete(vec![json!(7)]);
+        e.stage_cell(vec![json!(3)], 0, txt("3"), txt("7"), json!(7));
+        // A chain: 2 to 4, and 1 to the 2 it leaves.
+        e.stage_cell(vec![json!(1)], 0, txt("1"), txt("2"), json!(2));
+        e.stage_cell(vec![json!(2)], 0, txt("2"), txt("4"), json!(4));
+        // A new row keyed as a deleted one.
+        e.stage_delete(vec![json!(9)]);
+        let draft = e.stage_insert();
+        e.stage_insert_cell(&draft, 0, txt("9"), json!(9));
+        e.stage_insert_cell(&draft, 1, txt("new"), json!("new"));
+        // A duplicate of the row the set re-keys, read as it was.
+        e.stage_duplicate(vec![json!(3)], vec![(1, txt("three"), Bind::Source)]);
+        commit_live(&conn, &e).expect("the set commits");
+        let rows = alone("SELECT id, v FROM _dt_order ORDER BY id").rows;
+        assert_eq!(
+            rows,
+            [(2, "one"), (4, "two"), (7, "three"), (9, "new"), (100, "three")]
+                .map(|(id, v)| vec![json!(id), json!(v)])
+        );
+
+        alone("CREATE OR REPLACE TABLE _dt_double(k DOUBLE PRIMARY KEY, v INTEGER)");
+        alone("INSERT INTO _dt_double VALUES (924.2100000029881, 1)");
+        let page = harbor_client::query(&conn, "SELECT k, v FROM _dt_double").expect("page");
+        let mut e = Edits::new(
+            crate::sql::source("main", "_dt_double"),
+            vec!["k".into()],
+            vec!["k".into(), "v".into()],
+            vec!["DOUBLE".into(), "INTEGER".into()],
+        );
+        e.stage_cell(vec![page.rows[0][0].clone()], 1, txt("1"), txt("2"), json!(2));
+        commit_live(&conn, &e).expect("the key names its row");
+        alone("DROP TABLE _dt_order");
+        alone("DROP SEQUENCE _dt_order_seq");
+        alone("DROP TABLE _dt_double");
     }
 
     #[test]
