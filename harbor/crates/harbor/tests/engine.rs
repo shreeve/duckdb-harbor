@@ -868,6 +868,10 @@ mod wire {
         // A keyword field name is quoted in the type string, as DuckDB itself
         // does.
         schema(eng, "SELECT {'name': 1} AS s", r#"{"name":"s","duckdbType":"STRUCT(\"name\" INTEGER)","lossless":true,"fields":[{"name":"name","duckdbType":"INTEGER","lossless":true}]}"#);
+        // The type string is the engine's own: a keyword it knows and a
+        // geometry's coordinate system come through as `typeof` spells them.
+        schema(eng, "SELECT {'tuple': 1} AS s", r#"{"name":"s","duckdbType":"STRUCT(\"tuple\" INTEGER)","lossless":true,"fields":[{"name":"tuple","duckdbType":"INTEGER","lossless":true}]}"#);
+        schema(eng, "SELECT 'POINT(1 2)'::GEOMETRY('OGC:CRS84') AS g", r#"{"name":"g","duckdbType":"GEOMETRY('OGC:CRS84')","lossless":false,"encoding":"varchar-cast"}"#);
         schema(eng, "SELECT MAP([1],['x']) AS m", r#"{"name":"m","duckdbType":"MAP(INTEGER, VARCHAR)","lossless":true,"keyType":{"duckdbType":"INTEGER","lossless":true},"valueType":{"duckdbType":"VARCHAR","lossless":true},"encoding":"pairs"}"#);
         schema(eng, "SELECT 'a'::ENUM('a','b') AS e", r#"{"name":"e","duckdbType":"ENUM('a', 'b')","lossless":true,"values":["a","b"]}"#);
         schema(eng, "SELECT TIMETZ '14:30:00+02' AS t", r#"{"name":"t","duckdbType":"TIME WITH TIME ZONE","lossless":true}"#);

@@ -14,10 +14,8 @@ use super::{Error, str_view};
 use crate::encode::{
     civil_from_days, digit_pair, push_base64, push_bit_string, push_date, push_float,
     push_float32, push_fraction, push_i64_raw, push_int, push_int_pad, push_json_string,
-    push_time, push_tz_offset, push_u128_raw, push_u64_raw, push_uint, push_uuid, quote_identifier,
-    quote_nonfinite,
-    split_time,
-    varint_to_decimal,
+    push_time, push_tz_offset, push_u128_raw, push_u64_raw, push_uint, push_uuid, quote_nonfinite,
+    split_time, varint_to_decimal,
 };
 
 // ---------------------------------------------------------------------------
@@ -28,9 +26,9 @@ use crate::encode::{
 /// introspection so no handle outlives the result that produced it.
 pub struct Type {
     pub id: ffi::LOGICAL_TYPE_ID,
-    /// The engine's name for the type when it differs from the canonical
-    /// name of the id — an extension or user-defined alias such as JSON.
-    pub alias: Option<String>,
+    /// The type as SQL text, in the engine's own words: an alias such as
+    /// JSON by its alias, a struct's field names quoted as `typeof` quotes them.
+    pub name: String,
     /// DECIMAL only: (width, scale).
     pub decimal: (u8, u8),
     /// ARRAY only: the fixed element count.
@@ -42,34 +40,14 @@ pub struct Type {
     pub children: Vec<(String, Type)>,
 }
 
-/// The canonical names of the type ids this encoder knows, exactly as
-/// logical_type_get_name spells them. A name outside this set is an alias.
-fn is_canonical_name(name: &str) -> bool {
-    matches!(
-        name,
-        "BOOLEAN" | "TINYINT" | "SMALLINT" | "INTEGER" | "BIGINT" | "HUGEINT" | "UHUGEINT"
-            | "UTINYINT" | "USMALLINT" | "UINTEGER" | "UBIGINT" | "FLOAT" | "DOUBLE" | "VARCHAR"
-            | "BLOB" | "BIT" | "UUID" | "DATE" | "TIME" | "TIME WITH TIME ZONE" | "TIME_NS"
-            | "TIMESTAMP" | "TIMESTAMP_S" | "TIMESTAMP_MS" | "TIMESTAMP_NS"
-            | "TIMESTAMP WITH TIME ZONE" | "TIMESTAMPTZ_NS" | "INTERVAL"
-            | "DECIMAL" | "LIST" | "ARRAY" | "MAP" | "STRUCT" | "TUPLE" | "UNION" | "ENUM"
-            | "NULL" | "\"NULL\"" | "SQLNULL" | "GEOMETRY" | "VARIANT" | "BIGNUM" | "ANY"
-            | "INVALID" | "UNKNOWN" | "ROW"
-    )
-}
-
 impl Type {
     /// Read a borrowed logical_type handle into an owned tree.
     pub fn of(api: &ffi::Api, lt: ffi::logical_type_handle) -> Result<Type, Error> {
         let mut id: ffi::LOGICAL_TYPE_ID = 0;
         call!(api, logical_type_get_id(lt, &mut id));
+        let name = sized_text(api, api.logical_type_to_text, "logical_type_to_text", lt)?;
 
-        let mut name_view = ffi::identifier_t { ptr: std::ptr::null(), len: 0 };
-        call!(api, logical_type_get_name(lt, &mut name_view));
-        let name = unsafe { str_view(&name_view) }.to_owned();
-        let alias = (!is_canonical_name(&name)).then_some(name);
-
-        let mut ty = Type { id, alias, decimal: (0, 0), array_len: 0, enum_values: Vec::new(), children: Vec::new() };
+        let mut ty = Type { id, name, decimal: (0, 0), array_len: 0, enum_values: Vec::new(), children: Vec::new() };
 
         let mut count: ffi::idx_t = 0;
         call!(api, logical_type_get_param_count(lt, &mut count));
@@ -200,7 +178,7 @@ fn emit_schema(out: &mut String, name: Option<&str>, ty: &Type) {
         out.push(',');
     }
     out.push_str(r#""duckdbType":"#);
-    push_json_string(out, &type_name(ty));
+    push_json_string(out, &ty.name);
 
     match ty.id {
         LOGICAL_TYPE_ID_DECIMAL => {
@@ -312,79 +290,6 @@ fn is_lossless(id: ffi::LOGICAL_TYPE_ID) -> bool {
             | LOGICAL_TYPE_ID_TIME_NS
             | LOGICAL_TYPE_ID_TIMESTAMP_TZ_NS
     )
-}
-
-pub fn type_name(ty: &Type) -> String {
-    use ffi::*;
-    if let Some(alias) = &ty.alias {
-        return alias.clone();
-    }
-    match ty.id {
-        LOGICAL_TYPE_ID_BOOLEAN => "BOOLEAN".into(),
-        LOGICAL_TYPE_ID_TINYINT => "TINYINT".into(),
-        LOGICAL_TYPE_ID_SMALLINT => "SMALLINT".into(),
-        LOGICAL_TYPE_ID_INTEGER => "INTEGER".into(),
-        LOGICAL_TYPE_ID_BIGINT => "BIGINT".into(),
-        LOGICAL_TYPE_ID_HUGEINT => "HUGEINT".into(),
-        LOGICAL_TYPE_ID_UHUGEINT => "UHUGEINT".into(),
-        LOGICAL_TYPE_ID_UTINYINT => "UTINYINT".into(),
-        LOGICAL_TYPE_ID_USMALLINT => "USMALLINT".into(),
-        LOGICAL_TYPE_ID_UINTEGER => "UINTEGER".into(),
-        LOGICAL_TYPE_ID_UBIGINT => "UBIGINT".into(),
-        LOGICAL_TYPE_ID_FLOAT => "FLOAT".into(),
-        LOGICAL_TYPE_ID_DOUBLE => "DOUBLE".into(),
-        LOGICAL_TYPE_ID_VARCHAR => "VARCHAR".into(),
-        LOGICAL_TYPE_ID_BLOB => "BLOB".into(),
-        LOGICAL_TYPE_ID_BIT => "BIT".into(),
-        LOGICAL_TYPE_ID_UUID => "UUID".into(),
-        LOGICAL_TYPE_ID_DATE => "DATE".into(),
-        LOGICAL_TYPE_ID_TIME => "TIME".into(),
-        LOGICAL_TYPE_ID_TIME_TZ => "TIME WITH TIME ZONE".into(),
-        LOGICAL_TYPE_ID_TIME_NS => "TIME_NS".into(),
-        LOGICAL_TYPE_ID_TIMESTAMP => "TIMESTAMP".into(),
-        LOGICAL_TYPE_ID_TIMESTAMP_SEC => "TIMESTAMP_S".into(),
-        LOGICAL_TYPE_ID_TIMESTAMP_MS => "TIMESTAMP_MS".into(),
-        LOGICAL_TYPE_ID_TIMESTAMP_NS => "TIMESTAMP_NS".into(),
-        LOGICAL_TYPE_ID_TIMESTAMP_TZ => "TIMESTAMP WITH TIME ZONE".into(),
-        LOGICAL_TYPE_ID_TIMESTAMP_TZ_NS => "TIMESTAMPTZ_NS".into(),
-        LOGICAL_TYPE_ID_INTERVAL => "INTERVAL".into(),
-        LOGICAL_TYPE_ID_DECIMAL => format!("DECIMAL({},{})", ty.decimal.0, ty.decimal.1),
-        LOGICAL_TYPE_ID_LIST => format!("{}[]", type_name(&ty.children[0].1)),
-        LOGICAL_TYPE_ID_ARRAY => format!("{}[{}]", type_name(&ty.children[0].1), ty.array_len),
-        LOGICAL_TYPE_ID_ENUM => {
-            let values: Vec<String> =
-                ty.enum_values.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect();
-            format!("ENUM({})", values.join(", "))
-        }
-        LOGICAL_TYPE_ID_STRUCT => {
-            let fields: Vec<String> = ty
-                .children
-                .iter()
-                .map(|(n, c)| format!("{} {}", quote_identifier(n), type_name(c)))
-                .collect();
-            format!("STRUCT({})", fields.join(", "))
-        }
-        LOGICAL_TYPE_ID_TUPLE => {
-            let members: Vec<String> = ty.children.iter().map(|(_, c)| type_name(c)).collect();
-            format!("TUPLE({})", members.join(", "))
-        }
-        LOGICAL_TYPE_ID_MAP => {
-            format!("MAP({}, {})", type_name(&ty.children[0].1), type_name(&ty.children[1].1))
-        }
-        LOGICAL_TYPE_ID_UNION => {
-            let members: Vec<String> = ty
-                .children
-                .iter()
-                .map(|(n, c)| format!("{} {}", quote_identifier(n), type_name(c)))
-                .collect();
-            format!("UNION({})", members.join(", "))
-        }
-        LOGICAL_TYPE_ID_SQLNULL => "\"NULL\"".into(),
-        LOGICAL_TYPE_ID_GEOMETRY => "GEOMETRY".into(),
-        LOGICAL_TYPE_ID_VARIANT => "VARIANT".into(),
-        LOGICAL_TYPE_ID_BIGNUM => "BIGNUM".into(),
-        _ => "UNKNOWN".into(),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -918,25 +823,43 @@ fn push_ts(out: &mut String, nanos: i128, seconds_only: bool, zulu: bool) {
     }
 }
 
-/// The engine's text rendering of a value, via the sized two-call protocol.
+/// The engine's text rendering of a value.
 fn value_text(api: &ffi::Api, value: ffi::value_handle) -> Option<String> {
-    let to_string = api.value_to_string?;
+    sized_text(api, api.value_to_string, "value_to_string", value).ok()
+}
+
+/// One of the engine's sized text writers, such as `value_to_string`: a
+/// first call measures the text, a second writes it.
+type SizedWriter<H> = unsafe extern "C" fn(
+    H,
+    *mut std::ffi::c_char,
+    ffi::idx_t,
+    *mut ffi::idx_t,
+    *mut ffi::error_info_handle,
+) -> ffi::ERROR;
+
+/// The text `write` renders of `handle`. `name` names the writer when the
+/// engine lacks it.
+fn sized_text<H: Copy>(
+    api: &ffi::Api,
+    write: Option<SizedWriter<H>>,
+    name: &str,
+    handle: H,
+) -> Result<String, Error> {
+    let write = write
+        .ok_or_else(|| Error { code: ffi::ERROR_API, message: format!("engine lacks duckdb_v2_{name}") })?;
     let mut len: ffi::idx_t = 0;
     let mut err: ffi::error_info_handle = std::ptr::null_mut();
-    let code = unsafe { to_string(value, std::ptr::null_mut(), 0, &mut len, &mut err) };
+    let code = unsafe { write(handle, std::ptr::null_mut(), 0, &mut len, &mut err) };
     if code != ffi::ERROR_NONE {
-        let _ = Error::take(api, code, err);
-        return None;
+        return Err(Error::take(api, code, err));
     }
     let mut buf = vec![0u8; len as usize + 1];
-    let mut err: ffi::error_info_handle = std::ptr::null_mut();
-    let code = unsafe {
-        to_string(value, buf.as_mut_ptr() as *mut _, buf.len() as ffi::idx_t, &mut len, &mut err)
-    };
+    let code = unsafe { write(handle, buf.as_mut_ptr().cast(), buf.len() as ffi::idx_t, &mut len, &mut err) };
     if code != ffi::ERROR_NONE {
-        let _ = Error::take(api, code, err);
-        return None;
+        return Err(Error::take(api, code, err));
     }
     buf.truncate(len as usize);
-    String::from_utf8(buf).ok()
+    String::from_utf8(buf)
+        .map_err(|_| Error { code: ffi::ERROR_API, message: format!("{name} wrote text that is not UTF-8") })
 }
