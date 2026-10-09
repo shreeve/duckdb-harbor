@@ -60,11 +60,18 @@ pub struct Server {
     // Drop wakes and, for unix paths, unlinks each one).
     listening_addrs: Vec<ListenAddr>,
 
-    // live client connections, counted at accept and at connection end.
-    // A fact, not a policy: the host reads this to decide lifetime (a
-    // refcounted server exits when nobody has been connected for a
-    // while), and policy stays out of the HTTP layer.
-    connections: Arc<AtomicUsize>,
+    // client connections, counted at accept and at connection end. A fact,
+    // not a policy: the host reads this to decide lifetime (a refcounted
+    // server exits when nobody has been connected for a while), and policy
+    // stays out of the HTTP layer.
+    connections: Arc<Connections>,
+}
+
+/// Client connections: those live now, and every one ever accepted.
+#[derive(Default)]
+struct Connections {
+    live: AtomicUsize,
+    accepted: AtomicUsize,
 }
 
 enum Message {
@@ -144,7 +151,14 @@ impl Server {
     /// that is the point: an attached client, even a quiet one, is a
     /// claim on the server's lifetime.
     pub fn connection_count(&self) -> usize {
-        self.connections.load(Relaxed)
+        self.connections.live.load(Relaxed)
+    }
+
+    /// Every connection accepted since the server started, however briefly
+    /// it lived: one that came and went between two looks at
+    /// [`connection_count`](Self::connection_count) still counts here.
+    pub fn accepted_count(&self) -> usize {
+        self.connections.accepted.load(Relaxed)
     }
 }
 
@@ -183,7 +197,7 @@ impl Server {
         listeners: Vec<stream::Listener>,
     ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
         let close_trigger = Arc::new(AtomicBool::new(false));
-        let connections = Arc::new(AtomicUsize::new(0));
+        let connections = Arc::new(Connections::default());
         let messages = MessagesQueue::with_capacity(8);
 
         let mut listening_addrs = Vec::with_capacity(listeners.len());
@@ -212,7 +226,7 @@ fn spawn_accept(
     server: stream::Listener,
     inside_close_trigger: Arc<AtomicBool>,
     inside_messages: Arc<MessagesQueue<Message>>,
-    inside_connections: Arc<AtomicUsize>,
+    inside_connections: Arc<Connections>,
     tasks_pool: Arc<pool::TaskPool>,
 ) {
     thread::spawn(move || {
@@ -281,13 +295,14 @@ fn spawn_accept(
                         // request loop. A drop guard, not a bare dec, so a
                         // panic while handling the connection cannot leak the
                         // count and pin a refcounted host open forever.
-                        struct Connected(Arc<AtomicUsize>);
+                        struct Connected(Arc<Connections>);
                         impl Drop for Connected {
                             fn drop(&mut self) {
-                                self.0.fetch_sub(1, Relaxed);
+                                self.0.live.fetch_sub(1, Relaxed);
                             }
                         }
-                        inside_connections.fetch_add(1, Relaxed);
+                        inside_connections.accepted.fetch_add(1, Relaxed);
+                        inside_connections.live.fetch_add(1, Relaxed);
                         let mut guard = Some(Connected(inside_connections.clone()));
                         tasks_pool.spawn(Box::new(move || {
                             let _connected = guard.take();

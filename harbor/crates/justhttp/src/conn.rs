@@ -169,7 +169,7 @@ impl ClientConnection {
         // Nothing of this request has arrived yet, so this is how long the
         // connection may stay quiet: a short clock before it has ever asked
         // for anything, a long one between keep-alive requests.
-        let quiet_until = Instant::now()
+        let mut quiet_until = Instant::now()
             + match self.served_a_request {
                 true => IDLE_TIMEOUT,
                 false => FIRST_REQUEST_TIMEOUT,
@@ -183,7 +183,13 @@ impl ClientConnection {
                 Some(Err(ref e)) if is_read_timeout(e) => match *deadline {
                     // Idle: this request has not begun. Both the never-spoke
                     // and the between-requests cases are on a clock; only the
-                    // length differs.
+                    // length differs. The clock runs from the last answer:
+                    // a client waiting on a response is not idle, however
+                    // long the response takes.
+                    None if !self.sink.answered() => {
+                        quiet_until = Instant::now() + IDLE_TIMEOUT;
+                        continue;
+                    }
                     None if Instant::now() >= quiet_until => {
                         return Err(ReadError::ReadIoError(IoError::new(
                             ErrorKind::TimedOut,
@@ -585,6 +591,23 @@ mod test {
         assert!(super::parse_request_line("GET /hello").is_err());
         assert!(super::parse_request_line("qsd qsd qsd").is_err());
     }
+
+    /// The keep-alive idle clock runs only once the last response is done,
+    /// which is what this reports: a response still being written (a long
+    /// statement's) is no idle time.
+    #[test]
+    fn a_connection_is_answered_once_its_last_writer_is_done() {
+        let mut sink = super::SequentialWriterBuilder::new(Vec::<u8>::new());
+        assert!(sink.answered(), "nothing asked yet");
+        let first = sink.next().unwrap();
+        assert!(!sink.answered());
+        drop(first);
+        assert!(sink.answered());
+        // The next writer does not wait on the one already done.
+        let mut second = sink.next().unwrap();
+        std::io::Write::write_all(&mut second, b"x").unwrap();
+        assert!(!sink.answered());
+    }
 }
 
 mod sequential {
@@ -592,7 +615,7 @@ mod sequential {
     use std::io::{Read, Write};
 
     use std::sync::mpsc::channel;
-    use std::sync::mpsc::{Receiver, Sender};
+    use std::sync::mpsc::{Receiver, Sender, TryRecvError};
     use std::sync::{Arc, Mutex, Weak};
 
     use std::mem;
@@ -659,6 +682,20 @@ mod sequential {
             SequentialWriterBuilder {
                 writer: Some(Arc::new(Mutex::new(writer))),
                 next_trigger: None,
+            }
+        }
+
+        /// Whether every writer handed out has finished: the last response
+        /// is written, or nothing was ever asked.
+        pub fn answered(&mut self) -> bool {
+            match self.next_trigger.as_ref().map(Receiver::try_recv) {
+                Some(Err(TryRecvError::Empty)) => false,
+                None => true,
+                // Finished; the next writer has nothing to wait for.
+                Some(_) => {
+                    self.next_trigger = None;
+                    true
+                }
             }
         }
 
