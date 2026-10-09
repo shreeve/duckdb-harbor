@@ -354,6 +354,40 @@ mod conn {
         assert_eq!(rows(&mut c2, "SELECT sum(x)::INTEGER FROM u", &[]).unwrap(), ["3"]);
     }
 
+    /// A float param binds as the double its text names. The text a client
+    /// sends is the shortest that round-trips, which needs every digit;
+    /// serde_json's default parser is not correctly rounded and lands about
+    /// one such text in ten a ULP off, silently.
+    #[test]
+    fn a_float_param_binds_the_double_its_text_names() {
+        let Some(_) = v2_engine() else { return };
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut floats = Vec::new();
+        while floats.len() < 4000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Half across every exponent, half at ordinary magnitudes.
+            let f = match floats.len() % 2 {
+                0 => f64::from_bits(state),
+                _ => (state >> 11) as f64 / (1u64 << 53) as f64 * 2000.0 - 1000.0,
+            };
+            if f.is_finite() {
+                floats.push(f);
+            }
+        }
+        let text = floats.iter().map(|f| format!("{f:e}")).collect::<Vec<_>>().join(",");
+        let parsed: Vec<f64> = serde_json::from_str(&format!("[{text}]")).unwrap();
+        let off = floats.iter().zip(&parsed).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        assert_eq!(off, 0, "{off} of {} doubles parsed to a neighbour", floats.len());
+
+        let mut c = conn::open(Path::new(":memory:"), &[]).expect("open");
+        for f in parsed.iter().take(200) {
+            let got = rows(&mut c, "SELECT ?::DOUBLE", &[Param::F64(*f)]).unwrap();
+            assert_eq!(got[0].parse::<f64>().unwrap().to_bits(), f.to_bits(), "{f:e} came back {}", got[0]);
+        }
+    }
+
     #[test]
     fn set_option_reaches_the_engine() {
         let Some(_) = v2_engine() else { return };

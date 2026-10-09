@@ -13,8 +13,10 @@ license = "MIT"
 harbor-common = { path = "../common", features = ["config", "membership"] }
 libloading = "0.8"
 justhttp = { path = "../justhttp" }
-# preserve_order: --json rows must keep column order, not alphabetize it
-serde_json = { version = "1", features = ["preserve_order"] }
+# preserve_order: --json rows must keep column order, not alphabetize it.
+# float_roundtrip: a float param binds as the double its text names; the
+# default parser is not correctly rounded and lands some texts a ULP off.
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 # IgnoredAny: the json modes check that a JSON-text cell is JSON before
 # splicing it in, without building a tree for it
 serde = "1"

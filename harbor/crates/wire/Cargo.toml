@@ -11,4 +11,5 @@ license = "MIT"
 # dependency—pin compatibility. No I/O here, ever: types and codes only.
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip: a double read off the wire is the one its text names.
+serde_json = { version = "1", features = ["float_roundtrip"] }
