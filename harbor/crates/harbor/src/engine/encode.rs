@@ -667,57 +667,41 @@ fn emit(
             // on the connection that produced it, and the schema line says
             // "json". Without a caster (internal helpers) it falls back to
             // the display text, which cannot tell 42 from '42'.
-            LOGICAL_TYPE_ID_VARIANT => {
-                let mut value: ffi::value_handle = std::ptr::null_mut();
-                call!(api, vector_get_value(r.vector, row as ffi::idx_t, &mut value));
-                let text = match json {
-                    Some(j) => {
-                        let mut cast: ffi::value_handle = std::ptr::null_mut();
-                        let done = (|| -> Result<(), Error> {
-                            call!(api, value_cast_with_connection(j.conn, value, j.ty, &mut cast));
-                            Ok(())
-                        })();
-                        let text = if done.is_ok() { value_text(api, cast) } else { None };
-                        if !cast.is_null() {
-                            destroy_value(api, &mut cast);
-                        }
-                        destroy_value(api, &mut value);
-                        done?;
-                        text
-                    }
-                    None => {
-                        let text = value_text(api, value);
-                        destroy_value(api, &mut value);
-                        text
-                    }
-                };
-                match text {
-                    Some(s) if json.is_some() => push_json_string(out, &quote_nonfinite(&s)),
-                    Some(s) => push_json_string(out, &s),
-                    None => out.push_str("null"),
-                }
+            LOGICAL_TYPE_ID_VARIANT if json.is_some() => {
+                push_json_string(out, &quote_nonfinite(&cell_text(api, r, row, json)?))
             }
-            // GEOMETRY has no committed view layout either, and no JSON form;
-            // the payload goes out as the engine's text rendering, exactly
-            // what the schema's "varchar-cast" promises. (v1 emitted base64
-            // of storage bytes under the same lossless:false label — a
-            // payload nothing could decode; text is strictly better.)
-            LOGICAL_TYPE_ID_GEOMETRY => {
-                let mut value: ffi::value_handle = std::ptr::null_mut();
-                call!(api, vector_get_value(r.vector, row as ffi::idx_t, &mut value));
-                let text = value_text(api, value);
-                destroy_value(api, &mut value);
-                match text {
-                    Some(s) => push_json_string(out, &s),
-                    None => out.push_str("null"),
-                }
-            }
-            // A type this build has never seen: the schema line already said
-            // lossless:false, so the payload stays honest and empty.
-            _ => out.push_str("null"),
+            // GEOMETRY, TYPE, and any type with no view layout or JSON form
+            // of its own go out as the engine's text rendering, which is
+            // what the schema's "varchar-cast" promises.
+            _ => push_json_string(out, &cell_text(api, r, row, None)?),
         }
     }
     Ok(())
+}
+
+/// A cell's text through the single-value bridge: the engine's rendering of
+/// the value, or of its cast to `json`'s type. A cast or a rendering that
+/// fails fails the cell, since a null in its place would read as SQL NULL.
+fn cell_text(api: &ffi::Api, r: &Reader, row: usize, json: Option<Json>) -> Result<String, Error> {
+    let mut value: ffi::value_handle = std::ptr::null_mut();
+    call!(api, vector_get_value(r.vector, row as ffi::idx_t, &mut value));
+    let text = match json {
+        None => sized_text(api, api.value_to_string, "value_to_string", value),
+        Some(j) => {
+            let mut cast: ffi::value_handle = std::ptr::null_mut();
+            let done = (|| -> Result<(), Error> {
+                call!(api, value_cast_with_connection(j.conn, value, j.ty, &mut cast));
+                Ok(())
+            })();
+            let text = done.and_then(|()| sized_text(api, api.value_to_string, "value_to_string", cast));
+            if !cast.is_null() {
+                destroy_value(api, &mut cast);
+            }
+            text
+        }
+    };
+    destroy_value(api, &mut value);
+    text
 }
 
 fn hugeint(h: ffi::hugeint_t) -> i128 {
@@ -821,11 +805,6 @@ fn push_ts(out: &mut String, nanos: i128, seconds_only: bool, zulu: bool) {
     if zulu {
         out.push('Z');
     }
-}
-
-/// The engine's text rendering of a value.
-fn value_text(api: &ffi::Api, value: ffi::value_handle) -> Option<String> {
-    sized_text(api, api.value_to_string, "value_to_string", value).ok()
 }
 
 /// One of the engine's sized text writers, such as `value_to_string`: a

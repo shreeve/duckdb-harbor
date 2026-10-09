@@ -954,6 +954,10 @@ mod wire {
             r#""\"NaN\"","{\"a\":\"Infinity\",\"b\":\"-Infinity\",\"c\":\"NaN\",\"s\":\"NaN\"}","[\"-Infinity\"]""#,
         );
         schema(eng, "SELECT 42::VARIANT AS v", r#"{"name":"v","duckdbType":"VARIANT","lossless":false,"encoding":"json"}"#);
+        // A type with no view layout or JSON form of its own goes out as the
+        // engine's text, as its schema line's "varchar-cast" says.
+        row(eng, "SELECT 'POINT(1 2)'::GEOMETRY, get_type(1), make_type('LIST', make_type('VARCHAR'))", r#""POINT (1 2)","INTEGER","VARCHAR[]""#);
+        schema(eng, "SELECT get_type(1) AS t", r#"{"name":"t","duckdbType":"TYPE","lossless":false,"encoding":"varchar-cast"}"#);
         // A JSON column is text that is JSON: the alias name is what the
         // schema says, and the CLI's json modes splice such a cell by it.
         schema(eng, "SELECT '{\"a\":1}'::JSON AS j", r#"{"name":"j","duckdbType":"JSON","lossless":true}"#);
