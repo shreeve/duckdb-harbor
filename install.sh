@@ -6,7 +6,7 @@
 #
 # Pin a version by passing a tag (with or without the leading v):
 #
-#   curl -fsSL .../install.sh | bash -s v0.18.0
+#   curl -fsSL .../install.sh | bash -s v0.44.2
 #
 # Downloads the release archive for this platform, verifies its sha256 against
 # the published checksums, and runs the archive's own installer — the binary
@@ -48,6 +48,20 @@ uninstall() {
   LIB=${LIB:-$HOME/.local/lib}
   if [ ! -e "$BIN/$NAME" ] && [ ! -e "$LIB/libduckdb.dylib" ] && [ ! -e "$LIB/libduckdb.so" ]; then
     fail "$NAME is not installed at $(tildify "$BIN/$NAME") (BIN=/LIB= if it lives elsewhere)"
+  fi
+  # A login item runs the binary by its path, and launchd or systemd would
+  # retry a missing one every ten seconds until logout. Each goes first,
+  # while there is still a harbor to take it down.
+  items=""
+  for item in "$HOME"/Library/LaunchAgents/harbor.*.plist "${XDG_CONFIG_HOME:-$HOME/.config}"/systemd/user/harbor-*.service; do
+    [ -e "$item" ] || continue
+    name=${item##*/}; name=${name#harbor.}; name=${name#harbor-}; name=${name%.plist}; name=${name%.service}
+    items="$items  harbor $name autostart off stop\n"
+  done
+  if [ -n "$items" ]; then
+    printf "${Red}error${Color_Off}: login items still start harbor — take each down first:\n" >&2
+    printf '%b' "$items" >&2
+    exit 1
   fi
   if [ -e "$BIN/$NAME" ]; then
     rm -f "$BIN/$NAME" || fail "cannot remove $(tildify "$BIN/$NAME") — re-run under sudo if it was installed system-wide"
