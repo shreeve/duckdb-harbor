@@ -21,7 +21,6 @@ mod http;
 pub mod installs;
 mod interactive;
 mod keywords;
-pub mod scan;
 mod theme;
 mod snapshot;
 pub use snapshot::with_snapshot;

@@ -4,10 +4,10 @@
 //! `.theme`/`.appearance`. The default `duck` theme follows the duckdb shell:
 //! keywords green, literals yellow, comments dim, unterminated literals red.
 //! String/comment/dollar-quote boundaries come from the shared scanner
-//! (scan.rs) — the same spans the validator and splitter obey.
+//! (`wire::scan`) — the same spans the validator and splitter obey.
 
 use crate::repl::keywords::KEYWORDS;
-use crate::repl::scan::{Kind, scan};
+use wire::scan::{Kind, scan};
 use crate::repl::theme;
 use nu_ansi_term::Style;
 use reedline::{Highlighter, StyledText};

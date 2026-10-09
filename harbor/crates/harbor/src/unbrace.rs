@@ -37,7 +37,7 @@
 
 use std::borrow::Cow;
 
-use crate::repl::scan::{Kind, scan};
+use wire::scan::{Kind, scan};
 
 /// How much text one statement's expansion may write or re-read: twice the
 /// 8 MiB a request body may be, so what it produces is never much larger

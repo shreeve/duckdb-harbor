@@ -14,7 +14,7 @@ use std::borrow::Cow;
 
 use crate::repl::complete::SqlCompleter;
 use crate::repl::render::{Mode, RenderOpts};
-use crate::repl::scan::{Kind, scan};
+use wire::scan::{Kind, scan};
 use crate::repl::{Conn, Outcome, Transaction};
 
 struct BerthPrompt {
@@ -58,7 +58,7 @@ impl Validator for SqlValidator {
 }
 
 /// Complete = a dot-command, an empty line, or a buffer whose last
-/// non-whitespace code byte is `;` — judged by the shared scanner (scan.rs),
+/// non-whitespace code byte is `;` — judged by the shared scanner (`wire::scan`),
 /// so the validator, splitter, and highlighter can never disagree.
 pub fn statement_complete(buf: &str) -> bool {
     let t = buf.trim();

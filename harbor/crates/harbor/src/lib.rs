@@ -32,7 +32,8 @@ mod unbrace;
 
 /// The client half — REPL, renderer, transports. Lives in the same
 /// crate so both halves of `harbor` are one codebase with one version;
-/// the server half above never calls into it.
+/// the server half (this file, `encode`, `unbrace`, `engine`) never calls
+/// into it. The SQL lexer both halves read with is `wire::scan`.
 pub mod repl;
 
 // The v2 C API engine, generated from DuckDB's api_spec. The only path to

@@ -91,7 +91,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use harbor::repl::{scan::{scan, Kind}, split_statements};
+use harbor::repl::split_statements;
+use wire::scan::{scan, Kind};
 
 /// The one-line companion of `load.sql`: what to run after it. Only
 /// [`restore`] reads it; DuckDB's own IMPORT never will.
