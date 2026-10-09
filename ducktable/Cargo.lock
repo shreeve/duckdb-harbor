@@ -2887,6 +2887,7 @@ name = "harbor-client"
 version = "0.22.9"
 dependencies = [
  "harbor-common",
+ "harbor-http",
  "serde",
  "serde_json",
  "toml 1.1.4+spec-1.1.0",
@@ -2902,6 +2903,16 @@ dependencies = [
  "serde_json",
  "toml 1.1.4+spec-1.1.0",
  "toml_edit 0.22.27",
+]
+
+[[package]]
+name = "harbor-http"
+version = "0.44.2"
+dependencies = [
+ "harbor-common",
+ "serde",
+ "serde_json",
+ "wire",
 ]
 
 [[package]]

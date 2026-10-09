@@ -10,6 +10,8 @@ use std::io::BufRead as _;
 use std::time::Duration;
 use wire::{endpoint, Event, SqlRequest};
 
+pub use http::Failure;
+
 /// One statement's full result page, in server order.
 #[derive(Debug)]
 pub struct QueryResult {
@@ -21,40 +23,6 @@ pub struct QueryResult {
 
 pub fn query(conn: &Conn, sql: &str) -> Result<QueryResult, String> {
     exec(conn, sql, None, None)
-}
-
-/// Why a statement returned no result. The two cases differ in what the
-/// caller knows afterwards, which matters most for a `COMMIT`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Failure {
-    /// Harbor answered with an error of its own: the engine's verdict
-    /// (`sql_error`), or a refusal such as `no_such_session`. The statement
-    /// did not take effect.
-    Refused { code: String, message: String },
-    /// The request never reached Harbor whole: the connection could not be
-    /// made, or the request could not be written. The statement did not run.
-    Unsent(String),
-    /// The request was sent and no verdict arrived: its answer did not come,
-    /// or could not be read to the end. The statement may have run.
-    Unanswered(String),
-}
-
-impl Failure {
-    /// The session named in the request is gone: released, or reclaimed by
-    /// the server at its idle timeout or its deadline, with its transaction
-    /// rolled back.
-    pub fn session_gone(&self) -> bool {
-        matches!(self, Failure::Refused { code, .. } if code == "no_such_session")
-    }
-}
-
-impl std::fmt::Display for Failure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Failure::Refused { code, message } => write!(f, "{code}: {message}"),
-            Failure::Unsent(message) | Failure::Unanswered(message) => f.write_str(message),
-        }
-    }
 }
 
 /// One statement with everything the wire offers: bound parameters (never
@@ -106,11 +74,7 @@ pub fn exec_within(
     // as "bad wire line" from trying to decode it as NDJSON.
     let status = resp.status;
     if !(200..300).contains(&status) {
-        let body = resp.body_string().unwrap_or_default();
-        return Err(match Event::parse(body.trim()) {
-            Ok(Event::Error { code, message }) => Failure::Refused { code, message },
-            _ => Failure::Unanswered(format!("HTTP {status}")),
-        });
+        return Err(Failure::of(status, &resp.body_string().unwrap_or_default()));
     }
     decode(resp.body.lines())
 }
@@ -161,37 +125,20 @@ pub fn session_new(conn: &Conn) -> Result<String, String> {
 
 /// [`session_new`], with the lifetime Harbor granted.
 pub fn session_open(conn: &Conn) -> Result<Session, String> {
-    let transport = conn.transport()?;
-    let open = |route: &wire::endpoint::Route| {
-        http::request(
-            transport,
-            route,
-            Some("{}"),
-            Some(Duration::from_secs(10)),
-        )
-        .map_err(|e| format!("session: {e}"))
-    };
-    let mut resp = open(&endpoint::SESSIONS_CREATE)?;
-    if resp.status == 404 {
-        // A pre-0.22.1 harbor only knows the old spelling — and joining
-        // older servers is a feature, so fall back rather than fail.
-        resp = open(&endpoint::SESSIONS_CREATE_LEGACY)?;
-    }
-    let status = resp.status;
-    let body = resp.body_string().map_err(|e| e.to_string())?;
-    if !(200..300).contains(&status) {
-        return Err(match Event::parse(body.trim()) {
-            Ok(Event::Error { code, message }) => format!("{code}: {message}"),
-            _ => format!("HTTP {status}"),
-        });
-    }
-    serde_json::from_str::<wire::SessionNewResponse>(&body)
+    http::session_open(conn.transport()?, &Default::default())
         .map(|r| Session {
             id: r.session_id,
             ttl: Duration::from_millis(r.ttl_ms),
             idle: Duration::from_millis(r.idle_ttl_ms),
         })
-        .map_err(|e| format!("bad session response: {e}"))
+        .map_err(|e| format!("session: {e}"))
+}
+
+/// Renew a session without running anything on it: its idle clock starts
+/// again, and its ceiling stays. `Ok(false)` is a Harbor that renews only
+/// backup sessions, where a statement is what keeps a session alive.
+pub fn session_renew(conn: &Conn, session_id: &str) -> Result<bool, Failure> {
+    http::session_renew(conn.transport().map_err(Failure::Unsent)?, session_id)
 }
 
 /// Release a session's pinned connection, rolling back any open
@@ -240,19 +187,7 @@ pub fn session_end(conn: &Conn, session_id: &str, patience: Duration) -> Ended {
 }
 
 fn release(conn: &Conn, session_id: &str) -> Result<wire::ReleasedResponse, String> {
-    let resp = http::request(
-        conn.transport()?,
-        &endpoint::session(session_id),
-        None,
-        Some(Duration::from_secs(10)),
-    )
-    .map_err(|e| format!("release: {e}"))?;
-    let status = resp.status;
-    let body = resp.body_string().map_err(|e| format!("release: {e}"))?;
-    if !(200..300).contains(&status) {
-        return Err(format!("release: HTTP {status}"));
-    }
-    serde_json::from_str(body.trim()).map_err(|e| format!("release: {e}"))
+    http::session_release(conn.transport()?, session_id).map_err(|e| format!("release: {e}"))
 }
 
 /// Whether Harbor still lists the session among those it holds.

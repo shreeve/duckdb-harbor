@@ -60,11 +60,6 @@ pub mod endpoint {
     /// holds a transaction across requests. Release it with [`session`].
     /// (Servers also accept the legacy `/sql/sessions/new` spelling.)
     pub const SESSIONS_CREATE: Route = Route::fixed("POST", "/sql/sessions");
-    /// The pre-0.22.1 spelling of [`SESSIONS_CREATE`]. Not in [`FIXED`]
-    /// (new servers advertise the canonical route); clients keep it only
-    /// to fall back when an older harbor answers 404 — joining older
-    /// servers is a feature.
-    pub const SESSIONS_CREATE_LEGACY: Route = Route::fixed("POST", "/sql/sessions/new");
     /// GET the collection — the open sessions. (Legacy spelling: `/sessions`.)
     pub const SESSIONS: Route = Route::fixed("GET", "/sql/sessions");
     /// GET — the whole schema as one document, cheaper and more complete than
