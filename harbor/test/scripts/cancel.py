@@ -27,6 +27,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -299,6 +300,15 @@ def run_tests(h, db):
     eq("cancelling it again cancels nothing", False, doc.get("cancelled"))
     eq("and is not an error", 200, st)
     eq("cancelling a name nobody used is the same", False, h.cancel("never")[1].get("cancelled"))
+
+    # A name is chosen freely and travels in the path percent-encoded, as
+    # encodeURIComponent writes it; the server cancels by the name itself.
+    job = Background(h, statement=LONG, query="q 2/é?")
+    time.sleep(0.5)
+    st, doc, _ = h.cancel(urllib.parse.quote("q 2/é?", safe=""))
+    eq("a name with reserved characters is cancelled by its encoding", True, doc.get("cancelled"))
+    job.wait()
+    eq("and its query fails with 499", 499, job.status)
 
     eq("the server still answers", 1, h.value("SELECT 1"))
     eq("and can still write", 200, h.sql("INSERT INTO marks VALUES (1)")[0])

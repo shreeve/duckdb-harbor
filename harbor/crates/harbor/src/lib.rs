@@ -738,6 +738,32 @@ fn lease_renew(id: &str) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// A path segment as the client meant it: a `queryId` is chosen freely and
+/// arrives in the body as itself, but in a path as its percent-encoding
+/// (`encodeURIComponent`). A `%` that starts no escape is taken as itself.
+fn percent_decoded(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(byte)) => {
+                out.push(byte);
+                i += 3;
+            }
+            (byte, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn renewal_session_id(path: &str) -> Option<&str> {
     path.strip_prefix("/sql/sessions/")?.strip_suffix("/renew")
         .filter(|id| !id.is_empty() && !id.contains('/'))
@@ -1832,8 +1858,7 @@ fn handle(
             // finished is `false`, not an error, because by the time a Stop
             // button is pressed the query it refers to may well be over.
             (Method::Delete, p) if p.starts_with("/sql/queries/") => {
-                let id = p.trim_start_matches("/sql/queries/").to_string();
-                let cancelled = cancel_query(&id);
+                let cancelled = cancel_query(&percent_decoded(&p["/sql/queries/".len()..]));
                 let _ = req.respond(json_response(200, &format!(r#"{{"cancelled":{cancelled}}}"#)));
                 (true, 200)
             }
@@ -4821,6 +4846,18 @@ UNION ALL SELECT 1::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FRO
         assert!(interactive.expired(start + LEASE_MAX_TTL, start, true, LEASE_IDLE_TTL));
         assert!(interactive.expired(start + LEASE_IDLE_TTL, start, false, LEASE_IDLE_TTL));
         assert!(!interactive.expired(start + LEASE_IDLE_TTL, start, true, LEASE_IDLE_TTL));
+    }
+
+    #[test]
+    fn a_query_id_in_a_path_is_percent_decoded() {
+        use super::percent_decoded;
+        assert_eq!(percent_decoded("cli-1-2"), "cli-1-2");
+        assert_eq!(percent_decoded("a%20b%2Fc%3F%25"), "a b/c?%");
+        assert_eq!(percent_decoded("caf%C3%A9"), "café");
+        // A % that starts no escape is itself.
+        assert_eq!(percent_decoded("100%"), "100%");
+        assert_eq!(percent_decoded("%zz%4"), "%zz%4");
+        assert_eq!(percent_decoded("%+1"), "%+1");
     }
 
     #[test]
