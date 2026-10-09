@@ -42,8 +42,11 @@ pub struct Response<R> {
     status_code: StatusCode,
     headers: Vec<Header>,
     data_length: Option<usize>,
-    chunked_threshold: Option<usize>,
 }
+
+/// The known body length from which a response is sent chunked rather than
+/// with a `Content-Length`.
+const CHUNKED_THRESHOLD: usize = 32768;
 
 /// How a response body is framed on the wire.
 #[derive(Copy, Clone)]
@@ -91,14 +94,13 @@ fn choose_transfer_encoding(
     status_code: StatusCode,
     http_version: &HttpVersion,
     entity_length: Option<usize>,
-    chunked_threshold: usize,
 ) -> TransferEncoding {
     // HTTP/1.0 has no chunked encoding, and RFC 9112 §6.1 forbids a
     // Transfer-Encoding on a 1xx or 204.
     if *http_version <= (1, 0) || status_code.0 < 200 || status_code.0 == 204 {
         return TransferEncoding::Identity;
     }
-    if entity_length.is_none_or(|len| len >= chunked_threshold) {
+    if entity_length.is_none_or(|len| len >= CHUNKED_THRESHOLD) {
         return TransferEncoding::Chunked;
     }
     TransferEncoding::Identity
@@ -120,7 +122,6 @@ where
             status_code,
             headers: Vec::with_capacity(16),
             data_length,
-            chunked_threshold: None,
         };
 
         for h in headers {
@@ -128,23 +129,6 @@ where
         }
 
         response
-    }
-
-    /// Set a threshold for `Content-Length` where we chose chunked
-    /// transfer. Notice that chunked transfer happens regardless of
-    /// this threshold when there is no `Content-Length`.
-    #[must_use]
-    pub fn with_chunked_threshold(mut self, length: usize) -> Response<R> {
-        self.chunked_threshold = Some(length);
-        self
-    }
-
-    /// The current `Content-Length` threshold for switching over to
-    /// chunked transfer. The default is 32768 bytes. Notice that
-    /// chunked transfer is mutually exclusive with sending a
-    /// `Content-Length` header as per the HTTP spec.
-    pub fn chunked_threshold(&self) -> usize {
-        self.chunked_threshold.unwrap_or(32768)
     }
 
     /// Adds a header to the list.
@@ -211,21 +195,6 @@ where
         self
     }
 
-    /// Returns the same response, but with different data.
-    #[must_use]
-    pub fn with_data<S>(self, reader: S, data_length: Option<usize>) -> Response<S>
-    where
-        S: Read,
-    {
-        Response {
-            reader,
-            headers: self.headers,
-            status_code: self.status_code,
-            data_length,
-            chunked_threshold: self.chunked_threshold,
-        }
-    }
-
     /// Prints the HTTP response to a writer: the bytes that go to the
     /// client's socket, framed for `http_version`.
     ///
@@ -240,7 +209,6 @@ where
             self.status_code,
             &http_version,
             self.data_length,
-            self.chunked_threshold(),
         );
 
         // The whole head — status line through the blank separator — is
@@ -364,15 +332,5 @@ impl Response<io::Empty> {
             io::empty(),
             Some(0),
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn chunked_threshold() {
-        let resp = crate::Response::from_string("test".to_string());
-        assert_eq!(resp.chunked_threshold(), 32768);
-        assert_eq!(resp.with_chunked_threshold(42).chunked_threshold(), 42);
     }
 }

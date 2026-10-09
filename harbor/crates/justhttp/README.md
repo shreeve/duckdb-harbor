@@ -15,9 +15,10 @@ and license** below.
 ## What it does
 
 - `Server::http("127.0.0.1:9495")` / `Server::http_unix(path)` — one
-  listener, TCP or UDS
-- Blocking `recv()` (plus `try_recv()` / `incoming_requests()`): each
-  `Request` carries method, url, headers, and a lazy body reader
+  listener, TCP or UDS; `Server::serve(listeners)` — several, one queue
+- `recv_timeout()` hands out requests, and `unblock()` wakes a waiting
+  worker for shutdown: each `Request` carries method, url, headers, and a
+  lazy body reader
 - `request.respond(response)` — responses stream from any `Read` impl;
   unknown-length responses are framed chunked, so a client reads row one
   while the server produces row N
@@ -104,7 +105,7 @@ three tiny dependencies (`ascii`, `chunked_transfer`, `httpdate`):
 
 | File | Owns |
 |---|---|
-| `lib.rs` | `Server`, the accept loop (socket timeouts and accept retry live here), `recv`/`recv_timeout`/`unblock` |
+| `lib.rs` | `Server`, the accept loop (socket timeouts and accept retry live here), `recv_timeout`/`unblock` |
 | `http.rs` | `Method`, `StatusCode`, `Header`, `HttpVersion` (strict, smuggling-hardened parsing) |
 | `stream.rs` | TCP/UDS listeners and the half-close connection stream |
 | `conn.rs` | per-connection request sequencing: keep-alive, pipelining, response ordering, request-head bounds and framing checks |

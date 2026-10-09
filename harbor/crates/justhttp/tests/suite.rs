@@ -7,7 +7,7 @@
 //! - `keepalive` — connection reuse + chunked streaming from a Reader
 //! - `buffering` — response backpressure against closed/idle clients
 //! - `prompt`    — latency properties: responses leave when they should
-//! - `unblock`   — Server::unblock wakes blocked recv()
+//! - `unblock`   — Server::unblock wakes a blocked recv_timeout()
 //! - `unix`      — unix-domain sockets
 //! - `first_request` — the first-request idle clock, and that keep-alive is
 //!   exempt from it (`#[ignore]`, ~60s each)
@@ -20,41 +20,41 @@
 
 mod support {
 
-    use std::net::TcpStream;
+    use std::net::{SocketAddr, TcpStream};
     use std::thread;
     use std::time::Duration;
+
+    /// The TCP address a server listens on.
+    pub fn addr(server: &justhttp::Server) -> SocketAddr {
+        match server.server_addr() {
+            justhttp::ListenAddr::Ip(addr) => addr,
+            #[cfg(unix)]
+            other => panic!("not a TCP server: {other}"),
+        }
+    }
+
+    /// The server's next request, waiting as long as any test here should.
+    pub fn recv(server: &justhttp::Server) -> justhttp::Request {
+        server.recv_timeout(Duration::from_secs(30)).unwrap().expect("no request within 30s")
+    }
 
     /// Creates a server and a client connected to the server.
     pub fn new_one_server_one_client() -> (justhttp::Server, TcpStream) {
         let server = justhttp::Server::http("0.0.0.0:0").unwrap();
-        let port = server.server_addr().to_ip().unwrap().port();
-        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let client = TcpStream::connect(("127.0.0.1", addr(&server).port())).unwrap();
         (server, client)
     }
 
     /// Creates a "hello world" server with a client connected to the server.
     ///
-    /// The server will automatically close after 3 seconds.
+    /// The server closes once it has had no request for 3 seconds.
     pub fn new_client_to_hello_world_server() -> TcpStream {
-        let server = justhttp::Server::http("0.0.0.0:0").unwrap();
-        let port = server.server_addr().to_ip().unwrap().port();
-        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (server, client) = new_one_server_one_client();
 
         thread::spawn(move || {
-            let mut cycles = 3 * 1000 / 20;
-
-            loop {
-                if let Some(rq) = server.try_recv().unwrap() {
-                    let response = justhttp::Response::from_string("hello world".to_string());
-                    rq.respond(response).unwrap();
-                }
-
-                thread::sleep(Duration::from_millis(20));
-
-                cycles -= 1;
-                if cycles == 0 {
-                    break;
-                }
+            while let Ok(Some(rq)) = server.recv_timeout(Duration::from_secs(3)) {
+                let response = justhttp::Response::from_string("hello world".to_string());
+                rq.respond(response).unwrap();
             }
         });
 
@@ -122,14 +122,12 @@ mod basic {
         )
         .unwrap();
 
-        let request = server.recv().unwrap();
+        let request = support::recv(&server);
         assert!(*request.method() == justhttp::Method::Get);
         assert_eq!(request.url(), "/");
         request
             .respond(justhttp::Response::from_string("hello world".to_owned()))
             .unwrap();
-
-        server.try_recv().unwrap();
 
         let mut content = String::new();
         stream.read_to_string(&mut content).unwrap();
@@ -154,7 +152,7 @@ mod input {
             (write!(client, "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain; charset=utf8\r\nContent-Length: 5\r\n\r\nhello")).unwrap();
         }
 
-        let mut request = server.recv().unwrap();
+        let mut request = support::recv(&server);
 
         let mut output = String::new();
         request.as_reader().read_to_string(&mut output).unwrap();
@@ -170,7 +168,7 @@ mod input {
             (write!(client, "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain; charset=utf8\r\nContent-Length: 3\r\n\r\nhello")).unwrap();
         }
 
-        let mut request = server.recv().unwrap();
+        let mut request = support::recv(&server);
 
         let mut output = String::new();
         request.as_reader().read_to_string(&mut output).unwrap();
@@ -188,7 +186,7 @@ mod input {
         let (tx, rx) = mpsc::channel();
 
         thread::spawn(move || {
-            let mut request = server.recv().unwrap();
+            let mut request = support::recv(&server);
             let mut output = String::new();
             request.as_reader().read_to_string(&mut output).unwrap();
             assert_eq!(output, "hello");
@@ -238,7 +236,7 @@ mod input {
         )
         .unwrap();
 
-        let request = server.recv().unwrap();
+        let request = support::recv(&server);
         request
             .respond(
                 justhttp::Response::from_string("{\"custom\": \"Content-Type\"}").with_header(
@@ -348,7 +346,7 @@ mod head {
         )
         .unwrap();
 
-        let mut request = server.recv().unwrap();
+        let mut request = support::recv(&server);
         let mut body = String::new();
         request.as_reader().read_to_string(&mut body).unwrap();
         assert_eq!(body, "hello");
@@ -504,7 +502,7 @@ mod head {
         .unwrap();
 
         std::thread::spawn(move || {
-            let rq = server.recv().unwrap();
+            let rq = support::recv(&server);
             // Unknown length: exactly the shape harbor streams /sql with.
             let body = std::io::Cursor::new(b"streamed".to_vec());
             rq.respond(justhttp::Response::new(200.into(), Vec::new(), body, None))
@@ -530,7 +528,7 @@ mod head {
         write!(client, "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n").unwrap();
 
         std::thread::spawn(move || {
-            let rq = server.recv().unwrap();
+            let rq = support::recv(&server);
             let body = std::io::Cursor::new(b"streamed".to_vec());
             rq.respond(justhttp::Response::new(200.into(), Vec::new(), body, None))
                 .unwrap();
@@ -549,7 +547,7 @@ mod network {
     use super::support;
 
     use std::io::{Read, Write};
-    use std::net::{Shutdown, TcpStream};
+    use std::net::Shutdown;
     use std::thread;
     use std::time::Duration;
 
@@ -640,12 +638,10 @@ mod network {
 
     #[test]
     fn crash_500() {
-        let server = justhttp::Server::http("0.0.0.0:0").unwrap();
-        let port = server.server_addr().to_ip().unwrap().port();
-        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (server, mut client) = support::new_one_server_one_client();
 
         thread::spawn(move || {
-            server.recv().unwrap();
+            support::recv(&server);
             // oops, server crash
         });
 
@@ -672,8 +668,8 @@ mod network {
         .unwrap();
 
         thread::spawn(move || {
-            let rq1 = server.recv().unwrap();
-            let rq2 = server.recv().unwrap();
+            let rq1 = support::recv(&server);
+            let rq2 = support::recv(&server);
 
             thread::spawn(move || {
                 rq2.respond(justhttp::Response::from_string("second request".to_owned()))
@@ -704,7 +700,7 @@ mod network {
         .unwrap();
 
         thread::spawn(move || {
-            let rq = server.recv().unwrap();
+            let rq = support::recv(&server);
 
             let resp = justhttp::Response::empty(justhttp::StatusCode(204));
             rq.respond(resp).unwrap();
@@ -736,14 +732,11 @@ mod keepalive {
 
         std::thread::spawn(move || {
             for i in 0..3 {
-                let rq = server.recv().unwrap();
+                let rq = support::recv(&server);
                 let body = format!("resp-{i}").into_bytes();
                 // unknown length => chunked framing => connection stays reusable
-                rq.respond(
-                    justhttp::Response::empty(justhttp::StatusCode(200))
-                        .with_data(Cursor::new(body), None),
-                )
-                .unwrap();
+                rq.respond(justhttp::Response::new(200.into(), Vec::new(), Cursor::new(body), None))
+                    .unwrap();
             }
         });
 
@@ -789,15 +782,12 @@ mod keepalive {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
 
         std::thread::spawn(move || {
-            let rq = server.recv().unwrap();
+            let rq = support::recv(&server);
             let reader = ChannelReader {
                 rx,
                 pending: Vec::new(),
             };
-            rq.respond(
-                justhttp::Response::empty(justhttp::StatusCode(200)).with_data(reader, None),
-            )
-            .unwrap();
+            rq.respond(justhttp::Response::new(200.into(), Vec::new(), reader, None)).unwrap();
         });
 
         write!(client, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
@@ -880,11 +870,9 @@ mod buffering {
         }
     }
 
-    fn identity_served(r: &mut Reader) -> justhttp::Response<&mut Reader> {
+    fn served(r: &mut Reader) -> justhttp::Response<&mut Reader> {
         let body_len = r.inner.get_ref().len();
-        justhttp::Response::empty(200)
-            .with_chunked_threshold(usize::MAX)
-            .with_data(r, Some(body_len))
+        justhttp::Response::new(200.into(), Vec::new(), r, Some(body_len))
     }
 
     /// Checks that a body-Read:er is not called when the client has disconnected
@@ -897,14 +885,14 @@ mod buffering {
         )
         .unwrap();
 
-        let request = server.recv().unwrap();
+        let request = support::recv(&server);
 
         // Client already disconnected
         drop(stream);
 
         let mut reader = big_response_reader();
         request
-            .respond(identity_served(&mut reader))
+            .respond(served(&mut reader))
             .expect("Successful");
 
         assert!(reader.position.load(Acquire) < 1024 * 1024);
@@ -920,7 +908,7 @@ mod buffering {
         )
         .unwrap();
 
-        let request = server.recv().unwrap();
+        let request = support::recv(&server);
 
         let mut reader = big_response_reader();
         let position = reader.position.clone();
@@ -928,7 +916,7 @@ mod buffering {
         // Client still connected, but not reading anything
         std::thread::spawn(move || {
             request
-                .respond(identity_served(&mut reader))
+                .respond(served(&mut reader))
                 .expect("Successful");
         });
 
@@ -943,6 +931,7 @@ mod buffering {
 
 mod prompt {
 
+    use super::support;
     use justhttp::{Response, Server};
     use std::io::{Read, Write, copy};
     use std::net::{Shutdown, TcpStream};
@@ -1000,12 +989,12 @@ mod prompt {
             }; // very slow response body
 
             let server = Server::http("0.0.0.0:0").unwrap();
-            let mut client = TcpStream::connect(server.server_addr().to_ip().unwrap()).unwrap();
+            let mut client = TcpStream::connect(support::addr(&server)).unwrap();
             let (svr_send, svr_rcv) = channel();
 
             spawn(move || {
                 for _ in 0..req_cnt {
-                    let mut req = server.recv().unwrap();
+                    let mut req = support::recv(&server);
                     // read the whole body of the request
                     let mut body = Vec::new();
                     req.as_reader().read_to_end(&mut body).unwrap();
@@ -1013,7 +1002,7 @@ mod prompt {
                     // The next pipelined request should now be available for parsing,
                     // while we send the (possibly slow) response in another thread
                     spawn(move || {
-                        req.respond(Response::empty(200).with_data(resp_body, Some(resp_body.len)))
+                        req.respond(Response::new(200.into(), Vec::new(), resp_body, Some(resp_body.len)))
                     });
                 }
                 svr_send.send(()).unwrap();
@@ -1086,12 +1075,11 @@ mod prompt {
             req_writer: impl FnOnce(&mut dyn Write) + Send + 'static,
         ) {
             let server = Server::http("0.0.0.0:0").unwrap();
-            let client = TcpStream::connect(server.server_addr().to_ip().unwrap()).unwrap();
+            let client = TcpStream::connect(support::addr(&server)).unwrap();
 
             spawn(move || {
-                loop {
-                    // server attempts to respond immediately
-                    let req = server.recv().unwrap();
+                // server attempts to respond immediately
+                while let Ok(Some(req)) = server.recv_timeout(Duration::from_secs(5)) {
                     req.respond(Response::empty(400)).unwrap();
                 }
             });
@@ -1184,7 +1172,7 @@ mod first_request {
     fn a_served_connection_may_idle_past_the_first_request_timeout() {
         let (server, mut client) = support::new_one_server_one_client();
         std::thread::spawn(move || {
-            for rq in server.incoming_requests() {
+            while let Ok(Some(rq)) = server.recv_timeout(std::time::Duration::from_secs(90)) {
                 let _ = rq.respond(justhttp::Response::from_string("ok".to_owned()));
             }
         });
@@ -1208,6 +1196,15 @@ mod unblock {
 
     use std::sync::Arc;
     use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// Waits on the server for far longer than an unblock should take, and
+    /// says whether it was woken without a request.
+    fn woken(s: &justhttp::Server) -> bool {
+        let began = Instant::now();
+        let got = s.recv_timeout(Duration::from_secs(30)).unwrap();
+        got.is_none() && began.elapsed() < Duration::from_secs(10)
+    }
 
     #[test]
     fn unblock_server() {
@@ -1217,8 +1214,7 @@ mod unblock {
         let s1 = s.clone();
         thread::spawn(move || s1.unblock());
 
-        // Without unblock this would hang forever
-        for _rq in s.incoming_requests() {}
+        assert!(woken(&s));
     }
 
     #[test]
@@ -1228,8 +1224,8 @@ mod unblock {
 
         let s1 = s.clone();
         let s2 = s.clone();
-        let h1 = thread::spawn(move || for _rq in s1.incoming_requests() {});
-        let h2 = thread::spawn(move || for _rq in s2.incoming_requests() {});
+        let h1 = thread::spawn(move || assert!(woken(&s1)));
+        let h2 = thread::spawn(move || assert!(woken(&s2)));
 
         // Graceful shutdown; removing even one of the
         // unblock calls prevents termination
@@ -1243,10 +1239,10 @@ mod unblock {
 #[cfg(unix)]
 mod unix {
 
+    use super::support;
     use std::{
         io::{Read, Write},
         os::unix::net::UnixStream,
-        path::PathBuf,
     };
 
     #[test]
@@ -1254,14 +1250,7 @@ mod unix {
         let path = std::env::temp_dir().join(format!("justhttp-test-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let server = justhttp::Server::http_unix(&path).unwrap();
-        let path: PathBuf = server
-            .server_addr()
-            .to_unix()
-            .unwrap()
-            .as_pathname()
-            .unwrap()
-            .into();
-        let mut client = UnixStream::connect(path).unwrap();
+        let mut client = UnixStream::connect(&path).unwrap();
 
         write!(
             client,
@@ -1269,14 +1258,12 @@ mod unix {
         )
         .unwrap();
 
-        let request = server.recv().unwrap();
+        let request = support::recv(&server);
         assert!(*request.method() == justhttp::Method::Get);
         assert_eq!(request.url(), "/");
         request
             .respond(justhttp::Response::from_string("hello world".to_owned()))
             .unwrap();
-
-        server.try_recv().unwrap();
 
         let mut content = String::new();
         client.read_to_string(&mut content).unwrap();
@@ -1301,17 +1288,14 @@ mod stall {
         let (server, mut client) = support::new_one_server_one_client();
 
         write!(client, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
-        let rq = server.recv().unwrap();
+        let rq = support::recv(&server);
 
         // Far beyond any kernel socket buffer; the client never reads a byte.
         let body = vec![b'x'; 64 << 20];
         let len = body.len();
         let t = std::thread::spawn(move || {
             let start = Instant::now();
-            let _ = rq.respond(
-                justhttp::Response::empty(justhttp::StatusCode(200))
-                    .with_data(Cursor::new(body), Some(len)),
-            );
+            let _ = rq.respond(justhttp::Response::new(200.into(), Vec::new(), Cursor::new(body), Some(len)));
             start.elapsed()
         });
 

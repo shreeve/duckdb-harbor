@@ -171,26 +171,6 @@ mod listen {
         #[cfg(unix)]
         Unix(unix_net::SocketAddr),
     }
-    impl ListenAddr {
-        pub fn to_ip(self) -> Option<SocketAddr> {
-            match self {
-                Self::Ip(s) => Some(s),
-                #[cfg(unix)]
-                Self::Unix(_) => None,
-            }
-        }
-
-        /// Gets the Unix socket address.
-        ///
-        /// This is also available on non-Unix platforms, for ease of use, but always returns `None`.
-        #[cfg(unix)]
-        pub fn to_unix(self) -> Option<unix_net::SocketAddr> {
-            match self {
-                Self::Ip(_) => None,
-                Self::Unix(s) => Some(s),
-            }
-        }
-    }
     impl From<SocketAddr> for ListenAddr {
         fn from(s: SocketAddr) -> Self {
             Self::Ip(s)

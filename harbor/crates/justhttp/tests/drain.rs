@@ -11,10 +11,15 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 // (deliberately no shared support module: this binary must stay
 // allocation-quiet apart from the code under test)
 fn new_one_server_one_client() -> (justhttp::Server, std::net::TcpStream) {
-    let server = justhttp::Server::http("0.0.0.0:0").unwrap();
-    let port = server.server_addr().to_ip().unwrap().port();
-    let client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let server = justhttp::Server::http("127.0.0.1:0").unwrap();
+    let justhttp::ListenAddr::Ip(addr) = server.server_addr() else { unreachable!() };
+    let client = std::net::TcpStream::connect(addr).unwrap();
     (server, client)
+}
+
+fn recv(server: &justhttp::Server) -> justhttp::Request {
+    let timeout = std::time::Duration::from_secs(30);
+    server.recv_timeout(timeout).unwrap().expect("no request within 30s")
 }
 
 struct MaxAlloc;
@@ -44,7 +49,7 @@ fn big_declared_body_dropped_unread() {
     )
     .unwrap();
 
-    let rq = server.recv().unwrap();
+    let rq = recv(&server);
 
     // half-close so the drain sees EOF instead of blocking for the rest
     client.shutdown(Shutdown::Write).unwrap();
@@ -85,7 +90,7 @@ fn dribbling_body_does_not_hold_the_drain_forever() {
     )
     .unwrap();
 
-    let rq = server.recv().unwrap();
+    let rq = recv(&server);
 
     // A second thread dribbles a byte at a time, well inside any per-read
     // socket timeout, for far longer than the drain is allowed to run.

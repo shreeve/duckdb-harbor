@@ -47,31 +47,6 @@ mod messages_queue {
             self.condvar.notify_one();
         }
 
-        /// Pops an element. Blocks until one is available.
-        /// Returns None in case unblock() was issued.
-        pub fn pop(&self) -> Option<T> {
-            let mut queue = self.queue.lock().unwrap();
-
-            loop {
-                match queue.pop_front() {
-                    Some(Control::Elem(value)) => return Some(value),
-                    Some(Control::Unblock) => return None,
-                    None => (),
-                }
-
-                queue = self.condvar.wait(queue).unwrap();
-            }
-        }
-
-        /// Tries to pop an element without blocking.
-        pub fn try_pop(&self) -> Option<T> {
-            let mut queue = self.queue.lock().unwrap();
-            match queue.pop_front() {
-                Some(Control::Elem(value)) => Some(value),
-                Some(Control::Unblock) | None => None,
-            }
-        }
-
         /// Pops an element, blocking no longer than `timeout` in all: a
         /// wakeup that finds the queue empty waits only for what is left.
         /// Returns None on timeout or when unblock() was issued.

@@ -284,7 +284,8 @@ impl Request {
     /// ```no_run
     /// # use std::io::Read;
     /// # let server = justhttp::Server::http("0.0.0.0:0").unwrap();
-    /// let mut request = server.recv().unwrap();
+    /// # let timeout = std::time::Duration::from_secs(1);
+    /// let mut request = server.recv_timeout(timeout).unwrap().unwrap();
     ///
     /// let mut content = String::new();
     /// request.as_reader().read_to_string(&mut content).unwrap();
