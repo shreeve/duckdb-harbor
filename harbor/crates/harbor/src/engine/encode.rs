@@ -8,10 +8,10 @@
 //! this module owns everything that touches a vector view.
 
 use super::ffi;
-use super::{Error, str_view};
+use super::{Error, destroy_value, str_view};
 use crate::encode::{
     civil_from_days, digit_pair, push_base64, push_bit_string, push_date, push_float,
-    push_float32, push_fraction, push_i64_raw, push_int, push_int_pad, push_json_string,
+    push_fraction, push_i64_raw, push_int, push_int_pad, push_json_string,
     push_time, push_tz_offset, push_u128_raw, push_u64_raw, push_uint, push_uuid, quote_nonfinite,
     split_time, varint_to_decimal,
 };
@@ -84,7 +84,7 @@ impl Type {
 
 /// One (name, value) parameter where the value is a child TYPE.
 fn param_type(api: &ffi::Api, lt: ffi::logical_type_handle, i: ffi::idx_t) -> Result<(String, Type), Error> {
-    let (name, mut value) = param(api, lt, i)?;
+    let (name, value) = param(api, lt, i)?;
     let mut child: ffi::logical_type_handle = std::ptr::null_mut();
     let unwrapped = (|| -> Result<Type, Error> {
         call!(api, value_get_type(value, &mut child));
@@ -94,32 +94,32 @@ fn param_type(api: &ffi::Api, lt: ffi::logical_type_handle, i: ffi::idx_t) -> Re
         }
         ty
     })();
-    destroy_value(api, &mut value);
+    destroy_value(api, value);
     Ok((name, unwrapped?))
 }
 
 fn param_u8(api: &ffi::Api, lt: ffi::logical_type_handle, i: ffi::idx_t) -> Result<u8, Error> {
-    let (_, mut value) = param(api, lt, i)?;
+    let (_, value) = param(api, lt, i)?;
     let mut out: u8 = 0;
     let r = (|| -> Result<(), Error> { call!(api, value_get_utinyint(value, &mut out)); Ok(()) })();
-    destroy_value(api, &mut value);
+    destroy_value(api, value);
     r.map(|_| out)
 }
 
 fn param_u64(api: &ffi::Api, lt: ffi::logical_type_handle, i: ffi::idx_t) -> Result<u64, Error> {
-    let (_, mut value) = param(api, lt, i)?;
+    let (_, value) = param(api, lt, i)?;
     let mut out: i64 = 0;
     let r = (|| -> Result<(), Error> { call!(api, value_get_bigint(value, &mut out)); Ok(()) })();
-    destroy_value(api, &mut value);
+    destroy_value(api, value);
     r.map(|_| out as u64)
 }
 
 fn param_string(api: &ffi::Api, lt: ffi::logical_type_handle, i: ffi::idx_t) -> Result<String, Error> {
-    let (_, mut value) = param(api, lt, i)?;
+    let (_, value) = param(api, lt, i)?;
     let mut out = ffi::str_t { ptr: std::ptr::null(), len: 0 };
     let r = (|| -> Result<(), Error> { call!(api, value_get_varchar(value, &mut out)); Ok(()) })();
     let s = r.map(|_| unsafe { str_view(&out) }.to_owned());
-    destroy_value(api, &mut value);
+    destroy_value(api, value);
     s
 }
 
@@ -128,12 +128,6 @@ fn param(api: &ffi::Api, lt: ffi::logical_type_handle, i: ffi::idx_t) -> Result<
     let mut value: ffi::value_handle = std::ptr::null_mut();
     call!(api, logical_type_get_param(lt, i, &mut name, &mut value));
     Ok((unsafe { str_view(&name) }.to_owned(), value))
-}
-
-fn destroy_value(api: &ffi::Api, value: &mut ffi::value_handle) {
-    if let Some(d) = api.value_destroy {
-        unsafe { d(value) };
-    }
 }
 
 /// The columns of a result: names and owned type trees.
@@ -163,11 +157,8 @@ pub fn result_columns(api: &ffi::Api, result: ffi::result_handle) -> Result<Vec<
 // Schema emission — the type tree, over the scalar writers in src/encode.rs.
 // ---------------------------------------------------------------------------
 
+/// Emit the schema of a column, or of a nested type when `name` is None.
 pub fn emit_column_schema(out: &mut String, name: Option<&str>, ty: &Type) {
-    emit_schema(out, name, ty)
-}
-
-fn emit_schema(out: &mut String, name: Option<&str>, ty: &Type) {
     use ffi::*;
     out.push('{');
     if let Some(n) = name.filter(|n| !n.is_empty()) {
@@ -188,13 +179,13 @@ fn emit_schema(out: &mut String, name: Option<&str>, ty: &Type) {
         }
         LOGICAL_TYPE_ID_LIST => {
             out.push_str(r#","lossless":true,"child":"#);
-            emit_schema(out, None, &ty.children[0].1);
+            emit_column_schema(out, None, &ty.children[0].1);
         }
         LOGICAL_TYPE_ID_ARRAY => {
             out.push_str(r#","lossless":true,"arrayLength":"#);
             out.push_str(&ty.array_len.to_string());
             out.push_str(r#","child":"#);
-            emit_schema(out, None, &ty.children[0].1);
+            emit_column_schema(out, None, &ty.children[0].1);
         }
         LOGICAL_TYPE_ID_STRUCT | LOGICAL_TYPE_ID_TUPLE => {
             out.push_str(r#","lossless":true,"fields":["#);
@@ -202,15 +193,15 @@ fn emit_schema(out: &mut String, name: Option<&str>, ty: &Type) {
                 if i > 0 {
                     out.push(',');
                 }
-                emit_schema(out, Some(n), child);
+                emit_column_schema(out, Some(n), child);
             }
             out.push(']');
         }
         LOGICAL_TYPE_ID_MAP => {
             out.push_str(r#","lossless":true,"keyType":"#);
-            emit_schema(out, None, &ty.children[0].1);
+            emit_column_schema(out, None, &ty.children[0].1);
             out.push_str(r#","valueType":"#);
-            emit_schema(out, None, &ty.children[1].1);
+            emit_column_schema(out, None, &ty.children[1].1);
             out.push_str(r#","encoding":"pairs""#);
         }
         LOGICAL_TYPE_ID_UNION => {
@@ -221,7 +212,7 @@ fn emit_schema(out: &mut String, name: Option<&str>, ty: &Type) {
                 if i > 0 {
                     out.push(',');
                 }
-                emit_schema(out, Some(n), child);
+                emit_column_schema(out, Some(n), child);
             }
             out.push(']');
         }
@@ -381,17 +372,6 @@ pub fn emit_cell(
     ty: &Type,
     row: usize,
 ) -> Result<(), Error> {
-    emit(out, api, json, r, ty, row)
-}
-
-fn emit(
-    out: &mut String,
-    api: &ffi::Api,
-    json: Option<Json>,
-    r: &Reader,
-    ty: &Type,
-    row: usize,
-) -> Result<(), Error> {
     use ffi::*;
 
     // SQLNULL columns hold nothing but NULL and expose no storage.
@@ -424,7 +404,7 @@ fn emit(
                 let h: ffi::uhugeint_t = r.get(phys);
                 push_uint(out, (h.upper as u128) << 64 | h.lower as u128);
             }
-            LOGICAL_TYPE_ID_FLOAT => push_float32(out, r.get::<f32>(phys)),
+            LOGICAL_TYPE_ID_FLOAT => push_float(out, r.get::<f32>(phys)),
             LOGICAL_TYPE_ID_DOUBLE => push_float(out, r.get::<f64>(phys)),
             LOGICAL_TYPE_ID_DECIMAL => {
                 let v: i128 = match ty.decimal.0 {
@@ -581,7 +561,7 @@ fn emit(
                     if j > 0 {
                         out.push(',');
                     }
-                    emit(out, api, json, &r.children[0], &ty.children[0].1, (entry.offset + j) as usize)?;
+                    emit_cell(out, api, json, &r.children[0], &ty.children[0].1, (entry.offset + j) as usize)?;
                 }
                 out.push(']');
             }
@@ -591,7 +571,7 @@ fn emit(
                     if j > 0 {
                         out.push(',');
                     }
-                    emit(out, api, json, &r.children[0], &ty.children[0].1, phys * ty.array_len as usize + j as usize)?;
+                    emit_cell(out, api, json, &r.children[0], &ty.children[0].1, phys * ty.array_len as usize + j as usize)?;
                 }
                 out.push(']');
             }
@@ -603,7 +583,7 @@ fn emit(
                     }
                     push_json_string(out, name);
                     out.push(':');
-                    emit(out, api, json, &r.children[i], child_ty, phys)?;
+                    emit_cell(out, api, json, &r.children[i], child_ty, phys)?;
                 }
                 out.push('}');
             }
@@ -615,7 +595,7 @@ fn emit(
                     if i > 0 {
                         out.push(',');
                     }
-                    emit(out, api, json, &r.children[i], child_ty, phys)?;
+                    emit_cell(out, api, json, &r.children[i], child_ty, phys)?;
                 }
                 out.push(']');
             }
@@ -629,9 +609,9 @@ fn emit(
                         out.push(',');
                     }
                     out.push('[');
-                    emit(out, api, json, &r.children[0], &ty.children[0].1, (entry.offset + j) as usize)?;
+                    emit_cell(out, api, json, &r.children[0], &ty.children[0].1, (entry.offset + j) as usize)?;
                     out.push(',');
-                    emit(out, api, json, &r.children[1], &ty.children[1].1, (entry.offset + j) as usize)?;
+                    emit_cell(out, api, json, &r.children[1], &ty.children[1].1, (entry.offset + j) as usize)?;
                     out.push(']');
                 }
                 out.push(']');
@@ -651,7 +631,7 @@ fn emit(
                 out.push_str(r#"{"tag":"#);
                 push_json_string(out, name);
                 out.push_str(r#","value":"#);
-                emit(out, api, json, &r.children[1 + tag], member_ty, phys)?;
+                emit_cell(out, api, json, &r.children[1 + tag], member_ty, phys)?;
                 out.push('}');
             }
             // No committed view layout — the single-cell value bridge is the
@@ -688,12 +668,12 @@ fn cell_text(api: &ffi::Api, r: &Reader, row: usize, json: Option<Json>) -> Resu
             })();
             let text = done.and_then(|()| sized_text(api, api.value_to_string, "value_to_string", cast));
             if !cast.is_null() {
-                destroy_value(api, &mut cast);
+                destroy_value(api, cast);
             }
             text
         }
     };
-    destroy_value(api, &mut value);
+    destroy_value(api, value);
     text
 }
 

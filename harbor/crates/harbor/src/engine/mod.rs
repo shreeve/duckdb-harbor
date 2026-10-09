@@ -251,6 +251,13 @@ impl fmt::Display for Error {
     }
 }
 
+/// Destroy an engine value.
+fn destroy_value(api: &ffi::Api, mut value: ffi::value_handle) {
+    if let Some(f) = api.value_destroy {
+        unsafe { f(&mut value) };
+    }
+}
+
 /// View a borrowed engine string. Lossless for the UTF-8 DuckDB emits;
 /// callers keep the source (and its owner) alive for the borrow.
 ///

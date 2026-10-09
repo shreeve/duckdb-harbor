@@ -153,45 +153,33 @@ pub(crate) fn push_uint(out: &mut String, v: u128) {
     }
 }
 
-pub(crate) fn push_float(out: &mut String, f: f64) {
+/// A DOUBLE or a FLOAT, as the shortest text that round-trips to the same
+/// value of its own width. A FLOAT widened to f64 first would read
+/// 0.10000000149011612 for `0.1::FLOAT`: the same number, but not the text
+/// DuckDB writes, and less precise to the eye than a DOUBLE beside it.
+pub(crate) fn push_float<F>(out: &mut String, f: F)
+where
+    F: Copy + Into<f64> + std::fmt::Display + std::fmt::LowerExp,
+{
+    // Widening is exact, so it classifies an f32 as well as an f64.
+    let wide: f64 = f.into();
     // JSON has no NaN or Infinity, but null is not the answer: it is
     // indistinguishable from SQL NULL, so a client cannot tell a missing value
     // from a division that overflowed. The names go out as strings instead.
-    if f.is_nan() {
+    if wide.is_nan() {
         return push_json_string(out, "NaN");
     }
-    if f.is_infinite() {
-        return push_json_string(out, if f > 0.0 { "Infinity" } else { "-Infinity" });
+    if wide.is_infinite() {
+        return push_json_string(out, if wide > 0.0 { "Infinity" } else { "-Infinity" });
     }
     // Rust's Display never switches to exponent notation for large magnitudes,
-    // so f64::MAX would go out as 309 digits. Switch at 1e21, which is where
-    // JavaScript's own number formatting switches, so the text a client reads
-    // is the text it would have produced itself.
-    if f != 0.0 && f.abs() >= 1e21 {
+    // so f64::MAX would go out as 309 digits (and f32::MAX as 39). Switch at
+    // 1e21, where JavaScript's own formatting switches for large magnitudes.
+    if wide.abs() >= 1e21 {
         push_exponent(out, &format!("{f:e}"));
     } else {
         // Display, written straight into the buffer: the same shortest
         // round-trip text `to_string` yields, without its String.
-        let _ = std::fmt::Write::write_fmt(out, format_args!("{f}"));
-    }
-}
-
-/// A FLOAT, formatted as the f32 it is: the shortest text that round-trips
-/// to the same f32, as every other numeric type here does. Widened to f64
-/// first, `0.1::FLOAT` would read 0.10000000149011612 — the same number, but
-/// not the text DuckDB writes, and visibly less precise than a DOUBLE
-/// holding the same literal beside it.
-pub(crate) fn push_float32(out: &mut String, f: f32) {
-    if f.is_nan() {
-        return push_json_string(out, "NaN");
-    }
-    if f.is_infinite() {
-        return push_json_string(out, if f > 0.0 { "Infinity" } else { "-Infinity" });
-    }
-    // Same 1e21 switch as f64, and it is reachable: f32::MAX is ~3.4e38.
-    if f != 0.0 && f.abs() >= 1e21 {
-        push_exponent(out, &format!("{f:e}"));
-    } else {
         let _ = std::fmt::Write::write_fmt(out, format_args!("{f}"));
     }
 }

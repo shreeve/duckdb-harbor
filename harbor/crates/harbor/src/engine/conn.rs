@@ -22,14 +22,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
 use super::encode::{Type, result_columns};
-use super::{Engine, Error, ffi};
+use super::{Engine, Error, destroy_value, ffi};
 
 fn str_of(s: &str) -> ffi::str_t {
     ffi::str_t { ptr: s.as_ptr() as *const _, len: s.len() as ffi::idx_t }
-}
-
-fn ident_of(s: &str) -> ffi::identifier_t {
-    str_of(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -80,7 +76,7 @@ pub fn open(path: &Path, options: &[(&str, &str)]) -> Result<Conn, Error> {
     let mut build = || -> Result<(), Error> {
         for (name, setting) in options {
             let mut o: ffi::option_handle = std::ptr::null_mut();
-            call!(api, option_create(ident_of(name), str_of(setting), &mut o));
+            call!(api, option_create(str_of(name), str_of(setting), &mut o));
             opts.push(o);
         }
         Ok(())
@@ -269,7 +265,7 @@ impl Conn {
     pub fn set_option(&self, name: &str, setting: &str) -> Result<(), Error> {
         let api = &self.eng.api;
         let mut o: ffi::option_handle = std::ptr::null_mut();
-        call!(api, option_create(ident_of(name), str_of(setting), &mut o));
+        call!(api, option_create(str_of(name), str_of(setting), &mut o));
         let set = (|| -> Result<(), Error> {
             call!(api, database_option_set(self.db.db, o));
             Ok(())
@@ -759,13 +755,13 @@ struct Fetcher {
 unsafe impl Send for Fetcher {}
 
 impl Fetcher {
-    /// Fetch until end, error, or the consumer hangs up. Every terminal —
-    /// end-of-stream, error, even a panic out of the FFI — is an explicit
-    /// message, so the consumer can tell a finished stream from a dead
-    /// thread (see Stream::next_chunk).
+    /// Fetch until end, error, or the consumer hangs up. End-of-stream and
+    /// an error are explicit messages, and a panic out of the FFI takes the
+    /// channel down with it, which the consumer reads as a dead thread (see
+    /// Stream::next_chunk); the unwind has printed its own message.
     fn run(self, tx: mpsc::SyncSender<Result<Option<Chunk>, Error>>) {
         let mut this = std::panic::AssertUnwindSafe(self);
-        let outcome = std::panic::catch_unwind(move || {
+        let _ = std::panic::catch_unwind(move || {
             loop {
                 match this.next_chunk() {
                     Ok(Some(chunk)) => {
@@ -782,11 +778,6 @@ impl Fetcher {
             // `this` (and the tx clone it captured) drop here: the result
             // is destroyed before the thread exits, on unwind included.
         });
-        if outcome.is_err() {
-            // The channel went down with the panic; the consumer reads the
-            // RecvError as "fetch thread died". Nothing more to say here —
-            // the unwind already printed its own message.
-        }
     }
 
     /// The next chunk, or None at end-of-stream. An interrupted query
@@ -1045,12 +1036,6 @@ fn same_number(a: &str, b: &str) -> bool {
         (negative && !(whole.is_empty() && fraction.is_empty()), whole, fraction)
     }
     parts(a) == parts(b)
-}
-
-fn destroy_value(api: &ffi::Api, mut v: ffi::value_handle) {
-    if let Some(f) = api.value_destroy {
-        unsafe { f(&mut v) };
-    }
 }
 
 /// `value` cast to each type in turn, as a value of its own; `value` and the
