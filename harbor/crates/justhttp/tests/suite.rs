@@ -7,12 +7,16 @@
 //! - `keepalive` — connection reuse + chunked streaming from a Reader
 //! - `buffering` — response backpressure against closed/idle clients
 //! - `prompt`    — latency properties: responses leave when they should
-//! - `unblock`   — Server::unblock wakes blocked recv()
+//! - `unblock`   — Server::unblock wakes a blocked recv_timeout()
 //! - `unix`      — unix-domain sockets
+//! - `peer`      — `Peer::closed`: a departed client is seen, a quiet or
+//!   pipelining one is not
 //! - `first_request` — the first-request idle clock, and that keep-alive is
-//!   exempt from it (`#[ignore]`, ~60s each)
-//! - `stall`     — the 10s write-timeout backstop (`#[ignore]`, ~35s by
-//!   design: `cargo test --test suite -- --ignored`)
+//!   exempt from it (~72 s: the clock under test is 60 s)
+//! - `stall`     — the 10 s write-timeout backstop (~35 s on macOS loopback)
+//!
+//! The two slow tests run beside the rest, so the binary takes about as long
+//! as `first_request`.
 //!
 //! `tests/drain.rs` stays a separate binary on purpose: it measures
 //! allocations with a global allocator, and any other test running in the
@@ -20,41 +24,41 @@
 
 mod support {
 
-    use std::net::TcpStream;
+    use std::net::{SocketAddr, TcpStream};
     use std::thread;
     use std::time::Duration;
+
+    /// The TCP address a server listens on.
+    pub fn addr(server: &justhttp::Server) -> SocketAddr {
+        match server.server_addr() {
+            justhttp::ListenAddr::Ip(addr) => addr,
+            #[cfg(unix)]
+            other => panic!("not a TCP server: {other}"),
+        }
+    }
+
+    /// The server's next request, waiting as long as any test here should.
+    pub fn recv(server: &justhttp::Server) -> justhttp::Request {
+        server.recv_timeout(Duration::from_secs(30)).unwrap().expect("no request within 30s")
+    }
 
     /// Creates a server and a client connected to the server.
     pub fn new_one_server_one_client() -> (justhttp::Server, TcpStream) {
         let server = justhttp::Server::http("0.0.0.0:0").unwrap();
-        let port = server.server_addr().to_ip().unwrap().port();
-        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let client = TcpStream::connect(("127.0.0.1", addr(&server).port())).unwrap();
         (server, client)
     }
 
     /// Creates a "hello world" server with a client connected to the server.
     ///
-    /// The server will automatically close after 3 seconds.
+    /// The server closes once it has had no request for 3 seconds.
     pub fn new_client_to_hello_world_server() -> TcpStream {
-        let server = justhttp::Server::http("0.0.0.0:0").unwrap();
-        let port = server.server_addr().to_ip().unwrap().port();
-        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (server, client) = new_one_server_one_client();
 
         thread::spawn(move || {
-            let mut cycles = 3 * 1000 / 20;
-
-            loop {
-                if let Some(rq) = server.try_recv().unwrap() {
-                    let response = justhttp::Response::from_string("hello world".to_string());
-                    rq.respond(response).unwrap();
-                }
-
-                thread::sleep(Duration::from_millis(20));
-
-                cycles -= 1;
-                if cycles == 0 {
-                    break;
-                }
+            while let Ok(Some(rq)) = server.recv_timeout(Duration::from_secs(3)) {
+                let response = justhttp::Response::from_string("hello world".to_string());
+                rq.respond(response).unwrap();
             }
         });
 
@@ -122,14 +126,12 @@ mod basic {
         )
         .unwrap();
 
-        let request = server.recv().unwrap();
+        let request = support::recv(&server);
         assert!(*request.method() == justhttp::Method::Get);
         assert_eq!(request.url(), "/");
         request
             .respond(justhttp::Response::from_string("hello world".to_owned()))
             .unwrap();
-
-        server.try_recv().unwrap();
 
         let mut content = String::new();
         stream.read_to_string(&mut content).unwrap();
@@ -154,7 +156,7 @@ mod input {
             (write!(client, "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain; charset=utf8\r\nContent-Length: 5\r\n\r\nhello")).unwrap();
         }
 
-        let mut request = server.recv().unwrap();
+        let mut request = support::recv(&server);
 
         let mut output = String::new();
         request.as_reader().read_to_string(&mut output).unwrap();
@@ -170,7 +172,7 @@ mod input {
             (write!(client, "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain; charset=utf8\r\nContent-Length: 3\r\n\r\nhello")).unwrap();
         }
 
-        let mut request = server.recv().unwrap();
+        let mut request = support::recv(&server);
 
         let mut output = String::new();
         request.as_reader().read_to_string(&mut output).unwrap();
@@ -188,7 +190,7 @@ mod input {
         let (tx, rx) = mpsc::channel();
 
         thread::spawn(move || {
-            let mut request = server.recv().unwrap();
+            let mut request = support::recv(&server);
             let mut output = String::new();
             request.as_reader().read_to_string(&mut output).unwrap();
             assert_eq!(output, "hello");
@@ -238,7 +240,7 @@ mod input {
         )
         .unwrap();
 
-        let request = server.recv().unwrap();
+        let request = support::recv(&server);
         request
             .respond(
                 justhttp::Response::from_string("{\"custom\": \"Content-Type\"}").with_header(
@@ -267,10 +269,10 @@ mod head {
 
     use std::io::{Read, Write};
 
-    /// A header line with no end must not be an unbounded allocation. Before
-    /// `MAX_LINE` this loop had no ceiling: one socket, one never-terminated
-    /// header, and RSS climbed at line speed (30 MB to 1.5 GB in under five
-    /// seconds, measured, before any application handler ran).
+    /// A header line with no end must not be an unbounded allocation.
+    /// Without `MAX_LINE`, one socket and one never-terminated header climb
+    /// RSS at line speed (30 MB to 1.5 GB in under five seconds, measured,
+    /// before any application handler runs).
     #[test]
     fn an_endless_header_line_is_refused() {
         let (_server, mut client) = support::new_one_server_one_client();
@@ -348,7 +350,7 @@ mod head {
         )
         .unwrap();
 
-        let mut request = server.recv().unwrap();
+        let mut request = support::recv(&server);
         let mut body = String::new();
         request.as_reader().read_to_string(&mut body).unwrap();
         assert_eq!(body, "hello");
@@ -376,8 +378,8 @@ mod head {
         );
     }
 
-    /// A Content-Length that is not a number used to parse as "no body", so
-    /// the bytes the client did send were read as the next request.
+    /// A Content-Length that is not a number must not parse as "no body",
+    /// which would read the bytes the client did send as the next request.
     #[test]
     fn unparseable_content_length_is_refused() {
         let (_server, mut client) = support::new_one_server_one_client();
@@ -396,6 +398,100 @@ mod head {
         );
     }
 
+    /// A Content-Length is `1*DIGIT` and a Transfer-Encoding is exactly one
+    /// `chunked`. Anything a lenient parser would read as a length or a
+    /// coding, and a strict one would not, is a disagreement waiting for a
+    /// proxy to sit in front of this server.
+    #[test]
+    fn framing_that_parsers_could_read_two_ways_is_refused() {
+        for framing in [
+            "Content-Length: +5",
+            "Content-Length: 2 3",
+            "Content-Length: 5,5",
+            "Content-Length: -5",
+            "Content-Length: 99999999999999999999999",
+            "Transfer-Encoding: chunked, identity",
+            "Transfer-Encoding: identity",
+            "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked",
+        ] {
+            let (_server, mut client) = support::new_one_server_one_client();
+            write!(client, "POST / HTTP/1.1\r\nHost: localhost\r\n{framing}\r\n\r\nhello").unwrap();
+
+            let mut content = String::new();
+            let _ = client.read_to_string(&mut content);
+            assert!(
+                content.starts_with("HTTP/1.1 400"),
+                "{framing:?}: expected 400, got {:?}",
+                content.lines().next()
+            );
+        }
+    }
+
+    /// A chunked body the handler never reads must not be parsed as the next
+    /// request. It has no declared length to skip by, so the connection
+    /// ends after the response instead: one request, one response, then EOF,
+    /// whether the chunk data is well formed or not.
+    #[test]
+    fn an_unread_chunked_body_is_never_parsed_as_a_request() {
+        let smuggled = "GET /smuggled HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        for body in [
+            format!("{:x}\r\n{smuggled}\r\n0\r\n\r\n", smuggled.len()),
+            smuggled.to_string(),
+        ] {
+            let (server, mut client) = support::new_one_server_one_client();
+            let answered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let urls = answered.clone();
+            std::thread::spawn(move || {
+                while let Ok(Some(rq)) = server.recv_timeout(std::time::Duration::from_secs(5)) {
+                    urls.lock().unwrap().push(rq.url().to_string());
+                    let _ = rq.respond(justhttp::Response::empty(404));
+                }
+            });
+            write!(
+                client,
+                "POST /nope HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n{body}"
+            )
+            .unwrap();
+
+            client.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut content = Vec::new();
+            client.read_to_end(&mut content).expect("the connection must end, not idle");
+            let content = String::from_utf8_lossy(&content);
+            assert!(content.starts_with("HTTP/1.1 404"), "got {content:?}");
+            assert_eq!(content.matches("HTTP/1.1").count(), 1, "got {content:?}");
+            assert_eq!(*answered.lock().unwrap(), ["/nope"]);
+        }
+    }
+
+    /// A drain cut short by a stalled client — a read that times out before
+    /// the declared length arrives — ends the connection too: the rest of
+    /// the declared body, sent after the stall, is not a request.
+    #[test]
+    fn a_body_stalled_past_the_read_timeout_is_never_parsed_as_a_request() {
+        let (server, mut client) = support::new_one_server_one_client();
+        let answered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let urls = answered.clone();
+        std::thread::spawn(move || {
+            while let Ok(Some(rq)) = server.recv_timeout(std::time::Duration::from_secs(15)) {
+                urls.lock().unwrap().push(rq.url().to_string());
+                let _ = rq.respond(justhttp::Response::empty(404));
+            }
+        });
+        write!(client, "POST /nope HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2000\r\n\r\n")
+            .unwrap();
+        client.write_all(&[b'x'; 1500]).unwrap();
+        // Past the server's 5 s read timeout, so the drain's read fails.
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        let _ = write!(client, "GET /smuggled HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+        client.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        let mut content = Vec::new();
+        let _ = client.read_to_end(&mut content);
+        let content = String::from_utf8_lossy(&content);
+        assert_eq!(content.matches("HTTP/1.1").count(), 1, "got {content:?}");
+        assert_eq!(*answered.lock().unwrap(), ["/nope"]);
+    }
+
     /// `TE: identity` must not be able to turn a streamed response into a
     /// buffered one. `raw_print` discovers an unknown length by reading the
     /// whole body, so honoring this header hands control of the server's
@@ -410,7 +506,7 @@ mod head {
         .unwrap();
 
         std::thread::spawn(move || {
-            let rq = server.recv().unwrap();
+            let rq = support::recv(&server);
             // Unknown length: exactly the shape harbor streams /sql with.
             let body = std::io::Cursor::new(b"streamed".to_vec());
             rq.respond(justhttp::Response::new(200.into(), Vec::new(), body, None))
@@ -436,7 +532,7 @@ mod head {
         write!(client, "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n").unwrap();
 
         std::thread::spawn(move || {
-            let rq = server.recv().unwrap();
+            let rq = support::recv(&server);
             let body = std::io::Cursor::new(b"streamed".to_vec());
             rq.respond(justhttp::Response::new(200.into(), Vec::new(), body, None))
                 .unwrap();
@@ -455,7 +551,7 @@ mod network {
     use super::support;
 
     use std::io::{Read, Write};
-    use std::net::{Shutdown, TcpStream};
+    use std::net::Shutdown;
     use std::thread;
     use std::time::Duration;
 
@@ -546,12 +642,10 @@ mod network {
 
     #[test]
     fn crash_500() {
-        let server = justhttp::Server::http("0.0.0.0:0").unwrap();
-        let port = server.server_addr().to_ip().unwrap().port();
-        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (server, mut client) = support::new_one_server_one_client();
 
         thread::spawn(move || {
-            server.recv().unwrap();
+            support::recv(&server);
             // oops, server crash
         });
 
@@ -578,8 +672,8 @@ mod network {
         .unwrap();
 
         thread::spawn(move || {
-            let rq1 = server.recv().unwrap();
-            let rq2 = server.recv().unwrap();
+            let rq1 = support::recv(&server);
+            let rq2 = support::recv(&server);
 
             thread::spawn(move || {
                 rq2.respond(justhttp::Response::from_string("second request".to_owned()))
@@ -610,7 +704,7 @@ mod network {
         .unwrap();
 
         thread::spawn(move || {
-            let rq = server.recv().unwrap();
+            let rq = support::recv(&server);
 
             let resp = justhttp::Response::empty(justhttp::StatusCode(204));
             rq.respond(resp).unwrap();
@@ -642,14 +736,11 @@ mod keepalive {
 
         std::thread::spawn(move || {
             for i in 0..3 {
-                let rq = server.recv().unwrap();
+                let rq = support::recv(&server);
                 let body = format!("resp-{i}").into_bytes();
                 // unknown length => chunked framing => connection stays reusable
-                rq.respond(
-                    justhttp::Response::empty(justhttp::StatusCode(200))
-                        .with_data(Cursor::new(body), None),
-                )
-                .unwrap();
+                rq.respond(justhttp::Response::new(200.into(), Vec::new(), Cursor::new(body), None))
+                    .unwrap();
             }
         });
 
@@ -695,15 +786,12 @@ mod keepalive {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
 
         std::thread::spawn(move || {
-            let rq = server.recv().unwrap();
+            let rq = support::recv(&server);
             let reader = ChannelReader {
                 rx,
                 pending: Vec::new(),
             };
-            rq.respond(
-                justhttp::Response::empty(justhttp::StatusCode(200)).with_data(reader, None),
-            )
-            .unwrap();
+            rq.respond(justhttp::Response::new(200.into(), Vec::new(), reader, None)).unwrap();
         });
 
         write!(client, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
@@ -786,11 +874,9 @@ mod buffering {
         }
     }
 
-    fn identity_served(r: &mut Reader) -> justhttp::Response<&mut Reader> {
+    fn served(r: &mut Reader) -> justhttp::Response<&mut Reader> {
         let body_len = r.inner.get_ref().len();
-        justhttp::Response::empty(200)
-            .with_chunked_threshold(usize::MAX)
-            .with_data(r, Some(body_len))
+        justhttp::Response::new(200.into(), Vec::new(), r, Some(body_len))
     }
 
     /// Checks that a body-Read:er is not called when the client has disconnected
@@ -803,14 +889,14 @@ mod buffering {
         )
         .unwrap();
 
-        let request = server.recv().unwrap();
+        let request = support::recv(&server);
 
         // Client already disconnected
         drop(stream);
 
         let mut reader = big_response_reader();
         request
-            .respond(identity_served(&mut reader))
+            .respond(served(&mut reader))
             .expect("Successful");
 
         assert!(reader.position.load(Acquire) < 1024 * 1024);
@@ -826,7 +912,7 @@ mod buffering {
         )
         .unwrap();
 
-        let request = server.recv().unwrap();
+        let request = support::recv(&server);
 
         let mut reader = big_response_reader();
         let position = reader.position.clone();
@@ -834,7 +920,7 @@ mod buffering {
         // Client still connected, but not reading anything
         std::thread::spawn(move || {
             request
-                .respond(identity_served(&mut reader))
+                .respond(served(&mut reader))
                 .expect("Successful");
         });
 
@@ -849,6 +935,7 @@ mod buffering {
 
 mod prompt {
 
+    use super::support;
     use justhttp::{Response, Server};
     use std::io::{Read, Write, copy};
     use std::net::{Shutdown, TcpStream};
@@ -906,12 +993,12 @@ mod prompt {
             }; // very slow response body
 
             let server = Server::http("0.0.0.0:0").unwrap();
-            let mut client = TcpStream::connect(server.server_addr().to_ip().unwrap()).unwrap();
+            let mut client = TcpStream::connect(support::addr(&server)).unwrap();
             let (svr_send, svr_rcv) = channel();
 
             spawn(move || {
                 for _ in 0..req_cnt {
-                    let mut req = server.recv().unwrap();
+                    let mut req = support::recv(&server);
                     // read the whole body of the request
                     let mut body = Vec::new();
                     req.as_reader().read_to_end(&mut body).unwrap();
@@ -919,7 +1006,7 @@ mod prompt {
                     // The next pipelined request should now be available for parsing,
                     // while we send the (possibly slow) response in another thread
                     spawn(move || {
-                        req.respond(Response::empty(200).with_data(resp_body, Some(resp_body.len)))
+                        req.respond(Response::new(200.into(), Vec::new(), resp_body, Some(resp_body.len)))
                     });
                 }
                 svr_send.send(()).unwrap();
@@ -992,12 +1079,11 @@ mod prompt {
             req_writer: impl FnOnce(&mut dyn Write) + Send + 'static,
         ) {
             let server = Server::http("0.0.0.0:0").unwrap();
-            let client = TcpStream::connect(server.server_addr().to_ip().unwrap()).unwrap();
+            let client = TcpStream::connect(support::addr(&server)).unwrap();
 
             spawn(move || {
-                loop {
-                    // server attempts to respond immediately
-                    let req = server.recv().unwrap();
+                // server attempts to respond immediately
+                while let Ok(Some(req)) = server.recv_timeout(Duration::from_secs(5)) {
                     req.respond(Response::empty(400)).unwrap();
                 }
             });
@@ -1058,55 +1144,176 @@ mod prompt {
     }
 }
 
-/// The first-request clock (~60s each, so `#[ignore]`d by design; run with
-/// `cargo test -p justhttp --test suite -- --ignored`). A connection that has
-/// never sent a byte is closed; one that has served a request idles on the far
-/// longer keep-alive clock instead. Both halves matter: the first bounds an
-/// anonymous caller holding sockets, the second is what a REPL at its prompt
-/// relies on.
+/// The first-request clock. A connection that has never sent a byte is
+/// closed; one that has served a request idles on the far longer keep-alive
+/// clock instead. Both halves matter: the first bounds an anonymous caller
+/// holding sockets, the second is what a REPL at its prompt relies on. Both
+/// run in one test, side by side, because each has to outwait the real 60 s
+/// clock.
 mod first_request {
     use super::support;
 
     use std::io::{Read, Write};
-    use std::time::Instant;
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
 
     #[test]
-    #[ignore = "~60s by design: exercises the first-request timeout"]
-    fn a_connection_that_never_speaks_is_closed() {
-        let (_server, mut client) = support::new_one_server_one_client();
+    fn only_a_connection_that_never_spoke_is_on_the_first_request_clock() {
+        let server = justhttp::Server::http("127.0.0.1:0").unwrap();
+        let addr = support::addr(&server);
+        let mut silent = TcpStream::connect(addr).unwrap();
         let t0 = Instant::now();
-        let mut content = String::new();
-        let _ = client.read_to_string(&mut content);
-        assert!(
-            content.starts_with("HTTP/1.1 408"),
-            "expected 408, got {:?}",
-            content.lines().next()
-        );
-        assert!(t0.elapsed().as_secs() >= 55, "closed too early: {:?}", t0.elapsed());
-    }
-
-    #[test]
-    #[ignore = "~75s by design: proves keep-alive is not on the first-request clock"]
-    fn a_served_connection_may_idle_past_the_first_request_timeout() {
-        let (server, mut client) = support::new_one_server_one_client();
+        let mut served = TcpStream::connect(addr).unwrap();
         std::thread::spawn(move || {
-            for rq in server.incoming_requests() {
-                let _ = rq.respond(justhttp::Response::from_string("ok".to_owned()));
+            while let Ok(Some(rq)) = server.recv_timeout(Duration::from_secs(120)) {
+                let _ = rq.respond(justhttp::Response::from_string("ok"));
             }
         });
 
         let req = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
-        write!(client, "{req}").unwrap();
-        let (headers, _) = support::read_response(&mut client);
+        write!(served, "{req}").unwrap();
+        let (headers, _) = support::read_response(&mut served);
         assert!(headers.starts_with("HTTP/1.1 200"), "first request: {headers}");
 
-        // Well past FIRST_REQUEST_TIMEOUT. This connection has served a
-        // request, so it is a keep-alive client and the clock does not apply.
-        std::thread::sleep(std::time::Duration::from_secs(75));
+        let watcher = std::thread::spawn(move || {
+            let mut content = String::new();
+            let _ = silent.read_to_string(&mut content);
+            (content, t0.elapsed())
+        });
 
-        write!(client, "{req}").expect("connection was closed during keep-alive idle");
-        let (headers, _) = support::read_response(&mut client);
+        // Past the first-request clock and the 5 s read tick it is checked
+        // on. The served connection is a keep-alive client: it is not on
+        // that clock.
+        std::thread::sleep(Duration::from_secs(72));
+        write!(served, "{req}").expect("the served connection was closed while idle");
+        let (headers, _) = support::read_response(&mut served);
         assert!(headers.starts_with("HTTP/1.1 200"), "second request: {headers}");
+
+        let (content, closed_after) = watcher.join().unwrap();
+        assert!(content.starts_with("HTTP/1.1 408"), "expected 408, got {:?}", content.lines().next());
+        assert!(closed_after >= Duration::from_secs(55), "closed too early: {closed_after:?}");
+    }
+}
+
+/// `Peer::closed`: a client that leaves while its request is being answered
+/// is seen leaving, and one that is merely quiet, or sends more, is not.
+mod peer {
+    use super::support;
+
+    use std::io::{Read, Write};
+    use std::net::Shutdown;
+    use std::time::{Duration, Instant};
+
+    /// Whether `closed` turns true within two seconds.
+    fn closes(peer: &justhttp::Peer) -> bool {
+        let until = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < until {
+            if peer.closed() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// Whether `closed` stays false for half a second.
+    fn stays_open(peer: &justhttp::Peer) -> bool {
+        std::thread::sleep(Duration::from_millis(500));
+        !peer.closed()
+    }
+
+    #[test]
+    fn a_client_that_closes_is_gone() {
+        let (server, mut client) = support::new_one_server_one_client();
+        // A body past the 1 KiB buffered size, read to its end, as harbor
+        // reads a statement before it runs it.
+        let body = "x".repeat(2000);
+        write!(client, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2000\r\n\r\n{body}").unwrap();
+        let mut rq = support::recv(&server);
+        rq.as_reader().read_to_end(&mut Vec::new()).unwrap();
+        let peer = rq.peer();
+        assert!(stays_open(&peer), "a connected, quiet client read as gone");
+
+        drop(client);
+        assert!(closes(&peer), "the client closed and the request never saw it");
+    }
+
+    #[test]
+    fn a_pipelined_request_is_not_a_departure() {
+        let (server, mut client) = support::new_one_server_one_client();
+        write!(client, "GET /1 HTTP/1.1\r\nHost: x\r\n\r\nGET /2 HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let first = support::recv(&server);
+        assert!(stays_open(&first.peer()), "a pipelined request read as a departure");
+
+        first.respond(justhttp::Response::from_string("one")).unwrap();
+        let second = support::recv(&server);
+        assert_eq!(second.url(), "/2");
+        second.respond(justhttp::Response::from_string("two")).unwrap();
+        let (_, one) = support::read_response(&mut client);
+        let (_, two) = support::read_response(&mut client);
+        assert_eq!((one.as_str(), two.as_str()), ("one", "two"));
+    }
+
+    /// The last request on a connection is still watched: nothing reads the
+    /// next request there, so the connection reads on until it is answered.
+    #[test]
+    fn the_last_request_on_a_connection_is_watched() {
+        for head in ["GET / HTTP/1.1\r\nConnection: close\r\n\r\n", "GET / HTTP/1.0\r\n\r\n"] {
+            let (server, mut client) = support::new_one_server_one_client();
+            write!(client, "{head}").unwrap();
+            let rq = support::recv(&server);
+            let peer = rq.peer();
+            assert!(stays_open(&peer), "{head:?}: a connected client read as gone");
+
+            drop(client);
+            assert!(closes(&peer), "{head:?}: the client closed and the request never saw it");
+            let _ = rq.respond(justhttp::Response::empty(499));
+        }
+    }
+
+    /// A finished `Connection: close` response still ends the connection at
+    /// once, with the client still connected and silent.
+    #[test]
+    fn watching_does_not_hold_the_connection_open() {
+        let (server, mut client) = support::new_one_server_one_client();
+        write!(client, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap();
+        support::recv(&server).respond(justhttp::Response::from_string("done")).unwrap();
+
+        client.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut content = String::new();
+        client.read_to_string(&mut content).expect("the response did not end the connection");
+        assert!(content.ends_with("done"));
+    }
+
+    /// Ending the sending side is end-of-stream on the wire, the same bytes
+    /// a full close sends, so it reads as gone. The response still reaches a
+    /// client that answers it this way.
+    #[test]
+    fn a_client_that_half_closes_reads_as_gone() {
+        let (server, mut client) = support::new_one_server_one_client();
+        write!(client, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let rq = support::recv(&server);
+        client.shutdown(Shutdown::Write).unwrap();
+        assert!(closes(&rq.peer()));
+
+        rq.respond(justhttp::Response::from_string("still here")).unwrap();
+        let (_, body) = support::read_response(&mut client);
+        assert_eq!(body, "still here");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_client_that_closes_is_gone() {
+        let path = std::env::temp_dir().join(format!("justhttp-peer-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let server = justhttp::Server::http_unix(&path).unwrap();
+        let mut client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        write!(client, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let peer = support::recv(&server).peer();
+        assert!(stays_open(&peer), "a connected, quiet client read as gone");
+
+        drop(client);
+        assert!(closes(&peer), "the client closed and the request never saw it");
     }
 }
 
@@ -1114,6 +1321,15 @@ mod unblock {
 
     use std::sync::Arc;
     use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// Waits on the server for far longer than an unblock should take, and
+    /// says whether it was woken without a request.
+    fn woken(s: &justhttp::Server) -> bool {
+        let began = Instant::now();
+        let got = s.recv_timeout(Duration::from_secs(30)).unwrap();
+        got.is_none() && began.elapsed() < Duration::from_secs(10)
+    }
 
     #[test]
     fn unblock_server() {
@@ -1123,8 +1339,7 @@ mod unblock {
         let s1 = s.clone();
         thread::spawn(move || s1.unblock());
 
-        // Without unblock this would hang forever
-        for _rq in s.incoming_requests() {}
+        assert!(woken(&s));
     }
 
     #[test]
@@ -1134,8 +1349,8 @@ mod unblock {
 
         let s1 = s.clone();
         let s2 = s.clone();
-        let h1 = thread::spawn(move || for _rq in s1.incoming_requests() {});
-        let h2 = thread::spawn(move || for _rq in s2.incoming_requests() {});
+        let h1 = thread::spawn(move || assert!(woken(&s1)));
+        let h2 = thread::spawn(move || assert!(woken(&s2)));
 
         // Graceful shutdown; removing even one of the
         // unblock calls prevents termination
@@ -1149,10 +1364,10 @@ mod unblock {
 #[cfg(unix)]
 mod unix {
 
+    use super::support;
     use std::{
         io::{Read, Write},
         os::unix::net::UnixStream,
-        path::PathBuf,
     };
 
     #[test]
@@ -1160,14 +1375,7 @@ mod unix {
         let path = std::env::temp_dir().join(format!("justhttp-test-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let server = justhttp::Server::http_unix(&path).unwrap();
-        let path: PathBuf = server
-            .server_addr()
-            .to_unix()
-            .unwrap()
-            .as_pathname()
-            .unwrap()
-            .into();
-        let mut client = UnixStream::connect(path).unwrap();
+        let mut client = UnixStream::connect(&path).unwrap();
 
         write!(
             client,
@@ -1175,14 +1383,12 @@ mod unix {
         )
         .unwrap();
 
-        let request = server.recv().unwrap();
+        let request = support::recv(&server);
         assert!(*request.method() == justhttp::Method::Get);
         assert_eq!(request.url(), "/");
         request
             .respond(justhttp::Response::from_string("hello world".to_owned()))
             .unwrap();
-
-        server.try_recv().unwrap();
 
         let mut content = String::new();
         client.read_to_string(&mut content).unwrap();
@@ -1195,33 +1401,29 @@ mod stall {
 
     // Regression test for the response write timeout carried in this crate: a
     // client that stops reading its response must not pin a server thread inside
-    // `write` forever. Slow by design (the timeout under test is 10s), so it is
-    // `#[ignore]`d: run with `cargo test --test suite -- --ignored`.
+    // `write` forever. Slow by design: the timeout under test is 10 s, and it
+    // fires only once the kernel's socket buffers stop taking bytes.
 
     use std::io::{Cursor, Write};
     use std::time::{Duration, Instant};
 
     #[test]
-    #[ignore = "~35s by design: exercises the 10s stalled-reader write timeout"]
     fn stalled_reader_reclaimed() {
         let (server, mut client) = support::new_one_server_one_client();
 
         write!(client, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
-        let rq = server.recv().unwrap();
+        let rq = support::recv(&server);
 
         // Far beyond any kernel socket buffer; the client never reads a byte.
         let body = vec![b'x'; 64 << 20];
         let len = body.len();
         let t = std::thread::spawn(move || {
             let start = Instant::now();
-            let _ = rq.respond(
-                justhttp::Response::empty(justhttp::StatusCode(200))
-                    .with_data(Cursor::new(body), Some(len)),
-            );
+            let _ = rq.respond(justhttp::Response::new(200.into(), Vec::new(), Cursor::new(body), Some(len)));
             start.elapsed()
         });
 
-        // without the patch this join never returns: the worker is parked in write()
+        // without the write timeout this join never returns: the worker is parked in write()
         let elapsed = t.join().unwrap();
         assert!(
             elapsed >= Duration::from_secs(5),

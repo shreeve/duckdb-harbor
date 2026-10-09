@@ -8,12 +8,12 @@ use std::io::Error as IoError;
 use std::io::{self, Cursor, ErrorKind, Read, Write};
 
 use std::net::SocketAddr;
-use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::Response;
 use crate::http::{Header, HttpVersion, Method, StatusCode};
-use crate::stream::ShutdownHandle;
+use crate::stream::Socket;
 use budgeted_reader::BudgetedReader;
 use chunked_transfer::Decoder;
 use equal_reader::EqualReader;
@@ -21,15 +21,13 @@ use fused_reader::FusedReader;
 
 /// How long a request body may take to arrive, start to finish.
 ///
-/// `take(MAX_BODY)` bounds how many BYTES a handler will read; nothing bounded
-/// how LONG it would wait for them. A client dribbling a byte every few
-/// seconds stayed under the per-read socket timeout forever, so the read never
-/// failed and never finished — and it holds the thread that is serving the
-/// request, which on harbor is one of a handful of workers. Eight such
-/// connections took every worker and the berth answered nothing at all,
-/// `/ready` included. (The drop-drain had the same shape and is bounded
-/// separately; this is the other half — the body a handler actually asked
-/// for.)
+/// A handler's `take(MAX_BODY)` bounds how many BYTES it reads; this bounds
+/// how LONG it waits for them. A client dribbling a byte every few seconds
+/// stays under the per-read socket timeout forever, so without this the read
+/// never fails and never finishes, holding the thread serving the request,
+/// which on harbor is one of a handful of workers: eight such connections
+/// take every worker, `/ready` included. (The drop-drain has the same shape
+/// and its own bound; this is the body a handler asked for.)
 ///
 /// Thirty seconds is chosen against what this body IS: one SQL statement and
 /// its parameters, where a megabyte is already pathological. Even a maximal
@@ -91,6 +89,40 @@ pub struct Request {
 
     // true if a `100 Continue` response must be sent when `as_reader()` is called
     must_send_continue: bool,
+
+    // the connection this request arrived on
+    socket: Arc<Socket>,
+}
+
+/// Whether the client behind a request is still there; from
+/// [`Request::peer`].
+///
+/// [`closed`](Peer::closed) turns true once the connection's reader has
+/// seen the client close the connection or reset it, and stays true. It is
+/// false while the client is connected and silent, and false when the client
+/// sends more: a pipelined request is not a departure. A client that shuts
+/// down only its sending side is indistinguishable from one that closed, on
+/// TCP and on unix sockets alike (both arrive as end-of-stream before any
+/// response is written), so it reads as closed too.
+///
+/// The connection is read, and so watched, while a request is being
+/// answered: on a keep-alive connection by the wait for the next request,
+/// and after a `Connection: close` or HTTP/1.0 request by a read that
+/// discards what arrives until the response is done. Not while the request
+/// still holds a body it has not read to its end, since the stream is that
+/// body's until then; nor on a keep-alive connection after its idle timeout.
+/// In those spans `closed` stays false, which errs toward finishing the work.
+///
+/// Checking is one atomic load: poll it between units of work. Cloning is
+/// cheap, and a clone may outlive the request.
+#[derive(Clone)]
+pub struct Peer(Arc<Socket>);
+
+impl Peer {
+    /// True once the client has closed or reset the connection.
+    pub fn closed(&self) -> bool {
+        self.0.gone()
+    }
 }
 
 /// Error that can happen when building a `Request` object.
@@ -118,38 +150,26 @@ impl From<IoError> for RequestCreationError {
 /// It is the responsibility of the `Request` to read only the data of the request and not further.
 ///
 /// The `Write` object will be used by the `Request` to write the response.
+/// `content_length` is the length `check_framing` validated (conn.rs).
 #[allow(clippy::too_many_arguments)]
 pub fn new_request<R, W>(
     method: Method,
     path: String,
     version: HttpVersion,
     headers: Vec<Header>,
+    content_length: Option<usize>,
     remote_addr: Option<SocketAddr>,
     mut source_data: R,
     writer: W,
-    shutdown: Option<ShutdownHandle>,
+    socket: Arc<Socket>,
 ) -> Result<Request, RequestCreationError>
 where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    // finding the transfer-encoding header
-    let transfer_encoding = headers
-        .iter()
-        .find(|h: &&Header| h.field.equiv("Transfer-Encoding"))
-        .map(|h| h.value.clone());
-
-    // finding the content-length header
-    let content_length = if transfer_encoding.is_some() {
-        // if transfer-encoding is specified, the Content-Length
-        // header must be ignored (RFC2616 #4.4)
-        None
-    } else {
-        headers
-            .iter()
-            .find(|h: &&Header| h.field.equiv("Content-Length"))
-            .and_then(|h| FromStr::from_str(h.value.as_str()).ok())
-    };
+    // `check_framing` has already refused every ambiguous shape: a chunked
+    // body has no Content-Length, and the coding is exactly `chunked`.
+    let chunked = headers.iter().any(|h| h.field.equiv("Transfer-Encoding"));
 
     // true if the client sent a `Expect: 100-continue` header
     let expects_continue = {
@@ -164,10 +184,9 @@ where
         }
     };
 
-    // we wrap `source_data` around a reading whose nature depends on the transfer-encoding and
-    // content-length headers. (Upstream special-cased `Connection: upgrade` here, handing the
-    // raw stream to the request; with the upgrade API gone, upgrade requests get normal body
-    // framing and the connection still closes after them — see conn.rs.)
+    // The body reader depends on the framing. `Connection: upgrade` gets no
+    // special case: its body is framed like any other, and the connection
+    // closes after it (conn.rs).
     let reader = if let Some(content_length) = content_length {
         if content_length == 0 {
             Box::new(io::empty()) as Box<dyn Read + Send + 'static>
@@ -178,10 +197,10 @@ where
             let mut offset = 0;
             // On the same clock as every other body, and it has to be: this
             // read happens during request construction, before any handler or
-            // route exists to time it out, so a client dribbling into a
-            // declared 1024 bytes held this connection's thread for as long as
-            // it cared to — measured at ~51 minutes a connection, 60 of them
-            // at once, before any application handler ran.
+            // route exists to time it out, so without it a client dribbling
+            // into a declared 1024 bytes holds this connection's thread for as
+            // long as it cares to (51 minutes a connection, 60 at once, were
+            // measured).
             let deadline = Instant::now() + BODY_TIMEOUT;
 
             while offset != content_length {
@@ -204,19 +223,18 @@ where
 
             Box::new(Cursor::new(buffer)) as Box<dyn Read + Send + 'static>
         } else {
-            let data_reader = EqualReader::new(source_data, content_length, shutdown);
-            Box::new(BudgetedReader::new(FusedReader::new(data_reader), BODY_TIMEOUT))
+            let data_reader = EqualReader::new(source_data, content_length, Some(socket.clone()));
+            Box::new(BudgetedReader::new(FusedReader::new(data_reader, None), BODY_TIMEOUT))
                 as Box<dyn Read + Send + 'static>
         }
-    } else if transfer_encoding.is_some() {
-        // if a transfer-encoding was specified, then "chunked" is ALWAYS applied
-        // over the message (RFC2616 #3.6)
-        Box::new(BudgetedReader::new(FusedReader::new(Decoder::new(source_data)), BODY_TIMEOUT))
-            as Box<dyn Read + Send + 'static>
+    } else if chunked {
+        // A chunked body has no length to drain by: one left unread ends the
+        // connection instead.
+        let data_reader = FusedReader::new(Decoder::new(source_data), Some(socket.clone()));
+        Box::new(BudgetedReader::new(data_reader, BODY_TIMEOUT)) as Box<dyn Read + Send + 'static>
     } else {
-        // if we have neither a Content-Length nor a Transfer-Encoding,
-        // assuming that we have no data
-        // TODO: could also be multipart/byteranges
+        // Neither a Content-Length nor a Transfer-Encoding: a request framed
+        // that way has no body (RFC 9112 §6.3).
         Box::new(io::empty()) as Box<dyn Read + Send + 'static>
     };
 
@@ -230,6 +248,7 @@ where
         headers,
         body_length: content_length,
         must_send_continue: expects_continue,
+        socket,
     })
 }
 
@@ -256,6 +275,13 @@ impl Request {
     #[inline]
     pub fn http_version(&self) -> &HttpVersion {
         &self.http_version
+    }
+
+    /// Whether the client is still there, as a handle that can be polled
+    /// while the response is computed and after `respond` takes the
+    /// request. See [`Peer`] for exactly what it reports.
+    pub fn peer(&self) -> Peer {
+        Peer(self.socket.clone())
     }
 
     /// Answer this request as HTTP/1.1 regardless of what it claimed to be.
@@ -296,7 +322,8 @@ impl Request {
     /// ```no_run
     /// # use std::io::Read;
     /// # let server = justhttp::Server::http("0.0.0.0:0").unwrap();
-    /// let mut request = server.recv().unwrap();
+    /// # let timeout = std::time::Duration::from_secs(1);
+    /// let mut request = server.recv_timeout(timeout).unwrap().unwrap();
     ///
     /// let mut content = String::new();
     /// request.as_reader().read_to_string(&mut content).unwrap();
@@ -308,14 +335,9 @@ impl Request {
     pub fn as_reader(&mut self) -> &mut dyn Read {
         if self.must_send_continue {
             let msg = Response::empty(StatusCode(100));
-            msg.raw_print(
-                self.response_writer.as_mut().unwrap().by_ref(),
-                self.http_version,
-                &self.headers,
-                true,
-            )
-            .ok();
-            self.response_writer.as_mut().unwrap().flush().ok();
+            let writer = self.response_writer.as_mut().unwrap();
+            msg.raw_print(writer.by_ref(), self.http_version, true).ok();
+            writer.flush().ok();
             self.must_send_continue = false;
         }
 
@@ -351,7 +373,6 @@ impl Request {
         Self::ignore_client_closing_errors(response.raw_print(
             writer.by_ref(),
             self.http_version,
-            &self.headers,
             do_not_send_body,
         ))?;
 
@@ -485,20 +506,19 @@ mod equal_reader {
     use std::io::Result as IoResult;
     use std::time::{Duration, Instant};
 
-    use crate::stream::ShutdownHandle;
+    use crate::stream::Socket;
+    use std::sync::Arc;
 
     /// How long the drop-drain may spend discarding a body nobody asked for.
     ///
-    /// The buffer was already bounded; the *loop* was not. It follows the
-    /// client's declared Content-Length to completion, and the per-read socket
-    /// timeout only fires on a peer that has stopped entirely — so a client
-    /// dribbling one byte every few seconds kept every read succeeding and the
-    /// drain running forever. That drain runs on the thread that handled the
-    /// request (the `Request` is dropped when the handler returns), and it runs
-    /// *after* the response, so six of
-    /// them took every harbor worker and the berth answered nothing at all,
-    /// `/ready` included. Measured: 8 connections at one byte per 3s, and
-    /// /ready went from 0.01s to a hard timeout until the drip stopped.
+    /// The drain follows the client's declared Content-Length, and the
+    /// per-read socket timeout fires only on a peer that has stopped entirely,
+    /// so a client dribbling one byte every few seconds keeps every read
+    /// succeeding. The drain runs on the thread that handled the request (the
+    /// `Request` drops when the handler returns), after the response, so
+    /// without this bound a handful of drips take every harbor worker: 8
+    /// connections at one byte per 3 s took `/ready` from 0.01 s to a hard
+    /// timeout until the drip stopped.
     ///
     /// Two seconds is far more than a body already in flight needs and far
     /// less than a drip can exploit.
@@ -518,15 +538,15 @@ mod equal_reader {
         /// How to end the connection when the drain below gives up. See the
         /// note there: an abandoned drain leaves the stream at an unknown
         /// offset, and that is a smuggling primitive, not an untidiness.
-        shutdown: Option<ShutdownHandle>,
+        socket: Option<Arc<Socket>>,
     }
 
     impl<R> EqualReader<R>
     where
         R: Read,
     {
-        pub fn new(reader: R, size: usize, shutdown: Option<ShutdownHandle>) -> EqualReader<R> {
-            EqualReader { reader, size, shutdown }
+        pub fn new(reader: R, size: usize, socket: Option<Arc<Socket>>) -> EqualReader<R> {
+            EqualReader { reader, size, socket }
         }
     }
 
@@ -560,49 +580,35 @@ mod equal_reader {
         R: Read,
     {
         fn drop(&mut self) {
-            // THE BOUNDED DRAIN (one of the hardening behaviors this crate carries,
-            // with a regression test in tests/drain.rs): a fixed 64 KiB buffer instead
-            // of `vec![0; remaining_to_read]`. The
-            // remaining size is the client's *declared* Content-Length minus what
-            // was read — attacker-chosen and unbounded — so the upstream code let
-            // a request declaring 1 GB and sending 9 bytes cost
-            // this process a 1 GB zeroed allocation per connection at drop time,
-            // no matter what the server responded. Measured live before the
-            // patch: 6 such requests drove RSS from 22 MB to 2.2 GB.
-            //
-            // AND BOUNDED IN TIME, which the buffer alone was not: the loop
-            // followed the declared length to the end, so a client dribbling a
-            // byte at a time kept it running indefinitely on the handler's own
-            // thread. `DRAIN_TIMEOUT` is the ceiling on how long a body nobody
-            // asked for may hold that thread.
+            // THE BOUNDED DRAIN (a hardening behavior with a regression test
+            // in tests/drain.rs). What is left is the client's *declared*
+            // length minus what was read: attacker-chosen and unbounded. So
+            // it streams through a fixed 64 KiB buffer, never one sized by
+            // the declaration (one sized by it lets a request declaring 1 GB
+            // and sending 9 bytes cost a 1 GB allocation; six took RSS from
+            // 22 MB to 2.2 GB), and for at most `DRAIN_TIMEOUT`, because a
+            // client dribbling a byte at a time would otherwise hold the
+            // handler's thread for as long as it liked.
             let mut remaining_to_read = self.size;
             let mut buf = [0u8; 65536];
             let deadline = Instant::now() + DRAIN_TIMEOUT;
 
-            while remaining_to_read > 0 {
-                if Instant::now() >= deadline {
-                    // Out of patience with a body still arriving. The stream is
-                    // now at an offset neither side agrees on, and the bytes
-                    // still to come would be read as the next request line on
-                    // this connection — a request the client never sent and the
-                    // server would answer. Ending the connection is the only
-                    // safe close: shutting the read side down turns every later
-                    // read into EOF, so `ClientConnection::next` stops rather
-                    // than parsing whatever arrives next.
-                    if let Some(shutdown) = &self.shutdown {
-                        shutdown.shutdown_read();
-                    }
-                    break;
-                }
+            while remaining_to_read > 0 && Instant::now() < deadline {
                 let want = remaining_to_read.min(buf.len());
-
                 match self.reader.read(&mut buf[..want]) {
-                    // an error or EOF ends the drain — a half-closed socket
-                    // must not spin here
+                    // EOF or an error ends the drain: a half-closed socket
+                    // must not spin here.
                     Err(_) | Ok(0) => break,
-                    Ok(other) => {
-                        remaining_to_read -= other;
-                    }
+                    Ok(n) => remaining_to_read -= n,
+                }
+            }
+
+            // A body not drained to its end leaves the stream at an offset
+            // neither side agrees on: whatever the client sends next would be
+            // read as a request it never sent. So the connection ends.
+            if remaining_to_read > 0 {
+                if let Some(socket) = &self.socket {
+                    socket.end();
                 }
             }
         }
@@ -654,18 +660,25 @@ mod equal_reader {
 }
 
 mod fused_reader {
-    use std::io::{IoSliceMut, Read, Result as IoResult};
+    use std::io::{Read, Result as IoResult};
+    use std::sync::Arc;
 
-    /// Wraps another reader and provides "fused" behavior.
-    /// When the underlying reader reaches EOF, it is dropped
-    /// and the fused reader becomes an empty stub.
+    use crate::stream::Socket;
+
+    /// A body reader that lets go of the stream at the body's end.
+    ///
+    /// At EOF the inner reader is dropped, which hands the stream to the next
+    /// request on the connection, and every later read is EOF. `unfinished`
+    /// is the socket to end if this is dropped before EOF: a body whose
+    /// unread remainder cannot be skipped (see `Socket::end`).
     pub struct FusedReader<R: Read> {
         inner: Option<R>,
+        unfinished: Option<Arc<Socket>>,
     }
 
     impl<R: Read> FusedReader<R> {
-        pub fn new(inner: R) -> Self {
-            Self { inner: Some(inner) }
+        pub fn new(inner: R, unfinished: Option<Arc<Socket>>) -> Self {
+            Self { inner: Some(inner), unfinished }
         }
     }
 
@@ -674,7 +687,7 @@ mod fused_reader {
             match &mut self.inner {
                 Some(r) => {
                     let l = r.read(buf)?;
-                    if l == 0 {
+                    if l == 0 && !buf.is_empty() {
                         self.inner = None;
                     }
                     Ok(l)
@@ -682,17 +695,12 @@ mod fused_reader {
                 None => Ok(0),
             }
         }
+    }
 
-        fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> IoResult<usize> {
-            match &mut self.inner {
-                Some(r) => {
-                    let l = r.read_vectored(bufs)?;
-                    if l == 0 {
-                        self.inner = None;
-                    }
-                    Ok(l)
-                }
-                None => Ok(0),
+    impl<R: Read> Drop for FusedReader<R> {
+        fn drop(&mut self) {
+            if let (Some(_), Some(socket)) = (&self.inner, &self.unfinished) {
+                socket.end();
             }
         }
     }
