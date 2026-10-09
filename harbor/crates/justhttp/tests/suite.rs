@@ -267,10 +267,10 @@ mod head {
 
     use std::io::{Read, Write};
 
-    /// A header line with no end must not be an unbounded allocation. Before
-    /// `MAX_LINE` this loop had no ceiling: one socket, one never-terminated
-    /// header, and RSS climbed at line speed (30 MB to 1.5 GB in under five
-    /// seconds, measured, before any application handler ran).
+    /// A header line with no end must not be an unbounded allocation.
+    /// Without `MAX_LINE`, one socket and one never-terminated header climb
+    /// RSS at line speed (30 MB to 1.5 GB in under five seconds, measured,
+    /// before any application handler runs).
     #[test]
     fn an_endless_header_line_is_refused() {
         let (_server, mut client) = support::new_one_server_one_client();
@@ -376,8 +376,8 @@ mod head {
         );
     }
 
-    /// A Content-Length that is not a number used to parse as "no body", so
-    /// the bytes the client did send were read as the next request.
+    /// A Content-Length that is not a number must not parse as "no body",
+    /// which would read the bytes the client did send as the next request.
     #[test]
     fn unparseable_content_length_is_refused() {
         let (_server, mut client) = support::new_one_server_one_client();
@@ -1423,7 +1423,7 @@ mod stall {
             start.elapsed()
         });
 
-        // without the patch this join never returns: the worker is parked in write()
+        // without the write timeout this join never returns: the worker is parked in write()
         let elapsed = t.join().unwrap();
         assert!(
             elapsed >= Duration::from_secs(5),

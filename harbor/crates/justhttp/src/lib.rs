@@ -251,12 +251,12 @@ fn spawn_accept(
                         use crate::stream::RefinedTcpStream;
                         // Bound how long a single response write may block, so
                         // a client that stops reading cannot park a server
-                        // thread inside `write` forever. Read side is left
-                        // untouched — keep-alive connections must wait
-                        // indefinitely between requests. Only a fully stalled
-                        // peer trips it; a draining client resets the timer
-                        // every write. Best-effort — a socket that rejects the
-                        // option just keeps upstream's original behavior.
+                        // thread inside `write` forever; only a fully stalled
+                        // peer trips it, since a draining client resets the
+                        // timer every write. The read timeout is a tick, not a
+                        // limit: conn.rs keeps an idle connection waiting
+                        // through it on its own clocks. Both are best-effort;
+                        // a socket that rejects the option goes unbounded.
                         let _ = sock.set_write_timeout(Some(WRITE_TIMEOUT));
                         let _ = sock.set_read_timeout(Some(READ_TIMEOUT));
                         // One response = one flush, so Nagle has nothing to
@@ -342,7 +342,7 @@ impl Server {
         self.listening_addrs[0].clone()
     }
 
-    /// The next request, waiting no longer than `timeout`: `None` on timeout
+    /// The next request, waiting at most `timeout`: `None` on timeout
     /// or when `unblock()` woke this caller. An `Err` is the listener
     /// failing, which ends it.
     pub fn recv_timeout(&self, timeout: Duration) -> IoResult<Option<Request>> {
@@ -370,9 +370,7 @@ impl Drop for Server {
                 ListenAddr::Ip(addr) => TcpStream::connect(addr).map(Connection::from),
                 #[cfg(unix)]
                 ListenAddr::Unix(addr) => {
-                    // TODO: use connect_addr when its stabilized.
-                    let path = addr.as_pathname().unwrap();
-                    std::os::unix::net::UnixStream::connect(path).map(Connection::from)
+                    std::os::unix::net::UnixStream::connect_addr(addr).map(Connection::from)
                 }
             };
             if let Ok(stream) = maybe_stream {

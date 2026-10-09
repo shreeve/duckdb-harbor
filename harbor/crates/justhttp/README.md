@@ -48,24 +48,24 @@ security regression, not a flake.
    client's declared `Content-Length`. A drain that gives up, and a
    chunked body left unread (it has no length to skip by), end the
    connection after the response, so no leftover byte is ever parsed as
-   the next request. (Upstream allocated the declared
-   size, a memory-exhaustion DoS: a request declaring
-   `Content-Length: 1000000000` while sending three bytes cost the
-   process a gigabyte at drop time.)
+   the next request. A buffer sized by the declaration is a
+   memory-exhaustion DoS: a request declaring `Content-Length: 1000000000`
+   while sending three bytes costs the process a gigabyte at drop time.
+   The drain is bounded in time too, 2 s, so a client dribbling its body
+   cannot hold the thread that answered it.
 2. **Response write timeout.** Every accepted socket gets a 10 s write
    timeout, so a client that stops reading its response cannot pin a
    worker thread inside `write` forever.
 3. **Bounded request head.** A request line or header line is capped at
    8 KiB and a request at 128 headers; over either is `431` and a close.
-   The line buffer grew a byte at a time with no ceiling, so one socket
-   sending `X-Junk: ` and never stopping took RSS from 30 MB to 1.5 GB in
-   under five seconds — before routing or application handling.
+   The line buffer grows a byte at a time, so without the cap one socket
+   sending `X-Junk: ` and never stopping takes RSS from 30 MB to 1.5 GB in
+   under five seconds, before routing or application handling.
 4. **Read timeout.** Every accepted socket gets a 5 s read timeout, and
    the whole request head gets 10 s from its first byte. Before the first
    byte the connection is only idle, so it waits on the connection clocks
    below; after it, a client cannot hold a serving thread at one byte per
-   minute. This is also what bounds the drain in *time* rather than only
-   in memory.
+   minute.
 5. **Unambiguous framing.** Two `Content-Length` headers that disagree, a
    `Content-Length` beside a `Transfer-Encoding`, a `Content-Length` that
    is not plain digits (`+5`, `2 3`), or a `Transfer-Encoding` that is not
@@ -86,11 +86,10 @@ security regression, not a flake.
    closed after 60 s. Once it has served one request it is a keep-alive
    client and gets 5 minutes between requests — far longer than any pooled
    client's own idle timeout, so a REPL at its prompt or a pool between
-   queries is untouched. Without those clocks, a caller could hold sockets,
-   and a thread apiece, for as long as it liked, and one `/ready` was enough
-   to buy that right permanently
-   (measured: 120 connections holding 120 threads and 240 descriptors,
-   still answering after 100 s idle).
+   queries is untouched. Without those clocks a caller can hold sockets,
+   and a thread apiece, for as long as it likes, and one `/ready` buys that
+   right permanently (measured: 120 connections holding 120 threads and
+   240 descriptors, still answering after 100 s idle).
 8. **Transient accept failures are retried.** `ECONNABORTED` (the peer
    reset before `accept` took it) and descriptor or buffer exhaustion
    (`EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM`) leave the listener perfectly
@@ -99,7 +98,7 @@ security regression, not a flake.
    then sits there alive, accepting nothing. Only a failure meaning the
    listener is *gone* ends the loop, and that one is surfaced through
    `recv()` so the host can say so — as does a transient failure that has
-   persisted for a full minute, which is no longer a storm.
+   persisted for a full minute, which is not a storm.
 
 ## Layout
 
@@ -133,10 +132,9 @@ allocator must not see other tests' allocations.
 
 justhttp was originally derived from the synchronous HTTP/1.1 core of
 tiny_http 0.12.0 (MIT OR Apache-2.0) and relicensed here under its MIT option.
-That is historical lineage, not a current dependency, vendoring relationship,
-or upstream synchronization policy. Harbor's crate removed the unrelated
-surface and has since evolved under first-party ownership while retaining the
-delicate HTTP semantics that its tests pin. See [LICENSE](LICENSE) for
+That is lineage, not a dependency, a vendoring relationship or a
+synchronization policy: justhttp carries none of that crate's other surface,
+is maintained here, and keeps the HTTP semantics its tests pin. See [LICENSE](LICENSE) for
 combined attribution.
 
 ## Maintenance

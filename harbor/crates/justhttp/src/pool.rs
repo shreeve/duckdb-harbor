@@ -47,7 +47,7 @@ mod messages_queue {
             self.condvar.notify_one();
         }
 
-        /// Pops an element, blocking no longer than `timeout` in all: a
+        /// Pops an element, blocking for at most `timeout` in all: a
         /// wakeup that finds the queue empty waits only for what is left.
         /// Returns None on timeout or when unblock() was issued.
         pub fn pop_timeout(&self, timeout: Duration) -> Option<T> {

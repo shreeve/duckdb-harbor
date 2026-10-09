@@ -21,15 +21,13 @@ use fused_reader::FusedReader;
 
 /// How long a request body may take to arrive, start to finish.
 ///
-/// `take(MAX_BODY)` bounds how many BYTES a handler will read; nothing bounded
-/// how LONG it would wait for them. A client dribbling a byte every few
-/// seconds stayed under the per-read socket timeout forever, so the read never
-/// failed and never finished — and it holds the thread that is serving the
-/// request, which on harbor is one of a handful of workers. Eight such
-/// connections took every worker and the berth answered nothing at all,
-/// `/ready` included. (The drop-drain had the same shape and is bounded
-/// separately; this is the other half — the body a handler actually asked
-/// for.)
+/// A handler's `take(MAX_BODY)` bounds how many BYTES it reads; this bounds
+/// how LONG it waits for them. A client dribbling a byte every few seconds
+/// stays under the per-read socket timeout forever, so without this the read
+/// never fails and never finishes, holding the thread serving the request,
+/// which on harbor is one of a handful of workers: eight such connections
+/// take every worker, `/ready` included. (The drop-drain has the same shape
+/// and its own bound; this is the body a handler asked for.)
 ///
 /// Thirty seconds is chosen against what this body IS: one SQL statement and
 /// its parameters, where a megabyte is already pathological. Even a maximal
@@ -186,10 +184,9 @@ where
         }
     };
 
-    // we wrap `source_data` around a reading whose nature depends on the transfer-encoding and
-    // content-length headers. (Upstream special-cased `Connection: upgrade` here, handing the
-    // raw stream to the request; with the upgrade API gone, upgrade requests get normal body
-    // framing and the connection still closes after them — see conn.rs.)
+    // The body reader depends on the framing. `Connection: upgrade` gets no
+    // special case: its body is framed like any other, and the connection
+    // closes after it (conn.rs).
     let reader = if let Some(content_length) = content_length {
         if content_length == 0 {
             Box::new(io::empty()) as Box<dyn Read + Send + 'static>
@@ -200,10 +197,10 @@ where
             let mut offset = 0;
             // On the same clock as every other body, and it has to be: this
             // read happens during request construction, before any handler or
-            // route exists to time it out, so a client dribbling into a
-            // declared 1024 bytes held this connection's thread for as long as
-            // it cared to — measured at ~51 minutes a connection, 60 of them
-            // at once, before any application handler ran.
+            // route exists to time it out, so without it a client dribbling
+            // into a declared 1024 bytes holds this connection's thread for as
+            // long as it cares to (51 minutes a connection, 60 at once, were
+            // measured).
             let deadline = Instant::now() + BODY_TIMEOUT;
 
             while offset != content_length {
@@ -236,9 +233,8 @@ where
         let data_reader = FusedReader::new(Decoder::new(source_data), Some(socket.clone()));
         Box::new(BudgetedReader::new(data_reader, BODY_TIMEOUT)) as Box<dyn Read + Send + 'static>
     } else {
-        // if we have neither a Content-Length nor a Transfer-Encoding,
-        // assuming that we have no data
-        // TODO: could also be multipart/byteranges
+        // Neither a Content-Length nor a Transfer-Encoding: a request framed
+        // that way has no body (RFC 9112 §6.3).
         Box::new(io::empty()) as Box<dyn Read + Send + 'static>
     };
 
@@ -515,16 +511,14 @@ mod equal_reader {
 
     /// How long the drop-drain may spend discarding a body nobody asked for.
     ///
-    /// The buffer was already bounded; the *loop* was not. It follows the
-    /// client's declared Content-Length to completion, and the per-read socket
-    /// timeout only fires on a peer that has stopped entirely — so a client
-    /// dribbling one byte every few seconds kept every read succeeding and the
-    /// drain running forever. That drain runs on the thread that handled the
-    /// request (the `Request` is dropped when the handler returns), and it runs
-    /// *after* the response, so six of
-    /// them took every harbor worker and the berth answered nothing at all,
-    /// `/ready` included. Measured: 8 connections at one byte per 3s, and
-    /// /ready went from 0.01s to a hard timeout until the drip stopped.
+    /// The drain follows the client's declared Content-Length, and the
+    /// per-read socket timeout fires only on a peer that has stopped entirely,
+    /// so a client dribbling one byte every few seconds keeps every read
+    /// succeeding. The drain runs on the thread that handled the request (the
+    /// `Request` drops when the handler returns), after the response, so
+    /// without this bound a handful of drips take every harbor worker: 8
+    /// connections at one byte per 3 s took `/ready` from 0.01 s to a hard
+    /// timeout until the drip stopped.
     ///
     /// Two seconds is far more than a body already in flight needs and far
     /// less than a drip can exploit.

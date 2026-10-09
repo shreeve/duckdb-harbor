@@ -19,11 +19,10 @@ use sequential::{SequentialReader, SequentialReaderBuilder, SequentialWriterBuil
 
 /// The largest request line or header line we will assemble.
 ///
-/// There was no ceiling here at all, and the buffer grows a byte at a time
-/// until CRLF — so a remote client could open one socket, send
-/// `GET / HTTP/1.1\r\nX-Junk: ` and then never stop, and watch the server's
-/// RSS climb at line speed (measured: 30 MB to 1.5 GB in under five seconds).
-/// The check has to live here, before routing and application handling,
+/// The line buffer grows a byte at a time until CRLF, so without a ceiling
+/// one socket sending `GET / HTTP/1.1\r\nX-Junk: ` and never stopping climbs
+/// the server's RSS at line speed (30 MB to 1.5 GB in under five seconds,
+/// measured). The check lives here, before routing and application handling,
 /// because the allocation happens before either can run.
 const MAX_LINE: usize = 8 * 1024;
 
@@ -37,21 +36,20 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a brand-new connection may say nothing at all before it is closed.
 ///
-/// A socket that has never sent a byte has not asked for anything, and letting
-/// it wait forever meant an anonymous caller could hold connections — and a
-/// thread apiece — for as long as it liked, bounded only by the
-/// file-descriptor limit.
+/// A socket that has never sent a byte has not asked for anything. Without
+/// this clock an anonymous caller could hold connections, and a thread
+/// apiece, for as long as it liked, bounded only by the file-descriptor
+/// limit.
 const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long an established keep-alive connection may sit between requests.
 ///
-/// This clock used to not exist: serving one request took a connection off the
-/// first-request timeout permanently, on the reasoning that a REPL at its
-/// prompt or a pooled client between queries is doing nothing wrong. The gap
-/// is that the cheapest request on the server — a bare `/ready` — bought a
-/// connection the right to idle forever. Measured: 120 such connections held 120 threads
-/// and 240 descriptors indefinitely, still answering after 100 seconds idle,
-/// while 120 that said nothing at all were reclaimed on schedule.
+/// A REPL at its prompt or a pooled client between queries is doing nothing
+/// wrong, so a served connection is off the first-request clock. Without a
+/// clock of its own, though, the cheapest request on the server, a bare
+/// `/ready`, would buy a connection the right to idle forever: 120 such
+/// connections held 120 threads and 240 descriptors, still answering after
+/// 100 seconds idle, while 120 that said nothing were reclaimed on schedule.
 ///
 /// Five minutes is far longer than any pooled client's own idle timeout (30–90
 /// seconds is typical, and the repl sends `Connection: close` outright), so a
@@ -383,11 +381,7 @@ impl Iterator for ClientConnection {
             return None;
         }
 
-        // Not a loop any more, and deliberately so: every arm below either
-        // yields a request or ends the connection. The 505 arm was the one
-        // path that used to go round again, and it no longer can — a peer
-        // that opened with a version this server cannot speak gets its answer
-        // and the connection closes.
+        // Every arm below either yields a request or ends the connection.
         {
             let rq = match self.read() {
                 Err(ReadError::WrongRequestLine) => {
@@ -438,7 +432,7 @@ impl Iterator for ClientConnection {
                     let writer = self.sink.next().unwrap();
                     let response = Response::empty(StatusCode(417));
                     response.raw_print(writer, ver, true).ok();
-                    return None; // TODO: should be recoverable, but needs handling in case of body
+                    return None; // a body may follow that nothing will read, so close
                 }
 
                 Err(ReadError::ReadIoError(_)) => return None,
@@ -451,23 +445,19 @@ impl Iterator for ClientConnection {
                 // Answered through the request's OWN writer, and then the
                 // connection ends.
                 //
-                // This used to take a SECOND writer from the sink while `rq`
-                // still held the first, and that deadlocked the thread
-                // outright: a sequential writer blocks on its predecessor's
-                // release before its first byte (see SequentialWriter::write),
-                // and the predecessor was owned by an `rq` that could only drop
-                // after the write returned. So the connection thread parked
-                // forever, holding its descriptors, in a wait no socket timeout
-                // covers because it is a channel and not a read. One
-                // `GET / HTTP/2.0` cost a thread and three
-                // descriptors permanently, and a client merely *attempting*
-                // HTTP/2 — curl --http2, an h2c upgrade probe — triggered it by
-                // accident.
+                // Never through a second writer from the sink while `rq`
+                // holds the first: a sequential writer blocks on its
+                // predecessor's release before its first byte (see
+                // SequentialWriter::write), and the predecessor is owned by
+                // an `rq` that can only drop after the write returns. The
+                // connection thread would park forever, holding its
+                // descriptor, in a channel wait no socket timeout covers, and
+                // a client merely attempting HTTP/2 (curl --http2, an h2c
+                // probe) would trigger it.
                 //
-                // `return None` rather than `continue` for the same reason RFC
-                // 9110 pairs 505 with closing: a peer that opened with a
-                // version this server cannot speak has nothing useful to say
-                // next on the same connection.
+                // The connection ends for the reason RFC 9110 pairs 505 with
+                // closing: a peer that opened with a version this server
+                // cannot speak has nothing useful to say next on it.
                 let response = Response::from_string(
                     "This server only supports HTTP versions 1.0 and 1.1".to_owned(),
                 )
@@ -485,8 +475,7 @@ impl Iterator for ClientConnection {
                 .find(|h| h.field.equiv("Connection"))
                 .map(|h| h.value.as_str());
 
-            // case-insensitive substring match (NOT token-wise): exactly the
-            // lowercase-then-contains behavior this replaced, minus the alloc
+            // case-insensitive substring match, not token-wise
             fn contains_ignore_case(hay: &str, needle: &str) -> bool {
                 hay.as_bytes()
                     .windows(needle.len())
@@ -499,7 +488,7 @@ impl Iterator for ClientConnection {
                 // Every HTTP/1.0 request is the last one on its connection,
                 // `Connection: keep-alive` or not. 1.0 has no chunked encoding,
                 // so a response of unknown length can only be delimited by the
-                // close — which response.rs now relies on instead of buffering
+                // close, which response.rs relies on rather than buffering
                 // the whole body in memory to discover its length. Reusing a
                 // 1.0 connection and streaming an unknown length are mutually
                 // exclusive; this picks the one that cannot be turned into an

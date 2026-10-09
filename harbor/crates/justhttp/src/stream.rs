@@ -123,9 +123,8 @@ mod listen {
         /// header reader treats a timeout before the request has started as an
         /// idle keep-alive wait and keeps waiting; once a request is under way
         /// a timeout is fatal, which is what bounds a slowloris. It also bounds
-        /// the unread-body drain in `EqualReader::drop`, which otherwise reads
-        /// the client's *declared* Content-Length for as long as the client
-        /// cares to dribble it — parking the serving thread indefinitely.
+        /// each read of a body, and of the unread-body drain, against a peer
+        /// that has stopped sending.
         pub(crate) fn set_read_timeout(
             &self,
             dur: Option<std::time::Duration>,
@@ -206,7 +205,7 @@ mod refined {
     /// by the requests it carries: one descriptor per connection.
     pub(crate) struct Socket {
         conn: Connection,
-        /// The server no longer knows where the next request on this
+        /// The server cannot know where the next request on this
         /// connection begins.
         ended: AtomicBool,
         /// The connection's reader saw the client close or reset it.

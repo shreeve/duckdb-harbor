@@ -238,17 +238,13 @@ where
             head.extend_from_slice(b"\r\n");
         }
 
-        // Identity framing with an unknown length — only reachable for HTTP/1.0
-        // clients now, since 1.1 always chunks an unknown length — is delimited
-        // by the connection close, which is how HTTP/1.0 has always framed a
-        // body of unknown length. `conn.rs` closes after every 1.0 request, so
-        // that delimiter is guaranteed to arrive.
-        //
-        // This used to `read_to_end` the body to discover its length and emit a
-        // Content-Length. That kept the connection reusable, which HTTP/1.0
-        // barely wants, at the cost of holding the entire response in memory —
-        // and harbor streams results with no size limit down this path, so the
-        // cost was unbounded and chosen by the caller.
+        // Identity framing with an unknown length, reachable only for HTTP/1.0
+        // since 1.1 always chunks an unknown length, is delimited by the
+        // connection close: how HTTP/1.0 frames a body of unknown length.
+        // `conn.rs` closes after every 1.0 request, so that delimiter always
+        // arrives. Reading the body to learn its length instead would hold the
+        // whole response in memory, and harbor streams results of any size
+        // down this path.
         let mut reader: Box<dyn Read> = Box::new(self.reader);
         let data_length = self.data_length;
 
