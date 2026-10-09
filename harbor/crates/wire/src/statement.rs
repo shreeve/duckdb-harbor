@@ -8,23 +8,7 @@
 //! engine: the spaces it skips, the comments it skips, what it takes for a
 //! bare word, and the `EXPLAIN` that runs what it explains.
 
-/// How many bytes of whitespace `b` starts with, counted as the engine's
-/// parser counts it: the ASCII set with the vertical tab, and the Unicode
-/// spaces it strips before it parses (U+00A0, U+2000 to U+200B, U+202F,
-/// U+205F, U+2060, U+3000, and the byte order mark, U+FEFF). A scanner that
-/// knew fewer than the engine would read a statement behind one of them as
-/// no statement at all, and the engine would run it.
-pub fn space_len(b: &[u8]) -> usize {
-    match b {
-        [c, ..] if c.is_ascii_whitespace() || *c == 0x0b => 1,
-        [0xC2, 0xA0, ..] => 2,
-        [0xE2, 0x80, 0x80..=0x8B | 0xAF, ..]
-        | [0xE2, 0x81, 0x9F | 0xA0, ..]
-        | [0xE3, 0x80, 0x80, ..]
-        | [0xEF, 0xBB, 0xBF, ..] => 3,
-        _ => 0,
-    }
-}
+use crate::scan::space_len;
 
 /// Advance `i` past whitespace and SQL comments: `--` to end of line, nested
 /// `/* */`. The one skipper every reader of a statement's keywords shares.
