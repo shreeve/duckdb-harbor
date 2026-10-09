@@ -1,8 +1,8 @@
 //! The v2 connection: what the server needs from an engine, first-party.
 //!
-//! The successor to duckdb-rs's `Connection` in harbor's pool. One `Db` is
-//! opened per process and shared; each `Conn` is its own engine connection —
-//! Send but deliberately not Sync, one executor thread each. Statements are
+//! One `Db` is opened per process and shared by harbor's pool; each `Conn`
+//! is its own engine connection — Send but deliberately not Sync, one
+//! executor thread each. Statements are
 //! cached parsed-only (a v2 statement is raw parser output; binding happens
 //! inside statement_execute), so the cache mitigates the v2 parser's cost
 //! without ever holding a stale plan: catalog changes are seen because every
@@ -118,8 +118,7 @@ pub fn open(path: &Path, options: &[(&str, &str)]) -> Result<Conn, Error> {
 // Connection
 // ---------------------------------------------------------------------------
 
-/// How many distinct statement texts each connection keeps parsed. Matches
-/// the v1 prepared-statement cache the executor relied on.
+/// How many distinct statement texts each connection keeps parsed.
 const STMT_CACHE_CAP: usize = 64;
 // SQL bytes, not an estimate of the engine's AST allocations. Large one-off
 // imports still execute, but cannot fill every connection's retained cache.
@@ -540,9 +539,8 @@ impl Conn {
         Ok(())
     }
 
-    /// Parse and run a whole SQL string, draining every result. The
-    /// counterpart of duckdb-rs execute_batch: SETs, ROLLBACK, CHECKPOINT.
-    /// Goes through the statement cache: the per-job ROLLBACK reset runs
+    /// Parse and run a whole SQL string, draining every result: SETs,
+    /// ROLLBACK, CHECKPOINT. Goes through the statement cache: the per-job ROLLBACK reset runs
     /// this constantly with identical text.
     pub fn execute_batch(&mut self, sql: &str) -> Result<(), Error> {
         let stmts = self.statements(sql)?;
@@ -640,10 +638,10 @@ const PREFETCH: usize = 4;
 /// a channel of chunks. Drop promptly — while the result lives, the
 /// connection refuses new statements.
 ///
-/// The pipeline is the point: fetching and encoding used to share one
-/// thread, so every fetch stall — above all the engine's 20ms WaitForTask
-/// nap between chunks — sat on the critical path, and every encode ran
-/// with the engine idle. With a fetch thread, the engine produces chunk
+/// The pipeline is the point: on one thread, every fetch stall — above all
+/// the engine's 20ms WaitForTask nap between chunks — would sit on the
+/// critical path, and every encode would run with the engine idle. With a
+/// fetch thread, the engine produces chunk
 /// N+1 (on its full worker pool) while the consumer encodes chunk N; a
 /// nap only costs wall time when the consumer has nothing left to chew.
 pub struct Stream {

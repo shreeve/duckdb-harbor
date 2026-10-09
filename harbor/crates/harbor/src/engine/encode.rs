@@ -1,13 +1,11 @@
 //! v2 chunk encoder: DuckDB vector views → the NDJSON envelope's JSON.
 //!
-//! The same wire bytes as src/encode.rs, produced without duckdb-rs or
-//! arrow. Types are read once per result into an owned `Type` tree
-//! (logical_type introspection), then every chunk is walked through borrowed
-//! vector views: no per-row value materialization, no arrow arrays, no
-//! decoder panics. The pure formatters — dates, decimals, BIGNUM, BIT, UUID,
-//! base64, the JSON-safe integer rule — live in src/encode.rs, which the
-//! flip kept as the engine-free formatter home; this module owns everything
-//! that touches a vector view.
+//! Types are read once per result into an owned `Type` tree (logical_type
+//! introspection), then every chunk is walked through borrowed vector views:
+//! no per-row value materialization and no decoder to panic. The pure
+//! formatters — dates, decimals, BIGNUM, BIT, UUID, base64, the JSON-safe
+//! integer rule — live in src/encode.rs, which holds nothing of the engine;
+//! this module owns everything that touches a vector view.
 
 use super::ffi;
 use super::{Error, str_view};
@@ -216,9 +214,8 @@ fn emit_schema(out: &mut String, name: Option<&str>, ty: &Type) {
             out.push_str(r#","encoding":"pairs""#);
         }
         LOGICAL_TYPE_ID_UNION => {
-            // The v2 vector interface keeps the tag reachable inside
-            // containers too, so since 0.22 nothing is dropped anywhere —
-            // v1 could only recover the tag at the top of a column.
+            // The vector interface keeps the tag reachable inside
+            // containers too, so a union is lossless at any depth.
             out.push_str(r#","lossless":true,"members":["#);
             for (i, (n, child)) in ty.children.iter().enumerate() {
                 if i > 0 {
@@ -284,9 +281,7 @@ fn is_lossless(id: ffi::LOGICAL_TYPE_ID) -> bool {
             | LOGICAL_TYPE_ID_BIGNUM
             | LOGICAL_TYPE_ID_ENUM
             | LOGICAL_TYPE_ID_SQLNULL
-            // New under v2: v1 refused TIME_NS (its client had no decoder)
-            // and predates TIMESTAMP_NS WITH TIME ZONE. Both encode exactly
-            // here — nanoseconds carry into a nine-digit fraction.
+            // Nanoseconds carry into a nine-digit fraction.
             | LOGICAL_TYPE_ID_TIME_NS
             | LOGICAL_TYPE_ID_TIMESTAMP_TZ_NS
     )
@@ -503,8 +498,8 @@ fn emit(
             }
             // The stored value packs microseconds-since-midnight above a
             // 24-bit UTC offset in seconds, biased and reverse-ordered so
-            // +14:00 sorts before UTC. Since 0.22 both survive to the wire:
-            // the local clock, then the offset PostgreSQL-style.
+            // +14:00 sorts before UTC. Both go out: the local clock, then
+            // the offset PostgreSQL-style.
             LOGICAL_TYPE_ID_TIME_TZ => {
                 let packed: u64 = r.get(phys);
                 out.push('"');
@@ -625,9 +620,8 @@ fn emit(
                 out.push(']');
             }
             LOGICAL_TYPE_ID_MAP => {
-                // Pairs, with the key and value types carried through — the
-                // same lossless shape as v1, straight off the flattened key
-                // and value children.
+                // Pairs, with the key and value types carried through,
+                // straight off the flattened key and value children.
                 let entry: ffi::list_entry_t = r.get(phys);
                 out.push('[');
                 for j in 0..entry.length {
@@ -644,8 +638,7 @@ fn emit(
             }
             LOGICAL_TYPE_ID_UNION => {
                 // children[0] is the tag, children[1..] the members. The
-                // tagged object goes out at every depth since 0.22 — v1
-                // could only tag at the top of a column.
+                // tagged object goes out at every depth.
                 let tag = {
                     let t = &r.children[0];
                     let p = t.phys(phys);

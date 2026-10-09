@@ -583,7 +583,7 @@ mod conn {
     }
 
     /// The guard that matters most: an ordinary multi-chunk SELECT must not
-    /// lose or repeat its opening rows now that a chunk can arrive out of band.
+    /// lose or repeat its opening rows, though a chunk can arrive out of band.
     #[test]
     fn ordinary_statements_deliver_every_row_once() {
         let Some(_) = v2_engine() else { return };
@@ -833,10 +833,10 @@ mod wire {
              'infinity'::TIMESTAMP_MS, '-infinity'::TIMESTAMP_NS, 'infinity'::TIMESTAMPTZ, '-infinity'::TIMESTAMPTZ_NS",
             r#""infinity","-infinity","infinity","-infinity","infinity","-infinity","infinity","-infinity""#,
         );
-        // v1 refused TIME_NS outright; v2 encodes it.
+        // TIME_NS keeps its nanoseconds.
         row(eng, "SELECT TIME_NS '14:30:00.123456789'", r#""14:30:00.123456789""#);
-        // TIME WITH TIME ZONE: local time plus the ISO offset — v1 dropped
-        // the offset; 0.22 keeps it, down to second precision.
+        // TIME WITH TIME ZONE: local time plus the ISO offset, down to
+        // second precision.
         row(eng, "SELECT TIMETZ '14:30:00+02'", r#""14:30:00+02:00""#);
         row(eng, "SELECT TIMETZ '14:30:00-08:15'", r#""14:30:00-08:15""#);
         row(eng, "SELECT TIMETZ '14:30:00+05:30:15'", r#""14:30:00+05:30:15""#);
@@ -844,9 +844,9 @@ mod wire {
         // The full offset range DuckDB accepts, at both extremes.
         row(eng, "SELECT TIMETZ '12:00:00+15:59:59'", r#""12:00:00+15:59:59""#);
         row(eng, "SELECT TIMETZ '12:00:00-15:59:59'", r#""12:00:00-15:59:59""#);
-        // 24:00:00 is end-of-day, a legal value distinct from midnight —
-        // the wraparound used to fold it onto 00:00:00, on all three time
-        // types, while the schema claimed lossless.
+        // 24:00:00 is end-of-day, a legal value distinct from midnight, and
+        // must not wrap onto 00:00:00 on any of the three time types while
+        // the schema claims lossless.
         row(eng, "SELECT TIME '24:00:00'", r#""24:00:00""#);
         row(eng, "SELECT TIME_NS '24:00:00'", r#""24:00:00""#);
         row(eng, "SELECT TIMETZ '24:00:00+00'", r#""24:00:00+00:00""#);
@@ -894,8 +894,8 @@ mod wire {
         let Some(eng) = v2_engine() else { return };
         row(eng, "SELECT union_value(a := 2)::UNION(a INTEGER, b VARCHAR)", r#"{"tag":"a","value":2}"#);
         row(eng, "SELECT union_value(b := 'x')::UNION(a INTEGER, b VARCHAR)", r#"{"tag":"b","value":"x"}"#);
-        // Nested too — v1 could only tag at the top of a column and sent the
-        // payload alone inside containers; 0.22 tags at every depth.
+        // Nested too: the tag goes out at every depth, never the payload
+        // alone.
         row(eng, "SELECT [union_value(a := 2)::UNION(a INTEGER, b VARCHAR)]", r#"[{"tag":"a","value":2}]"#);
         row(
             eng,

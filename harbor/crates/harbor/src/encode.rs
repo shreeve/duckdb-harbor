@@ -124,11 +124,10 @@ pub(crate) fn push_int_pad(out: &mut String, v: i64, width: usize) {
 
 pub(crate) fn push_int(out: &mut String, i: i128) {
     // unsigned_abs, not abs: `i128::MIN` has no positive counterpart, so
-    // `abs()` overflows there. In release that wraps back to `i128::MIN`, which
-    // compares under the threshold, and the HUGEINT minimum went out as a bare
-    // JSON number — the exact silent-reprecision failure this function exists
-    // to prevent, on a value any `SELECT (-170141183460469231731687303715884105728)::HUGEINT`
-    // produces. In debug it panicked instead.
+    // `abs()` overflows there, and in release wraps back to `i128::MIN`, which
+    // compares under the threshold: the HUGEINT minimum would go out as a
+    // bare JSON number, the silent reprecision this function exists to
+    // prevent.
     if i.unsigned_abs() <= JSON_SAFE as u128 {
         // Under 2^53 always fits i64; stay on the 64-bit digit writer.
         push_i64_raw(out, i as i64);
@@ -177,14 +176,11 @@ pub(crate) fn push_float(out: &mut String, f: f64) {
     }
 }
 
-/// A FLOAT, formatted as the f32 it is.
-///
-/// This used to widen to f64 first and format that, which is lossless but not
-/// faithful: `0.1::FLOAT` went out as 0.10000000149011612 — the same number,
-/// but not the text DuckDB writes, not the text an f32-aware client writes,
-/// and visibly *less* precise than the DOUBLE column holding the same literal
-/// right beside it. `f32::to_string` gives the shortest text that round-trips
-/// back to the same f32, which is what every other numeric type here does.
+/// A FLOAT, formatted as the f32 it is: the shortest text that round-trips
+/// to the same f32, as every other numeric type here does. Widened to f64
+/// first, `0.1::FLOAT` would read 0.10000000149011612 — the same number, but
+/// not the text DuckDB writes, and visibly less precise than a DOUBLE
+/// holding the same literal beside it.
 pub(crate) fn push_float32(out: &mut String, f: f32) {
     if f.is_nan() {
         return push_json_string(out, "NaN");
@@ -250,17 +246,16 @@ fn push_exponent(out: &mut String, formatted: &str) {
 }
 
 pub(crate) fn push_json_string(out: &mut String, s: &str) {
-    // One pass, byte-identical to what serde_json::to_string used to produce
-    // here (its escaping rules are reproduced below and pinned by a
-    // fuzz-comparison test), plus one rule serde_json correctly does not
-    // apply because it is about the container rather than the value: U+2028
-    // LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are legal inside a JSON
-    // string, but this is a newline-delimited format and they are line
-    // terminators to every Unicode-aware line splitter. Left raw, one row is
-    // read as two — and the half that is left over is not valid JSON, so a
-    // client sees a parse error whose cause is nowhere near where it
-    // happened. Writing straight into `out` drops the String serde_json
-    // allocated per cell and the two container scans over it.
+    // One pass, byte-identical to serde_json::to_string (its escaping rules
+    // are reproduced below and pinned by a fuzz-comparison test), plus one
+    // rule serde_json correctly does not apply because it is about the
+    // container rather than the value: U+2028 LINE SEPARATOR and U+2029
+    // PARAGRAPH SEPARATOR are legal inside a JSON string, but this is a
+    // newline-delimited format and they are line terminators to every
+    // Unicode-aware line splitter. Left raw, one row is read as two — and the
+    // half that is left over is not valid JSON, so a client sees a parse
+    // error whose cause is nowhere near where it happened. Writing straight
+    // into `out` saves a String per cell and the scans over it.
     out.push('"');
     let bytes = s.as_bytes();
     let mut start = 0;
@@ -450,7 +445,7 @@ pub(crate) fn push_fraction(out: &mut String, nanos: i64) {
     out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[..end]) });
 }
 
-/// DuckDB stores BIGNUM (formerly VARINT) as a three-byte header followed by
+/// DuckDB stores BIGNUM as a three-byte header followed by
 /// the magnitude, most significant byte first. Without this the value goes out
 /// base64-encoded — DuckDB's private storage layout, leaked onto the wire,
 /// where no client could read it and nothing would say it was wrong.
@@ -565,8 +560,7 @@ mod tests {
     use super::*;
 
     /// The reference bytes push_json_string must reproduce: serde_json's
-    /// escaping, then the U+2028/U+2029 post-pass — exactly the two-step
-    /// encoding this function replaced.
+    /// escaping, then a pass that escapes U+2028 and U+2029.
     fn reference(s: &str) -> String {
         let encoded = serde_json::to_string(s).unwrap();
         let mut out = String::new();

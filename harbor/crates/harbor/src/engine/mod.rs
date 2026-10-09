@@ -3,8 +3,7 @@
 //! ffi.rs is generated from DuckDB's api_spec/v2 YAML (scripts/gen-v2-ffi.rb):
 //! the whole surface as one dlsym-filled function table. This module is the
 //! hand-written rim: find the library, load it once, and give errors and
-//! string views a Rust shape. The candidate search here replaced the v1-era
-//! loader (src/engine.rs) when 0.21's flip retired it along with duckdb-rs.
+//! string views a Rust shape.
 //!
 //! Unix opens the engine RTLD_NOW and, once it proves to serve the v2 API,
 //! RTLD_GLOBAL. GLOBAL is load-bearing: DuckDB's own extension loading
