@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
 use super::encode::{Type, result_columns};
@@ -182,12 +182,12 @@ impl Conn {
     /// stable: executor registrations already hold handles to this slot.
     pub fn reset(&mut self) -> Result<(), Error> {
         let mut fresh = Self::connect(self.db.clone())?;
-        let mut slot = self.interrupt.lock().unwrap();
+        let mut slot = self.interrupt.lock().unwrap_or_else(PoisonError::into_inner);
         // The old connection is dropped with its own slot after the swap.
         // No caller can interrupt either handle during the replacement.
         std::mem::swap(&mut self.conn, &mut fresh.conn);
         *slot = self.conn;
-        *fresh.interrupt.lock().unwrap() = fresh.conn;
+        *fresh.interrupt.lock().unwrap_or_else(PoisonError::into_inner) = fresh.conn;
         self.cache.clear();
         self.cache_bytes = 0;
         self.tick = 0;
@@ -582,7 +582,7 @@ impl Drop for Conn {
         }
         // Disconnect under the interrupt lock: a canceller mid-call finishes
         // against the live handle first, and every later one sees null.
-        let mut slot = self.interrupt.lock().unwrap_or_else(|p| p.into_inner());
+        let mut slot = self.interrupt.lock().unwrap_or_else(PoisonError::into_inner);
         unsafe {
             if let Some(f) = self.eng.api.disconnect {
                 f(&mut self.conn);
@@ -918,8 +918,8 @@ pub struct Chunk {
 unsafe impl Send for Chunk {}
 
 impl Chunk {
-    /// Build the readers for the chunk's columns. Valid until the chunk is
-    /// dropped; the borrow ties them to it.
+    /// Build the readers for the chunk's columns. They point into the chunk
+    /// and nothing ties them to it, so the caller drops them before it.
     pub fn readers(&self, count: usize) -> Result<Vec<super::encode::Reader>, Error> {
         let api = &self.eng.api;
         let mut readers = Vec::with_capacity(count);
@@ -963,7 +963,7 @@ impl Interrupt {
     /// alive for the duration of the call; connection_interrupt only sets a
     /// flag, so the hold is momentary.
     pub fn interrupt(&self) {
-        let slot = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let slot = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         if slot.is_null() {
             return;
         }
