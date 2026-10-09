@@ -675,6 +675,26 @@ impl Stream {
             }
         }
     }
+
+    /// The error to report when encoding a cell of this stream failed with
+    /// `cell`: the statement's own error when one is waiting behind it, else
+    /// `cell`. A cell cast runs in the statement's transaction, and a
+    /// statement error the fetch thread met has already aborted that, so in
+    /// a session the cast fails "transaction is aborted" while the cause sits
+    /// in the channel. The query is interrupted first, so the wait for the
+    /// fetch thread's last word is short.
+    pub fn error_after(&mut self, cell: Error) -> Error {
+        self.pending = None;
+        self.interrupt.interrupt();
+        loop {
+            match self.next_chunk() {
+                Ok(Some(_)) => {}
+                Ok(None) => return cell,
+                Err(e) if e.code == ffi::ERROR_RUNTIME_INTERRUPT => return cell,
+                Err(e) => return e,
+            }
+        }
+    }
 }
 
 impl Drop for Stream {

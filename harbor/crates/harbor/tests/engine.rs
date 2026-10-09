@@ -219,7 +219,9 @@ mod conn {
                         if i > 0 {
                             line.push(',');
                         }
-                        harbor::engine::encode::emit_cell(&mut line, api, Some(json), &readers[i], ty, row)?;
+                        if let Err(e) = harbor::engine::encode::emit_cell(&mut line, api, Some(json), &readers[i], ty, row) {
+                            return Err(stream.error_after(e));
+                        }
                     }
                     out.push(line);
                 }
@@ -281,6 +283,26 @@ mod conn {
         assert!(err.to_string().contains("aborted"), "{err}");
         c.execute_batch("ROLLBACK").unwrap();
         assert_eq!(rows(&mut c, "SELECT variant_typeof(doc) FROM t WHERE id = 1", &[]).unwrap(), [r#""OBJECT(a)""#]);
+    }
+
+    /// A statement that fails mid-stream in a transaction reports its own
+    /// error, not the "transaction is aborted" a VARIANT cell's cast meets
+    /// after it: the failure aborts the transaction before the fetch thread
+    /// can say why.
+    #[test]
+    fn a_session_statement_failing_mid_stream_reports_its_own_error() {
+        let Some(_) = v2_engine() else { return };
+        // A small streaming buffer keeps the engine a few chunks ahead of
+        // the encoder, so the error lands mid-stream with casts to come.
+        let mut c = conn::open(Path::new(":memory:"), &[]).expect("open");
+        c.execute_batch("SET streaming_buffer_size = '1KB'").unwrap();
+        let sql = "SELECT i::VARIANT v, CASE WHEN i = 60000 THEN error('boom at ' || i) END FROM range(100000) r(i)";
+        for _ in 0..3 {
+            c.execute_batch("BEGIN").unwrap();
+            let err = rows(&mut c, sql, &[]).unwrap_err().to_string();
+            assert!(err.contains("boom at 60000"), "{err}");
+            c.execute_batch("ROLLBACK").unwrap();
+        }
     }
 
     /// The types a document is cast through are the connection's own: a
