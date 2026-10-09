@@ -98,44 +98,35 @@ fn discover() -> Vec<Live> {
         if !sock.extension().is_some_and(|x| x == "sock") {
             continue;
         }
-        #[cfg(not(unix))]
-        {
+        let t = Transport::Unix(sock.clone());
+        let Ok(r) = request(&t, &wire::endpoint::INFO, None, Some(Duration::from_secs(2))) else {
+            continue;
+        };
+        if r.status != 200 {
             continue;
         }
-        #[cfg(unix)]
-        {
-            let t = Transport::Unix(sock.clone());
-            let Ok(r) =
-                request(&t, &wire::endpoint::INFO, None, Some(Duration::from_secs(2)))
-            else {
-                continue;
-            };
-            if r.status != 200 {
-                continue;
-            }
-            let Ok(body) = r.body_string() else { continue };
-            let Ok(info) = serde_json::from_str::<wire::InfoResponse>(body.trim()) else {
-                continue;
-            };
-            // 0.22.1-and-earlier servers send no name (the field entered
-            // /info after them) — label the row from the file stem rather
-            // than showing a blank.
-            let name = if info.name.is_empty() {
-                std::path::Path::new(&info.database)
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| info.database.clone())
-            } else {
-                info.name
-            };
-            out.push(Live {
-                name,
-                db: PathBuf::from(info.database),
-                sock,
-                version: info.harbor_version,
-                ephemeral: info.ephemeral,
-            });
-        }
+        let Ok(body) = r.body_string() else { continue };
+        let Ok(info) = serde_json::from_str::<wire::InfoResponse>(body.trim()) else {
+            continue;
+        };
+        // 0.22.1-and-earlier servers send no name (the field entered
+        // /info after them) — label the row from the file stem rather
+        // than showing a blank.
+        let name = if info.name.is_empty() {
+            std::path::Path::new(&info.database)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| info.database.clone())
+        } else {
+            info.name
+        };
+        out.push(Live {
+            name,
+            db: PathBuf::from(info.database),
+            sock,
+            version: info.harbor_version,
+            ephemeral: info.ephemeral,
+        });
     }
     out
 }
@@ -251,12 +242,9 @@ pub fn survey() -> Fleet {
                 }
             }
             // No live server named this file in its `/info`. It is running
-            // all the same if the socket derived from its path answers, or
-            // if the socket named for it does and serves this file
-            // (`file_socket`).
+            // all the same if the socket derived from its path answers.
             Planned::Berth { name, db } => {
-                let named = home.as_ref().map(|home| paths::sock_file(home, name));
-                let running = matches!(file_socket(&db, sock_of(&db), named), FileSocket::Found(_));
+                let running = sock_of(&db).is_some_and(|sock| sock_ready(&sock));
                 Survey {
                     name: name.to_string(),
                     state: if running { State::Running } else { State::Stopped },
@@ -360,59 +348,7 @@ fn probe(transport: &Transport) -> bool {
 
 /// A unix socket that exists and answers /ready.
 fn sock_ready(sock: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        sock.exists() && probe(&Transport::Unix(sock.to_path_buf()))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = sock;
-        false
-    }
-}
-
-/// Where the server on a database file listens, if one does.
-#[derive(Debug, PartialEq)]
-enum FileSocket {
-    /// On this socket, ready.
-    Found(PathBuf),
-    /// Nowhere: no socket of the file's answers, or the one named for it
-    /// serves another file.
-    Absent,
-    /// A server answers on the socket named for the file and did not say
-    /// which database it serves. It may be this file's: starting another on
-    /// the file would only lose the file lock to it.
-    Unidentified(PathBuf),
-}
-
-/// The ready socket of the server on `db`: the one derived from the file's
-/// path, or else the one named for it, which is trusted only when the server
-/// behind it says in `/info` that this file is its database. A name is not a
-/// file: another database of the same name can be listening there, and a
-/// connection made to it would be labelled with this file's path, which
-/// every later Stop and comparison goes by.
-fn file_socket(db: &Path, own: Option<PathBuf>, named: Option<PathBuf>) -> FileSocket {
-    if let Some(own) = own.filter(|s| sock_ready(s)) {
-        return FileSocket::Found(own);
-    }
-    let Some(named) = named.filter(|s| sock_ready(s)) else { return FileSocket::Absent };
-    #[cfg(unix)]
-    let info = info_of(&Transport::Unix(named.clone()));
-    #[cfg(not(unix))]
-    let info: Option<wire::InfoResponse> = None;
-    // An answer that names no database says as little as no answer: the
-    // field is empty when the server left it out.
-    match info.as_ref().map(|info| info.database.as_str()).filter(|database| !database.is_empty()) {
-        None => FileSocket::Unidentified(named),
-        Some(database) if names_file(Some(database), db) => FileSocket::Found(named),
-        Some(_) => FileSocket::Absent,
-    }
-}
-
-/// Whether the database a server reports is the file `db`, under any
-/// spelling of either path. A server that reports none is not known to be.
-fn names_file(reported: Option<&str>, db: &Path) -> bool {
-    reported.filter(|r| !r.is_empty()).is_some_and(|reported| same_file(Path::new(reported), db))
+    sock.exists() && probe(&Transport::Unix(sock.to_path_buf()))
 }
 
 /// Whether two paths name one database file, however each is spelled.
@@ -544,36 +480,11 @@ pub fn join_file(name: &str, db: &Path) -> Option<Conn> {
 }
 
 /// Join the server on `db`, or summon one when `summon_it` and none answers.
-/// Join before summoning, and look on both sockets a server of this file can
-/// listen on: the one derived from the path, and the one named for it when
-/// the server there serves this file (`file_socket`). Spawning over a live
-/// server would only lose DuckDB's file-lock race and read as a failure.
+/// Spawning over a live server would only lose DuckDB's file-lock race and
+/// read as a failure.
 fn serve_file(name: String, db: &Path, summon_it: bool) -> Result<Conn, String> {
-    let home = runtime_dir()?;
-    let sock21 = paths::socket_for(&home, db)?;
-    let sock19 = paths::sock_file(&home, &name);
-    let join = |summoned: bool| -> Result<Option<Conn>, String> {
-        match file_socket(db, Some(sock21.clone()), Some(sock19.clone())) {
-            FileSocket::Found(s) => Ok(Conn::plain(
-                name.clone(),
-                #[cfg(unix)]
-                Transport::Unix(s),
-                #[cfg(not(unix))]
-                Transport::Tcp(String::new()),
-                summoned,
-            )
-            .ok()
-            .map(|conn| conn.serving(db))),
-            FileSocket::Absent => Ok(None),
-            // Not joined, since it may be another database's server, and
-            // not started over, since it may be this one's.
-            FileSocket::Unidentified(sock) => Err(format!(
-                "a server answers on {} and did not say which database it serves: try again",
-                sock.display()
-            )),
-        }
-    };
-    if let Some(conn) = join(false)? {
+    let sock = paths::socket_for(&runtime_dir()?, db)?;
+    if let Some(conn) = join(&name, db, &sock, false)? {
         return Ok(conn);
     }
     if !summon_it {
@@ -582,21 +493,20 @@ fn serve_file(name: String, db: &Path, summon_it: bool) -> Result<Conn, String> 
     // Nothing serves the file yet: summon an ephemeral server — it
     // self-retires when this window's connection drops, since opening a
     // database is not a request to keep it running. Two windows can race
-    // one summon; DuckDB's file lock lets exactly one server win and the
-    // loser exits nonzero, so the loser judges by the end state: if a
-    // socket comes ready anyway, its exit was noise.
-    let spawn_err = summon(db, true).err();
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
-    loop {
-        if let Ok(Some(conn)) = join(true) {
-            return Ok(conn);
-        }
-        if std::time::Instant::now() > deadline {
-            return Err(spawn_err
-                .unwrap_or_else(|| format!("harbor never answered for {}", db.display())));
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    // one summon; DuckDB's file lock lets exactly one server win, and the
+    // loser's socket is the winner's.
+    summon(db, &sock, true)?;
+    join(&name, db, &sock, true)?.ok_or_else(|| format!("harbor never answered for {}", db.display()))
+}
+
+/// The server answering on `sock`, joined, or `None` when nothing answers
+/// there. One that answers and then refuses the connection's anchor says
+/// why, rather than reading as nothing serving the file.
+fn join(name: &str, db: &Path, sock: &Path, summoned: bool) -> Result<Option<Conn>, String> {
+    if !sock_ready(sock) {
+        return Ok(None);
     }
+    Conn::plain(name.to_string(), Transport::Unix(sock.to_path_buf()), summoned).map(|conn| Some(conn.serving(db)))
 }
 
 /// Open a database FILE directly — the File→Open / drag-drop door. No
@@ -605,9 +515,9 @@ fn serve_file(name: String, db: &Path, summon_it: bool) -> Result<Conn, String> 
 /// summoned like any file (`serve_file`).
 pub fn connect_path(db: &Path) -> Result<Conn, String> {
     let db = paths::canonical_db(db).map_err(|e| format!("{}: {e}", db.display()))?;
-    // The stem-derived name harbor itself would mint for this path — used
-    // only for the name-keyed socket lookup; the server's /info answers
-    // with its own truth on the next refresh.
+    // The stem-derived name harbor itself would mint for this path, which
+    // labels the connection; the server's /info answers with its own truth
+    // on the next refresh.
     let name = db
         .file_stem()
         .and_then(|s| s.to_str())
@@ -628,10 +538,7 @@ pub fn stop(db: &Path) -> Result<(), String> {
     let own = paths::socket_for(&home, &db).ok();
     for s in stop_targets(&db, own, &discover()) {
         if sock_ready(&s) {
-            #[cfg(unix)]
             let t = Transport::Unix(s);
-            #[cfg(not(unix))]
-            let t = Transport::Tcp(String::new());
             // 202 {"stopping":true}, then the server drains and the socket
             // goes away — a refresh a beat later drops the row.
             request(&t, &wire::endpoint::SHUTDOWN, None, Some(Duration::from_secs(5)))
@@ -656,24 +563,14 @@ fn stop_targets(db: &Path, own: Option<PathBuf>, live: &[Live]) -> Vec<PathBuf> 
     socks
 }
 
-/// Start a persistent server for this database, if one is not already up:
-/// summon `harbor <db> start` and wait for its socket to answer.
+/// Start a persistent server for this database, if one is not already up.
 pub fn start(db: &Path) -> Result<(), String> {
-    let home = runtime_dir()?;
     let canon = paths::canonical_db(db)?;
-    let sock = paths::socket_for(&home, &canon)?;
+    let sock = paths::socket_for(&runtime_dir()?, &canon)?;
     if sock_ready(&sock) {
         return Ok(()); // already running
     }
-    summon(&canon, false)?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while std::time::Instant::now() < deadline {
-        if sock_ready(&sock) {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    Err(format!("{} did not come up — see its harbor log", db.display()))
+    summon(&canon, &sock, false)
 }
 
 /// Add this database to your list (config.toml): membership is what makes a
@@ -771,16 +668,10 @@ fn info_of(t: &Transport) -> Option<wire::InfoResponse> {
 /// one thing a hand-typed `stop; start` gets wrong), then summon it again in
 /// the same lifetime mode. The one-click upgrade path.
 pub fn restart(db: &Path, ephemeral: bool) -> Result<(), String> {
-    let home = runtime_dir()?;
     let canon = paths::canonical_db(db)?;
-    let sock = paths::socket_for(&home, &canon)?;
-    // Shut down the server on this file's socket.
+    let sock = paths::socket_for(&runtime_dir()?, &canon)?;
     if sock_ready(&sock) {
-        #[cfg(unix)]
-        let t = Transport::Unix(sock.clone());
-        #[cfg(not(unix))]
-        let t = Transport::Tcp(String::new());
-        request(&t, &wire::endpoint::SHUTDOWN, None, Some(Duration::from_secs(5)))
+        request(&Transport::Unix(sock.clone()), &wire::endpoint::SHUTDOWN, None, Some(Duration::from_secs(5)))
             .map_err(|e| format!("stop {}: {e}", db.display()))?;
     }
     // Wait for the server to drain and release the lock.
@@ -792,38 +683,17 @@ pub fn restart(db: &Path, ephemeral: bool) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(100));
     }
     // Bring it back the way it was running.
-    summon(&canon, ephemeral)?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    while !sock_ready(&sock) {
-        if std::time::Instant::now() > deadline {
-            return Err(format!("{} did not come back up — see its harbor log", db.display()));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Ok(())
+    summon(&canon, &sock, ephemeral)
 }
 
-/// Summon through harbor's own front door: `harbor <db> start`, detached and
-/// headless. `ephemeral` sets `HARBOR_EPHEMERAL` so the child self-retires
-/// once its last client disconnects — the implicit open-a-database path, where
-/// a server nobody asked to persist should not outlive the window that raised
-/// it. Without it the child is a plain persistent `start` that runs until
-/// stopped, which is what the explicit Start action wants. Either way this
-/// process only waits for the socket to answer.
-fn summon(db: &Path, ephemeral: bool) -> Result<(), String> {
-    let harbor = harbor_bin();
-    let mut cmd = std::process::Command::new(&harbor);
-    cmd.arg(db)
-        .arg("start")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    if ephemeral {
-        cmd.env("HARBOR_EPHEMERAL", "1");
-    }
-    cmd.spawn()
-        .map_err(|e| format!("cannot run {harbor:?} (is harbor installed?): {e}"))?;
-    Ok(())
+/// Summon through harbor's own front door, `harbor <db> start`, and wait
+/// for it to answer on `sock`. `ephemeral` makes the server self-retire once
+/// its last client disconnects: the implicit open-a-database path, where a
+/// server nobody asked to persist should not outlive the window that raised
+/// it. Without it the server is a plain persistent `start` that runs until
+/// stopped, which is what the explicit Start action wants.
+fn summon(db: &Path, sock: &Path, ephemeral: bool) -> Result<(), String> {
+    crate::http::summon(harbor_bin(), db, sock, &[], ephemeral)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1284,103 +1154,42 @@ mod tests {
         assert!(remote_entry(&cfg, "missing").is_err());
     }
 
-    /// A server on a unix socket that answers `/ready`, and `/info` with
-    /// `info`, or hangs up on `/info` when there is none.
-    #[cfg(unix)]
-    fn serving(sock: &Path, info: Option<String>) -> std::thread::JoinHandle<()> {
-        let _ = std::fs::remove_file(sock);
-        let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { break };
-                let mut request = Vec::new();
-                let mut byte = [0_u8; 1];
-                while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
-                    request.push(byte[0]);
-                }
-                let request = String::from_utf8_lossy(&request).into_owned();
-                let body = if request.starts_with("GET /ready") {
-                    Some("ok".to_string())
-                } else if request.starts_with("GET /info") {
-                    info.clone()
-                } else if request.starts_with("GET /quit") {
-                    break;
-                } else {
-                    None
-                };
-                if let Some(body) = body {
-                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
-                }
-            }
-        })
-    }
-
-    #[cfg(unix)]
-    fn quit(sock: &Path, server: std::thread::JoinHandle<()>) {
-        if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(sock) {
-            let _ = stream.write_all(b"GET /quit HTTP/1.1\r\n\r\n");
-        }
-        server.join().unwrap();
-        let _ = std::fs::remove_file(sock);
-    }
-
     #[test]
-    fn a_socket_named_for_a_database_is_trusted_only_for_its_own_file() {
+    fn two_spellings_of_one_file_are_one_database() {
         let dir = std::env::temp_dir();
         let db = dir.join("harbor-client-a.duckdb");
         let same = dir.join(".").join("harbor-client-a.duckdb");
         let other = dir.join("harbor-client-other").join("harbor-client-a.duckdb");
-        // The server says it serves this file, under either spelling.
-        assert!(names_file(Some(&db.to_string_lossy()), &db));
-        assert!(names_file(Some(&same.to_string_lossy()), &db));
         assert!(same_file(&same, &db) && !same_file(&other, &db));
-        // Another file of the same name, a server that reports no database,
-        // and one that did not answer `/info` at all are not this file's.
-        assert!(!names_file(Some(&other.to_string_lossy()), &db));
-        assert!(!names_file(Some(""), &db));
-        assert!(!names_file(None, &db));
-        // With neither socket answering there is none to join.
-        let missing = dir.join("harbor-client-no-such.sock");
-        assert_eq!(file_socket(&db, Some(missing.clone()), Some(missing.clone())), FileSocket::Absent);
-        assert_eq!(file_socket(&db, None, None), FileSocket::Absent);
+    }
 
-        // A live socket named for the database, asked which file it serves.
-        #[cfg(unix)]
-        {
-            let info = |database: &Path| {
-                serde_json::to_string(&wire::InfoResponse {
-                    database: database.to_string_lossy().into_owned(),
-                    ..Default::default()
-                })
-                .unwrap()
-            };
-            let sock = dir.join(format!("hc-named-{}.sock", std::process::id()));
-            // It serves this file: joined.
-            let server = serving(&sock, Some(info(&same)));
-            assert_eq!(file_socket(&db, Some(missing.clone()), Some(sock.clone())), FileSocket::Found(sock.clone()));
-            quit(&sock, server);
-            // It serves another file of the same name: not this file's
-            // server, and this file may be started.
-            let server = serving(&sock, Some(info(&other)));
-            assert_eq!(file_socket(&db, Some(missing.clone()), Some(sock.clone())), FileSocket::Absent);
-            quit(&sock, server);
-            // It answers and does not say: neither joined nor started over.
-            let server = serving(&sock, None);
-            assert_eq!(
-                file_socket(&db, Some(missing.clone()), Some(sock.clone())),
-                FileSocket::Unidentified(sock.clone())
-            );
-            // The file's own socket is the file's whatever its name says.
-            assert_eq!(file_socket(&db, Some(sock.clone()), None), FileSocket::Found(sock.clone()));
-            quit(&sock, server);
-            // It answers `/info` and names no database: as good as silence.
-            let server = serving(&sock, Some(info(Path::new(""))));
-            assert_eq!(
-                file_socket(&db, Some(missing.clone()), Some(sock.clone())),
-                FileSocket::Unidentified(sock.clone())
-            );
-            quit(&sock, server);
-        }
+    #[test]
+    fn a_server_that_refuses_the_anchor_says_why() {
+        // Nothing listens: nothing to join, and so a server may be started.
+        let dir = std::env::temp_dir();
+        let db = dir.join("harbor-client-join.duckdb");
+        let sock = dir.join(format!("hc-join-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        assert!(join("join", &db, &sock, false).unwrap().is_none());
+
+        // A server that answers `/ready` once and then refuses it, as one
+        // shutting down does: its refusal is the answer, not a summon over it.
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            for reply in ["200 OK", "503 Service Unavailable"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap() == 1 {
+                    request.push(byte[0]);
+                }
+                write!(stream, "HTTP/1.1 {reply}\r\nContent-Length: 0\r\n\r\n").unwrap();
+            }
+        });
+        let refused = join("join", &db, &sock, false).err().unwrap();
+        assert!(refused.contains("HTTP 503"), "{refused}");
+        server.join().unwrap();
+        std::fs::remove_file(&sock).unwrap();
     }
 
     #[test]
