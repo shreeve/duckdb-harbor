@@ -243,8 +243,8 @@ impl Server {
     }
 
     /// One server over any number of pre-bound doors: one request queue, one
-    /// close trigger, one connection count — and one accept thread per
-    /// listener feeding them. The caller owns the binding policy (which
+    /// close trigger, one connection count, one pool of connection threads —
+    /// and one accept thread per listener feeding them. The caller owns the binding policy (which
     /// addresses, which sockets); this owns everything after the bind. The
     /// first listener is the primary: `server_addr()` reports it.
     pub fn serve(
@@ -258,8 +258,15 @@ impl Server {
         for listener in &listeners {
             listening_addrs.push(listener.local_addr()?);
         }
+        let tasks = Arc::new(pool::TaskPool::new());
         for listener in listeners {
-            spawn_accept(listener, close_trigger.clone(), messages.clone(), connections.clone());
+            spawn_accept(
+                listener,
+                close_trigger.clone(),
+                messages.clone(),
+                connections.clone(),
+                tasks.clone(),
+            );
         }
 
         Ok(Server { messages, close: close_trigger, listening_addrs, connections })
@@ -267,17 +274,16 @@ impl Server {
 }
 
 /// The accept loop for one listener: accepted connections are dispatched to
-/// the task pool, and every request they produce lands in the shared queue.
+/// the task pool every listener shares, and every request they produce lands
+/// in the shared queue.
 fn spawn_accept(
     server: stream::Listener,
     inside_close_trigger: Arc<AtomicBool>,
     inside_messages: Arc<MessagesQueue<Message>>,
     inside_connections: Arc<AtomicUsize>,
+    tasks_pool: Arc<pool::TaskPool>,
 ) {
     thread::spawn(move || {
-            // a tasks pool is used to dispatch the connections into threads
-            let tasks_pool = pool::TaskPool::new();
-
             // The ceiling on how long a single
             // response write may block before the connection is dropped. A dead
             // reader is finite, not precise — 10s reads as "this peer is gone,"
