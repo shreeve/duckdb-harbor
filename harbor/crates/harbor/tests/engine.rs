@@ -452,6 +452,18 @@ mod conn {
         assert_eq!(got, [r#""123456789012345678901235""#]);
     }
 
+    /// A database path that is not UTF-8 is refused, not opened as the
+    /// different file its lossy rendering would name.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_is_not_utf8_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let Some(_) = v2_engine() else { return };
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"/nonexistent/caf\xe9.duckdb"));
+        let err = conn::open(path, &[]).err().expect("refused").to_string();
+        assert!(err.contains("not UTF-8"), "{err}");
+    }
+
     #[test]
     fn set_option_reaches_the_engine() {
         let Some(_) = v2_engine() else { return };

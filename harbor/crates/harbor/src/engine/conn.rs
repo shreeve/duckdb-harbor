@@ -65,6 +65,12 @@ impl Drop for Db {
 pub fn open(path: &Path, options: &[(&str, &str)]) -> Result<Conn, Error> {
     let eng = super::engine().map_err(|message| Error { code: ffi::ERROR_API, message })?;
     let api = &eng.api;
+    // The engine takes the path as UTF-8; a path that is not would reach it
+    // with U+FFFD in place of its bytes, naming a different file.
+    let path_text = path.to_str().ok_or_else(|| Error {
+        code: ffi::ERROR_INPUT_INVALID,
+        message: format!("{}: the database path is not UTF-8", path.display()),
+    })?;
 
     let mut env: ffi::environment_handle = std::ptr::null_mut();
     call!(api, create_environment(&mut env));
@@ -81,13 +87,12 @@ pub fn open(path: &Path, options: &[(&str, &str)]) -> Result<Conn, Error> {
     };
     let built = build();
 
-    let path_text = path.to_string_lossy();
     let mut db: ffi::database_handle = std::ptr::null_mut();
     let opened = match built {
         Ok(()) => (|| -> Result<(), Error> {
             call!(
                 api,
-                open(env, str_of(&path_text), opts.as_mut_ptr(), opts.len() as ffi::idx_t, &mut db)
+                open(env, str_of(path_text), opts.as_mut_ptr(), opts.len() as ffi::idx_t, &mut db)
             );
             Ok(())
         })(),
