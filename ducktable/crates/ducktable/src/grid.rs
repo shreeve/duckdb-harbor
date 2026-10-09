@@ -450,7 +450,7 @@ impl Grid {
         // and only the WHERE clauses see it.
         let pk_cols: Vec<String> = structure
             .as_ref()
-            .map(|s| s.cols.iter().filter(|c| c.pk).map(|c| c.name.clone()).collect())
+            .map(|s| s.cols.iter().filter(|c| c.primary).map(|c| c.name.clone()).collect())
             .unwrap_or_default();
         let rowid = structure.as_ref().is_some_and(|s| s.keyed_by_rowid());
         let pk_cols = if rowid { vec!["rowid".to_string()] } else { pk_cols };
@@ -689,7 +689,7 @@ impl Grid {
                     .folding(false)
                     .scroll_beyond_last_line(Some(0))
                     .cursor_surrounding_lines(Some(0))
-                    .default_value(ddl)
+                    .default_value(crate::structure::pretty_ddl(&ddl))
             })
         });
         cx.subscribe(&col_search, |_, _, _: &gpui_kit::component::input::InputEvent, cx| {
@@ -4382,9 +4382,9 @@ fn insert_metadata(
             structure.and_then(|s| s.cols.iter().find(|c| c.name == name.as_ref()))
         })
         .collect();
-    let not_null: Vec<bool> = cols.iter().map(|c| c.is_some_and(|c| c.notnull)).collect();
+    let not_null: Vec<bool> = cols.iter().map(|c| c.is_some_and(|c| c.not_null)).collect();
     let defaults: Vec<Option<String>> =
-        cols.iter().map(|c| c.and_then(|c| c.dflt.clone())).collect();
+        cols.iter().map(|c| c.and_then(|c| c.default.clone())).collect();
     let generated: Vec<bool> = cols.iter().map(|c| c.is_some_and(|c| c.generated)).collect();
     let hints = cols
         .iter()
@@ -4403,7 +4403,7 @@ fn insert_metadata(
             }
         })
         .collect();
-    let types = cols.iter().map(|c| c.map(|c| c.ty.clone())).collect();
+    let types = cols.iter().map(|c| c.map(|c| c.duck_type.clone())).collect();
     (not_null, defaults, generated, hints, types)
 }
 
@@ -4934,14 +4934,14 @@ mod tests {
 
     #[test]
     fn insert_metadata_ranks_generated_then_default_then_required() {
-        let col = |name: &str, notnull, dflt: Option<&str>, generated| crate::structure::StructCol {
+        let col = |name: &str, not_null, default: Option<&str>, generated| harbor_client::catalog::Column {
             name: name.into(),
-            ty: "INTEGER".into(),
-            notnull,
-            dflt: dflt.map(Into::into),
+            duck_type: "INTEGER".into(),
+            not_null,
+            default: default.map(Into::into),
             generated,
             generation_expression: generated.then(|| "a + 1".into()),
-            pk: false,
+            primary: false,
         };
         let structure = crate::structure::TableStructure {
             cols: vec![
