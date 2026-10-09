@@ -396,6 +396,35 @@ mod head {
         );
     }
 
+    /// A Content-Length is `1*DIGIT` and a Transfer-Encoding is exactly one
+    /// `chunked`. Anything a lenient parser would read as a length or a
+    /// coding, and a strict one would not, is a disagreement waiting for a
+    /// proxy to sit in front of this server.
+    #[test]
+    fn framing_that_parsers_could_read_two_ways_is_refused() {
+        for framing in [
+            "Content-Length: +5",
+            "Content-Length: 2 3",
+            "Content-Length: 5,5",
+            "Content-Length: -5",
+            "Content-Length: 99999999999999999999999",
+            "Transfer-Encoding: chunked, identity",
+            "Transfer-Encoding: identity",
+            "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked",
+        ] {
+            let (_server, mut client) = support::new_one_server_one_client();
+            write!(client, "POST / HTTP/1.1\r\nHost: localhost\r\n{framing}\r\n\r\nhello").unwrap();
+
+            let mut content = String::new();
+            let _ = client.read_to_string(&mut content);
+            assert!(
+                content.starts_with("HTTP/1.1 400"),
+                "{framing:?}: expected 400, got {:?}",
+                content.lines().next()
+            );
+        }
+    }
+
     /// `TE: identity` must not be able to turn a streamed response into a
     /// buffered one. `raw_print` discovers an unknown length by reading the
     /// whole body, so honoring this header hands control of the server's

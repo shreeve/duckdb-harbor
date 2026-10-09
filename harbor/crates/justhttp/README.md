@@ -60,8 +60,9 @@ security regression, not a flake.
    minute. This is also what bounds the drain in *time* rather than only
    in memory.
 5. **Unambiguous framing.** Two `Content-Length` headers that disagree, a
-   `Content-Length` beside a `Transfer-Encoding`, or a `Content-Length`
-   that is not a number are all `400` and a close. Each is a
+   `Content-Length` beside a `Transfer-Encoding`, a `Content-Length` that
+   is not plain digits (`+5`, `2 3`), or a `Transfer-Encoding` that is not
+   exactly one `chunked` are all `400` and a close. Each is a
    request-smuggling primitive: whenever this server and a proxy in front
    of it can resolve a request differently, they eventually will.
 6. **`TE` does not choose the server's buffering.** An unknown-length

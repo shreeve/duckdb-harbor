@@ -8,7 +8,6 @@ use std::io::Error as IoError;
 use std::io::{self, Cursor, ErrorKind, Read, Write};
 
 use std::net::SocketAddr;
-use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use crate::Response;
@@ -118,12 +117,14 @@ impl From<IoError> for RequestCreationError {
 /// It is the responsibility of the `Request` to read only the data of the request and not further.
 ///
 /// The `Write` object will be used by the `Request` to write the response.
+/// `content_length` is the length `check_framing` validated (conn.rs).
 #[allow(clippy::too_many_arguments)]
 pub fn new_request<R, W>(
     method: Method,
     path: String,
     version: HttpVersion,
     headers: Vec<Header>,
+    content_length: Option<usize>,
     remote_addr: Option<SocketAddr>,
     mut source_data: R,
     writer: W,
@@ -133,23 +134,9 @@ where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    // finding the transfer-encoding header
-    let transfer_encoding = headers
-        .iter()
-        .find(|h: &&Header| h.field.equiv("Transfer-Encoding"))
-        .map(|h| h.value.clone());
-
-    // finding the content-length header
-    let content_length = if transfer_encoding.is_some() {
-        // if transfer-encoding is specified, the Content-Length
-        // header must be ignored (RFC2616 #4.4)
-        None
-    } else {
-        headers
-            .iter()
-            .find(|h: &&Header| h.field.equiv("Content-Length"))
-            .and_then(|h| FromStr::from_str(h.value.as_str()).ok())
-    };
+    // `check_framing` has already refused every ambiguous shape: a chunked
+    // body has no Content-Length, and the coding is exactly `chunked`.
+    let chunked = headers.iter().any(|h| h.field.equiv("Transfer-Encoding"));
 
     // true if the client sent a `Expect: 100-continue` header
     let expects_continue = {
@@ -208,9 +195,7 @@ where
             Box::new(BudgetedReader::new(FusedReader::new(data_reader), BODY_TIMEOUT))
                 as Box<dyn Read + Send + 'static>
         }
-    } else if transfer_encoding.is_some() {
-        // if a transfer-encoding was specified, then "chunked" is ALWAYS applied
-        // over the message (RFC2616 #3.6)
+    } else if chunked {
         Box::new(BudgetedReader::new(FusedReader::new(Decoder::new(source_data)), BODY_TIMEOUT))
             as Box<dyn Read + Send + 'static>
     } else {

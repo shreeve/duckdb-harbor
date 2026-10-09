@@ -241,7 +241,7 @@ impl ClientConnection {
     /// Reads a request from the stream.
     /// Blocks until the header has been read.
     fn read(&mut self) -> Result<Request, ReadError> {
-        let (method, path, version, headers) = {
+        let (method, path, version, headers, content_length) = {
             // one line buffer reused for the request line and every header line
             let mut line_buf = Vec::with_capacity(128);
             // One budget for the whole head, started by its first byte.
@@ -277,9 +277,10 @@ impl ClientConnection {
                 headers
             };
 
-            check_framing(&headers).map_err(|()| ReadError::AmbiguousFraming(version))?;
+            let content_length =
+                check_framing(&headers).map_err(|()| ReadError::AmbiguousFraming(version))?;
 
-            (method, path, version, headers)
+            (method, path, version, headers, content_length)
         };
 
         // building the writer for the request
@@ -295,6 +296,7 @@ impl ClientConnection {
             path,
             version,
             headers,
+            content_length,
             *self.remote_addr.as_ref().unwrap(),
             data_source,
             writer,
@@ -464,7 +466,8 @@ impl Iterator for ClientConnection {
     }
 }
 
-/// Reject a request whose body length is ambiguous.
+/// The body length a request declares, or `Err` when its framing is
+/// ambiguous.
 ///
 /// Two `Content-Length` headers that disagree, or a `Content-Length` alongside
 /// a `Transfer-Encoding`, do not have a right answer — they have two, and the
@@ -472,31 +475,32 @@ impl Iterator for ClientConnection {
 /// picks is exactly a request-smuggling desync. RFC 9110 §8.6 says to reject,
 /// and rejecting costs nothing: no correct client sends either shape.
 ///
-/// A `Content-Length` that is not a number is refused for the same reason. It
-/// used to parse as `None` and the request was served as though it had no body
-/// at all, leaving the bytes the client did send to be read as the next
-/// request on the connection.
-fn check_framing(headers: &[crate::http::Header]) -> Result<(), ()> {
-    let mut lengths = headers
-        .iter()
-        .filter(|h| h.field.equiv("Content-Length"))
-        .map(|h| h.value.as_str().trim().parse::<usize>());
-
-    let first = match lengths.next() {
-        None => return Ok(()),
-        Some(Ok(n)) => n,
-        Some(Err(_)) => return Err(()),
-    };
-    for other in lengths {
-        if !matches!(other, Ok(n) if n == first) {
+/// For the same reason a `Content-Length` is exactly `1*DIGIT` (`+24` and
+/// `2 4` are numbers to some parsers and not to others), and a
+/// `Transfer-Encoding` is exactly one `chunked`, the only coding this server
+/// decodes (RFC 9112 §6.3). A value refused here is never read as "no body",
+/// which would leave the bytes the client did send to be parsed as the next
+/// request.
+fn check_framing(headers: &[crate::http::Header]) -> Result<Option<usize>, ()> {
+    let mut length = None;
+    for h in headers.iter().filter(|h| h.field.equiv("Content-Length")) {
+        let value = h.value.as_str();
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
             return Err(());
         }
+        let n = value.parse::<usize>().map_err(|_| ())?;
+        if length.is_some_and(|first| first != n) {
+            return Err(());
+        }
+        length = Some(n);
     }
-    // A body cannot be framed two ways at once.
-    if headers.iter().any(|h| h.field.equiv("Transfer-Encoding")) {
-        return Err(());
+    let mut codings = headers.iter().filter(|h| h.field.equiv("Transfer-Encoding"));
+    let chunked = |te: &crate::http::Header| te.value.as_str().eq_ignore_ascii_case("chunked");
+    match (codings.next(), codings.next()) {
+        (None, _) => Ok(length),
+        (Some(te), None) if length.is_none() && chunked(te) => Ok(None),
+        _ => Err(()),
     }
-    Ok(())
 }
 
 /// Parses a "HTTP/1.1" string.
