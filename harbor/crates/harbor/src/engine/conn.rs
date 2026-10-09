@@ -133,12 +133,10 @@ pub struct Conn {
     cache: HashMap<String, CacheEntry>,
     cache_bytes: usize,
     tick: u64,
-    /// The VARIANT-to-JSON caster for this connection's results, made on
-    /// first use and destroyed with the connection.
-    json: Option<super::encode::Json>,
-    /// The VARIANT type. A document param is cast through the caster's JSON
-    /// type to this one; made on first use and destroyed with the connection.
-    variant: Option<ffi::logical_type_handle>,
+    /// Logical types by the text that names them, made on first use and
+    /// destroyed with the connection: JSON (the VARIANT caster's target),
+    /// VARIANT, and the types params bind as.
+    types: HashMap<String, ffi::logical_type_handle>,
 }
 
 unsafe impl Send for Conn {}
@@ -165,8 +163,7 @@ impl Conn {
             cache: HashMap::new(),
             cache_bytes: 0,
             tick: 0,
-            json: None,
-            variant: None,
+            types: HashMap::new(),
         })
     }
 
@@ -189,10 +186,8 @@ impl Conn {
         self.cache.clear();
         self.cache_bytes = 0;
         self.tick = 0;
-        // The caster and the VARIANT type were made on the old handle; they
-        // go out with it.
-        fresh.json = self.json.take();
-        fresh.variant = self.variant.take();
+        // The types were made on the old handle; they go out with it.
+        fresh.types = std::mem::take(&mut self.types);
         drop(fresh);
         Ok(())
     }
@@ -200,25 +195,22 @@ impl Conn {
     /// The VARIANT-to-JSON caster for results of this connection, made on
     /// first use. Hand it to [`encode::emit_cell`](super::encode::emit_cell).
     pub fn json(&mut self) -> Result<super::encode::Json, Error> {
-        if let Some(j) = self.json {
-            return Ok(j);
-        }
-        let j = super::encode::Json::of(&self.eng.api, self.conn)?;
-        self.json = Some(j);
-        Ok(j)
+        Ok(super::encode::Json { conn: self.conn, ty: self.type_named("JSON")? })
     }
 
-    /// The types a document param is cast through, JSON then VARIANT, each
-    /// made once per connection. Making a type from its name costs about a
-    /// millisecond and the casts microseconds, so the types are kept. None
-    /// when the engine refuses to make one, as it does inside an aborted
-    /// transaction; nothing is kept of a refusal, and the next call asks again.
-    fn document_types(&mut self) -> Option<[ffi::logical_type_handle; 2]> {
-        let json = self.json().ok()?.ty;
-        if self.variant.is_none() {
-            self.variant = type_from_text(&self.eng.api, self.conn, "VARIANT").ok();
+    /// The logical type `text` names, made on this connection once and kept:
+    /// making a type costs about a millisecond, using one microseconds. The
+    /// engine refuses to make one inside an aborted transaction; nothing is
+    /// kept of a refusal, and the next call asks again.
+    fn type_named(&mut self, text: &str) -> Result<ffi::logical_type_handle, Error> {
+        if let Some(&ty) = self.types.get(text) {
+            return Ok(ty);
         }
-        Some([json, self.variant?])
+        let api = &self.eng.api;
+        let mut ty: ffi::logical_type_handle = std::ptr::null_mut();
+        call!(api, connection_create_type_from_text(self.conn, str_of(text), &mut ty));
+        self.types.insert(text.to_string(), ty);
+        Ok(ty)
     }
 
     pub fn engine_version(&self) -> &'static str {
@@ -409,13 +401,10 @@ impl Conn {
     /// is nearly every statement, and nothing is kept: the answer follows the
     /// catalog, and the statement cache holds parses only. A bind that fails
     /// marks nothing, and the statement reports the failure itself.
-    ///
-    /// Returns whether any was marked.
-    fn aim_documents(&self, stmt: &Stmt, params: &mut [Param]) -> bool {
+    fn aim_documents(&self, stmt: &Stmt, params: &mut [Param]) {
         if !params.iter().any(|p| matches!(p, Param::Document { .. })) {
-            return false;
+            return;
         }
-        let mut aimed = false;
         let api = &self.eng.api;
         let mut schema: ffi::schema_handle = std::ptr::null_mut();
         let mut expects: ffi::schema_handle = std::ptr::null_mut();
@@ -439,7 +428,6 @@ impl Conn {
                 let Ok(n) = unsafe { super::str_view(&name) }.parse::<usize>() else { continue };
                 if let Some(Param::Document { variant, .. }) = n.checked_sub(1).and_then(|at| params.get_mut(at)) {
                     *variant = true;
-                    aimed = true;
                 }
             }
             Ok(())
@@ -451,7 +439,6 @@ impl Conn {
                 }
             }
         }
-        aimed
     }
 
     /// Build the statement's params as engine values, a document aimed at a
@@ -461,15 +448,51 @@ impl Conn {
     /// casts, so a caller that can be cancelled looks again between this and
     /// [`Conn::execute`].
     pub fn bind(&mut self, stmt: &Stmt, params: &mut [Param]) -> Result<Bound, Error> {
-        let through = match self.aim_documents(stmt, params) {
-            true => self.document_types(),
-            false => None,
-        };
+        self.aim_documents(stmt, params);
         let mut bound = Bound { eng: self.eng, values: Vec::with_capacity(params.len()) };
         for p in params.iter() {
-            bound.values.push(p.to_value(self.eng, self.conn, through)?);
+            bound.values.push(self.value_of(p)?);
         }
         Ok(bound)
+    }
+
+    /// One param as an engine value, which the caller destroys.
+    fn value_of(&mut self, param: &Param) -> Result<ffi::value_handle, Error> {
+        let api = &self.eng.api;
+        let conn = self.conn;
+        let mut out: ffi::value_handle = std::ptr::null_mut();
+        match param {
+            // Untyped, as DuckDB's own `EXECUTE p(NULL)` binds it: the
+            // statement's inference types it, so `coalesce(?, 'x')` is 'x'.
+            Param::Null => {
+                let null = self.type_named("\"NULL\"")?;
+                call!(api, value_create_null_with_connection(conn, null, &mut out));
+            }
+            Param::Bool(b) => call!(api, value_create_bool_with_connection(conn, *b, &mut out)),
+            Param::I64(i) => call!(api, value_create_bigint_with_connection(conn, *i, &mut out)),
+            Param::U64(u) => call!(api, value_create_ubigint_with_connection(conn, *u, &mut out)),
+            Param::F64(f) => call!(api, value_create_double_with_connection(conn, *f, &mut out)),
+            Param::Text(s) => {
+                call!(api, value_create_varchar_with_connection(conn, str_of(s), &mut out))
+            }
+            Param::Document { text, variant } => {
+                call!(api, value_create_varchar_with_connection(conn, str_of(text), &mut out));
+                // The text is a document, and the engine reads text cast to
+                // VARIANT as a string; read through JSON it is the document.
+                // A cast that fails — an aborted transaction refuses every
+                // one, and the types with them — leaves the text, and the
+                // statement reports what is wrong.
+                let types = match variant {
+                    true => self.type_named("JSON").and_then(|j| Ok([j, self.type_named("VARIANT")?])),
+                    false => return Ok(out),
+                };
+                if let Ok(doc) = types.and_then(|t| cast_through(api, conn, out, &t)) {
+                    destroy_value(api, out);
+                    out = doc;
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Execute one parsed statement as a pipelined stream. The statement is
@@ -540,11 +563,10 @@ impl Conn {
 impl Drop for Conn {
     fn drop(&mut self) {
         self.cache.clear();
-        if let Some(j) = self.json.take() {
-            j.destroy(&self.eng.api);
-        }
-        if let (Some(mut ty), Some(f)) = (self.variant.take(), self.eng.api.logical_type_destroy) {
-            unsafe { f(&mut ty) };
+        if let Some(f) = self.eng.api.logical_type_destroy {
+            for (_, mut ty) in self.types.drain() {
+                unsafe { f(&mut ty) };
+            }
         }
         // Disconnect under the interrupt lock: a canceller mid-call finishes
         // against the live handle first, and every later one sees null.
@@ -964,83 +986,10 @@ pub enum Param {
     Document { text: String, variant: bool },
 }
 
-impl Param {
-    /// `through` is the connection's JSON and VARIANT types
-    /// ([`Conn::document_types`]), the route an aimed document takes.
-    fn to_value(
-        &self,
-        eng: &'static Engine,
-        conn: ffi::connection_handle,
-        through: Option<[ffi::logical_type_handle; 2]>,
-    ) -> Result<ffi::value_handle, Error> {
-        let api = &eng.api;
-        let mut out: ffi::value_handle = std::ptr::null_mut();
-        match self {
-            // A NULL needs a type; INTEGER's null casts to anything at bind.
-            Param::Null => {
-                let mut ty: ffi::logical_type_handle = std::ptr::null_mut();
-                call!(
-                    api,
-                    connection_create_type_from_id(
-                        conn,
-                        ffi::LOGICAL_TYPE_ID_INTEGER,
-                        std::ptr::null(),
-                        std::ptr::null(),
-                        0,
-                        &mut ty
-                    )
-                );
-                let made = (|| -> Result<(), Error> {
-                    call!(api, value_create_null_with_connection(conn, ty, &mut out));
-                    Ok(())
-                })();
-                if let Some(f) = api.logical_type_destroy {
-                    let mut ty = ty;
-                    unsafe { f(&mut ty) };
-                }
-                made?;
-            }
-            Param::Bool(b) => call!(api, value_create_bool_with_connection(conn, *b, &mut out)),
-            Param::I64(i) => call!(api, value_create_bigint_with_connection(conn, *i, &mut out)),
-            Param::U64(u) => call!(api, value_create_ubigint_with_connection(conn, *u, &mut out)),
-            Param::F64(f) => call!(api, value_create_double_with_connection(conn, *f, &mut out)),
-            Param::Text(s) => {
-                call!(api, value_create_varchar_with_connection(conn, str_of(s), &mut out))
-            }
-            Param::Document { text, variant } => {
-                call!(api, value_create_varchar_with_connection(conn, str_of(text), &mut out));
-                if let (true, Some(types)) = (*variant, through) {
-                    // The text is a document, and the engine reads text cast
-                    // to VARIANT as a string; read through JSON it is the
-                    // document. A cast that fails — an aborted transaction
-                    // refuses every one, and the types with them — leaves the
-                    // text, and the statement reports what is wrong.
-                    if let Ok(doc) = cast_through(api, conn, out, &types) {
-                        destroy_value(api, out);
-                        out = doc;
-                    }
-                }
-            }
-        }
-        Ok(out)
-    }
-}
-
 fn destroy_value(api: &ffi::Api, mut v: ffi::value_handle) {
     if let Some(f) = api.value_destroy {
         unsafe { f(&mut v) };
     }
-}
-
-/// The logical type `name` spells, made on `conn`. The caller releases it.
-fn type_from_text(
-    api: &ffi::Api,
-    conn: ffi::connection_handle,
-    name: &str,
-) -> Result<ffi::logical_type_handle, Error> {
-    let mut ty: ffi::logical_type_handle = std::ptr::null_mut();
-    call!(api, connection_create_type_from_text(conn, str_of(name), &mut ty));
-    Ok(ty)
 }
 
 /// `value` cast to each type in turn, as a value of its own; `value` and the

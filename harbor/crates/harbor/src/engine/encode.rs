@@ -464,27 +464,8 @@ impl Reader {
 #[derive(Clone, Copy)]
 pub struct Json {
     pub conn: ffi::connection_handle,
-    /// The JSON logical type, made on `conn`. Owned by whoever made it.
+    /// The JSON logical type, made on `conn` and owned by whoever made it.
     pub ty: ffi::logical_type_handle,
-}
-
-impl Json {
-    /// Make the JSON type on `conn`. Destroy it with [`Json::destroy`].
-    pub fn of(api: &ffi::Api, conn: ffi::connection_handle) -> Result<Json, Error> {
-        let name = "JSON";
-        let text = ffi::str_t { ptr: name.as_ptr() as *const _, len: name.len() as ffi::idx_t };
-        let mut ty: ffi::logical_type_handle = std::ptr::null_mut();
-        call!(api, connection_create_type_from_text(conn, text, &mut ty));
-        Ok(Json { conn, ty })
-    }
-
-    /// Release the type. The connection handle is not this value's to close.
-    pub fn destroy(self, api: &ffi::Api) {
-        if let Some(d) = api.logical_type_destroy {
-            let mut ty = self.ty;
-            unsafe { d(&mut ty) };
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

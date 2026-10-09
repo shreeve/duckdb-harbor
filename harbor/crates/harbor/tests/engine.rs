@@ -348,7 +348,7 @@ mod conn {
         let mut c = conn::open(Path::new(":memory:"), &[]).expect("open");
         assert!(c.engine_version().starts_with("v2."));
 
-        // Params bind positionally; NULL binds as a typed null.
+        // Params bind positionally.
         let got = rows(&mut c, "SELECT $1 + 1, $2, $3", &[
             Param::I64(41),
             Param::Text("hi".into()),
@@ -408,6 +408,18 @@ mod conn {
             let got = rows(&mut c, "SELECT ?::DOUBLE", &[Param::F64(*f)]).unwrap();
             assert_eq!(got[0].parse::<f64>().unwrap().to_bits(), f.to_bits(), "{f:e} came back {}", got[0]);
         }
+    }
+
+    /// A NULL param is untyped, as `EXECUTE p(NULL)` binds it, so the
+    /// statement's inference types it from its neighbours.
+    #[test]
+    fn a_null_param_takes_the_type_the_statement_infers() {
+        let Some(_) = v2_engine() else { return };
+        let mut c = conn::open(Path::new(":memory:"), &[]).expect("open");
+        let sql = "SELECT typeof(?), coalesce(?, 'x'), [?, 'a'], list_value(?, DATE '2020-01-01'), ? + 1";
+        assert_eq!(rows(&mut c, sql, &vec![Param::Null; 5]).unwrap(), [
+            r#""\"NULL\"","x",[null,"a"],[null,"2020-01-01"],null"#
+        ]);
     }
 
     #[test]
@@ -605,7 +617,8 @@ mod wire {
         ));
         let mut conn: ffi::connection_handle = std::ptr::null_mut();
         ok!(connect(db, &mut conn));
-        let json = encode::Json::of(api, conn)?;
+        let mut json = encode::Json { conn, ty: std::ptr::null_mut() };
+        ok!(connection_create_type_from_text(conn, ffi::str_t { ptr: c"JSON".as_ptr(), len: 4 }, &mut json.ty));
 
         let sql_c = std::ffi::CString::new(sql).unwrap();
         let mut iter: ffi::statement_iterator_handle = std::ptr::null_mut();
@@ -663,7 +676,7 @@ mod wire {
             }
         }
 
-        json.destroy(api);
+        unsafe { (api.logical_type_destroy.unwrap())(&mut json.ty) };
         unsafe {
             (api.statement_iterator_destroy.unwrap())(&mut iter);
             (api.disconnect.unwrap())(&mut conn);
