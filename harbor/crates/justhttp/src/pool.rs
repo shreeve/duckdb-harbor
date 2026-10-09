@@ -72,33 +72,46 @@ mod messages_queue {
             }
         }
 
-        /// Tries to pop an element without blocking
-        /// more than the specified timeout duration
-        /// or unblock() was issued
+        /// Pops an element, blocking no longer than `timeout` in all: a
+        /// wakeup that finds the queue empty waits only for what is left.
+        /// Returns None on timeout or when unblock() was issued.
         pub fn pop_timeout(&self, timeout: Duration) -> Option<T> {
+            let deadline = Instant::now() + timeout;
             let mut queue = self.queue.lock().unwrap();
-            let mut duration = timeout;
             loop {
                 match queue.pop_front() {
                     Some(Control::Elem(value)) => return Some(value),
                     Some(Control::Unblock) => return None,
                     None => (),
                 }
-                let now = Instant::now();
-                let (_queue, result) = self.condvar.wait_timeout(queue, timeout).unwrap();
-                queue = _queue;
-                let sleep_time = now.elapsed();
-                duration = if duration > sleep_time {
-                    duration - sleep_time
-                } else {
-                    Duration::from_millis(0)
-                };
-                if result.timed_out()
-                    || (duration.as_secs() == 0 && duration.subsec_nanos() < 1_000_000)
-                {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
                     return None;
                 }
+                queue = self.condvar.wait_timeout(queue, left).unwrap().0;
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::MessagesQueue;
+        use std::time::{Duration, Instant};
+
+        /// A wakeup late in the wait, with nothing queued, must not restart
+        /// the whole timeout.
+        #[test]
+        fn an_empty_wakeup_does_not_extend_the_timeout() {
+            let queue = MessagesQueue::<()>::with_capacity(1);
+            let waker = queue.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(350));
+                waker.condvar.notify_all();
+            });
+            let began = Instant::now();
+            assert!(queue.pop_timeout(Duration::from_millis(400)).is_none());
+            let took = began.elapsed();
+            assert!(took < Duration::from_millis(650), "waited {took:?} for a 400ms timeout");
         }
     }
 }
