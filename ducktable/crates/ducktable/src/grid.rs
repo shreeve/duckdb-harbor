@@ -267,12 +267,14 @@ pub(crate) struct GridDelegate {
     /// Each row's identity: the key columns' RAW fetched values, captured
     /// before display conversion — the WHERE clause binds these.
     identities: Vec<Vec<Value>>,
-    /// Identity key -> row index on this page, for projecting staged
-    /// changes onto the view.
+    /// Identity key -> the row's index among the fetched rows, built once
+    /// per page for projecting staged changes onto the view (drafts sit
+    /// above the fetched rows, so a display row is this plus their count).
     row_of: std::collections::HashMap<String, usize>,
-    /// Projection of the staged layer onto this page: (row, schema col)
-    /// -> staged display text (None = staged NULL).
-    staged: std::collections::HashMap<(usize, usize), Option<SharedString>>,
+    /// Projection of the staged layer onto this page: row -> schema col ->
+    /// staged display text (None = staged NULL). Keyed by row first, so
+    /// whether a row carries a staged cell is one lookup.
+    staged: std::collections::HashMap<usize, std::collections::HashMap<usize, Option<SharedString>>>,
     /// Synthetic INSERT rows prepended to the fetched page, in display
     /// order. Their private keys live only in Edits and never enter SQL.
     draft_keys: Vec<String>,
@@ -1984,7 +1986,7 @@ impl Grid {
             let staged = if draft_key.is_some() {
                 d.draft_cells.get(&(row, col)).cloned()
             } else {
-                d.staged.get(&(row, col)).cloned()
+                d.staged_cell(row, col)
             };
             (
                 staged.unwrap_or(base),
@@ -2147,7 +2149,7 @@ impl Grid {
                 (
                     ty,
                     d.rows.get(ed.row).and_then(|r| r.get(ed.col)).cloned().flatten(),
-                    d.staged.get(&at).cloned(),
+                    d.staged_cell(ed.row, ed.col),
                     d.identities.get(ed.row).cloned(),
                 )
             }
@@ -2637,20 +2639,13 @@ impl Grid {
             labels.append(&mut d.row_labels);
             d.row_labels = labels;
 
-            // Fetched identities shifted down by the inserted drafts.
-            d.row_of = d
-                .identities
-                .iter()
-                .enumerate()
-                .skip(draft_count)
-                .map(|(ix, id)| (edits::key_of(id), ix))
-                .collect();
             for (key, _, change) in &changes {
-                let Some(&row) = d.row_of.get(key) else { continue };
+                let Some(row) = d.row_of.get(key).map(|fetched| fetched + draft_count) else { continue };
                 match change {
                     edits::RowChange::Update(cells) => {
+                        let staged = d.staged.entry(row).or_default();
                         for (col, cell) in cells {
-                            d.staged.insert((row, *col), cell.text.clone());
+                            staged.insert(*col, cell.text.clone());
                         }
                     }
                     edits::RowChange::Delete => {
@@ -2950,12 +2945,13 @@ impl Grid {
                         // would be its own artifact).
                         grid.table.update(cx, |state, cx| {
                             let d = state.delegate_mut();
-                            let staged: Vec<_> = d.staged.drain().collect();
-                            for ((row, col), text) in staged {
-                                if let Some(cell) =
-                                    d.rows.get_mut(row).and_then(|r| r.get_mut(col))
-                                {
-                                    *cell = text;
+                            for (row, cells) in std::mem::take(&mut d.staged) {
+                                for (col, text) in cells {
+                                    if let Some(cell) =
+                                        d.rows.get_mut(row).and_then(|r| r.get_mut(col))
+                                    {
+                                        *cell = text;
+                                    }
                                 }
                             }
                             state.refresh(cx);
@@ -3218,29 +3214,25 @@ impl GridDelegate {
         self.staged = self
             .staged
             .drain()
-            .filter_map(|((row, col), value)| {
-                (row >= count).then_some(((row - count, col), value))
-            })
+            .filter_map(|(row, cells)| (row >= count).then_some((row - count, cells)))
             .collect();
         self.deleted = self
             .deleted
             .drain()
             .filter_map(|row| (row >= count).then_some(row - count))
             .collect();
-        self.row_of = self
-            .identities
-            .iter()
-            .enumerate()
-            .map(|(ix, id)| (edits::key_of(id), ix))
-            .collect();
+    }
+
+    /// The staged text of one fetched cell, if it has one (`Some(None)` is
+    /// a staged NULL).
+    fn staged_cell(&self, row: usize, col: usize) -> Option<Option<SharedString>> {
+        self.staged.get(&row)?.get(&col).cloned()
     }
 
     /// A row carrying any staged change — the rows whose color already
     /// tells a story, so the selection wash stays off them.
     fn row_dirty(&self, row: usize) -> bool {
-        row < self.draft_count()
-            || self.deleted.contains(&row)
-            || self.staged.keys().any(|(r, _)| *r == row)
+        row < self.draft_count() || self.deleted.contains(&row) || self.staged.contains_key(&row)
     }
 
     /// Adopt a page's schema and rows — the one birth, shared by Grid::new
@@ -3373,7 +3365,7 @@ impl GridDelegate {
         let mut chars = 4; // the NULL tag's footprint
         for row in &self.rows {
             if let Some(Some(s)) = row.get(schema_ix) {
-                chars = chars.max(s.chars().count());
+                chars = chars.max(s.chars().take(CAP).count());
                 if chars >= CAP {
                     break;
                 }
@@ -3443,7 +3435,7 @@ impl TableDelegate for GridDelegate {
             let is_draft = row_ix < self.draft_count();
             let row_deleted = self.deleted.contains(&row_ix);
             let row_dirty = is_draft
-                || (!row_deleted && self.staged.keys().any(|(r, _)| *r == row_ix));
+                || (!row_deleted && self.staged.contains_key(&row_ix));
             return div()
                 .h_flex()
                 .relative()
@@ -3582,7 +3574,7 @@ impl TableDelegate for GridDelegate {
         // makes it the database's truth.
         let is_draft = row_ix < self.draft_count();
         let draft_explicit = is_draft && self.draft_cells.contains_key(&(row_ix, data_col));
-        let staged = (!is_draft).then(|| self.staged.get(&(row_ix, data_col)).cloned()).flatten();
+        let staged = (!is_draft).then(|| self.staged_cell(row_ix, data_col)).flatten();
         let is_staged = is_draft || staged.is_some();
         let value = match staged {
             Some(v) => Some(v),
