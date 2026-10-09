@@ -686,4 +686,61 @@ mod tests {
             assert_eq!(out, v.to_string());
         }
     }
+
+    /// `civil_from_days` backs both DATE formatting and the log timestamp.
+    /// Pinned to dates whose answers are known independently: the epoch,
+    /// both sides of a leap day, the 1900/2000 century rules, and dates before
+    /// the epoch, where the sign correction on the era division matters and a
+    /// plain truncating divide is a day out.
+    #[test]
+    fn converts_days_to_civil_dates() {
+        for (days, want) in [
+            (0_i64, (1970_i64, 1_u32, 1_u32)),
+            (59, (1970, 3, 1)),      // 1970 is not a leap year
+            (-1, (1969, 12, 31)),    // before the epoch
+            (-719_468, (0, 3, 1)),   // start of the era
+            (11_016, (2000, 2, 29)), // 2000 is a leap year: the /400 rule
+            (11_017, (2000, 3, 1)),
+            (-25_508, (1900, 3, 1)), // 1900 is not: the /100 rule
+            (20_677, (2026, 8, 12)),
+            (2_932_896, (9999, 12, 31)),
+        ] {
+            assert_eq!(civil_from_days(days), want, "days={days}");
+        }
+    }
+
+    /// The byte strings here are what DuckDB v1.5.5 actually put on the wire
+    /// for these values, captured from a running server rather than derived
+    /// from the format description — a decoder tested only against its own
+    /// author's reading of the spec proves nothing about the encoder.
+    #[test]
+    fn decodes_bignum_wire_format() {
+        fn hex(s: &str) -> Vec<u8> {
+            (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        }
+        for (bytes, want) in [
+            ("80000100", "0"),
+            ("80000101", "1"),
+            ("7ffffefe", "-1"),
+            ("8000017f", "127"),
+            ("7ffffe80", "-127"),
+            ("800001ff", "255"),
+            ("7ffffe00", "-255"),
+            ("80000d018ee90ff6c373e0ee4e3f0ad2", "123456789012345678901234567890"),
+            ("7ffff2fe7116f0093c8c1f11b1c0f52d", "-123456789012345678901234567890"),
+        ] {
+            assert_eq!(varint_to_decimal(&hex(bytes)).as_deref(), Some(want), "for {bytes}");
+        }
+    }
+
+    /// Malformed input must return None so the caller can fall back, rather
+    /// than produce a confidently wrong number from garbage.
+    #[test]
+    fn rejects_malformed_bignum() {
+        // Too short to hold a header at all.
+        assert_eq!(varint_to_decimal(&[]), None);
+        assert_eq!(varint_to_decimal(&[0x80, 0x00]), None);
+        // Header claims four magnitude bytes; only one follows.
+        assert_eq!(varint_to_decimal(&[0x80, 0x00, 0x04, 0x01]), None);
+    }
 }

@@ -44,9 +44,6 @@ getrandom = "0.2"
 zstd = "0.13"
 libc = "0.2"
 
-[target.'cfg(unix)'.dependencies]
-signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }
-
 # The server engine (pool, leases, cancellation, NDJSON /sql) lives in this
 # crate's library beside the CLI in the bin — one crate, nothing else links
 # the engine.

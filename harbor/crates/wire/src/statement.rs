@@ -106,6 +106,12 @@ pub fn transaction_effect(sql: &str) -> Option<bool> {
     }
 }
 
+/// Whether the engine runs a statement as a COMMIT: one that, once begun,
+/// runs to its answer.
+pub fn commits(sql: &str) -> bool {
+    matches!(acting_keyword(sql).as_str(), "COMMIT" | "END")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +127,31 @@ mod tests {
         for not_a_space in ["\u{85}", "\u{1680}", "\u{2028}", "\u{2029}"] {
             assert_eq!(transaction_effect(&format!("{not_a_space}COMMIT")), None, "{not_a_space:?}");
         }
+    }
+
+    /// The effect is the engine's, measured: an analyzed EXPLAIN runs the
+    /// statement behind it, in each spelling the engine takes.
+    #[test]
+    fn a_transaction_ends_where_the_engine_ends_it() {
+        for sql in [
+            "COMMIT", "commit;", "END", "ROLLBACK", "ABORT", "COMMIT--x", "COMMIT/**/", "-- c\rCOMMIT",
+            "EXPLAIN ANALYZE COMMIT", "EXPLAIN ANALYSE COMMIT", "EXPLAIN (ANALYZE) COMMIT",
+            "EXPLAIN (ANALYZE, FORMAT JSON) COMMIT", "EXPLAIN (FORMAT JSON, ANALYZE) COMMIT",
+            "EXPLAIN ANALYZE (FORMAT JSON) COMMIT", "EXPLAIN (ANALYZE false) COMMIT", "EXPLAIN ANALYZE ROLLBACK",
+        ] {
+            assert_eq!(transaction_effect(sql), Some(false), "{sql:?}");
+        }
+        for sql in [
+            "EXPLAIN COMMIT", "EXPLAIN (FORMAT JSON) COMMIT", "EXPLAIN (FORMAT JSON) ANALYZE COMMIT",
+            "COMMIT_X", "COMMIT1", "COMMIT$x", "COMMIT\u{e9}", "\"COMMIT\"", "(COMMIT)", "SELECT 'COMMIT'", "",
+        ] {
+            assert_eq!(transaction_effect(sql), None, "{sql:?}");
+        }
+        for sql in ["EXPLAIN ANALYZE BEGIN", "EXPLAIN /* x */ ANALYZE BEGIN", "\u{feff}BEGIN"] {
+            assert_eq!(transaction_effect(sql), Some(true), "{sql:?}");
+        }
+        assert_eq!(transaction_effect("EXPLAIN BEGIN"), None);
+        assert!(commits("end") && commits("EXPLAIN ANALYZE COMMIT") && !commits("ROLLBACK") && !commits("EXPLAIN COMMIT"));
     }
 
     #[test]
