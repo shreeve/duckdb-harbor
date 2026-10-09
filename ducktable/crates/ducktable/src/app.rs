@@ -54,15 +54,15 @@ fn after_quit_dialog(called_off: Option<Aim>, deferred: Option<(String, String)>
     }
 }
 
-/// What quitting would lose or leave unreported. Law 2 (docs/EDITING.md)
-/// makes staged changes the only place work lives before ⌘S, so a quit
-/// asks before it discards them.
+/// What quitting, or leaving a database, would lose or leave unreported.
+/// Law 2 (docs/EDITING.md) makes staged changes the only place work lives
+/// before ⌘S, so a quit asks before it discards them.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct QuitRisks {
     /// Staged changes not yet sent, over every table that holds some: the
-    /// one on screen and those parked by a table switch. The changes of a
-    /// commit in flight are not among them: quitting does not simply
-    /// discard those, and `committing` says what becomes of them.
+    /// one on screen and those parked for later. The changes of a commit in
+    /// flight are not among them: quitting does not simply discard those,
+    /// and `committing` says what becomes of them.
     pub(crate) staged: usize,
     /// How many tables hold them.
     pub(crate) tables: usize,
@@ -82,8 +82,8 @@ pub(crate) struct QuitRisks {
 }
 
 /// The one dialog (docs/EDITING.md, "Dialogs"): its message, its detail,
-/// and the label of the button that quits. Cancel is the other button, and
-/// the default.
+/// and the label of the button that goes ahead. Cancel is the other button,
+/// and the default.
 #[derive(Debug, PartialEq)]
 pub(crate) struct QuitQuestion {
     pub(crate) message: String,
@@ -91,84 +91,146 @@ pub(crate) struct QuitQuestion {
     pub(crate) confirm: &'static str,
 }
 
-/// How the app is about to end: quitting, or the updater's Install and
-/// Relaunch, which quits to install and opens the new version.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// What the one dialog asks before: the app ending, by quitting or by the
+/// updater's Install and Relaunch, which quits to install and opens the
+/// new version; or the connected database left for another, a database's
+/// server stopped, or a saved remote removed.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Leaving {
     Quit,
     Relaunch,
+    /// Database `from`, the one connected, left for `to`.
+    Switch { from: String, to: Aim },
+    Stop { name: String, path: std::path::PathBuf },
+    Remove { name: String },
+}
+
+impl Leaving {
+    /// What going ahead is called in the dialog's sentences.
+    fn going(&self) -> String {
+        match self {
+            Leaving::Quit | Leaving::Relaunch => "quitting".to_string(),
+            Leaving::Switch { from, .. } => format!("leaving {from}"),
+            Leaving::Stop { name, .. } => format!("stopping {name}"),
+            Leaving::Remove { name } => format!("removing {name}"),
+        }
+    }
+
+    /// The question the dialog asks once nothing is left to lose, as when
+    /// a commit settles under it.
+    pub(crate) fn plain_question(&self) -> QuitQuestion {
+        let (message, confirm) = match self {
+            Leaving::Quit => ("Quit DuckTable?".to_string(), "Quit"),
+            Leaving::Relaunch => ("Install the update now?".to_string(), "Install"),
+            Leaving::Switch { from, .. } => (format!("Leave {from}?"), "Leave"),
+            Leaving::Stop { name, .. } => (format!("Stop {name}?"), "Stop"),
+            Leaving::Remove { name } => (format!("Remove {name}?"), "Remove"),
+        };
+        QuitQuestion { message, detail: format!("Nothing is left that {} would lose.", self.going()), confirm }
+    }
+}
+
+/// `text` with its first letter in capitals, to begin a sentence.
+fn sentence(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
 }
 
 impl QuitRisks {
     /// The question to ask before quitting, or None when quitting loses
     /// nothing.
     pub(crate) fn question(&self) -> Option<QuitQuestion> {
-        self.question_for(Leaving::Quit)
+        self.question_for(&Leaving::Quit)
     }
 
-    /// The same question, asked of the way the app is about to end.
-    /// Installing an update quits too, so the facts are the same; only the
-    /// question and its button name the relaunch, and Cancel's outcome is
-    /// said, since the update still waits.
-    pub(crate) fn question_for(&self, leaving: Leaving) -> Option<QuitQuestion> {
-        let changes = match self.staged {
+    /// The same question, asked of what is about to happen. Installing an
+    /// update quits too, so the facts are the same; only the question and
+    /// its button name the relaunch, and Cancel's outcome is said, since the
+    /// update still waits. A database left behind keeps its staged and held
+    /// sets parked for its return (docs/EDITING.md, "Staging"), so a switch
+    /// does not count them and a stop says they are kept; removing a remote
+    /// forgets them with it.
+    pub(crate) fn question_for(&self, leaving: &Leaving) -> Option<QuitQuestion> {
+        let going = leaving.going();
+        let parked = matches!(leaving, Leaving::Switch { .. });
+        let kept = match leaving {
+            Leaving::Stop { name, .. } => Some(name.as_str()),
+            _ => None,
+        };
+        let staged = if parked { 0 } else { self.staged };
+        let held = if parked { 0 } else { self.held };
+        let changes = match staged {
             0 => None,
             1 => Some("1 staged change".to_string()),
             n => Some(format!("{n} staged changes")),
         };
         let mut detail = Vec::new();
         if let Some(changes) = &changes {
-            let (verb, them) = if self.staged == 1 { ("has", "it") } else { ("have", "them") };
+            let (verb, them, stay) = if staged == 1 { ("has", "it", "stays") } else { ("have", "them", "stay") };
             let place = if self.tables > 1 { format!(" in {} tables", self.tables) } else { String::new() };
-            detail.push(format!(
-                "{changes}{place} {verb} not been committed, and quitting discards {them}."
-            ));
+            detail.push(match kept {
+                Some(name) => {
+                    format!("{changes}{place} {verb} not been committed, and {stay} staged for when {name} is opened again.")
+                }
+                None => format!("{changes}{place} {verb} not been committed, and {going} discards {them}."),
+            });
         }
-        if self.held > 0 {
-            let (them, are, they) =
-                if self.held == 1 { ("1 change", "is", "it") } else { ("changes", "are", "they") };
-            let them = if self.held == 1 { them.to_string() } else { format!("{} {them}", self.held) };
-            detail.push(format!(
-                "{them} {are} held after a commit that got no answer: {they} may already be in \
-                 the database, and quitting drops the held copy."
-            ));
+        if held > 0 {
+            let (them, are, they, stay) =
+                if held == 1 { ("1 change", "is", "it", "stays") } else { ("changes", "are", "they", "stay") };
+            let them = if held == 1 { them.to_string() } else { format!("{held} {them}") };
+            detail.push(match kept {
+                Some(name) => format!(
+                    "{them} {are} held after a commit that got no answer, and {stay} held for when \
+                     {name} is opened again."
+                ),
+                None => format!(
+                    "{them} {are} held after a commit that got no answer: {they} may already be in \
+                     the database, and {going} drops the held copy."
+                ),
+            });
         }
         if self.editing {
-            detail.push(
-                "A cell editor is open: what is typed in it is not staged, and quitting discards it."
-                    .to_string(),
-            );
+            detail.push(format!("A cell editor is open: what is typed in it is not staged, and {going} discards it."));
         }
         if self.committing {
-            detail.push(
-                "A commit is still running. Quitting ends it unreported: its changes land only \
-                 if the server already has its COMMIT, and are rolled back otherwise."
+            detail.push(match leaving {
+                Leaving::Quit | Leaving::Relaunch => "A commit is still running. Quitting ends it unreported: \
+                     its changes land only if the server already has its COMMIT, and are rolled back \
+                     otherwise."
                     .to_string(),
-            );
+                Leaving::Remove { .. } => format!(
+                    "A commit is still running. {} leaves it unreported: its changes land only if the \
+                     server already has its COMMIT, and are not kept here.",
+                    sentence(&going)
+                ),
+                Leaving::Switch { from: name, .. } | Leaving::Stop { name, .. } => format!(
+                    "A commit is still running. {} leaves it unreported, and its changes are held for \
+                     when {name} is opened again, to say whether they landed.",
+                    sentence(&going)
+                ),
+            });
         }
         if self.transaction {
-            detail.push("The Query view holds a transaction open, and quitting rolls it back.".to_string());
+            detail.push(format!("The Query view holds a transaction open, and {going} rolls it back."));
         }
         if self.running {
-            detail.push(
-                "A statement is still running in the Query view. Quitting leaves its outcome \
-                 unreported."
-                    .to_string(),
-            );
+            detail.push(format!(
+                "A statement is still running in the Query view. {} leaves its outcome unreported.",
+                sentence(&going)
+            ));
         }
         if detail.is_empty() {
             return None;
         }
         // Staged changes alone are the common case, and the question names
         // them; anything else is asked plainly, with the facts below it.
-        let only_staged =
-            !(self.held > 0 || self.editing || self.committing || self.transaction || self.running);
+        let only_staged = !(held > 0 || self.editing || self.committing || self.transaction || self.running);
+        let discard =
+            |what: &str| changes.as_ref().filter(|_| only_staged).map(|c| format!("Discard {c} and {what}?"));
         let (message, confirm) = match leaving {
             Leaving::Quit => (
-                match (&changes, only_staged) {
-                    (Some(changes), true) => format!("Discard {changes} and quit?"),
-                    _ => "Quit DuckTable?".to_string(),
-                },
+                discard("quit").unwrap_or_else(|| "Quit DuckTable?".to_string()),
                 if only_staged { "Discard and Quit" } else { "Quit Anyway" },
             ),
             Leaving::Relaunch => {
@@ -178,13 +240,16 @@ impl QuitRisks {
                         .to_string(),
                 );
                 (
-                    match (&changes, only_staged) {
-                        (Some(changes), true) => format!("Discard {changes} and install the update?"),
-                        _ => "Install the update now?".to_string(),
-                    },
+                    discard("install the update").unwrap_or_else(|| "Install the update now?".to_string()),
                     if only_staged { "Discard and Install" } else { "Install Anyway" },
                 )
             }
+            Leaving::Remove { name } => (
+                discard(&format!("remove {name}")).unwrap_or_else(|| format!("Remove {name}?")),
+                if only_staged { "Discard and Remove" } else { "Remove Anyway" },
+            ),
+            Leaving::Stop { name, .. } => (format!("Stop {name}?"), "Stop Anyway"),
+            Leaving::Switch { from, .. } => (format!("Leave {from}?"), "Leave Anyway"),
         };
         Some(QuitQuestion { message, detail: detail.join(" "), confirm })
     }
@@ -326,8 +391,9 @@ pub struct DuckTable {
     pub(crate) table_filter: Option<Entity<gpui_kit::component::input::InputState>>,
     /// The sidebar's database-name filter; Some = the field is open.
     pub(crate) berth_filter: Option<Entity<gpui_kit::component::input::InputState>>,
-    /// The quit dialog is on screen. A second ⌘Q, or a click on the close
-    /// button, while it is up asks nothing more.
+    /// The one dialog is on screen, asking before a quit or before a
+    /// database is left. A second ⌘Q, or a click on the close button, while
+    /// it is up asks nothing more.
     pub(crate) asking_to_quit: bool,
     /// Fence for table selection: a first-page fetch that finishes after a
     /// newer click discards itself instead of swapping in a stale grid.
@@ -355,9 +421,10 @@ pub struct DuckTable {
     pub(crate) query: Option<Entity<crate::query::QueryView>>,
     /// Staged edits parked while their table is off-screen (Law 4 in
     /// docs/EDITING.md: staged changes belong to the table, not the
-    /// view). Keyed by source; handed back when the table's grid is
-    /// rebuilt, cleared on disconnect (a new berth is a new world).
-    staged: std::collections::HashMap<String, crate::edits::Edits>,
+    /// view), per database: a table switch parks the outgoing table's, a
+    /// connection that goes parks its grid's. Handed back when the table's
+    /// grid is built on that database again.
+    staged: crate::edits::Parked<DbKey>,
     /// The sidebar/content divider (DESIGN.md: divider positions persist —
     /// the width saves at the end of each drag).
     pub(crate) sidebar_resize: Entity<gpui_kit::component::resizable::ResizableState>,
@@ -447,7 +514,7 @@ impl DuckTable {
             catalog_seq: 0,
             warning: None,
             query: None,
-            staged: std::collections::HashMap::new(),
+            staged: Default::default(),
             sidebar_resize,
             stopping: std::collections::HashSet::new(),
             leaving: std::collections::HashSet::new(),
@@ -469,26 +536,96 @@ impl DuckTable {
 
     /// What a quit would lose right now (`QuitRisks`).
     pub(crate) fn quit_risks(&self, cx: &App) -> QuitRisks {
-        let grid = self.grid.as_ref().map(|g| g.read(cx));
+        self.risks(&Leaving::Quit, cx)
+    }
+
+    /// What going ahead with `leaving` would put at risk: for a quit,
+    /// everything the window holds; for a database left behind, the sets
+    /// parked for it and, when it is the one connected, what is on screen.
+    pub(crate) fn risks(&self, leaving: &Leaving, cx: &App) -> QuitRisks {
+        let connected = self.connected_key();
+        let db = match leaving {
+            Leaving::Quit | Leaving::Relaunch => None,
+            Leaving::Switch { .. } if connected.is_none() => return QuitRisks::default(),
+            Leaving::Switch { .. } => connected.clone(),
+            Leaving::Stop { name, path } => Some(self.key_of(name, Some(path))),
+            Leaving::Remove { name } => Some(DbKey::Remote(clone_str(name))),
+        };
+        let here = db.is_none() || db == connected;
+        let grid = self.grid.as_ref().filter(|_| here).map(|g| g.read(cx));
+        let query = self.query.as_ref().filter(|_| here).map(|q| q.read(cx));
         let committing = grid.is_some_and(|g| g.committing);
-        // Every staged set the window holds: the grid's own, unless a
-        // commit has it in flight, and those parked by a table switch.
+        // The grid's own staged set, unless a commit has it in flight, and
+        // those parked: for the database, or for every one.
         let on_screen = grid.filter(|_| !committing).into_iter().flat_map(|g| g.staged_sets());
-        let sets: Vec<&crate::edits::Edits> =
-            self.staged.values().chain(on_screen).filter(|e| e.any_staged()).collect();
-        let staged: Vec<usize> = sets.iter().filter(|e| !e.in_doubt()).map(|e| e.len()).collect();
+        let parked: Vec<&crate::edits::Edits> = match &db {
+            Some(db) => self.staged.at(db).collect(),
+            None => self.staged.sets().collect(),
+        };
+        let tally = crate::edits::Tally::of(parked.into_iter().chain(on_screen));
         QuitRisks {
-            staged: staged.iter().sum(),
-            tables: staged.len(),
-            held: sets.iter().filter(|e| e.in_doubt()).map(|e| e.len()).sum(),
+            staged: tally.staged,
+            tables: tally.tables,
+            held: tally.held,
             editing: grid.is_some_and(|g| g.is_editing()),
             committing,
-            transaction: self.query.as_ref().is_some_and(|q| q.read(cx).in_transaction()),
-            running: self.query.as_ref().is_some_and(|q| q.read(cx).is_running()),
+            transaction: query.is_some_and(|q| q.in_transaction()),
+            running: query.is_some_and(|q| q.is_running()),
         }
     }
 
-    /// The quit dialog opens. A connect still in flight is called off: its
+    /// The database on screen, if one is connected.
+    pub(crate) fn connected_key(&self) -> Option<DbKey> {
+        match &self.phase {
+            Phase::Connected { conn, .. } => Some(DbKey::of_conn(conn)),
+            _ => None,
+        }
+    }
+
+    /// Before the connected database is left (`Leaving::Switch`, or a Stop
+    /// or Remove of it), text in an open cell editor is staged, to be
+    /// parked with the rest. False when its column refuses it: the editor
+    /// stays open with the reason, and nothing is left.
+    pub(crate) fn settle_before(&mut self, leaving: &Leaving, cx: &mut Context<Self>) -> bool {
+        let db = match leaving {
+            Leaving::Quit | Leaving::Relaunch => return true,
+            Leaving::Switch { .. } => self.connected_key(),
+            Leaving::Stop { name, path } => Some(self.key_of(name, Some(path))),
+            Leaving::Remove { name } => Some(DbKey::Remote(clone_str(name))),
+        };
+        match self.grid.clone() {
+            Some(grid) if db.is_some() && db == self.connected_key() => grid.update(cx, |g, cx| g.settle_editor(cx)),
+            _ => true,
+        }
+    }
+
+    /// Go ahead with what the one dialog asked about, or what needed no
+    /// asking: leave the connected database for another, stop a server, or
+    /// remove a saved remote. A quit is main.rs's to carry out. A switch
+    /// replaces whatever the dialog held back; anything else resumes it,
+    /// as a Cancel would.
+    pub(crate) fn go_ahead(&mut self, leaving: Leaving, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(leaving, Leaving::Quit | Leaving::Relaunch) {
+            return;
+        }
+        let asked = std::mem::take(&mut self.asking_to_quit);
+        match leaving {
+            Leaving::Quit | Leaving::Relaunch => {}
+            Leaving::Switch { to, .. } => {
+                self.called_off = None;
+                self.deferred_select = None;
+                self.redial(to, cx);
+                return;
+            }
+            Leaving::Stop { name, path } => self.stop_berth(name, path, cx),
+            Leaving::Remove { name } => self.remove_remote_database(name, cx),
+        }
+        if asked {
+            self.resume(window, cx);
+        }
+    }
+
+    /// The one dialog opens. A connect still in flight is called off: its
     /// landing would replace the grid, the query and every staged edit
     /// under the dialog, and Cancel must find them as they were. What it
     /// was aimed at is kept, and dialed again if the dialog is cancelled.
@@ -498,11 +635,16 @@ impl DuckTable {
         self.cancel(cx);
     }
 
-    /// The quit dialog was cancelled. What waited for it runs
-    /// (`after_quit_dialog`), and the fleet is reconciled, which drops a
-    /// connection whose server stopped meanwhile.
+    /// The one dialog was cancelled. What waited for it runs (`resume`).
     pub(crate) fn quit_dialog_cancelled(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.asking_to_quit = false;
+        self.resume(window, cx);
+    }
+
+    /// What the dialog held back runs (`after_quit_dialog`), and the fleet
+    /// is reconciled, which drops a connection whose server stopped
+    /// meanwhile.
+    fn resume(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match after_quit_dialog(self.called_off.take(), self.deferred_select.take()) {
             Resume::Dial(aim) => self.redial(aim, cx),
             Resume::Select(schema, name) => self.select_table(schema, name, window, cx),
@@ -579,8 +721,9 @@ impl DuckTable {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (conn, solo_schema, structure) = match &self.phase {
+        let (db, conn, solo_schema, structure) = match &self.phase {
             Phase::Connected { conn, catalog, .. } => (
+                DbKey::of_conn(conn),
                 conn.clone(),
                 catalog.schemas().len() <= 1,
                 catalog
@@ -608,7 +751,7 @@ impl DuckTable {
         // to distinguish it from.
         let title =
             if solo_schema { clone_str(&name) } else { format!("{schema}.{name}") };
-        self.selected_table = Some((clone_str(&schema), clone_str(&name)));
+        let previous = self.selected_table.replace((clone_str(&schema), clone_str(&name)));
         self.select_seq += 1;
         let fence = self.select_seq;
         let page_size = crate::prefs::get(cx).page_size;
@@ -644,13 +787,25 @@ impl DuckTable {
                     state.deferred_select = Some((clone_str(&schema), clone_str(&name)));
                     return;
                 }
+                // A key typed while the page was on its way opened an
+                // editor on the outgoing grid. Its text is staged first, to
+                // be parked with the rest; text the column refuses keeps
+                // the editor, its reason and its table, and the sidebar
+                // goes back to that table.
+                if let Some(old) = state.grid.clone()
+                    && !old.update(cx, |g, cx| g.settle_editor(cx))
+                {
+                    state.selected_table = previous;
+                    cx.notify();
+                    return;
+                }
                 // Staged edits outlive the grid that collected them (Law
-                // 4): park the outgoing table's, keyed by source, before
-                // the swap discards its view.
-                if let Some(old) = state.grid.take() {
-                    if let Some(edits) = old.update(cx, |g, _| g.take_edits()) {
-                        state.staged.insert(edits.source().to_string(), edits);
-                    }
+                // 4): park the outgoing table's, keyed by its database and
+                // source, before the swap discards its view.
+                if let Some(old) = state.grid.take()
+                    && let Some(edits) = old.update(cx, |g, _| g.take_edits())
+                {
+                    state.staged.park(db.clone(), edits);
                 }
                 // The Data/Structure choice is a browsing mode, not table
                 // state (prefs.view): it survives this table switch.
@@ -683,7 +838,7 @@ impl DuckTable {
                 // a fetch brings some, and surrenders them again through
                 // `take_edits` if it is replaced first.
                 let source = crate::sql::source(&schema, &name);
-                if let Some(stash) = state.staged.remove(&source) {
+                if let Some(stash) = state.staged.take(&db, &source) {
                     grid.update(cx, |g, cx| g.adopt_edits(stash, cx));
                 }
                 // The berth's scratchpad rides along: created once per
@@ -1084,6 +1239,29 @@ impl DuckTable {
         );
     }
 
+    /// A click on a sidebar row. The database already on screen stays as it
+    /// is, and a connect in flight to another is called off; any other is
+    /// opened, asking first when leaving the connected one would lose
+    /// something (`Leaving::Switch`).
+    pub(crate) fn choose_row(&mut self, name: String, path: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
+        if self.connected_key() == Some(self.key_of(&name, path.as_deref())) {
+            if self.connecting.is_some() {
+                self.cancel(cx);
+            }
+            return;
+        }
+        crate::leave_asking(self.switch_to(Aim::Row { name, path }), cx);
+    }
+
+    /// Leaving the connected database, if any, for `to`.
+    pub(crate) fn switch_to(&self, to: Aim) -> Leaving {
+        let from = match &self.phase {
+            Phase::Connected { conn, .. } => clone_str(&conn.name),
+            _ => String::new(),
+        };
+        Leaving::Switch { from, to }
+    }
+
     /// Dial again what a failed connect was aimed at.
     pub(crate) fn retry(&mut self, cx: &mut Context<Self>) {
         if let Phase::Failed { aim, .. } = &self.phase {
@@ -1140,6 +1318,9 @@ impl DuckTable {
         if connected_here {
             self.drop_connection(cx);
         }
+        // The database is forgotten, and what was staged for it with it:
+        // the one dialog asked first (`Leaving::Remove`).
+        self.staged.forget(&DbKey::Remote(clone_str(&name)));
         self.fleet_then_refresh(move || fleet::remove_remote(&name), cx);
     }
 
@@ -1196,9 +1377,8 @@ impl DuckTable {
                 state.connecting_key = None;
                 state.connecting_aim = None;
                 state.selected_table = None;
-                state.grid = None;
+                state.park_grid(cx);
                 state.query = None;
-                state.staged.clear();
                 state.deferred_select = None;
                 state.select_seq += 1;
                 state.phase = match outcome {
@@ -1253,17 +1433,34 @@ impl DuckTable {
         );
     }
 
-    /// Clear the connected world back to Idle, forgetting its table, grid,
-    /// query, and staged edits. Shared by Stop and by refresh's reconciliation
-    /// when the server exits out from under us — either way there is nothing
+    /// The grid goes with its connection, and its staged set is parked for
+    /// its database (`Grid::surrender_edits`), to come back when that
+    /// database is opened again. Text in an open editor is staged first;
+    /// text its column refuses goes with the grid.
+    fn park_grid(&mut self, cx: &mut Context<Self>) {
+        let Some(grid) = self.grid.take() else { return };
+        let Phase::Connected { conn, .. } = &self.phase else { return };
+        let db = DbKey::of_conn(conn);
+        let edits = grid.update(cx, |g, cx| {
+            g.settle_editor(cx);
+            g.surrender_edits()
+        });
+        if let Some(edits) = edits {
+            self.staged.park(db, edits);
+        }
+    }
+
+    /// Clear the connected world back to Idle, forgetting its table, grid
+    /// and query; its staged edits are parked for the database
+    /// (`park_grid`). Shared by Stop and by refresh's reconciliation when
+    /// the server exits out from under us — either way there is nothing
     /// left to show, and a lingering dead connection would only fail the next
     /// catalog or query with a raw OS error.
     fn drop_connection(&mut self, cx: &mut Context<Self>) {
+        self.park_grid(cx);
         self.phase = Phase::Idle;
         self.selected_table = None;
-        self.grid = None;
         self.query = None;
-        self.staged.clear();
         // A switch that waited on this berth's commit belongs to it too: the
         // grid it waited on is gone, and no CommitSettled will come for it.
         self.deferred_select = None;
@@ -1555,9 +1752,9 @@ mod tests {
     fn installing_an_update_asks_what_quitting_asks() {
         use super::Leaving::Relaunch;
         // Nothing to lose, nothing asked: the relaunch goes ahead.
-        assert_eq!(QuitRisks::default().question_for(Relaunch), None);
+        assert_eq!(QuitRisks::default().question_for(&Relaunch), None);
 
-        let one = QuitRisks { staged: 1, tables: 1, ..Default::default() }.question_for(Relaunch).unwrap();
+        let one = QuitRisks { staged: 1, tables: 1, ..Default::default() }.question_for(&Relaunch).unwrap();
         assert_eq!(one.message, "Discard 1 staged change and install the update?");
         assert_eq!(
             one.detail,
@@ -1566,9 +1763,62 @@ mod tests {
         );
         assert_eq!(one.confirm, "Discard and Install");
 
-        let open = QuitRisks { transaction: true, ..Default::default() }.question_for(Relaunch).unwrap();
+        let open = QuitRisks { transaction: true, ..Default::default() }.question_for(&Relaunch).unwrap();
         assert_eq!((open.message.as_str(), open.confirm), ("Install the update now?", "Install Anyway"));
         assert!(open.detail.starts_with("The Query view holds a transaction open, and quitting rolls it back."));
+    }
+
+    #[test]
+    fn leaving_a_database_asks_only_about_what_leaving_it_loses() {
+        use super::Leaving;
+        let switch = Leaving::Switch { from: "orders".into(), to: Aim::File("/tmp/x.duckdb".into()) };
+        let stop = Leaving::Stop { name: "orders".into(), path: "/data/orders.duckdb".into() };
+        let remove = Leaving::Remove { name: "orders".into() };
+        let staged = QuitRisks { staged: 3, tables: 2, held: 1, ..Default::default() };
+
+        // A switch parks staged and held sets for the database's return:
+        // they are no reason to ask.
+        assert_eq!(staged.question_for(&switch), None);
+        // Stop keeps them parked too, and asks, saying so.
+        let stopping = staged.question_for(&stop).unwrap();
+        assert_eq!((stopping.message.as_str(), stopping.confirm), ("Stop orders?", "Stop Anyway"));
+        assert_eq!(
+            stopping.detail,
+            "3 staged changes in 2 tables have not been committed, and stay staged for when orders is \
+             opened again. 1 change is held after a commit that got no answer, and stays held for when \
+             orders is opened again."
+        );
+        assert!(!stopping.detail.contains("discards"));
+        // Removing a remote forgets them with it.
+        let removing = QuitRisks { staged: 1, tables: 1, ..Default::default() }.question_for(&remove).unwrap();
+        assert_eq!(removing.message, "Discard 1 staged change and remove orders?");
+        assert_eq!(removing.detail, "1 staged change has not been committed, and removing orders discards it.");
+        assert_eq!(removing.confirm, "Discard and Remove");
+        let removing = staged.question_for(&remove).unwrap();
+        assert_eq!((removing.message.as_str(), removing.confirm), ("Remove orders?", "Remove Anyway"));
+        assert!(removing.detail.ends_with("and removing orders drops the held copy."));
+
+        // What leaving the connected database ends is asked about on every way out.
+        let open = QuitRisks { transaction: true, running: true, ..Default::default() };
+        let leaving = open.question_for(&switch).unwrap();
+        assert_eq!((leaving.message.as_str(), leaving.confirm), ("Leave orders?", "Leave Anyway"));
+        assert_eq!(
+            leaving.detail,
+            "The Query view holds a transaction open, and leaving orders rolls it back. A statement is \
+             still running in the Query view. Leaving orders leaves its outcome unreported."
+        );
+        assert!(open.question_for(&stop).unwrap().detail.contains("and stopping orders rolls it back."));
+        let committing = QuitRisks { committing: true, ..Default::default() };
+        assert!(committing.question_for(&switch).unwrap().detail.contains("held for when orders is opened again"));
+        assert!(committing.question_for(&remove).unwrap().detail.contains("are not kept here"));
+
+        // Once nothing is at risk the dialog still names what goes ahead.
+        let plain = stop.plain_question();
+        assert_eq!(
+            (plain.message.as_str(), plain.detail.as_str(), plain.confirm),
+            ("Stop orders?", "Nothing is left that stopping orders would lose.", "Stop")
+        );
+        assert_eq!(Leaving::Quit.plain_question().detail, "Nothing is left that quitting would lose.");
     }
 
     #[test]

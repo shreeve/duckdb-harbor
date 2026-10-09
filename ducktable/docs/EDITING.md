@@ -214,10 +214,17 @@ not change, and printable exotica (AltGr, IME) already land on rung 6.
   editor open with the reason, and the page, the strip, the columns and the
   table where they are. ⌥↑/⌥↓ are not among them: with an editor open they
   are the editor's keys and flip no page.
-- Two things drop an open editor's text besides Esc. Choosing a database in
-  the sidebar, the connected one included, leaves the connected one without
-  asking: its staged changes, parked ones too, and any text being typed go
-  with it. Quitting asks first (Dialogs, below).
+- Staged changes belong to their table on their database, not to the
+  connection. Leaving a database parks the grid's set with the rest of that
+  database's: choosing another database or opening one by file or URL, Stop,
+  and a server that stops or goes away under the window. Text in an open
+  editor is confirmed first. When the user leaves, text its column refuses
+  keeps the editor open with the reason, and the database stays; when the
+  server goes, that text goes with the grid. Each set comes back when its
+  table is opened on that database again, held sets still held, and is
+  judged there like one parked by a table switch. A click on the database
+  already on screen changes nothing. Only quitting and removing a saved
+  remote drop parked sets, and both ask first (Dialogs, below).
 - Staged changes parked by a table switch wait for a grid that can take them.
   Returning to the table while its first page fails to load leaves them
   parked: the grid has no columns to check them against, keeps them until a
@@ -515,16 +522,17 @@ the NULL tag, visually distinct from empty, always.
 
 ## Dialogs
 
-Exactly one: quitting with something to lose, by ⌘Q, DuckTable → Quit, the
+Exactly one, and it asks before work is lost: before quitting, and before a
+database is left (below). Quitting comes by ⌘Q, DuckTable → Quit, the
 window's close button or the updater's Install and Relaunch, which quits to
 install. Those four ask first when any of these holds, and quit at once when
 none does:
 
 - **Staged changes**, in the table on screen or parked for a table that is
-  not. They are counted together: `Discard 5 staged changes and quit?`, and
-  under it `5 staged changes in 2 tables have not been committed, and quitting
-  discards them.` The changes of a commit in flight are not counted here:
-  quitting does not simply discard them.
+  not, on any database. They are counted together: `Discard 5 staged changes
+  and quit?`, and under it `5 staged changes in 2 tables have not been
+  committed, and quitting discards them.` The changes of a commit in flight
+  are not counted here: quitting does not simply discard them.
 - **Changes held after a commit that got no answer** (Commit, above). They
   are not called uncommitted: `3 changes are held after a commit that got no
   answer: they may already be in the database, and quitting drops the held
@@ -573,6 +581,26 @@ update installs when DuckTable next quits. Sparkle holds the relaunch until
 the dialog is answered. It holds it only once per update, so while an update
 waits, Check for Updates asks again rather than opening Sparkle's window,
 whose second Install and Relaunch would not wait.
+
+The same dialog asks before a database is left with something at stake on
+it, and only the facts that concern that database are listed:
+
+- **Choosing another database** (a sidebar row, Open Database File, a dropped
+  file) parks its staged and held changes for its return, so they are
+  no reason to ask. It asks when leaving would end something: a transaction
+  open in the Query view, which it rolls back, a statement running there, or
+  a commit in flight, whose changes are then held for the database's return.
+  `Leave orders?`, with `Leave Anyway`.
+- **Stop** asks when the database holds any of the list above, staged changes
+  included, and says that staged and held changes stay for when it is opened
+  again: `Stop orders?`, with `Stop Anyway`.
+- **Remove Database** forgets what is parked for the remote, so it asks as a
+  quit does: `Discard 1 staged change and remove prod?` with `Discard and
+  Remove`, or `Remove prod?` with `Remove Anyway`.
+
+Before any of the three, text in an open cell editor on that database is
+confirmed; text its column refuses keeps the editor open with the reason,
+and nothing is left.
 
 Two ways out end the app through macOS without passing through the dialog,
 and ask nothing: Quit from the Dock's menu, and a logout, restart or

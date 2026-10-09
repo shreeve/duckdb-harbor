@@ -205,7 +205,8 @@ transaction is open.
   rollback.
 - **Leaving ends it.** The session is released, and the transaction rolled
   back, when the view goes: the connection drops, another database is chosen,
-  or the app quits. ⌘Q and the close button ask first (EDITING.md,
+  the server is stopped, or the app quits. ⌘Q, the close button, choosing
+  another database, Stop and Remove Database ask first (EDITING.md,
   "Dialogs"); every quit releases the session, the ones that ask nothing
   included, and so does one while the `BEGIN` itself is still in flight.
 

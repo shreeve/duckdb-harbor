@@ -2566,7 +2566,6 @@ impl Grid {
     /// the server stopped or gone, or another database chosen. A stash
     /// parked here goes back as it came; a set of a commit in flight goes
     /// held (`surrender`). None when nothing is staged.
-    #[expect(dead_code, reason = "app.rs parks this when a connection goes")]
     pub(crate) fn surrender_edits(&mut self) -> Option<Edits> {
         if let Some(parked) = self.parked.take() {
             return Some(parked);

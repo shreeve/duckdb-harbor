@@ -271,7 +271,7 @@ impl DuckTable {
                             let name = clone_str(&name);
                             let path = row.path.clone();
                             move |this, _: &ClickEvent, _, cx| {
-                                this.connect_row(clone_str(&name), path.clone(), cx)
+                                this.choose_row(clone_str(&name), path.clone(), cx)
                             }
                         }))
                         // Right-click → Stop: shut this berth's server down.

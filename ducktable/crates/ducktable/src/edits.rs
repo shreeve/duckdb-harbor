@@ -184,7 +184,6 @@ pub fn handoff(mine: Option<&Edits>, has_columns: bool, stash: &Edits) -> Handof
 /// gone, another database chosen — parks the grid's own with the rest.
 /// Each is handed back when its table is opened on its database again,
 /// and judged there (`handoff`). `K` is the database's key, app.rs's.
-#[cfg_attr(not(test), expect(dead_code, reason = "app.rs parks staged sets here, per database"))]
 pub struct Parked<K> {
     sets: HashMap<K, HashMap<String, Edits>>,
 }
@@ -195,7 +194,6 @@ impl<K> Default for Parked<K> {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "app.rs parks staged sets here, per database"))]
 impl<K: Eq + std::hash::Hash> Parked<K> {
     /// Keep `edits` for its table on database `db`. A set with nothing in
     /// it is not kept.
@@ -234,7 +232,6 @@ impl<K: Eq + std::hash::Hash> Parked<K> {
 
 /// What staged sets hold, as the dialogs that would lose them count it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "app.rs counts staged sets with this"))]
 pub struct Tally {
     /// Changes staged and not sent.
     pub staged: usize,
@@ -245,7 +242,6 @@ pub struct Tally {
     pub held: usize,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "app.rs counts staged sets with this"))]
 impl Tally {
     pub fn of<'a>(sets: impl IntoIterator<Item = &'a Edits>) -> Self {
         sets.into_iter().filter(|e| e.any_staged()).fold(Self::default(), |t, e| {
@@ -255,10 +251,6 @@ impl Tally {
                 Self { staged: t.staged + e.len(), tables: t.tables + 1, ..t }
             }
         })
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.staged == 0 && self.held == 0
     }
 }
 
@@ -3059,8 +3051,7 @@ mod tests {
         let sets = [staged_on("u", 3), held, staged_on("v", 0)];
         let tally = Tally::of(&sets);
         assert_eq!(tally, Tally { staged: 3, tables: 1, held: 2 });
-        assert!(!tally.is_empty());
-        assert!(Tally::of(&sets[2..]).is_empty());
+        assert_eq!(Tally::of(&sets[2..]), Tally::default());
 
         // A held set parked and handed back is still held, and is judged
         // against the page its table is opened with.

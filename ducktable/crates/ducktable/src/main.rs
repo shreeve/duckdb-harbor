@@ -257,19 +257,22 @@ fn app_menus(can_update: bool) -> Vec<Menu> {
     ]
 }
 
-/// Quit, asking first when that would lose something (docs/EDITING.md,
-/// "Dialogs"): staged changes in any table, text in an open cell editor, a
-/// commit or a Query statement still in flight, a transaction open in the
-/// Query view. ⌘Q, the menu's Quit and the window's close button all come
-/// here, and so does the updater's Install and Relaunch, which quits too.
+/// Quit, or leave the connected database, stop a server or remove a saved
+/// remote, asking first when that would lose something (docs/EDITING.md,
+/// "Dialogs"): staged changes, text in an open cell editor, a commit or a
+/// Query statement still in flight, a transaction open in the Query view.
+/// ⌘Q, the menu's Quit and the window's close button all come here, and so
+/// does the updater's Install and Relaunch, which quits too; so do a row
+/// click, Open Database File and a dropped file while another database is
+/// connected, and the sidebar's Stop and Remove Database.
 ///
 /// The dialog is the app's own, not the platform's alert, because Cancel
 /// has to be its default. Measured on the alert GPUI builds: a first button
 /// titled Cancel takes Esc and gives up Return, so the alert has no default,
 /// and GPUI seats the keyboard focus on the other button, where Space
-/// presses it. Here Return and Esc both go back, and the button that
-/// discards and quits is no tab stop, so the keyboard cannot reach it: it
-/// answers only to a click.
+/// presses it. Here Return and Esc both go back, and the button that goes
+/// ahead is no tab stop, so the keyboard cannot reach it: it answers only
+/// to a click.
 fn request_leave(leaving: app::Leaving, window: &mut Window, cx: &mut App) {
     use gpui_kit::component::WindowExt as _;
     use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -279,8 +282,16 @@ fn request_leave(leaving: app::Leaving, window: &mut Window, cx: &mut App) {
         leave(leaving, cx);
         return;
     };
-    if view.read(cx).quit_risks(cx).question_for(leaving).is_none() {
-        leave(leaving, cx);
+    let quitting = matches!(leaving, app::Leaving::Quit | app::Leaving::Relaunch);
+    // Under the dialog no database is left: Cancel must find it as it was.
+    if !quitting && view.read(cx).asking_to_quit {
+        return;
+    }
+    if !view.update(cx, |this, cx| this.settle_before(&leaving, cx)) {
+        return;
+    }
+    if view.read(cx).risks(&leaving, cx).question_for(&leaving).is_none() {
+        go_ahead(&view, leaving, window, cx);
         return;
     }
     if view.read(cx).asking_to_quit {
@@ -291,18 +302,11 @@ fn request_leave(leaving: app::Leaving, window: &mut Window, cx: &mut App) {
         // What is at risk is read each time the dialog is drawn, not once
         // when it opened: a commit that settles under it has by then landed
         // or kept its edits, and the text follows.
-        let question = view.read(cx).quit_risks(cx).question_for(leaving).unwrap_or(match leaving {
-            app::Leaving::Quit => app::QuitQuestion {
-                message: "Quit DuckTable?".to_string(),
-                detail: "Nothing is left that quitting would lose.".to_string(),
-                confirm: "Quit",
-            },
-            app::Leaving::Relaunch => app::QuitQuestion {
-                message: "Install the update now?".to_string(),
-                detail: "Nothing is left that quitting would lose.".to_string(),
-                confirm: "Install",
-            },
-        });
+        let question = view
+            .read(cx)
+            .risks(&leaving, cx)
+            .question_for(&leaving)
+            .unwrap_or_else(|| leaving.plain_question());
         // Going back, by Return, Esc or the Cancel button.
         let stay = {
             let view = view.clone();
@@ -312,10 +316,14 @@ fn request_leave(leaving: app::Leaving, window: &mut Window, cx: &mut App) {
             }
         };
         let quit = {
-            let view = view.clone();
-            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                view.update(cx, |this, cx| this.release_for_quit(cx));
-                leave(leaving, cx);
+            let (view, leaving) = (view.clone(), leaving.clone());
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                // A quit takes the window with it; anything else goes on
+                // without the dialog.
+                if !quitting {
+                    window.close_dialog(cx);
+                }
+                go_ahead(&view, leaving.clone(), window, cx);
             }
         };
         dialog
@@ -341,8 +349,21 @@ fn request_leave(leaving: app::Leaving, window: &mut Window, cx: &mut App) {
     });
 }
 
+/// Do what was asked about, or needed no asking: end the app, or leave a
+/// database through the view.
+fn go_ahead(view: &Entity<DuckTable>, leaving: app::Leaving, window: &mut Window, cx: &mut App) {
+    match leaving {
+        app::Leaving::Quit | app::Leaving::Relaunch => {
+            view.update(cx, |this, cx| this.release_for_quit(cx));
+            leave(leaving, cx);
+        }
+        leaving => view.update(cx, |this, cx| this.go_ahead(leaving, window, cx)),
+    }
+}
+
 /// End the app the way it was asked to: quit, or let the updater install
-/// and relaunch. With no update waiting, a relaunch has nothing to do.
+/// and relaunch. With no update waiting, a relaunch has nothing to do, and
+/// leaving a database is the view's (`go_ahead`).
 fn leave(leaving: app::Leaving, cx: &mut App) {
     match leaving {
         app::Leaving::Quit => cx.quit(),
@@ -351,12 +372,14 @@ fn leave(leaving: app::Leaving, cx: &mut App) {
                 updater.install();
             }
         }
+        _ => {}
     }
 }
 
-/// Ask through the window, from an App-level action or the updater.
-/// Deferred, like every action that touches the window: a key or menu
-/// action arrives inside the window's own update.
+/// Ask through the window, from an App-level action, the updater, or a
+/// view that cannot open the dialog from inside its own update. Deferred,
+/// like every action that touches the window: a key or menu action arrives
+/// inside the window's own update.
 fn leave_asking(leaving: app::Leaving, cx: &mut App) {
     cx.defer(move |cx| {
         let window = cx.active_window().or_else(|| cx.windows().first().copied());
@@ -455,7 +478,7 @@ impl Render for DuckTable {
             // databases would be N-1 surprises.
             .on_drop(cx.listener(|this, dropped: &ExternalPaths, _, cx| {
                 if let Some(path) = dropped.paths().first().cloned() {
-                    this.open_path(path, cx);
+                    leave_asking(this.switch_to(app::Aim::File(path)), cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &FitColumns, _, cx| {
@@ -624,7 +647,8 @@ fn main() {
                         if let Some(view) =
                             cx.try_global::<AppView>().and_then(|v| v.0.upgrade())
                         {
-                            view.update(cx, |this, cx| this.open_path(path, cx));
+                            let leaving = view.read(cx).switch_to(app::Aim::File(path));
+                            leave_asking(leaving, cx);
                         }
                     });
                 }
@@ -644,18 +668,10 @@ fn main() {
                 }
             });
         });
-        // Right-click → Stop. Reaches the view through AppView (the menu
-        // fires at App level) and defers, the FitColumns pattern — a menu
-        // action arrives inside the window's update, so the view is touched
-        // on the next tick, not re-entrantly.
+        // Right-click → Stop and Remove Database ask first when the
+        // database holds something to lose (`request_leave`).
         cx.on_action(|a: &StopBerth, cx| {
-            let name = a.name.clone();
-            let path = a.path.clone();
-            if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
-                cx.defer(move |cx| {
-                    view.update(cx, |this, cx| this.stop_berth(name, path, cx));
-                });
-            }
+            leave_asking(app::Leaving::Stop { name: a.name.clone(), path: a.path.clone() }, cx);
         });
         cx.on_action(|a: &StartBerth, cx| {
             let path = a.path.clone();
@@ -691,12 +707,7 @@ fn main() {
             }
         });
         cx.on_action(|a: &RemoveRemoteDatabase, cx| {
-            let name = a.name.clone();
-            if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
-                cx.defer(move |cx| {
-                    view.update(cx, |this, cx| this.remove_remote_database(name, cx));
-                });
-            }
+            leave_asking(app::Leaving::Remove { name: a.name.clone() }, cx);
         });
         cx.on_action(|_: &TablePrev, cx| step_table(-1, cx));
         cx.on_action(|_: &TableNext, cx| step_table(1, cx));
