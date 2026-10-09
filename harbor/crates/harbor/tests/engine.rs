@@ -787,6 +787,11 @@ mod wire {
         row(eng, "SELECT TIMESTAMP_NS '2026-09-01 14:30:00.123456789'", r#""2026-09-01T14:30:00.123456789""#);
         row(eng, "SELECT TIMESTAMPTZ '2026-09-01 14:30:00+00'", r#""2026-09-01T14:30:00Z""#);
         row(eng, "SELECT DATE '1600-02-29'", r#""1600-02-29""#);
+        // Before 1 AD the year is ISO 8601's, signed with four digits: 1 BC
+        // is year 0, 44 BC is -0043.
+        row(eng, "SELECT DATE '0001-01-01 (BC)', DATE '0010-06-01 (BC)'", r#""0000-01-01","-0009-06-01""#);
+        row(eng, "SELECT TIMESTAMP '0044-03-15 (BC) 12:00:00'", r#""-0043-03-15T12:00:00""#);
+        row(eng, "SELECT DATE '5877642-06-25 (BC)'", r#""-5877641-06-25""#);
         // v1 refused TIME_NS outright; v2 encodes it.
         row(eng, "SELECT TIME_NS '14:30:00.123456789'", r#""14:30:00.123456789""#);
         // TIME WITH TIME ZONE: local time plus the ISO offset — v1 dropped

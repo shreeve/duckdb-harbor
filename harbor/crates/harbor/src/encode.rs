@@ -97,8 +97,8 @@ pub(crate) fn push_i64_raw(out: &mut String, v: i64) {
     push_u64_raw(out, v.unsigned_abs());
 }
 
-/// An integer zero-padded to `width` the way `format!("{v:0width$}")` pads:
-/// the sign first, then zeros, then the digits, sign counted toward the width.
+/// An integer with its digits zero-padded to `width`, the sign before them
+/// and not counted: ISO 8601's year 44 BC is `-0043`, four digits signed.
 pub(crate) fn push_int_pad(out: &mut String, v: i64, width: usize) {
     let neg = v < 0;
     if neg {
@@ -115,8 +115,7 @@ pub(crate) fn push_int_pad(out: &mut String, v: i64, width: usize) {
             break;
         }
     }
-    let written = (buf.len() - i) + neg as usize;
-    for _ in written..width {
+    for _ in buf.len() - i..width {
         out.push('0');
     }
     // Safety: the slice holds only ASCII digits.
@@ -655,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn int_pad_matches_format() {
+    fn int_pad_pads_the_digits_after_the_sign() {
         for &(v, w) in &[
             (0i64, 2usize),
             (0, 4),
@@ -676,7 +675,8 @@ mod tests {
         ] {
             let mut out = String::new();
             push_int_pad(&mut out, v, w);
-            assert_eq!(out, format!("{v:0w$}"), "for {v} width {w}");
+            let sign = if v < 0 { "-" } else { "" };
+            assert_eq!(out, format!("{sign}{:0w$}", v.unsigned_abs()), "for {v} width {w}");
         }
     }
 
