@@ -1069,7 +1069,13 @@ impl DuckTable {
                                 .flatten(),
                         };
                         RowVm {
-                            state: if connected_here { State::Running } else { row.state },
+                            // The survey cannot see a tunneled remote, which it never
+                            // dials, and a connection does not say whether it is
+                            // tunneled, so for a remote the connection says it is
+                            // running. A file's server it sees, and its word stands:
+                            // a server that exited under the connection shows as
+                            // stopped, and the reconciliation below lets it go.
+                            state: if connected_here && row.path.is_none() { State::Running } else { row.state },
                             attached: row.attached,
                             autostart: row.autostart,
                             path: row.path,
