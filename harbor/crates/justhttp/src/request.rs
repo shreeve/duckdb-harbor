@@ -296,14 +296,9 @@ impl Request {
     pub fn as_reader(&mut self) -> &mut dyn Read {
         if self.must_send_continue {
             let msg = Response::empty(StatusCode(100));
-            msg.raw_print(
-                self.response_writer.as_mut().unwrap().by_ref(),
-                self.http_version,
-                &self.headers,
-                true,
-            )
-            .ok();
-            self.response_writer.as_mut().unwrap().flush().ok();
+            let writer = self.response_writer.as_mut().unwrap();
+            msg.raw_print(writer.by_ref(), self.http_version, true).ok();
+            writer.flush().ok();
             self.must_send_continue = false;
         }
 
@@ -339,7 +334,6 @@ impl Request {
         Self::ignore_client_closing_errors(response.raw_print(
             writer.by_ref(),
             self.http_version,
-            &self.headers,
             do_not_send_body,
         ))?;
 

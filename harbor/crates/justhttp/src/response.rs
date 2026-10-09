@@ -4,7 +4,6 @@
 
 use crate::http::{Header, HttpVersion, StatusCode};
 use httpdate::HttpDate;
-use std::cmp::Ordering;
 
 use std::io::Result as IoResult;
 use std::io::{self, Cursor, Read, Write};
@@ -46,26 +45,11 @@ pub struct Response<R> {
     chunked_threshold: Option<usize>,
 }
 
-/// Transfer encoding to use when sending the message.
-/// Note that only *supported* encodings are listed here.
+/// How a response body is framed on the wire.
 #[derive(Copy, Clone)]
 enum TransferEncoding {
     Identity,
     Chunked,
-}
-
-impl FromStr for TransferEncoding {
-    type Err = ();
-
-    fn from_str(input: &str) -> Result<TransferEncoding, ()> {
-        if input.eq_ignore_ascii_case("identity") {
-            Ok(TransferEncoding::Identity)
-        } else if input.eq_ignore_ascii_case("chunked") {
-            Ok(TransferEncoding::Chunked)
-        } else {
-            Err(())
-        }
-    }
 }
 
 /// Appends a `Date: ...\r\n` line with the current time. The rendered line is
@@ -93,80 +77,30 @@ fn write_date_line(out: &mut Vec<u8>) {
     });
 }
 
+/// The framing for a response: a function of the version, the status and
+/// the body's length, never of anything the client sent.
+///
+/// An unknown length leaves chunked as the only framing that can both start
+/// before the body is complete and delimit it on a reusable connection.
+/// Identity framing would have to read the whole body to learn its length,
+/// so a header that could choose it would hand control of this server's
+/// memory to the caller: a streamed six-million-row result is +316 MB of
+/// RSS when buffered. A request's `TE` header is therefore not consulted at
+/// all.
 fn choose_transfer_encoding(
     status_code: StatusCode,
-    request_headers: &[Header],
     http_version: &HttpVersion,
     entity_length: Option<usize>,
     chunked_threshold: usize,
 ) -> TransferEncoding {
-    // HTTP 1.0 doesn't support other encoding
-    if *http_version <= (1, 0) {
+    // HTTP/1.0 has no chunked encoding, and RFC 9112 §6.1 forbids a
+    // Transfer-Encoding on a 1xx or 204.
+    if *http_version <= (1, 0) || status_code.0 < 200 || status_code.0 == 204 {
         return TransferEncoding::Identity;
     }
-
-    // Per section 3.3.1 of RFC7230:
-    // A server MUST NOT send a Transfer-Encoding header field in any response with a status code
-    // of 1xx (Informational) or 204 (No Content).
-    if status_code.0 < 200 || status_code.0 == 204 {
-        return TransferEncoding::Identity;
-    }
-
-    // parsing the request's TE header
-    let user_request = request_headers
-        .iter()
-        // finding TE
-        .find(|h| h.field.equiv("TE"))
-        // getting the corresponding TransferEncoding
-        .and_then(|header| {
-            // getting list of requested elements
-            let mut parse = parse_header_value(header.value.as_str());
-
-            // sorting elements by most priority
-            parse.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-
-            // trying to parse each requested encoding
-            for value in parse.iter() {
-                // q=0 are ignored
-                if value.1 <= 0.0 {
-                    continue;
-                }
-
-                if let Ok(te) = TransferEncoding::from_str(value.0) {
-                    return Some(te);
-                }
-            }
-
-            // encoding not found
-            None
-        });
-
-    // An unknown length leaves chunked as the only framing that can both start
-    // before the body is complete and delimit it on a reusable connection. The
-    // client does not get a vote here, and that is the point: honoring
-    // `TE: identity` on an unknown-length response sends control of this
-    // server's memory to the caller. `raw_print` would have to read the whole
-    // body to discover its length, so a client could turn any streamed result
-    // into an allocation of that result's size by adding one header —
-    // measured at +316 MB of RSS on a six-million-row query, and neatly
-    // sidestepping the ceiling the one-shot JSON shape enforces for exactly
-    // this reason. `TE` is a hint about what the client can decode, never a
-    // licence to pick the server's buffering strategy. (RFC 7230 dropped
-    // `identity` from `TE` altogether.)
-    if entity_length.is_none() {
+    if entity_length.is_none_or(|len| len >= chunked_threshold) {
         return TransferEncoding::Chunked;
     }
-
-    if let Some(user_request) = user_request {
-        return user_request;
-    }
-
-    // if the Content-Length is too big, using chunks writer
-    if entity_length.is_none_or(|val| val >= chunked_threshold) {
-        return TransferEncoding::Chunked;
-    }
-
-    // Identity by default
     TransferEncoding::Identity
 }
 
@@ -197,9 +131,8 @@ where
     }
 
     /// Set a threshold for `Content-Length` where we chose chunked
-    /// transfer. Notice that chunked transfer might happen regardless of
-    /// this threshold, for instance when the request headers indicate
-    /// it is wanted or when there is no `Content-Length`.
+    /// transfer. Notice that chunked transfer happens regardless of
+    /// this threshold when there is no `Content-Length`.
     #[must_use]
     pub fn with_chunked_threshold(mut self, length: usize) -> Response<R> {
         self.chunked_threshold = Some(length);
@@ -293,29 +226,22 @@ where
         }
     }
 
-    /// Prints the HTTP response to a writer.
-    ///
-    /// This function is the one used to send the response to the client's socket.
-    /// Therefore you shouldn't expect anything pretty-printed or even readable.
-    ///
-    /// The HTTP version and headers passed as arguments are used to
-    ///  decide which features (most notably, encoding) to use.
+    /// Prints the HTTP response to a writer: the bytes that go to the
+    /// client's socket, framed for `http_version`.
     ///
     /// Note: does not flush the writer.
-    pub fn raw_print<W: Write>(
+    pub(crate) fn raw_print<W: Write>(
         self,
         mut writer: W,
         http_version: HttpVersion,
-        request_headers: &[Header],
         do_not_send_body: bool,
     ) -> IoResult<()> {
-        let transfer_encoding = Some(choose_transfer_encoding(
+        let transfer_encoding = choose_transfer_encoding(
             self.status_code,
-            request_headers,
             &http_version,
             self.data_length,
             self.chunked_threshold(),
-        ));
+        );
 
         // The whole head — status line through the blank separator — is
         // assembled in one local buffer and sent with a single write, instead
@@ -365,19 +291,17 @@ where
 
         // framing header, then the blank separator, then the single head write
         match transfer_encoding {
-            Some(TransferEncoding::Chunked) => {
+            TransferEncoding::Chunked => {
                 head.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
             }
 
             // No Content-Length when the length is unknown: the close is the
             // delimiter (see above).
-            Some(TransferEncoding::Identity) => {
+            TransferEncoding::Identity => {
                 if let Some(length) = data_length {
                     write!(head, "Content-Length: {length}\r\n")?;
                 }
             }
-
-            _ => (),
         };
         head.extend_from_slice(b"\r\n");
         writer.write_all(&head)?;
@@ -385,7 +309,7 @@ where
         // sending the body
         if !do_not_send_body {
             match transfer_encoding {
-                Some(TransferEncoding::Chunked) => {
+                TransferEncoding::Chunked => {
                     use chunked_transfer::Encoder;
 
                     let mut writer = Encoder::new(writer);
@@ -394,11 +318,11 @@ where
 
                 // An unknown length is a stream: copy it. A known length of
                 // zero has nothing to copy.
-                Some(TransferEncoding::Identity) if data_length != Some(0) => {
+                TransferEncoding::Identity if data_length != Some(0) => {
                     io::copy(&mut reader, &mut writer)?;
                 }
 
-                _ => (),
+                TransferEncoding::Identity => (),
             }
         }
 
@@ -443,51 +367,8 @@ impl Response<io::Empty> {
     }
 }
 
-/// Parses the value of a header.
-/// Suitable for `Accept-*`, `TE`, etc.
-///
-/// For example with `text/plain, image/png; q=1.5` this function would
-/// return `[ ("text/plain", 1.0), ("image/png", 1.5) ]`
-fn parse_header_value(input: &str) -> Vec<(&str, f32)> {
-    input
-        .split(',')
-        .filter_map(|elem| {
-            let mut params = elem.split(';');
-
-            let t = params.next()?;
-
-            let mut value = 1.0_f32;
-
-            for p in params {
-                if p.trim_start().starts_with("q=") {
-                    if let Ok(val) = f32::from_str(p.trim_start()[2..].trim()) {
-                        value = val;
-                        break;
-                    }
-                }
-            }
-
-            Some((t.trim(), value))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
-    #[test]
-    #[allow(clippy::float_cmp)]
-    fn test_parse_header() {
-        let result = super::parse_header_value("text/html, text/plain; q=1.5 , image/png ; q=2.0");
-
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0].0, "text/html");
-        assert_eq!(result[0].1, 1.0);
-        assert_eq!(result[1].0, "text/plain");
-        assert_eq!(result[1].1, 1.5);
-        assert_eq!(result[2].0, "image/png");
-        assert_eq!(result[2].1, 2.0);
-    }
-
     #[test]
     fn chunked_threshold() {
         let resp = crate::Response::from_string("test".to_string());

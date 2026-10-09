@@ -372,7 +372,7 @@ impl Iterator for ClientConnection {
                     let writer = self.sink.next().unwrap();
                     let response = Response::empty(StatusCode(400));
                     response
-                        .raw_print(writer, HttpVersion(1, 1), &[], false)
+                        .raw_print(writer, HttpVersion(1, 1), false)
                         .ok();
                     return None; // we don't know where the next request would start,
                     // so we have to close
@@ -381,7 +381,7 @@ impl Iterator for ClientConnection {
                 Err(ReadError::WrongHeader(ver)) => {
                     let writer = self.sink.next().unwrap();
                     let response = Response::empty(StatusCode(400));
-                    response.raw_print(writer, ver, &[], false).ok();
+                    response.raw_print(writer, ver, false).ok();
                     return None; // we don't know where the next request would start,
                     // so we have to close
                 }
@@ -391,7 +391,7 @@ impl Iterator for ClientConnection {
                     let writer = self.sink.next().unwrap();
                     let response = Response::empty(StatusCode(408));
                     response
-                        .raw_print(writer, HttpVersion(1, 1), &[], false)
+                        .raw_print(writer, HttpVersion(1, 1), false)
                         .ok();
                     return None; // closing the connection
                 }
@@ -400,7 +400,7 @@ impl Iterator for ClientConnection {
                     let writer = self.sink.next().unwrap();
                     let response = Response::empty(status);
                     response
-                        .raw_print(writer, HttpVersion(1, 1), &[], false)
+                        .raw_print(writer, HttpVersion(1, 1), false)
                         .ok();
                     return None; // the head is unbounded from here; close
                 }
@@ -408,14 +408,14 @@ impl Iterator for ClientConnection {
                 Err(ReadError::AmbiguousFraming(ver)) => {
                     let writer = self.sink.next().unwrap();
                     let response = Response::empty(StatusCode(400));
-                    response.raw_print(writer, ver, &[], false).ok();
+                    response.raw_print(writer, ver, false).ok();
                     return None; // we cannot know where the body ends, so close
                 }
 
                 Err(ReadError::ExpectationFailed(ver)) => {
                     let writer = self.sink.next().unwrap();
                     let response = Response::empty(StatusCode(417));
-                    response.raw_print(writer, ver, &[], true).ok();
+                    response.raw_print(writer, ver, true).ok();
                     return None; // TODO: should be recoverable, but needs handling in case of body
                 }
 

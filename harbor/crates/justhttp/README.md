@@ -68,15 +68,16 @@ security regression, not a flake.
    exactly one `chunked` are all `400` and a close. Each is a
    request-smuggling primitive: whenever this server and a proxy in front
    of it can resolve a request differently, they eventually will.
-6. **`TE` does not choose the server's buffering.** An unknown-length
-   response is always chunked on HTTP/1.1, whatever the client's `TE`
-   says. Identity framing has to read the whole body to discover its
-   length, so honoring `TE: identity` handed control of this process's
-   memory to the caller — measured at +316 MB of RSS from adding one
-   header to one query. (RFC 7230 dropped `identity` from `TE` anyway.)
-   HTTP/1.0, which has no chunked encoding, streams an unknown length to
-   the connection close instead of buffering it, and `conn.rs` closes
-   after every 1.0 request so that delimiter always arrives.
+6. **The client does not choose the server's buffering.** A response's
+   framing follows from its version, status and length alone; a request's
+   `TE` header is not consulted. An unknown-length response is always
+   chunked on HTTP/1.1: identity framing would have to read the whole
+   body to learn its length, and a header that could ask for it would add
+   a result's size to this process's memory (+316 MB of RSS on one
+   streamed query). HTTP/1.0, which has no chunked encoding, streams an
+   unknown length to the connection close instead of buffering it, and
+   `conn.rs` closes after every 1.0 request so that delimiter always
+   arrives.
 7. **Connection idle clocks.** A connection that has never sent a byte is
    closed after 60 s. Once it has served one request it is a keep-alive
    client and gets 5 minutes between requests — far longer than any pooled
