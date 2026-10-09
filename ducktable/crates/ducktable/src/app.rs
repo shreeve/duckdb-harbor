@@ -690,10 +690,10 @@ impl DuckTable {
             })
     }
 
-    /// The user chose to quit: give back every session this window holds,
-    /// so the server ends what runs on them at once instead of at their
-    /// timeouts. They are the Query view's transaction, open or still
-    /// opening, and the grid's commit in flight. Each release is one
+    /// The app is ending (`on_app_quit`): give back every session this
+    /// window holds, so the server ends what runs on them at once instead
+    /// of at their timeouts. They are the Query view's transaction, open or
+    /// still opening, and the grid's commit in flight. Each release is one
     /// request; they run side by side, and the quit waits for them briefly
     /// and no longer, since the server reclaims an abandoned session itself.
     pub(crate) fn release_for_quit(&mut self, cx: &mut Context<Self>) {

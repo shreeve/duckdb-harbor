@@ -350,13 +350,12 @@ fn request_leave(leaving: app::Leaving, window: &mut Window, cx: &mut App) {
 }
 
 /// Do what was asked about, or needed no asking: end the app, or leave a
-/// database through the view.
+/// database through the view. Ending the app gives back the window's
+/// sessions on the way out (`on_app_quit`), as every way out does; a
+/// relaunch with no update waiting ends nothing, and keeps them.
 fn go_ahead(view: &Entity<DuckTable>, leaving: app::Leaving, window: &mut Window, cx: &mut App) {
     match leaving {
-        app::Leaving::Quit | app::Leaving::Relaunch => {
-            view.update(cx, |this, cx| this.release_for_quit(cx));
-            leave(leaving, cx);
-        }
+        app::Leaving::Quit | app::Leaving::Relaunch => leave(leaving, cx),
         leaving => view.update(cx, |this, cx| this.go_ahead(leaving, window, cx)),
     }
 }
