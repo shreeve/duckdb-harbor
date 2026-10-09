@@ -19,7 +19,7 @@ DuckTable (Rust + GPUI, one macOS app bundle)
     |  HTTP over a local socket or IPv4 loopback TCP
     |  optional app-owned OpenSSH local forward
     v
-DuckDB Harbor 0.39 or later (required; owns engine, files, versions)
+DuckDB Harbor 0.44.2 or later (required; owns engine, files, versions)
     |
     v
 DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
@@ -28,6 +28,10 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
 - **Harbor is required, not optional.** The client never links DuckDB and
   never sees a database file's contents. FFI, engine version lock, WAL
   handling and checkpoint hazards are Harbor's job, not the client's.
+  DuckTable reads a `COMMIT`'s answer as Harbor 0.44.2 gives it: a `COMMIT`
+  of an aborted transaction is rolled back and answered `400` saying so, and
+  a `COMMIT` runs to its answer, so a `499` means nothing was kept. Older
+  servers answer neither way, and DuckTable requires that one or later.
 - **A berth is a file on this machine or a named remote.** Connection works
   the way `harbor`'s own does: a local database is dialed by its file, whose
   server Harbor's socket discovery finds and opening it spawns on demand, and

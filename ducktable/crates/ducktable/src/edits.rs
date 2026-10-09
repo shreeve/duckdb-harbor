@@ -167,6 +167,46 @@ pub fn handoff(mine: Option<&Edits>, has_columns: bool, stash: &Edits) -> Handof
     }
 }
 
+/// What a COMMIT's answer says of its transaction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CommitOutcome {
+    /// Harbor acknowledged it: everything since BEGIN is in the database.
+    Landed,
+    /// Nothing since BEGIN is in the database.
+    NotLanded,
+    /// The answer says nothing of the outcome: the server may have
+    /// committed, or may be committing still.
+    InDoubt,
+}
+
+/// Read the answer to a COMMIT sent on a session, `None` being success.
+/// The grid's commit and the Query view judge it by this one rule.
+///
+/// Not landed: a COMMIT that could not be sent; one Harbor refused before
+/// the engine saw it (the session gone, busy, or the server not serving),
+/// which the release of the session rolls back; one the engine refused,
+/// `400 sql_error`, Harbor's answer too for a COMMIT of a transaction an
+/// earlier error aborted, which it rolls back and says so; and a `499
+/// cancelled`, since a COMMIT runs to its answer and a cancel lands before
+/// it starts or not at all (Harbor 0.44.2, the floor DuckTable requires).
+/// In doubt: no answer, Harbor's `500 internal`, which it sends for a
+/// statement the engine had already run, and any code this client does not
+/// know, since nothing is assumed not to have run.
+pub fn commit_outcome(failure: Option<&harbor_client::Failure>) -> CommitOutcome {
+    use harbor_client::Failure;
+    match failure {
+        None => CommitOutcome::Landed,
+        Some(Failure::Unsent(_)) => CommitOutcome::NotLanded,
+        Some(Failure::Unanswered(_)) => CommitOutcome::InDoubt,
+        Some(Failure::Refused { code, .. }) => match code.as_str() {
+            "sql_error" | "cancelled" | "bad_request" | "not_found" | "forbidden" | "body_too_large"
+            | "no_such_session" | "session_busy" | "query_id_in_use" | "no_lease_connections"
+            | "no_lease_available" | "unavailable" | "unready" => CommitOutcome::NotLanded,
+            _ => CommitOutcome::InDoubt,
+        },
+    }
+}
+
 /// A row identity's map key: its canonical JSON. Values compare by
 /// serialization, which is exactly the equality the wire speaks.
 pub fn key_of(identity: &[Value]) -> String {
@@ -2729,6 +2769,30 @@ mod tests {
         e.stage_duplicate(vec![json!(5)], vec![(1, txt("Ada"), Bind::Source)]);
         let labels: Vec<_> = e.entries().iter().map(|(_, identity, _)| e.source_label(identity)).collect();
         assert_eq!(labels, vec![None, Some("copy of id = 5".to_string())]);
+    }
+
+    #[test]
+    fn a_commits_answer_says_it_landed_did_not_or_may_have() {
+        use harbor_client::Failure;
+        let refused = |code: &str| Failure::Refused { code: code.into(), message: "m".into() };
+        assert_eq!(commit_outcome(None), CommitOutcome::Landed);
+        // Never sent, refused before the engine saw it, refused by the
+        // engine (a rolled-back COMMIT of an aborted transaction among
+        // them), or cancelled before it started: nothing was kept.
+        assert_eq!(commit_outcome(Some(&Failure::Unsent("refused".into()))), CommitOutcome::NotLanded);
+        for code in [
+            "sql_error", "cancelled", "no_such_session", "session_busy", "unavailable", "unready",
+            "bad_request", "forbidden", "body_too_large", "not_found", "query_id_in_use",
+            "no_lease_connections", "no_lease_available",
+        ] {
+            assert_eq!(commit_outcome(Some(&refused(code))), CommitOutcome::NotLanded, "{code}");
+        }
+        // No answer, an error after the engine ran it, or a code this client
+        // does not know: it may have landed.
+        assert_eq!(commit_outcome(Some(&Failure::Unanswered("timed out".into()))), CommitOutcome::InDoubt);
+        for code in ["internal", "response_too_large", "some_later_code"] {
+            assert_eq!(commit_outcome(Some(&refused(code))), CommitOutcome::InDoubt, "{code}");
+        }
     }
 
     #[test]

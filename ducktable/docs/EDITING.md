@@ -411,11 +411,17 @@ the keyboard and from the review popover's button alike.
 
 One failure cannot be read as "nothing landed": the `COMMIT` request sent and
 left unanswered, by a timeout or a dropped tunnel. The server may have
-committed before the answer was lost, or may be committing still. An error
-Harbor reports for the `COMMIT` is a verdict, not a doubt: the engine refused
-it or the session was gone, and the transaction is rolled back. So is a
-`COMMIT` that could not be sent at all, because the connection could not be
-made: it did nothing, and the edits are kept as after any failure.
+committed before the answer was lost, or may be committing still. Harbor's
+`internal` error is read the same way, since Harbor sends it about a statement
+the engine had already run, and so is any code DuckTable does not know. Every
+other error Harbor reports for the `COMMIT` is a verdict, not a doubt, and the
+transaction is rolled back: the engine refused it, the session was gone or
+busy, the transaction had been aborted by an earlier error (Harbor rolls it
+back and says so), or the commit was cancelled, which Harbor answers only
+before a `COMMIT` starts. So is a `COMMIT` that could not be sent at all,
+because the connection could not be made: it did nothing, and the edits are
+kept as after any failure. The grid and the Query view read a `COMMIT`'s
+answer by the same rule (`edits::commit_outcome`).
 
 After an unanswered `COMMIT`:
 

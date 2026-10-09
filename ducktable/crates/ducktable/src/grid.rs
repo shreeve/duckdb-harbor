@@ -4626,20 +4626,15 @@ fn run_statements(conn: &Conn, sid: &str, stmts: &[edits::Statement]) -> Result<
     Ok(())
 }
 
-/// Read the answer to the COMMIT request. An error Harbor reports is a
-/// verdict: the engine refused the commit, or the session was gone, and
-/// either way the transaction is rolled back. A request that could not be
-/// sent did nothing, and releasing the session rolls its transaction back.
-/// Anything else — a timeout, a dropped tunnel, an answer cut short — came
-/// after the request was sent, and says nothing about whether the server
-/// committed first.
+/// Read the answer to the COMMIT request (`edits::commit_outcome`), with
+/// the words the status line gives it.
 fn commit_verdict(answer: Result<harbor_client::QueryResult, harbor_client::Failure>) -> Committed {
-    use harbor_client::Failure;
-    match answer {
-        Ok(_) => Committed::Landed,
-        Err(refused @ Failure::Refused { .. }) => Committed::Refused(refused.to_string()),
-        Err(Failure::Unsent(message)) => Committed::Refused(message),
-        Err(Failure::Unanswered(message)) => Committed::InDoubt(message),
+    let failure = answer.err();
+    let message = failure.as_ref().map(ToString::to_string).unwrap_or_default();
+    match edits::commit_outcome(failure.as_ref()) {
+        edits::CommitOutcome::Landed => Committed::Landed,
+        edits::CommitOutcome::NotLanded => Committed::Refused(message),
+        edits::CommitOutcome::InDoubt => Committed::InDoubt(message),
     }
 }
 
@@ -5154,6 +5149,12 @@ mod tests {
         );
         let gone = Failure::Refused { code: "no_such_session".into(), message: "no such session".into() };
         assert!(matches!(commit_verdict(Err(gone)), Committed::Refused(_)));
+        // A cancel lands before a COMMIT starts or not at all.
+        let cancelled = Failure::Refused { code: "cancelled".into(), message: "cancelled".into() };
+        assert!(matches!(commit_verdict(Err(cancelled)), Committed::Refused(_)));
+        // Harbor's internal error comes after the engine ran the statement.
+        let internal = Failure::Refused { code: "internal".into(), message: "recovered".into() };
+        assert_eq!(commit_verdict(Err(internal)), Committed::InDoubt("internal: recovered".into()));
         // A COMMIT that could not be sent did nothing: there is no doubt.
         let unsent = "query: Connection refused (os error 61)";
         assert_eq!(commit_verdict(Err(Failure::Unsent(unsent.into()))), Committed::Refused(unsent.into()));
