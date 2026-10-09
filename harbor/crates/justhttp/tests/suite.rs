@@ -461,6 +461,35 @@ mod head {
         }
     }
 
+    /// A drain cut short by a stalled client — a read that times out before
+    /// the declared length arrives — ends the connection too: the rest of
+    /// the declared body, sent after the stall, is not a request.
+    #[test]
+    fn a_body_stalled_past_the_read_timeout_is_never_parsed_as_a_request() {
+        let (server, mut client) = support::new_one_server_one_client();
+        let answered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let urls = answered.clone();
+        std::thread::spawn(move || {
+            while let Ok(Some(rq)) = server.recv_timeout(std::time::Duration::from_secs(15)) {
+                urls.lock().unwrap().push(rq.url().to_string());
+                let _ = rq.respond(justhttp::Response::empty(404));
+            }
+        });
+        write!(client, "POST /nope HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2000\r\n\r\n")
+            .unwrap();
+        client.write_all(&[b'x'; 1500]).unwrap();
+        // Past the server's 5 s read timeout, so the drain's read fails.
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        let _ = write!(client, "GET /smuggled HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+        client.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        let mut content = Vec::new();
+        let _ = client.read_to_end(&mut content);
+        let content = String::from_utf8_lossy(&content);
+        assert_eq!(content.matches("HTTP/1.1").count(), 1, "got {content:?}");
+        assert_eq!(*answered.lock().unwrap(), ["/nope"]);
+    }
+
     /// `TE: identity` must not be able to turn a streamed response into a
     /// buffered one. `raw_print` discovers an unknown length by reading the
     /// whole body, so honoring this header hands control of the server's

@@ -549,49 +549,35 @@ mod equal_reader {
         R: Read,
     {
         fn drop(&mut self) {
-            // THE BOUNDED DRAIN (one of the hardening behaviors this crate carries,
-            // with a regression test in tests/drain.rs): a fixed 64 KiB buffer instead
-            // of `vec![0; remaining_to_read]`. The
-            // remaining size is the client's *declared* Content-Length minus what
-            // was read — attacker-chosen and unbounded — so the upstream code let
-            // a request declaring 1 GB and sending 9 bytes cost
-            // this process a 1 GB zeroed allocation per connection at drop time,
-            // no matter what the server responded. Measured live before the
-            // patch: 6 such requests drove RSS from 22 MB to 2.2 GB.
-            //
-            // AND BOUNDED IN TIME, which the buffer alone was not: the loop
-            // followed the declared length to the end, so a client dribbling a
-            // byte at a time kept it running indefinitely on the handler's own
-            // thread. `DRAIN_TIMEOUT` is the ceiling on how long a body nobody
-            // asked for may hold that thread.
+            // THE BOUNDED DRAIN (a hardening behavior with a regression test
+            // in tests/drain.rs). What is left is the client's *declared*
+            // length minus what was read: attacker-chosen and unbounded. So
+            // it streams through a fixed 64 KiB buffer, never one sized by
+            // the declaration (one sized by it lets a request declaring 1 GB
+            // and sending 9 bytes cost a 1 GB allocation; six took RSS from
+            // 22 MB to 2.2 GB), and for at most `DRAIN_TIMEOUT`, because a
+            // client dribbling a byte at a time would otherwise hold the
+            // handler's thread for as long as it liked.
             let mut remaining_to_read = self.size;
             let mut buf = [0u8; 65536];
             let deadline = Instant::now() + DRAIN_TIMEOUT;
 
-            while remaining_to_read > 0 {
-                if Instant::now() >= deadline {
-                    // Out of patience with a body still arriving. The stream is
-                    // now at an offset neither side agrees on, and the bytes
-                    // still to come would be read as the next request line on
-                    // this connection — a request the client never sent and the
-                    // server would answer. Ending the connection is the only
-                    // safe close: shutting the read side down turns every later
-                    // read into EOF, so `ClientConnection::next` stops rather
-                    // than parsing whatever arrives next.
-                    if let Some(socket) = &self.socket {
-                        socket.end();
-                    }
-                    break;
-                }
+            while remaining_to_read > 0 && Instant::now() < deadline {
                 let want = remaining_to_read.min(buf.len());
-
                 match self.reader.read(&mut buf[..want]) {
-                    // an error or EOF ends the drain — a half-closed socket
-                    // must not spin here
+                    // EOF or an error ends the drain: a half-closed socket
+                    // must not spin here.
                     Err(_) | Ok(0) => break,
-                    Ok(other) => {
-                        remaining_to_read -= other;
-                    }
+                    Ok(n) => remaining_to_read -= n,
+                }
+            }
+
+            // A body not drained to its end leaves the stream at an offset
+            // neither side agrees on: whatever the client sends next would be
+            // read as a request it never sent. So the connection ends.
+            if remaining_to_read > 0 {
+                if let Some(socket) = &self.socket {
+                    socket.end();
                 }
             }
         }

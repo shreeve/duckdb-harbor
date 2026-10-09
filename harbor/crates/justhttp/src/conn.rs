@@ -61,6 +61,11 @@ const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// again every five minutes instead of being taken once and kept.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long an ended connection keeps reading what the client still sends
+/// before it closes (see `ClientConnection::linger`). A single read may
+/// overrun it by up to the socket's read timeout.
+const LINGER: Duration = Duration::from_secs(2);
+
 /// A socket read timeout, as opposed to a real I/O failure. macOS reports
 /// `SO_RCVTIMEO` as `WouldBlock` and Linux as `TimedOut`; both mean "nothing
 /// arrived in the window", which is a decision point rather than an error.
@@ -216,6 +221,7 @@ impl ClientConnection {
                 // byte, since a read only gets its turn on the stream once
                 // that request's body reader is gone.
                 if self.socket.ended() {
+                    self.linger();
                     return Err(ReadError::ReadIoError(IoError::new(
                         ErrorKind::ConnectionAborted,
                         "the connection was ended mid-body",
@@ -242,6 +248,22 @@ impl ClientConnection {
             buf.push(byte);
             if buf.len() > MAX_LINE {
                 return Err(ReadError::HeadTooLarge(too_large));
+            }
+        }
+    }
+
+    /// Reads and discards what the client still sends, until it closes or
+    /// for at most `LINGER`, before an ended connection closes. Closing a
+    /// socket with unread data resets it, and the reset can destroy a
+    /// response the client has not read yet (RFC 9112 §9.6).
+    fn linger(&mut self) {
+        let until = Instant::now() + LINGER;
+        let mut scratch = [0u8; 4096];
+        while Instant::now() < until {
+            match self.next_header_source.read(&mut scratch) {
+                Ok(0) => break,
+                Err(e) if !is_read_timeout(&e) => break,
+                _ => (),
             }
         }
     }

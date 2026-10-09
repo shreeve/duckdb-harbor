@@ -232,17 +232,20 @@ mod refined {
     }
 
     impl Socket {
-        /// Ends the connection once the request being answered is done.
+        /// Ends the connection after a request whose body was abandoned
+        /// part-way. Called once that request is answered, as it drops.
         ///
-        /// For a body abandoned part-way: the stream sits at an offset
-        /// neither side agrees on, and the bytes still to come — already in
-        /// the connection's buffer, or still arriving — would otherwise be
-        /// parsed as the next request, a request the client never sent.
-        /// `ClientConnection` parses nothing after this, and the read side
-        /// is shut down so a reader waiting on the socket sees EOF.
+        /// The stream sits at an offset neither side agrees on, and the bytes
+        /// still to come — already in the connection's buffer, or still
+        /// arriving — would otherwise be parsed as the next request, a
+        /// request the client never sent. `ClientConnection` parses nothing
+        /// after this. The write side is shut down here, so the client sees
+        /// the end of the connection right after its response and closes
+        /// its own side, which is what lets the connection thread stop
+        /// reading.
         pub(crate) fn end(&self) {
             self.ended.store(true, Ordering::Release);
-            self.conn.shutdown(Shutdown::Read).ok();
+            self.conn.shutdown(Shutdown::Write).ok();
         }
 
         pub(crate) fn ended(&self) -> bool {
