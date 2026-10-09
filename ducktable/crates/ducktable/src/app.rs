@@ -1,21 +1,22 @@
 //! The root entity: connection state and its lifecycle rules.
 //!
-//! Every mutation of phase or attempt lives here. The rendering files
-//! (`sidebar.rs`, `content.rs`) read this state and call back into these
-//! methods; they never mutate it themselves. The attempt counter is the
-//! fence: a late completion compares its fence and discards itself.
+//! Every mutation of the phase and its fences lives here. The rendering
+//! files (`sidebar.rs`, `content.rs`) read this state and call back into
+//! these methods; they never mutate it themselves. The fences are counters
+//! (the connect attempt, the connection, the table selection, the
+//! refreshes): a late completion compares its own and discards itself.
 
 use crate::util::clone_str;
 use gpui_kit::*;
 use harbor_client::{fleet, Conn, State};
 
 fn catalog_refresh_is_current(
-    current_attempt: u64,
+    current_connection: u64,
     current_refresh: u64,
-    fenced_attempt: u64,
+    fenced_connection: u64,
     fenced_refresh: u64,
 ) -> bool {
-    current_attempt == fenced_attempt && current_refresh == fenced_refresh
+    current_connection == fenced_connection && current_refresh == fenced_refresh
 }
 
 /// A child surface finished work that may have changed any table. The root
@@ -376,7 +377,13 @@ pub(crate) enum Phase {
 pub struct DuckTable {
     pub(crate) rows: Vec<RowVm>,
     pub(crate) phase: Phase,
-    pub(crate) attempt: u64,
+    /// The connect fence: bumped by every connect and every cancel, so a
+    /// connect that lands late discards itself.
+    attempt: u64,
+    /// Which connection is on screen: bumped at every phase change, so a
+    /// catalog refresh of one that has gone discards itself. A connect
+    /// called off leaves it as it was.
+    connection: u64,
     pub(crate) selected_table: Option<(String, String)>,
     pub(crate) grid: Option<Entity<crate::grid::Grid>>,
     /// A connect in flight (berth name). The current phase keeps rendering
@@ -502,6 +509,7 @@ impl DuckTable {
             rows: Vec::new(),
             phase: Phase::Idle,
             attempt: 0,
+            connection: 0,
             selected_table: None,
             grid: None,
             connecting: None,
@@ -635,7 +643,9 @@ impl DuckTable {
     pub(crate) fn quit_dialog_opened(&mut self, cx: &mut Context<Self>) {
         self.asking_to_quit = true;
         self.called_off = self.connecting_aim.take();
-        self.cancel(cx);
+        if self.called_off.is_some() {
+            self.cancel(cx);
+        }
     }
 
     /// The one dialog was cancelled. What waited for it runs (`resume`).
@@ -965,7 +975,7 @@ impl DuckTable {
             _ => return,
         };
         self.catalog_seq += 1;
-        let attempt = self.attempt;
+        let connection = self.connection;
         let refresh = self.catalog_seq;
         cx.spawn(async move |this, cx| {
             let outcome = cx
@@ -973,7 +983,7 @@ impl DuckTable {
                 .spawn(async move { harbor_client::catalog(&conn) })
                 .await;
             this.update(cx, |state, cx| {
-                if !catalog_refresh_is_current(state.attempt, state.catalog_seq, attempt, refresh) {
+                if !catalog_refresh_is_current(state.connection, state.catalog_seq, connection, refresh) {
                     return;
                 }
                 match outcome {
@@ -1401,6 +1411,7 @@ impl DuckTable {
                 state.query = None;
                 state.deferred_select = None;
                 state.select_seq += 1;
+                state.connection += 1;
                 state.phase = match outcome {
                     Ok((conn, info, catalog)) => Phase::Connected { conn, info, catalog },
                     Err(message) => Phase::Failed { name: clone_str(&shown), message, aim },
@@ -1478,6 +1489,7 @@ impl DuckTable {
     /// catalog or query with a raw OS error.
     fn drop_connection(&mut self, cx: &mut Context<Self>) {
         self.park_grid(cx);
+        self.connection += 1;
         self.phase = Phase::Idle;
         self.selected_table = None;
         self.query = None;
