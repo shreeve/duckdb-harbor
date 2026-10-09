@@ -355,6 +355,9 @@ pub(crate) enum Aim {
     Row { name: String, path: Option<std::path::PathBuf> },
     /// File → Open, or a drop: the path alone.
     File(std::path::PathBuf),
+    /// File → Open Database URL: the name to save the address under, and
+    /// the address. Dialed again, it saves again (`add_database`).
+    Url { name: String, host: String, port: String },
 }
 
 pub(crate) enum Phase {
@@ -658,6 +661,7 @@ impl DuckTable {
         match aim {
             Aim::Row { name, path } => self.connect_row(name, path, cx),
             Aim::File(path) => self.open_path(path, cx),
+            Aim::Url { name, host, port } => self.add_database(name, host, port, cx),
         }
     }
 
@@ -1279,22 +1283,25 @@ impl DuckTable {
         active_key(self.connecting_key.as_ref(), connected.as_ref()) == Some(&row.key)
     }
 
-    /// File → Open Database URL: persist the named port, then connect
-    /// through the same path a sidebar click uses. A failed dial still leaves
-    /// the database saved so Retry has something durable to target.
-    pub(crate) fn add_database(
-        &mut self,
-        name: String,
-        host: String,
-        port: String,
-        cx: &mut Context<Self>,
-    ) {
+    /// File → Open Database URL: save the address under its name, then
+    /// connect to it as its sidebar row would. Dialed again (Retry, or
+    /// Cancel on the one dialog that called it off), it saves again: an
+    /// earlier dial may have saved it already, since the save runs to its
+    /// end whatever becomes of the dial.
+    fn add_database(&mut self, name: String, host: String, port: String, cx: &mut Context<Self>) {
         let shown = harbor_client::paths::normalize(&name).unwrap_or(name);
+        let aim = Aim::Url { name: clone_str(&shown), host: clone_str(&host), port: clone_str(&port) };
         self.dial(
             clone_str(&shown),
-            Aim::Row { name: clone_str(&shown), path: None },
+            aim,
             move || {
-                let name = fleet::add_database(&shown, &host, &port)?;
+                // The name was free when the dialog checked it, so a name
+                // taken since is this address, saved by an earlier dial of
+                // this aim; a config refused is refused to the connect too.
+                let name = match fleet::validate_database(&shown, &host, &port) {
+                    Ok(()) => fleet::add_database(&shown, &host, &port)?,
+                    Err(_) => shown,
+                };
                 let conn = fleet::connect_remote(&name)?;
                 let info = fleet::info(&conn)?;
                 let catalog = harbor_client::catalog(&conn)?;
@@ -1302,6 +1309,12 @@ impl DuckTable {
             },
             cx,
         );
+    }
+
+    /// File → Open Database URL's OK: open the address, asking first when
+    /// leaving the connected database would lose something.
+    pub(crate) fn open_url(&mut self, name: String, host: String, port: String, cx: &mut Context<Self>) {
+        crate::leave_asking(self.switch_to(Aim::Url { name, host, port }), cx);
     }
 
     /// Forget a port-based database and close its tunnel if it is the one on
@@ -1347,6 +1360,7 @@ impl DuckTable {
         self.connecting_key = Some(match &aim {
             Aim::Row { name, path } => self.key_of(name, path.as_deref()),
             Aim::File(path) => self.key_of("", Some(path)),
+            Aim::Url { name, .. } => DbKey::Remote(clone_str(name)),
         });
         self.connecting_aim = Some(aim.clone());
         // A file opened by one spelling of its path may have a row under
@@ -1354,7 +1368,7 @@ impl DuckTable {
         // canonical path, which is read off this thread.
         let opened = match &aim {
             Aim::File(path) => Some(path.clone()),
-            Aim::Row { .. } => None,
+            Aim::Row { .. } | Aim::Url { .. } => None,
         };
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -1631,6 +1645,10 @@ mod tests {
         assert_eq!(after_quit_dialog(Some(row.clone()), None), Resume::Dial(row.clone()));
         let file = Aim::File("/tmp/x.duckdb".into());
         assert_eq!(after_quit_dialog(Some(file.clone()), None), Resume::Dial(file));
+        // An Open Database URL dial is dialed again as itself: it saves the
+        // address again, not a plain connect to a name that may not be saved.
+        let url = Aim::Url { name: "prod".into(), host: "db.example".into(), port: "9495".into() };
+        assert_eq!(after_quit_dialog(Some(url.clone()), None), Resume::Dial(url));
         // A table switch that waited under it runs.
         assert_eq!(
             after_quit_dialog(None, switch.clone()),

@@ -263,8 +263,8 @@ fn app_menus(can_update: bool) -> Vec<Menu> {
 /// Query statement still in flight, a transaction open in the Query view.
 /// ⌘Q, the menu's Quit and the window's close button all come here, and so
 /// does the updater's Install and Relaunch, which quits too; so do a row
-/// click, Open Database File and a dropped file while another database is
-/// connected, and the sidebar's Stop and Remove Database.
+/// click, Open Database File or URL and a dropped file while another
+/// database is connected, and the sidebar's Stop and Remove Database.
 ///
 /// The dialog is the app's own, not the platform's alert, because Cancel
 /// has to be its default. Measured on the alert GPUI builds: a first button

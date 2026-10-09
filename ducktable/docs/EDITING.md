@@ -585,8 +585,8 @@ whose second Install and Relaunch would not wait.
 The same dialog asks before a database is left with something at stake on
 it, and only the facts that concern that database are listed:
 
-- **Choosing another database** (a sidebar row, Open Database File, a dropped
-  file) parks its staged and held changes for its return, so they are
+- **Choosing another database** (a sidebar row, Open Database File or URL, a
+  dropped file) parks its staged and held changes for its return, so they are
   no reason to ask. It asks when leaving would end something: a transaction
   open in the Query view, which it rolls back, a statement running there, or
   a commit in flight, whose changes are then held for the database's return.

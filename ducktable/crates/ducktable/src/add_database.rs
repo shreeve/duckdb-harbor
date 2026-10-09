@@ -86,9 +86,7 @@ pub(crate) fn open(view: WeakEntity<DuckTable>, window: &mut Window, cx: &mut Ap
                             return false;
                         }
                         if let Some(view) = view.upgrade() {
-                            view.update(cx, |app, cx| {
-                                app.add_database(name, host, port, cx);
-                            });
+                            view.update(cx, |app, cx| app.open_url(name, host, port, cx));
                         }
                         true
                     }
