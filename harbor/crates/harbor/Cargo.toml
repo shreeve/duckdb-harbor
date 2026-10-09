@@ -16,10 +16,12 @@ justhttp = { path = "../justhttp" }
 # preserve_order: --json rows must keep column order, not alphabetize it.
 # float_roundtrip: a float param binds as the double its text names; the
 # default parser is not correctly rounded and lands some texts a ULP off.
-serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+# raw_value: a param past 64 bits is told apart by its text, whole number
+# or not (lib.rs `written_whole`).
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip", "raw_value"] }
 # IgnoredAny: the json modes check that a JSON-text cell is JSON before
 # splicing it in, without building a tree for it
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 # --- the client half (src/repl/) ---------------------------------------------
 # Pure protocol client: it never touches DuckDB. HTTP/1.1 over
 # UnixStream/TcpStream is hand-rolled because dragging an async stack in

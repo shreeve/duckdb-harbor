@@ -475,13 +475,6 @@ impl Conn {
             Param::Text(s) => {
                 call!(api, value_create_varchar_with_connection(conn, str_of(s), &mut out))
             }
-            Param::Exact { text, ty } => {
-                let ty = self.type_named(ty)?;
-                call!(api, value_create_varchar_with_connection(conn, str_of(text), &mut out));
-                let exact = cast_through(api, conn, out, &[ty]);
-                destroy_value(api, out);
-                out = exact?;
-            }
             Param::Document { text, variant } => {
                 call!(api, value_create_varchar_with_connection(conn, str_of(text), &mut out));
                 // The text is a document, and the engine reads text cast to
@@ -985,57 +978,6 @@ pub enum Param {
     /// aims it at a VARIANT ([`Conn::bind`]), where it is bound as
     /// the document; anywhere else it is bound as the text, a VARCHAR.
     Document { text: String, variant: bool },
-    /// A number no i64, u64 or double holds exactly: its text, cast to the
-    /// type a SQL literal of the same digits takes ([`Param::number`]).
-    Exact { text: String, ty: String },
-}
-
-impl Param {
-    /// A JSON number, from its text, as the param that holds it exactly. A
-    /// whole number is an I64 or a U64 where it fits and past that the
-    /// HUGEINT or BIGNUM a SQL literal of its digits is. A number with an
-    /// exponent is a double, as in SQL, and so is a fraction whose double
-    /// reads back as the same number, which is what every encoder sends for
-    /// a double. A fraction with more digits than a double holds is the
-    /// DECIMAL a SQL literal of it is; past DECIMAL's 38 digits, where SQL
-    /// would round it to a double, it is refused.
-    pub fn number(text: &str) -> Result<Param, String> {
-        if let Ok(i) = text.parse() {
-            return Ok(Param::I64(i));
-        }
-        if let Ok(u) = text.parse() {
-            return Ok(Param::U64(u));
-        }
-        let f: f64 = text.parse().map_err(|_| format!("{text} is not a number"))?;
-        if text.contains(['e', 'E']) {
-            return Ok(Param::F64(f));
-        }
-        let Some((whole, fraction)) = text.split_once('.') else {
-            let ty = if text.parse::<i128>().is_ok() { "HUGEINT" } else { "BIGNUM" };
-            return Ok(Param::Exact { text: text.into(), ty: ty.into() });
-        };
-        if same_number(text, &f.to_string()) {
-            return Ok(Param::F64(f));
-        }
-        let width = whole.trim_start_matches('-').trim_start_matches('0').len() + fraction.len();
-        if width > 38 {
-            return Err(format!(
-                "{text} has more digits than a DECIMAL holds; send it as a string for the statement to cast"
-            ));
-        }
-        Ok(Param::Exact { text: text.into(), ty: format!("DECIMAL({width},{})", fraction.len()) })
-    }
-}
-
-/// Whether two decimal texts with no exponent name the same number.
-fn same_number(a: &str, b: &str) -> bool {
-    fn parts(t: &str) -> (bool, &str, &str) {
-        let (negative, t) = t.strip_prefix('-').map_or((false, t), |t| (true, t));
-        let (whole, fraction) = t.split_once('.').unwrap_or((t, ""));
-        let (whole, fraction) = (whole.trim_start_matches('0'), fraction.trim_end_matches('0'));
-        (negative && !(whole.is_empty() && fraction.is_empty()), whole, fraction)
-    }
-    parts(a) == parts(b)
 }
 
 /// `value` cast to each type in turn, as a value of its own; `value` and the

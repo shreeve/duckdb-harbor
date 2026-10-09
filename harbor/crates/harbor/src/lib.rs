@@ -2067,7 +2067,11 @@ fn parse_request(body: &str) -> Result<SqlRequest, String> {
     }
     let params = match v.get("params") {
         None | Some(serde_json::Value::Null) => Vec::new(),
-        Some(serde_json::Value::Array(a)) => a.iter().map(json_to_duckdb).collect::<Result<_, _>>()?,
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .enumerate()
+            .map(|(i, param)| json_to_duckdb(param, || written_whole(body, i)))
+            .collect::<Result<_, _>>()?,
         Some(_) => return Err("\"params\" must be an array".to_string()),
     };
     let session = match v.get("sessionId") {
@@ -2110,22 +2114,29 @@ fn parse_request(body: &str) -> Result<SqlRequest, String> {
     Ok(SqlRequest { sql, params, session, query, timeout })
 }
 
-fn json_to_duckdb(v: &serde_json::Value) -> Result<Param, String> {
+/// One JSON param as the value it binds. `whole` says whether the param was
+/// written as a whole number, asked only of one past what 64 bits hold.
+fn json_to_duckdb(v: &serde_json::Value, whole: impl FnOnce() -> bool) -> Result<Param, String> {
     Ok(match v {
         serde_json::Value::Null => Param::Null,
         serde_json::Value::Bool(b) => Param::Bool(*b),
         serde_json::Value::String(s) => Param::Text(s.clone()),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Param::I64(i)
-            } else if let Some(u) = n.as_u64() {
-                Param::U64(u)
-            } else if let Some(f) = n.as_f64() {
-                Param::F64(f)
-            } else {
-                return Err("unrepresentable number in \"params\"".to_string());
+        // A fraction or an exponent binds as the double its text names, as
+        // in SQL. A whole number past i64 and u64 reads as the nearest
+        // double, a different number, so it is refused rather than stored
+        // as one: JSON numbers do not carry it exactly through most clients
+        // either, and a string cast in the statement does.
+        serde_json::Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
+            (Some(i), _, _) => Param::I64(i),
+            (_, Some(u), _) => Param::U64(u),
+            (_, _, Some(f)) if f.fract() == 0.0 && f.abs() >= 9_223_372_036_854_775_808.0 && whole() => {
+                return Err("a whole number param past what 64 bits hold would bind as a different \
+                            number: send it as a string and cast it in the statement, as ?::HUGEINT"
+                    .to_string());
             }
-        }
+            (_, _, Some(f)) => Param::F64(f),
+            _ => return Err("unrepresentable number in \"params\"".to_string()),
+        },
         // An object or an array is a document. Aimed at a VARIANT it is bound
         // as one (`Conn::bind`); everywhere else it has no SQL type of
         // its own and goes as its JSON text, for the statement to cast. A
@@ -2136,6 +2147,19 @@ fn json_to_duckdb(v: &serde_json::Value) -> Result<Param, String> {
         }
         _ => return Err(too_deep()),
     })
+}
+
+/// Whether param `i` of `body` is written as a whole number: no fraction and
+/// no exponent. The parsed value cannot say, since a whole number past 64
+/// bits parses to a double; the text can.
+fn written_whole(body: &str, i: usize) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Params<'a> {
+        #[serde(borrow)]
+        params: Vec<&'a serde_json::value::RawValue>,
+    }
+    serde_json::from_str::<Params>(body)
+        .is_ok_and(|p| p.params.get(i).is_some_and(|raw| !raw.get().contains(['.', 'e', 'E'])))
 }
 
 fn too_deep() -> String {
@@ -4563,6 +4587,23 @@ mod tests {
         // A string is data, however deep the JSON it spells.
         let text = request(format!("\"{}{}\"", "[".repeat(150), "]".repeat(150))).unwrap();
         assert!(matches!(text.params[..], [super::Param::Text(_)]));
+    }
+
+    /// A whole number past 64 bits is refused, not bound as the nearest
+    /// double; a double past them, written as one, binds as itself.
+    #[test]
+    fn a_number_param_binds_as_itself_or_is_refused() {
+        let request = |param: &str| super::parse_request(&format!(r#"{{"sql":"SELECT ?","params":[1, {param}]}}"#));
+        for whole in ["123456789012345678901234", "-9223372036854775809", "18446744073709551616"] {
+            assert!(request(whole).err().unwrap().contains("send it as a string"), "{whole}");
+        }
+        for (text, want) in [("1.5e30", 1.5e30), ("123456789012345678901234.0", 1.2345678901234568e23),
+            ("-976.7280889488817", -976.7280889488817), ("1e19", 1e19)] {
+            let params = request(text).unwrap().params;
+            assert!(matches!(params[1], super::Param::F64(f) if f == want), "{text}");
+        }
+        assert!(matches!(request("-9223372036854775808").unwrap().params[1], super::Param::I64(i64::MIN)));
+        assert!(matches!(request("18446744073709551615").unwrap().params[1], super::Param::U64(u64::MAX)));
     }
 
     #[test]
