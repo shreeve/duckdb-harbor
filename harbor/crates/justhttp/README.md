@@ -22,6 +22,9 @@ and license** below.
 - `request.respond(response)` — responses stream from any `Read` impl;
   unknown-length responses are framed chunked, so a client reads row one
   while the server produces row N
+- `request.peer()` — a cheap handle whose `closed()` turns true once the
+  client has closed or reset the connection, so a handler can stop work
+  nobody will read; a quiet or pipelining client is not a departure
 - Keep-alive and pipelining handled internally: requests from one
   connection are answered in order, connections are reused, and a
   half-closed socket is shut down cleanly

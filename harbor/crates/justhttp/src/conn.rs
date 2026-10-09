@@ -206,8 +206,12 @@ impl ClientConnection {
                         )));
                     }
                 },
-                Some(Err(e)) => return Err(ReadError::ReadIoError(e)),
+                Some(Err(e)) => {
+                    self.socket.depart();
+                    return Err(ReadError::ReadIoError(e));
+                }
                 None => {
+                    self.socket.depart();
                     return Err(ReadError::ReadIoError(IoError::new(
                         ErrorKind::ConnectionAborted,
                         "Unexpected EOF",
@@ -263,6 +267,23 @@ impl ClientConnection {
             match self.next_header_source.read(&mut scratch) {
                 Ok(0) => break,
                 Err(e) if !is_read_timeout(&e) => break,
+                _ => (),
+            }
+        }
+    }
+
+    /// After the last request on a connection, goes on reading until it is
+    /// answered, so that the client's departure is still seen (see
+    /// `Peer::closed`). Nothing after the last request is a request, so what
+    /// arrives is discarded. The writer is let go of first, so the
+    /// connection still closes the moment the response is done.
+    fn watch_until_answered(&mut self) {
+        let answering = self.sink.release();
+        let mut scratch = [0u8; 4096];
+        while answering.strong_count() > 0 {
+            match self.next_header_source.read(&mut scratch) {
+                Ok(0) => return self.socket.depart(),
+                Err(e) if !is_read_timeout(&e) => return self.socket.depart(),
                 _ => (),
             }
         }
@@ -358,6 +379,7 @@ impl Iterator for ClientConnection {
         // the client sent a "connection: close" header in this previous request
         //  or is using HTTP 1.0, meaning that no new request will come
         if self.no_more_requests {
+            self.watch_until_answered();
             return None;
         }
 
@@ -582,7 +604,7 @@ mod sequential {
 
     use std::sync::mpsc::channel;
     use std::sync::mpsc::{Receiver, Sender};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, Weak};
 
     use std::mem;
 
@@ -622,7 +644,7 @@ mod sequential {
     where
         W: Write + Send,
     {
-        writer: Arc<Mutex<W>>,
+        writer: Option<Arc<Mutex<W>>>,
         next_trigger: Option<Receiver<()>>,
     }
 
@@ -646,9 +668,16 @@ mod sequential {
     impl<W: Write + Send> SequentialWriterBuilder<W> {
         pub fn new(writer: W) -> SequentialWriterBuilder<W> {
             SequentialWriterBuilder {
-                writer: Arc::new(Mutex::new(writer)),
+                writer: Some(Arc::new(Mutex::new(writer))),
                 next_trigger: None,
             }
+        }
+
+        /// Lets go of the writer, so it is dropped with the last writer
+        /// already handed out; the `Weak` says whether that has happened.
+        /// No writer is handed out after this.
+        pub fn release(&mut self) -> Weak<Mutex<W>> {
+            self.writer.take().as_ref().map_or_else(Weak::new, Arc::downgrade)
         }
     }
 
@@ -683,7 +712,7 @@ mod sequential {
 
             Some(SequentialWriter {
                 trigger: next_next_trigger,
-                writer: self.writer.clone(),
+                writer: self.writer.clone()?,
                 on_finish: tx,
             })
         }

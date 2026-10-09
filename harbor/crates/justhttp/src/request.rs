@@ -91,6 +91,40 @@ pub struct Request {
 
     // true if a `100 Continue` response must be sent when `as_reader()` is called
     must_send_continue: bool,
+
+    // the connection this request arrived on
+    socket: Arc<Socket>,
+}
+
+/// Whether the client behind a request is still there; from
+/// [`Request::peer`].
+///
+/// [`closed`](Peer::closed) turns true once the connection's reader has
+/// seen the client close the connection or reset it, and stays true. It is
+/// false while the client is connected and silent, and false when the client
+/// sends more: a pipelined request is not a departure. A client that shuts
+/// down only its sending side is indistinguishable from one that closed, on
+/// TCP and on unix sockets alike (both arrive as end-of-stream before any
+/// response is written), so it reads as closed too.
+///
+/// The connection is read, and so watched, while a request is being
+/// answered: on a keep-alive connection by the wait for the next request,
+/// and after a `Connection: close` or HTTP/1.0 request by a read that
+/// discards what arrives until the response is done. Not while the request
+/// still holds a body it has not read to its end, since the stream is that
+/// body's until then; nor on a keep-alive connection after its idle timeout.
+/// In those spans `closed` stays false, which errs toward finishing the work.
+///
+/// Checking is one atomic load: poll it between units of work. Cloning is
+/// cheap, and a clone may outlive the request.
+#[derive(Clone)]
+pub struct Peer(Arc<Socket>);
+
+impl Peer {
+    /// True once the client has closed or reset the connection.
+    pub fn closed(&self) -> bool {
+        self.0.gone()
+    }
 }
 
 /// Error that can happen when building a `Request` object.
@@ -192,14 +226,14 @@ where
 
             Box::new(Cursor::new(buffer)) as Box<dyn Read + Send + 'static>
         } else {
-            let data_reader = EqualReader::new(source_data, content_length, Some(socket));
+            let data_reader = EqualReader::new(source_data, content_length, Some(socket.clone()));
             Box::new(BudgetedReader::new(FusedReader::new(data_reader, None), BODY_TIMEOUT))
                 as Box<dyn Read + Send + 'static>
         }
     } else if chunked {
         // A chunked body has no length to drain by: one left unread ends the
         // connection instead.
-        let data_reader = FusedReader::new(Decoder::new(source_data), Some(socket));
+        let data_reader = FusedReader::new(Decoder::new(source_data), Some(socket.clone()));
         Box::new(BudgetedReader::new(data_reader, BODY_TIMEOUT)) as Box<dyn Read + Send + 'static>
     } else {
         // if we have neither a Content-Length nor a Transfer-Encoding,
@@ -218,6 +252,7 @@ where
         headers,
         body_length: content_length,
         must_send_continue: expects_continue,
+        socket,
     })
 }
 
@@ -244,6 +279,13 @@ impl Request {
     #[inline]
     pub fn http_version(&self) -> &HttpVersion {
         &self.http_version
+    }
+
+    /// Whether the client is still there, as a handle that can be polled
+    /// while the response is computed and after `respond` takes the
+    /// request. See [`Peer`] for exactly what it reports.
+    pub fn peer(&self) -> Peer {
+        Peer(self.socket.clone())
     }
 
     /// Answer this request as HTTP/1.1 regardless of what it claimed to be.

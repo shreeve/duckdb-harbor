@@ -209,6 +209,8 @@ mod refined {
         /// The server no longer knows where the next request on this
         /// connection begins.
         ended: AtomicBool,
+        /// The connection's reader saw the client close or reset it.
+        gone: AtomicBool,
     }
 
     impl Socket {
@@ -231,6 +233,15 @@ mod refined {
         pub(crate) fn ended(&self) -> bool {
             self.ended.load(Ordering::Acquire)
         }
+
+        /// Records that a read on this socket saw EOF or a reset.
+        pub(crate) fn depart(&self) {
+            self.gone.store(true, Ordering::Release);
+        }
+
+        pub(crate) fn gone(&self) -> bool {
+            self.gone.load(Ordering::Acquire)
+        }
     }
 
     /// One half of a connection: dropping it shuts its direction down.
@@ -245,7 +256,11 @@ mod refined {
         where
             S: Into<Connection>,
         {
-            let socket = Arc::new(Socket { conn: stream.into(), ended: AtomicBool::new(false) });
+            let socket = Arc::new(Socket {
+                conn: stream.into(),
+                ended: AtomicBool::new(false),
+                gone: AtomicBool::new(false),
+            });
 
             let read = RefinedTcpStream {
                 socket: socket.clone(),

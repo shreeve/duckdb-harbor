@@ -9,6 +9,8 @@
 //! - `prompt`    — latency properties: responses leave when they should
 //! - `unblock`   — Server::unblock wakes a blocked recv_timeout()
 //! - `unix`      — unix-domain sockets
+//! - `peer`      — `Peer::closed`: a departed client is seen, a quiet or
+//!   pipelining one is not
 //! - `first_request` — the first-request idle clock, and that keep-alive is
 //!   exempt from it (`#[ignore]`, ~60s each)
 //! - `stall`     — the 10s write-timeout backstop (`#[ignore]`, ~35s by
@@ -1189,6 +1191,128 @@ mod first_request {
         write!(client, "{req}").expect("connection was closed during keep-alive idle");
         let (headers, _) = support::read_response(&mut client);
         assert!(headers.starts_with("HTTP/1.1 200"), "second request: {headers}");
+    }
+}
+
+/// `Peer::closed`: a client that leaves while its request is being answered
+/// is seen leaving, and one that is merely quiet, or sends more, is not.
+mod peer {
+    use super::support;
+
+    use std::io::{Read, Write};
+    use std::net::Shutdown;
+    use std::time::{Duration, Instant};
+
+    /// Whether `closed` turns true within two seconds.
+    fn closes(peer: &justhttp::Peer) -> bool {
+        let until = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < until {
+            if peer.closed() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// Whether `closed` stays false for half a second.
+    fn stays_open(peer: &justhttp::Peer) -> bool {
+        std::thread::sleep(Duration::from_millis(500));
+        !peer.closed()
+    }
+
+    #[test]
+    fn a_client_that_closes_is_gone() {
+        let (server, mut client) = support::new_one_server_one_client();
+        // A body past the 1 KiB buffered size, read to its end, as harbor
+        // reads a statement before it runs it.
+        let body = "x".repeat(2000);
+        write!(client, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2000\r\n\r\n{body}").unwrap();
+        let mut rq = support::recv(&server);
+        rq.as_reader().read_to_end(&mut Vec::new()).unwrap();
+        let peer = rq.peer();
+        assert!(stays_open(&peer), "a connected, quiet client read as gone");
+
+        drop(client);
+        assert!(closes(&peer), "the client closed and the request never saw it");
+    }
+
+    #[test]
+    fn a_pipelined_request_is_not_a_departure() {
+        let (server, mut client) = support::new_one_server_one_client();
+        write!(client, "GET /1 HTTP/1.1\r\nHost: x\r\n\r\nGET /2 HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let first = support::recv(&server);
+        assert!(stays_open(&first.peer()), "a pipelined request read as a departure");
+
+        first.respond(justhttp::Response::from_string("one")).unwrap();
+        let second = support::recv(&server);
+        assert_eq!(second.url(), "/2");
+        second.respond(justhttp::Response::from_string("two")).unwrap();
+        let (_, one) = support::read_response(&mut client);
+        let (_, two) = support::read_response(&mut client);
+        assert_eq!((one.as_str(), two.as_str()), ("one", "two"));
+    }
+
+    /// The last request on a connection is still watched: nothing reads the
+    /// next request there, so the connection reads on until it is answered.
+    #[test]
+    fn the_last_request_on_a_connection_is_watched() {
+        for head in ["GET / HTTP/1.1\r\nConnection: close\r\n\r\n", "GET / HTTP/1.0\r\n\r\n"] {
+            let (server, mut client) = support::new_one_server_one_client();
+            write!(client, "{head}").unwrap();
+            let rq = support::recv(&server);
+            let peer = rq.peer();
+            assert!(stays_open(&peer), "{head:?}: a connected client read as gone");
+
+            drop(client);
+            assert!(closes(&peer), "{head:?}: the client closed and the request never saw it");
+            let _ = rq.respond(justhttp::Response::empty(499));
+        }
+    }
+
+    /// A finished `Connection: close` response still ends the connection at
+    /// once, with the client still connected and silent.
+    #[test]
+    fn watching_does_not_hold_the_connection_open() {
+        let (server, mut client) = support::new_one_server_one_client();
+        write!(client, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap();
+        support::recv(&server).respond(justhttp::Response::from_string("done")).unwrap();
+
+        client.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut content = String::new();
+        client.read_to_string(&mut content).expect("the response did not end the connection");
+        assert!(content.ends_with("done"));
+    }
+
+    /// Ending the sending side is end-of-stream on the wire, the same bytes
+    /// a full close sends, so it reads as gone. The response still reaches a
+    /// client that answers it this way.
+    #[test]
+    fn a_client_that_half_closes_reads_as_gone() {
+        let (server, mut client) = support::new_one_server_one_client();
+        write!(client, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let rq = support::recv(&server);
+        client.shutdown(Shutdown::Write).unwrap();
+        assert!(closes(&rq.peer()));
+
+        rq.respond(justhttp::Response::from_string("still here")).unwrap();
+        let (_, body) = support::read_response(&mut client);
+        assert_eq!(body, "still here");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_client_that_closes_is_gone() {
+        let path = std::env::temp_dir().join(format!("justhttp-peer-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let server = justhttp::Server::http_unix(&path).unwrap();
+        let mut client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        write!(client, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let peer = support::recv(&server).peer();
+        assert!(stays_open(&peer), "a connected, quiet client read as gone");
+
+        drop(client);
+        assert!(closes(&peer), "the client closed and the request never saw it");
     }
 }
 

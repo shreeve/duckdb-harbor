@@ -31,7 +31,7 @@ use pool::MessagesQueue;
 use stream::Connection;
 
 pub use http::{Header, Method, StatusCode};
-pub use request::Request;
+pub use request::{Peer, Request};
 pub use response::Response;
 pub use stream::{ListenAddr, Listener};
 
