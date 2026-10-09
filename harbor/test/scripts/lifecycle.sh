@@ -530,6 +530,35 @@ check "tabs, newlines, quotes and backslashes all round-trip" 0 "5 of 5 survived
   _ "$harbor" "$work/hard.rs.duckdb" "$work/hard.out"
 wait_gone
 
+# A backup is written under a name of its own and renamed into place last,
+# and a restore the same way, so neither path ever holds a fragment that
+# would be taken for the real thing.
+mode=$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$work/bk.out")
+[[ $mode == 0o700 ]] && ok "a backup directory is its owner's alone" || bad "a backup directory is $mode"
+"$harbor" "$work/un.duckdb" -c "CREATE TABLE u(x UNION(n INTEGER, s VARCHAR)); INSERT INTO u VALUES (1)" >/dev/null 2>&1
+wait_gone
+check "a backup that cannot finish fails" 1 "cannot be written as text" \
+  "$harbor" "$work/un.duckdb" backup "$work/un.out" --strict
+if [[ ! -e $work/un.out ]] && ! ls -d "$work"/un.out.partial-* >/dev/null 2>&1; then
+  ok "and leaves no directory, whole or partial"
+else
+  bad "a failed backup left $(ls -d "$work"/un.out* 2>&1)"
+fi
+wait_gone
+"$harbor" "$work/bk.duckdb" -c "EXPORT DATABASE '$work/raw.out' (FORMAT csv)" >/dev/null 2>&1
+wait_gone
+check "restore refuses EXPORT DATABASE's own directory" 1 "not a harbor backup" \
+  "$harbor" "$work/raw.duckdb" restore "$work/raw.out"
+cp -R "$work/bk.out" "$work/bk.bad"
+printf 'id\ts\nnot-a-number\tx\n' > "$work/bk.bad/t.csv"
+check "a restore whose load fails" 1 "" "$harbor" "$work/bad.duckdb" restore "$work/bk.bad"
+if [[ ! -e $work/bad.duckdb ]] && ! ls "$work"/bad.duckdb.restoring-* >/dev/null 2>&1; then
+  ok "leaves no database, whole or partial"
+else
+  bad "a failed restore left $(ls "$work"/bad.duckdb* 2>&1)"
+fi
+wait_gone
+
 check "neither verb combines with a lifetime verb" 1 "combines with nothing" \
   "$harbor" "$work/bk.duckdb" start backup
 check "nor with each other" 1 "runs alone" \
