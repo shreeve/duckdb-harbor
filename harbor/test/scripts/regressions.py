@@ -97,7 +97,8 @@ class Regressions(unittest.TestCase):
         self.assertEqual(ordinary["idleTtlMs"], 30000)
         sid = ordinary["sessionId"]
         try:
-            self.assertEqual(self.request("POST", f"/sql/sessions/{sid}/renew")[0], 400)
+            # An ordinary session renews its idle clock (sessions.py).
+            self.assertEqual(self.request("POST", f"/sql/sessions/{sid}/renew"), (200, {"renewed": True}))
         finally:
             self.release(sid)
         status, backup = self.request("POST", "/sql/sessions", {"purpose": "backup", "ttlMs": 999999})

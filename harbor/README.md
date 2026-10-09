@@ -95,7 +95,7 @@ POST /sql                  run one statement, stream the result as NDJSON
 POST /sql/sessions         take a connection and hold it, for a transaction
 GET  /sql/sessions         list ALL open sessions — who holds each, how long
 DELETE /sql/sessions/<id>  give that one back
-POST /sql/sessions/<id>/renew  renew a backup lease
+POST /sql/sessions/<id>/renew  keep a session alive, running nothing
 DELETE /sql/queries/<id>   stop a statement the caller named when it sent it
 ```
 
@@ -266,9 +266,10 @@ fails, or ends with its transaction still open, has it rolled back and says
 so. The session is an ordinary one. At the REPL it is kept alive while the
 prompt waits or a result is being read, so the thirty-second idle limit does
 not take a transaction from someone thinking; the five-minute ceiling still
-ends it, and the REPL says so when one opens. The keeping is a `SELECT 1` on
-the session every ten seconds, which the session counts as a statement. A script's statements follow one another and
-need no keeping.
+ends it, and the REPL says so when one opens. The keeping is a renewal every
+ten seconds, which runs nothing; a server that renews only backup sessions
+gets a `SELECT 1` on the session instead. A script's statements follow one
+another and need no keeping.
 
 **Sessions draw from their own connections.** `HARBOR_POOL_SIZE` (default 16)
 is opened at load and split: the workers take theirs, sessions get the rest. A
@@ -279,8 +280,13 @@ session is a `503` with `Retry-After` — queries keep working throughout.
 **Ordinary sessions have a fixed deadline.** Ask for a lifetime with
 `{"ttlMs": N}`; Harbor caps it at five minutes and returns the granted lifetime
 alongside a thirty-second idle timeout. Running SQL does not count as idle,
-but the fixed deadline applies even while a statement is running. Ordinary
-sessions cannot be renewed.
+but the fixed deadline applies even while a statement is running. A client
+that holds one open between statements renews it with `POST
+/sql/sessions/<id>/renew`, which restarts the idle timeout and leaves the
+deadline where it was. A renewal runs nothing: it is not counted as a
+statement, it waits for no worker and is answered while a statement runs on
+the session, and it returns `{"renewed":true}`. A session that has idled out
+is gone even before it is reclaimed, and a renewal of it returns `404`.
 
 **Backup sessions renew their deadline.** Open one with `{"purpose":"backup"}`
 and require `"purpose":"backup"` in the response (older servers do not support
@@ -289,8 +295,8 @@ this policy). Its `ttlMs` is a renewal window, default and maximum 60 seconds;
 (the CLI uses 20-second intervals). Successful renewal returns `{"renewed":true}`
 and starts a fresh window, even while SQL is running. Heartbeats replace both
 the ordinary five-minute ceiling and the thirty-second statement-idle timeout.
-Expired or released leases return `404` and cannot be revived; attempts to renew
-ordinary leases return `400`. `/sessions` reports `renewable` and `expiresInMs`.
+Expired or released leases return `404` and cannot be revived. `/sessions`
+reports `renewable` and `expiresInMs`.
 Renewals use the control path so a busy SQL worker cannot block them indefinitely.
 Custom shorter renewal windows must allow for network and scheduling delays,
 including up to five seconds before the control lane activates for forwarded

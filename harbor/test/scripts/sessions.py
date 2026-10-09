@@ -355,6 +355,42 @@ def run_all(h, leases, proc, db, port):
     eq("a released one answers the same", "no_such_session", h.sql("SELECT 1", sid)[1].get("code"))
 
     # -----------------------------------------------------------------------
+    section("A renewal keeps a session and runs nothing")
+    # -----------------------------------------------------------------------
+    def lease(sid):
+        return next(s for s in h.sessions()["sessions"] if s["sessionId"] == sid)
+
+    sid = h.open()[1]["sessionId"]
+    renew = f"/sql/sessions/{sid}/renew"
+    h.sql("BEGIN", sid)
+    h.sql("UPDATE t SET n = 8 WHERE id = 1", sid)
+    time.sleep(1.2)
+    before = lease(sid)
+    st, doc, _ = h.call("POST", renew)
+    eq("an ordinary session is renewed", (200, {"renewed": True}), (st, doc))
+    after = lease(sid)
+    eq("its idle clock starts again", True, after["idleMs"] < before["idleMs"] - 1000)
+    eq("its ceiling stays where it was", True, after["expiresInMs"] <= before["expiresInMs"])
+    eq("and it ran no statement", before["statements"], after["statements"])
+    eq("the transaction is still the session's", 8, h.value("SELECT n FROM t WHERE id=1", sid))
+
+    # It takes no turn on the session, so a statement running there does
+    # not stand in its way, nor it in the statement's.
+    result = {}
+    t = threading.Thread(target=lambda: result.update(
+        long=h.sql("SELECT count(DISTINCT i) FROM range(100000000) t(i)", sid, timeout=120)[0]))
+    t.start()
+    time.sleep(0.4)
+    eq("a session busy with a statement is renewed", 200, h.call("POST", renew)[0])
+    t.join()
+    eq("and the statement runs on to its answer", 200, result["long"])
+    h.sql("ROLLBACK", sid)
+    h.release(sid)
+    st, doc, _ = h.call("POST", renew)
+    eq("a released session is not renewed", (404, "no_such_session"), (st, doc.get("code")))
+    eq("nor one that never was", 404, h.call("POST", f"/sql/sessions/{'0' * 36}/renew")[0])
+
+    # -----------------------------------------------------------------------
     section("The reaper reclaims what is abandoned")
     # -----------------------------------------------------------------------
     # A deadline the client asked for, rather than waiting out the idle

@@ -564,8 +564,9 @@ struct Lease {
     doomed: bool,
 }
 
-/// Interactive leases have an absolute deadline. Backups instead prove client
-/// liveness with renewals; SQL activity alone never renews either kind.
+/// Interactive leases have an absolute deadline, and an idle clock that a
+/// statement or a renewal resets. Backups instead prove client liveness with
+/// renewals that move the deadline; SQL activity alone never does.
 struct LeaseLifetime {
     deadline: Instant,
     renewal_ttl: Option<Duration>,
@@ -581,10 +582,16 @@ impl LeaseLifetime {
             || (self.renewal_ttl.is_none() && !busy && now.duration_since(last) >= idle_ttl)
     }
 
-    fn renew(&mut self, now: Instant) -> bool {
-        let Some(ttl) = self.renewal_ttl else { return false };
-        if now >= self.deadline { return false; }
-        self.deadline = now + ttl;
+    /// Renew a lease that has not expired: a backup's deadline, or an
+    /// interactive lease's idle clock, whose deadline stays where it was.
+    fn renew(&mut self, now: Instant, last: &mut Instant, busy: bool, idle_ttl: Duration) -> bool {
+        if self.expired(now, *last, busy, idle_ttl) {
+            return false;
+        }
+        match self.renewal_ttl {
+            Some(ttl) => self.deadline = now + ttl,
+            None => *last = now,
+        }
         true
     }
 }
@@ -711,20 +718,22 @@ fn lease_open(requested_ttl: Option<Duration>, backup: bool) -> Result<(String, 
 }
 
 /// Renewals use only the registry lock, so the probe lane can serve them
-/// while SQL workers are occupied. Released or expired leases stay dead.
+/// while SQL workers are occupied, and a renewal runs no statement: it
+/// counts in nothing and needs no claim, so it never meets the client's next
+/// statement. Released or expired leases stay dead: one that has idled out
+/// is gone even before the reaper takes it.
 fn lease_renew(id: &str) -> Result<(), Refusal> {
     let missing = || Refusal {
         status: 404, code: "no_such_session",
-        message: "backup session was released, expired, or never existed".into(),
+        message: "no such session: it was released, timed out, or never existed".into(),
     };
     let mut guard = LEASES.lock().unwrap();
-    let lease = guard.as_mut().and_then(|leases| leases.live.get_mut(id)).ok_or_else(missing)?;
-    let now = Instant::now();
-    if lease.doomed || now >= lease.lifetime.deadline { return Err(missing()); }
-    if !lease.lifetime.renew(now) {
-        return Err(Refusal {
-            status: 400, code: "bad_request", message: "only backup sessions can be renewed".into(),
-        });
+    let leases = guard.as_mut().ok_or_else(missing)?;
+    let idle_ttl = leases.idle_ttl;
+    let lease = leases.live.get_mut(id).ok_or_else(missing)?;
+    if lease.doomed || !lease.lifetime.renew(Instant::now(), &mut lease.last, lease.busy, idle_ttl) {
+        lease.doomed = true;
+        return Err(missing());
     }
     Ok(())
 }
@@ -4783,21 +4792,50 @@ UNION ALL SELECT 1::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FRO
         use super::{LeaseLifetime, BACKUP_RENEWAL_TTL, LEASE_MAX_TTL, LEASE_IDLE_TTL};
         let start = Instant::now();
         let mut backup = LeaseLifetime::new(start, BACKUP_RENEWAL_TTL, true);
-        let mut interactive = LeaseLifetime::new(start, LEASE_MAX_TTL, false);
-        assert!(!interactive.renew(start));
+        let mut last = start;
         for seconds in (20..=600).step_by(20) {
             let now = start + Duration::from_secs(seconds);
             // No SQL activity: a long file scan does not consume the idle TTL.
             assert!(!backup.expired(now, start, false, LEASE_IDLE_TTL));
-            assert!(backup.renew(now));
+            assert!(backup.renew(now, &mut last, false, LEASE_IDLE_TTL));
         }
+        assert_eq!(last, start, "a backup renewal moves its deadline, not its idle clock");
         let end = start + Duration::from_secs(660);
         assert!(backup.expired(end, start, true, LEASE_IDLE_TTL));
-        assert!(!backup.renew(end));
-        assert!(!backup.renew(end + Duration::from_secs(1)));
+        assert!(!backup.renew(end, &mut last, false, LEASE_IDLE_TTL));
+        assert!(!backup.renew(end + Duration::from_secs(1), &mut last, false, LEASE_IDLE_TTL));
+        let interactive = LeaseLifetime::new(start, LEASE_MAX_TTL, false);
         assert!(interactive.expired(start + LEASE_MAX_TTL, start, true, LEASE_IDLE_TTL));
         assert!(interactive.expired(start + LEASE_IDLE_TTL, start, false, LEASE_IDLE_TTL));
         assert!(!interactive.expired(start + LEASE_IDLE_TTL, start, true, LEASE_IDLE_TTL));
+    }
+
+    #[test]
+    fn an_interactive_renewal_resets_the_idle_clock_and_leaves_the_ceiling() {
+        use super::{LeaseLifetime, LEASE_MAX_TTL, LEASE_IDLE_TTL};
+        let start = Instant::now();
+        let mut lease = LeaseLifetime::new(start, LEASE_MAX_TTL, false);
+        let mut last = start;
+        // Renewed at a third of the idle limit, it outlives the idle limit
+        // many times over, and only that.
+        let step = LEASE_IDLE_TTL / 3;
+        let mut now = start;
+        while now + step < start + LEASE_MAX_TTL {
+            now += step;
+            assert!(lease.renew(now, &mut last, false, LEASE_IDLE_TTL), "{:?}", now - start);
+            assert_eq!(last, now);
+        }
+        assert_eq!(lease.deadline, start + LEASE_MAX_TTL, "the ceiling stays");
+        assert!(lease.expired(start + LEASE_MAX_TTL, last, false, LEASE_IDLE_TTL));
+        assert!(!lease.renew(start + LEASE_MAX_TTL, &mut last, false, LEASE_IDLE_TTL));
+
+        // One that idled out is not revived, though nothing reaped it yet;
+        // one busy with a statement has no idle clock running.
+        let mut idle = LeaseLifetime::new(start, LEASE_MAX_TTL, false);
+        let mut last = start;
+        assert!(!idle.renew(start + LEASE_IDLE_TTL, &mut last, false, LEASE_IDLE_TTL));
+        assert_eq!(last, start);
+        assert!(idle.renew(start + LEASE_IDLE_TTL, &mut last, true, LEASE_IDLE_TTL));
     }
 
     #[test]

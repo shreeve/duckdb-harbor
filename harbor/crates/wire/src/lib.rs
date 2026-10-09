@@ -86,7 +86,9 @@ pub mod endpoint {
     pub const FIXED: &[Route] =
         &[SQL, SESSIONS_CREATE, SESSIONS, CATALOG, SHUTDOWN, READY, INFO];
 
-    /// Renew a backup lease, including while its statement is running.
+    /// POST — renew a session, running nothing, even while a statement runs
+    /// on it: a backup's window, or an ordinary session's idle clock, whose
+    /// ceiling stays.
     pub fn session_renew(id: &str) -> Route {
         Route::built("POST", format!("/sql/sessions/{id}/renew"))
     }
