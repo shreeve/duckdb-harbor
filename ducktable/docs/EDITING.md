@@ -311,7 +311,10 @@ affected-exactly-one check are the backstop there, as everywhere.
     base64, `null` included: `null`, `NULL` and `Null` are four base64
     characters each, three bytes (`9EE965`, `3542CB`, `36E965`) that a cell
     can hold and show. A `BLOB`'s NULL is entered with ⌃⇧N, with Delete, or by
-    emptying the cell.
+    emptying the cell. Text that is not base64 — a length that is not a
+    multiple of four, a character outside the standard alphabet, padding
+    anywhere but the end, whitespace — would fail the commit in the engine's
+    decode, and is refused in the editor with the reason.
 - A `FLOAT` key binds through `?::FLOAT` in the WHERE. A FLOAT crosses the
   wire as the shortest decimal that names it and a JSON number binds as a
   DOUBLE; compared bare, the column is widened and 1.1 the FLOAT is not 1.1

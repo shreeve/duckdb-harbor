@@ -1121,17 +1121,25 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
         check_json(text)?;
         return Ok(Value::String(text.to_string()));
     }
+    // A BLOB cell is base64 both ways (`placeholder_for`). The engine decodes
+    // it at commit, where text that is not base64 fails the whole
+    // transaction, so it is judged here.
+    if ty == "BLOB" {
+        return if is_base64(text) {
+            Ok(Value::String(text.to_string()))
+        } else {
+            Err(format!("{text:?} is not base64 \u{2014} a BLOB cell holds its bytes as base64, like \"qg==\""))
+        };
+    }
     // A container that holds a VARIANT, a JSON or a BLOB is bound as the
     // container's text, and no cast of that text reaches the inner value: a
     // `BLOB[]` stores the base64 characters as the bytes, and the elements of
     // a `VARIANT[]` or a `JSON[]` become strings. Nothing is said, so the edit
     // is refused here; `null` above, and NULL from an emptied cell, are safe.
-    if ty != "BLOB" {
-        if let Some(inner) = document_or_blob_within(&ty) {
-            return Err(format!(
-                "typed text cannot carry the {inner} inside {duck_type} \u{2014} edit this cell in the Query tab"
-            ));
-        }
+    if let Some(inner) = document_or_blob_within(&ty) {
+        return Err(format!(
+            "typed text cannot carry the {inner} inside {duck_type} \u{2014} edit this cell in the Query tab"
+        ));
     }
     // A UNION's text names no member. It is bound as a VARCHAR, and the
     // engine stores a VARCHAR under the member of that type: `8` typed over
@@ -1211,6 +1219,16 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
     // text and let the engine cast — its error comes back atomically at
     // commit.
     Ok(Value::String(text.to_string()))
+}
+
+/// Whether text is base64 as the engine's `from_base64` reads it: the
+/// standard alphabet in groups of four, with one or two `=` of padding at
+/// the end and nowhere else, and no whitespace.
+fn is_base64(text: &str) -> bool {
+    let body = text.trim_end_matches('=');
+    text.len().is_multiple_of(4)
+        && text.len() - body.len() <= 2
+        && body.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
 }
 
 /// A type whose text the engine casts element by element: a list or an
@@ -2663,6 +2681,18 @@ mod tests {
         }
         // A cell that shows those bytes is left as it is.
         assert_eq!(confirm("NULL", &persisted("BLOB", Some("NULL"), None)), Confirm::Keep);
+        // What the engine's from_base64 decodes is taken; what it refuses
+        // (measured) is refused here, before it can fail the commit.
+        for text in ["qg==", "qrs=", "AAAA", "ab==", "qr==", "+/9A", ""] {
+            assert_eq!(parse_value(text, "BLOB"), Ok(json!(text)), "{text}");
+        }
+        for text in ["abc", "q===", "a=bc", "qg==qg==", "ab-_", " qg==", "qg== ", "Zm9v\nYmFy", "===="] {
+            let err = parse_value(text, "BLOB").unwrap_err();
+            assert!(err.contains("is not base64"), "{text}: {err}");
+            assert!(matches!(confirm(text, &persisted("BLOB", Some("AAAA"), None)), Confirm::Refuse(_)), "{text:?}");
+        }
+        // Text the cell already holds is never judged, base64 or not.
+        assert_eq!(confirm("abc", &persisted("BLOB", Some("abc"), None)), Confirm::Keep);
         // An emptied BLOB cell is NULL, as Delete and ⌃⇧N make it.
         assert_eq!(confirm("", &persisted("BLOB", Some("qg=="), None)), Confirm::Stage(None, Value::Null));
         // Every other type that is not text keeps the rule, a container of
