@@ -350,6 +350,60 @@ kill -TERM "$tsrv" 2>/dev/null
 wait "$tsrv" 2>/dev/null
 tsrv=""
 
+echo "— a config that will not load stops a start, and says why"
+# It may hold `sealed`, a statement ceiling or the boot SQL; a server that
+# came up without them would look configured while being open.
+mv "$work/config.toml" "$work/config.good"
+printf '[connection.typo]\npath = "%s/typo.duckdb"\npth = 1\n' "$work" > "$work/config.toml"
+chmod 600 "$work/config.toml"
+check "a start refuses, naming the file and the key" 1 "config.toml is not valid" \
+  "$harbor" "$work/typo.duckdb" start
+check "and so does the server a client summons" 1 "pth" \
+  "$harbor" "$work/typo.duckdb" -c "SELECT 1"
+printf '[defaults]\nmode = "csv"\n' > "$work/config.toml"
+check "a [defaults] section is refused with the fix" 1 "delete that section" \
+  "$harbor" "$work/typo.duckdb" start
+chmod 664 "$work/config.toml"
+check "a config others can write is refused with the fix" 1 "chmod go-w" \
+  "$harbor" "$work/typo.duckdb" start
+[[ -e $work/typo.duckdb ]] && bad "a refused start made the database" || ok "and nothing was made"
+mv "$work/config.good" "$work/config.toml"
+
+echo "— a restart brings a server back as it was"
+wait_gone
+check "a restart with options brings one up in the background" 0 "serving" \
+  "$harbor" "$work/again.duckdb" restart --port 9532 --sealed
+check "a bare restart" 0 "stopped" "$harbor" "$work/again.duckdb" restart
+check "keeps the port it was started with" 0 "9" \
+  "$harbor" http://127.0.0.1:9532 --mode csv -c "SELECT 9 AS nine"
+check "and stays sealed" 0 "false" \
+  "$harbor" "$work/again.duckdb" --mode csv -c "SELECT current_setting('enable_external_access')"
+check "a server is stopped by its URL" 0 "stopped" "$harbor" http://127.0.0.1:9532 stop
+[[ -z $(live_sock) ]] && ok "drained, with its socket gone" || bad "the URL stop left a server: $(live_sock)"
+"$harbor" "$work/again.duckdb" detach restart >/dev/null 2>&1
+"$harbor" "$work/again.duckdb" restart >/dev/null 2>&1
+eph=$(curl -s --max-time 2 --unix-socket "$(live_sock)" http://harbor/info \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ephemeral"))' 2>/dev/null)
+[[ $eph == True ]] && ok "a server that leaves with its clients comes back that way" \
+                   || bad "the restart changed the lifetime (ephemeral: $eph)"
+wait_gone
+
+echo "— a name belongs to a file"
+mkdir -p "$work/a" "$work/b"
+"$harbor" "$work/a/data.duckdb" attach >/dev/null 2>&1
+check "detaching another file with the same stem" 0 "was not attached" \
+  "$harbor" "$work/b/data.duckdb" detach
+grep -q "a/data.duckdb" "$work/config.toml" && ok "leaves the attached one's entry" \
+                                          || bad "it removed a/data.duckdb's entry"
+check "detaching the file itself" 0 "detached data" "$harbor" "$work/a/data.duckdb" detach
+check "attach refuses a name the CLI reads as a verb" 1 "reads as a verb" \
+  "$harbor" "$work/start.duckdb" attach
+check "a stem past the name law still opens" 0 "42" \
+  "$harbor" "$work/$(printf 'y%.0s' $(seq 1 100)).duckdb" --mode csv -c "SELECT 42"
+check "a relative HARBOR_HOME is refused, not ignored" 1 "absolute path" env HARBOR_HOME=rel "$harbor"
+check "a database's own -h is the whole help" 0 "start options" "$harbor" "$work/x.duckdb" -h
+wait_gone
+
 # — backup and restore ---------------------------------------------------
 #
 # The round trip is the whole claim, and only a real EXPORT/IMPORT pair can
