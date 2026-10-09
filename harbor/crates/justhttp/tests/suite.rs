@@ -425,6 +425,42 @@ mod head {
         }
     }
 
+    /// A chunked body the handler never reads must not be parsed as the next
+    /// request. It has no declared length to skip by, so the connection
+    /// ends after the response instead: one request, one response, then EOF,
+    /// whether the chunk data is well formed or not.
+    #[test]
+    fn an_unread_chunked_body_is_never_parsed_as_a_request() {
+        let smuggled = "GET /smuggled HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        for body in [
+            format!("{:x}\r\n{smuggled}\r\n0\r\n\r\n", smuggled.len()),
+            smuggled.to_string(),
+        ] {
+            let (server, mut client) = support::new_one_server_one_client();
+            let answered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let urls = answered.clone();
+            std::thread::spawn(move || {
+                while let Ok(Some(rq)) = server.recv_timeout(std::time::Duration::from_secs(5)) {
+                    urls.lock().unwrap().push(rq.url().to_string());
+                    let _ = rq.respond(justhttp::Response::empty(404));
+                }
+            });
+            write!(
+                client,
+                "POST /nope HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n{body}"
+            )
+            .unwrap();
+
+            client.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut content = Vec::new();
+            client.read_to_end(&mut content).expect("the connection must end, not idle");
+            let content = String::from_utf8_lossy(&content);
+            assert!(content.starts_with("HTTP/1.1 404"), "got {content:?}");
+            assert_eq!(content.matches("HTTP/1.1").count(), 1, "got {content:?}");
+            assert_eq!(*answered.lock().unwrap(), ["/nope"]);
+        }
+    }
+
     /// `TE: identity` must not be able to turn a streamed response into a
     /// buffered one. `raw_print` discovers an unknown length by reading the
     /// whole body, so honoring this header hands control of the server's

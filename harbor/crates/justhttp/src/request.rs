@@ -8,11 +8,12 @@ use std::io::Error as IoError;
 use std::io::{self, Cursor, ErrorKind, Read, Write};
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::Response;
 use crate::http::{Header, HttpVersion, Method, StatusCode};
-use crate::stream::ShutdownHandle;
+use crate::stream::Socket;
 use budgeted_reader::BudgetedReader;
 use chunked_transfer::Decoder;
 use equal_reader::EqualReader;
@@ -128,7 +129,7 @@ pub fn new_request<R, W>(
     remote_addr: Option<SocketAddr>,
     mut source_data: R,
     writer: W,
-    shutdown: Option<ShutdownHandle>,
+    socket: Arc<Socket>,
 ) -> Result<Request, RequestCreationError>
 where
     R: Read + Send + 'static,
@@ -191,13 +192,15 @@ where
 
             Box::new(Cursor::new(buffer)) as Box<dyn Read + Send + 'static>
         } else {
-            let data_reader = EqualReader::new(source_data, content_length, shutdown);
-            Box::new(BudgetedReader::new(FusedReader::new(data_reader), BODY_TIMEOUT))
+            let data_reader = EqualReader::new(source_data, content_length, Some(socket));
+            Box::new(BudgetedReader::new(FusedReader::new(data_reader, None), BODY_TIMEOUT))
                 as Box<dyn Read + Send + 'static>
         }
     } else if chunked {
-        Box::new(BudgetedReader::new(FusedReader::new(Decoder::new(source_data)), BODY_TIMEOUT))
-            as Box<dyn Read + Send + 'static>
+        // A chunked body has no length to drain by: one left unread ends the
+        // connection instead.
+        let data_reader = FusedReader::new(Decoder::new(source_data), Some(socket));
+        Box::new(BudgetedReader::new(data_reader, BODY_TIMEOUT)) as Box<dyn Read + Send + 'static>
     } else {
         // if we have neither a Content-Length nor a Transfer-Encoding,
         // assuming that we have no data
@@ -470,7 +473,8 @@ mod equal_reader {
     use std::io::Result as IoResult;
     use std::time::{Duration, Instant};
 
-    use crate::stream::ShutdownHandle;
+    use crate::stream::Socket;
+    use std::sync::Arc;
 
     /// How long the drop-drain may spend discarding a body nobody asked for.
     ///
@@ -503,15 +507,15 @@ mod equal_reader {
         /// How to end the connection when the drain below gives up. See the
         /// note there: an abandoned drain leaves the stream at an unknown
         /// offset, and that is a smuggling primitive, not an untidiness.
-        shutdown: Option<ShutdownHandle>,
+        socket: Option<Arc<Socket>>,
     }
 
     impl<R> EqualReader<R>
     where
         R: Read,
     {
-        pub fn new(reader: R, size: usize, shutdown: Option<ShutdownHandle>) -> EqualReader<R> {
-            EqualReader { reader, size, shutdown }
+        pub fn new(reader: R, size: usize, socket: Option<Arc<Socket>>) -> EqualReader<R> {
+            EqualReader { reader, size, socket }
         }
     }
 
@@ -574,8 +578,8 @@ mod equal_reader {
                     // safe close: shutting the read side down turns every later
                     // read into EOF, so `ClientConnection::next` stops rather
                     // than parsing whatever arrives next.
-                    if let Some(shutdown) = &self.shutdown {
-                        shutdown.shutdown_read();
+                    if let Some(socket) = &self.socket {
+                        socket.end();
                     }
                     break;
                 }
@@ -639,18 +643,25 @@ mod equal_reader {
 }
 
 mod fused_reader {
-    use std::io::{IoSliceMut, Read, Result as IoResult};
+    use std::io::{Read, Result as IoResult};
+    use std::sync::Arc;
 
-    /// Wraps another reader and provides "fused" behavior.
-    /// When the underlying reader reaches EOF, it is dropped
-    /// and the fused reader becomes an empty stub.
+    use crate::stream::Socket;
+
+    /// A body reader that lets go of the stream at the body's end.
+    ///
+    /// At EOF the inner reader is dropped, which hands the stream to the next
+    /// request on the connection, and every later read is EOF. `unfinished`
+    /// is the socket to end if this is dropped before EOF: a body whose
+    /// unread remainder cannot be skipped (see `Socket::end`).
     pub struct FusedReader<R: Read> {
         inner: Option<R>,
+        unfinished: Option<Arc<Socket>>,
     }
 
     impl<R: Read> FusedReader<R> {
-        pub fn new(inner: R) -> Self {
-            Self { inner: Some(inner) }
+        pub fn new(inner: R, unfinished: Option<Arc<Socket>>) -> Self {
+            Self { inner: Some(inner), unfinished }
         }
     }
 
@@ -659,7 +670,7 @@ mod fused_reader {
             match &mut self.inner {
                 Some(r) => {
                     let l = r.read(buf)?;
-                    if l == 0 {
+                    if l == 0 && !buf.is_empty() {
                         self.inner = None;
                     }
                     Ok(l)
@@ -667,17 +678,12 @@ mod fused_reader {
                 None => Ok(0),
             }
         }
+    }
 
-        fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> IoResult<usize> {
-            match &mut self.inner {
-                Some(r) => {
-                    let l = r.read_vectored(bufs)?;
-                    if l == 0 {
-                        self.inner = None;
-                    }
-                    Ok(l)
-                }
-                None => Ok(0),
+    impl<R: Read> Drop for FusedReader<R> {
+        fn drop(&mut self) {
+            if let (Some(_), Some(socket)) = (&self.inner, &self.unfinished) {
+                socket.end();
             }
         }
     }

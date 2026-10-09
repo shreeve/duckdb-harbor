@@ -2,9 +2,8 @@
 //! stream that lets one connection be read and written from two threads.
 
 pub use listen::{ListenAddr, Listener};
-pub use refined::ShutdownHandle;
 pub(crate) use listen::Connection;
-pub(crate) use refined::RefinedTcpStream;
+pub(crate) use refined::{RefinedTcpStream, Socket};
 
 mod listen {
     //! Abstractions of Tcp and Unix socket types
@@ -57,35 +56,37 @@ mod listen {
         #[cfg(unix)]
         Unix(unix_net::UnixStream),
     }
-    impl std::io::Read for Connection {
+    // On a shared reference, as std does for both stream types: the read and
+    // write halves of one connection share one socket.
+    impl std::io::Read for &Connection {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            match self {
-                Self::Tcp(s) => s.read(buf),
+            match *self {
+                Connection::Tcp(s) => (&*s).read(buf),
                 #[cfg(unix)]
-                Self::Unix(s) => s.read(buf),
+                Connection::Unix(s) => (&*s).read(buf),
             }
         }
     }
-    impl std::io::Write for Connection {
+    impl std::io::Write for &Connection {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            match self {
-                Self::Tcp(s) => s.write(buf),
+            match *self {
+                Connection::Tcp(s) => (&*s).write(buf),
                 #[cfg(unix)]
-                Self::Unix(s) => s.write(buf),
+                Connection::Unix(s) => (&*s).write(buf),
             }
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
-            match self {
-                Self::Tcp(s) => s.flush(),
+            match *self {
+                Connection::Tcp(s) => (&*s).flush(),
                 #[cfg(unix)]
-                Self::Unix(s) => s.flush(),
+                Connection::Unix(s) => (&*s).flush(),
             }
         }
     }
     impl Connection {
         /// Gets the peer's address. Some for TCP, None for Unix sockets.
-        pub(crate) fn peer_addr(&mut self) -> std::io::Result<Option<SocketAddr>> {
+        pub(crate) fn peer_addr(&self) -> std::io::Result<Option<SocketAddr>> {
             match self {
                 Self::Tcp(s) => s.peer_addr().map(Some),
                 #[cfg(unix)]
@@ -148,14 +149,6 @@ mod listen {
                 Self::Tcp(s) => s.set_nodelay(nodelay),
                 #[cfg(unix)]
                 Self::Unix(_) => Ok(()),
-            }
-        }
-
-        pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
-            match self {
-                Self::Tcp(s) => s.try_clone().map(Self::from),
-                #[cfg(unix)]
-                Self::Unix(s) => s.try_clone().map(Self::from),
             }
         }
     }
@@ -224,15 +217,42 @@ mod refined {
     use std::io::Result as IoResult;
     use std::io::{Read, Write};
     use std::net::{Shutdown, SocketAddr};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::listen::Connection;
 
-    // harbor: upstream wrapped the connection in a Stream enum whose other
-    // variant was Https(SslStream); with TLS stripped the enum collapsed away
-    // and RefinedTcpStream holds the Connection directly.
+    /// One accepted socket, shared by the halves that read and write it and
+    /// by the requests it carries: one descriptor per connection.
+    pub(crate) struct Socket {
+        conn: Connection,
+        /// The server no longer knows where the next request on this
+        /// connection begins.
+        ended: AtomicBool,
+    }
 
+    impl Socket {
+        /// Ends the connection once the request being answered is done.
+        ///
+        /// For a body abandoned part-way: the stream sits at an offset
+        /// neither side agrees on, and the bytes still to come — already in
+        /// the connection's buffer, or still arriving — would otherwise be
+        /// parsed as the next request, a request the client never sent.
+        /// `ClientConnection` parses nothing after this, and the read side
+        /// is shut down so a reader waiting on the socket sees EOF.
+        pub(crate) fn end(&self) {
+            self.ended.store(true, Ordering::Release);
+            self.conn.shutdown(Shutdown::Read).ok();
+        }
+
+        pub(crate) fn ended(&self) -> bool {
+            self.ended.load(Ordering::Acquire)
+        }
+    }
+
+    /// One half of a connection: dropping it shuts its direction down.
     pub struct RefinedTcpStream {
-        stream: Connection,
+        socket: Arc<Socket>,
         close_read: bool,
         close_write: bool,
     }
@@ -242,20 +262,16 @@ mod refined {
         where
             S: Into<Connection>,
         {
-            let stream: Connection = stream.into();
-
-            // same panic surface as upstream: a socket whose fd cannot be
-            // duplicated is unusable anyway
-            let (read, write) = (stream.try_clone().unwrap(), stream);
+            let socket = Arc::new(Socket { conn: stream.into(), ended: AtomicBool::new(false) });
 
             let read = RefinedTcpStream {
-                stream: read,
+                socket: socket.clone(),
                 close_read: true,
                 close_write: false,
             };
 
             let write = RefinedTcpStream {
-                stream: write,
+                socket,
                 close_read: false,
                 close_write: true,
             };
@@ -264,60 +280,40 @@ mod refined {
         }
 
         pub(crate) fn peer_addr(&mut self) -> IoResult<Option<SocketAddr>> {
-            self.stream.peer_addr()
+            self.socket.conn.peer_addr()
         }
 
-        /// A handle that can shut the read side down from somewhere that does
-        /// not own the stream.
-        ///
-        /// The one caller is the bounded body drain (request.rs): when it
-        /// gives up on a body the client is still dribbling, the connection is
-        /// left at an unknown offset, and the bytes still to come would
-        /// otherwise be read as the next request line — turning a denial of
-        /// service into request smuggling. Shutting the read side down makes
-        /// every later read return EOF, so the connection ends instead.
-        pub(crate) fn shutdown_handle(&self) -> IoResult<ShutdownHandle> {
-            Ok(ShutdownHandle(std::sync::Arc::new(self.stream.try_clone()?)))
-        }
-    }
-
-    /// A cloned descriptor kept only to shut the read side down. Cheap to
-    /// clone and safe to hold past the stream it came from: shutting down an
-    /// already-closed socket is an error this deliberately ignores.
-    #[derive(Clone)]
-    pub struct ShutdownHandle(std::sync::Arc<Connection>);
-
-    impl ShutdownHandle {
-        pub(crate) fn shutdown_read(&self) {
-            self.0.shutdown(Shutdown::Read).ok();
+        /// The socket under this half, for code that does not own the stream.
+        pub(crate) fn socket(&self) -> Arc<Socket> {
+            self.socket.clone()
         }
     }
 
     impl Drop for RefinedTcpStream {
         fn drop(&mut self) {
             if self.close_read {
-                self.stream.shutdown(Shutdown::Read).ok();
+                self.socket.conn.shutdown(Shutdown::Read).ok();
             }
 
             if self.close_write {
-                self.stream.shutdown(Shutdown::Write).ok();
+                self.socket.conn.shutdown(Shutdown::Write).ok();
             }
         }
     }
 
     impl Read for RefinedTcpStream {
         fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
-            self.stream.read(buf)
+            (&self.socket.conn).read(buf)
         }
     }
 
     impl Write for RefinedTcpStream {
         fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
-            self.stream.write(buf)
+            (&self.socket.conn).write(buf)
         }
 
         fn flush(&mut self) -> IoResult<()> {
-            self.stream.flush()
+            (&self.socket.conn).flush()
         }
     }
 }

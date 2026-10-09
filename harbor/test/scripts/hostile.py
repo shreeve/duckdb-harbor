@@ -286,6 +286,32 @@ def one_response_per_request(port, rng):
         s.close()
 
 
+def unread_chunked_body(port, head, well_formed):
+    """Oracle 4, chunked. A route that answers without reading the body
+    (a 404, a browser's 403) leaves a chunked body on the stream with no
+    length to skip it by. The bait is a request carried as chunk data: it
+    must never be answered, so one request draws one response."""
+    smuggled = b"GET /info HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+    body = (b"%x\r\n" % len(smuggled) + smuggled + b"\r\n0\r\n\r\n"
+            if well_formed else smuggled)
+    s = socket.create_connection(("127.0.0.1", port), timeout=15)
+    try:
+        s.sendall(head + b"Host: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n" + body)
+        s.settimeout(3)
+        seen = b""
+        while True:
+            try:
+                chunk = s.recv(8192)
+            except (socket.timeout, OSError):
+                break
+            if not chunk:
+                break
+            seen += chunk
+        return seen.count(b"HTTP/1.1")
+    finally:
+        s.close()
+
+
 # ---------------------------------------------------------------------------
 # Cases
 # ---------------------------------------------------------------------------
@@ -468,6 +494,16 @@ def main():
             ok("one request drew one response", f"max {worst} seen")
         else:
             bad("desync", f"one request drew {worst} responses — leftover bytes were parsed")
+        heads = [b"POST /nope HTTP/1.1\r\n",
+                 b"POST /sql HTTP/1.1\r\nOrigin: http://evil.example\r\n"]
+        counts = [unread_chunked_body(port, head, well_formed)
+                  for head in heads for well_formed in (True, False)]
+        if counts == [1] * len(counts):
+            ok("an unread chunked body was never parsed as a request",
+               "404 and 403, well-formed and malformed chunks")
+        else:
+            bad("desync (chunked)",
+                f"responses per request {counts} — chunk data was answered as a request")
 
         section("No leak")
         # Every case above abandoned connections on purpose, and each has its

@@ -41,7 +41,10 @@ security regression, not a flake.
 
 1. **Bounded body drain.** Discarding an unread request body streams
    through a fixed 64 KiB buffer — never an allocation sized by the
-   client's declared `Content-Length`. (Upstream allocated the declared
+   client's declared `Content-Length`. A drain that gives up, and a
+   chunked body left unread (it has no length to skip by), end the
+   connection after the response, so no leftover byte is ever parsed as
+   the next request. (Upstream allocated the declared
    size, a memory-exhaustion DoS: a request declaring
    `Content-Length: 1000000000` while sending three bytes cost the
    process a gigabyte at drop time.)

@@ -9,11 +9,12 @@ use std::io::{BufReader, BufWriter, ErrorKind, Read};
 
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::Request;
 use crate::http::{HttpVersion, Method, StatusCode};
-use crate::stream::{RefinedTcpStream, ShutdownHandle};
+use crate::stream::{RefinedTcpStream, Socket};
 use sequential::{SequentialReader, SequentialReaderBuilder, SequentialWriterBuilder};
 
 /// The largest request line or header line we will assemble.
@@ -91,9 +92,9 @@ pub struct ClientConnection {
     // it on the FIRST_REQUEST_TIMEOUT clock
     served_a_request: bool,
 
-    // how the bounded body drain ends this connection when it gives up on a
-    // body the client is still dribbling (see EqualReader's Drop)
-    shutdown: Option<ShutdownHandle>,
+    // the socket, shared with each request's body reader so that a body
+    // abandoned part-way can end the connection (see `Socket::end`)
+    socket: Arc<Socket>,
 }
 
 /// Error that can happen when reading a request.
@@ -121,10 +122,7 @@ impl ClientConnection {
         mut read_socket: RefinedTcpStream,
     ) -> ClientConnection {
         let remote_addr = read_socket.peer_addr();
-        // Taken while the stream is still here, exactly as the interrupt
-        // handles are on the harbor side: nothing can reach this socket once
-        // it is inside the BufReader.
-        let shutdown = read_socket.shutdown_handle().ok();
+        let socket = read_socket.socket();
 
         let mut source = SequentialReaderBuilder::new(BufReader::with_capacity(1024, read_socket));
         let first_header = source.next().unwrap();
@@ -138,7 +136,7 @@ impl ClientConnection {
             next_header_source: first_header,
             no_more_requests: false,
             served_a_request: false,
-            shutdown,
+            socket,
         }
     }
 
@@ -212,8 +210,18 @@ impl ClientConnection {
                 }
             };
 
-            // The head has started: from here the client is on the clock.
             if deadline.is_none() {
+                // An earlier request ended this connection: what arrives
+                // here is not known to begin a request. Checked on the first
+                // byte, since a read only gets its turn on the stream once
+                // that request's body reader is gone.
+                if self.socket.ended() {
+                    return Err(ReadError::ReadIoError(IoError::new(
+                        ErrorKind::ConnectionAborted,
+                        "the connection was ended mid-body",
+                    )));
+                }
+                // The head has started: from here the client is on the clock.
                 *deadline = Some(Instant::now() + HEAD_TIMEOUT);
             }
 
@@ -300,7 +308,7 @@ impl ClientConnection {
             *self.remote_addr.as_ref().unwrap(),
             data_source,
             writer,
-            self.shutdown.clone(),
+            self.socket.clone(),
         )
         .map_err(|e| {
             use crate::request;
