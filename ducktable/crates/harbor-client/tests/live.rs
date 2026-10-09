@@ -1130,8 +1130,8 @@ fn a_decimal_cast_rounds_to_its_scale_and_refuses_past_its_width() {
 /// What the Query view's transactions stand on (ducktable's `query.rs`): a
 /// session holds a transaction across requests, other connections do not see
 /// it until COMMIT, a statement that fails to parse leaves it as it was, any
-/// other error aborts it, a COMMIT of an aborted one answers and rolls back,
-/// and a released session is gone by name.
+/// other error aborts it, a COMMIT of an aborted one is refused and rolled
+/// back, and a released session is gone by name.
 #[test]
 #[ignore]
 fn a_session_holds_a_transaction_the_way_the_query_view_expects() {
@@ -1142,17 +1142,10 @@ fn a_session_holds_a_transaction_the_way_the_query_view_expects() {
     alone("CREATE OR REPLACE TABLE _dt_txn_probe(id INTEGER PRIMARY KEY, v VARCHAR)").expect("create");
     alone("INSERT INTO _dt_txn_probe VALUES (1, 'a')").expect("insert");
 
-    // Alone, a BEGIN opens nothing a later request can join: Harbor either
-    // refuses it outright or answers and discards it. Either way a ROLLBACK
-    // sent alone finds no transaction, and the view never sends a BEGIN alone.
-    match alone("BEGIN") {
-        Ok(_) => println!("BEGIN alone: answered, and discarded with its connection"),
-        Err(Failure::Refused { code, message }) => {
-            println!("BEGIN alone: refused ({code}): {message}");
-            assert_eq!(code, "sql_error");
-        }
-        Err(other) => panic!("BEGIN alone: {other}"),
-    }
+    // Alone, a BEGIN would open a transaction nothing can join: Harbor refuses it.
+    let refused = alone("BEGIN").unwrap_err();
+    println!("BEGIN alone: {refused}");
+    assert!(matches!(&refused, Failure::Refused { code, .. } if code == "sql_error"), "{refused:?}");
     assert!(matches!(alone("ROLLBACK"), Err(Failure::Refused { .. })));
 
     let session = harbor_client::session_open(&conn).expect("session");
@@ -1182,8 +1175,14 @@ fn a_session_holds_a_transaction_the_way_the_query_view_expects() {
     let aborted = held("SELECT 1").unwrap_err();
     println!("then SELECT 1: {aborted}");
     assert!(aborted.to_string().contains("aborted"));
-    // COMMIT answers, and what it does is roll back.
-    held("COMMIT").expect("COMMIT of an aborted transaction answers");
+    // Harbor refuses a COMMIT of an aborted transaction and rolls it back.
+    let rolled = held("COMMIT").unwrap_err();
+    println!("COMMIT of it: {rolled}");
+    assert!(
+        matches!(&rolled, Failure::Refused { code, message } if code == "sql_error" && message.contains("rolled back")),
+        "{rolled:?}"
+    );
+    assert!(!rolled.session_gone());
     assert_eq!(value(alone("SELECT v FROM _dt_txn_probe")), json!("a"), "nothing landed");
     assert!(matches!(held("ROLLBACK"), Err(Failure::Refused { .. })), "and the transaction is over");
 
@@ -1215,9 +1214,10 @@ fn a_session_holds_a_transaction_the_way_the_query_view_expects() {
 }
 
 /// A session left idle is reclaimed by Harbor with its transaction rolled
-/// back, and one touched inside its idle window is kept: the Query view's
-/// keepalive. Takes as long as the idle timeout the server grants, plus a
-/// few seconds.
+/// back, and one renewed inside its idle window is kept: the Query view's
+/// keepalive. A renewal runs nothing and leaves the session's ceiling where
+/// it was. Takes as long as the idle timeout the server grants, plus a few
+/// seconds.
 #[test]
 #[ignore]
 fn a_session_touched_in_time_outlives_its_idle_timeout() {
@@ -1234,17 +1234,36 @@ fn a_session_touched_in_time_outlives_its_idle_timeout() {
     on(&left.id, "BEGIN").expect("BEGIN");
     on(&kept.id, "UPDATE _dt_idle_probe SET v = 'kept'").expect("update");
 
-    // Past the idle timeout, one session touched at a third of it.
+    // What Harbor's list of sessions says of the kept one.
+    let listed = |field: &str| -> u64 {
+        let r = harbor_client::http::request(
+            conn.transport().unwrap(),
+            &wire::endpoint::SESSIONS,
+            None,
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .expect("sessions");
+        let list: serde_json::Value = serde_json::from_str(&r.body_string().unwrap()).unwrap();
+        let session = list["sessions"].as_array().unwrap().iter().find(|s| s["sessionId"] == kept.id.as_str());
+        session.expect("listed")[field].as_u64().unwrap()
+    };
+    let (statements, ceiling) = (listed("statements"), listed("expiresInMs"));
+
+    // Past the idle timeout, one session renewed at a third of it.
     let until = std::time::Instant::now() + kept.idle + std::time::Duration::from_secs(4);
     while std::time::Instant::now() < until {
         std::thread::sleep(kept.idle / 3);
-        on(&kept.id, "SELECT 1").expect("the touched session answers");
+        assert_eq!(harbor_client::session_renew(&conn, &kept.id), Ok(true), "the renewed session answers");
     }
+    assert_eq!(listed("statements"), statements, "a renewal runs nothing");
+    assert!(listed("expiresInMs") + kept.idle.as_millis() as u64 <= ceiling, "and leaves the ceiling");
     let reclaimed = on(&left.id, "SELECT 1").unwrap_err();
     println!("the idle session: {reclaimed}");
     assert!(reclaimed.session_gone());
-    on(&kept.id, "COMMIT").expect("the touched session still holds its transaction");
+    assert!(harbor_client::session_renew(&conn, &left.id).unwrap_err().session_gone());
+    on(&kept.id, "COMMIT").expect("the renewed session still holds its transaction");
     harbor_client::session_release(&conn, &kept.id);
+    assert!(harbor_client::session_renew(&conn, &kept.id).unwrap_err().session_gone());
     let read = alone("SELECT v FROM _dt_idle_probe").expect("select");
     assert_eq!(read.rows[0][0], json!("kept"));
     alone("DROP TABLE _dt_idle_probe").expect("drop");
