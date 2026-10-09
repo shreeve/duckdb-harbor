@@ -11,20 +11,17 @@ and TIME_NS shipped panicking the executor thread and returning 200 with an
 empty body. Both were in no suite, so nothing failed.
 
 This closes the loop by working from the type list the encoder dispatches on —
-the LOGICAL_TYPE_ID list in the generated v2 bindings (crates/harbor/src/engine/ffi.rs)
-at the version Cargo.lock actually pins — and requiring every variant to be
-either produced by a corpus case, deliberately refused, or listed in EXCUSED
-with a reason.
+the LOGICAL_TYPE_ID list in the generated v2 bindings
+(crates/harbor/src/engine/ffi.rs) — and requiring every variant to be either
+produced by a corpus case or listed in EXCUSED with a reason.
 
-"Produced" means produced. This suite used to substring-match type names
-against the corpus SQL text, which is a much weaker claim than it reads as:
-nothing ran, and `"Varchar": ["VARCHAR", "'"]` meant any query containing a
-quote counted as covering VARCHAR, `[3]` inside a LIST case covered ARRAY, and
-`UBIGINT` covered BIGINT. Deleting every plain TIME, UNION and ARRAY case still
-reported full coverage. Now each corpus query is sent to a running server and
+"Produced" means produced. Each corpus query is sent to a running server and
 the types are read back out of the `duckdbType` fields the server itself
 emitted, recursing through `child` and `fields` so a type that only ever
-appears nested still counts.
+appears nested still counts. Matching type names against the corpus SQL text
+would be a much weaker claim than it reads as: nothing would run, a query
+containing a quote would cover VARCHAR, `[3]` inside a LIST case would cover
+ARRAY, and `UBIGINT` would cover BIGINT.
 
 The consequence worth having: when a DuckDB upgrade adds a type, this fails on
 the next run, before the type reaches anyone's data.
@@ -34,7 +31,6 @@ Exit codes: 0 covered, 1 a gap, 77 could not run (no generated bindings found) �
 """
 
 import argparse
-import glob
 import http.client
 import json
 import os
@@ -43,24 +39,6 @@ import sys
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 import corpus  # noqa: E402
-
-
-# Every berth a test starts registers under $HARBOR_HOME. Run through the
-# suite, check.sh sets it; run directly — which the usage line above invites —
-# nothing did, so sockets and logs landed in the operator's real
-# runtime directory and each run left a dead name behind. `setdefault` keeps
-# the harness in charge when there is one.
-#
-# Short, and under /tmp deliberately: a macOS unix socket path must fit in
-# SUN_LEN (104 bytes), and the per-user $TMPDIR alone is most of that.
-def _isolate_fleet():
-    import tempfile
-    if not os.environ.get("HARBOR_HOME"):
-        os.environ["HARBOR_HOME"] = tempfile.mkdtemp(prefix="hb-", dir="/tmp")
-
-
-_isolate_fleet()
-
 
 
 SKIPPED = 77
@@ -74,17 +52,7 @@ EXCUSED = {
     "UNKNOWN": "the type of an unresolved parameter expression during binding",
     "TYPE": "a type carried as a value; reachable through the C API's "
             "create_type parameters, not through a result column",
-    "GEOMETRY": "requires the spatial extension, which harbor does not depend "
-                "on. Worth adding a case if spatial is ever a dependency.",
-    "TIMESTAMP_TZ_NS": "the cast is Unimplemented in current v2 engine builds; "
-                       "harbor's encoder is ready — add a case when it lands.",
 }
-
-# Types harbor refuses rather than encodes. Empty since 0.21: the v2 C API
-# gave TIME_NS and VARIANT real encodings, so the refusals they justified are
-# gone. The machinery stays, because the next engine type to arrive before
-# its view layout is committed will want it back.
-REFUSED = {}
 
 # duckdbType strings are SQL spellings; the enum is Rust names. Only the ones
 # that differ need an entry — anything else matches case-insensitively.
@@ -114,7 +82,7 @@ def spec_source():
     """
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     path = os.path.join(root, "crates", "harbor", "src", "engine", "ffi.rs")
-    return (path, None) if os.path.exists(path) else (None, None)
+    return path if os.path.exists(path) else None
 
 
 def spec_types(path):
@@ -184,7 +152,7 @@ def main():
     ap.add_argument("--port", type=int, required=True)
     args = ap.parse_args()
 
-    path, _ = spec_source()
+    path = spec_source()
     if path is None:
         print("type coverage: crates/harbor/src/engine/ffi.rs not found — cannot run")
         return SKIPPED
@@ -193,7 +161,6 @@ def main():
 
     client = Client(args.host, args.port)
     produced = set()
-    refused = set()
 
     cases = [(g, n, s, None) for g, n, s in corpus.all_queries()]
     cases += [(g, n, s, p) for g, n, s, p in corpus.all_params()]
@@ -215,11 +182,6 @@ def main():
             if message.get("type") == "schema":
                 for column in message.get("columns") or []:
                     types_in(column, produced)
-            elif message.get("type") == "error" and status == 400:
-                blurb = (message.get("message") or "").upper()
-                for variant, spelling in REFUSED.items():
-                    if spelling in blurb:
-                        refused.add(variant)
 
     if unreachable:
         print("type coverage: %d of %d cases never reached the server" % (unreachable, len(cases)))
@@ -230,20 +192,12 @@ def main():
     by_upper = {v.upper(): v for v in variants}
     seen = {by_upper[t.upper()] for t in produced if t.upper() in by_upper}
 
-    missing = []
-    for name in variants:
-        if name in EXCUSED:
-            continue
-        if name in REFUSED:
-            if name not in refused:
-                missing.append((name, "harbor should refuse it with a 400 that names it, and did not"))
-            continue
-        if name not in seen:
-            missing.append((name, "no corpus case produced a column of this type"))
+    missing = [(name, "no corpus case produced a column of this type")
+               for name in variants if name not in EXCUSED and name not in seen]
 
     excused = [v for v in variants if v in EXCUSED]
-    print("type coverage: %d produced, %d refused as designed, %d excused, of %d"
-          % (len(seen), len(refused), len(excused), len(variants)))
+    print("type coverage: %d produced, %d excused, of %d"
+          % (len(seen), len(excused), len(variants)))
 
     # A type the server named that the enum does not have means the two lists
     # have drifted — worth saying out loud rather than silently ignoring.

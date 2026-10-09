@@ -4,10 +4,10 @@ spec.py — assert the encoding harbor produces, spelled out.
 
     test/scripts/spec.py --port 9499
 
-This suite proves the answer on the wire is the right one, straight from
-SPEC. An implementation that misreads SPEC §5.4 agrees with itself
-perfectly; only expectations written from the spec catch it, and that is
-the whole reason this file exists.
+This suite is the wire encoding's specification, and proves the answer on
+the wire is the right one. An encoder that misreads a type agrees with
+itself perfectly; only expectations written independently catch it, and
+that is the whole reason this file exists.
 
 Every expectation below is written out by hand from the SQL literal, not
 captured from a run. Capturing output and calling it an expectation only
@@ -139,6 +139,10 @@ CASES = [
     ("ts-ns-inf",      "SELECT 'infinity'::TIMESTAMP_NS AS v",        "TIMESTAMP_NS", True, "infinity"),
     ("ts-s-inf",       "SELECT 'infinity'::TIMESTAMP_S AS v",         "TIMESTAMP_S", True, "infinity"),
     ("tstz-ninf",      "SELECT '-infinity'::TIMESTAMPTZ AS v",        "TIMESTAMP WITH TIME ZONE", True, "-infinity"),
+    # TIMESTAMPTZ_NS is stored in UTC, so it goes out at UTC, with every
+    # nanosecond.
+    ("tstz-ns",        "SELECT '2026-01-01 02:00:00.123456789+02'::TIMESTAMPTZ_NS AS v",
+                       "TIMESTAMPTZ_NS", True, "2026-01-01T00:00:00.123456789Z"),
 
     # -- times: a fraction appears only when there is one -------------------
     ("time-midnight",  "SELECT '00:00:00'::TIME AS v",                "TIME", True, "00:00:00"),
@@ -192,6 +196,9 @@ CASES = [
                        "ENUM('sad', 'ok', 'happy')", True, "happy"),
     ("union",          "SELECT union_value(num := 2) AS v",
                        "UNION(num INTEGER)", True, {"tag": "num", "value": 2}),
+    # A JSON column is named by its type and carries the document's text
+    # unchanged, not a parsed value.
+    ("json",           "SELECT '{\"a\": 1}'::JSON AS v",  "JSON", True, '{"a": 1}'),
 
     # -- nulls -------------------------------------------------------------
     ("null-varchar",   "SELECT NULL::VARCHAR AS v",  "VARCHAR",  True, None),
@@ -200,9 +207,9 @@ CASES = [
     ("null-decimal",   "SELECT NULL::DECIMAL(10,2) AS v", "DECIMAL(10,2)", True, None),
 
     # -- TIME WITH TIME ZONE ------------------------------------------------
-    # Lossy through 0.21 (the offset was dropped, schema said so); 0.22 keeps
-    # the offset in ISO shape — ±HH:MM, plus :SS only when the offset has
-    # seconds — so the value round-trips and the column reads lossless.
+    # The offset goes out in ISO shape — ±HH:MM, plus :SS only when the
+    # offset has seconds — so the value round-trips and the column reads
+    # lossless.
     ("timetz-utc",     "SELECT '12:34:56+00'::TIMETZ AS v",
                        "TIME WITH TIME ZONE", True, "12:34:56+00:00"),
     ("timetz-offset",  "SELECT '12:34:56+05'::TIMETZ AS v",
@@ -219,14 +226,14 @@ CASES = [
                        "SELECT date_part('timezone', '12:34:56+05'::TIMETZ) AS v",
                        "BIGINT", True, 18000),
 
-    # -- the lossy column ---------------------------------------------------
-    # Every case above asserts lossless=True, which means the flag had never
-    # been checked in the one state that carries information. A column that
-    # silently started reporting lossless:true would have passed this suite
-    # from top to bottom. VARIANT is the representative since TIMETZ turned
-    # lossless in 0.22: no committed view layout, so the payload goes out as
-    # JSON text cast by the engine, and the schema says so. JSON keeps the
-    # number 42 and the string "42" apart, which display text never could.
+    # -- the lossy columns --------------------------------------------------
+    # Every case above asserts lossless=True. Without these, a column that
+    # silently started reporting lossless:true would pass this suite from
+    # top to bottom, because the flag would never be checked in the one
+    # state that carries information. VARIANT has no committed view layout,
+    # so the payload goes out as JSON text cast by the engine, and the schema
+    # says so. JSON keeps the number 42 and the string "42" apart, which
+    # display text never could.
     ("variant-lossy",  "SELECT 42::VARIANT AS v",
                        "VARIANT", False, "42"),
     ("variant-string", "SELECT '42'::VARIANT AS v",
@@ -238,6 +245,10 @@ CASES = [
                        "VARIANT", False, '"NaN"'),
     ("variant-inf-nested", "SELECT {'a': 'inf'::DOUBLE, 'b': ['-inf'::DOUBLE]}::VARIANT AS v",
                        "VARIANT", False, '{"a":"Infinity","b":["-Infinity"]}'),
+    # GEOMETRY is a type harbor does not encode itself: it goes out as the
+    # engine's own text for it (WKT), and the schema names that cast.
+    ("geometry",       "SELECT 'POINT (1 2)'::GEOMETRY AS v",
+                       "GEOMETRY", False, "POINT (1 2)"),
 
     # -- HUGEINT minimum ----------------------------------------------------
     # i128::MIN has no positive counterpart, so the "is this JSON-safe" test
@@ -261,6 +272,7 @@ SCHEMA_EXTRAS = {
     "variant-string": {"encoding": "json"},
     "variant-nan":    {"encoding": "json"},
     "variant-inf-nested": {"encoding": "json"},
+    "geometry":       {"encoding": "varchar-cast"},
 }
 
 
@@ -313,7 +325,7 @@ def main():
         else:
             passed += 1
 
-    print("spec: %d of %d cases match SPEC §5.4" % (passed, len(CASES)))
+    print("spec: %d of %d cases match" % (passed, len(CASES)))
     if failures:
         print()
         for name, why in failures:
