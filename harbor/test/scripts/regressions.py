@@ -298,6 +298,36 @@ class Regressions(unittest.TestCase):
         self.sql("SET default_order='DESC'")
         self.sql("RESET default_order")
 
+    def test_one_statement_per_request(self):
+        # The engine's parser counts the statements before anything runs, and
+        # more than one is refused; a canary only a second statement could
+        # drop is the proof it never ran. Each form here hides its `;` from a
+        # reader that disagrees with the engine on one rule: a CR ending a
+        # `--` comment, a `$` inside a word, an `e` that ends a keyword, an
+        # E string's backslash.
+        self.sql("CREATE TABLE canary(x INT)")
+        sid = self.session()
+        try:
+            for sql in ["SELECT 1; DROP TABLE canary", "SELECT ';';DROP TABLE canary",
+                        "SELECT 1 --\r; DROP TABLE canary", "SELECT 1 -- note\r\n; DROP TABLE canary",
+                        "SELECT 1 a$b$c; DROP TABLE canary", "SELECT 1 a$b$c$$; DROP TABLE canary",
+                        "SELECT 1 x$1$; DROP TABLE canary", r"SELECT 1 WHERE 'a' LIKE'\'; DROP TABLE canary",
+                        r"SELECT 'a' LIKE 'b' ESCAPE'\'; DROP TABLE canary",
+                        r"SELECT date'2020-01-01'; DROP TABLE canary", r"SELECT e'\''; DROP TABLE canary",
+                        r"SELECT E'a\\'; DROP TABLE canary", "/* x; */ SELECT 1; DROP TABLE canary"]:
+                for session in (None, sid):
+                    doc = self.sql(sql, session, status=400)
+                    self.assertEqual(doc["code"], "bad_request", sql)
+                    self.sql("SELECT count(*) FROM canary")
+        finally:
+            self.release(sid)
+        self.sql("DROP TABLE canary")
+        # What follows the one statement may be a comment or nothing at all,
+        # and a `;` inside a dollar quote is data, whatever bytes its tag holds.
+        self.assertEqual(self.sql("SELECT 1; -- c")["data"], [[1]])
+        self.assertEqual(self.sql("SELECT 1;;")["data"], [[1]])
+        self.assertEqual(self.sql("SELECT $é$a;b$é$")["data"], [["a;b"]])
+
     def test_a_web_page_cannot_reach_the_tcp_listener(self):
         # A page's form POST needs no preflight; DNS rebinding reads the answer
         # under a hostname the page controls. Both are refused before routing.

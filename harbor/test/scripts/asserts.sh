@@ -414,11 +414,10 @@ eq "PIVOT-shaped conditional aggregate" "$exp_active" \
 section "One statement per request"
 # ---------------------------------------------------------------------------
 
-# duckdb-rs's prepare() executes every statement but the last, so anything that
-# slips a second statement past the scanner runs it. Each of these was accepted
-# once: DuckDB needs no space between a keyword and a literal, so LIKE', ILIKE'
-# and ESCAPE' end in `e` and were read as the start of an E'...' escape string —
-# the backslash then hid the closing quote and every terminator after it.
+# The engine's parser counts the statements before any of them runs. DuckDB
+# needs no space between a keyword and a literal, so LIKE' ends in an `e` that
+# a reader of the text could take for an E'...' prefix, and its backslash for
+# an escape hiding the terminator; the engine's own reading is the one counted.
 eq "a plain second statement is refused" "400" \
    "$(status 'SELECT 1; SELECT 2')"
 eq "LIKE against an escape-looking literal is refused" "400" \
@@ -554,8 +553,8 @@ section "One statement per request"
 eq "a second statement is rejected" "400" "$(status 'SELECT 1; DROP TABLE sites')"
 eq "and the table is still there" "$exp_n_sites" "$(scalar 'SELECT count(*) FROM sites')"
 eq "no whitespace before it either" "400" "$(status 'SELECT 1;DROP TABLE sites')"
-eq "a trailing comment counts as a second statement" "400" "$(status 'SELECT 1; -- sneaky')"
-eq "an empty second statement is still a second statement" "400" "$(status 'SELECT 1;;')"
+eq "a trailing comment is no second statement" "200" "$(status 'SELECT 1; -- note')"
+eq "nor is an empty one" "200" "$(status 'SELECT 1;;')"
 eq "a semicolon inside a literal is data" ";drop" "$(post "SELECT ';drop' AS s" | nd 'rows[0][0]')"
 eq "a doubled quote does not end the literal" "it's; fine" \
    "$(post "SELECT 'it''s; fine' AS s" | nd 'rows[0][0]')"

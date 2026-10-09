@@ -2125,147 +2125,6 @@ fn nests_within(v: &serde_json::Value, levels: usize) -> bool {
     }
 }
 
-/// A byte that can appear inside a DuckDB identifier. `$` is one of them,
-/// which is why a `$` after one does not open a dollar-quote; bytes >= 0x80
-/// are UTF-8 continuation or lead bytes and belong to whatever identifier
-/// they are part of.
-fn is_ident_byte(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80
-}
-
-/// Early rejection for the public one-statement contract. The engine's parsed
-/// statement count is checked again before execution. This lexical scan keeps
-/// the existing strict handling of text following a trailing semicolon.
-fn ensure_single_statement(sql: &str) -> Result<(), String> {
-    let b = sql.as_bytes();
-    let mut i = 0;
-
-    while i < b.len() {
-        match b[i] {
-            b'-' if b.get(i + 1) == Some(&b'-') => {
-                // Both terminators, and the second one is not a nicety.
-                // DuckDB inherits Postgres's lexer, which ends a `--` comment
-                // at CR as well as LF. Scanning for LF alone read
-                // `SELECT 1 --\r; DROP TABLE orders` as one statement with a
-                // comment on the end, while the engine read two — and
-                // `duckdb-rs` runs everything but the last during `prepare`,
-                // so the DROP landed before a row was ever fetched. That is
-                // this function's one job, defeated by one byte. (CR is the
-                // only divergence: VT, FF, NEL, U+2028 and U+2029 do not end a
-                // comment for either of us — verified against the engine.)
-                i = b[i..]
-                    .iter()
-                    .position(|&c| c == b'\n' || c == b'\r')
-                    .map_or(b.len(), |p| i + p + 1);
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                // Block comments nest in DuckDB, as they do in Postgres.
-                let mut depth = 1;
-                i += 2;
-                while i < b.len() && depth > 0 {
-                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
-                        depth += 1;
-                        i += 2;
-                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
-                        depth -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            q @ (b'\'' | b'"') => {
-                // A doubled quote is an escaped quote, not the end of the
-                // literal. E'...' additionally honours backslash escapes.
-                //
-                // That `e` has to be a token on its own. Testing only the byte
-                // before the quote is not enough, and the difference is a hole
-                // rather than a nicety: DuckDB needs no space between a keyword
-                // and a literal, so LIKE', ILIKE', ESCAPE', date' and time' all
-                // end in `e`. Reading one of those as an escape string makes the
-                // scanner honour a backslash, skip the byte after it — the real
-                // closing quote — and swallow every `;` that follows. That is a
-                // second statement smuggled past this function, which is the one
-                // thing it exists to prevent.
-                let standalone_e = |j: usize| {
-                    (b[j] | 0x20) == b'e'
-                        && (j == 0 || !(b[j - 1].is_ascii_alphanumeric() || b[j - 1] == b'_' || b[j - 1] >= 0x80))
-                };
-                let escapes = q == b'\'' && i > 0 && standalone_e(i - 1);
-                i += 1;
-                while i < b.len() {
-                    if escapes && b[i] == b'\\' {
-                        i += 2;
-                    } else if b[i] == q {
-                        if b.get(i + 1) == Some(&q) {
-                            i += 2;
-                        } else {
-                            i += 1;
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            b'$' => {
-                // $tag$ ... $tag$, where the tag is empty or an identifier.
-                //
-                // Only when the `$` actually opens something. DuckDB allows
-                // `$` *inside* an identifier, so `a$b$c` is one identifier and
-                // not a dollar-quote — but this scanner read the `$b$` as an
-                // opener, hunted for a closing `$b$` that was never coming,
-                // and swallowed the rest of the input as string content.
-                // Everything after it, terminator included, then looked like
-                // data: `SELECT 1 a$b$c; DROP TABLE orders` was accepted as a
-                // single statement and the DROP ran during `prepare`. Same
-                // shape as the CR-comment hole, same consequence.
-                //
-                // the repl's scanner already guarded this (scan.rs, `prev_ident`)
-                // — the two must agree, and the security lexer was the one
-                // that was wrong.
-                let opens = i == 0 || !is_ident_byte(b[i - 1]);
-                let tag_end = b[i + 1..]
-                    .iter()
-                    .position(|&c| !(c.is_ascii_alphanumeric() || c == b'_'))
-                    .map(|p| i + 1 + p);
-                match tag_end {
-                    // A tag may not start with a digit: `$1$` is a bind
-                    // parameter to DuckDB, not the opening of a string. Reading
-                    // it as one would let `$1$; DROP TABLE t; $1$` hide a
-                    // terminator the two lexers disagree about.
-                    Some(end) if opens && b[end] == b'$' && !b[i + 1].is_ascii_digit() => {
-                        let tag = &b[i..=end];
-                        let rest = &b[end + 1..];
-                        i = rest
-                            .windows(tag.len())
-                            .position(|w| w == tag)
-                            .map_or(b.len(), |p| end + 1 + p + tag.len());
-                    }
-                    _ => i += 1,
-                }
-            }
-            b';' => {
-                // Anything after a terminator is a second statement, even if
-                // it is only a comment — harbor has no reason to accept it.
-                //
-                // Decided once, here, rather than re-tested on every byte that
-                // follows. The earlier form rescanned the whole tail each time
-                // round the loop, which is Θ(n²): a request of `SELECT 1;` plus
-                // trailing whitespace, still inside the 8 MiB body limit, cost
-                // hours of CPU on the worker thread that read it.
-                return if b[i + 1..].iter().all(|c| c.is_ascii_whitespace()) {
-                    Ok(())
-                } else {
-                    Err("only one statement per request".to_string())
-                };
-            }
-            _ => i += 1,
-        }
-    }
-    Ok(())
-}
-
 /// Which shape the caller asked for. NDJSON is the default and the only one
 /// that streams; see `wants_one_shot`.
 ///
@@ -3401,14 +3260,9 @@ fn run_sql(
         }
     };
 
-    if let Err(e) = ensure_single_statement(&parsed.sql) {
-        let _ = req.respond(error_response(400, "bad_request", &e));
-        return (true, 400);
-    }
-
-    // `r.{a,b}` becomes `r.a, r.b` here, once, for every client. After the
-    // statement count, which the expansion cannot change, and before the
-    // guards below, which read the statement the engine will run.
+    // `r.{a,b}` becomes `r.a, r.b` here, once, for every client: before the
+    // guards below and the engine's statement count, which read the
+    // statement the engine will run.
     match unbrace::expand(&parsed.sql) {
         Ok(std::borrow::Cow::Owned(expanded)) => parsed.sql = expanded,
         Ok(std::borrow::Cow::Borrowed(_)) => {}
@@ -3433,8 +3287,8 @@ fn run_sql(
     // `USE` sets the CURRENT DATABASE on the connection it runs on, and
     // outside a session that connection is a pooled one that goes back to the
     // pool when this request ends. Since a request carries exactly one
-    // statement (`ensure_single_statement`, just above), nothing can ever
-    // follow it on that connection — so the USE reports success and is
+    // statement (the engine's count refuses more, in `run_statement`), nothing
+    // can ever follow it on that connection — so the USE reports success and is
     // discarded, every time. There is no case where running it is useful,
     // which is what makes refusing safe rather than merely stricter.
     //
@@ -3860,9 +3714,9 @@ fn run_statement(
         return true;
     };
 
-    // Parsing is side-effect free. Enforce the public one-statement contract
-    // with the engine's parser before executing anything, even if the lexical
-    // check at the HTTP boundary misses a new grammar form.
+    // One statement per request, counted by the engine's own parser on the
+    // text it would run, before anything runs: parsing is side-effect free,
+    // and no reading of the text but the engine's can say what it holds.
     if !front.is_empty() {
         on_slot.finish();
         let _ = ready.send(Err(Refusal {
@@ -4448,7 +4302,6 @@ fn error_response(status: u16, code: &'static str, message: &str) -> Response<st
 mod tests {
     use super::Method;
     use crate::encode::civil_from_days;
-    use super::ensure_single_statement as one;
     use super::{fenced_setting, lost_without_session};
 
     /// USE outside a session is refused, not silently discarded: one request
@@ -4885,90 +4738,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn accepts_a_single_statement() {
-        for sql in [
-            "SELECT 1",
-            "SELECT 1;",
-            "SELECT 1;   \n  ",
-            "SELECT ';' AS semi",
-            "SELECT 'it''s; fine'",
-            "SELECT E'a\\'; b'",
-            "SELECT e'a\\'; b'",
-            "SELECT (E'a\\'; b')",
-            r#"SELECT 1 AS "a;b""#,
-            "SELECT $$a; b$$",
-            "SELECT $tag$a; b$tag$",
-            "SELECT 1 -- trailing; comment",
-            "/* a; b */ SELECT 1",
-            "/* a /* nested; */ b */ SELECT 1",
-            // A keyword ending in `e` butted against a literal. The backslash
-            // is data here, not an escape, and the literal ends at the next
-            // quote — so there is no second statement and nothing to reject.
-            r"SELECT 1 WHERE 'a' LIKE'\'",
-        ] {
-            assert!(one(sql).is_ok(), "should accept: {sql}");
-        }
-    }
-
-    /// DuckDB allows `$` inside an identifier, so `a$b$c` is one identifier —
-    /// not a dollar-quoted string. Reading it as an opener made the scanner
-    /// hunt for a close that never came and swallow the rest of the input,
-    /// terminator and all, so the second statement ran during `prepare`.
-    /// Found by differential fuzzing against the engine, which is also the
-    /// only way to be confident about the cases still not listed here.
-    #[test]
-    fn rejects_a_statement_after_a_dollar_inside_an_identifier() {
-        for sql in [
-            "SELECT 1 a$b$c; DROP TABLE orders",
-            "SELECT a$b$c; DROP TABLE orders",
-            "SELECT 1 a$b$c$$; DROP TABLE orders",
-            "SELECT 1 a$b$c\r; DROP TABLE orders",
-            "SELECT 1 x$1$; DROP TABLE orders",
-        ] {
-            assert!(one(sql).is_err(), "should reject: {sql:?}");
-        }
-        // ...while a real dollar-quote, opened where one can be opened, still
-        // hides its terminator exactly as before.
-        for sql in ["SELECT a$b$c", "SELECT $$a; b$$", "SELECT $t$a; b$t$", "SELECT 'x'$$a;b$$"] {
-            assert!(one(sql).is_ok(), "should accept: {sql:?}");
-        }
-    }
-
-    /// A bare CR ends a `--` comment for DuckDB (Postgres lexer heritage), so
-    /// everything after one is a second statement. Scanning for LF alone made
-    /// each of these look like a single statement with a trailing comment,
-    /// and `duckdb-rs` executes all but the last during `prepare` — so the
-    /// DROP ran before a row was fetched. Verified live against the engine
-    /// before the fix: the table was gone and the response carried the DROP's
-    /// own `Success BOOLEAN` schema.
-    #[test]
-    fn rejects_a_statement_hidden_behind_a_cr_terminated_comment() {
-        for sql in [
-            "SELECT 1 --\r; DROP TABLE orders",
-            "SELECT 1 -- note\r; DROP TABLE orders",
-            "SELECT 1 --\r\n; DROP TABLE orders",
-            "SET --\r memory_limit='1TB'; SELECT 1",
-        ] {
-            assert!(one(sql).is_err(), "should reject: {sql:?}");
-        }
-    }
-
-    /// The other side of the same byte: CR must not end a comment that is only
-    /// data, and a comment that really does run to the end of the input is
-    /// still a single statement.
-    #[test]
-    fn a_cr_inside_a_literal_is_not_a_comment_terminator() {
-        for sql in [
-            "SELECT 1 -- trailing\r",
-            "SELECT 1 -- trailing\r\n",
-            "SELECT '--\r; DROP TABLE orders'",
-            "SELECT 1 /* \r; still one comment */",
-        ] {
-            assert!(one(sql).is_ok(), "should accept: {sql:?}");
-        }
-    }
-
     /// The fleet-safety fence reads through comments with the same
     /// scanner, and fell to the same byte from the other direction: the key
     /// hid behind a CR-terminated comment, so `fenced_setting` saw a bare
@@ -4985,53 +4754,6 @@ mod tests {
         }
         // ...and an unrelated key behind the same comment still passes.
         assert_eq!(fenced_setting("SET --\r timezone='UTC'"), None);
-    }
-
-    /// Every case here was accepted by the scanner before the `e` in `E'...'`
-    /// was required to be a token of its own, and each one reached DuckDB as
-    /// more than one statement. `duckdb-rs` executes all but the last during
-    /// `prepare`, so accepting these dropped the table.
-    #[test]
-    fn rejects_a_keyword_ending_in_e_used_as_an_escape_string() {
-        for sql in [
-            r"SELECT 1 WHERE 'a' LIKE'\'; DROP TABLE orders; SELECT 1",
-            r"SELECT 1 WHERE 'a' ILIKE'\'; DROP TABLE orders",
-            r"SELECT 'a' LIKE 'b' ESCAPE'\'; DROP TABLE orders",
-            r"SELECT date'2020-01-01'; DROP TABLE orders",
-            r"SELECT time'12:00:00'; DROP TABLE orders",
-            // `$1` is a bind parameter, not a dollar-quote tag, so the
-            // terminator between these markers is a real one.
-            "SELECT $1$; DROP TABLE orders; $1$",
-        ] {
-            assert!(one(sql).is_err(), "should reject: {sql}");
-        }
-    }
-
-    /// The tail after a terminator is checked once. When it was re-checked on
-    /// every following byte the cost was Θ(n²) — measured at 80 seconds for
-    /// 800 KB, so the 8 MiB a request may carry ran for hours on the worker
-    /// thread that read it. This finishes instantly or not at all.
-    #[test]
-    fn scans_a_large_trailing_tail_in_linear_time() {
-        let padded = format!("SELECT 1;{}", " ".repeat(4 << 20));
-        assert!(one(&padded).is_ok());
-        let mut trailing = format!("SELECT 1;{}", " ".repeat(4 << 20));
-        trailing.push('x');
-        assert!(one(&trailing).is_err());
-    }
-
-    #[test]
-    fn rejects_a_second_statement() {
-        for sql in [
-            "SELECT 1; DROP TABLE orders",
-            "SELECT 1;DROP TABLE orders",
-            "SELECT ';'; DROP TABLE orders",
-            "SELECT 1; -- sneaky",
-            "SELECT 1;;",
-            "/* x */ SELECT 1; SELECT 2",
-        ] {
-            assert!(one(sql).is_err(), "should reject: {sql}");
-        }
     }
 
     /// The byte strings here are what DuckDB v1.5.5 actually put on the wire

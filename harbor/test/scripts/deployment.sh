@@ -226,9 +226,8 @@ else
   bad "errors carry a code clients can branch on" "no code field: $(head -c 200 <<<"$err")"
 fi
 
-# The reason this check exists: duckdb-rs's prepare() runs every statement but
-# the last, so a server that forwards a multi-statement body executes the DROP
-# and reports on the SELECT. It must be refused before anything runs.
+# A request is one statement. A body of two is refused before either runs, so
+# a DROP behind a SELECT never executes behind an answer about the SELECT.
 eq "multiple statements are refused"  "400" "$(code 'SELECT 1; SELECT 2')"
 eq "a trailing semicolon is still one statement" "200" "$(code 'SELECT 1;')"
 eq "a semicolon inside a string is not a separator" "200" "$(code "SELECT 'a;b' AS s")"

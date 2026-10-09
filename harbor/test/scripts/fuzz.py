@@ -248,12 +248,11 @@ FENCE_FRAGMENTS = [
 def fuzz_statement_fence(args, rng, n, failures):
     """Does harbor's one-statement verdict match what the engine actually does?
 
-    `ensure_single_statement` is the only thing standing between a client's SQL
-    string and multi-statement execution — `duckdb-rs` runs everything but the
-    last statement during `prepare`, so a smuggled `DROP` lands before a row is
-    fetched. Two holes of exactly this shape have already shipped (a CR ending a
-    `--` comment, and a `$` inside an identifier read as a dollar-quote), and
-    both were found here rather than by reading.
+    Harbor refuses a request of more than one statement by the engine's own
+    count, before any of it runs. Random fragments of the SQL surface where
+    readers of the text disagree (a CR ending a `--` comment, a `$` inside an
+    identifier, an `e` before a quote) probe whether a second statement can
+    still run behind an answer.
 
     The oracle is a side effect, never an opinion: a canary table that only a
     second statement can drop. Harbor answering 200 with the canary gone is a

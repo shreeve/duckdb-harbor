@@ -280,12 +280,10 @@ ERRORS = [
     ("out-of-range-cast",    "SELECT 99999::TINYINT AS v"),
     ("unknown-function",     "SELECT no_such_function(1)"),
 
-    # Multi-statement text must be refused before it reaches DuckDB, because
-    # duckdb-rs executes every statement but the last during prepare. These
-    # are the shapes that got past the scanner: a keyword ending in `e` butted
-    # against a literal reads as an E'...' escape string, so the backslash
-    # hides the closing quote and the terminator after it. Each of these
-    # dropped a table when it was accepted.
+    # Multi-statement text is refused before any of it runs. In these a
+    # keyword ending in `e` is butted against a literal, which a reader of the
+    # text could take for an E'...' escape string whose backslash hides the
+    # closing quote and the terminator after it.
     ("multi-statement",      "SELECT 1; SELECT 2"),
     ("multi-like-escape",    r"SELECT 1 WHERE 'a' LIKE'\'; SELECT 2"),
     ("multi-ilike-escape",   r"SELECT 1 WHERE 'a' ILIKE'\'; SELECT 2"),
