@@ -121,7 +121,7 @@ enum Format {
 impl Format {
     fn parse(word: &str) -> Result<Format, String> {
         match word {
-            "tsv" | "csv" | "text" => Ok(Format::Tsv),
+            "tsv" => Ok(Format::Tsv),
             "parquet" => Ok(Format::Parquet),
             _ => Err(format!("unknown format {word:?} — tsv or parquet")),
         }
@@ -231,21 +231,31 @@ pub fn backup(db: &Path, args: &[String]) -> Result<(), String> {
         Some(d) => absolute(&d)?,
         None => default_dir(db)?,
     };
+    let in_the_way = |dir: &Path| {
+        format!("{} already exists — a backup never writes into a directory that is there", dir.display())
+    };
     if dir.exists() {
-        return Err(format!(
-            "{} already exists — a backup never writes into a directory that is there",
-            dir.display()
-        ));
+        return Err(in_the_way(&dir));
     }
     if let Some(parent) = dir.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
 
-    // A backup that fails takes its half-written directory with it. Anything
-    // left behind would stand in the way of the retry that fixes the flag,
-    // and would read as a backup while being a fragment of one.
-    if let Err(e) = write_backup(db, &dir, format, strict) {
-        let _ = fs::remove_dir_all(&dir);
+    // Written under a name of its own and renamed into place as the last
+    // step, so the directory at `dir` is a finished backup or nothing: a
+    // failure, a Ctrl-C or a kill leaves at most `<dir>.partial-<pid>`, which
+    // says what it is and which restore refuses. Only its owner can read it,
+    // as only the owner can read the database it holds.
+    let partial = beside(&dir, "partial");
+    harbor_common::create_dir_private(&partial).map_err(|e| format!("{}: {e}", partial.display()))?;
+    let done = write_backup(db, &partial, format, strict).and_then(|()| {
+        if dir.exists() {
+            return Err(in_the_way(&dir));
+        }
+        fs::rename(&partial, &dir).map_err(|e| format!("{}: {e}", dir.display()))
+    });
+    if let Err(e) = done {
+        let _ = fs::remove_dir_all(&partial);
         return Err(e);
     }
 
@@ -256,8 +266,24 @@ pub fn backup(db: &Path, args: &[String]) -> Result<(), String> {
         harbor_common::paths::shorten(&dir),
         size(bytes)
     );
-    eprintln!("harbor: restore it with — harbor <new.duckdb> restore {}", dir.display());
+    eprintln!("harbor: restore it with — harbor <new.duckdb> restore {}", shell(&dir));
     Ok(())
+}
+
+/// `<path>.<what>-<pid>`: the name a backup or a restore builds under before
+/// it is moved to `path`.
+fn beside(path: &Path, what: &str) -> PathBuf {
+    PathBuf::from(format!("{}.{what}-{}", path.display(), std::process::id()))
+}
+
+/// A path as one shell word, for a command printed to be pasted.
+fn shell(p: &Path) -> String {
+    let s = p.display().to_string();
+    if s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+~,:@%".contains(c)) {
+        s
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
 }
 
 /// Everything between an empty directory and a finished backup. Split out so
@@ -305,12 +331,22 @@ pub fn restore(db: &Path, args: &[String]) -> Result<(), String> {
         return Err("restore from where? — harbor <new.duckdb> restore <dir>".into());
     };
     let dir = absolute(&dir)?;
-    if !dir.join("load.sql").exists() {
+    let load = dir.join("load.sql");
+    if !load.exists() {
         return Err(format!("{} has no load.sql — not a backup directory", dir.display()));
+    }
+    let load = read(&load)?;
+    if !written_by_harbor(&load) {
+        return Err(format!(
+            "{} is not a harbor backup: its load.sql is EXPORT DATABASE's own, which reads a \
+             quoted \"NULL\" back as a null — `harbor <db> backup` writes one this restores",
+            dir.display()
+        ));
     }
     // The law of this verb. A restore is allowed to make a database and
     // nothing else; the WAL is named too, since a stray one would be read
     // as belonging to the file we are about to write.
+    let db = absolute(&db.display().to_string())?;
     if db.exists() {
         return Err(format!(
             "{} already exists — restore only ever makes a NEW database. Restore beside it, \
@@ -327,45 +363,112 @@ pub fn restore(db: &Path, args: &[String]) -> Result<(), String> {
         Some(v) => vec!["--block-size".into(), v.clone()],
         None => Vec::new(),
     };
-    let target = db.display().to_string();
     let after = dir.join(AFTER);
     let plan = restore_plan(
         &dir,
         &read(&dir.join("schema.sql"))?,
-        &read(&dir.join("load.sql"))?,
+        &load,
         &if after.exists() { read(&after)? } else { String::new() },
     )?;
     let mut sql: Vec<&str> = plan.iter().map(String::as_str).collect();
     sql.push("CHECKPOINT");
-    if let Err(e) = harbor::repl::exec_quiet(&target, &sql, &spawn) {
-        // A half-written database is worse than none: it exists, so the next
-        // restore refuses, and it opens, so it can be mistaken for the real
-        // thing. Take it back out.
-        let _ = harbor::repl::shutdown(db);
-        let _ = fs::remove_file(db);
-        let _ = fs::remove_file(&wal);
+
+    // Built under a name of its own and moved to `db` whole, so a failed
+    // statement, a Ctrl-C or a kill never leaves a half-restored database
+    // where the real one belongs: one would open, and be taken for the
+    // thing restored. A restored database is a FILE, not a berth — nobody
+    // asked for a server on it — so its server is stopped, folding the WAL
+    // in, before the file moves.
+    let building = beside(&db, "restoring");
+    let building_wal = PathBuf::from(format!("{}.wal", building.display()));
+    let target = building.display().to_string();
+    let done = interruptible(&building, || harbor::repl::exec_quiet(&target, &sql, &spawn))
+        .and_then(|()| harbor::repl::shutdown(&building))
+        .and_then(|_| {
+            if building_wal.exists() {
+                fs::rename(&building_wal, &wal).map_err(|e| format!("{}: {e}", wal.display()))?;
+            }
+            place(&building, &db)
+        });
+    if let Err(e) = done {
+        let _ = harbor::repl::shutdown(&building);
+        let _ = fs::remove_file(&building);
+        let _ = fs::remove_file(&building_wal);
         return Err(e);
     }
-    // A restored database is a FILE, not a berth — nobody asked for a server
-    // on it. Fold the WAL in and let it go. A server that will not go is
-    // worth saying and is not a failed restore: the rows are in.
-    if let Err(e) = harbor::repl::shutdown(db) {
-        eprintln!("harbor: restored, but its server is still up — {e}");
-    }
 
-    let bytes = fs::metadata(db).map(|m| m.len()).unwrap_or(0);
+    let bytes = fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
     let (tables, _) = weigh(&dir)?;
     eprintln!(
         "harbor: restored {tables} table{} into {} ({})",
         if tables == 1 { "" } else { "s" },
-        harbor_common::paths::shorten(db),
+        harbor_common::paths::shorten(&db),
         size(bytes)
     );
     // Say what it is NOT, because the mistake is silent: a restored file that
     // nothing serves looks exactly like a database that came back.
     eprintln!("harbor: it is a FILE, not a berth — put it in service by hand:");
-    eprintln!("  harbor <berth> stop && mv {} <the database it replaces>", db.display());
+    eprintln!("  harbor <berth> stop && mv {} <the database it replaces>", shell(&db));
     Ok(())
+}
+
+/// Move a finished file to `to` unless something is already there. A hard
+/// link fails rather than replace, which a rename does not; a filesystem
+/// without links gets the rename, after a last look.
+fn place(from: &Path, to: &Path) -> Result<(), String> {
+    let taken = || format!("{} appeared while restoring — the restored copy is left at {}", to.display(), from.display());
+    match fs::hard_link(from, to) {
+        Ok(()) => fs::remove_file(from).map_err(|e| format!("{}: {e}", from.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(taken()),
+        Err(_) if to.exists() => Err(taken()),
+        Err(_) => fs::rename(from, to).map_err(|e| format!("{}: {e}", to.display())),
+    }
+}
+
+/// Run `work` with Ctrl-C bound to stopping the server that builds
+/// `building`: the statement under way is cancelled by the stop, `work`
+/// returns its error, and the caller takes the file back out. A second
+/// Ctrl-C leaves at once.
+fn interruptible(building: &Path, work: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use signal_hook::{consts::SIGINT, flag};
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let _ = flag::register_conditional_shutdown(SIGINT, 130, interrupted.clone());
+    let _ = flag::register(SIGINT, interrupted.clone());
+    let finished = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let (interrupted, finished, building) = (interrupted.clone(), finished.clone(), building.to_path_buf());
+        std::thread::spawn(move || {
+            while !finished.load(Ordering::Relaxed) {
+                if interrupted.load(Ordering::Relaxed) && harbor::repl::shutdown(&building).unwrap_or(false) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        })
+    };
+    let done = work();
+    finished.store(true, Ordering::Relaxed);
+    let _ = watcher.join();
+    if interrupted.load(Ordering::Relaxed) {
+        return Err("interrupted — nothing was restored".into());
+    }
+    done
+}
+
+/// Whether every load in `load.sql` is one a harbor backup writes: a file of
+/// the directory by its bare name, read as text with quoted nulls kept as
+/// strings, or read as parquet. EXPORT DATABASE's own names each file by the
+/// path it was handed and reads text with DuckDB's default, which turns the
+/// escaped string "NULL" into a null.
+fn written_by_harbor(load_sql: &str) -> bool {
+    split_statements(load_sql).iter().all(|line| {
+        copy_parts(line).is_some_and(|(_, _, name)| {
+            Path::new(&name).file_name() == Some(std::ffi::OsStr::new(&name))
+                && (name.ends_with(".parquet") || line.contains("allow_quoted_nulls false"))
+        })
+    })
 }
 
 /// Every statement a restore runs, in order: `schema.sql` as written, each
@@ -567,8 +670,9 @@ struct Reformat {
 /// default (duckdb#7162), which reads a QUOTED null marker as a null — so
 /// `"NULL"`, the one spelling that exists to escape the marker, comes back as
 /// a null and the escape has no way to work. The writer is right and the
-/// reader is wrong, so the fix goes on the reader. That half comes out once
-/// 25501 lands; the rest stays.
+/// reader is wrong, so the fix goes on the reader — and it is also how a
+/// restore tells harbor's `load.sql` from EXPORT's own (see
+/// [`written_by_harbor`]).
 ///
 /// And the shapes text cannot hold, which are read out of `schema.sql` —
 /// the artifact's own account of itself — and pointed at a parquet file
@@ -611,7 +715,7 @@ fn patch_loader(
                     execute(&statement)?;
                     let TableSchema { variants, generated, .. } = &schema[table];
                     let source = outgoing(table, generated, variants);
-                    text_checks(dir, execute, table, variants, &loader, &source, strict, &mut again, &mut after)?;
+                    text_checks(dir, execute, table, &schema[table], &loader, &source, strict, &mut again, &mut after)?;
                 } else {
                     again.statements.push(statement);
                 }
@@ -640,7 +744,7 @@ fn patch_loader(
                     if !variants.is_empty() {
                         execute(&format!("COPY {source} TO {} ({DIALECT})", quote(Path::new(&name))))?;
                     }
-                    text_checks(dir, execute, table, variants, &line, &source, strict, &mut again, &mut after)?;
+                    text_checks(dir, execute, table, &schema[table], &line, &source, strict, &mut again, &mut after)?;
                 }
                 lines.push(line.to_string());
             }
@@ -664,19 +768,22 @@ fn patch_loader(
 /// What every table written as text needs once its file is on disk, however
 /// it came to be text. Its VARIANT columns travelled as JSON: say what JSON
 /// could not carry, and queue the decode for `after.sql`. And a file holding
-/// a blank record is written again quoted, since a reader skips that line.
+/// a blank record is written again quoted, since a reader skips that line —
+/// which only a table of one stored column can write, since every other
+/// record, and the header, holds a tab.
 #[allow(clippy::too_many_arguments)]
 fn text_checks(
     dir: &Path,
     execute: &dyn Fn(&str) -> Result<(), String>,
     table: &str,
-    variants: &[String],
+    declared: &TableSchema,
     line: &str,
     source: &str,
     strict: bool,
     again: &mut Reformat,
     after: &mut Vec<String>,
 ) -> Result<(), String> {
+    let variants = &declared.variants;
     if !variants.is_empty() {
         for (column, held) in json_check(execute, dir, table, variants)? {
             if strict {
@@ -695,7 +802,9 @@ fn text_checks(
         }
         after.push(json_in(table, variants));
     }
-    if let Some((statement, note)) = requote(dir, line, source)? {
+    if declared.columns - declared.generated.len() == 1
+        && let Some((statement, note)) = requote(dir, line, source)?
+    {
         again.statements.push(statement);
         again.notes.push(note);
     }
@@ -1145,6 +1254,22 @@ fn quote(p: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restore_takes_only_what_a_harbor_backup_writes() {
+        let ours = "COPY t FROM 't.csv' (FORMAT 'csv', allow_quoted_nulls false, delimiter '\\t', \
+                    quote '\"', header 1, nullstr 'NULL');\nCOPY u FROM 'u.parquet' (FORMAT 'parquet');\n";
+        assert!(written_by_harbor(ours));
+        // EXPORT DATABASE's own: the path it was handed, and the reader's default.
+        assert!(!written_by_harbor("COPY t FROM '/tmp/bk.partial-9/t.csv' (FORMAT 'csv', allow_quoted_nulls false);\n"));
+        assert!(!written_by_harbor("COPY t FROM 't.csv' (FORMAT 'csv', quote '\"', delimiter ',', header 1);\n"));
+    }
+
+    #[test]
+    fn a_printed_path_is_one_shell_word() {
+        assert_eq!(shell(Path::new("/srv/db.backups/20261009")), "/srv/db.backups/20261009");
+        assert_eq!(shell(Path::new("/my data/it's.duckdb")), r"'/my data/it'\''s.duckdb'");
+    }
 
     #[test]
     fn blank_records_are_scanned_across_buffer_boundaries() {

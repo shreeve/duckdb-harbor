@@ -6,10 +6,10 @@ edition = "2024"
 description = "harbor-common — shared paths, names, permissions, config, lifetimes, and states"
 license = "MIT"
 
-# No DuckDB, no HTTP, no process spawning, and nothing that shells out. Both
-# binaries depend on this crate, so anything that lands here lands in the
-# server too — including in the process holding an exclusive write lock on a
-# database. Keep it to files, strings, and formatting.
+# No DuckDB and no HTTP. Both binaries depend on this crate, so anything that
+# lands here lands in the server too — including in the process holding an
+# exclusive write lock on a database. Files, strings and formatting, and the
+# login item, which runs launchctl or systemctl.
 [features]
 # The terminal renderer. On by default for harbor. A GUI takes
 # `default-features = false` and skips it along with unicode-width — it wants
@@ -18,20 +18,17 @@ default = ["term"]
 term = ["dep:unicode-width"]
 # The shared config reader. Off by default so consumers that need only paths
 # and state semantics do not carry the TOML/serde stack.
-config = ["dep:serde", "dep:toml", "dep:serde_json"]
+config = ["dep:serde", "dep:toml"]
 # The membership writer: attach/detach editing the [connection.*] sections of
-# config.toml, format-preserving via toml_edit's DOM. harbor enables this (it
-# owns the CLI verbs); it is separate from `config` so a pure reader need not
-# link the editor, and a GUI that wants neither takes default-features = false.
-membership = ["dep:toml_edit"]
+# config.toml, format-preserving via toml_edit's DOM, and the login item. Every
+# edit is checked by the config reader before it lands, so it carries that.
+membership = ["config", "dep:toml_edit"]
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"], optional = true }
 toml = { version = "1.1.4", optional = true }
 # format-preserving TOML edits (comments and ordering survive) for membership
-toml_edit = { version = "0.22", optional = true }
-# the berth sidecar is a shared format: harbor writes it, pilot and DuckTable read it
-serde_json = { version = "1", optional = true }
+toml_edit = { version = "0.25", optional = true }
 # terminal-cell widths: a path with CJK or an emoji in it must not shear a
 # table, and counting bytes (or even chars) is exactly how that happens.
 unicode-width = { version = "0.2", optional = true }

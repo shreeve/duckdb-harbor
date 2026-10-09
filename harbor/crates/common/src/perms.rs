@@ -1,7 +1,6 @@
 //! File modes, and the one question worth asking about a config file: could
 //! anyone but me have written this?
 
-use std::io::Write;
 use std::path::Path;
 
 /// True if someone other than us could swap this path's contents out from
@@ -30,36 +29,11 @@ pub fn exposed(_path: &Path) -> bool {
     false
 }
 
-/// Create a file that is 0600 from its first byte, and write `contents`.
-///
-/// The point is the absence of a window: `fs::write` followed by `chmod` is
-/// correct at rest and wrong in between, and "in between" is where a secret
-/// leaks.
-pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false) // secure an existing file before replacing its contents
-            .mode(0o600)
-            .open(path)?;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        f.set_len(0)?;
-        f.write_all(contents.as_bytes())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents)
-    }
-}
-
-/// Create a directory that is 0700 from the moment it exists. Same reasoning
-/// as `write_private`, for the runtime dir whose mode IS the access control:
-/// `create_dir_all` applies the umask, so the plain form is 0755 for the
-/// instant before a chmod — and in that window another local user can reach
-/// sockets this directory exists to fence off.
+/// Create a directory that is 0700 from the moment it exists, for the runtime
+/// dir whose mode IS the access control: `create_dir_all` applies the umask,
+/// so the plain form is 0755 for the instant before a chmod — and in that
+/// window another local user can reach sockets this directory exists to
+/// fence off.
 pub fn create_dir_private(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {

@@ -42,20 +42,26 @@ for d in "$BIN" "$LIB"; do
   [ -w "$d" ] || fail "$d is not writable by you — pick another BIN=/LIB=, or re-run the whole command under sudo"
 done
 
-# rm first, install second: macOS caches a binary's code signature per inode,
-# and overwriting in place leaves every later exec SIGKILL'd against the stale
-# cache. A fresh inode gets a fresh verdict; upgrades stay safe.
-# Each file is written beside the old one and renamed over it, so there is
-# never a moment with no harbor installed, and a running server keeps the
-# file it opened until it is restarted. The other platform's engine name, if
-# a copy from elsewhere left one, goes.
-install -m 0755 bin/harbor "$BIN/harbor.new" && mv -f "$BIN/harbor.new" "$BIN/harbor"
-for lib in lib/libduckdb.*; do
-  name=$(basename "$lib")
-  install -m 0755 "$lib" "$LIB/$name.new" && mv -f "$LIB/$name.new" "$LIB/$name"
-  for stale in "$LIB"/libduckdb.dylib "$LIB"/libduckdb.so; do
-    [ "$(basename "$stale")" = "$name" ] || rm -f "$stale"
-  done
+# The binary and its engine are one install. Each is written beside the file
+# it replaces, and only once both are written are they renamed into place, so
+# a copy that fails changes nothing and there is never a moment with no
+# harbor installed. The rename is also a fresh inode: macOS caches a binary's
+# code signature per inode, and a file overwritten in place is SIGKILL'd
+# against the stale cache. A running server keeps the file it opened until it
+# is restarted. The other platform's engine name, if a copy from elsewhere
+# left one, goes.
+lib=""
+for found in lib/libduckdb.*; do
+  [ -e "$found" ] && lib=$found
+done
+[ -n "$lib" ] || fail "this archive has no lib/libduckdb — it is not a whole harbor release"
+name=$(basename "$lib")
+install -m 0755 bin/harbor "$BIN/harbor.new" || fail "cannot write $BIN/harbor.new"
+install -m 0755 "$lib" "$LIB/$name.new" || { rm -f "$BIN/harbor.new"; fail "cannot write $LIB/$name.new"; }
+mv -f "$LIB/$name.new" "$LIB/$name"
+mv -f "$BIN/harbor.new" "$BIN/harbor"
+for stale in "$LIB"/libduckdb.dylib "$LIB"/libduckdb.so; do
+  [ "$(basename "$stale")" = "$name" ] || rm -f "$stale"
 done
 
 # Sockets and logs live in the runtime dir. harbor heals these permissions on

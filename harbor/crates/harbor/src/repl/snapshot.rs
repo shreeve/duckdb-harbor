@@ -108,6 +108,14 @@ pub fn with_snapshot<T>(
 ) -> Result<T, String> {
     let (conn, _) = resolve(target, &[])?;
     let _anchor = http::hold(&conn.transport);
+    // Ctrl-C cancels the statement under way and fails the work, and the
+    // caller takes back whatever it had written. A statement that runs to
+    // its end regardless is still the last one: the interrupt is kept here
+    // as well, since the cancel's own flag is spent on asking.
+    super::cancel_on_interrupt();
+    let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, interrupted.clone());
+    let interrupted = || interrupted.load(std::sync::atomic::Ordering::Relaxed);
     let response = http::request(
         &conn.transport,
         &endpoint::SESSIONS_CREATE,
@@ -142,8 +150,9 @@ pub fn with_snapshot<T>(
             run_sql_in_session(&conn, sql, &opts, Some(&release.1), Some(&heartbeat.health));
         heartbeat.health.check().map_err(|e| e.to_string())?;
         match outcome {
-            Outcome::Done => Ok(()),
             Outcome::Cancelled => Err("backup interrupted".into()),
+            Outcome::Done if interrupted() => Err("backup interrupted".into()),
+            Outcome::Done => Ok(()),
             Outcome::Failed => Err("backup statement failed; the snapshot was abandoned".into()),
         }
     };
@@ -333,7 +342,7 @@ mod tests {
     fn old_server_is_rejected_and_its_lease_released() {
         let server = Server::new(false, 200);
         let error = with_snapshot(&server.target, |_| -> Result<(), String> {
-            panic!("must not export on a legacy lease");
+            panic!("must not export on a lease that cannot be renewed");
         })
         .unwrap_err();
         assert!(error.contains("upgrade"), "{error}");

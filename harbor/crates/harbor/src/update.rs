@@ -12,9 +12,9 @@
 //! forward. It restarts nothing on its own: a restart drops that server's
 //! clients mid-request, and when that happens is the operator's call.
 
-use std::io::IsTerminal;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 
 const REPO: &str = "shreeve/duckdb-harbor";
 const INSTALL_SH: &str = "https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.sh";
@@ -157,13 +157,15 @@ fn installer(exe: &Path, version: &str) -> Command {
 /// Which running servers are not on `version`, and what to do about each.
 /// With `--restart`, do it: each goes through `harbor <db> restart`, run
 /// from the binary now installed, so a login-item server comes back under
-/// its login item and a hand-started one as it was. As it was includes
-/// where it runs: with no terminal, a hand-started server's restart serves
-/// in place until SIGTERM, as `start` does for a service manager, and would
-/// hold this command with it. Headless, such a server is named, not
-/// restarted.
+/// its login item and a hand-started one as it was, in the background.
+///
+/// A restart outlives the terminal that asked for it. Over ssh the session
+/// can close mid-restart, and a restart cut off between its stop and its
+/// start leaves the server down. So each one runs in a process group of its
+/// own, which a hangup does not reach, with its output in a log, and this
+/// command ignores the hangup and goes on to the next; whatever reaches the
+/// terminal reaches it as well.
 fn report(version: &str, restart: bool) -> Result<ExitCode, String> {
-    let headless = !std::io::stdin().is_terminal();
     let behind: Vec<(String, PathBuf, String)> = harbor::repl::running()?
         .into_iter()
         .filter(|(_, _, v)| v != version)
@@ -171,28 +173,54 @@ fn report(version: &str, restart: bool) -> Result<ExitCode, String> {
     if behind.is_empty() {
         return Ok(ExitCode::SUCCESS);
     }
+    if !restart {
+        for (name, db, running) in &behind {
+            say(&format!("harbor: {name} still runs {running} — harbor {} restart", harbor_common::paths::shorten(db)));
+        }
+        say("harbor: a running server keeps the code it started with; --restart does the above");
+        return Ok(ExitCode::SUCCESS);
+    }
+    #[cfg(unix)]
+    let _ = signal_hook::flag::register(
+        signal_hook::consts::SIGHUP,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
     let exe = std::env::current_exe().map_err(|e| format!("cannot find this binary: {e}"))?;
+    let log = harbor_common::log_file(&harbor_common::runtime_dir()?, "update");
+    if let Some(dir) = log.parent() {
+        harbor_common::create_dir_private(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
     let mut failed = false;
     for (name, db, running) in &behind {
-        let shown = harbor_common::paths::shorten(db);
-        if restart && headless && !harbor_common::autostart::installed(name) {
-            eprintln!("harbor: {name} still runs {running}, and was started by hand — restart it from a terminal: harbor {shown} restart");
-            failed = true;
-        } else if restart {
-            eprintln!("harbor: restarting {name} ({running} -> {version})");
-            let ok = Command::new(&exe)
-                .arg(db)
-                .arg("restart")
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            failed |= !ok;
-        } else {
-            eprintln!("harbor: {name} still runs {running} — harbor {shown} restart");
-        }
-    }
-    if !restart {
-        eprintln!("harbor: a running server keeps the code it started with; --restart does the above");
+        say(&format!("harbor: restarting {name} ({running} -> {version}) — its word is kept in {}", harbor_common::paths::shorten(&log)));
+        failed |= !restart_one(&exe, db, &log);
     }
     Ok(if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS })
+}
+
+/// `harbor <db> restart` from `exe`, out of reach of a hangup, its output
+/// appended to `log` and then repeated here. Whether it succeeded.
+fn restart_one(exe: &Path, db: &Path, log: &Path) -> bool {
+    let from = std::fs::metadata(log).map_or(0, |m| m.len());
+    let Ok(out) = std::fs::OpenOptions::new().append(true).create(true).open(log) else { return false };
+    let Ok(err) = out.try_clone() else { return false };
+    let mut cmd = Command::new(exe);
+    cmd.arg(db).arg("restart").stdin(Stdio::null()).stdout(out).stderr(err);
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let ok = cmd.status().is_ok_and(|s| s.success());
+    if let Ok(mut f) = std::fs::File::open(log)
+        && f.seek(SeekFrom::Start(from)).is_ok()
+    {
+        let mut said = String::new();
+        let _ = f.read_to_string(&mut said);
+        said.lines().for_each(say);
+    }
+    ok
+}
+
+/// A line to the terminal that cannot fail: after a hangup there is no
+/// terminal, and the restarts still to run matter more than the telling.
+fn say(line: &str) {
+    let _ = writeln!(std::io::stderr(), "{line}");
 }

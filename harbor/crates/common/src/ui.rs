@@ -44,19 +44,6 @@ impl Tone {
     }
 }
 
-/// The terminal's reading of a severity level. A GUI writes its own.
-impl From<crate::state::Level> for Tone {
-    fn from(l: crate::state::Level) -> Tone {
-        use crate::state::Level;
-        match l {
-            Level::Idle => Tone::Dim,
-            Level::Good => Tone::Green,
-            Level::Warn => Tone::Yellow,
-            Level::Bad => Tone::Red,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct Style {
     pub color: bool,
@@ -74,20 +61,6 @@ impl Style {
         Style { color: color_allowed(tty), boxed: tty }
     }
 
-    /// Bytes, for a pipe or a file. Never colored, never boxed.
-    pub fn plain() -> Self {
-        Style { color: false, boxed: false }
-    }
-
-    /// `--color auto|always|never`, or `[defaults] color`.
-    pub fn with_choice(self, choice: Option<&str>) -> Self {
-        match choice {
-            Some("always") => Style { color: true, ..self },
-            Some("never") => Style { color: false, ..self },
-            _ => self,
-        }
-    }
-
     pub fn paint(&self, tone: Tone, s: &str) -> String {
         if !self.color || tone == Tone::Plain {
             return s.to_string();
@@ -97,14 +70,19 @@ impl Style {
 }
 
 fn color_allowed(tty: bool) -> bool {
-    if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+    let var = |k| std::env::var_os(k).map(|v| v.to_string_lossy().into_owned());
+    color_by(tty, var("NO_COLOR"), var("CLICOLOR_FORCE"), var("TERM"))
+}
+
+fn color_by(tty: bool, no_color: Option<String>, force: Option<String>, term: Option<String>) -> bool {
+    if no_color.is_some_and(|v| !v.is_empty()) {
         return false;
     }
-    if std::env::var_os("CLICOLOR_FORCE").is_some_and(|v| !v.is_empty() && v != "0") {
+    if force.is_some_and(|v| !v.is_empty() && v != "0") {
         return true;
     }
     // TERM=dumb means a terminal that cannot, not one that would rather not.
-    if std::env::var("TERM").is_ok_and(|t| t == "dumb") {
+    if term.as_deref() == Some("dumb") {
         return false;
     }
     tty
@@ -114,11 +92,18 @@ fn color_allowed(tty: bool) -> bool {
 // safety and width
 // ---------------------------------------------------------------------------
 
-/// Strip anything that could move the cursor, change the color, or forge a
-/// border. Replaces rather than deletes, so a hostile name still occupies
-/// space and stays visible instead of quietly vanishing.
+/// Strip anything that could move the cursor, change the color, forge a
+/// border, or reorder the text around it: control characters, the vertical
+/// bars a column is drawn with, and the bidirectional controls. Replaces
+/// rather than deletes, so a hostile name still occupies space and stays
+/// visible instead of quietly vanishing.
 fn sanitize(s: &str) -> String {
-    s.chars().map(|c| if c == '\u{1b}' || c.is_control() { '\u{fffd}' } else { c }).collect()
+    let forged = |c: char| {
+        c.is_control()
+            || matches!(c, '│' | '┃' | '║')
+            || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    };
+    s.chars().map(|c| if forged(c) { '\u{fffd}' } else { c }).collect()
 }
 
 /// Terminal cells, not bytes and not chars.
@@ -387,12 +372,16 @@ mod tests {
         Style { color: false, boxed: true }
     }
 
+    fn plain() -> Style {
+        Style { color: false, boxed: false }
+    }
+
     #[test]
     fn a_pipe_gets_tsv_with_no_escapes() {
         let mut t = Table::new(["NAME", "STATE"]);
         t.row([Cell::new("medlabs"), Cell::new("running").tone(Tone::Green)]);
         t.note(Tone::Yellow, "config changed — harbor stop medlabs && harbor start medlabs");
-        let out = t.render(&Style::plain());
+        let out = t.render(&plain());
         assert_eq!(out, "NAME\tSTATE\nmedlabs\trunning\n");
         assert!(!out.contains('\u{1b}'));
     }
@@ -425,7 +414,7 @@ mod tests {
         t.caption("fleet");
         t.row([Cell::new("db.duckdb"), Cell::new("old")]);
         assert_eq!(
-            t.render(&Style::plain()),
+            t.render(&plain()),
             "fleet\nDATABASE\tVERSION\ndb.duckdb\told\n"
         );
     }
@@ -467,7 +456,7 @@ mod tests {
         let bottom = out.lines().position(|l| l.starts_with('╰')).unwrap();
         let below: Vec<&str> = out.lines().skip(bottom + 1).collect();
         assert_eq!(below, ["¹ not in your config", "² held but no longer configured"], "{out}");
-        assert!(!out.contains('!'), "the old inline note style survived:\n{out}");
+        assert!(!out.contains('!'), "a note was drawn inside the grid:\n{out}");
     }
 
     #[test]
@@ -484,18 +473,25 @@ mod tests {
     #[test]
     fn a_hostile_name_cannot_repaint_the_terminal() {
         let mut t = Table::new(["NAME"]);
-        t.row([Cell::new("\u{1b}[31mred\u{1b}[0m│fake")]);
+        t.row([Cell::new("\u{1b}[31mred\u{1b}[0m│fake\u{202e}ti\u{2066}x")]);
         let out = t.render(&boxed());
         assert!(!out.contains('\u{1b}'), "escape survived: {out:?}");
+        assert!(!out.contains(['\u{202e}', '\u{2066}']), "a bidi control survived: {out:?}");
         // The bars that remain are the table's own, one per side.
         let bars = out.lines().nth(3).unwrap().matches('│').count();
-        assert_eq!(bars, 3, "a forged bar got through: {out}");
+        assert_eq!(bars, 2, "a forged bar got through: {out}");
     }
 
     #[test]
     fn no_color_beats_everything() {
+        let set = |s: &str| Some(s.to_string());
+        assert!(!color_by(true, set("1"), set("1"), None), "NO_COLOR beats CLICOLOR_FORCE");
+        assert!(color_by(true, set(""), None, None), "an empty NO_COLOR is unset");
+        assert!(color_by(false, None, set("1"), None), "CLICOLOR_FORCE colors a pipe");
+        assert!(!color_by(false, None, set("0"), None));
+        assert!(!color_by(true, None, None, set("dumb")));
+        assert!(!color_by(false, None, None, None));
         let st = Style { color: false, boxed: true };
         assert_eq!(st.paint(Tone::Red, "x"), "x");
     }
-
 }

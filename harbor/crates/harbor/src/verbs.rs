@@ -41,6 +41,19 @@ pub enum Verb {
     Restore,
 }
 
+/// Each verb and its spelling, once, for both directions.
+const VERBS: [(&str, Verb); 9] = [
+    ("attach", Verb::Attach),
+    ("detach", Verb::Detach),
+    ("start", Verb::Start),
+    ("stop", Verb::Stop),
+    ("restart", Verb::Restart),
+    ("autostart", Verb::Autostart),
+    ("off", Verb::Off),
+    ("backup", Verb::Backup),
+    ("restore", Verb::Restore),
+];
+
 impl Verb {
     /// A one-shot content verb: dispatched on its own, never planned.
     pub fn is_oneshot(self) -> bool {
@@ -48,18 +61,7 @@ impl Verb {
     }
 
     pub fn parse(s: &str) -> Option<Verb> {
-        Some(match s {
-            "attach" => Verb::Attach,
-            "detach" => Verb::Detach,
-            "start" => Verb::Start,
-            "stop" => Verb::Stop,
-            "restart" => Verb::Restart,
-            "autostart" => Verb::Autostart,
-            "off" => Verb::Off,
-            "backup" => Verb::Backup,
-            "restore" => Verb::Restore,
-            _ => return None,
-        })
+        VERBS.iter().find(|(word, _)| *word == s).map(|(_, v)| *v)
     }
 
     /// Is this token one of our verbs? Lets the dispatcher tell a management
@@ -69,17 +71,7 @@ impl Verb {
     }
 
     fn as_str(self) -> &'static str {
-        match self {
-            Verb::Attach => "attach",
-            Verb::Detach => "detach",
-            Verb::Start => "start",
-            Verb::Stop => "stop",
-            Verb::Restart => "restart",
-            Verb::Autostart => "autostart",
-            Verb::Off => "off",
-            Verb::Backup => "backup",
-            Verb::Restore => "restore",
-        }
+        VERBS.iter().find(|(_, v)| *v == self).map_or("", |(word, _)| word)
     }
 }
 
@@ -238,6 +230,17 @@ mod tests {
         assert!(err("backup").contains("run it alone"));
         assert!(err("start backup").contains("run it alone"));
         assert!(err("backup restore").contains("run it alone"));
+    }
+
+    /// Every verb spells back as itself, and none can be a database's name:
+    /// attach refuses to file a database under a word the CLI reads as a verb.
+    #[test]
+    fn every_verb_round_trips_and_is_reserved() {
+        for (word, verb) in VERBS {
+            assert_eq!(Verb::parse(word), Some(verb));
+            assert_eq!(verb.as_str(), word);
+            assert!(harbor_common::membership::RESERVED.contains(&word), "{word} is not reserved");
+        }
     }
 
     #[test]

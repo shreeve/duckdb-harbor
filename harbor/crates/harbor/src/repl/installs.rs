@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 pub enum Channel {
     /// Under a Homebrew cellar: Homebrew put it there and keeps the record.
     Homebrew,
-    /// `~/.local/bin/harbor`, where install.sh puts it.
+    /// Where the install script puts it (see `script_dir`).
     Script,
     /// Anywhere else: a build, a hand-placed binary, a system-wide install.
     Other,
@@ -38,6 +38,20 @@ pub struct Install {
 const NAME: &str = "harbor.exe";
 #[cfg(not(windows))]
 const NAME: &str = "harbor";
+
+/// Where the install script puts harbor: install.sh in `~/.local/bin`,
+/// install.ps1 in `%LOCALAPPDATA%\Programs\harbor\bin`.
+fn script_dir(home: Option<&Path>) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let _ = home;
+        std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join(r"Programs\harbor\bin"))
+    }
+    #[cfg(not(windows))]
+    {
+        home.map(|h| h.join(".local/bin"))
+    }
+}
 
 /// The Homebrew formula a resolved path belongs to (`duckdb-harbor` in
 /// `/opt/homebrew/Cellar/duckdb-harbor/0.43.4/libexec/bin/harbor`), and the
@@ -71,8 +85,8 @@ impl Install {
         let (channel, key) = match cellar(&real) {
             Some((_, root)) => (Channel::Homebrew, root),
             None => {
-                let script = home
-                    .and_then(|h| h.join(".local/bin").join(NAME).canonicalize().ok())
+                let script = script_dir(home)
+                    .and_then(|d| d.join(NAME).canonicalize().ok())
                     .is_some_and(|s| s == real);
                 (if script { Channel::Script } else { Channel::Other }, real)
             }
@@ -90,6 +104,9 @@ impl Install {
             Channel::Homebrew => {
                 Some(format!("brew uninstall {}", formula_of(&self.key).unwrap_or_else(|| "duckdb-harbor".into())))
             }
+            Channel::Script if cfg!(windows) => Some(
+                r#"Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Programs\harbor""#.into(),
+            ),
             Channel::Script => Some(
                 "curl -fsSL https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.sh | bash -s -- --uninstall"
                     .into(),
@@ -118,9 +135,7 @@ pub fn distinct(candidates: impl IntoIterator<Item = PathBuf>, home: Option<&Pat
 /// this shell's PATH (a GUI app's PATH is shorter than a terminal's).
 fn candidates(path_var: Option<&std::ffi::OsStr>, home: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = path_var.map(|p| std::env::split_paths(p).collect()).unwrap_or_default();
-    if let Some(home) = home {
-        dirs.push(home.join(".local/bin"));
-    }
+    dirs.extend(script_dir(home));
     for prefix in ["/opt/homebrew/bin", "/usr/local/bin", "/home/linuxbrew/.linuxbrew/bin"] {
         dirs.push(PathBuf::from(prefix));
     }
