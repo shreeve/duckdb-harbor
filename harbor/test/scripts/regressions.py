@@ -288,13 +288,28 @@ class Regressions(unittest.TestCase):
         finally:
             self.release(second)
 
-    def test_wrapped_settings_cannot_override_operator_policy(self):
-        before = self.sql("SELECT current_setting('threads')")["data"]
-        for sql in ["EXPLAIN ANALYZE SET threads=2", "EXPLAIN ANALYZE SET worker_threads=2",
-                    "EXPLAIN ANALYZE SET allowed_configs=['threads']",
-                    "EXPLAIN ANALYZE SET lock_configuration=false"]:
-            self.sql(sql, status=400)
-        self.assertEqual(self.sql("SELECT current_setting('threads')")["data"], before)
+    def test_settings_cannot_override_operator_policy(self):
+        # Process-global settings are locked in the engine, which refuses
+        # every way of reaching one and names it.
+        settings = "SELECT current_setting('threads'), current_setting('memory_limit')"
+        before = self.sql(settings)["data"]
+        for sql, name in [("SET threads=1", "threads"), ("SET GLOBAL threads=1", "threads"),
+                          ("SET SESSION worker_threads=1", "worker_threads"), ("RESET threads", "threads"),
+                          ("PRAGMA threads=1", "threads"), ("SET \"memory_limit\"='1TB'", "memory_limit"),
+                          ("/* x */ SET max_memory='1TB'", "max_memory"),
+                          ("SET --\r memory_limit='1TB'", "memory_limit"),
+                          ("RESET --\r\n external_threads", "external_threads"),
+                          ("SET max_temp_directory_size='100TB'", "max_temp_directory_size"),
+                          ("PRAGMA temp_directory='/tmp/x'", "temp_directory"),
+                          ("EXPLAIN ANALYZE SET threads=2", "threads"),
+                          ("EXPLAIN ANALYZE RESET memory_limit", "memory_limit"),
+                          ("EXPLAIN ANALYZE SET allowed_configs=['threads']", "allowed_configs"),
+                          ("EXPLAIN ANALYZE SET lock_configuration=false", "lock_configuration")]:
+            doc = self.sql(sql, status=400)
+            self.assertEqual(doc["code"], "sql_error", sql)
+            self.assertIn("configuration has been locked", doc["message"], sql)
+            self.assertIn(name, doc["message"], sql)
+        self.assertEqual(self.sql(settings)["data"], before)
         self.sql("SET default_order='DESC'")
         self.sql("RESET default_order")
 

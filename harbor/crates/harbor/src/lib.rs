@@ -20,7 +20,7 @@ use std::{
 };
 
 use justhttp::{Header, Method, Request, Response, Server};
-use wire::statement::{acting_keyword, skip_trivia, transaction_effect};
+use wire::statement::{acting_keyword, bare_word, transaction_effect};
 
 use crate::engine::conn::{Conn as Connection, Interrupt as InterruptHandle, Param};
 
@@ -3272,18 +3272,6 @@ fn run_sql(
         }
     }
 
-    if let Some(setting) = fenced_setting(&parsed.sql) {
-        let _ = req.respond(error_response(
-            400,
-            "sql_error",
-            &format!(
-                "{setting} is protected by Harbor's startup configuration and cannot be \
-                 changed over the wire"
-            ),
-        ));
-        return (true, 400);
-    }
-
     // `USE` sets the CURRENT DATABASE on the connection it runs on, and
     // outside a session that connection is a pooled one that goes back to the
     // pool when this request ends. Since a request carries exactly one
@@ -3459,48 +3447,6 @@ fn run_sql(
     }
 }
 
-/// The next token after trivia, uppercased: an identifier run
-/// (`[A-Za-z0-9_]`) or a `"double-quoted"` identifier (`""` escapes an inner
-/// quote). Quoted and bareword forms name the same thing to DuckDB, so the
-/// fence must read both. Empty at end of input; on stray punctuation it
-/// consumes one byte and returns it, so a caller loop always makes progress.
-fn next_word(b: &[u8], i: &mut usize) -> String {
-    skip_trivia(b, i);
-    if *i < b.len() && b[*i] == b'"' {
-        *i += 1;
-        let mut ident = String::new();
-        while *i < b.len() {
-            if b[*i] == b'"' {
-                if b.get(*i + 1) == Some(&b'"') {
-                    ident.push('"');
-                    *i += 2;
-                    continue;
-                }
-                *i += 1;
-                break;
-            }
-            ident.push(b[*i] as char);
-            *i += 1;
-        }
-        return ident.to_ascii_uppercase();
-    }
-    let start = *i;
-    while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'_') {
-        *i += 1;
-    }
-    if *i == start && *i < b.len() {
-        *i += 1;
-    }
-    std::str::from_utf8(&b[start..*i]).unwrap_or("").to_ascii_uppercase()
-}
-
-/// The first real word of a statement, upper-cased, skipping leading
-/// whitespace and comments. Empty when there is no leading identifier — a
-/// statement starting with `(`, or nothing at all.
-fn first_keyword(sql: &str) -> String {
-    next_word(sql.as_bytes(), &mut 0)
-}
-
 /// A block size as bytes: `65536`, or a `k`/`kb`/`kib` suffix on the number
 /// people actually say — `64k`. DuckDB takes only a power of two from 16 KiB
 /// to 256 KiB, and refusing the rest HERE rather than at open means the
@@ -3524,6 +3470,10 @@ pub fn parse_block_size(s: &str) -> Result<u64, String> {
     Ok(bytes)
 }
 
+/// Settings a client must not change: they are process-global in DuckDB, so
+/// one `SET memory_limit='100GB'` raises it for every neighbor berth on the
+/// host and defeats the fleet-safe cap the operator chose at berth start.
+/// Verified live: the SET took effect for all workers at once.
 const FENCED: &[&str] = &[
     "memory_limit",
     "max_memory",
@@ -3541,8 +3491,10 @@ const FENCED: &[&str] = &[
     "lock_configuration",
 ];
 
-/// Apply policy in the engine, so wrappers and future SQL forms cannot bypass
-/// the friendly request-time check. Initialization runs before this function.
+/// Lock [`FENCED`] in the engine, which then refuses every form that reaches
+/// one (`SET`, `RESET`, `PRAGMA`, a quoted name, an analyzed `EXPLAIN`)
+/// with its own message, naming the setting. Initialization runs before this
+/// function.
 fn lock_operator_settings(conn: &mut Connection) -> Result<(), String> {
     let locked = conn.query_strings("SELECT current_setting('lock_configuration')")
         .map_err(|e| e.into_text())?;
@@ -3564,26 +3516,6 @@ fn lock_operator_settings(conn: &mut Connection) -> Result<(), String> {
         .collect::<Vec<_>>().join(",");
     conn.execute_batch(&format!("SET allowed_configs=[{allowed}]; SET lock_configuration=true"))
         .map_err(|e| format!("cannot protect operator settings: {e}"))
-}
-
-/// Settings a client must not change: they are process-global in DuckDB, so
-/// one `SET memory_limit='100GB'` raises it for every neighbor berth on the
-/// host and defeats the fleet-safe cap the operator chose at berth start.
-/// Verified live: the SET took effect for all workers at once.
-///
-/// Reads through comments, whitespace, and double-quoting via `next_word`, so
-/// neither `/*x*/ SET threads=8` nor `SET "memory_limit"=…` slips past.
-fn fenced_setting(sql: &str) -> Option<&'static str> {
-    let b = sql.as_bytes();
-    let mut i = 0;
-    if !matches!(next_word(b, &mut i).as_str(), "SET" | "RESET" | "PRAGMA") {
-        return None;
-    }
-    let mut name = next_word(b, &mut i);
-    if matches!(name.as_str(), "GLOBAL" | "SESSION" | "LOCAL") {
-        name = next_word(b, &mut i);
-    }
-    FENCED.iter().find(|f| name.eq_ignore_ascii_case(f)).copied()
 }
 
 /// Refuse, outside a session, the statements whose whole purpose is to change
@@ -3621,7 +3553,7 @@ fn lost_without_session(sql: &str) -> Option<&'static str> {
 /// take the conservative path. Pinned sessions reset only on release.
 fn needs_connection_reset(sql: &str) -> bool {
     !matches!(
-        first_keyword(sql).as_str(),
+        bare_word(sql.as_bytes(), &mut 0).as_str(),
         "SELECT" | "WITH" | "FROM" | "VALUES" | "TABLE"
             | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "TRUNCATE"
             | "COPY" | "EXPORT" | "CHECKPOINT" | "ANALYZE" | "VACUUM"
@@ -4302,7 +4234,7 @@ fn error_response(status: u16, code: &'static str, message: &str) -> Response<st
 mod tests {
     use super::Method;
     use crate::encode::civil_from_days;
-    use super::{fenced_setting, lost_without_session};
+    use super::lost_without_session;
 
     /// USE outside a session is refused, not silently discarded: one request
     /// carries one statement, so nothing can follow it on that connection.
@@ -4738,24 +4670,6 @@ mod tests {
         }
     }
 
-    /// The fleet-safety fence reads through comments with the same
-    /// scanner, and fell to the same byte from the other direction: the key
-    /// hid behind a CR-terminated comment, so `fenced_setting` saw a bare
-    /// `SET` and passed it, while the engine set a process-global limit.
-    #[test]
-    fn the_fence_sees_a_key_behind_a_cr_terminated_comment() {
-        for sql in [
-            "SET --\r memory_limit='1TB'",
-            "SET --x\r memory_limit='1TB'",
-            "PRAGMA --\r threads=64",
-            "RESET --\r\n threads",
-        ] {
-            assert!(fenced_setting(sql).is_some(), "should be fenced: {sql:?}");
-        }
-        // ...and an unrelated key behind the same comment still passes.
-        assert_eq!(fenced_setting("SET --\r timezone='UTC'"), None);
-    }
-
     /// The byte strings here are what DuckDB v1.5.5 actually put on the wire
     /// for these values, captured from a running server rather than derived
     /// from the format description — a decoder tested only against its own
@@ -4862,45 +4776,6 @@ UNION ALL SELECT 1::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FRO
         assert_eq!(varint_to_decimal(&[0x80, 0x00]), None);
         // Header claims four magnitude bytes; only one follows.
         assert_eq!(varint_to_decimal(&[0x80, 0x00, 0x04, 0x01]), None);
-    }
-
-    #[test]
-    fn fences_process_global_settings() {
-        // The fleet-safety fence: these change a DuckDB global and must
-        // not be settable over the wire.
-        for sql in [
-            "SET memory_limit='1TB'",
-            "set MEMORY_LIMIT = '1TB'",
-            "PRAGMA threads=64",
-            "SET GLOBAL max_memory='1TB'",
-            "RESET threads",
-            "/* sneak */ SET memory_limit='1TB'",
-            "SET  --c\n threads=1",
-            // the quoted-identifier bypass: a double-quoted name reaches the
-            // same setting, so the fence must see through the quotes
-            "SET \"memory_limit\"='1TB'",
-            "PRAGMA \"threads\"=64",
-            "SET GLOBAL \"max_memory\"='1TB'",
-            "SET \"me\"\"mory_limit\"='1TB'", // (not a real key, but scanner must unquote)
-            // disk-spill caps are fenced too — SET around --max-temp-size
-            "SET max_temp_directory_size='100TB'",
-            "SET temp_directory='/tmp/x'",
-            "PRAGMA \"max_temp_directory_size\"='100TB'",
-        ] {
-            let got = fenced_setting(sql);
-            let expect_fenced = !sql.contains("me\"\"mory");
-            assert_eq!(got.is_some(), expect_fenced, "fence verdict for {sql:?}");
-        }
-        // Ordinary statements and unrelated settings pass.
-        for sql in [
-            "SELECT 1",
-            "SET timezone='UTC'",
-            "SET \"search_path\"='main'",
-            "CREATE TABLE t(x int)",
-            "PRAGMA database_list",
-        ] {
-            assert_eq!(fenced_setting(sql), None, "should pass: {sql:?}");
-        }
     }
 
     #[test]
