@@ -753,7 +753,11 @@ fn a_document_cell_takes_strict_json_a_hundred_levels_deep() {
     );
     println!("NaN through ?::JSON: {:?}", nan.rows[0]);
     assert_eq!(nan.rows[0][1], json!("DOUBLE"), "the engine takes NaN in a document");
-    assert!(document(&nan.rows[0][0]).is_err(), "and what comes back is not JSON");
+    assert_eq!(
+        document(&nan.rows[0][0]).unwrap(),
+        json!({"x": "NaN"}),
+        "and it comes back as JSON, the NaN a string as in a DOUBLE column"
+    );
     run("DROP TABLE _dt_depth_probe", None);
 }
 
