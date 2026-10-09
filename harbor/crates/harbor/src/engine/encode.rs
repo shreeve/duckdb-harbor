@@ -15,6 +15,7 @@ use crate::encode::{
     civil_from_days, digit_pair, push_base64, push_bit_string, push_date, push_float,
     push_float32, push_fraction, push_i64_raw, push_int, push_int_pad, push_json_string,
     push_time, push_tz_offset, push_u128_raw, push_u64_raw, push_uint, push_uuid, quote_identifier,
+    quote_nonfinite,
     split_time,
     varint_to_decimal,
 };
@@ -805,6 +806,7 @@ fn emit(
                     }
                 };
                 match text {
+                    Some(s) if json.is_some() => push_json_string(out, &quote_nonfinite(&s)),
                     Some(s) => push_json_string(out, &s),
                     None => out.push_str("null"),
                 }

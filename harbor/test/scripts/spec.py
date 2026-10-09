@@ -225,6 +225,13 @@ CASES = [
                        "VARIANT", False, "42"),
     ("variant-string", "SELECT '42'::VARIANT AS v",
                        "VARIANT", False, '"42"'),
+    # The engine writes a non-finite double in a VARIANT as a bare NaN or
+    # Infinity, which no JSON parser reads. It goes out as the string a
+    # DOUBLE column sends, at any depth, so the cell's text is JSON.
+    ("variant-nan",    "SELECT 'nan'::DOUBLE::VARIANT AS v",
+                       "VARIANT", False, '"NaN"'),
+    ("variant-inf-nested", "SELECT {'a': 'inf'::DOUBLE, 'b': ['-inf'::DOUBLE]}::VARIANT AS v",
+                       "VARIANT", False, '{"a":"Infinity","b":["-Infinity"]}'),
 
     # -- HUGEINT minimum ----------------------------------------------------
     # i128::MIN has no positive counterpart, so the "is this JSON-safe" test
@@ -246,6 +253,8 @@ SCHEMA_EXTRAS = {
     # value's properties it must not trust.
     "variant-lossy":  {"encoding": "json"},
     "variant-string": {"encoding": "json"},
+    "variant-nan":    {"encoding": "json"},
+    "variant-inf-nested": {"encoding": "json"},
 }
 
 

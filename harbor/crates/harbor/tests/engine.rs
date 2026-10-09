@@ -894,6 +894,13 @@ mod wire {
         // JSON text tells the number from the string, which display text
         // could not; a JSON document round-trips byte for byte.
         row(eng, "SELECT '42'::VARIANT, '{\"n\":42,\"s\":\"42\",\"l\":[1,null]}'::JSON::VARIANT", r#""\"42\"","{\"n\":42,\"s\":\"42\",\"l\":[1,null]}""#);
+        // JSON has no NaN or Infinity: inside a VARIANT, at any depth, they
+        // go out as the strings a DOUBLE column sends, so the text parses.
+        row(
+            eng,
+            "SELECT 'nan'::DOUBLE::VARIANT, {'a': 'inf'::DOUBLE, 'b': '-inf'::DOUBLE, 'c': 'nan'::FLOAT, 's': 'NaN'}::VARIANT, [-('inf'::DOUBLE)]::VARIANT",
+            r#""\"NaN\"","{\"a\":\"Infinity\",\"b\":\"-Infinity\",\"c\":\"NaN\",\"s\":\"NaN\"}","[\"-Infinity\"]""#,
+        );
         schema(eng, "SELECT 42::VARIANT AS v", r#"{"name":"v","duckdbType":"VARIANT","lossless":false,"encoding":"json"}"#);
         // A JSON column is text that is JSON: the alias name is what the
         // schema says, and the CLI's json modes splice such a cell by it.

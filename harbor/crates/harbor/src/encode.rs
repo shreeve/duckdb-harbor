@@ -215,6 +215,42 @@ pub(crate) fn push_float32(out: &mut String, f: f32) {
     }
 }
 
+/// The engine's JSON text for a VARIANT writes a non-finite double as a bare
+/// `NaN`, `Infinity` or `-Infinity`, which is not JSON: a client's parser
+/// throws on the whole row. Each goes out as the string a DOUBLE column sends
+/// ([`push_float`]). Outside a string, JSON text holds no other capital
+/// letter, so the scan is skipped for text with no `N` or `I` at all.
+pub(crate) fn quote_nonfinite(json: &str) -> std::borrow::Cow<'_, str> {
+    let b = json.as_bytes();
+    if !b.iter().any(|&c| c == b'N' || c == b'I') {
+        return json.into();
+    }
+    let mut out = String::with_capacity(json.len() + 8);
+    let (mut start, mut i, mut in_string) = (0, 0, false);
+    while i < b.len() {
+        match b[i] {
+            b'\\' if in_string => i += 1,
+            b'"' => in_string = !in_string,
+            b'N' | b'I' | b'-' if !in_string => {
+                let word = ["NaN", "Infinity", "-Infinity"].into_iter().find(|w| json[i..].starts_with(w));
+                if let Some(word) = word {
+                    out.push_str(&json[start..i]);
+                    out.push('"');
+                    out.push_str(word);
+                    out.push('"');
+                    i += word.len();
+                    start = i;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push_str(&json[start..]);
+    out.into()
+}
+
 /// Rust writes `1e21`; JSON and JavaScript write `1e+21`. Only a positive
 /// exponent is missing its sign.
 fn push_exponent(out: &mut String, formatted: &str) {
@@ -690,6 +726,22 @@ mod tests {
             let s: String =
                 (0..len).map(|_| alphabet[next() as usize % alphabet.len()]).collect();
             assert_eq!(ours(&s), reference(&s), "for {s:?}");
+        }
+    }
+
+    #[test]
+    fn nonfinite_words_become_strings_outside_strings_only() {
+        for (text, want) in [
+            ("42", "42"),
+            ("NaN", r#""NaN""#),
+            ("-Infinity", r#""-Infinity""#),
+            ("[NaN,1,Infinity]", r#"["NaN",1,"Infinity"]"#),
+            (r#"{"a":Infinity,"b":-Infinity,"c":NaN}"#, r#"{"a":"Infinity","b":"-Infinity","c":"NaN"}"#),
+            (r#"{"NaN":"Infinity","s":"x\"NaN","n":-1}"#, r#"{"NaN":"Infinity","s":"x\"NaN","n":-1}"#),
+            (r#"["\\",NaN,"é Infinity"]"#, r#"["\\","NaN","é Infinity"]"#),
+        ] {
+            assert_eq!(quote_nonfinite(text), want, "for {text}");
+            serde_json::from_str::<serde_json::Value>(&quote_nonfinite(text)).expect(text);
         }
     }
 
