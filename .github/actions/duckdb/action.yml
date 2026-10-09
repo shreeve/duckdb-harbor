@@ -1,15 +1,15 @@
 name: Set up DuckDB
 description: >
   Put a DuckDB engine where CI can run it: the library harbor dlopens and the
-  duckdb CLI that builds the test fixture, both from DuckDB's official nightly
-  channel, fetched by the same script a developer runs (scripts/fetch-duckdb.sh
-  — the one place the channel and the archive shapes are spelled). The channel
-  is the latest green build of the 2.0 branch, so the suite runs against
-  DuckDB's current main; the script refuses a library that lacks the v2 C API.
+  duckdb CLI of the same build, which builds the test fixture, fetched by the
+  script a developer runs (scripts/fetch-duckdb.sh, the one place the sources
+  and the archive shapes are spelled). DUCKDB_LIB_BUILD in the job's
+  environment picks the build: a name takes both from this repository's
+  engine-<build> release, `latest` or empty from DuckDB's nightly channel.
 runs:
   using: composite
   steps:
-    - name: DuckDB engine and CLI (official nightly)
+    - name: DuckDB engine and CLI
       shell: bash
       run: |
         set -euo pipefail
