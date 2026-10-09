@@ -6,11 +6,12 @@ install.ps1 — install harbor with one command (Windows):
 
 Pin a version:
 
-    & ([scriptblock]::Create((irm .../install.ps1))) -Tag v0.18.0
+    & ([scriptblock]::Create((irm .../install.ps1))) -Tag v0.44.2
 
 Downloads the release zip for this architecture, verifies its SHA-256 against
-the published checksums, and installs into %LOCALAPPDATA%\Programs\harbor —
-the per-user convention on Windows, so nothing here needs Administrator.
+the published checksums, and runs the archive's own installer, which puts it
+in %LOCALAPPDATA%\Programs\harbor — the per-user convention on Windows, so
+nothing here needs Administrator.
 
 duckdb.dll sits beside the executables, which is where Windows looks first.
 
@@ -23,87 +24,76 @@ param(
   [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\harbor')
 )
 
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-# PowerShell 5.1 can still default to TLS 1.0, which github.com refuses.
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# `irm | iex` runs this in the caller's own session, so everything below runs
+# in a scope of its own: the strict mode and error preference it sets end
+# with it, a failure throws instead of closing the caller's window, and the
+# TLS setting it needs is put back.
+& {
+  Set-StrictMode -Version Latest
+  $ErrorActionPreference = 'Stop'
+  # PowerShell 5.1 can still default to TLS 1.0, which github.com refuses.
+  $tls = [Net.ServicePointManager]::SecurityProtocol
+  [Net.ServicePointManager]::SecurityProtocol = $tls -bor [Net.SecurityProtocolType]::Tls12
 
-$repo = 'shreeve/duckdb-harbor'
-function Fail($msg) { Write-Error "install: $msg"; exit 1 }
+  $repo = 'shreeve/duckdb-harbor'
+  function Fail($msg) { throw "install: $msg" }
 
-# --- platform -> release asset suffix ---------------------------------------
-$arch = switch ($env:PROCESSOR_ARCHITECTURE) {
-  'AMD64' { 'amd64' }
-  'ARM64' { 'arm64' }
-  default { Fail "unsupported architecture: $($env:PROCESSOR_ARCHITECTURE)" }
-}
-$plat = "windows-$arch"
-
-# --- version: the argument, or whatever `latest` resolves to -----------------
-if (-not $Tag) {
+  $tmp = Join-Path ([IO.Path]::GetTempPath()) ("harbor-" + [Guid]::NewGuid().ToString('N'))
   try {
-    $Tag = (Invoke-RestMethod -UseBasicParsing -Headers @{ 'User-Agent' = 'harbor-install' } `
-      "https://api.github.com/repos/$repo/releases/latest").tag_name
-  } catch { Fail "cannot reach github.com: $($_.Exception.Message)" }
-}
-if (-not $Tag) { Fail "no releases found for $repo" }
-if ($Tag -notmatch '^v') { $Tag = "v$Tag" }
+    # --- platform -> release asset suffix -------------------------------------
+    $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
+      'AMD64' { 'amd64' }
+      'ARM64' { 'arm64' }
+      default { Fail "unsupported architecture: $($env:PROCESSOR_ARCHITECTURE)" }
+    }
+    $plat = "windows-$arch"
 
-$asset = "harbor-$Tag-$plat.zip"
-$base  = "https://github.com/$repo/releases/download/$Tag"
-$tmp   = Join-Path ([IO.Path]::GetTempPath()) ("harbor-" + [Guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+    # --- version: the argument, or whatever `latest` resolves to ---------------
+    if (-not $Tag) {
+      try {
+        $Tag = (Invoke-RestMethod -UseBasicParsing -Headers @{ 'User-Agent' = 'harbor-install' } `
+          "https://api.github.com/repos/$repo/releases/latest").tag_name
+      } catch { Fail "cannot reach github.com: $($_.Exception.Message)" }
+    }
+    if (-not $Tag) { Fail "no releases found for $repo" }
+    if ($Tag -notmatch '^v') { $Tag = "v$Tag" }
 
-try {
-  Write-Host "installing harbor $Tag ($plat)"
-  $zip = Join-Path $tmp $asset
-  try { Invoke-WebRequest -UseBasicParsing -Uri "$base/$asset" -OutFile $zip }
-  catch { Fail "download failed: $base/$asset" }
+    $asset = "harbor-$Tag-$plat.zip"
+    $base  = "https://github.com/$repo/releases/download/$Tag"
+    New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 
-  # --- verify against the release's published checksums ----------------------
-  $sums = Join-Path $tmp 'checksums.txt'
-  try { Invoke-WebRequest -UseBasicParsing -Uri "$base/harbor-$Tag-checksums.txt" -OutFile $sums }
-  catch { Fail "download failed: harbor-$Tag-checksums.txt" }
+    Write-Host "installing harbor $Tag ($plat)"
+    $zip = Join-Path $tmp $asset
+    try { Invoke-WebRequest -UseBasicParsing -Uri "$base/$asset" -OutFile $zip }
+    catch { Fail "download failed: $base/$asset" }
 
-  $want = (Get-Content $sums | ForEach-Object {
-    $f = $_ -split '\s+'
-    if ($f.Count -ge 2 -and $f[1] -eq $asset) { $f[0] }
-  }) | Select-Object -First 1
-  if (-not $want) { Fail "no checksum published for $asset" }
-  $got = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash
-  if ($got -ne $want.ToUpperInvariant()) { Fail "checksum mismatch for $asset" }
+    # --- verify against the release's published checksums --------------------
+    $sums = Join-Path $tmp 'checksums.txt'
+    try { Invoke-WebRequest -UseBasicParsing -Uri "$base/harbor-$Tag-checksums.txt" -OutFile $sums }
+    catch { Fail "download failed: harbor-$Tag-checksums.txt" }
 
-  # --- unpack and place ------------------------------------------------------
-  Expand-Archive -Path $zip -DestinationPath $tmp -Force
-  $src = Join-Path $tmp "harbor-$Tag-$plat\bin"
-  if (-not (Test-Path $src)) { Fail "archive did not contain bin\ — got $(Get-ChildItem $tmp | Select-Object -Expand Name)" }
+    $want = (Get-Content $sums | ForEach-Object {
+      $f = $_ -split '\s+'
+      if ($f.Count -ge 2 -and $f[1] -eq $asset) { $f[0] }
+    }) | Select-Object -First 1
+    if (-not $want) { Fail "no checksum published for $asset" }
+    $got = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash
+    if ($got -ne $want.ToUpperInvariant()) { Fail "checksum mismatch for $asset" }
 
-  $bin = Join-Path $InstallDir 'bin'
-  New-Item -ItemType Directory -Path $bin -Force | Out-Null
-
-  # A running berth holds its own .exe open, so replacing it fails with a
-  # sharing violation. Say which one and what to do rather than half-installing.
-  foreach ($f in Get-ChildItem $src -File) {
-    $dest = Join-Path $bin $f.Name
-    try { Copy-Item $f.FullName $dest -Force }
-    catch { Fail "cannot replace $dest — a running harbor is holding it; stop your harbor servers (close their windows or end the processes), then re-run" }
+    # --- unpack and hand off to the archive's own installer -------------------
+    Expand-Archive -Path $zip -DestinationPath $tmp -Force
+    $installer = Join-Path $tmp "harbor-$Tag-$plat\install.ps1"
+    if (-not (Test-Path $installer)) { Fail "archive did not contain install.ps1" }
+    & $installer -InstallDir $InstallDir
+    if (-not $?) { Fail "the archive's installer did not finish" }
+  } finally {
+    Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    [Net.ServicePointManager]::SecurityProtocol = $tls
   }
-} finally {
-  Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+
+  Write-Host ""
+  # Windows has no unix sockets, so starting is explicit here (spawn-on-use is a
+  # unix-socket feature); the client half works the same everywhere.
+  Write-Host "try: harbor mydata.duckdb start --port 9495"
+  Write-Host "     harbor http://127.0.0.1:9495"
 }
-
-Write-Host "installed: harbor -> $bin"
-
-# --- PATH, for this user only ------------------------------------------------
-$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-if (($userPath -split ';') -notcontains $bin) {
-  [Environment]::SetEnvironmentVariable('Path', (($userPath.TrimEnd(';') + ";$bin").TrimStart(';')), 'User')
-  $env:Path = "$env:Path;$bin"
-  Write-Host "added to your PATH — open a new terminal for it to take effect elsewhere"
-}
-
-Write-Host ""
-# Windows has no unix sockets, so starting is explicit here (spawn-on-use is a
-# unix-socket feature); the client half works the same everywhere.
-Write-Host "try: harbor mydata.duckdb start --port 9495"
-Write-Host "     harbor http://127.0.0.1:9495"
