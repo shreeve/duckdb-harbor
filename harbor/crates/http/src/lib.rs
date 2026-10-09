@@ -210,6 +210,10 @@ fn moor(transport: &Transport) -> io::Result<Response> {
     Ok(response)
 }
 
+/// The most a response head may hold: per line, and lines.
+const HEAD_LINE: u64 = 8 * 1024;
+const HEAD_LINES: usize = 100;
+
 trait Stream: Read + Write + Send {}
 impl<T: Read + Write + Send> Stream for T {}
 
@@ -323,14 +327,20 @@ fn request_inner(
     // Headers may not arrive until the statement completes (the server
     // responds once execution starts producing), so the wait happens here,
     // which is why the tick callback fires here: it is how a Ctrl-C reaches
-    // a query that has not sent a byte yet.
+    // a query that has not sent a byte yet. A line is read only so far, and
+    // so many of them: what answers on a port that is not Harbor's must not
+    // grow the head without end.
     let read_line = |reader: &mut BufReader<Box<dyn Stream>>, line: &mut String| -> io::Result<usize> {
         loop {
             if let Some(f) = on_tick {
                 f()?;
             }
-            match reader.read_line(line) {
+            let room = HEAD_LINE.saturating_sub(line.len() as u64);
+            match reader.by_ref().take(room).read_line(line) {
                 Err(e) if on_tick.is_some() && matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                Ok(_) if line.len() as u64 >= HEAD_LINE && !line.ends_with('\n') => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "a response header line runs past 8 KiB"));
+                }
                 other => return other,
             }
         }
@@ -346,12 +356,15 @@ fn request_inner(
 
     let mut chunked = false;
     let mut content_length: Option<u64> = None;
-    loop {
+    for count in 0.. {
         let mut line = String::new();
         read_line(&mut reader, &mut line)?;
         let line = line.trim_end();
         if line.is_empty() {
             break;
+        }
+        if count == HEAD_LINES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "a response has more than 100 header lines"));
         }
         if let Some((k, v)) = line.split_once(':') {
             let v = v.trim();
@@ -438,6 +451,21 @@ mod tests {
         assert_eq!(refused.to_string(), "no_such_session: gone");
         assert_eq!(Failure::of(502, "<html>"), Failure::Unanswered("HTTP 502".into()));
         assert!(!Failure::Unsent("x".into()).session_gone());
+    }
+
+    #[test]
+    fn a_head_that_runs_on_is_refused() {
+        let long: &'static str = format!("HTTP/1.1 200 OK\r\nX: {}\r\n\r\n", "a".repeat(9000)).leak();
+        let many: &'static str = format!("HTTP/1.1 200 OK\r\n{}\r\n", "X: 1\r\n".repeat(101)).leak();
+        for reply in [long, many] {
+            let (transport, server) = one_shot(reply);
+            let e = request(&transport, &wire::endpoint::READY, None, None).err().unwrap();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+            server.join().unwrap();
+        }
+        let (transport, server) = one_shot("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        assert_eq!(request(&transport, &wire::endpoint::READY, None, None).unwrap().body_string().unwrap(), "ok");
+        server.join().unwrap();
     }
 
     #[test]

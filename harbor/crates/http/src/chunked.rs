@@ -52,6 +52,9 @@ impl<R: BufRead> ChunkedReader<R> {
 
 impl<R: BufRead> Read for ChunkedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         loop {
             match self.state {
                 ChunkState::Done => return Ok(0),
@@ -92,7 +95,16 @@ impl<R: BufRead> Read for ChunkedReader<R> {
                     return Ok(n);
                 }
                 ChunkState::DataEnd => {
-                    self.fill_line()?; // the CRLF after the payload
+                    // The CRLF after the payload, and nothing before it: a
+                    // chunk that runs past its size is refused, not skipped.
+                    let eol = self.fill_line()?;
+                    if !matches!(self.line.as_slice(), b"\r\n" | b"\n") {
+                        let (kind, why) = match eol {
+                            true => (io::ErrorKind::InvalidData, "a chunk ran past its size"),
+                            false => (io::ErrorKind::UnexpectedEof, "connection closed mid-chunk"),
+                        };
+                        return Err(io::Error::new(kind, why));
+                    }
                     self.line.clear();
                     self.state = ChunkState::Size;
                 }
@@ -188,5 +200,21 @@ mod tests {
         let mut out = Vec::new();
         let err = r.read_to_end(&mut out).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        // Or after the payload, before the CRLF that ends it.
+        let mut r = ChunkedReader::new(BufReader::new(Cursor::new(&b"2\r\nok"[..])));
+        assert_eq!(r.read_to_end(&mut Vec::new()).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn a_chunk_longer_than_its_size_is_refused() {
+        let mut r = ChunkedReader::new(BufReader::new(Cursor::new(&b"2\r\nokay\r\n0\r\n\r\n"[..])));
+        let err = r.read_to_end(&mut Vec::new()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        // An empty buffer asks for nothing, wherever the reader stands.
+        let mut r = ChunkedReader::new(BufReader::new(Cursor::new(&b"2\r\nok\r\n0\r\n\r\n"[..])));
+        assert_eq!(r.read(&mut []).unwrap(), 0);
+        let mut out = String::new();
+        r.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "ok");
     }
 }
