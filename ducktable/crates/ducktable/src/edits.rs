@@ -12,6 +12,7 @@
 //! selection, discard-all) is one entry too: the rows stay separate
 //! changes for review, and one ⌘Z takes the whole gesture back.
 
+use crate::util::qident;
 use gpui_kit::SharedString;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -55,6 +56,16 @@ pub enum RowChange {
     /// Schema column index -> staged cell.
     Update(BTreeMap<usize, CellEdit>),
     Delete,
+}
+
+/// The cell a gesture stages into.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Target {
+    /// A draft row's cell, by the draft's key.
+    Draft(String),
+    /// A fetched row's cell: the row's identity, and the cell's text as it
+    /// was fetched (None = NULL).
+    Fetched(Vec<Value>, Option<SharedString>),
 }
 
 /// How commit verifies one generated statement.
@@ -440,7 +451,8 @@ impl Edits {
 
     /// Add an intentional all-DEFAULT draft. It is staged immediately:
     /// DEFAULT VALUES can itself be a valid insert, and one undo removes it.
-    pub fn stage_insert(&mut self) -> String {
+    /// Its key, or None when the set is held and takes no staging.
+    pub fn stage_insert(&mut self) -> Option<String> {
         self.stage_duplicate(Vec::new(), Vec::new())
     }
 
@@ -448,11 +460,15 @@ impl Edits {
     /// `text`; a `Bind::Source` cell is read from that row when the INSERT
     /// runs, and a `Bind::Value` cell is bound like any typed one. The
     /// whole copied row is one undo step, just as an empty New Row is.
+    /// Its key, or None when the set is held and takes no staging.
     pub fn stage_duplicate(
         &mut self,
         source: Vec<Value>,
         cells: Vec<(usize, Option<SharedString>, Bind)>,
-    ) -> String {
+    ) -> Option<String> {
+        if self.in_doubt {
+            return None;
+        }
         let key = format!("draft:{:020}", self.next_draft);
         self.next_draft += 1;
         let cells = cells
@@ -468,7 +484,31 @@ impl Edits {
             prev: None,
             next: Some(RowChange::Insert(cells)),
         });
-        key
+        Some(key)
+    }
+
+    /// Stage `text`, bound as `value`, into a cell: a draft's, or a fetched
+    /// row's, where the text it was fetched with drops the staged edit.
+    pub fn stage_into(&mut self, target: Target, col: usize, text: Option<SharedString>, value: Value) {
+        match target {
+            Target::Draft(key) => self.stage_insert_cell(&key, col, text, value),
+            Target::Fetched(identity, fetched) => self.stage_cell(identity, col, fetched, text, value),
+        }
+    }
+
+    /// Stage what confirming an editor decided (`confirm`). A cell kept, or
+    /// text refused, stages nothing. A cell reverted goes back to the text
+    /// it had before anyone typed in it: a fetched cell's staged edit is
+    /// dropped, and a duplicate's cell is read from its source row again.
+    pub fn stage_confirmed(&mut self, target: Target, col: usize, confirmed: Confirm) {
+        match (confirmed, target) {
+            (Confirm::Keep | Confirm::Refuse(_), _) => {}
+            (Confirm::Revert, Target::Draft(key)) => self.stage_insert_copied(&key, col),
+            (Confirm::Revert, Target::Fetched(identity, fetched)) => {
+                self.stage_cell(identity, col, fetched.clone(), fetched, Value::Null)
+            }
+            (Confirm::Stage(text, value), target) => self.stage_into(target, col, text, value),
+        }
     }
 
     /// Supply one draft cell. `text = None` is explicit SQL NULL; an
@@ -589,6 +629,22 @@ impl Edits {
             return;
         }
         self.apply(Op { key, identity, prev, next: Some(RowChange::Delete) });
+    }
+
+    /// ⌘⌫ over rows, as one undo step: a draft is discarded, since it never
+    /// existed, and a fetched row is staged for DELETE, unless the set is
+    /// `stale` (the table reshaped, the page from before a commit, or the
+    /// set held), where only the discards are taken.
+    pub fn delete_rows(&mut self, rows: Vec<Target>, stale: bool) {
+        self.grouped(|edits| {
+            for row in rows {
+                match row {
+                    Target::Draft(key) => edits.discard(&key),
+                    Target::Fetched(identity, _) if !stale => edits.stage_delete(identity),
+                    Target::Fetched(..) => {}
+                }
+            }
+        });
     }
 
     /// Whether `key` names a draft row nothing has been entered into: an
@@ -889,9 +945,14 @@ fn key_placeholder_for(duck_type: &str) -> &'static str {
     }
 }
 
-/// Quote an identifier the DuckDB way.
-fn qident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+/// What clearing a cell stages, type-honestly: `''` for text, NULL for
+/// every other type (`is_text_type`).
+pub fn cleared(duck_type: &str) -> (Option<SharedString>, Value) {
+    if is_text_type(duck_type) {
+        (Some(SharedString::from("")), Value::String(String::new()))
+    } else {
+        (None, Value::Null)
+    }
 }
 
 /// Text columns are where `''` is a value in its own right; clearing any
@@ -1077,13 +1138,10 @@ pub fn confirm(text: &str, cell: &Held) -> Confirm {
         return Confirm::Revert;
     }
     if text.is_empty() {
-        // An emptied editor: '' for text (the one honest way to enter it),
-        // NULL for everything else — docs/EDITING.md.
-        return if is_text_type(cell.ty) {
-            Confirm::Stage(Some(SharedString::from("")), Value::String(String::new()))
-        } else {
-            Confirm::Stage(None, Value::Null)
-        };
+        // An emptied editor clears the cell: '' for text (the one honest
+        // way to enter it), NULL for everything else.
+        let (text, value) = cleared(cell.ty);
+        return Confirm::Stage(text, value);
     }
     match parse_value(text, cell.ty) {
         Ok(Value::Null) => Confirm::Stage(None, Value::Null),
@@ -1159,12 +1217,12 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
     // `linenbreak`, with no error. Outside quotes the cast keeps a backslash
     // as typed; the rule is one rule all the same, since any value can be
     // written quoted.
-    if is_container(&ty) {
-        if let Some(escape) = lossy_escape(text) {
-            return Err(format!(
-                "typed text for {duck_type} can escape only a quote and a backslash: inside quotes the engine reads {escape} as plain characters \u{2014} edit this cell in the Query tab"
-            ));
-        }
+    if is_container(&ty)
+        && let Some(escape) = lossy_escape(text)
+    {
+        return Err(format!(
+            "typed text for {duck_type} can escape only a quote and a backslash: inside quotes the engine reads {escape} as plain characters \u{2014} edit this cell in the Query tab"
+        ));
     }
     // Every test below is on the scalar's own name, so a nested type —
     // `INTEGER[]`, `STRUCT(a INTEGER)`, `MAP(VARCHAR, INTEGER)` — and a
@@ -1540,9 +1598,9 @@ mod tests {
 
         // A new row keyed as a deleted one, and as one an update re-keys away.
         let mut e = edits();
-        let draft = e.stage_insert();
+        let draft = e.stage_insert().unwrap();
         e.stage_insert_cell(&draft, 0, txt("5"), json!(5));
-        let other = e.stage_insert();
+        let other = e.stage_insert().unwrap();
         e.stage_insert_cell(&other, 0, txt("6"), json!(6));
         e.stage_delete(vec![json!(5)]);
         e.stage_cell(vec![json!(6)], 0, txt("6"), txt("60"), json!(60));
@@ -1639,6 +1697,20 @@ mod tests {
         assert!(e.undo());
         assert!(e.is_empty());
         assert!(!e.undo());
+    }
+
+    #[test]
+    fn command_delete_discards_drafts_and_deletes_fetched_rows_as_one_step() {
+        let mut e = edits();
+        let draft = e.stage_insert().unwrap();
+        let fetched = |id: i64| Target::Fetched(vec![json!(id)], None);
+        e.delete_rows(vec![Target::Draft(draft.clone()), fetched(1), fetched(2)], false);
+        assert_eq!(e.counts(), (0, 0, 2));
+        assert!(e.undo(), "one ⌘Z brings the draft back and the rows with it");
+        assert_eq!(e.counts(), (1, 0, 0));
+        // Against a stale page the deletes are not taken; the discard is.
+        e.delete_rows(vec![Target::Draft(draft), fetched(3)], true);
+        assert!(e.is_empty());
     }
 
     #[test]
@@ -1794,7 +1866,7 @@ mod tests {
         e.stage_cell(vec![json!(1)], 1, txt("{}"), txt("{\"a\":1}"), json!("{\"a\":1}"));
         e.stage_cell(vec![json!(1)], 2, txt("[]"), txt("[1]"), json!("[1]"));
         e.stage_cell(vec![json!(1)], 3, txt("qg=="), txt("qrs="), json!("qrs="));
-        let draft = e.stage_insert();
+        let draft = e.stage_insert().unwrap();
         e.stage_insert_cell(&draft, 1, txt("{\"a\":1}"), json!("{\"a\":1}"));
         e.stage_insert_cell(&draft, 3, None, Value::Null);
 
@@ -1945,8 +2017,8 @@ mod tests {
     #[test]
     fn inserts_omit_defaults_bind_values_and_undo_as_rows() {
         let mut e = edits();
-        let defaults = e.stage_insert();
-        let supplied = e.stage_insert();
+        let defaults = e.stage_insert().unwrap();
+        let supplied = e.stage_insert().unwrap();
         e.stage_insert_cell(&supplied, 1, txt("Ada"), json!("Ada"));
         e.stage_insert_cell(&supplied, 2, None, Value::Null);
         assert_eq!(e.counts(), (2, 0, 0));
@@ -1973,7 +2045,7 @@ mod tests {
         let key = e.stage_duplicate(
             vec![json!(5)],
             vec![(1, txt("Ada"), Bind::Source), (2, None, Bind::Source)],
-        );
+        ).unwrap();
         assert_eq!(e.counts(), (1, 0, 0));
         assert_eq!(e.staged_text(&key, 1), Some(txt("Ada")));
         assert_eq!(e.staged_text(&key, 2), Some(None));
@@ -1995,7 +2067,7 @@ mod tests {
                 (2, txt("[2]"), Bind::Value(json!("[2]"))),
                 (3, txt("qg=="), Bind::Source),
             ],
-        );
+        ).unwrap();
         let stmts = e.statements();
         assert_eq!(
             stmts[0].sql,
@@ -2040,7 +2112,7 @@ mod tests {
                 (2, txt("[2]"), Bind::Value(json!("[2]"))),
                 (3, None, Bind::Source),
             ],
-        );
+        ).unwrap();
         let copied = e.statements();
         assert_eq!(e.copied_text(&key, 1), Some(txt("{\"when\":\"2024-02-29\"}")));
         assert_eq!(e.copied_text(&key, 3), Some(None), "a copied NULL is remembered as one");
@@ -2092,7 +2164,7 @@ mod tests {
         e.stage_insert_cell(&key, 2, txt("[3]"), json!("[3]"));
         e.stage_insert_cell(&key, 2, txt("[2]"), json!("[2]"));
         assert_eq!(e.statements(), copied, "bound again, as it was");
-        let fresh = e.stage_insert();
+        let fresh = e.stage_insert().unwrap();
         e.stage_insert_cell(&fresh, 1, txt("1"), json!("1"));
         e.stage_insert_copied(&fresh, 1);
         assert_eq!(e.copied_text(&fresh, 1), None);
@@ -2174,11 +2246,11 @@ mod tests {
     #[test]
     fn only_a_draft_with_nothing_entered_is_untouched() {
         let mut e = edits();
-        let blank = e.stage_insert();
+        let blank = e.stage_insert().unwrap();
         assert!(e.is_untouched_insert(&blank));
         e.stage_insert_cell(&blank, 1, None, Value::Null);
         assert!(!e.is_untouched_insert(&blank), "an explicit NULL was entered");
-        let copy = e.stage_duplicate(vec![json!(5)], vec![(2, txt("3"), Bind::Source)]);
+        let copy = e.stage_duplicate(vec![json!(5)], vec![(2, txt("3"), Bind::Source)]).unwrap();
         assert!(!e.is_untouched_insert(&copy), "a duplicate carries its copied cells");
         assert!(!e.is_untouched_insert("draft:missing"));
     }
@@ -2186,7 +2258,7 @@ mod tests {
     #[test]
     fn a_duplicate_is_reviewed_discarded_and_validated_like_any_draft() {
         let mut e = edits();
-        let key = e.stage_duplicate(vec![json!(5)], vec![(2, txt("3"), Bind::Source)]);
+        let key = e.stage_duplicate(vec![json!(5)], vec![(2, txt("3"), Bind::Source)]).unwrap();
         // `name` is NOT NULL with no default and was not copied.
         let required = |e: &Edits| e.first_missing_required(&[true, true, false], &[None, None, None], &[true, false, false]);
         assert_eq!(required(&e), Some((key.clone(), 1)));
@@ -2261,6 +2333,36 @@ mod tests {
         assert!(matches!(confirm("abc", &persisted("INTEGER", Some("7"), None)), Confirm::Refuse(_)));
         assert!(matches!(confirm("NaN", &persisted("VARIANT", Some("1"), None)), Confirm::Refuse(_)));
         assert!(matches!(confirm("NaN", &persisted("VARIANT", None, Some(Some("1")))), Confirm::Refuse(_)));
+    }
+
+    #[test]
+    fn a_confirmed_cell_lands_in_its_draft_or_its_fetched_row() {
+        let mut e = edits();
+        let row = || Target::Fetched(vec![json!(1)], txt("a"));
+        // Kept or refused, nothing is staged.
+        e.stage_confirmed(row(), 1, Confirm::Keep);
+        e.stage_confirmed(row(), 1, Confirm::Refuse("no".into()));
+        assert!(e.is_empty());
+        // Staged, the cell holds the text; reverted, the edit is dropped.
+        e.stage_confirmed(row(), 1, stage("b", json!("b")));
+        assert_eq!(e.staged_text(&key_of(&[json!(1)]), 1), Some(txt("b")));
+        e.stage_confirmed(row(), 1, Confirm::Revert);
+        assert!(e.is_empty());
+        // A duplicate's cell typed over and reverted is read from its source.
+        let key = e.stage_duplicate(vec![json!(5)], vec![(1, txt("Ada"), Bind::Source)]).unwrap();
+        let copied = e.statements();
+        e.stage_confirmed(Target::Draft(key.clone()), 1, stage("Bo", json!("Bo")));
+        assert_eq!(e.staged_text(&key, 1), Some(txt("Bo")));
+        e.stage_confirmed(Target::Draft(key.clone()), 1, Confirm::Revert);
+        assert_eq!(e.statements(), copied);
+        // Cleared, type-honestly: '' for text, NULL for the rest.
+        let (text, value) = cleared("VARCHAR");
+        e.stage_into(Target::Draft(key.clone()), 1, text, value);
+        assert_eq!(e.staged_text(&key, 1), Some(txt("")));
+        let (text, value) = cleared("INTEGER");
+        e.stage_into(row(), 2, text, value);
+        assert_eq!(e.staged_text(&key_of(&[json!(1)]), 2), Some(None));
+        assert_eq!(cleared("UUID"), (None, Value::Null));
     }
 
     #[test]
@@ -2472,7 +2574,7 @@ mod tests {
         e.mark_in_doubt(None, true);
         assert!(!e.in_doubt());
 
-        let draft = e.stage_insert();
+        let draft = e.stage_insert().unwrap();
         e.stage_cell(vec![json!(1)], 1, txt("a"), txt("b"), json!("b"));
         e.stage_delete(vec![json!(7)]);
         assert_eq!(e.statements().len(), 3);
@@ -2487,7 +2589,8 @@ mod tests {
         assert!(e.statements().is_empty());
         e.stage_cell(vec![json!(2)], 1, txt("x"), txt("y"), json!("y"));
         e.stage_delete(vec![json!(3)]);
-        e.stage_insert();
+        assert_eq!(e.stage_insert(), None, "no key for a draft that was not staged");
+        assert_eq!(e.stage_duplicate(vec![json!(1)], vec![(1, txt("a"), Bind::Source)]), None);
         e.discard(&draft);
         e.discard(&key_of(&[json!(7)]));
         e.grouped(|e| e.discard(&key_of(&[json!(1)])));
@@ -2620,7 +2723,7 @@ mod tests {
     #[test]
     fn required_insert_validation_respects_defaults_and_generated_columns() {
         let mut e = edits();
-        let key = e.stage_insert();
+        let key = e.stage_insert().unwrap();
         assert_eq!(
             e.first_missing_required(
                 &[true, true, true],

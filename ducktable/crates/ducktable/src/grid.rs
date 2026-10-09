@@ -228,9 +228,6 @@ struct CellEditor {
     row: usize,
     /// Schema column index.
     col: usize,
-    /// Present for a synthetic INSERT row; existing rows resolve through
-    /// their fetched identity instead.
-    draft_key: Option<String>,
     input: Entity<gpui_kit::component::input::InputState>,
     replace: bool,
 }
@@ -376,6 +373,7 @@ impl Grid {
     /// BEFORE constructing (DESIGN.md: fetch first, commit over the old
     /// value), so the swap from the previous grid is one complete frame —
     /// no skeleton, no columns popping in, no gutter re-widening.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         conn: Conn,
         schema: &str,
@@ -403,6 +401,7 @@ impl Grid {
     /// the same machinery pages `SELECT * FROM (statement)`. No catalog
     /// structure, so no key, so no Edits: read-only by construction,
     /// not by gate.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_query(
         conn: Conn,
         sql: &str,
@@ -497,15 +496,7 @@ impl Grid {
             }
             Err(message) => (Some(message), 0),
         };
-        let edits = (!delegate.pk_ix.is_empty()).then(|| {
-            Edits::new(
-                source.clone(),
-                pk_cols.clone(),
-                delegate.names.iter().map(|n| n.to_string()).collect(),
-                delegate.schema_cols.iter().map(|c| c.duckdb_type.clone()).collect(),
-            )
-        })
-        .map(|e| if rowid { e.keyed_by_rowid() } else { e });
+        let edits = delegate.new_edits(&source, &pk_cols, rowid);
         let (not_null, defaults, generated, hints, types) =
             insert_metadata(&delegate.names, structure.as_ref());
         delegate.draft_hints = hints;
@@ -557,7 +548,7 @@ impl Grid {
             let key = ks.key.clone();
             grid.update(cx, |g, cx| {
                 // A bare arrow with no ring yet just takes the top-left
-                // seat (Steve's ruling): the first press shows you where
+                // seat: the first press shows you where
                 // you are, the next one moves. seed_ring says whether it
                 // placed the ring; a placed ring consumes the press.
                 let seeded =
@@ -622,10 +613,10 @@ impl Grid {
                             if let Some(col) = d.cols.get_mut(i) {
                                 col.width = *w;
                             }
-                            if i >= g {
-                                if let Some(&schema_ix) = d.visible.get(i - g) {
-                                    d.widths.insert(schema_ix, *w);
-                                }
+                            if i >= g
+                                && let Some(&schema_ix) = d.visible.get(i - g)
+                            {
+                                d.widths.insert(schema_ix, *w);
                             }
                         }
                     });
@@ -896,12 +887,7 @@ impl Grid {
                             } else {
                                 d.adopt_rows(result.rows, base);
                             }
-                            d.selection.clear();
-                            d.active_cell = None;
-                            d.editing = None;
-                            d.editor_input = None;
-                            d.pick = None;
-                            d.tab_anchor = None;
+                            d.reset_cursor();
                         }
                         let d = state.delegate();
                         if d.gutter {
@@ -922,18 +908,10 @@ impl Grid {
                 // A keyboard page flip keeps the ring seated: same
                 // column (if still visible), same row clamped to the new
                 // page's rows.
-                if let (Some((r, c)), true) = (ring_keep, grid.error.is_none()) {
+                if let (Some(at), true) = (ring_keep, grid.error.is_none()) {
                     grid.table.update(cx, |state, cx| {
                         let d = state.delegate_mut();
-                        if d.rows.is_empty() {
-                            return;
-                        }
-                        let row = r.min(d.rows.len() - 1);
-                        let col = if d.visible.contains(&c) {
-                            c
-                        } else {
-                            d.visible.first().copied().unwrap_or(0)
-                        };
+                        let Some((row, col, _)) = ring_step(d.rows.len(), &d.visible, at, 0, 0) else { return };
                         d.active_cell = Some((row, col));
                         select_row(state, row, cx);
                         cx.notify();
@@ -1021,23 +999,9 @@ impl Grid {
     /// adopted only with none — so the set built here is empty, and the
     /// stash parked for this table is judged against it.
     fn settle_schema(&mut self, cx: &mut Context<Self>) {
-        let (keyed, names, types) = {
-            let d = self.table.read(cx).delegate();
-            (
-                !d.pk_ix.is_empty(),
-                d.names.clone(),
-                d.schema_cols.iter().map(|c| c.duckdb_type.clone()).collect::<Vec<_>>(),
-            )
-        };
-        self.edits = keyed.then(|| {
-            let edits = Edits::new(
-                self.source.clone(),
-                self.pk_cols.clone(),
-                names.iter().map(|n| n.to_string()).collect(),
-                types,
-            );
-            if self.rowid { edits.keyed_by_rowid() } else { edits }
-        });
+        let d = self.table.read(cx).delegate();
+        let names = d.names.clone();
+        self.edits = d.new_edits(&self.source, &self.pk_cols, self.rowid);
         let (not_null, defaults, generated, hints, types) =
             insert_metadata(&names, self.structure.as_ref());
         self.not_null = not_null;
@@ -1096,10 +1060,10 @@ impl Grid {
     /// Jump to the last page — only reachable once the total is known,
     /// because the offset comes from it.
     pub(crate) fn jump_last(&mut self, cx: &mut Context<Self>) {
-        if let Some(last) = self.last_page() {
-            if self.page < last {
-                self.fetch_page(last, cx);
-            }
+        if let Some(last) = self.last_page()
+            && self.page < last
+        {
+            self.fetch_page(last, cx);
         }
     }
 
@@ -1117,17 +1081,13 @@ impl Grid {
 
     /// Last page index under the current count, when known.
     pub(crate) fn last_page(&self) -> Option<usize> {
-        let total = self.total_rows?;
-        Some((total.max(1) as usize - 1) / self.page_size)
+        Some(last_page_of(self.total_rows?, self.page_size))
     }
 
-    /// Whether a next page plausibly exists. Unknown total: a full page
-    /// suggests there may be more.
+    /// Whether a next page plausibly exists (`has_next_page`).
     pub(crate) fn has_next(&self, cx: &App) -> bool {
-        match self.last_page() {
-            Some(last) => self.page < last,
-            None => self.table.read(cx).delegate().fetched_count() == self.page_size,
-        }
+        let fetched = self.table.read(cx).delegate().fetched_count();
+        has_next_page(self.page, self.last_page(), fetched, self.page_size)
     }
 
     /// Cycle the page size through PAGE_SIZES (a global preference) and
@@ -1332,26 +1292,17 @@ impl Grid {
             let x = e.position.x - bounds.origin.x - scroll_x;
             let d = state.delegate_mut();
             let g = d.gutter as usize;
-            let mut cum = px(0.);
-            for (disp, col) in d.cols.iter().enumerate() {
-                cum += col.width;
-                // The gutter/first-column boundary is not a data divider.
-                if disp < g {
-                    continue;
-                }
-                if (x - cum).abs() <= px(4.) {
-                    let Some(&schema_ix) = d.visible.get(disp - g) else { return };
-                    if d.all_selected {
-                        d.all_selected = false;
-                        d.fit_widths(zoom);
-                    } else {
-                        d.fit_one(schema_ix, zoom);
-                    }
-                    state.refresh(cx);
-                    cx.notify();
-                    return;
-                }
+            let widths: Vec<f32> = d.cols.iter().map(|c| f32::from(c.width)).collect();
+            let Some(disp) = divider_at(&widths, g, f32::from(x)) else { return };
+            let Some(&schema_ix) = d.visible.get(disp - g) else { return };
+            if d.all_selected {
+                d.all_selected = false;
+                d.fit_widths(zoom);
+            } else {
+                d.fit_one(schema_ix, zoom);
             }
+            state.refresh(cx);
+            cx.notify();
         });
     }
 
@@ -1460,13 +1411,10 @@ impl Grid {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.committing || self.edits.is_none() || self.refuse_stale(cx) {
+        if self.committing || self.refuse_stale(cx) || !self.settle_editor(cx) {
             return;
         }
-        if self.editor.is_some() && !self.confirm_and_move(0, 0, cx) {
-            return;
-        }
-        let key = self.edits.as_mut().expect("checked above").stage_insert();
+        let Some(key) = self.edits.as_mut().and_then(Edits::stage_insert) else { return };
         self.error = None;
         self.sync_staged(cx);
         self.focus_draft(&key, window, cx);
@@ -1484,10 +1432,7 @@ impl Grid {
     ) {
         // A read-only table and a commit in flight say so in the footer,
         // and the Edit menu's gate (`accepts_row_commands`) stops both first.
-        if self.committing || self.edits.is_none() || self.refuse_stale(cx) {
-            return;
-        }
-        if self.editor.is_some() && !self.confirm_and_move(0, 0, cx) {
+        if self.committing || self.edits.is_none() || self.refuse_stale(cx) || !self.settle_editor(cx) {
             return;
         }
         let source = {
@@ -1537,7 +1482,7 @@ impl Grid {
             })
             .unwrap_or_default();
         let cells = duplicate_cells(fetched, &staged, first_schema, &pk_ix, &self.generated);
-        let key = edits.stage_duplicate(identity, cells);
+        let Some(key) = edits.stage_duplicate(identity, cells) else { return };
         self.error = None;
         self.sync_staged(cx);
         self.focus_draft(&key, window, cx);
@@ -1552,19 +1497,16 @@ impl Grid {
         self.needs_focus = false;
         let (row, col, reveal) = {
             let d = self.table.read(cx).delegate();
-            let row = d.draft_keys.iter().position(|k| k == key).unwrap_or(0);
-            let first_schema = d.identity as usize;
-            let required = (first_schema..d.names.len()).find(|&col| {
-                self.not_null.get(col).copied().unwrap_or(false)
-                    && self.defaults.get(col).and_then(Option::as_ref).is_none()
-                    && !self.generated.get(col).copied().unwrap_or(false)
-            });
-            let fallback = d
-                .visible
-                .iter()
-                .copied()
-                .find(|&col| !self.generated.get(col).copied().unwrap_or(false));
-            let col = required.or(fallback);
+            // The draft was just staged; one not on the page has no row to
+            // focus, and no other row is the one meant.
+            let Some(row) = d.draft_keys.iter().position(|k| k == key) else { return };
+            let col = first_entry_column(
+                d.identity as usize..d.names.len(),
+                &d.visible,
+                &self.not_null,
+                &self.defaults,
+                &self.generated,
+            );
             (row, col, col.is_some_and(|col| d.hidden.contains(&col)))
         };
         if reveal {
@@ -1635,11 +1577,10 @@ impl Grid {
                         self.clear_ring(cx);
                     }
                 }
-                // The newline family (Steve's ruling): ⇧Enter first —
-                // the chat-composer convention every hand knows — with
-                // ⌥Enter as the Sheets twin. They belong to the text.
-                // (Visibly inert until the multi-line editor arrives —
-                // reserved is not dead.)
+                // The newline family: ⇧Enter first — the chat-composer
+                // convention every hand knows — with ⌥Enter as the Sheets
+                // twin. They belong to the text. The cell editor is one
+                // line, so both are reserved: inert, and never a confirm.
                 "enter" if m.shift || m.alt => return,
                 "enter" if m.platform => {
                     // ⌘Enter — "send it" (normally consumed by the input
@@ -1692,20 +1633,12 @@ impl Grid {
             return;
         }
         if m.platform && ks.key == "z" {
-            let did = match &mut self.edits {
-                // The statements were built at ⌘S; an undo now would show
-                // the edit gone while the commit writes it anyway.
-                _ if self.committing => false,
-                // A held set has no history to walk: the reason is said.
-                Some(e) if e.in_doubt() => {
-                    self.error = stale_reason(self.reshaped, false, true).map(str::to_string);
-                    cx.notify();
-                    false
-                }
-                Some(e) if m.shift => e.redo(),
-                Some(e) => e.undo(),
-                None => false,
-            };
+            // The statements were built at ⌘S; an undo now would show the
+            // edit gone while the commit writes it anyway. A held set has no
+            // history to walk, and the reason is said.
+            let did = !self.committing
+                && !self.refuse_held(cx)
+                && self.edits.as_mut().is_some_and(|e| if m.shift { e.redo() } else { e.undo() });
             if did {
                 self.sync_staged(cx);
             }
@@ -1727,11 +1660,13 @@ impl Grid {
             return;
         }
         if m.control && m.shift && ks.key == "n" {
-            self.stage_null(cx);
+            if let Some((row, col)) = self.table.read(cx).delegate().active_cell {
+                self.stage_blank(row, col, true, cx);
+            }
             cx.stop_propagation();
             return;
         }
-        // (⌥←/⌥→, the view-switcher carousel, live at App level in
+        // (⌥←/⌥→, which step through the tables, live at App level in
         // main.rs — they must keep working in Structure mode, where
         // this listener's focus source doesn't exist.)
         // A navigation chord with no ring on the page yet: assume the
@@ -1847,7 +1782,7 @@ impl Grid {
                 cx.stop_propagation();
             }
             "backspace" | "delete" => {
-                self.stage_clear(row, col, cx);
+                self.stage_blank(row, col, false, cx);
                 cx.stop_propagation();
             }
             "up" if !m.shift && !m.alt => {
@@ -1877,11 +1812,12 @@ impl Grid {
             _ => {
                 // The typing contract: a printable character opens the
                 // editor seeded with itself — replace entry.
-                if let Some(ch) = &ks.key_char {
-                    if !ch.chars().all(char::is_control) && self.edits.is_some() {
-                        self.open_editor(row, col, Some(ch.clone()), window, cx);
-                        cx.stop_propagation();
-                    }
+                if let Some(ch) = &ks.key_char
+                    && !ch.chars().all(char::is_control)
+                    && self.edits.is_some()
+                {
+                    self.open_editor(row, col, Some(ch.clone()), window, cx);
+                    cx.stop_propagation();
                 }
             }
         }
@@ -1964,35 +1900,15 @@ impl Grid {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.edits.is_none() || self.committing {
-            return; // read-only says why in the footer, not with a beep
-        }
-        if self.refuse_stale(cx) {
+        // A read-only grid says why in the footer, not with a beep.
+        if self.edits.is_none() || self.committing || self.refuse_stale(cx) || self.refuse_generated(col, cx) {
             return;
         }
-        if self.generated.get(col).copied().unwrap_or(false) {
-            let name = self.table.read(cx).delegate().names[col].clone();
-            self.error = Some(format!("{name} is generated by DuckDB"));
-            cx.notify();
-            return;
-        }
-        let (original, deleted, draft_key) = {
+        let (original, deleted) = {
             let d = self.table.read(cx).delegate();
-            if row >= d.rows.len() {
-                return;
-            }
-            let base = d.rows[row].get(col).cloned().flatten();
-            let draft_key = d.draft_key(row).map(str::to_string);
-            let staged = if draft_key.is_some() {
-                d.draft_cells.get(&(row, col)).cloned()
-            } else {
-                d.staged_cell(row, col)
-            };
-            (
-                staged.unwrap_or(base),
-                d.deleted.contains(&row),
-                draft_key,
-            )
+            let Some(fetched) = d.rows.get(row) else { return };
+            let original = d.staged_at(row, col).unwrap_or_else(|| fetched.get(col).cloned().flatten());
+            (original, d.deleted.contains(&row))
         };
         if deleted {
             return; // you cannot edit a ghost; revert the delete first (⌘Z)
@@ -2034,13 +1950,7 @@ impl Grid {
             }
         })
         .detach();
-        self.editor = Some(CellEditor {
-            row,
-            col,
-            draft_key,
-            input: input.clone(),
-            replace,
-        });
+        self.editor = Some(CellEditor { row, col, input: input.clone(), replace });
         let grid = cx.entity().downgrade();
         self.table.update(cx, |state, cx| {
             let d = state.delegate_mut();
@@ -2138,25 +2048,17 @@ impl Grid {
         }
         let Some(ed) = self.editor.take() else { return true };
         let text = ed.input.read(cx).value().to_string();
-        let (ty, fetched, staged, identity) = {
+        let (ty, target, staged) = {
             let d = self.table.read(cx).delegate();
-            let at = (ed.row, ed.col);
             let ty = d.schema_cols.get(ed.col).map(|c| c.duckdb_type.clone()).unwrap_or_default();
-            // A draft's row is its own cells: nothing in it was fetched.
-            if ed.draft_key.is_some() {
-                (ty, None, d.draft_cells.get(&at).cloned(), None)
-            } else {
-                (
-                    ty,
-                    d.rows.get(ed.row).and_then(|r| r.get(ed.col)).cloned().flatten(),
-                    d.staged_cell(ed.row, ed.col),
-                    d.identities.get(ed.row).cloned(),
-                )
-            }
+            (ty, d.target(ed.row, ed.col), d.staged_at(ed.row, ed.col))
         };
-        let copied = match (&self.edits, &ed.draft_key) {
-            (Some(edits), Some(key)) => edits.copied_text(key, ed.col),
-            _ => None,
+        // A draft's row is its own cells: nothing in it was fetched, and a
+        // duplicate's cells were copied.
+        let (fetched, copied) = match (&target, &self.edits) {
+            (Some(edits::Target::Fetched(_, fetched)), _) => (fetched.clone(), None),
+            (Some(edits::Target::Draft(key)), Some(edits)) => (None, edits.copied_text(key, ed.col)),
+            _ => (None, None),
         };
         fn shown(text: &Option<SharedString>) -> Option<&str> {
             text.as_ref().map(|t| t.as_ref())
@@ -2165,14 +2067,13 @@ impl Grid {
             &text,
             &edits::Held {
                 ty: &ty,
-                draft: ed.draft_key.is_some(),
+                draft: matches!(target, Some(edits::Target::Draft(_))),
                 fetched: shown(&fetched),
                 staged: staged.as_ref().map(shown),
                 copied: copied.as_ref().map(shown),
             },
         );
         match verdict {
-            edits::Confirm::Keep => self.error = None,
             edits::Confirm::Refuse(reason) => {
                 // Validation informs, never imprisons: the editor stays
                 // open with the reason; Esc still works.
@@ -2185,25 +2086,10 @@ impl Grid {
                 self.editor = Some(ed);
                 return false;
             }
-            edits::Confirm::Revert | edits::Confirm::Stage(..) => {
-                if let Some(edits) = &mut self.edits {
-                    self.error = None;
-                    match (verdict, &ed.draft_key, identity) {
-                        (edits::Confirm::Stage(text, value), Some(key), _) => {
-                            edits.stage_insert_cell(key, ed.col, text, value)
-                        }
-                        (edits::Confirm::Stage(text, value), None, Some(identity)) => {
-                            edits.stage_cell(identity, ed.col, fetched, text, value)
-                        }
-                        (edits::Confirm::Revert, Some(key), _) => edits.stage_insert_copied(key, ed.col),
-                        // Staging what was fetched is what drops a staged edit.
-                        (edits::Confirm::Revert, None, Some(identity)) => {
-                            edits.stage_cell(identity, ed.col, fetched.clone(), fetched, Value::Null)
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            _ => self.error = None,
+        }
+        if let (Some(edits), Some(target)) = (&mut self.edits, target) {
+            edits.stage_confirmed(target, ed.col, verdict);
         }
         self.close_editor_cell(cx);
         self.sync_staged(cx);
@@ -2231,85 +2117,38 @@ impl Grid {
         true
     }
 
-    /// Delete on a cell: clear it, type-honestly — '' for text columns,
-    /// NULL for everything else. Never touches the row.
-    fn stage_clear(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
-        if self.committing || self.edits.is_some() && self.refuse_stale(cx) {
-            return;
-        }
-        if self.generated.get(col).copied().unwrap_or(false) {
+    /// A generated column takes no value. Says so, and returns true, for one.
+    fn refuse_generated(&mut self, col: usize, cx: &mut Context<Self>) -> bool {
+        let generated = self.generated.get(col).copied().unwrap_or(false);
+        if generated {
             let name = self.table.read(cx).delegate().names[col].clone();
             self.error = Some(format!("{name} is generated by DuckDB"));
             cx.notify();
-            return;
         }
-        let (ty, fetched, identity, draft_key, deleted) = {
-            let d = self.table.read(cx).delegate();
-            (
-                d.schema_cols.get(col).map(|c| c.duckdb_type.clone()).unwrap_or_default(),
-                d.rows.get(row).and_then(|r| r.get(col)).cloned().flatten(),
-                d.identities.get(row).cloned(),
-                d.draft_key(row).map(str::to_string),
-                d.deleted.contains(&row),
-            )
-        };
-        if deleted {
-            return;
-        }
-        let (text, value) = if edits::is_text_type(&ty) {
-            (Some(SharedString::from("")), Value::String(String::new()))
-        } else {
-            if !self.stageable_null(col, cx) {
-                return;
-            }
-            (None, Value::Null)
-        };
-        if let Some(edits) = &mut self.edits {
-            self.error = None;
-            if let Some(key) = draft_key {
-                edits.stage_insert_cell(&key, col, text, value);
-            } else if let Some(identity) = identity {
-                edits.stage_cell(identity, col, fetched, text, value);
-            }
-            self.sync_staged(cx);
-        }
+        generated
     }
 
-    /// ⌃⇧N: SQL NULL, deliberately, any column type.
-    fn stage_null(&mut self, cx: &mut Context<Self>) {
-        let Some((row, col)) = self.table.read(cx).delegate().active_cell else { return };
-        if self.committing || self.edits.is_some() && self.refuse_stale(cx) {
+    /// Delete on a cell clears it, type-honestly (`edits::cleared`); ⌃⇧N
+    /// (`null`) stages SQL NULL, deliberately, any column type. Neither
+    /// touches the row, and a row staged for deletion takes neither: it is a
+    /// ghost, as for the editor.
+    fn stage_blank(&mut self, row: usize, col: usize, null: bool, cx: &mut Context<Self>) {
+        if self.committing || self.edits.is_none() || self.refuse_stale(cx) || self.refuse_generated(col, cx) {
             return;
         }
-        if self.generated.get(col).copied().unwrap_or(false) {
-            let name = self.table.read(cx).delegate().names[col].clone();
-            self.error = Some(format!("{name} is generated by DuckDB"));
-            cx.notify();
-            return;
-        }
-        let (fetched, identity, draft_key, deleted) = {
+        let (ty, target, deleted) = {
             let d = self.table.read(cx).delegate();
-            (
-                d.rows.get(row).and_then(|r| r.get(col)).cloned().flatten(),
-                d.identities.get(row).cloned(),
-                d.draft_key(row).map(str::to_string),
-                d.deleted.contains(&row),
-            )
+            let ty = d.schema_cols.get(col).map(|c| c.duckdb_type.clone()).unwrap_or_default();
+            (ty, d.target(row, col), d.deleted.contains(&row))
         };
-        if deleted {
-            return; // the row is a ghost, as for Delete and the editor
-        }
-        if !self.stageable_null(col, cx) {
+        let (text, value) = if null { (None, Value::Null) } else { edits::cleared(&ty) };
+        if deleted || text.is_none() && !self.stageable_null(col, cx) {
             return;
         }
-        if let Some(edits) = &mut self.edits {
-            if let Some(key) = draft_key {
-                edits.stage_insert_cell(&key, col, None, Value::Null);
-            } else if let Some(identity) = identity {
-                edits.stage_cell(identity, col, fetched, None, Value::Null);
-            }
-            self.sync_staged(cx);
-        }
+        let (Some(edits), Some(target)) = (&mut self.edits, target) else { return };
+        self.error = None;
+        edits.stage_into(target, col, text, value);
+        self.sync_staged(cx);
     }
 
     /// Edit-menu entry point; the window argument keeps its signature
@@ -2326,30 +2165,18 @@ impl Grid {
         if self.committing {
             return;
         }
-        let targets: Vec<(Option<Vec<Value>>, Option<String>)> = {
+        let targets: Vec<edits::Target> = {
             let d = self.table.read(cx).delegate();
             let rows: Vec<usize> = if d.selection.rows.is_empty() {
                 d.active_cell.map(|(r, _)| r).into_iter().collect()
             } else {
                 d.selection.rows.iter().copied().collect()
             };
-            rows.into_iter()
-                .map(|row| (d.identities.get(row).cloned(), d.draft_key(row).map(str::to_string)))
-                .collect()
+            rows.into_iter().filter_map(|row| d.target(row, 0)).collect()
         };
-        // Removing a draft is a discard, which a reshaped table allows;
-        // staging a DELETE is not.
-        let reshaped = self.reshaped || self.unrefreshed || self.in_doubt();
+        let stale = self.reshaped || self.unrefreshed || self.in_doubt();
         let Some(edits) = &mut self.edits else { return };
-        edits.grouped(|edits| {
-            for (identity, draft_key) in targets {
-                if let Some(key) = draft_key {
-                    edits.discard(&key);
-                } else if let (Some(identity), false) = (identity, reshaped) {
-                    edits.stage_delete(identity);
-                }
-            }
-        });
+        edits.delete_rows(targets, stale);
         self.refuse_stale(cx);
         self.sync_staged(cx);
     }
@@ -2482,12 +2309,7 @@ impl Grid {
             let d = state.delegate_mut();
             d.tab_anchor = None;
             let Some((r, _)) = d.active_cell else { return };
-            if d.rows.is_empty() || d.visible.is_empty() {
-                return;
-            }
-            let nr = (r as i32 + dr).clamp(0, d.rows.len() as i32 - 1) as usize;
-            let nc = if d.visible.contains(&col) { col } else { d.visible[0] };
-            let np = d.visible.iter().position(|&v| v == nc).unwrap_or(0);
+            let Some((nr, nc, np)) = ring_step(d.rows.len(), &d.visible, (r, col), dr, 0) else { return };
             let gutter = d.gutter as usize;
             d.active_cell = Some((nr, nc));
             select_row(state, nr, cx);
@@ -2500,7 +2322,7 @@ impl Grid {
         cx.notify();
     }
 
-    /// The A1 assumption (Steve's ruling): a navigation gesture with no
+    /// The A1 assumption: a navigation gesture with no
     /// ring on the page yet starts at the top-left cell. Returns whether
     /// it placed the ring — a bare arrow's first press consumes itself
     /// on that placement (the interceptor checks), while chords apply
@@ -2527,14 +2349,8 @@ impl Grid {
         self.table.update(cx, |state, cx| {
             let d = state.delegate_mut();
             d.tab_anchor = None;
-            let Some((r, c)) = d.active_cell else { return };
-            if d.rows.is_empty() || d.visible.is_empty() {
-                return;
-            }
-            let nr = (r as i32 + dr).clamp(0, d.rows.len() as i32 - 1) as usize;
-            let pos = d.visible.iter().position(|&v| v == c).unwrap_or(0);
-            let np = (pos as i32 + dc).clamp(0, d.visible.len() as i32 - 1) as usize;
-            let nc = d.visible[np];
+            let Some(at) = d.active_cell else { return };
+            let Some((nr, nc, np)) = ring_step(d.rows.len(), &d.visible, at, dr, dc) else { return };
             let gutter = d.gutter as usize;
             d.active_cell = Some((nr, nc));
             select_row(state, nr, cx);
@@ -2655,12 +2471,7 @@ impl Grid {
                 }
             }
             if draft_shape_changed {
-                d.selection.clear();
-                d.active_cell = None;
-                d.editing = None;
-                d.editor_input = None;
-                d.pick = None;
-                d.tab_anchor = None;
+                d.reset_cursor();
             }
             // Draft hints need room only while a draft or editor is on
             // screen. Rebuild from the compact fitted widths whenever
@@ -3028,7 +2839,7 @@ impl Grid {
     /// is first staged (or the refresh stops on validation failure), so a
     /// refresh can never silently discard what the user was typing.
     pub(crate) fn refresh_current(&mut self, cx: &mut Context<Self>) {
-        if self.editor.is_some() && !self.confirm_and_move(0, 0, cx) {
+        if !self.settle_editor(cx) {
             return;
         }
         self.fetch_page_now(self.page, cx);
@@ -3201,6 +3012,44 @@ impl GridDelegate {
         self.draft_keys.get(row).map(String::as_str)
     }
 
+    /// The cell a gesture at (row, schema col) stages into, when the row
+    /// has an identity or is a draft.
+    fn target(&self, row: usize, col: usize) -> Option<edits::Target> {
+        if let Some(key) = self.draft_key(row) {
+            return Some(edits::Target::Draft(key.to_string()));
+        }
+        let fetched = self.rows.get(row).and_then(|r| r.get(col)).cloned().flatten();
+        Some(edits::Target::Fetched(self.identities.get(row)?.clone(), fetched))
+    }
+
+    /// A staging set for the columns this delegate holds, when they carry
+    /// the whole key: the catalog's, or the hidden rowid of a table
+    /// without one. None for a source without an identity, which is
+    /// read-only.
+    fn new_edits(&self, source: &str, pk_cols: &[String], rowid: bool) -> Option<Edits> {
+        if self.pk_ix.is_empty() {
+            return None;
+        }
+        let edits = Edits::new(
+            source.to_string(),
+            pk_cols.to_vec(),
+            self.names.iter().map(|n| n.to_string()).collect(),
+            self.schema_cols.iter().map(|c| c.duckdb_type.clone()).collect(),
+        );
+        Some(if rowid { edits.keyed_by_rowid() } else { edits })
+    }
+
+    /// Clear the selection, the ring, the Tab run and the editor's cell:
+    /// what a new page, or a change in the draft rows, leaves no place for.
+    fn reset_cursor(&mut self) {
+        self.selection.clear();
+        self.active_cell = None;
+        self.editing = None;
+        self.editor_input = None;
+        self.pick = None;
+        self.tab_anchor = None;
+    }
+
     fn remove_drafts(&mut self) {
         let count = self.draft_count();
         if count == 0 {
@@ -3229,6 +3078,16 @@ impl GridDelegate {
         self.staged.get(&row)?.get(&col).cloned()
     }
 
+    /// What a cell holds that the database does not: a draft's cell, or a
+    /// fetched row's staged one. None for a cell left as fetched, or a
+    /// draft's untouched (DEFAULT) cell.
+    fn staged_at(&self, row: usize, col: usize) -> Option<Option<SharedString>> {
+        match self.draft_key(row) {
+            Some(_) => self.draft_cells.get(&(row, col)).cloned(),
+            None => self.staged_cell(row, col),
+        }
+    }
+
     /// A row carrying any staged change — the rows whose color already
     /// tells a story, so the selection wash stays off them.
     fn row_dirty(&self, row: usize) -> bool {
@@ -3246,8 +3105,9 @@ impl GridDelegate {
         zoom: f32,
         pk_cols: &[String],
     ) {
-        self.numeric =
-            page.columns.iter().map(|c| numeric(&c.duckdb_type.to_uppercase())).collect();
+        // Numbers right-align, judged by the type's own name, so an
+        // INTERVAL, an `INTEGER[]` and an `ENUM('POINT')` do not.
+        self.numeric = page.columns.iter().map(|c| edits::is_numeric_type(&c.duckdb_type)).collect();
         self.names = page
             .columns
             .iter()
@@ -3491,82 +3351,80 @@ impl TableDelegate for GridDelegate {
         // An open editor replaces the cell's content outright — the
         // editor surface IS the state (no tint underneath). It wears the
         // active-cell ring so the eye never has to relocate.
-        if self.editing == Some((row_ix, data_col)) {
-            if let Some(input) = self.editor_input.clone() {
-                return div()
-                    .h_flex()
-                    .relative()
-                    .w_full()
-                    .h(row_h)
-                    .items_center()
-                    .border_r_1()
-                    .border_b_1()
-                    .border_color(t.grid_line)
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(-PANE_INSET))
-                            .right_0()
-                            .top_0()
-                            .bottom_0()
-                            .bg(t.surface)
-                            .border_2()
-                            .border_color(t.accent),
-                    )
-                    .child(
-                        div().w_full().child(
-                            gpui_kit::component::input::Input::new(&input)
-                                .appearance(false)
-                                // Zero the input's built-in insets, both
-                                // sides. Left pins the caret exactly on
-                                // the column's text axis; right keeps the
-                                // editor's text area at least as wide as
-                                // the display cell's, so opening the
-                                // editor on a fitted column never scrolls
-                                // the value — view and edit paint the
-                                // same pixels. (The input's Medium inset
-                                // is 12px a side; a fitted column has
-                                // only ~9px of slack, and the caret needs
-                                // 1.5px more — the old right inset made
-                                // every fitted cell start edit shifted.)
-                                .pl(px(0.))
-                                .pr(px(0.))
-                                .text_size(px(CELL_TEXT * p.zoom_factor()))
-                                .font_family(value_font()),
-                        ),
-                    )
-                    // The column card (⌘T), floating just under the cell for as
-                    // long as it is edited, so the value being edited stays
-                    // in view: a zero-size box seats it below the cell's
-                    // bottom edge, and it is deferred so it paints over the
-                    // rows below and escapes the table's clip, snapped to
-                    // stay inside the window.
-                    .when(p.column_cards, |d| d.child(
-                        div().absolute().left(px(-PANE_INSET)).top(row_h + px(4.)).child(
-                            deferred(
-                                anchored()
-                                    .snap_to_window_with_margin(px(8.))
-                                    .child(
-                                        column_card(
-                                            t,
-                                            p.zoom_factor(),
-                                            self.names.get(data_col).cloned().unwrap_or_default(),
-                                            self.col_types.get(data_col).cloned().unwrap_or_default(),
-                                            &self
-                                                .draft_hints
-                                                .get(data_col)
-                                                .cloned()
-                                                .unwrap_or(DraftHint::Null),
-                                            self.pick.clone(),
-                                        )
-                                        .occlude(),
-                                    ),
-                            )
-                            .with_priority(1),
-                        ),
-                    ))
-                    .into_any_element();
-            }
+        if self.editing == Some((row_ix, data_col)) && let Some(input) = self.editor_input.clone() {
+            return div()
+                .h_flex()
+                .relative()
+                .w_full()
+                .h(row_h)
+                .items_center()
+                .border_r_1()
+                .border_b_1()
+                .border_color(t.grid_line)
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(-PANE_INSET))
+                        .right_0()
+                        .top_0()
+                        .bottom_0()
+                        .bg(t.surface)
+                        .border_2()
+                        .border_color(t.accent),
+                )
+                .child(
+                    div().w_full().child(
+                        gpui_kit::component::input::Input::new(&input)
+                            .appearance(false)
+                            // Zero the input's built-in insets, both
+                            // sides. Left pins the caret exactly on
+                            // the column's text axis; right keeps the
+                            // editor's text area at least as wide as
+                            // the display cell's, so opening the
+                            // editor on a fitted column never scrolls
+                            // the value — view and edit paint the
+                            // same pixels. (The input's Medium inset
+                            // is 12px a side; a fitted column has
+                            // only ~9px of slack, and the caret needs
+                            // 1.5px more, so any right inset would
+                            // start every fitted cell's edit shifted.)
+                            .pl(px(0.))
+                            .pr(px(0.))
+                            .text_size(px(CELL_TEXT * p.zoom_factor()))
+                            .font_family(value_font()),
+                    ),
+                )
+                // The column card (⌘T), floating just under the cell for as
+                // long as it is edited, so the value being edited stays
+                // in view: a zero-size box seats it below the cell's
+                // bottom edge, and it is deferred so it paints over the
+                // rows below and escapes the table's clip, snapped to
+                // stay inside the window.
+                .when(p.column_cards, |d| d.child(
+                    div().absolute().left(px(-PANE_INSET)).top(row_h + px(4.)).child(
+                        deferred(
+                            anchored()
+                                .snap_to_window_with_margin(px(8.))
+                                .child(
+                                    column_card(
+                                        t,
+                                        p.zoom_factor(),
+                                        self.names.get(data_col).cloned().unwrap_or_default(),
+                                        self.col_types.get(data_col).cloned().unwrap_or_default(),
+                                        &self
+                                            .draft_hints
+                                            .get(data_col)
+                                            .cloned()
+                                            .unwrap_or(DraftHint::Null),
+                                        self.pick.clone(),
+                                    )
+                                    .occlude(),
+                                ),
+                        )
+                        .with_priority(1),
+                    ),
+                ))
+                .into_any_element();
         }
         let right = p.right_align && self.numeric.get(data_col).copied().unwrap_or(false);
         // The staged layer overrides the fetched value: a confirmed edit
@@ -4160,7 +4018,7 @@ impl Render for Grid {
                     .border_b_1()
                     // The grid's top frame line, so it reads the slot —
                     // the title strip is chrome but this edge is the
-                    // grid's (the red audit's "not red", 2026-09-01).
+                    // grid's, in the grid-line color.
                     .border_color(t.grid_line)
                     .child(
                         // Semibold like the design proof's breadcrumb table
@@ -4874,10 +4732,61 @@ fn build_columns(
         .collect()
 }
 
-/// Whether a column right-aligns as numbers do: judged by the type's own
-/// name, so an INTERVAL, an `INTEGER[]` and an `ENUM('POINT')` do not.
-fn numeric(ty: &str) -> bool {
-    edits::is_numeric_type(ty)
+/// Where the ring lands moved `dr` rows and `dc` visible columns from
+/// `at`: the row clamped to the page's `rows`, the column stepped along the
+/// visible order and clamped to it. A column that is not visible counts as
+/// the first. The new (row, schema column), and the column's place in the
+/// visible order; None on an empty page.
+fn ring_step(rows: usize, visible: &[usize], at: (usize, usize), dr: i32, dc: i32) -> Option<(usize, usize, usize)> {
+    if rows == 0 || visible.is_empty() {
+        return None;
+    }
+    let row = (at.0 as i64 + dr as i64).clamp(0, rows as i64 - 1) as usize;
+    let pos = visible.iter().position(|&v| v == at.1).unwrap_or(0);
+    let pos = (pos as i64 + dc as i64).clamp(0, visible.len() as i64 - 1) as usize;
+    Some((row, visible[pos], pos))
+}
+
+/// The column a new row's editor opens on: the first that needs a value
+/// (NOT NULL, no default, not generated), else the first visible one that
+/// takes typing. `cols` is the schema columns a user sees.
+fn first_entry_column(
+    cols: std::ops::Range<usize>,
+    visible: &[usize],
+    not_null: &[bool],
+    defaults: &[Option<String>],
+    generated: &[bool],
+) -> Option<usize> {
+    let is = |flags: &[bool], col: usize| flags.get(col).copied().unwrap_or(false);
+    cols.into_iter()
+        .find(|&col| is(not_null, col) && defaults.get(col).is_none_or(Option::is_none) && !is(generated, col))
+        .or_else(|| visible.iter().copied().find(|&col| !is(generated, col)))
+}
+
+/// The last page's index for `total` rows at `size` rows a page. An empty
+/// table has one page, its first.
+fn last_page_of(total: u64, size: usize) -> usize {
+    (total.max(1) as usize - 1) / size
+}
+
+/// Whether a page follows page `page`. With the total unknown, a full page
+/// suggests there may be more.
+fn has_next_page(page: usize, last: Option<usize>, fetched: usize, size: usize) -> bool {
+    match last {
+        Some(last) => page < last,
+        None => fetched == size,
+    }
+}
+
+/// The display column whose right edge lies within 4px of `x`, the
+/// columns being `widths` wide from 0. The edges of the first `gutter`
+/// columns, the row-number gutter's, divide no data.
+fn divider_at(widths: &[f32], gutter: usize, x: f32) -> Option<usize> {
+    let mut edge = 0.;
+    widths.iter().enumerate().find_map(|(disp, width)| {
+        edge += width;
+        (disp >= gutter && (x - edge).abs() <= 4.).then_some(disp)
+    })
 }
 
 fn wrapped_step(len: usize, position: usize, delta: i32) -> usize {
@@ -4900,7 +4809,8 @@ mod tests {
     use super::{
         ClickKind, DraftHint, Lead, RowSelection, duplicate_cells, tag_width, duplicate_refusal, orphaned, same_columns, should_reconcile_selection,
         wrapped_step, Committed, Page, PostCommit, commit_status, commit_verdict, settle_fetch,
-        stale_reason, verdict_refusal,
+        stale_reason, verdict_refusal, ring_step, first_entry_column, last_page_of, has_next_page,
+        divider_at,
     };
     use crate::edits::{self, Bind, CellEdit, Edits};
     use gpui_kit::{Modifiers, SharedString};
@@ -4965,6 +4875,63 @@ mod tests {
         assert_eq!(wrapped_step(4, 3, 1), 0);
         assert_eq!(wrapped_step(4, 3, -1), 2);
         assert_eq!(wrapped_step(4, 0, -1), 3);
+    }
+
+    #[test]
+    fn the_ring_steps_along_visible_columns_and_stops_at_the_edges() {
+        let visible = [1, 2, 4, 5];
+        assert_eq!(ring_step(10, &visible, (3, 2), 1, 1), Some((4, 4, 2)));
+        // A jump of any size lands on the edge, both ways.
+        assert_eq!(ring_step(10, &visible, (3, 2), 1_000_000, 1_000_000), Some((9, 5, 3)));
+        assert_eq!(ring_step(10, &visible, (3, 2), -1_000_000, -1_000_000), Some((0, 1, 0)));
+        // A column that is not visible counts as the first: the sweep back to
+        // an anchor that was hidden meanwhile, a page flip that kept a seat.
+        assert_eq!(ring_step(10, &visible, (3, 3), 1, 0), Some((4, 1, 0)));
+        // A seat past a shorter page clamps to its last row.
+        assert_eq!(ring_step(2, &visible, (7, 4), 0, 0), Some((1, 4, 2)));
+        assert_eq!(ring_step(0, &visible, (0, 1), 0, 0), None);
+        assert_eq!(ring_step(3, &[], (0, 1), 0, 0), None);
+    }
+
+    #[test]
+    fn a_new_row_opens_on_the_first_column_it_needs_or_takes() {
+        let not_null = [true, true, true, false, false];
+        let defaults = [None, Some("nextval('s')".to_string()), None, None, None];
+        let generated = [false, false, true, true, false];
+        // Column 0 is a hidden rowid here: the user's columns start at 1. 1
+        // has a default, 2 is generated, so none of them needs a value.
+        assert_eq!(first_entry_column(1..5, &[1, 2, 3, 4], &not_null, &defaults, &generated), Some(1));
+        // Nothing required and the first visible generated: the next one.
+        assert_eq!(first_entry_column(3..5, &[3, 4], &not_null, &defaults, &generated), Some(4));
+        // Required wins over the visible order, even hidden (it is revealed).
+        assert_eq!(first_entry_column(0..5, &[4], &not_null, &defaults, &generated), Some(0));
+        // Only generated columns: no column takes typing.
+        assert_eq!(first_entry_column(2..4, &[2, 3], &not_null, &defaults, &generated), None);
+    }
+
+    #[test]
+    fn pages_are_counted_from_the_total_or_guessed_from_a_full_page() {
+        assert_eq!(last_page_of(0, 500), 0);
+        assert_eq!(last_page_of(500, 500), 0);
+        assert_eq!(last_page_of(501, 500), 1);
+        assert_eq!(last_page_of(5_410, 500), 10);
+        assert!(has_next_page(0, Some(1), 500, 500));
+        assert!(!has_next_page(1, Some(1), 1, 500));
+        assert!(has_next_page(3, None, 500, 500), "a full page may have more after it");
+        assert!(!has_next_page(3, None, 499, 500));
+    }
+
+    #[test]
+    fn a_divider_is_hit_within_four_pixels_of_a_data_columns_edge() {
+        // A 30px gutter, then columns 100 and 80 wide: edges at 30, 130, 210.
+        let widths = [30., 100., 80.];
+        assert_eq!(divider_at(&widths, 1, 130.), Some(1));
+        assert_eq!(divider_at(&widths, 1, 126.), Some(1));
+        assert_eq!(divider_at(&widths, 1, 214.), Some(2));
+        assert_eq!(divider_at(&widths, 1, 120.), None);
+        // The gutter's own edge divides no data; without a gutter it does.
+        assert_eq!(divider_at(&widths, 1, 30.), None);
+        assert_eq!(divider_at(&widths, 0, 30.), Some(0));
     }
 
     #[test]
@@ -5375,7 +5342,7 @@ mod tests {
         e.stage_cell(vec![json!(2)], 0, txt("2"), txt("4"), json!(4));
         // A new row keyed as a deleted one.
         e.stage_delete(vec![json!(9)]);
-        let draft = e.stage_insert();
+        let draft = e.stage_insert().unwrap();
         e.stage_insert_cell(&draft, 0, txt("9"), json!(9));
         e.stage_insert_cell(&draft, 1, txt("new"), json!("new"));
         // A duplicate of the row the set re-keys, read as it was.
