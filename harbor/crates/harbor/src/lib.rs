@@ -3951,16 +3951,20 @@ fn execute_jobs(
         // thread: the worker would find the job channel closed, leave the
         // accept loop, and the slot would be gone for the life of the
         // process, so a handful of such queries would retire every worker.
-        // On a panic the `OnSlot` guard drops — retiring the slot — the
-        // waiting worker is told (500), and this executor takes the next job.
-        // The connection itself is intact (the panic was in Rust-side
-        // encoding, not DuckDB's engine), so the next job resets first.
+        // On a panic the slot is retired, the statement's transaction is
+        // left aborted, as any statement cut short leaves it, so a COMMIT
+        // after it is told; the waiting worker is told (500), and this
+        // executor takes the next job. The connection itself is intact (the
+        // panic was in Rust-side encoding, not DuckDB's engine), so the next
+        // job on a worker resets first.
         let ready_guard = ready.clone();
         needs_reset = match std::panic::catch_unwind(AssertUnwindSafe(|| {
             run_statement(&mut conn, &mut on_slot, sql, params, shape, ready, body, started)
         })) {
             Ok(next_reset) => next_reset,
             Err(_) => {
+                on_slot.finish();
+                conn.abort_transaction();
                 let _ = ready_guard.send(Err(Refusal {
                     status: 500,
                     code: code::INTERNAL,
