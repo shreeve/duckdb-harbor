@@ -95,6 +95,15 @@ pub const INSPECTOR_MAX: f32 = 600.;
 pub const SIDEBAR_MIN: f32 = 224.;
 pub const SIDEBAR_MAX: f32 = 480.;
 
+/// The content pane's floor: a database's identity card (440pt, DESIGN.md
+/// sizing rule 2) inside the pane's 24pt padding.
+pub const CONTENT_MIN: f32 = 440. + 2. * 24.;
+
+/// The window's smallest content size: the sidebar's floor beside the
+/// content's (DESIGN.md sizing rule 4), and room in height for the title
+/// strip, a few rows and the bottom bar.
+pub const WINDOW_MIN: (f32, f32) = (SIDEBAR_MIN + CONTENT_MIN, 420.);
+
 /// Query editor-pane height bounds: never squashed below a few rows,
 /// never allowed to push the results out of reach entirely.
 pub const QUERY_SPLIT_MIN: f32 = 72.;
@@ -192,14 +201,14 @@ pub fn init(cx: &mut App) {
             .filter(|h| *h > 0.)
             .map(|h| (h as f32).clamp(STRUCTURE_SPLIT_MIN, STRUCTURE_SPLIT_MAX))
             .unwrap_or(prefs.structure_split);
-        // The window frame: four finite numbers with a plausible size,
-        // or the platform default. (A frame saved on a display that no
+        // The window frame: four numbers with a size, held to the
+        // window's minimum, or the platform default. (A frame saved on a display that no
         // longer exists still restores — macOS pulls windows on-screen.)
         prefs.win = v.get("window").and_then(Value::as_array).and_then(|a| {
             let n = |i: usize| a.get(i).and_then(Value::as_f64).map(|f| f as f32);
             match (n(0), n(1), n(2), n(3)) {
-                (Some(x), Some(y), Some(w), Some(h)) if w >= 400. && h >= 300. => {
-                    Some((x, y, w, h))
+                (Some(x), Some(y), Some(w), Some(h)) if w > 0. && h > 0. => {
+                    Some((x, y, w.max(WINDOW_MIN.0), h.max(WINDOW_MIN.1)))
                 }
                 _ => None,
             }
@@ -216,6 +225,12 @@ pub fn get(cx: &App) -> Prefs {
 pub fn toggle(cx: &mut App, change: impl FnOnce(&mut Prefs)) {
     save(cx, change);
     cx.refresh_windows();
+}
+
+/// Change without a repaint or a write, for a value saved later: the
+/// window's frame while it moves.
+pub fn remember(cx: &mut App, change: impl FnOnce(&mut Prefs)) {
+    change(cx.global_mut::<Prefs>());
 }
 
 /// Change and persist without a repaint — for values the UI already

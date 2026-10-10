@@ -772,7 +772,7 @@ fn main() {
         });
         gpui_kit::open_window(
             WindowOptions {
-                window_min_size: Some(size(px(720.), px(420.))),
+                window_min_size: Some(size(px(prefs::WINDOW_MIN.0), px(prefs::WINDOW_MIN.1))),
                 window_bounds: remembered,
                 ..Default::default()
             },
@@ -801,13 +801,17 @@ fn main() {
                     // the outer frame's: macOS restores through
                     // initWithContentRect, so an outer-frame size
                     // would regrow by one titlebar every launch.
-                    cx.observe_window_bounds(window, |_, window, cx| {
+                    // A drag fires many times a second, so the frame is
+                    // kept in memory at once and written once the window
+                    // has been still a moment, or at quit (`on_app_quit`).
+                    let moves = std::rc::Rc::new(std::cell::Cell::new(0u64));
+                    cx.observe_window_bounds(window, move |_, window, cx| {
                         if window.is_fullscreen() {
                             return;
                         }
                         let origin = window.bounds().origin;
                         let content = window.viewport_size();
-                        prefs::save(cx, |p| {
+                        prefs::remember(cx, |p| {
                             p.win = Some((
                                 f32::from(origin.x),
                                 f32::from(origin.y),
@@ -815,6 +819,16 @@ fn main() {
                                 f32::from(content.height),
                             ));
                         });
+                        let this_move = moves.get() + 1;
+                        moves.set(this_move);
+                        let moves = moves.clone();
+                        cx.spawn(async move |_, cx| {
+                            cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                            if moves.get() == this_move {
+                                cx.update(|cx| prefs::save(cx, |_| {}));
+                            }
+                        })
+                        .detach();
                     })
                     .detach();
                 });

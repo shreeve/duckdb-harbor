@@ -558,10 +558,12 @@ impl DuckTable {
         };
         // Every way out of the app gives its sessions back, the ones that
         // ask nothing included: Quit from the Dock, a logout, the updater's
-        // relaunch. The release is the whole hook, so the future it hands
-        // back has nothing left to do.
+        // relaunch. The prefs are written too, with the window's frame a
+        // move just before the quit left in memory. The hook does it all, so
+        // the future it hands back has nothing left to do.
         cx.on_app_quit(|this, cx| {
             this.release_for_quit(cx);
+            crate::prefs::save(cx, |_| {});
             async {}
         })
         .detach();
