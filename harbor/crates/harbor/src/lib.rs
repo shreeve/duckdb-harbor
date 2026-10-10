@@ -20,6 +20,7 @@ use std::{
 };
 
 use justhttp::{Header, Method, Request, Response, Server};
+use wire::catalog::{Catalog, Column, ForeignKey, Index, Inventory, Named, Sequence, Table, Unique};
 use wire::code;
 use wire::statement::{acting_keyword, bare_word, commits, transaction_effect};
 
@@ -2691,63 +2692,6 @@ fn index_columns(expressions: &str) -> Vec<String> {
     items
 }
 
-struct CatalogColumn {
-    name: String,
-    ty: String,
-    not_null: bool,
-    default: Option<String>,
-    generated: bool,
-    generation_expression: Option<String>,
-    primary: bool,
-}
-
-struct CatalogIndex {
-    name: String,
-    columns: Vec<String>,
-    expressions: Vec<String>,
-    unique: bool,
-}
-
-struct CatalogFk {
-    columns: Vec<String>,
-    ref_table: String,
-    ref_schema: String,
-    ref_columns: Vec<String>,
-}
-
-struct CatalogTable {
-    schema: String,
-    name: String,
-    row_count: u64,
-    ddl: Option<String>,
-    columns: Vec<CatalogColumn>,
-    primary_key: Vec<String>,
-    unique_constraints: Vec<Vec<String>>,
-    indexes: Vec<CatalogIndex>,
-    foreign_keys: Vec<CatalogFk>,
-}
-
-/// The document's opening run, shared by both styles: versions and sizes,
-/// with the object left open for the style's own `tables` emission.
-fn catalog_header(duckdb_version: &str) -> String {
-    let (database_size, wal_size) = database_disk_sizes();
-    let mut out = String::from("{\"harborVersion\":");
-    push_json_string(&mut out, env!("CARGO_PKG_VERSION"));
-    out.push_str(",\"duckdbVersion\":");
-    push_json_string(&mut out, duckdb_version);
-    out.push_str(",\"databaseSizeBytes\":");
-    match database_size {
-        Some(bytes) => out.push_str(&bytes.to_string()),
-        None => out.push_str("null"),
-    }
-    out.push_str(",\"walSizeBytes\":");
-    match wal_size {
-        Some(bytes) => out.push_str(&bytes.to_string()),
-        None => out.push_str("null"),
-    }
-    out
-}
-
 /// The served file's actual bytes on disk, from the one process that can
 /// stat them. `(data, wal)` — a checkpointed database legitimately has no
 /// WAL file, which is 0 bytes of WAL, not an unknown. A berth serving no
@@ -2899,24 +2843,21 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         Err(failure) => return catalog_refuse(req, failure),
     };
     let duckdb_version = version_rows.first().map(|r| cell_str(r, 0)).unwrap_or_default();
+    let harbor_version = env!("CARGO_PKG_VERSION").to_string();
+    let (database_size_bytes, wal_size_bytes) = database_disk_sizes();
 
     // The lite style stops here: everything it answers is already in hand,
     // and the count plus four shape queries below never run.
     if let CatalogStyle::Lite = style {
-        let mut out = catalog_header(&duckdb_version);
-        out.push_str(",\"tables\":[");
-        for (i, row) in table_rows.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push_str("{\"name\":");
-            push_json_string(&mut out, &cell_str(row, 1));
-            out.push_str(",\"schema\":");
-            push_json_string(&mut out, &cell_str(row, 0));
-            out.push('}');
-        }
-        out.push_str("]}");
-        let _ = req.respond(json_response(200, &out));
+        let tables = table_rows.iter().map(|row| Named { name: cell_str(row, 1), schema: cell_str(row, 0) });
+        let inventory = Inventory {
+            harbor_version,
+            duckdb_version,
+            database_size_bytes,
+            wal_size_bytes,
+            tables: tables.collect(),
+        };
+        let _ = req.respond(json_response(200, &serde_json::to_string(&inventory).unwrap()));
         return (true, 200);
     }
 
@@ -3009,29 +2950,19 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
     // Assembled in the order the queries delivered — every ORDER BY above is
     // load-bearing — and looked up by (schema, name), never iterated from the
     // map, so nothing about the output depends on hash order.
-    let mut tables: Vec<CatalogTable> = Vec::new();
+    let mut tables: Vec<Table> = Vec::new();
     let mut index_of: HashMap<(String, String), usize> = HashMap::new();
     for (row, row_count) in table_rows.iter().zip(row_counts) {
         let schema = cell_str(row, 0);
         let name = cell_str(row, 1);
         index_of.insert((schema.clone(), name.clone()), tables.len());
-        tables.push(CatalogTable {
-            schema,
-            name,
-            row_count,
-            ddl: cell_opt_str(row, 2),
-            columns: Vec::new(),
-            primary_key: Vec::new(),
-            unique_constraints: Vec::new(),
-            indexes: Vec::new(),
-            foreign_keys: Vec::new(),
-        });
+        tables.push(Table { schema, name, row_count: Some(row_count), ddl: cell_opt_str(row, 2), ..Table::default() });
     }
     for row in &column_rows {
         let Some(&t) = index_of.get(&(cell_str(row, 0), cell_str(row, 1))) else { continue };
-        tables[t].columns.push(CatalogColumn {
+        tables[t].columns.push(Column {
             name: cell_str(row, 2),
-            ty: cell_str(row, 3),
+            duck_type: cell_str(row, 3),
             not_null: !cell_bool(row, 4),
             default: cell_opt_str(row, 5),
             generated: cell_bool(row, 6),
@@ -3052,11 +2983,11 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
                 tables[t].primary_key = columns;
             }
             "UNIQUE" => {
-                tables[t].unique_constraints.push(columns);
+                tables[t].unique_constraints.push(Unique { columns });
             }
             "FOREIGN KEY" => {
                 let ref_schema = tables[t].schema.clone();
-                tables[t].foreign_keys.push(CatalogFk {
+                tables[t].foreign_keys.push(ForeignKey {
                     columns,
                     ref_table: cell_str(row, 4),
                     ref_schema,
@@ -3075,7 +3006,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
                 IndexPart::Expression(text) => expressions.push(text),
             }
         }
-        tables[t].indexes.push(CatalogIndex {
+        tables[t].indexes.push(Index {
             name: cell_str(row, 2),
             columns,
             expressions,
@@ -3085,7 +3016,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
     for table in tables.iter_mut() {
         // A unique constraint has no name in this shape either, so the same
         // rule: pin its position to its column list, never to storage order.
-        table.unique_constraints.sort();
+        table.unique_constraints.sort_by(|a, b| a.columns.cmp(&b.columns));
         // A foreign key has no name in this shape, so its position cannot be
         // inherited from catalog storage order; pin it to what the entry says.
         table.foreign_keys.sort_by(|a, b| {
@@ -3093,147 +3024,14 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         });
     }
 
-    let mut out = catalog_header(&duckdb_version);
-    out.push_str(",\"tables\":[");
-    for (i, table) in tables.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push_str("{\"name\":");
-        push_json_string(&mut out, &table.name);
-        out.push_str(",\"schema\":");
-        push_json_string(&mut out, &table.schema);
-        out.push_str(",\"rowCount\":");
-        out.push_str(&table.row_count.to_string());
-        out.push_str(",\"columns\":[");
-        for (j, column) in table.columns.iter().enumerate() {
-            if j > 0 {
-                out.push(',');
-            }
-            out.push_str("{\"name\":");
-            push_json_string(&mut out, &column.name);
-            out.push_str(",\"type\":");
-            push_json_string(&mut out, &column.ty);
-            out.push_str(",\"notNull\":");
-            out.push_str(if column.not_null { "true" } else { "false" });
-            out.push_str(",\"default\":");
-            match &column.default {
-                Some(expression) => push_json_string(&mut out, expression),
-                None => out.push_str("null"),
-            }
-            out.push_str(",\"generated\":");
-            out.push_str(if column.generated { "true" } else { "false" });
-            out.push_str(",\"generationExpression\":");
-            match &column.generation_expression {
-                Some(expression) => push_json_string(&mut out, expression),
-                None => out.push_str("null"),
-            }
-            out.push_str(",\"primary\":");
-            out.push_str(if column.primary { "true" } else { "false" });
-            out.push('}');
-        }
-        out.push_str("],\"primaryKey\":[");
-        for (j, name) in table.primary_key.iter().enumerate() {
-            if j > 0 {
-                out.push(',');
-            }
-            push_json_string(&mut out, name);
-        }
-        out.push_str("],\"uniqueConstraints\":[");
-        for (j, unique) in table.unique_constraints.iter().enumerate() {
-            if j > 0 {
-                out.push(',');
-            }
-            out.push_str("{\"columns\":[");
-            for (k, column) in unique.iter().enumerate() {
-                if k > 0 {
-                    out.push(',');
-                }
-                push_json_string(&mut out, column);
-            }
-            out.push_str("]}");
-        }
-        out.push_str("],\"indexes\":[");
-        for (j, index) in table.indexes.iter().enumerate() {
-            if j > 0 {
-                out.push(',');
-            }
-            out.push_str("{\"name\":");
-            push_json_string(&mut out, &index.name);
-            out.push_str(",\"columns\":[");
-            for (k, column) in index.columns.iter().enumerate() {
-                if k > 0 {
-                    out.push(',');
-                }
-                push_json_string(&mut out, column);
-            }
-            // Kept apart from `columns` on purpose: an entry here is
-            // computed, not a column, and a differ that joined it against
-            // `columns[].name` would be matching on a rendering.
-            out.push_str("],\"expressions\":[");
-            for (k, expression) in index.expressions.iter().enumerate() {
-                if k > 0 {
-                    out.push(',');
-                }
-                push_json_string(&mut out, expression);
-            }
-            out.push_str("],\"unique\":");
-            out.push_str(if index.unique { "true" } else { "false" });
-            out.push('}');
-        }
-        out.push_str("],\"foreignKeys\":[");
-        for (j, fk) in table.foreign_keys.iter().enumerate() {
-            if j > 0 {
-                out.push(',');
-            }
-            out.push_str("{\"columns\":[");
-            for (k, column) in fk.columns.iter().enumerate() {
-                if k > 0 {
-                    out.push(',');
-                }
-                push_json_string(&mut out, column);
-            }
-            out.push_str("],\"refTable\":");
-            push_json_string(&mut out, &fk.ref_table);
-            out.push_str(",\"refSchema\":");
-            push_json_string(&mut out, &fk.ref_schema);
-            out.push_str(",\"refColumns\":[");
-            for (k, column) in fk.ref_columns.iter().enumerate() {
-                if k > 0 {
-                    out.push(',');
-                }
-                push_json_string(&mut out, column);
-            }
-            out.push_str("]}");
-        }
-        // Last in the object on purpose: the engine's own CREATE TABLE text
-        // runs long, and the fields a reader scans for stay up front.
-        out.push_str("],\"ddl\":");
-        match &table.ddl {
-            Some(sql) => push_json_string(&mut out, sql),
-            None => out.push_str("null"),
-        }
-        out.push('}');
-    }
-    out.push_str("],\"sequences\":[");
-    for (i, row) in sequence_rows.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push_str("{\"name\":");
-        push_json_string(&mut out, &cell_str(row, 0));
-        out.push_str(",\"start\":");
+    let sequences = sequence_rows
+        .iter()
         // The executor already applied harbor's integer policy — bare within
-        // JSON's exact range, quoted past it — so the value re-emits as is.
-        match row.get(1) {
-            Some(value) => out.push_str(&value.to_string()),
-            None => out.push_str("null"),
-        }
-        out.push('}');
-    }
-    out.push_str("]}");
-
-    let _ = req.respond(json_response(200, &out));
+        // JSON's exact range, quoted past it — so the value goes out as is.
+        .map(|row| Sequence { name: cell_str(row, 0), start: row.get(1).cloned().unwrap_or_default() })
+        .collect();
+    let catalog = Catalog { harbor_version, duckdb_version, database_size_bytes, wal_size_bytes, tables, sequences };
+    let _ = req.respond(json_response(200, &serde_json::to_string(&catalog).unwrap()));
     (true, 200)
 }
 
