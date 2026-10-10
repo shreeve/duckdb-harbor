@@ -4191,7 +4191,8 @@ enum Committed {
     /// Nothing landed: a statement failed or was refused, and releasing the
     /// session rolled the transaction back. The reason.
     Refused(String),
-    /// The COMMIT was sent and no verdict came back. The reason.
+    /// The COMMIT was sent and no verdict came back: no answer, or one that
+    /// does not settle it. What came, as the status line says it.
     InDoubt(String),
 }
 
@@ -4200,9 +4201,11 @@ enum Committed {
 enum PostCommit {
     /// The commit landed and the staged set is cleared.
     Landed,
-    /// The COMMIT got no answer; the staged set is kept, and held.
-    /// `unsettled` is the commit's session when it was not seen to be over
-    /// before the page was read: the commit may still be running.
+    /// The COMMIT got no answer, or one that does not say whether it
+    /// landed; the staged set is kept, and held. `message` says which, as
+    /// the status line begins (`commit_verdict`). `unsettled` is the
+    /// commit's session when it was not seen to be over before the page
+    /// was read: the commit may still be running.
     InDoubt { message: String, unsettled: Option<String> },
 }
 
@@ -4332,7 +4335,14 @@ fn commit_verdict(answer: Result<harbor_client::QueryResult, harbor_client::Fail
     match edits::commit_outcome(failure.as_ref()) {
         edits::CommitOutcome::Landed => Committed::Landed,
         edits::CommitOutcome::NotLanded => Committed::Refused(message),
-        edits::CommitOutcome::InDoubt => Committed::InDoubt(message),
+        // Harbor's `internal`, or a code this client does not know, is an
+        // answer that does not settle the outcome: it is not called none.
+        edits::CommitOutcome::InDoubt => Committed::InDoubt(match failure {
+            Some(harbor_client::Failure::Refused { .. }) => {
+                format!("COMMIT was answered ({message}), but not with whether it landed")
+            }
+            _ => format!("COMMIT got no answer ({message})"),
+        }),
     }
 }
 
@@ -4348,25 +4358,25 @@ fn commit_status(after: &PostCommit, page: Page) -> Option<String> {
              what was typed, not what the database stored · refresh (⌘R) before editing"
         )),
         (PostCommit::InDoubt { message, unsettled: None }, Page::Read) => Some(format!(
-            "COMMIT got no answer ({message}), so the changes may or may not have landed · the \
+            "{message}, so the changes may or may not have landed · the \
              commit is over, and this page was read after it · {HELD}"
         )),
         (PostCommit::InDoubt { message, unsettled: Some(_) }, Page::Read) => Some(format!(
-            "COMMIT got no answer ({message}) and may still be running, so this page may not \
+            "{message} and may still be running, so this page may not \
              show its outcome yet · the staged changes are held, off the page · refresh (⌘R) \
              until the commit is over"
         )),
         (PostCommit::InDoubt { message, unsettled: None }, Page::Reshaped) => Some(format!(
-            "COMMIT got no answer ({message}), so the changes may or may not have landed · \
+            "{message}, so the changes may or may not have landed · \
              {HELD_RESHAPED}"
         )),
         (PostCommit::InDoubt { message, unsettled: Some(_) }, Page::Reshaped) => Some(format!(
-            "COMMIT got no answer ({message}) and may still be running · this table’s columns \
+            "{message} and may still be running · this table’s columns \
              changed in the database, so the staged changes are held and cannot be staged again \
              · refresh (⌘R) until the commit is over, then click the count and discard them all"
         )),
         (PostCommit::InDoubt { message, .. }, Page::Failed(why)) => Some(format!(
-            "COMMIT got no answer ({message}), so the changes may or may not have landed, and \
+            "{message}, so the changes may or may not have landed, and \
              this page could not be read again ({why}) · the staged changes are held, off the \
              page · refresh (⌘R)"
         )),
@@ -4990,15 +5000,20 @@ mod tests {
         // A cancel lands before a COMMIT starts or not at all.
         let cancelled = Failure::Refused { code: "cancelled".into(), message: "cancelled".into() };
         assert!(matches!(commit_verdict(Err(cancelled)), Committed::Refused(_)));
-        // Harbor's internal error comes after the engine ran the statement.
+        // Harbor's internal error comes after the engine ran the statement:
+        // an answer, which is not called none, that does not settle it.
         let internal = Failure::Refused { code: "internal".into(), message: "recovered".into() };
-        assert_eq!(commit_verdict(Err(internal)), Committed::InDoubt("internal: recovered".into()));
+        assert_eq!(
+            commit_verdict(Err(internal)),
+            Committed::InDoubt("COMMIT was answered (internal: recovered), but not with whether it landed".into())
+        );
         // A COMMIT that could not be sent did nothing: there is no doubt.
         let unsent = "query: Connection refused (os error 61)";
         assert_eq!(commit_verdict(Err(Failure::Unsent(unsent.into()))), Committed::Refused(unsent.into()));
         // A timeout or a dropped tunnel after it was sent is no verdict at all.
         for lost in ["query: Resource temporarily unavailable (os error 35)", "stream: connection closed mid-chunk", "HTTP 502"] {
-            assert_eq!(commit_verdict(Err(Failure::Unanswered(lost.into()))), Committed::InDoubt(lost.into()));
+            let told = format!("COMMIT got no answer ({lost})");
+            assert_eq!(commit_verdict(Err(Failure::Unanswered(lost.into()))), Committed::InDoubt(told));
         }
     }
 
@@ -5026,7 +5041,7 @@ mod tests {
         assert!(!stale.contains("held"), "the staged set was cleared: {stale}");
 
         let doubt = |running: bool| PostCommit::InDoubt {
-            message: "query: timed out".into(),
+            message: "COMMIT got no answer (query: timed out)".into(),
             unsettled: running.then(|| "session-1".to_string()),
         };
         // The commit's session was seen to end before the page was read: the
@@ -5041,6 +5056,14 @@ mod tests {
         assert!(running.contains("may still be running") && running.contains("may not show its outcome yet"));
         assert!(!running.contains("read after it") && !running.contains("say whether"));
         assert!(running.ends_with("refresh (⌘R) until the commit is over"));
+        // An answer that does not settle it is not called no answer.
+        let answered = PostCommit::InDoubt {
+            message: "COMMIT was answered (internal: recovered), but not with whether it landed".into(),
+            unsettled: None,
+        };
+        let said = commit_status(&answered, Page::Read).unwrap();
+        assert!(said.starts_with("COMMIT was answered (internal: recovered), but not with whether it landed, so"));
+        assert!(!said.contains("no answer"), "{said}");
         let unread = commit_status(&doubt(false), Page::Failed("HTTP 503")).unwrap();
         assert!(unread.contains("could not be read again (HTTP 503)") && !unread.contains("read after it"));
         // Every one of them says the set is held.

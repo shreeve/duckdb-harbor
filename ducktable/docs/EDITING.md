@@ -429,7 +429,9 @@ One failure cannot be read as "nothing landed": the `COMMIT` request sent and
 left unanswered, by a timeout or a dropped tunnel. The server may have
 committed before the answer was lost, or may be committing still. Harbor's
 `internal` error is read the same way, since Harbor sends it about a statement
-the engine had already run, and so is any code DuckTable does not know. Every
+the engine had already run, and so is any code DuckTable does not know; the
+status line says that the `COMMIT` was answered, but not with whether it
+landed, rather than that it got no answer. Every
 other error Harbor reports for the `COMMIT` is a verdict, not a doubt, and the
 transaction is rolled back: the engine refused it, the session was gone or
 busy, the transaction had been aborted by an earlier error (Harbor rolls it
