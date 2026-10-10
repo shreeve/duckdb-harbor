@@ -4,9 +4,9 @@
 # so the build needs no engine at all and a pure client runs on machines
 # without one. The engine lives in ~/.duckdb (DuckDB's world), version-scoped
 # so several can coexist; the binary installs into ~/.local/bin. `make
-# fetch-duckdb` pulls DuckDB's official nightly artifacts into ~/.duckdb
-# (CI fetches the same way, through .github/actions/duckdb). `make install`
-# copies the binary to $(BIN). No step needs root.
+# fetch-duckdb` puts an engine and its CLI into ~/.duckdb (CI fetches the
+# same way, through .github/actions/duckdb). `make install` copies the
+# binary to $(BIN). No step needs root.
 
 .PHONY: all harbor unit test bench install fetch-duckdb bootstrap clean
 
@@ -43,18 +43,18 @@ bench: harbor
 # The rm first is load-bearing on macOS: overwriting a binary in place leaves
 # the kernel's per-inode signature cache stale, and every exec dies by SIGKILL
 # ("valid on disk", still killed). A fresh inode gets a fresh verdict.
-# The stale `pilot` is swept on upgrade: it merged into harbor in 0.20.
 install: harbor
 	@install -d -m 0755 "$(BIN)"
-	@rm -f "$(BIN)/harbor" "$(BIN)/pilot"
+	@rm -f "$(BIN)/harbor"
 	@install -m 0755 target/release/harbor "$(BIN)/harbor"
 	@echo "installed harbor -> $(BIN)"
 	@case ":$$PATH:" in *":$(BIN):"*) ;; \
 	  *) echo "note: $(BIN) is not on your PATH — add it to your shell rc" ;; esac
 
-# Pull DuckDB's official nightly artifacts (libduckdb + headers + duckdb CLI)
-# from artifacts.duckdb.org into $(DUCKDB_LIB), where harbor's runtime search
-# finds it. The channel is the latest build of the 2.0 branch; the script
+# libduckdb and the duckdb CLI of one build into $(DUCKDB_LIB), where
+# harbor's runtime search finds the library and test/scripts/check.sh the
+# pair. DUCKDB_LIB_BUILD=<build> takes both from this repository's
+# engine-<build> release; unset, DuckDB's nightly channel. The script
 # refuses a library without the v2 C API.
 fetch-duckdb:
 	DEST=$(DUCKDB_LIB) scripts/fetch-duckdb.sh

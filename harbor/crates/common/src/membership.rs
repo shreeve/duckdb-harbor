@@ -4,8 +4,8 @@
 //! connection, editing the file through
 //! toml_edit's DOM so the comments and ordering the operator wrote survive
 //! untouched — we mutate one node, we don't reserialize the file. The full
-//! schema stays with the `config` reader; here we only ever touch a section's
-//! `path`, so we need the editor, not the typed deserializer.
+//! schema stays with the `config` reader, which checks every edit before it
+//! lands; here we only ever add or remove a section, so we need the editor.
 //!
 //! Section keys are matched normalized, so `[connection.MedLabs]` answers
 //! `medlabs`, and every valid spelling — a standard table, an inline
@@ -33,51 +33,55 @@ pub enum Attached {
 // the pure edit, verify the postcondition, write it back atomically.
 // ---------------------------------------------------------------------------
 
+/// The words the CLI reads as verbs where a database's name would go, so a
+/// database filed under one could never be named.
+pub const RESERVED: [&str; 12] = [
+    "attach", "detach", "start", "stop", "restart", "autostart", "off", "backup", "restore",
+    "update", "help", "version",
+];
+
 /// Add `db` to the config under its normalized stem, or confirm it is already
 /// there — under whatever key already names this file. Returns the name it is
 /// filed under. Errors if the stem already belongs to a different file.
 pub fn attach(db: &Path) -> Result<(String, Attached), String> {
     let _lock = lock_config()?;
     let canon = paths::canonical_db(db)?;
-    if let Some(key) = listed_as(&canon) {
-        return Ok((key, Attached::AlreadyThere));
+    let mut doc = parse(&read()?)?;
+    if let Some(key) = filed_as(&doc, &canon)? {
+        return Ok((paths::normalize(&key)?, Attached::AlreadyThere));
     }
     let name = name_of(db)?;
-    let stored = paths::shorten(&canon);
-    let mut doc = parse(&read()?)?;
-
+    if RESERVED.contains(&name.as_str()) {
+        return Err(format!(
+            "'{name}' is a word harbor reads as a verb, so it could not name this database — rename the file"
+        ));
+    }
     if let Some((_, existing)) = find(&doc, &name)? {
-        // Same file under the same name is idempotent success; a different file
-        // wanting the same name is the collision only its author can resolve.
-        if let Some(p) = &existing
-            && paths::canonical_db(&paths::expand(p)).ok() == Some(canon)
-        {
-            return Ok((name, Attached::AlreadyThere));
-        }
         return Err(match existing {
             Some(p) => format!("'{name}' already names {p} — detach it first, or rename this one"),
             None => format!("'{name}' already exists and is not a local database — remove it by hand first"),
         });
     }
 
-    insert(&mut doc, &name, &stored)?;
+    insert(&mut doc, &name, "path", &paths::shorten(&canon))?;
     let text = doc.to_string();
     verify(&text, &name, true)?;
     write(&text)?;
     Ok((name, Attached::Added))
 }
 
-/// Remove `db` from the config, whatever key names it. Returns whether a
-/// section was actually there to remove; a missing file or absent name is a
-/// quiet `false`, never an error.
+/// Remove `db` from the config: the entry whose `path` is this file, and only
+/// that one. Another file that shares its stem keeps its entry. Returns the
+/// name it was filed under (its stem when nothing names it) and whether an
+/// entry was there to remove; nothing to remove is a quiet `false`.
 pub fn detach(db: &Path) -> Result<(String, bool), String> {
     let _lock = lock_config()?;
-    let name = name_for(db)?;
+    let canon = paths::canonical_db(db)?;
     let mut doc = parse(&read()?)?;
-
-    let Some((key, _)) = find(&doc, &name)? else {
-        return Ok((name, false));
+    let Some(key) = filed_as(&doc, &canon)? else {
+        return Ok((name_of(db)?, false));
     };
+    let name = paths::normalize(&key)?;
     remove(&mut doc, &key)?;
     let text = doc.to_string();
     verify(&text, &name, false)?;
@@ -97,7 +101,7 @@ pub fn add_remote(name: &str, url: &str) -> Result<String, String> {
     if find(&doc, &name)?.is_some() {
         return Err(format!("'{name}' already exists — choose another name"));
     }
-    insert_remote(&mut doc, &name, url)?;
+    insert(&mut doc, &name, "url", url)?;
     let text = doc.to_string();
     verify(&text, &name, true)?;
     write(&text)?;
@@ -144,13 +148,31 @@ fn listed_as(canon: &Path) -> Option<String> {
 }
 
 /// The name a database files under when nothing names it yet: its stem,
-/// normalized to the registry alphabet.
+/// normalized to the registry alphabet and cut to the name law's 64
+/// characters. Any file DuckDB can open has one: a stem that is long or not
+/// UTF-8 is shortened or spelled with `-`, never refused.
 pub fn name_of(db: &Path) -> Result<String, String> {
     let stem = db
         .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| format!("not a database path: {}", db.display()))?;
-    paths::normalize(stem)
+        .ok_or_else(|| format!("not a database path: {}", db.display()))?
+        .to_string_lossy();
+    // Lowercased first, since that can lengthen a char; `normalize` then maps
+    // each char to one.
+    let stem: String = stem.to_lowercase().chars().take(64).collect();
+    paths::normalize(&stem)
+}
+
+/// The key of the entry whose `path` is this canonical file, in the
+/// operator's spelling.
+fn filed_as(doc: &DocumentMut, canon: &Path) -> Result<Option<String>, String> {
+    let Some(item) = doc.get("connection") else {
+        return Ok(None);
+    };
+    let table = item.as_table_like().ok_or("`connection` in config.toml is not a table")?;
+    Ok(table.iter().find_map(|(key, val)| {
+        let path = val.as_table_like()?.get("path")?.as_str()?;
+        (paths::canonical_db(&paths::expand(path)).ok()? == canon).then(|| key.to_string())
+    }))
 }
 
 /// Hold this separate inode across the entire read-modify-rename operation.
@@ -255,9 +277,11 @@ fn find(doc: &DocumentMut, name: &str) -> Result<Option<(String, Option<String>)
     Ok(None)
 }
 
-/// Add `[connection.<name>]` with `path = <stored>`. The caller has ruled out a
-/// collision, so this only ever creates.
-fn insert(doc: &mut DocumentMut, name: &str, stored: &str) -> Result<(), String> {
+/// Add `[connection.<name>]` holding the one key that says what it is —
+/// `path` for a local database, `url` for a remote — without disturbing the
+/// document around it. The caller has ruled out a collision, so this only
+/// ever creates.
+fn insert(doc: &mut DocumentMut, name: &str, key: &str, val: &str) -> Result<(), String> {
     if doc.get("connection").is_none() {
         // A fresh parent table, implicit so no bare `[connection]` header is
         // emitted — only the `[connection.<name>]` child below.
@@ -269,23 +293,7 @@ fn insert(doc: &mut DocumentMut, name: &str, stored: &str) -> Result<(), String>
         .as_table_mut()
         .ok_or("`connection` in config.toml is not a table")?;
     let mut entry = Table::new();
-    entry["path"] = value(stored);
-    conn.insert(name, Item::Table(entry));
-    Ok(())
-}
-
-/// Add a remote section without disturbing the document around it.
-fn insert_remote(doc: &mut DocumentMut, name: &str, url: &str) -> Result<(), String> {
-    if doc.get("connection").is_none() {
-        let mut parent = Table::new();
-        parent.set_implicit(true);
-        doc.insert("connection", Item::Table(parent));
-    }
-    let conn = doc["connection"]
-        .as_table_mut()
-        .ok_or("`connection` in config.toml is not a table")?;
-    let mut entry = Table::new();
-    entry["url"] = value(url);
+    entry[key] = value(val);
     conn.insert(name, Item::Table(entry));
     Ok(())
 }
@@ -303,10 +311,12 @@ fn remove(doc: &mut DocumentMut, key: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Postcondition, checked before the bytes land: the edited text still parses,
-/// and the named section is present (`want`) or gone (`!want`). Cheap insurance
-/// that the edit did what we think.
+/// Postcondition, checked before the bytes land: the edited text is a config
+/// the typed reader accepts, so no edit leaves behind a file `load` refuses,
+/// and the named section is present (`want`) or gone (`!want`).
 fn verify(text: &str, name: &str, want: bool) -> Result<(), String> {
+    crate::config::parse(text)
+        .map_err(|e| format!("config.toml is not valid, so it is left unchanged — {e}"))?;
     let ok = match parse(text) {
         Ok(doc) => find(&doc, name).map(|f| f.is_some() == want).unwrap_or(false),
         Err(_) => false,
@@ -329,7 +339,7 @@ mod tests {
     fn attached(text: &str, name: &str, path: &str) -> String {
         let mut doc = parse(text).unwrap();
         assert!(find(&doc, name).unwrap().is_none(), "expected a fresh name");
-        insert(&mut doc, name, path).unwrap();
+        insert(&mut doc, name, "path", path).unwrap();
         let out = doc.to_string();
         verify(&out, name, true).unwrap();
         out
@@ -359,14 +369,15 @@ mod tests {
     fn attach_preserves_comments_and_prior_sections() {
         let before = "\
 # my databases
-[defaults]
-mode = \"duckbox\"
+[connection.prod] # through the tunnel
+url = \"http://localhost:9495\"
 
 [connection.medlabs]
 path = \"~/med.duckdb\"
 ";
         let after = attached(before, "warehouse", "~/wh.duckdb");
         assert!(after.contains("# my databases"), "the comment must survive");
+        assert!(after.contains("[connection.prod] # through the tunnel"), "the remote must survive");
         assert!(after.contains("[connection.medlabs]"), "the prior berth must survive");
         assert!(after.contains("[connection.warehouse]") && after.contains("~/wh.duckdb"));
     }
@@ -389,18 +400,14 @@ path = \"~/med.duckdb\"
     #[test]
     fn detach_removes_only_its_section() {
         let text = "\
-[defaults]
-mode = \"csv\"
-
 [connection.foo]
 path = \"~/foo.duckdb\"
 
-[connection.bar]
+[connection.bar] # kept
 url = \"https://x\"
 ";
         let after = detached(text, "foo");
-        assert!(after.contains("[defaults]") && after.contains("mode = \"csv\""));
-        assert!(after.contains("[connection.bar]"));
+        assert!(after.contains("[connection.bar] # kept"));
         assert!(!after.contains("[connection.foo]") && !after.contains("foo.duckdb"));
     }
 
@@ -412,8 +419,7 @@ url = \"https://x\"
     }
 
     #[test]
-    fn inline_connection_now_edits_instead_of_refusing() {
-        // The form the hand-rolled writer used to refuse: toml_edit handles it.
+    fn an_inline_connection_is_edited_like_a_section() {
         let text = "connection.foo = { path = \"~/foo.duckdb\" }\n";
         assert!(present(text, "foo"));
         assert!(!present(&detached(text, "foo"), "foo"), "the inline entry is removed");
@@ -427,12 +433,40 @@ url = \"https://x\"
         assert!(present(&after, "bar"), "the sibling survives");
     }
 
+    /// An entry is found by the file it names, never by a stem it shares:
+    /// detaching `~/b/data.duckdb` must not take `~/a/data.duckdb`'s entry.
     #[test]
-    fn defaults_connection_key_is_not_mistaken_for_a_section() {
-        // `connection = "medlabs"` inside [defaults] is a key, not a berth.
-        let text = "[defaults]\nconnection = \"medlabs\"\n\n[connection.medlabs]\npath = \"~/m.duckdb\"\n";
-        let (key, _) = find(&parse(text).unwrap(), "medlabs").unwrap().unwrap();
-        assert_eq!(key, "medlabs");
+    fn an_entry_is_filed_by_its_canonical_path() {
+        let root = std::env::temp_dir().join(format!("hb-filed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let text = format!("[connection.Data]\npath = \"{}\"\n", root.join("a/data.duckdb").display());
+        let doc = parse(&text).unwrap();
+        assert_eq!(filed_as(&doc, &root.join("a/data.duckdb")).unwrap().as_deref(), Some("Data"));
+        assert_eq!(filed_as(&doc, &root.join("b/data.duckdb")).unwrap(), None);
+        // Another spelling of the same file is the same file.
+        assert_eq!(filed_as(&doc, &paths::canonical_db(&root.join("b/../a/data.duckdb")).unwrap()).unwrap().as_deref(), Some("Data"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_stem_beyond_the_name_law_is_cut_not_refused() {
+        let long = format!("/x/{}.duckdb", "Q".repeat(200));
+        assert_eq!(name_of(Path::new(&long)).unwrap(), "q".repeat(64));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let odd = Path::new(std::ffi::OsStr::from_bytes(b"/x/caf\xe9.duckdb"));
+            assert_eq!(name_of(odd).unwrap(), "caf-");
+        }
+    }
+
+    #[test]
+    fn an_edit_that_leaves_an_invalid_config_is_refused() {
+        let e = verify("[connection.a]\npath = \"/a.duckdb\"\npth = 1\n", "a", true).unwrap_err();
+        assert!(e.contains("left unchanged") && e.contains("pth"), "{e}");
     }
 
     #[test]
@@ -450,7 +484,7 @@ url = \"https://x\"
     #[test]
     fn remote_addition_is_named_and_transport_explicit() {
         let mut doc = parse("# mine\n").unwrap();
-        insert_remote(&mut doc, "prod", "http://foo.bar.com:9494").unwrap();
+        insert(&mut doc, "prod", "url", "http://foo.bar.com:9494").unwrap();
         let text = doc.to_string();
         assert!(text.contains("# mine"));
         assert!(text.contains("[connection.prod]"));

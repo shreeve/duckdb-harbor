@@ -4,7 +4,7 @@
 Runs its own server, because most of what is below needs a query that takes
 seconds and a pool small enough to saturate on purpose.
 
-  test/scripts/cancel.py [--db PATH] [--keep]
+  test/scripts/cancel.py [--keep]
 
 A statement inside DuckDB does not come back until it is done, so a runaway
 query is not a slow request — it is a connection permanently out of service.
@@ -16,10 +16,12 @@ that the accounting still balances when clients cancel things at random.
 """
 
 import argparse
+import http.client
 import json
 import os
 import random
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -27,6 +29,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -233,14 +236,11 @@ def stop_server(proc):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db")
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
 
     work = tempfile.mkdtemp(prefix="harbor-cancel-")
     db = os.path.join(work, "cancel.duckdb")
-    if args.db and os.path.exists(args.db):
-        shutil.copy(args.db, db)
 
     # Eight connections: four workers, four leases. Small enough that the
     # saturation test can block every worker without running eight slow
@@ -248,7 +248,7 @@ def main():
     proc, h, log = start_server(db, pool_size=8, workers=4, port=free_port())
     try:
         h.sql("CREATE TABLE IF NOT EXISTS marks(n INTEGER)")
-        run_tests(h, db)
+        run_tests(h, db, proc)
     finally:
         stop_server(proc)
         log.close()
@@ -265,7 +265,7 @@ def main():
     return 0
 
 
-def run_tests(h, db):
+def run_tests(h, db, proc):
     # -----------------------------------------------------------------------
     section("Cancelling a query by the name the client gave it")
 
@@ -299,6 +299,15 @@ def run_tests(h, db):
     eq("cancelling it again cancels nothing", False, doc.get("cancelled"))
     eq("and is not an error", 200, st)
     eq("cancelling a name nobody used is the same", False, h.cancel("never")[1].get("cancelled"))
+
+    # A name is chosen freely and travels in the path percent-encoded, as
+    # encodeURIComponent writes it; the server cancels by the name itself.
+    job = Background(h, statement=LONG, query="q 2/é?")
+    time.sleep(0.5)
+    st, doc, _ = h.cancel(urllib.parse.quote("q 2/é?", safe=""))
+    eq("a name with reserved characters is cancelled by its encoding", True, doc.get("cancelled"))
+    job.wait()
+    eq("and its query fails with 499", 499, job.status)
 
     eq("the server still answers", 1, h.value("SELECT 1"))
     eq("and can still write", 200, h.sql("INSERT INTO marks VALUES (1)")[0])
@@ -503,9 +512,8 @@ def run_tests(h, db):
     # -----------------------------------------------------------------------
     section("A lease that runs past its deadline is taken back")
 
-    # Before cancellation the reaper skipped busy leases, so the one lease that
-    # most needed reclaiming — wedged inside a runaway statement — was the one
-    # it could never reclaim.
+    # The lease that most needs reclaiming is the one wedged inside a runaway
+    # statement.
     before = h.connections()
     st, doc, _ = h.open(ttl_ms=1000)
     sid = doc["sessionId"]
@@ -533,6 +541,95 @@ def run_tests(h, db):
     # that reuses one id per tab is not slowly poisoned.
     eq("the name is reusable once the statement is over", 200, h.sql("SELECT 1", query="dup")[0])
     eq("an over-long queryId is a clean 400", 400, h.sql("SELECT 1", query="x" * 129)[0])
+
+    # -----------------------------------------------------------------------
+    section("A cancel that comes after the statement finished stops nothing")
+
+    # The statement is over, and its answer waits on the connection behind
+    # one the client pipelined ahead of it, when the cancel lands. It stopped
+    # nothing, so it says so, and the answer arrives whole.
+    def post(body, last=False):
+        close = "Connection: close\r\n" if last else ""
+        return (f"POST /sql HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                f"Accept: application/json\r\n{close}Content-Length: {len(body)}\r\n\r\n{body}").encode()
+
+    def answers(data):
+        """(status, document) of each response on a connection."""
+        out = []
+        while data:
+            head, _, data = data.partition(b"\r\n\r\n")
+            lines = head.split(b"\r\n")
+            fields = dict(line.lower().split(b": ", 1) for line in lines[1:])
+            if b"content-length" in fields:
+                length = int(fields[b"content-length"])
+                body, data = data[:length], data[length:]
+            else:
+                body = b""
+                while True:
+                    size, _, data = data.partition(b"\r\n")
+                    length = int(size, 16)
+                    body, data = body + data[:length], data[length + 2:]
+                    if length == 0:
+                        break
+            out.append((int(lines[0].split()[1]), json.loads(body)))
+        return out
+
+    told, drawn = [], []
+    for attempt in range(10):
+        s = socket.create_connection(("127.0.0.1", int(h.base.rsplit(":", 1)[1])), timeout=30)
+        s.sendall(post(json.dumps({"sql": LONG, "queryId": f"ahead{attempt}"}))
+                  + post(json.dumps({"sql": "SELECT range FROM range(6000)", "queryId": f"late{attempt}"}), last=True))
+        time.sleep(0.5)
+        told.append(h.cancel(f"late{attempt}")[1].get("cancelled"))
+        h.cancel(f"ahead{attempt}")
+        data = b""
+        while chunk := s.recv(65536):
+            data += chunk
+        s.close()
+        drawn.append([(status, doc.get("rowCount")) for status, doc in answers(data)])
+    eq("the cancel says it stopped nothing", [False] * 10, told)
+    eq("and every answer arrives whole", [[(499, None), (200, 6000)]] * 10, drawn)
+
+    # -----------------------------------------------------------------------
+    section("A session needs no free worker")
+
+    # Every worker busy with a long scan: a session's statements, COMMIT
+    # included, run on the session's own connection all the same.
+    st, doc, _ = h.open()
+    sid = doc["sessionId"]
+    jobs = [Background(h, statement=LONG, query=f"busy{i}") for i in range(4)]
+    time.sleep(0.6)
+    answers = [h.sql(sql, session=sid, timeout=10)[0]
+               for sql in ("BEGIN", "INSERT INTO marks VALUES (94)", "COMMIT")]
+    busy = sum(job.thread.is_alive() for job in jobs)
+    eq("BEGIN, a write and COMMIT answer while the workers are busy", [200, 200, 200], answers)
+    eq("which they were, all four", 4, busy)
+    # As many pooled requests as there are lease connections, each body
+    # stalled after its first bytes: they hold the lane's readers, not the
+    # seats a session's statement runs in.
+    stalled = []
+    for _ in range(4):
+        s = socket.create_connection(("127.0.0.1", int(h.base.rsplit(":", 1)[1])))
+        body = json.dumps({"sql": "SELECT 1"}).encode()
+        s.sendall(b"POST /sql HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                  b"Content-Length: %d\r\n\r\n" % (len(body) + 2000) + body[:5])
+        stalled.append(s)
+    time.sleep(0.5)
+    st = h.sql("SELECT 1", session=sid, timeout=10)[0]
+    busy = sum(job.thread.is_alive() for job in jobs)
+    eq("a session's statement runs beside pooled bodies that stall, the workers busy",
+       (200, 4), (st, busy))
+    for s in stalled:
+        s.close()
+    for i in range(4):
+        h.cancel(f"busy{i}")
+    for job in jobs:
+        job.wait()
+    # The probe lane may still be listening for a moment after the workers
+    # free up, and sheds what it takes with the 503 that says to retry.
+    until(lambda: h.sql("SELECT 1")[0], 200)
+    eq("and the write is committed", 94, h.value("SELECT n FROM marks WHERE n = 94"))
+    eq("release", True, h.release(sid)[1].get("released"))
 
     # -----------------------------------------------------------------------
     section("Chaos: cancel everything, at random, and check the books")
@@ -614,6 +711,35 @@ def run_tests(h, db):
     eq("every connection came back", (c["total"], 0, 0), (c["free"], c["live"], c["inflight"]))
     eq("the server still answers", 1, h.value("SELECT 1"))
     eq("and can still write", 200, h.sql("INSERT INTO marks VALUES (7)")[0])
+
+    # -----------------------------------------------------------------------
+    section("A server that is stopping says so")
+
+    # A reader that stops reading holds its worker in a write, and the stop
+    # waits on that worker, while the TCP door stays open. A request that
+    # arrives then is told that nothing of it ran, not left to the exit.
+    port = int(h.base.rsplit(":", 1)[1])
+    stall = socket.socket()
+    stall.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    stall.connect(("127.0.0.1", port))
+    body = json.dumps({"sql": "SELECT i, repeat('x', 200) FROM range(2000000) t(i)"})
+    stall.sendall(f"POST /sql HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                  f"Content-Length: {len(body)}\r\n\r\n{body}".encode())
+    time.sleep(1.0)
+    proc.send_signal(signal.SIGTERM)
+    time.sleep(0.7)
+    late = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    try:
+        late.request("POST", "/sql", json.dumps({"sql": "SELECT 1"}), {"Content-Type": "application/json"})
+        response = late.getresponse()
+        answer = (response.status, json.loads(response.read()).get("message"))
+    except (OSError, http.client.HTTPException) as e:
+        answer = type(e).__name__
+    late.close()
+    stall.close()
+    eq("a request that arrives as it stops is told nothing ran",
+       (503, "harbor is stopping; this statement did not run"), answer)
+    proc.wait(timeout=30)
 
 
 if __name__ == "__main__":

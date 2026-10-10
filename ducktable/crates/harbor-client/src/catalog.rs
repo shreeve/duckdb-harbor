@@ -1,95 +1,14 @@
-//! `GET /catalog` — the whole schema as one document.
+//! `GET /catalog` — the whole schema as one document, in the types the
+//! server writes it with (`wire::catalog`).
 //!
 //! Harbor curates what the engine's catalog functions expose, so version
 //! differences between DuckDB releases vanish before they reach a client.
-//! The shapes here decode what the server sends today (tables and
-//! sequences) and ignore sections it may grow later, so a newer Harbor
-//! never breaks an older DuckTable.
 
 use crate::fleet::Conn;
 use crate::http::request;
-use serde::Deserialize;
 use std::time::Duration;
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Catalog {
-    // The response also carries harbor/duckdb versions; identity comes
-    // from /info, so they are not modeled here.
-    #[serde(default)]
-    pub tables: Vec<Table>,
-    #[serde(default)]
-    pub sequences: Vec<Sequence>,
-    /// Exact bytes of the served file, statted by the server (harbor
-    /// 0.18+); None from an older Harbor or a berth serving no file.
-    #[serde(default)]
-    pub database_size_bytes: Option<u64>,
-    /// Exact bytes of the WAL beside it — 0 after a checkpoint, which is
-    /// an answer, not an absence.
-    #[serde(default)]
-    pub wal_size_bytes: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Table {
-    pub name: String,
-    pub schema: String,
-    /// Exact COUNT(*) from the full catalog; absent from the lite inventory.
-    #[serde(default)]
-    pub row_count: Option<u64>,
-    /// The engine's own CREATE TABLE rendering (harbor 0.18+).
-    #[serde(default)]
-    pub ddl: Option<String>,
-    #[serde(default)]
-    pub columns: Vec<Column>,
-    #[serde(default)]
-    pub primary_key: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Column {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub duck_type: String,
-    #[serde(default)]
-    pub not_null: bool,
-    #[serde(default)]
-    pub default: Option<String>,
-    #[serde(default)]
-    pub generated: bool,
-    #[serde(default)]
-    pub generation_expression: Option<String>,
-    #[serde(default)]
-    pub primary: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Sequence {
-    pub name: String,
-}
-
-impl Catalog {
-    /// Schemas in display order, `main` first the way DuckDB presents it.
-    pub fn schemas(&self) -> Vec<&str> {
-        let mut v: Vec<&str> = self.tables.iter().map(|t| t.schema.as_str()).collect();
-        v.sort_unstable();
-        v.dedup();
-        if let Some(pos) = v.iter().position(|s| *s == "main") {
-            let main = v.remove(pos);
-            v.insert(0, main);
-        }
-        v
-    }
-
-    pub fn tables_in(&self, schema: &str) -> Vec<&Table> {
-        let mut v: Vec<&Table> = self.tables.iter().filter(|t| t.schema == schema).collect();
-        v.sort_by(|a, b| a.name.cmp(&b.name));
-        v
-    }
-}
+pub use wire::catalog::{Catalog, Column, Sequence, Table};
 
 pub fn catalog(conn: &Conn) -> Result<Catalog, String> {
     fetch(conn, &wire::endpoint::CATALOG)
@@ -103,24 +22,26 @@ pub fn catalog_lite(conn: &Conn) -> Result<Catalog, String> {
 }
 
 fn fetch(conn: &Conn, route: &wire::endpoint::Route) -> Result<Catalog, String> {
-    let r = request(
-        conn.transport()?,
-        route,
-        None,
-        Some(Duration::from_secs(15)),
-    )
-    .map_err(|e| e.to_string())?;
+    let r = request(conn.transport()?, route, None, Some(Duration::from_secs(15)))
+        .map_err(|e| e.to_string())?;
+    let status = r.status;
     let body = r.body_string().map_err(|e| e.to_string())?;
-    if let Ok(c) = serde_json::from_str::<Catalog>(&body) {
-        return Ok(c);
+    decode(status, &body)
+}
+
+/// Status first: every field of a catalog has a default, so an error body
+/// would decode as an empty one, and a refresh that failed would replace the
+/// schema on screen with nothing.
+fn decode(status: u16, body: &str) -> Result<Catalog, String> {
+    if status != 200 {
+        return Err(match wire::Event::parse(body.trim()) {
+            Ok(wire::Event::Error { code, message }) => format!("{code}: {message}"),
+            _ => format!("HTTP {status}"),
+        });
     }
-    match wire::Event::parse(body.trim()) {
-        Ok(wire::Event::Error { code, message }) => Err(format!("{code}: {message}")),
-        _ => Err(format!(
-            "unexpected /catalog response: {}",
-            body.chars().take(120).collect::<String>()
-        )),
-    }
+    serde_json::from_str(body).map_err(|_| {
+        format!("unexpected /catalog response: {}", body.chars().take(120).collect::<String>())
+    })
 }
 
 #[cfg(test)]
@@ -128,47 +49,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decodes_the_live_shape_and_ignores_growth() {
-        let doc = r#"{
-            "harborVersion": "0.15.0",
-            "duckdbVersion": "v2.0.0",
-            "databaseSizeBytes": 1310720,
-            "walSizeBytes": 0,
-            "tables": [
-                {"name": "events", "schema": "main", "rowCount": 42,
-                 "columns": [{"name": "id", "type": "INTEGER", "notNull": true, "default": "nextval('id')", "generated": false, "generationExpression": null, "primary": true},
-                              {"name": "slug", "type": "VARCHAR", "notNull": false, "default": "lower(name)", "generated": true, "generationExpression": "lower(name)", "primary": false}],
-                 "primaryKey": ["id"], "uniqueConstraints": [], "indexes": [], "foreignKeys": [],
-                 "ddl": "CREATE TABLE events(id INTEGER PRIMARY KEY DEFAULT(nextval('id')));"},
-                {"name": "zeta", "schema": "audit", "rowCount": 7, "columns": [], "primaryKey": []}
-            ],
-            "sequences": [{"name": "id", "start": 1}],
-            "viewsSomeday": []
-        }"#;
-        let c: Catalog = serde_json::from_str(doc).unwrap();
-        assert_eq!(c.schemas(), vec!["main", "audit"]);
-        assert_eq!(c.tables_in("main")[0].columns[0].duck_type, "INTEGER");
-        assert!(c.tables_in("main")[0].columns[0].primary);
-        assert!(!c.tables_in("main")[0].columns[0].generated);
-        assert!(c.tables_in("main")[0].columns[1].generated);
-        assert_eq!(
-            c.tables_in("main")[0].columns[1].generation_expression.as_deref(),
-            Some("lower(name)")
-        );
-        assert_eq!(c.tables_in("main")[0].row_count, Some(42));
-        assert!(c.tables_in("main")[0].ddl.as_deref().unwrap().starts_with("CREATE TABLE"));
-        assert_eq!(c.tables_in("audit")[0].row_count, Some(7));
-        assert_eq!(c.database_size_bytes, Some(1310720));
-        assert_eq!(c.wal_size_bytes, Some(0));
-        assert_eq!(c.sequences[0].name, "id");
-    }
-
-    #[test]
-    fn lite_catalog_omits_row_counts() {
-        let c: Catalog = serde_json::from_str(
-            r#"{"tables":[{"name":"events","schema":"main"}]}"#,
-        )
-        .unwrap();
-        assert_eq!(c.tables[0].row_count, None);
+    fn a_failed_answer_is_an_error_never_an_empty_catalog() {
+        let error = r#"{"type":"error","code":"unavailable","message":"harbor is not serving"}"#;
+        assert_eq!(decode(503, error).unwrap_err(), "unavailable: harbor is not serving");
+        assert_eq!(decode(502, "<html>bad gateway</html>").unwrap_err(), "HTTP 502");
+        let c = decode(200, r#"{"tables":[{"name":"events","schema":"main"}]}"#).unwrap();
+        assert_eq!((c.tables[0].name.as_str(), c.tables[0].row_count), ("events", None));
     }
 }

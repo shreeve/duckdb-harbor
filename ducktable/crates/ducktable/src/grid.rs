@@ -2,7 +2,7 @@
 //! two-axis virtualization stress-checked by `examples/wide_probe.rs`, a
 //! plain-cell probe of the library — not of this delegate), DuckTable's
 //! delegate on top.
-//! This surface owns fetching (server-side pages via `POST /sql`), value
+//! This surface owns fetching (server-side pages via `POST /sl`), value
 //! presentation, its header/status strips, and inline editing (the cell
 //! editor and staging here, the edit model in `edits.rs`).
 //!
@@ -13,7 +13,6 @@
 //! its row's identity (`edits.rs`) and projected onto whatever page is
 //! showing, never stored by index.
 
-use crate::chrome::{icon_tile, toggle_tile};
 use crate::edits::{self, Edits};
 use crate::prefs::{self, ViewMode};
 use crate::theme::{
@@ -70,12 +69,6 @@ pub(crate) struct Grid {
     /// ran inside it: its later pages are read on the same session, so they
     /// see what the transaction has written. None everywhere else.
     pub(crate) session: Option<crate::query::Txn>,
-    /// The berth's Query view, injected by the app (berth-scoped, so it
-    /// outlives this table's grid); rendered by the Query segment.
-    pub(crate) query_view: Option<Entity<crate::query::QueryView>>,
-    /// Repaints the footer's status line as the query view's run state
-    /// ticks and settles; replaced whole when a berth swaps views in.
-    pub(crate) query_obs: Option<Subscription>,
     /// This grid is someone else's results pane (the Query view): it
     /// renders body only — no title strip, no filter, no footer. The
     /// host owns the chrome; the app footer reads THIS grid through it.
@@ -111,7 +104,7 @@ pub(crate) struct Grid {
     rowid: bool,
     /// Primary-key column names from the catalog — kept so an error-born
     /// grid can build its Edits when its first schema finally lands.
-    pk_cols: Vec<String>,
+    pub(crate) pk_cols: Vec<String>,
     /// NOT NULL per schema column (from the catalog, by name) — staging
     /// NULL into one refuses at the fingers, not at the server.
     not_null: Vec<bool>,
@@ -139,6 +132,10 @@ pub(crate) struct Grid {
     /// lands, the rows on screen carry the identities they were fetched
     /// with, and a commit that re-keyed a row has made those stale.
     pub(crate) committing: bool,
+    /// Another table's first page is on its way to replace this grid
+    /// (`app::select_table`). Like a page of its own on its way, it keeps
+    /// editors shut until it lands (`open_editor`).
+    pub(crate) replacing: bool,
     /// The commit has answered and its page fetch is in flight; what the
     /// fetch's landing settles (`settle_commit`).
     post_commit: Option<PostCommit>,
@@ -228,9 +225,6 @@ struct CellEditor {
     row: usize,
     /// Schema column index.
     col: usize,
-    /// Present for a synthetic INSERT row; existing rows resolve through
-    /// their fetched identity instead.
-    draft_key: Option<String>,
     input: Entity<gpui_kit::component::input::InputState>,
     replace: bool,
 }
@@ -267,12 +261,14 @@ pub(crate) struct GridDelegate {
     /// Each row's identity: the key columns' RAW fetched values, captured
     /// before display conversion — the WHERE clause binds these.
     identities: Vec<Vec<Value>>,
-    /// Identity key -> row index on this page, for projecting staged
-    /// changes onto the view.
+    /// Identity key -> the row's index among the fetched rows, built once
+    /// per page for projecting staged changes onto the view (drafts sit
+    /// above the fetched rows, so a display row is this plus their count).
     row_of: std::collections::HashMap<String, usize>,
-    /// Projection of the staged layer onto this page: (row, schema col)
-    /// -> staged display text (None = staged NULL).
-    staged: std::collections::HashMap<(usize, usize), Option<SharedString>>,
+    /// Projection of the staged layer onto this page: row -> schema col ->
+    /// staged display text (None = staged NULL). Keyed by row first, so
+    /// whether a row carries a staged cell is one lookup.
+    staged: std::collections::HashMap<usize, std::collections::HashMap<usize, Option<SharedString>>>,
     /// Synthetic INSERT rows prepended to the fetched page, in display
     /// order. Their private keys live only in Edits and never enter SQL.
     draft_keys: Vec<String>,
@@ -374,6 +370,7 @@ impl Grid {
     /// BEFORE constructing (DESIGN.md: fetch first, commit over the old
     /// value), so the swap from the previous grid is one complete frame —
     /// no skeleton, no columns popping in, no gutter re-widening.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         conn: Conn,
         schema: &str,
@@ -401,6 +398,7 @@ impl Grid {
     /// the same machinery pages `SELECT * FROM (statement)`. No catalog
     /// structure, so no key, so no Edits: read-only by construction,
     /// not by gate.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_query(
         conn: Conn,
         sql: &str,
@@ -450,7 +448,7 @@ impl Grid {
         // and only the WHERE clauses see it.
         let pk_cols: Vec<String> = structure
             .as_ref()
-            .map(|s| s.cols.iter().filter(|c| c.pk).map(|c| c.name.clone()).collect())
+            .map(|s| s.cols.iter().filter(|c| c.primary).map(|c| c.name.clone()).collect())
             .unwrap_or_default();
         let rowid = structure.as_ref().is_some_and(|s| s.keyed_by_rowid());
         let pk_cols = if rowid { vec!["rowid".to_string()] } else { pk_cols };
@@ -495,15 +493,7 @@ impl Grid {
             }
             Err(message) => (Some(message), 0),
         };
-        let edits = (!delegate.pk_ix.is_empty()).then(|| {
-            Edits::new(
-                source.clone(),
-                pk_cols.clone(),
-                delegate.names.iter().map(|n| n.to_string()).collect(),
-                delegate.schema_cols.iter().map(|c| c.duckdb_type.clone()).collect(),
-            )
-        })
-        .map(|e| if rowid { e.keyed_by_rowid() } else { e });
+        let edits = delegate.new_edits(&source, &pk_cols, rowid);
         let (not_null, defaults, generated, hints, types) =
             insert_metadata(&delegate.names, structure.as_ref());
         delegate.draft_hints = hints;
@@ -555,7 +545,7 @@ impl Grid {
             let key = ks.key.clone();
             grid.update(cx, |g, cx| {
                 // A bare arrow with no ring yet just takes the top-left
-                // seat (Steve's ruling): the first press shows you where
+                // seat: the first press shows you where
                 // you are, the next one moves. seed_ring says whether it
                 // placed the ring; a placed ring consumes the press.
                 let seeded =
@@ -620,10 +610,10 @@ impl Grid {
                             if let Some(col) = d.cols.get_mut(i) {
                                 col.width = *w;
                             }
-                            if i >= g {
-                                if let Some(&schema_ix) = d.visible.get(i - g) {
-                                    d.widths.insert(schema_ix, *w);
-                                }
+                            if i >= g
+                                && let Some(&schema_ix) = d.visible.get(i - g)
+                            {
+                                d.widths.insert(schema_ix, *w);
                             }
                         }
                     });
@@ -689,7 +679,7 @@ impl Grid {
                     .folding(false)
                     .scroll_beyond_last_line(Some(0))
                     .cursor_surrounding_lines(Some(0))
-                    .default_value(ddl)
+                    .default_value(crate::structure::pretty_ddl(&ddl))
             })
         });
         cx.subscribe(&col_search, |_, _, _: &gpui_kit::component::input::InputEvent, cx| {
@@ -729,8 +719,6 @@ impl Grid {
             table,
             conn,
             session: None,
-            query_view: None,
-            query_obs: None,
             embedded,
             pageable,
             source,
@@ -751,6 +739,7 @@ impl Grid {
             parked: None,
             reshaped: false,
             committing: false,
+            replacing: false,
             post_commit: None,
             unrefreshed: false,
             commit_session: Default::default(),
@@ -835,17 +824,15 @@ impl Grid {
                 // The page query answered, whether its page is kept or
                 // dropped below: the database was read at this moment.
                 let read = outcome.is_ok();
-                let result = match outcome {
-                    // Edits staged against the columns on screen are keyed
-                    // and typed by them. They are not rebound to the table's
-                    // present shape, and its rows do not fit the view they
-                    // live in: the page is dropped and the view stays.
-                    Ok(_) if reshaped && grid.edits.as_ref().is_some_and(Edits::any_staged) => {
+                let staged = grid.edits.as_ref().is_some_and(Edits::any_staged);
+                let result = match (outcome, landing(grid.editor.is_some(), reshaped, staged)) {
+                    (Ok(_), Landing::Dropped) => None,
+                    (Ok(_), Landing::Reshaped) => {
                         grid.reshaped = true;
                         grid.error = stale_reason(true, false, grid.in_doubt()).map(str::to_string);
                         None
                     }
-                    Ok((result, total)) => {
+                    (Ok((result, total)), Landing::Shown) => {
                         grid.reshaped = false;
                         grid.unrefreshed = false;
                         grid.error = None;
@@ -858,12 +845,9 @@ impl Grid {
                             grid.total_rows = t;
                         }
                         grid.last_time_ms = result.time_ms;
-                        // New rows displace old indexes; an editor left
-                        // open would be typing into a stranger's cell.
-                        grid.editor = None;
                         Some(result)
                     }
-                    Err(message) => {
+                    (Err(message), _) => {
                         grid.error = Some(message);
                         None
                     }
@@ -892,12 +876,7 @@ impl Grid {
                             } else {
                                 d.adopt_rows(result.rows, base);
                             }
-                            d.selection.clear();
-                            d.active_cell = None;
-                            d.editing = None;
-                            d.editor_input = None;
-                            d.pick = None;
-                            d.tab_anchor = None;
+                            d.reset_cursor();
                         }
                         let d = state.delegate();
                         if d.gutter {
@@ -918,18 +897,10 @@ impl Grid {
                 // A keyboard page flip keeps the ring seated: same
                 // column (if still visible), same row clamped to the new
                 // page's rows.
-                if let (Some((r, c)), true) = (ring_keep, grid.error.is_none()) {
+                if let (Some(at), true) = (ring_keep, grid.error.is_none()) {
                     grid.table.update(cx, |state, cx| {
                         let d = state.delegate_mut();
-                        if d.rows.is_empty() {
-                            return;
-                        }
-                        let row = r.min(d.rows.len() - 1);
-                        let col = if d.visible.contains(&c) {
-                            c
-                        } else {
-                            d.visible.first().copied().unwrap_or(0)
-                        };
+                        let Some((row, col, _)) = ring_step(d.rows.len(), &d.visible, at, 0, 0) else { return };
                         d.active_cell = Some((row, col));
                         select_row(state, row, cx);
                         cx.notify();
@@ -1017,23 +988,9 @@ impl Grid {
     /// adopted only with none — so the set built here is empty, and the
     /// stash parked for this table is judged against it.
     fn settle_schema(&mut self, cx: &mut Context<Self>) {
-        let (keyed, names, types) = {
-            let d = self.table.read(cx).delegate();
-            (
-                !d.pk_ix.is_empty(),
-                d.names.clone(),
-                d.schema_cols.iter().map(|c| c.duckdb_type.clone()).collect::<Vec<_>>(),
-            )
-        };
-        self.edits = keyed.then(|| {
-            let edits = Edits::new(
-                self.source.clone(),
-                self.pk_cols.clone(),
-                names.iter().map(|n| n.to_string()).collect(),
-                types,
-            );
-            if self.rowid { edits.keyed_by_rowid() } else { edits }
-        });
+        let d = self.table.read(cx).delegate();
+        let names = d.names.clone();
+        self.edits = d.new_edits(&self.source, &self.pk_cols, self.rowid);
         let (not_null, defaults, generated, hints, types) =
             insert_metadata(&names, self.structure.as_ref());
         self.not_null = not_null;
@@ -1092,10 +1049,10 @@ impl Grid {
     /// Jump to the last page — only reachable once the total is known,
     /// because the offset comes from it.
     pub(crate) fn jump_last(&mut self, cx: &mut Context<Self>) {
-        if let Some(last) = self.last_page() {
-            if self.page < last {
-                self.fetch_page(last, cx);
-            }
+        if let Some(last) = self.last_page()
+            && self.page < last
+        {
+            self.fetch_page(last, cx);
         }
     }
 
@@ -1113,17 +1070,13 @@ impl Grid {
 
     /// Last page index under the current count, when known.
     pub(crate) fn last_page(&self) -> Option<usize> {
-        let total = self.total_rows?;
-        Some((total.max(1) as usize - 1) / self.page_size)
+        Some(last_page_of(self.total_rows?, self.page_size))
     }
 
-    /// Whether a next page plausibly exists. Unknown total: a full page
-    /// suggests there may be more.
+    /// Whether a next page plausibly exists (`has_next_page`).
     pub(crate) fn has_next(&self, cx: &App) -> bool {
-        match self.last_page() {
-            Some(last) => self.page < last,
-            None => self.table.read(cx).delegate().fetched_count() == self.page_size,
-        }
+        let fetched = self.table.read(cx).delegate().fetched_count();
+        has_next_page(self.page, self.last_page(), fetched, self.page_size)
     }
 
     /// Cycle the page size through PAGE_SIZES (a global preference) and
@@ -1147,29 +1100,6 @@ impl Grid {
         self.table.update(cx, |state, _| {
             state.delegate_mut().pill_cols.insert(schema_ix);
         });
-    }
-
-    /// The grid the footer's stats and pager describe when the Query
-    /// view is up: the query view's embedded results grid.
-    pub(crate) fn query_results_grid(&self, cx: &App) -> Option<Entity<Grid>> {
-        self.query_view.as_ref().and_then(|q| q.read(cx).results_grid())
-    }
-
-    /// Route a pager action to the grid it belongs to: this one (Data),
-    /// or the Query view's results grid. Both are Grids — the whole
-    /// point of the unification — so one closure fits either.
-    pub(crate) fn pager_dispatch(
-        &mut self,
-        cx: &mut Context<Self>,
-        act: impl FnOnce(&mut Grid, &mut Context<Grid>),
-    ) {
-        if prefs::get(cx).view == ViewMode::Query {
-            if let Some(grid) = self.query_results_grid(cx) {
-                grid.update(cx, act);
-            }
-            return;
-        }
-        act(self, cx)
     }
 
     /// Open or close the raw-SQL filter strip. Closing clears an active
@@ -1283,8 +1213,13 @@ impl Grid {
         cx.notify();
     }
 
-    /// Show or hide one column (never the last visible one).
+    /// Show or hide one column (never the last visible one). Text in an open
+    /// editor is staged first, as for "Hide all": a hidden column cannot
+    /// show the editor typing into it.
     pub(crate) fn toggle_column(&mut self, schema_ix: usize, cx: &mut Context<Self>) {
+        if !self.settle_editor(cx) {
+            return;
+        }
         self.remap_columns(cx, |d| {
             if !d.hidden.remove(&schema_ix) {
                 if d.visible.len() <= 1 {
@@ -1323,26 +1258,17 @@ impl Grid {
             let x = e.position.x - bounds.origin.x - scroll_x;
             let d = state.delegate_mut();
             let g = d.gutter as usize;
-            let mut cum = px(0.);
-            for (disp, col) in d.cols.iter().enumerate() {
-                cum += col.width;
-                // The gutter/first-column boundary is not a data divider.
-                if disp < g {
-                    continue;
-                }
-                if (x - cum).abs() <= px(4.) {
-                    let Some(&schema_ix) = d.visible.get(disp - g) else { return };
-                    if d.all_selected {
-                        d.all_selected = false;
-                        d.fit_widths(zoom);
-                    } else {
-                        d.fit_one(schema_ix, zoom);
-                    }
-                    state.refresh(cx);
-                    cx.notify();
-                    return;
-                }
+            let widths: Vec<f32> = d.cols.iter().map(|c| f32::from(c.width)).collect();
+            let Some(disp) = divider_at(&widths, g, f32::from(x)) else { return };
+            let Some(&schema_ix) = d.visible.get(disp - g) else { return };
+            if d.all_selected {
+                d.all_selected = false;
+                d.fit_widths(zoom);
+            } else {
+                d.fit_one(schema_ix, zoom);
             }
+            state.refresh(cx);
+            cx.notify();
         });
     }
 
@@ -1373,6 +1299,9 @@ impl Grid {
     /// all" — the grid never goes to zero columns, so start-from-nothing
     /// keeps one anchor to build from).
     pub(crate) fn hide_all_columns(&mut self, cx: &mut Context<Self>) {
+        if !self.settle_editor(cx) {
+            return;
+        }
         self.remap_columns(cx, |d| {
             if d.visible.len() <= 1 {
                 return false;
@@ -1448,13 +1377,10 @@ impl Grid {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.committing || self.edits.is_none() || self.refuse_stale(cx) {
+        if self.committing || self.refuse_stale(cx) || !self.settle_editor(cx) {
             return;
         }
-        if self.editor.is_some() && !self.confirm_and_move(0, 0, cx) {
-            return;
-        }
-        let key = self.edits.as_mut().expect("checked above").stage_insert();
+        let Some(key) = self.edits.as_mut().and_then(Edits::stage_insert) else { return };
         self.error = None;
         self.sync_staged(cx);
         self.focus_draft(&key, window, cx);
@@ -1472,10 +1398,7 @@ impl Grid {
     ) {
         // A read-only table and a commit in flight say so in the footer,
         // and the Edit menu's gate (`accepts_row_commands`) stops both first.
-        if self.committing || self.edits.is_none() || self.refuse_stale(cx) {
-            return;
-        }
-        if self.editor.is_some() && !self.confirm_and_move(0, 0, cx) {
+        if self.committing || self.edits.is_none() || self.refuse_stale(cx) || !self.settle_editor(cx) {
             return;
         }
         let source = {
@@ -1525,7 +1448,7 @@ impl Grid {
             })
             .unwrap_or_default();
         let cells = duplicate_cells(fetched, &staged, first_schema, &pk_ix, &self.generated);
-        let key = edits.stage_duplicate(identity, cells);
+        let Some(key) = edits.stage_duplicate(identity, cells) else { return };
         self.error = None;
         self.sync_staged(cx);
         self.focus_draft(&key, window, cx);
@@ -1540,19 +1463,16 @@ impl Grid {
         self.needs_focus = false;
         let (row, col, reveal) = {
             let d = self.table.read(cx).delegate();
-            let row = d.draft_keys.iter().position(|k| k == key).unwrap_or(0);
-            let first_schema = d.identity as usize;
-            let required = (first_schema..d.names.len()).find(|&col| {
-                self.not_null.get(col).copied().unwrap_or(false)
-                    && self.defaults.get(col).and_then(Option::as_ref).is_none()
-                    && !self.generated.get(col).copied().unwrap_or(false)
-            });
-            let fallback = d
-                .visible
-                .iter()
-                .copied()
-                .find(|&col| !self.generated.get(col).copied().unwrap_or(false));
-            let col = required.or(fallback);
+            // The draft was just staged; one not on the page has no row to
+            // focus, and no other row is the one meant.
+            let Some(row) = d.draft_keys.iter().position(|k| k == key) else { return };
+            let col = first_entry_column(
+                d.identity as usize..d.names.len(),
+                &d.visible,
+                &self.not_null,
+                &self.defaults,
+                &self.generated,
+            );
             (row, col, col.is_some_and(|col| d.hidden.contains(&col)))
         };
         if reveal {
@@ -1623,11 +1543,10 @@ impl Grid {
                         self.clear_ring(cx);
                     }
                 }
-                // The newline family (Steve's ruling): ⇧Enter first —
-                // the chat-composer convention every hand knows — with
-                // ⌥Enter as the Sheets twin. They belong to the text.
-                // (Visibly inert until the multi-line editor arrives —
-                // reserved is not dead.)
+                // The newline family: ⇧Enter first — the chat-composer
+                // convention every hand knows — with ⌥Enter as the Sheets
+                // twin. They belong to the text. The cell editor is one
+                // line, so both are reserved: inert, and never a confirm.
                 "enter" if m.shift || m.alt => return,
                 "enter" if m.platform => {
                     // ⌘Enter — "send it" (normally consumed by the input
@@ -1680,20 +1599,12 @@ impl Grid {
             return;
         }
         if m.platform && ks.key == "z" {
-            let did = match &mut self.edits {
-                // The statements were built at ⌘S; an undo now would show
-                // the edit gone while the commit writes it anyway.
-                _ if self.committing => false,
-                // A held set has no history to walk: the reason is said.
-                Some(e) if e.in_doubt() => {
-                    self.error = stale_reason(self.reshaped, false, true).map(str::to_string);
-                    cx.notify();
-                    false
-                }
-                Some(e) if m.shift => e.redo(),
-                Some(e) => e.undo(),
-                None => false,
-            };
+            // The statements were built at ⌘S; an undo now would show the
+            // edit gone while the commit writes it anyway. A held set has no
+            // history to walk, and the reason is said.
+            let did = !self.committing
+                && !self.refuse_held(cx)
+                && self.edits.as_mut().is_some_and(|e| if m.shift { e.redo() } else { e.undo() });
             if did {
                 self.sync_staged(cx);
             }
@@ -1715,11 +1626,13 @@ impl Grid {
             return;
         }
         if m.control && m.shift && ks.key == "n" {
-            self.stage_null(cx);
+            if let Some((row, col)) = self.table.read(cx).delegate().active_cell {
+                self.stage_blank(row, col, true, cx);
+            }
             cx.stop_propagation();
             return;
         }
-        // (⌥←/⌥→, the view-switcher carousel, live at App level in
+        // (⌥←/⌥→, which step through the tables, live at App level in
         // main.rs — they must keep working in Structure mode, where
         // this listener's focus source doesn't exist.)
         // A navigation chord with no ring on the page yet: assume the
@@ -1835,7 +1748,7 @@ impl Grid {
                 cx.stop_propagation();
             }
             "backspace" | "delete" => {
-                self.stage_clear(row, col, cx);
+                self.stage_blank(row, col, false, cx);
                 cx.stop_propagation();
             }
             "up" if !m.shift && !m.alt => {
@@ -1865,11 +1778,12 @@ impl Grid {
             _ => {
                 // The typing contract: a printable character opens the
                 // editor seeded with itself — replace entry.
-                if let Some(ch) = &ks.key_char {
-                    if !ch.chars().all(char::is_control) && self.edits.is_some() {
-                        self.open_editor(row, col, Some(ch.clone()), window, cx);
-                        cx.stop_propagation();
-                    }
+                if let Some(ch) = &ks.key_char
+                    && !ch.chars().all(char::is_control)
+                    && self.edits.is_some()
+                {
+                    self.open_editor(row, col, Some(ch.clone()), window, cx);
+                    cx.stop_propagation();
                 }
             }
         }
@@ -1952,35 +1866,23 @@ impl Grid {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.edits.is_none() || self.committing {
-            return; // read-only says why in the footer, not with a beep
-        }
-        if self.refuse_stale(cx) {
+        // A read-only grid says why in the footer, not with a beep. While a
+        // page is on its way, the key is let go as it is during a commit:
+        // text typed then would belong to rows about to leave the screen.
+        if self.edits.is_none()
+            || self.committing
+            || self.replacing
+            || self.table.read(cx).delegate().loading
+            || self.refuse_stale(cx)
+            || self.refuse_generated(col, cx)
+        {
             return;
         }
-        if self.generated.get(col).copied().unwrap_or(false) {
-            let name = self.table.read(cx).delegate().names[col].clone();
-            self.error = Some(format!("{name} is generated by DuckDB"));
-            cx.notify();
-            return;
-        }
-        let (original, deleted, draft_key) = {
+        let (original, deleted) = {
             let d = self.table.read(cx).delegate();
-            if row >= d.rows.len() {
-                return;
-            }
-            let base = d.rows[row].get(col).cloned().flatten();
-            let draft_key = d.draft_key(row).map(str::to_string);
-            let staged = if draft_key.is_some() {
-                d.draft_cells.get(&(row, col)).cloned()
-            } else {
-                d.staged.get(&(row, col)).cloned()
-            };
-            (
-                staged.unwrap_or(base),
-                d.deleted.contains(&row),
-                draft_key,
-            )
+            let Some(fetched) = d.rows.get(row) else { return };
+            let original = d.staged_at(row, col).unwrap_or_else(|| fetched.get(col).cloned().flatten());
+            (original, d.deleted.contains(&row))
         };
         if deleted {
             return; // you cannot edit a ghost; revert the delete first (⌘Z)
@@ -2022,13 +1924,7 @@ impl Grid {
             }
         })
         .detach();
-        self.editor = Some(CellEditor {
-            row,
-            col,
-            draft_key,
-            input: input.clone(),
-            replace,
-        });
+        self.editor = Some(CellEditor { row, col, input: input.clone(), replace });
         let grid = cx.entity().downgrade();
         self.table.update(cx, |state, cx| {
             let d = state.delegate_mut();
@@ -2126,25 +2022,17 @@ impl Grid {
         }
         let Some(ed) = self.editor.take() else { return true };
         let text = ed.input.read(cx).value().to_string();
-        let (ty, fetched, staged, identity) = {
+        let (ty, target, staged) = {
             let d = self.table.read(cx).delegate();
-            let at = (ed.row, ed.col);
             let ty = d.schema_cols.get(ed.col).map(|c| c.duckdb_type.clone()).unwrap_or_default();
-            // A draft's row is its own cells: nothing in it was fetched.
-            if ed.draft_key.is_some() {
-                (ty, None, d.draft_cells.get(&at).cloned(), None)
-            } else {
-                (
-                    ty,
-                    d.rows.get(ed.row).and_then(|r| r.get(ed.col)).cloned().flatten(),
-                    d.staged.get(&at).cloned(),
-                    d.identities.get(ed.row).cloned(),
-                )
-            }
+            (ty, d.target(ed.row, ed.col), d.staged_at(ed.row, ed.col))
         };
-        let copied = match (&self.edits, &ed.draft_key) {
-            (Some(edits), Some(key)) => edits.copied_text(key, ed.col),
-            _ => None,
+        // A draft's row is its own cells: nothing in it was fetched, and a
+        // duplicate's cells were copied.
+        let (fetched, copied) = match (&target, &self.edits) {
+            (Some(edits::Target::Fetched(_, fetched)), _) => (fetched.clone(), None),
+            (Some(edits::Target::Draft(key)), Some(edits)) => (None, edits.copied_text(key, ed.col)),
+            _ => (None, None),
         };
         fn shown(text: &Option<SharedString>) -> Option<&str> {
             text.as_ref().map(|t| t.as_ref())
@@ -2153,14 +2041,13 @@ impl Grid {
             &text,
             &edits::Held {
                 ty: &ty,
-                draft: ed.draft_key.is_some(),
+                draft: matches!(target, Some(edits::Target::Draft(_))),
                 fetched: shown(&fetched),
                 staged: staged.as_ref().map(shown),
                 copied: copied.as_ref().map(shown),
             },
         );
         match verdict {
-            edits::Confirm::Keep => self.error = None,
             edits::Confirm::Refuse(reason) => {
                 // Validation informs, never imprisons: the editor stays
                 // open with the reason; Esc still works.
@@ -2173,25 +2060,10 @@ impl Grid {
                 self.editor = Some(ed);
                 return false;
             }
-            edits::Confirm::Revert | edits::Confirm::Stage(..) => {
-                if let Some(edits) = &mut self.edits {
-                    self.error = None;
-                    match (verdict, &ed.draft_key, identity) {
-                        (edits::Confirm::Stage(text, value), Some(key), _) => {
-                            edits.stage_insert_cell(key, ed.col, text, value)
-                        }
-                        (edits::Confirm::Stage(text, value), None, Some(identity)) => {
-                            edits.stage_cell(identity, ed.col, fetched, text, value)
-                        }
-                        (edits::Confirm::Revert, Some(key), _) => edits.stage_insert_copied(key, ed.col),
-                        // Staging what was fetched is what drops a staged edit.
-                        (edits::Confirm::Revert, None, Some(identity)) => {
-                            edits.stage_cell(identity, ed.col, fetched.clone(), fetched, Value::Null)
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            _ => self.error = None,
+        }
+        if let (Some(edits), Some(target)) = (&mut self.edits, target) {
+            edits.stage_confirmed(target, ed.col, verdict);
         }
         self.close_editor_cell(cx);
         self.sync_staged(cx);
@@ -2219,85 +2091,38 @@ impl Grid {
         true
     }
 
-    /// Delete on a cell: clear it, type-honestly — '' for text columns,
-    /// NULL for everything else. Never touches the row.
-    fn stage_clear(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
-        if self.committing || self.edits.is_some() && self.refuse_stale(cx) {
-            return;
-        }
-        if self.generated.get(col).copied().unwrap_or(false) {
+    /// A generated column takes no value. Says so, and returns true, for one.
+    fn refuse_generated(&mut self, col: usize, cx: &mut Context<Self>) -> bool {
+        let generated = self.generated.get(col).copied().unwrap_or(false);
+        if generated {
             let name = self.table.read(cx).delegate().names[col].clone();
             self.error = Some(format!("{name} is generated by DuckDB"));
             cx.notify();
-            return;
         }
-        let (ty, fetched, identity, draft_key, deleted) = {
-            let d = self.table.read(cx).delegate();
-            (
-                d.schema_cols.get(col).map(|c| c.duckdb_type.clone()).unwrap_or_default(),
-                d.rows.get(row).and_then(|r| r.get(col)).cloned().flatten(),
-                d.identities.get(row).cloned(),
-                d.draft_key(row).map(str::to_string),
-                d.deleted.contains(&row),
-            )
-        };
-        if deleted {
-            return;
-        }
-        let (text, value) = if edits::is_text_type(&ty) {
-            (Some(SharedString::from("")), Value::String(String::new()))
-        } else {
-            if !self.stageable_null(col, cx) {
-                return;
-            }
-            (None, Value::Null)
-        };
-        if let Some(edits) = &mut self.edits {
-            self.error = None;
-            if let Some(key) = draft_key {
-                edits.stage_insert_cell(&key, col, text, value);
-            } else if let Some(identity) = identity {
-                edits.stage_cell(identity, col, fetched, text, value);
-            }
-            self.sync_staged(cx);
-        }
+        generated
     }
 
-    /// ⌃⇧N: SQL NULL, deliberately, any column type.
-    fn stage_null(&mut self, cx: &mut Context<Self>) {
-        let Some((row, col)) = self.table.read(cx).delegate().active_cell else { return };
-        if self.committing || self.edits.is_some() && self.refuse_stale(cx) {
+    /// Delete on a cell clears it, type-honestly (`edits::cleared`); ⌃⇧N
+    /// (`null`) stages SQL NULL, deliberately, any column type. Neither
+    /// touches the row, and a row staged for deletion takes neither: it is a
+    /// ghost, as for the editor.
+    fn stage_blank(&mut self, row: usize, col: usize, null: bool, cx: &mut Context<Self>) {
+        if self.committing || self.edits.is_none() || self.refuse_stale(cx) || self.refuse_generated(col, cx) {
             return;
         }
-        if self.generated.get(col).copied().unwrap_or(false) {
-            let name = self.table.read(cx).delegate().names[col].clone();
-            self.error = Some(format!("{name} is generated by DuckDB"));
-            cx.notify();
-            return;
-        }
-        let (fetched, identity, draft_key, deleted) = {
+        let (ty, target, deleted) = {
             let d = self.table.read(cx).delegate();
-            (
-                d.rows.get(row).and_then(|r| r.get(col)).cloned().flatten(),
-                d.identities.get(row).cloned(),
-                d.draft_key(row).map(str::to_string),
-                d.deleted.contains(&row),
-            )
+            let ty = d.schema_cols.get(col).map(|c| c.duckdb_type.clone()).unwrap_or_default();
+            (ty, d.target(row, col), d.deleted.contains(&row))
         };
-        if deleted {
-            return; // the row is a ghost, as for Delete and the editor
-        }
-        if !self.stageable_null(col, cx) {
+        let (text, value) = if null { (None, Value::Null) } else { edits::cleared(&ty) };
+        if deleted || text.is_none() && !self.stageable_null(col, cx) {
             return;
         }
-        if let Some(edits) = &mut self.edits {
-            if let Some(key) = draft_key {
-                edits.stage_insert_cell(&key, col, None, Value::Null);
-            } else if let Some(identity) = identity {
-                edits.stage_cell(identity, col, fetched, None, Value::Null);
-            }
-            self.sync_staged(cx);
-        }
+        let (Some(edits), Some(target)) = (&mut self.edits, target) else { return };
+        self.error = None;
+        edits.stage_into(target, col, text, value);
+        self.sync_staged(cx);
     }
 
     /// Edit-menu entry point; the window argument keeps its signature
@@ -2314,30 +2139,18 @@ impl Grid {
         if self.committing {
             return;
         }
-        let targets: Vec<(Option<Vec<Value>>, Option<String>)> = {
+        let targets: Vec<edits::Target> = {
             let d = self.table.read(cx).delegate();
             let rows: Vec<usize> = if d.selection.rows.is_empty() {
                 d.active_cell.map(|(r, _)| r).into_iter().collect()
             } else {
                 d.selection.rows.iter().copied().collect()
             };
-            rows.into_iter()
-                .map(|row| (d.identities.get(row).cloned(), d.draft_key(row).map(str::to_string)))
-                .collect()
+            rows.into_iter().filter_map(|row| d.target(row, 0)).collect()
         };
-        // Removing a draft is a discard, which a reshaped table allows;
-        // staging a DELETE is not.
-        let reshaped = self.reshaped || self.unrefreshed || self.in_doubt();
+        let stale = self.reshaped || self.unrefreshed || self.in_doubt();
         let Some(edits) = &mut self.edits else { return };
-        edits.grouped(|edits| {
-            for (identity, draft_key) in targets {
-                if let Some(key) = draft_key {
-                    edits.discard(&key);
-                } else if let (Some(identity), false) = (identity, reshaped) {
-                    edits.stage_delete(identity);
-                }
-            }
-        });
+        edits.delete_rows(targets, stale);
         self.refuse_stale(cx);
         self.sync_staged(cx);
     }
@@ -2470,12 +2283,7 @@ impl Grid {
             let d = state.delegate_mut();
             d.tab_anchor = None;
             let Some((r, _)) = d.active_cell else { return };
-            if d.rows.is_empty() || d.visible.is_empty() {
-                return;
-            }
-            let nr = (r as i32 + dr).clamp(0, d.rows.len() as i32 - 1) as usize;
-            let nc = if d.visible.contains(&col) { col } else { d.visible[0] };
-            let np = d.visible.iter().position(|&v| v == nc).unwrap_or(0);
+            let Some((nr, nc, np)) = ring_step(d.rows.len(), &d.visible, (r, col), dr, 0) else { return };
             let gutter = d.gutter as usize;
             d.active_cell = Some((nr, nc));
             select_row(state, nr, cx);
@@ -2488,7 +2296,7 @@ impl Grid {
         cx.notify();
     }
 
-    /// The A1 assumption (Steve's ruling): a navigation gesture with no
+    /// The A1 assumption: a navigation gesture with no
     /// ring on the page yet starts at the top-left cell. Returns whether
     /// it placed the ring — a bare arrow's first press consumes itself
     /// on that placement (the interceptor checks), while chords apply
@@ -2515,14 +2323,8 @@ impl Grid {
         self.table.update(cx, |state, cx| {
             let d = state.delegate_mut();
             d.tab_anchor = None;
-            let Some((r, c)) = d.active_cell else { return };
-            if d.rows.is_empty() || d.visible.is_empty() {
-                return;
-            }
-            let nr = (r as i32 + dr).clamp(0, d.rows.len() as i32 - 1) as usize;
-            let pos = d.visible.iter().position(|&v| v == c).unwrap_or(0);
-            let np = (pos as i32 + dc).clamp(0, d.visible.len() as i32 - 1) as usize;
-            let nc = d.visible[np];
+            let Some(at) = d.active_cell else { return };
+            let Some((nr, nc, np)) = ring_step(d.rows.len(), &d.visible, at, dr, dc) else { return };
             let gutter = d.gutter as usize;
             d.active_cell = Some((nr, nc));
             select_row(state, nr, cx);
@@ -2627,20 +2429,13 @@ impl Grid {
             labels.append(&mut d.row_labels);
             d.row_labels = labels;
 
-            // Fetched identities shifted down by the inserted drafts.
-            d.row_of = d
-                .identities
-                .iter()
-                .enumerate()
-                .skip(draft_count)
-                .map(|(ix, id)| (edits::key_of(id), ix))
-                .collect();
             for (key, _, change) in &changes {
-                let Some(&row) = d.row_of.get(key) else { continue };
+                let Some(row) = d.row_of.get(key).map(|fetched| fetched + draft_count) else { continue };
                 match change {
                     edits::RowChange::Update(cells) => {
+                        let staged = d.staged.entry(row).or_default();
                         for (col, cell) in cells {
-                            d.staged.insert((row, *col), cell.text.clone());
+                            staged.insert(*col, cell.text.clone());
                         }
                     }
                     edits::RowChange::Delete => {
@@ -2650,12 +2445,7 @@ impl Grid {
                 }
             }
             if draft_shape_changed {
-                d.selection.clear();
-                d.active_cell = None;
-                d.editing = None;
-                d.editor_input = None;
-                d.pick = None;
-                d.tab_anchor = None;
+                d.reset_cursor();
             }
             // Draft hints need room only while a draft or editor is on
             // screen. Rebuild from the compact fitted widths whenever
@@ -2746,6 +2536,18 @@ impl Grid {
         Some(e)
     }
 
+    /// Surrender the staged set this grid holds when its connection goes:
+    /// the server stopped or gone, or another database chosen. A stash
+    /// parked here goes back as it came; a set of a commit in flight goes
+    /// held (`surrender`). None when nothing is staged.
+    pub(crate) fn surrender_edits(&mut self) -> Option<Edits> {
+        if let Some(parked) = self.parked.take() {
+            return Some(parked);
+        }
+        let session = self.commit_session.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        surrender(self.edits.take()?, self.committing, self.post_commit.as_ref(), session)
+    }
+
     /// Receive a stashed staging set from a previous visit to this
     /// table (`edits::handoff`). Adopted only when the table still has the
     /// same identity and columns — a changed schema orphans the stash rather
@@ -2793,9 +2595,11 @@ impl Grid {
     }
 
     /// Discard one staged row change (the review popover's per-entry ✕).
-    /// Itself undoable — nothing is more than one ⌘Z from recovery.
+    /// Itself undoable — nothing is more than one ⌘Z from recovery. Text in
+    /// an open editor is staged first, here and in `discard_all`, so a
+    /// discard that removes its row never takes it unseen.
     pub(crate) fn discard_change(&mut self, key: &str, cx: &mut Context<Self>) {
-        if self.committing || self.refuse_held(cx) {
+        if self.committing || !self.settle_editor(cx) || self.refuse_held(cx) {
             return;
         }
         if let Some(e) = &mut self.edits {
@@ -2807,7 +2611,7 @@ impl Grid {
     /// Discard everything staged — one gesture, one undo step, so ⌘Z
     /// brings all of it back at once.
     pub(crate) fn discard_all(&mut self, cx: &mut Context<Self>) {
-        if self.committing || self.refuse_held(cx) {
+        if self.committing || !self.settle_editor(cx) || self.refuse_held(cx) {
             return;
         }
         if let Some(e) = &mut self.edits {
@@ -2888,58 +2692,12 @@ impl Grid {
                         Err(message) => return (Committed::Refused(message), None),
                     };
                     *held.lock().unwrap_or_else(|p| p.into_inner()) = Some(sid.clone());
-                    let run = || -> Result<(), String> {
-                        harbor_client::exec(&conn, "BEGIN", None, Some(&sid))?;
-                        for stmt in &stmts {
-                            let r = harbor_client::exec(
-                                &conn,
-                                &stmt.sql,
-                                Some(stmt.params.clone()),
-                                Some(&sid),
-                            )?;
-                            match stmt.expectation {
-                                edits::StatementExpectation::AffectedOne => {
-                                    // The engine answers UPDATE/DELETE with one
-                                    // count row; anything but exactly 1 means the
-                                    // row is not what we fetched. Nothing lands.
-                                    let affected = crate::sql::count_of(&r).unwrap_or(0);
-                                    if affected != 1 {
-                                        return Err(format!(
-                                            "a row changed since you read it \
-                                             ({affected} rows matched) — refresh and retry"
-                                        ));
-                                    }
-                                }
-                                edits::StatementExpectation::ReturnedOne => {
-                                    // Only a duplicate selects its row, from the
-                                    // row it copies: none back means that row is
-                                    // gone. Nothing lands, and no refresh brings
-                                    // it back: the draft names that row until it
-                                    // is discarded.
-                                    if r.rows.is_empty() {
-                                        return Err(
-                                            "a duplicated row's source is gone — discard \
-                                             that duplicate (⌘Z, or the review popover)"
-                                                .to_string()
-                                        );
-                                    }
-                                    if r.rows.len() != 1 {
-                                        return Err(format!(
-                                            "insert returned {} rows instead of 1",
-                                            r.rows.len()
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        Ok(())
-                    };
                     // Everything before COMMIT fails cleanly: the release
                     // below rolls the transaction back. COMMIT itself is
                     // the one request whose lost answer leaves the outcome
                     // unknown, since the server may have committed before the
                     // connection failed.
-                    let result = match run() {
+                    let result = match run_statements(&conn, &sid, &stmts) {
                         Err(message) => Committed::Refused(message),
                         Ok(()) => commit_verdict(harbor_client::exec_checked(
                             &conn,
@@ -2984,12 +2742,13 @@ impl Grid {
                         // would be its own artifact).
                         grid.table.update(cx, |state, cx| {
                             let d = state.delegate_mut();
-                            let staged: Vec<_> = d.staged.drain().collect();
-                            for ((row, col), text) in staged {
-                                if let Some(cell) =
-                                    d.rows.get_mut(row).and_then(|r| r.get_mut(col))
-                                {
-                                    *cell = text;
+                            for (row, cells) in std::mem::take(&mut d.staged) {
+                                for (col, text) in cells {
+                                    if let Some(cell) =
+                                        d.rows.get_mut(row).and_then(|r| r.get_mut(col))
+                                    {
+                                        *cell = text;
+                                    }
                                 }
                             }
                             state.refresh(cx);
@@ -3066,7 +2825,7 @@ impl Grid {
     /// is first staged (or the refresh stops on validation failure), so a
     /// refresh can never silently discard what the user was typing.
     pub(crate) fn refresh_current(&mut self, cx: &mut Context<Self>) {
-        if self.editor.is_some() && !self.confirm_and_move(0, 0, cx) {
+        if !self.settle_editor(cx) {
             return;
         }
         self.fetch_page_now(self.page, cx);
@@ -3239,6 +2998,44 @@ impl GridDelegate {
         self.draft_keys.get(row).map(String::as_str)
     }
 
+    /// The cell a gesture at (row, schema col) stages into, when the row
+    /// has an identity or is a draft.
+    fn target(&self, row: usize, col: usize) -> Option<edits::Target> {
+        if let Some(key) = self.draft_key(row) {
+            return Some(edits::Target::Draft(key.to_string()));
+        }
+        let fetched = self.rows.get(row).and_then(|r| r.get(col)).cloned().flatten();
+        Some(edits::Target::Fetched(self.identities.get(row)?.clone(), fetched))
+    }
+
+    /// A staging set for the columns this delegate holds, when they carry
+    /// the whole key: the catalog's, or the hidden rowid of a table
+    /// without one. None for a source without an identity, which is
+    /// read-only.
+    fn new_edits(&self, source: &str, pk_cols: &[String], rowid: bool) -> Option<Edits> {
+        if self.pk_ix.is_empty() {
+            return None;
+        }
+        let edits = Edits::new(
+            source.to_string(),
+            pk_cols.to_vec(),
+            self.names.iter().map(|n| n.to_string()).collect(),
+            self.schema_cols.iter().map(|c| c.duckdb_type.clone()).collect(),
+        );
+        Some(if rowid { edits.keyed_by_rowid() } else { edits })
+    }
+
+    /// Clear the selection, the ring, the Tab run and the editor's cell:
+    /// what a new page, or a change in the draft rows, leaves no place for.
+    fn reset_cursor(&mut self) {
+        self.selection.clear();
+        self.active_cell = None;
+        self.editing = None;
+        self.editor_input = None;
+        self.pick = None;
+        self.tab_anchor = None;
+    }
+
     fn remove_drafts(&mut self) {
         let count = self.draft_count();
         if count == 0 {
@@ -3252,29 +3049,35 @@ impl GridDelegate {
         self.staged = self
             .staged
             .drain()
-            .filter_map(|((row, col), value)| {
-                (row >= count).then_some(((row - count, col), value))
-            })
+            .filter_map(|(row, cells)| (row >= count).then_some((row - count, cells)))
             .collect();
         self.deleted = self
             .deleted
             .drain()
             .filter_map(|row| (row >= count).then_some(row - count))
             .collect();
-        self.row_of = self
-            .identities
-            .iter()
-            .enumerate()
-            .map(|(ix, id)| (edits::key_of(id), ix))
-            .collect();
+    }
+
+    /// The staged text of one fetched cell, if it has one (`Some(None)` is
+    /// a staged NULL).
+    fn staged_cell(&self, row: usize, col: usize) -> Option<Option<SharedString>> {
+        self.staged.get(&row)?.get(&col).cloned()
+    }
+
+    /// What a cell holds that the database does not: a draft's cell, or a
+    /// fetched row's staged one. None for a cell left as fetched, or a
+    /// draft's untouched (DEFAULT) cell.
+    fn staged_at(&self, row: usize, col: usize) -> Option<Option<SharedString>> {
+        match self.draft_key(row) {
+            Some(_) => self.draft_cells.get(&(row, col)).cloned(),
+            None => self.staged_cell(row, col),
+        }
     }
 
     /// A row carrying any staged change — the rows whose color already
     /// tells a story, so the selection wash stays off them.
     fn row_dirty(&self, row: usize) -> bool {
-        row < self.draft_count()
-            || self.deleted.contains(&row)
-            || self.staged.keys().any(|(r, _)| *r == row)
+        row < self.draft_count() || self.deleted.contains(&row) || self.staged.contains_key(&row)
     }
 
     /// Adopt a page's schema and rows — the one birth, shared by Grid::new
@@ -3288,8 +3091,9 @@ impl GridDelegate {
         zoom: f32,
         pk_cols: &[String],
     ) {
-        self.numeric =
-            page.columns.iter().map(|c| numeric(&c.duckdb_type.to_uppercase())).collect();
+        // Numbers right-align, judged by the type's own name, so an
+        // INTERVAL, an `INTEGER[]` and an `ENUM('POINT')` do not.
+        self.numeric = page.columns.iter().map(|c| edits::is_numeric_type(&c.duckdb_type)).collect();
         self.names = page
             .columns
             .iter()
@@ -3407,7 +3211,7 @@ impl GridDelegate {
         let mut chars = 4; // the NULL tag's footprint
         for row in &self.rows {
             if let Some(Some(s)) = row.get(schema_ix) {
-                chars = chars.max(s.chars().count());
+                chars = chars.max(s.chars().take(CAP).count());
                 if chars >= CAP {
                     break;
                 }
@@ -3477,7 +3281,7 @@ impl TableDelegate for GridDelegate {
             let is_draft = row_ix < self.draft_count();
             let row_deleted = self.deleted.contains(&row_ix);
             let row_dirty = is_draft
-                || (!row_deleted && self.staged.keys().any(|(r, _)| *r == row_ix));
+                || (!row_deleted && self.staged.contains_key(&row_ix));
             return div()
                 .h_flex()
                 .relative()
@@ -3533,82 +3337,80 @@ impl TableDelegate for GridDelegate {
         // An open editor replaces the cell's content outright — the
         // editor surface IS the state (no tint underneath). It wears the
         // active-cell ring so the eye never has to relocate.
-        if self.editing == Some((row_ix, data_col)) {
-            if let Some(input) = self.editor_input.clone() {
-                return div()
-                    .h_flex()
-                    .relative()
-                    .w_full()
-                    .h(row_h)
-                    .items_center()
-                    .border_r_1()
-                    .border_b_1()
-                    .border_color(t.grid_line)
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(-PANE_INSET))
-                            .right_0()
-                            .top_0()
-                            .bottom_0()
-                            .bg(t.surface)
-                            .border_2()
-                            .border_color(t.accent),
-                    )
-                    .child(
-                        div().w_full().child(
-                            gpui_kit::component::input::Input::new(&input)
-                                .appearance(false)
-                                // Zero the input's built-in insets, both
-                                // sides. Left pins the caret exactly on
-                                // the column's text axis; right keeps the
-                                // editor's text area at least as wide as
-                                // the display cell's, so opening the
-                                // editor on a fitted column never scrolls
-                                // the value — view and edit paint the
-                                // same pixels. (The input's Medium inset
-                                // is 12px a side; a fitted column has
-                                // only ~9px of slack, and the caret needs
-                                // 1.5px more — the old right inset made
-                                // every fitted cell start edit shifted.)
-                                .pl(px(0.))
-                                .pr(px(0.))
-                                .text_size(px(CELL_TEXT * p.zoom_factor()))
-                                .font_family(value_font()),
-                        ),
-                    )
-                    // The column card (⌘T), floating just under the cell for as
-                    // long as it is edited, so the value being edited stays
-                    // in view: a zero-size box seats it below the cell's
-                    // bottom edge, and it is deferred so it paints over the
-                    // rows below and escapes the table's clip, snapped to
-                    // stay inside the window.
-                    .when(p.column_cards, |d| d.child(
-                        div().absolute().left(px(-PANE_INSET)).top(row_h + px(4.)).child(
-                            deferred(
-                                anchored()
-                                    .snap_to_window_with_margin(px(8.))
-                                    .child(
-                                        column_card(
-                                            t,
-                                            p.zoom_factor(),
-                                            self.names.get(data_col).cloned().unwrap_or_default(),
-                                            self.col_types.get(data_col).cloned().unwrap_or_default(),
-                                            &self
-                                                .draft_hints
-                                                .get(data_col)
-                                                .cloned()
-                                                .unwrap_or(DraftHint::Null),
-                                            self.pick.clone(),
-                                        )
-                                        .occlude(),
-                                    ),
-                            )
-                            .with_priority(1),
-                        ),
-                    ))
-                    .into_any_element();
-            }
+        if self.editing == Some((row_ix, data_col)) && let Some(input) = self.editor_input.clone() {
+            return div()
+                .h_flex()
+                .relative()
+                .w_full()
+                .h(row_h)
+                .items_center()
+                .border_r_1()
+                .border_b_1()
+                .border_color(t.grid_line)
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(-PANE_INSET))
+                        .right_0()
+                        .top_0()
+                        .bottom_0()
+                        .bg(t.surface)
+                        .border_2()
+                        .border_color(t.accent),
+                )
+                .child(
+                    div().w_full().child(
+                        gpui_kit::component::input::Input::new(&input)
+                            .appearance(false)
+                            // Zero the input's built-in insets, both
+                            // sides. Left pins the caret exactly on
+                            // the column's text axis; right keeps the
+                            // editor's text area at least as wide as
+                            // the display cell's, so opening the
+                            // editor on a fitted column never scrolls
+                            // the value — view and edit paint the
+                            // same pixels. (The input's Medium inset
+                            // is 12px a side; a fitted column has
+                            // only ~9px of slack, and the caret needs
+                            // 1.5px more, so any right inset would
+                            // start every fitted cell's edit shifted.)
+                            .pl(px(0.))
+                            .pr(px(0.))
+                            .text_size(px(CELL_TEXT * p.zoom_factor()))
+                            .font_family(value_font()),
+                    ),
+                )
+                // The column card (⌘T), floating just under the cell for as
+                // long as it is edited, so the value being edited stays
+                // in view: a zero-size box seats it below the cell's
+                // bottom edge, and it is deferred so it paints over the
+                // rows below and escapes the table's clip, snapped to
+                // stay inside the window.
+                .when(p.column_cards, |d| d.child(
+                    div().absolute().left(px(-PANE_INSET)).top(row_h + px(4.)).child(
+                        deferred(
+                            anchored()
+                                .snap_to_window_with_margin(px(8.))
+                                .child(
+                                    column_card(
+                                        t,
+                                        p.zoom_factor(),
+                                        self.names.get(data_col).cloned().unwrap_or_default(),
+                                        self.col_types.get(data_col).cloned().unwrap_or_default(),
+                                        &self
+                                            .draft_hints
+                                            .get(data_col)
+                                            .cloned()
+                                            .unwrap_or(DraftHint::Null),
+                                        self.pick.clone(),
+                                    )
+                                    .occlude(),
+                                ),
+                        )
+                        .with_priority(1),
+                    ),
+                ))
+                .into_any_element();
         }
         let right = p.right_align && self.numeric.get(data_col).copied().unwrap_or(false);
         // The staged layer overrides the fetched value: a confirmed edit
@@ -3616,7 +3418,7 @@ impl TableDelegate for GridDelegate {
         // makes it the database's truth.
         let is_draft = row_ix < self.draft_count();
         let draft_explicit = is_draft && self.draft_cells.contains_key(&(row_ix, data_col));
-        let staged = (!is_draft).then(|| self.staged.get(&(row_ix, data_col)).cloned()).flatten();
+        let staged = (!is_draft).then(|| self.staged_cell(row_ix, data_col)).flatten();
         let is_staged = is_draft || staged.is_some();
         let value = match staged {
             Some(v) => Some(v),
@@ -4070,30 +3872,15 @@ impl Render for Grid {
                 table.update(cx, |_, cx| cx.notify());
             });
         }
-        // An editor whose column just got hidden would be invisible but
-        // still focused — cancel it (lossless, like any Esc).
-        if let Some(ed) = &self.editor {
-            if !self.table.read(cx).delegate().visible.contains(&ed.col) {
-                self.cancel_edit(cx);
-            }
-        }
-        let view = p.view;
-        // The title band names what fills the pane. Structure and Data
-        // are about the selected table, so they wear its name; Query is
-        // about whatever you ask — the berth-scoped scratchpad — so it
-        // wears its own (the sidebar selection would be a lie there).
-        let title = if view == ViewMode::Query {
-            "Query".to_string()
-        } else {
-            self.title.clone()
-        };
+        // The table's own grid shows Data or Structure; the Query view is
+        // the content pane's, beside it (content.rs).
+        let structure = p.view == ViewMode::Structure;
         let error = self.error.clone();
         let editing_cell = self.editor.is_some();
         // Embedded (the Query view's results pane): body only. The host
         // owns the chrome — its editor above, the app footer below,
-        // which reads this grid's stats and pager state through it. The
-        // ViewMode switch below is the HOST grid's concern; an embedded
-        // grid is always its table.
+        // which reads this grid's stats and pager state. An embedded grid
+        // is always its table.
         if self.embedded {
             // The inspector rides query results exactly as it rides the
             // Data grid — row_kv is delegate data, and a result row is
@@ -4159,8 +3946,7 @@ impl Render for Grid {
         // never shifts it. It is row-level: here it accompanies Data; in
         // the Query view the EMBEDDED results grid carries its own
         // (the branch above).
-        let inspector = (p.inspector && p.view == ViewMode::Data)
-            .then(|| self.inspector(cx).into_any_element());
+        let inspector = (p.inspector && !structure).then(|| self.inspector(cx).into_any_element());
         div()
             .size_full()
             .min_w_0()
@@ -4176,130 +3962,10 @@ impl Render for Grid {
                 d.on_action(cx.listener(Self::on_editor_tab))
                     .on_action(cx.listener(Self::on_editor_shift_tab))
             })
-            .child(
-                div()
-                    .h_flex()
-                    .h_8()
-                    .relative()
-                    // The strip spans the pane in every view: its canvas
-                    // records the width the Structure view needs BEFORE
-                    // the DDL's first paint (see pane_width).
-                    .child(
-                        div().absolute().inset_0().child(
-                            canvas(
-                                move |b, _, _| {
-                                    crate::structure::record_pane_width(b.size.width)
-                                },
-                                |_, _, _, _| {},
-                            )
-                            .size_full(),
-                        ),
-                    )
-                    // Left inset matches the grid text (PANE_INSET cell
-                    // padding), so the title sits flush over the first
-                    // column.
-                    .pl(px(PANE_INSET))
-                    .pr_3()
-                    .gap_3()
-                    .flex_none()
-                    .items_center()
-                    // A shade beyond raised: the column-header row below
-                    // is raised, and two identical bands would merge.
-                    .bg(t.strip)
-                    .border_b_1()
-                    // The grid's top frame line, so it reads the slot —
-                    // the title strip is chrome but this edge is the
-                    // grid's (the red audit's "not red", 2026-09-01).
-                    .border_color(t.grid_line)
-                    .child(
-                        // Semibold like the design proof's breadcrumb table
-                        // name (`.crumb b`, weight 600).
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(t.text)
-                            .truncate()
-                            .child(title),
-                    )
-                    // The display toggles ride every view that shows
-                    // rows — Data and Query alike (prefs are global, set
-                    // once, honored by every grid); the Structure view
-                    // drops them. The inspector glyph stays Data-only:
-                    // its panel is row-level.
-                    .when(matches!(view, ViewMode::Data | ViewMode::Query), |d| d.child(
-                        // Recessed track, macOS-toolbar style: a subtle
-                        // inset container; flat icon tiles with a 2px gap
-                        // (edges never touch); the ON state is an
-                        // accent-tinted fill. These are independent
-                        // toggles, so no segment ever "wins" the track.
-                        div()
-                            .h_flex()
-                            .flex_none()
-                            .gap(px(2.))
-                            .p(px(2.))
-                            .rounded(px(6.))
-                            // Surface track on the raised strip, the same
-                            // relationship the footer seg has to its bar.
-                            .bg(t.surface)
-                            .border_1()
-                            .border_color(t.pill)
-                            .child(toggle_tile(
-                                "toggle-rows",
-                                "#",
-                                "Show row numbers (\u{2318}7 or \u{2325}7)",
-                                p.row_numbers,
-                                t,
-                                cx.listener(|_, _, _, cx| {
-                                    // No explicit sync: the toggle
-                                    // refreshes every window and each
-                                    // grid self-heals its gutter at the
-                                    // top of its own render.
-                                    prefs::toggle(cx, |p| p.row_numbers = !p.row_numbers);
-                                }),
-                            ))
-                            .child(toggle_tile(
-                                "toggle-align",
-                                "\u{21e5}",
-                                "Right-align numeric columns (\u{2318}8 or \u{2325}8)",
-                                p.right_align,
-                                t,
-                                cx.listener(|_, _, _, cx| {
-                                    prefs::toggle(cx, |p| p.right_align = !p.right_align);
-                                }),
-                            ))
-                            .child(toggle_tile(
-                                "toggle-nulls",
-                                "\u{2205}",
-                                "Show NULL tags (\u{2318}9 or \u{2325}9)",
-                                p.null_tags,
-                                t,
-                                cx.listener(|_, _, _, cx| {
-                                    prefs::toggle(cx, |p| p.null_tags = !p.null_tags);
-                                }),
-                            )),
-                    ))
-                    .when(matches!(view, ViewMode::Data | ViewMode::Query), |d| d.child(
-                        // The inspector's panel glyph (Finder/Xcode
-                        // convention), right of the lozenge.
-                        icon_tile("toggle-inspector", 22., true, t)
-                            .text_color(if p.inspector { t.accent } else { t.muted })
-                            .tooltip(|window, cx| {
-                                Tooltip::new("Show inspector (\u{2318}I)").build(window, cx)
-                            })
-                            .on_click(cx.listener(|_, _, _, cx| {
-                                prefs::toggle(cx, |p| p.inspector = !p.inspector);
-                            }))
-                            .child(
-                                gpui_kit::component::Icon::new(
-                                    gpui_kit::component::IconName::PanelRight,
-                                )
-                                .size_4(),
-                            ),
-                    )),
-            )
-            .when(view == ViewMode::Data, |d| {
+            // The display toggles ride the views that show rows; the
+            // Structure view drops them.
+            .child(crate::chrome::title_strip(self.title.clone(), !structure, cx))
+            .when(!structure, |d| {
                 // The raw-SQL filter strip (DESIGN.md "Bottom bar"): one
                 // WHERE input, applied on Enter through the same
                 // fetch-first swap as everything else.
@@ -4345,59 +4011,30 @@ impl Render for Grid {
                         .child(message),
                 )
             })
-            .child(match view {
-                ViewMode::Data => {
-                    let table_el = self.table_body(cx);
-                    let body = div().flex_1().min_h_0().w_full();
-                    match inspector {
-                        // With the inspector open, the two panes share a
-                        // draggable divider; the saved width seeds it.
-                        Some(pane) => body.child(
-                            h_resizable("data-split")
-                                .with_state(&self.resize)
-                                .child(
-                                    resizable_panel()
-                                        .child(div().size_full().child(table_el)),
-                                )
-                                .child(
-                                    resizable_panel()
-                                        .size(px(p.inspector_width))
-                                        .size_range(
-                                            px(prefs::INSPECTOR_MIN)..px(prefs::INSPECTOR_MAX),
-                                        )
-                                        // Furniture, like the sidebar.
-                                        .fixed()
-                                        .child(pane),
-                                ),
-                        ),
-                        None => body.h_flex().child(
-                            div().flex_1().min_w_0().h_full().child(table_el),
-                        ),
-                    }
-                    .into_any_element()
-                }
-                ViewMode::Structure => div()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .child(self.structure_view(cx))
-                    .into_any_element(),
-                ViewMode::Query => {
-                    let body = div().flex_1().min_h_0().w_full();
-                    match self.query_view.clone() {
-                        Some(view) => body.child(view),
-                        None => body
-                            .v_flex()
-                            .items_center()
-                            .justify_center()
-                            .child(div().text_sm().text_color(t.muted).child(
-                                "Select a table once to open the query scratchpad.",
-                            )),
-                    }
-                    .into_any_element()
+            .child(if structure {
+                div().flex_1().min_h_0().w_full().child(self.structure_view(cx))
+            } else {
+                let table_el = self.table_body(cx);
+                let body = div().flex_1().min_h_0().w_full();
+                match inspector {
+                    // With the inspector open, the two panes share a
+                    // draggable divider; the saved width seeds it.
+                    Some(pane) => body.child(
+                        h_resizable("data-split")
+                            .with_state(&self.resize)
+                            .child(resizable_panel().child(div().size_full().child(table_el)))
+                            .child(
+                                resizable_panel()
+                                    .size(px(p.inspector_width))
+                                    .size_range(px(prefs::INSPECTOR_MIN)..px(prefs::INSPECTOR_MAX))
+                                    // Furniture, like the sidebar.
+                                    .fixed()
+                                    .child(pane),
+                            ),
+                    ),
+                    None => body.h_flex().child(div().flex_1().min_w_0().h_full().child(table_el)),
                 }
             })
-            .child(self.footer(cx))
             .into_any_element()
     }
 }
@@ -4423,9 +4060,9 @@ fn insert_metadata(
             structure.and_then(|s| s.cols.iter().find(|c| c.name == name.as_ref()))
         })
         .collect();
-    let not_null: Vec<bool> = cols.iter().map(|c| c.is_some_and(|c| c.notnull)).collect();
+    let not_null: Vec<bool> = cols.iter().map(|c| c.is_some_and(|c| c.not_null)).collect();
     let defaults: Vec<Option<String>> =
-        cols.iter().map(|c| c.and_then(|c| c.dflt.clone())).collect();
+        cols.iter().map(|c| c.and_then(|c| c.default.clone())).collect();
     let generated: Vec<bool> = cols.iter().map(|c| c.is_some_and(|c| c.generated)).collect();
     let hints = cols
         .iter()
@@ -4444,7 +4081,7 @@ fn insert_metadata(
             }
         })
         .collect();
-    let types = cols.iter().map(|c| c.map(|c| c.ty.clone())).collect();
+    let types = cols.iter().map(|c| c.map(|c| c.duck_type.clone())).collect();
     (not_null, defaults, generated, hints, types)
 }
 
@@ -4554,7 +4191,8 @@ enum Committed {
     /// Nothing landed: a statement failed or was refused, and releasing the
     /// session rolled the transaction back. The reason.
     Refused(String),
-    /// The COMMIT was sent and no verdict came back. The reason.
+    /// The COMMIT was sent and no verdict came back: no answer, or one that
+    /// does not settle it. What came, as the status line says it.
     InDoubt(String),
 }
 
@@ -4563,9 +4201,11 @@ enum Committed {
 enum PostCommit {
     /// The commit landed and the staged set is cleared.
     Landed,
-    /// The COMMIT got no answer; the staged set is kept, and held.
-    /// `unsettled` is the commit's session when it was not seen to be over
-    /// before the page was read: the commit may still be running.
+    /// The COMMIT got no answer, or one that does not say whether it
+    /// landed; the staged set is kept, and held. `message` says which, as
+    /// the status line begins (`commit_verdict`). `unsettled` is the
+    /// commit's session when it was not seen to be over before the page
+    /// was read: the commit may still be running.
     InDoubt { message: String, unsettled: Option<String> },
 }
 
@@ -4583,6 +4223,21 @@ fn settle_fetch(after: Option<&PostCommit>, read: bool, edits: Option<&mut Edits
         (Some(PostCommit::Landed), _) => !read,
         _ => false,
     }
+}
+
+/// The staged set a grid gives up when its connection goes. One whose
+/// commit is in flight may land with no answer seen here, so it goes held,
+/// to be judged whole when its table is opened again: with the commit's
+/// session while that may still be running, and with no page read after
+/// it. One whose commit got no answer goes as `settle_fetch` would have
+/// held it; one whose commit landed was cleared. None when nothing is left.
+fn surrender(mut edits: Edits, committing: bool, after: Option<&PostCommit>, session: Option<String>) -> Option<Edits> {
+    match after {
+        Some(PostCommit::InDoubt { unsettled, .. }) => edits.mark_in_doubt(unsettled.clone(), false),
+        None if committing => edits.mark_in_doubt(session, false),
+        _ => {}
+    }
+    edits.any_staged().then_some(edits)
 }
 
 /// Why a verdict on a held set is not taken, if it is not. Neither verdict
@@ -4636,20 +4291,58 @@ enum Page<'a> {
     Failed(&'a str),
 }
 
-/// Read the answer to the COMMIT request. An error Harbor reports is a
-/// verdict: the engine refused the commit, or the session was gone, and
-/// either way the transaction is rolled back. A request that could not be
-/// sent did nothing, and releasing the session rolls its transaction back.
-/// Anything else — a timeout, a dropped tunnel, an answer cut short — came
-/// after the request was sent, and says nothing about whether the server
-/// committed first.
+/// Open the transaction on session `sid` and run a staged set's statements
+/// in it, each checked for the one row it must touch. The first that fails
+/// stops the run with the reason, and nothing has landed: the caller's
+/// release of the session rolls the transaction back.
+fn run_statements(conn: &Conn, sid: &str, stmts: &[edits::Statement]) -> Result<(), String> {
+    harbor_client::exec(conn, "BEGIN", None, Some(sid))?;
+    for stmt in stmts {
+        let r = harbor_client::exec(conn, &stmt.sql, Some(stmt.params.clone()), Some(sid))?;
+        match stmt.expectation {
+            // The engine answers UPDATE/DELETE with one count row; anything
+            // but exactly 1 means the row is not what was fetched.
+            edits::StatementExpectation::AffectedOne => {
+                let affected = crate::sql::count_of(&r).unwrap_or(0);
+                if affected != 1 {
+                    return Err(format!(
+                        "a row changed since you read it ({affected} rows matched) — refresh and retry"
+                    ));
+                }
+            }
+            // Only a duplicate selects its row, from the row it copies: none
+            // back means that row is gone, and no refresh brings it back,
+            // since the draft names that row until it is discarded.
+            edits::StatementExpectation::ReturnedOne if r.rows.is_empty() => {
+                return Err("a duplicated row's source is gone — discard that duplicate \
+                            (⌘Z, or the review popover)"
+                    .to_string());
+            }
+            edits::StatementExpectation::ReturnedOne if r.rows.len() != 1 => {
+                return Err(format!("insert returned {} rows instead of 1", r.rows.len()));
+            }
+            edits::StatementExpectation::ReturnedOne => {}
+        }
+    }
+    Ok(())
+}
+
+/// Read the answer to the COMMIT request (`edits::commit_outcome`), with
+/// the words the status line gives it.
 fn commit_verdict(answer: Result<harbor_client::QueryResult, harbor_client::Failure>) -> Committed {
-    use harbor_client::Failure;
-    match answer {
-        Ok(_) => Committed::Landed,
-        Err(refused @ Failure::Refused { .. }) => Committed::Refused(refused.to_string()),
-        Err(Failure::Unsent(message)) => Committed::Refused(message),
-        Err(Failure::Unanswered(message)) => Committed::InDoubt(message),
+    let failure = answer.err();
+    let message = failure.as_ref().map(ToString::to_string).unwrap_or_default();
+    match edits::commit_outcome(failure.as_ref()) {
+        edits::CommitOutcome::Landed => Committed::Landed,
+        edits::CommitOutcome::NotLanded => Committed::Refused(message),
+        // Harbor's `internal`, or a code this client does not know, is an
+        // answer that does not settle the outcome: it is not called none.
+        edits::CommitOutcome::InDoubt => Committed::InDoubt(match failure {
+            Some(harbor_client::Failure::Refused { .. }) => {
+                format!("COMMIT was answered ({message}), but not with whether it landed")
+            }
+            _ => format!("COMMIT got no answer ({message})"),
+        }),
     }
 }
 
@@ -4665,25 +4358,25 @@ fn commit_status(after: &PostCommit, page: Page) -> Option<String> {
              what was typed, not what the database stored · refresh (⌘R) before editing"
         )),
         (PostCommit::InDoubt { message, unsettled: None }, Page::Read) => Some(format!(
-            "COMMIT got no answer ({message}), so the changes may or may not have landed · the \
+            "{message}, so the changes may or may not have landed · the \
              commit is over, and this page was read after it · {HELD}"
         )),
         (PostCommit::InDoubt { message, unsettled: Some(_) }, Page::Read) => Some(format!(
-            "COMMIT got no answer ({message}) and may still be running, so this page may not \
+            "{message} and may still be running, so this page may not \
              show its outcome yet · the staged changes are held, off the page · refresh (⌘R) \
              until the commit is over"
         )),
         (PostCommit::InDoubt { message, unsettled: None }, Page::Reshaped) => Some(format!(
-            "COMMIT got no answer ({message}), so the changes may or may not have landed · \
+            "{message}, so the changes may or may not have landed · \
              {HELD_RESHAPED}"
         )),
         (PostCommit::InDoubt { message, unsettled: Some(_) }, Page::Reshaped) => Some(format!(
-            "COMMIT got no answer ({message}) and may still be running · this table’s columns \
+            "{message} and may still be running · this table’s columns \
              changed in the database, so the staged changes are held and cannot be staged again \
              · refresh (⌘R) until the commit is over, then click the count and discard them all"
         )),
         (PostCommit::InDoubt { message, .. }, Page::Failed(why)) => Some(format!(
-            "COMMIT got no answer ({message}), so the changes may or may not have landed, and \
+            "{message}, so the changes may or may not have landed, and \
              this page could not be read again ({why}) · the staged changes are held, off the \
              page · refresh (⌘R)"
         )),
@@ -4731,6 +4424,37 @@ fn orphaned(staged: usize) -> String {
 /// names and the same DuckDB types, in the same order. The types decide how
 /// every staged value is bound (`edits::placeholder_for`) and the names
 /// decide where, so a page that differs in either is another table's.
+/// What a page that answered does when it lands.
+#[derive(Debug, PartialEq)]
+enum Landing {
+    /// It is dropped, and the view stays as it is.
+    Dropped,
+    /// It is dropped, and the view stays, refusing to stage or commit
+    /// until its staged set is gone (`reshaped`).
+    Reshaped,
+    /// It replaces the page on screen, and a reshaped table's columns
+    /// with it.
+    Shown,
+}
+
+/// How a page lands, with an editor open or not, from a table that has
+/// other columns than the grid's or not, over staged changes or not. Every
+/// fetch begins with no editor open (`settle_editor`) and none opens while
+/// one is on its way (`open_editor`); were one open, its text would be
+/// neither confirmed unasked nor dropped: the page is, and the editor keeps
+/// the rows it was opened on. That comes first, so text in an editor is
+/// never staged into a set that a reshaped table's adoption then replaces.
+/// Edits staged against the columns on screen are keyed and typed by them:
+/// they are not rebound to the table's present shape, and its rows do not
+/// fit the view they live in.
+fn landing(editing: bool, reshaped: bool, staged: bool) -> Landing {
+    match (editing, reshaped && staged) {
+        (true, _) => Landing::Dropped,
+        (false, true) => Landing::Reshaped,
+        (false, false) => Landing::Shown,
+    }
+}
+
 fn same_columns(have: &[wire::Column], page: &[wire::Column]) -> bool {
     have.len() == page.len()
         && have
@@ -4892,10 +4616,61 @@ fn build_columns(
         .collect()
 }
 
-/// Whether a column right-aligns as numbers do: judged by the type's own
-/// name, so an INTERVAL, an `INTEGER[]` and an `ENUM('POINT')` do not.
-fn numeric(ty: &str) -> bool {
-    edits::is_numeric_type(ty)
+/// Where the ring lands moved `dr` rows and `dc` visible columns from
+/// `at`: the row clamped to the page's `rows`, the column stepped along the
+/// visible order and clamped to it. A column that is not visible counts as
+/// the first. The new (row, schema column), and the column's place in the
+/// visible order; None on an empty page.
+fn ring_step(rows: usize, visible: &[usize], at: (usize, usize), dr: i32, dc: i32) -> Option<(usize, usize, usize)> {
+    if rows == 0 || visible.is_empty() {
+        return None;
+    }
+    let row = (at.0 as i64 + dr as i64).clamp(0, rows as i64 - 1) as usize;
+    let pos = visible.iter().position(|&v| v == at.1).unwrap_or(0);
+    let pos = (pos as i64 + dc as i64).clamp(0, visible.len() as i64 - 1) as usize;
+    Some((row, visible[pos], pos))
+}
+
+/// The column a new row's editor opens on: the first that needs a value
+/// (NOT NULL, no default, not generated), else the first visible one that
+/// takes typing. `cols` is the schema columns a user sees.
+fn first_entry_column(
+    cols: std::ops::Range<usize>,
+    visible: &[usize],
+    not_null: &[bool],
+    defaults: &[Option<String>],
+    generated: &[bool],
+) -> Option<usize> {
+    let is = |flags: &[bool], col: usize| flags.get(col).copied().unwrap_or(false);
+    cols.into_iter()
+        .find(|&col| is(not_null, col) && defaults.get(col).is_none_or(Option::is_none) && !is(generated, col))
+        .or_else(|| visible.iter().copied().find(|&col| !is(generated, col)))
+}
+
+/// The last page's index for `total` rows at `size` rows a page. An empty
+/// table has one page, its first.
+fn last_page_of(total: u64, size: usize) -> usize {
+    (total.max(1) as usize - 1) / size
+}
+
+/// Whether a page follows page `page`. With the total unknown, a full page
+/// suggests there may be more.
+fn has_next_page(page: usize, last: Option<usize>, fetched: usize, size: usize) -> bool {
+    match last {
+        Some(last) => page < last,
+        None => fetched == size,
+    }
+}
+
+/// The display column whose right edge lies within 4px of `x`, the
+/// columns being `widths` wide from 0. The edges of the first `gutter`
+/// columns, the row-number gutter's, divide no data.
+fn divider_at(widths: &[f32], gutter: usize, x: f32) -> Option<usize> {
+    let mut edge = 0.;
+    widths.iter().enumerate().find_map(|(disp, width)| {
+        edge += width;
+        (disp >= gutter && (x - edge).abs() <= 4.).then_some(disp)
+    })
 }
 
 fn wrapped_step(len: usize, position: usize, delta: i32) -> usize {
@@ -4918,7 +4693,8 @@ mod tests {
     use super::{
         ClickKind, DraftHint, Lead, RowSelection, duplicate_cells, tag_width, duplicate_refusal, orphaned, same_columns, should_reconcile_selection,
         wrapped_step, Committed, Page, PostCommit, commit_status, commit_verdict, settle_fetch,
-        stale_reason, verdict_refusal,
+        stale_reason, verdict_refusal, ring_step, first_entry_column, last_page_of, has_next_page,
+        divider_at,
     };
     use crate::edits::{self, Bind, CellEdit, Edits};
     use gpui_kit::{Modifiers, SharedString};
@@ -4944,14 +4720,14 @@ mod tests {
 
     #[test]
     fn insert_metadata_ranks_generated_then_default_then_required() {
-        let col = |name: &str, notnull, dflt: Option<&str>, generated| crate::structure::StructCol {
+        let col = |name: &str, not_null, default: Option<&str>, generated| harbor_client::catalog::Column {
             name: name.into(),
-            ty: "INTEGER".into(),
-            notnull,
-            dflt: dflt.map(Into::into),
+            duck_type: "INTEGER".into(),
+            not_null,
+            default: default.map(Into::into),
             generated,
             generation_expression: generated.then(|| "a + 1".into()),
-            pk: false,
+            primary: false,
         };
         let structure = crate::structure::TableStructure {
             cols: vec![
@@ -4983,6 +4759,63 @@ mod tests {
         assert_eq!(wrapped_step(4, 3, 1), 0);
         assert_eq!(wrapped_step(4, 3, -1), 2);
         assert_eq!(wrapped_step(4, 0, -1), 3);
+    }
+
+    #[test]
+    fn the_ring_steps_along_visible_columns_and_stops_at_the_edges() {
+        let visible = [1, 2, 4, 5];
+        assert_eq!(ring_step(10, &visible, (3, 2), 1, 1), Some((4, 4, 2)));
+        // A jump of any size lands on the edge, both ways.
+        assert_eq!(ring_step(10, &visible, (3, 2), 1_000_000, 1_000_000), Some((9, 5, 3)));
+        assert_eq!(ring_step(10, &visible, (3, 2), -1_000_000, -1_000_000), Some((0, 1, 0)));
+        // A column that is not visible counts as the first: the sweep back to
+        // an anchor that was hidden meanwhile, a page flip that kept a seat.
+        assert_eq!(ring_step(10, &visible, (3, 3), 1, 0), Some((4, 1, 0)));
+        // A seat past a shorter page clamps to its last row.
+        assert_eq!(ring_step(2, &visible, (7, 4), 0, 0), Some((1, 4, 2)));
+        assert_eq!(ring_step(0, &visible, (0, 1), 0, 0), None);
+        assert_eq!(ring_step(3, &[], (0, 1), 0, 0), None);
+    }
+
+    #[test]
+    fn a_new_row_opens_on_the_first_column_it_needs_or_takes() {
+        let not_null = [true, true, true, false, false];
+        let defaults = [None, Some("nextval('s')".to_string()), None, None, None];
+        let generated = [false, false, true, true, false];
+        // Column 0 is a hidden rowid here: the user's columns start at 1. 1
+        // has a default, 2 is generated, so none of them needs a value.
+        assert_eq!(first_entry_column(1..5, &[1, 2, 3, 4], &not_null, &defaults, &generated), Some(1));
+        // Nothing required and the first visible generated: the next one.
+        assert_eq!(first_entry_column(3..5, &[3, 4], &not_null, &defaults, &generated), Some(4));
+        // Required wins over the visible order, even hidden (it is revealed).
+        assert_eq!(first_entry_column(0..5, &[4], &not_null, &defaults, &generated), Some(0));
+        // Only generated columns: no column takes typing.
+        assert_eq!(first_entry_column(2..4, &[2, 3], &not_null, &defaults, &generated), None);
+    }
+
+    #[test]
+    fn pages_are_counted_from_the_total_or_guessed_from_a_full_page() {
+        assert_eq!(last_page_of(0, 500), 0);
+        assert_eq!(last_page_of(500, 500), 0);
+        assert_eq!(last_page_of(501, 500), 1);
+        assert_eq!(last_page_of(5_410, 500), 10);
+        assert!(has_next_page(0, Some(1), 500, 500));
+        assert!(!has_next_page(1, Some(1), 1, 500));
+        assert!(has_next_page(3, None, 500, 500), "a full page may have more after it");
+        assert!(!has_next_page(3, None, 499, 500));
+    }
+
+    #[test]
+    fn a_divider_is_hit_within_four_pixels_of_a_data_columns_edge() {
+        // A 30px gutter, then columns 100 and 80 wide: edges at 30, 130, 210.
+        let widths = [30., 100., 80.];
+        assert_eq!(divider_at(&widths, 1, 130.), Some(1));
+        assert_eq!(divider_at(&widths, 1, 126.), Some(1));
+        assert_eq!(divider_at(&widths, 1, 214.), Some(2));
+        assert_eq!(divider_at(&widths, 1, 120.), None);
+        // The gutter's own edge divides no data; without a gutter it does.
+        assert_eq!(divider_at(&widths, 1, 30.), None);
+        assert_eq!(divider_at(&widths, 0, 30.), Some(0));
     }
 
     #[test]
@@ -5164,13 +4997,38 @@ mod tests {
         );
         let gone = Failure::Refused { code: "no_such_session".into(), message: "no such session".into() };
         assert!(matches!(commit_verdict(Err(gone)), Committed::Refused(_)));
+        // A cancel lands before a COMMIT starts or not at all.
+        let cancelled = Failure::Refused { code: "cancelled".into(), message: "cancelled".into() };
+        assert!(matches!(commit_verdict(Err(cancelled)), Committed::Refused(_)));
+        // Harbor's internal error comes after the engine ran the statement:
+        // an answer, which is not called none, that does not settle it.
+        let internal = Failure::Refused { code: "internal".into(), message: "recovered".into() };
+        assert_eq!(
+            commit_verdict(Err(internal)),
+            Committed::InDoubt("COMMIT was answered (internal: recovered), but not with whether it landed".into())
+        );
         // A COMMIT that could not be sent did nothing: there is no doubt.
         let unsent = "query: Connection refused (os error 61)";
         assert_eq!(commit_verdict(Err(Failure::Unsent(unsent.into()))), Committed::Refused(unsent.into()));
         // A timeout or a dropped tunnel after it was sent is no verdict at all.
         for lost in ["query: Resource temporarily unavailable (os error 35)", "stream: connection closed mid-chunk", "HTTP 502"] {
-            assert_eq!(commit_verdict(Err(Failure::Unanswered(lost.into()))), Committed::InDoubt(lost.into()));
+            let told = format!("COMMIT got no answer ({lost})");
+            assert_eq!(commit_verdict(Err(Failure::Unanswered(lost.into()))), Committed::InDoubt(told));
         }
+    }
+
+    #[test]
+    fn a_page_never_lands_over_an_open_editor() {
+        use super::{landing, Landing};
+        // An editor open as a page lands: its text is not confirmed into a
+        // row leaving the screen, and a reshaped table is not adopted over
+        // it, where the fresh set would drop what it then staged.
+        for (reshaped, staged) in [(false, false), (true, false), (true, true)] {
+            assert_eq!(landing(true, reshaped, staged), Landing::Dropped, "{reshaped} {staged}");
+        }
+        assert_eq!(landing(false, true, true), Landing::Reshaped);
+        assert_eq!(landing(false, true, false), Landing::Shown);
+        assert_eq!(landing(false, false, true), Landing::Shown);
     }
 
     #[test]
@@ -5183,7 +5041,7 @@ mod tests {
         assert!(!stale.contains("held"), "the staged set was cleared: {stale}");
 
         let doubt = |running: bool| PostCommit::InDoubt {
-            message: "query: timed out".into(),
+            message: "COMMIT got no answer (query: timed out)".into(),
             unsettled: running.then(|| "session-1".to_string()),
         };
         // The commit's session was seen to end before the page was read: the
@@ -5198,6 +5056,14 @@ mod tests {
         assert!(running.contains("may still be running") && running.contains("may not show its outcome yet"));
         assert!(!running.contains("read after it") && !running.contains("say whether"));
         assert!(running.ends_with("refresh (⌘R) until the commit is over"));
+        // An answer that does not settle it is not called no answer.
+        let answered = PostCommit::InDoubt {
+            message: "COMMIT was answered (internal: recovered), but not with whether it landed".into(),
+            unsettled: None,
+        };
+        let said = commit_status(&answered, Page::Read).unwrap();
+        assert!(said.starts_with("COMMIT was answered (internal: recovered), but not with whether it landed, so"));
+        assert!(!said.contains("no answer"), "{said}");
         let unread = commit_status(&doubt(false), Page::Failed("HTTP 503")).unwrap();
         assert!(unread.contains("could not be read again (HTTP 503)") && !unread.contains("read after it"));
         // Every one of them says the set is held.
@@ -5343,6 +5209,115 @@ mod tests {
         settle_fetch(Some(&PostCommit::InDoubt { message: "x".into(), unsettled: None }), true, Some(&mut e));
         assert!(e.judge(true));
         assert!(e.projection().is_empty() && e.statements().is_empty());
+    }
+
+    /// Run `e` as ⌘S does, in one session's transaction, and commit it.
+    fn commit_live(conn: &harbor_client::Conn, e: &Edits) -> Result<(), String> {
+        let sid = harbor_client::session_new(conn)?;
+        let run = super::run_statements(conn, &sid, &e.statements())
+            .and_then(|()| harbor_client::exec(conn, "COMMIT", None, Some(&sid)).map(drop));
+        harbor_client::session_release(conn, &sid);
+        run
+    }
+
+    /// Staged sets that move keys commit, and a full-precision DOUBLE key
+    /// names its row, which also needs a Harbor that reads the param as
+    /// exactly as DuckTable writes it. Live: needs `HARBOR_LIVE_DB`, a
+    /// scratch database file, as the probes in harbor-client's
+    /// `tests/live.rs` do.
+    #[test]
+    #[ignore]
+    fn staged_sets_that_move_keys_commit() {
+        let Some(db) = std::env::var_os("HARBOR_LIVE_DB") else {
+            println!("set HARBOR_LIVE_DB to a scratch database file; skipping");
+            return;
+        };
+        let conn = harbor_client::fleet::connect_path(std::path::Path::new(&db)).expect("connect");
+        let alone = |sql: &str| harbor_client::exec(&conn, sql, None, None).expect(sql);
+        let txt = |s: &str| Some(SharedString::from(s.to_string()));
+        alone("DROP TABLE IF EXISTS _dt_order");
+        alone("CREATE OR REPLACE SEQUENCE _dt_order_seq START 100");
+        alone("CREATE OR REPLACE TABLE _dt_order(id INTEGER PRIMARY KEY DEFAULT nextval('_dt_order_seq'), v VARCHAR)");
+        alone("INSERT INTO _dt_order VALUES (1, 'one'), (2, 'two'), (3, 'three'), (7, 'seven'), (9, 'nine')");
+        let mut e = Edits::new(
+            crate::sql::source("main", "_dt_order"),
+            vec!["id".into()],
+            vec!["id".into(), "v".into()],
+            vec!["INTEGER".into(), "VARCHAR".into()],
+        );
+        // EDITING.md's example: a DELETE of 7 and a re-key of 3 to 7.
+        e.stage_delete(vec![json!(7)]);
+        e.stage_cell(vec![json!(3)], 0, txt("3"), txt("7"), json!(7));
+        // A chain: 2 to 4, and 1 to the 2 it leaves.
+        e.stage_cell(vec![json!(1)], 0, txt("1"), txt("2"), json!(2));
+        e.stage_cell(vec![json!(2)], 0, txt("2"), txt("4"), json!(4));
+        // A new row keyed as a deleted one.
+        e.stage_delete(vec![json!(9)]);
+        let draft = e.stage_insert().unwrap();
+        e.stage_insert_cell(&draft, 0, txt("9"), json!(9));
+        e.stage_insert_cell(&draft, 1, txt("new"), json!("new"));
+        // A duplicate of the row the set re-keys, read as it was.
+        e.stage_duplicate(vec![json!(3)], vec![(1, txt("three"), Bind::Source)]);
+        commit_live(&conn, &e).expect("the set commits");
+        let rows = alone("SELECT id, v FROM _dt_order ORDER BY id").rows;
+        assert_eq!(
+            rows,
+            [(2, "one"), (4, "two"), (7, "three"), (9, "new"), (100, "three")]
+                .map(|(id, v)| vec![json!(id), json!(v)])
+        );
+        // A duplicate of a row the set leaves alone takes a key it frees:
+        // 9 copied as 7 beside a delete of 7.
+        let mut e = Edits::new(
+            crate::sql::source("main", "_dt_order"),
+            vec!["id".into()],
+            vec!["id".into(), "v".into()],
+            vec!["INTEGER".into(), "VARCHAR".into()],
+        );
+        e.stage_delete(vec![json!(7)]);
+        e.stage_duplicate(vec![json!(9)], vec![(0, txt("7"), Bind::Value(json!(7))), (1, txt("new"), Bind::Source)]);
+        commit_live(&conn, &e).expect("the duplicate takes the freed key");
+        let rows = alone("SELECT id, v FROM _dt_order ORDER BY id").rows;
+        assert_eq!(rows, [(2, "one"), (4, "two"), (7, "new"), (9, "new"), (100, "three")].map(|(id, v)| vec![json!(id), json!(v)]));
+
+        alone("CREATE OR REPLACE TABLE _dt_double(k DOUBLE PRIMARY KEY, v INTEGER)");
+        alone("INSERT INTO _dt_double VALUES (924.2100000029881, 1)");
+        let page = harbor_client::query(&conn, "SELECT k, v FROM _dt_double").expect("page");
+        let mut e = Edits::new(
+            crate::sql::source("main", "_dt_double"),
+            vec!["k".into()],
+            vec!["k".into(), "v".into()],
+            vec!["DOUBLE".into(), "INTEGER".into()],
+        );
+        e.stage_cell(vec![page.rows[0][0].clone()], 1, txt("1"), txt("2"), json!(2));
+        commit_live(&conn, &e).expect("the key names its row");
+        alone("DROP TABLE _dt_order");
+        alone("DROP SEQUENCE _dt_order_seq");
+        alone("DROP TABLE _dt_double");
+    }
+
+    #[test]
+    fn a_set_whose_commit_is_in_flight_goes_held_with_its_connection() {
+        use edits::Unjudged::{Running, Unread};
+        // Not committing: the set goes as it is, and an empty one not at all.
+        let e = super::surrender(staged(), false, None, None).unwrap();
+        assert!(!e.in_doubt() && e.statements().len() == 2);
+        let empty = Edits::new("\"main\".\"t\"".into(), vec!["id".into()], vec!["id".into()], vec!["INTEGER".into()]);
+        assert!(super::surrender(empty, false, None, None).is_none());
+        // The commit is running on its session: held, and asked after.
+        let e = super::surrender(staged(), true, None, Some("session-1".into())).unwrap();
+        assert!(e.in_doubt() && e.statements().is_empty());
+        assert_eq!((e.unsettled(), e.unjudged()), (Some("session-1"), Some(Running)));
+        // Its session not yet opened: held all the same, judged on a page.
+        let e = super::surrender(staged(), true, None, None).unwrap();
+        assert_eq!(e.unjudged(), Some(Unread));
+        // The COMMIT got no answer and its page has not landed.
+        let doubt = PostCommit::InDoubt { message: "x".into(), unsettled: Some("session-2".into()) };
+        let e = super::surrender(staged(), true, Some(&doubt), None).unwrap();
+        assert_eq!((e.unsettled(), e.unjudged()), (Some("session-2"), Some(Running)));
+        // The commit landed and cleared the set: nothing to keep.
+        let mut cleared = staged();
+        cleared.clear();
+        assert!(super::surrender(cleared, true, Some(&PostCommit::Landed), None).is_none());
     }
 
     #[test]

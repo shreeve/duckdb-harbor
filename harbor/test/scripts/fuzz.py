@@ -34,23 +34,6 @@ import sys
 import tempfile
 
 
-# Every berth a test starts registers under $HARBOR_HOME. Run through the
-# suite, check.sh sets it; run directly — which the usage line above invites —
-# nothing did, so sockets and logs landed in the operator's real
-# runtime directory and each run left a dead name behind. `setdefault` keeps
-# the harness in charge when there is one.
-#
-# Short, and under /tmp deliberately: a macOS unix socket path must fit in
-# SUN_LEN (104 bytes), and the per-user $TMPDIR alone is most of that.
-def _isolate_fleet():
-    import tempfile
-    if not os.environ.get("HARBOR_HOME"):
-        os.environ["HARBOR_HOME"] = tempfile.mkdtemp(prefix="hb-", dir="/tmp")
-
-
-_isolate_fleet()
-
-
 BATCH = 250
 
 # Two to the 53rd minus one: the largest integer a double holds exactly, and so
@@ -240,6 +223,7 @@ FENCE_FRAGMENTS = [
     "--", "-- c", "/*", "*/", "/* c", "c */", "/*/*", "*/*/", "'", "''", "'a",
     "e'", "E'", "\\", "\\'", '"', '""', '"a', "$", "$$", "$t$", "$1$", "$_$",
     "a", "1", "_", "a$b", "$b$", " ", "\t", "\n", "\r", "\r\n", "\x0b", "\x0c",
+    "1_0", "1e5", ".5", " ", "　",
     ";", "x'41'", "b'1'", "u&'a'", "LIKE", "ESCAPE", "date", "time", "\u00e9", "\u3042",
     "SELECT", "1", "AS", "(", ")", ",",
 ]
@@ -248,16 +232,16 @@ FENCE_FRAGMENTS = [
 def fuzz_statement_fence(args, rng, n, failures):
     """Does harbor's one-statement verdict match what the engine actually does?
 
-    `ensure_single_statement` is the only thing standing between a client's SQL
-    string and multi-statement execution — `duckdb-rs` runs everything but the
-    last statement during `prepare`, so a smuggled `DROP` lands before a row is
-    fetched. Two holes of exactly this shape have already shipped (a CR ending a
-    `--` comment, and a `$` inside an identifier read as a dollar-quote), and
-    both were found here rather than by reading.
+    Harbor refuses a request of more than one statement by the engine's own
+    count, before any of it runs. Random fragments of the SQL surface where
+    readers of the text disagree (a CR ending a `--` comment, a `$` inside an
+    identifier, an `e` before a quote) probe whether a second statement can
+    still run behind an answer.
 
     The oracle is a side effect, never an opinion: a canary table that only a
-    second statement can drop. Harbor answering 200 with the canary gone is a
-    bypass. Over-rejection is counted but is not a failure — refusing a
+    second statement can drop. The canary gone is a bypass, whatever harbor
+    answered: a refusal that came after the second statement ran is no
+    fence. Over-rejection is counted but is not a failure — refusing a
     statement someone could have written differently is the safe direction.
     """
     bypasses = 0
@@ -269,9 +253,9 @@ def fuzz_statement_fence(args, rng, n, failures):
         _, rows, _ = request(args.host, args.port,
                              "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'canary'")
         alive = bool(rows) and rows[0][0] == 1
-        if status == 200 and not alive:
+        if not alive:
             bypasses += 1
-            failures.append(("fence", "accepted, but the engine ran a second statement: %r" % probe))
+            failures.append(("fence", "answered %s, and the engine ran a second statement: %r" % (status, probe)))
             if bypasses > 20:
                 return
 

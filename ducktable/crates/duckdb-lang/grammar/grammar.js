@@ -1,10 +1,10 @@
 // tree-sitter-duckdb — a tree-sitter grammar derived from DuckDB's PEG
-// grammar (the bible: upstream/statements/*.gram, pinned in
-// upstream/COMMIT). Structural node names mirror the PEG rule names,
-// snake_cased (SelectStatement -> select_statement, StarExpression ->
-// star_expression); the 16-level stratified expression ladder collapses
-// into precedence-annotated binary rules, one prec number per PEG LEVEL
-// comment. Keywords follow DuckDB's own discipline: only structurally
+// grammar (the bible: src/parser/peg/grammar/statements/*.gram in
+// duckdb/duckdb at 8616efa9da99). Structural node names mirror the PEG
+// rule names, snake_cased (SelectStatement -> select_statement,
+// StarExpression -> star_expression); the 16-level stratified expression
+// ladder collapses into precedence-annotated binary rules, one prec number
+// per PEG LEVEL comment. Keywords follow DuckDB's own discipline: only structurally
 // required keywords are tokens (case-insensitive, aliased to their
 // uppercase spelling); unreserved keywords parse as identifiers, exactly
 // as the PEG's ColId does. Deviations from a line-by-line transliteration

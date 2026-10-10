@@ -12,8 +12,8 @@ DESIGN.md.
    same frame, first character never lost.
 2. **Nothing writes to the database until you say so.** ⌘S commits
    everything staged as one all-or-nothing transaction. There is no live
-   mode in v1; staging is the load-bearing wall that makes every other
-   liberty here safe.
+   mode; staging is the load-bearing wall that makes every other liberty
+   here safe.
 3. **Esc is a panic key, so it is lossless.** It cancels what you are
    typing and never discards anything you typed: a staged change stays
    staged. The one thing it removes is a new row nothing has been entered
@@ -72,9 +72,11 @@ copied with is read from the source row again, so a DATE inside a `VARIANT` that
 was typed over and restored is still a DATE. Primary-key and generated columns
 are omitted so DuckDB can supply the new identity and derived values. A natural
 key without a default therefore stays `required`. The entire copied
-row is one undo step and is not written until ⌘S. Inserts run first in the
-transaction, so the source row is read as the database holds it at ⌘S, even when
-the same commit updates or deletes it; a source row that is gone by then fails
+row is one undo step and is not written until ⌘S. A duplicate of a row the same
+commit updates or deletes runs first in the transaction, so the source row is
+read as the database holds it at ⌘S; one of a row the commit leaves alone runs
+after the deletes and updates, and so may take a key they free. A source row
+that is gone by then fails
 the commit, and nothing lands. A refresh does not help, because the draft still
 names that row: discard the duplicate (⌘Z, or the review popover) and the rest
 commits.
@@ -92,7 +94,7 @@ One meaning per key. No contextual double-agents.
 |---|---|---|
 | typing | opens the editor **replacing** the value, seeded with the keystroke | inserts text |
 | Enter | opens the editor **keeping** the value, caret at end — but during a Tab run, sweeps to the run's anchor column one row down (the carriage return) | confirms the cell, ring moves down — or sweeps, if a Tab run is going |
-| ⇧Enter | (same as Enter, sweeping/moving up) | inserts a line break — the chat-composer convention (Slack, every message box); confirm-and-move-up retired in its favor |
+| ⇧Enter | (same as Enter, sweeping/moving up) | the line break of the chat-composer convention (Slack, every message box): the cell editor is one line, so it is reserved, and never confirms |
 | Tab / ⇧Tab | moves the ring right / left with row-local wraparound, arming the typewriter anchor | confirms, moves right / left with row-local wraparound, and immediately edits the destination cell; anchor kept |
 | arrows | move the ring | *replace entry:* confirm + move the ring · *kept-value entry:* move the caret |
 | double-click | opens the editor keeping the value, caret at the click | — |
@@ -106,7 +108,7 @@ One meaning per key. No contextual double-agents.
 | ⌘⌫ | stages a DELETE for every selected row (ghost strikethrough; one undo step, each row its own entry for review; reversible until commit); a selected new row is discarded instead, since it never existed | — |
 | ⌘Z / ⌘⇧Z | un-stages / re-stages the most recent change | text undo / redo |
 | ⌘S | commits all staged changes — one transaction, all or nothing | confirms the cell, then commits (⌘Enter is its equal) |
-| ⌥Enter | — | newline (the Sheets-hand twin of ⇧Enter) |
+| ⌥Enter | — | reserved for a line break, the Sheets-hand twin of ⇧Enter |
 | ⌘Enter | commits all staged changes | confirms the cell, then commits: ⌘Enter means send, as it does in a chat composer, and ⇧Enter or ⌥Enter mean newline |
 
 The replace-vs-kept-value arrow split is Sheets' own physics, unnamed:
@@ -136,7 +138,7 @@ combination has a deliberate answer:
 | F2 | opens the kept-value editor (the third door, with Enter and double-click — and the one that works mid-Tab-run) |
 | PageUp / PageDown | one screenful up / down within the loaded page (Sheets' meaning), a row of overlap, clamped at the page edge |
 | ⌥↑ / ⌥↓ | previous / next DATABASE page (the pager) — the ring keeps its seat (same column, row clamped); when multiple grid tabs exist someday, these migrate to tab switching (Sheets' worksheet keys) |
-| ⌥← / ⌥→ | step the view switcher's segments left / right, rolling over at the ends (Structure / Data / Query) |
+| ⌥← / ⌥→ | the previous / next table in the sidebar, rolling over at the ends; the views are ⌘1/⌘2/⌘3's |
 | ⌘⇧⌫ | discard all staged changes (TablePlus's chord; one undo step, so even this is reversible) |
 | ⇧ + arrows | deliberately inert — range selection's seat, reserved until ranges ship; a ring that moved when you expected a range to grow would lie |
 | ⌃ + arrows | never bound — macOS owns them (Mission Control, Spaces) |
@@ -206,14 +208,27 @@ not change, and printable exotica (AltGr, IME) already land on rung 6.
 - A gesture that replaces the page, or the grid, confirms an open editor
   first: a pager click, a page-size change, a filter applied or cleared, the
   filter strip closed over an applied filter, a refresh, a switch to another
-  table, and ⌘S from the review popover. Text the column refuses keeps the
-  editor open with the reason, and the page, the strip and the table where
+  table, and ⌘S from the review popover. So do a discard from the review
+  popover and hiding columns. Text the column refuses keeps the editor open
+  with the reason, and the page, the strip, the columns and the table where
   they are. ⌥↑/⌥↓ are not among them: with an editor open they are the
   editor's keys and flip no page.
-- Two things drop an open editor's text besides Esc. Choosing a database in
-  the sidebar, the connected one included, leaves the connected one without
-  asking: its staged changes, parked ones too, and any text being typed go
-  with it. Quitting asks first (Dialogs, below).
+- While a page is on its way, the grid's own or another table's, no editor
+  opens: ⌥↓ keeps the ring seated, and a key typed before the next page
+  arrives is let go, as it is during a commit, rather than open an editor on
+  rows about to leave the screen. A page never confirms an editor when it
+  lands.
+- Staged changes belong to their table on their database, not to the
+  connection. Leaving a database parks the grid's set with the rest of that
+  database's: choosing another database or opening one by file or URL, Stop,
+  and a server that stops or goes away under the window. Text in an open
+  editor is confirmed first. When the user leaves, text its column refuses
+  keeps the editor open with the reason, and the database stays; when the
+  server goes, that text goes with the grid. Each set comes back when its
+  table is opened on that database again, held sets still held, and is
+  judged there like one parked by a table switch. A click on the database
+  already on screen changes nothing. Only quitting and removing a saved
+  remote drop parked sets, and both ask first (Dialogs, below).
 - Staged changes parked by a table switch wait for a grid that can take them.
   Returning to the table while its first page fails to load leaves them
   parked: the grid has no columns to check them against, keeps them until a
@@ -307,7 +322,10 @@ affected-exactly-one check are the backstop there, as everywhere.
     base64, `null` included: `null`, `NULL` and `Null` are four base64
     characters each, three bytes (`9EE965`, `3542CB`, `36E965`) that a cell
     can hold and show. A `BLOB`'s NULL is entered with ⌃⇧N, with Delete, or by
-    emptying the cell.
+    emptying the cell. Text that is not base64 — a length that is not a
+    multiple of four, a character outside the standard alphabet, padding
+    anywhere but the end, whitespace — would fail the commit in the engine's
+    decode, and is refused in the editor with the reason.
 - A `FLOAT` key binds through `?::FLOAT` in the WHERE. A FLOAT crosses the
   wire as the shortest decimal that names it and a JSON number binds as a
   DOUBLE; compared bare, the column is widened and 1.1 the FLOAT is not 1.1
@@ -393,8 +411,26 @@ affected-exactly-one check are the backstop there, as everywhere.
 ## Commit
 
 ⌘S opens a Harbor session (a pinned connection), then:
-`BEGIN` → parameterized inserts, updates, and deletes, each verified to have
-affected or returned **exactly one row** → `COMMIT` → release. Before opening
+`BEGIN` → parameterized statements, each verified to have affected or returned
+**exactly one row** → `COMMIT` → release. The engine checks a key as each
+statement runs, so they run in the order that frees a key before another row
+takes it: duplicates of rows the commit changes, then deletes, then updates,
+each after the one whose key it takes, then the other duplicates and new rows.
+A DELETE of 7 beside a re-key of 3 to 7 commits, as does a new row or a
+duplicate keyed like a deleted one, or a chain of re-keys; a swap of two keys
+has no such order, and the engine refuses it, edits kept. The order has
+limits, each refused the same way, and each committed in two steps:
+
+- A duplicate of a row the commit changes runs before any key is freed, so it
+  cannot take one.
+- A chain of re-keys is seen as one only when each new key is typed as the
+  wire spells the old one: a `DATE`, a `TIMESTAMP` or a `DECIMAL` typed another
+  way (`1.5` for `1.50`) is not seen to take the other row's key.
+- Only the primary key is ordered. Moves on another `UNIQUE` column (`a` to
+  `b` while `b` goes to `c`) run in the order of their rows' keys, which need
+  not free a value before another row takes it.
+
+Before opening
 the session, DuckTable refuses a draft missing a `NOT NULL` column with no
 default. Any failure rolls the whole transaction back: an SQL error, a
 constraint, or a row its identity no longer names, because the row is gone,
@@ -406,11 +442,19 @@ the keyboard and from the review popover's button alike.
 
 One failure cannot be read as "nothing landed": the `COMMIT` request sent and
 left unanswered, by a timeout or a dropped tunnel. The server may have
-committed before the answer was lost, or may be committing still. An error
-Harbor reports for the `COMMIT` is a verdict, not a doubt: the engine refused
-it or the session was gone, and the transaction is rolled back. So is a
-`COMMIT` that could not be sent at all, because the connection could not be
-made: it did nothing, and the edits are kept as after any failure.
+committed before the answer was lost, or may be committing still. Harbor's
+`internal` error is read the same way, since Harbor sends it about a statement
+the engine had already run, and so is any code DuckTable does not know; the
+status line says that the `COMMIT` was answered, but not with whether it
+landed, rather than that it got no answer. Every
+other error Harbor reports for the `COMMIT` is a verdict, not a doubt, and the
+transaction is rolled back: the engine refused it, the session was gone or
+busy, the transaction had been aborted by an earlier error (Harbor rolls it
+back and says so), or the commit was cancelled, which Harbor answers only
+before a `COMMIT` starts. So is a `COMMIT` that could not be sent at all,
+because the connection could not be made: it did nothing, and the edits are
+kept as after any failure. The grid and the Query view read a `COMMIT`'s
+answer by the same rule (`edits::commit_outcome`).
 
 After an unanswered `COMMIT`:
 
@@ -497,16 +541,17 @@ the NULL tag, visually distinct from empty, always.
 
 ## Dialogs
 
-Exactly one: quitting with something to lose, by ⌘Q, DuckTable → Quit, the
+Exactly one, and it asks before work is lost: before quitting, and before a
+database is left (below). Quitting comes by ⌘Q, DuckTable → Quit, the
 window's close button or the updater's Install and Relaunch, which quits to
 install. Those four ask first when any of these holds, and quit at once when
 none does:
 
 - **Staged changes**, in the table on screen or parked for a table that is
-  not. They are counted together: `Discard 5 staged changes and quit?`, and
-  under it `5 staged changes in 2 tables have not been committed, and quitting
-  discards them.` The changes of a commit in flight are not counted here:
-  quitting does not simply discard them.
+  not, on any database. They are counted together: `Discard 5 staged changes
+  and quit?`, and under it `5 staged changes in 2 tables have not been
+  committed, and quitting discards them.` The changes of a commit in flight
+  are not counted here: quitting does not simply discard them.
 - **Changes held after a commit that got no answer** (Commit, above). They
   are not called uncommitted: `3 changes are held after a commit that got no
   answer: they may already be in the database, and quitting drops the held
@@ -537,7 +582,8 @@ the keyboard to the grid or the editor behind the dialog), Refresh Tables,
 and New Row, Duplicate Row and Delete Row. Three things already under way
 wait for the answer. A connect still in flight when the dialog opens is
 called off, since landing it would replace everything behind the dialog; on
-Cancel it is dialed again. A table switch whose page arrives under the
+Cancel it is dialed again, as a choice of that database, which asks first
+when leaving the one on screen would end something. A table switch whose page arrives under the
 dialog, or that was waiting on a commit which settles under it, runs on
 Cancel; when a connect is dialed again the switch is dropped, since the
 connect replaces the grid it was for. A server that stops under the dialog leaves its connection on screen
@@ -555,6 +601,32 @@ update installs when DuckTable next quits. Sparkle holds the relaunch until
 the dialog is answered. It holds it only once per update, so while an update
 waits, Check for Updates asks again rather than opening Sparkle's window,
 whose second Install and Relaunch would not wait.
+
+The same dialog asks before a database is left with something at stake on
+it, and only the facts that concern that database are listed:
+
+- **Choosing another database** (a sidebar row, Open Database File or URL, a
+  dropped file) parks its staged and held changes for its return, so they are
+  no reason to ask. It asks when leaving would end something: a transaction
+  open in the Query view, which it rolls back, a statement running there, or
+  a commit in flight, whose changes are then held for the database's return.
+  `Leave orders?`, with `Leave Anyway`.
+- **Stop** asks when the database holds any of the list above, staged changes
+  included, and says that staged and held changes stay for when it is opened
+  again: `Stop orders?`, with `Stop Anyway`.
+- **Remove Database** forgets what is parked for the remote, so it asks as a
+  quit does: `Discard 1 staged change and remove prod?` with `Discard and
+  Remove`, or `Remove prod?` with `Remove Anyway`.
+
+Before any of the three, text in an open cell editor on that database is
+confirmed; text its column refuses keeps the editor open with the reason,
+and nothing is left.
+
+A connect takes a moment, and the database on screen stays usable until it
+lands. When something has been put at stake there meanwhile (a `BEGIN`
+typed, a statement started, an editor opened), the landing asks the switch's
+question rather than end it unasked; what was asked about before the
+connect began is not asked again. Leave Anyway connects afresh.
 
 Two ways out end the app through macOS without passing through the dialog,
 and ask nothing: Quit from the Dock's menu, and a logout, restart or

@@ -41,13 +41,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-
-      # The engine comes from DuckDB's official nightly channel through the
-      # same script a developer runs, so the archive bundles the current
-      # build of the 2.0 branch — the same channel the test suites ran
-      # against on the way here. The channel moves nightly and cannot be
-      # asked for an older build; the archive is what pins an engine to a
-      # release, and its name records which (see the smoke step).
+      # The engine comes through the same script a developer and the test
+      # workflows run, by the same repository variable: a named build from
+      # this repository's engine-<build> release, checksummed, or `latest`
+      # from DuckDB's nightly channel. The archive is what pins an engine to
+      # a release. The script refuses a library without the v2 C API this
+      # harbor binds, so no runner packages an engine harbor refuses.
       - name: Fetch DuckDB engine
         shell: bash
         env:
@@ -55,29 +54,6 @@ jobs:
           # the channel's current build (see scripts/fetch-duckdb.sh).
           DUCKDB_LIB_BUILD: ${{ vars.DUCKDB_LIB_BUILD }}
         run: DEST="$DUCKDB_LIB" DUCKDB_PLATFORM=${{ matrix.duck_plat }} scripts/fetch-duckdb.sh
-
-      # Fail FAST if the fetched library cannot serve this harbor — grep the
-      # v2 symbol names straight out of the binary. The fetch script checks
-      # the same thing; this stays because the failure it prevents (five
-      # native runners packaging an engine harbor refuses at dlopen,
-      # surfaced late and cryptically by the smoke test) is worth two
-      # seconds per run, whatever the engine's provenance.
-      - name: Engine can serve this harbor
-        shell: bash
-        run: |
-          # No `ls | head`: a candidate that doesn't exist makes ls exit
-          # nonzero, and -e/pipefail would kill the step before any
-          # diagnostic prints.
-          lib=""
-          for f in "$DUCKDB_LIB"/libduckdb.so "$DUCKDB_LIB"/libduckdb.dylib \
-                   "$DUCKDB_LIB"/duckdb.dll; do
-            if [ -f "$f" ]; then lib=$f; break; fi
-          done
-          [ -n "$lib" ] || { echo "no libduckdb found in $DUCKDB_LIB"; exit 1; }
-          if ! grep -qc duckdb_v2_create_environment "$lib"; then
-            echo "::error::$lib exports no v2 C API symbols — harbor $(grep -m1 '^version' Cargo.toml) cannot serve with it."
-            exit 1
-          fi
 
       # Nothing links the engine — harbor dlopens it at runtime (bin/../lib
       # is the first place it looks), so the build needs no rpath and no

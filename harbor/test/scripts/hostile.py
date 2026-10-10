@@ -9,12 +9,13 @@ survive that or report cleanly afterwards.
 
 WHAT THIS IS FOR, AND WHY IT IS NOT A PARSER FUZZER
 
-Every network-facing bug found in this server so far parsed *fine*. The header
-flood, the unbounded body drain, the dripping body that took every worker, the
-connection held open forever by one idle /ready, the 51-minute eager read:
-in all of them the request was well-formed and the parser was right. What was
-wrong was everything around it — what got allocated, what got held, and for how
-long. A `cargo-fuzz` target asserting "no panic" would have caught none of them.
+The network-facing failures this guards against all parse *fine*: a header
+flood, an unbounded body drain, a dripping body that takes every worker, a
+connection held open forever by one idle /ready, an eager read that runs for
+most of an hour. In each the request is well-formed and the parser is right.
+What goes wrong is everything around it — what gets allocated, what gets held,
+and for how long. A `cargo-fuzz` target asserting "no panic" catches none of
+them.
 
 So the oracle here is not "did it parse". It is what the process DID: is it
 still answering, did the threads and descriptors come back, did memory stay
@@ -136,6 +137,12 @@ def rss_kb(pid):
 
 
 def threads(pid):
+    # Linux lists a process's threads in /proc; macOS's `ps -M` prints one
+    # line per thread. Linux's `ps -M` is something else, one line in all,
+    # which would make every thread check here pass.
+    task = f"/proc/{pid}/task"
+    if os.path.isdir(task):
+        return len(os.listdir(task))
     out = subprocess.run(["ps", "-M", str(pid)], capture_output=True, text=True).stdout
     return max(0, len(out.strip().splitlines()) - 1)
 
@@ -148,9 +155,9 @@ def fds(pid):
 def responsive(port, timeout=8):
     """Oracle 1 — liveness. The berth must still answer while under attack.
 
-    This is the one that would have caught every denial of service found so
-    far: each of them left /ready timing out while the process looked healthy
-    to anything watching the pid.
+    This is the one that catches a denial of service: each kind leaves
+    /ready timing out while the process looks healthy to anything watching
+    the pid.
     """
     began = time.time()
     try:
@@ -188,10 +195,9 @@ def settled(pid, base_threads, base_fds, slack=8, wait=45):
 
 # PRI and `*` are here for one shape in particular: `PRI * HTTP/2.0`, the
 # prior-knowledge HTTP/2 connection preface. A version this server cannot
-# speak used to strand the connection thread permanently, and the realistic
-# way to send one is not a hand-typed `GET / HTTP/2.0` — it is a client
-# quietly attempting h2c. Generating the version alone found that bug; the
-# preface is how it would actually have reached a berth.
+# speak can strand a connection thread for good, and the realistic way to
+# send one is not a hand-typed `GET / HTTP/2.0` — it is a client quietly
+# attempting h2c, so the preface is sent whole as well as generated.
 METHODS = ["GET", "POST", "DELETE", "PUT", "HEAD", "OPTIONS", "PATCH", "TRACE",
            "PRI", "\x00BAD"]
 PATHS = ["/ready", "/sql", "/info", "/sessions", "/catalog", "/keepalive",
@@ -265,13 +271,44 @@ def one_response_per_request(port, rng):
         s.sendall(b"POST /sql HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4000000\r\n\r\n")
         for _ in range(rng.randint(3, 10)):
             try:
-                # DELETE is the legacy shutdown verb — using it here also
-                # proves the alias stays served beside canonical POST.
+                # The bait asks for a shutdown, so a desync that answers it
+                # also stops the berth, which the closing checks see too.
                 s.sendall(b"DELETE /shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
             except OSError:
                 break
             time.sleep(0.2)
-        s.settimeout(6)
+        # The server answers the stalled body once its body clock runs out,
+        # a few seconds after the last bait. A desync would answer the bait right behind that
+        # first response, from bytes already buffered, so after it only a
+        # short quiet is waited for, not the server's lingering close.
+        s.settimeout(15)
+        seen = b""
+        while True:
+            try:
+                chunk = s.recv(8192)
+            except (socket.timeout, OSError):
+                break
+            if not chunk:
+                break
+            seen += chunk
+            s.settimeout(2)
+        return seen.count(b"HTTP/1.1")
+    finally:
+        s.close()
+
+
+def unread_chunked_body(port, head, well_formed):
+    """Oracle 4, chunked. A route that answers without reading the body
+    (a 404, a browser's 403) leaves a chunked body on the stream with no
+    length to skip it by. The bait is a request carried as chunk data: it
+    must never be answered, so one request draws one response."""
+    smuggled = b"GET /info HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+    body = (b"%x\r\n" % len(smuggled) + smuggled + b"\r\n0\r\n\r\n"
+            if well_formed else smuggled)
+    s = socket.create_connection(("127.0.0.1", port), timeout=15)
+    try:
+        s.sendall(head + b"Host: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n" + body)
+        s.settimeout(3)
         seen = b""
         while True:
             try:
@@ -282,6 +319,39 @@ def one_response_per_request(port, rng):
                 break
             seen += chunk
         return seen.count(b"HTTP/1.1")
+    finally:
+        s.close()
+
+
+FRAMED_TWO_WAYS = {
+    "an obs-fold header": b"X-A: a\r\n Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    "a bare LF in a header": b"X-A: a\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    "a signed chunk size": b"Transfer-Encoding: chunked\r\n\r\n+5\r\nhello\r\n0\r\n\r\n",
+    "a bare LF after a chunk size": b"Transfer-Encoding: chunked\r\n\r\n5\n\r\nhello\r\n0\r\n\r\n",
+    "a bare LF after a chunk extension": b"Transfer-Encoding: chunked\r\n\r\n5;x\nhello\r\n0\r\n\r\n",
+}
+
+
+def framed_two_ways(port, framing):
+    """Oracle 4, lenient framing. A request a lenient parser would frame
+    differently, sent to a route that reads its body, with a request behind
+    it as bait: it is refused, and the bait is never answered. Returns the
+    statuses drawn."""
+    smuggled = b"GET /info HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+    s = socket.create_connection(("127.0.0.1", port), timeout=15)
+    try:
+        s.sendall(b"POST /sql HTTP/1.1\r\nHost: 127.0.0.1\r\n" + framing + smuggled)
+        s.settimeout(3)
+        seen = b""
+        while True:
+            try:
+                chunk = s.recv(8192)
+            except (socket.timeout, OSError):
+                break
+            if not chunk:
+                break
+            seen += chunk
+        return [seen[i + 9:i + 12].decode() for i in range(len(seen)) if seen.startswith(b"HTTP/1.1 ", i)]
     finally:
         s.close()
 
@@ -298,7 +368,11 @@ def case_random_heads(port, pid, rng, n, base_rss):
         try:
             s = socket.create_connection(("127.0.0.1", port), timeout=5)
             s.sendall(H2_PREFACE if rng.random() < 0.04 else hostile_head(rng))
-            s.settimeout(3)
+            # A head the server can answer is answered at once. One that
+            # draws nothing is one it is still waiting on (an unended head,
+            # an undelivered body), and waiting longer here learns nothing:
+            # what is asserted is liveness and memory, not the answer.
+            s.settimeout(0.5)
             try:
                 s.recv(4096)
             except (socket.timeout, OSError):
@@ -468,6 +542,22 @@ def main():
             ok("one request drew one response", f"max {worst} seen")
         else:
             bad("desync", f"one request drew {worst} responses — leftover bytes were parsed")
+        heads = [b"POST /nope HTTP/1.1\r\n",
+                 b"POST /sql HTTP/1.1\r\nOrigin: http://evil.example\r\n"]
+        counts = [unread_chunked_body(port, head, well_formed)
+                  for head in heads for well_formed in (True, False)]
+        if counts == [1] * len(counts):
+            ok("an unread chunked body was never parsed as a request",
+               "404 and 403, well-formed and malformed chunks")
+        else:
+            bad("desync (chunked)",
+                f"responses per request {counts} — chunk data was answered as a request")
+        drawn = {name: framed_two_ways(port, framing) for name, framing in FRAMED_TWO_WAYS.items()}
+        if all(statuses == ["400"] for statuses in drawn.values()):
+            ok("framing a lenient parser reads another way is refused, and nothing behind it answered",
+               ", ".join(drawn))
+        else:
+            bad("desync (lenient framing)", f"statuses drawn {drawn}")
 
         section("No leak")
         # Every case above abandoned connections on purpose, and each has its

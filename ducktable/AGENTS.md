@@ -22,12 +22,14 @@ read it first.
   (every hand-written query) are pure. Colors resolve through `theme.rs`.
   `main.rs` holds the entry point, menus, key bindings and the quit dialog;
   `updater.rs` is the Sparkle glue.
-- `crates/harbor-client`: HTTP to Harbor over unix sockets and TCP, sessions,
-  and the fleet (which databases exist and which server serves each).
+- `crates/harbor-client`: results read whole, the catalog, and the fleet
+  (which databases exist, which server serves each, and the SSH tunnel to a
+  remote), on harbor's `harbor-http`, the transport, sessions and summon
+  harbor's own CLI speaks through.
 - `crates/duckdb-lang`: the tree-sitter grammar the Query editor highlights
   with.
-- Harbor's `wire` and `common` crates are built from the sibling `harbor/`
-  tree, so the protocol is checked on both sides of every commit.
+- Harbor's `wire`, `common` and `http` crates are built from the sibling
+  `harbor/` tree, so the protocol is checked on both sides of every commit.
 
 A rule with a decision in it belongs in a pure function, with a unit test.
 
@@ -87,7 +89,11 @@ HARBOR_LIVE_DB=/tmp/scratch.duckdb cargo test -p harbor-client --test live -- --
 the probes their own `HARBOR_HOME` under `$TMPDIR`: a unix socket path has
 104 bytes, and a scratchpad path runs past it.
 
-To try a change, run `target/release/ducktable <scratch.duckdb>`, or build
-the signed bundle with `scripts/macos-app.sh release`, which leaves
-`target/DuckTable.app`. Copy a bundle somewhere scratch before opening it,
-never over `/Applications/DuckTable.app`.
+To try a change, run `target/release/ducktable` with a scratch `HARBOR_HOME`
+whose config attaches a scratch database (`harbor <scratch.duckdb> attach`;
+DuckTable takes no path argument, and lists what the config attaches), and
+a scratch `HOME` for its own prefs, with `~/.ssh` linked into it, since ssh
+reads its `Include`s through `$HOME`. Or build the signed bundle with
+`scripts/macos-app.sh release`, which leaves `target/DuckTable.app`. Copy a
+bundle somewhere scratch before opening it, never over
+`/Applications/DuckTable.app`.

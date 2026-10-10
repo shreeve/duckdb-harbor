@@ -19,7 +19,7 @@ DuckTable (Rust + GPUI, one macOS app bundle)
     |  HTTP over a local socket or IPv4 loopback TCP
     |  optional app-owned OpenSSH local forward
     v
-DuckDB Harbor 0.39 or later (required; owns engine, files, versions)
+DuckDB Harbor 0.44.2 or later (required; owns engine, files, versions)
     |
     v
 DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
@@ -28,6 +28,11 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
 - **Harbor is required, not optional.** The client never links DuckDB and
   never sees a database file's contents. FFI, engine version lock, WAL
   handling and checkpoint hazards are Harbor's job, not the client's.
+  DuckTable reads a `COMMIT`'s answer as Harbor 0.44.2 gives it: a `COMMIT`
+  of an aborted transaction is rolled back and answered `400` saying so, and
+  a `COMMIT` runs to its answer, so a `499` means nothing was kept. Older
+  servers answer neither way, so DuckTable refuses to connect to one: the
+  failed-connect card names the version `/info` reports and the floor.
 - **A berth is a file on this machine or a named remote.** Connection works
   the way `harbor`'s own does: a local database is dialed by its file, whose
   server Harbor's socket discovery finds and opening it spawns on demand, and
@@ -36,18 +41,23 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
   consumes Harbor's `wire` protocol crate and `harbor-common` (features
   `config` and `membership`) as path dependencies on the sibling
   `../../../harbor/crates/*`, so the wire contract is checked on both sides of
-  every commit. The HTTP layer (blocking client, NDJSON streaming, chunked
-  decoding) is DuckTable's own `harbor-client` crate.
+  every commit. The HTTP layer (blocking client, chunked decoding, sessions,
+  summoning and stopping a server) is harbor's `harbor-http`, the one
+  harbor's own CLI speaks through; DuckTable's `harbor-client` adds results
+  read whole, the catalog and the fleet.
 - **A database can be opened by file or added by port.** File → Open Database
   File chooses a DuckDB path. File → Open Database URL saves a sidebar name and
   a Harbor host and port. `localhost` means a direct IPv4-loopback connection;
   any other host means SSH. DuckTable runs `/usr/bin/ssh` directly, forwards a
-  free local `127.0.0.1` port to that machine's Harbor loopback port, and keeps
-  the tunnel inside the connection's reference-counted lifetime. No survey opens
+  unix socket in Harbor's runtime directory (0700, so no other user of the
+  Mac reaches the database through it, as any could through a loopback port)
+  to that machine's Harbor loopback port, and keeps the tunnel inside the
+  connection's reference-counted lifetime. No survey opens
   SSH; selecting the database does. The last connection clone kills and reaps
-  the process. `-S none` makes that process the owner, `BatchMode=yes` keeps
-  failures visible rather than interactive, and SSH keepalives detect a dead
-  path.
+  the process, and a quit closes every tunnel still open, process and socket.
+  A launch removes the sockets of tunnels whose app is not running.
+  `-S none` makes that process the owner, `BatchMode=yes` keeps failures
+  visible rather than interactive, and SSH keepalives detect a dead path.
 - **A connected berth is kept alive by presence, not pulses.** A held
   connection is the keepalive. The lifetime rule is Harbor's own: one `start`
   verb, two lifetimes. A plain start is persistent and runs until stopped; an
@@ -164,9 +174,13 @@ law is EDITING.md's "content snaps, chrome fades"; durations are under
 ### Window
 
 Three panes: the sidebar, the content, and the inspector. The content shows
-one of three views of the selected table, **Structure | Data | Query**, chosen
-by the switcher at the left of the bottom bar, by ⌘1/⌘2/⌘3, or by the ⌥←/⌥→
-carousel. Data is the default. The inspector opens beside the Data grid only.
+one of three views, **Structure | Data | Query**, chosen by the switcher at the
+left of the bottom bar or by ⌘1/⌘2/⌘3, either way landing the keyboard on the
+view, and kept across a table switch; ⌥←/⌥→ step through the tables. Data is
+the default. Structure and Data show the selected table, and the database's
+card until one is chosen; Query is the database's, there from the connect on,
+with tables or none. The inspector opens beside the Data grid and the Query
+results.
 
 The sidebar width, the inspector's open state and width, the Structure view's
 columns/DDL divider and the Query view's editor/results split all persist.
@@ -272,10 +286,14 @@ What can be edited, and how, is EDITING.md.
 
 ### Bottom bar
 
-The view switcher sits at the left. The Data view adds the raw-SQL filter
-toggle, the Columns popover (search past ten columns, Show all and Hide all,
-full-row click targets) and the Add Row button. The right-anchored status line
-reads `1 ms · 1–500 of 5,410 rows · 9 columns · |< < 500 per > >|`.
+The view switcher sits at the left, under every view, the database's card
+included. The Data view adds the raw-SQL filter toggle, the Columns popover
+(search past ten columns, Show all and Hide all, full-row click targets), the
+Add Row button, and the staging story: the staged count, `committing…`, or why
+the table is read-only (`no key, and a column named rowid`, or `its key is not
+among the columns read`). The right-anchored status line describes the grid
+the view shows, the table's or the Query results', and reads
+`1 ms · 1–500 of 5,410 rows · 9 columns · |< < 500 per > >|`.
 
 The order is the anti-jump rule: in a right-justified cluster an element moves
 only when something to its right changes width. So the pager, the only
@@ -284,7 +302,10 @@ corner, and neither a page flip nor a table switch moves a click target. The
 column count sits beside the row range it describes.
 
 The filter is one raw SQL `WHERE` strip under the header, applied on Enter,
-which refetches page 1 with a fresh count.
+which refetches page 1 with a fresh count. An `ORDER BY` that ends it sorts
+the pages (`x > 0 ORDER BY name`, or `ORDER BY name` alone); the grid has no
+sort of its own. The condition is wrapped in parentheses and the ordering
+follows them, so the strip cannot reach past the page's `LIMIT`.
 
 ### Inspector
 
@@ -312,7 +333,7 @@ arrows, ⌘S, ⌘Z, ⌘⌫, ⌃⇧N, ⌘⇧⌫) is EDITING.md's; the Query view'
 | ⌘O | Open Database File |
 | ⌘R | Refresh Tables: the catalog and the open Data page |
 | ⌘1 / ⌘2 / ⌘3 | Structure / Data / Query |
-| ⌥← / ⌥→ | previous / next view, rolling over at the ends |
+| ⌥← / ⌥→ | previous / next table in the sidebar, rolling over at the ends |
 | ⌘N / ⌘D | New Row / Duplicate Row |
 | ⌘I | toggle the inspector |
 | ⌘7 / ⌘8 / ⌘9 (or ⌥7 / ⌥8 / ⌥9) | row numbers / right-aligned numbers / NULL tags |
@@ -457,5 +478,3 @@ blocks them.
   shares the grid's one editing session, and a schema editor in Structure.
 - **Catalog.** Views, macros and attached catalogs in the TABLES tree once
   `/catalog` carries them.
-- **Other platforms.** Linux and Windows builds with native window chrome and
-  menus, and per-platform keymaps rather than a blind ⌘-to-Ctrl swap.

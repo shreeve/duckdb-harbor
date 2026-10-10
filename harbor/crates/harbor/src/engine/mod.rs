@@ -3,12 +3,11 @@
 //! ffi.rs is generated from DuckDB's api_spec/v2 YAML (scripts/gen-v2-ffi.rb):
 //! the whole surface as one dlsym-filled function table. This module is the
 //! hand-written rim: find the library, load it once, and give errors and
-//! string views a Rust shape. The candidate search here replaced the v1-era
-//! loader (src/engine.rs) when 0.21's flip retired it along with duckdb-rs.
+//! string views a Rust shape.
 //!
-//! Unix opens with RTLD_NOW | RTLD_GLOBAL. GLOBAL is load-bearing: DuckDB's
-//! own extension loading expects engine symbols resolvable from the global
-//! namespace.
+//! Unix opens the engine RTLD_NOW and, once it proves to serve the v2 API,
+//! RTLD_GLOBAL. GLOBAL is load-bearing: DuckDB's own extension loading
+//! expects engine symbols resolvable from the global namespace.
 
 /// One fallible v2 call inside a `Result<_, Error>` function. Defined
 /// before the modules so both conn and encode see it.
@@ -35,7 +34,7 @@ pub mod ffi;
 
 use std::env;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use libloading::Library;
@@ -67,14 +66,22 @@ pub fn engine() -> Result<&'static Engine, String> {
     }
 }
 
-/// Where to look, in order. First hit wins; the bare name at the end lets
-/// the system loader's own search have the final say. `HARBOR_LIBDUCKDB` is
-/// not in this list — an explicit override is handled first in `load`,
-/// where a miss is a hard error rather than a fall-through.
+/// Where to look, in order. The first that loads and serves the v2 API
+/// wins. On Linux the bare name at the end lets ld.so's own search have the
+/// final say; macOS and Windows would search the working directory for it,
+/// so they stop at the paths. `HARBOR_LIBDUCKDB` is not in this list — an
+/// explicit override is handled first in `load`, where a miss is a hard
+/// error rather than a fall-through.
 fn candidates() -> Vec<PathBuf> {
     let mut c = Vec::new();
     if let Ok(exe) = env::current_exe() {
-        if let Some(dir) = exe.parent() {
+        // macOS names the path that was run, a symlink's included, and the
+        // library sits beside the binary itself; Linux resolves it already.
+        #[cfg(target_os = "macos")]
+        let real = std::fs::canonicalize(&exe).ok().filter(|r| *r != exe);
+        #[cfg(not(target_os = "macos"))]
+        let real: Option<PathBuf> = None;
+        for dir in real.iter().chain([&exe]).filter_map(|e| e.parent()) {
             c.push(dir.join("../lib").join(LIB_NAME));
             c.push(dir.join(LIB_NAME));
         }
@@ -105,18 +112,22 @@ fn candidates() -> Vec<PathBuf> {
             }
         }
     }
+    #[cfg(target_os = "linux")]
     c.push(PathBuf::from(LIB_NAME));
     c
 }
 
+/// Open a library with its symbols kept to itself, or, `global`, offered to
+/// every library loaded after it.
 #[cfg(unix)]
-fn open_lib(path: &PathBuf) -> Result<Library, libloading::Error> {
-    use libloading::os::unix::{Library as Unix, RTLD_GLOBAL, RTLD_NOW};
-    unsafe { Unix::open(Some(path), RTLD_NOW | RTLD_GLOBAL).map(Into::into) }
+fn open_lib(path: &Path, global: bool) -> Result<Library, libloading::Error> {
+    use libloading::os::unix::{Library as Unix, RTLD_GLOBAL, RTLD_LOCAL, RTLD_NOW};
+    let scope = if global { RTLD_GLOBAL } else { RTLD_LOCAL };
+    unsafe { Unix::open(Some(path), RTLD_NOW | scope).map(Into::into) }
 }
 
 #[cfg(windows)]
-fn open_lib(path: &PathBuf) -> Result<Library, libloading::Error> {
+fn open_lib(path: &Path, _global: bool) -> Result<Library, libloading::Error> {
     unsafe { Library::new(path) }
 }
 
@@ -124,28 +135,28 @@ fn load() -> Result<Engine, String> {
     // An explicit override is a contract, not a hint: when HARBOR_LIBDUCKDB
     // is set, the engine comes from that file or the load fails naming it.
     // Falling through to the search would silently bind a different
-    // libduckdb — in CI, exactly the failure that must be loud.
+    // libduckdb — in CI, exactly the failure that must be loud. The value is
+    // resolved here, so the file opened is the one it names from the working
+    // directory and not one the dynamic loader's own search finds.
     if let Ok(p) = env::var("HARBOR_LIBDUCKDB") {
-        let path = PathBuf::from(&p);
-        if !path.exists() {
-            return Err(format!("HARBOR_LIBDUCKDB={p}: no such file"));
-        }
-        let lib = open_lib(&path).map_err(|e| format!("HARBOR_LIBDUCKDB={p}: {e}"))?;
-        return boot(lib, path);
+        let path = std::fs::canonicalize(&p).map_err(|e| format!("HARBOR_LIBDUCKDB={p}: {e}"))?;
+        return boot(&path).map_err(|e| format!("HARBOR_LIBDUCKDB={p}: {e}"));
     }
+    search(&candidates())
+}
 
-    let tried = candidates();
+/// The first of `tried` that boots.
+fn search(tried: &[PathBuf]) -> Result<Engine, String> {
     let mut failed = Vec::new();
-    for p in &tried {
-        let bare = p.as_os_str() == LIB_NAME.as_ref() as &std::ffi::OsStr;
-        if !bare && !p.exists() {
+    for p in tried {
+        if p.is_absolute() && !p.exists() {
             continue;
         }
-        match open_lib(p) {
-            Ok(lib) => return boot(lib, p.clone()),
-            // A candidate that exists but will not load carries the real
-            // story (wrong arch, missing dependency) — keep it for the
-            // error instead of reporting a bare "not found".
+        match boot(p) {
+            Ok(engine) => return Ok(engine),
+            // A candidate that exists but will not load, or predates the v2
+            // API, carries the real story (wrong arch, missing dependency,
+            // an old engine): keep it for the error and try the next.
             Err(e) => failed.push(format!("{}: {e}", p.display())),
         }
     }
@@ -159,7 +170,11 @@ fn load() -> Result<Engine, String> {
     Err(msg)
 }
 
-fn boot(lib: Library, path: PathBuf) -> Result<Engine, String> {
+/// Load the engine at `path`. It is opened with its symbols kept to itself
+/// until it proves to serve the v2 API: a library that does not is closed
+/// again, and must not have offered its symbols to the one loaded after it.
+fn boot(path: &Path) -> Result<Engine, String> {
+    let lib = open_lib(path, false).map_err(|e| e.to_string())?;
     let (api, symbols) = unsafe { ffi::Api::fill(&lib) };
     // Both symbols gate together: an engine odd enough to export one
     // without the other must not reach the unwrap-free calls below.
@@ -167,8 +182,7 @@ fn boot(lib: Library, path: PathBuf) -> Result<Engine, String> {
         (Some(_), Some(f)) => f,
         _ => {
             return Err(format!(
-                "{}: engine has no v2 C API ({symbols} v2 symbols) — needs DuckDB v2.0.0 or later",
-                path.display()
+                "engine has no v2 C API ({symbols} v2 symbols) — needs DuckDB v2.0.0 or later"
             ));
         }
     };
@@ -181,11 +195,15 @@ fn boot(lib: Library, path: PathBuf) -> Result<Engine, String> {
     }
     let version = unsafe { str_view(&ver) }.to_owned();
 
-    // The engine stays for the life of the process — closing it would turn
-    // every filled pointer into a dangling one.
+    // Opened again, the same library offers its symbols globally: DuckDB's
+    // own extension loading expects engine symbols resolvable from there.
+    // Both handles stay for the life of the process — closing the engine
+    // would turn every filled pointer into a dangling one.
+    let global = open_lib(path, true).map_err(|e| e.to_string())?;
+    std::mem::forget(global);
     std::mem::forget(lib);
 
-    Ok(Engine { api, version, path, symbols })
+    Ok(Engine { api, version, path: path.to_path_buf(), symbols })
 }
 
 /// A failed v2 call: the structured code plus the engine's rendered text.
@@ -233,6 +251,13 @@ impl fmt::Display for Error {
     }
 }
 
+/// Destroy an engine value.
+fn destroy_value(api: &ffi::Api, mut value: ffi::value_handle) {
+    if let Some(f) = api.value_destroy {
+        unsafe { f(&mut value) };
+    }
+}
+
 /// View a borrowed engine string. Lossless for the UTF-8 DuckDB emits;
 /// callers keep the source (and its owner) alive for the borrow.
 ///
@@ -260,5 +285,36 @@ pub unsafe fn bytes_view(b: &ffi::bytes_t) -> &[u8] {
             b.value.pointer.ptr
         };
         std::slice::from_raw_parts(ptr as *const u8, len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A candidate that will not boot, for whatever reason, is reported and
+    /// passed over: the engine after it still loads.
+    #[test]
+    fn the_search_keeps_going_past_a_candidate_that_fails() {
+        // Without an engine there is nothing to search for, except where
+        // one is promised: CI, or a library named outright.
+        let good = match engine() {
+            Ok(good) => good,
+            Err(e) if ["HARBOR_LIBDUCKDB", "CI"].iter().any(|v| std::env::var_os(v).is_some()) => {
+                panic!("no engine: {e}")
+            }
+            Err(_) => return,
+        };
+        let dir = std::env::temp_dir().join(format!("harbor-search-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join(LIB_NAME);
+        std::fs::write(&bad, b"not a library").unwrap();
+        let missing = dir.join("missing").join(LIB_NAME);
+
+        let found = search(&[missing.clone(), bad.clone(), good.path.clone()]).map(|e| e.path);
+        let refused = search(&[missing, bad.clone()]).err().unwrap_or_default();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(found.unwrap(), good.path);
+        assert!(refused.contains(&format!("failed to load: {}", bad.display())), "{refused}");
     }
 }

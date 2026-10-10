@@ -1,13 +1,16 @@
 #
-# Quick gate — the sub-minute suite, on every PR (and manual runs). It is the
-# only check a pull request shows. The full suite (fuzz, stress, deployment,
-# asserts) is a separate workflow, FullSuite.yml, that runs on main and nightly,
-# so it never appears here as a skipped check.
+# The pull-request gate, on every PR (and manual runs): the quick suites and
+# the unit tests as two jobs side by side, and a Windows build. DuckTable.yml
+# adds `ducktable check`. Every suite runs in FullSuite.yml, on main and
+# nightly, kept out of the PR event so it never shows as a skipped check.
 #
-# The focused suite selection is explicit below; the engine comes from the
-# local composite action (.github/actions/duckdb) — libduckdb and the duckdb
-# CLI from DuckDB's official nightly channel, the current build of the 2.0
-# branch.
+# The engine and its CLI come from the composite action
+# (.github/actions/duckdb), of the build the repository variable
+# DUCKDB_LIB_BUILD names (see scripts/fetch-duckdb.sh).
+#
+# rust-cache saves only from main, where FullSuite.yml saves under the same
+# shared key, and a PR restores what main built: a cache saved from a PR
+# could serve that PR alone.
 #
 name: Tests
 
@@ -38,22 +41,36 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: harbor
+          shared-key: harbor-linux
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-python@v6
         with:
-          # Pinned, not '3.x': the suites run from test/scripts/, so a stdlib
-          # name collision there breaks on newer Pythons — pin for reproducibility.
           python-version: '3.12'
       - uses: ./.github/actions/duckdb
 
-      - name: Build the fixture database
-        run: test/scripts/fixture.sh sample.duckdb
-
       - name: Quick suites
-        run: make test SUITES="unit lifecycle types spec catalog sessions cancel"
+        run: make test SUITES="regressions lifecycle types spec catalog sessions cancel"
 
-      - name: Server log on failure
-        if: failure()
-        run: cat /tmp/harbor-check.*/server.log 2>/dev/null || true
+  # The unit tests include justhttp's timeout tests, which wait out the
+  # server's own clocks for over a minute. Beside the quick suites rather
+  # than ahead of them, they add nothing to the gate's wall time.
+  unit:
+    name: unit tests
+    runs-on: ubuntu-latest
+    env:
+      DUCKDB_LIB_BUILD: ${{ vars.DUCKDB_LIB_BUILD }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: harbor
+          shared-key: harbor-linux
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/duckdb
+
+      - name: Unit tests
+        run: make unit
 
   # Windows has no unix sockets, so the list, spawn-on-use and joining by
   # name all have nothing to read there. This job proves what Windows does

@@ -1,5 +1,5 @@
-//! Regression test for the bounded body drain (the DoS fix carried in this
-//! crate): dropping a request whose declared Content-Length is huge must NOT
+//! Regression tests for the bounded body drain, a hardening behavior of this
+//! crate: dropping a request whose declared Content-Length is huge must NOT
 //! allocate anywhere near the declared size. Lives in its own file so the
 //! measuring global allocator sees only this test.
 
@@ -11,10 +11,15 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 // (deliberately no shared support module: this binary must stay
 // allocation-quiet apart from the code under test)
 fn new_one_server_one_client() -> (justhttp::Server, std::net::TcpStream) {
-    let server = justhttp::Server::http("0.0.0.0:0").unwrap();
-    let port = server.server_addr().to_ip().unwrap().port();
-    let client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let server = justhttp::Server::http("127.0.0.1:0").unwrap();
+    let justhttp::ListenAddr::Ip(addr) = server.server_addr() else { unreachable!() };
+    let client = std::net::TcpStream::connect(addr).unwrap();
     (server, client)
+}
+
+fn recv(server: &justhttp::Server) -> justhttp::Request {
+    let timeout = std::time::Duration::from_secs(30);
+    server.recv_timeout(timeout).unwrap().expect("no request within 30s")
 }
 
 struct MaxAlloc;
@@ -44,7 +49,7 @@ fn big_declared_body_dropped_unread() {
     )
     .unwrap();
 
-    let rq = server.recv().unwrap();
+    let rq = recv(&server);
 
     // half-close so the drain sees EOF instead of blocking for the rest
     client.shutdown(Shutdown::Write).unwrap();
@@ -66,10 +71,9 @@ fn big_declared_body_dropped_unread() {
 }
 
 /// The drain must also be bounded in TIME, not only in buffer size: a client
-/// that keeps dribbling bytes kept every read succeeding, so the loop followed
-/// the declared length forever — on the thread that handled the request, and
-/// after the response, so six of them
-/// took every harbor worker and the berth stopped answering at all.
+/// that keeps dribbling bytes keeps every read succeeding, so an unbounded
+/// loop follows the declared length forever, on the thread that handled the
+/// request and after the response, and six of them take every harbor worker.
 ///
 /// And when it gives up it must END THE CONNECTION. The stream is left at an
 /// offset neither side agrees on, so the bytes still in flight would otherwise
@@ -85,7 +89,7 @@ fn dribbling_body_does_not_hold_the_drain_forever() {
     )
     .unwrap();
 
-    let rq = server.recv().unwrap();
+    let rq = recv(&server);
 
     // A second thread dribbles a byte at a time, well inside any per-read
     // socket timeout, for far longer than the drain is allowed to run.
@@ -131,13 +135,12 @@ fn dribbling_body_does_not_hold_the_drain_forever() {
 /// A version this server does not speak must be refused WITHOUT stranding the
 /// connection.
 ///
-/// The 505 path used to take a second writer from the sink while the request
-/// still held the first. A sequential writer blocks on its predecessor's
-/// release before its first byte, and that predecessor could only drop after
-/// the write returned — so the thread parked forever, holding its descriptors,
-/// in a channel wait no socket timeout covers. One
-/// `GET / HTTP/2.0` leaked a thread and three descriptors permanently, and a
-/// client merely attempting HTTP/2 tripped it by accident.
+/// Answering the 505 through a second writer from the sink, while the request
+/// holds the first, parks the thread forever: a sequential writer blocks on
+/// its predecessor's release before its first byte, and that predecessor can
+/// only drop after the write returns. That wait is a channel no socket timeout
+/// covers, so one `GET / HTTP/2.0` would leak a thread and its descriptor,
+/// and a client merely attempting HTTP/2 would trip it.
 #[test]
 fn an_unsupported_version_is_refused_without_stranding_the_thread() {
     use std::sync::mpsc;

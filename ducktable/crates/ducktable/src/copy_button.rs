@@ -5,7 +5,7 @@
 //! stay inside.
 //!
 //! Liftable to another app with `theme::pal` and the `icon_tile` chassis
-//! (grid.rs) it renders with, plus the copy/check icon assets.
+//! (chrome.rs) it renders with, plus the copy/check icon assets.
 
 use crate::theme::pal;
 use gpui_kit::*;
@@ -24,7 +24,7 @@ enum Phase {
 // How long the green check DWELLS before reverting — a readability budget,
 // not a motion one (see docs/DESIGN.md, Motion). You initiated the copy and are
 // looking right at it, so you register the check in <100ms; ~1.2s is
-// un-missable without overstaying (1.6s + the fade read as "stuck").
+// un-missable without overstaying; longer starts to read as stuck.
 const HOLD_MS: u64 = 1200;
 // The revert crossfade is an in-place micro-fade: one shared duration with
 // the rest of the app's small fades, so they can't drift.
@@ -33,15 +33,15 @@ const FADE_MS: u64 = crate::chrome::QUICK_FADE_MS;
 pub(crate) struct CopyButton {
     /// Tooltip label in the resting state ("Copy DDL").
     label: &'static str,
-    text: String,
+    text: SharedString,
     phase: Phase,
     /// A rapid re-copy restarts the flash; only its own timers advance it.
     seq: u64,
 }
 
 impl CopyButton {
-    pub(crate) fn new(label: &'static str, text: String) -> Self {
-        Self { label, text, phase: Phase::Rest, seq: 0 }
+    pub(crate) fn new(label: &'static str, text: impl Into<SharedString>) -> Self {
+        Self { label, text: text.into(), phase: Phase::Rest, seq: 0 }
     }
 }
 
@@ -72,7 +72,7 @@ impl Render for CopyButton {
                 .into_any_element(),
             })
             .on_click(cx.listener(move |this, _, _, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
                 this.phase = Phase::Copied;
                 this.seq += 1;
                 let seq = this.seq;

@@ -7,13 +7,13 @@ bench.py — is this harbor faster than that harbor, and can we trust the answer
     test/scripts/bench.py --rounds 9 --shapes ints,heavy
 
 Every binary serves its own fresh database on its own port, all servers up for
-the whole run, and each round times every (shape, binary) pair with the binary
-order rotated per round. The rotation is the point: measurements taken
-sequentially — all of binary A, then all of binary B — pick up whatever the
-machine was doing during each binary's turn, and a bisect run that way once
-fingered an innocent commit. Interleaving spreads background noise across all
-binaries evenly, so it cancels out of the comparison instead of settling into
-one column.
+the whole run under a HARBOR_HOME of the bench's own, and each round times
+every (shape, binary) pair with the binary order rotated per round. The
+rotation is the point: measurements taken sequentially — all of binary A, then
+all of binary B — pick up whatever the machine was doing during each binary's
+turn, enough for a bisect to finger an innocent commit. Interleaving spreads
+background noise across all binaries evenly, so it cancels out of the
+comparison instead of settling into one column.
 
 Two clocks per request, because they disagree in useful ways: wall time is
 what a client feels, and the server's own timeMs (from the end object) is
@@ -21,9 +21,9 @@ immune to client-side and transport noise. When the two diverge, the problem
 is not in the encoder.
 
 The shape matrix exists because query shapes fail differently. A fetch-path
-change once made streaming 6x faster and compute-heavy queries 17x slower,
-and the streaming-only benchmarks of the day called it a pure win. Every
-shape here earned its place by catching something:
+change can make streaming 6x faster and compute-heavy queries 17x slower at
+once, and a streaming-only benchmark calls that a pure win. Every shape here
+earns its place by catching something:
 
     point    server round-trip floor, no data to speak of
     ints     cheap production, encoder-bound: the integer hot path
@@ -43,6 +43,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import statistics
 import subprocess
 import sys
@@ -58,7 +59,12 @@ SHAPES = [
     ("heavy", "SELECT count(DISTINCT i) FROM range(100000000) t(i)"),
 ]
 
-BASE_PORT = 18800
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
 
 
 class Server:
@@ -157,11 +163,16 @@ def main():
         print(f"bench: WARNING load average {load:.1f} on {cores} cores — "
               f"results will be noisy, prefer a quiet machine")
 
-    workdir = tempfile.mkdtemp(prefix="harbor-bench.")
+    # Under /tmp, short: the servers' sockets live in $HARBOR_HOME and must fit
+    # a 104-byte sockaddr_un. A HARBOR_HOME of its own keeps the bench's
+    # servers out of the operator's fleet, whatever the environment says.
+    workdir = tempfile.mkdtemp(prefix="hb-bench.", dir="/tmp")
+    os.environ["HARBOR_HOME"] = os.path.join(workdir, "home")
+    os.mkdir(os.environ["HARBOR_HOME"])
     servers = []
     try:
-        for i, b in enumerate(binaries):
-            s = Server(b, BASE_PORT + i, workdir)
+        for b in binaries:
+            s = Server(b, free_port(), workdir)
             servers.append(s)
             if not s.ready():
                 sys.exit(f"bench: {b} did not come up — see {s.log.name}")
@@ -198,9 +209,9 @@ def main():
                 wall_ms = sorted(w * 1000 for w, _ in samples)
                 median = statistics.median(server_ms)
                 # min matters as much as median: a bimodal engine pathology
-                # (the v2 alpha's nap-race makes ~1 in 3 heavy runs ~20x
-                # slower) can land the median on either mode, but the min is
-                # the machine's honest capability.
+                # (DuckDB's nap race, duckdb#25282, makes ~1 in 3 heavy runs
+                # ~20x slower) can land the median on either mode, but the
+                # min is the machine's honest capability.
                 spread = (max(server_ms) / min(server_ms)) if min(server_ms) > 0 else 1.0
                 if spread > 2.0:
                     noisy = True

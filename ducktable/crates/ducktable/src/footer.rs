@@ -1,9 +1,12 @@
-//! The grid's bottom bar (DESIGN.md "Bottom bar", design.css `.bbar`):
-//! view switcher, filter toggle, Columns popover, pager, and the
-//! right-anchored status line. An `impl Grid` satellite, the same shape
-//! as `inspector.rs` and `structure.rs` — per-table controls, a
-//! different scope from the header strip's global display prefs.
+//! The content pane's bottom bar (DESIGN.md "Bottom bar", design.css
+//! `.bbar`): the view switcher, the Data view's own controls (filter toggle,
+//! Columns popover, Add Row and the staging story), and the right-anchored
+//! status line and pager. The app renders it under whichever surface shows
+//! (content.rs), and it describes that surface's grid: the table's, or the
+//! Query view's results grid. The Data view's controls are an `impl Grid`
+//! satellite, the same shape as `inspector.rs` and `structure.rs`.
 
+use crate::app::DuckTable;
 use crate::chrome::{icon_tile, seg_sep, seg_tile};
 use crate::grid::Grid;
 use crate::prefs::ViewMode;
@@ -24,10 +27,9 @@ fn vtext(v: &serde_json::Value) -> String {
     }
 }
 
-/// What the footer's right-anchored cluster renders from — computed off
-/// whichever grid the current view shows: the Data view's own, or the
-/// Query view's embedded results grid. Both are Grids; the footer does
-/// not care which.
+/// What the footer's right-anchored cluster renders from, read off the grid
+/// the view shows.
+#[derive(Clone, Debug, Default)]
 pub(crate) struct FooterFacts {
     pub(crate) ms: u64,
     pub(crate) count: usize,
@@ -40,6 +42,74 @@ pub(crate) struct FooterFacts {
     pub(crate) can_next: bool,
     pub(crate) can_last: bool,
     pub(crate) pageable: bool,
+}
+
+/// What the status line shows: the leading text (time and row range, a
+/// loading line, or the Query view's own word), the column count, and
+/// whether the pager is there.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Status {
+    pub(crate) prefix: Option<String>,
+    pub(crate) columns: Option<String>,
+    pub(crate) pager: bool,
+}
+
+/// The status line for `view`, from its grid's facts (None when it has no
+/// grid: no table chosen, or no result yet) and the Query view's own word
+/// (`QueryView::status_override`: a ticking run, a note, a resultless
+/// statement's "ok"), which outranks the grid's stats while it speaks.
+pub(crate) fn status(view: ViewMode, facts: Option<&FooterFacts>, says: Option<String>) -> Status {
+    let rows = |f: &FooterFacts| {
+        let base = f.page * f.page_size;
+        let (first, last) = (commas(base as u64 + 1), commas((base + f.count) as u64));
+        match (f.count, f.total) {
+            (0, _) => "0 rows".to_string(),
+            (_, Some(total)) => format!("{first}\u{2013}{last} of {} rows", commas(total)),
+            (_, None) => format!("{first}\u{2013}{last} rows"),
+        }
+    };
+    let verdict = facts.map(|f| format!("{} \u{00b7} {}", crate::util::human(f.ms as f64 / 1000., "s"), rows(f)));
+    let columns = facts.map(|f| format!("{} {}", f.cols, if f.cols == 1 { "column" } else { "columns" }));
+    let loading = view == ViewMode::Data && facts.is_some_and(|f| f.loading && f.count == 0);
+    // The pager holds its ground in the Query view even while a run's
+    // ticking word speaks (always-present chrome); it stays home only for
+    // a statement that cannot page, and with no result.
+    let pager = match view {
+        ViewMode::Data => facts.is_some() && !loading,
+        ViewMode::Query => facts.is_some_and(|f| f.pageable),
+        ViewMode::Structure => false,
+    };
+    let quiet = says.is_some();
+    Status {
+        prefix: match view {
+            ViewMode::Data if loading => Some("loading...".to_string()),
+            ViewMode::Data => verdict,
+            ViewMode::Query => says.or(verdict),
+            ViewMode::Structure => None,
+        },
+        // Structure lists its columns with nothing beside them; while the
+        // Query view's word speaks, the grid's column count stays quiet.
+        columns: match view {
+            ViewMode::Structure => columns,
+            ViewMode::Data if pager => columns,
+            ViewMode::Query if !quiet => columns,
+            _ => None,
+        },
+        pager,
+    }
+}
+
+/// Why a table's grid takes no edits, said where the eye rests
+/// (docs/EDITING.md: a refusal is stated, never a mystery). `pk_cols` is
+/// the identity the grid asked for: the table's key, `rowid` for a table
+/// without one, or nothing for a keyless table with a column of its own
+/// named `rowid`, which hides DuckDB's.
+pub(crate) fn read_only_reason(pk_cols: &[String]) -> &'static str {
+    if pk_cols.is_empty() {
+        "read-only \u{00b7} no key, and a column named rowid"
+    } else {
+        "read-only \u{00b7} its key is not among the columns read"
+    }
 }
 
 impl Grid {
@@ -60,196 +130,37 @@ impl Grid {
         }
     }
 
-    pub(crate) fn footer(&self, cx: &mut Context<Self>) -> Div {
+    /// The Data view's controls beside the switcher: the filter toggle,
+    /// the Columns popover, Add Row, and the staging story — the verb-split
+    /// count while changes wait, "committing…" while the transaction runs,
+    /// or why the table is read-only.
+    pub(crate) fn data_controls(&self, cx: &mut Context<Self>) -> Div {
         let t = pal(cx);
-        let view = crate::prefs::get(cx).view;
-        // The grid this footer describes. The Query view may have none
-        // yet (no run, or a resultless statement) — then only the query
-        // view's own status override speaks.
-        let qgrid = (view == ViewMode::Query)
-            .then(|| self.query_results_grid(cx))
-            .flatten();
-        let facts = match (view, &qgrid) {
-            (ViewMode::Query, Some(g)) => Some(g.read(cx).footer_facts(cx)),
-            (ViewMode::Query, None) => None,
-            _ => Some(self.footer_facts(cx)),
-        };
-        // The Query view's transient voice — ticking "running…", a
-        // note, or a resultless statement's "ok · N ms" — outranks the
-        // grid stats while it has something to say.
-        let qoverride = (view == ViewMode::Query)
-            .then(|| {
-                self.query_view.as_ref().and_then(|q| q.read(cx).status_override())
-            })
-            .flatten();
+        let (count, cols, loading) = self.table_facts(cx);
         let filter_open = self.filter_input.is_some();
-        let rows_part = facts.as_ref().map(|f| {
-            let base = f.page * f.page_size;
-            let (first, last) = (base + 1, base + f.count);
-            if f.count == 0 {
-                "0 rows".to_string()
-            } else {
-                match f.total {
-                    Some(t) => format!(
-                        "{}\u{2013}{} of {} rows",
-                        commas(first as u64),
-                        commas(last as u64),
-                        commas(t)
-                    ),
-                    None => format!(
-                        "{}\u{2013}{} rows",
-                        commas(first as u64),
-                        commas(last as u64)
-                    ),
-                }
-            }
-        });
-        // Ordering rule for a jitter-free footer: in a right-justified
-        // cluster an element only moves when something to its RIGHT
-        // changes width. The pager — the only interactive element — is
-        // therefore RIGHTMOST: constant-width glyphs pinned to the
-        // corner, so neither page flips nor table switches ever move the
-        // click targets ("N per" grows only when the user cycles it).
-        // "N columns" sits just left of it, beside the row range it
-        // describes; the per-page variables (ms, range) stay leftmost.
-        // Table switches shift only text whose content changed anyway.
-        // The columns text is its OWN node — as a suffix of one longer
-        // string its glyphs land a subpixel differently and the view
-        // switch shows a 1px shift.
-        let columns_part = facts.as_ref().map(|f| {
-            format!("{} {}", f.cols, if f.cols == 1 { "column" } else { "columns" })
-        });
-        let verdict = facts.as_ref().map(|f| {
-            format!(
-                "{} \u{00b7} {}",
-                crate::util::human(f.ms as f64 / 1000., "s"),
-                rows_part.clone().unwrap_or_default()
-            )
-        });
-        let loading_empty = view == ViewMode::Data
-            && facts.as_ref().is_some_and(|f| f.loading && f.count == 0);
-        let pager_visible = match view {
-            ViewMode::Data => !loading_empty,
-            // The pager holds its ground even while a run's ticking
-            // override speaks (always-present chrome); it only stays
-            // home for unpageable statements and empty scratchpads.
-            ViewMode::Query => facts.as_ref().is_some_and(|f| f.pageable),
-            ViewMode::Structure => false,
-        };
-        let status_prefix = match view {
-            ViewMode::Data if loading_empty => Some("loading...".to_string()),
-            ViewMode::Data => verdict,
-            ViewMode::Query => qoverride.clone().or(verdict),
-            ViewMode::Structure => None,
-        };
-        // Structure lists its columns with no prefix beside them; while
-        // the query override speaks, the grid's column count stays quiet.
-        let status_columns = match view {
-            ViewMode::Structure => columns_part,
-            ViewMode::Data if pager_visible => columns_part,
-            ViewMode::Query if qoverride.is_none() => columns_part,
-            _ => None,
-        };
-        let (can_prev, can_next, can_last, per) = facts
-            .as_ref()
-            .map(|f| (f.can_prev, f.can_next, f.can_last, f.page_size))
-            .unwrap_or((false, false, false, 0));
-        let dotted = status_prefix.is_some();
+        let (inserts, updates, deletes) = self.edits.as_ref().map(|e| e.counts()).unwrap_or((0, 0, 0));
         div()
             .h_flex()
-            .h(px(38.))
-            .flex_none()
             .items_center()
-            // Left inset matches the title strip and the grid text
-            // (PANE_INSET), so the view switcher sits on the same axis as
-            // everything above it.
-            .pl(px(PANE_INSET))
-            .pr(px(10.))
-            .bg(t.raised)
-            .border_t_1()
-            // The pane's bottom frame line — the grid-line slot, like
-            // every line that frames the data surface (red-audit
-            // ruling, 2026-09-01).
-            .border_color(t.grid_line)
+            // The filter toggle sits by the view switcher; accent when a
+            // filter is ACTIVE, not just open.
             .child(
-                // design.css `.seg`: the active fill runs flush to the
-                // track's edges. gpui does not clip child backgrounds to
-                // the track's radius, so each end segment carries its own
-                // matching outer corners (nested radius = track radius -
-                // border).
-                div()
-                    .h_flex()
-                    .flex_none()
-                    .rounded(px(8.))
-                    .bg(t.surface)
-                    .border_1()
-                    .border_color(t.border)
-                    .child(seg_tile(
-                        "view-structure",
-                        "Structure",
-                        view == ViewMode::Structure,
-                        (true, false),
-                        t,
-                        cx.listener(|_, _, _, cx| {
-                            crate::prefs::toggle(cx, |p| p.view = ViewMode::Structure);
-                        }),
-                    ))
-                    .child(seg_sep(t))
-                    // Structure, Data, Query — what it is, what it holds,
-                    // what you ask (Sequel Pro's arc). Data, the default
-                    // and hub, sits center: one ⌥-arrow from each side.
-                    .child(seg_tile(
-                        "view-data",
-                        "Data",
-                        view == ViewMode::Data,
-                        (false, false),
-                        t,
-                        cx.listener(|_, _, _, cx| {
-                            crate::prefs::toggle(cx, |p| p.view = ViewMode::Data);
-                        }),
-                    ))
-                    .child(seg_sep(t))
-                    .child(seg_tile(
-                        "view-query",
-                        "Query",
-                        view == ViewMode::Query,
-                        (false, true),
-                        t,
-                        cx.listener(|_, _, _, cx| {
-                            crate::prefs::toggle(cx, |p| p.view = ViewMode::Query);
-                        }),
-                    )),
+                icon_tile("toggle-filter", 22., true, t)
+                    .ml_2()
+                    .tooltip(|window, cx| Tooltip::new("Filter (raw SQL WHERE)").build(window, cx))
+                    .child(
+                        svg().path("icons/funnel.svg").size_3p5().text_color(
+                            if self.filter.is_some() || filter_open { t.accent } else { t.muted },
+                        ),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_filter_strip(window, cx);
+                    })),
             )
-            .when(view == ViewMode::Data, |d| {
-                // The filter toggle sits by the view switcher; accent
-                // when a filter is ACTIVE, not just open.
-                d.child(
-                    icon_tile("toggle-filter", 22., true, t)
-                        .ml_2()
-                        .tooltip(|window, cx| {
-                            Tooltip::new("Filter (raw SQL WHERE)").build(window, cx)
-                        })
-                        .child(
-                            svg()
-                                .path("icons/funnel.svg")
-                                .size_3p5()
-                                .text_color(if self.filter.is_some() || filter_open {
-                                    t.accent
-                                } else {
-                                    t.muted
-                                }),
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.toggle_filter_strip(window, cx);
-                        })),
-                )
-            })
-            .when(view == ViewMode::Data, |d| {
-                // A breath between the funnel and the eye — the tiles
-                // read as separate controls, not a fused cluster.
-                d.child(div().ml_1().child(self.columns_popover(cx)))
-            })
-            .when(view == ViewMode::Data && self.edits.is_some(), |d| {
+            // A breath between the funnel and the eye: the tiles read as
+            // separate controls, not a fused cluster.
+            .child(div().ml_1().child(self.columns_popover(cx)))
+            .when(self.edits.is_some(), |d| {
                 d.child(
                     gpui_kit::component::button::Button::new("add-row")
                         .icon(gpui_kit::component::IconName::Plus)
@@ -262,44 +173,94 @@ impl Grid {
                         })),
                 )
             })
-            // The staging story, told where the eye rests between edits:
-            // the verb-split count while changes wait, "committing…"
-            // while the transaction runs, or the read-only reason when
-            // there is no primary key to key changes by (docs/EDITING.md
-            // — a refusal is stated, never a mystery).
-            .when(view == ViewMode::Data, |d| {
-                let (inserts, updates, deletes) =
-                    self.edits.as_ref().map(|e| e.counts()).unwrap_or((0, 0, 0));
+            .map(|d| {
+                let note = |text: &'static str| div().ml_2().text_xs().text_color(t.muted).child(text);
                 if self.committing {
-                    d.child(
-                        div()
-                            .ml_2()
-                            .text_xs()
-                            .text_color(t.muted)
-                            .child("committing\u{2026}"),
-                    )
+                    d.child(note("committing\u{2026}"))
                 } else if inserts + updates + deletes > 0 {
-                    d.child(
-                        div()
-                            .ml_2()
-                            .child(self.staged_popover(inserts, updates, deletes, cx)),
-                    )
-                } else if self.edits.is_none() && !loading_empty {
-                    d.child(
-                        div()
-                            .ml_2()
-                            .text_xs()
-                            .text_color(t.muted.opacity(0.8))
-                            .child("read-only \u{00b7} no primary key"),
-                    )
+                    d.child(div().ml_2().child(self.staged_popover(inserts, updates, deletes, cx)))
+                } else if self.edits.is_none() && cols > 0 && !(loading && count == 0) {
+                    d.child(note(read_only_reason(&self.pk_cols)).text_color(t.muted.opacity(0.8)))
                 } else {
                     d
                 }
             })
+    }
+}
+
+impl DuckTable {
+    /// The bottom bar under the content pane.
+    pub(crate) fn footer(&self, cx: &mut Context<Self>) -> Div {
+        let t = pal(cx);
+        let view = crate::prefs::get(cx).view;
+        let query = self.query.as_ref().filter(|_| view == ViewMode::Query).map(|q| q.read(cx));
+        let shown = match &query {
+            Some(query) => query.results_grid(),
+            None => self.grid.clone().filter(|_| view != ViewMode::Query),
+        };
+        let says = query.and_then(|q| q.status_override());
+        let facts = shown.as_ref().map(|g| g.read(cx).footer_facts(cx));
+        let status = status(view, facts.as_ref(), says);
+        let facts = facts.unwrap_or_default();
+        let controls = match (&self.grid, view) {
+            (Some(grid), ViewMode::Data) => Some(grid.update(cx, |g, cx| g.data_controls(cx))),
+            _ => None,
+        };
+        let dotted = status.prefix.is_some();
+        // Each segment lands on its view as ⌘1/⌘2/⌘3 do (`go_view`), focus
+        // and all.
+        let segment = |id, label, mode, ends| {
+            seg_tile(id, label, view == mode, ends, t, move |_, _, cx| crate::go_view(mode, cx))
+        };
+        div()
+            .h_flex()
+            .h(px(38.))
+            .flex_none()
+            .items_center()
+            // Left inset matches the title strip and the grid text
+            // (PANE_INSET), so the view switcher sits on the same axis as
+            // everything above it.
+            .pl(px(PANE_INSET))
+            .pr(px(10.))
+            .bg(t.raised)
+            .border_t_1()
+            // The pane's bottom frame line, in the grid-line slot like
+            // every line that frames the data surface.
+            .border_color(t.grid_line)
+            .child(
+                // design.css `.seg`: the active fill runs flush to the
+                // track's edges. gpui does not clip child backgrounds to
+                // the track's radius, so each end segment carries its own
+                // matching outer corners (nested radius = track radius -
+                // border). Structure, Data, Query: what it is, what it
+                // holds, what you ask (Sequel Pro's arc). Data, the default
+                // and hub, sits center.
+                div()
+                    .h_flex()
+                    .flex_none()
+                    .rounded(px(8.))
+                    .bg(t.surface)
+                    .border_1()
+                    .border_color(t.border)
+                    .child(segment("view-structure", "Structure", ViewMode::Structure, (true, false)))
+                    .child(seg_sep(t))
+                    .child(segment("view-data", "Data", ViewMode::Data, (false, false)))
+                    .child(seg_sep(t))
+                    .child(segment("view-query", "Query", ViewMode::Query, (false, true))),
+            )
+            .children(controls)
             .child(div().flex_1())
             .child(
-                // One right-anchored line: ms · range · columns · pager
-                // (see the ordering rule above).
+                // One right-anchored line: ms · range · columns · pager.
+                // In a right-justified cluster an element moves only when
+                // something to its RIGHT changes width, so the pager, the
+                // only interactive element, is rightmost: constant-width
+                // glyphs pinned to the corner, so neither a page flip nor
+                // a table switch moves a click target ("N per" grows only
+                // when the user cycles it). The column count is its OWN
+                // node: as a suffix of a longer string its glyphs land a
+                // subpixel differently, and a view switch shows a 1px
+                // shift.
                 div()
                     .ml_2()
                     .h_flex()
@@ -308,98 +269,54 @@ impl Grid {
                     .gap_2()
                     .text_xs()
                     .text_color(t.muted)
-                    .when_some(status_prefix, |d, text| d.child(div().child(text)))
-                    .when_some(status_columns, |d, text| {
-                        d.when(dotted, |d| d.child(div().child("\u{00b7}")))
-                            .child(div().child(text))
+                    .when_some(status.prefix, |d, text| d.child(div().child(text)))
+                    .when_some(status.columns, |d, text| {
+                        d.when(dotted, |d| d.child(div().child("\u{00b7}"))).child(div().child(text))
                     })
-                    .when(pager_visible, |d| {
+                    .when_some(shown.filter(|_| status.pager), |d, grid| {
                         let arrow = |id: &'static str,
                                      path: &'static str,
-                                     enabled: bool| {
+                                     enabled: bool,
+                                     act: fn(&mut Grid, &mut Context<Grid>)| {
+                            let grid = grid.clone();
                             icon_tile(id, 20., enabled, t)
-                                .text_color(if enabled {
-                                    t.text
-                                } else {
-                                    t.muted.opacity(0.4)
-                                })
+                                .text_color(if enabled { t.text } else { t.muted.opacity(0.4) })
                                 .child(gpui_kit::component::Icon::empty().path(path).size_4())
+                                .on_click(move |_, _, cx| grid.update(cx, act))
                         };
-                        d.child(div().child("\u{00b7}"))
-                            .child(
-                                div()
-                                    .h_flex()
-                                    .items_center()
-                                    .gap_0p5()
-                                    .child(
-                                        arrow(
-                                            "page-first",
-                                            "icons/chevron-first.svg",
-                                            can_prev,
-                                        )
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.pager_dispatch(cx, |g, cx| g.jump_first(cx))
-                                        })),
-                                    )
-                                    .child(
-                                        arrow(
-                                            "page-prev",
-                                            "icons/chevron-left.svg",
-                                            can_prev,
-                                        )
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.pager_dispatch(cx, |g, cx| g.prev_page(cx))
-                                        })),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("page-size")
-                                            .px_1()
-                                            .h(px(20.))
-                                            .h_flex()
-                                            .items_center()
-                                            .rounded(px(4.))
-                                            .cursor_pointer()
-                                            .hover(|d| d.bg(t.row_hover))
-                                            .tooltip(|window, cx| {
-                                                Tooltip::new(
-                                                    "Rows per page \u{2014} \
-                                                     click to change",
-                                                )
-                                                .build(window, cx)
-                                            })
-                                            .child(format!("{} per", commas(per as u64)))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.pager_dispatch(cx, |g, cx| {
-                                                    g.cycle_page_size(cx)
-                                                });
-                                            })),
-                                    )
-                                    .child(
-                                        arrow(
-                                            "page-next",
-                                            "icons/chevron-right.svg",
-                                            can_next,
-                                        )
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.pager_dispatch(cx, |g, cx| g.next_page(cx))
-                                        })),
-                                    )
-                                    .child(
-                                        arrow(
-                                            "page-last",
-                                            "icons/chevron-last.svg",
-                                            can_last,
-                                        )
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.pager_dispatch(cx, |g, cx| g.jump_last(cx))
-                                        })),
-                                    ),
-                            )
+                        d.child(div().child("\u{00b7}")).child(
+                            div()
+                                .h_flex()
+                                .items_center()
+                                .gap_0p5()
+                                .child(arrow("page-first", "icons/chevron-first.svg", facts.can_prev, Grid::jump_first))
+                                .child(arrow("page-prev", "icons/chevron-left.svg", facts.can_prev, Grid::prev_page))
+                                .child({
+                                    let grid = grid.clone();
+                                    div()
+                                        .id("page-size")
+                                        .px_1()
+                                        .h(px(20.))
+                                        .h_flex()
+                                        .items_center()
+                                        .rounded(px(4.))
+                                        .cursor_pointer()
+                                        .hover(|d| d.bg(t.row_hover))
+                                        .tooltip(|window, cx| {
+                                            Tooltip::new("Rows per page \u{2014} click to change").build(window, cx)
+                                        })
+                                        .child(format!("{} per", commas(facts.page_size as u64)))
+                                        .on_click(move |_, _, cx| grid.update(cx, Grid::cycle_page_size))
+                                })
+                                .child(arrow("page-next", "icons/chevron-right.svg", facts.can_next, Grid::next_page))
+                                .child(arrow("page-last", "icons/chevron-last.svg", facts.can_last, Grid::jump_last)),
+                        )
                     }),
             )
     }
+}
 
+impl Grid {
     /// The staged-changes chip and its review popover: the count is the
     /// trigger, the audit is pull-based (docs/EDITING.md). Each entry
     /// lists its diffs (`column: old → new`) with a per-entry discard;
@@ -877,5 +794,58 @@ impl Grid {
                     .child(rows)
                     .into_any_element()
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the glob would bring in gpui's `test` attribute.
+    use super::{read_only_reason, status, FooterFacts, Status};
+    use crate::prefs::ViewMode;
+
+    fn page(count: usize, total: Option<u64>) -> FooterFacts {
+        FooterFacts { ms: 1, count, cols: 9, page_size: 500, total, pageable: true, ..Default::default() }
+    }
+
+    #[test]
+    fn the_status_line_describes_the_grid_the_view_shows() {
+        let rows = page(500, Some(5_410));
+        assert_eq!(
+            status(ViewMode::Data, Some(&rows), None),
+            Status {
+                prefix: Some("1ms \u{b7} 1\u{2013}500 of 5,410 rows".into()),
+                columns: Some("9 columns".into()),
+                pager: true,
+            }
+        );
+        // A first page on its way says so, and nothing else.
+        let loading = FooterFacts { loading: true, ..page(0, None) };
+        assert_eq!(
+            status(ViewMode::Data, Some(&loading), None),
+            Status { prefix: Some("loading...".into()), columns: None, pager: false }
+        );
+        // No table chosen, or no result yet: the switcher alone.
+        let empty = Status { prefix: None, columns: None, pager: false };
+        assert_eq!(status(ViewMode::Data, None, None), empty);
+        assert_eq!(status(ViewMode::Query, None, None), empty);
+        // Structure lists the columns alone.
+        assert_eq!(
+            status(ViewMode::Structure, Some(&rows), None),
+            Status { prefix: None, columns: Some("9 columns".into()), pager: false }
+        );
+        // The Query view's word outranks the result's stats and quiets its
+        // column count; the pager holds its ground for a result that pages.
+        let said = status(ViewMode::Query, Some(&rows), Some("running\u{2026} 1.2s".into()));
+        assert_eq!(said, Status { prefix: Some("running\u{2026} 1.2s".into()), columns: None, pager: true });
+        let whole = FooterFacts { pageable: false, ..page(3, Some(3)) };
+        assert!(!status(ViewMode::Query, Some(&whole), None).pager);
+        assert_eq!(status(ViewMode::Query, None, Some("ok \u{b7} 2ms".into())).prefix.as_deref(), Some("ok \u{b7} 2ms"));
+        assert_eq!(status(ViewMode::Data, Some(&page(0, Some(0))), None).prefix.as_deref(), Some("1ms \u{b7} 0 rows"));
+    }
+
+    #[test]
+    fn a_read_only_table_says_why() {
+        assert_eq!(read_only_reason(&[]), "read-only \u{b7} no key, and a column named rowid");
+        assert_eq!(read_only_reason(&["id".to_string()]), "read-only \u{b7} its key is not among the columns read");
     }
 }

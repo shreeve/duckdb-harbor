@@ -4,9 +4,6 @@
 //! kind of thing an entry is follows from which key it sets:
 //!
 //! ```toml
-//! [defaults]
-//! mode      = "duckbox"     # the client's taste
-//!
 //! [connection.medlabs]      # has `path` -> a local berth, harbor can start it
 //! path = "~/Data/Code/medlabs/api/db/medlabs.duckdb"
 //! memory-limit = "8GB"      # typed tuning fields mirror `harbor start` flags
@@ -27,7 +24,8 @@
 //! settings — memory, threads, boot SQL, extensions — so starting it honors
 //! them without flags. A config anyone else can write is refused whole
 //! before any of it is read, since a berth's `init` runs SQL and `LOAD`
-//! runs code.
+//! runs code. A key harbor does not know is an error naming it, never a
+//! setting quietly dropped.
 //!
 //! Every berth key that harbor acts on is the matching `harbor start` flag
 //! with the dashes stripped, so there is no second dialect to learn.
@@ -43,35 +41,7 @@ use std::path::PathBuf;
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct FileConfig {
     #[serde(default)]
-    pub defaults: Defaults,
-    #[serde(default)]
     pub connection: HashMap<String, Connection>,
-}
-
-#[derive(Deserialize, Default, Debug)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub struct Defaults {
-    // --- the client: how output looks --------------------------------------
-    pub mode: Option<String>,
-    pub timer: Option<bool>,
-    pub maxrows: Option<usize>,
-    pub nullvalue: Option<String>,
-    /// duck | mono | vivid
-    pub theme: Option<String>,
-    /// auto | light | dark — `auto` asks the terminal for its background.
-    pub appearance: Option<String>,
-    /// auto | always | never. `NO_COLOR` in the environment beats all three.
-    pub color: Option<String>,
-    /// What the bare client opens. Unset, it lists what is openable
-    /// instead — deliberately, rather than connecting to the only berth when
-    /// there happens to be one, which would make adding a second database
-    /// silently change what the command does.
-    pub connection: Option<String>,
-
-    // --- harbor: how a berth is started ------------------------------------
-    pub memory_limit: Option<String>,
-    pub workers: Option<usize>,
-    pub threads: Option<usize>,
 }
 
 #[derive(Deserialize, Default, Debug, Clone)]
@@ -240,10 +210,17 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Missing(p) => write!(f, "no config file at {}", p.display()),
+            Error::Refused { file, offender } if file == offender => write!(
+                f,
+                "{} is writable by others or not yours — chmod go-w {}",
+                file.display(),
+                file.display()
+            ),
             Error::Refused { file, offender } => write!(
                 f,
-                "ignoring {} — {} is writable by others or not yours (chmod go-w it)",
+                "{} is refused: its directory {} is writable by others or not yours — chmod go-w {}",
                 file.display(),
+                offender.display(),
                 offender.display()
             ),
             Error::Invalid { file, why } => write!(f, "{} is not valid: {why}", file.display()),
@@ -255,7 +232,25 @@ impl std::fmt::Display for Error {
 /// Schema-check a candidate config text — the gate a writer runs BEFORE the
 /// bytes land, so an edit can never leave behind a file `load` will refuse.
 pub fn parse(text: &str) -> Result<FileConfig, String> {
-    toml::from_str(text).map_err(|e| e.to_string()).and_then(normalize_keys)
+    match toml::from_str(text) {
+        Ok(cfg) => normalize_keys(cfg),
+        // A section with no reader is named with what to do about it: the
+        // generic answer lists the keys that are allowed, not the fix.
+        Err(_) if text.parse::<toml::Table>().is_ok_and(|t| t.contains_key("defaults")) => {
+            Err("its [defaults] section is read by nothing: delete that section".into())
+        }
+        // One line, where the parser's own text runs to five with a drawing
+        // of the line: a server's refusal is read from the last lines of its
+        // log, and the place and the reason must both be in them.
+        Err(e) => Err(match e.span() {
+            Some(at) => {
+                let before = text.get(..at.start).unwrap_or(text);
+                let column = before.chars().rev().take_while(|&c| c != '\n').count() + 1;
+                format!("line {}, column {column}: {}", before.matches('\n').count() + 1, e.message())
+            }
+            None => e.message().to_string(),
+        }),
+    }
 }
 
 /// The name law, applied at the door: a section key is the operator's
@@ -300,9 +295,7 @@ pub fn load() -> Result<FileConfig, Error> {
             return Err(Error::Refused { file: file.clone(), offender: p.clone() });
         }
     }
-    let cfg: FileConfig = toml::from_str(&text)
-        .map_err(|e| Error::Invalid { file: file.clone(), why: e.to_string() })?;
-    normalize_keys(cfg).map_err(|why| Error::Invalid { file, why })
+    parse(&text).map_err(|why| Error::Invalid { file, why })
 }
 
 #[cfg(test)]
@@ -324,9 +317,6 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = r#"
-        [defaults]
-        mode = "duckbox"
-
         [connection.medlabs]
         path = "~/Data/Code/medlabs/api/db/medlabs.duckdb"
 
@@ -345,8 +335,6 @@ mod tests {
     #[test]
     fn one_namespace_two_kinds() {
         let c: FileConfig = toml::from_str(SAMPLE).unwrap();
-        assert_eq!(c.defaults.mode.as_deref(), Some("duckbox"));
-
         let berths: Vec<_> = c.berths().iter().map(|(n, _)| *n).collect();
         assert_eq!(berths, ["medlabs", "warehouse"]);
         let remotes: Vec<_> = c.remotes().iter().map(|(n, _)| *n).collect();
@@ -386,8 +374,18 @@ mod tests {
     fn unknown_keys_are_an_error_not_a_silent_typo() {
         // `default-address-pool` vs `default-address-pools` cost Docker users
         // years. A misspelled key here is a hard error naming the key.
-        let e = toml::from_str::<FileConfig>("[connection.x]\npth = \"/a.duckdb\"\n");
-        assert!(e.is_err());
+        let e = parse("[connection.x]\npth = \"/a.duckdb\"\n").unwrap_err();
+        assert!(e.contains("pth"), "{e}");
+        // On one line, with where: a server's log is read by its last lines.
+        assert!(e.starts_with("line 2, column 1: unknown field `pth`") && !e.contains('\n'), "{e}");
+    }
+
+    /// A section nothing reads is refused like any unknown key, and the
+    /// refusal says exactly what to delete.
+    #[test]
+    fn a_defaults_section_is_refused_with_the_fix() {
+        let e = parse("[defaults]\nmode = \"csv\"\n\n[connection.m]\npath = \"/m.duckdb\"\n").unwrap_err();
+        assert!(e.contains("[defaults]") && e.contains("delete that section"), "{e}");
     }
 
     #[test]

@@ -4,10 +4,10 @@ spec.py — assert the encoding harbor produces, spelled out.
 
     test/scripts/spec.py --port 9499
 
-This suite proves the answer on the wire is the right one, straight from
-SPEC. An implementation that misreads SPEC §5.4 agrees with itself
-perfectly; only expectations written from the spec catch it, and that is
-the whole reason this file exists.
+This suite is the wire encoding's specification, and proves the answer on
+the wire is the right one. An encoder that misreads a type agrees with
+itself perfectly; only expectations written independently catch it, and
+that is the whole reason this file exists.
 
 Every expectation below is written out by hand from the SQL literal, not
 captured from a run. Capturing output and calling it an expectation only
@@ -123,6 +123,25 @@ CASES = [
     ("date-leap-2024", "SELECT '2024-02-29'::DATE AS v",              "DATE", True, "2024-02-29"),
     ("date-year-1",    "SELECT '0001-01-01'::DATE AS v",              "DATE", True, "0001-01-01"),
     ("date-year-9999", "SELECT '9999-12-31'::DATE AS v",              "DATE", True, "9999-12-31"),
+    # Before 1 AD the year is ISO 8601's astronomical one: 1 BC is 0000. A
+    # year before 0 takes the expanded form, a minus and six digits, which a
+    # JavaScript Date reads (it reads -0043 as 2043) and DuckDB reads back:
+    # 44 BC is -000043. A year past 9999 is its bare digits, as DuckDB writes
+    # it, since DuckDB refuses the +010000 JavaScript would want.
+    ("date-1-bc",      "SELECT '0001-01-01 (BC)'::DATE AS v",         "DATE", True, "0000-01-01"),
+    ("date-44-bc",     "SELECT '0044-03-15 (BC)'::DATE AS v",         "DATE", True, "-000043-03-15"),
+    ("ts-44-bc",       "SELECT '0044-03-15 (BC) 12:00:00'::TIMESTAMP AS v",
+                       "TIMESTAMP", True, "-000043-03-15T12:00:00"),
+    ("date-10000",     "SELECT '10000-01-01'::DATE AS v",             "DATE", True, "10000-01-01"),
+    ("ts-10000",       "SELECT '10000-01-01 00:00:00'::TIMESTAMP AS v",
+                       "TIMESTAMP", True, "10000-01-01T00:00:00"),
+    # DuckDB reads the negative form back (and refuses the + of the other).
+    ("date-readback",  "SELECT '-000043-03-15T12:00:00'::TIMESTAMP = TIMESTAMP '0044-03-15 (BC) 12:00:00' AS v",
+                       "BOOLEAN", True, True),
+    # The literal one past HUGEINT's largest is the engine's UHUGEINT, and
+    # goes out as a string like every integer past 2^53.
+    ("uhugeint-literal", "SELECT 170141183460469231731687303715884105728 AS v",
+                       "UHUGEINT", True, "170141183460469231731687303715884105728"),
     # An infinite date is a sentinel in storage, the type's largest value.
     # Formatted as a date it reads as a real one millennia out, so it goes
     # out as the word the engine prints and parses back.
@@ -133,6 +152,10 @@ CASES = [
     ("ts-ns-inf",      "SELECT 'infinity'::TIMESTAMP_NS AS v",        "TIMESTAMP_NS", True, "infinity"),
     ("ts-s-inf",       "SELECT 'infinity'::TIMESTAMP_S AS v",         "TIMESTAMP_S", True, "infinity"),
     ("tstz-ninf",      "SELECT '-infinity'::TIMESTAMPTZ AS v",        "TIMESTAMP WITH TIME ZONE", True, "-infinity"),
+    # TIMESTAMPTZ_NS is stored in UTC, so it goes out at UTC, with every
+    # nanosecond.
+    ("tstz-ns",        "SELECT '2026-01-01 02:00:00.123456789+02'::TIMESTAMPTZ_NS AS v",
+                       "TIMESTAMPTZ_NS", True, "2026-01-01T00:00:00.123456789Z"),
 
     # -- times: a fraction appears only when there is one -------------------
     ("time-midnight",  "SELECT '00:00:00'::TIME AS v",                "TIME", True, "00:00:00"),
@@ -186,6 +209,9 @@ CASES = [
                        "ENUM('sad', 'ok', 'happy')", True, "happy"),
     ("union",          "SELECT union_value(num := 2) AS v",
                        "UNION(num INTEGER)", True, {"tag": "num", "value": 2}),
+    # A JSON column is named by its type and carries the document's text
+    # unchanged, not a parsed value.
+    ("json",           "SELECT '{\"a\": 1}'::JSON AS v",  "JSON", True, '{"a": 1}'),
 
     # -- nulls -------------------------------------------------------------
     ("null-varchar",   "SELECT NULL::VARCHAR AS v",  "VARCHAR",  True, None),
@@ -194,9 +220,9 @@ CASES = [
     ("null-decimal",   "SELECT NULL::DECIMAL(10,2) AS v", "DECIMAL(10,2)", True, None),
 
     # -- TIME WITH TIME ZONE ------------------------------------------------
-    # Lossy through 0.21 (the offset was dropped, schema said so); 0.22 keeps
-    # the offset in ISO shape — ±HH:MM, plus :SS only when the offset has
-    # seconds — so the value round-trips and the column reads lossless.
+    # The offset goes out in ISO shape — ±HH:MM, plus :SS only when the
+    # offset has seconds — so the value round-trips and the column reads
+    # lossless.
     ("timetz-utc",     "SELECT '12:34:56+00'::TIMETZ AS v",
                        "TIME WITH TIME ZONE", True, "12:34:56+00:00"),
     ("timetz-offset",  "SELECT '12:34:56+05'::TIMETZ AS v",
@@ -213,18 +239,29 @@ CASES = [
                        "SELECT date_part('timezone', '12:34:56+05'::TIMETZ) AS v",
                        "BIGINT", True, 18000),
 
-    # -- the lossy column ---------------------------------------------------
-    # Every case above asserts lossless=True, which means the flag had never
-    # been checked in the one state that carries information. A column that
-    # silently started reporting lossless:true would have passed this suite
-    # from top to bottom. VARIANT is the representative since TIMETZ turned
-    # lossless in 0.22: no committed view layout, so the payload goes out as
-    # JSON text cast by the engine, and the schema says so. JSON keeps the
-    # number 42 and the string "42" apart, which display text never could.
+    # -- the lossy columns --------------------------------------------------
+    # Every case above asserts lossless=True. Without these, a column that
+    # silently started reporting lossless:true would pass this suite from
+    # top to bottom, because the flag would never be checked in the one
+    # state that carries information. VARIANT has no committed view layout,
+    # so the payload goes out as JSON text cast by the engine, and the schema
+    # says so. JSON keeps the number 42 and the string "42" apart, which
+    # display text never could.
     ("variant-lossy",  "SELECT 42::VARIANT AS v",
                        "VARIANT", False, "42"),
     ("variant-string", "SELECT '42'::VARIANT AS v",
                        "VARIANT", False, '"42"'),
+    # The engine writes a non-finite double in a VARIANT as a bare NaN or
+    # Infinity, which no JSON parser reads. It goes out as the string a
+    # DOUBLE column sends, at any depth, so the cell's text is JSON.
+    ("variant-nan",    "SELECT 'nan'::DOUBLE::VARIANT AS v",
+                       "VARIANT", False, '"NaN"'),
+    ("variant-inf-nested", "SELECT {'a': 'inf'::DOUBLE, 'b': ['-inf'::DOUBLE]}::VARIANT AS v",
+                       "VARIANT", False, '{"a":"Infinity","b":["-Infinity"]}'),
+    # GEOMETRY is a type harbor does not encode itself: it goes out as the
+    # engine's own text for it (WKT), and the schema names that cast.
+    ("geometry",       "SELECT 'POINT (1 2)'::GEOMETRY AS v",
+                       "GEOMETRY", False, "POINT (1 2)"),
 
     # -- HUGEINT minimum ----------------------------------------------------
     # i128::MIN has no positive counterpart, so the "is this JSON-safe" test
@@ -246,6 +283,9 @@ SCHEMA_EXTRAS = {
     # value's properties it must not trust.
     "variant-lossy":  {"encoding": "json"},
     "variant-string": {"encoding": "json"},
+    "variant-nan":    {"encoding": "json"},
+    "variant-inf-nested": {"encoding": "json"},
+    "geometry":       {"encoding": "varchar-cast"},
 }
 
 
@@ -298,7 +338,7 @@ def main():
         else:
             passed += 1
 
-    print("spec: %d of %d cases match SPEC §5.4" % (passed, len(CASES)))
+    print("spec: %d of %d cases match" % (passed, len(CASES)))
     if failures:
         print()
         for name, why in failures:

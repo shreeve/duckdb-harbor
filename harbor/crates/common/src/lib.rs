@@ -1,10 +1,6 @@
-//! What harbor and ducktable both need.
-//!
-//! Before this crate each binary had its own copy of "where does config
-//! live", "what is a legal berth name", and "may I trust this file" — and the
-//! copies disagreed: harbor refused to start without `$HOME` while the client
-//! quietly resolved to `./.config/harbor` and looked for sockets in a
-//! relative directory. One definition, imported everywhere, is the point.
+//! What harbor and ducktable both need: one definition each of where config
+//! and state live, what a legal berth name is, and whether a file may be
+//! trusted, imported by both binaries so the two never disagree.
 //!
 //! # Front ends
 //!
@@ -13,9 +9,8 @@
 //! `default-features = false` and gets the semantics without the ANSI:
 //! [`state::State`] answers *what is this berth doing* and
 //! [`state::Level`] answers *how alarming is that*, leaving each front end to
-//! map a level onto its own palette — a `Tone` in a terminal, a token in a
-//! stylesheet. Nothing in this crate decides that a running berth is
-//! `#22c55e`.
+//! map a level onto its own palette. Nothing in this crate decides that a
+//! running berth is `#22c55e`.
 
 #[cfg(feature = "config")]
 pub mod config;
@@ -31,8 +26,8 @@ pub mod state;
 pub mod ui;
 
 pub use paths::{
-    config_file, config_root, expand, history_file, lock_file, log_file, looks_like_path,
-    normalize, runtime_dir, sidecar_file, sock_file, socket_for, state_root,
+    config_file, config_root, expand, history_file, log_file, looks_like_path, normalize,
+    runtime_dir, socket_for, state_root,
 };
 pub use state::{Level, State};
-pub use perms::{chmod, create_dir_private, exposed, write_private};
+pub use perms::{chmod, create_dir_private, exposed};

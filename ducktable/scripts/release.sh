@@ -247,12 +247,16 @@ git push -q --atomic origin main "$tag"
 stage=pushed
 gh release edit "$tag" --repo "$repo" --draft=false --latest=false --verify-tag >/dev/null
 stage=published
-# The feed release is a prerelease and never --latest, so /releases/latest stays harbor's. Files
-# only: generate_appcast sets the archives it prunes aside in old_updates/, and a directory is not
-# an asset; what it set aside stays on the feed release, unlisted.
-gh release view "$feed_release" --repo "$repo" >/dev/null 2>&1 \
-    || gh release create "$feed_release" --repo "$repo" --title "DuckTable update feed" --prerelease --latest=false \
+# The feed release is a prerelease and never --latest, so /releases/latest stays harbor's: said
+# again on every release, since /releases/latest rests on it. Files only: generate_appcast sets the
+# archives it prunes aside in old_updates/, and a directory is not an asset; what it set aside
+# stays on the feed release, unlisted.
+if gh release view "$feed_release" --repo "$repo" >/dev/null 2>&1; then
+    gh release edit "$feed_release" --repo "$repo" --prerelease --latest=false >/dev/null
+else
+    gh release create "$feed_release" --repo "$repo" --title "DuckTable update feed" --prerelease --latest=false \
         --notes "The Sparkle feed DuckTable checks for updates. Not a release: install from the newest DuckTable release." >/dev/null
+fi
 # The archives and deltas first, the feed that offers them last: an appcast that is up before the
 # archive it names sends every client that checks in between to a 404.
 find "$out/feed" -maxdepth 1 -type f ! -name appcast.xml -exec gh release upload "$feed_release" --repo "$repo" --clobber {} +

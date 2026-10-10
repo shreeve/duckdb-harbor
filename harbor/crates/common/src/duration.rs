@@ -63,7 +63,7 @@ mod tests {
     fn humanized_uptime_is_coarse() {
         assert_eq!(humanize(Duration::from_secs(14)), "14s");
         assert_eq!(humanize(Duration::from_secs(240)), "4m");
-        // The one that used to lie: 90s must not read as "1m".
+        // Coarse, never wrong: 90s must not read as "1m".
         assert_eq!(humanize(Duration::from_secs(90)), "1m30s");
         assert_eq!(humanize(Duration::from_secs(4320)), "1h12m");
         assert_eq!(humanize(Duration::from_secs(7200)), "2h");

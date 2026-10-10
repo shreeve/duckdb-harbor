@@ -125,13 +125,15 @@ impl FromStr for Header {
     type Err = ();
 
     fn from_str(input: &str) -> Result<Header, ()> {
-        let mut elems = input.splitn(2, ':');
-
-        let field = elems.next().and_then(|f| f.parse().ok()).ok_or(())?;
-        let value = elems
-            .next()
-            .and_then(|v| AsciiString::from_ascii(v.trim()).ok())
-            .ok_or(())?;
+        let (field, value) = input.split_once(':').ok_or(())?;
+        let field = field.parse()?;
+        let value = value.trim_matches([' ', '\t']);
+        // A CR or LF ends a line for some parsers and not others, and a NUL
+        // ends a string for some (RFC 9110 §5.5).
+        if value.contains(['\r', '\n', '\0']) {
+            return Err(());
+        }
+        let value = AsciiString::from_ascii(value).map_err(|_| ())?;
 
         Ok(Header { field, value })
     }
@@ -164,7 +166,7 @@ impl FromStr for HeaderField {
     type Err = ();
 
     fn from_str(s: &str) -> Result<HeaderField, ()> {
-        if s.contains(char::is_whitespace) {
+        if s.is_empty() || s.contains(char::is_whitespace) {
             Err(())
         } else {
             AsciiString::from_ascii(s).map(HeaderField).map_err(|_| ())

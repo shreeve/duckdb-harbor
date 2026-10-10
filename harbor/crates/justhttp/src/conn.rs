@@ -9,20 +9,20 @@ use std::io::{BufReader, BufWriter, ErrorKind, Read};
 
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::Request;
 use crate::http::{HttpVersion, Method, StatusCode};
-use crate::stream::{RefinedTcpStream, ShutdownHandle};
+use crate::stream::{RefinedTcpStream, Socket};
 use sequential::{SequentialReader, SequentialReaderBuilder, SequentialWriterBuilder};
 
 /// The largest request line or header line we will assemble.
 ///
-/// There was no ceiling here at all, and the buffer grows a byte at a time
-/// until CRLF — so a remote client could open one socket, send
-/// `GET / HTTP/1.1\r\nX-Junk: ` and then never stop, and watch the server's
-/// RSS climb at line speed (measured: 30 MB to 1.5 GB in under five seconds).
-/// The check has to live here, before routing and application handling,
+/// The line buffer grows a byte at a time until CRLF, so without a ceiling
+/// one socket sending `GET / HTTP/1.1\r\nX-Junk: ` and never stopping climbs
+/// the server's RSS at line speed (30 MB to 1.5 GB in under five seconds,
+/// measured). The check lives here, before routing and application handling,
 /// because the allocation happens before either can run.
 const MAX_LINE: usize = 8 * 1024;
 
@@ -36,21 +36,20 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a brand-new connection may say nothing at all before it is closed.
 ///
-/// A socket that has never sent a byte has not asked for anything, and letting
-/// it wait forever meant an anonymous caller could hold connections — and a
-/// thread apiece — for as long as it liked, bounded only by the
-/// file-descriptor limit.
+/// A socket that has never sent a byte has not asked for anything. Without
+/// this clock an anonymous caller could hold connections, and a thread
+/// apiece, for as long as it liked, bounded only by the file-descriptor
+/// limit.
 const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long an established keep-alive connection may sit between requests.
 ///
-/// This clock used to not exist: serving one request took a connection off the
-/// first-request timeout permanently, on the reasoning that a REPL at its
-/// prompt or a pooled client between queries is doing nothing wrong. The gap
-/// is that the cheapest request on the server — a bare `/ready` — bought a
-/// connection the right to idle forever. Measured: 120 such connections held 120 threads
-/// and 240 descriptors indefinitely, still answering after 100 seconds idle,
-/// while 120 that said nothing at all were reclaimed on schedule.
+/// A REPL at its prompt or a pooled client between queries is doing nothing
+/// wrong, so a served connection is off the first-request clock. Without a
+/// clock of its own, though, the cheapest request on the server, a bare
+/// `/ready`, would buy a connection the right to idle forever: 120 such
+/// connections held 120 threads and 240 descriptors, still answering after
+/// 100 seconds idle, while 120 that said nothing were reclaimed on schedule.
 ///
 /// Five minutes is far longer than any pooled client's own idle timeout (30–90
 /// seconds is typical, and the repl sends `Connection: close` outright), so a
@@ -59,6 +58,11 @@ const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// caps concurrent connections — but it does mean they have to be paid for
 /// again every five minutes instead of being taken once and kept.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long an ended connection keeps reading what the client still sends
+/// before it closes (see `ClientConnection::linger`). A single read may
+/// overrun it by up to the socket's read timeout.
+const LINGER: Duration = Duration::from_secs(2);
 
 /// A socket read timeout, as opposed to a real I/O failure. macOS reports
 /// `SO_RCVTIMEO` as `WouldBlock` and Linux as `TimedOut`; both mean "nothing
@@ -91,9 +95,9 @@ pub struct ClientConnection {
     // it on the FIRST_REQUEST_TIMEOUT clock
     served_a_request: bool,
 
-    // how the bounded body drain ends this connection when it gives up on a
-    // body the client is still dribbling (see EqualReader's Drop)
-    shutdown: Option<ShutdownHandle>,
+    // the socket, shared with each request's body reader so that a body
+    // abandoned part-way can end the connection (see `Socket::end`)
+    socket: Arc<Socket>,
 }
 
 /// Error that can happen when reading a request.
@@ -121,10 +125,7 @@ impl ClientConnection {
         mut read_socket: RefinedTcpStream,
     ) -> ClientConnection {
         let remote_addr = read_socket.peer_addr();
-        // Taken while the stream is still here, exactly as the interrupt
-        // handles are on the harbor side: nothing can reach this socket once
-        // it is inside the BufReader.
-        let shutdown = read_socket.shutdown_handle().ok();
+        let socket = read_socket.socket();
 
         let mut source = SequentialReaderBuilder::new(BufReader::with_capacity(1024, read_socket));
         let first_header = source.next().unwrap();
@@ -138,7 +139,7 @@ impl ClientConnection {
             next_header_source: first_header,
             no_more_requests: false,
             served_a_request: false,
-            shutdown,
+            socket,
         }
     }
 
@@ -168,7 +169,7 @@ impl ClientConnection {
         // Nothing of this request has arrived yet, so this is how long the
         // connection may stay quiet: a short clock before it has ever asked
         // for anything, a long one between keep-alive requests.
-        let quiet_until = Instant::now()
+        let mut quiet_until = Instant::now()
             + match self.served_a_request {
                 true => IDLE_TIMEOUT,
                 false => FIRST_REQUEST_TIMEOUT,
@@ -182,7 +183,13 @@ impl ClientConnection {
                 Some(Err(ref e)) if is_read_timeout(e) => match *deadline {
                     // Idle: this request has not begun. Both the never-spoke
                     // and the between-requests cases are on a clock; only the
-                    // length differs.
+                    // length differs. The clock runs from the last answer:
+                    // a client waiting on a response is not idle, however
+                    // long the response takes.
+                    None if !self.sink.answered() => {
+                        quiet_until = Instant::now() + IDLE_TIMEOUT;
+                        continue;
+                    }
                     None if Instant::now() >= quiet_until => {
                         return Err(ReadError::ReadIoError(IoError::new(
                             ErrorKind::TimedOut,
@@ -203,8 +210,12 @@ impl ClientConnection {
                         )));
                     }
                 },
-                Some(Err(e)) => return Err(ReadError::ReadIoError(e)),
+                Some(Err(e)) => {
+                    self.socket.depart();
+                    return Err(ReadError::ReadIoError(e));
+                }
                 None => {
+                    self.socket.depart();
                     return Err(ReadError::ReadIoError(IoError::new(
                         ErrorKind::ConnectionAborted,
                         "Unexpected EOF",
@@ -212,8 +223,19 @@ impl ClientConnection {
                 }
             };
 
-            // The head has started: from here the client is on the clock.
             if deadline.is_none() {
+                // An earlier request ended this connection: what arrives
+                // here is not known to begin a request. Checked on the first
+                // byte, since a read only gets its turn on the stream once
+                // that request's body reader is gone.
+                if self.socket.ended() {
+                    self.linger();
+                    return Err(ReadError::ReadIoError(IoError::new(
+                        ErrorKind::ConnectionAborted,
+                        "the connection was ended mid-body",
+                    )));
+                }
+                // The head has started: from here the client is on the clock.
                 *deadline = Some(Instant::now() + HEAD_TIMEOUT);
             }
 
@@ -238,10 +260,43 @@ impl ClientConnection {
         }
     }
 
+    /// Reads and discards what the client still sends, until it closes or
+    /// for at most `LINGER`, before an ended connection closes. Closing a
+    /// socket with unread data resets it, and the reset can destroy a
+    /// response the client has not read yet (RFC 9112 §9.6).
+    fn linger(&mut self) {
+        let until = Instant::now() + LINGER;
+        let mut scratch = [0u8; 4096];
+        while Instant::now() < until {
+            match self.next_header_source.read(&mut scratch) {
+                Ok(0) => break,
+                Err(e) if !is_read_timeout(&e) => break,
+                _ => (),
+            }
+        }
+    }
+
+    /// After the last request on a connection, goes on reading until it is
+    /// answered, so that the client's departure is still seen (see
+    /// `Peer::closed`). Nothing after the last request is a request, so what
+    /// arrives is discarded. The writer is let go of first, so the
+    /// connection still closes the moment the response is done.
+    fn watch_until_answered(&mut self) {
+        let answering = self.sink.release();
+        let mut scratch = [0u8; 4096];
+        while answering.strong_count() > 0 {
+            match self.next_header_source.read(&mut scratch) {
+                Ok(0) => return self.socket.depart(),
+                Err(e) if !is_read_timeout(&e) => return self.socket.depart(),
+                _ => (),
+            }
+        }
+    }
+
     /// Reads a request from the stream.
     /// Blocks until the header has been read.
     fn read(&mut self) -> Result<Request, ReadError> {
-        let (method, path, version, headers) = {
+        let (method, path, version, headers, content_length) = {
             // one line buffer reused for the request line and every header line
             let mut line_buf = Vec::with_capacity(128);
             // One budget for the whole head, started by its first byte.
@@ -268,7 +323,14 @@ impl ClientConnection {
                     if headers.len() >= MAX_HEADERS {
                         return Err(ReadError::HeadTooLarge(StatusCode(431)));
                     }
-                    headers.push(match FromStr::from_str(line.trim()) {
+                    // A line that begins with whitespace continues the one
+                    // before it (obs-fold): a proxy may join the two, so it
+                    // is refused, never read as a header of its own (RFC
+                    // 9112 §5.2).
+                    if line.starts_with([' ', '\t']) {
+                        return Err(ReadError::WrongHeader(version));
+                    }
+                    headers.push(match FromStr::from_str(line) {
                         Ok(h) => h,
                         _ => return Err(ReadError::WrongHeader(version)),
                     });
@@ -277,9 +339,10 @@ impl ClientConnection {
                 headers
             };
 
-            check_framing(&headers).map_err(|()| ReadError::AmbiguousFraming(version))?;
+            let content_length =
+                check_framing(&headers).map_err(|()| ReadError::AmbiguousFraming(version))?;
 
-            (method, path, version, headers)
+            (method, path, version, headers, content_length)
         };
 
         // building the writer for the request
@@ -295,10 +358,11 @@ impl ClientConnection {
             path,
             version,
             headers,
+            content_length,
             *self.remote_addr.as_ref().unwrap(),
             data_source,
             writer,
-            self.shutdown.clone(),
+            self.socket.clone(),
         )
         .map_err(|e| {
             use crate::request;
@@ -326,21 +390,18 @@ impl Iterator for ClientConnection {
         // the client sent a "connection: close" header in this previous request
         //  or is using HTTP 1.0, meaning that no new request will come
         if self.no_more_requests {
+            self.watch_until_answered();
             return None;
         }
 
-        // Not a loop any more, and deliberately so: every arm below either
-        // yields a request or ends the connection. The 505 arm was the one
-        // path that used to go round again, and it no longer can — a peer
-        // that opened with a version this server cannot speak gets its answer
-        // and the connection closes.
+        // Every arm below either yields a request or ends the connection.
         {
             let rq = match self.read() {
                 Err(ReadError::WrongRequestLine) => {
                     let writer = self.sink.next().unwrap();
                     let response = Response::empty(StatusCode(400));
                     response
-                        .raw_print(writer, HttpVersion(1, 1), &[], false)
+                        .raw_print(writer, HttpVersion(1, 1), false)
                         .ok();
                     return None; // we don't know where the next request would start,
                     // so we have to close
@@ -349,7 +410,7 @@ impl Iterator for ClientConnection {
                 Err(ReadError::WrongHeader(ver)) => {
                     let writer = self.sink.next().unwrap();
                     let response = Response::empty(StatusCode(400));
-                    response.raw_print(writer, ver, &[], false).ok();
+                    response.raw_print(writer, ver, false).ok();
                     return None; // we don't know where the next request would start,
                     // so we have to close
                 }
@@ -359,7 +420,7 @@ impl Iterator for ClientConnection {
                     let writer = self.sink.next().unwrap();
                     let response = Response::empty(StatusCode(408));
                     response
-                        .raw_print(writer, HttpVersion(1, 1), &[], false)
+                        .raw_print(writer, HttpVersion(1, 1), false)
                         .ok();
                     return None; // closing the connection
                 }
@@ -368,7 +429,7 @@ impl Iterator for ClientConnection {
                     let writer = self.sink.next().unwrap();
                     let response = Response::empty(status);
                     response
-                        .raw_print(writer, HttpVersion(1, 1), &[], false)
+                        .raw_print(writer, HttpVersion(1, 1), false)
                         .ok();
                     return None; // the head is unbounded from here; close
                 }
@@ -376,15 +437,15 @@ impl Iterator for ClientConnection {
                 Err(ReadError::AmbiguousFraming(ver)) => {
                     let writer = self.sink.next().unwrap();
                     let response = Response::empty(StatusCode(400));
-                    response.raw_print(writer, ver, &[], false).ok();
+                    response.raw_print(writer, ver, false).ok();
                     return None; // we cannot know where the body ends, so close
                 }
 
                 Err(ReadError::ExpectationFailed(ver)) => {
                     let writer = self.sink.next().unwrap();
                     let response = Response::empty(StatusCode(417));
-                    response.raw_print(writer, ver, &[], true).ok();
-                    return None; // TODO: should be recoverable, but needs handling in case of body
+                    response.raw_print(writer, ver, true).ok();
+                    return None; // a body may follow that nothing will read, so close
                 }
 
                 Err(ReadError::ReadIoError(_)) => return None,
@@ -397,23 +458,19 @@ impl Iterator for ClientConnection {
                 // Answered through the request's OWN writer, and then the
                 // connection ends.
                 //
-                // This used to take a SECOND writer from the sink while `rq`
-                // still held the first, and that deadlocked the thread
-                // outright: a sequential writer blocks on its predecessor's
-                // release before its first byte (see SequentialWriter::write),
-                // and the predecessor was owned by an `rq` that could only drop
-                // after the write returned. So the connection thread parked
-                // forever, holding its descriptors, in a wait no socket timeout
-                // covers because it is a channel and not a read. One
-                // `GET / HTTP/2.0` cost a thread and three
-                // descriptors permanently, and a client merely *attempting*
-                // HTTP/2 — curl --http2, an h2c upgrade probe — triggered it by
-                // accident.
+                // Never through a second writer from the sink while `rq`
+                // holds the first: a sequential writer blocks on its
+                // predecessor's release before its first byte (see
+                // SequentialWriter::write), and the predecessor is owned by
+                // an `rq` that can only drop after the write returns. The
+                // connection thread would park forever, holding its
+                // descriptor, in a channel wait no socket timeout covers, and
+                // a client merely attempting HTTP/2 (curl --http2, an h2c
+                // probe) would trigger it.
                 //
-                // `return None` rather than `continue` for the same reason RFC
-                // 9110 pairs 505 with closing: a peer that opened with a
-                // version this server cannot speak has nothing useful to say
-                // next on the same connection.
+                // The connection ends for the reason RFC 9110 pairs 505 with
+                // closing: a peer that opened with a version this server
+                // cannot speak has nothing useful to say next on it.
                 let response = Response::from_string(
                     "This server only supports HTTP versions 1.0 and 1.1".to_owned(),
                 )
@@ -431,8 +488,7 @@ impl Iterator for ClientConnection {
                 .find(|h| h.field.equiv("Connection"))
                 .map(|h| h.value.as_str());
 
-            // case-insensitive substring match (NOT token-wise): exactly the
-            // lowercase-then-contains behavior this replaced, minus the alloc
+            // case-insensitive substring match, not token-wise
             fn contains_ignore_case(hay: &str, needle: &str) -> bool {
                 hay.as_bytes()
                     .windows(needle.len())
@@ -445,7 +501,7 @@ impl Iterator for ClientConnection {
                 // Every HTTP/1.0 request is the last one on its connection,
                 // `Connection: keep-alive` or not. 1.0 has no chunked encoding,
                 // so a response of unknown length can only be delimited by the
-                // close — which response.rs now relies on instead of buffering
+                // close, which response.rs relies on rather than buffering
                 // the whole body in memory to discover its length. Reusing a
                 // 1.0 connection and streaming an unknown length are mutually
                 // exclusive; this picks the one that cannot be turned into an
@@ -464,7 +520,8 @@ impl Iterator for ClientConnection {
     }
 }
 
-/// Reject a request whose body length is ambiguous.
+/// The body length a request declares, or `Err` when its framing is
+/// ambiguous.
 ///
 /// Two `Content-Length` headers that disagree, or a `Content-Length` alongside
 /// a `Transfer-Encoding`, do not have a right answer — they have two, and the
@@ -472,31 +529,32 @@ impl Iterator for ClientConnection {
 /// picks is exactly a request-smuggling desync. RFC 9110 §8.6 says to reject,
 /// and rejecting costs nothing: no correct client sends either shape.
 ///
-/// A `Content-Length` that is not a number is refused for the same reason. It
-/// used to parse as `None` and the request was served as though it had no body
-/// at all, leaving the bytes the client did send to be read as the next
-/// request on the connection.
-fn check_framing(headers: &[crate::http::Header]) -> Result<(), ()> {
-    let mut lengths = headers
-        .iter()
-        .filter(|h| h.field.equiv("Content-Length"))
-        .map(|h| h.value.as_str().trim().parse::<usize>());
-
-    let first = match lengths.next() {
-        None => return Ok(()),
-        Some(Ok(n)) => n,
-        Some(Err(_)) => return Err(()),
-    };
-    for other in lengths {
-        if !matches!(other, Ok(n) if n == first) {
+/// For the same reason a `Content-Length` is exactly `1*DIGIT` (`+24` and
+/// `2 4` are numbers to some parsers and not to others), and a
+/// `Transfer-Encoding` is exactly one `chunked`, the only coding this server
+/// decodes (RFC 9112 §6.3). A value refused here is never read as "no body",
+/// which would leave the bytes the client did send to be parsed as the next
+/// request.
+fn check_framing(headers: &[crate::http::Header]) -> Result<Option<usize>, ()> {
+    let mut length = None;
+    for h in headers.iter().filter(|h| h.field.equiv("Content-Length")) {
+        let value = h.value.as_str();
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
             return Err(());
         }
+        let n = value.parse::<usize>().map_err(|_| ())?;
+        if length.is_some_and(|first| first != n) {
+            return Err(());
+        }
+        length = Some(n);
     }
-    // A body cannot be framed two ways at once.
-    if headers.iter().any(|h| h.field.equiv("Transfer-Encoding")) {
-        return Err(());
+    let mut codings = headers.iter().filter(|h| h.field.equiv("Transfer-Encoding"));
+    let chunked = |te: &crate::http::Header| te.value.as_str().eq_ignore_ascii_case("chunked");
+    match (codings.next(), codings.next()) {
+        (None, _) => Ok(length),
+        (Some(te), None) if length.is_none() && chunked(te) => Ok(None),
+        _ => Err(()),
     }
-    Ok(())
 }
 
 /// Parses a "HTTP/1.1" string.
@@ -540,6 +598,23 @@ mod test {
         assert!(super::parse_request_line("GET /hello").is_err());
         assert!(super::parse_request_line("qsd qsd qsd").is_err());
     }
+
+    /// The keep-alive idle clock runs only once the last response is done,
+    /// which is what this reports: a response still being written (a long
+    /// statement's) is no idle time.
+    #[test]
+    fn a_connection_is_answered_once_its_last_writer_is_done() {
+        let mut sink = super::SequentialWriterBuilder::new(Vec::<u8>::new());
+        assert!(sink.answered(), "nothing asked yet");
+        let first = sink.next().unwrap();
+        assert!(!sink.answered());
+        drop(first);
+        assert!(sink.answered());
+        // The next writer does not wait on the one already done.
+        let mut second = sink.next().unwrap();
+        std::io::Write::write_all(&mut second, b"x").unwrap();
+        assert!(!sink.answered());
+    }
 }
 
 mod sequential {
@@ -547,8 +622,8 @@ mod sequential {
     use std::io::{Read, Write};
 
     use std::sync::mpsc::channel;
-    use std::sync::mpsc::{Receiver, Sender};
-    use std::sync::{Arc, Mutex};
+    use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+    use std::sync::{Arc, Mutex, Weak};
 
     use std::mem;
 
@@ -588,7 +663,7 @@ mod sequential {
     where
         W: Write + Send,
     {
-        writer: Arc<Mutex<W>>,
+        writer: Option<Arc<Mutex<W>>>,
         next_trigger: Option<Receiver<()>>,
     }
 
@@ -612,9 +687,30 @@ mod sequential {
     impl<W: Write + Send> SequentialWriterBuilder<W> {
         pub fn new(writer: W) -> SequentialWriterBuilder<W> {
             SequentialWriterBuilder {
-                writer: Arc::new(Mutex::new(writer)),
+                writer: Some(Arc::new(Mutex::new(writer))),
                 next_trigger: None,
             }
+        }
+
+        /// Whether every writer handed out has finished: the last response
+        /// is written, or nothing was ever asked.
+        pub fn answered(&mut self) -> bool {
+            match self.next_trigger.as_ref().map(Receiver::try_recv) {
+                Some(Err(TryRecvError::Empty)) => false,
+                None => true,
+                // Finished; the next writer has nothing to wait for.
+                Some(_) => {
+                    self.next_trigger = None;
+                    true
+                }
+            }
+        }
+
+        /// Lets go of the writer, so it is dropped with the last writer
+        /// already handed out; the `Weak` says whether that has happened.
+        /// No writer is handed out after this.
+        pub fn release(&mut self) -> Weak<Mutex<W>> {
+            self.writer.take().as_ref().map_or_else(Weak::new, Arc::downgrade)
         }
     }
 
@@ -649,7 +745,7 @@ mod sequential {
 
             Some(SequentialWriter {
                 trigger: next_next_trigger,
-                writer: self.writer.clone(),
+                writer: self.writer.clone()?,
                 on_finish: tx,
             })
         }

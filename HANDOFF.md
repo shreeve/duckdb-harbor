@@ -2,8 +2,10 @@
 
 Read this first. It says what the repo is, how its owner works, how the
 pieces fit, how to build, test and release, and what is open. Everything
-here was true on 2026-10-04 at harbor v0.44.2 and DuckTable v0.22.9; the
-changelog and git history are the record after that.
+here was true on 2026-10-10, when the revamp landed on `main` carrying
+harbor 0.45.0 and DuckTable 0.23.0 in their changelogs, unreleased; harbor
+v0.44.2 and DuckTable v0.22.9 are the releases in use. The changelogs and git history
+are the record after that.
 
 ## What this is
 
@@ -47,8 +49,14 @@ These are standing rules, not preferences to weigh.
   `gh api repos/shreeve/duckdb-harbor/branches --jq '.[].name'`.
 - **Verify empirically.** Claims about engine behavior are measured against
   the engine, not recalled. When a probe contradicts a belief, the probe
-  wins and the doc gets corrected. Subagent reviews are welcome and have
-  caught real bugs.
+  wins and the doc gets corrected. Concurrency claims are raced and counted
+  ("N of M runs").
+- **A server change gets a cold review before it lands**: subagents that
+  wrote none of it read the diff and probe the binary. They have caught a
+  real defect every time.
+- **Landing is on Steve's word.** Another session's approval is not his. A
+  code pull request merges once all four checks pass, unless he says
+  otherwise.
 - **Commit messages** are prose: a one-line subject in the form
   `area: what it now does`, then paragraphs that say why, in complete
   sentences. Same voice as the changelog.
@@ -68,7 +76,19 @@ These are standing rules, not preferences to weigh.
   sessions at once: each lands what it touched, and says so to the other
   before touching a file both use.
 - **Public text is Steve's.** An issue, a comment or a release note goes
-  out under his name: his voice, plain, and posted on his word.
+  out under his name: his voice, plain, and posted on his word. An issue he
+  asks for says what happens, what would be better, and "Not urgent; noted
+  to come back to." (#132, #133).
+- **The machines are shared through cpuq.** Every build, test suite and
+  benchmark runs under `cpuq run --label harbor:<task> --cores 2-6 -- sh -c
+  'CARGO_BUILD_JOBS="$CPUQ_CORES" …'` (single quotes, so the grant expands
+  inside the job). An integration suite does its work in servers that leave
+  the job's process tree, so it runs `--cores 2-4 --opaque`. Never more than
+  half the CPUs, and benchmarks only on a quiet machine. When the Mac's
+  queue is long, harbor's builds and suites run on the Linux box `pup`
+  (`ssh pup`, 22 CPUs) through its own cpuq; DuckTable builds only on the
+  Mac. The cpuq session owns machine load and says how; its rules are in
+  `~/Data/Code/cpuq/AGENTS.md`.
 - **Scratch only.** Probes run on a scratch database with a short
   `HARBOR_HOME` (`/tmp/x`: a unix socket path has about a hundred bytes),
   stopped when done. Never the MedLabs database, here or on `live`.
@@ -77,60 +97,94 @@ These are standing rules, not preferences to weigh.
 
 One crate, `crates/harbor`, holds both halves of the binary:
 
-- **Server half** — `src/lib.rs` (HTTP routes, sessions, request guards),
+- **Server half** — `src/lib.rs` (HTTP routes, sessions, request guards,
+  statement running, cancel and departure),
   `src/engine/` (the DuckDB v2 C API: `ffi.rs` is generated, `conn.rs` is
   the connection, `encode.rs` turns vectors into NDJSON), `src/encode.rs`
   (the JSON-safe rules), `src/verbs.rs` (start/stop/attach/backup…),
   `src/backup.rs`, and `src/unbrace.rs` (brace expansion, applied to every
-  statement before the engine sees it).
-- **Client half** — `src/repl/`: `mod.rs` (the client, transports, dot
-  commands), `interactive.rs` (reedline setup, keybindings, the statement
+  statement before the engine sees it). `src/main.rs` parses the command
+  line and owns start, restart, linger and the verbs' dispatch.
+- **Client half** — `src/repl/`: `mod.rs` (the client, dot commands,
+  scripts), `interactive.rs` (reedline setup, keybindings, the statement
   splitter and Enter validator), `render.rs` (every output mode),
-  `scan.rs` (the one lexer for strings/comments/dollar quotes, shared by
-  the splitter, highlighter and unbrace), `complete.rs`, `highlight.rs`,
-  `http.rs`, `snapshot.rs` (the renewable session a backup runs on),
-  `installs.rs` (finding a second copy of harbor on the machine), and
-  `src/update.rs` (`harbor update`, which runs `install.sh` and reports
-  servers on old code). The client is an HTTP client of its own server and
-  never touches DuckDB.
+  `complete.rs`, `highlight.rs`, `keywords.rs`, `theme.rs`, `snapshot.rs`
+  (the renewable session a backup runs on), `installs.rs` (finding a second
+  copy of harbor on the machine), and `src/update.rs` (`harbor update`,
+  which runs `install.sh` and restarts servers on old code). The client is
+  an HTTP client of its own server and never touches DuckDB.
 
-Three more first-party crates: `common` (paths, config, membership,
-autostart, permissions — shared with DuckTable), `wire` (protocol types,
-protocol version 1, and `statement`: which keyword the engine will act on,
-read once for the server, the CLI and DuckTable), `justhttp` (the
-synchronous HTTP/1.1 server over TCP and unix sockets; a first-party fork).
+Four more first-party crates:
+
+- `common` — paths, config, membership, autostart, permissions; shared with
+  DuckTable.
+- `wire` — protocol version 1 and what both sides read the same way:
+  `scan` (the one SQL lexer: where strings, quoted names, dollar quotes and
+  comments end, read as the engine's tokenizer reads them, used by brace
+  expansion, the REPL and DuckTable's Query view), `statement` (which
+  keyword the engine will act on), `plan` (whether a result is an EXPLAIN
+  plan) and `catalog` (the `/catalog` document's types).
+- `http` (`harbor-http`) — the one Harbor client: transport over unix
+  sockets and TCP, sessions and their renewal, summoning a server, and
+  finding and stopping the servers on this machine. The REPL and DuckTable
+  both use it.
+- `justhttp` — the synchronous HTTP/1.1 server over TCP and unix sockets,
+  first-party and used only by harbor.
 
 Facts that shape everything:
 
 - **Nothing links `libduckdb`.** The engine is loaded at runtime:
   `HARBOR_LIBDUCKDB` first, then `../lib` beside the binary and the binary's
-  own directory, `~/.local/lib`, `~/.duckdb/cli/latest`, then the newest
-  `~/.duckdb/cli/<version>`. The client half runs with no engine at all.
+  own directory (the binary's own path, a symlink followed), `~/.local/lib`,
+  `~/.duckdb/cli/latest`, then the newest `~/.duckdb/cli/<version>`, passing
+  over a library without the v2 API and never the working directory. The
+  client half runs with no engine at all.
 - **One process per database file.** DuckDB's own file lock is the mutex.
   There is no registry; the listening unix socket is the registration.
   `harbor <db>` on a terminal is the REPL and spawns a server behind the
   file if none is up (refcounted, leaves with its last client);
-  `harbor <db> start` is an owned server that runs until `stop`.
+  `harbor <db> start` is an owned server that runs until `stop`. A
+  summoned server leaves only when no client has come since it last looked,
+  and stops on SIGTERM, SIGINT and SIGHUP alike, folding the WAL.
+- **A configuration that will not load stops a start.** A typo, an unknown
+  key (a `[defaults]` section among them) or a file others can write makes
+  `start` and every summon refuse, in one line naming the file, the line and
+  the fix; a running server is not affected. `restart` checks before it
+  stops anything and reuses the options the server recorded in its `.args`;
+  a server from 0.44 or earlier recorded none and is restarted only with
+  its options typed. Login items and entries are matched by path, under one
+  `HARBOR_HOME`.
 - **Paths.** `~/.config/harbor/config.toml` is desired state (what is
   attached, per-connection options); `~/.local/state/harbor/runtime/` holds
-  each server's `.sock` and `.log`, named `<basename>-<fnv1a32(path)>`.
-  `harbor` alone lists what is running and attached.
+  each server's `.sock` and the `.args` a restart reads, named
+  `<basename>-<hash>` (the low 32 bits of the path's 64-bit FNV-1a), and
+  `runtime/log/` the logs, a login item's named for its database. `harbor`
+  alone lists what is running and attached.
 - **Wire.** `POST /sql` takes one statement and streams NDJSON: a schema
   line per column, then rows. A `VARIANT` cell crosses as JSON text with
   `"encoding":"json"`; a `JSON` column by its type. Bodies cap at 8 MiB.
-  Sessions (`/sql/sessions`) hold a connection for a transaction. See the
-  README's endpoint table.
+  Sessions (`/sql/sessions`) hold a connection for a transaction. One
+  statement per request is the engine's rule, not the server's: the
+  engine's parse of the brace-expanded text counts the statements and its
+  configuration lock guards the protected settings, before anything runs.
+  See the README's endpoint table and `config.toml` reference.
 - **A transaction lives in a session, and its end is told truly.** `BEGIN`
   without a `sessionId` is a `400`, as `USE` is: the pooled connection goes
   back when the request ends. The CLI opens a session at `BEGIN` and holds
-  it to the `COMMIT` or `ROLLBACK` that ends the transaction; the REPL
-  keeps it past the thirty-second idle limit with a `SELECT 1` every ten
-  seconds, and the five-minute ceiling ends it. A `COMMIT` on a transaction
+  it to the `COMMIT` or `ROLLBACK` that ends the transaction; the REPL and
+  DuckTable keep it past the thirty-second idle limit by renewing the
+  session every ten seconds (`POST /sql/sessions/<id>/renew`, which runs
+  nothing; `SELECT 1` against a server older than 0.45), and the five-minute
+  ceiling ends it. A statement whose client hangs up is cancelled by its
+  job id, and a session's statements are relayed when every worker is busy,
+  so neither a departed client nor a busy pool takes a transaction. A
+  `COMMIT` on a transaction
   an error or a cancel aborted is rolled back by the server and answered
   `400` saying so, where the engine alone answers success. A `COMMIT` runs
   to its answer: a cancel lands before it starts or not at all, so a `499`
   means nothing was kept. A streaming statement its reader cut short leaves
-  its transaction aborted. All of it is measured in `regressions` and
+  its transaction aborted, and a cancel answers `true` only when it stopped
+  something. All of it is measured in `regressions`, `sessions` and
   `cancel`.
 - **The TCP door is for programs.** A request with an `Origin`, or a `Host`
   that is not `localhost` or an IP literal, is a `403`: a web page in the
@@ -145,7 +199,9 @@ Facts that shape everything:
 - **Every statement is brace-expanded in the server** (`unbrace.rs`):
   `r.{a, b}` becomes `r.a, r.b` for every client. A struct literal (a lone
   `:` at its top level), strings, quoted identifiers, dollar quotes,
-  comments and unbalanced braces are left alone.
+  comments and unbalanced braces are left alone, their boundaries taken
+  from `wire::scan`, which must agree with the engine's tokenizer: a
+  disagreement there is a way to rewrite a string.
 
 ## Build, test, run
 
@@ -155,42 +211,49 @@ make harbor            # cargo build -p harbor --release → target/release/harb
 make unit              # cargo test --release --workspace --all-features
 make test              # test/scripts/check.sh: unit plus the thirteen integration suites
 make test SUITES="regressions spec"      # a subset
-make fetch-duckdb      # engine + CLI + headers into ~/.duckdb/cli/2.0.0
+DUCKDB_LIB_BUILD=alpha42289 make fetch-duckdb   # the pinned engine and its CLI into ~/.duckdb/cli/2.0.0
 make install           # copy the binary to ~/.local/bin
 ```
 
 The suites live in `test/scripts/` and each file's header says what it
 proves. The ones to reach for: `regressions` (request isolation, settings,
 limits), `spec` (the wire encoding, spelled out), `types` (every DuckDB
-type), `hostile` (adversarial HTTP input, statement smuggling), `roundtrip`
+type), `hostile` (adversarial HTTP input, request smuggling), `roundtrip`
 (backup/restore fidelity), `asserts` (answers checked against an independent
 oracle, curl in and NDJSON out), `sessions`, `cancel`, `catalog`, `lifecycle`,
-`stress`, `fuzz`, `deployment`. CI's quick gate runs
-`unit lifecycle types spec catalog sessions cancel`; `FullSuite.yml` runs
-all of them on every push to main and nightly at 23:41 UTC. A pull request
-gets three checks: the quick gate, `windows` (build, the listing's note,
-and a query over the URL form on `windows-2025`), and `ducktable check`,
-which compiles DuckTable against harbor's crates. A full local run is ten
-to twelve minutes.
+`stress`, `fuzz`, `deployment`. `check.sh` builds `sample.duckdb` when it
+is missing, and runs the suites on the `duckdb` CLI that sits beside the
+engine (`HARBOR_LIBDUCKDB`'s directory, else `~/.duckdb/cli/2.0.0`), so the
+oracle and the engine are one build. CI's quick gate runs `lifecycle types
+spec catalog sessions cancel regressions`, with the unit tests as a job of
+their own beside it; `FullSuite.yml` runs all of them on every push to main
+and nightly at 23:41 UTC, and saves the build cache the pull requests
+restore. A pull request gets four checks: the quick gate, `unit tests`,
+`windows` (build, the listing's note, and a query over the URL form on
+`windows-2025`), and `ducktable check`, which compiles DuckTable against
+harbor's crates. A full local run is ten to twelve minutes; `justhttp`'s
+tests wait out real timeouts and take about 75 s of it.
 
-Two things bite locally:
+What bites locally:
 
-- The `sessions` suite needs a `duckdb` CLI at least as new as the engine's
-  file format. A laptop CLI older than the pinned engine fails "the
-  committed row survived" for environmental reasons while CI is green.
-- The full suite wants `sample.duckdb`; make it with
-  `test/scripts/fixture.sh sample.duckdb`.
-- `catalog` checks the server's `harborVersion` against `Cargo.toml`, so a
-  version bump made while a run is under way fails it against the binary
-  built before the bump.
 - `harbor <db> start` serves in place when stdin or stdout is not a
   terminal. A script that wants a server puts it in the background and
   ends it with `harbor <db> stop`.
+- A suite on a loaded machine can miss a timing bound; rerun it before
+  reading a failure as a regression, and run timing on a quiet machine.
+
+On `pup`, a checkout without `.git` works: `rsync -a --exclude target
+harbor/ pup:hr/<name>/harbor/`, the engine fetched there with `DEST=$HOME/hr/engine
+DUCKDB_LIB_BUILD=alpha42289 bash scripts/fetch-duckdb.sh`, and the suites
+run with `HARBOR_LIBDUCKDB` and `PATH` pointing at it. Remove `~/hr/<name>`
+when done.
 
 To drive the REPL non-interactively for a proof, use `expect` and answer the
-two terminal probes it makes on startup (cursor position `ESC[6n` → reply
-`ESC[1;1R`; background color `OSC 11;?` → reply `OSC 11;rgb:0000/0000/0000`).
-A working script from the last session is the pattern.
+three terminal probes it makes on startup: cursor position `ESC[6n` → reply
+`ESC[1;1R`; background color `OSC 11;?` → reply
+`OSC 11;rgb:0000/0000/0000`; device attributes `ESC[c` → reply
+`ESC[?62;22c`. The pty driver in `test/scripts/lifecycle.sh` is the
+pattern.
 
 For a scratch database, use a file in a scratch directory
 (`harbor ./x.duckdb --mode csv -c "…"` or `< file.sql`), and `harbor
@@ -199,42 +262,51 @@ For a scratch database, use a file in a scratch directory
 ## The engine
 
 Harbor binds DuckDB's **v2 C API**; DuckDB 2.0 is the floor. `ffi.rs` is
-generated from DuckDB's `api_spec/v2` by `scripts/gen-v2-ffi.rb`, never
-transcribed from the header. The engine comes from DuckDB's nightly channel
-of the 2.0 branch (`artifacts.duckdb.org/v2.0-cyanoptera`) via
-`scripts/fetch-duckdb.sh`.
+generated from DuckDB's `api_spec/v2` by `scripts/gen-v2-ffi.rb <commit>
+[path/to/duckdb]`, which reads the spec at that DuckDB commit and records
+the commit in `ffi.rs`'s header; it is never transcribed from the header
+file. `ffi.rs` regenerates byte for byte from 8b255c3ee6, and every function,
+struct and enum harbor calls is identical at 394f547866, the pinned engine's
+commit.
 
-**The engine is pinned right now.** On 2026-09-17 the nightly reworked the v2
-API (duckdb/duckdb#25751: `open` → `database_create` + `database_attach`,
-`connect` → `connection_create`, options by name, seventeen renames) and
-harbor's loader refuses it ("engine has no v2 C API"). The repository
-variable `DUCKDB_LIB_BUILD=alpha42289` makes the fetch script take
-`libduckdb` from the `engine-alpha42289` release of this repository (one
-`libduckdb-<plat>.tar.gz` per platform, a pre-release so `/releases/latest`
-never points at it) while the CLI and headers still come from the channel.
-`Tests.yml`, `FullSuite.yml` and `Release.yml` all honor it, and so does a
-local `DUCKDB_LIB_BUILD=alpha42289 make fetch-duckdb`; without it a local
-fetch refuses the channel's engine. `latest`, or no value, is the channel.
-Every release since 0.39.0 carries alpha42289 on all five platforms, and
-the engine release holds those same libraries byte for byte.
+**The engine is pinned.** On 2026-09-17 the nightly reworked the v2 API
+(duckdb/duckdb#25751) and harbor's loader refuses it ("engine has no v2 C
+API"). The repository variable `DUCKDB_LIB_BUILD=alpha42289` makes
+`scripts/fetch-duckdb.sh` take both `libduckdb` and the `duckdb` CLI from
+the `engine-alpha42289` release of this repository (`libduckdb-<plat>` and
+`duckdb-cli-<plat>` for five platforms, checked against
+`engine-alpha42289-checksums.txt`; a prerelease, so `/releases/latest` never
+points at it) and nothing from DuckDB's channel. The libraries are the ones
+every release since 0.39.0 carries; the CLIs come from DuckDB's own CI run
+for that build (duckdb/duckdb run 35206247008) and its libraries match the
+release's byte for byte. `Tests.yml`, `FullSuite.yml` and `Release.yml` all
+honor the variable, and so does a local `DUCKDB_LIB_BUILD=alpha42289 make
+fetch-duckdb`. `latest`, or no value, is the channel, whose engine harbor
+cannot load until the port.
 
-The fetch script and `Release.yml` decide "can this engine serve harbor" by
-looking for `duckdb_v2_create_environment`, the symbol the loader gates on
-in `engine/mod.rs`. The port to the reworked API changes what the loader
-gates on, and those two greps change with it.
+The fetch script decides "can this engine serve harbor" by looking for
+`duckdb_v2_create_environment`, the symbol the loader gates on in
+`engine/mod.rs`. The port changes what the loader gates on, and that grep
+changes with it.
 
-The way forward is to port to the reworked API once DuckDB's naming settles
-(re-run `gen-v2-ffi.rb` against the new spec, fix the seventeen call sites),
-then set the variable to `latest`. The API is still moving: duckdb/duckdb#26230
-passes structs by pointer, which touches thirty-three of harbor's bindings,
-and the draft duckdb/duckdb#25865 reworks query results, the calls behind
-`statement_execute`, `result_step` and `result_fetch_chunk`. The port waits
-for the result API to settle; DuckDB 2.0.0 is scheduled for 2026-10-21. A
-clone of DuckDB for reading the source is at `~/Data/Code/duckdb`. Upstream
-issues harbor has filed and watches: duckdb#25282 (nap race), duckdb#25301
-(prepare cost), duckdb#25967 (deeply nested VARIANT: quadratic `UPDATE`,
-segfault in the cast). duckdb-rs#841 is resolved. A DuckDB VARIANT cast bug
-we hit is duckdb#25873.
+**The port to the reworked API**, measured on 2026-10-09 against the 2.0
+branch: harbor calls 55 functions; 45 are unchanged, two pass a `str_t` by
+pointer, and eight are gone, all of them opening and closing (environment,
+open, connect, options → `instance_create`, `instance_attach`,
+`connection_create`, options by name). The open duckdb/duckdb#26820
+(2026-10-09) would remove nine more, every value constructor harbor binds
+with and `connection_create_type_from_text`, in favour of a factory handle,
+and the result API rework (draft #25865) was closed on 2026-10-07 for "a
+slightly different route". So the port waits for #26820 and the result API
+to settle, or for 2.0.0 (scheduled 2026-10-21), and is then mostly
+`engine/conn.rs`'s opening, the value constructors, a regenerated
+`ffi.rs`, and the variable set to `latest`. Once settled, the v2 API's
+`parse_sql` may also hand back the engine's own tokens (duckdb/duckdb#26289),
+which could replace `wire::scan`'s rules. A clone of DuckDB for reading the
+source is at `~/Data/Code/duckdb`. Upstream issues harbor has filed and
+watches: duckdb#25282 (nap race), duckdb#25301 (prepare cost), duckdb#25967
+(deeply nested VARIANT: quadratic `UPDATE`, segfault in the cast).
+duckdb-rs#841 is resolved. A DuckDB VARIANT cast bug we hit is duckdb#25873.
 
 ## Releasing
 
@@ -279,8 +351,9 @@ has a newer stable release — every DuckTable release ships the latest stable
 Sparkle, never a beta: set `sparkle_version` and `sparkle_sha256` together
 in `scripts/sparkle.sh`, the path in `docs/UPDATES.md`, and say so in the
 changelog. The changelog heading carries the day the release ships. Release
-harbor first when both ship, since the lockfile records harbor-common and
-wire. Then, from a clean `main` in step with origin, in `ducktable/`:
+harbor first when both ship, since the lockfile records harbor-common, wire
+and harbor-http, and DuckTable refuses to connect to a harbor older than
+0.44.2. Then, from a clean `main` in step with origin, in `ducktable/`:
 `scripts/release.sh X.Y.Z --dry-run`, `scripts/release.sh X.Y.Z`, and
 `scripts/update-cask.sh X.Y.Z`, and merge the tap's pull request
 (`Casks/ducktable.rb` on `shreeve/homebrew-tap`) once its checksum matches
@@ -317,12 +390,16 @@ serving `~/src/medlabs/api/db/medlabs.duckdb` on `http://127.0.0.1:9495`.
 Steve upgrades it himself with `ssh -t live 'harbor update --restart'`,
 which installs the release and restarts the unit; `systemctl --user restart
 harbor-medlabs` restarts it alone, and nothing kills it. The MedLabs app
-rides through a harbor restart. The ssh session closes at "restarting
-medlabs", before the last line prints, and the unit comes back about
-fifteen seconds later, so look after that, not at once: `harbor` (the
-listing, whose VERSION column is the running server's),
+rides through a harbor restart. Each restart `harbor update` starts runs in
+its own process group and writes to `runtime/log/update.log`, which is where
+its last lines are when the ssh session closes before they print. The unit
+comes back about fifteen seconds later, so look after that, not at once:
+`harbor` (the listing, whose VERSION column is the running server's),
 `systemctl --user is-active harbor-medlabs`, and
-`cd ~/src/medlabs && rip sites status medlabs --json`.
+`cd ~/src/medlabs && rip sites status medlabs --json`. A configuration that
+will not load keeps the unit from starting at all (systemd retries every
+ten seconds and the log names the line), so `harbor update --restart`
+checks it before it stops anything.
 
 ## DuckTable and the gpui-kit fork
 
@@ -381,7 +458,7 @@ reedline upgrade is checked against them:
 The proof after any upgrade is the repro: `create or replace ta`, Tab, keep
 typing, Enter. The statement must run with no stray word appended; type the
 tail fast enough to arrive as one batch. The pty driver in
-`test/scripts/lifecycle.sh` (the mooring check) answers the two terminal
+`test/scripts/lifecycle.sh` (the mooring check) answers the three terminal
 probes the REPL makes on startup and is the pattern for scripting it.
 
 ## REPL key rules, as settled
@@ -390,15 +467,18 @@ Up and Down walk history wherever history is, on a recalled line edited or
 not, until it is emptied. On the live line at the bottom, Down opens the
 completion panel, since there is nothing below to move to; open, Down moves
 through it and Tab accepts. Ctrl-Space opens the panel anywhere. Tab
-accepts a completion or the inline history hint; Right at end of line does
-too. A statement submits on Enter only when it ends in `;`.
+accepts a completion or the inline history hint; Right at end of line
+accepts the hint too, when no completion panel is open. A statement submits
+on Enter only when it ends in `;`. Dot commands work at the prompt, in piped
+scripts and in `.read` files, as the duckdb shell takes them.
 
 ## Output modes, as settled
 
 Display modes (duckbox, duckboxy, markdown, line, list) show a VARIANT
 string bare; a JSON column shows its text with quotes, as DuckDB's own table
 does. csv carries the JSON text CSV-escaped, so `42` and `"42"` stay apart
-for a program. json and jsonlines splice a VARIANT or JSON cell in as JSON,
+for a program, and writes SQL NULL as an empty field and the empty string
+as `""`, as DuckDB writes CSV; `.nullvalue` is for the display modes. json and jsonlines splice a VARIANT or JSON cell in as JSON,
 with newlines in a pretty-printed JSON column folded to spaces so jsonlines
 stays one record per line. `NaN` and `Infinity` stay strings; a document is
 spliced whole however deep it nests, since the well-formedness check skips
@@ -432,87 +512,78 @@ counted, and harbor answers one more with a 400 before anything is bound
 document before it is sent. Only a string the statement casts through
 `?::JSON`, which no layer inspects, reaches any of this.
 
-## Recent history, for orientation
+## History
 
-| version | date | change |
-|---|---|---|
-| 0.42.0 | 09-22 | the TCP door refuses a browser; keyless rows by hash; infinite dates as `infinity`; a brace-expansion budget |
-| 0.42.1 | 09-23 | reedline in step with upstream |
-| 0.43.0 | 09-23 | `harbor update [version] [--check] [--restart]` |
-| 0.43.1 | 09-26 | reedline 0.52 from crates.io; the vendored copy is gone |
-| 0.43.2 | 10-03 | on Windows the list says why a running server is not in it |
-| 0.43.3 | 10-03 | `EXPLAIN` prints the plan as the engine drew it |
-| 0.43.4 | 10-03 | a plan is colored the way DuckDB's shell colors it |
-| 0.43.5 | 10-03 | Homebrew installs harbor; `harbor` names a second copy on the machine |
-| 0.44.0 | 10-03 | a transaction holds from the CLI; `BEGIN` needs a session; the review's remaining defects |
-| 0.44.1 | 10-04 | a `COMMIT` on an aborted transaction says it was rolled back; the REPL keeps its session alive |
-| 0.44.2 | 10-04 | a `COMMIT` runs to its answer, so a `499` means nothing was kept |
-
-Older milestones the code still reflects: 0.20 collapsed everything into
-one binary with the refcounted lifetime; 0.21 moved to the direct v2 C API
-and retired duckdb-rs; 0.33 gave autostart the brew-services model; 0.34
-added `--block-size` and fixed backup/restore; 0.39 is where VARIANT became
-usable end to end; 0.40 put brace expansion in the server; 0.41 bound an
-object or array param aimed at a VARIANT as the document, to a hundred
-levels.
+`harbor/CHANGELOG.md` and `ducktable/CHANGELOG.md` are the record, release by
+release, and say why each change was made. Milestones the code still
+reflects: one binary with the refcounted lifetime (0.20), the direct v2 C API
+(0.21), autostart on the brew-services model (0.33), VARIANT end to end
+(0.39), brace expansion in the server (0.40), a transaction held in a
+session from the CLI (0.44), and the revamp of both products that 0.45.0
+and DuckTable 0.23.0 record.
 
 ## Open items
 
-- **Port to DuckDB's reworked v2 C API**, then set the
-  `DUCKDB_LIB_BUILD` repository variable to `latest`. Wait for the naming to
-  settle; there was reviewer discussion upstream about instance-versus-
-  database option scope.
-- **A binary wire mode** is parked until DuckDB GA.
-- **The deployment runbook** (`duckdb-harbor-runbook`) is deferred to GA;
-  four decisions were recorded so they are not re-derived.
-- **DuckTable** is at 0.22.9, early and moving fast; its own docs are under
-  `ducktable/docs/`. Its Sparkle signing key lives in the login keychain
-  under the account `ducktable`, with a backup in the gitignored, untracked
-  `notes.txt` at the repo root. Never read or commit that file. Open:
-  - *EXPLAIN output* (#132): the grid shows a plan's first line, which is a
-    box border, and the inspector right-aligns the plan. It wants a
-    preformatted, full-width view.
-  - *A called-off Open Database URL* is dialed again on Cancel as a plain
-    remote connect, without the config entry being saved again. It wants an
-    `Aim` of its own.
-  - *A COMMIT answered 499* is read as in doubt. A session's COMMIT runs to
-    its answer (harbor 0.44.2), so a 499 there means nothing was kept, and
-    the held set's verdict could say so.
-  - *Paths reviewed and unit-tested but not yet watched on screen:* the held
-    set's two verdicts after a COMMIT that got no answer, and Install and
-    Relaunch held by the quit dialog against a real update.
+- **Release the revamp.** `main` carries harbor 0.45.0 and DuckTable 0.23.0
+  in their changelogs, unreleased: the version-bump pull request for harbor
+  first, its tag, `harbor update` here and the Homebrew formula; then
+  DuckTable's release script, the cask and the checks of every way in. The
+  revamp was verified on macOS arm64 and Linux x86_64 (the full suite on
+  `pup`), with DuckTable's live probes green and its SSH tunnel, version
+  floor and quit watched on screen against `live`. `live` runs 0.44.2 until
+  Steve runs `ssh -t live 'harbor update --restart'`; its config passes the
+  checks a start makes.
+- **Port to DuckDB's reworked v2 C API**, then set the `DUCKDB_LIB_BUILD`
+  repository variable to `latest`. "The engine" above has the measured size
+  of the port and what it waits for.
+- **Upstream bug to file (Steve's voice):** DuckDB's parser strips Unicode
+  spaces only where its own pre-pass thinks it is in code, and a `'` inside
+  a comment or after an `E'\''` string misleads it into rewriting a
+  U+00A0 inside a real string: `SELECT /* don't */ 'x<U+00A0>y'` returns
+  `x y` (`Parser::StripUnicodeSpaces`, `parser.cpp` at 394f547866;
+  measured on alpha42779). `wire::statement` mirrors the pre-pass, quirks
+  included, so harbor reads the statement as the engine runs it.
+- **The old community extension** `harbor` v0.4.0 is still listed in DuckDB's
+  community extensions, pointing at a commit no longer in this repository
+  (#145 is a user who found it). Asking DuckDB to retire the listing or point
+  it at this harbor is Steve's call.
+- **Measure on quiet hardware.** The README's Performance section names the
+  benchmark shapes but quotes no figures, since every run during the revamp
+  was on a loaded machine; SALES-PITCH's Quack comparison was not re-run.
+- **Proved only by reading or by CI:** the PowerShell installers and
+  `harbor update` on Windows (moving the running `harbor.exe` aside), Ctrl-C
+  stopping a Windows server, and macOS symbol promotion with a real
+  extension loaded.
+- **Small, known, deferred:**
+  - A tunneled remote in DuckTable whose server exits while ssh stays up
+    shows green until its next request fails; probing through the tunnel on
+    each refresh would misread a slow link.
+  - DuckTable's commit order does not recognize a key move typed differently
+    from the wire's spelling of it, or a UNIQUE column that is not the key
+    (EDITING.md says so).
+  - Ctrl-C during a restore's final shutdown-and-move step is not honored;
+    the restore completes.
+  - A `GEOMETRY[]` column reports `lossless: true` on the list while its
+    child says `false`; a question of wire semantics.
+- **DuckTable** keeps its Sparkle signing key in the login keychain under
+  the account `ducktable`, with a backup in the gitignored, untracked
+  `notes.txt` at the repo root. Never read or commit that file. Paths
+  unit-tested but not yet watched on screen: the held set's two verdicts
+  after a COMMIT that got no answer, and Install and Relaunch held by the
+  quit dialog against a real update.
+- **A binary wire mode** is parked until DuckDB GA. **The deployment
+  runbook** (`duckdb-harbor-runbook`) is deferred to GA; four decisions were
+  recorded so they are not re-derived.
 - **Windows cannot list its servers.** The list finds servers by unix
   socket and Windows has none; the list says so and gives the URL form.
 - **Linux glibc floor.** Release archives are built on Ubuntu 24.04 and
   need glibc 2.39; the README and the release notes say so. Building on an
-  older baseline (a manylinux container or cargo-zigbuild) would run on
-  older distributions without changing harbor, and is deliberately not
-  scheduled; issue #56 was closed with an offer to revisit if it blocks
-  someone.
-- **A cleanup pass, when there is a session for one.** The code review of
-  2026-09 closed its defects through 0.44.2; what it left is recorded here
-  and in the issues, none of it urgent.
-  - *A statement keeps running after its client disconnects before any rows
-    are sent* (#133). The server learns a client is gone only at a failed
-    write. The connection's reader already sees the close; the work is
-    carrying that to the request being answered without reading a half-close
-    or a pipelined request as a departure. A statement deadline bounds it
-    meanwhile.
-  - *The REPL's and DuckTable's keep-alive is a statement.* `SELECT 1` on
-    the session every ten seconds counts in `/sessions` and overwrites a
-    session's profiling output. A touch that runs nothing, a renew for an
-    ordinary session that resets its idle clock and leaves its ceiling
-    alone, would replace both.
-  - *`harbor update --restart` over ssh ends without its last line.* The
-    session closes once the restart begins and "restarted" is never
-    printed, though the restart completes. Cause not looked into.
-  - *Left by the review on purpose:* workflow actions pinned by tag, not
-    commit; the engine layer's types that can outlive what they point to,
-    which is why `cargo clippy` fails on harbor, and its slow VARIANT cell
-    path, both of which the port to the reworked v2 API rewrites; type names
-    built by hand beside the engine's; the `[defaults]` config section,
-    parsed and read by nothing; and era framing in older comments in
-    `lib.rs`, `wire` and `justhttp`.
+  older baseline would run on older distributions without changing harbor,
+  and is deliberately not scheduled (#56).
+- **Left on purpose:** workflow actions pinned by tag, not commit; the
+  engine layer's types that can outlive what they point to, which is why
+  `cargo clippy` fails on harbor, and its slow VARIANT cell path, both of
+  which the port rewrites.
 - **Optional polish:** a distinct color for braces in the highlighter; the
   brace expander could take aliases inside a group if a syntax that does
   not collide with the struct-literal colon is chosen.

@@ -13,17 +13,23 @@ license = "MIT"
 harbor-common = { path = "../common", features = ["config", "membership"] }
 libloading = "0.8"
 justhttp = { path = "../justhttp" }
-# preserve_order: --json rows must keep column order, not alphabetize it
-serde_json = { version = "1", features = ["preserve_order"] }
+# preserve_order: --json rows must keep column order, not alphabetize it.
+# float_roundtrip: a float param binds as the double its text names; the
+# default parser is not correctly rounded and lands some texts a ULP off.
+# raw_value: a param past 64 bits is told apart by its text, whole number
+# or not (lib.rs `written_whole`).
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip", "raw_value"] }
 # IgnoredAny: the json modes check that a JSON-text cell is JSON before
 # splicing it in, without building a tree for it
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 # --- the client half (src/repl/) ---------------------------------------------
 # Pure protocol client: it never touches DuckDB. HTTP/1.1 over
 # UnixStream/TcpStream is hand-rolled because dragging an async stack in
 # for one request at a time buys nothing. TLS-free on purpose; remote
 # human access goes through SSH, while Caddy serves HTTPS app clients.
 wire = { path = "../wire" }
+# The transport, sessions and summon the client half shares with DuckTable.
+harbor-http = { path = "../http" }
 crossterm = "0.29.0"
 nu-ansi-term = "0.50.3"
 reedline = "0.52.0"
@@ -39,9 +45,6 @@ getrandom = "0.2"
 # exists), the one C dependency in the binary.
 zstd = "0.13"
 libc = "0.2"
-
-[target.'cfg(unix)'.dependencies]
-signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }
 
 # The server engine (pool, leases, cancellation, NDJSON /sql) lives in this
 # crate's library beside the CLI in the bin — one crate, nothing else links

@@ -1,11 +1,10 @@
 //! A snapshot whose lifetime follows the backup client, including file work
 //! between SQL requests. Losing its renewal aborts rather than reopening it.
 
-use super::{Conn, Mode, Outcome, RenderOpts, endpoint, http, resolve, run_sql_in_session};
+use super::{Mode, Outcome, RenderOpts, Transport, http, resolve, run_sql};
 use std::io;
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Clone, Default)]
 pub(super) struct Health(Arc<Mutex<Option<String>>>);
@@ -19,83 +18,33 @@ impl Health {
     }
 }
 
-struct Heartbeat {
-    stop: mpsc::Sender<()>,
-    thread: Option<JoinHandle<()>>,
-    health: Health,
-}
-
-impl Heartbeat {
-    fn start(conn: &Conn, id: &str, ttl: Duration) -> Result<Self, String> {
-        if ttl < Duration::from_millis(30) {
-            return Err("backup renewal window is too short".into());
-        }
-        let (stop, rx) = mpsc::channel();
-        let health = Health::default();
-        let failure = health.clone();
-        let transport = conn.transport.clone();
-        let route = endpoint::session_renew(id);
-        let interval = ttl / 3;
-        let timeout = interval.min(Duration::from_secs(5));
-        let thread = thread::Builder::new()
-            .name("backup-heartbeat".into())
-            .spawn(move || {
-                while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(interval) {
-                    let deadline = Instant::now() + timeout;
-                    let tick = || {
-                        if Instant::now() >= deadline {
-                            Err(io::Error::new(io::ErrorKind::TimedOut, "renewal timed out"))
-                        } else {
-                            Ok(())
-                        }
-                    };
-                    let result = http::request_streaming(&transport, &route, None, &tick).and_then(
-                        |response| {
-                            tick()?;
-                            if response.status == 200 {
-                                Ok(())
-                            } else {
-                                Err(io::Error::other(format!("HTTP {}", response.status)))
-                            }
-                        },
-                    );
-                    if let Err(e) = result {
-                        *failure.0.lock().unwrap() = Some(format!(
-                            "backup lease renewal failed: {e}; the snapshot was abandoned"
-                        ));
-                        break;
-                    }
-                }
-            })
-            .map_err(|e| format!("starting backup heartbeat: {e}"))?;
-        Ok(Self {
-            stop,
-            thread: Some(thread),
-            health,
-        })
+/// The backup session renewed every third of its window until this is
+/// dropped. The first renewal that fails marks `health`, which ends the
+/// statement under way and every one after it, and the renewals stop.
+fn heartbeat(transport: &Transport, id: &str, ttl: Duration, health: &Health) -> Result<http::Beat, String> {
+    if ttl < Duration::from_millis(30) {
+        return Err("backup renewal window is too short".into());
     }
+    let (transport, id, failure) = (transport.clone(), id.to_string(), health.clone());
+    http::beat("backup-heartbeat", ttl / 3, move || {
+        let why = match http::session_renew(&transport, &id) {
+            Ok(true) => return Some(ttl / 3),
+            Ok(false) => "the server renews no such session".to_string(),
+            Err(e) => e.to_string(),
+        };
+        *failure.0.lock().unwrap() = Some(format!("backup lease renewal failed: {why}; the snapshot was abandoned"));
+        None
+    })
+    .map_err(|e| format!("starting backup heartbeat: {e}"))
 }
 
-impl Drop for Heartbeat {
-    fn drop(&mut self) {
-        let _ = self.stop.send(());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-struct Release<'a>(&'a Conn, String);
+/// Releasing the session cancels its work and rolls it back, on an error
+/// and on unwind as well as at the end.
+struct Release<'a>(&'a Transport, String);
 
 impl Drop for Release<'_> {
     fn drop(&mut self) {
-        // DELETE cancels active work and rolls back on errors and unwind.
-        let _ = http::request(
-            &self.0.transport,
-            &endpoint::session(&self.1),
-            None,
-            Some(Duration::from_secs(5)),
-        );
+        let _ = http::session_release(self.0, &self.1);
     }
 }
 
@@ -106,44 +55,35 @@ pub fn with_snapshot<T>(
     target: &str,
     work: impl FnOnce(&dyn Fn(&str) -> Result<(), String>) -> Result<T, String>,
 ) -> Result<T, String> {
-    let (conn, _) = resolve(target, &[])?;
-    let _anchor = http::hold(&conn.transport);
-    let response = http::request(
-        &conn.transport,
-        &endpoint::SESSIONS_CREATE,
-        Some(r#"{"purpose":"backup"}"#),
-        Some(Duration::from_secs(10)),
-    )
-    .map_err(|e| format!("opening backup session: {e}"))?;
-    let status = response.status;
-    let text = response
-        .body_string()
-        .map_err(|e| format!("reading backup session: {e}"))?;
-    if status != 200 {
-        return Err(format!("opening backup session: HTTP {status}: {text}"));
-    }
-    let lease: wire::SessionNewResponse =
-        serde_json::from_str(&text).map_err(|e| format!("invalid backup session response: {e}"))?;
-    // Construct this first: stop the heartbeat before releasing the lease.
-    let release = Release(&conn, lease.session_id);
+    let (transport, _) = resolve(target, &[])?;
+    let _anchor = http::hold(&transport);
+    // Ctrl-C cancels the statement under way and fails the work, and the
+    // caller takes back whatever it had written. A statement that runs to
+    // its end regardless is still the last one: the interrupt is kept here
+    // as well, since the cancel's own flag is spent on asking.
+    super::cancel_on_interrupt();
+    let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, interrupted.clone());
+    let interrupted = || interrupted.load(std::sync::atomic::Ordering::Relaxed);
+    let ask = wire::SessionNewRequest { purpose: Some(wire::SessionPurpose::Backup), ..Default::default() };
+    let lease = http::session_open(&transport, &ask).map_err(|e| format!("opening backup session: {e}"))?;
+    // Made before the heartbeat, so it drops after it: the renewals stop
+    // before the lease is released.
+    let release = Release(&transport, lease.session_id);
     if lease.purpose != Some(wire::SessionPurpose::Backup) {
-        return Err(
-            "server does not support renewable backup sessions; upgrade the Harbor server".into(),
-        );
+        return Err("server does not support renewable backup sessions; upgrade the Harbor server".into());
     }
-    let heartbeat = Heartbeat::start(&conn, &release.1, Duration::from_millis(lease.ttl_ms))?;
-    let opts = RenderOpts {
-        mode: Mode::Trash,
-        ..RenderOpts::default()
-    };
+    let health = Health::default();
+    let _heartbeat = heartbeat(&transport, &release.1, Duration::from_millis(lease.ttl_ms), &health)?;
+    let opts = RenderOpts { mode: Mode::Trash, ..RenderOpts::default() };
     let execute = |sql: &str| {
-        heartbeat.health.check().map_err(|e| e.to_string())?;
-        let outcome =
-            run_sql_in_session(&conn, sql, &opts, Some(&release.1), Some(&heartbeat.health));
-        heartbeat.health.check().map_err(|e| e.to_string())?;
+        health.check().map_err(|e| e.to_string())?;
+        let (outcome, _) = run_sql(&transport, sql, &opts, Some(&release.1), Some(&health));
+        health.check().map_err(|e| e.to_string())?;
         match outcome {
-            Outcome::Done => Ok(()),
             Outcome::Cancelled => Err("backup interrupted".into()),
+            Outcome::Done | Outcome::Closed if interrupted() => Err("backup interrupted".into()),
+            Outcome::Done | Outcome::Closed => Ok(()),
             Outcome::Failed => Err("backup statement failed; the snapshot was abandoned".into()),
         }
     };
@@ -158,6 +98,8 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::thread::{self, JoinHandle};
+    use std::time::Instant;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct Server {
@@ -330,10 +272,10 @@ mod tests {
     }
 
     #[test]
-    fn old_server_is_rejected_and_its_lease_released() {
+    fn a_server_without_renewable_sessions_is_refused_and_its_lease_released() {
         let server = Server::new(false, 200);
         let error = with_snapshot(&server.target, |_| -> Result<(), String> {
-            panic!("must not export on a legacy lease");
+            panic!("must not export on a lease that cannot be renewed");
         })
         .unwrap_err();
         assert!(error.contains("upgrade"), "{error}");

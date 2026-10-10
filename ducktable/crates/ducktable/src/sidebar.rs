@@ -138,8 +138,8 @@ impl DuckTable {
                     // an older harbor than the one installed. Click to restart
                     // them onto the current binary. Refresh (below) keeps its
                     // plain meaning; upgrading is this deliberate, separate tap.
-                    .when(self.outdated_count() > 0, |d| {
-                        let n = self.outdated_count();
+                    .when(self.outdated().next().is_some(), |d| {
+                        let n = self.outdated().count();
                         d.child(
                             div()
                                 .id("upgrade-badge")
@@ -229,8 +229,8 @@ impl DuckTable {
                         })
                         // Same grammar as the table rows below: name with
                         // its count hugging it, magnitude on the right.
-                        // (The dot alone says stopped; "on demand" gave
-                        // way to the size, known even for stopped files.)
+                        // The dot alone says stopped, and the size shows
+                        // whether it runs or not.
                         .child(named_count(&row.name, row.tables, t))
                         .when_some(row.size, |d, s| {
                             d.child(dim(t, crate::util::human(s as f64, "B")))
@@ -271,7 +271,7 @@ impl DuckTable {
                             let name = clone_str(&name);
                             let path = row.path.clone();
                             move |this, _: &ClickEvent, _, cx| {
-                                this.connect_row(clone_str(&name), path.clone(), cx)
+                                this.choose_row(clone_str(&name), path.clone(), cx)
                             }
                         }))
                         // Right-click → Stop: shut this berth's server down.

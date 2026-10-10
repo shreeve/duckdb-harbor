@@ -8,75 +8,41 @@
 //! engine: the spaces it skips, the comments it skips, what it takes for a
 //! bare word, and the `EXPLAIN` that runs what it explains.
 
-/// How many bytes of whitespace `b` starts with, counted as the engine's
-/// parser counts it: the ASCII set with the vertical tab, and the Unicode
-/// spaces it strips before it parses (U+00A0, U+2000 to U+200B, U+202F,
-/// U+205F, U+2060, U+3000, and the byte order mark, U+FEFF). A scanner that
-/// knew fewer than the engine would read a statement behind one of them as
-/// no statement at all, and the engine would run it.
-pub fn space_len(b: &[u8]) -> usize {
-    match b {
-        [c, ..] if c.is_ascii_whitespace() || *c == 0x0b => 1,
-        [0xC2, 0xA0, ..] => 2,
-        [0xE2, 0x80, 0x80..=0x8B | 0xAF, ..]
-        | [0xE2, 0x81, 0x9F | 0xA0, ..]
-        | [0xE3, 0x80, 0x80, ..]
-        | [0xEF, 0xBB, 0xBF, ..] => 3,
-        _ => 0,
-    }
-}
+use crate::scan::{Kind, comment_at, is_space, is_word_byte, plain_spaces, spans};
 
-/// Advance `i` past whitespace and SQL comments: `--` to end of line, nested
-/// `/* */`. The one skipper every reader of a statement's keywords shares.
+/// Advance `i` past whitespace and SQL comments, read by [`crate::scan`]. The
+/// one skipper every reader of a statement's keywords shares. `b` is the
+/// whole text: whether a Unicode space is one depends on what comes before
+/// it.
 pub fn skip_trivia(b: &[u8], i: &mut usize) {
-    loop {
-        while let n @ 1.. = space_len(&b[*i..]) {
-            *i += n;
-        }
-        if b[*i..].starts_with(b"--") {
-            // CR ends the comment too — see ensure_single_statement. The same
-            // one-byte gap defeated the fleet-safety fence from the other
-            // side: `SET --\r memory_limit='1TB'` looked like a bare `SET`
-            // with a trailing comment here, so `fenced_setting` never saw the
-            // key, while the engine set it. memory_limit is process-global,
-            // so that is every neighbor berth's ceiling raised by one caller
-            // — measured going from 1.8 GiB to 931.3 GiB.
-            *i = b[*i..]
-                .iter()
-                .position(|&c| c == b'\n' || c == b'\r')
-                .map_or(b.len(), |p| *i + p + 1);
-        } else if b[*i..].starts_with(b"/*") {
-            let mut depth = 1;
-            *i += 2;
-            while *i < b.len() && depth > 0 {
-                if b[*i..].starts_with(b"/*") {
-                    depth += 1;
-                    *i += 2;
-                } else if b[*i..].starts_with(b"*/") {
-                    depth -= 1;
-                    *i += 2;
-                } else {
-                    *i += 1;
-                }
-            }
-        } else {
-            break;
-        }
-    }
+    skip(&plain_spaces(b), i)
 }
 
-/// A bare keyword after trivia, uppercased: a run of what the engine takes
-/// for an unquoted identifier (ASCII letters and digits, `_`, `$`, and
-/// anything past ASCII that is not a space). A quoted identifier is a name
+/// A bare keyword after trivia, uppercased: a run of what the engine keeps
+/// in an unquoted word (anything but ASCII punctuation and the spaces, with
+/// `_` and `$` let in; see [`crate::scan`]). A quoted identifier is a name
 /// and never a keyword, so it reads as nothing, and so does punctuation;
 /// `COMMIT$x` and `"BEGIN"` are table names to the engine and to this.
 pub fn bare_word(b: &[u8], i: &mut usize) -> String {
-    skip_trivia(b, i);
+    word(&plain_spaces(b), i)
+}
+
+fn skip(b: &[u8], i: &mut usize) {
+    loop {
+        while b.get(*i).is_some_and(|&c| is_space(c)) {
+            *i += 1;
+        }
+        match comment_at(b, *i) {
+            Some(comment) => *i = comment.end,
+            None => break,
+        }
+    }
+}
+
+fn word(b: &[u8], i: &mut usize) -> String {
+    skip(b, i);
     let start = *i;
-    while *i < b.len()
-        && space_len(&b[*i..]) == 0
-        && (b[*i].is_ascii_alphanumeric() || matches!(b[*i], b'_' | b'$') || b[*i] >= 0x80)
-    {
+    while b.get(*i).is_some_and(|&c| is_word_byte(c)) {
         *i += 1;
     }
     String::from_utf8_lossy(&b[start..*i]).to_ascii_uppercase()
@@ -89,43 +55,53 @@ pub fn bare_word(b: &[u8], i: &mut usize) -> String {
 /// value the option is given, and takes a list after the word too; an
 /// `EXPLAIN` without it only plans.
 pub fn acting_keyword(sql: &str) -> String {
-    let b = sql.as_bytes();
+    let b = &*plain_spaces(sql.as_bytes());
     let mut i = 0;
-    let word = bare_word(b, &mut i);
-    if word != "EXPLAIN" {
-        return word;
+    let first = word(b, &mut i);
+    if first != "EXPLAIN" {
+        return first;
     }
     let analyzes = |w: &str| matches!(w, "ANALYZE" | "ANALYSE");
     let at = i;
-    let mut analyze = analyzes(&bare_word(b, &mut i));
+    let mut analyze = analyzes(&word(b, &mut i));
     if !analyze {
         i = at;
     }
-    skip_trivia(b, &mut i);
+    skip(b, &mut i);
     if b.get(i) == Some(&b'(') {
+        // The list is read in its code alone: a parenthesis or a word in an
+        // option's quoted value is part of the value. `(ANALYZE 'x)')` is
+        // one option, and the statement after it runs.
+        let list = &b[i..];
+        let mut end = list.len();
         let mut depth = 0usize;
-        while i < b.len() {
-            match b[i] {
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        i += 1;
-                        break;
+        'list: for span in spans(list).into_iter().filter(|s| s.kind == Kind::Code) {
+            let code = &list[..span.end];
+            let mut j = span.start;
+            while j < span.end {
+                match code[j] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = j + 1;
+                            break 'list;
+                        }
+                    }
+                    _ => {
+                        let at = j;
+                        analyze |= analyzes(&word(code, &mut j));
+                        if j > at {
+                            continue;
+                        }
                     }
                 }
-                _ => {
-                    let at = i;
-                    analyze |= analyzes(&bare_word(b, &mut i));
-                    if i > at {
-                        continue;
-                    }
-                }
+                j += 1;
             }
-            i += 1;
         }
+        i += end;
     }
-    if analyze { bare_word(b, &mut i) } else { word }
+    if analyze { word(b, &mut i) } else { first }
 }
 
 /// What a statement does to the surrounding transaction, when that is knowable
@@ -140,21 +116,61 @@ pub fn transaction_effect(sql: &str) -> Option<bool> {
     }
 }
 
+/// Whether the engine runs a statement as a COMMIT: one that, once begun,
+/// runs to its answer.
+pub fn commits(sql: &str) -> bool {
+    matches!(acting_keyword(sql).as_str(), "COMMIT" | "END")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// The spaces are the engine's list and no wider: a space it does not
-    /// skip is part of a word to it, and the word is then no keyword.
+    /// skip is part of a word to it, and the word is then no keyword. Its
+    /// pre-pass never looks at a text's last two bytes, so a final U+00A0
+    /// is part of the word: `COMMIT` and that space is a table to the
+    /// engine, which runs it as `FROM` and aborts the transaction.
     #[test]
     fn a_keyword_is_read_past_the_spaces_the_engine_skips_and_no_others() {
         for space in ["\u{a0}", "\u{2000}", "\u{200b}", "\u{202f}", "\u{205f}", "\u{2060}", "\u{3000}", "\u{feff}", "\u{b}", "\t\r\n"] {
             assert_eq!(acting_keyword(&format!("{space}COMMIT")), "COMMIT", "{space:?}");
-            assert_eq!(transaction_effect(&format!("COMMIT{space}")), Some(false), "{space:?}");
+            assert_eq!(transaction_effect(&format!("COMMIT{space};")), Some(false), "{space:?}");
         }
+        assert_eq!(transaction_effect("COMMIT\u{a0}"), None);
+        assert_eq!(transaction_effect("COMMIT\u{3000}"), Some(false));
         for not_a_space in ["\u{85}", "\u{1680}", "\u{2028}", "\u{2029}"] {
             assert_eq!(transaction_effect(&format!("{not_a_space}COMMIT")), None, "{not_a_space:?}");
         }
+        // A space the pre-pass passes over, here inside the quote that a
+        // `'` in a comment opens for it, is part of the word as well.
+        assert_eq!(acting_keyword("/* ' */ COMMIT\u{3000}x"), "COMMIT\u{3000}X");
+        assert_eq!(bare_word("/* ' */ COMMIT\u{3000}x".as_bytes(), &mut 0), "COMMIT\u{3000}X");
+    }
+
+    /// The effect is the engine's, measured: an analyzed EXPLAIN runs the
+    /// statement behind it, in each spelling the engine takes.
+    #[test]
+    fn a_transaction_ends_where_the_engine_ends_it() {
+        for sql in [
+            "COMMIT", "commit;", "END", "ROLLBACK", "ABORT", "COMMIT--x", "COMMIT/**/", "-- c\rCOMMIT",
+            "EXPLAIN ANALYZE COMMIT", "EXPLAIN ANALYSE COMMIT", "EXPLAIN (ANALYZE) COMMIT",
+            "EXPLAIN (ANALYZE, FORMAT JSON) COMMIT", "EXPLAIN (FORMAT JSON, ANALYZE) COMMIT",
+            "EXPLAIN ANALYZE (FORMAT JSON) COMMIT", "EXPLAIN (ANALYZE false) COMMIT", "EXPLAIN ANALYZE ROLLBACK",
+        ] {
+            assert_eq!(transaction_effect(sql), Some(false), "{sql:?}");
+        }
+        for sql in [
+            "EXPLAIN COMMIT", "EXPLAIN (FORMAT JSON) COMMIT", "EXPLAIN (FORMAT JSON) ANALYZE COMMIT",
+            "COMMIT_X", "COMMIT1", "COMMIT$x", "COMMIT\u{e9}", "\"COMMIT\"", "(COMMIT)", "SELECT 'COMMIT'", "",
+        ] {
+            assert_eq!(transaction_effect(sql), None, "{sql:?}");
+        }
+        for sql in ["EXPLAIN ANALYZE BEGIN", "EXPLAIN /* x */ ANALYZE BEGIN", "\u{feff}BEGIN"] {
+            assert_eq!(transaction_effect(sql), Some(true), "{sql:?}");
+        }
+        assert_eq!(transaction_effect("EXPLAIN BEGIN"), None);
+        assert!(commits("end") && commits("EXPLAIN ANALYZE COMMIT") && !commits("ROLLBACK") && !commits("EXPLAIN COMMIT"));
     }
 
     #[test]
@@ -167,6 +183,14 @@ mod tests {
             ("EXPLAIN ANALYZE (FORMAT JSON) COMMIT", "COMMIT"),
             ("EXPLAIN COMMIT", "EXPLAIN"),
             ("EXPLAIN (FORMAT JSON) ANALYZE COMMIT", "EXPLAIN"),
+            ("EXPLAIN (ANALYZE 'x)') COMMIT", "COMMIT"),
+            ("EXPLAIN (ANALYZE, FORMAT \"a)\") COMMIT", "COMMIT"),
+            ("EXPLAIN (ANALYZE $t$)$t$, FORMAT JSON) COMMIT", "COMMIT"),
+            ("EXPLAIN (ANALYZE /* ) */) COMMIT", "COMMIT"),
+            ("EXPLAIN (FORMAT 'analyze') COMMIT", "EXPLAIN"),
+            ("EXPLAIN (FORMAT /* analyze */ JSON) COMMIT", "EXPLAIN"),
+            ("EXPLAIN (ANALYZE 'x)'", ""),
+            ("-- c\rCOMMIT", "COMMIT"),
             ("\"COMMIT\"", ""),
             ("COMMIT$x", "COMMIT$X"),
             ("(COMMIT)", ""),

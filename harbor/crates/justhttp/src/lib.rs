@@ -1,81 +1,17 @@
-//! # Simple usage
+//! Just HTTP: a small synchronous HTTP/1.1 server over TCP or unix sockets.
 //!
-//! ## Creating the server
-//!
-//! The easiest way to create a server is to call `Server::http()`.
-//!
-//! The `http()` function returns a `Result<Server, _>` which will contain an error
-//! in the case where the server creation fails (for example if the listening port is already
-//! occupied).
+//! A `Server` starts listening as soon as it is built. Worker threads take
+//! requests with `recv_timeout`, and `unblock` wakes one of them for a
+//! graceful shutdown. Every `Request` is answered with `respond`; one dropped
+//! unanswered gets a 500.
 //!
 //! ```no_run
-//! let server = justhttp::Server::http("0.0.0.0:0").unwrap();
-//! ```
+//! use std::time::Duration;
 //!
-//! A newly-created `Server` will immediately start listening for incoming connections and HTTP
-//! requests.
-//!
-//! ## Receiving requests
-//!
-//! Calling `server.recv()` will block until the next request is available.
-//! This function returns an `IoResult<Request>`, so you need to handle the possible errors.
-//!
-//! ```no_run
-//! # let server = justhttp::Server::http("0.0.0.0:0").unwrap();
-//!
-//! loop {
-//!     // blocks until the next request is received
-//!     let request = match server.recv() {
-//!         Ok(rq) => rq,
-//!         Err(e) => { println!("error: {}", e); break }
-//!     };
-//!
-//!     // do something with the request
-//!     // ...
+//! let server = justhttp::Server::http("127.0.0.1:0").unwrap();
+//! while let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(200)) {
+//!     let _ = request.respond(justhttp::Response::from_string("hello world"));
 //! }
-//! ```
-//!
-//! In a real-case scenario, you will probably want to spawn multiple worker tasks and call
-//! `server.recv()` on all of them. Like this:
-//!
-//! ```no_run
-//! # use std::sync::Arc;
-//! # use std::thread;
-//! # let server = justhttp::Server::http("0.0.0.0:0").unwrap();
-//! let server = Arc::new(server);
-//! let mut guards = Vec::with_capacity(4);
-//!
-//! for _ in (0 .. 4) {
-//!     let server = server.clone();
-//!
-//!     let guard = thread::spawn(move || {
-//!         loop {
-//!             let rq = server.recv().unwrap();
-//!
-//!             // ...
-//!         }
-//!     });
-//!
-//!     guards.push(guard);
-//! }
-//! ```
-//!
-//! If you don't want to block, you can call `server.try_recv()` instead.
-//!
-//! ## Handling requests
-//!
-//! The `Request` object returned by `server.recv()` contains informations about the client's request.
-//! The most useful methods are probably `request.method()` and `request.url()` which return
-//! the requested method (`GET`, `POST`, etc.) and url.
-//!
-//! To handle a request, you need to create a `Response` object. See the docs of this object for
-//! more infos. Here is an example of creating a `Response` from a string, and responding:
-//!
-//! ```no_run
-//! # let server = justhttp::Server::http("0.0.0.0:0").unwrap();
-//! # let request = server.recv().unwrap();
-//! let response = justhttp::Response::from_string("hello world");
-//! let _ = request.respond(response);
 //! ```
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
@@ -95,7 +31,7 @@ use pool::MessagesQueue;
 use stream::Connection;
 
 pub use http::{Header, Method, StatusCode};
-pub use request::Request;
+pub use request::{Peer, Request};
 pub use response::Response;
 pub use stream::{ListenAddr, Listener};
 
@@ -108,9 +44,9 @@ mod stream;
 
 /// The main class of this library.
 ///
-/// Destroying this object will immediately close the listening socket and the reading
-///  part of all the client's connections. Requests that have already been returned by
-///  the `recv()` function will not close and the responses will be transferred to the client.
+/// Destroying this object closes the listening sockets. Requests already
+/// returned by `recv_timeout()` stay open, and their responses still reach
+/// the client.
 pub struct Server {
     // should be false as long as the server exists
     // when set to true, all the subtasks will close within a few hundreds ms
@@ -124,11 +60,18 @@ pub struct Server {
     // Drop wakes and, for unix paths, unlinks each one).
     listening_addrs: Vec<ListenAddr>,
 
-    // live client connections, counted at accept and at connection end.
-    // A fact, not a policy: the host reads this to decide lifetime (a
-    // refcounted server exits when nobody has been connected for a
-    // while), and policy stays out of the HTTP layer.
-    connections: Arc<AtomicUsize>,
+    // client connections, counted at accept and at connection end. A fact,
+    // not a policy: the host reads this to decide lifetime (a refcounted
+    // server exits when nobody has been connected for a while), and policy
+    // stays out of the HTTP layer.
+    connections: Arc<Connections>,
+}
+
+/// Client connections: those live now, and every one ever accepted.
+#[derive(Default)]
+struct Connections {
+    live: AtomicUsize,
+    accepted: AtomicUsize,
 }
 
 enum Message {
@@ -208,12 +151,15 @@ impl Server {
     /// that is the point: an attached client, even a quiet one, is a
     /// claim on the server's lifetime.
     pub fn connection_count(&self) -> usize {
-        self.connections.load(Relaxed)
+        self.connections.live.load(Relaxed)
     }
-}
 
-pub struct IncomingRequests<'a> {
-    server: &'a Server,
+    /// Every connection accepted since the server started, however briefly
+    /// it lived: one that came and went between two looks at
+    /// [`connection_count`](Self::connection_count) still counts here.
+    pub fn accepted_count(&self) -> usize {
+        self.connections.accepted.load(Relaxed)
+    }
 }
 
 impl Server {
@@ -243,23 +189,30 @@ impl Server {
     }
 
     /// One server over any number of pre-bound doors: one request queue, one
-    /// close trigger, one connection count — and one accept thread per
-    /// listener feeding them. The caller owns the binding policy (which
+    /// close trigger, one connection count, one pool of connection threads —
+    /// and one accept thread per listener feeding them. The caller owns the binding policy (which
     /// addresses, which sockets); this owns everything after the bind. The
     /// first listener is the primary: `server_addr()` reports it.
     pub fn serve(
         listeners: Vec<stream::Listener>,
     ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
         let close_trigger = Arc::new(AtomicBool::new(false));
-        let connections = Arc::new(AtomicUsize::new(0));
+        let connections = Arc::new(Connections::default());
         let messages = MessagesQueue::with_capacity(8);
 
         let mut listening_addrs = Vec::with_capacity(listeners.len());
         for listener in &listeners {
             listening_addrs.push(listener.local_addr()?);
         }
+        let tasks = Arc::new(pool::TaskPool::new());
         for listener in listeners {
-            spawn_accept(listener, close_trigger.clone(), messages.clone(), connections.clone());
+            spawn_accept(
+                listener,
+                close_trigger.clone(),
+                messages.clone(),
+                connections.clone(),
+                tasks.clone(),
+            );
         }
 
         Ok(Server { messages, close: close_trigger, listening_addrs, connections })
@@ -267,17 +220,16 @@ impl Server {
 }
 
 /// The accept loop for one listener: accepted connections are dispatched to
-/// the task pool, and every request they produce lands in the shared queue.
+/// the task pool every listener shares, and every request they produce lands
+/// in the shared queue.
 fn spawn_accept(
     server: stream::Listener,
     inside_close_trigger: Arc<AtomicBool>,
     inside_messages: Arc<MessagesQueue<Message>>,
-    inside_connections: Arc<AtomicUsize>,
+    inside_connections: Arc<Connections>,
+    tasks_pool: Arc<pool::TaskPool>,
 ) {
     thread::spawn(move || {
-            // a tasks pool is used to dispatch the connections into threads
-            let tasks_pool = pool::TaskPool::new();
-
             // The ceiling on how long a single
             // response write may block before the connection is dropped. A dead
             // reader is finite, not precise — 10s reads as "this peer is gone,"
@@ -313,12 +265,12 @@ fn spawn_accept(
                         use crate::stream::RefinedTcpStream;
                         // Bound how long a single response write may block, so
                         // a client that stops reading cannot park a server
-                        // thread inside `write` forever. Read side is left
-                        // untouched — keep-alive connections must wait
-                        // indefinitely between requests. Only a fully stalled
-                        // peer trips it; a draining client resets the timer
-                        // every write. Best-effort — a socket that rejects the
-                        // option just keeps upstream's original behavior.
+                        // thread inside `write` forever; only a fully stalled
+                        // peer trips it, since a draining client resets the
+                        // timer every write. The read timeout is a tick, not a
+                        // limit: conn.rs keeps an idle connection waiting
+                        // through it on its own clocks. Both are best-effort;
+                        // a socket that rejects the option goes unbounded.
                         let _ = sock.set_write_timeout(Some(WRITE_TIMEOUT));
                         let _ = sock.set_read_timeout(Some(READ_TIMEOUT));
                         // One response = one flush, so Nagle has nothing to
@@ -343,13 +295,14 @@ fn spawn_accept(
                         // request loop. A drop guard, not a bare dec, so a
                         // panic while handling the connection cannot leak the
                         // count and pin a refcounted host open forever.
-                        struct Connected(Arc<AtomicUsize>);
+                        struct Connected(Arc<Connections>);
                         impl Drop for Connected {
                             fn drop(&mut self) {
-                                self.0.fetch_sub(1, Relaxed);
+                                self.0.live.fetch_sub(1, Relaxed);
                             }
                         }
-                        inside_connections.fetch_add(1, Relaxed);
+                        inside_connections.accepted.fetch_add(1, Relaxed);
+                        inside_connections.live.fetch_add(1, Relaxed);
                         let mut guard = Some(Connected(inside_connections.clone()));
                         tasks_pool.spawn(Box::new(move || {
                             let _connected = guard.take();
@@ -397,14 +350,6 @@ fn spawn_accept(
 }
 
 impl Server {
-    /// Returns an iterator for all the incoming requests.
-    ///
-    /// The iterator will return `None` if the server socket is shutdown.
-    #[inline]
-    pub fn incoming_requests(&self) -> IncomingRequests<'_> {
-        IncomingRequests { server: self }
-    }
-
     /// Returns the primary address the server is listening to (the first
     /// bound listener; a dual server reports its TCP address here).
     #[inline]
@@ -412,16 +357,9 @@ impl Server {
         self.listening_addrs[0].clone()
     }
 
-    /// Blocks until an HTTP request has been submitted and returns it.
-    pub fn recv(&self) -> IoResult<Request> {
-        match self.messages.pop() {
-            Some(Message::Error(err)) => Err(err),
-            Some(Message::NewRequest(rq)) => Ok(rq),
-            None => Err(IoError::other("thread unblocked")),
-        }
-    }
-
-    /// Same as `recv()` but doesn't block longer than timeout
+    /// The next request, waiting at most `timeout`: `None` on timeout
+    /// or when `unblock()` woke this caller. An `Err` is the listener
+    /// failing, which ends it.
     pub fn recv_timeout(&self, timeout: Duration) -> IoResult<Option<Request>> {
         match self.messages.pop_timeout(timeout) {
             Some(Message::Error(err)) => Err(err),
@@ -430,49 +368,42 @@ impl Server {
         }
     }
 
-    /// Same as `recv()` but doesn't block.
-    pub fn try_recv(&self) -> IoResult<Option<Request>> {
-        match self.messages.try_pop() {
-            Some(Message::Error(err)) => Err(err),
-            Some(Message::NewRequest(rq)) => Ok(Some(rq)),
-            None => Ok(None),
-        }
-    }
-
-    /// Unblock thread stuck in recv() or incoming_requests().
-    /// If there are several such threads, only one is unblocked.
-    /// This method allows graceful shutdown of server.
+    /// Wakes one thread waiting in `recv_timeout()`, which then returns
+    /// `None`: a graceful shutdown wakes each worker this way.
     pub fn unblock(&self) {
         self.messages.unblock();
     }
-}
 
-impl Iterator for IncomingRequests<'_> {
-    type Item = Request;
-    fn next(&mut self) -> Option<Request> {
-        self.server.recv().ok()
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
+    /// Stops accepting connections, leaving those already accepted to be
+    /// answered: a client that arrives from here on is refused at connect,
+    /// and so knows its request was never sent. Unix socket paths stay on
+    /// disk until the server is dropped.
+    pub fn close_doors(&self) {
         self.close.store(true, Relaxed);
         // Connect briefly to each listener to unblock its accept thread,
-        // then sweep every unix socket path off disk.
+        // which then ends, and its listener with it.
         for addr in &self.listening_addrs {
             let maybe_stream = match addr {
                 ListenAddr::Ip(addr) => TcpStream::connect(addr).map(Connection::from),
                 #[cfg(unix)]
                 ListenAddr::Unix(addr) => {
-                    // TODO: use connect_addr when its stabilized.
-                    let path = addr.as_pathname().unwrap();
-                    std::os::unix::net::UnixStream::connect(path).map(Connection::from)
+                    std::os::unix::net::UnixStream::connect_addr(addr).map(Connection::from)
                 }
             };
             if let Ok(stream) = maybe_stream {
                 let _ = stream.shutdown(Shutdown::Both);
             }
+        }
+    }
+}
 
+impl Drop for Server {
+    fn drop(&mut self) {
+        if !self.close.load(Relaxed) {
+            self.close_doors();
+        }
+        // Then sweep every unix socket path off disk.
+        for addr in &self.listening_addrs {
             #[cfg(unix)]
             if let ListenAddr::Unix(addr) = addr {
                 if let Some(path) = addr.as_pathname() {

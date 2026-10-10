@@ -47,6 +47,7 @@ _isolate_fleet()
 
 
 HERE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+LAUNCHER = os.environ.get("HARBOR_LAUNCHER", os.path.join(HERE, "target", "release", "harbor")).split()
 passed = 0
 failed = []
 
@@ -100,10 +101,7 @@ def free_port():
 def start_server(db, port):
     log = open(db + ".log", "w")
     proc = subprocess.Popen(
-        [
-            *os.environ.get("HARBOR_LAUNCHER", os.path.join(HERE, "target", "release", "harbor")).split(), db, "start",
-            "--port", str(port), "--workers", "2",
-        ],
+        [*LAUNCHER, db, "start", "--port", str(port), "--workers", "2"],
         stdout=log, stderr=log, stdin=subprocess.DEVNULL,
     )
     base = f"http://127.0.0.1:{port}"
@@ -352,10 +350,10 @@ def run_fixture(base):
     # -----------------------------------------------------------------------
     section("Uniqueness declared in the table, not just indexed on")
     # -----------------------------------------------------------------------
-    # UNIQUE constraints are not indexes to duckdb_indexes(), so before this
-    # field existed a hand-written `CREATE TABLE (... UNIQUE)` schema read as
-    # having no uniqueness at all. Both spellings arrive structurally: inline
-    # on a column and table-level across two.
+    # UNIQUE constraints are not indexes to duckdb_indexes(), so without this
+    # field a hand-written `CREATE TABLE (... UNIQUE)` schema reads as having
+    # no uniqueness at all. Both spellings arrive structurally: inline on a
+    # column and table-level across two.
     tables = {t["name"]: t for t in doc["tables"]}
     eq("an inline UNIQUE arrives as a constraint",
        [{"columns": ["label"]}], tables["tags"]["uniqueConstraints"])
@@ -376,10 +374,10 @@ def run_fixture(base):
     # -----------------------------------------------------------------------
     # The point of this field is to be joined against columns[].name. DuckDB
     # renders anything beyond a plain identifier single-quoted and keeps the
-    # double quotes, so `"a b"` used to arrive quoted and matched nothing —
-    # three of four names on this table. Every entry now joins, and a computed
-    # index is reported separately instead of posing as a column with an
-    # extraordinary name.
+    # double quotes, so taken as DuckDB gives it `"a b"` arrives quoted and
+    # matches nothing — three of four names on this table. Every entry joins,
+    # and a computed index is reported separately instead of posing as a
+    # column with an extraordinary name.
     awk = tables["awkward"]
     names = {c["name"] for c in awk["columns"]}
     by_name = {i["name"]: i for i in awk["indexes"]}
@@ -456,13 +454,10 @@ def run_empty(base):
 
 
 def harbor_version():
-    """The workspace version, read from the one place it is written: the root
-    Cargo.toml's [workspace.package] — every crate inherits it."""
-    with open(os.path.join(HERE, "Cargo.toml")) as f:
-        for line in f:
-            if line.startswith("version"):
-                return line.split('"')[1]
-    return ""
+    """The version the binary under test reports, not the one Cargo.toml
+    holds: a bump made after the build would fail a correct server."""
+    out = subprocess.run([*LAUNCHER, "--version"], capture_output=True, text=True).stdout
+    return out.split()[-1] if out.split() else ""
 
 
 if __name__ == "__main__":

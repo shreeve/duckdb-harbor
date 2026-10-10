@@ -4,6 +4,142 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.45.0 — 2026-10-10
+
+The server
+
+- **A double param binds as the double its text names.** The JSON reader
+  rounded about one full-precision double in ten to its neighbour, and the
+  neighbour is what was bound and stored: 47 of 400 measured. Every client
+  that wrote a DOUBLE through `params` was affected. A whole number past 64
+  bits is refused with a `400` that says to send it as a string and cast it,
+  where it was bound as an approximate double, and a body that names
+  `params` twice is a `400`, where the second one won silently.
+- **A statement whose client has gone is stopped** (#133). A pooled statement
+  ran to its end when its client left before the first row, and six of them
+  held every worker: each later `/sql` was a `503` while the engine burned
+  CPU. The server watches the connection while a statement computes and
+  cancels it when the client hangs up; inside a session the transaction is
+  left aborted, as any statement cut short leaves it. A client that shuts
+  down only its sending side reads the same way and has its statement
+  cancelled. A `COMMIT` still runs to its answer.
+- **A session's statements do not wait for a free worker.** With every
+  worker busy, a session's own statements and its `COMMIT` were answered
+  `503` and the transaction died at its idle limit. They are relayed on a
+  thread of their own, capped by the session count.
+- **A session can be renewed without running anything.** `POST
+  /sql/sessions/<id>/renew` accepts any session: it resets the idle clock and
+  leaves the five-minute ceiling alone. The REPL and DuckTable keep a
+  transaction alive this way, and fall back to `SELECT 1` against an older
+  server.
+- **A cancel answers `true` only when it stopped something.** One that landed
+  after its statement finished was answered `true` while the whole result
+  arrived.
+- **One request is one request.** A chunked body the handler did not read, or
+  a body whose sender stalled mid-way, was left on the connection and read as
+  the next request. Either ends the connection. `Content-Length` must be
+  plain digits, `Transfer-Encoding` exactly `chunked`, a chunk size plain hex,
+  and a folded header line or a CR, LF or NUL inside a header value is a
+  `400`.
+- **The engine counts the statements.** The server's own scan for a second
+  statement and its fence around protected settings are gone; the engine's
+  parse and its configuration lock refuse the same requests, and every
+  form that once slipped past the scan is in the suites. `SELECT 1; --
+  note` is accepted, the refusal reads "exactly one SQL statement is allowed
+  per request", and a protected `SET` inside a transaction is refused by the
+  engine, which aborts the transaction.
+- **One lexer, read the way the engine reads.** Brace expansion, the
+  statement classifier and the REPL take string, comment and dollar-quote
+  boundaries from `wire::scan`. It agrees with the engine on non-ASCII
+  dollar-quote tags, `$` inside a word, `E` strings, numbers with an exponent
+  or `_`, and the Unicode spaces the engine strips; brace expansion can no
+  longer rewrite text the engine reads as a string, and `EXPLAIN (…, FORMAT
+  ')') COMMIT` is read as the `COMMIT` it is.
+- **Errors and values are told truly.**
+  - A session statement whose result fails partway reports its own error,
+    not "transaction is aborted".
+  - A NaN or infinity inside a VARIANT goes out as the strings a DOUBLE
+    column uses, so the document parses; a VARIANT or GEOMETRY cell that
+    cannot be rendered fails the stream instead of reading as `null`; a
+    `TYPE` value goes out as its text.
+  - A `NULL` param binds untyped, as `EXECUTE` binds it, so `coalesce(?,
+    'x')` works.
+  - Column type names are the engine's own, so `GEOMETRY('OGC:CRS84')` keeps
+    its CRS and 2.0's keywords are quoted.
+  - A year before year 0 goes out as `-000043-03-15`, the form JavaScript
+    and DuckDB both read.
+- **The engine is found safely.** The search passes over a library without
+  the v2 API, follows a symlinked binary to its own `lib`, and never loads a
+  `libduckdb` from the working directory.
+- **A server can be stopped cleanly any way it is asked.** SIGHUP stops it as
+  SIGTERM does, so a terminal that closes folds the WAL; Ctrl-C does on
+  Windows. A stopping server answers new requests `503` instead of leaving
+  them unanswered, and a summoned server leaves only when no client has come
+  since it last looked, so a quick open of a server that is leaving
+  succeeds. `/info` reports the bound port, so `--port 0` lists the real one.
+
+Starting, stopping and the configuration
+
+- **A configuration that will not load stops a start.** One typo, an unknown
+  key or a file others can write made the server start without `sealed`,
+  `statement-timeout` or `init`. `start` and a summon refuse, in one line
+  naming the file, the line and the fix; a server already running is not
+  affected. A `[defaults]` section, which nothing read, is refused with the
+  same kind of message, and a relative `HARBOR_HOME` is an error.
+- **`restart` brings a server back as it was.** It dropped `--sealed`,
+  `--port` and an ephemeral server's lifetime. A server keeps its start
+  options in a private file beside its socket, not in `/info`, and `restart`
+  reads them. It checks the configuration before it stops anything and
+  leaves the server running when it would not start again. A server started
+  by 0.44 or earlier published no options, so it is restarted only with its
+  options typed, and `harbor update --restart` names it instead.
+- **A login item and a config entry belong to one file.** A second database
+  with the same file name could detach the first's entry, take over its login
+  item, or stop it. Every verb matches by path, under one `HARBOR_HOME`.
+- **A backup or a restore appears whole or not at all.** An interrupted backup
+  left EXPORT's raw directory, which `restore` accepted and which turned the
+  string `'NULL'` into a null; an interrupted restore left half a database.
+  Both work under a temporary name and rename at the end, a backup is private
+  to its owner, and `restore` accepts only what harbor wrote.
+- **`harbor update`.** Each `--restart` runs in its own process group and
+  logs to `runtime/log/update.log`. On Windows the update moves the running
+  `harbor.exe` aside first, which could not be replaced before. Uninstalling
+  refuses while a login item runs this copy, and names the commands that
+  take it down, where it left the item retrying a binary that was gone.
+- **Logs.** A server summoned by the REPL or DuckTable logs under
+  `runtime/log`, starting over past 1 MiB.
+
+The REPL
+
+- **csv keeps NULL apart from text.** SQL NULL is an empty field and the
+  empty string is `""`, as DuckDB writes CSV; `.nullvalue` is for the display
+  modes.
+- **A script stops when its reader has gone.** A closed output pipe ended the
+  output and the script ran on, writes included; boxed output into a closed
+  pipe panicked.
+- **Scripts read as the duckdb shell reads them.** Dot commands work in piped
+  scripts and `.read` files, and a failed one fails the script.
+- **Command-line checks come first.** An unknown `--mode` creates no file and
+  starts no server; an empty or repeated `-c` is refused; `--flag=value`
+  works.
+- **Smaller corrections.** Markdown escapes `|` in cells; DDL draws no empty
+  frame; the terminal's late answer to the colour query no longer appears at
+  the prompt, and a terminal that answers nothing costs 120 ms; the history
+  directory is private; a request that fails says whether the statement was
+  sent; completion stops asking a server that cannot autocomplete.
+
+Shared code and the build
+
+- **One Harbor client for both products.** The transport, sessions, the
+  keep-alive, summoning and server discovery live in the `harbor-http` crate,
+  used by the REPL and DuckTable. Every wait on a server is bounded.
+- **A pinned engine comes whole from its release.** With `DUCKDB_LIB_BUILD`
+  naming a build, `make fetch-duckdb` takes the library and the `duckdb` CLI
+  from this repository's `engine-<build>` release, checked against its
+  checksums, and nothing from DuckDB's channel, whose outages had failed the
+  nightly suite. Pull requests run the `regressions` suite, and the unit
+  tests run beside the quick gate.
+
 ## 0.44.2 — 2026-10-04
 
 - **A cancelled `COMMIT` is not answered `499` after it landed.** A cancel

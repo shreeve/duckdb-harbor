@@ -68,14 +68,6 @@ impl State {
     pub fn is_live(self) -> bool {
         matches!(self, State::Running)
     }
-
-    /// Sort order for the fleet view: running and stopped both rank together —
-    /// they are the configured berths, listed by name, not by liveness.
-    pub fn rank(self) -> u8 {
-        match self {
-            State::Running | State::Stopped => 0,
-        }
-    }
 }
 
 #[cfg(test)]

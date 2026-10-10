@@ -57,7 +57,9 @@ pub(crate) fn open(view: WeakEntity<DuckTable>, window: &mut Window, cx: &mut Ap
                 .close_button(false)
                 .footer(
                     DialogFooter::new()
-                        .child(DialogClose::new().child(Button::new("cancel").label("Cancel")))
+                        // DialogClose fills the width it is given, so it sits
+                        // in a box of its own, only as wide as the button.
+                        .child(div().child(DialogClose::new().child(Button::new("cancel").label("Cancel"))))
                         .child(DialogAction::new().child(
                             Button::new("ok").label("Open Database").primary(),
                         )),
@@ -86,9 +88,7 @@ pub(crate) fn open(view: WeakEntity<DuckTable>, window: &mut Window, cx: &mut Ap
                             return false;
                         }
                         if let Some(view) = view.upgrade() {
-                            view.update(cx, |app, cx| {
-                                app.add_database(name, host, port, cx);
-                            });
+                            view.update(cx, |app, cx| app.open_url(name, host, port, cx));
                         }
                         true
                     }

@@ -12,6 +12,7 @@
 //! selection, discard-all) is one entry too: the rows stay separate
 //! changes for review, and one ⌘Z takes the whole gesture back.
 
+use crate::util::qident;
 use gpui_kit::SharedString;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -55,6 +56,16 @@ pub enum RowChange {
     /// Schema column index -> staged cell.
     Update(BTreeMap<usize, CellEdit>),
     Delete,
+}
+
+/// The cell a gesture stages into.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Target {
+    /// A draft row's cell, by the draft's key.
+    Draft(String),
+    /// A fetched row's cell: the row's identity, and the cell's text as it
+    /// was fetched (None = NULL).
+    Fetched(Vec<Value>, Option<SharedString>),
 }
 
 /// How commit verifies one generated statement.
@@ -166,6 +177,135 @@ pub fn handoff(mine: Option<&Edits>, has_columns: bool, stash: &Edits) -> Handof
         _ => Handoff::Orphan,
     }
 }
+
+/// Staged sets kept off screen, per database and per table (Law 4: staged
+/// changes belong to the table, not the view). A table switch parks the
+/// outgoing table's set; a connection that goes — the server stopped or
+/// gone, another database chosen — parks the grid's own with the rest.
+/// Each is handed back when its table is opened on its database again,
+/// and judged there (`handoff`). `K` is the database's key, app.rs's.
+pub struct Parked<K> {
+    sets: HashMap<K, HashMap<String, Edits>>,
+}
+
+impl<K> Default for Parked<K> {
+    fn default() -> Self {
+        Self { sets: HashMap::new() }
+    }
+}
+
+impl<K: Eq + std::hash::Hash> Parked<K> {
+    /// Keep `edits` for its table on database `db`. A set with nothing in
+    /// it is not kept.
+    pub fn park(&mut self, db: K, edits: Edits) {
+        if edits.any_staged() {
+            self.sets.entry(db).or_default().insert(edits.source().to_string(), edits);
+        }
+    }
+
+    /// The set parked for table `source` on database `db`, given up to the
+    /// grid that opens that table.
+    pub fn take(&mut self, db: &K, source: &str) -> Option<Edits> {
+        let tables = self.sets.get_mut(db)?;
+        let edits = tables.remove(source);
+        if tables.is_empty() {
+            self.sets.remove(db);
+        }
+        edits
+    }
+
+    /// Every set parked for database `db`.
+    pub fn at(&self, db: &K) -> impl Iterator<Item = &Edits> {
+        self.sets.get(db).into_iter().flat_map(HashMap::values)
+    }
+
+    /// Every set parked, on every database: what a quit would lose.
+    pub fn sets(&self) -> impl Iterator<Item = &Edits> {
+        self.sets.values().flat_map(HashMap::values)
+    }
+
+    /// Drop every set parked for database `db`, which is being forgotten.
+    pub fn forget(&mut self, db: &K) {
+        self.sets.remove(db);
+    }
+}
+
+/// What staged sets hold, as the dialogs that would lose them count it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Tally {
+    /// Changes staged and not sent.
+    pub staged: usize,
+    /// The tables those are in.
+    pub tables: usize,
+    /// Changes held after a commit that got no answer: they may already be
+    /// in the database, so they are not called uncommitted.
+    pub held: usize,
+}
+
+impl Tally {
+    pub fn of<'a>(sets: impl IntoIterator<Item = &'a Edits>) -> Self {
+        sets.into_iter().filter(|e| e.any_staged()).fold(Self::default(), |t, e| {
+            if e.in_doubt() {
+                Self { held: t.held + e.len(), ..t }
+            } else {
+                Self { staged: t.staged + e.len(), tables: t.tables + 1, ..t }
+            }
+        })
+    }
+}
+
+/// What a COMMIT's answer says of its transaction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CommitOutcome {
+    /// Harbor acknowledged it: everything since BEGIN is in the database.
+    Landed,
+    /// Nothing since BEGIN is in the database.
+    NotLanded,
+    /// The answer says nothing of the outcome: the server may have
+    /// committed, or may be committing still.
+    InDoubt,
+}
+
+/// Read the answer to a COMMIT sent on a session, `None` being success.
+/// The grid's commit and the Query view judge it by this one rule.
+///
+/// Not landed: a COMMIT that could not be sent; one Harbor refused before
+/// the engine saw it (the session gone, busy, or the server not serving),
+/// which the release of the session rolls back; one the engine refused,
+/// `400 sql_error`, Harbor's answer too for a COMMIT of a transaction an
+/// earlier error aborted, which it rolls back and says so; and a `499
+/// cancelled`, since a COMMIT runs to its answer and a cancel lands before
+/// it starts or not at all (Harbor 0.44.2, the floor `app::connect` keeps).
+/// In doubt: no answer, Harbor's `500 internal`, which it sends for a
+/// statement the engine had already run, and any code this client does not
+/// know, since nothing is assumed not to have run.
+pub fn commit_outcome(failure: Option<&harbor_client::Failure>) -> CommitOutcome {
+    use harbor_client::Failure;
+    match failure {
+        None => CommitOutcome::Landed,
+        Some(Failure::Unsent(_)) => CommitOutcome::NotLanded,
+        Some(Failure::Unanswered(_)) => CommitOutcome::InDoubt,
+        Some(Failure::Refused { code, .. }) if NOT_LANDED.contains(&code.as_str()) => CommitOutcome::NotLanded,
+        Some(Failure::Refused { .. }) => CommitOutcome::InDoubt,
+    }
+}
+
+/// The codes a COMMIT is refused with when nothing since BEGIN was kept.
+const NOT_LANDED: [&str; 13] = [
+    wire::code::SQL_ERROR,
+    wire::code::CANCELLED,
+    wire::code::BAD_REQUEST,
+    wire::code::NOT_FOUND,
+    wire::code::FORBIDDEN,
+    wire::code::BODY_TOO_LARGE,
+    wire::code::NO_SUCH_SESSION,
+    wire::code::SESSION_BUSY,
+    wire::code::QUERY_ID_IN_USE,
+    wire::code::NO_LEASE_CONNECTIONS,
+    wire::code::NO_LEASE_AVAILABLE,
+    wire::code::UNAVAILABLE,
+    wire::code::UNREADY,
+];
 
 /// A row identity's map key: its canonical JSON. Values compare by
 /// serialization, which is exactly the equality the wire speaks.
@@ -400,7 +540,8 @@ impl Edits {
 
     /// Add an intentional all-DEFAULT draft. It is staged immediately:
     /// DEFAULT VALUES can itself be a valid insert, and one undo removes it.
-    pub fn stage_insert(&mut self) -> String {
+    /// Its key, or None when the set is held and takes no staging.
+    pub fn stage_insert(&mut self) -> Option<String> {
         self.stage_duplicate(Vec::new(), Vec::new())
     }
 
@@ -408,11 +549,15 @@ impl Edits {
     /// `text`; a `Bind::Source` cell is read from that row when the INSERT
     /// runs, and a `Bind::Value` cell is bound like any typed one. The
     /// whole copied row is one undo step, just as an empty New Row is.
+    /// Its key, or None when the set is held and takes no staging.
     pub fn stage_duplicate(
         &mut self,
         source: Vec<Value>,
         cells: Vec<(usize, Option<SharedString>, Bind)>,
-    ) -> String {
+    ) -> Option<String> {
+        if self.in_doubt {
+            return None;
+        }
         let key = format!("draft:{:020}", self.next_draft);
         self.next_draft += 1;
         let cells = cells
@@ -428,7 +573,31 @@ impl Edits {
             prev: None,
             next: Some(RowChange::Insert(cells)),
         });
-        key
+        Some(key)
+    }
+
+    /// Stage `text`, bound as `value`, into a cell: a draft's, or a fetched
+    /// row's, where the text it was fetched with drops the staged edit.
+    pub fn stage_into(&mut self, target: Target, col: usize, text: Option<SharedString>, value: Value) {
+        match target {
+            Target::Draft(key) => self.stage_insert_cell(&key, col, text, value),
+            Target::Fetched(identity, fetched) => self.stage_cell(identity, col, fetched, text, value),
+        }
+    }
+
+    /// Stage what confirming an editor decided (`confirm`). A cell kept, or
+    /// text refused, stages nothing. A cell reverted goes back to the text
+    /// it had before anyone typed in it: a fetched cell's staged edit is
+    /// dropped, and a duplicate's cell is read from its source row again.
+    pub fn stage_confirmed(&mut self, target: Target, col: usize, confirmed: Confirm) {
+        match (confirmed, target) {
+            (Confirm::Keep | Confirm::Refuse(_), _) => {}
+            (Confirm::Revert, Target::Draft(key)) => self.stage_insert_copied(&key, col),
+            (Confirm::Revert, Target::Fetched(identity, fetched)) => {
+                self.stage_cell(identity, col, fetched.clone(), fetched, Value::Null)
+            }
+            (Confirm::Stage(text, value), target) => self.stage_into(target, col, text, value),
+        }
     }
 
     /// Supply one draft cell. `text = None` is explicit SQL NULL; an
@@ -551,6 +720,22 @@ impl Edits {
         self.apply(Op { key, identity, prev, next: Some(RowChange::Delete) });
     }
 
+    /// ⌘⌫ over rows, as one undo step: a draft is discarded, since it never
+    /// existed, and a fetched row is staged for DELETE, unless the set is
+    /// `stale` (the table reshaped, the page from before a commit, or the
+    /// set held), where only the discards are taken.
+    pub fn delete_rows(&mut self, rows: Vec<Target>, stale: bool) {
+        self.grouped(|edits| {
+            for row in rows {
+                match row {
+                    Target::Draft(key) => edits.discard(&key),
+                    Target::Fetched(identity, _) if !stale => edits.stage_delete(identity),
+                    Target::Fetched(..) => {}
+                }
+            }
+        });
+    }
+
     /// Whether `key` names a draft row nothing has been entered into: an
     /// INSERT with no cells, every column left to the database.
     pub fn is_untouched_insert(&self, key: &str) -> bool {
@@ -626,23 +811,31 @@ impl Edits {
         self.unread = false;
     }
 
-    /// The staged set as parameterized statements: inserts, updates,
-    /// deletes, deterministic within each verb. Missing insert columns
+    /// The staged set as parameterized statements. Missing insert columns
     /// stay out of the statement so DuckDB supplies DEFAULT. The WHERE
     /// binds the ORIGINAL key values for existing rows.
     ///
-    /// A duplicate with `Bind::Source` cells selects them from its source
-    /// row, so the engine copies what the wire could not carry. Inserts
-    /// run before any update or delete, so that row is read as the
-    /// database holds it, whatever else is staged on it; and a source row
-    /// that is gone returns no row, which commit refuses.
+    /// The order is what lets a set commit whatever keys it moves, since
+    /// the engine checks a key as each statement runs. A duplicate with
+    /// `Bind::Source` cells selects them from its source row, so the engine
+    /// copies what the wire could not carry, and that row is read as the
+    /// database holds it, whatever else is staged on it; a source row that
+    /// is gone returns no row, which commit refuses. So a duplicate of a row
+    /// the set updates or deletes comes first, before its source changes.
+    /// Then deletes, which free their keys; then updates, each after the
+    /// one whose key it takes (`claim_order`); then the other duplicates,
+    /// whose sources read the same at any point, and new rows, which may
+    /// take a key any of those freed. A delete of 7 and a re-key of 3 to 7
+    /// runs in that order, and so does a new row, or a duplicate of an
+    /// untouched row, keyed 7 beside a delete of 7. A duplicate of a row the
+    /// set changes cannot take a key the set frees: it runs before the key
+    /// is free, and the engine refuses it.
     ///
     /// A held set (`in_doubt`) yields none: it may already be in the
     /// database, and is not sent again until it has been staged again.
     pub fn statements(&self) -> Vec<Statement> {
-        let mut out = Vec::new();
         if self.in_doubt {
-            return out;
+            return Vec::new();
         }
         // The table as the WHERE sees it: aliased when the row itself is
         // hashed, since `hash("t")` names a column if the table has one
@@ -662,12 +855,19 @@ impl Edits {
                 .join(" AND ");
             (self.source.clone(), clause)
         };
-        for (_, identity, change) in self.entries() {
-            if let RowChange::Insert(cells) = change {
-                let mut params = Vec::new();
-                let sql = if cells.is_empty() {
-                    format!("INSERT INTO {} DEFAULT VALUES RETURNING *", self.source)
-                } else {
+        let (mut duplicates, mut deletes, mut updates, mut copies_late, mut inserts) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        // Each update's key before and after, for `claim_order`.
+        let mut moves = Vec::new();
+        for (key, identity, change) in self.entries() {
+            let mut params = Vec::new();
+            match change {
+                RowChange::Insert(cells) if cells.is_empty() => inserts.push(Statement {
+                    sql: format!("INSERT INTO {} DEFAULT VALUES RETURNING *", self.source),
+                    params,
+                    expectation: StatementExpectation::ReturnedOne,
+                }),
+                RowChange::Insert(cells) => {
                     let names = cells
                         .keys()
                         .map(|ix| qident(self.column_name(*ix)))
@@ -678,7 +878,8 @@ impl Edits {
                         .map(|(ix, cell)| self.supply(*ix, cell, &mut params))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    if cells.values().any(|c| c.bind == Bind::Source) {
+                    let copies = cells.values().any(|c| c.bind == Bind::Source);
+                    let sql = if copies {
                         params.extend(self.bound_identity(identity));
                         format!(
                             "INSERT INTO {} ({names}) SELECT {supplied} FROM {target} WHERE {where_clause} RETURNING *",
@@ -686,43 +887,62 @@ impl Edits {
                         )
                     } else {
                         format!("INSERT INTO {} ({names}) VALUES ({supplied}) RETURNING *", self.source)
+                    };
+                    let stmt = Statement { sql, params, expectation: StatementExpectation::ReturnedOne };
+                    match (copies, self.changes.get(&key_of(identity)).map(|e| &e.change)) {
+                        (true, Some(RowChange::Update(_) | RowChange::Delete)) => duplicates.push(stmt),
+                        (true, _) => copies_late.push(stmt),
+                        (false, _) => inserts.push(stmt),
                     }
-                };
-                out.push(Statement {
-                    sql,
-                    params,
-                    expectation: StatementExpectation::ReturnedOne,
-                });
-            }
-        }
-        for (_, identity, change) in self.entries() {
-            if let RowChange::Update(cells) = change {
-                let mut params = Vec::new();
-                let set = cells
-                    .iter()
-                    .map(|(ix, cell)| {
-                        format!("{} = {}", qident(self.column_name(*ix)), self.supply(*ix, cell, &mut params))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                params.extend(self.bound_identity(identity));
-                out.push(Statement {
-                    sql: format!("UPDATE {target} SET {set} WHERE {where_clause}"),
-                    params,
-                    expectation: StatementExpectation::AffectedOne,
-                });
-            }
-        }
-        for (_, identity, change) in self.entries() {
-            if matches!(change, RowChange::Delete) {
-                out.push(Statement {
+                }
+                RowChange::Update(cells) => {
+                    let set = cells
+                        .iter()
+                        .map(|(ix, cell)| {
+                            format!("{} = {}", qident(self.column_name(*ix)), self.supply(*ix, cell, &mut params))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    params.extend(self.bound_identity(identity));
+                    moves.push((key.to_string(), self.moved_key(identity, cells)));
+                    updates.push(Statement {
+                        sql: format!("UPDATE {target} SET {set} WHERE {where_clause}"),
+                        params,
+                        expectation: StatementExpectation::AffectedOne,
+                    });
+                }
+                RowChange::Delete => deletes.push(Statement {
                     sql: format!("DELETE FROM {target} WHERE {where_clause}"),
                     params: self.bound_identity(identity),
                     expectation: StatementExpectation::AffectedOne,
-                });
+                }),
             }
         }
-        out
+        let mut updates: Vec<Option<Statement>> = updates.into_iter().map(Some).collect();
+        let updates = claim_order(&moves).into_iter().filter_map(|ix| updates[ix].take());
+        duplicates.into_iter().chain(deletes).chain(updates).chain(copies_late).chain(inserts).collect()
+    }
+
+    /// The key an update gives its row, as `key_of` spells it, when the
+    /// update changes a key column. A table keyed by rowid moves no key.
+    /// The typed value is compared as bound, not as the engine stores it, so
+    /// a key typed in another spelling than the wire's (a DATE, a DECIMAL's
+    /// `1.5` for `1.50`) is not seen to take another row's key, and a chain
+    /// of such moves may run out of order and be refused (EDITING.md,
+    /// "Commit").
+    fn moved_key(&self, identity: &[Value], cells: &BTreeMap<usize, CellEdit>) -> Option<String> {
+        if self.by_rowid {
+            return None;
+        }
+        let mut moved = identity.to_vec();
+        for (slot, name) in moved.iter_mut().zip(&self.pk_cols) {
+            let ix = self.columns.iter().position(|c| c == name);
+            if let Some(Bind::Value(value)) = ix.and_then(|ix| cells.get(&ix)).map(|c| &c.bind) {
+                *slot = value.clone();
+            }
+        }
+        let moved = key_of(&moved);
+        (moved != key_of(identity)).then_some(moved)
     }
 
     /// What a WHERE binds for `identity`: the key values, or the rowid and
@@ -768,6 +988,37 @@ impl Edits {
     }
 }
 
+/// The order to run updates in, as indices into `moves`: each update's key
+/// before, and after when it changes one. An update that takes the key
+/// another leaves runs after that one, so a chain of re-keys (2 to 4, then 1
+/// to 2) commits. Otherwise the updates keep their order. A cycle (a swap of
+/// two keys) has no order that commits, and the engine refuses it.
+fn claim_order(moves: &[(String, Option<String>)]) -> Vec<usize> {
+    let leaves: HashMap<&str, usize> =
+        moves.iter().enumerate().map(|(ix, (before, _))| (before.as_str(), ix)).collect();
+    // The update each one waits on: the one whose key it takes.
+    let waits_on: Vec<Option<usize>> = moves
+        .iter()
+        .enumerate()
+        .map(|(ix, (_, after))| after.as_deref().and_then(|k| leaves.get(k)).copied().filter(|&on| on != ix))
+        .collect();
+    let mut placed = vec![false; moves.len()];
+    let mut order = Vec::with_capacity(moves.len());
+    for start in 0..moves.len() {
+        // Walk back along what this update waits on, then run that chain
+        // from its far end.
+        let mut chain = Vec::new();
+        let mut at = Some(start);
+        while let Some(ix) = at.filter(|&ix| !placed[ix]) {
+            placed[ix] = true;
+            chain.push(ix);
+            at = waits_on[ix];
+        }
+        order.extend(chain.into_iter().rev());
+    }
+    order
+}
+
 /// The placeholder that carries a value of this type to the engine as the
 /// value it is. Harbor binds text as VARCHAR, and for most types the
 /// engine's cast from VARCHAR is the right one. Two are not. JSON text cast
@@ -797,9 +1048,14 @@ fn key_placeholder_for(duck_type: &str) -> &'static str {
     }
 }
 
-/// Quote an identifier the DuckDB way.
-fn qident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+/// What clearing a cell stages, type-honestly: `''` for text, NULL for
+/// every other type (`is_text_type`).
+pub fn cleared(duck_type: &str) -> (Option<SharedString>, Value) {
+    if is_text_type(duck_type) {
+        (Some(SharedString::from("")), Value::String(String::new()))
+    } else {
+        (None, Value::Null)
+    }
 }
 
 /// Text columns are where `''` is a value in its own right; clearing any
@@ -985,13 +1241,10 @@ pub fn confirm(text: &str, cell: &Held) -> Confirm {
         return Confirm::Revert;
     }
     if text.is_empty() {
-        // An emptied editor: '' for text (the one honest way to enter it),
-        // NULL for everything else — docs/EDITING.md.
-        return if is_text_type(cell.ty) {
-            Confirm::Stage(Some(SharedString::from("")), Value::String(String::new()))
-        } else {
-            Confirm::Stage(None, Value::Null)
-        };
+        // An emptied editor clears the cell: '' for text (the one honest
+        // way to enter it), NULL for everything else.
+        let (text, value) = cleared(cell.ty);
+        return Confirm::Stage(text, value);
     }
     match parse_value(text, cell.ty) {
         Ok(Value::Null) => Confirm::Stage(None, Value::Null),
@@ -1009,7 +1262,7 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
     // A JSON column holds JSON text, and `null` is a JSON value there,
     // distinct from SQL NULL — so this comes before the `null` rule below.
     if ty == "JSON" {
-        check_json(text)?;
+        check_json(text, false)?;
         return Ok(Value::String(text.to_string()));
     }
     // Typing the literal `null` into a non-text column means SQL NULL —
@@ -1026,20 +1279,28 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
     // already said. The text is bound as typed, never re-serialized: a
     // round trip through serde would rewrite 12.340 and any wide integer.
     if ty == "VARIANT" {
-        check_json(text)?;
+        check_json(text, true)?;
         return Ok(Value::String(text.to_string()));
+    }
+    // A BLOB cell is base64 both ways (`placeholder_for`). The engine decodes
+    // it at commit, where text that is not base64 fails the whole
+    // transaction, so it is judged here.
+    if ty == "BLOB" {
+        return if is_base64(text) {
+            Ok(Value::String(text.to_string()))
+        } else {
+            Err(format!("{text:?} is not base64 \u{2014} a BLOB cell holds its bytes as base64, like \"qg==\""))
+        };
     }
     // A container that holds a VARIANT, a JSON or a BLOB is bound as the
     // container's text, and no cast of that text reaches the inner value: a
     // `BLOB[]` stores the base64 characters as the bytes, and the elements of
     // a `VARIANT[]` or a `JSON[]` become strings. Nothing is said, so the edit
     // is refused here; `null` above, and NULL from an emptied cell, are safe.
-    if ty != "BLOB" {
-        if let Some(inner) = document_or_blob_within(&ty) {
-            return Err(format!(
-                "typed text cannot carry the {inner} inside {duck_type} \u{2014} edit this cell in the Query tab"
-            ));
-        }
+    if let Some(inner) = document_or_blob_within(&ty) {
+        return Err(format!(
+            "typed text cannot carry the {inner} inside {duck_type} \u{2014} edit this cell in the Query tab"
+        ));
     }
     // A UNION's text names no member. It is bound as a VARCHAR, and the
     // engine stores a VARCHAR under the member of that type: `8` typed over
@@ -1059,12 +1320,12 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
     // `linenbreak`, with no error. Outside quotes the cast keeps a backslash
     // as typed; the rule is one rule all the same, since any value can be
     // written quoted.
-    if is_container(&ty) {
-        if let Some(escape) = lossy_escape(text) {
-            return Err(format!(
-                "typed text for {duck_type} can escape only a quote and a backslash: inside quotes the engine reads {escape} as plain characters \u{2014} edit this cell in the Query tab"
-            ));
-        }
+    if is_container(&ty)
+        && let Some(escape) = lossy_escape(text)
+    {
+        return Err(format!(
+            "typed text for {duck_type} can escape only a quote and a backslash: inside quotes the engine reads {escape} as plain characters \u{2014} edit this cell in the Query tab"
+        ));
     }
     // Every test below is on the scalar's own name, so a nested type —
     // `INTEGER[]`, `STRUCT(a INTEGER)`, `MAP(VARCHAR, INTEGER)` — and a
@@ -1119,6 +1380,16 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
     // text and let the engine cast — its error comes back atomically at
     // commit.
     Ok(Value::String(text.to_string()))
+}
+
+/// Whether text is base64 as the engine's `from_base64` reads it: the
+/// standard alphabet in groups of four, with one or two `=` of padding at
+/// the end and nowhere else, and no whitespace.
+fn is_base64(text: &str) -> bool {
+    let body = text.trim_end_matches('=');
+    text.len().is_multiple_of(4)
+        && text.len() - body.len() <= 2
+        && body.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
 }
 
 /// A type whose text the engine casts element by element: a list or an
@@ -1220,14 +1491,50 @@ const JSON_DEPTH: usize = 100;
 /// `{"x":NaN}`, which no JSON reader accepts, and the whole document reaches
 /// a client as a string. So serde's verdict is the verdict. Depth is
 /// measured first, so that a document refused for its depth is told so.
-fn check_json(text: &str) -> Result<(), String> {
+///
+/// A JSON column keeps the text as typed, so a number past a double
+/// (`{"x": 1e400}`) is stored as written, and the check builds nothing. A
+/// VARIANT reads its numbers as doubles and stores that one as the string
+/// "Infinity" (measured), so there it is refused, as a number serde's
+/// `Value` cannot hold.
+fn check_json(text: &str, variant: bool) -> Result<(), String> {
     if json_depth(text) > JSON_DEPTH {
         return Err(format!("this JSON nests deeper than {JSON_DEPTH} levels"));
     }
-    match serde_json::from_str::<Value>(text) {
-        Ok(_) => Ok(()),
+    let parsed = match variant {
+        true => serde_json::from_str::<Value>(text).map(drop),
+        false => serde_json::from_str::<serde::de::IgnoredAny>(text).map(drop),
+    };
+    match parsed {
+        Ok(()) if lone_surrogate(text) => {
+            Err(format!("{text:?} is not JSON \u{2014} a \\u escape names half a surrogate pair"))
+        }
+        Ok(()) => Ok(()),
         Err(_) => Err(format!("{text:?} is not JSON \u{2014} text needs quotes, like \"Morel\"")),
     }
+}
+
+/// Whether a `\u` escape in `text` names half of a surrogate pair alone.
+/// serde passes over an escape it is not asked to build, and the engine's
+/// JSON refuses one (measured: `'"\ud800"'::JSON` fails, and so do a low
+/// half first and a high half before anything but a low one).
+fn lone_surrogate(text: &str) -> bool {
+    let b = text.as_bytes();
+    let unit = |i: usize| {
+        let hex = b.get(i..i + 6).filter(|e| e.starts_with(b"\\u"))?;
+        u16::from_str_radix(std::str::from_utf8(&hex[2..]).ok()?, 16).ok()
+    };
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], unit(i)) {
+            (_, Some(0xD800..=0xDBFF)) if matches!(unit(i + 6), Some(0xDC00..=0xDFFF)) => i += 12,
+            (_, Some(0xD800..=0xDFFF)) => return true,
+            // Any other escape, `\\` among them, passes as its two bytes.
+            (b'\\', _) => i += 2,
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 /// The most brackets open at once in `text`, outside any string.
@@ -1383,14 +1690,14 @@ mod tests {
         let stmts = e.statements();
         assert_eq!(
             stmts[0].sql,
-            "UPDATE \"main\".\"t\" AS \"row_\" SET \"row\" = ? WHERE \"rowid\" = ? AND hash(\"row_\") = ?::UBIGINT"
-        );
-        assert_eq!(stmts[0].params, vec![json!("b"), json!(5), json!(77)]);
-        assert_eq!(
-            stmts[1].sql,
             "DELETE FROM \"main\".\"t\" AS \"row_\" WHERE \"rowid\" = ? AND hash(\"row_\") = ?::UBIGINT"
         );
-        assert_eq!(stmts[1].params, vec![json!(6), json!("18446744073709551615")]);
+        assert_eq!(stmts[0].params, vec![json!(6), json!("18446744073709551615")]);
+        assert_eq!(
+            stmts[1].sql,
+            "UPDATE \"main\".\"t\" AS \"row_\" SET \"row\" = ? WHERE \"rowid\" = ? AND hash(\"row_\") = ?::UBIGINT"
+        );
+        assert_eq!(stmts[1].params, vec![json!("b"), json!(5), json!(77)]);
     }
 
     #[test]
@@ -1401,11 +1708,112 @@ mod tests {
         e.stage_delete(vec![json!(9)]);
         let stmts = e.statements();
         assert_eq!(stmts.len(), 2);
-        assert_eq!(stmts[0].sql, "UPDATE \"main\".\"t\" SET \"id\" = ?, \"qty\" = ? WHERE \"id\" = ?");
+        assert_eq!(stmts[0].sql, "DELETE FROM \"main\".\"t\" WHERE \"id\" = ?");
+        assert_eq!(stmts[0].params, vec![json!(9)]);
+        assert_eq!(stmts[1].sql, "UPDATE \"main\".\"t\" SET \"id\" = ?, \"qty\" = ? WHERE \"id\" = ?");
         // A PK edit is just an update: SET binds the new value, WHERE the original.
-        assert_eq!(stmts[0].params, vec![json!(7), Value::Null, json!(5)]);
-        assert_eq!(stmts[1].sql, "DELETE FROM \"main\".\"t\" WHERE \"id\" = ?");
-        assert_eq!(stmts[1].params, vec![json!(9)]);
+        assert_eq!(stmts[1].params, vec![json!(7), Value::Null, json!(5)]);
+    }
+
+    /// Each statement's verb and the key its WHERE or VALUES names.
+    fn plan(e: &Edits) -> Vec<(String, Value)> {
+        e.statements()
+            .into_iter()
+            .map(|s| (s.sql.split(' ').next().unwrap().to_string(), s.params.last().cloned().unwrap_or(Value::Null)))
+            .collect()
+    }
+
+    fn verb(name: &str, key: i64) -> (String, Value) {
+        (name.to_string(), json!(key))
+    }
+
+    #[test]
+    fn statements_free_a_key_before_another_row_takes_it() {
+        // EDITING.md's example: a DELETE of 7 and a re-key of 3 to 7.
+        let mut e = edits();
+        e.stage_delete(vec![json!(7)]);
+        e.stage_cell(vec![json!(3)], 0, txt("3"), txt("7"), json!(7));
+        assert_eq!(plan(&e), vec![verb("DELETE", 7), verb("UPDATE", 3)]);
+
+        // A new row keyed as a deleted one, and as one an update re-keys away.
+        let mut e = edits();
+        let draft = e.stage_insert().unwrap();
+        e.stage_insert_cell(&draft, 0, txt("5"), json!(5));
+        let other = e.stage_insert().unwrap();
+        e.stage_insert_cell(&other, 0, txt("6"), json!(6));
+        e.stage_delete(vec![json!(5)]);
+        e.stage_cell(vec![json!(6)], 0, txt("6"), txt("60"), json!(60));
+        assert_eq!(plan(&e), vec![verb("DELETE", 5), verb("UPDATE", 6), verb("INSERT", 5), verb("INSERT", 6)]);
+
+        // A chain: 3 takes 4, 2 takes 3, 1 takes 2. Each runs after the one
+        // whose key it takes, whatever order they were staged or sorted in.
+        let mut e = edits();
+        for (from, to) in [(1, 2), (2, 3), (3, 4)] {
+            e.stage_cell(vec![json!(from)], 0, txt(&from.to_string()), txt(&to.to_string()), json!(to));
+        }
+        assert_eq!(plan(&e), vec![verb("UPDATE", 3), verb("UPDATE", 2), verb("UPDATE", 1)]);
+        // A chain that ends in a deleted key: the delete comes first of all.
+        e.stage_delete(vec![json!(4)]);
+        assert_eq!(plan(&e)[0], verb("DELETE", 4));
+
+        // A duplicate reads its source before the set deletes or re-keys it.
+        let mut e = edits();
+        e.stage_cell(vec![json!(5)], 0, txt("5"), txt("9"), json!(9));
+        e.stage_delete(vec![json!(8)]);
+        e.stage_duplicate(vec![json!(8)], vec![(1, txt("Ada"), Bind::Source)]);
+        e.stage_duplicate(vec![json!(5)], vec![(1, txt("Bo"), Bind::Source)]);
+        assert_eq!(
+            plan(&e),
+            vec![verb("INSERT", 8), verb("INSERT", 5), verb("DELETE", 8), verb("UPDATE", 5)]
+        );
+
+        // A duplicate of a row the set leaves alone reads it the same at
+        // any point, so it runs after the deletes and updates and may take
+        // a key they free: row 1 copied as id 7 beside a delete of 7, and as
+        // id 8 beside a re-key of 8 to 9.
+        let mut e = edits();
+        e.stage_duplicate(vec![json!(1)], vec![(0, txt("7"), Bind::Value(json!(7))), (1, txt("a"), Bind::Source)]);
+        e.stage_delete(vec![json!(7)]);
+        e.stage_duplicate(vec![json!(1)], vec![(0, txt("8"), Bind::Value(json!(8))), (1, txt("a"), Bind::Source)]);
+        e.stage_cell(vec![json!(8)], 0, txt("8"), txt("9"), json!(9));
+        assert_eq!(
+            plan(&e),
+            vec![verb("DELETE", 7), verb("UPDATE", 8), verb("INSERT", 1), verb("INSERT", 1)]
+        );
+        let stmts = e.statements();
+        assert_eq!((stmts[2].params[0].clone(), stmts[3].params[0].clone()), (json!(7), json!(8)));
+
+        // A composite key moves when any of its columns does.
+        let mut e = Edits::new(
+            "\"main\".\"t\"".into(),
+            vec!["a".into(), "b".into()],
+            vec!["a".into(), "b".into(), "name".into()],
+            vec!["INTEGER".into(), "INTEGER".into(), "VARCHAR".into()],
+        );
+        e.stage_cell(vec![json!(1), json!(1)], 1, txt("1"), txt("2"), json!(2));
+        e.stage_cell(vec![json!(1), json!(2)], 1, txt("2"), txt("3"), json!(3));
+        let order: Vec<_> = e.statements().into_iter().map(|s| s.params).collect();
+        assert_eq!(order, vec![vec![json!(3), json!(1), json!(2)], vec![json!(2), json!(1), json!(1)]]);
+    }
+
+    #[test]
+    fn updates_run_after_the_ones_whose_keys_they_take() {
+        let moves = |m: &[(&str, Option<&str>)]| -> Vec<(String, Option<String>)> {
+            m.iter().map(|(a, b)| (a.to_string(), b.map(str::to_string))).collect()
+        };
+        // Nothing moves: the order stands.
+        assert_eq!(claim_order(&moves(&[("1", None), ("2", None)])), vec![0, 1]);
+        // 0 takes the key 1 leaves, and 1 the key 2 leaves.
+        assert_eq!(claim_order(&moves(&[("1", Some("2")), ("2", Some("3")), ("3", Some("4"))])), vec![2, 1, 0]);
+        // Two chains and a bystander keep their own places otherwise.
+        let order = claim_order(&moves(&[("a", Some("b")), ("x", None), ("b", Some("c")), ("y", Some("z"))]));
+        assert_eq!(order, vec![2, 0, 1, 3]);
+        // A swap has no order that commits; each runs once all the same.
+        let mut swap = claim_order(&moves(&[("1", Some("2")), ("2", Some("1"))]));
+        swap.sort();
+        assert_eq!(swap, vec![0, 1]);
+        // A key moved to itself waits on nothing.
+        assert_eq!(claim_order(&moves(&[("1", Some("1"))])), vec![0]);
     }
 
     #[test]
@@ -1444,6 +1852,20 @@ mod tests {
         assert!(e.undo());
         assert!(e.is_empty());
         assert!(!e.undo());
+    }
+
+    #[test]
+    fn command_delete_discards_drafts_and_deletes_fetched_rows_as_one_step() {
+        let mut e = edits();
+        let draft = e.stage_insert().unwrap();
+        let fetched = |id: i64| Target::Fetched(vec![json!(id)], None);
+        e.delete_rows(vec![Target::Draft(draft.clone()), fetched(1), fetched(2)], false);
+        assert_eq!(e.counts(), (0, 0, 2));
+        assert!(e.undo(), "one ⌘Z brings the draft back and the rows with it");
+        assert_eq!(e.counts(), (1, 0, 0));
+        // Against a stale page the deletes are not taken; the discard is.
+        e.delete_rows(vec![Target::Draft(draft), fetched(3)], true);
+        assert!(e.is_empty());
     }
 
     #[test]
@@ -1599,22 +2021,22 @@ mod tests {
         e.stage_cell(vec![json!(1)], 1, txt("{}"), txt("{\"a\":1}"), json!("{\"a\":1}"));
         e.stage_cell(vec![json!(1)], 2, txt("[]"), txt("[1]"), json!("[1]"));
         e.stage_cell(vec![json!(1)], 3, txt("qg=="), txt("qrs="), json!("qrs="));
-        let draft = e.stage_insert();
+        let draft = e.stage_insert().unwrap();
         e.stage_insert_cell(&draft, 1, txt("{\"a\":1}"), json!("{\"a\":1}"));
         e.stage_insert_cell(&draft, 3, None, Value::Null);
 
         let stmts = e.statements();
         assert_eq!(
             stmts[0].sql,
-            "INSERT INTO \"main\".\"t\" (\"doc\", \"b\") VALUES (?::JSON, from_base64(?::VARCHAR)) RETURNING *"
-        );
-        assert_eq!(stmts[0].params, vec![json!("{\"a\":1}"), Value::Null]);
-        assert_eq!(
-            stmts[1].sql,
             "UPDATE \"main\".\"t\" SET \"doc\" = ?::JSON, \"j\" = ?::JSON, \"b\" = from_base64(?::VARCHAR) WHERE \"id\" = ?"
         );
         // The text goes as typed: the cast reads it, nothing re-serializes it.
-        assert_eq!(stmts[1].params, vec![json!("{\"a\":1}"), json!("[1]"), json!("qrs="), json!(1)]);
+        assert_eq!(stmts[0].params, vec![json!("{\"a\":1}"), json!("[1]"), json!("qrs="), json!(1)]);
+        assert_eq!(
+            stmts[1].sql,
+            "INSERT INTO \"main\".\"t\" (\"doc\", \"b\") VALUES (?::JSON, from_base64(?::VARCHAR)) RETURNING *"
+        );
+        assert_eq!(stmts[1].params, vec![json!("{\"a\":1}"), Value::Null]);
     }
 
     #[test]
@@ -1628,11 +2050,11 @@ mod tests {
         e.stage_cell(vec![json!("AAE=")], 1, txt("a"), txt("b"), json!("b"));
         e.stage_delete(vec![json!("qg==")]);
         let stmts = e.statements();
+        assert_eq!(stmts[0].sql, "DELETE FROM \"main\".\"t\" WHERE \"k\" = from_base64(?::VARCHAR)");
         assert_eq!(
-            stmts[0].sql,
+            stmts[1].sql,
             "UPDATE \"main\".\"t\" SET \"name\" = ? WHERE \"k\" = from_base64(?::VARCHAR)"
         );
-        assert_eq!(stmts[1].sql, "DELETE FROM \"main\".\"t\" WHERE \"k\" = from_base64(?::VARCHAR)");
     }
 
     #[test]
@@ -1650,14 +2072,14 @@ mod tests {
         e.stage_duplicate(vec![json!(0.5), json!(0.5)], vec![(3, txt("a"), Bind::Source)]);
         let stmts = e.statements();
         let key = "WHERE \"k\" = ?::FLOAT AND \"d\" = ?";
-        assert_eq!(
-            stmts[0].sql,
-            format!("INSERT INTO \"main\".\"t\" (\"name\") SELECT \"name\" FROM \"main\".\"t\" {key} RETURNING *")
-        );
-        assert_eq!(stmts[0].params, vec![json!(0.5), json!(0.5)]);
+        assert_eq!(stmts[0].sql, format!("DELETE FROM \"main\".\"t\" {key}"));
         assert_eq!(stmts[1].sql, format!("UPDATE \"main\".\"t\" SET \"k\" = ?, \"f\" = ? {key}"));
         assert_eq!(stmts[1].params, vec![json!(2.2), json!(0.2), json!(1.1), json!(1.1)]);
-        assert_eq!(stmts[2].sql, format!("DELETE FROM \"main\".\"t\" {key}"));
+        assert_eq!(
+            stmts[2].sql,
+            format!("INSERT INTO \"main\".\"t\" (\"name\") SELECT \"name\" FROM \"main\".\"t\" {key} RETURNING *")
+        );
+        assert_eq!(stmts[2].params, vec![json!(0.5), json!(0.5)]);
 
         for ty in ["FLOAT", "float", "REAL", "FLOAT4"] {
             assert_eq!(key_placeholder_for(ty), "?::FLOAT", "{ty}");
@@ -1668,6 +2090,25 @@ mod tests {
             assert_eq!(key_placeholder_for(ty), "?", "{ty}");
         }
         assert_eq!(key_placeholder_for("BLOB"), "from_base64(?::VARCHAR)");
+    }
+
+    #[test]
+    fn a_full_precision_double_key_names_its_row() {
+        // 924.2100000029881 needs all seventeen digits. Read by serde_json's
+        // default float parser it is its neighbor, 924.210000002988, and an
+        // UPDATE keyed by that names no row.
+        let line = r#"{"type":"row","values":[924.2100000029881,"a"]}"#;
+        let wire::Event::Row { values } = wire::Event::parse(line).unwrap() else { panic!("a row") };
+        let mut e = Edits::new(
+            "\"main\".\"t\"".into(),
+            vec!["k".into()],
+            vec!["k".into(), "v".into()],
+            vec!["DOUBLE".into(), "VARCHAR".into()],
+        );
+        e.stage_cell(vec![values[0].clone()], 1, txt("a"), txt("b"), json!("b"));
+        let stmts = e.statements();
+        assert_eq!(stmts[0].sql, "UPDATE \"main\".\"t\" SET \"v\" = ? WHERE \"k\" = ?");
+        assert_eq!(serde_json::to_string(&stmts[0].params).unwrap(), r#"["b",924.2100000029881]"#);
     }
 
     #[test]
@@ -1699,6 +2140,24 @@ mod tests {
             }
             // Inside a string they are the string's own business.
             assert_eq!(parse_value("\"NaN and Infinity\"", ty), Ok(json!("\"NaN and Infinity\"")));
+            // A trailing comma is not JSON either.
+            assert!(parse_value("[1, 2,]", ty).unwrap_err().contains("is not JSON"), "{ty}");
+            // A number past a double: a JSON column keeps it as written, and
+            // a VARIANT would store it as "Infinity", so it is refused there.
+            let wide = "{\"x\": 1e400}";
+            match ty.eq_ignore_ascii_case("VARIANT") {
+                true => assert!(parse_value(wide, ty).unwrap_err().contains("is not JSON"), "{ty}"),
+                false => assert_eq!(parse_value(wide, ty), Ok(json!(wide)), "{ty}"),
+            }
+            // Half a surrogate pair alone is refused, as the engine's JSON
+            // refuses it; a whole pair and an escaped backslash are not.
+            for text in [r#""\ud800""#, r#"{"a":"\udc00x"}"#, r#""\uD800A""#, r#""x\uDBFF""#] {
+                let err = parse_value(text, ty).unwrap_err();
+                assert!(err.contains("is not JSON"), "{ty} {text}: {err}");
+            }
+            for text in [r#""😀""#, r#""\\ud800""#, r#""􏿿""#, r#""A""#] {
+                assert_eq!(parse_value(text, ty), Ok(json!(text)), "{ty} {text}");
+            }
 
             // A document nests 100 levels and no deeper, and says so.
             let nested = |depth: usize, open: &str, close: &str| {
@@ -1731,8 +2190,8 @@ mod tests {
     #[test]
     fn inserts_omit_defaults_bind_values_and_undo_as_rows() {
         let mut e = edits();
-        let defaults = e.stage_insert();
-        let supplied = e.stage_insert();
+        let defaults = e.stage_insert().unwrap();
+        let supplied = e.stage_insert().unwrap();
         e.stage_insert_cell(&supplied, 1, txt("Ada"), json!("Ada"));
         e.stage_insert_cell(&supplied, 2, None, Value::Null);
         assert_eq!(e.counts(), (2, 0, 0));
@@ -1759,7 +2218,7 @@ mod tests {
         let key = e.stage_duplicate(
             vec![json!(5)],
             vec![(1, txt("Ada"), Bind::Source), (2, None, Bind::Source)],
-        );
+        ).unwrap();
         assert_eq!(e.counts(), (1, 0, 0));
         assert_eq!(e.staged_text(&key, 1), Some(txt("Ada")));
         assert_eq!(e.staged_text(&key, 2), Some(None));
@@ -1781,7 +2240,7 @@ mod tests {
                 (2, txt("[2]"), Bind::Value(json!("[2]"))),
                 (3, txt("qg=="), Bind::Source),
             ],
-        );
+        ).unwrap();
         let stmts = e.statements();
         assert_eq!(
             stmts[0].sql,
@@ -1826,7 +2285,7 @@ mod tests {
                 (2, txt("[2]"), Bind::Value(json!("[2]"))),
                 (3, None, Bind::Source),
             ],
-        );
+        ).unwrap();
         let copied = e.statements();
         assert_eq!(e.copied_text(&key, 1), Some(txt("{\"when\":\"2024-02-29\"}")));
         assert_eq!(e.copied_text(&key, 3), Some(None), "a copied NULL is remembered as one");
@@ -1878,7 +2337,7 @@ mod tests {
         e.stage_insert_cell(&key, 2, txt("[3]"), json!("[3]"));
         e.stage_insert_cell(&key, 2, txt("[2]"), json!("[2]"));
         assert_eq!(e.statements(), copied, "bound again, as it was");
-        let fresh = e.stage_insert();
+        let fresh = e.stage_insert().unwrap();
         e.stage_insert_cell(&fresh, 1, txt("1"), json!("1"));
         e.stage_insert_copied(&fresh, 1);
         assert_eq!(e.copied_text(&fresh, 1), None);
@@ -1887,8 +2346,8 @@ mod tests {
 
     #[test]
     fn a_duplicate_names_its_source_by_the_original_identity() {
-        // The source row is both re-keyed and deleted in the same staged
-        // set: the insert runs first and names the key the database holds.
+        // The source rows are re-keyed and deleted in the same staged set:
+        // the duplicates run first and name the keys the database holds.
         let mut e = edits();
         e.stage_cell(vec![json!(5)], 0, txt("5"), txt("7"), json!(7));
         e.stage_duplicate(vec![json!(5)], vec![(1, txt("Ada"), Bind::Source)]);
@@ -1899,9 +2358,9 @@ mod tests {
         assert_eq!(stmts.len(), 4);
         assert_eq!((stmts[0].sql.as_str(), &stmts[0].params), (copy, &vec![json!(5)]));
         assert_eq!((stmts[1].sql.as_str(), &stmts[1].params), (copy, &vec![json!(9)]));
-        assert!(stmts[2].sql.starts_with("UPDATE"));
-        assert_eq!(stmts[2].params, vec![json!(7), json!(5)]);
-        assert!(stmts[3].sql.starts_with("DELETE"));
+        assert!(stmts[2].sql.starts_with("DELETE"));
+        assert!(stmts[3].sql.starts_with("UPDATE"));
+        assert_eq!(stmts[3].params, vec![json!(7), json!(5)]);
 
         // A BLOB key is decoded in the duplicate's WHERE as in any other.
         let mut blob_keyed = Edits::new(
@@ -1960,11 +2419,11 @@ mod tests {
     #[test]
     fn only_a_draft_with_nothing_entered_is_untouched() {
         let mut e = edits();
-        let blank = e.stage_insert();
+        let blank = e.stage_insert().unwrap();
         assert!(e.is_untouched_insert(&blank));
         e.stage_insert_cell(&blank, 1, None, Value::Null);
         assert!(!e.is_untouched_insert(&blank), "an explicit NULL was entered");
-        let copy = e.stage_duplicate(vec![json!(5)], vec![(2, txt("3"), Bind::Source)]);
+        let copy = e.stage_duplicate(vec![json!(5)], vec![(2, txt("3"), Bind::Source)]).unwrap();
         assert!(!e.is_untouched_insert(&copy), "a duplicate carries its copied cells");
         assert!(!e.is_untouched_insert("draft:missing"));
     }
@@ -1972,7 +2431,7 @@ mod tests {
     #[test]
     fn a_duplicate_is_reviewed_discarded_and_validated_like_any_draft() {
         let mut e = edits();
-        let key = e.stage_duplicate(vec![json!(5)], vec![(2, txt("3"), Bind::Source)]);
+        let key = e.stage_duplicate(vec![json!(5)], vec![(2, txt("3"), Bind::Source)]).unwrap();
         // `name` is NOT NULL with no default and was not copied.
         let required = |e: &Edits| e.first_missing_required(&[true, true, false], &[None, None, None], &[true, false, false]);
         assert_eq!(required(&e), Some((key.clone(), 1)));
@@ -2047,6 +2506,36 @@ mod tests {
         assert!(matches!(confirm("abc", &persisted("INTEGER", Some("7"), None)), Confirm::Refuse(_)));
         assert!(matches!(confirm("NaN", &persisted("VARIANT", Some("1"), None)), Confirm::Refuse(_)));
         assert!(matches!(confirm("NaN", &persisted("VARIANT", None, Some(Some("1")))), Confirm::Refuse(_)));
+    }
+
+    #[test]
+    fn a_confirmed_cell_lands_in_its_draft_or_its_fetched_row() {
+        let mut e = edits();
+        let row = || Target::Fetched(vec![json!(1)], txt("a"));
+        // Kept or refused, nothing is staged.
+        e.stage_confirmed(row(), 1, Confirm::Keep);
+        e.stage_confirmed(row(), 1, Confirm::Refuse("no".into()));
+        assert!(e.is_empty());
+        // Staged, the cell holds the text; reverted, the edit is dropped.
+        e.stage_confirmed(row(), 1, stage("b", json!("b")));
+        assert_eq!(e.staged_text(&key_of(&[json!(1)]), 1), Some(txt("b")));
+        e.stage_confirmed(row(), 1, Confirm::Revert);
+        assert!(e.is_empty());
+        // A duplicate's cell typed over and reverted is read from its source.
+        let key = e.stage_duplicate(vec![json!(5)], vec![(1, txt("Ada"), Bind::Source)]).unwrap();
+        let copied = e.statements();
+        e.stage_confirmed(Target::Draft(key.clone()), 1, stage("Bo", json!("Bo")));
+        assert_eq!(e.staged_text(&key, 1), Some(txt("Bo")));
+        e.stage_confirmed(Target::Draft(key.clone()), 1, Confirm::Revert);
+        assert_eq!(e.statements(), copied);
+        // Cleared, type-honestly: '' for text, NULL for the rest.
+        let (text, value) = cleared("VARCHAR");
+        e.stage_into(Target::Draft(key.clone()), 1, text, value);
+        assert_eq!(e.staged_text(&key, 1), Some(txt("")));
+        let (text, value) = cleared("INTEGER");
+        e.stage_into(row(), 2, text, value);
+        assert_eq!(e.staged_text(&key_of(&[json!(1)]), 2), Some(None));
+        assert_eq!(cleared("UUID"), (None, Value::Null));
     }
 
     #[test]
@@ -2258,7 +2747,7 @@ mod tests {
         e.mark_in_doubt(None, true);
         assert!(!e.in_doubt());
 
-        let draft = e.stage_insert();
+        let draft = e.stage_insert().unwrap();
         e.stage_cell(vec![json!(1)], 1, txt("a"), txt("b"), json!("b"));
         e.stage_delete(vec![json!(7)]);
         assert_eq!(e.statements().len(), 3);
@@ -2273,7 +2762,8 @@ mod tests {
         assert!(e.statements().is_empty());
         e.stage_cell(vec![json!(2)], 1, txt("x"), txt("y"), json!("y"));
         e.stage_delete(vec![json!(3)]);
-        e.stage_insert();
+        assert_eq!(e.stage_insert(), None, "no key for a draft that was not staged");
+        assert_eq!(e.stage_duplicate(vec![json!(1)], vec![(1, txt("a"), Bind::Source)]), None);
         e.discard(&draft);
         e.discard(&key_of(&[json!(7)]));
         e.grouped(|e| e.discard(&key_of(&[json!(1)])));
@@ -2406,7 +2896,7 @@ mod tests {
     #[test]
     fn required_insert_validation_respects_defaults_and_generated_columns() {
         let mut e = edits();
-        let key = e.stage_insert();
+        let key = e.stage_insert().unwrap();
         assert_eq!(
             e.first_missing_required(
                 &[true, true, true],
@@ -2467,6 +2957,18 @@ mod tests {
         }
         // A cell that shows those bytes is left as it is.
         assert_eq!(confirm("NULL", &persisted("BLOB", Some("NULL"), None)), Confirm::Keep);
+        // What the engine's from_base64 decodes is taken; what it refuses
+        // (measured) is refused here, before it can fail the commit.
+        for text in ["qg==", "qrs=", "AAAA", "ab==", "qr==", "+/9A", ""] {
+            assert_eq!(parse_value(text, "BLOB"), Ok(json!(text)), "{text}");
+        }
+        for text in ["abc", "q===", "a=bc", "qg==qg==", "ab-_", " qg==", "qg== ", "Zm9v\nYmFy", "===="] {
+            let err = parse_value(text, "BLOB").unwrap_err();
+            assert!(err.contains("is not base64"), "{text}: {err}");
+            assert!(matches!(confirm(text, &persisted("BLOB", Some("AAAA"), None)), Confirm::Refuse(_)), "{text:?}");
+        }
+        // Text the cell already holds is never judged, base64 or not.
+        assert_eq!(confirm("abc", &persisted("BLOB", Some("abc"), None)), Confirm::Keep);
         // An emptied BLOB cell is NULL, as Delete and ⌃⇧N make it.
         assert_eq!(confirm("", &persisted("BLOB", Some("qg=="), None)), Confirm::Stage(None, Value::Null));
         // Every other type that is not text keeps the rule, a container of
@@ -2573,6 +3075,85 @@ mod tests {
         e.stage_duplicate(vec![json!(5)], vec![(1, txt("Ada"), Bind::Source)]);
         let labels: Vec<_> = e.entries().iter().map(|(_, identity, _)| e.source_label(identity)).collect();
         assert_eq!(labels, vec![None, Some("copy of id = 5".to_string())]);
+    }
+
+    #[test]
+    fn a_commits_answer_says_it_landed_did_not_or_may_have() {
+        use harbor_client::Failure;
+        let refused = |code: &str| Failure::Refused { code: code.into(), message: "m".into() };
+        assert_eq!(commit_outcome(None), CommitOutcome::Landed);
+        // Never sent, refused before the engine saw it, refused by the
+        // engine (a rolled-back COMMIT of an aborted transaction among
+        // them), or cancelled before it started: nothing was kept.
+        assert_eq!(commit_outcome(Some(&Failure::Unsent("refused".into()))), CommitOutcome::NotLanded);
+        for code in NOT_LANDED {
+            assert_eq!(commit_outcome(Some(&refused(code))), CommitOutcome::NotLanded, "{code}");
+        }
+        // No answer, an error after the engine ran it, or a code this client
+        // does not know: it may have landed.
+        assert_eq!(commit_outcome(Some(&Failure::Unanswered("timed out".into()))), CommitOutcome::InDoubt);
+        for code in [wire::code::INTERNAL, wire::code::RESPONSE_TOO_LARGE, "some_later_code"] {
+            assert_eq!(commit_outcome(Some(&refused(code))), CommitOutcome::InDoubt, "{code}");
+        }
+    }
+
+    /// A set staged against `"main".<table>`, with `n` rows changed.
+    fn staged_on(table: &str, n: i64) -> Edits {
+        let mut e = Edits::new(
+            format!("\"main\".\"{table}\""),
+            vec!["id".into()],
+            vec!["id".into(), "name".into()],
+            vec!["INTEGER".into(), "VARCHAR".into()],
+        );
+        for id in 0..n {
+            e.stage_delete(vec![json!(id)]);
+        }
+        e
+    }
+
+    #[test]
+    fn staged_sets_are_parked_per_database_and_per_table() {
+        let mut parked = Parked::default();
+        parked.park("a.duckdb", staged_on("t", 2));
+        parked.park("a.duckdb", staged_on("u", 1));
+        parked.park("b.duckdb", staged_on("t", 3));
+        // An empty set is nothing to keep.
+        parked.park("b.duckdb", staged_on("v", 0));
+        assert_eq!(Tally::of(parked.sets()), Tally { staged: 6, tables: 3, held: 0 });
+        assert_eq!(Tally::of(parked.at(&"a.duckdb")), Tally { staged: 3, tables: 2, held: 0 });
+        // A table of one database is not the same-named table of another.
+        let t = parked.take(&"b.duckdb", "\"main\".\"t\"").unwrap();
+        assert_eq!(t.len(), 3);
+        assert!(parked.take(&"b.duckdb", "\"main\".\"t\"").is_none(), "given up once");
+        assert!(parked.take(&"b.duckdb", "\"main\".\"v\"").is_none());
+        assert_eq!(parked.at(&"b.duckdb").count(), 0);
+        assert_eq!(parked.take(&"a.duckdb", "\"main\".\"t\"").map(|e| e.len()), Some(2));
+        // Parking a table's set again replaces what was parked for it.
+        parked.park("a.duckdb", staged_on("u", 4));
+        assert_eq!(Tally::of(parked.sets()), Tally { staged: 4, tables: 1, held: 0 });
+        // A database forgotten takes its sets with it, and only its own.
+        parked.park("b.duckdb", t);
+        parked.forget(&"a.duckdb");
+        assert_eq!(Tally::of(parked.sets()), Tally { staged: 3, tables: 1, held: 0 });
+    }
+
+    #[test]
+    fn a_tally_counts_held_changes_apart_from_staged_ones() {
+        let mut held = staged_on("t", 2);
+        held.mark_in_doubt(None, false);
+        let sets = [staged_on("u", 3), held, staged_on("v", 0)];
+        let tally = Tally::of(&sets);
+        assert_eq!(tally, Tally { staged: 3, tables: 1, held: 2 });
+        assert_eq!(Tally::of(&sets[2..]), Tally::default());
+
+        // A held set parked and handed back is still held, and is judged
+        // against the page its table is opened with.
+        let mut parked = Parked::default();
+        let [_, held, _] = sets;
+        parked.park(1, held);
+        let back = parked.take(&1, "\"main\".\"t\"").unwrap();
+        assert!(back.in_doubt() && back.statements().is_empty());
+        assert_eq!(handoff(Some(&staged_on("t", 0)), true, &back), Handoff::Adopt);
     }
 
     #[test]

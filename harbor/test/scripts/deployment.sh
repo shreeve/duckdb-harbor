@@ -55,13 +55,13 @@ soft() { warn=$((warn+1)); warnings+=("$1"); record "$1" warn "${2:-}"
          say '  %s!%s %s\n     %s%s%s\n' "$yellow" "$off" "$1" "$dim" "${2:-}" "$off"; }
 eq()   { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1" "expected [$2], got [$3]"; fi; }
 
-command -v jq >/dev/null || { echo "validate-deployment needs jq" >&2; exit 2; }
+command -v jq >/dev/null || { echo "deployment.sh needs jq" >&2; exit 2; }
 
 # Scratch space for the two checks that shell out to Python. Their output goes
 # through a file rather than a command substitution: bash 3.2, which is what
 # macOS ships, mis-parses a heredoc nested inside $( ), and the damage shows up
 # as a syntax error hundreds of lines further down.
-work=$(mktemp -d "${TMPDIR:-/tmp}/harbor-validate.XXXXXX")
+work=$(mktemp -d "${TMPDIR:-/tmp}/harbor-deployment.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
 # post <sql> [params-json] — the NDJSON body, or empty on transport failure
@@ -226,9 +226,8 @@ else
   bad "errors carry a code clients can branch on" "no code field: $(head -c 200 <<<"$err")"
 fi
 
-# The reason this check exists: duckdb-rs's prepare() runs every statement but
-# the last, so a server that forwards a multi-statement body executes the DROP
-# and reports on the SELECT. It must be refused before anything runs.
+# A request is one statement. A body of two is refused before either runs, so
+# a DROP behind a SELECT never executes behind an answer about the SELECT.
 eq "multiple statements are refused"  "400" "$(code 'SELECT 1; SELECT 2')"
 eq "a trailing semicolon is still one statement" "200" "$(code 'SELECT 1;')"
 eq "a semicolon inside a string is not a separator" "200" "$(code "SELECT 'a;b' AS s")"
@@ -280,16 +279,13 @@ if (( rows >= 300000 )); then
 else
   bad "a 300k-row result streams to completion" "only ${rows} rows arrived"
 fi
-# A failure, not a warning. The comment above calls this the single most common
-# way a streaming deployment stops streaming; reporting it as a warning meant
-# the run still exited 0 and printed "the deployment is fit to serve". The
-# total_ms < 500 escape hatch went with it — a response fast enough to look
-# instant is exactly where a buffering proxy hides.
+# A failure, not a warning: this is the single most common way a streaming
+# deployment stops streaming, and a warning still exits 0 and prints "the
+# deployment is fit to serve". A fast total earns no pass either — a
+# response fast enough to look instant is exactly where a buffering proxy
+# hides.
 if (( first_ms * 2 < total_ms )); then
   ok "the first row arrives before the last" "first ${first_ms}ms of ${total_ms}ms"
-elif (( total_ms < 500 )); then
-  soft "the first row arrives before the last" \
-       "the whole result took ${total_ms}ms, too fast to tell buffering from speed — rerun against a larger result to be sure"
 else
   bad "the first row arrives before the last" \
       "first row at ${first_ms}ms of ${total_ms}ms — something between here and harbor is buffering the whole response"
@@ -358,10 +354,8 @@ fi
 mode=$(scalar "SELECT current_setting('access_mode') AS m")
 case "$mode" in
   # Either answer is a legitimate deployment, so this reports rather than
-  # judges — but it must not report a pass. Both branches used to call ok(),
-  # which meant a query that failed outright came back as
-  # "✓ the deployment accepts writes (access_mode=NO-ROWS)" and added one to
-  # the pass count.
+  # judges — but it must not report a pass, and a query that failed
+  # outright is a failure, not an access mode.
   READ_ONLY|read_only) record "access mode" ok "read-only, as configured"
                        say '  %s·%s access mode: read-only\n' "$dim" "$off" ;;
   NO-ROWS|"")          bad "access mode could not be read" "the server did not answer current_setting('access_mode')" ;;

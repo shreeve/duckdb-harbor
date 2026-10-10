@@ -10,6 +10,8 @@ use std::io::BufRead as _;
 use std::time::Duration;
 use wire::{endpoint, Event, SqlRequest};
 
+pub use http::Failure;
+
 /// One statement's full result page, in server order.
 #[derive(Debug)]
 pub struct QueryResult {
@@ -21,40 +23,6 @@ pub struct QueryResult {
 
 pub fn query(conn: &Conn, sql: &str) -> Result<QueryResult, String> {
     exec(conn, sql, None, None)
-}
-
-/// Why a statement returned no result. The two cases differ in what the
-/// caller knows afterwards, which matters most for a `COMMIT`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Failure {
-    /// Harbor answered with an error of its own: the engine's verdict
-    /// (`sql_error`), or a refusal such as `no_such_session`. The statement
-    /// did not take effect.
-    Refused { code: String, message: String },
-    /// The request never reached Harbor whole: the connection could not be
-    /// made, or the request could not be written. The statement did not run.
-    Unsent(String),
-    /// The request was sent and no verdict arrived: its answer did not come,
-    /// or could not be read to the end. The statement may have run.
-    Unanswered(String),
-}
-
-impl Failure {
-    /// The session named in the request is gone: released, or reclaimed by
-    /// the server at its idle timeout or its deadline, with its transaction
-    /// rolled back.
-    pub fn session_gone(&self) -> bool {
-        matches!(self, Failure::Refused { code, .. } if code == "no_such_session")
-    }
-}
-
-impl std::fmt::Display for Failure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Failure::Refused { code, message } => write!(f, "{code}: {message}"),
-            Failure::Unsent(message) | Failure::Unanswered(message) => f.write_str(message),
-        }
-    }
 }
 
 /// One statement with everything the wire offers: bound parameters (never
@@ -97,20 +65,13 @@ pub fn exec_within(
     .map_err(|e| Failure::Unsent(e.to_string()))?;
     // A tunnel that has died takes its route with it: nothing can be sent.
     let transport = conn.transport().map_err(Failure::Unsent)?;
-    let resp = http::request(transport, &endpoint::SQL, Some(&body), Some(patience)).map_err(|e| {
-        let message = format!("query: {e}");
-        if http::was_not_sent(&e) { Failure::Unsent(message) } else { Failure::Unanswered(message) }
-    })?;
+    let resp = http::request(transport, &endpoint::SQL, Some(&body), Some(patience)).map_err(Failure::from)?;
 
     // Status first: a non-2xx or a proxy's HTML body must answer as itself, not
     // as "bad wire line" from trying to decode it as NDJSON.
     let status = resp.status;
     if !(200..300).contains(&status) {
-        let body = resp.body_string().unwrap_or_default();
-        return Err(match Event::parse(body.trim()) {
-            Ok(Event::Error { code, message }) => Failure::Refused { code, message },
-            _ => Failure::Unanswered(format!("HTTP {status}")),
-        });
+        return Err(Failure::of(status, &resp.body_string().unwrap_or_default()));
     }
     decode(resp.body.lines())
 }
@@ -118,9 +79,10 @@ pub fn exec_within(
 /// Read a result from its NDJSON lines. The stream is complete only when
 /// its `end` event arrives: one that stops short of it, because the server
 /// died or the connection dropped mid-answer, is no verdict, however many
-/// rows came first.
+/// rows came first. Nor is one out of the wire's order: a row before the
+/// schema, a second schema, or anything after the end.
 fn decode(lines: impl Iterator<Item = std::io::Result<String>>) -> Result<QueryResult, Failure> {
-    let mut columns = Vec::new();
+    let mut columns = None;
     let mut rows = Vec::new();
     let mut end = None;
     for line in lines {
@@ -128,13 +90,18 @@ fn decode(lines: impl Iterator<Item = std::io::Result<String>>) -> Result<QueryR
         if line.trim().is_empty() {
             continue;
         }
-        match Event::parse(&line).map_err(|e| Failure::Unanswered(format!("bad wire line: {e}")))? {
-            Event::Schema { columns: c } => columns = c,
-            Event::Row { values } => rows.push(values),
+        let event = Event::parse(&line).map_err(|e| Failure::Unanswered(format!("bad wire line: {e}")))?;
+        match event {
+            _ if end.is_some() => return Err(Failure::Unanswered("bad wire line: the answer went on after its end".into())),
+            Event::Schema { columns: c } if columns.is_none() => columns = Some(c),
+            Event::Row { values } if columns.is_some() => rows.push(values),
             Event::End { row_count, time_ms } => end = Some((row_count, time_ms)),
             Event::Error { code, message } => return Err(Failure::Refused { code, message }),
+            Event::Schema { .. } => return Err(Failure::Unanswered("bad wire line: a second schema".into())),
+            Event::Row { .. } => return Err(Failure::Unanswered("bad wire line: a row before the schema".into())),
         }
     }
+    let columns = columns.unwrap_or_default();
     let Some((row_count, time_ms)) = end else {
         return Err(Failure::Unanswered("stream: the answer ended before it was complete".to_string()));
     };
@@ -161,37 +128,20 @@ pub fn session_new(conn: &Conn) -> Result<String, String> {
 
 /// [`session_new`], with the lifetime Harbor granted.
 pub fn session_open(conn: &Conn) -> Result<Session, String> {
-    let transport = conn.transport()?;
-    let open = |route: &wire::endpoint::Route| {
-        http::request(
-            transport,
-            route,
-            Some("{}"),
-            Some(Duration::from_secs(10)),
-        )
-        .map_err(|e| format!("session: {e}"))
-    };
-    let mut resp = open(&endpoint::SESSIONS_CREATE)?;
-    if resp.status == 404 {
-        // A pre-0.22.1 harbor only knows the old spelling — and joining
-        // older servers is a feature, so fall back rather than fail.
-        resp = open(&endpoint::SESSIONS_CREATE_LEGACY)?;
-    }
-    let status = resp.status;
-    let body = resp.body_string().map_err(|e| e.to_string())?;
-    if !(200..300).contains(&status) {
-        return Err(match Event::parse(body.trim()) {
-            Ok(Event::Error { code, message }) => format!("{code}: {message}"),
-            _ => format!("HTTP {status}"),
-        });
-    }
-    serde_json::from_str::<wire::SessionNewResponse>(&body)
+    http::session_open(conn.transport()?, &Default::default())
         .map(|r| Session {
             id: r.session_id,
             ttl: Duration::from_millis(r.ttl_ms),
             idle: Duration::from_millis(r.idle_ttl_ms),
         })
-        .map_err(|e| format!("bad session response: {e}"))
+        .map_err(|e| format!("session: {e}"))
+}
+
+/// Renew a session without running anything on it: its idle clock starts
+/// again, and its ceiling stays. `Ok(false)` is a Harbor that renews only
+/// backup sessions, where a statement is what keeps a session alive.
+pub fn session_renew(conn: &Conn, session_id: &str) -> Result<bool, Failure> {
+    http::session_renew(conn.transport().map_err(Failure::Unsent)?, session_id)
 }
 
 /// Release a session's pinned connection, rolling back any open
@@ -240,19 +190,7 @@ pub fn session_end(conn: &Conn, session_id: &str, patience: Duration) -> Ended {
 }
 
 fn release(conn: &Conn, session_id: &str) -> Result<wire::ReleasedResponse, String> {
-    let resp = http::request(
-        conn.transport()?,
-        &endpoint::session(session_id),
-        None,
-        Some(Duration::from_secs(10)),
-    )
-    .map_err(|e| format!("release: {e}"))?;
-    let status = resp.status;
-    let body = resp.body_string().map_err(|e| format!("release: {e}"))?;
-    if !(200..300).contains(&status) {
-        return Err(format!("release: HTTP {status}"));
-    }
-    serde_json::from_str(body.trim()).map_err(|e| format!("release: {e}"))
+    http::session_release(conn.transport()?, session_id).map_err(|e| format!("release: {e}"))
 }
 
 /// Whether Harbor still lists the session among those it holds.
@@ -327,5 +265,22 @@ mod tests {
         let broken = [Ok(SCHEMA.to_string()), Err(std::io::Error::other("connection closed mid-chunk"))];
         assert!(matches!(decode(broken.into_iter()).unwrap_err(), Failure::Unanswered(why) if why.starts_with("stream: ")));
         assert!(matches!(decode(lines("<html>")).unwrap_err(), Failure::Unanswered(why) if why.starts_with("bad wire line")));
+    }
+
+    #[test]
+    fn a_result_out_of_the_wires_order_is_no_verdict() {
+        const ROW: &str = r#"{"type":"row","values":[1]}"#;
+        const END: &str = r#"{"type":"end","rowCount":1,"timeMs":2}"#;
+        for (text, why) in [
+            (format!("{ROW}\n{SCHEMA}\n{END}\n"), "a row before the schema"),
+            (format!("{SCHEMA}\n{SCHEMA}\n{END}\n"), "a second schema"),
+            (format!("{SCHEMA}\n{END}\n{ROW}\n"), "after its end"),
+            (format!("{SCHEMA}\n{END}\n{END}\n"), "after its end"),
+        ] {
+            let failure = decode(lines(&text)).unwrap_err();
+            assert!(matches!(&failure, Failure::Unanswered(m) if m.ends_with(why)), "{text:?}: {failure:?}");
+        }
+        // An end alone is an answer with no columns.
+        assert_eq!(decode(lines(&format!("{END}\n"))).unwrap().columns.len(), 0);
     }
 }

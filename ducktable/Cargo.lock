@@ -1462,9 +1462,10 @@ dependencies = [
  "duckdb-lang",
  "gpui-kit",
  "harbor-client",
+ "harbor-common",
  "libc",
- "objc",
  "objc2 0.6.4",
+ "serde",
  "serde_json",
  "wire",
 ]
@@ -2887,6 +2888,8 @@ name = "harbor-client"
 version = "0.22.9"
 dependencies = [
  "harbor-common",
+ "harbor-http",
+ "libc",
  "serde",
  "serde_json",
  "toml 1.1.4+spec-1.1.0",
@@ -2899,9 +2902,19 @@ version = "0.44.2"
 dependencies = [
  "libc",
  "serde",
- "serde_json",
  "toml 1.1.4+spec-1.1.0",
- "toml_edit 0.22.27",
+ "toml_edit 0.25.13+spec-1.1.0",
+]
+
+[[package]]
+name = "harbor-http"
+version = "0.44.2"
+dependencies = [
+ "harbor-common",
+ "libc",
+ "serde",
+ "serde_json",
+ "wire",
 ]
 
 [[package]]
@@ -6894,6 +6907,7 @@ dependencies = [
  "indexmap",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.4",
 ]
 

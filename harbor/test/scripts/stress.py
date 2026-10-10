@@ -15,7 +15,7 @@ average.
 Two things this is careful about:
 
 Connections are reused, one per client thread, because that is what a real
-client does and what harbor now supports. `--no-keepalive` opens a fresh
+client does. `--no-keepalive` opens a fresh
 connection per request instead; the contrast is stark, and not because the
 server got slower. Without reuse each request burns a client ephemeral port
 for the TIME_WAIT interval, so a few thousand requests per second exhausts
@@ -149,10 +149,8 @@ def run_level(args, clients, expected, stop_after):
                 ok = code == 200
             else:
                 # All three reads have an answer read from the database file
-                # before the server opened it. Two of these used to carry
-                # want=None, so 55% of the read mix was checked only for
-                # "some rows came back" and the "wrong answers" column could
-                # not have caught a wrong aggregate.
+                # before the server opened it, so the "wrong answers" column
+                # catches a wrong aggregate, not only a missing one.
                 choice = rng.random()
                 if choice < 0.45:
                     sql, want = "SELECT count(*) AS n FROM sites", expected["sites"]
@@ -188,12 +186,11 @@ def pct(values, p):
 # The queries the load sends, and — below — the queries whose answers verify
 # them. Kept together so the two can never drift apart.
 #
-# These are ordinary aggregates, deliberately: an earlier version wrapped each
-# one in md5(string_agg(...)) to get a single comparable value, which made the
-# benchmark measure a workload nobody runs — about 24% slower per request than
-# the query it replaced. The first cell of an ordered aggregate is verification
-# enough. A wrong grouping, a wrong join, or a dropped row changes which client
-# sorts first, and it costs nothing to check.
+# These are ordinary aggregates, deliberately: wrapping each in
+# md5(string_agg(...)) for a single comparable value would measure a workload
+# nobody runs, about 24% slower per request. The first cell of an ordered
+# aggregate is verification enough. A wrong grouping, a wrong join, or a
+# dropped row changes which client sorts first, and it costs nothing to check.
 TOP_PLANS_SQL = (
     "SELECT client, count(*) AS n FROM plans GROUP BY 1 ORDER BY n DESC, client LIMIT 5"
 )
@@ -230,14 +227,14 @@ def main():
                     help="open a fresh connection per request")
     ap.add_argument("--dump-oracle-sql", action="store_true",
                     help="print the queries the oracle must answer, then exit")
-    ap.add_argument("--expect-sites", required=True,
+    ap.add_argument("--expect-sites", default="",
                     help="count(*) FROM sites, read from the database file by the caller")
-    ap.add_argument("--expect-top-plans", required=True,
-                    help="digest of the top-plans aggregate, read the same way")
-    ap.add_argument("--expect-join", required=True,
-                    help="digest of the sites/plans join, read the same way")
-    args = ap.parse_args(namespace=None) if "--dump-oracle-sql" not in sys.argv else None
-    if args is None:
+    ap.add_argument("--expect-top-plans", default="",
+                    help="first cell of the top-plans aggregate, read the same way")
+    ap.add_argument("--expect-join", default="",
+                    help="first cell of the sites/plans join, read the same way")
+    args = ap.parse_args()
+    if args.dump_oracle_sql:
         return dump_oracle_sql()
 
     code, _, lines = request(args.host, args.port, "SELECT 1 AS up")
@@ -246,12 +243,10 @@ def main():
         return 2
 
     # The expected values are supplied by the caller, which reads them from the
-    # database file directly before the server takes the lock. They used to be
-    # read from the server itself, and the banner still claimed reads were
-    # "verified" — but a server that returned a consistently wrong count under
-    # load would have been compared against its own wrong count and reported
-    # zero wrong answers. An oracle that shares an implementation with the thing
-    # it checks is not an oracle.
+    # database file directly before the server takes the lock. Read from the
+    # server itself, a consistently wrong count under load would be compared
+    # against itself and report zero wrong answers. An oracle that shares an
+    # implementation with the thing it checks is not an oracle.
     expected = {
         "sites": args.expect_sites,
         "top_plans": args.expect_top_plans,
@@ -289,16 +284,18 @@ def main():
         # What counts as a regression — and what doesn't. A 503 is harbor's
         # bounded-queue backpressure doing its job; on a starved shared CI
         # runner a burst of shedding is a hardware fact, not a harbor bug
-        # (seen 24% on a congested nightly and 53% on a worse one, same commit
-        # green on rerun). The shed FRACTION is therefore a property of the
-        # machine and not of this build, so it is held only to "the berth did
-        # not stop serving entirely". What does indict harbor is checked
-        # exactly and at any rate: a wrong answer, or any status that is
-        # neither the work nor the backpressure.
+        # (24% on a congested nightly and 53% on a worse one, the same commit
+        # green on rerun). Under load the shed FRACTION is therefore a
+        # property of the machine and not of this build, so it is held only
+        # to "the berth did not stop serving entirely". One client has one
+        # request in flight and a pool of workers to serve it, so any shedding
+        # there is harbor's. What does indict harbor is checked exactly and at
+        # any rate: a wrong answer, or any status that is neither the work
+        # nor the backpressure.
         total = sum(lv.status.values())
         shed = lv.status.get(503, 0)
         foreign = {c: n for c, n in lv.status.items() if c not in (200, 503)}
-        if lv.wrong or foreign or (total and shed / total > 0.9):
+        if lv.wrong or foreign or (total and shed / total > 0.9) or (clients == 1 and shed):
             regressions.append((clients, lv.errors, lv.wrong, lv.status))
         elif shed:
             print("  %7d  note: %d requests shed with 503 (%.0f%%) — backpressure, tolerated"

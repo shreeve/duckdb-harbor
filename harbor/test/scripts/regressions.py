@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Review regressions: request isolation, settings policy, body limits and config writes.
 
-Runs an isolated one-worker/two-connection server so connection reuse is deterministic.
+Runs an isolated one-worker/two-connection server so connection reuse is deterministic,
+and a two-worker one for the race a single worker would serialize.
 """
 import concurrent.futures
 import http.client
@@ -19,19 +20,22 @@ BINARY = ROOT / "target/release/harbor"
 LIMIT = 8 << 20
 
 
-class Regressions(unittest.TestCase):
+class Harbor:
+    """A server of its own for the test class, and requests to it."""
+    WORKERS, POOL = 1, 2
+
     @classmethod
     def setUpClass(cls):
         cls.work = tempfile.TemporaryDirectory(prefix="hb-reg-", dir="/tmp")
         cls.root = Path(cls.work.name)
-        cls.env = dict(os.environ, HARBOR_HOME=str(cls.root / "home"), HARBOR_POOL_SIZE="2")
+        cls.env = dict(os.environ, HARBOR_HOME=str(cls.root / "home"), HARBOR_POOL_SIZE=str(cls.POOL))
         cls.db = cls.root / "source.duckdb"
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             cls.port = s.getsockname()[1]
         cls.log = open(cls.root / "server.log", "w")
         cls.server = subprocess.Popen(
-            [str(BINARY), str(cls.db), "start", "--port", str(cls.port), "--workers", "1"],
+            [str(BINARY), str(cls.db), "start", "--port", str(cls.port), "--workers", str(cls.WORKERS)],
             env=cls.env, stdout=cls.log, stderr=cls.log,
         )
         for _ in range(100):
@@ -81,12 +85,23 @@ class Regressions(unittest.TestCase):
         return doc
 
     def session(self):
-        status, doc = self.request("POST", "/sql/sessions", {})
+        # A session released the instant its last answer arrived can still
+        # hold its claim, and is then released by the reaper's next tick:
+        # every lease taken is the documented 503, retried.
+        deadline = time.time() + 3
+        while True:
+            status, doc = self.request("POST", "/sql/sessions", {})
+            if doc.get("code") != "no_lease_available" or time.time() > deadline:
+                break
+            time.sleep(.05)
         self.assertEqual(status, 200, doc)
         return doc["sessionId"]
 
     def release(self, sid):
         self.assertEqual(self.request("DELETE", "/sql/sessions/" + sid)[0], 200)
+
+
+class Regressions(Harbor, unittest.TestCase):
 
     def test_backup_lease_policy_and_expiry(self):
         for data in ({"purpose": "unknown"}, {"ttlMs": 0}, {"ttlMs": -1}):
@@ -97,7 +112,8 @@ class Regressions(unittest.TestCase):
         self.assertEqual(ordinary["idleTtlMs"], 30000)
         sid = ordinary["sessionId"]
         try:
-            self.assertEqual(self.request("POST", f"/sql/sessions/{sid}/renew")[0], 400)
+            # An ordinary session renews its idle clock (sessions.py).
+            self.assertEqual(self.request("POST", f"/sql/sessions/{sid}/renew"), (200, {"renewed": True}))
         finally:
             self.release(sid)
         status, backup = self.request("POST", "/sql/sessions", {"purpose": "backup", "ttlMs": 999999})
@@ -197,43 +213,62 @@ class Regressions(unittest.TestCase):
             self.release(sid)
         self.assertEqual(self.sql("SELECT x FROM kept")["data"], [[2]])
 
-    def test_a_cancelled_commit_kept_everything_or_nothing_and_says_which(self):
-        # A cancel raced against a healthy COMMIT. Whichever wins, the answer
-        # is true: 200 and the row is there, or 499 and it is not, with the
-        # transaction left aborted. Never 499 for a commit that landed.
-        import threading
-        self.sql("CREATE TABLE raced(x INTEGER)")
-        landed = cancelled = 0
-        for attempt in range(150):
-            sid = self.session()
-            try:
-                self.sql("BEGIN", sid)
-                self.sql(f"INSERT INTO raced VALUES ({attempt})", sid)
-                name, answer = f"race-{attempt}", {}
+    def test_a_statement_that_fails_mid_stream_in_a_session_says_why(self):
+        # A VARIANT cell is cast in the statement's transaction, which the
+        # statement's own error has already aborted; the answer is that
+        # error, not the aborted transaction the next cell then meets.
+        sid = self.session()
+        try:
+            self.sql("BEGIN", sid)
+            doc = self.sql("SELECT i::VARIANT v, CASE WHEN i = 250000 THEN error('boom at 250000') END "
+                           "FROM range(300000) t(i)", sid, status=400)
+            self.assertIn("boom at 250000", doc["message"])
+        finally:
+            self.release(sid)
 
-                def commit():
-                    answer["commit"] = self.request(
-                        "POST", "/sql", {"sql": "COMMIT", "sessionId": sid, "queryId": name})
+    def hang_up(self, body, accept, wait=1.0):
+        """Send a statement and close the connection before reading anything."""
+        data = json.dumps(body).encode()
+        with socket.create_connection(("127.0.0.1", self.port)) as s:
+            s.sendall(b"POST /sql HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                      + f"Accept: {accept}\r\nContent-Length: {len(data)}\r\n\r\n".encode() + data)
+            time.sleep(wait)
 
-                thread = threading.Thread(target=commit)
-                thread.start()
-                time.sleep((attempt % 8) * 0.0002)
-                self.request("DELETE", "/sql/queries/" + name)
-                thread.join()
-                status, doc = answer["commit"]
-                kept = self.sql(f"SELECT count(*) FROM raced WHERE x = {attempt}")["data"][0][0]
-                if status == 200:
-                    landed += 1
-                    self.assertEqual(kept, 1, (attempt, doc))
-                else:
-                    cancelled += 1
-                    self.assertEqual((status, doc.get("code")), (499, "cancelled"), (attempt, doc))
-                    self.assertEqual(kept, 0, (attempt, "answered cancelled, and the row is committed"))
-                    self.assertIn("aborted", self.sql("SELECT 1", sid, status=400)["message"])
-            finally:
-                self.release(sid)
-        self.assertEqual(landed + cancelled, 150)
-        self.assertEqual(self.sql("SELECT count(*) FROM raced")["data"], [[landed]])
+    def test_a_client_that_hangs_up_takes_its_statement_with_it(self):
+        # This server has one worker. A statement that sends no row for
+        # minutes — a count over a huge range, a cross join, a filter that
+        # matches nothing — whose client leaves before any byte comes back
+        # is stopped, in either shape, so the worker serves the next request.
+        long = ["SELECT count(*) FROM range(2000000000000)",
+                "SELECT count(*) FROM range(100000000) a, range(1000000) b",
+                "SELECT i FROM range(2000000000000) t(i) WHERE i = -1"]
+        for sql in long:
+            for accept in ("application/json", "application/x-ndjson"):
+                self.hang_up({"sql": sql}, accept)
+                # The probe lane sheds with a 503 until the worker is free;
+                # it is free within moments, not when the statement would end.
+                deadline = time.monotonic() + 5
+                while True:
+                    status, doc = self.request("POST", "/sql", {"sql": "SELECT 42"})
+                    if status != 503 or time.monotonic() > deadline:
+                        break
+                    time.sleep(.05)
+                self.assertEqual((status, doc.get("data")), (200, [[42]]), (sql, accept))
+        # In a session the statement stops too, and its transaction is over.
+        sid = self.session()
+        try:
+            self.sql("BEGIN", sid)
+            self.hang_up({"sql": long[0], "sessionId": sid}, "application/x-ndjson")
+            deadline = time.time() + 5
+            while True:
+                status, doc = self.request("POST", "/sql", {"sql": "SELECT 1", "sessionId": sid})
+                if status != 409 or time.time() > deadline:
+                    break
+                time.sleep(.05)
+            self.assertEqual(status, 400, doc)
+            self.assertIn("aborted", doc["message"])
+        finally:
+            self.release(sid)
 
     def test_a_statement_cut_short_in_a_transaction_aborts_it_every_time(self):
         self.sql("CREATE TABLE half(x INTEGER)")
@@ -288,15 +323,60 @@ class Regressions(unittest.TestCase):
         finally:
             self.release(second)
 
-    def test_wrapped_settings_cannot_override_operator_policy(self):
-        before = self.sql("SELECT current_setting('threads')")["data"]
-        for sql in ["EXPLAIN ANALYZE SET threads=2", "EXPLAIN ANALYZE SET worker_threads=2",
-                    "EXPLAIN ANALYZE SET allowed_configs=['threads']",
-                    "EXPLAIN ANALYZE SET lock_configuration=false"]:
-            self.sql(sql, status=400)
-        self.assertEqual(self.sql("SELECT current_setting('threads')")["data"], before)
+    def test_settings_cannot_override_operator_policy(self):
+        # Process-global settings are locked in the engine, which refuses
+        # every way of reaching one and names it.
+        settings = "SELECT current_setting('threads'), current_setting('memory_limit')"
+        before = self.sql(settings)["data"]
+        for sql, name in [("SET threads=1", "threads"), ("SET GLOBAL threads=1", "threads"),
+                          ("SET SESSION worker_threads=1", "worker_threads"), ("RESET threads", "threads"),
+                          ("PRAGMA threads=1", "threads"), ("SET \"memory_limit\"='1TB'", "memory_limit"),
+                          ("/* x */ SET max_memory='1TB'", "max_memory"),
+                          ("SET --\r memory_limit='1TB'", "memory_limit"),
+                          ("RESET --\r\n external_threads", "external_threads"),
+                          ("SET max_temp_directory_size='100TB'", "max_temp_directory_size"),
+                          ("PRAGMA temp_directory='/tmp/x'", "temp_directory"),
+                          ("EXPLAIN ANALYZE SET threads=2", "threads"),
+                          ("EXPLAIN ANALYZE RESET memory_limit", "memory_limit"),
+                          ("EXPLAIN ANALYZE SET allowed_configs=['threads']", "allowed_configs"),
+                          ("EXPLAIN ANALYZE SET lock_configuration=false", "lock_configuration")]:
+            doc = self.sql(sql, status=400)
+            self.assertEqual(doc["code"], "sql_error", sql)
+            self.assertIn("configuration has been locked", doc["message"], sql)
+            self.assertIn(name, doc["message"], sql)
+        self.assertEqual(self.sql(settings)["data"], before)
         self.sql("SET default_order='DESC'")
         self.sql("RESET default_order")
+
+    def test_one_statement_per_request(self):
+        # The engine's parser counts the statements before anything runs, and
+        # more than one is refused; a canary only a second statement could
+        # drop is the proof it never ran. Each form here hides its `;` from a
+        # reader that disagrees with the engine on one rule: a CR ending a
+        # `--` comment, a `$` inside a word, an `e` that ends a keyword, an
+        # E string's backslash.
+        self.sql("CREATE TABLE canary(x INT)")
+        sid = self.session()
+        try:
+            for sql in ["SELECT 1; DROP TABLE canary", "SELECT ';';DROP TABLE canary",
+                        "SELECT 1 --\r; DROP TABLE canary", "SELECT 1 -- note\r\n; DROP TABLE canary",
+                        "SELECT 1 a$b$c; DROP TABLE canary", "SELECT 1 a$b$c$$; DROP TABLE canary",
+                        "SELECT 1 x$1$; DROP TABLE canary", r"SELECT 1 WHERE 'a' LIKE'\'; DROP TABLE canary",
+                        r"SELECT 'a' LIKE 'b' ESCAPE'\'; DROP TABLE canary",
+                        r"SELECT date'2020-01-01'; DROP TABLE canary", r"SELECT e'\''; DROP TABLE canary",
+                        r"SELECT E'a\\'; DROP TABLE canary", "/* x; */ SELECT 1; DROP TABLE canary"]:
+                for session in (None, sid):
+                    doc = self.sql(sql, session, status=400)
+                    self.assertEqual(doc["code"], "bad_request", sql)
+                    self.sql("SELECT count(*) FROM canary")
+        finally:
+            self.release(sid)
+        self.sql("DROP TABLE canary")
+        # What follows the one statement may be a comment or nothing at all,
+        # and a `;` inside a dollar quote is data, whatever bytes its tag holds.
+        self.assertEqual(self.sql("SELECT 1; -- c")["data"], [[1]])
+        self.assertEqual(self.sql("SELECT 1;;")["data"], [[1]])
+        self.assertEqual(self.sql("SELECT $é$a;b$é$")["data"], [["a;b"]])
 
     def test_a_web_page_cannot_reach_the_tcp_listener(self):
         # A page's form POST needs no preflight; DNS rebinding reads the answer
@@ -328,6 +408,21 @@ class Regressions(unittest.TestCase):
         status, doc = self.request("POST", "/sql", prefix + b" " * (LIMIT - len(prefix)), chunked=True)
         self.assertEqual(status, 200, doc)
         self.assertEqual(doc["data"], [[42]])
+
+    def test_params_are_read_once_each(self):
+        # A double past 64 bits is told from a whole number by its own text.
+        # Read from the whole body once per such param, 50,000 of them held
+        # a worker for twenty seconds, and the cost grew with their square.
+        body = '{"sql":"SELECT ?","params":[' + ",".join(["1e30"] * 50000) + "]}"
+        started = time.monotonic()
+        status, doc = self.request("POST", "/sql", body.encode())
+        self.assertLess(time.monotonic() - started, 5, doc)
+        self.assertEqual(status, 400, doc)
+        # Two `params` keys are refused, not read as the last one.
+        body = b'{"sql":"SELECT ?::HUGEINT","params":[1],"params":[123456789012345678901234]}'
+        status, doc = self.request("POST", "/sql", body)
+        self.assertEqual(status, 400, doc)
+        self.assertIn("duplicate field", doc["message"])
 
     def test_concurrent_membership_updates_keep_every_success(self):
         home = self.root / "config-writers"
@@ -379,6 +474,99 @@ class Regressions(unittest.TestCase):
         self.assertIn("ARRAY", json.dumps(result))
         self.assertEqual(self.request("GET", "/ready")[0], 200)
         self.assertIn("1", json.dumps(self.sql("SELECT 1 AS one")))
+
+
+
+class CommitRaces(Harbor, unittest.TestCase):
+    """Two workers: on one, the cancel would wait behind the COMMIT it races."""
+    WORKERS, POOL = 2, 3
+
+    def test_a_cancelled_commit_kept_everything_or_nothing_and_says_which(self):
+        # A cancel raced against a healthy COMMIT. Whichever wins, the answer
+        # is true: 200 and the row is there, or 499 and it is not, with the
+        # transaction left aborted. Never 499 for a commit that landed.
+        import threading
+        self.sql("CREATE TABLE raced(x INTEGER)")
+        landed = cancelled = 0
+        for attempt in range(150):
+            sid = self.session()
+            try:
+                self.sql("BEGIN", sid)
+                self.sql(f"INSERT INTO raced VALUES ({attempt})", sid)
+                name, answer = f"race-{attempt}", {}
+
+                def commit():
+                    answer["commit"] = self.request(
+                        "POST", "/sql", {"sql": "COMMIT", "sessionId": sid, "queryId": name})
+
+                thread = threading.Thread(target=commit)
+                thread.start()
+                if attempt % 2:
+                    time.sleep((attempt % 8) * 0.0002)
+                    self.request("DELETE", "/sql/queries/" + name)
+                else:
+                    # Asked until it is answered, so a cancel can land before
+                    # the COMMIT begins, which on a fast machine a single one
+                    # sent after it never does.
+                    while thread.is_alive() and not self.request("DELETE", "/sql/queries/" + name)[1]["cancelled"]:
+                        pass
+                thread.join()
+                status, doc = answer["commit"]
+                kept = self.sql(f"SELECT count(*) FROM raced WHERE x = {attempt}")["data"][0][0]
+                if status == 200:
+                    landed += 1
+                    self.assertEqual(kept, 1, (attempt, doc))
+                else:
+                    cancelled += 1
+                    self.assertEqual((status, doc.get("code")), (499, "cancelled"), (attempt, doc))
+                    self.assertEqual(kept, 0, (attempt, "answered cancelled, and the row is committed"))
+                    self.assertIn("aborted", self.sql("SELECT 1", sid, status=400)["message"])
+            finally:
+                self.release(sid)
+        self.assertEqual(landed + cancelled, 150)
+        # Both answers were exercised, or the test proved nothing about one.
+        self.assertGreater(landed, 0)
+        self.assertGreater(cancelled, 0)
+        self.assertEqual(self.sql("SELECT count(*) FROM raced")["data"], [[landed]])
+
+    def test_a_string_after_a_number_is_never_brace_expanded(self):
+        # The engine ends `1_0` and `1e5` before an `e'`, which opens an
+        # E-string, so the brace group in the string after it is text.
+        for sql in (r"SELECT 1_0e'\'' , '{a,b}' AS y", r"SELECT 1e5e'\'' , '{a,b}' AS y"):
+            with self.subTest(sql=sql):
+                row = self.sql(sql)["data"][0]
+                self.assertEqual((len(row), row[1]), (2, "{a,b}"), row)
+
+    def test_a_null_param_is_typed_as_the_engine_types_a_null(self):
+        # Bound untyped, as the engine's own EXECUTE p(NULL) binds it: the
+        # statement types it, and where nothing does, a table made from it
+        # has the column a NULL literal makes. A cast says what it is.
+        self.sql("CREATE TABLE null_literal AS SELECT NULL AS c")
+        for sql in ("CREATE TABLE null_param AS SELECT ? AS c", "CREATE TABLE null_cast AS SELECT ?::INTEGER AS c"):
+            status, doc = self.request("POST", "/sql", {"sql": sql, "params": [None]})
+            self.assertEqual(status, 200, (sql, doc))
+        typed = lambda t: self.sql(f"SELECT data_type FROM information_schema.columns WHERE table_name = '{t}'")["data"]
+        self.assertEqual(typed("null_param"), typed("null_literal"))
+        self.assertEqual(typed("null_cast"), [["INTEGER"]])
+        status, doc = self.request("POST", "/sql", {"sql": "SELECT coalesce(?, 'x') AS v", "params": [None]})
+        self.assertEqual((status, doc["data"]), (200, [["x"]]), doc)
+
+    def test_an_open_transaction_is_reported_as_the_engine_holds_it(self):
+        # `COMMIT` and a final U+00A0 is no COMMIT to the engine, whose
+        # pre-pass never looks at a text's last two bytes: it reads a table
+        # name, fails, and the transaction stays open, aborted.
+        self.sql("CREATE TABLE unspaced(x INTEGER)")
+        sid = self.session()
+        try:
+            self.sql("BEGIN", sid)
+            self.sql("INSERT INTO unspaced VALUES (1)", sid)
+            self.sql("COMMIT ", sid, status=400)
+            sessions = self.request("GET", "/sessions")[1]["sessions"]
+            self.assertEqual([s["inTransaction"] for s in sessions if s["sessionId"] == sid], [True])
+            self.assertIn("aborted", self.sql("SELECT 1", sid, status=400)["message"])
+        finally:
+            self.release(sid)
+        self.assertEqual(self.sql("SELECT count(*) FROM unspaced")["data"], [[0]])
 
 
 if __name__ == "__main__":

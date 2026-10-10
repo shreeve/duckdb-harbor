@@ -1,7 +1,6 @@
 //! A multi-pass backup must retain its snapshot when another caller commits
 //! between export and re-export. Exercise the real HTTP session helper.
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -20,7 +19,12 @@ impl Drop for Server {
 
 #[test]
 fn export_passes_share_a_snapshot_and_failures_rollback() {
-    if harbor::engine::engine().is_err() {
+    // Skipped, and saying so, only where no engine is promised.
+    if let Err(e) = harbor::engine::engine() {
+        if ["HARBOR_LIBDUCKDB", "CI"].iter().any(|v| std::env::var_os(v).is_some()) {
+            panic!("no engine: {e}");
+        }
+        eprintln!("snapshot: skipped — {e}");
         return;
     }
     let base = if cfg!(unix) {
@@ -30,15 +34,14 @@ fn export_passes_share_a_snapshot_and_failures_rollback() {
     };
     let dir = base.join(format!("hb-snapshot-{}", std::process::id()));
     std::fs::create_dir(&dir).unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
+    // Port 0: the server takes whatever port is free and says which once it
+    // serves, so no other process can take it in between.
     let child = Command::new(env!("CARGO_BIN_EXE_harbor"))
         .args([
             dir.join("source.duckdb").to_str().unwrap(),
             "start",
             "--port",
-            &address.port().to_string(),
+            "0",
             "--workers",
             "1",
             "--statement-timeout",
@@ -48,32 +51,33 @@ fn export_passes_share_a_snapshot_and_failures_rollback() {
         .env("HARBOR_POOL_SIZE", "2")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let mut server = Server { child, dir };
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Ok(mut stream) = TcpStream::connect(address) {
-            stream
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
-            stream
-                .write_all(b"GET /ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                .unwrap();
-            let mut response = String::new();
-            if stream.read_to_string(&mut response).is_ok() && response.starts_with("HTTP/1.1 200")
-            {
-                break;
-            }
+    // Read on a thread of its own, to the end, so a full pipe never stalls
+    // the server, and a server that hangs before it says where it serves
+    // fails the test at the deadline.
+    let said = BufReader::new(server.child.stderr.take().unwrap());
+    let (lines, heard) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in said.lines().map_while(Result::ok) {
+            let _ = lines.send(line);
         }
-        assert!(
-            server.child.try_wait().unwrap().is_none(),
-            "server exited during startup"
-        );
-        assert!(Instant::now() < deadline, "server never became ready");
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let address = loop {
+        let line = heard
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("the server exited, or did not say where it serves in 10s");
+        // `harbor X: serving <db> on 127.0.0.1:<port>[ + <socket>] (duckdb …)`
+        if let Some((_, serving)) = line.split_once(": serving ")
+            && let Some((_, on)) = serving.split_once(" on ")
+            && let Some(address) = on.split_whitespace().next()
+        {
+            break address.to_string();
+        }
+    };
     let target = format!("http://{address}");
     let quiet = |sql: &[&str]| harbor::repl::exec_quiet(&target, sql, &[]).unwrap();
     quiet(&["CREATE TABLE t(x INTEGER)", "INSERT INTO t VALUES (1)"]);

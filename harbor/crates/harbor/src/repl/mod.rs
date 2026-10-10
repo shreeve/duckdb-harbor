@@ -17,17 +17,17 @@
 mod complete;
 mod render;
 mod highlight;
-mod http;
 pub mod installs;
 mod interactive;
 mod keywords;
-pub mod scan;
 mod theme;
 mod snapshot;
 pub use snapshot::with_snapshot;
 
-pub use http::Transport;
 pub use interactive::split_statements;
+
+use harbor_http as http;
+use http::Transport;
 
 use wire::{Event, SqlRequest, endpoint};
 use render::{Mode, RenderOpts, Renderer};
@@ -36,32 +36,32 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// Set by SIGINT while a statement streams (registered in cli_main);
-/// checked at every read tick. Cleared before each statement.
 /// Set when this invocation spawned the server it is talking to, rather
 /// than joining one already up. Only `--block-size` reads it, and only to
 /// tell the caller when their size had nothing to shape — a flag that
 /// silently does nothing is worse than one that is refused.
 static SPAWNED: AtomicBool = AtomicBool::new(false);
 
+/// Set by SIGINT while a statement streams (registered in cli_main);
+/// checked at every read tick. Cleared before each statement.
 static CANCEL: LazyLock<std::sync::Arc<AtomicBool>> =
     LazyLock::new(|| std::sync::Arc::new(AtomicBool::new(false)));
 static QUERY_SEQ: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone)]
-struct Conn {
-    transport: Transport,
-}
-
-/// What became of one statement. The REPL and `.read` stop a multi-statement
-/// run on anything but Done; main() maps it to the process exit code.
-#[derive(Clone, Copy, PartialEq)]
+/// What became of one statement. A script, the REPL's buffer and `.read`
+/// stop on anything but Done; cli_main maps it to the process exit code.
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Outcome {
     Done,
     Cancelled,
     Failed,
+    /// A write met a closed pipe (`harbor … | head`): its reader has gone,
+    /// so nothing after this statement runs. Output small enough to land in
+    /// the pipe before the reader leaves meets no closed pipe, and the run
+    /// goes on; only a write that fails can end it.
+    Closed,
 }
 
 /// From here on Ctrl-C cancels the running statement (via its queryId), it
@@ -77,41 +77,51 @@ fn cancel_on_interrupt() {
 }
 
 /// The client's whole CLI: everything except bare `harbor` (the list, which
-/// main dispatches straight to list_main) and `<db> start` (the server).
+/// main dispatches straight to list_main), `<db> start` (the server), and
+/// `-h`, which main answers with the one usage text.
 pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
     let mut args = args.into_iter();
     let mut target: Option<String> = None;
     let mut sql: Option<String> = None;
-    let mut json = false;
-    let mut mode: Option<String> = None;
     let mut block_size: Option<String> = None;
+    let mut opts = RenderOpts::default();
 
     while let Some(a) = args.next() {
-        match a.as_str() {
-            "-c" | "--command" => match args.next() {
-                Some(v) => sql = Some(v),
-                None => return fail("-c needs the SQL to run"),
+        // `--mode=csv` is `--mode csv`, as for any long option.
+        let (flag, inline) = match a.split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => (flag, Some(value.to_string())),
+            _ => (a.as_str(), None),
+        };
+        let mut value = |what: &str| {
+            inline.clone().or_else(|| args.next()).ok_or_else(|| format!("{flag} needs {what}"))
+        };
+        match flag {
+            "-c" | "--command" => match value("the SQL to run") {
+                Ok(_) if sql.is_some() => return fail("-c is given once; separate statements with ;"),
+                Ok(v) => sql = Some(v),
+                Err(e) => return fail(&e),
             },
             // Not a server tuning knob, which is why it is here and not
             // only in config.toml: block size shapes the FILE, and this is
             // one of the paths that creates a file. It reaches the server
             // only when this call spawns one — see below.
-            "--block-size" => match args.next() {
-                Some(v) => match crate::parse_block_size(&v) {
+            "--block-size" => match value("a size (16k, 32k, 64k, 128k, 256k)") {
+                Ok(v) => match crate::parse_block_size(&v) {
                     Ok(_) => block_size = Some(v),
                     Err(e) => return fail(&e),
                 },
-                None => return fail("--block-size needs a size (16k, 32k, 64k, 128k, 256k)"),
+                Err(e) => return fail(&e),
             },
-            "--json" => json = true,
-            "--mode" => match args.next() {
-                Some(v) => mode = Some(v),
-                None => return fail("--mode needs a mode name"),
+            "--json" if inline.is_none() => opts.mode = Mode::JsonLines,
+            // Read before the target resolves: a mistyped mode must not
+            // leave a database file and a server behind it.
+            "--mode" => match value("a mode name") {
+                Ok(m) => match Mode::parse(&m) {
+                    Some(m) => opts.mode = m,
+                    None => return fail(&format!("unknown mode {m:?}")),
+                },
+                Err(e) => return fail(&e),
             },
-            "-h" | "--help" => {
-                print!("{HELP}");
-                return ExitCode::SUCCESS;
-            }
             _ if target.is_none() && !a.starts_with('-') => target = Some(a),
             _ => return fail(&format!("unexpected argument: {a}")),
         }
@@ -120,11 +130,32 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
     let Some(target) = target else {
         return fail("which database? (harbor <db.duckdb> — or bare harbor to see what's running)");
     };
+    // The script, read before the target resolves: one with nothing in it is
+    // refused without a server spawned for it. No -c and a terminal is the
+    // REPL.
+    let script = match sql {
+        Some(text) => Some(text),
+        None if std::io::stdin().is_terminal() => None,
+        None => {
+            let mut bytes = Vec::new();
+            if let Err(e) = std::io::stdin().read_to_end(&mut bytes) {
+                return fail(&format!("reading stdin: {e}"));
+            }
+            match String::from_utf8(bytes) {
+                Ok(text) => Some(text),
+                Err(_) => return fail("stdin is not UTF-8 text"),
+            }
+        }
+    };
+    let steps = script.as_deref().map(interactive::script);
+    if steps.as_ref().is_some_and(Vec::is_empty) {
+        return fail("no SQL given: use -c \"...\" or pipe on stdin");
+    }
     let spawn: Vec<String> = match &block_size {
         Some(v) => vec!["--block-size".into(), v.clone()],
         None => Vec::new(),
     };
-    let (conn, name) = match resolve(&target, &spawn) {
+    let (mut transport, name) = match resolve(&target, &spawn) {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
@@ -132,7 +163,7 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
     // the moment of creation, so joining a server that is already up — or
     // opening a database that already exists — leaves it with nothing to do,
     // and silence there reads exactly like success.
-    if block_size.is_some() && !SPAWNED.load(std::sync::atomic::Ordering::Relaxed) {
+    if block_size.is_some() && !SPAWNED.load(Ordering::Relaxed) {
         eprintln!(
             "harbor: --block-size was not used — {name} is already being served, and a block \
              size is fixed when a database is created"
@@ -141,89 +172,47 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
     // The mooring, held for the life of this invocation: a spawned server
     // lives while anyone is connected, and between statements — a human
     // thinking at the prompt, a script paused mid-pipe — this silent open
-    // connection is the "anyone".
-    let anchor = http::hold(&conn.transport);
-
-    let mut opts = RenderOpts::default();
-    if json {
-        opts.mode = Mode::JsonLines;
-    }
-    if let Some(m) = mode {
-        match Mode::parse(&m) {
-            Some(m) => opts.mode = m,
-            None => return fail(&format!("unknown mode {m:?}")),
-        }
+    // connection is the "anyone". A summoned server found ready can be
+    // leaving by the time the mooring reaches it, its last client gone a
+    // moment before; looking again finds it gone and summons another, and
+    // nothing has run yet, so looking again is safe.
+    let mut anchor = http::hold(&transport).ok();
+    if anchor.is_none()
+        && let Ok((again, _)) = resolve(&target, &spawn)
+    {
+        transport = again;
+        anchor = http::hold(&transport).ok();
     }
 
-    let sql = match sql {
-        Some(s) => s,
-        None => {
-            // No -c and a real terminal: the REPL. On a pipe: read stdin.
-            if std::io::stdin().is_terminal() {
-                // Resolve the highlight theme now, while we own the tty: the
-                // "auto" appearance queries the terminal (OSC 11), which needs
-                // an interactive stdin/stdout and must run before reedline does.
-                theme::init(None, None);
-                cancel_on_interrupt();
-                return interactive::run(&conn, &name, opts, anchor);
-            }
-            let mut s = String::new();
-            if std::io::stdin().read_to_string(&mut s).is_err() || s.trim().is_empty() {
-                return fail("no SQL given: use -c \"...\" or pipe on stdin");
-            }
-            s
-        }
+    let Some(steps) = steps else {
+        // Resolve the highlight colors now, while we own the tty: the
+        // appearance comes from asking the terminal (OSC 11), which needs an
+        // interactive stdin/stdout and must run before reedline does.
+        theme::init();
+        cancel_on_interrupt();
+        return interactive::run(&transport, &name, opts, anchor);
     };
     cancel_on_interrupt();
 
-    if !std::io::stdout().is_terminal() && opts.mode == Mode::Duckbox {
+    let restyled = steps.iter().any(|s| matches!(s, interactive::Step::Dot(_)));
+    if !std::io::stdout().is_terminal() && opts.mode == Mode::Duckbox && !restyled {
         eprintln!("hint: boxed output on a pipe; consider --mode csv or --json");
     }
     // Piped scripts and -c may carry several statements; the protocol takes
-    // one per request, so split exactly the way the REPL and .read do,
-    // stopping at the first failure or interrupt.
-    let mut last = Outcome::Done;
-    let mut transaction = Transaction::new(&conn, false);
-    for stmt in interactive::split_statements(&sql) {
-        last = transaction.run(&stmt, &opts);
-        if last != Outcome::Done {
-            break;
-        }
-    }
+    // one per request, so they run the way the REPL's `.read` runs a file,
+    // stopping at the first failure, interrupt or closed output.
+    let mut transaction = Transaction::new(&transport, false);
+    let last = interactive::run_steps(steps, &mut opts, &mut transaction);
     // Released before the mooring: a transaction the script left open is
     // rolled back while the server is still held up for it.
     drop(transaction);
     drop(anchor);
     match last {
-        Outcome::Done => ExitCode::SUCCESS,
+        Outcome::Done | Outcome::Closed => ExitCode::SUCCESS,
         Outcome::Cancelled => ExitCode::from(130), // the shell convention for SIGINT
         Outcome::Failed => ExitCode::FAILURE,
     }
 }
-
-const HELP: &str = "\
-harbor — a DuckDB database, served
-
-usage:
-  harbor                       what's running
-  harbor <db.duckdb>           open a database: the REPL on a terminal, or
-                               SQL from -c \"...\" / stdin on a pipe. No server
-                               behind the file yet? One is spawned for it —
-                               it lives while anyone is connected.
-  harbor <path/to.sock>        a harbor unix socket
-  harbor http://host:port      a harbor TCP listener
-  harbor <name> | <footnote>   a database by its name (medlabs) or its number
-                               in the list — running, or attached and stopped
-  harbor <db.duckdb> start     bring its server up in the background and
-                               return; it runs until `stop` (harbor <db> start -h)
-
-options:
-  -c \"SQL\"                     run statements and exit (stdin works too)
-  --mode <m>                   duckbox, duckboxy, markdown, csv, json, jsonlines, line, list, trash
-  --json                       shorthand for --mode jsonlines
-
-Remote TLS is Caddy's job; ssh is the human path to a remote host.
-";
 
 /// Which database a bare word means, over the survey's footnote order. All
 /// digits is a footnote number (1-based, as printed); anything else is a
@@ -297,9 +286,9 @@ pub fn deref_db(target: &str) -> Result<PathBuf, String> {
 /// connection and the name the prompt wears: what the server calls itself
 /// when the fleet resolved the target (so `harbor 1` prompts `ducks>`, not
 /// `1>`), the target's own stem otherwise.
-fn resolve(target: &str, spawn: &[String]) -> Result<(Conn, String), String> {
-    if target.starts_with("http://") || target.starts_with("https://") {
-        return Ok((Conn { transport: url_transport(target)? }, prompt_name(target)));
+fn resolve(target: &str, spawn: &[String]) -> Result<(Transport, String), String> {
+    if let Some(addr) = url_server(target) {
+        return Ok((Transport::Tcp(addr?), prompt_name(target)));
     }
     if !harbor_common::looks_like_path(target) {
         // A bare word reaches what is listed — running, or attached — never
@@ -307,7 +296,13 @@ fn resolve(target: &str, spawn: &[String]) -> Result<(Conn, String), String> {
         // opened the way its path would be: joined or summoned.
         let row = fleet_find(target)?;
         if let Some(stopped) = row.stopped {
-            return Ok((Conn { transport: ensure_server(&stopped.db, spawn)? }, stopped.name));
+            // Windows has no socket to find or summon a server on, and its
+            // list sees none running: an entry with a port is dialled there.
+            #[cfg(windows)]
+            if let Some(port) = harbor_common::config::load().ok().and_then(|c| c.get(&stopped.name)?.port) {
+                return Ok((Transport::Tcp(format!("127.0.0.1:{port}")), stopped.name));
+            }
+            return Ok((ensure_server(&stopped.db, spawn)?, stopped.name));
         }
         #[cfg(unix)]
         {
@@ -316,7 +311,7 @@ fn resolve(target: &str, spawn: &[String]) -> Result<(Conn, String), String> {
                 .as_ref()
                 .and_then(|v| v["name"].as_str())
                 .map_or_else(|| target.to_string(), str::to_string);
-            return Ok((Conn { transport: Transport::Unix(row.sock) }, name));
+            return Ok((Transport::Unix(row.sock), name));
         }
         #[cfg(windows)]
         {
@@ -335,11 +330,11 @@ fn resolve(target: &str, spawn: &[String]) -> Result<(Conn, String), String> {
     // quietly becoming a fresh database.
     if is_socket(&p) || target.ends_with(".sock") {
         #[cfg(unix)]
-        return Ok((Conn { transport: Transport::Unix(p) }, prompt_name(target)));
+        return Ok((Transport::Unix(p), prompt_name(target)));
         #[cfg(windows)]
         return Err("Unix socket targets are not supported on Windows; use http://host:port".into());
     }
-    Ok((Conn { transport: ensure_server(&p, spawn)? }, prompt_name(target)))
+    Ok((ensure_server(&p, spawn)?, prompt_name(target)))
 }
 
 /// Run statements against `target` in order, rendering nothing, stopping at
@@ -354,12 +349,12 @@ fn resolve(target: &str, spawn: &[String]) -> Result<(Conn, String), String> {
 /// share a request with anything else. One anchor covers the lot, since a
 /// summoned server would otherwise depart between two of them.
 pub fn exec_quiet(target: &str, sql: &[&str], spawn: &[String]) -> Result<(), String> {
-    let (conn, _name) = resolve(target, spawn)?;
-    let _anchor = http::hold(&conn.transport);
+    let (transport, _name) = resolve(target, spawn)?;
+    let _anchor = http::hold(&transport);
     let opts = RenderOpts { mode: Mode::Trash, ..RenderOpts::default() };
     for one in sql {
-        match run_sql(&conn, one, &opts) {
-            Outcome::Done => {}
+        match run_sql(&transport, one, &opts, None, None).0 {
+            Outcome::Done | Outcome::Closed => {}
             Outcome::Cancelled => return Err("interrupted".into()),
             Outcome::Failed => return Err("the statement failed".into()),
         }
@@ -384,15 +379,13 @@ fn ensure_server(path: &Path, spawn: &[String]) -> Result<Transport, String> {
     }
     #[cfg(unix)]
     {
-        let runtime = harbor_common::runtime_dir()?;
-        let canon = harbor_common::paths::canonical_db(path)?;
-        let sock = harbor_common::socket_for(&runtime, &canon)?;
+        let (_, canon, sock) = harbor_common::paths::socket_of(path)?;
         let transport = Transport::Unix(sock.clone());
-        if ready(&transport) {
+        if http::ready(&transport) {
             return Ok(transport);
         }
-        SPAWNED.store(true, std::sync::atomic::Ordering::Relaxed);
-        launch(&runtime, &canon, &sock, spawn, true)?;
+        SPAWNED.store(true, Ordering::Relaxed);
+        summon(&canon, &sock, spawn, true)?;
         Ok(transport)
     }
 }
@@ -404,122 +397,35 @@ fn ensure_server(path: &Path, spawn: &[String]) -> Result<Transport, String> {
 /// were typed. Returns the socket the server answers on.
 #[cfg(unix)]
 pub fn start_detached(db: &Path, args: &[String], ephemeral: bool) -> Result<PathBuf, String> {
-    let runtime = harbor_common::runtime_dir()?;
-    let canon = harbor_common::paths::canonical_db(db)?;
-    let sock = harbor_common::socket_for(&runtime, &canon)?;
-    launch(&runtime, &canon, &sock, args, ephemeral)?;
+    let (_, canon, sock) = harbor_common::paths::socket_of(db)?;
+    summon(&canon, &sock, args, ephemeral)?;
     Ok(sock)
 }
 
-/// Spawn a server for `canon` and wait until it answers on `sock`. Same
-/// binary, no PATH lookup, no environment contract — current_exe is the whole
-/// story. Detached (own process group, no tty), stdout and stderr to a log
-/// beside the socket so a failure has a face. `ephemeral` is the private
-/// lifetime signal: a summoned server is refcounted, so it leaves when idle.
-/// It rides an env channel, not the command line — ephemerality is something
-/// membership says, never a flag, and a spawn is not a verb the user typed.
+/// Spawn this same binary as the server for `canon`: no PATH lookup and no
+/// environment contract, `current_exe` is the whole story.
 #[cfg(unix)]
-fn launch(runtime: &Path, canon: &Path, sock: &Path, args: &[String], ephemeral: bool) -> Result<(), String> {
-    let transport = Transport::Unix(sock.to_path_buf());
-    harbor_common::perms::ensure_private_dir(runtime)?;
-    let log_path = sock.with_extension("log");
-    let log = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&log_path)
-        .map_err(|e| format!("log file: {e}"))?;
+fn summon(canon: &Path, sock: &Path, args: &[String], ephemeral: bool) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg(canon).arg("start").args(args);
-    if ephemeral {
-        cmd.env("HARBOR_EPHEMERAL", "1");
-    }
-    // A typed path is the duckdb-cli contract: start opens it existing or
-    // not, so a database that isn't there yet is simply created.
-    {
-        use std::os::unix::process::CommandExt;
-        use std::process::Stdio;
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
-            .stderr(Stdio::from(log))
-            .process_group(0); // detached from our tty/session
-    }
-    let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
-
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while Instant::now() < deadline {
-        if ready(&transport) {
-            return Ok(());
-        }
-        // The child dying is an answer, not a timeout — but it can be the
-        // GOOD answer: two clients raced, ours lost the database lock to
-        // the winner, and the winner's socket (same derived path) serves
-        // us fine. Only a dead child AND no listener is a failure.
-        if let Ok(Some(status)) = child.try_wait() {
-            if ready(&transport) {
-                return Ok(());
-            }
-            return Err(format!(
-                "the server did not start ({status}) — {}",
-                log_tail(&log_path)
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Err(format!("{} did not come up in 15s — {}", canon.display(), log_tail(&log_path)))
-}
-
-/// The last few log lines, inlined — the operator should not have to go
-/// find the file to learn why their prompt never appeared.
-fn log_tail(log_path: &Path) -> String {
-    match std::fs::read_to_string(log_path) {
-        Ok(s) if !s.trim().is_empty() => {
-            let tail: Vec<&str> = s.lines().rev().take(3).collect();
-            let tail: Vec<&str> = tail.into_iter().rev().collect();
-            format!("its log says:\n        {}", tail.join("\n        "))
-        }
-        _ => format!("see {}", log_path.display()),
-    }
+    http::summon(exe, canon, sock, args, ephemeral)
 }
 
 /// Is a harbor answering on this socket right now? start's pre-flight, for
 /// a friendlier refusal than the database lock error.
 #[cfg(unix)]
 pub fn sock_ready(sock: &Path) -> bool {
-    ready(&Transport::Unix(sock.to_path_buf()))
+    http::ready(&Transport::Unix(sock.to_path_buf()))
 }
 
-/// Stop the server for a database FILE, if one is running. Never spawns —
-/// stopping a stopped berth is a quiet no-op. Returns whether a server was
-/// actually there to stop. The `stop` verb's whole implementation.
+/// Stop the server for a database FILE, if one is running, and return once
+/// it has gone, so a `start` that follows, by hand or inside `restart`, meets
+/// a database that is free. Never spawns — stopping a stopped berth is a
+/// quiet no-op. Returns whether a server was actually there to stop. The
+/// `stop` verb's whole implementation.
 #[cfg(unix)]
 pub fn shutdown(db: &Path) -> Result<bool, String> {
-    let runtime = harbor_common::runtime_dir()?;
-    let canon = harbor_common::paths::canonical_db(db)?;
-    let sock = harbor_common::socket_for(&runtime, &canon)?;
-    let transport = Transport::Unix(sock.clone());
-    if !ready(&transport) {
-        return Ok(false); // nothing answering on its socket
-    }
-    // POST /shutdown drains, checkpoints, and exits. The server can close the
-    // socket as it goes, so a dropped connection right after the request is
-    // success, not failure. Either way, `stop` means stopped: the server
-    // unlinks its socket as the last thing before it exits and releases the
-    // database lock, so wait for the file to be gone — then a `start` that
-    // follows, by hand or inside `restart`, meets a database that is free.
-    if let Err(e) = http::request(&transport, &endpoint::SHUTDOWN, None, Some(Duration::from_secs(30)))
-        && ready(&transport)
-    {
-        return Err(format!("stop: {e}"));
-    }
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while sock.exists() || ready(&transport) {
-        if Instant::now() > deadline {
-            return Err(format!("stop: {} is still shutting down after 60s", canon.display()));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    Ok(true)
+    let (_, canon, sock) = harbor_common::paths::socket_of(db)?;
+    http::shutdown(&sock).map_err(|e| format!("stop {}: {e}", canon.display()))
 }
 
 #[cfg(windows)]
@@ -527,22 +433,28 @@ pub fn shutdown(_db: &Path) -> Result<bool, String> {
     Err("a TCP server is stopped by its own SIGTERM, not over a socket".into())
 }
 
-/// GET /ready, 200 or bust.
-fn ready(transport: &Transport) -> bool {
-    matches!(
-        http::request(transport, &endpoint::READY, None, Some(Duration::from_secs(2))),
-        Ok(r) if r.status == 200
-    )
+/// The `host:port` a URL names, or `None` when `target` is no URL. A scheme
+/// is case-insensitive: `HTTP://host` is a URL, never a file.
+pub fn url_server(target: &str) -> Option<Result<String, String>> {
+    let (scheme, rest) = target.split_once("://")?;
+    ["http", "https"]
+        .iter()
+        .any(|s| scheme.eq_ignore_ascii_case(s))
+        .then(|| url_addr(&format!("{}://{rest}", scheme.to_ascii_lowercase())))
 }
 
-fn url_transport(url: &str) -> Result<Transport, String> {
+fn url_addr(url: &str) -> Result<String, String> {
     if let Some(rest) = url.strip_prefix("http://") {
         let (addr, extra) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
         if !extra.is_empty() {
             return Err("path-prefixed HTTP targets are not supported; use a Harbor host:port or SSH to its socket".into());
         }
-        let addr = if addr.contains(':') { addr.to_string() } else { format!("{addr}:9495") };
-        return Ok(Transport::Tcp(addr));
+        // A port follows the host; an IPv6 host is bracketed, so its own
+        // colons are inside the brackets.
+        return Ok(match addr.rsplit_once(':') {
+            Some((_, port)) if !port.contains(']') => addr.to_string(),
+            _ => format!("{addr}:9495"),
+        });
     }
     if url.starts_with("https://") {
         return Err(
@@ -638,62 +550,24 @@ impl SurveyRow {
 }
 
 /// The fleet, in footnote order: every server that answered, then every
-/// attached database nothing is serving. Readdir the runtime dir for
-/// sockets, ask each for /info, and unlink the ones nothing answers on — the
+/// attached database nothing is serving. Every socket in the runtime dir is
+/// asked for /info, and the ones nothing listens on are unlinked — the
 /// registry IS the listening socket, so a stale file is litter, not state.
-/// Then config.toml's berths, less the ones a live row already claimed by
-/// socket, name, or file: the socket decides running, config decides mine,
-/// and a bare `harbor` answers both. Both faces of the fleet read this: the
-/// list renders it, and a bare-name or footnote target resolves against it.
+/// One that answers without an /info this client can read is alive all the
+/// same: it has a row, and claims nothing. Then config.toml's berths, less
+/// the ones a live row already claimed by socket, name, or file: the socket
+/// decides running, config decides mine, and a bare `harbor` answers both.
+/// Both faces of the fleet read this: the list renders it, and a bare-name
+/// or footnote target resolves against it.
 fn survey() -> Result<Vec<SurveyRow>, String> {
     let runtime = harbor_common::runtime_dir()?;
-    let mut socks: Vec<PathBuf> = match std::fs::read_dir(&runtime) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "sock"))
-            .collect(),
-        Err(_) => Vec::new(), // no runtime dir yet: nothing has ever served
-    };
-    socks.sort();
-
+    #[cfg(unix)]
+    let mut rows: Vec<SurveyRow> = http::discover(&runtime, true)
+        .into_iter()
+        .map(|found| SurveyRow { sock: found.sock, info: found.info, stopped: None })
+        .collect();
+    #[cfg(windows)]
     let mut rows: Vec<SurveyRow> = Vec::new();
-    for sock in socks {
-        let transport = {
-            #[cfg(unix)]
-            {
-                Transport::Unix(sock.clone())
-            }
-            #[cfg(windows)]
-            {
-                continue;
-            }
-        };
-        match http::request(&transport, &endpoint::INFO, None, Some(Duration::from_secs(2))) {
-            Ok(r) if r.status == 200 => {
-                let info = serde_json::from_str(r.body_string().unwrap_or_default().trim())
-                    .unwrap_or_default();
-                rows.push(SurveyRow { sock, info: Some(info), stopped: None });
-            }
-            // It answered, just not with an /info this client could read.
-            // Alive is alive — show the row, claim nothing.
-            Ok(_) => rows.push(SurveyRow { sock, info: None, stopped: None }),
-            // Refused means nothing listens: a leftover from a kill -9 or a
-            // crash. Anything else (a transient error, a permission oddity)
-            // proves nothing, and an unlink on "proves nothing" is how a live
-            // server loses its front door. A server whose listen queue is
-            // full refuses too, for a moment, so one refusal proves nothing
-            // either: the socket goes only when a second try, a beat later,
-            // is refused as well.
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                std::thread::sleep(Duration::from_millis(200));
-                let again = http::request(&transport, &endpoint::INFO, None, Some(Duration::from_secs(2)));
-                if again.is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused) {
-                    let _ = std::fs::remove_file(&sock);
-                }
-            }
-            Err(_) => {}
-        }
-    }
 
     // A config that will not load is reported, not fatal: the running half
     // of the fleet is still the truth, and a broken file must not hide it.
@@ -727,8 +601,8 @@ fn survey() -> Result<Vec<SurveyRow>, String> {
             info: None,
             stopped: Some(Stopped {
                 name: name.to_string(),
+                autostart: harbor_common::autostart::keeps(&canon, name),
                 db: canon,
-                autostart: harbor_common::autostart::installed(name),
             }),
         });
     }
@@ -855,12 +729,12 @@ fn list() -> Result<(), String> {
         t.caption(format!("harbor {}", env!("CARGO_PKG_VERSION")));
         println!("{}", t.render(&Style::stdout()));
         #[cfg(windows)]
+        print!("{WINDOWS_LISTING}");
+        #[cfg(unix)]
         {
-            print!("{WINDOWS_LISTING}");
-            return Ok(());
+            println!("  Nothing running\n");
+            println!("  harbor <db.duckdb>   open a database — served while anyone is connected");
         }
-        println!("  Nothing running\n");
-        println!("  harbor <db.duckdb>   open a database — served while anyone is connected");
         return Ok(());
     }
 
@@ -928,17 +802,6 @@ fn list() -> Result<(), String> {
     Ok(())
 }
 
-fn run_sql(conn: &Conn, sql: &str, opts: &RenderOpts) -> Outcome {
-    run_sql_in_session(conn, sql, opts, None, None)
-}
-
-fn run_sql_in_session(
-    conn: &Conn, sql: &str, opts: &RenderOpts, session: Option<&str>,
-    health: Option<&snapshot::Health>,
-) -> Outcome {
-    run_sql_reporting(conn, sql, opts, session, health, None, None)
-}
-
 /// `30s`, `5m`, `1h`: a server limit, as short as it reads.
 fn brief(ms: u64) -> String {
     match ms / 1000 {
@@ -959,108 +822,26 @@ fn brief(ms: u64) -> String {
 /// longer has a session for all end the same way, with the transaction rolled
 /// back by the server and a line saying so.
 struct Transaction {
-    conn: Conn,
+    transport: Transport,
     session: Option<String>,
     /// At a prompt, where a person reads and thinks between statements for
     /// longer than the server lets a session sit idle: the session is kept
-    /// alive there, and its remaining limit is said.
+    /// alive there (`http::keep_alive`), and its remaining limit is said.
     interactive: bool,
-    /// Held while a statement of this client's is on the session, so the
-    /// keep-alive never sends one beside it: a session takes one at a time.
-    turn: std::sync::Arc<std::sync::Mutex<()>>,
-    alive: Option<KeepAlive>,
-}
-
-/// A session touched often enough that the server's idle limit never takes
-/// it while this client is alive. That limit is there to reclaim the session
-/// of a client that is gone; one waiting at a prompt is not, and says so by
-/// asking `SELECT 1` every third of the limit. When the client dies the
-/// touches stop and the server reclaims the session as it would any other.
-/// The session's fixed ceiling is untouched by this, and still ends it.
-struct KeepAlive {
-    stop: std::sync::mpsc::Sender<()>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl KeepAlive {
-    fn start(conn: &Conn, session: &str, idle: Duration, turn: &std::sync::Arc<std::sync::Mutex<()>>) -> Option<Self> {
-        if idle.is_zero() {
-            return None;
-        }
-        let body = serde_json::to_string(&SqlRequest {
-            sql: "SELECT 1".to_string(),
-            session_id: Some(session.to_string()),
-            ..Default::default()
-        })
-        .expect("request serializes");
-        let (stop, stopped) = std::sync::mpsc::channel::<()>();
-        let (conn, turn) = (conn.clone(), std::sync::Arc::clone(turn));
-        let thread = std::thread::Builder::new()
-            .name("harbor-keepalive".into())
-            .spawn(move || {
-                use std::sync::mpsc::RecvTimeoutError;
-                while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(idle / 3) {
-                    // A statement on the session is its own sign of life, and
-                    // a second one beside it would be refused: skip the turn.
-                    let Ok(_turn) = turn.try_lock() else { continue };
-                    let answer = http::request(
-                        &conn.transport, &endpoint::SQL, Some(&body), Some(Duration::from_secs(5)),
-                    );
-                    // The session is gone from the server: nothing to keep.
-                    if answer.is_ok_and(|r| r.status == 404) {
-                        break;
-                    }
-                }
-            })
-            .ok()?;
-        Some(Self { stop, thread: Some(thread) })
-    }
-}
-
-impl Drop for KeepAlive {
-    fn drop(&mut self) {
-        let _ = self.stop.send(());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
+    alive: Option<http::Beat>,
 }
 
 impl Transaction {
-    fn new(conn: &Conn, interactive: bool) -> Self {
-        Self { conn: conn.clone(), session: None, interactive, turn: Default::default(), alive: None }
-    }
-
-    fn open(&self) -> Result<wire::SessionNewResponse, String> {
-        let response = http::request(
-            &self.conn.transport,
-            &endpoint::SESSIONS_CREATE,
-            Some("{}"),
-            Some(Duration::from_secs(10)),
-        )
-        .map_err(|e| e.to_string())?;
-        let status = response.status;
-        let text = response.body_string().map_err(|e| e.to_string())?;
-        if status != 200 {
-            return Err(match Event::parse(text.trim()) {
-                Ok(Event::Error { message, .. }) => message,
-                _ => format!("HTTP {status}: {text}"),
-            });
-        }
-        serde_json::from_str(&text).map_err(|e| format!("invalid session response: {e}"))
+    fn new(transport: &Transport, interactive: bool) -> Self {
+        Self { transport: transport.clone(), session: None, interactive, alive: None }
     }
 
     fn release(&mut self) {
         // The keep-alive first: it must not touch a session being released.
         self.alive = None;
         if let Some(id) = self.session.take() {
-            // DELETE rolls back whatever is still open.
-            let _ = http::request(
-                &self.conn.transport,
-                &endpoint::session(&id),
-                None,
-                Some(Duration::from_secs(5)),
-            );
+            // Releasing rolls back whatever is still open.
+            let _ = http::session_release(&self.transport, &id);
         }
     }
 
@@ -1070,7 +851,7 @@ impl Transaction {
         let effect = crate::transaction_effect(sql);
         let mut opened = None;
         if effect == Some(true) && self.session.is_none() {
-            match self.open() {
+            match http::session_open(&self.transport, &Default::default()) {
                 Ok(lease) => {
                     self.session = Some(lease.session_id.clone());
                     opened = Some(lease);
@@ -1078,14 +859,7 @@ impl Transaction {
                 Err(e) => return err(&format!("cannot open a session for the transaction: {e}")),
             }
         }
-        let mut refused = None;
-        let outcome = {
-            let turn = std::sync::Arc::clone(&self.turn);
-            let on_session = turn.lock().unwrap_or_else(|p| p.into_inner());
-            run_sql_reporting(
-                &self.conn, sql, opts, self.session.as_deref(), None, Some(&mut refused), Some(on_session),
-            )
-        };
+        let (outcome, refused) = run_sql(&self.transport, sql, opts, self.session.as_deref(), None);
         if refused.as_ref().is_some_and(|(code, _)| code == wire::code::NO_SUCH_SESSION) {
             // The server reaped it: idle too long, or open too long.
             self.alive = None;
@@ -1106,7 +880,7 @@ impl Transaction {
                 // way) or was interrupted, and the transaction is still the
                 // session's to hold until a ROLLBACK that lands.
                 let ended = match outcome {
-                    Outcome::Done => true,
+                    Outcome::Done | Outcome::Closed => true,
                     Outcome::Cancelled => false,
                     Outcome::Failed => refused.as_ref().is_some_and(|(code, message)| {
                         code == wire::code::SQL_ERROR && !message.starts_with("Parser Error")
@@ -1114,20 +888,28 @@ impl Transaction {
                 };
                 if ended {
                     self.release();
-                    if outcome != Outcome::Done {
+                    if outcome == Outcome::Failed {
                         eprintln!("harbor: the transaction has ended and was rolled back");
                     }
+                } else if outcome == Outcome::Cancelled
+                    && matches!(wire::statement::acting_keyword(sql).as_str(), "COMMIT" | "END")
+                {
+                    // A COMMIT runs to its answer once it starts, so the
+                    // cancel landed before it: it did not run, and the cancel
+                    // left the transaction aborted.
+                    eprintln!(
+                        "harbor: the COMMIT did not run: nothing since BEGIN was kept, and the \
+                         transaction is aborted — ROLLBACK ends it"
+                    );
                 }
             }
             Some(true) => match opened {
                 // A BEGIN that did not begin leaves nothing to hold.
                 Some(_) if outcome != Outcome::Done => self.release(),
                 Some(lease) if self.interactive => {
-                    if let Some(session) = &self.session {
-                        self.alive = KeepAlive::start(
-                            &self.conn, session, Duration::from_millis(lease.idle_ttl_ms), &self.turn,
-                        );
-                    }
+                    self.alive = http::keep_alive(
+                        &self.transport, &lease.session_id, Duration::from_millis(lease.idle_ttl_ms),
+                    );
                     match self.alive {
                         Some(_) => eprintln!(
                             "harbor: transaction open, and held while this prompt is; the server \
@@ -1157,23 +939,22 @@ impl Drop for Transaction {
     }
 }
 
-fn run_sql_reporting(
-    conn: &Conn, sql: &str, opts: &RenderOpts, session: Option<&str>,
-    health: Option<&snapshot::Health>, refused: Option<&mut Option<(String, String)>>,
-    on_session: Option<std::sync::MutexGuard<'_, ()>>,
-) -> Outcome {
-    // The session's turn, held while the statement is on it and let go when
-    // its answer has been read: drawing the result, and a reader paging
-    // through it, are not the session's business, and the keep-alive must
-    // have its turn while someone reads.
-    let mut on_session = on_session;
+/// Run one statement and render its answer: what became of it, and the
+/// server's refusal (its code and message) when it gave one. A refusal that
+/// names a session as gone is told by the caller holding that session, whose
+/// words are about its transaction; the server's are about leases. `health`
+/// is a backup's renewal, whose failure ends the statement.
+fn run_sql(
+    transport: &Transport, sql: &str, opts: &RenderOpts, session: Option<&str>,
+    health: Option<&snapshot::Health>,
+) -> (Outcome, Option<(String, String)>) {
     let wall = std::time::Instant::now();
     let qid = format!("cli-{}-{}", std::process::id(), QUERY_SEQ.fetch_add(1, Ordering::Relaxed));
     // A Ctrl-C that landed between statements (say, while the pager showed
     // the last result) aborts before this one starts — never silently clear.
     if CANCEL.swap(false, Ordering::Relaxed) {
         eprintln!("Interrupted.");
-        return Outcome::Cancelled;
+        return (Outcome::Cancelled, None);
     }
     let body = serde_json::to_string(&SqlRequest {
         sql: sql.to_string(),
@@ -1182,18 +963,17 @@ fn run_sql_reporting(
         ..Default::default()
     })
     .expect("request serializes");
-    // Runs on every 250ms socket tick: paints the spinner, and turns a
-    // Ctrl-C into a DELETE on the query. A second Ctrl-C while the first
-    // cancel is pending means the server is not honoring it — exit outright.
     // Whether this client asked for the cancel. A statement the server
     // stopped on its own account (a deadline, a session at its limit,
     // another client's cancel) answers with the same code, and is not an
     // interrupt.
     let interrupted = AtomicBool::new(false);
+    // Runs on every 250ms socket tick: paints the spinner, and turns a
+    // Ctrl-C into a DELETE on the query. A second Ctrl-C while the first
+    // cancel is pending means the server is not honoring it — exit outright.
     let on_tick = {
         let fired = &interrupted;
         let spun = AtomicU64::new(0);
-        let conn = conn.clone();
         let qid = qid.clone();
         move || -> std::io::Result<()> {
             if let Some(health) = health { health.check()?; }
@@ -1209,12 +989,7 @@ fn run_sql_reporting(
                 if !fired.swap(true, Ordering::Relaxed) {
                     clear_spinner();
                     eprintln!("Interrupted — cancelling…");
-                    let _ = http::request(
-                        &conn.transport,
-                        &endpoint::query(&qid),
-                        None,
-                        Some(Duration::from_secs(2)),
-                    );
+                    let _ = http::request(transport, &endpoint::query(&qid), None, Some(Duration::from_secs(2)));
                 } else {
                     eprintln!("\nharbor: second interrupt — leaving (the server keeps cancelling)");
                     std::process::exit(130);
@@ -1223,9 +998,9 @@ fn run_sql_reporting(
             Ok(())
         }
     };
-    let resp = match http::request_streaming(&conn.transport, &endpoint::SQL, Some(&body), &on_tick) {
+    let resp = match http::request_streaming(transport, &endpoint::SQL, Some(&body), &on_tick) {
         Ok(r) => r,
-        Err(e) => return err(&format!("cannot reach harbor: {e}")),
+        Err(e) => return (err(&unreached(&e)), None),
     };
 
     // Non-2xx: the body is one Event::Error document. The socket still has
@@ -1234,27 +1009,19 @@ fn run_sql_reporting(
         let status = resp.status;
         let text = match read_patient(resp.body, &on_tick) {
             Ok(text) => text,
-            Err(e) => return err(&format!("reading response: {e}")),
+            Err(e) => return (err(&format!("reading response: {e}")), None),
         };
         clear_spinner();
         return match Event::parse(text.trim()) {
-            Ok(Event::Error { code, .. }) if code == wire::code::CANCELLED => stopped(&interrupted),
+            Ok(Event::Error { code, .. }) if code == wire::code::CANCELLED => (stopped(&interrupted), None),
             Ok(Event::Error { code, message }) => {
-                // A caller that asked for the refusal speaks for a lost
-                // session itself; the server's wording is about leases, not
-                // transactions.
-                let lost = refused.is_some() && code == wire::code::NO_SUCH_SESSION;
-                let outcome = if lost {
-                    Outcome::Failed
-                } else {
-                    err(&format!("harbor error ({code}): {message}"))
+                let outcome = match session.is_some() && code == wire::code::NO_SUCH_SESSION {
+                    true => Outcome::Failed,
+                    false => err(&format!("harbor error ({code}): {message}")),
                 };
-                if let Some(refused) = refused {
-                    *refused = Some((code, message));
-                }
-                outcome
+                (outcome, Some((code, message)))
             }
-            _ => err(&format!("HTTP {status} from harbor: {text}")),
+            _ => (err(&format!("HTTP {status} from harbor: {text}")), None),
         };
     }
 
@@ -1263,86 +1030,84 @@ fn run_sql_reporting(
     clear_spinner();
     let mut renderer = Renderer::new(opts);
     let mut body = resp.body;
-    let mut acc: Vec<u8> = Vec::new();
-    // How far into `acc` the newline search has already looked. Without it the
-    // scan restarted at byte 0 on every 8 KiB read, so one wide row — a large
-    // VARCHAR, a big STRUCT — cost O(row²) byte comparisons to find its single
-    // terminator. Bytes already examined cannot grow a newline later.
-    let mut scanned = 0usize;
-    let mut chunk = [0u8; 8192];
+    // Bytes, not read_line: a tick can land in the middle of a multi-byte
+    // character, and read_line, which decodes as it goes, would fail the
+    // stream there. read_until keeps what it read when a tick interrupts it,
+    // so a line simply goes on growing across ticks.
+    let mut line = Vec::new();
     loop {
         if let Some(health) = health && let Err(e) = health.check() {
-            return err(&e.to_string());
+            return (err(&e.to_string()), None);
         }
-        // Reading bytes, not read_line: the socket ticks every 250ms
-        // (request_streaming) and a tick can land mid-line. read_line decodes
-        // UTF-8 as it goes, so a tick arriving in the middle of a multi-byte
-        // char (CJK/emoji) makes its guard consume those bytes, fail, and
-        // return InvalidData — aborting a perfectly healthy stream and dropping
-        // data. A byte accumulator has no char-boundary dependency: partial
-        // bytes simply wait in `acc` for the next read.
-        let found = acc[scanned..].iter().position(|&b| b == b'\n').map(|p| scanned + p);
-        let Some(nl) = found else {
-            scanned = acc.len();
-            match body.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => acc.extend_from_slice(&chunk[..n]),
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    if let Err(e) = on_tick() { return err(&e.to_string()); }
+        match body.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                if let Err(e) = on_tick() {
+                    return (err(&e.to_string()), None);
                 }
-                Err(e) => return err(&format!("stream died: {e}")),
+                continue;
             }
-            continue;
-        };
-        let text = String::from_utf8_lossy(&acc[..=nl]).into_owned();
-        acc.drain(..=nl);
-        scanned = 0;
+            Err(e) => return (err(&format!("stream died: {e}")), None),
+        }
+        let text = String::from_utf8_lossy(&line);
         let trimmed = text.trim();
         if trimmed.is_empty() {
+            line.clear();
             continue;
         }
         let event = match Event::parse(trimmed) {
             Ok(ev) => ev,
-            Err(e) => return err(&format!("bad envelope line ({e}): {trimmed}")),
+            Err(e) => return (err(&format!("bad envelope line ({e}): {trimmed}")), None),
         };
-        match event {
-            Event::Schema { columns } => renderer.schema(&columns),
+        line.clear();
+        let outcome = match event {
+            Event::Schema { columns } => {
+                renderer.schema(&columns);
+                continue;
+            }
             Event::Row { values } => {
                 renderer.row(values);
-                if let Some(kind) = renderer.failed() {
-                    // Stop reading; dropping the connection tells the server.
-                    // A closed pipe (`harbor … | head`) is the Unix goodbye,
-                    // not an error; anything else gets reported.
-                    return if kind == std::io::ErrorKind::BrokenPipe {
-                        Outcome::Done
-                    } else {
-                        err(&format!("writing output failed: {kind}"))
-                    };
+                // Stop reading; dropping the connection tells the server.
+                match renderer.failed() {
+                    None => continue,
+                    Some(kind) => written(Err(kind.into())),
                 }
             }
             Event::End { row_count, time_ms } => {
-                drop(on_session.take());
-                return match renderer.end(row_count, time_ms, wall.elapsed().as_millis()) {
-                    Ok(()) => Outcome::Done,
-                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Outcome::Done,
-                    Err(e) => err(&format!("writing output failed: {e}")),
-                };
+                written(renderer.end(row_count, time_ms, wall.elapsed().as_millis()))
             }
             Event::Error { code, .. } if code == wire::code::CANCELLED => {
                 clear_spinner();
-                return stopped(&interrupted);
+                stopped(&interrupted)
             }
-            Event::Error { code, message } => {
-                return err(&format!("harbor error ({code}): {message}"));
-            }
-        }
+            Event::Error { code, message } => err(&format!("harbor error ({code}): {message}")),
+        };
+        return (outcome, None);
     }
-    err("stream ended without an end event")
+    (err("stream ended without an end event"), None)
+}
+
+/// What a write of the output came to. A write that meets a closed pipe
+/// (`harbor … | head`) is the Unix goodbye, not an error: the reader has what
+/// it wanted, and the run ends there.
+fn written(result: std::io::Result<()>) -> Outcome {
+    match result {
+        Ok(()) => Outcome::Done,
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Outcome::Closed,
+        Err(e) => err(&format!("writing output failed: {e}")),
+    }
+}
+
+/// What a request that failed on the way says about its statement: one that
+/// never left did nothing, and one that left unanswered may have run. For a
+/// COMMIT that is the difference between a transaction still open and one
+/// whose end is unknown.
+fn unreached(e: &std::io::Error) -> String {
+    match http::was_not_sent(e) {
+        true => format!("cannot reach harbor ({e}): the statement was not sent"),
+        false => format!("harbor did not answer ({e}): whether the statement ran is unknown"),
+    }
 }
 
 /// Read a whole (small) body over a socket that has the streaming tick
@@ -1380,7 +1145,14 @@ fn clear_spinner() {
 
 /// A statement the server reports cancelled: this client's own interrupt, or
 /// a stop it did not ask for, which is a failure with its likely causes named.
+/// Set by a caller about to stop the server under its own statement, as a
+/// restore's Ctrl-C does: that statement's cancel is the caller's to tell.
+pub static STOPPING: AtomicBool = AtomicBool::new(false);
+
 fn stopped(interrupted: &AtomicBool) -> Outcome {
+    if STOPPING.load(Ordering::Relaxed) {
+        return Outcome::Cancelled;
+    }
     if interrupted.load(Ordering::Relaxed) {
         eprintln!("Interrupted.");
         return Outcome::Cancelled;
@@ -1401,8 +1173,34 @@ fn fail(msg: &str) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{brief, pick};
+    use super::{Transport, brief, http, pick, resolve, unreached, url_server};
     use crate::transaction_effect;
+
+    #[test]
+    fn a_statement_that_never_left_is_told_from_one_unanswered() {
+        // Nothing listens on a port just closed: the COMMIT never left, and
+        // the transaction it was meant to end is still open.
+        let closed = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap();
+        let transport = Transport::Tcp(closed.to_string());
+        let e = http::request(&transport, &wire::endpoint::SQL, Some("{}"), None).err().unwrap();
+        assert!(unreached(&e).ends_with("the statement was not sent"), "{}", unreached(&e));
+
+        // A server that reads it and hangs up: it may have run.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let transport = Transport::Tcp(listener.local_addr().unwrap().to_string());
+        let server = std::thread::spawn(move || {
+            use std::io::Read;
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut seen = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !seen.ends_with(b"\r\n\r\n{}") && stream.read(&mut byte).unwrap() == 1 {
+                seen.push(byte[0]);
+            }
+        });
+        let e = http::request(&transport, &wire::endpoint::SQL, Some("{}"), None).err().unwrap();
+        server.join().unwrap();
+        assert!(unreached(&e).ends_with("whether the statement ran is unknown"), "{}", unreached(&e));
+    }
 
     #[test]
     fn a_statement_says_what_it_does_to_the_transaction() {
@@ -1415,6 +1213,26 @@ mod tests {
         for sql in ["SELECT 'BEGIN'", "CREATE TABLE beginnings(i INT)", "FROM commits", "", "-- BEGIN", "$$BEGIN$$"] {
             assert_eq!(transaction_effect(sql), None, "{sql:?} leaves it alone");
         }
+    }
+
+    #[test]
+    fn a_url_without_a_port_gets_harbors_own() {
+        let tcp = |url: &str| url_server(url).unwrap();
+        assert_eq!(tcp("http://db.lan").unwrap(), "db.lan:9495");
+        assert_eq!(tcp("HTTP://db.lan").unwrap(), "db.lan:9495");
+        assert!(url_server("./db.lan").is_none());
+        assert_eq!(tcp("http://db.lan:8080").unwrap(), "db.lan:8080");
+        assert_eq!(tcp("http://[::1]").unwrap(), "[::1]:9495");
+        assert_eq!(tcp("http://[::1]:8080/").unwrap(), "[::1]:8080");
+        assert!(tcp("http://db.lan/prefix").is_err());
+        assert!(tcp("https://db.lan").unwrap_err().contains("Caddy"));
+    }
+
+    #[test]
+    fn a_scheme_is_read_in_any_case() {
+        let (transport, name) = resolve("HTTP://db.lan:8080", &[]).unwrap();
+        assert_eq!(transport, Transport::Tcp("db.lan:8080".into()));
+        assert_eq!(name, "db.lan:8080");
     }
 
     #[test]

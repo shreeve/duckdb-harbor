@@ -6,18 +6,16 @@
 #   make test SUITES="spec fuzz" just those
 #
 # Invoked by the `test` target in the Makefile; run it directly if you want
-# the arguments. The ordering is deliberate — unit tests take seconds and
-# catch the compile-level mistakes, the HTTP suites take a minute, and the
+# the arguments. The ordering is deliberate — unit tests catch the
+# compile-level mistakes, the HTTP suites take a minute, and the
 # server-lifecycle suites take several because they kill and restart servers
 # repeatedly. A failure early means not paying for the rest.
 
 set -uo pipefail
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-# Look in the checkout before the parent directory. Locally the fixture tends
-# to sit beside the repo, in CI test/scripts/fixture.sh writes it into the checkout,
-# and a default that only knew one of those failed every CI run with "no
-# database" while the build and the fixture step had both succeeded.
+# The fixture is looked for in the checkout, then beside it. When a suite
+# needs one and neither has it, it is built in the checkout (below).
 db=${DB:-}
 if [[ -z "$db" ]]; then
   for candidate in "$here/sample.duckdb" "$here/../sample.duckdb"; do
@@ -52,9 +50,8 @@ declare -a failed=() skipped=() passed=()
 # battery dies at "the server did not come up".
 work=$(mktemp -d /tmp/harbor-check.XXXXXX)
 # Every berth this suite starts registers under $HARBOR_HOME. Without this the
-# sockets and logs land in the operator's real runtime directory,
-# and each run leaves a fistful of dead names behind — invisible before
-# `harbor show` learned to report them, and noise in the fleet view now.
+# sockets and logs land in the operator's real runtime directory, and each run
+# leaves dead names in the operator's fleet view.
 export HARBOR_HOME="$work/harbor-home"
 mkdir -p "$HARBOR_HOME"
 server_pid=""
@@ -65,9 +62,9 @@ server_pid=""
 # reaches, and reaching it costs a KILL rather than the run.
 #
 # Both callers need the same thing, which is why it is a function rather
-# than two copies. The mid-script call is the one that mattered: a bare
-# `wait` there is unbounded, and the EXIT trap that would have killed the
-# server cannot help, because a script stuck in `wait` never reaches EXIT.
+# than two copies. The mid-script call is the one that needs it most: a bare
+# `wait` there is unbounded, and the EXIT trap that would kill the server
+# cannot help, because a script stuck in `wait` never reaches EXIT.
 reap() {
   [[ -n "$server_pid" ]] || return 0
   kill -TERM "$server_pid" 2>/dev/null
@@ -89,9 +86,10 @@ banner() { printf '\n%s══ %s %s%s\n' "$bold" "$1" "$(printf '═%.0s' $(seq 
 # Exit 77 means "could not run", and it is not a pass. A suite that reports
 # success when its subject is missing is worse than one that fails: it keeps
 # reporting success forever, and the gap it was built to guard goes unwatched.
+wants() { local s; for s in "$@"; do [[ " $suites " == *" $s "* ]] && return 0; done; return 1; }
 run() { # run <name> <command...>
   local name=$1 status=0; shift
-  [[ " $suites " == *" $name "* ]] || return 0
+  wants "$name" || return 0
   banner "$name"
   "$@" || status=$?
   case $status in
@@ -100,9 +98,33 @@ run() { # run <name> <command...>
     *)  failed+=("$name");  printf '%s✗ %s%s\n' "$red" "$name" "$off" ;;
   esac
 }
-skip() { skipped+=("$1"); printf '%s— %s skipped: %s%s\n' "$dim" "$1" "$2" "$off"; }
 
-[[ -f "$db" ]] || { echo "check: no database at $db (set DB=...)" >&2; exit 2; }
+# The engine the suites serve with and the duckdb CLI they build fixtures and
+# read oracles with are the pair fetch-duckdb.sh installs side by side. A CLI
+# found elsewhere on PATH can be another build, one that writes a storage
+# format the engine cannot read. HARBOR_LIBDUCKDB names another pair by its
+# library, and the CLI is looked for beside it.
+if [[ -z "${HARBOR_LIBDUCKDB:-}" ]]; then
+  for lib in "$HOME"/.duckdb/cli/2.0.0/libduckdb.{dylib,so}; do
+    [[ -f "$lib" ]] && { export HARBOR_LIBDUCKDB=$lib; break; }
+  done
+fi
+engine_dir=$(dirname "${HARBOR_LIBDUCKDB:-$HOME/.duckdb/cli/2.0.0/libduckdb}")
+export PATH="$engine_dir:$PATH"
+
+build_fixture=0
+wants asserts types spec fuzz deployment stress cancel && [[ ! -f "$db" ]] && build_fixture=1
+if (( build_fixture )) || wants asserts stress sessions catalog; then
+  if [[ ! -x "$engine_dir/duckdb" ]]; then
+    echo "check: no duckdb CLI beside the engine in $engine_dir" >&2
+    echo "  (make fetch-duckdb installs the engine and its CLI together)" >&2
+    exit 2
+  fi
+fi
+if (( build_fixture )); then
+  echo "check: no database at $db, so building the fixture there"
+  "$here/test/scripts/fixture.sh" "$db" || exit 2
+fi
 
 # ---------------------------------------------------------------------------
 # The suites that need no server
@@ -111,8 +133,7 @@ skip() { skipped+=("$1"); printf '%s— %s skipped: %s%s\n' "$dim" "$1" "$2" "$o
 # --workspace --all-features, both load-bearing. `default-members` is wire and
 # harbor, so a bare `cargo test` never sees crates/common or crates/justhttp;
 # and `config`/`membership` are off by default, so it never compiles the config
-# reader either. Between them that left 101 tests — every justhttp test and
-# every config test — building fine and running nowhere.
+# reader either.
 run unit     cargo test --release --workspace --all-features
 run regressions python3 "$here/test/scripts/regressions.py"
 # The lifetime doctrine runs the real binary in its own $HARBOR_HOME sandbox —
@@ -127,12 +148,7 @@ run roundtrip "$here/test/scripts/roundtrip.py"
 # One server, shared by the read-only HTTP suites, on its own copy
 # ---------------------------------------------------------------------------
 
-needs_server=0
-for s in types asserts spec fuzz deployment stress; do
-  [[ " $suites " == *" $s "* ]] && needs_server=1
-done
-
-if (( needs_server )); then
+if wants types spec fuzz deployment stress; then
   cp "$db" "$work/check.duckdb"
   launcher="${HARBOR_LAUNCHER:-$here/target/release/harbor}"
   ${launcher%% *} --help >/dev/null 2>&1 || cargo build -p harbor --release
@@ -157,7 +173,7 @@ fi
 run asserts "$here/test/scripts/asserts.sh" "$db"
 
 # typecov.py sends every corpus query and reads the types back out of the
-# schema lines, so it needs a server; it used to grep the query text instead.
+# schema lines, so it needs a server.
 # (The file is not named types.py: a script dir on sys.path[0] would then
 # shadow the stdlib `types` module and break every Python suite run from here.)
 run types "$here/test/scripts/typecov.py" --port "$port"
@@ -166,28 +182,23 @@ run spec  "$here/test/scripts/spec.py" --port "$port"
 run fuzz  "$here/test/scripts/fuzz.py"       --port "$port"
 run deployment "$here/test/scripts/deployment.sh" --url "http://127.0.0.1:$port"
 # Load runs against the same server as the read-only suites rather than
-# standing up its own. There was a second copy of the start-and-wait logic in
-# the CI workflow doing exactly this, and it was the only place that could not
-# get a server up — one proven path is better than two, one of which is only
-# exercised in CI.
+# standing up its own: one start-and-wait path, proven by every suite here.
 #
 # The expected answers come from the source database, read here before the
-# server ever opened its copy — not from the server, which is what stress.py
-# used to do. Verifying a server against its own replies cannot detect a server
-# that is consistently wrong.
-if [[ " $suites " == *" stress "* ]]; then
-  oracle_sql=$("$here/test/scripts/stress.py" --dump-oracle-sql)
-  mapfile_compat=()
-  while IFS= read -r line; do mapfile_compat+=("$line"); done <<< "$oracle_sql"
+# server ever opened its copy. Verifying a server against its own replies
+# cannot detect a server that is consistently wrong.
+if wants stress; then
+  oracle=()
+  while IFS= read -r line; do oracle+=("$line"); done < <("$here/test/scripts/stress.py" --dump-oracle-sql)
   # -no-init on all three. An operator's ~/.duckdbrc runs otherwise, and
   # the flags here do not shield every setting it can carry: `-csv`
   # overrides .mode and .separator, but nothing on this line overrides
   # .nullvalue, which rewrites how a NULL prints. These are the ORACLE
   # values the stress suite compares the server against — a value that
   # depends on whose machine ran the suite is not an oracle.
-  expect_sites=$(duckdb -no-init -readonly -csv -noheader "$db" -c "${mapfile_compat[0]}" | tail -1)
-  expect_top=$(duckdb   -no-init -readonly -csv -noheader "$db" -c "${mapfile_compat[1]}" | tail -1)
-  expect_join=$(duckdb  -no-init -readonly -csv -noheader "$db" -c "${mapfile_compat[2]}" | tail -1)
+  expect_sites=$(duckdb -no-init -readonly -csv -noheader "$db" -c "${oracle[0]}" | tail -1)
+  expect_top=$(duckdb   -no-init -readonly -csv -noheader "$db" -c "${oracle[1]}" | tail -1)
+  expect_join=$(duckdb  -no-init -readonly -csv -noheader "$db" -c "${oracle[2]}" | tail -1)
 fi
 run stress "$here/test/scripts/stress.py" --port "$port" \
            --levels "${SWARM_LEVELS:-1,4,16}" --seconds "${SWARM_SECONDS:-10}" \
@@ -201,15 +212,15 @@ reap
 # The suites that manage their own servers
 # ---------------------------------------------------------------------------
 
-# catalog.py runs its own servers: the shapes it asserts — a foreign key, a
-# second schema, a sequence-backed pk, an empty database — are not in the
-# shared fixture, and proving byte-stable output wants a database nothing
-# else is writing to.
 # hostile.py runs its own server, and has to: every case is designed to hurt
 # it — wedging every worker, flooding the head, stranding connections — which
 # the shared berth could not survive or report cleanly after.
 run hostile "$here/test/scripts/hostile.py"
 
+# catalog.py runs its own servers: the shapes it asserts — a foreign key, a
+# second schema, a sequence-backed pk, an empty database — are not in the
+# shared fixture, and proving byte-stable output wants a database nothing
+# else is writing to.
 run catalog "$here/test/scripts/catalog.py"
 
 # sessions.py runs its own server: it needs a pool size the shared one does not
@@ -219,7 +230,7 @@ run sessions "$here/test/scripts/sessions.py"
 
 # So does cancel.py, and for a sharper reason: it saturates the worker pool on
 # purpose, which no suite may do to a server the other suites are sharing.
-run cancel "$here/test/scripts/cancel.py" --db "$db"
+run cancel "$here/test/scripts/cancel.py"
 
 # ---------------------------------------------------------------------------
 
@@ -232,5 +243,13 @@ for s in ${skipped[@]+"${skipped[@]}"}; do printf '  %s—%s %s\n' "$dim" "$off"
 for s in ${failed[@]+"${failed[@]}"};   do printf '  %s✗%s %s\n' "$red" "$off" "$s"; done
 printf '\n%s%d passed, %d failed, %d skipped%s\n' \
        "$bold" "${#passed[@]}" "${#failed[@]}" "${#skipped[@]}" "$off"
-(( ${#failed[@]} > 0 )) && exit 1
+if (( ${#failed[@]} > 0 )); then
+  # The EXIT trap removes $work, so this is where a failed run shows the
+  # shared server's side of it.
+  if [[ -s "$work/server.log" ]]; then
+    banner "shared server log, last 200 lines"
+    tail -n 200 "$work/server.log"
+  fi
+  exit 1
+fi
 exit 0

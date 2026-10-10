@@ -21,12 +21,31 @@ if (-not (Test-Path $src)) { Write-Error "install: no bin\ beside this script"; 
 $bin = Join-Path $InstallDir 'bin'
 New-Item -ItemType Directory -Path $bin -Force | Out-Null
 
-# A running berth holds its own .exe open, so replacing it fails with a sharing
-# violation. Name the file and the fix rather than half-installing.
-foreach ($f in Get-ChildItem $src -File) {
-  $dest = Join-Path $bin $f.Name
-  try { Copy-Item $f.FullName $dest -Force }
-  catch { Write-Error "install: cannot replace $dest — stop any running harbor servers first, then re-run"; exit 1 }
+# Windows will not overwrite a file a running program holds — a server, a
+# REPL, or the `harbor update` that ran this — but it will rename one. So each
+# file is moved aside first and the new one copied into its place; the copies
+# moved aside by an earlier install go now, those no longer running. A copy
+# that fails puts every file back as it was: harbor.exe and duckdb.dll are
+# one install, never half of each.
+Get-ChildItem $bin -Filter '*.old-*' | Remove-Item -Force -ErrorAction SilentlyContinue
+$moved = @()
+try {
+  foreach ($f in Get-ChildItem $src -File) {
+    $dest = Join-Path $bin $f.Name
+    if (Test-Path $dest) {
+      $aside = "$dest.old-" + [Guid]::NewGuid().ToString('N').Substring(0, 8)
+      Move-Item $dest $aside
+      $moved += ,@($dest, $aside)
+    }
+    Copy-Item $f.FullName $dest
+  }
+} catch {
+  foreach ($m in $moved) {
+    Remove-Item $m[0] -Force -ErrorAction SilentlyContinue
+    Move-Item $m[1] $m[0] -ErrorAction SilentlyContinue
+  }
+  Write-Error "install: cannot replace the files in $bin — $($_.Exception.Message); nothing was changed"
+  exit 1
 }
 
 Write-Host "installed: harbor -> $bin"

@@ -7,9 +7,8 @@
 #   SOAK=30 test/scripts/asserts.sh               # add a 30s sustained-load phase
 #
 # The suite talks to the server the way a client does: curl in, NDJSON out.
-# It knows nothing about Rust, so it is equally valid against the v1 harbor —
-# which is the point. It is the acceptance harness for the rewrite, not a set
-# of unit tests that only prove this implementation agrees with itself.
+# It knows nothing about the implementation, so it is not a set of unit tests
+# that only prove harbor agrees with itself.
 #
 # Correctness claims are checked against an oracle rather than against
 # harbor's own earlier answers: every expected value is computed by the DuckDB
@@ -28,7 +27,8 @@ set -uo pipefail
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 src_db=${1:-$here/../sample.duckdb}
-port=${PORT:-9499}
+# A port the kernel says is free, not a fixed one another server may hold.
+port=${PORT:-$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')}
 soak=${SOAK:-0}
 base="http://127.0.0.1:$port"
 timeout=${TIMEOUT:-120}
@@ -46,9 +46,8 @@ fi
 # Keep the root short enough for macOS's 104-byte sockaddr_un limit.
 work=$(mktemp -d /tmp/harbor-asserts.XXXXXX)
 # Every berth this suite starts registers under $HARBOR_HOME. Without this the
-# sockets and logs land in the operator's real runtime directory,
-# and each run leaves a fistful of dead names behind — invisible before
-# `harbor show` learned to report them, and noise in the fleet view now.
+# sockets and logs land in the operator's real runtime directory, and each run
+# leaves dead names in the operator's fleet view.
 export HARBOR_HOME="$work/harbor-home"
 mkdir -p "$HARBOR_HOME"
 db="$work/asserts.duckdb"
@@ -199,8 +198,8 @@ exp_payers=$(oracle    "SELECT count(DISTINCT payer) FROM plans")
 exp_join4=$(oracle     "SELECT count(*) FROM sites s JOIN rules r USING (client) JOIN plans p USING (client) JOIN cohorts c USING (client)")
 # Read the value the data actually holds rather than a literal. 'Active' is
 # spelled that way in the local export and lowercase in the synthesised CI
-# fixture, so the assertion below was 0 == 0 in CI — a WHERE-clause test whose
-# predicate never matched anything.
+# fixture, so a literal makes the assertion below 0 == 0 in CI — a
+# WHERE-clause test whose predicate never matches anything.
 exp_status=$(oracle    "SELECT status FROM rules WHERE status IS NOT NULL GROUP BY 1 ORDER BY count(*) DESC, 1 LIMIT 1")
 exp_active=$(oracle    "SELECT count(*) FROM rules WHERE status = '$exp_status'")
 exp_inactive=$(oracle  "SELECT count(*) FROM rules WHERE status IS DISTINCT FROM '$exp_status'")
@@ -248,10 +247,6 @@ section "HTTP routing"
 eq "/ready answers" "200" \
    "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$base/ready")"
 eq "/ready body" '{"status":"ready"}' "$(curl -sS -m 5 "$base/ready")"
-# The endpoint it replaced. Readiness and liveness are not synonyms, and a
-# static 200 answered the question nobody was asking.
-eq "/health is gone" "404" \
-   "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$base/health")"
 eq "/sql accepts a query" "200" "$(status 'SELECT 1')"
 eq "unknown path is 404" "404" \
    "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$base/nope")"
@@ -285,70 +280,20 @@ eq "response is chunked, not buffered" "chunked" \
 section "Type fidelity"
 # ---------------------------------------------------------------------------
 
-eq "DECIMAL carries width and scale" "10|2" \
-   "$(post "SELECT 19.99::DECIMAL(10,2) AS d" | nd '"%s|%s" % (cols[0]["decimal"]["width"], cols[0]["decimal"]["scale"])')"
-eq "DECIMAL value keeps trailing zeros" "str:4.50" \
-   "$(post "SELECT 4.5::DECIMAL(10,2) AS d" | nd 'typed')"
-eq "large BIGINT is quoted, not truncated" "str:9007199254740993" \
-   "$(post 'SELECT 9007199254740993::BIGINT AS n' | nd 'typed')"
-eq "small BIGINT stays a number" "int:42" \
-   "$(post 'SELECT 42::BIGINT AS n' | nd 'typed')"
+# spec.py spells out the encoding type by type; these are the values it does
+# not carry.
 eq "HUGEINT survives" "str:123456789012345678901234567890" \
    "$(post 'SELECT 123456789012345678901234567890::HUGEINT AS n' | nd 'typed')"
-eq "UUID is canonical" "str:6ba7b810-9dad-11d1-80b4-00c04fd430c8" \
-   "$(post "SELECT '6ba7b810-9dad-11d1-80b4-00c04fd430c8'::UUID AS u" | nd 'typed')"
 eq "BLOB is base64" "str:aGk=" \
    "$(post "SELECT 'hi'::BLOB AS b" | nd 'typed')"
-eq "TIMESTAMP keeps microseconds" "str:2026-08-11T07:24:05.123456" \
-   "$(post "SELECT '2026-08-11 07:24:05.123456'::TIMESTAMP AS t" | nd 'typed')"
 eq "DATE is ISO" "str:2026-08-11" \
    "$(post "SELECT '2026-08-11'::DATE AS d" | nd 'typed')"
-eq "NULL is JSON null" "NoneType:None" \
-   "$(post 'SELECT NULL::VARCHAR AS v' | nd 'typed')"
-# JSON has no Infinity, and null is the wrong stand-in: it makes an overflow
-# indistinguishable from a missing value. Quoted, the distinction survives and
-# a client can decide what to do with it. The v1 harbor does the same, and
-# SPEC 5.4 requires it.
-# BIGNUM is arbitrary precision and is stored as a header plus a big-endian
-# magnitude. Rendered as anything but its decimal digits it is unreadable, and
-# base64 of the storage bytes is what it used to be.
-eq "BIGNUM renders its digits, not its storage" "str:123456789012345678901234567890" \
-   "$(post 'SELECT 123456789012345678901234567890::VARINT AS v' | nd 'typed')"
-eq "a negative BIGNUM keeps its sign" "str:-123456789012345678901234567890" \
-   "$(post 'SELECT (-123456789012345678901234567890)::VARINT AS v' | nd 'typed')"
 eq "a small BIGNUM is a bare number" "int:42" \
    "$(post 'SELECT 42::VARINT AS v' | nd 'typed')"
-eq "BIGNUM zero round-trips" "int:0" \
-   "$(post 'SELECT 0::VARINT AS v' | nd 'typed')"
-eq "BIGNUM is marked lossless" "True" \
-   "$(post 'SELECT 1::VARINT AS v' | nd 'cols[0]["lossless"]')"
-
-eq "non-finite DOUBLE is a quoted Infinity" "str:Infinity" \
-   "$(post "SELECT 'inf'::DOUBLE AS f" | nd 'typed')"
-eq "negative infinity keeps its sign" "str:-Infinity" \
-   "$(post "SELECT '-inf'::DOUBLE AS f" | nd 'typed')"
-eq "NaN is quoted too" "str:NaN" \
-   "$(post "SELECT 'nan'::DOUBLE AS f" | nd 'typed')"
 eq "LIST nests its child type" "VARCHAR" \
    "$(post "SELECT ['a','b'] AS l" | nd 'cols[0]["child"]["duckdbType"]')"
 eq "LIST value round-trips" "True" \
    "$(post "SELECT ['a','b'] AS l" | nd "rows[0][0] == ['a', 'b']")"
-# The SQL goes through a variable rather than being written inline. bash 3.2 —
-# which is what macOS ships — brace-expands `{'a': 1, 'b': 'x'}` even inside
-# the double quotes of a "$( ... )" used as a command argument, splitting it
-# into two words and running the whole pipeline twice. Assignment is not a
-# brace-expansion context, so this sidesteps it.
-struct_sql="SELECT {'a': 1, 'b': 'x'} AS s"
-eq "STRUCT names its fields" "a|b" \
-   "$(post "$struct_sql" | nd '"|".join(f["name"] for f in cols[0]["fields"])')"
-# Same brace-expansion hazard, so the expected value is spelled with brackets
-# and tuples rather than a dict literal.
-eq "STRUCT value round-trips" "True" \
-   "$(post "$struct_sql" | nd "sorted(rows[0][0].items()) == [('a', 1), ('b', 'x')]")"
-eq "unicode survives the encoder" "str:héllo — 世界 🦆" \
-   "$(post "SELECT 'héllo — 世界 🦆' AS s" | nd 'typed')"
-eq "control characters are escaped" "True" \
-   "$(post "SELECT 'a' || chr(9) || 'b' || chr(10) || 'c' AS s" | nd "rows[0][0] == 'a\\tb\\nc'")"
 
 # ---------------------------------------------------------------------------
 section "Real queries against the loaded data"
@@ -393,10 +338,9 @@ eq "regexp filter runs" "$exp_regexp" \
 # one: no left row is dropped.
 eq "LEFT JOIN has the cardinality DuckDB says" "$exp_leftjoin" \
    "$(scalar 'SELECT count(*) FROM plans p LEFT JOIN rules r USING (client)')"
-# Both sides of this used to be oracle values, which made it an assertion that
-# DuckDB's LEFT JOIN preserves left rows — tested against DuckDB. harbor could
-# have answered 0 to every query and it would still have passed. The right-hand
-# side has to come from the server.
+# The right-hand side has to come from the server. With an oracle value on
+# both sides this would assert that DuckDB's LEFT JOIN preserves left rows,
+# tested against DuckDB, and a harbor answering 0 to every query would pass.
 eq "LEFT JOIN drops no row from the left side" "$exp_n_plans" \
    "$(scalar 'SELECT count(DISTINCT p.rowid) FROM plans p LEFT JOIN rules r USING (client)')"
 eq "UNION ALL" "$(( $exp_n_sites + $exp_n_rules ))" \
@@ -414,11 +358,10 @@ eq "PIVOT-shaped conditional aggregate" "$exp_active" \
 section "One statement per request"
 # ---------------------------------------------------------------------------
 
-# duckdb-rs's prepare() executes every statement but the last, so anything that
-# slips a second statement past the scanner runs it. Each of these was accepted
-# once: DuckDB needs no space between a keyword and a literal, so LIKE', ILIKE'
-# and ESCAPE' end in `e` and were read as the start of an E'...' escape string —
-# the backslash then hid the closing quote and every terminator after it.
+# The engine's parser counts the statements before any of them runs. DuckDB
+# needs no space between a keyword and a literal, so LIKE' ends in an `e` that
+# a reader of the text could take for an E'...' prefix, and its backslash for
+# an escape hiding the terminator; the engine's own reading is the one counted.
 eq "a plain second statement is refused" "400" \
    "$(status 'SELECT 1; SELECT 2')"
 eq "LIKE against an escape-looking literal is refused" "400" \
@@ -436,10 +379,24 @@ eq "a real escape string still works" "a'; b" \
    "$(scalar "SELECT E'a\\'; b' AS v")"
 eq "LIKE with a backslash literal still works" "0" \
    "$(scalar "SELECT count(*) AS n FROM sites WHERE 'a' LIKE'\\'")"
+eq "a second statement is rejected" "400" "$(status 'SELECT 1; DROP TABLE sites')"
+eq "and the table is still there" "$exp_n_sites" "$(scalar 'SELECT count(*) FROM sites')"
+eq "no whitespace before it either" "400" "$(status 'SELECT 1;DROP TABLE sites')"
+eq "a trailing comment is no second statement" "200" "$(status 'SELECT 1; -- note')"
+eq "nor is an empty one" "200" "$(status 'SELECT 1;;')"
+eq "a semicolon inside a literal is data" ";drop" "$(post "SELECT ';drop' AS s" | nd 'rows[0][0]')"
+eq "a doubled quote does not end the literal" "it's; fine" \
+   "$(post "SELECT 'it''s; fine' AS s" | nd 'rows[0][0]')"
+eq "a dollar-quoted body is data" "a; b" "$(post 'SELECT $tag$a; b$tag$ AS s' | nd 'rows[0][0]')"
+eq "a semicolon in a quoted identifier is data" "200" "$(status 'SELECT 1 AS "a;b"')"
+eq "a semicolon in a block comment is data" "200" "$(status '/* a; b */ SELECT 1')"
+eq "nested block comments are handled" "200" "$(status '/* a /* b; c */ d */ SELECT 1')"
+eq "a trailing semicolon is fine" "200" "$(status 'SELECT 1;')"
+eq "trailing whitespace after the semicolon is fine" "200" "$(status 'SELECT 1;   ')"
 
 # The scan after a terminator is done once, not re-run per byte. At Theta(n^2)
-# a request this size ran for hours on the worker thread that read it. The body
-# goes through a file: four megabytes will not fit in an argv entry.
+# a request this size would run for hours on the worker thread that read it.
+# The body goes through a file: four megabytes will not fit in an argv entry.
 python3 -c "
 import json, sys
 sys.stdout.write(json.dumps({'sql': 'SELECT 1;' + ' ' * 4000000}))" > "$work/big.json"
@@ -548,25 +505,6 @@ eq "and is stored at that depth" "ARRAY(1)|300" \
 post 'DETACH scratch' > /dev/null
 
 # ---------------------------------------------------------------------------
-section "One statement per request"
-# ---------------------------------------------------------------------------
-
-eq "a second statement is rejected" "400" "$(status 'SELECT 1; DROP TABLE sites')"
-eq "and the table is still there" "$exp_n_sites" "$(scalar 'SELECT count(*) FROM sites')"
-eq "no whitespace before it either" "400" "$(status 'SELECT 1;DROP TABLE sites')"
-eq "a trailing comment counts as a second statement" "400" "$(status 'SELECT 1; -- sneaky')"
-eq "an empty second statement is still a second statement" "400" "$(status 'SELECT 1;;')"
-eq "a semicolon inside a literal is data" ";drop" "$(post "SELECT ';drop' AS s" | nd 'rows[0][0]')"
-eq "a doubled quote does not end the literal" "it's; fine" \
-   "$(post "SELECT 'it''s; fine' AS s" | nd 'rows[0][0]')"
-eq "a dollar-quoted body is data" "a; b" "$(post 'SELECT $tag$a; b$tag$ AS s' | nd 'rows[0][0]')"
-eq "a semicolon in a quoted identifier is data" "200" "$(status 'SELECT 1 AS "a;b"')"
-eq "a semicolon in a block comment is data" "200" "$(status '/* a; b */ SELECT 1')"
-eq "nested block comments are handled" "200" "$(status '/* a /* b; c */ d */ SELECT 1')"
-eq "a trailing semicolon is fine" "200" "$(status 'SELECT 1;')"
-eq "trailing whitespace after the semicolon is fine" "200" "$(status 'SELECT 1;   ')"
-
-# ---------------------------------------------------------------------------
 section "Error handling"
 # ---------------------------------------------------------------------------
 
@@ -638,14 +576,16 @@ eq "rowCount agrees with the rows" "3|3" \
    "$(json 'SELECT i FROM range(3) t(i)' | js '"%s|%s" % (doc["rowCount"], len(rows))')"
 eq "an empty result is still a document" "0|[]" \
    "$(json 'SELECT 1 WHERE false' | js '"%s|%s" % (doc["rowCount"], rows)')"
+# Each check reads its whole input: under pipefail a `grep -q` that leaves
+# at its match kills the writer before it, and the pipeline then fails.
 eq "it declares Content-Length, not chunked" "True" \
    "$(curl -sS -m "$timeout" -D - -o /dev/null \
         -H 'Accept: application/json' --data '{"sql":"SELECT 1"}' "$base/sql" \
-      | tr -d '\r' | grep -qi '^content-length:' && echo True || echo False)"
+      | tr -d '\r' | grep -ci '^content-length:' >/dev/null && echo True || echo False)"
 eq "and says it is JSON" "True" \
    "$(curl -sS -m "$timeout" -D - -o /dev/null \
         -H 'Accept: application/json' --data '{"sql":"SELECT 1"}' "$base/sql" \
-      | tr -d '\r' | grep -qi '^content-type: application/json' && echo True || echo False)"
+      | tr -d '\r' | grep -ci '^content-type: application/json' >/dev/null && echo True || echo False)"
 
 # Values are produced by the same encoder in both shapes, so a difference here
 # would mean the framing had leaked into the encoding.
@@ -654,16 +594,14 @@ eq "values match the streamed shape exactly" "True" \
       b=$(json 'SELECT 1, 2.5, NULL, [1,2], {'"'"'x'"'"': 1}' | js 'json.dumps(rows)'); \
       [[ "$a" == "$b" ]] && echo True || echo False)"
 
-eq "streaming stays the default with no Accept" "True" \
-   "$(post 'SELECT 1' | head -c 20 | grep -q '"type":"schema"' && echo True || echo False)"
-eq "Accept: */* still streams" "True" \
-   "$(json 'SELECT 1' '*/*' | head -c 20 | grep -q '"type":"schema"' && echo True || echo False)"
-eq "asking for NDJSON explicitly streams" "True" \
-   "$(json 'SELECT 1' 'application/x-ndjson' | head -c 20 | grep -q '"type":"schema"' && echo True || echo False)"
+# streams <body>: whether it opens with a schema line, as a stream does.
+streams() { [[ ${1:0:20} == *'"type":"schema"'* ]] && echo True || echo False; }
+eq "streaming stays the default with no Accept" "True" "$(streams "$(post 'SELECT 1')")"
+eq "Accept: */* still streams" "True" "$(streams "$(json 'SELECT 1' '*/*')")"
+eq "asking for NDJSON explicitly streams" "True" "$(streams "$(json 'SELECT 1' 'application/x-ndjson')")"
 # Ambiguity resolves to the shape that cannot fail on size.
 eq "naming both shapes streams" "True" \
-   "$(json 'SELECT 1' 'application/json, application/x-ndjson' | head -c 20 \
-      | grep -q '"type":"schema"' && echo True || echo False)"
+   "$(streams "$(json 'SELECT 1' 'application/json, application/x-ndjson')")"
 
 # The reason one-shot defers its handshake: nothing has been sent, so a failure
 # is still a status code rather than a 200 with an apology in the body.
@@ -766,7 +704,7 @@ section "Abuse"
 eq "an oversized body does not take the server down" "True" \
    "$(python3 -c 'print("x" * 200000)' > "$work/huge.txt"; \
       curl -sS -m 30 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
-        --data-binary "@$work/huge.txt" "$base/sql" | grep -q '^4' && echo True || echo False)"
+        --data-binary "@$work/huge.txt" "$base/sql" | grep -c '^4' >/dev/null && echo True || echo False)"
 eq "a client that hangs up mid-stream does not wedge a worker" "200" \
    "$(curl -sS -m 1 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
         --data '{"sql":"SELECT i FROM range(5000000) t(i)"}' "$base/sql" >/dev/null 2>&1; \
@@ -774,7 +712,7 @@ eq "a client that hangs up mid-stream does not wedge a worker" "200" \
 eq "the server still answers correctly afterwards" "$exp_n_sites" \
    "$(scalar 'SELECT count(*) FROM sites')"
 eq "deeply nested SQL is handled, not crashed" "True" \
-   "$(status "$(python3 -c 'print("SELECT * FROM (" * 40 + "SELECT 1 AS x" + ") t" * 40)')" | grep -qE '^(200|400)$' && echo True || echo False)"
+   "$(status "$(python3 -c 'print("SELECT * FROM (" * 40 + "SELECT 1 AS x" + ") t" * 40)')" | grep -cE '^(200|400)$' >/dev/null && echo True || echo False)"
 
 # ---------------------------------------------------------------------------
 if [[ "$soak" -gt 0 ]]; then

@@ -1,14 +1,10 @@
 """
-corpus.py — the shared body of queries every suite runs.
+corpus.py — the shared body of queries, one per type and shape.
 
-One list, used three ways: the differential runner sends it to both the C++
-harbor and harbor and compares the answers, the type checker asserts the
-spelled-out SPEC §5.4 encoding for the cases where harbor formats values
-itself, and the fuzzer uses the generators at the bottom to produce far more
-of the same shapes than anyone would write by hand.
-
-Keeping it in one place is the point. A type that is exercised by only one of
-the three is a type where a bug can hide.
+One list, used two ways: typecov.py sends every query to a server and
+requires each DuckDB type to come back from at least one of them, and
+roundtrip.py stores every TYPES case in a table and requires a backup to
+bring it back. The encoding itself is spelled out by hand in spec.py.
 
 Every entry is a single SELECT — harbor takes one statement per request — and
 every entry is deterministic, so two runs against two servers are comparable.
@@ -17,12 +13,11 @@ every entry is deterministic, so two runs against two servers are comparable.
 # ---------------------------------------------------------------------------
 # Types
 #
-# The hand-formatted cases matter most. In the v1 harbor these conversions
-# were DuckDB's own (Timestamp::ToString, UUID::ToString, Bit::ToString,
-# DecimalToString); harbor reimplements them in Rust — civil_from_days,
-# fmt_time, fmt_timestamp per TimeUnit, the interval micros conversion, the
-# UUID high-bit flip, base64 — so these are original code paths with original
-# bugs available. The boundary values below are chosen to break them.
+# The hand-formatted cases matter most. Harbor formats these values itself
+# rather than taking DuckDB's text for them — civil_from_days, fmt_time,
+# fmt_timestamp per TimeUnit, the interval micros conversion, the UUID
+# high-bit flip, base64 — so they are harbor's code paths with harbor's bugs
+# available. The boundary values below are chosen to break them.
 # ---------------------------------------------------------------------------
 
 TYPES = [
@@ -80,23 +75,21 @@ TYPES = [
     ("double-inf",           "SELECT 'inf'::DOUBLE AS v"),
     ("double-nan",           "SELECT 'nan'::DOUBLE AS v"),
 
-    # BIGNUM (VARINT before v1.5). Arbitrary precision, and stored as a
-    # three-byte header plus a big-endian magnitude that is one's-complemented
-    # when negative — so the sign, the zero case and the boundary where the
-    # value stops fitting a double all exercise different code.
-    # TIME_NS and VARIANT: neither was in any suite, and TIME_NS panicked the
-    # executor thread. Present now so they can never leave again unnoticed.
     ("time-ns",              "SELECT TIME_NS '12:34:56.123456789' AS v"),
     ("time-ns-cast",         "SELECT TIME_NS '12:34:56.123456789'::VARCHAR AS v"),
     ("variant",              "SELECT 42::VARIANT AS v"),
     # A VARIANT that entered as JSON, which is how one is populated in
     # practice — and the shape a text backup carries exactly.
     ("variant-json",         "SELECT '{\"n\":42,\"s\":\"42\",\"l\":[1,\"2\",null]}'::JSON::VARIANT AS v"),
-    # ROW() with no names is TUPLE under the v2 engine (v1 coerced to STRUCT);
-    # it goes out as a JSON array, since an object would collide on the empty key.
+    # ROW() with no names is TUPLE; it goes out as a JSON array, since an
+    # object would collide on the empty key.
     ("tuple",                "SELECT ROW(1, 'a') AS v"),
 
-    ("bignum-zero",          "SELECT 0::VARINT AS v"),
+    # BIGNUM, written here by its alias VARINT. Arbitrary precision, and stored as a
+    # three-byte header plus a big-endian magnitude that is one's-complemented
+    # when negative — so the sign, the zero case and the boundary where the
+    # value stops fitting a double all exercise different code.
+    ("bignum-zero",         "SELECT 0::VARINT AS v"),
     ("bignum-one",           "SELECT 1::VARINT AS v"),
     ("bignum-neg-one",       "SELECT (-1)::VARINT AS v"),
     ("bignum-small",         "SELECT 42::VARINT AS v"),
@@ -193,6 +186,12 @@ TYPES = [
     ("timestamp-ns-round",   "SELECT '2026-08-11 07:24:05.000000001'::TIMESTAMP_NS AS v"),
     ("timestamptz-utc",      "SELECT '2026-08-11 07:24:05+00'::TIMESTAMPTZ AS v"),
     ("timestamptz-offset",   "SELECT '2026-08-11 07:24:05+02'::TIMESTAMPTZ AS v"),
+    ("timestamptz-ns",       "SELECT '2026-08-11 07:24:05.123456789+00'::TIMESTAMPTZ_NS AS v"),
+
+    # -- GEOMETRY: built in, no spatial extension needed; it goes out as the
+    # engine's own text for it, which the schema marks lossy
+    ("geometry-point",       "SELECT 'POINT (1 2)'::GEOMETRY AS v"),
+    ("geometry-null",        "SELECT NULL::GEOMETRY AS v"),
 
     # -- intervals: months, days and micros are stored separately and none of
     # them normalises into the others
@@ -265,36 +264,6 @@ SHAPES = [
 ]
 
 # ---------------------------------------------------------------------------
-# Errors
-#
-# Failures have to look the same on both implementations too: same status,
-# same envelope. A client that special-cases an error string is relying on it.
-# ---------------------------------------------------------------------------
-
-ERRORS = [
-    ("unknown-table",        "SELECT * FROM definitely_not_a_table"),
-    ("unknown-column",       "SELECT no_such_column FROM sites"),
-    ("syntax-error",         "SELECT FROM WHERE"),
-    ("division-by-zero",     "SELECT 1 // 0 AS v"),
-    ("cast-failure",         "SELECT 'abc'::INTEGER AS v"),
-    ("out-of-range-cast",    "SELECT 99999::TINYINT AS v"),
-    ("unknown-function",     "SELECT no_such_function(1)"),
-
-    # Multi-statement text must be refused before it reaches DuckDB, because
-    # duckdb-rs executes every statement but the last during prepare. These
-    # are the shapes that got past the scanner: a keyword ending in `e` butted
-    # against a literal reads as an E'...' escape string, so the backslash
-    # hides the closing quote and the terminator after it. Each of these
-    # dropped a table when it was accepted.
-    ("multi-statement",      "SELECT 1; SELECT 2"),
-    ("multi-like-escape",    r"SELECT 1 WHERE 'a' LIKE'\'; SELECT 2"),
-    ("multi-ilike-escape",   r"SELECT 1 WHERE 'a' ILIKE'\'; SELECT 2"),
-    ("multi-escape-keyword", r"SELECT 'a' LIKE 'b' ESCAPE'\'; SELECT 2"),
-    ("multi-date-literal",   "SELECT date'2020-01-01'; SELECT 2"),
-    ("multi-dollar-param",   "SELECT $1$; SELECT 2; $1$"),
-]
-
-# ---------------------------------------------------------------------------
 # Real data
 #
 # The loaded tables, queried the way anything real would query them.
@@ -353,8 +322,7 @@ PARAMS = [
 def all_queries():
     """Everything with no parameters, as (group, name, sql)."""
     out = []
-    for group, entries in (("types", TYPES), ("shapes", SHAPES),
-                           ("errors", ERRORS), ("data", DATA)):
+    for group, entries in (("types", TYPES), ("shapes", SHAPES), ("data", DATA)):
         for name, sql in entries:
             out.append((group, name, sql))
     return out

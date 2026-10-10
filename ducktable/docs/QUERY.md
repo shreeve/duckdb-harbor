@@ -73,15 +73,21 @@ moves with the caret in the same frame.
 
 **Splitting** happens in the client, because the wire takes one statement per
 request, and there is one boundary: a top-level `;`, aware of quotes, comments
-and dollar quotes, exactly where the engine's own parser would cut. Blank lines
-never divide: FROM-first syntax makes every keyword heuristic lie eventually,
+and dollar quotes, exactly where the engine's own parser would cut, read with
+the one lexer Harbor's server and client use (`wire::scan`). Blank lines never
+divide: FROM-first syntax makes every keyword heuristic lie eventually,
 and a wrong split can leave a runnable prefix. The terminator belongs to its
 statement, and the payload sheds it along with any same-line trailing comment.
 
 **Each run stands alone, outside a transaction.** A run is one request on a
 pooled connection, so it commits on its own, as it would in the duckdb CLI,
 and nothing else carries to the next run: a temp table is gone by then. What
-does carry is a transaction, below.
+does carry is a transaction, below. A run that gets no answer (a timeout, a
+dropped stream, Harbor's `cancelled` or `internal`) may have run and
+committed, and the view says so under the error, so that a rerun of an
+`INSERT` is a choice and not an accident. A query (`SELECT`, `FROM`,
+`WITH`, `DESCRIBE`, a plain `EXPLAIN` and their kin) commits nothing, and
+gets no such warning.
 
 **One run at a time.** ⌘Enter during a run answers `already running…` rather
 than queueing, so no result is ever in flight behind another.
@@ -135,16 +141,17 @@ transaction is open.
 - **The server bounds it.** A session lives five minutes from its `BEGIN`,
   whatever runs on it, and the band counts that down. Harbor also reclaims a
   session that sits thirty seconds between statements, which composing the
-  next statement easily takes, so while nothing is running the view sends
-  `SELECT 1` to the session at a third of that interval, waiting five seconds
-  for its answer and no longer. At the five-minute deadline the server rolls
-  the transaction back, and the view says so: `The transaction is gone: the
-  server reclaimed its session and rolled back everything since BEGIN.` The
-  view checks every second, so a loss a results page runs into shows within
-  one. The keepalive is a timer in the app, and whether macOS delays it while
-  the window is hidden (App Nap) is not measured: a transaction left open
-  behind a hidden window may be found gone on return, and is then reported as
-  any lost one is.
+  next statement easily takes, so at a third of that interval the view
+  renews the session, which runs nothing on it, waiting five seconds for the
+  answer and no longer. A server that renews only backup sessions gets
+  `SELECT 1` instead, sent while nothing else is running. At the five-minute
+  deadline the server rolls the transaction back, and the view says so: `The
+  transaction is gone: the server reclaimed its session and rolled back
+  everything since BEGIN.` The view checks every second, so a loss a results
+  page runs into shows within one. The keepalive is a timer in the app, and
+  whether macOS delays it while the window is hidden (App Nap) is not
+  measured: a transaction left open behind a hidden window may be found gone
+  on return, and is then reported as any lost one is.
 - **A statement typed for a lost transaction never runs on its own
   unannounced.** One sent to a session that is gone is not run outside it
   instead; it fails with that message and `This statement did not run.` When
@@ -161,17 +168,24 @@ transaction is open.
   missing parameter (`Invalid Input Error`), and a second `BEGIN`
   (`TransactionContext Error`). After any of them a statement that reads or
   writes answers `Current transaction is aborted (please ROLLBACK)` until
-  `ROLLBACK` or `COMMIT` ends it, and a `COMMIT` then answers like any other
-  and rolls back.
+  `ROLLBACK` or `COMMIT` ends it. Harbor refuses a `COMMIT` of it, `400
+  sql_error`, saying the transaction has been rolled back and nothing since
+  `BEGIN` was kept.
 - **The view knows whether the transaction is aborted by asking it.** Only
   one answer settles it: an aborted transaction answers `SELECT 1` with that
   error, and a sound one answers it. Other statements prove nothing, since
   some answer on an aborted transaction (measured: `PREPARE` does). So after
   any statement on the session that may have run and failed, the view asks
   `SELECT 1` at once, in the same turn on the session, and the band says what
-  came back. The keepalive asks too. The band is therefore not a guess, and
-  does not say aborted of a statement Harbor itself turned away, such as a
-  protected `SET`. When the question cannot be answered, the band reads
+  came back. While the band is unconfirmed or aborted the keepalive asks too,
+  in place of the renew; a renew cannot change the band, since only a
+  statement on the session can abort its transaction, and one another client
+  sends there is found by the next statement or the `COMMIT`, which asks
+  first. The band is therefore not a guess, and does not say aborted of a
+  statement Harbor itself turned away, such as two statements sent as one.
+  A protected `SET` is the engine's refusal (measured: the locked
+  configuration answers `Invalid Input Error`), and aborts the transaction
+  like any other. When the question cannot be answered, the band reads
   `transaction open, its state unconfirmed after an error`.
 - **A `COMMIT` that rolled back says so.** Before a `COMMIT` the view asks
   once more, and sends the `COMMIT` in the same turn, so no results page or
@@ -194,18 +208,21 @@ transaction is open.
   (`session_busy`, which a statement that outlived the view's two-minute wait
   can cause) or the server is not serving, or it could not be sent at all.
 - **An ending with no verdict is not shown as open.** That is a `COMMIT` or
-  `ROLLBACK` that got no answer, or that Harbor answered `cancelled` (a
-  deadline or a cancel interrupted it after the engine had it) or `internal`.
-  The view releases the session, which rolls back anything still open, and
-  says the transaction may have ended either way. Two cases leave no doubt and
-  say so: a `ROLLBACK` is rolled back either way, by the statement or by that
-  release, and so is a `COMMIT` of a transaction already found aborted. If the
-  engine answers that no transaction is active, the view says the session
-  held none and that the statement changed nothing; it does not claim a
-  rollback.
+  `ROLLBACK` that got no answer, or that Harbor answered `internal`, or a
+  `ROLLBACK` it answered `cancelled`. The view releases the session, which
+  rolls back anything still open, and says the transaction may have ended
+  either way. A `COMMIT` answered `cancelled` is a verdict: Harbor runs a
+  session's `COMMIT` to its answer, so a `499` means it never started, and
+  the view says `The COMMIT did not run, and nothing since BEGIN was kept.`
+  and releases the session. Two cases leave no doubt and say so: a
+  `ROLLBACK` is rolled back either way, by the statement or by that release,
+  and so is a `COMMIT` of a transaction already found aborted. If the engine
+  answers that no transaction is active, the view says the session held none
+  and that the statement changed nothing; it does not claim a rollback.
 - **Leaving ends it.** The session is released, and the transaction rolled
   back, when the view goes: the connection drops, another database is chosen,
-  or the app quits. ⌘Q and the close button ask first (EDITING.md,
+  the server is stopped, or the app quits. ⌘Q, the close button, choosing
+  another database, Stop and Remove Database ask first (EDITING.md,
   "Dialogs"); every quit releases the session, the ones that ask nothing
   included, and so does one while the `BEGIN` itself is still in flight.
 
@@ -226,11 +243,14 @@ A run costs at most the two queries the Data view pays for a table, and usually
 one. Page 0 fetches `size + 1` rows, and a result that fits the page is its own
 exact count; only the extra row's arrival proves there is more, and only then
 does `count(*)` run for the total. The page query doubles as the wrap probe: if
-it fails, because the statement is not really SELECT-shaped or does not parse,
-the statement runs bare, so an error always quotes the user's own SQL, never the
-wrapper's. A statement that cannot be wrapped keeps its whole result as one
-page, with the pager hidden. The costs are named: a big result runs its plan
-twice, and deep OFFSET pages re-skip rows, as table paging does.
+the engine refuses it, because the statement is not really SELECT-shaped or
+does not parse, the statement runs bare, so an engine error always quotes the
+user's own SQL, never the wrapper's. A probe that got no answer, or that
+Harbor cut short, may have run, and is the run's verdict: a SELECT that timed
+out does not run a second time, nor a `nextval` twice. A statement that cannot
+be wrapped keeps its whole result as one page, with the pager hidden. The
+costs are named: a big result runs its plan twice, and deep OFFSET pages
+re-skip rows, as table paging does.
 
 Inside a transaction every page of a result is read on the transaction's
 session, so later pages see what it has written, for as long as it is open.
@@ -242,6 +262,14 @@ are one higher than the statement's own.
 **A statement with no result set** reports `ok · 2 ms` in the status line
 rather than showing an empty grid.
 
+**A plan** shows whole. `EXPLAIN` and `EXPLAIN ANALYZE` answer with rows of
+`explain_key` and `explain_value`, a box drawing over many lines in one cell,
+which a grid would show as its first line, a border. So a result of exactly
+that shape shows as the engine drew it: preformatted in the value font, at the
+data surfaces' zoom, scrolling both ways with no wrapping, with a copy tile in
+its corner, each plan under its own name when there are several. The status
+line reads `plan · 3 ms`.
+
 **Errors** show the engine's message verbatim in the results pane.
 
 **Feedback is three-phase.** For the first 300ms of a run nothing on screen
@@ -252,11 +280,16 @@ results fade, stale but never blanked. Completion is always one atomic swap.
 ## Persistence
 
 - **Scratch:** `~/.config/ducktable/scratch/<berth>.sql`, written on every
-  change to the editor. The files are small, so the write is not debounced.
+  change to the editor, off the UI thread: one write at a time, always of the
+  newest text, so a burst of typing never lands an older text over a newer.
+  Each write goes to a file beside it, renamed over it, and a quit waits a
+  second at most for one under way, so the file holds a whole text, never a
+  truncated one. A write that fails says `scratch not saved: …` in the status
+  line, beside the run's verdict, until one succeeds.
 - **History:** `~/.config/ducktable/history/<berth>.ndjson`, one line per run
   with its text, time, duration and row count or error. It is captured before
   any UI reads it, because history never captured cannot be recovered. It keeps
-  the newest 10,000 entries, pruned when the view is created.
+  the newest 10,000 entries, pruned off the UI thread when the view is made.
 
 ## `crates/duckdb-lang`, the lens
 
@@ -279,6 +312,8 @@ existed elsewhere.
   that cannot recover mid-keystroke. The engine over the wire is the validity
   oracle, version-exact for the attached database.
 - The generated `parser.c` is vendored and compiled by `cc` in `build.rs`.
+  The `.gram` files it derives from are DuckDB's, read in DuckDB's own tree
+  at the commit `grammar/grammar.js` names, and not copied here.
 
 ## Planned
 
@@ -307,8 +342,8 @@ Designed, not built.
 - **Editing keys.** ⌘/ toggles `--` comments; ⇧⌥F formats through the engine's
   own `duckdb_format_sql`; ⌃R opens a history popover that inserts, never
   runs.
-- **EXPLAIN.** ⌘⇧E as a one-shot that explains the marked statement and shows
-  the plan text verbatim. A sticky toggle that rewrote every send would lie
+- **EXPLAIN.** ⌘⇧E as a one-shot that explains the marked statement, its plan
+  shown as any plan is. A sticky toggle that rewrote every send would lie
   about what ⌘Enter sends.
 - **Grammar upkeep.** A `grammar-sync` task that pins a DuckDB tag,
   regenerates the keyword layer and diffs the `.gram` files per release, with a

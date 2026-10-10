@@ -97,7 +97,7 @@ fn compute_pal(cx: &App) -> Pal {
         row_selected: t.list_active,
         row_active: t.primary.opacity(if t.background.l < 0.5 { 0.17 } else { 0.10 }),
         row_hover: t.list_hover,
-        // ONE hairline color, exactly (Steve's ruling, 2026-09-01): the
+        // ONE hairline color, exactly: the
         // chrome border, so every line in the app — grid mesh, rail,
         // frames, divider handles — is literally the same color. Proven
         // by the red audit: paint this slot #FF0000 and every hairline
@@ -111,11 +111,7 @@ fn compute_pal(cx: &App) -> Pal {
 /// The one owner of the value font: every control that shows a stored
 /// value uses this family (DESIGN.md: one font rule, one owner).
 pub fn value_font() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "Menlo"
-    } else {
-        "monospace"
-    }
+    "Menlo"
 }
 
 /// The UI font, for chrome inside value surfaces (e.g. the NULL tag).
@@ -142,8 +138,7 @@ struct Themes {
 impl Global for Themes {}
 
 fn choice_file() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(std::path::Path::new(&home).join(".config").join("ducktable").join("theme"))
+    Some(crate::prefs::config_dir()?.join("theme"))
 }
 
 /// Load the bundled themes, apply the persisted choice (or the set's

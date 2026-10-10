@@ -1,4 +1,4 @@
-//! In-app updates. macOS delegates to the Sparkle framework that
+//! In-app updates, through the Sparkle framework that
 //! `scripts/macos-app.sh` embeds in DuckTable.app; the feed it reads is the
 //! `ducktable-updates` GitHub release (docs/UPDATES.md).
 //!
@@ -22,33 +22,8 @@ pub struct UpdaterState(pub Option<Updater>);
 
 impl Global for UpdaterState {}
 
-#[cfg(target_os = "macos")]
 pub use macos::Updater;
 
-/// Other platforms have no updater; the menu item is omitted with it.
-#[cfg(not(target_os = "macos"))]
-pub struct Updater;
-
-#[cfg(not(target_os = "macos"))]
-impl Updater {
-    pub fn init() -> Option<Self> {
-        None
-    }
-
-    pub fn check_for_updates(&self) {}
-
-    pub fn relaunch_requests(&self) -> async_channel::Receiver<()> {
-        async_channel::unbounded().1
-    }
-
-    pub fn install_waiting(&self) -> bool {
-        false
-    }
-
-    pub fn install(&self) {}
-}
-
-#[cfg(target_os = "macos")]
 mod macos {
     use std::cell::RefCell;
     use std::ffi::{CStr, CString, c_char};

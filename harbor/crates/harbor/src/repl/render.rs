@@ -82,8 +82,7 @@ impl Default for RenderOpts {
             max_rows: 40,
             null: "NULL".into(),
             timer: false,
-            // Detected once here rather than per cell; overridden by the CLI,
-            // and false in tests so expectations stay byte-exact.
+            // Read once here rather than per cell.
             tty: std::io::IsTerminal::is_terminal(&std::io::stdout()),
         }
     }
@@ -204,11 +203,7 @@ impl<'a> Renderer<'a> {
         match self.opts.mode {
             Mode::Trash => {}
             Mode::Csv => {
-                let line = values
-                    .iter()
-                    .map(|v| csv_cell_for(&self.render(v), self.opts.tty))
-                    .collect::<Vec<_>>()
-                    .join(",");
+                let line = values.iter().map(|v| self.csv_field(v)).collect::<Vec<_>>().join(",");
                 self.emit(format_args!("{line}\n"));
             }
             Mode::JsonLines => {
@@ -237,7 +232,7 @@ impl<'a> Renderer<'a> {
                     .enumerate()
                     .map(|(i, (c, v))| {
                         let pad = " ".repeat(w.saturating_sub(display_width(c)));
-                        format!("{pad}{} = {}", shown_safe(c), shown_safe(&self.shown(i, v)))
+                        format!("{pad}{} = {}", boxed_safe(c), boxed_safe(&self.shown(i, v)))
                     })
                     .collect();
                 self.emit(format_args!("{}\n\n", lines.join("\n")));
@@ -246,23 +241,23 @@ impl<'a> Renderer<'a> {
                 let line = values
                     .iter()
                     .enumerate()
-                    .map(|(i, v)| shown_safe(&self.shown(i, v)))
+                    .map(|(i, v)| boxed_safe(&self.shown(i, v)))
                     .collect::<Vec<_>>()
                     .join("|");
                 self.emit(format_args!("{line}\n"));
             }
             Mode::Duckbox | Mode::Duckboxy | Mode::Markdown => {
-                // boxed_safe: a value with an embedded newline/tab must not
-                // shatter the frame; escape it for display only. A plan is
-                // the one value whose newlines are its content: it is kept
-                // whole here and printed as text at `end`, never boxed.
-                let plan = self.is_plan();
+                // A value with an embedded newline or tab must not shatter
+                // the frame; it is escaped for display only. A plan is the
+                // one value whose newlines are its content: it is kept whole
+                // here and printed as text at `end`, never boxed.
+                let plan = wire::plan::is_plan(&self.columns);
                 let cells: Vec<String> = values
                     .iter()
                     .enumerate()
                     .map(|(i, v)| {
                         let s = self.shown(i, v);
-                        if plan { plan_safe(&s) } else { boxed_safe(&s) }
+                        if plan { plan_safe(&s) } else { self.framed(&s) }
                     })
                     .collect();
                 if self.head.len() < self.opts.max_rows {
@@ -282,9 +277,9 @@ impl<'a> Renderer<'a> {
         // `\n`s cut off at the column edge. The boxed modes print it as the
         // engine drew it, the way DuckDB's own shell does, and say nothing
         // after it: a row count means nothing for a plan.
-        if self.is_plan() && !self.opts.mode.is_streaming() {
+        if wire::plan::is_plan(&self.columns) && !self.opts.mode.is_streaming() {
             let rows: Vec<Vec<String>> = std::mem::take(&mut self.head);
-            if let Some(text) = plan_text(&self.columns, &rows) {
+            if let Some(text) = wire::plan::text(&rows) {
                 let fenced = self.opts.mode == Mode::Markdown;
                 let width = text.lines().map(display_width).max().unwrap_or(0);
                 let out = if fenced {
@@ -294,12 +289,18 @@ impl<'a> Renderer<'a> {
                 } else {
                     text
                 };
-                deliver(out, width);
-                return match self.broken {
-                    None => Ok(()),
-                    Some(kind) => Err(kind.into()),
-                };
+                return deliver(out, width);
             }
+        }
+        // A statement that makes or changes the schema answers a `Count`
+        // column and no rows. The boxed modes print nothing for it, as
+        // DuckDB's shell does: an empty frame and "0 rows" say nothing.
+        let ddl = row_count == 0 && self.columns == ["Count"] && self.types == ["bigint"];
+        if ddl && !self.opts.mode.is_streaming() {
+            if self.opts.timer {
+                eprintln!("Run Time: server {time_ms} ms, wall {wall_ms} ms");
+            }
+            return Ok(());
         }
         match self.opts.mode {
             Mode::Json => self.emit(format_args!("\n]\n")),
@@ -316,11 +317,23 @@ impl<'a> Renderer<'a> {
         if self.opts.timer {
             eprintln!("Run Time: server {time_ms} ms, wall {wall_ms} ms");
         } else if !self.opts.mode.is_streaming() {
-            eprintln!("{row_count} rows ({time_ms} ms)");
+            let rows = if row_count == 1 { "row" } else { "rows" };
+            eprintln!("{row_count} {rows} ({time_ms} ms)");
         }
         match self.broken {
             None => Ok(()),
             Some(kind) => Err(kind.into()),
+        }
+    }
+
+    /// A program reads csv, so a SQL NULL is an empty field and an empty
+    /// string is `""`, as DuckDB's COPY writes them: NULL, '' and 'NULL'
+    /// stay three values. `.nullvalue` is for the display modes.
+    fn csv_field(&self, v: &Value) -> String {
+        match v {
+            Value::Null => String::new(),
+            Value::String(s) if s.is_empty() => "\"\"".to_string(),
+            v => csv_cell_for(&self.render(v), self.opts.tty),
         }
     }
 
@@ -335,21 +348,11 @@ impl<'a> Renderer<'a> {
     /// A cell as a display mode shows it. A column the wire encodes as JSON
     /// (a VARIANT) holds JSON text in each cell; when that text is a JSON
     /// string, the table shows the string's content — `L2605106156`, not
-    /// `"L2605106156"` — the way a VARCHAR column has always shown a string.
-    /// A number, a boolean, a null, an object or an array keeps its JSON
-    /// text, so 42 and "42" print alike here, as they do from a VARCHAR;
-    /// csv and json stay raw and keep them apart. A SQL NULL is still the
-    /// NULL marker, and text that is not JSON shows as it came.
-    /// Whether this result is an EXPLAIN: exactly the two text columns the
-    /// engine names `explain_key` and `explain_value`, which nothing else
-    /// produces. The client never sees the statement, only its schema, and
-    /// the schema is signature enough.
-    fn is_plan(&self) -> bool {
-        self.columns.len() == 2
-            && self.columns[0].eq_ignore_ascii_case("explain_key")
-            && self.columns[1].eq_ignore_ascii_case("explain_value")
-    }
-
+    /// `"L2605106156"` — the way a VARCHAR column shows a string. A number,
+    /// a boolean, a null, an object or an array keeps its JSON text, so 42
+    /// and "42" print alike here, as they do from a VARCHAR; csv and json
+    /// stay raw and keep them apart. A SQL NULL is the NULL marker, and text
+    /// that is not JSON shows as it came.
     fn shown(&self, i: usize, v: &Value) -> String {
         if self.cells.get(i) == Some(&Cell::Variant)
             && let Value::String(s) = v
@@ -358,6 +361,16 @@ impl<'a> Renderer<'a> {
             return text;
         }
         self.render(v)
+    }
+
+    /// Text as it sits inside a frame: control characters escaped, and in
+    /// markdown a `|`, which would end the cell, escaped as `\|`.
+    fn framed(&self, s: &str) -> String {
+        let safe = boxed_safe(s);
+        match self.opts.mode == Mode::Markdown && safe.contains('|') {
+            true => safe.replace('|', "\\|"),
+            false => safe,
+        }
     }
 
     /// The boxed layout. Rows shown: all of head when nothing spilled, else
@@ -376,11 +389,12 @@ impl<'a> Renderer<'a> {
 
         // Column widths from what will be shown: natural when the frame fits
         // the terminal, else the widest columns shrink first (fit_widths, to a
-        // floor of MAX_COL); values truncate only to their column's width.
-        let ncols = self.columns.len();
+        // floor of COL_FLOOR); values truncate only to their column's width.
+        let cols: Vec<String> = self.columns.iter().map(|c| self.framed(c)).collect();
+        let ncols = cols.len();
         let mut widths: Vec<usize> = (0..ncols)
             .map(|i| {
-                let mut w = display_width(&self.columns[i]);
+                let mut w = display_width(&cols[i]);
                 if g.type_row {
                     w = w.max(display_width(&self.types[i]));
                 }
@@ -440,7 +454,6 @@ impl<'a> Renderer<'a> {
         };
 
         rule(g.tl, g.tm, g.tr, &mut out);
-        let cols: Vec<String> = self.columns.iter().map(|c| boxed_safe(c)).collect();
         cells_line(&|i| cols[i].clone(), true, &mut out);
         if g.type_row {
             cells_line(&|i| self.types[i].clone(), false, &mut out);
@@ -477,14 +490,17 @@ impl<'a> Renderer<'a> {
         // on that so the box doesn't soft-wrap and shatter.
         let frame_width =
             2 + idx.iter().map(|o| colw(o) + 2).sum::<usize>() + idx.len().saturating_sub(1);
-        deliver(out, frame_width);
+        if let Err(e) = deliver(out, frame_width) {
+            self.broken.get_or_insert(e.kind());
+        }
     }
 }
 
 /// Boxed output taller OR wider than the terminal pages through $PAGER (default
 /// `less -SRFX`: -S no-wrap so a wide box scrolls horizontally instead of
-/// shattering, -F quit-if-one-screen). Streaming modes never page.
-fn deliver(out: String, width: usize) {
+/// shattering, -F quit-if-one-screen). Streaming modes never page. A failed
+/// write to stdout is returned, a closed pipe among them.
+fn deliver(out: String, width: usize) -> std::io::Result<()> {
     let (term_w, term_h) = match crossterm::terminal::size() {
         Ok((w, h)) if h > 0 => (w as usize, h as usize),
         _ => (0, 40), // unknown size (odd pty): guess height, don't force width paging
@@ -505,12 +521,13 @@ fn deliver(out: String, width: usize) {
                     let _ = stdin.write_all(out.as_bytes());
                 }
                 let _ = c.wait();
-                return;
+                return Ok(());
             }
         }
     }
-    print!("{out}");
-    let _ = std::io::stdout().flush();
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(out.as_bytes())?;
+    stdout.flush()
 }
 
 struct Glyphs {
@@ -550,7 +567,11 @@ fn terminal_width() -> usize {
 
 /// The floor a column shrinks to before pruning takes over — and, on a narrow
 /// terminal, the effective cap a wide value is cut back to.
-const MAX_COL: usize = 40;
+const COL_FLOOR: usize = 40;
+/// The " │ " between two cells.
+const GAP: usize = 3;
+/// The outer borders and their padding.
+const EDGES: usize = 4;
 
 /// Cut a spilled result down to the two halves it shows, in place: `head`
 /// becomes the first rows and `tail` the last. The ring holds only rows past
@@ -570,10 +591,8 @@ fn halves(head: &mut Vec<Vec<String>>, tail: &mut Vec<Vec<String>>, max_rows: us
 /// Fit natural column widths to the terminal. A frame that fits keeps every
 /// column at its natural width; one that doesn't shrinks the widest columns
 /// first — all ties together, down to the runner-up level — never below
-/// MAX_COL. Whatever still cannot fit at the floor is plan_columns's problem.
+/// COL_FLOOR. Whatever still cannot fit at the floor is plan_columns's problem.
 fn fit_widths(widths: &mut [usize], term_w: usize) {
-    const GAP: usize = 3; // " │ " between cells
-    const EDGES: usize = 4; // the outer borders and their padding
     let budget = term_w.saturating_sub(EDGES + widths.len().saturating_sub(1) * GAP);
     loop {
         let total: usize = widths.iter().sum();
@@ -581,12 +600,12 @@ fn fit_widths(widths: &mut [usize], term_w: usize) {
             return;
         }
         let mx = widths.iter().copied().max().unwrap_or(0);
-        if mx <= MAX_COL {
+        if mx <= COL_FLOOR {
             return;
         }
         let at_max = widths.iter().filter(|&&w| w == mx).count();
         let next = widths.iter().copied().filter(|&w| w < mx).max().unwrap_or(0);
-        let target = next.max(MAX_COL).max(mx.saturating_sub((total - budget).div_ceil(at_max)));
+        let target = next.max(COL_FLOOR).max(mx.saturating_sub((total - budget).div_ceil(at_max)));
         for w in widths.iter_mut() {
             if *w == mx {
                 *w = target;
@@ -599,8 +618,6 @@ fn fit_widths(widths: &mut [usize], term_w: usize) {
 /// left…right selection with `None` marking the "…" elision column.
 /// Growth alternates sides from 1+1 until the next column would not fit.
 fn plan_columns(widths: &[usize], term_w: usize) -> Vec<Option<usize>> {
-    const GAP: usize = 3; // " │ " between cells
-    const EDGES: usize = 4; // the outer borders and their padding
     const ELLIPSIS: usize = 3; // the "…" column: 1 wide plus its padding
     let ncols = widths.len();
     let fits = |ws: &[usize], pruned: bool| {
@@ -665,14 +682,6 @@ fn truncate(s: &str, w: usize) -> String {
     out
 }
 
-/// Control characters in a value shown at a terminal are the terminal's
-/// instructions, not the value's content. `boxed_safe` is this with the frame
-/// as its reason; this is the same rule for the unframed display modes, where
-/// the reason is only that a value must not be able to drive the terminal.
-fn shown_safe(s: &str) -> String {
-    boxed_safe(s)
-}
-
 /// A plan's text as the terminal may see it: its newlines and tabs are its
 /// layout and stay, every other control character is shown escaped, the
 /// same rule as `boxed_safe` for everything the frame is not the reason for.
@@ -688,37 +697,6 @@ fn plan_safe(s: &str) -> String {
             c => c.to_string(),
         })
         .collect()
-}
-
-/// The text an EXPLAIN result prints as: each plan verbatim, ending in a
-/// newline. One plan prints bare, as DuckDB's shell prints it. Several — the
-/// logical and physical plans under `explain_output = 'all'`, or an analyzed
-/// plan beside its physical one — each get a one-line label in the shell's
-/// words, since the drawings do not say which is which. None when the rows
-/// are not plans.
-fn plan_text(columns: &[String], rows: &[Vec<String>]) -> Option<String> {
-    if columns.len() != 2 || rows.is_empty() || rows.iter().any(|r| r.len() != 2) {
-        return None;
-    }
-    let mut out = String::new();
-    for row in rows {
-        if rows.len() > 1 {
-            let label = match row[0].as_str() {
-                "logical_plan" => "Unoptimized Logical Plan",
-                "logical_opt" => "Optimized Logical Plan",
-                "physical_plan" => "Physical Plan",
-                "analyzed_plan" => "Analyzed Plan",
-                other => other,
-            };
-            out.push_str(label);
-            out.push('\n');
-        }
-        out.push_str(&row[1]);
-        if !row[1].ends_with('\n') {
-            out.push('\n');
-        }
-    }
-    Some(out)
 }
 
 /// What a character of a plan drawing is, as the engine's tree renderer
@@ -983,7 +961,9 @@ fn plan_colored(text: &str) -> String {
     out
 }
 
-/// Control characters would shatter the boxed frame; show them escaped.
+/// Control characters in a value shown at a terminal are the terminal's
+/// instructions, not the value's content, and in a frame they would shatter
+/// it: every display mode shows them escaped.
 fn boxed_safe(s: &str) -> String {
     if !s.chars().any(|c| c.is_control()) {
         return s.to_string();
@@ -1123,6 +1103,24 @@ mod tests {
     }
 
     #[test]
+    fn csv_tells_null_from_empty_from_the_word() {
+        let opts = RenderOpts { mode: Mode::Csv, null: "(null)".into(), tty: false, ..Default::default() };
+        let r = Renderer::new(&opts);
+        assert_eq!(r.csv_field(&Value::Null), "");
+        assert_eq!(r.csv_field(&json!("")), "\"\"");
+        assert_eq!(r.csv_field(&json!("NULL")), "NULL");
+        assert_eq!(r.csv_field(&json!(1)), "1");
+    }
+
+    #[test]
+    fn markdown_escapes_a_bar_inside_a_cell() {
+        let markdown = RenderOpts { mode: Mode::Markdown, ..Default::default() };
+        assert_eq!(Renderer::new(&markdown).framed("a|b\nc"), "a\\|b\\nc");
+        let duckbox = RenderOpts { mode: Mode::Duckbox, ..Default::default() };
+        assert_eq!(Renderer::new(&duckbox).framed("a|b"), "a|b");
+    }
+
+    #[test]
     fn head_tail_retention_bounds_memory() {
         let opts = RenderOpts { max_rows: 4, ..Default::default() };
         let mut r = Renderer::new(&opts);
@@ -1142,13 +1140,12 @@ mod tests {
     #[test]
     fn display_modes_neutralize_control_characters() {
         let esc = "\u{1b}[31mRED\u{1b}[0m";
-        assert!(!shown_safe(esc).contains('\u{1b}'), "escape survived: {:?}", shown_safe(esc));
-        assert!(!boxed_safe(esc).contains('\u{1b}'));
+        assert!(!boxed_safe(esc).contains('\u{1b}'), "escape survived: {:?}", boxed_safe(esc));
         // Ordinary text is untouched, including multi-byte characters.
-        assert_eq!(shown_safe("plain あ"), "plain あ");
+        assert_eq!(boxed_safe("plain あ"), "plain あ");
         // The common whitespace escapes stay readable rather than becoming
         // replacement characters.
-        assert_eq!(shown_safe("a\nb\tc"), "a\\nb\\tc");
+        assert_eq!(boxed_safe("a\nb\tc"), "a\\nb\\tc");
     }
 
     #[test]
@@ -1204,7 +1201,7 @@ mod tests {
         assert_eq!(json_row(&cols, &flags, &[json!("{\"a\":[1,\"2\",null]}"), json!(null)]), r#"{"v":{"a":[1,"2",null]},"s":null}"#);
         assert_eq!(json_row(&cols, &flags, &[json!("null"), json!("null")]), r#"{"v":null,"s":"null"}"#);
         assert_eq!(json_row(&cols, &flags, &[json!("true"), json!(true)]), r#"{"v":true,"s":true}"#);
-        // a SQL NULL is null, as it always was
+        // a SQL NULL is null
         assert_eq!(json_row(&cols, &flags, &[Value::Null, Value::Null]), r#"{"v":null,"s":null}"#);
         // text that is not JSON stays a string: the object is never malformed
         assert_eq!(json_row(&cols, &flags, &[json!("not json"), json!("x")]), r#"{"v":"not json","s":"x"}"#);
@@ -1260,21 +1257,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plan_prints_whole_and_labels_only_a_set() {
-        let cols = vec!["explain_key".to_string(), "explain_value".to_string()];
-        let plan = "╭─ Projection ───╮\n│ Projections: a │\n╰────────────────╯".to_string();
-        let one = plan_text(&cols, &[vec!["physical_plan".into(), plan.clone()]]).unwrap();
-        assert_eq!(one, format!("{plan}\n"));
-        let two = plan_text(
-            &cols,
-            &[vec!["logical_opt".into(), "L".into()], vec!["physical_plan".into(), "P\n".into()]],
-        )
-        .unwrap();
-        assert!(two.contains("Optimized Logical Plan"), "{two}");
-        assert!(two.contains("Physical Plan"), "{two}");
-        assert!(two.ends_with("P\n"), "{two}");
-        // Any other two-column result is a table, whatever it holds.
-        assert!(plan_text(&["k".to_string(), "v".to_string()], &[vec!["a".into(), "b\nc".into()]]).is_some());
+    fn a_plan_keeps_its_layout_and_nothing_else_that_drives_a_terminal() {
         assert_eq!(plan_safe("a\nb\tc\re\u{1b}"), "a\nb\tc\\re\u{FFFD}");
     }
 

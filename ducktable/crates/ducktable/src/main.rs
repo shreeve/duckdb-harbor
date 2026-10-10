@@ -105,15 +105,30 @@ pub struct RemoveRemoteDatabase {
 /// grammar: ↑/↓ pages within a table, ←/→ circles the tables (with
 /// rollover); views are ⌘1/⌘2/⌘3's job.
 fn step_table(delta: i32, cx: &mut App) {
-    let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) else {
-        return;
-    };
+    on_view_in(cx, move |this, window, cx| this.step_table(delta, window, cx));
+}
+
+/// The window's view, for App-level handlers (menus fire at App level when
+/// focus skips the view).
+fn app_view(cx: &App) -> Option<Entity<DuckTable>> {
+    cx.try_global::<AppView>().and_then(|v| v.0.upgrade())
+}
+
+/// Run `f` on the view on the next tick: a key or menu action arrives
+/// inside the window's own update, so the view is touched after it, never
+/// re-entrantly.
+fn on_view(cx: &mut App, f: impl FnOnce(&mut DuckTable, &mut Context<DuckTable>) + 'static) {
+    if let Some(view) = app_view(cx) {
+        cx.defer(move |cx| view.update(cx, f));
+    }
+}
+
+/// `on_view`, with the active window.
+fn on_view_in(cx: &mut App, f: impl FnOnce(&mut DuckTable, &mut Window, &mut Context<DuckTable>) + 'static) {
+    let Some(view) = app_view(cx) else { return };
     cx.defer(move |cx| {
         if let Some(w) = cx.active_window() {
-            w.update(cx, |_, window, cx| {
-                view.update(cx, |this, cx| this.step_table(delta, window, cx));
-            })
-            .ok();
+            w.update(cx, |_, window, cx| view.update(cx, |this, cx| f(this, window, cx))).ok();
         }
     });
 }
@@ -122,29 +137,16 @@ fn step_table(delta: i32, cx: &mut App) {
 /// focus. App-level registration makes native menu items work; the grid
 /// gate keeps the same shortcuts inert in Query, Structure, filters, and
 /// cell editors.
-fn run_row_action(
-    action: fn(&mut grid::Grid, &mut Window, &mut Context<grid::Grid>),
-    cx: &mut App,
-) {
-    let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) else {
-        return;
-    };
-    cx.defer(move |cx| {
-        let Some(active) = cx.active_window() else { return };
-        active
-            .update(cx, |_, window, cx| {
-                view.update(cx, |this, cx| {
-                    // Under the quit dialog no row is staged.
-                    if this.asking_to_quit {
-                        return;
-                    }
-                    let Some(grid) = this.grid.clone() else { return };
-                    if grid.read(cx).accepts_row_commands(window, cx) {
-                        grid.update(cx, |grid, cx| action(grid, window, cx));
-                    }
-                });
-            })
-            .ok();
+fn run_row_action(action: fn(&mut grid::Grid, &mut Window, &mut Context<grid::Grid>), cx: &mut App) {
+    on_view_in(cx, move |this, window, cx| {
+        // Under the quit dialog no row is staged.
+        if this.asking_to_quit {
+            return;
+        }
+        let Some(grid) = this.grid.clone() else { return };
+        if grid.read(cx).accepts_row_commands(window, cx) {
+            grid.update(cx, |grid, cx| action(grid, window, cx));
+        }
     });
 }
 
@@ -168,23 +170,15 @@ fn go_view(next: prefs::ViewMode, cx: &mut App) {
     prefs::toggle(cx, |p| p.view = next);
     // Landing on Data hands focus back to the table; landing on Query
     // hands it to the editor — the same symmetry (docs/QUERY.md).
-    if matches!(next, ViewMode::Data | ViewMode::Query)
-        && let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade())
-    {
-        cx.defer(move |cx| {
-            view.update(cx, |this, cx| {
-                match next {
-                    ViewMode::Data => {
-                        if let Some(grid) = &this.grid {
-                            grid.update(cx, |grid, cx| grid.request_focus(cx));
-                        }
-                    }
-                    ViewMode::Query => this.focus_query(cx),
-                    ViewMode::Structure => {}
-                }
-            });
-        });
-    }
+    on_view(cx, move |this, cx| match next {
+        ViewMode::Data => {
+            if let Some(grid) = &this.grid {
+                grid.update(cx, |grid, cx| grid.request_focus(cx));
+            }
+        }
+        ViewMode::Query => this.focus_query(cx),
+        ViewMode::Structure => {}
+    });
 }
 
 /// The one window's root view, for App-level action handlers that need
@@ -257,30 +251,41 @@ fn app_menus(can_update: bool) -> Vec<Menu> {
     ]
 }
 
-/// Quit, asking first when that would lose something (docs/EDITING.md,
-/// "Dialogs"): staged changes in any table, text in an open cell editor, a
-/// commit or a Query statement still in flight, a transaction open in the
-/// Query view. ⌘Q, the menu's Quit and the window's close button all come
-/// here, and so does the updater's Install and Relaunch, which quits too.
+/// Quit, or leave the connected database, stop a server or remove a saved
+/// remote, asking first when that would lose something (docs/EDITING.md,
+/// "Dialogs"): staged changes, text in an open cell editor, a commit or a
+/// Query statement still in flight, a transaction open in the Query view.
+/// ⌘Q, the menu's Quit and the window's close button all come here, and so
+/// does the updater's Install and Relaunch, which quits too; so do a row
+/// click, Open Database File or URL and a dropped file while another
+/// database is connected, and the sidebar's Stop and Remove Database.
 ///
 /// The dialog is the app's own, not the platform's alert, because Cancel
 /// has to be its default. Measured on the alert GPUI builds: a first button
 /// titled Cancel takes Esc and gives up Return, so the alert has no default,
 /// and GPUI seats the keyboard focus on the other button, where Space
-/// presses it. Here Return and Esc both go back, and the button that
-/// discards and quits is no tab stop, so the keyboard cannot reach it: it
-/// answers only to a click.
+/// presses it. Here Return and Esc both go back, and the button that goes
+/// ahead is no tab stop, so the keyboard cannot reach it: it answers only
+/// to a click.
 fn request_leave(leaving: app::Leaving, window: &mut Window, cx: &mut App) {
     use gpui_kit::component::WindowExt as _;
     use gpui_kit::component::button::{Button, ButtonVariants as _};
     use gpui_kit::component::dialog::{DialogClose, DialogFooter};
 
-    let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) else {
+    let Some(view) = app_view(cx) else {
         leave(leaving, cx);
         return;
     };
-    if view.read(cx).quit_risks(cx).question_for(leaving).is_none() {
-        leave(leaving, cx);
+    let quitting = matches!(leaving, app::Leaving::Quit | app::Leaving::Relaunch);
+    // Under the dialog no database is left: Cancel must find it as it was.
+    if !quitting && view.read(cx).asking_to_quit {
+        return;
+    }
+    if !view.update(cx, |this, cx| this.settle_before(&leaving, cx)) {
+        return;
+    }
+    if view.read(cx).risks(&leaving, cx).question_for(&leaving).is_none() {
+        go_ahead(&view, leaving, window, cx);
         return;
     }
     if view.read(cx).asking_to_quit {
@@ -291,18 +296,11 @@ fn request_leave(leaving: app::Leaving, window: &mut Window, cx: &mut App) {
         // What is at risk is read each time the dialog is drawn, not once
         // when it opened: a commit that settles under it has by then landed
         // or kept its edits, and the text follows.
-        let question = view.read(cx).quit_risks(cx).question_for(leaving).unwrap_or(match leaving {
-            app::Leaving::Quit => app::QuitQuestion {
-                message: "Quit DuckTable?".to_string(),
-                detail: "Nothing is left that quitting would lose.".to_string(),
-                confirm: "Quit",
-            },
-            app::Leaving::Relaunch => app::QuitQuestion {
-                message: "Install the update now?".to_string(),
-                detail: "Nothing is left that quitting would lose.".to_string(),
-                confirm: "Install",
-            },
-        });
+        let question = view
+            .read(cx)
+            .risks(&leaving, cx)
+            .question_for(&leaving)
+            .unwrap_or_else(|| leaving.plain_question());
         // Going back, by Return, Esc or the Cancel button.
         let stay = {
             let view = view.clone();
@@ -312,10 +310,14 @@ fn request_leave(leaving: app::Leaving, window: &mut Window, cx: &mut App) {
             }
         };
         let quit = {
-            let view = view.clone();
-            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                view.update(cx, |this, cx| this.release_for_quit(cx));
-                leave(leaving, cx);
+            let (view, leaving) = (view.clone(), leaving.clone());
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                // A quit takes the window with it; anything else goes on
+                // without the dialog.
+                if !quitting {
+                    window.close_dialog(cx);
+                }
+                go_ahead(&view, leaving.clone(), window, cx);
             }
         };
         dialog
@@ -341,8 +343,20 @@ fn request_leave(leaving: app::Leaving, window: &mut Window, cx: &mut App) {
     });
 }
 
+/// Do what was asked about, or needed no asking: end the app, or leave a
+/// database through the view. Ending the app gives back the window's
+/// sessions on the way out (`on_app_quit`), as every way out does; a
+/// relaunch with no update waiting ends nothing, and keeps them.
+fn go_ahead(view: &Entity<DuckTable>, leaving: app::Leaving, window: &mut Window, cx: &mut App) {
+    match leaving {
+        app::Leaving::Quit | app::Leaving::Relaunch => leave(leaving, cx),
+        leaving => view.update(cx, |this, cx| this.go_ahead(leaving, window, cx)),
+    }
+}
+
 /// End the app the way it was asked to: quit, or let the updater install
-/// and relaunch. With no update waiting, a relaunch has nothing to do.
+/// and relaunch. With no update waiting, a relaunch has nothing to do, and
+/// leaving a database is the view's (`go_ahead`).
 fn leave(leaving: app::Leaving, cx: &mut App) {
     match leaving {
         app::Leaving::Quit => cx.quit(),
@@ -351,12 +365,14 @@ fn leave(leaving: app::Leaving, cx: &mut App) {
                 updater.install();
             }
         }
+        _ => {}
     }
 }
 
-/// Ask through the window, from an App-level action or the updater.
-/// Deferred, like every action that touches the window: a key or menu
-/// action arrives inside the window's own update.
+/// Ask through the window, from an App-level action, the updater, or a
+/// view that cannot open the dialog from inside its own update. Deferred,
+/// like every action that touches the window: a key or menu action arrives
+/// inside the window's own update.
 fn leave_asking(leaving: app::Leaving, cx: &mut App) {
     cx.defer(move |cx| {
         let window = cx.active_window().or_else(|| cx.windows().first().copied());
@@ -373,9 +389,7 @@ fn leave_asking(leaving: app::Leaving, cx: &mut App) {
 /// work under it, and the actions that would replace the connected database
 /// check this first.
 fn asking_to_quit(cx: &App) -> bool {
-    cx.try_global::<AppView>()
-        .and_then(|v| v.0.upgrade())
-        .is_some_and(|view| view.read(cx).asking_to_quit)
+    app_view(cx).is_some_and(|view| view.read(cx).asking_to_quit)
 }
 
 /// The About dialog: native, version-stamped, with a link out.
@@ -447,26 +461,17 @@ impl Render for DuckTable {
             .size_full()
             .h_flex()
             .font_family(theme::ui_font())
-            .on_action(cx.listener(|_, _: &ToggleInspector, _, cx| {
-                prefs::toggle(cx, |p| p.inspector = !p.inspector);
-            }))
             // Drop a database file anywhere on the window: the same door
             // as File→Open. First path wins — a multi-file drop opening N
             // databases would be N-1 surprises.
             .on_drop(cx.listener(|this, dropped: &ExternalPaths, _, cx| {
                 if let Some(path) = dropped.paths().first().cloned() {
-                    this.open_path(path, cx);
+                    leave_asking(this.switch_to(app::Aim::File(path)), cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &FitColumns, _, cx| {
-                if let Some(grid) = &this.grid {
-                    grid.update(cx, |grid, cx| grid.fit_columns(cx));
-                }
-            }))
-            // The sidebar/content divider drags rightward from the
-            // classic fixed width — today's size is the floor, the
-            // divider only grants more room — and persists like the
-            // inspector's does.
+            // The sidebar/content divider drags rightward from its
+            // classic fixed width, the floor: the divider only grants more
+            // room. It persists like the inspector's does.
             .child(
                 gpui_kit::base::h_resizable("root-split")
                     .with_state(&self.sidebar_resize)
@@ -492,29 +497,23 @@ impl Render for DuckTable {
 /// named View, which also forces an icon column that indents its
 /// neighbors. This AppKit default, registered before the menu is built,
 /// turns the injection off; the green traffic light still fullscreens.
-#[cfg(target_os = "macos")]
-// The objc crate's macros probe cfg(cargo-clippy), which rustc now
-// flags; the allow keeps OUR build warning-clean without touching the
-// vendored macro.
-#[allow(unexpected_cfgs)]
 fn suppress_fullscreen_menu_item() {
-    use objc::runtime::{Object, NO};
-    use objc::{class, msg_send, sel, sel_impl};
+    use objc2::runtime::{AnyObject, Bool};
+    use objc2::{class, msg_send};
+    // SAFETY: Foundation's class methods, each called with the argument
+    // types its selector takes; the objects are autoreleased, and
+    // `registerDefaults:` copies what it is given.
     unsafe {
-        let key: *mut Object = msg_send![
-            class!(NSString),
-            stringWithUTF8String: c"NSFullScreenMenuItemEverywhere".as_ptr()
-        ];
-        let no: *mut Object = msg_send![class!(NSNumber), numberWithBool: NO];
-        let dict: *mut Object =
-            msg_send![class!(NSDictionary), dictionaryWithObject: no forKey: key];
-        let defaults: *mut Object = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let key: *mut AnyObject =
+            msg_send![class!(NSString), stringWithUTF8String: c"NSFullScreenMenuItemEverywhere".as_ptr()];
+        let no: *mut AnyObject = msg_send![class!(NSNumber), numberWithBool: Bool::NO];
+        let dict: *mut AnyObject = msg_send![class!(NSDictionary), dictionaryWithObject: no, forKey: key];
+        let defaults: *mut AnyObject = msg_send![class!(NSUserDefaults), standardUserDefaults];
         let _: () = msg_send![defaults, registerDefaults: dict];
     }
 }
 
 fn main() {
-    #[cfg(target_os = "macos")]
     suppress_fullscreen_menu_item();
     let app = gpui_kit::application().with_assets(Assets);
 
@@ -598,10 +597,8 @@ fn main() {
             KeyBinding::new("cmd-9", ToggleNullTags, None),
             KeyBinding::new("cmd-t", ToggleColumnCards, None),
         ]);
-        // File→Open: the platform picker, then app.open_path — the same
-        // door a drag-drop uses. .duckdb is what it speaks today; the
-        // open-anything dispatcher (CSV, Parquet, Sheets URLs…) grows on
-        // this trunk. The picker offers no extension filter (gpui's
+        // File→Open: the platform picker, then the same door a drag-drop
+        // uses (`Aim::File`). It opens a DuckDB file. The picker offers no extension filter (gpui's
         // PathPromptOptions has none), and none is enforced here: a wrong
         // file fails honestly in the connect card with harbor's own error.
         cx.on_action(|_: &OpenDatabase, cx| {
@@ -621,10 +618,9 @@ fn main() {
                     && let Some(path) = paths.pop()
                 {
                     cx.update(|cx| {
-                        if let Some(view) =
-                            cx.try_global::<AppView>().and_then(|v| v.0.upgrade())
-                        {
-                            view.update(cx, |this, cx| this.open_path(path, cx));
+                        if let Some(view) = app_view(cx) {
+                            let leaving = view.read(cx).switch_to(app::Aim::File(path));
+                            leave_asking(leaving, cx);
                         }
                     });
                 }
@@ -644,59 +640,29 @@ fn main() {
                 }
             });
         });
-        // Right-click → Stop. Reaches the view through AppView (the menu
-        // fires at App level) and defers, the FitColumns pattern — a menu
-        // action arrives inside the window's update, so the view is touched
-        // on the next tick, not re-entrantly.
+        // Right-click → Stop and Remove Database ask first when the
+        // database holds something to lose (`request_leave`).
         cx.on_action(|a: &StopBerth, cx| {
-            let name = a.name.clone();
-            let path = a.path.clone();
-            if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
-                cx.defer(move |cx| {
-                    view.update(cx, |this, cx| this.stop_berth(name, path, cx));
-                });
-            }
+            leave_asking(app::Leaving::Stop { name: a.name.clone(), path: a.path.clone() }, cx);
         });
         cx.on_action(|a: &StartBerth, cx| {
             let path = a.path.clone();
-            if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
-                cx.defer(move |cx| {
-                    view.update(cx, |this, cx| this.start_berth(path, cx));
-                });
-            }
+            on_view(cx, move |this, cx| this.start_berth(path, cx));
         });
         cx.on_action(|a: &AttachBerth, cx| {
             let path = a.path.clone();
-            if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
-                cx.defer(move |cx| {
-                    view.update(cx, |this, cx| this.attach_berth(path, cx));
-                });
-            }
+            on_view(cx, move |this, cx| this.attach_berth(path, cx));
         });
         cx.on_action(|a: &DetachBerth, cx| {
             let path = a.path.clone();
-            if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
-                cx.defer(move |cx| {
-                    view.update(cx, |this, cx| this.detach_berth(path, cx));
-                });
-            }
+            on_view(cx, move |this, cx| this.detach_berth(path, cx));
         });
         cx.on_action(|a: &ToggleAutostart, cx| {
-            let path = a.path.clone();
-            let on = a.on;
-            if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
-                cx.defer(move |cx| {
-                    view.update(cx, |this, cx| this.toggle_autostart(path, on, cx));
-                });
-            }
+            let (path, on) = (a.path.clone(), a.on);
+            on_view(cx, move |this, cx| this.toggle_autostart(path, on, cx));
         });
         cx.on_action(|a: &RemoveRemoteDatabase, cx| {
-            let name = a.name.clone();
-            if let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) {
-                cx.defer(move |cx| {
-                    view.update(cx, |this, cx| this.remove_remote_database(name, cx));
-                });
-            }
+            leave_asking(app::Leaving::Remove { name: a.name.clone() }, cx);
         });
         cx.on_action(|_: &TablePrev, cx| step_table(-1, cx));
         cx.on_action(|_: &TableNext, cx| step_table(1, cx));
@@ -710,14 +676,7 @@ fn main() {
         // One command behind both the View menu and Cmd+R. The sidebar
         // glyph calls the same refresh_tables method directly from its
         // DuckTable context, so every entrance has identical semantics.
-        cx.on_action(|_: &RefreshTables, cx| {
-            let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) else {
-                return;
-            };
-            cx.defer(move |cx| {
-                view.update(cx, |this, cx| this.refresh_tables(cx));
-            });
-        });
+        cx.on_action(|_: &RefreshTables, cx| on_view(cx, |this, cx| this.refresh_tables(cx)));
         cx.on_action(|_: &ToggleFullScreen, cx| {
             cx.defer(|cx| {
                 if let Some(w) = cx.active_window() {
@@ -753,9 +712,8 @@ fn main() {
         // The sidebar picker dispatches this into the window; it lands
         // here, the way the zoom and view actions do.
         cx.on_action(|a: &SetTheme, cx| theme::select(a.ix, cx));
-        // Global fallback so the menu item validates and works; the
-        // view-scoped listener handles the keyboard path first and a
-        // handled action never reaches here (no double toggle).
+        // Global, like every app-wide action: the menu item validates by
+        // it, and the key reaches it from wherever focus is.
         cx.on_action(|_: &ToggleInspector, cx| {
             prefs::toggle(cx, |p| p.inspector = !p.inspector);
         });
@@ -776,25 +734,15 @@ fn main() {
         cx.on_action(|_: &ToggleColumnCards, cx| {
             prefs::toggle(cx, |p| p.column_cards = !p.column_cards);
         });
-        // FitColumns needs the window's grid, which this handler reaches
-        // through the app-view handle — directly, never by re-dispatching
-        // into the window. A re-dispatch here once looped forever: with
-        // focus in a text input the window listener is off the dispatch
-        // path, so the action came straight back to this handler, which
-        // deferred it again, and Cmd-Shift-F pinned the main thread until
-        // force-quit. This handler both validates the menu item and does
-        // the work when the view-scoped listener was skipped (a handled
-        // dispatch never reaches here, so there is no double fit).
+        // FitColumns reaches the window's grid through the view, never by
+        // dispatching into the window again: with focus in a text input
+        // the window's listeners are off the dispatch path, so a dispatch
+        // would come straight back here, deferred again forever.
         cx.on_action(|_: &FitColumns, cx| {
-            let Some(view) = cx.try_global::<AppView>().and_then(|v| v.0.upgrade()) else {
-                return;
-            };
-            cx.defer(move |cx| {
-                view.update(cx, |this, cx| {
-                    if let Some(grid) = &this.grid {
-                        grid.update(cx, |grid, cx| grid.fit_columns(cx));
-                    }
-                });
+            on_view(cx, |this, cx| {
+                if let Some(grid) = &this.grid {
+                    grid.update(cx, |grid, cx| grid.fit_columns(cx));
+                }
             });
         });
         // Global, not view-scoped: menu items must work regardless of
@@ -822,7 +770,7 @@ fn main() {
         });
         gpui_kit::open_window(
             WindowOptions {
-                window_min_size: Some(size(px(720.), px(420.))),
+                window_min_size: Some(size(px(prefs::WINDOW_MIN.0), px(prefs::WINDOW_MIN.1))),
                 window_bounds: remembered,
                 ..Default::default()
             },
@@ -836,10 +784,8 @@ fn main() {
                 // question: with something to lose the window stays, and
                 // the dialog's answer decides.
                 window.on_window_should_close(cx, |window, cx| {
-                    let at_risk = cx
-                        .try_global::<AppView>()
-                        .and_then(|v| v.0.upgrade())
-                        .is_some_and(|view| view.read(cx).quit_risks(cx).question().is_some());
+                    let at_risk =
+                        app_view(cx).is_some_and(|view| view.read(cx).quit_risks(cx).question().is_some());
                     if at_risk {
                         request_leave(app::Leaving::Quit, window, cx);
                     }
@@ -853,13 +799,17 @@ fn main() {
                     // the outer frame's: macOS restores through
                     // initWithContentRect, so an outer-frame size
                     // would regrow by one titlebar every launch.
-                    cx.observe_window_bounds(window, |_, window, cx| {
+                    // A drag fires many times a second, so the frame is
+                    // kept in memory at once and written once the window
+                    // has been still a moment, or at quit (`on_app_quit`).
+                    let moves = std::rc::Rc::new(std::cell::Cell::new(0u64));
+                    cx.observe_window_bounds(window, move |_, window, cx| {
                         if window.is_fullscreen() {
                             return;
                         }
                         let origin = window.bounds().origin;
                         let content = window.viewport_size();
-                        prefs::save(cx, |p| {
+                        prefs::remember(cx, |p| {
                             p.win = Some((
                                 f32::from(origin.x),
                                 f32::from(origin.y),
@@ -867,6 +817,16 @@ fn main() {
                                 f32::from(content.height),
                             ));
                         });
+                        let this_move = moves.get() + 1;
+                        moves.set(this_move);
+                        let moves = moves.clone();
+                        cx.spawn(async move |_, cx| {
+                            cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                            if moves.get() == this_move {
+                                cx.update(|cx| prefs::save(cx, |_| {}));
+                            }
+                        })
+                        .detach();
                     })
                     .detach();
                 });
