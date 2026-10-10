@@ -1780,14 +1780,10 @@ fn handle(req: Request, exec: Option<Executor>, log: bool) -> bool {
     // previous one's left on this worker thread.
     LAST_REASON.with(|c| c.set(""));
 
-    // One gate before any routing: the declared length. justhttp drains an
-    // undelivered body when a request is dropped — with a single
-    // `vec![0; remaining]` — and it does so for EVERY response path, 404s
-    // included. `take()` bounds what harbor buffers but not what the client
-    // may declare, and the declared length is attacker-chosen: a request
-    // declaring 1 GB and sending 9 bytes would cost a 1 GB zeroed
-    // allocation. Refusing here, before anything else can respond, means the
-    // allocation never happens on any path.
+    // One gate before any routing: the declared length. A body declared
+    // over the limit is refused here, so no handler reads or buffers any of
+    // it, whatever route it names; what the client sends of it is discarded
+    // by justhttp's drain, which is bounded in time and memory.
     //
     // Every listener is machine-local: the unix socket is protected by its
     // 0700 runtime directory and TCP binds loopback only. Callers beyond this
