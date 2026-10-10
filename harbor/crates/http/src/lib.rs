@@ -6,13 +6,18 @@
 //! async stack would be pure weight. Beside the transport live the pieces
 //! both clients build on it: a failure that says whether the request left,
 //! sessions and the touch that keeps one alive, the anchor that keeps a
-//! summoned server present, and the summon itself.
+//! summoned server present, the summon itself, and finding and stopping the
+//! servers on this machine.
 
 mod chunked;
+#[cfg(unix)]
+mod local;
 mod session;
 #[cfg(unix)]
 mod summon;
 
+#[cfg(unix)]
+pub use local::{Found, discover, shutdown};
 pub use session::{keep_alive, session_open, session_release, session_renew, session_touch};
 #[cfg(unix)]
 pub use summon::summon;
