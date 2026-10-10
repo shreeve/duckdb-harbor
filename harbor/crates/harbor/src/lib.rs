@@ -1301,6 +1301,31 @@ pub fn tcp_port() -> Option<u16> {
 }
 
 pub fn stop() -> Result<String, String> {
+    stop_with(RUNNING.lock().unwrap())
+}
+
+/// Stop the server only if no client has connected since `accepted` had been
+/// accepted and none is connected now: a refcounted server's departure. The
+/// last look and the start of the stop are one step under the server's lock.
+/// `hide` takes the door out of reach before that look, so no client can find
+/// it while the server drains, and `show` puts it back when a client turned up
+/// after all, which then keeps the server.
+pub fn stop_if_idle(accepted: usize, hide: impl FnOnce(), show: impl FnOnce()) -> bool {
+    let running = RUNNING.lock().unwrap();
+    let idle = || connections() == Some((0, accepted));
+    if !idle() {
+        return false;
+    }
+    hide();
+    if !idle() {
+        show();
+        return false;
+    }
+    let _ = stop_with(running);
+    true
+}
+
+fn stop_with(mut running: std::sync::MutexGuard<'_, Option<Running>>) -> Result<String, String> {
     // Held for the whole of the shutdown, not just the take(). Releasing it
     // here — which `RUNNING.lock().unwrap().take()` as a statement does, since
     // the guard is a temporary — leaves a window in which RUNNING is None while
@@ -1308,7 +1333,6 @@ pub fn stop() -> Result<String, String> {
     // start() arriving in that window sees no server, takes whichever
     // connections happen to be back in the pool, and then fails to bind a port
     // the old listener has not released yet.
-    let mut running = RUNNING.lock().unwrap();
     let Some(r) = running.take() else {
         return Err("harbor is not serving".to_string());
     };
