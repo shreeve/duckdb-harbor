@@ -1306,19 +1306,11 @@ pub fn stop() -> Result<String, String> {
 
 /// Stop the server only if no client has connected since `accepted` had been
 /// accepted and none is connected now: a refcounted server's departure. The
-/// last look and the start of the stop are one step under the server's lock.
-/// `hide` takes the door out of reach before that look, so no client can find
-/// it while the server drains, and `show` puts it back when a client turned up
-/// after all, which then keeps the server.
-pub fn stop_if_idle(accepted: usize, hide: impl FnOnce(), show: impl FnOnce()) -> bool {
+/// last look and the start of the stop are one step under the server's lock,
+/// so a client that arrived since the host last looked keeps the server.
+pub fn stop_if_idle(accepted: usize) -> bool {
     let running = RUNNING.lock().unwrap();
-    let idle = || connections() == Some((0, accepted));
-    if !idle() {
-        return false;
-    }
-    hide();
-    if !idle() {
-        show();
+    if connections() != Some((0, accepted)) {
         return false;
     }
     let _ = stop_with(running);

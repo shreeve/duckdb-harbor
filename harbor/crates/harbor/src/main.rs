@@ -942,11 +942,6 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool, background: bool) -> R
         let linger = std::env::var("HARBOR_LINGER_MS")
             .ok().and_then(|v| v.parse().ok())
             .map_or(Duration::from_secs(3), Duration::from_millis);
-        // While it leaves, the socket is renamed aside, so a client that
-        // arrives finds no server rather than one that will not answer; a
-        // client that connected in the last moment is still counted, and
-        // the socket goes back.
-        let (sock, aside) = (sock_path.clone(), sock_path.with_extension("leaving"));
         std::thread::spawn(move || {
             // Since when nobody has been connected, and how many had been
             // accepted then.
@@ -965,11 +960,7 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool, background: bool) -> R
                         }
                         let allowed = if accepted > 0 { linger } else { startup };
                         if quiet.is_some_and(|(since, _)| since.elapsed() >= allowed)
-                            && harbor::stop_if_idle(
-                                accepted,
-                                || drop(std::fs::rename(&sock, &aside)),
-                                || drop(std::fs::rename(&aside, &sock)),
-                            )
+                            && harbor::stop_if_idle(accepted)
                         {
                             eprintln!("harbor: no clients — leaving");
                             break;
@@ -985,9 +976,7 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool, background: bool) -> R
     // departure finishes drain + CHECKPOINT.
     let farewell = harbor::wait()?;
     #[cfg(unix)]
-    for path in [sock_path.clone(), sock_path.with_extension("leaving")] {
-        let _ = std::fs::remove_file(path);
-    }
+    let _ = std::fs::remove_file(&sock_path);
     eprintln!("harbor: {} closed ({farewell})", harbor_common::paths::display_path(&canon));
     Ok(())
 }
