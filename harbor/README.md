@@ -35,7 +35,7 @@ The library is DuckDB — all of it, one dynamic library, vanilla, compiled and
 shipped by the DuckDB team. We never patch it, fork it, or wrap it in
 bindings. Version hop = swap the file.
 
-The binary is harbor: one 2.2MB executable that is both sides of the
+The binary is harbor: one small executable that is both sides of the
 conversation. As a server it loads libduckdb and serves your database over
 HTTP, on a Unix socket or TCP. As a client it connects to any harbor and
 gives you a modern shell — syntax highlighting, completion, history — in
@@ -55,8 +55,7 @@ another harbor.
 `harbor` by itself shows what's being served.
 
 Zero-config by default. No drivers, no ORM, no fleet manager. Built directly
-on DuckDB's new v2 C API — the API of the 2.0 line — so it's smaller, faster,
-and simpler than everything it replaces.
+on DuckDB's v2 C API, the API of the 2.0 line.
 
 If it can speak HTTP and parse JSON, it can query your database.
 
@@ -75,10 +74,10 @@ One `schema` message, one `row` per row, one `end`. Rows go out as DuckDB
 produces them, so a client can start on row one while the server is still
 producing the last one.
 
-Nine routes. That is the whole surface — two of them for queries, three so a
-transaction can outlive one request, one to stop a statement that is running,
-one to read the schema without asking five questions, one that says who a
-server is, and one graceful shutdown route:
+Ten routes. That is the whole surface — one to run a statement and one to ask
+whether a server can, four so a transaction can outlive one request, one to
+stop a statement that is running, one to read the schema without asking five
+questions, one that says who a server is, and one graceful shutdown route:
 
 ```
 GET  /ready                can this server answer a query?
@@ -99,7 +98,7 @@ POST /sql/sessions/<id>/renew  keep a session alive, running nothing
 DELETE /sql/queries/<id>   stop a statement the caller named when it sent it
 ```
 
-Three alias spellings stay served beside the canonical routes:
+Three alias spellings are served beside the canonical routes:
 `POST /sql/sessions/new`, `GET /sessions`, and `DELETE /shutdown`.
 
 `POST /sql` streams by default. Send `Accept: application/json` and the same
@@ -124,11 +123,11 @@ The one thing one-shot does better: since nothing has been sent when the last
 row lands, a failure is still a real status code. The same query that streams a
 `200` with an `{"type":"error"}` line at the end answers `400` in this shape.
 
-The stream compresses on request — `Accept-Encoding: zstd`, the standard
-coding browsers, newer curl, and Node/Bun offer on their own. The wrapped
-bytes are the identical NDJSON: a 5M-row integer result measures 161MB
-plain and 1.1MB as zstd, and when the query does any real work the
-compression rides the writer thread for free. Anything else — gzip
+The stream compresses on request — `Accept-Encoding: zstd`, which browsers,
+Node and Bun send on their own and `curl --compressed` sends when curl has
+zstd. The wrapped bytes are the identical NDJSON: a 5M-row integer result
+measures 169 MB plain and 1.1 MB as zstd, and when the query does any real
+work the compression rides the writer thread for free. Anything else — gzip
 included, its encoder would throttle the stream — gets identity, and
 `curl -H 'Accept-Encoding: zstd' ... | zstd -d` recovers the stream
 byte-for-byte.
@@ -167,9 +166,10 @@ be over.
 
 The id is chosen by the caller rather than issued by harbor, and it has to be:
 the response does not begin until the statement is streaming or done, so an id
-in the reply would arrive too late to be any use. It is refused with a `409`
-while a statement of that name is already running, so two live queries can
-never share one name and make a cancel a coin flip.
+in the reply would arrive too late to be any use. It is a non-empty string of
+at most 128 characters, and it is refused with a `409` while a statement of
+that name is already running, so two live queries can never share one name and
+make a cancel a coin flip.
 
 **A deadline is the backstop.** `{"timeoutMs": N}` on a request, or
 `HARBOR_STATEMENT_TIMEOUT_MS` for a whole deployment, stops a statement without
@@ -177,8 +177,8 @@ anyone having to ask. There is no default, deliberately: harbor streams
 300,000-row results and is used for queries that take minutes on purpose, so a
 default deadline would break correct programs to catch incorrect ones. With no
 deployment cap, zero on a request means no limit. When a deployment cap is set,
-it is a hard ceiling: a request may ask for less time, but neither a larger value
-nor zero can opt out of the operator's limit.
+it is a hard ceiling: a request may ask for less time, but neither a larger
+value nor zero can opt out of the operator's limit.
 
 Explicit cancellation remains reachable when every executor is inside a long
 statement: after sustained saturation, a connection-free probe lane accepts
@@ -189,15 +189,14 @@ client disappears. If a deployment's worry is runaway queries rather than
 impatient users, set `HARBOR_STATEMENT_TIMEOUT_MS` or
 `--statement-timeout <duration>`.
 
-A client that goes away while its rows are being written has its statement
-interrupted without asking, on a pooled connection: the write to it fails and
-nobody is left to read the rest. That is noticed at a write. A statement
-still computing in silence, with no rows out yet, runs until it has some to
-send, so a deadline remains the backstop for a client that vanishes. In a
-session a statement cut short this way ends at its next flush and leaves its
-transaction aborted, as a cancel does: a transaction with a statement missing
-does not commit. A result small enough to have been sent whole before the
-client left was not cut short, and its transaction stands.
+A client that goes away has its statement stopped without asking. The server
+watches the connection while a statement computes and while its rows are
+written, and a client that closes it, resets it or shuts down its sending side
+has its statement cancelled, in the minutes a plan computes before its first
+row as well as mid-stream. In a session a statement cut short this way leaves
+its transaction aborted, as a cancel does: a transaction with a statement
+missing does not commit. A result small enough to have been sent whole before
+the client left was not cut short, and its transaction stands.
 
 Two smaller things follow from the same machinery. Releasing a session whose
 statement is still running stops it — `{"released":false,"cancelling":true}`
@@ -288,18 +287,18 @@ statement, it waits for no worker and is answered while a statement runs on
 the session, and it returns `{"renewed":true}`. A session that has idled out
 is gone even before it is reclaimed, and a renewal of it returns `404`.
 
-**Backup sessions renew their deadline.** Open one with `{"purpose":"backup"}`
-and require `"purpose":"backup"` in the response (older servers do not support
-this policy). Its `ttlMs` is a renewal window, default and maximum 60 seconds;
-`idleTtlMs` is zero. Send `POST /sql/sessions/<id>/renew` well before each deadline
-(the CLI uses 20-second intervals). Successful renewal returns `{"renewed":true}`
-and starts a fresh window, even while SQL is running. Heartbeats replace both
-the ordinary five-minute ceiling and the thirty-second statement-idle timeout.
-Expired or released leases return `404` and cannot be revived. `/sessions`
-reports `renewable` and `expiresInMs`.
-Renewals use the control path so a busy SQL worker cannot block them indefinitely.
-Custom shorter renewal windows must allow for network and scheduling delays,
-including up to five seconds before the control lane activates for forwarded
+**Backup sessions renew their deadline.** Open one with
+`{"purpose":"backup"}`; the response carries `"purpose":"backup"` when the
+session granted is one, and a client that depends on it checks. Its `ttlMs` is
+a renewal window, default and maximum 60 seconds; `idleTtlMs` is zero. Send
+`POST /sql/sessions/<id>/renew` well before each deadline (the CLI renews every
+20 seconds). A renewal returns `{"renewed":true}` and starts a fresh window,
+even while SQL is running, and the renewals take the place of both the
+five-minute ceiling and the thirty-second idle timeout. Expired or released
+leases return `404` and cannot be revived. `/sessions` reports `renewable` and
+`expiresInMs`. Renewals use the control path, so a busy SQL worker cannot block
+them indefinitely. A shorter window must allow for network and scheduling
+delays, including up to five seconds before the control lane takes forwarded
 lease work; the CLI uses the full 60-second window.
 
 **Expired sessions are reclaimed.** If a client disappears, its ordinary
@@ -414,10 +413,9 @@ An unknown style value is a loud `400`; unknown parameters pass.
 
 One binary, ready without configuration. The client half never touches DuckDB —
 the engine (`libduckdb`) loads on demand, only when this process is the one
-serving a file, so the same 2.2MB `harbor` is a pure protocol client on
-machines that never host a database. `make fetch-duckdb` pulls DuckDB's
-official artifacts into `~/.duckdb/cli/2.0.0/`, one of the places harbor
-looks at runtime; then:
+serving a file, so the same `harbor` is a pure protocol client on machines
+that never host a database. `make fetch-duckdb` puts an engine into
+`~/.duckdb/cli/2.0.0/`, one of the places harbor looks at runtime; then:
 
 ```console
 $ make fetch-duckdb            # libduckdb + duckdb CLI -> ~/.duckdb/cli/2.0.0/
@@ -430,26 +428,22 @@ mydata>
 `~/.duckdb`, then build and install `harbor` into `~/.local/bin`. No step
 needs root.
 
-The engine `fetch-duckdb` pulls is DuckDB's official nightly of the 2.0
-branch — the latest green build, which is a moving target by design. The
-release archives below bundle the engine they were built with, so a release
-is reproducible; a local fetch is deliberately current. The script refuses a
-library that lacks the v2 C API harbor binds, before it installs anything,
-since harbor would refuse it at dlopen.
+`make fetch-duckdb` installs the engine and the `duckdb` CLI of one build.
+`DUCKDB_LIB_BUILD` names the build. `latest`, the default, is DuckDB's nightly
+channel for the 2.0 branch: the latest green build, which moves by design and
+cannot be asked for an older one. Anything else is a DuckDB build by name —
+`DUCKDB_LIB_BUILD=alpha42289 make fetch-duckdb` for `v2.0.0-alpha42289` — and
+both binaries come from this repository's `engine-<build>` release, checked
+against its published checksums, with nothing taken from the channel; each
+must say it is the build asked for. An engine release is where a fixed build
+lives when the channel moves to one harbor cannot load. Either way the script
+refuses a library that lacks the v2 C API harbor binds, before it installs
+anything.
 
-`DUCKDB_LIB_BUILD` names the build of `libduckdb` to fetch. `latest`, the
-default, is the channel's current build. Anything else is a DuckDB build by
-name — `DUCKDB_LIB_BUILD=alpha42289 make fetch-duckdb` for
-`v2.0.0-alpha42289` — taken from the `engine-<build>` release of this
-repository, which holds that one library for each platform; the CLI and
-headers still come from the channel. The channel cannot serve a build by
-name, so an engine release is where a fixed one lives when the channel moves
-to an engine harbor cannot load — as it did when the v2 C API was reworked
-(duckdb/duckdb#25751). The script checks that the library it got says it is
-the build it was asked for. The repository variable of the same name sets the
-build for CI and the release builds; `latest`, or clearing it, returns to the
-channel. Set it locally to match while the variable names a build, or
-`make fetch-duckdb` refuses the channel's engine and installs nothing.
+The repository variable of the same name sets the build for CI and the release
+builds, and each release archive bundles the engine it was built and tested
+with. Fetch the build the variable names to test locally against the same
+engine.
 
 No toolchain? One command installs the latest release — it picks the right
 archive for the platform, verifies its sha256 against the published checksums,
@@ -504,13 +498,14 @@ with `sudo` in front of the whole command — the installer never escalates on
 its own. On Windows the binary lands in `%LOCALAPPDATA%\Programs\harbor\bin`,
 which the installer adds to your user `PATH`.
 
-Pin a version with `... | bash -s v0.32.1` (or `-Tag v0.32.1` on Windows). Each
-[release](https://github.com/shreeve/duckdb-harbor/releases)
-ships one self-contained archive per
-platform (osx-arm64, linux-amd64, linux-arm64, windows-amd64, windows-arm64):
-harbor and the exact DuckDB shared library it was tested against. Unix
-archives carry `bin/`, `lib/` and `install.sh`; Windows archives put
-`duckdb.dll` beside the executable and run in place.
+Pin a version with `... | bash -s v0.32.1`, or on Windows with
+`& ([scriptblock]::Create((irm .../install.ps1))) -Tag v0.32.1`, since a
+parameter cannot pass through `| iex`. Each
+[release](https://github.com/shreeve/duckdb-harbor/releases) ships one
+self-contained archive per platform (osx-arm64, linux-amd64, linux-arm64,
+windows-amd64, windows-arm64): harbor and the exact DuckDB shared library it
+was tested against. Unix archives carry `bin/`, `lib/` and `install.sh`;
+Windows archives put `duckdb.dll` beside the executable and run in place.
 
 On Windows, banners and fleet displays omit the `\\?\` prefix for readability.
 File access, configuration, and `/info` keep native canonical paths, including
@@ -528,29 +523,36 @@ is an alias for Invoke-WebRequest; call `curl.exe`.
 ### The two lifetimes
 
 **`harbor <db.duckdb>` — the server is everyone's.** On a terminal it is the
-REPL — highlighting, completion (Down on the live line or Ctrl-Space lists,
-Tab accepts; Up and Down are history everywhere else), the duckdb-shell dot
-commands. With `-c` or stdin it runs statements and exits; a dot command at
-the start of a line runs there as at the prompt, and one that fails — an
-unknown command, a bad argument, a `.read` of a file that is missing or whose
-statement fails — ends the script with exit 1, as a failed statement does.
-Either way, if nothing serves the file
-yet, a server is spawned behind the scenes: detached, refcounted, alive while
-anyone is connected. Every client holds one silent connection for its
-lifetime, so a human thinking at a prompt counts as presence; when the last
-client leaves, the server drains, `CHECKPOINT`s, sweeps its socket, and exits
-a few seconds later. A second `harbor` on the same file — any spelling of the
-same path — joins the same server instead of reporting "database is locked".
+REPL — highlighting, completion (Down on the live line or Ctrl-Space lists, Tab
+accepts; Up and Down are history everywhere else), the duckdb-shell dot
+commands. With `-c` or stdin it runs statements and exits; a dot command at the
+start of a line runs there as at the prompt, and one that fails — an unknown
+command, a bad argument, a `.read` of a file that is missing or whose statement
+fails — ends the script with exit 1, as a failed statement does. Either way, if
+nothing serves the file yet, a server is spawned behind the scenes: detached,
+refcounted, alive while anyone is connected. Every client holds one quiet
+connection for its lifetime, so a human thinking at a prompt counts as
+presence; when the last client leaves, the server drains, `CHECKPOINT`s, sweeps
+its socket, and exits a few seconds later. A second `harbor` on the same file —
+any spelling of the same path — joins the same server instead of reporting
+"database is locked".
 
 **`harbor <db.duckdb> start` — the server is yours.** No refcount: it lives
 until you stop it. At a terminal the server comes up in the background and
 `start` returns — under the database's login item when it has one, so the
 session manager owns it from the first second, otherwise as a detached
 process that `harbor <db> stop` ends. Headless, meaning stdin or stdout is
-not a terminal, it serves in place until `SIGTERM`, which is the shape launchd,
-systemd and a spawn want; `--foreground` asks for that shape at a terminal,
-to watch a server work. Either exit is clean — drain, `CHECKPOINT` so the
-next open never replays a WAL, socket swept.
+not a terminal, it serves in place until `SIGTERM`, which is the shape
+launchd, systemd and a spawn want; `--foreground` asks for that shape at a
+terminal, to watch a server work. `SIGINT` and `SIGHUP` stop it the same way,
+so a terminal or an ssh session that closes still folds the WAL, and on
+Windows Ctrl-C does. Every stop is clean — drain, `CHECKPOINT` so the next
+open never replays a WAL, socket swept.
+
+A server in the background, started by hand or on use, writes its output to
+`runtime/log/<basename>-<hash>.log` in the state directory, which starts over
+at a start once it has passed 1 MiB; a login item's server writes to
+`runtime/log/<name>.log`.
 
 **`harbor <db.duckdb> autostart` — the server is the session manager's.**
 harbor never becomes a supervisor; it hands exactly this `start` to one that
@@ -560,10 +562,9 @@ login, and again after a crash — never after a clean exit, so `stop` stays
 stopped until the next login and `restart` bounces it with a fresh read of
 its config. `autostart off` drops the login item and leaves a running server
 alone; `autostart off stop` takes both down. A login item runs a bare
-`start`, so its options are the `[connection.<name>]` entry in config.toml
-(`statement-timeout`, `memory-limit`, `workers`, `threads`, `init`), never
-flags. The verbs move two independent facts, the way `brew services` and
-`systemctl` do:
+`start`, so its options are the database's entry in
+[config.toml](#configtoml), never flags. The verbs move two independent
+facts, the way `brew services` and `systemctl` do:
 
 | You type             | Registered at login | Running now       |
 | -------------------- | ------------------- | ----------------- |
@@ -590,16 +591,9 @@ are typed. A server keeps those options beside its socket, in
 `/info`, which answers anyone who reaches its TCP door: an `--init` can hold
 a secret. Everything the start will read is read before anything stops, so a
 restart that cannot start refuses and leaves the server running: a config
-that will not load, a typed option that does not parse, or a server started
-by a harbor older than this one, which kept no record of its options. That
-one is restarted with its options typed — the refusal names its `--port` —
-or stopped and started.
-
-A config.toml that will not load stops every start and summon, since it may
-hold `sealed`, a statement ceiling or the boot SQL, and a server that came up
-without them would look configured while being open. The refusal is one line
-with the file, the line and column, and the reason; a server already running
-is not touched.
+that will not load, a typed option that does not parse, or a server whose
+harbor kept no record of its options. That one is restarted with its options
+typed — the refusal names its `--port` — or stopped and started.
 
 There is no registry. The socket **is** the runtime registration: its name is
 derived from the database's canonical path
@@ -648,6 +642,67 @@ suites use it to keep their servers out of the real fleet view. A relative
 or empty `HARBOR_HOME` is an error, never a quiet fall back to the real
 config and fleet.
 
+### config.toml
+
+`~/.config/harbor/config.toml` (in `$XDG_CONFIG_HOME/harbor` when that is set,
+and in `$HARBOR_HOME` when that is) is optional: without it every default
+stands. It holds one `[connection.<name>]` entry per database, and DuckTable
+reads the same file. An entry with `path` is a database on this machine, which
+harbor can start and which `harbor <name>` reaches; an entry with `url` is a
+server elsewhere, for DuckTable. `attach` and `detach` add and remove entries,
+and an entry may be written by hand:
+
+```toml
+[connection.medlabs]
+path = "~/db/medlabs.duckdb"
+memory-limit = "8GB"
+statement-timeout = "5m"
+init = ["INSTALL httpfs", "LOAD httpfs"]
+
+[connection.medlabs.settings]
+enable_progress_bar = true
+default_null_order = "NULLS LAST"
+
+[connection.warehouse]
+url = "http://warehouse.example.com:9495"
+```
+
+The entry whose `path` names the file being started, in any spelling,
+supplies its settings to every start of it: a `start` typed by hand, a
+summon, and the login item. Each key is the `start` option of the same name,
+and an option typed on the command line overrides the key:
+
+| Key | Value | Default |
+| --- | --- | --- |
+| `path` | the database file; `~` expands | — |
+| `memory-limit` | DuckDB's `memory_limit`, as `"8GB"` | `"2GB"` |
+| `threads` | DuckDB's threads | DuckDB's own |
+| `workers` | statements run at once | `6` |
+| `statement-timeout` | the ceiling on every statement: `"90s"`, `"10m"`, `"2h"` | none |
+| `max-temp-size` | the cap on disk spill, as `"10GB"` | DuckDB's own |
+| `block-size` | the block size of a file this start creates: `"16k"` to `"256k"` | DuckDB's own |
+| `sealed` | `true`: no host file access, no community extensions | off |
+| `unsigned` | `true`: unsigned extensions load | off |
+| `log` | `true`: one line per request in the server's log | off |
+| `init` | SQL run at boot, before serving, in order | none |
+| `port` | a loopback TCP port beside the socket, for a start that is not a summon | none |
+
+`[connection.<name>.settings]` passes any DuckDB setting through: each
+`key = value` runs as `SET key = value` after `init`, so it can tune an
+extension `init` just loaded, in key order, a string quoted and a number or
+boolean bare. A typed `--init` runs after both. `default_block_size` is chosen
+when a file is created, where no `SET` reaches, so it is skipped with a word
+that names `block-size`.
+
+A config.toml that will not load stops every start and summon, since it may
+hold `sealed`, a statement ceiling or the boot SQL, and a server that came up
+without them would look configured while being open. An unknown key, a
+`[defaults]` section, a value of the wrong type, two entry names that are one
+name once normalized, and a file or a directory holding it that others can
+write or another user owns are all refused, in one line that names the file
+and, for what is written in it, the line and column. A server already running
+is not touched.
+
 ### Output modes
 
 `--mode <m>` picks how results are rendered, and `.mode <m>` changes it at the
@@ -657,7 +712,10 @@ The data modes — `csv`, `json` and `jsonlines` (`--json` is shorthand) — are
 for programs, and boxed output on a pipe gets a hint to pick one. `trash`
 discards results and reports only errors. `csv` writes a `NULL` as an empty
 field, an empty string as `""` and the word `NULL` as itself: three values,
-as DuckDB's `COPY` writes them.
+as DuckDB's `COPY` writes them. `.nullvalue` sets what a `NULL` shows as in
+the display modes. Output into a pipe whose reader has gone, as in
+`harbor db.duckdb < script.sql | head`, ends the script there: no statement
+after the one whose output failed runs.
 
 The modes differ in how they treat a `VARIANT` or `JSON` cell, which the wire
 carries as JSON text. A display mode shows a `VARIANT` string bare — a value
@@ -799,11 +857,11 @@ harbor: settings cannot round-trip in either backup format: parquet has no write
 implemented Error`. Keep a `VARIANT` a plain column, or hold the nested shape
 inside one `VARIANT` document, and the table backs up.
 
-The whole of this is a test suite rather than a claim: `test/scripts/roundtrip.py`
-backs up and restores every type in the shared corpus, a schema of constraints
-and indexes and views and sequences, the strings that attack the format, and a
-seeded fuzz of random tables — then attaches both databases and asks DuckDB
-whether anything differs.
+The whole of this is a test suite rather than a claim:
+`test/scripts/roundtrip.py` backs up and restores every type in the shared
+corpus, a schema of constraints and indexes and views and sequences, the
+strings that attack the format, and a seeded fuzz of random tables — then
+attaches both databases and asks DuckDB whether anything differs.
 
 Backup holds one transaction for the initial export and every rewrite pass,
 so concurrent committed table changes cannot mix snapshots. It needs a free
@@ -813,9 +871,10 @@ If the client disappears, the lease expires 60 seconds after its last successful
 renewal (or creation if never renewed). Harbor cancels active work, then rolls
 back and reclaims the connection once execution stops. A renewal failure or
 failed pass aborts the backup and removes its incomplete directory; it never
-resumes on a newer snapshot. The operator's `--statement-timeout` still limits each SQL statement;
-configure it to accommodate the longest export pass. The server must support
-renewable backup sessions; older servers produce an explicit upgrade error. Exported data is scanned with a bounded buffer. Sequence counters
+resumes on a newer snapshot. The operator's `--statement-timeout` still limits
+each SQL statement; configure it to accommodate the longest export pass. A
+server that grants no backup session is refused with a message that says to
+upgrade it. Exported data is scanned with a bounded buffer. Sequence counters
 are not transactional in DuckDB; quiesce sequence users when their exact
 position must correspond to the exported rows.
 
@@ -825,12 +884,12 @@ or committed to a repo and still restore — an absolute path would have nailed
 it to the machine that wrote it.
 
 Each appears whole or not at all. A backup is written under
-`<dir>.partial-<pid>` and renamed into place as its last step, and a restore
-builds `<db>.restoring-<pid>` and moves it into place once its server has
-folded the WAL in; a Ctrl-C or a failure takes the partial one back out, and
-a kill leaves only that name, which restore refuses. `restore` also refuses a
-directory `EXPORT DATABASE` wrote itself: its `load.sql` reads a quoted
-`"NULL"` back as a null.
+`<dir>.partial-<pid>`, a directory only its owner can enter, and renamed into
+place as its last step, and a restore builds `<db>.restoring-<pid>` and moves
+it into place once its server has folded the WAL in; a Ctrl-C or a failure
+takes the partial one back out, and a kill leaves only that name, which restore
+refuses. `restore` also refuses a directory `EXPORT DATABASE` wrote itself: its
+`load.sql` reads a quoted `"NULL"` back as a null.
 
 `restore` always builds a **new** file and refuses one that exists. A restore
 that can overwrite is a restore that can be run at the wrong moment and take
@@ -851,25 +910,28 @@ $ harbor mydata.duckdb start --port 9495
 $ harbor http://127.0.0.1:9495 -c "SELECT count(*) FROM orders"
 ```
 
-An explicit start can also take its port from the matching
-`[connection.<name>]` entry in `~/.config/harbor/config.toml`; a summon stays
-on the Unix socket, so opening a database never silently adds a TCP listener.
-TCP binds IPv4 loopback only: `127.0.0.1`. `harbor http://127.0.0.1:9495
-stop` stops a server by its URL — drained and checkpointed, as over its
-socket — which is the one clean stop a server on Windows has.
+An explicit start can also take its port from the database's `port` key in
+[config.toml](#configtoml); a summon stays on the Unix socket, so opening a
+database never silently adds a TCP listener. TCP binds IPv4 loopback only:
+`127.0.0.1`. `--port 0` takes a free port, and `/info` and the list show the
+one bound. `harbor http://127.0.0.1:9495 stop` stops a server by its URL —
+drained and checkpointed, as over its socket — which is how a server on
+Windows is stopped from anywhere but its own terminal.
 
-Remote access is Caddy's job at the edge (TLS and access policy); harbor itself speaks
-plain HTTP over a unix socket or a loopback TCP port. A human reaches a
-remote host over ssh and uses the socket.
+Remote access is Caddy's job at the edge (TLS and access policy); harbor
+itself speaks plain HTTP over a unix socket or a loopback TCP port. A human
+reaches a remote host over ssh and uses the socket.
 
-Ordinary DuckDB SQL can read host files or load extensions. For a server whose
-callers should not receive those capabilities, `--sealed` disables host-file
-access and community extensions.
-After startup initialization, Harbor locks its memory, thread and spill settings
-inside DuckDB. SQL wrappers cannot override them or unlock configuration.
-Other settings registered at startup remain changeable unless `--init` imposed
-a stricter lock. Load extensions that need configurable settings during
-initialization; settings registered later are outside the allowed list.
+Ordinary DuckDB SQL can read host files or load extensions. For a server
+whose callers should not receive those capabilities, `--sealed` disables
+host-file access and community extensions. Once initialization has run,
+Harbor locks its memory, thread and spill settings inside DuckDB, and the
+setting that unlocks them: the engine refuses every statement that would
+change one, with its own message naming the setting, and inside a transaction
+that refusal aborts the transaction as any error does. Other settings
+registered at startup remain changeable unless `--init` imposed a stricter
+lock. Load extensions that need configurable settings during initialization;
+settings registered later are outside the allowed list.
 
 `--max-temp-size` bounds disk spill, and `--statement-timeout` places the
 hard statement ceiling described above. These are independent of Caddy's
@@ -884,10 +946,10 @@ harbor: 2026-08-12T04:31:07Z 127.0.0.1 POST /sql 200 12ms
 ```
 
 Timestamp, peer, method, path, status, duration — measured to the last body
-byte rather than the first, so a slow query and a slow client both show. Off by
-default. The SQL itself is never logged: it arrives in the request body, it can
-be megabytes, and on this endpoint it is as likely to hold customer data as the
-tables it reads.
+byte rather than the first, so a slow query and a slow client both show — and,
+for a status of `400` or more, the error code. Off by default. The SQL itself
+is never logged: it arrives in the request body, it can be megabytes, and on
+this endpoint it is as likely to hold customer data as the tables it reads.
 
 stderr, not stdout, so it stays clear of anything a client reads. Send it
 wherever the log belongs — `2>>/var/log/harbor.log`, a pipe, or a supervisor's
@@ -950,75 +1012,53 @@ if (pending.trim()) {
 
 ## Performance
 
-DuckDB answers the query; DuckDB Harbor's job is to stay out of the way. It
-sustains tens of thousands of requests per second across concurrent clients
-on a laptop, with sub-100µs round trips at low concurrency.
+DuckDB answers the query; DuckDB Harbor's job is to stay out of the way.
+`test/scripts/bench.py` measures how well it does. It serves a fresh database,
+sends each query shape below over one keep-alive connection, round after
+round, and reports the server's own `timeMs` beside the wall time the client
+saw. Seven rounds on an Apple M5 (10 cores) with DuckDB `v2.0.0-alpha42289`:
 
-**harbor 0.13.0, DuckDB v2.0.0 nightly** (alpha38195), eight workers, pure
-read path — `POST /sql` with `{"sql":"select 1"}` over keep-alive loopback
-TCP, 10-second `oha` runs, every response a 200:
+| Shape | Query | Best | Median | Wall, median |
+| --- | --- | --: | --: | --: |
+| point | `SELECT 42` | < 1 ms | < 1 ms | 0.5 ms |
+| ints | 5,000,000 integers | 70 ms | 78 ms | 85 ms |
+| strings | 1,000,000 strings | 32 ms | 38 ms | 40 ms |
+| mixed | 2,000,000 rows of three columns | 84 ms | 100 ms | 105 ms |
+| temporal | 1,000,000 timestamps | 28 ms | 37 ms | 39 ms |
+| heavy | `count(DISTINCT i)` over 100,000,000 | 1,049 ms | 1,096 ms | 1,096 ms |
 
-| clients | req/s | p50 | p99 |
-|--:|--:|--:|--:|
-| 1 | 10,914 | 0.09 ms | 0.12 ms |
-| 4 | 28,167 | 0.14 ms | 0.22 ms |
-| 16 | 44,079 | 0.24 ms | 0.61 ms |
-
-The HTTP layer is not the ceiling: `GET /ready` — the same plumbing with no
-SQL — measures ~99,000 req/s at 16 clients. Most of the per-request engine
-cost is reduced by the per-connection parsed-statement cache (below);
-0.13.0 also coalesced each response head into a single buffered write, set
-`TCP_NODELAY`, and removed most per-request allocations from the HTTP layer.
-
-An earlier, deliberately harsher benchmark — 20% `INSERT`s, every read
-checked against an oracle, harbor 0.12.0 (no statement cache), **DuckDB
-v1.5.5**, eight workers:
-
-| clients | req/s | p50 | p95 | p99 | non-200 | wrong answers |
-|--:|--:|--:|--:|--:|--:|--:|
-| 1 | 3,269 | 0.20 ms | 0.58 ms | 0.74 ms | 0 | 0 |
-| 4 | 7,012 | 0.50 ms | 1.18 ms | 1.40 ms | 0 | 0 |
-| 16 | 9,096 | 1.66 ms | 2.90 ms | 3.60 ms | 0 | 0 |
-
-Mean of five 10-second runs per level on an idle M-series laptop, connections
-reused, throughput taken from wall-clock across the level rather than summed
-from per-request timings. Run-to-run spread was under 4% at every level.
-
-The engine version belongs beside the numbers, because it moves them. The same
-harbor build on a **v2.0.0** nightly gets roughly half this on small statements
-— 1,352 / 3,667 / 4,739 req/s at the same three levels (alpha37626; still true
-of alpha38195). That is not a debug build and it is not harbor. It is v2's [new
-PEG parser](https://duckdb.org/2026/08/20/duckdb-20-peg-parser), plus a small
-fixed cost per execute — measured by driving each engine directly, no server:
-re-executing an already-prepared statement costs +11 µs on v2, while parsing
-fresh SQL text costs about 2× v1.5.5, growing with statement size. Execution
-itself is at parity or faster (bulk CTAS is quicker on v2 than on 1.5.5).
-The current v2 implementation caches parsed SQL, not bound execution plans.
-Each execution still binds against the current catalog. Each connection keeps
-at most 64 texts and 1 MiB of SQL text, skips caching individual statements
-larger than 64 KiB, and clears its cache when the connection is replaced. AST
-allocations are additional engine memory; these limits bound retained SQL text,
-not total process RSS. Historical benchmark figures above describe their stated
-versions; measure the current build against the engine you deploy.
-
-Every read in the mixed run was checked against an answer taken from the database
-file before the server opened it — a benchmark whose oracle is the server it is
-benchmarking cannot detect a server that is consistently wrong.
+`make bench` runs it against `target/release/harbor`, and
+`make bench BENCH_ARGS="./harbor-a ./harbor-b"` compares two builds. Their
+servers run side by side and each round rotates which goes first, so
+whatever else the machine is doing lands on both columns rather than one. A
+spread past 2× between a shape's fastest and slowest round is reported as
+noise, and such numbers are re-earned on quiet hardware rather than quoted.
+Measure the build and the engine you deploy: an engine moves these numbers as
+much as harbor does.
 
 Streaming matters more than the rate for large results. A 300,000-row result
-starts arriving in single-digit milliseconds — before the query has finished
-running — and completes in well under 100 ms, because nothing is buffered. A
-client can start work on row one while the server is still producing row
-300,000. (Whether the *query* materialises is DuckDB's business: `ORDER BY`,
-hash aggregates and joins all build state first.)
+starts arriving before the query has finished running and completes in well
+under 100 ms, because nothing is buffered. A client can start work on row one
+while the server is still producing row 300,000. (Whether the *query*
+materialises is DuckDB's business: `ORDER BY`, hash aggregates and joins all
+build state first.)
+
+A repeated statement skips DuckDB's parse, the largest engine cost of a small
+statement: each connection keeps the parsed form of the SQL texts it has run
+— at most 64 texts and 1 MiB of SQL, no single statement over 64 KiB — and
+clears it when the connection is replaced. A cached statement is the parser's
+output, not a plan, so each execution binds against the current catalog. The
+limits bound the retained SQL text, not the engine's memory for the parsed
+statements.
 
 Many connections, few queries: DuckDB Harbor accepts many concurrent
 connections and executes a small, bounded number of statements — six by
-default, settable with `--workers`. DuckDB parallelises a *single* query across
-every core, so running hundreds at once produces thrashing, not throughput. A
-request normally waits for a worker. If every worker has been inside a
-statement for at least 250 ms, the dedicated probe lane keeps control routes
-responsive and may shed new `/sql` or `/catalog` work with a retryable `503`
+default, settable with `--workers`. DuckDB parallelises a *single* query
+across every core, so running hundreds at once produces thrashing, not
+throughput. A request normally waits for a worker. If every worker has been
+inside a statement for at least 250 ms, the dedicated probe lane keeps control
+routes responsive, relays a session's statement to the session's own
+connection, and sheds other `/sql` and `/catalog` work with a retryable `503`
 instead of hiding an unbounded queue behind saturated analytics.
 
 ## Why it looks like this
@@ -1028,14 +1068,22 @@ belongs at the edge, where certificates, renewal, and HTTP/2 and /3 are already
 solved by software that does nothing else. Put Caddy or nginx in front and
 terminate there.
 
-**One statement per request.** A second statement is rejected with `400`, and
-that check is load-bearing rather than decorative: the Rust DuckDB client
-*executes* every statement but the last while merely preparing one, so anything
-that gets past it runs. Use `params` for values. A `null` param is bound
-untyped, as DuckDB's own `EXECUTE p(NULL)` binds it: the statement types it,
-and where nothing does, as in `CREATE TABLE t AS SELECT ?`, the column takes
-the type a `NULL` literal gets, which holds nothing else. Cast it there
-(`?::INTEGER`).
+**One statement per request.** A request has one answer — one schema, one
+stream of rows, one end — so it carries one statement. The engine's own
+parser counts them in the text it would run, before anything runs, and a
+second is a `400`, `exactly one SQL statement is allowed per request`. A
+comment is not a statement, so `SELECT 1; -- note` runs.
+
+**Values travel as `params`.** Each `?` or `$1` takes one element of the
+`params` array. A string binds as text, a boolean as a boolean, a whole number
+as a 64-bit integer, and a number with a fraction or an exponent as the double
+its text names. A whole number past what 64 bits hold is a `400` that says to
+send it as a string and cast it (`?::HUGEINT`), since as a double it would be
+a different number. An object or an array is a document (below). A `null` is
+bound untyped, as DuckDB's own `EXECUTE p(NULL)` binds it: the statement types
+it, so `coalesce(?, 'x')` works, and where nothing does, as in
+`CREATE TABLE t AS SELECT ?`, the column takes the type a `NULL` literal gets,
+which holds nothing else. Cast it there (`?::INTEGER`).
 
 **Types survive the trip.** Every column carries its `duckdbType`, plus width
 and scale for `DECIMAL` and nested `child`/`fields` for `LIST` and `STRUCT`, so
@@ -1082,9 +1130,9 @@ committed vector layout in the v2 C API, so each cell crosses as one value. A
 document that entered as JSON leaves as the same JSON; the column says
 `"lossless": false, "encoding": "json"` because JSON has no `DATE` or
 `TIMESTAMP` of its own (those arrive as strings). A `GEOMETRY` goes out as the
-engine's own text rendering under `"encoding": "varchar-cast"`. (Two
-limitations this section used to carry are gone: `TIME WITH TIME ZONE` keeps
-its offset since 0.22, and `TIME_NS` encodes since 0.21.)
+engine's own text rendering under `"encoding": "varchar-cast"`. A cell that
+cannot be rendered fails the stream with an error rather than arriving as
+`null`.
 
 **A `VARIANT` is JSON at every edge, and not quite JSON inside.** A column
 that always enters as JSON can be stored as `VARIANT` for the engine's typed
@@ -1166,17 +1214,18 @@ which keeps the `VARIANT` as itself.
 
 **Bodies are capped at 8 MiB**, declared or delivered; over that is a `413`.
 There is no rate limiting and no CORS. **A web page cannot reach the TCP
-listener**: a request carrying an `Origin` header, or a `Host` that is a hostname
-rather than `localhost` or an IP address, is refused with `403 forbidden` before
-anything runs. That shuts out a page on the same machine posting SQL to
-loopback, and DNS rebinding reading the answer. Harbor's own clients, Rip and
-curl send no `Origin`, and their `Host` is whatever address they were given:
-`http://127.0.0.1:9495` or `http://localhost:9495` passes, including through
-an SSH tunnel, but a name that only `/etc/hosts` maps to loopback does not. A browser client belongs behind an edge proxy that enforces
+listener**: a request carrying an `Origin` header, or a `Host` that is a
+hostname rather than `localhost` or an IP address, is refused with `403
+forbidden` before anything runs. That shuts out a page on the same machine
+posting SQL to loopback, and DNS rebinding reading the answer. Harbor's own
+clients, Rip and curl send no `Origin`, and their `Host` is whatever address
+they were given: `http://127.0.0.1:9495` or `http://localhost:9495` passes,
+including through an SSH tunnel, but a name that only `/etc/hosts` maps to
+loopback does not. A browser client belongs behind an edge proxy that enforces
 its own policy, drops `Origin`, and sends the upstream's address as `Host`
 (Caddy: `header_up -Origin` and `header_up Host {upstream_hostport}`). The unix
-socket is out of a browser's reach and skips the check. Request logging is available with
-`--log`, off by default.
+socket is out of a browser's reach and skips the check. Request logging is
+available with `--log`, off by default.
 
 **Windows serves over loopback TCP only.** Unix sockets — and with them
 spawn-on-use, the list and joining a server by its file or name — are a unix
@@ -1186,21 +1235,33 @@ by URL: `harbor http://127.0.0.1:<p>`. Everything past the connection is the
 same everywhere.
 
 **The engine is the loaded `libduckdb`, not the binary.** Nothing is linked:
-harbor loads the engine on demand (`HARBOR_LIBDUCKDB`, then `../lib` beside
-the binary, `~/.local/lib`, and `~/.duckdb/cli/*` — DuckDB's own world,
-disposable and refetchable). Harbor binds DuckDB's v2 C API, so DuckDB 2.0
-is the engine floor; the same build has been verified against every
-v2-API engine it has met, and CI runs the suite against DuckDB's current
-nightly of the 2.0 branch. Treat that as tested compatibility, not a
-promise that an arbitrary future DuckDB ABI will work. Your database files
-need no such care: a file created by a 1.5-era DuckDB opens as-is, because
-2.0's storage layer reads it. A machine with
-no engine at all still runs the client half; only serving needs the library,
-and the error says exactly where it looked.
+harbor loads the engine on demand, from the first of these that loads and
+serves the v2 C API:
+
+1. `HARBOR_LIBDUCKDB`, when it is set — that file and no other, or the start
+   fails naming it;
+2. `../lib` beside the binary, then the binary's own directory — for a
+   symlinked binary on macOS, beside the file it links to first, then beside
+   the link;
+3. `~/.local/lib`;
+4. `~/.duckdb/cli/latest`, then the newest `~/.duckdb/cli/<version>`, compared
+   number by number — DuckDB's own world, disposable and refetchable;
+5. on Linux, the dynamic loader's own search.
+
+A library without the v2 C API is passed over for the next, and the working
+directory is never searched. Harbor binds DuckDB's v2 C API, so DuckDB 2.0 is
+the engine floor; one harbor build has run against every v2-API engine it has
+met, and CI runs the suite, and the release archives are built, against the
+build the repository's `DUCKDB_LIB_BUILD` names. Treat that as tested
+compatibility, not a promise that an arbitrary future DuckDB ABI will work.
+Your database files need no such care: a file created by a 1.5-era DuckDB opens
+as-is, because 2.0's storage layer reads it. A machine with no engine at all
+still runs the client half; only serving needs the library, and the error says
+exactly where it looked.
 
 ## Working on it
 
-Building is only needed to change it. The workspace has four first-party
+Building is only needed to change it. The workspace has five first-party
 crates:
 
 - **`harbor`** — the server engine, the client (`src/repl/`, which never
@@ -1208,34 +1269,35 @@ crates:
 - **`harbor-common`** — paths, names, permissions, durations: the vocabulary
   shared with DuckTable so the two cannot drift;
 - **`wire`** — protocol request and response types consumed by the client
-  half; and
-- **`justhttp`** — Harbor's small synchronous HTTP/1.1 server over TCP and
-  Unix sockets.
+  half;
+- **`harbor-http`** — the client's transport, sessions, keep-alive, summoning
+  and server discovery, used by the REPL and DuckTable; and
+- **[`justhttp`](crates/justhttp/)** — Harbor's small synchronous HTTP/1.1
+  server over TCP and Unix sockets.
 
 The server implements its protocol shapes directly rather than depending on
 `wire`, so a wire change needs tests on both sides; drift is not a Rust
 compile error. Nothing links `libduckdb` — the engine loads on demand — so no
 DuckDB source tree, library, or header is required to build: `make harbor`
 works on a bare machine, and `make fetch-duckdb` fetches the duckdb CLI plus
-a library (honoring `DUCKDB_LIB_BUILD`, under "Get it running"). The
-crate ships pregenerated bindings, so there is no bindgen.
+a library (honoring `DUCKDB_LIB_BUILD`, under
+[Get it running](#get-it-running)). The crate ships pregenerated bindings, so
+there is no bindgen.
 
-`make unit` runs the fast Rust tests and `make test` runs the full suite. The
-full suite expects `sample.duckdb`; create it with
-`test/scripts/fixture.sh sample.duckdb` when it is absent. CI performs that
-fixture step explicitly. The thirteen suites use independent oracles where answers
+`make unit` runs the Rust tests and `make test` runs them with the integration
+suites (`SUITES="spec fuzz"` picks some), building the `sample.duckdb` fixture
+first when it is missing. The suites use independent oracles where answers
 need comparison — values read from the database file before the server takes
-the lock, and Python's own `datetime` and `base64` for fuzzed values. An oracle
-that shares an implementation with the thing it checks confirms only that the
-code is self-consistent.
+the lock, and Python's own `datetime` and `base64` for fuzzed values. An
+oracle that shares an implementation with the thing it checks confirms only
+that the code is self-consistent.
 
 ## Status
 
-Pre-production. One small binary. Nothing is linked: harbor loads a DuckDB
-2.0+ `libduckdb` at runtime — the v2 C API is the floor — and database files
-from 1.5-era DuckDBs open as-is. Deploy remote TCP behind Caddy, which owns
-TLS and edge request
-policy; Harbor independently owns SQL statement deadlines.
+Pre-1.0, with protocol v1 held compatible: a release adds to the wire and never
+removes or renames (see [PRODUCT.md](PRODUCT.md#the-wire-is-a-commitment)).
+Deploy remote TCP behind Caddy, which owns TLS and edge request policy; Harbor
+independently owns SQL statement deadlines.
 
 ## License
 
