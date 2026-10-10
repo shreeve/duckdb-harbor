@@ -1516,15 +1516,15 @@ impl Fate {
                  released.",
             ),
             Fate::MaybeRan => Some(
-                "No answer came back: the statement may have run, and on its own it commits. \
+                "No verdict came back: the statement may have run, and on its own it commits. \
                  Look before running it again.",
             ),
             Fate::InDoubt if effect == Some(TxnEffect::RollsBack) => Some(
-                "No answer came back. The session was released, which rolls the transaction \
+                "No verdict came back. The session was released, which rolls the transaction \
                  back if the statement had not already.",
             ),
             Fate::InDoubt => Some(
-                "No answer came back, so the transaction may have ended either way. Its session \
+                "No verdict came back, so the transaction may have ended either way. Its session \
                  was released, which rolls back anything still open.",
             ),
             Fate::Lost if effect.is_some_and(TxnEffect::ends) => Some(LOST),
@@ -2340,6 +2340,13 @@ mod tests {
             assert_eq!(fate(Route::Alone, None, false, Some(failure), false), Fate::MaybeRan, "{failure:?}");
         }
         assert!(Fate::MaybeRan.note(None).unwrap().contains("may have run, and on its own it commits"));
+        // Harbor's `cancelled` and `internal` are answers: none is called no
+        // answer, only no verdict.
+        for fate in [Fate::MaybeRan, Fate::InDoubt] {
+            for effect in [None, Some(TxnEffect::Commits), Some(TxnEffect::RollsBack)] {
+                assert!(fate.note(effect).unwrap().starts_with("No verdict came back"), "{fate:?} {effect:?}");
+            }
+        }
         // A read that got no answer committed nothing: no warning.
         assert_eq!(fate(Route::Alone, None, false, Some(&lost_answer), true), Fate::Closed);
         for read in ["SELECT 1", " from t", "WITH x AS (SELECT 1) SELECT * FROM x", "EXPLAIN SELECT 1", "describe t"] {
