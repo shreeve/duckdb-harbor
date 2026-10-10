@@ -24,9 +24,6 @@ pub(crate) struct QueryView {
     /// display toggles exactly like the Data view, and it is read-only
     /// by construction (no catalog structure, no key, no Edits).
     results: Option<Entity<crate::grid::Grid>>,
-    /// Bubbles the results grid's repaints (page flips, ticking loads)
-    /// up to the app footer, which reads that grid through us.
-    results_obs: Option<Subscription>,
     /// A resultless statement's verdict: the engine said ok in N ms.
     ok_ms: Option<u64>,
     /// A transient footer note ("nothing to run"), cleared by the next
@@ -144,7 +141,6 @@ impl QueryView {
             berth: berth.to_string(),
             editor,
             results: None,
-            results_obs: None,
             ok_ms: None,
             note: None,
             error: None,
@@ -287,12 +283,6 @@ impl QueryView {
                 cx.notify();
             });
         }
-    }
-
-    /// True when this view already speaks for `berth` — table switches
-    /// keep the scratchpad, reconnects rebuild it (docs/QUERY.md law 1).
-    pub(crate) fn is_for(&self, berth: &str) -> bool {
-        self.berth == berth
     }
 
     fn on_editor_event(
@@ -530,7 +520,6 @@ impl QueryView {
                         // ANALYZE they answer with the plan, which shows.
                         if result.columns.is_empty() || effect.is_some() && result.rows.is_empty() {
                             this.results = None;
-                            this.results_obs = None;
                             this.ok_ms = Some(ms);
                         } else {
                             this.ok_ms = None;
@@ -567,8 +556,6 @@ impl QueryView {
                                 grid.session = session;
                                 grid
                             });
-                            this.results_obs =
-                                Some(cx.observe(&grid, |_, _, cx| cx.notify()));
                             this.results = Some(grid);
                         }
                     }
@@ -579,7 +566,6 @@ impl QueryView {
                         };
                         this.error = Some(SharedString::from(message));
                         this.results = None;
-                        this.results_obs = None;
                         this.ok_ms = None;
                     }
                 }

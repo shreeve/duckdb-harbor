@@ -357,8 +357,31 @@ pub(crate) enum Aim {
     /// File → Open, or a drop: the path alone.
     File(std::path::PathBuf),
     /// File → Open Database URL: the name to save the address under, and
-    /// the address. Dialed again, it saves again (`add_database`).
+    /// the address. Dialed again, it saves again (`DuckTable::dial`).
     Url { name: String, host: String, port: String },
+}
+
+/// Reach the database `aim` names and read what the pane shows of it. Blocks;
+/// `DuckTable::dial` runs it off the main thread.
+fn connect(aim: Aim) -> Result<(Conn, wire::InfoResponse, harbor_client::Catalog), String> {
+    let conn = match aim {
+        Aim::Row { name, path: Some(path) } => fleet::connect_file(&name, &path)?,
+        Aim::Row { name, path: None } => fleet::connect_remote(&name)?,
+        Aim::File(path) => fleet::connect_path(&path)?,
+        Aim::Url { name, host, port } => {
+            // The name was free when the dialog checked it, so a name taken
+            // since is this address, saved by an earlier dial of this aim;
+            // a config refused is refused to the connect too.
+            let name = match fleet::validate_database(&name, &host, &port) {
+                Ok(()) => fleet::add_database(&name, &host, &port)?,
+                Err(_) => name,
+            };
+            fleet::connect_remote(&name)?
+        }
+    };
+    let info = fleet::info(&conn)?;
+    let catalog = harbor_client::catalog(&conn)?;
+    Ok((conn, info, catalog))
 }
 
 pub(crate) enum Phase {
@@ -426,8 +449,9 @@ pub struct DuckTable {
     /// "harbor is broken"; a dead refresh click reads as "it worked").
     /// The next fleet refresh rewrites it from the config's truth.
     pub(crate) warning: Option<String>,
-    /// The berth's one Query scratchpad (docs/QUERY.md law 1): owned
-    /// here so table switches never touch it; rebuilt per berth.
+    /// The database's one Query scratchpad (docs/QUERY.md law 1), made
+    /// when it connects, tables or none, and gone with the connection.
+    /// Table switches never touch it.
     pub(crate) query: Option<Entity<crate::query::QueryView>>,
     /// Staged edits parked while their table is off-screen (Law 4 in
     /// docs/EDITING.md: staged changes belong to the table, not the
@@ -625,7 +649,7 @@ impl DuckTable {
             Leaving::Switch { to, .. } => {
                 self.called_off = None;
                 self.deferred_select = None;
-                self.redial(to, cx);
+                self.dial(to, window, cx);
                 return;
             }
             Leaving::Stop { name, path } => self.stop_berth(name, path, cx),
@@ -659,20 +683,11 @@ impl DuckTable {
     /// meanwhile.
     fn resume(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match after_quit_dialog(self.called_off.take(), self.deferred_select.take()) {
-            Resume::Dial(aim) => self.redial(aim, cx),
+            Resume::Dial(aim) => self.dial(aim, window, cx),
             Resume::Select(schema, name) => self.select_table(schema, name, window, cx),
             Resume::Nothing => {}
         }
         self.refresh(cx);
-    }
-
-    /// Dial what a connect was aimed at, as the click or the drop did.
-    fn redial(&mut self, aim: Aim, cx: &mut Context<Self>) {
-        match aim {
-            Aim::Row { name, path } => self.connect_row(name, path, cx),
-            Aim::File(path) => self.open_path(path, cx),
-            Aim::Url { name, host, port } => self.add_database(name, host, port, cx),
-        }
     }
 
     /// The key of the row called `name` with this `path`, as the fleet's
@@ -855,33 +870,6 @@ impl DuckTable {
                 if let Some(stash) = state.staged.take(&db, &source) {
                     grid.update(cx, |g, cx| g.adopt_edits(stash, cx));
                 }
-                // The berth's scratchpad rides along: created once per
-                // berth, injected into every grid it outlives.
-                let berth = match &state.phase {
-                    Phase::Connected { info, .. } => clone_str(&info.name),
-                    _ => String::new(),
-                };
-                if !state
-                    .query
-                    .as_ref()
-                    .is_some_and(|q| q.read(cx).is_for(&berth))
-                {
-                    let qconn = grid.read(cx).conn.clone();
-                    let query =
-                        cx.new(|cx| crate::query::QueryView::new(qconn, &berth, window, cx));
-                    cx.subscribe(&query, |state, _, _: &CatalogRefreshRequested, cx| {
-                        state.refresh_tables(cx)
-                    })
-                    .detach();
-                    state.query = Some(query);
-                }
-                grid.update(cx, |g, cx| {
-                    g.query_view = state.query.clone();
-                    g.query_obs = g
-                        .query_view
-                        .as_ref()
-                        .map(|q| cx.observe(q, |_, _, cx| cx.notify()));
-                });
                 // A fresh grid hears the keyboard at once: landing on a
                 // table and pressing ↓ must navigate, not vanish into
                 // the sidebar. Data only — Query keeps its editor.
@@ -1226,39 +1214,6 @@ impl DuckTable {
         .detach();
     }
 
-    /// Connect to a berth: the current content keeps rendering while the
-    /// connect chain runs, and the whole pane swaps to the new berth in ONE
-    /// frame when the outcome lands (same fetch-first rule as
-    /// `select_table` — a click never flashes an intermediate state). The
-    /// in-flight name shows on the sidebar row; the idle/failed cards show
-    /// a connecting card since they hold nothing worth preserving.
-    ///
-    /// A sidebar row connects to what it shows: its file when it has one,
-    /// the config's remote of its name otherwise. The name alone is never
-    /// looked up again, because a local file and a remote can share one.
-    pub(crate) fn connect_row(
-        &mut self,
-        name: String,
-        path: Option<std::path::PathBuf>,
-        cx: &mut Context<Self>,
-    ) {
-        let aim = Aim::Row { name: clone_str(&name), path: path.clone() };
-        self.dial(
-            clone_str(&name),
-            aim,
-            move || {
-                let conn = match &path {
-                    Some(path) => fleet::connect_file(&name, path)?,
-                    None => fleet::connect_remote(&name)?,
-                };
-                let info = fleet::info(&conn)?;
-                let catalog = harbor_client::catalog(&conn)?;
-                Ok((conn, info, catalog))
-            },
-            cx,
-        );
-    }
-
     /// A click on a sidebar row. The database already on screen stays as it
     /// is, and a connect in flight to another is called off; any other is
     /// opened, asking first when leaving the connected one would lose
@@ -1283,9 +1238,9 @@ impl DuckTable {
     }
 
     /// Dial again what a failed connect was aimed at.
-    pub(crate) fn retry(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn retry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Phase::Failed { aim, .. } = &self.phase {
-            self.redial(aim.clone(), cx);
+            self.dial(aim.clone(), window, cx);
         }
     }
 
@@ -1299,37 +1254,10 @@ impl DuckTable {
         active_key(self.connecting_key.as_ref(), connected.as_ref()) == Some(&row.key)
     }
 
-    /// File → Open Database URL: save the address under its name, then
-    /// connect to it as its sidebar row would. Dialed again (Retry, or
-    /// Cancel on the one dialog that called it off), it saves again: an
-    /// earlier dial may have saved it already, since the save runs to its
-    /// end whatever becomes of the dial.
-    fn add_database(&mut self, name: String, host: String, port: String, cx: &mut Context<Self>) {
-        let shown = harbor_client::paths::normalize(&name).unwrap_or(name);
-        let aim = Aim::Url { name: clone_str(&shown), host: clone_str(&host), port: clone_str(&port) };
-        self.dial(
-            clone_str(&shown),
-            aim,
-            move || {
-                // The name was free when the dialog checked it, so a name
-                // taken since is this address, saved by an earlier dial of
-                // this aim; a config refused is refused to the connect too.
-                let name = match fleet::validate_database(&shown, &host, &port) {
-                    Ok(()) => fleet::add_database(&shown, &host, &port)?,
-                    Err(_) => shown,
-                };
-                let conn = fleet::connect_remote(&name)?;
-                let info = fleet::info(&conn)?;
-                let catalog = harbor_client::catalog(&conn)?;
-                Ok((conn, info, catalog))
-            },
-            cx,
-        );
-    }
-
     /// File → Open Database URL's OK: open the address, asking first when
     /// leaving the connected database would lose something.
     pub(crate) fn open_url(&mut self, name: String, host: String, port: String, cx: &mut Context<Self>) {
+        let name = harbor_client::paths::normalize(&name).unwrap_or(name);
         crate::leave_asking(self.switch_to(Aim::Url { name, host, port }), cx);
     }
 
@@ -1353,25 +1281,41 @@ impl DuckTable {
         self.fleet_then_refresh(move || fleet::remove_remote(&name), cx);
     }
 
-    /// The shared spine of connect / open_path: show `shown` as the connecting
-    /// label under a fresh fence, run `dial` (raise-or-join the server and read
-    /// its catalog) on a background thread, then swap the pane to the outcome
-    /// in one frame. A stale fence discards itself, so a slow attempt never
-    /// clobbers a newer one; current content keeps rendering until it lands.
-    fn dial<F>(&mut self, shown: String, aim: Aim, dial: F, cx: &mut Context<Self>)
-    where
-        F: FnOnce() -> Result<(Conn, wire::InfoResponse, harbor_client::Catalog), String>
-            + Send
-            + 'static,
-    {
-        // The quit dialog promises that Cancel leaves everything as it was.
-        // A connect replaces the grid, the query and every staged edit, and
-        // the menu bar and a file drop still reach it under the dialog.
+    /// Connect to what `aim` names: the current content keeps rendering
+    /// while the connect runs on a background thread (raise or join the
+    /// server, read its catalog), and the whole pane swaps to the outcome in
+    /// one frame (the fetch-first rule of `select_table`: a click never
+    /// flashes an intermediate state). The name shows on the sidebar row
+    /// meanwhile; the idle and failed cards give way to a connecting card,
+    /// since they hold nothing worth keeping. A stale fence discards itself,
+    /// so a slow attempt never clobbers a newer one.
+    ///
+    /// A sidebar row connects to what it shows: its file when it has one,
+    /// the config's remote of its name otherwise, never the name looked up
+    /// again, because a file and a remote can share one. A file opened or
+    /// dropped needs no config entry: the path is the target, and the
+    /// refresh that follows shows the server under its own `/info` name.
+    /// Open Database URL saves the address under its name and connects to
+    /// that remote; dialed again (Retry, or Cancel on the one dialog that
+    /// called it off), it saves again, since an earlier dial may or may not
+    /// have saved it.
+    fn dial(&mut self, aim: Aim, window: &mut Window, cx: &mut Context<Self>) {
+        // The one dialog promises that Cancel leaves everything as it was. A
+        // connect replaces the grid, the query and the staged edits on
+        // screen, and the menu bar and a file drop still reach it under the
+        // dialog.
         if self.asking_to_quit {
             return;
         }
         self.attempt += 1;
         let fence = self.attempt;
+        let shown = match &aim {
+            Aim::Row { name, .. } | Aim::Url { name, .. } => clone_str(name),
+            Aim::File(path) => path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+        };
         self.connecting = Some(clone_str(&shown));
         self.connecting_key = Some(match &aim {
             Aim::Row { name, path } => self.key_of(name, path.as_deref()),
@@ -1379,16 +1323,14 @@ impl DuckTable {
             Aim::Url { name, .. } => DbKey::Remote(clone_str(name)),
         });
         self.connecting_aim = Some(aim.clone());
-        // A file opened by one spelling of its path may have a row under
-        // another (/tmp and /private/tmp): the row to light is found by the
-        // canonical path, which is read off this thread.
-        let opened = match &aim {
-            Aim::File(path) => Some(path.clone()),
-            Aim::Row { .. } | Aim::Url { .. } => None,
-        };
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            if let Some(path) = opened {
+        let target = aim.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            // A file opened by one spelling of its path may have a row under
+            // another (/tmp and /private/tmp): the row to light is found by
+            // the canonical path, which is read off this thread.
+            if let Aim::File(path) = &target {
+                let path = path.clone();
                 let key = cx.background_executor().spawn(async move { DbKey::of_file(&path) }).await;
                 this.update(cx, |state, cx| {
                     if state.attempt == fence {
@@ -1398,8 +1340,8 @@ impl DuckTable {
                 })
                 .ok();
             }
-            let outcome = cx.background_executor().spawn(async move { dial() }).await;
-            this.update(cx, |state, cx| {
+            let outcome = cx.background_executor().spawn(async move { connect(target) }).await;
+            this.update_in(cx, |state, window, cx| {
                 if state.attempt != fence {
                     return;
                 }
@@ -1408,10 +1350,18 @@ impl DuckTable {
                 state.connecting_aim = None;
                 state.selected_table = None;
                 state.park_grid(cx);
-                state.query = None;
                 state.deferred_select = None;
                 state.select_seq += 1;
                 state.connection += 1;
+                // The database's one Query scratchpad (docs/QUERY.md law 1)
+                // is there as soon as it connects, tables or none.
+                state.query = outcome.as_ref().ok().map(|(conn, info, _)| {
+                    let (conn, name) = (conn.clone(), clone_str(&info.name));
+                    let query = cx.new(|cx| crate::query::QueryView::new(conn, &name, window, cx));
+                    cx.subscribe(&query, |state, _, _: &CatalogRefreshRequested, cx| state.refresh_tables(cx))
+                        .detach();
+                    query
+                });
                 state.phase = match outcome {
                     Ok((conn, info, catalog)) => Phase::Connected { conn, info, catalog },
                     Err(message) => Phase::Failed { name: clone_str(&shown), message, aim },
@@ -1437,31 +1387,6 @@ impl DuckTable {
             }
             _ => None,
         };
-    }
-
-    /// File→Open and drag-drop land here: connect to a database FILE the
-    /// picker or the drop named. No config entry needed — the path is the
-    /// target — and the flow is `connect`'s exactly: current content keeps
-    /// rendering, the pane swaps in one frame when the outcome lands, and
-    /// the refresh that follows shows the server under its own /info name.
-    /// This is the trunk the open-anything dispatcher (CSV, Parquet,
-    /// Sheets URLs…) grows from later; today it speaks .duckdb.
-    pub(crate) fn open_path(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
-        let shown = path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
-        self.dial(
-            shown,
-            Aim::File(path.clone()),
-            move || {
-                let conn = fleet::connect_path(&path)?;
-                let info = fleet::info(&conn)?;
-                let catalog = harbor_client::catalog(&conn)?;
-                Ok((conn, info, catalog))
-            },
-            cx,
-        );
     }
 
     /// The grid goes with its connection, and its staged set is parked for

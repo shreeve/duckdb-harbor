@@ -168,10 +168,13 @@ law is EDITING.md's "content snaps, chrome fades"; durations are under
 ### Window
 
 Three panes: the sidebar, the content, and the inspector. The content shows
-one of three views of the selected table, **Structure | Data | Query**, chosen
-by the switcher at the left of the bottom bar or by ⌘1/⌘2/⌘3, and kept across
-a table switch; ⌥←/⌥→ step through the tables. Data is the default. The
-inspector opens beside the Data grid only.
+one of three views, **Structure | Data | Query**, chosen by the switcher at the
+left of the bottom bar or by ⌘1/⌘2/⌘3, either way landing the keyboard on the
+view, and kept across a table switch; ⌥←/⌥→ step through the tables. Data is
+the default. Structure and Data show the selected table, and the database's
+card until one is chosen; Query is the database's, there from the connect on,
+with tables or none. The inspector opens beside the Data grid and the Query
+results.
 
 The sidebar width, the inspector's open state and width, the Structure view's
 columns/DDL divider and the Query view's editor/results split all persist.
@@ -277,10 +280,14 @@ What can be edited, and how, is EDITING.md.
 
 ### Bottom bar
 
-The view switcher sits at the left. The Data view adds the raw-SQL filter
-toggle, the Columns popover (search past ten columns, Show all and Hide all,
-full-row click targets) and the Add Row button. The right-anchored status line
-reads `1 ms · 1–500 of 5,410 rows · 9 columns · |< < 500 per > >|`.
+The view switcher sits at the left, under every view, the database's card
+included. The Data view adds the raw-SQL filter toggle, the Columns popover
+(search past ten columns, Show all and Hide all, full-row click targets), the
+Add Row button, and the staging story: the staged count, `committing…`, or why
+the table is read-only (`no key, and a column named rowid`, or `its key is not
+among the columns read`). The right-anchored status line describes the grid
+the view shows, the table's or the Query results', and reads
+`1 ms · 1–500 of 5,410 rows · 9 columns · |< < 500 per > >|`.
 
 The order is the anti-jump rule: in a right-justified cluster an element moves
 only when something to its right changes width. So the pager, the only
