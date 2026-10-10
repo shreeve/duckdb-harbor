@@ -82,9 +82,10 @@ pub fn exec_within(
 /// Read a result from its NDJSON lines. The stream is complete only when
 /// its `end` event arrives: one that stops short of it, because the server
 /// died or the connection dropped mid-answer, is no verdict, however many
-/// rows came first.
+/// rows came first. Nor is one out of the wire's order: a row before the
+/// schema, a second schema, or anything after the end.
 fn decode(lines: impl Iterator<Item = std::io::Result<String>>) -> Result<QueryResult, Failure> {
-    let mut columns = Vec::new();
+    let mut columns = None;
     let mut rows = Vec::new();
     let mut end = None;
     for line in lines {
@@ -92,13 +93,18 @@ fn decode(lines: impl Iterator<Item = std::io::Result<String>>) -> Result<QueryR
         if line.trim().is_empty() {
             continue;
         }
-        match Event::parse(&line).map_err(|e| Failure::Unanswered(format!("bad wire line: {e}")))? {
-            Event::Schema { columns: c } => columns = c,
-            Event::Row { values } => rows.push(values),
+        let event = Event::parse(&line).map_err(|e| Failure::Unanswered(format!("bad wire line: {e}")))?;
+        match event {
+            _ if end.is_some() => return Err(Failure::Unanswered("bad wire line: the answer went on after its end".into())),
+            Event::Schema { columns: c } if columns.is_none() => columns = Some(c),
+            Event::Row { values } if columns.is_some() => rows.push(values),
             Event::End { row_count, time_ms } => end = Some((row_count, time_ms)),
             Event::Error { code, message } => return Err(Failure::Refused { code, message }),
+            Event::Schema { .. } => return Err(Failure::Unanswered("bad wire line: a second schema".into())),
+            Event::Row { .. } => return Err(Failure::Unanswered("bad wire line: a row before the schema".into())),
         }
     }
+    let columns = columns.unwrap_or_default();
     let Some((row_count, time_ms)) = end else {
         return Err(Failure::Unanswered("stream: the answer ended before it was complete".to_string()));
     };
@@ -262,5 +268,22 @@ mod tests {
         let broken = [Ok(SCHEMA.to_string()), Err(std::io::Error::other("connection closed mid-chunk"))];
         assert!(matches!(decode(broken.into_iter()).unwrap_err(), Failure::Unanswered(why) if why.starts_with("stream: ")));
         assert!(matches!(decode(lines("<html>")).unwrap_err(), Failure::Unanswered(why) if why.starts_with("bad wire line")));
+    }
+
+    #[test]
+    fn a_result_out_of_the_wires_order_is_no_verdict() {
+        const ROW: &str = r#"{"type":"row","values":[1]}"#;
+        const END: &str = r#"{"type":"end","rowCount":1,"timeMs":2}"#;
+        for (text, why) in [
+            (format!("{ROW}\n{SCHEMA}\n{END}\n"), "a row before the schema"),
+            (format!("{SCHEMA}\n{SCHEMA}\n{END}\n"), "a second schema"),
+            (format!("{SCHEMA}\n{END}\n{ROW}\n"), "after its end"),
+            (format!("{SCHEMA}\n{END}\n{END}\n"), "after its end"),
+        ] {
+            let failure = decode(lines(&text)).unwrap_err();
+            assert!(matches!(&failure, Failure::Unanswered(m) if m.ends_with(why)), "{text:?}: {failure:?}");
+        }
+        // An end alone is an answer with no columns.
+        assert_eq!(decode(lines(&format!("{END}\n"))).unwrap().columns.len(), 0);
     }
 }

@@ -8,10 +8,11 @@
 > data. Nothing else.**
 
 DuckTable speaks to [DuckDB Harbor](https://github.com/shreeve/duckdb-harbor)
-and requires it. It never links DuckDB, never opens a database file, and never
-asks you for a path. You connect to a database by name; Harbor owns the
-engine, the files, and the versioning. Local files work through Harbor's
-spawn-on-demand, the same way `harbor <file>` opens them.
+and requires it. It never links DuckDB and never opens a database file
+itself: it reaches every database through a Harbor server, a file on this
+Mac or a remote by name, and Harbor owns the engine, the files, and the
+versioning. Local files work through Harbor's spawn-on-demand, the same way
+`harbor <file>` opens them.
 
 ## Screenshots
 
@@ -91,11 +92,14 @@ Host  foo.bar.com
 Port  9494
 ```
 
-DuckTable asks macOS's `/usr/bin/ssh` to forward an arbitrary local IPv4
-loopback port to `127.0.0.1:9494` as seen from `foo.bar.com`, then speaks Harbor
-through that local port. SSH runs unattended and honors `~/.ssh/config`, keys,
-certificates, ProxyJump, ssh-agent, and the macOS Keychain. Run `ssh
-foo.bar.com` once in Terminal if a host key or login still needs confirmation.
+DuckTable asks macOS's `/usr/bin/ssh` to forward a unix socket of its own to
+`127.0.0.1:9494` as seen from `foo.bar.com`, then speaks Harbor through that
+socket. The socket sits in Harbor's runtime directory, which only you can
+enter, so no other user of the Mac reaches the database through the tunnel,
+as any could through a loopback port. SSH runs unattended and honors
+`~/.ssh/config`, keys, certificates, ProxyJump, ssh-agent, and the macOS
+Keychain. Run `ssh foo.bar.com` once in Terminal if a host key or login still
+needs confirmation.
 
 macOS 15 and later gate each app's traffic to the local network, and the `ssh`
 DuckTable starts counts as DuckTable. For a host on your LAN, macOS decides
@@ -153,7 +157,7 @@ the sibling `harbor/` tree in this repository.
 Early releases, moving fast. Working today: the fleet sidebar, the paged
 data grid with filters and column control, the Structure view with DDL,
 staged cell editing with a Sheets-style keyboard grammar, and the Query
-scratchpad with per-statement send. Requires Harbor 0.39 or later. See
+scratchpad with per-statement send. Requires Harbor 0.44.2 or later. See
 `docs/DESIGN.md` for the architecture, the interface and what is planned.
 
 ## License

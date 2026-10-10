@@ -22,12 +22,14 @@ read it first.
   (every hand-written query) are pure. Colors resolve through `theme.rs`.
   `main.rs` holds the entry point, menus, key bindings and the quit dialog;
   `updater.rs` is the Sparkle glue.
-- `crates/harbor-client`: HTTP to Harbor over unix sockets and TCP, sessions,
-  and the fleet (which databases exist and which server serves each).
+- `crates/harbor-client`: results read whole, the catalog, and the fleet
+  (which databases exist, which server serves each, and the SSH tunnel to a
+  remote), on harbor's `harbor-http`, the transport, sessions and summon
+  harbor's own CLI speaks through.
 - `crates/duckdb-lang`: the tree-sitter grammar the Query editor highlights
   with.
-- Harbor's `wire` and `common` crates are built from the sibling `harbor/`
-  tree, so the protocol is checked on both sides of every commit.
+- Harbor's `wire`, `common` and `http` crates are built from the sibling
+  `harbor/` tree, so the protocol is checked on both sides of every commit.
 
 A rule with a decision in it belongs in a pure function, with a unit test.
 

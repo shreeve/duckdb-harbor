@@ -118,7 +118,12 @@ signature by inode and kills the next launch of a file overwritten under it.
 the destination, rename the installed app aside, rename the staged one in,
 remove the old one last (putting it back if the rename fails), and register
 the result with Launch Services (`lsregister -f`). Sparkle replaces the
-bundle whole on update, which is the same kind of swap.
+bundle whole on update, which is the same kind of swap. `scripts/install.sh`
+takes a download only when its signature carries the identifier and the
+team's Developer ID, since any valid signature, an ad hoc one included,
+passes a plain verify. `scripts/install-local.sh` refuses while the copy it
+would replace is running: quitting is the app's to do, where ⌘Q asks before
+anything staged is lost.
 
 ## Cutting a release
 

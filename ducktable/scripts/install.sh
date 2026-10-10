@@ -100,9 +100,14 @@ main() {
     # copy: nothing is written into an app once it is in place.
     rm -rf "$staged"
     mv "$tmp/DuckTable.app" "$staged"
-    # A damaged download stops here, with the installed app still standing.
-    codesign --verify --deep --strict "$staged" 2>/dev/null \
-        || fail "the downloaded DuckTable.app does not verify; nothing was changed"
+    # A damaged download stops here, with the installed app still standing,
+    # and so does a bundle that is whole but not DuckTable's: any valid
+    # signature verifies, an ad hoc one included, so the requirement names
+    # the identifier and the Developer ID team that sign every release.
+    codesign --verify --deep --strict \
+        -R='anchor apple generic and identifier "com.shreeve.ducktable" and certificate leaf[subject.OU] = "SD6N7Z8P9P"' \
+        "$staged" 2>/dev/null \
+        || fail "the downloaded DuckTable.app does not verify as DuckTable's; nothing was changed"
 
     # A swap that died between its two renames left the only copy set
     # aside; it goes back before anything else.

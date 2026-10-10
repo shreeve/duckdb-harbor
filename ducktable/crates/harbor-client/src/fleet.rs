@@ -15,15 +15,18 @@
 //! as long as a database is open, so an ephemeral server stays present between
 //! its otherwise one-shot requests and retires when the database closes.
 
-use crate::http::{Transport, request};
+use crate::http::{Failure, Transport};
 use harbor_common::State;
 use harbor_common::config;
 use harbor_common::paths::{self, runtime_dir};
 use std::io::Read;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// One sidebar row: a database's honest state, plus the size on disk only
 /// a GUI wants.
@@ -48,8 +51,8 @@ pub struct Survey {
     /// Size on disk (data file + WAL) — knowable without a connection,
     /// so stopped databases answer too.
     pub size: Option<u64>,
-    /// The harbor version a running server reports (`None` when stopped or
-    /// when an older server did not answer `/info`). Compared against the
+    /// The harbor version a running server reports (`None` when stopped, or
+    /// when its server was found by `/ready` alone). Compared against the
     /// installed binary to decide whether the row is outdated.
     pub version: Option<String>,
     /// Whether a running server self-retires when its last client leaves — the
@@ -86,49 +89,26 @@ struct Live {
     ephemeral: bool,
 }
 
-/// Every server actually listening right now — the same discovery bare
-/// `harbor` performs: `readdir` for `*.sock`, `GET /info` per socket. A
-/// socket that does not answer is skipped, not unlinked: sweeping residue
-/// is harbor's job, and this is a read-only view.
+/// Every server listening right now, found the way bare `harbor` finds
+/// them. A socket nothing answers on is left where it is: sweeping residue
+/// is harbor's job, and this is a read-only view. So is a server that
+/// answers without saying which file it serves, since a local row is dialed
+/// by its file.
 fn discover() -> Vec<Live> {
     let Ok(runtime) = runtime_dir() else { return Vec::new() };
-    let Ok(rd) = std::fs::read_dir(&runtime) else { return Vec::new() };
-    let mut out = Vec::new();
-    for sock in rd.filter_map(|e| e.ok().map(|e| e.path())) {
-        if !sock.extension().is_some_and(|x| x == "sock") {
-            continue;
-        }
-        let t = Transport::Unix(sock.clone());
-        let Ok(r) = request(&t, &wire::endpoint::INFO, None, Some(Duration::from_secs(2))) else {
-            continue;
-        };
-        if r.status != 200 {
-            continue;
-        }
-        let Ok(body) = r.body_string() else { continue };
-        let Ok(info) = serde_json::from_str::<wire::InfoResponse>(body.trim()) else {
-            continue;
-        };
-        // 0.22.1-and-earlier servers send no name (the field entered
-        // /info after them) — label the row from the file stem rather
-        // than showing a blank.
-        let name = if info.name.is_empty() {
-            std::path::Path::new(&info.database)
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| info.database.clone())
-        } else {
-            info.name
-        };
-        out.push(Live {
-            name,
-            db: PathBuf::from(info.database),
-            sock,
-            version: info.harbor_version,
-            ephemeral: info.ephemeral,
-        });
-    }
-    out
+    crate::http::discover(&runtime, false)
+        .into_iter()
+        .filter_map(|found| {
+            let info: wire::InfoResponse = serde_json::from_value(found.info?).ok()?;
+            (!info.database.is_empty()).then(|| Live {
+                name: info.name,
+                db: PathBuf::from(info.database),
+                sock: found.sock,
+                version: info.harbor_version,
+                ephemeral: info.ephemeral,
+            })
+        })
+        .collect()
 }
 
 /// The config, with a GUI-honest error contract: absent is fine, refused or
@@ -230,10 +210,9 @@ pub fn survey() -> Fleet {
                     name: l.name.clone(),
                     state: State::Running,
                     attached,
-                    // A login item is kept by name. When the config gives
-                    // this name to another database, the item is that one's.
-                    autostart: (attached || cfg.get(&l.name).is_none())
-                        && harbor_common::autostart::installed(&l.name),
+                    // A login item is filed by name, and is this row's only
+                    // when it runs this file.
+                    autostart: harbor_common::autostart::keeps(&l.db, &l.name),
                     path: Some(l.db.clone()),
                     note: None,
                     size: disk_size(&l.db),
@@ -249,7 +228,7 @@ pub fn survey() -> Fleet {
                     name: name.to_string(),
                     state: if running { State::Running } else { State::Stopped },
                     attached: true,
-                    autostart: harbor_common::autostart::installed(name),
+                    autostart: harbor_common::autostart::keeps(&db, name),
                     size: disk_size(&db),
                     path: Some(db),
                     note: None,
@@ -272,12 +251,12 @@ pub fn survey() -> Fleet {
                     .as_ref()
                     .filter(|target| target.is_local())
                     .map(|target| Transport::Tcp(target.addr()));
-                let alive = transport.as_ref().is_some_and(probe);
+                let alive = transport.as_ref().is_some_and(crate::http::ready);
                 // Best-effort version, so the card can note a remote running behind
                 // your own binary. Informational only — you cannot restart a remote
                 // from here, so this never counts toward the upgrade badge.
                 let version = alive
-                    .then(|| transport.as_ref().and_then(info_of))
+                    .then(|| transport.as_ref().and_then(|t| info_of(t, Duration::from_millis(800)).ok()))
                     .flatten()
                     .map(|i| i.harbor_version);
                 Survey {
@@ -338,17 +317,9 @@ fn name_clashes(rows: &mut [Survey]) -> Option<String> {
     })
 }
 
-
-/// `GET /ready` — the truth test.
-fn probe(transport: &Transport) -> bool {
-    request(transport, &wire::endpoint::READY, None, Some(Duration::from_millis(800)))
-        .map(|r| r.status == 200)
-        .unwrap_or(false)
-}
-
 /// A unix socket that exists and answers /ready.
 fn sock_ready(sock: &Path) -> bool {
-    sock.exists() && probe(&Transport::Unix(sock.to_path_buf()))
+    sock.exists() && crate::http::ready(&Transport::Unix(sock.to_path_buf()))
 }
 
 /// Whether two paths name one database file, however each is spelled.
@@ -371,8 +342,9 @@ pub struct Conn {
     transport: Transport,
     /// Presence is shared with every clone, just like the tunnel. The final
     /// clone closes it, allowing an ephemeral Harbor server to retire.
+    /// `None` for a connection that asks once and lets go.
     #[allow(dead_code)]
-    anchor: Arc<crate::http::Anchor>,
+    anchor: Option<Arc<Presence>>,
     /// True when this connect raised the server (worth a status line).
     /// A summoned server is an ephemeral `start` — it self-retires once its
     /// last client disconnects, so closing the window that opened it lets it
@@ -384,11 +356,27 @@ pub struct Conn {
     tunnel: Option<Arc<SshTunnel>>,
 }
 
+/// An anchor, let go of off the thread that drops it. Dropping an anchor
+/// waits for its thread, which a renewal in progress holds for as long as
+/// its read timeout, and the last clone of a connection often dies on the
+/// UI thread.
+struct Presence(Option<crate::http::Anchor>);
+
+impl Drop for Presence {
+    fn drop(&mut self) {
+        if let Some(anchor) = self.0.take() {
+            let _ = std::thread::Builder::new().name("harbor-unmoor".into()).spawn(move || drop(anchor));
+        }
+    }
+}
+
+fn anchor(transport: &Transport) -> std::io::Result<Option<Arc<Presence>>> {
+    crate::http::hold(transport).map(|anchor| Some(Arc::new(Presence(Some(anchor)))))
+}
+
 impl Conn {
     fn plain(name: String, transport: Transport, summoned: bool) -> Result<Self, String> {
-        let anchor = crate::http::hold(&transport)
-            .map(Arc::new)
-            .map_err(|e| format!("connecting to Harbor: {e}"))?;
+        let anchor = anchor(&transport).map_err(|e| format!("connecting to Harbor: {e}"))?;
         Ok(Self { name, db: None, transport, anchor, summoned, tunnel: None })
     }
 
@@ -398,10 +386,9 @@ impl Conn {
         self
     }
 
-    fn tunneled(name: String, transport: Transport, tunnel: SshTunnel) -> Result<Self, String> {
-        let anchor = crate::http::hold(&transport)
-            .map(Arc::new)
-            .map_err(|e| format!("connecting to Harbor through SSH: {e}"))?;
+    fn tunneled(name: String, tunnel: SshTunnel) -> Result<Self, String> {
+        let transport = Transport::Unix(tunnel.sock.clone());
+        let anchor = anchor(&transport).map_err(|e| format!("connecting to Harbor through SSH: {e}"))?;
         Ok(Self {
             name,
             db: None,
@@ -456,8 +443,7 @@ fn dial_remote(name: String, entry: &config::Connection) -> Result<Conn, String>
     let target = http_target(url)?;
     if !target.is_local() {
         validate_ssh_host(&target.host)?;
-        let (transport, tunnel) = open_tunnel(&target.host, target.port)?;
-        return Conn::tunneled(name, transport, tunnel);
+        return Conn::tunneled(name, open_tunnel(&target.host, target.port)?);
     }
     Conn::plain(name, Transport::Tcp(target.addr()), false)
 }
@@ -468,27 +454,33 @@ fn dial_remote(name: String, entry: &config::Connection) -> Result<Conn, String>
 /// A stopped database is started on demand, as an ephemeral server.
 pub fn connect_file(name: &str, db: &Path) -> Result<Conn, String> {
     let db = paths::canonical_db(db).map_err(|e| format!("{}: {e}", db.display()))?;
-    serve_file(name.to_string(), &db, true)
+    serve_file(name.to_string(), &db)
 }
 
 /// Connect to the server of one database file only if it is already
-/// running. For a caller that must never start a server, such as the
-/// sidebar's table counts.
+/// running, to ask it one thing: the sidebar's table counts. It never
+/// starts a server, and holds no anchor, since the server is up and the
+/// answer is all it wants.
 pub fn join_file(name: &str, db: &Path) -> Option<Conn> {
     let db = paths::canonical_db(db).ok()?;
-    serve_file(name.to_string(), &db, false).ok()
+    let sock = paths::socket_for(&runtime_dir().ok()?, &db).ok()?;
+    sock_ready(&sock).then(|| Conn {
+        name: name.to_string(),
+        db: Some(db),
+        transport: Transport::Unix(sock),
+        anchor: None,
+        summoned: false,
+        tunnel: None,
+    })
 }
 
-/// Join the server on `db`, or summon one when `summon_it` and none answers.
-/// Spawning over a live server would only lose DuckDB's file-lock race and
-/// read as a failure.
-fn serve_file(name: String, db: &Path, summon_it: bool) -> Result<Conn, String> {
+/// Join the server on `db`, or summon one when none answers. Spawning over
+/// a live server would only lose DuckDB's file-lock race and read as a
+/// failure.
+fn serve_file(name: String, db: &Path) -> Result<Conn, String> {
     let sock = paths::socket_for(&runtime_dir()?, db)?;
     if let Some(conn) = join(&name, db, &sock, false)? {
         return Ok(conn);
-    }
-    if !summon_it {
-        return Err(format!("{} is not running", db.display()));
     }
     // Nothing serves the file yet: summon an ephemeral server — it
     // self-retires when this window's connection drops, since opening a
@@ -523,27 +515,23 @@ pub fn connect_path(db: &Path) -> Result<Conn, String> {
         .and_then(|s| s.to_str())
         .ok_or_else(|| format!("no usable name in {}", db.display()))
         .and_then(harbor_common::paths::normalize)?;
-    serve_file(name, &db, true)
+    serve_file(name, &db)
 }
 
 /// Stop the server of one database file: POST /shutdown to its live socket,
-/// if one answers. The counterpart to spawn-on-open — the GUI can close what
-/// it opened. Idempotent and never-spawning: a file with nothing running is
-/// Ok(()), the same as a Stop that raced the server's own departure. The
-/// file is the whole target, as for `connect_file`: a name can belong to two
-/// databases, and stopping by name could shut down the other one.
+/// if one answers, and return once it has gone, so the refresh that follows
+/// does not find it. The counterpart to spawn-on-open — the GUI can close
+/// what it opened. Idempotent and never-spawning: a file with nothing
+/// running is Ok(()), the same as a Stop that raced the server's own
+/// departure. The file is the whole target, as for `connect_file`: a name
+/// can belong to two databases, and stopping by name could shut down the
+/// other one.
 pub fn stop(db: &Path) -> Result<(), String> {
     let db = paths::canonical_db(db).map_err(|e| format!("{}: {e}", db.display()))?;
-    let home = runtime_dir()?;
-    let own = paths::socket_for(&home, &db).ok();
-    for s in stop_targets(&db, own, &discover()) {
-        if sock_ready(&s) {
-            let t = Transport::Unix(s);
-            // 202 {"stopping":true}, then the server drains and the socket
-            // goes away — a refresh a beat later drops the row.
-            request(&t, &wire::endpoint::SHUTDOWN, None, Some(Duration::from_secs(5)))
-                .map_err(|e| format!("stop {}: {e}", db.display()))?;
-            return Ok(());
+    let own = paths::socket_for(&runtime_dir()?, &db).ok();
+    for sock in stop_targets(&db, own, &discover()) {
+        if crate::http::shutdown(&sock).map_err(|e| format!("stop {}: {e}", db.display()))? {
+            break;
         }
     }
     Ok(())
@@ -592,8 +580,12 @@ pub fn set_autostart(db: &Path, on: bool) -> Result<(), String> {
     if on {
         harbor_common::membership::attach(db)?;
         harbor_common::autostart::arm(db, &name)
-    } else {
+    } else if harbor_common::autostart::keeps(db, &name) {
         harbor_common::autostart::remove(&name).map(|_| ())
+    } else {
+        // The item filed under this name runs another database, or there
+        // is none: this one has nothing to disarm.
+        Ok(())
     }
 }
 
@@ -654,35 +646,19 @@ pub fn version_older(running: &str, installed: &str) -> bool {
     false
 }
 
-/// `/info` on a transport, parsed. Used for a remote's best-effort version.
-fn info_of(t: &Transport) -> Option<wire::InfoResponse> {
-    let r = request(t, &wire::endpoint::INFO, None, Some(Duration::from_millis(800))).ok()?;
-    if r.status != 200 {
-        return None;
-    }
-    serde_json::from_str(r.body_string().ok()?.trim()).ok()
+/// `GET /info` on a transport: the server's identity.
+fn info_of(t: &Transport, patience: Duration) -> Result<wire::InfoResponse, Failure> {
+    crate::http::call(t, &wire::endpoint::INFO, None, patience)
 }
 
-/// Restart a running local server so it comes back on the current binary: stop
-/// it, wait for its socket to clear (so DuckDB's file lock is released — the
-/// one thing a hand-typed `stop; start` gets wrong), then summon it again in
-/// the same lifetime mode. The one-click upgrade path.
+/// Restart a running local server so it comes back on the current binary:
+/// stop it, wait until it has gone and let go of DuckDB's file lock (the one
+/// thing a hand-typed `stop; start` gets wrong), then summon it again in the
+/// same lifetime mode. The one-click upgrade path.
 pub fn restart(db: &Path, ephemeral: bool) -> Result<(), String> {
     let canon = paths::canonical_db(db)?;
     let sock = paths::socket_for(&runtime_dir()?, &canon)?;
-    if sock_ready(&sock) {
-        request(&Transport::Unix(sock.clone()), &wire::endpoint::SHUTDOWN, None, Some(Duration::from_secs(5)))
-            .map_err(|e| format!("stop {}: {e}", db.display()))?;
-    }
-    // Wait for the server to drain and release the lock.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while sock_ready(&sock) {
-        if std::time::Instant::now() > deadline {
-            return Err(format!("{} did not stop in time to upgrade", db.display()));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    // Bring it back the way it was running.
+    crate::http::shutdown(&sock).map_err(|e| format!("stop {}: {e}", db.display()))?;
     summon(&canon, &sock, ephemeral)
 }
 
@@ -752,13 +728,20 @@ fn http_target(url: &str) -> Result<HttpTarget, String> {
     Ok(HttpTarget { host, port })
 }
 
-/// One app-owned OpenSSH process. It is shared by every clone of its Conn;
-/// the last clone kills and reaps it, which binds tunnel lifetime to the
+/// One app-owned OpenSSH process, forwarding a unix socket to Harbor's
+/// loopback port on the host. It is shared by every clone of its Conn; the
+/// last clone kills and reaps it, which binds tunnel lifetime to the
 /// matching database connection without a global registry.
+///
+/// The socket sits in the runtime directory, which is this user's alone
+/// (0700), so only this user's processes reach the database through it. A
+/// loopback TCP port would be open to every process and every user on the
+/// Mac, and Harbor's TCP door asks for no credential.
 struct SshTunnel {
     child: Mutex<Child>,
     stderr: Arc<Mutex<Vec<u8>>>,
     host: String,
+    sock: PathBuf,
 }
 
 impl SshTunnel {
@@ -777,6 +760,7 @@ impl Drop for SshTunnel {
             let _ = child.kill();
             let _ = child.wait();
         }
+        let _ = std::fs::remove_file(&self.sock);
     }
 }
 
@@ -792,7 +776,24 @@ fn ssh_failure(host: &str, status: String, stderr: &Arc<Mutex<Vec<u8>>>) -> Stri
     )
 }
 
-fn ssh_command(ssh_host: &str, remote_port: u16, local_port: u16) -> Command {
+/// Where a new tunnel listens. Its name is not `*.sock`, which discovery
+/// would take for a server of this machine.
+fn tunnel_socket(runtime: &Path) -> Result<PathBuf, String> {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let sock = runtime.join(format!("ssh-{}-{}.tunnel", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    // sun_path holds 104 bytes with its NUL.
+    if sock.as_os_str().len() > 103 {
+        return Err(format!(
+            "the runtime directory is too deep for a unix socket ({}): shorten $HARBOR_HOME",
+            runtime.display()
+        ));
+    }
+    Ok(sock)
+}
+
+fn ssh_command(ssh_host: &str, remote_port: u16, local: &Path) -> Command {
+    // ssh splits a forward at `:` and takes `\` as an escape.
+    let local = local.to_string_lossy().replace('\\', "\\\\").replace(':', "\\:");
     let mut command = Command::new("/usr/bin/ssh");
     command
         .arg("-N")
@@ -809,8 +810,12 @@ fn ssh_command(ssh_host: &str, remote_port: u16, local_port: u16) -> Command {
         .arg("ServerAliveCountMax=3")
         .arg("-o")
         .arg("TCPKeepAlive=yes")
+        // A socket of the same name left by an earlier run is replaced,
+        // not refused.
+        .arg("-o")
+        .arg("StreamLocalBindUnlink=yes")
         .arg("-L")
-        .arg(format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"))
+        .arg(format!("{local}:127.0.0.1:{remote_port}"))
         .arg(ssh_host)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -818,7 +823,7 @@ fn ssh_command(ssh_host: &str, remote_port: u16, local_port: u16) -> Command {
     command
 }
 
-fn capture_stderr(mut pipe: impl Read + Send + 'static, captured: Arc<Mutex<Vec<u8>>>) {
+fn capture_stderr(mut pipe: impl Read + Send + 'static, captured: Arc<Mutex<Vec<u8>>>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0_u8; 1024];
         while let Ok(n) = pipe.read(&mut buf) {
@@ -829,69 +834,45 @@ fn capture_stderr(mut pipe: impl Read + Send + 'static, captured: Arc<Mutex<Vec<
             let room = (64_usize * 1024).saturating_sub(out.len());
             out.extend_from_slice(&buf[..n.min(room)]);
         }
-    });
+    })
 }
 
-fn open_tunnel(ssh_host: &str, remote_port: u16) -> Result<(Transport, SshTunnel), String> {
-    for attempt in 0..5 {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
-            .map_err(|e| format!("choosing a local SSH port: {e}"))?;
-        let local_port = listener
-            .local_addr()
-            .map_err(|e| format!("reading the local SSH port: {e}"))?
-            .port();
-        drop(listener);
+/// Start ssh and wait until its socket takes connections. A slow ProxyJump
+/// chain gets twenty seconds.
+fn open_tunnel(ssh_host: &str, remote_port: u16) -> Result<SshTunnel, String> {
+    let runtime = runtime_dir()?;
+    harbor_common::perms::ensure_private_dir(&runtime)?;
+    let sock = tunnel_socket(&runtime)?;
+    let mut child = ssh_command(ssh_host, remote_port, &sock)
+        .spawn()
+        .map_err(|e| format!("cannot run /usr/bin/ssh: {e}"))?;
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let reader = child.stderr.take().map(|stderr| capture_stderr(stderr, Arc::clone(&captured)));
+    let tunnel = SshTunnel { child: Mutex::new(child), stderr: captured, host: ssh_host.to_string(), sock };
 
-        let mut child = ssh_command(ssh_host, remote_port, local_port)
-            .spawn()
-            .map_err(|e| format!("cannot run /usr/bin/ssh: {e}"))?;
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        if let Some(stderr) = child.stderr.take() {
-            capture_stderr(stderr, Arc::clone(&captured));
-        }
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|e| format!("checking SSH to {ssh_host}: {e}"))?
-            {
-                // Let the stderr reader consume the final bytes before the
-                // diagnostic is built.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let exited = tunnel.child.lock().map_err(|_| "SSH process lock failed")?.try_wait();
+        if let Some(status) = exited.map_err(|e| format!("checking SSH to {ssh_host}: {e}"))? {
+            // ssh is gone, so its stderr ends: read it to the end before the
+            // diagnostic is built, a moment at most, since a ProxyCommand
+            // ssh started may still hold the pipe.
+            let read = Instant::now() + Duration::from_secs(1);
+            while reader.as_ref().is_some_and(|r| !r.is_finished()) && Instant::now() < read {
                 std::thread::sleep(Duration::from_millis(10));
-                let message = ssh_failure(ssh_host, status.to_string(), &captured);
-                let port_race = message.contains("Address already in use")
-                    || message.contains("cannot listen to port");
-                if port_race && attempt < 4 {
-                    break;
-                }
-                return Err(message);
             }
-            let addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, local_port);
-            if std::net::TcpStream::connect_timeout(&addr.into(), Duration::from_millis(100))
-                .is_ok()
-            {
-                return Ok((
-                    Transport::Tcp(format!("127.0.0.1:{local_port}")),
-                    SshTunnel {
-                        child: Mutex::new(child),
-                        stderr: captured,
-                        host: ssh_host.to_string(),
-                    },
-                ));
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "SSH connection to {} timed out\n\nVerify the connection in Terminal:\n    ssh {}",
-                    ssh_host, ssh_host
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(50));
+            return Err(ssh_failure(ssh_host, status.to_string(), &tunnel.stderr));
         }
+        if UnixStream::connect(&tunnel.sock).is_ok() {
+            return Ok(tunnel);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "SSH connection to {ssh_host} timed out\n\nVerify the connection in Terminal:\n    ssh {ssh_host}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    Err("could not allocate a local SSH port after five attempts".into())
 }
 
 /// Validate and persist the dialog's port-based database without opening its
@@ -963,23 +944,7 @@ fn validate_ssh_host(host: &str) -> Result<(), String> {
 
 /// `GET /info` — server identity, for the inspector's Metadata section.
 pub fn info(conn: &Conn) -> Result<wire::InfoResponse, String> {
-    let r = request(
-        conn.transport()?,
-        &wire::endpoint::INFO,
-        None,
-        Some(Duration::from_secs(5)),
-    )
-    .map_err(|e| e.to_string())?;
-    let status = r.status;
-    let body = r.body_string().map_err(|e| e.to_string())?;
-    // Status first: an error body must not decode as an identity.
-    if status != 200 {
-        return Err(match wire::Event::parse(body.trim()) {
-            Ok(wire::Event::Error { code, message }) => format!("{code}: {message}"),
-            _ => format!("HTTP {status}"),
-        });
-    }
-    serde_json::from_str(&body).map_err(|e| format!("bad /info response: {e}"))
+    info_of(conn.transport()?, Duration::from_secs(5)).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -987,10 +952,12 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
-    fn accepting_transport() -> (Transport, std::thread::JoinHandle<()>) {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
+    /// A server that answers one anchor's `/ready` on `sock` and waits for
+    /// the anchor to let go.
+    fn accepting(sock: &Path) -> std::thread::JoinHandle<()> {
+        let _ = std::fs::remove_file(sock);
+        let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
+        std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = Vec::new();
             let mut byte = [0_u8; 1];
@@ -1006,8 +973,12 @@ mod tests {
                 .unwrap();
             let mut byte = [0_u8; 1];
             assert_eq!(stream.read(&mut byte).unwrap(), 0);
-        });
-        (Transport::Tcp(addr.to_string()), server)
+        })
+    }
+
+    /// A socket path of this test's own, short enough for sun_path.
+    fn test_socket(name: &str) -> PathBuf {
+        PathBuf::from(format!("/tmp/hc-{name}-{}.sock", std::process::id()))
     }
 
     // The name law and the socket-naming rule live in harbor-common,
@@ -1025,8 +996,9 @@ mod tests {
     }
 
     #[test]
-    fn ssh_command_is_loopback_only_unattended_and_owned() {
-        let command = ssh_command("foo.bar.com", 9494, 53172);
+    fn ssh_command_forwards_a_private_socket_unattended_and_owned() {
+        let sock = Path::new("/Users/me/.local/state/harbor/runtime/ssh-41-0.tunnel");
+        let command = ssh_command("foo.bar.com", 9494, sock);
         assert_eq!(command.get_program(), "/usr/bin/ssh");
         let args: Vec<_> = command
             .get_args()
@@ -1038,10 +1010,26 @@ mod tests {
         assert!(args.windows(2).any(|a| a == ["-o", "ServerAliveInterval=15"]));
         assert!(args.windows(2).any(|a| a == ["-o", "ServerAliveCountMax=3"]));
         assert!(args.windows(2).any(|a| a == ["-o", "TCPKeepAlive=yes"]));
+        assert!(args.windows(2).any(|a| a == ["-o", "StreamLocalBindUnlink=yes"]));
         assert!(args.windows(2).any(|a| {
-            a == ["-L", "127.0.0.1:53172:127.0.0.1:9494"]
+            a == ["-L", "/Users/me/.local/state/harbor/runtime/ssh-41-0.tunnel:127.0.0.1:9494"]
         }));
         assert_eq!(args.last().map(String::as_str), Some("foo.bar.com"));
+        // A path with ssh's separator or its escape in it stays one field.
+        let odd = ssh_command("h", 9494, Path::new("/odd:dir\\x/s.tunnel"));
+        assert!(odd.get_args().any(|a| a.to_string_lossy() == "/odd\\:dir\\\\x/s.tunnel:127.0.0.1:9494"));
+    }
+
+    #[test]
+    fn a_tunnel_socket_is_unique_private_to_its_directory_and_fits_sun_path() {
+        let runtime = Path::new("/Users/me/.local/state/harbor/runtime");
+        let (a, b) = (tunnel_socket(runtime).unwrap(), tunnel_socket(runtime).unwrap());
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), Some(runtime));
+        // Not a name discovery reads as a server's.
+        assert!(a.extension().is_some_and(|x| x == "tunnel"));
+        let deep = PathBuf::from(format!("/{}", "d".repeat(90)));
+        assert!(tunnel_socket(&deep).unwrap_err().contains("shorten $HARBOR_HOME"));
     }
 
     #[test]
@@ -1166,9 +1154,8 @@ mod tests {
     #[test]
     fn a_server_that_refuses_the_anchor_says_why() {
         // Nothing listens: nothing to join, and so a server may be started.
-        let dir = std::env::temp_dir();
-        let db = dir.join("harbor-client-join.duckdb");
-        let sock = dir.join(format!("hc-join-{}.sock", std::process::id()));
+        let db = std::env::temp_dir().join("harbor-client-join.duckdb");
+        let sock = test_socket("join");
         let _ = std::fs::remove_file(&sock);
         assert!(join("join", &db, &sock, false).unwrap().is_none());
 
@@ -1248,8 +1235,9 @@ mod tests {
 
     #[test]
     fn the_last_connection_clone_releases_its_harbor_presence() {
-        let (transport, server) = accepting_transport();
-        let conn = Conn::plain("local".into(), transport, true).unwrap();
+        let sock = test_socket("anchor");
+        let server = accepting(&sock);
+        let conn = Conn::plain("local".into(), Transport::Unix(sock.clone()), true).unwrap();
         let last = conn.clone();
         drop(conn);
 
@@ -1257,9 +1245,23 @@ mod tests {
         assert!(!server.is_finished());
         drop(last);
         server.join().unwrap();
+        std::fs::remove_file(&sock).unwrap();
     }
 
-    #[cfg(unix)]
+    #[test]
+    fn letting_go_of_presence_never_waits_on_the_dropping_thread() {
+        // An anchor whose thread is busy, as one is mid-renewal.
+        let busy = crate::http::beat("test-anchor", Duration::ZERO, || {
+            std::thread::sleep(Duration::from_secs(2));
+            None
+        })
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let began = std::time::Instant::now();
+        drop(Presence(Some(busy)));
+        assert!(began.elapsed() < Duration::from_millis(500), "{:?}", began.elapsed());
+    }
+
     #[test]
     fn the_last_connection_clone_closes_its_ssh_process() {
         let exists = |pid: &str| {
@@ -1273,22 +1275,24 @@ mod tests {
         };
         let child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         let pid = child.id().to_string();
-        let (transport, server) = accepting_transport();
+        let sock = test_socket("tunnel");
+        let server = accepting(&sock);
         let conn = Conn::tunneled(
             "remote".into(),
-            transport,
             SshTunnel {
                 child: Mutex::new(child),
                 stderr: Arc::new(Mutex::new(Vec::new())),
                 host: "remote".into(),
+                sock: sock.clone(),
             },
         )
         .unwrap();
         let last = conn.clone();
         drop(conn);
-        assert!(exists(&pid));
+        assert!(exists(&pid) && sock.exists());
         drop(last);
         assert!(!exists(&pid));
+        assert!(!sock.exists(), "the tunnel's socket goes with it");
         server.join().unwrap();
     }
 }
