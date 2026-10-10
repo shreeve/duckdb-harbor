@@ -260,6 +260,14 @@ are one higher than the statement's own.
 **A statement with no result set** reports `ok · 2 ms` in the status line
 rather than showing an empty grid.
 
+**A plan** shows whole. `EXPLAIN` and `EXPLAIN ANALYZE` answer with rows of
+`explain_key` and `explain_value`, a box drawing over many lines in one cell,
+which a grid would show as its first line, a border. So a result of exactly
+that shape shows as the engine drew it: preformatted in the value font, at the
+data surfaces' zoom, scrolling both ways with no wrapping, with a copy tile in
+its corner, each plan under its own name when there are several. The status
+line reads `plan · 3 ms`.
+
 **Errors** show the engine's message verbatim in the results pane.
 
 **Feedback is three-phase.** For the first 300ms of a run nothing on screen
@@ -325,8 +333,8 @@ Designed, not built.
 - **Editing keys.** ⌘/ toggles `--` comments; ⇧⌥F formats through the engine's
   own `duckdb_format_sql`; ⌃R opens a history popover that inserts, never
   runs.
-- **EXPLAIN.** ⌘⇧E as a one-shot that explains the marked statement and shows
-  the plan text verbatim. A sticky toggle that rewrote every send would lie
+- **EXPLAIN.** ⌘⇧E as a one-shot that explains the marked statement, its plan
+  shown as any plan is. A sticky toggle that rewrote every send would lie
   about what ⌘Enter sends.
 - **Grammar upkeep.** A `grammar-sync` task that pins a DuckDB tag,
   regenerates the keyword layer and diffs the `.gram` files per release, with a

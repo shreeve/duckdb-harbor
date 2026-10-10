@@ -26,6 +26,9 @@ pub(crate) struct QueryView {
     results: Option<Entity<crate::grid::Grid>>,
     /// A resultless statement's verdict: the engine said ok in N ms.
     ok_ms: Option<u64>,
+    /// A plan EXPLAIN answered, shown as the engine drew it in place of a
+    /// results grid.
+    plan: Option<Plan>,
     /// A transient footer note ("nothing to run"), cleared by the next
     /// verdict.
     note: Option<SharedString>,
@@ -142,6 +145,7 @@ impl QueryView {
             editor,
             results: None,
             ok_ms: None,
+            plan: None,
             note: None,
             error: None,
             running: false,
@@ -509,49 +513,52 @@ impl QueryView {
                 match outcome {
                     Ok(result) => {
                         let ms = result.time_ms;
-                        // BEGIN, COMMIT and their kin answer with an empty
-                        // `Success` column; their verdict is the status
-                        // line's and the transaction mark's. Under EXPLAIN
-                        // ANALYZE they answer with the plan, which shows.
-                        if result.columns.is_empty() || effect.is_some() && result.rows.is_empty() {
-                            this.results = None;
-                            this.ok_ms = Some(ms);
-                        } else {
-                            this.ok_ms = None;
-                            // A paged run holds page 0 of a paged grid
-                            // (total exact, or unknown if the count
-                            // failed); a bare run (unwrappable, or the
-                            // wrap probe failed) holds its entire
-                            // result as one inert page whose total is
-                            // its own length.
-                            let (grid_total, page_size) = if paged {
-                                (total, size)
-                            } else {
-                                (
-                                    Some(result.rows.len() as u64),
-                                    result.rows.len().max(1),
-                                )
-                            };
-                            let conn = this.conn.clone();
-                            // Later pages of a result read inside the
-                            // transaction are read inside it too, while
-                            // it lasts.
-                            let session = this.txn.clone();
-                            let grid = cx.new(|cx| {
-                                let mut grid = crate::grid::Grid::new_query(
-                                    conn,
-                                    &sql_logged,
-                                    Ok(result),
-                                    grid_total,
-                                    page_size,
-                                    paged,
-                                    window,
-                                    cx,
-                                );
-                                grid.session = session;
-                                grid
-                            });
-                            this.results = Some(grid);
+                        this.results = None;
+                        this.ok_ms = None;
+                        this.plan = None;
+                        match shown(&result, effect) {
+                            Shown::Ok => this.ok_ms = Some(ms),
+                            Shown::Plan(text) => {
+                                let text = SharedString::from(text);
+                                let copy = cx.new(|_| crate::copy_button::CopyButton::new("Copy plan", text.clone()));
+                                this.plan = Some(Plan { text, ms, copy });
+                            }
+                            Shown::Grid => {
+                                // A paged run holds page 0 of a paged grid
+                                // (total exact, or unknown if the count
+                                // failed); a bare run (unwrappable, or the
+                                // wrap probe failed) holds its entire
+                                // result as one inert page whose total is
+                                // its own length.
+                                let (grid_total, page_size) = if paged {
+                                    (total, size)
+                                } else {
+                                    (
+                                        Some(result.rows.len() as u64),
+                                        result.rows.len().max(1),
+                                    )
+                                };
+                                let conn = this.conn.clone();
+                                // Later pages of a result read inside the
+                                // transaction are read inside it too, while
+                                // it lasts.
+                                let session = this.txn.clone();
+                                let grid = cx.new(|cx| {
+                                    let mut grid = crate::grid::Grid::new_query(
+                                        conn,
+                                        &sql_logged,
+                                        Ok(result),
+                                        grid_total,
+                                        page_size,
+                                        paged,
+                                        window,
+                                        cx,
+                                    );
+                                    grid.session = session;
+                                    grid
+                                });
+                                this.results = Some(grid);
+                            }
                         }
                     }
                     Err(message) => {
@@ -562,6 +569,7 @@ impl QueryView {
                         this.error = Some(SharedString::from(message));
                         this.results = None;
                         this.ok_ms = None;
+                        this.plan = None;
                     }
                 }
                 // Arbitrary SQL may change any table. Request a catalog
@@ -670,23 +678,23 @@ impl QueryView {
 
     /// The footer's transient voice, which outranks the results grid's
     /// stats while it has something to say: the ticking elapsed line of
-    /// a slow run, a note ("nothing to run"), or a resultless
-    /// statement's "ok". The grid stats themselves come straight from
-    /// the results grid — the footer reads it through results_grid().
+    /// a slow run, a note ("nothing to run"), a plan's "plan", or a
+    /// resultless statement's "ok". The grid stats themselves come straight
+    /// from the results grid — the footer reads it through results_grid().
     pub(crate) fn status_override(&self) -> Option<String> {
-        if self.show_running {
-            if let Some(t) = self.run_started {
-                return Some(format!(
-                    "running\u{2026} {}",
-                    crate::util::human(t.elapsed().as_secs_f64(), "s")
-                ));
-            }
+        let took = |ms: u64| crate::util::human(ms as f64 / 1000., "s");
+        if self.show_running
+            && let Some(t) = self.run_started
+        {
+            return Some(format!("running\u{2026} {}", crate::util::human(t.elapsed().as_secs_f64(), "s")));
         }
         if let Some(note) = &self.note {
             return Some(note.to_string());
         }
-        self.ok_ms
-            .map(|ms| format!("ok \u{00b7} {}", crate::util::human(ms as f64 / 1000., "s")))
+        if let Some(plan) = &self.plan {
+            return Some(format!("plan \u{00b7} {}", took(plan.ms)));
+        }
+        self.ok_ms.map(|ms| format!("ok \u{00b7} {}", took(ms)))
     }
 
     /// The embedded results grid, for the footer's stats and pager.
@@ -856,15 +864,40 @@ impl Render for QueryView {
                 // the same widgets and ordering as the Data view — no
                 // mid-pane strip (Steve's unification ruling,
                 // 2026-08-31).
-                match self.results.clone() {
+                // A plan shows whole, preformatted, scrolling both ways in
+                // the value font, with its copy tile in the corner.
+                let answer = match (self.results.clone(), &self.plan) {
+                    (Some(grid), _) => Some(grid.into_any_element()),
+                    (None, Some(plan)) => Some(
+                        div()
+                            .size_full()
+                            .relative()
+                            .child(
+                                div()
+                                    .id("plan")
+                                    .size_full()
+                                    .overflow_scroll()
+                                    .p(px(crate::theme::PANE_INSET))
+                                    .whitespace_nowrap()
+                                    .font_family(value_font())
+                                    .text_size(px(CELL_TEXT * crate::prefs::get(cx).zoom_factor()))
+                                    .text_color(t.text)
+                                    .child(plan.text.clone()),
+                            )
+                            .child(div().absolute().top_2().right_3().child(plan.copy.clone()))
+                            .into_any_element(),
+                    ),
+                    (None, None) => None,
+                };
+                match answer {
                     // The results pane: a snapshot that snaps (law 5).
                     // While a slow run holds the floor, the prior
                     // snapshot fades — visibly stale, never blanked.
                     // The divider between the panes is the user's: a
                     // draggable 1px splitter whose position persists
-                    // (docs/QUERY.md's split), the handle's own line
-                    // standing in for the old border_t.
-                    Some(grid) => d.child(
+                    // (docs/QUERY.md's split); the handle's own line is
+                    // the border between them.
+                    Some(answer) => d.child(
                         gpui_kit::base::v_resizable("query-split")
                             .with_state(&self.split)
                             .child(
@@ -894,7 +927,7 @@ impl Render for QueryView {
                                         .size_full()
                                         .min_h_0()
                                         .when(self.show_running, |d| d.opacity(0.45))
-                                        .child(grid),
+                                        .child(answer),
                                 ),
                             ),
                     ),
@@ -902,6 +935,74 @@ impl Render for QueryView {
                 }
             })
     }
+}
+
+/// A plan EXPLAIN answered: its text, the engine's time, and its copy tile
+/// (DESIGN.md: explicit copy, never selection).
+struct Plan {
+    text: SharedString,
+    ms: u64,
+    copy: Entity<crate::copy_button::CopyButton>,
+}
+
+/// What a run's answer shows as.
+#[derive(Debug, PartialEq)]
+enum Shown {
+    /// The status line's `ok · N ms`, and no results.
+    Ok,
+    /// A plan, as the engine drew it.
+    Plan(String),
+    /// The results grid.
+    Grid,
+}
+
+/// How to show `result`. BEGIN, COMMIT and their kin answer with an empty
+/// `Success` column, and their verdict is the status line's and the
+/// transaction mark's; under EXPLAIN ANALYZE they answer with the plan, which
+/// shows. A plan is box art over many lines in one cell, which a grid shows
+/// as its first line, a border: it shows whole instead.
+fn shown(result: &harbor_client::QueryResult, effect: Option<TxnEffect>) -> Shown {
+    if let Some(text) = plan_text(result) {
+        return Shown::Plan(text);
+    }
+    if result.columns.is_empty() || effect.is_some() && result.rows.is_empty() {
+        return Shown::Ok;
+    }
+    Shown::Grid
+}
+
+/// The text of a plan EXPLAIN answered: rows of `explain_key` and
+/// `explain_value`, each plan under its own name when there are several,
+/// as Harbor's REPL prints it. This reads the wire's plan schema the way
+/// the REPL does; when that rule moves into `wire` as `wire::plan`, this
+/// calls it, and both clients detect a plan by one rule.
+fn plan_text(result: &harbor_client::QueryResult) -> Option<String> {
+    let name = |i: usize| result.columns.get(i).and_then(|c| c.name.as_deref());
+    let plan = result.columns.len() == 2
+        && name(0).is_some_and(|n| n.eq_ignore_ascii_case("explain_key"))
+        && name(1).is_some_and(|n| n.eq_ignore_ascii_case("explain_value"));
+    if !plan || result.rows.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for row in &result.rows {
+        let (Some(key), Some(value)) = (row.first()?.as_str(), row.get(1)?.as_str()) else { return None };
+        if result.rows.len() > 1 {
+            out.push_str(match key {
+                "logical_plan" => "Unoptimized Logical Plan",
+                "logical_opt" => "Optimized Logical Plan",
+                "physical_plan" => "Physical Plan",
+                "analyzed_plan" => "Analyzed Plan",
+                other => other,
+            });
+            out.push('\n');
+        }
+        out.push_str(value);
+        if !value.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    Some(out)
 }
 
 /// Statements the results grid can page by wrapping in a subquery —
@@ -2001,6 +2102,40 @@ mod tests {
             "transaction aborted by an error \u{b7} 4:32 left \u{b7} ROLLBACK ends it"
         );
         assert!(transaction_mark(Health::Unknown, left).starts_with("transaction open, its state unconfirmed"));
+    }
+
+    fn answer(names: &[&str], rows: Vec<Vec<serde_json::Value>>) -> harbor_client::QueryResult {
+        let columns = names
+            .iter()
+            .map(|n| wire::Column { name: Some(n.to_string()), duckdb_type: "VARCHAR".into(), ..Default::default() })
+            .collect();
+        harbor_client::QueryResult { columns, row_count: rows.len() as u64, rows, time_ms: 3 }
+    }
+
+    #[test]
+    fn a_plan_shows_whole_and_a_resultless_statement_says_ok() {
+        use super::{shown, Shown};
+        use serde_json::json;
+        let box_art = "┌───┐\n│ 1 │\n└───┘";
+        // EXPLAIN: one plan, shown as drawn, with no heading.
+        let plan = answer(&["explain_key", "explain_value"], vec![vec![json!("physical_plan"), json!(box_art)]]);
+        assert_eq!(shown(&plan, None), Shown::Plan(format!("{box_art}\n")));
+        // EXPLAIN ANALYZE COMMIT: the plan, though the statement ends the
+        // transaction. Several plans each go under their names.
+        assert_eq!(shown(&plan, Some(TxnEffect::Commits)), Shown::Plan(format!("{box_art}\n")));
+        let two = answer(
+            &["explain_key", "explain_value"],
+            vec![vec![json!("logical_opt"), json!("a\n")], vec![json!("physical_plan"), json!("b")]],
+        );
+        assert_eq!(shown(&two, None), Shown::Plan("Optimized Logical Plan\na\nPhysical Plan\nb\n".into()));
+        // The same two names under another shape, or no rows, are rows.
+        assert_eq!(shown(&answer(&["explain_key", "x"], vec![vec![json!("a"), json!("b")]]), None), Shown::Grid);
+        assert_eq!(shown(&answer(&["explain_key", "explain_value"], vec![vec![json!("a"), json!(1)]]), None), Shown::Grid);
+        assert_eq!(shown(&answer(&["v"], vec![vec![json!(1)]]), None), Shown::Grid);
+        // BEGIN and its kin, and a statement with no result set, say ok.
+        assert_eq!(shown(&answer(&["Success"], vec![]), Some(TxnEffect::Opens)), Shown::Ok);
+        assert_eq!(shown(&answer(&[], vec![]), None), Shown::Ok);
+        assert_eq!(shown(&answer(&["v"], vec![]), None), Shown::Grid);
     }
 
     #[test]
