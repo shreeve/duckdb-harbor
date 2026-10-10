@@ -1340,6 +1340,19 @@ fn stop_with(mut running: std::sync::MutexGuard<'_, Option<Running>>) -> Result<
     }
     r.stop.store(true, Ordering::SeqCst);
     r.server.unblock();
+    // What still reaches the queue, through the TCP door or on a connection
+    // already open, is answered rather than left to the process's exit, and
+    // the answer says that nothing of it ran. The thread lets go of the
+    // server between requests, so it ends when the server does.
+    let server = Arc::downgrade(&r.server);
+    let _ = thread::Builder::new().name("harbor-stopping".to_string()).spawn(move || {
+        while let Some(next) = server.upgrade().and_then(|s| s.recv_timeout(Duration::from_millis(50)).ok()) {
+            if let Some(req) = next {
+                let _ = req.respond(error_response(503, code::UNAVAILABLE,
+                    "harbor is stopping; this statement did not run"));
+            }
+        }
+    });
 
     // Before anything else: roll back every live transaction. This is not
     // tidiness. An open write transaction makes CHECKPOINT fail outright —

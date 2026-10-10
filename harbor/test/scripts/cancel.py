@@ -21,6 +21,7 @@ import json
 import os
 import random
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -250,7 +251,7 @@ def main():
     proc, h, log = start_server(db, pool_size=8, workers=4, port=free_port())
     try:
         h.sql("CREATE TABLE IF NOT EXISTS marks(n INTEGER)")
-        run_tests(h, db)
+        run_tests(h, db, proc)
     finally:
         stop_server(proc)
         log.close()
@@ -267,7 +268,7 @@ def main():
     return 0
 
 
-def run_tests(h, db):
+def run_tests(h, db, proc):
     # -----------------------------------------------------------------------
     section("Cancelling a query by the name the client gave it")
 
@@ -684,6 +685,35 @@ def run_tests(h, db):
     eq("every connection came back", (c["total"], 0, 0), (c["free"], c["live"], c["inflight"]))
     eq("the server still answers", 1, h.value("SELECT 1"))
     eq("and can still write", 200, h.sql("INSERT INTO marks VALUES (7)")[0])
+
+    # -----------------------------------------------------------------------
+    section("A server that is stopping says so")
+
+    # A reader that stops reading holds its worker in a write, and the stop
+    # waits on that worker, while the TCP door stays open. A request that
+    # arrives then is told that nothing of it ran, not left to the exit.
+    port = int(h.base.rsplit(":", 1)[1])
+    stall = socket.socket()
+    stall.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    stall.connect(("127.0.0.1", port))
+    body = json.dumps({"sql": "SELECT i, repeat('x', 200) FROM range(2000000) t(i)"})
+    stall.sendall(f"POST /sql HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                  f"Content-Length: {len(body)}\r\n\r\n{body}".encode())
+    time.sleep(1.0)
+    proc.send_signal(signal.SIGTERM)
+    time.sleep(0.7)
+    late = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    try:
+        late.request("POST", "/sql", json.dumps({"sql": "SELECT 1"}), {"Content-Type": "application/json"})
+        response = late.getresponse()
+        answer = (response.status, json.loads(response.read()).get("message"))
+    except (OSError, http.client.HTTPException) as e:
+        answer = type(e).__name__
+    late.close()
+    stall.close()
+    eq("a request that arrives as it stops is told nothing ran",
+       (503, "harbor is stopping; this statement did not run"), answer)
+    proc.wait(timeout=30)
 
 
 if __name__ == "__main__":
