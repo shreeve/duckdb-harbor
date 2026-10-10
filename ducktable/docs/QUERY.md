@@ -81,7 +81,10 @@ statement, and the payload sheds it along with any same-line trailing comment.
 **Each run stands alone, outside a transaction.** A run is one request on a
 pooled connection, so it commits on its own, as it would in the duckdb CLI,
 and nothing else carries to the next run: a temp table is gone by then. What
-does carry is a transaction, below.
+does carry is a transaction, below. A run that gets no answer (a timeout, a
+dropped stream, Harbor's `cancelled` or `internal`) may have run and
+committed, and the view says so under the error, so that a rerun of an
+`INSERT` is a choice and not an accident.
 
 **One run at a time.** ⌘Enter during a run answers `already running…` rather
 than queueing, so no result is ever in flight behind another.
@@ -161,8 +164,9 @@ transaction is open.
   missing parameter (`Invalid Input Error`), and a second `BEGIN`
   (`TransactionContext Error`). After any of them a statement that reads or
   writes answers `Current transaction is aborted (please ROLLBACK)` until
-  `ROLLBACK` or `COMMIT` ends it, and a `COMMIT` then answers like any other
-  and rolls back.
+  `ROLLBACK` or `COMMIT` ends it. Harbor refuses a `COMMIT` of it, `400
+  sql_error`, saying the transaction has been rolled back and nothing since
+  `BEGIN` was kept.
 - **The view knows whether the transaction is aborted by asking it.** Only
   one answer settles it: an aborted transaction answers `SELECT 1` with that
   error, and a sound one answers it. Other statements prove nothing, since
@@ -194,15 +198,17 @@ transaction is open.
   (`session_busy`, which a statement that outlived the view's two-minute wait
   can cause) or the server is not serving, or it could not be sent at all.
 - **An ending with no verdict is not shown as open.** That is a `COMMIT` or
-  `ROLLBACK` that got no answer, or that Harbor answered `cancelled` (a
-  deadline or a cancel interrupted it after the engine had it) or `internal`.
-  The view releases the session, which rolls back anything still open, and
-  says the transaction may have ended either way. Two cases leave no doubt and
-  say so: a `ROLLBACK` is rolled back either way, by the statement or by that
-  release, and so is a `COMMIT` of a transaction already found aborted. If the
-  engine answers that no transaction is active, the view says the session
-  held none and that the statement changed nothing; it does not claim a
-  rollback.
+  `ROLLBACK` that got no answer, or that Harbor answered `internal`, or a
+  `ROLLBACK` it answered `cancelled`. The view releases the session, which
+  rolls back anything still open, and says the transaction may have ended
+  either way. A `COMMIT` answered `cancelled` is a verdict: Harbor runs a
+  session's `COMMIT` to its answer, so a `499` means it never started, and
+  the view says `The COMMIT did not run, and nothing since BEGIN was kept.`
+  and releases the session. Two cases leave no doubt and say so: a
+  `ROLLBACK` is rolled back either way, by the statement or by that release,
+  and so is a `COMMIT` of a transaction already found aborted. If the engine
+  answers that no transaction is active, the view says the session held none
+  and that the statement changed nothing; it does not claim a rollback.
 - **Leaving ends it.** The session is released, and the transaction rolled
   back, when the view goes: the connection drops, another database is chosen,
   the server is stopped, or the app quits. ⌘Q, the close button, choosing

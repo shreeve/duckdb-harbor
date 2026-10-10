@@ -1286,9 +1286,15 @@ enum Fate {
     /// had ended it already, on a statement the view did not read as one
     /// that ends a transaction. Nothing was rolled back by this one.
     NoneActive,
+    /// A COMMIT Harbor answered `cancelled`: it never started, Harbor
+    /// aborted the transaction, and nothing since BEGIN was kept.
+    NotKept,
     /// An ending statement got no answer, so the transaction may have
     /// ended either way.
     InDoubt,
+    /// A statement sent on its own got no answer: it may have run, and on
+    /// its own it commits.
+    MaybeRan,
     /// Harbor no longer knows the session: it reclaimed it, at its idle
     /// timeout or its deadline, and rolled the transaction back. The
     /// statement did not run.
@@ -1307,6 +1313,9 @@ fn fate(
     let ends = effect.is_some_and(TxnEffect::ends);
     let doomed = aborted && effect == Some(TxnEffect::Commits);
     match (route, failure) {
+        // A statement sent on its own that got no answer may have run, and
+        // on its own it commits.
+        (Route::Alone, Some(failure)) if effect.is_none() && ran(failure) == Ran::Unknown => Fate::MaybeRan,
         (Route::Alone | Route::Refused, _) => Fate::Closed,
         (Route::Opening, None) => Fate::Open,
         (Route::Opening, Some(_)) => Fate::Closed,
@@ -1333,6 +1342,15 @@ fn fate(
             // doubt: it rolls back when it runs, and when its session is
             // released if it did not.
             Ran::Unknown if doomed => Fate::RolledBack,
+            // A COMMIT runs to its answer, so one Harbor answered `cancelled`
+            // never started: nothing since BEGIN was kept
+            // (`edits::commit_outcome`, the grid's rule too).
+            Ran::Unknown
+                if effect == Some(TxnEffect::Commits)
+                    && crate::edits::commit_outcome(Some(failure)) == crate::edits::CommitOutcome::NotLanded =>
+            {
+                Fate::NotKept
+            }
             Ran::Unknown => Fate::InDoubt,
         },
     }
@@ -1357,6 +1375,14 @@ impl Fate {
             ),
             // A rollback rolls back either way: by the statement, or by the
             // release of its session.
+            Fate::NotKept => Some(
+                "The COMMIT did not run, and nothing since BEGIN was kept. The session was \
+                 released.",
+            ),
+            Fate::MaybeRan => Some(
+                "No answer came back: the statement may have run, and on its own it commits. \
+                 Look before running it again.",
+            ),
             Fate::InDoubt if effect == Some(TxnEffect::RollsBack) => Some(
                 "No answer came back. The session was released, which rolls the transaction \
                  back if the statement had not already.",
@@ -2018,8 +2044,14 @@ mod tests {
         // rolls back when it runs or when its session is released.
         for failure in [Failure::Unanswered("query: timed out".into()), harbor("cancelled"), harbor("internal")] {
             assert_eq!(fate(Route::Held, commits, true, Some(&failure)), Fate::RolledBack, "{failure:?}");
+        }
+        // Not aborted: with no answer, or Harbor's `internal`, it may have
+        // committed; answered `cancelled`, it never started.
+        for failure in [Failure::Unanswered("query: timed out".into()), harbor("internal")] {
             assert_eq!(fate(Route::Held, commits, false, Some(&failure)), Fate::InDoubt, "{failure:?}");
         }
+        assert_eq!(fate(Route::Held, commits, false, Some(&harbor("cancelled"))), Fate::NotKept);
+        assert!(Fate::NotKept.note(commits).unwrap().starts_with("The COMMIT did not run, and nothing since BEGIN was kept."));
         // A ROLLBACK does what was asked either way, and says no more.
         assert_eq!(fate(Route::Held, rolls_back, true, None), Fate::Closed);
         assert_eq!(fate(Route::Held, rolls_back, false, None), Fate::Closed);
@@ -2049,9 +2081,17 @@ mod tests {
 
         // Alone, nothing is open before or after, whatever the verdict.
         for failure in [None, Some(&catalog), Some(&lost_answer)] {
-            assert_eq!(fate(Route::Alone, None, false, failure), Fate::Closed);
             assert_eq!(fate(Route::Alone, commits, false, failure), Fate::Closed);
         }
+        for failure in [None, Some(&catalog), Some(&parse), Some(&unsent)] {
+            assert_eq!(fate(Route::Alone, None, false, failure), Fate::Closed);
+        }
+        // A statement alone that got no answer may have run, and committed:
+        // the view says so, and a rerun is the user's to weigh.
+        for failure in [&lost_answer, &harbor("cancelled"), &harbor("internal")] {
+            assert_eq!(fate(Route::Alone, None, false, Some(failure)), Fate::MaybeRan, "{failure:?}");
+        }
+        assert!(Fate::MaybeRan.note(None).unwrap().contains("may have run, and on its own it commits"));
         // BEGIN opens one only if it succeeded; its session goes back otherwise.
         assert_eq!(fate(Route::Opening, opens, false, None), Fate::Open);
         assert_eq!(fate(Route::Opening, opens, false, Some(&catalog)), Fate::Closed);
@@ -2082,9 +2122,9 @@ mod tests {
             // One Harbor interrupted after the engine had it, at a deadline
             // or a cancel, or failed on after it ran, has no verdict either:
             // the transaction is not shown as open.
-            for code in ["cancelled", "internal"] {
-                assert_eq!(fate(Route::Held, ends, false, Some(&harbor(code))), Fate::InDoubt, "{code}");
-            }
+            assert_eq!(fate(Route::Held, ends, false, Some(&harbor("internal"))), Fate::InDoubt);
+            let cancelled = if ends == commits { Fate::NotKept } else { Fate::InDoubt };
+            assert_eq!(fate(Route::Held, ends, false, Some(&harbor("cancelled"))), cancelled);
             // The engine found no transaction to end: the view's mark was
             // wrong, and nothing is claimed to have been rolled back.
             for verb in ["commit", "rollback"] {
