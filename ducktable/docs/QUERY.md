@@ -308,6 +308,8 @@ existed elsewhere.
   that cannot recover mid-keystroke. The engine over the wire is the validity
   oracle, version-exact for the attached database.
 - The generated `parser.c` is vendored and compiled by `cc` in `build.rs`.
+  The `.gram` files it derives from are DuckDB's, read in DuckDB's own tree
+  at the commit `grammar/grammar.js` names, and not copied here.
 
 ## Planned
 
