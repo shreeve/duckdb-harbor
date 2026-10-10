@@ -1014,18 +1014,18 @@ if (pending.trim()) {
 
 DuckDB answers the query; DuckDB Harbor's job is to stay out of the way.
 `test/scripts/bench.py` measures how well it does. It serves a fresh database,
-sends each query shape below over one keep-alive connection, round after
-round, and reports the server's own `timeMs` beside the wall time the client
-saw. Seven rounds on an Apple M5 (10 cores) with DuckDB `v2.0.0-alpha42289`:
+sends each query shape over one keep-alive connection, round after round,
+and reports the server's own `timeMs` beside the wall time the client saw.
+The shapes are chosen because each fails differently:
 
-| Shape | Query | Best | Median | Wall, median |
-| --- | --- | --: | --: | --: |
-| point | `SELECT 42` | < 1 ms | < 1 ms | 0.5 ms |
-| ints | 5,000,000 integers | 70 ms | 78 ms | 85 ms |
-| strings | 1,000,000 strings | 32 ms | 38 ms | 40 ms |
-| mixed | 2,000,000 rows of three columns | 84 ms | 100 ms | 105 ms |
-| temporal | 1,000,000 timestamps | 28 ms | 37 ms | 39 ms |
-| heavy | `count(DISTINCT i)` over 100,000,000 | 1,049 ms | 1,096 ms | 1,096 ms |
+| Shape | Query | What it catches |
+| --- | --- | --- |
+| point | `SELECT 42` | the round trip, with nothing to encode |
+| ints | 5,000,000 integers | the integer encoder |
+| strings | 1,000,000 strings | the JSON escape scan |
+| mixed | 2,000,000 rows of three columns | per-row framing |
+| temporal | 1,000,000 timestamps | date and time formatting |
+| heavy | `count(DISTINCT i)` over 100,000,000 | the engine's own work, one row out |
 
 `make bench` runs it against `target/release/harbor`, and
 `make bench BENCH_ARGS="./harbor-a ./harbor-b"` compares two builds. Their
@@ -1037,9 +1037,9 @@ Measure the build and the engine you deploy: an engine moves these numbers as
 much as harbor does.
 
 Streaming matters more than the rate for large results. A 300,000-row result
-starts arriving before the query has finished running and completes in well
-under 100 ms, because nothing is buffered. A client can start work on row one
-while the server is still producing row 300,000. (Whether the *query*
+starts arriving before the query has finished running, because nothing is
+buffered: a client can start work on row one while the server is still
+producing row 300,000. (Whether the *query*
 materialises is DuckDB's business: `ORDER BY`, hash aggregates and joins all
 build state first.)
 
