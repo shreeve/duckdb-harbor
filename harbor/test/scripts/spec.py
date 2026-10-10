@@ -123,12 +123,24 @@ CASES = [
     ("date-leap-2024", "SELECT '2024-02-29'::DATE AS v",              "DATE", True, "2024-02-29"),
     ("date-year-1",    "SELECT '0001-01-01'::DATE AS v",              "DATE", True, "0001-01-01"),
     ("date-year-9999", "SELECT '9999-12-31'::DATE AS v",              "DATE", True, "9999-12-31"),
-    # Before 1 AD the year is ISO 8601's astronomical one, signed and four
-    # digits: 1 BC is 0000, 44 BC is -0043, never the three-digit -043.
+    # Before 1 AD the year is ISO 8601's astronomical one: 1 BC is 0000. A
+    # year outside 0000-9999 takes the expanded form, a sign and six digits,
+    # the one a JavaScript Date reads (it reads -0043 as 2043): 44 BC is
+    # -000043, and 10000 is +010000.
     ("date-1-bc",      "SELECT '0001-01-01 (BC)'::DATE AS v",         "DATE", True, "0000-01-01"),
-    ("date-44-bc",     "SELECT '0044-03-15 (BC)'::DATE AS v",         "DATE", True, "-0043-03-15"),
+    ("date-44-bc",     "SELECT '0044-03-15 (BC)'::DATE AS v",         "DATE", True, "-000043-03-15"),
     ("ts-44-bc",       "SELECT '0044-03-15 (BC) 12:00:00'::TIMESTAMP AS v",
-                       "TIMESTAMP", True, "-0043-03-15T12:00:00"),
+                       "TIMESTAMP", True, "-000043-03-15T12:00:00"),
+    ("date-10000",     "SELECT '10000-01-01'::DATE AS v",             "DATE", True, "+010000-01-01"),
+    ("ts-10000",       "SELECT '10000-01-01 00:00:00'::TIMESTAMP AS v",
+                       "TIMESTAMP", True, "+010000-01-01T00:00:00"),
+    # DuckDB reads the negative form back (and refuses the + of the other).
+    ("date-readback",  "SELECT '-000043-03-15T12:00:00'::TIMESTAMP = TIMESTAMP '0044-03-15 (BC) 12:00:00' AS v",
+                       "BOOLEAN", True, True),
+    # The literal one past HUGEINT's largest is the engine's UHUGEINT, and
+    # goes out as a string like every integer past 2^53.
+    ("uhugeint-literal", "SELECT 170141183460469231731687303715884105728 AS v",
+                       "UHUGEINT", True, "170141183460469231731687303715884105728"),
     # An infinite date is a sentinel in storage, the type's largest value.
     # Formatted as a date it reads as a real one millennia out, so it goes
     # out as the word the engine prints and parses back.

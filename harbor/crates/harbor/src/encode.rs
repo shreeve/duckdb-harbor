@@ -97,8 +97,18 @@ pub(crate) fn push_i64_raw(out: &mut String, v: i64) {
     push_u64_raw(out, v.unsigned_abs());
 }
 
+/// A year outside 0000 to 9999, in ISO 8601's expanded form: a sign and six
+/// digits (`-000043` is 44 BC, `+010000`), more for a year that needs them.
+/// It is the form JavaScript's `toISOString` writes and the only one its
+/// `Date` reads; `-0043` reads there as the year 2043. DuckDB reads the
+/// negative form back, and refuses the `+`.
+pub(crate) fn push_expanded_year(out: &mut String, y: i64) {
+    out.push(if y < 0 { '-' } else { '+' });
+    push_int_pad(out, y.abs(), 6);
+}
+
 /// An integer with its digits zero-padded to `width`, the sign before them
-/// and not counted: ISO 8601's year 44 BC is `-0043`, four digits signed.
+/// and not counted.
 pub(crate) fn push_int_pad(out: &mut String, v: i64, width: usize) {
     let neg = v < 0;
     if neg {
@@ -332,7 +342,7 @@ pub(crate) fn push_date(out: &mut String, days: i32) {
         // Safety: the buffer holds only ASCII digits and dashes.
         out.push_str(unsafe { std::str::from_utf8_unchecked(&b) });
     } else {
-        push_int_pad(out, y, 4);
+        push_expanded_year(out, y);
         out.push('-');
         push_int_pad(out, m as i64, 2);
         out.push('-');
@@ -706,6 +716,23 @@ mod tests {
             (2_932_896, (9999, 12, 31)),
         ] {
             assert_eq!(civil_from_days(days), want, "days={days}");
+        }
+    }
+
+    /// A year past four digits, or before year 0, goes out in the expanded
+    /// form a JavaScript `Date` reads: a sign and six digits.
+    #[test]
+    fn a_year_outside_four_digits_is_expanded() {
+        for (days, want) in [
+            (2_932_896, "9999-12-31"),
+            (2_932_897, "+010000-01-01"),
+            (-719_469, "0000-02-29"),
+            (-719_834, "-000001-03-01"),
+            (i32::MAX as i64 - 1, "+5881580-07-10"),
+        ] {
+            let mut out = String::new();
+            push_date(&mut out, days as i32);
+            assert_eq!(out, want, "days={days}");
         }
     }
 

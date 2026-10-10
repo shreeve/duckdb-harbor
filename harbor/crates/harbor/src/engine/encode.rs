@@ -10,7 +10,7 @@
 use super::ffi;
 use super::{Error, destroy_value, str_view};
 use crate::encode::{
-    civil_from_days, digit_pair, push_base64, push_bit_string, push_date, push_float,
+    civil_from_days, digit_pair, push_base64, push_bit_string, push_date, push_expanded_year, push_float,
     push_fraction, push_i64_raw, push_int, push_int_pad, push_json_string,
     push_time, push_tz_offset, push_u128_raw, push_u64_raw, push_uint, push_uuid, quote_nonfinite,
     split_time, varint_to_decimal,
@@ -760,7 +760,7 @@ fn push_ts(out: &mut String, nanos: i128, seconds_only: bool, zulu: bool) {
         // Safety: the buffer holds only ASCII digits and punctuation.
         out.push_str(unsafe { std::str::from_utf8_unchecked(&b) });
     } else {
-        push_int_pad(out, y, 4);
+        push_expanded_year(out, y);
         out.push('-');
         push_int_pad(out, m as i64, 2);
         out.push('-');
