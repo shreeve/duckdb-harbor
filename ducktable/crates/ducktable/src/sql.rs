@@ -79,14 +79,19 @@ fn where_part(cond: &str) -> String {
 /// than they open is not cut: whole inside the parentheses, it is the
 /// engine's syntax error, and never a way past the page's LIMIT.
 pub(crate) fn split_order(filter: &str) -> (&str, Option<&str>) {
-    use wire::{scan::space_len, statement::bare_word};
+    use wire::statement::{bare_word, skip_trivia};
     let b = filter.as_bytes();
     let (mut depth, mut cut) = (0i32, None);
     for span in wire::scan::scan(filter).into_iter().filter(|s| s.kind == wire::scan::Kind::Code) {
         let mut i = span.start;
         while i < span.end {
+            // Spaces as the engine reads them, Unicode ones included.
+            let at = i;
+            skip_trivia(b, &mut i);
+            if i > at || i >= span.end {
+                continue;
+            }
             match b[i] {
-                _ if space_len(&b[i..]) > 0 => i += space_len(&b[i..]),
                 b'(' => (depth, i) = (depth + 1, i + 1),
                 b')' if depth == 0 => return (filter, None),
                 b')' => (depth, i) = (depth - 1, i + 1),
