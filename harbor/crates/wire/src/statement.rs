@@ -8,20 +8,14 @@
 //! engine: the spaces it skips, the comments it skips, what it takes for a
 //! bare word, and the `EXPLAIN` that runs what it explains.
 
-use crate::scan::{Kind, comment_at, is_word_byte, scan, space_len};
+use crate::scan::{Kind, comment_at, is_space, is_word_byte, plain_spaces, spans};
 
 /// Advance `i` past whitespace and SQL comments, read by [`crate::scan`]. The
-/// one skipper every reader of a statement's keywords shares.
+/// one skipper every reader of a statement's keywords shares. `b` is the
+/// whole text: whether a Unicode space is one depends on what comes before
+/// it.
 pub fn skip_trivia(b: &[u8], i: &mut usize) {
-    loop {
-        while let n @ 1.. = space_len(&b[*i..]) {
-            *i += n;
-        }
-        match comment_at(b, *i) {
-            Some(comment) => *i = comment.end,
-            None => break,
-        }
-    }
+    skip(&plain_spaces(b), i)
 }
 
 /// A bare keyword after trivia, uppercased: a run of what the engine keeps
@@ -30,9 +24,25 @@ pub fn skip_trivia(b: &[u8], i: &mut usize) {
 /// and never a keyword, so it reads as nothing, and so does punctuation;
 /// `COMMIT$x` and `"BEGIN"` are table names to the engine and to this.
 pub fn bare_word(b: &[u8], i: &mut usize) -> String {
-    skip_trivia(b, i);
+    word(&plain_spaces(b), i)
+}
+
+fn skip(b: &[u8], i: &mut usize) {
+    loop {
+        while b.get(*i).is_some_and(|&c| is_space(c)) {
+            *i += 1;
+        }
+        match comment_at(b, *i) {
+            Some(comment) => *i = comment.end,
+            None => break,
+        }
+    }
+}
+
+fn word(b: &[u8], i: &mut usize) -> String {
+    skip(b, i);
     let start = *i;
-    while *i < b.len() && space_len(&b[*i..]) == 0 && is_word_byte(b[*i]) {
+    while b.get(*i).is_some_and(|&c| is_word_byte(c)) {
         *i += 1;
     }
     String::from_utf8_lossy(&b[start..*i]).to_ascii_uppercase()
@@ -45,28 +55,28 @@ pub fn bare_word(b: &[u8], i: &mut usize) -> String {
 /// value the option is given, and takes a list after the word too; an
 /// `EXPLAIN` without it only plans.
 pub fn acting_keyword(sql: &str) -> String {
-    let b = sql.as_bytes();
+    let b = &*plain_spaces(sql.as_bytes());
     let mut i = 0;
-    let word = bare_word(b, &mut i);
-    if word != "EXPLAIN" {
-        return word;
+    let first = word(b, &mut i);
+    if first != "EXPLAIN" {
+        return first;
     }
     let analyzes = |w: &str| matches!(w, "ANALYZE" | "ANALYSE");
     let at = i;
-    let mut analyze = analyzes(&bare_word(b, &mut i));
+    let mut analyze = analyzes(&word(b, &mut i));
     if !analyze {
         i = at;
     }
-    skip_trivia(b, &mut i);
+    skip(b, &mut i);
     if b.get(i) == Some(&b'(') {
         // The list is read in its code alone: a parenthesis or a word in an
         // option's quoted value is part of the value. `(ANALYZE 'x)')` is
         // one option, and the statement after it runs.
-        let list = &sql[i..];
+        let list = &b[i..];
         let mut end = list.len();
         let mut depth = 0usize;
-        'list: for span in scan(list).into_iter().filter(|s| s.kind == Kind::Code) {
-            let code = &list.as_bytes()[..span.end];
+        'list: for span in spans(list).into_iter().filter(|s| s.kind == Kind::Code) {
+            let code = &list[..span.end];
             let mut j = span.start;
             while j < span.end {
                 match code[j] {
@@ -80,7 +90,7 @@ pub fn acting_keyword(sql: &str) -> String {
                     }
                     _ => {
                         let at = j;
-                        analyze |= analyzes(&bare_word(code, &mut j));
+                        analyze |= analyzes(&word(code, &mut j));
                         if j > at {
                             continue;
                         }
@@ -91,7 +101,7 @@ pub fn acting_keyword(sql: &str) -> String {
         }
         i += end;
     }
-    if analyze { bare_word(b, &mut i) } else { word }
+    if analyze { word(b, &mut i) } else { first }
 }
 
 /// What a statement does to the surrounding transaction, when that is knowable
@@ -117,16 +127,25 @@ mod tests {
     use super::*;
 
     /// The spaces are the engine's list and no wider: a space it does not
-    /// skip is part of a word to it, and the word is then no keyword.
+    /// skip is part of a word to it, and the word is then no keyword. Its
+    /// pre-pass never looks at a text's last two bytes, so a final U+00A0
+    /// is part of the word: `COMMIT` and that space is a table to the
+    /// engine, which runs it as `FROM` and aborts the transaction.
     #[test]
     fn a_keyword_is_read_past_the_spaces_the_engine_skips_and_no_others() {
         for space in ["\u{a0}", "\u{2000}", "\u{200b}", "\u{202f}", "\u{205f}", "\u{2060}", "\u{3000}", "\u{feff}", "\u{b}", "\t\r\n"] {
             assert_eq!(acting_keyword(&format!("{space}COMMIT")), "COMMIT", "{space:?}");
-            assert_eq!(transaction_effect(&format!("COMMIT{space}")), Some(false), "{space:?}");
+            assert_eq!(transaction_effect(&format!("COMMIT{space};")), Some(false), "{space:?}");
         }
+        assert_eq!(transaction_effect("COMMIT\u{a0}"), None);
+        assert_eq!(transaction_effect("COMMIT\u{3000}"), Some(false));
         for not_a_space in ["\u{85}", "\u{1680}", "\u{2028}", "\u{2029}"] {
             assert_eq!(transaction_effect(&format!("{not_a_space}COMMIT")), None, "{not_a_space:?}");
         }
+        // A space the pre-pass passes over, here inside the quote that a
+        // `'` in a comment opens for it, is part of the word as well.
+        assert_eq!(acting_keyword("/* ' */ COMMIT\u{3000}x"), "COMMIT\u{3000}X");
+        assert_eq!(bare_word("/* ' */ COMMIT\u{3000}x".as_bytes(), &mut 0), "COMMIT\u{3000}X");
     }
 
     /// The effect is the engine's, measured: an analyzed EXPLAIN runs the
