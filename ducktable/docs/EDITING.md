@@ -563,7 +563,8 @@ the keyboard to the grid or the editor behind the dialog), Refresh Tables,
 and New Row, Duplicate Row and Delete Row. Three things already under way
 wait for the answer. A connect still in flight when the dialog opens is
 called off, since landing it would replace everything behind the dialog; on
-Cancel it is dialed again. A table switch whose page arrives under the
+Cancel it is dialed again, as a choice of that database, which asks first
+when leaving the one on screen would end something. A table switch whose page arrives under the
 dialog, or that was waiting on a commit which settles under it, runs on
 Cancel; when a connect is dialed again the switch is dropped, since the
 connect replaces the grid it was for. A server that stops under the dialog leaves its connection on screen
@@ -601,6 +602,12 @@ it, and only the facts that concern that database are listed:
 Before any of the three, text in an open cell editor on that database is
 confirmed; text its column refuses keeps the editor open with the reason,
 and nothing is left.
+
+A connect takes a moment, and the database on screen stays usable until it
+lands. When something has been put at stake there meanwhile (a `BEGIN`
+typed, a statement started, an editor opened), the landing asks the switch's
+question rather than end it unasked; what was asked about before the
+connect began is not asked again. Leave Anyway connects afresh.
 
 Two ways out end the app through macOS without passing through the dialog,
 and ask nothing: Quit from the Dock's menu, and a logout, restart or
