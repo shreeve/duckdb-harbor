@@ -35,7 +35,8 @@ fn active_key<'a>(connecting: Option<&'a DbKey>, connected: Option<&'a DbKey>) -
 }
 
 /// The state a row shows. The survey's word stands for a file and for a
-/// remote on this machine, whose servers it probes. It never dials a
+/// remote on this machine, whose servers it probes (a miss of the one on
+/// screen is checked again, `lost`). It never dials a
 /// tunnel, so for the tunneled remote on screen (`tunnel_up` is `Some`)
 /// the tunnel's SSH process answers: running, the row is; exited, it is not.
 fn shown_state(surveyed: State, tunnel_up: Option<bool>) -> State {
@@ -44,6 +45,15 @@ fn shown_state(surveyed: State, tunnel_up: Option<bool>) -> State {
         Some(false) => State::Stopped,
         None => surveyed,
     }
+}
+
+/// Whether the connection on screen has lost its server. For a tunneled
+/// remote the survey's word stands: the tunnel's SSH process gave it. For
+/// any other the survey gives each server two seconds, which a busy one can
+/// miss, so a miss is checked with `/ready` on the connection's own
+/// transport, and only a server that fails that too has stopped.
+fn lost(surveyed_live: bool, tunneled: bool, ready: impl FnOnce() -> bool) -> bool {
+    !surveyed_live && (tunneled || !ready())
 }
 
 /// What runs when the quit dialog is cancelled.
@@ -1118,6 +1128,10 @@ impl DuckTable {
             }
             _ => None,
         };
+        let conn = match &self.phase {
+            Phase::Connected { conn, .. } => Some(conn.clone()),
+            _ => None,
+        };
         cx.spawn(async move |this, cx| {
             // survey() answers liveness from each server's own socket:
             // a listening socket is the registration, so a running
@@ -1188,6 +1202,22 @@ impl DuckTable {
             for task in tasks {
                 rows.push(task.await);
             }
+            // The connection on screen, if its server is gone (`lost`). One
+            // that a busy server's missed survey would have dropped is asked
+            // again on its own transport, and its row shows what it answers.
+            let lost = match (connected, conn) {
+                (Some((key, _, tunnel_up)), Some(conn)) => {
+                    let surveyed = rows.iter().any(|r| r.key == key && r.state.is_live());
+                    let ready = move || conn.transport().is_ok_and(harbor_client::http::ready);
+                    let tunneled = tunnel_up.is_some();
+                    let gone = cx.background_executor().spawn(async move { lost(surveyed, tunneled, ready) }).await;
+                    if !gone && !surveyed {
+                        rows.iter_mut().filter(|r| r.key == key).for_each(|r| r.state = State::Running);
+                    }
+                    gone.then_some(key)
+                }
+                _ => None,
+            };
             this.update(cx, |state, cx| {
                 if state.refresh_seq != fence {
                     return;
@@ -1215,11 +1245,11 @@ impl DuckTable {
                 state.rows = rows;
                 state.warning = warning;
                 state.installed_version = installed_version;
-                // Reconcile the connection against the survey's truth: if we
-                // still think we're connected to a berth the survey no longer
-                // shows running, its server exited out from under us. Drop it
-                // cleanly and point the way back, rather than leaving a dead
-                // connection to fail the next catalog or query with an OS error.
+                // Reconcile the connection: one whose server exited out from
+                // under it (`lost`) is dropped cleanly with the way back
+                // pointed out, rather than left to fail the next catalog or
+                // query with an OS error. A connection made since the survey
+                // began is not the one it judged.
                 let connected = match &state.phase {
                     Phase::Connected { conn, .. } => {
                         Some((clone_str(&conn.name), DbKey::of_conn(conn), conn.tunnel_up().is_some()))
@@ -1232,7 +1262,7 @@ impl DuckTable {
                 // follows a cancel reconciles.
                 if let Some((name, key, tunneled)) = connected
                     && !state.asking_to_quit
-                    && !state.rows.iter().any(|r| r.key == key && r.state.is_live())
+                    && lost.as_ref() == Some(&key)
                 {
                     state.drop_connection(cx);
                     let gone = if tunneled { "lost its SSH tunnel" } else { "stopped" };
@@ -1703,6 +1733,30 @@ mod tests {
         // SSH process says whether it is up.
         assert_eq!(shown_state(State::Stopped, Some(true)), State::Running);
         assert_eq!(shown_state(State::Stopped, Some(false)), State::Stopped);
+    }
+
+    #[test]
+    fn a_missed_survey_drops_a_connection_only_when_its_server_fails_ready_too() {
+        use super::lost;
+        let asked = std::cell::Cell::new(0);
+        let answers = |up: bool| {
+            let asked = &asked;
+            move || {
+                asked.set(asked.get() + 1);
+                up
+            }
+        };
+        // Seen running: nothing is asked.
+        assert!(!lost(true, false, answers(false)));
+        assert_eq!(asked.get(), 0);
+        // Missed by a survey, yet answering on its own transport: kept.
+        assert!(!lost(false, false, answers(true)));
+        // Missed, and not answering either: gone.
+        assert!(lost(false, false, answers(false)));
+        assert_eq!(asked.get(), 2);
+        // A tunnel whose SSH process exited is gone without asking.
+        assert!(lost(false, true, answers(true)));
+        assert_eq!(asked.get(), 2);
     }
 
     #[test]
