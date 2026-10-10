@@ -1403,10 +1403,11 @@ impl DuckTable {
         if connected_here {
             self.drop_connection(cx);
         }
-        // The database is forgotten, and what was staged for it with it:
-        // the one dialog asked first (`Leaving::Remove`).
-        self.staged.forget(&DbKey::Remote(clone_str(&name)));
-        self.fleet_then_refresh(move || fleet::remove_remote(&name), cx);
+        // The database is forgotten, and what was staged for it with it,
+        // once the config has let it go: the one dialog asked first
+        // (`Leaving::Remove`). A removal the config refuses keeps both.
+        let db = DbKey::Remote(clone_str(&name));
+        self.fleet_then(move || fleet::remove_remote(&name), move |state| state.staged.forget(&db), cx);
     }
 
     /// Connect to what `aim` names: the current content keeps rendering
@@ -1654,11 +1655,23 @@ impl DuckTable {
         op: impl FnOnce() -> Result<(), String> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        self.fleet_then(op, |_| {}, cx);
+    }
+
+    /// `fleet_then_refresh`, with `done` run on the app once the call has
+    /// succeeded.
+    fn fleet_then(
+        &self,
+        op: impl FnOnce() -> Result<(), String> + Send + 'static,
+        done: impl FnOnce(&mut Self) + 'static,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
             let outcome = cx.background_executor().spawn(async move { op() }).await;
             this.update(cx, |state, cx| {
-                if let Err(message) = outcome {
-                    state.warning = Some(message);
+                match outcome {
+                    Ok(()) => done(state),
+                    Err(message) => state.warning = Some(message),
                 }
                 state.refresh(cx);
                 cx.notify();
