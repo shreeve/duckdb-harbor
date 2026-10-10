@@ -10,9 +10,9 @@
 # how the app performs; install debug only to keep a bundle around for
 # the element inspector.
 #
-# A copy already running from the destination is quit and relaunched, so
-# what is on screen afterwards is the build just installed. Uncommitted
-# staged edits in that window go with it, exactly as ⌘Q would take them.
+# A copy running from the destination is refused, not quit: quitting is
+# the app's to do, where ⌘Q asks about staged edits and an open
+# transaction before anything is lost.
 set -e
 cd "$(dirname "$0")/.."
 
@@ -27,14 +27,18 @@ case "$profile" in
         ;;
 esac
 
-# A plain command, never a pipeline: a pipeline reports the last stage's
-# status, which would hide a failed build from set -e and carry an empty
-# path into the replace below — taking the installed app with it and
-# putting nothing back. macos-app.sh writes this one fixed path; the
-# check keeps that coupling honest if it ever moves.
-scripts/macos-app.sh "$profile" >/dev/null
-app="target/DuckTable.app"
-[ -d "$app" ] || { echo "No bundle at $app after building." >&2; exit 1; }
+# Only ever the copy being replaced: matched by its executable's path, never
+# by name. Every build shares one bundle id, so a name-addressed check would
+# also catch a dev copy running from target/. comm= carries the full
+# executable path, so -F matches it literally and a destination holding
+# regex characters cannot slip past.
+refuse_if_running() {
+    pids=$(ps -A -o pid=,comm= | grep -F "$1/Contents/MacOS/ducktable" | awk '{print $1}')
+    [ -z "$pids" ] || {
+        echo "DuckTable is running from $1 (pid $(echo "$pids" | paste -sd' ' -)); quit it, then re-run." >&2
+        exit 1
+    }
+}
 
 # A destination given explicitly is honored or refused, never quietly
 # swapped for another — only the default falls back, for Macs where
@@ -45,42 +49,25 @@ else
     dest="/Applications"
     [ -w "$dest" ] || [ ! -d "$dest" ] || dest="$HOME/Applications"
 fi
+installed="$dest/DuckTable.app"
+# Once before the build, so a running copy costs no build, and again before
+# the swap, since it may have been opened meanwhile.
+refuse_if_running "$installed"
+
+# A plain command, never a pipeline: a pipeline reports the last stage's
+# status, which would hide a failed build from set -e and carry an empty
+# path into the replace below — taking the installed app with it and
+# putting nothing back. macos-app.sh writes this one fixed path; the
+# check keeps that coupling honest if it ever moves.
+scripts/macos-app.sh "$profile" >/dev/null
+app="target/DuckTable.app"
+[ -d "$app" ] || { echo "No bundle at $app after building." >&2; exit 1; }
+
 mkdir -p "$dest"
 [ -w "$dest" ] || { echo "$dest is not writable." >&2; exit 1; }
-installed="$dest/DuckTable.app"
-
-# Only ever the copy being replaced: signalling by pid, never by name.
-# Every build shares one bundle id, so anything name-addressed — an
-# AppleScript quit, `killall DuckTable` — is as likely to reach a dev
-# copy running from target/ as the app installed here. comm= carries the
-# full executable path, so -F matches it literally and a destination
-# holding regex characters cannot slip past.
-running_pids() {
-    ps -A -o pid=,comm= | grep -F "$installed/Contents/MacOS/ducktable" | awk '{print $1}'
-}
-
 # A process whose bundle is replaced underneath it runs on deleted files
-# and misbehaves until relaunched, so the old copy goes down first and
-# comes back up at the end — running this script means wanting the new
-# build in front of you. TERM is what ⌘Q already amounts to here: the app
-# keeps no unsaved state but staged edits, and it discards those on quit
-# without asking either way.
-relaunch=""
-pids=$(running_pids)
-if [ -n "$pids" ]; then
-    echo "Quitting DuckTable (pid $(echo "$pids" | paste -sd' ' -))..."
-    kill $pids 2>/dev/null || true
-    n=0
-    while [ -n "$(running_pids)" ]; do
-        n=$((n + 1))
-        [ "$n" -gt 20 ] && {
-            echo "DuckTable did not exit; quit it and re-run." >&2
-            exit 1
-        }
-        sleep 0.5
-    done
-    relaunch=1
-fi
+# and misbehaves until relaunched.
+refuse_if_running "$installed"
 
 # Stage beside the destination, then swap: the installed app stands until
 # the copy is whole, so a ditto that dies partway leaves the Mac with the
@@ -125,9 +112,3 @@ if [ -x "$lsregister" ]; then
 fi
 
 echo "Installed $installed ($profile)"
-
-# Back to where it was: relaunch only what this script took down, so a
-# scripted install onto a Mac where DuckTable sat closed leaves it closed.
-if [ -n "$relaunch" ]; then
-    open "$installed"
-fi
