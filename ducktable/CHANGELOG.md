@@ -3,6 +3,70 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by release
 date, newest first.
 
+## 0.23.0 — 2026-10-10
+
+- **Staged changes are kept per database.** Choosing another database,
+  Stop, a server that exits and a refresh that misses one dropped every staged
+  and held set without a word. Each database keeps its own, as each table
+  already did, and they come back when it is chosen again; the quit dialog
+  counts them all. Leaving a database asks only about what cannot be parked:
+  a Query transaction, a running statement or a commit in flight. Stop asks
+  and keeps the changes; Remove asks and forgets them, once the removal has
+  succeeded. A click on the database already connected does nothing.
+- **Doubles read and key exactly.** About one full-precision DOUBLE in ten
+  showed one digit off, and a row keyed by such a DOUBLE could not be edited:
+  the UPDATE named a neighbouring value and matched nothing. Values decode to
+  the double Harbor sent.
+- **A commit's statements run in an order that can land.** Deleting row 7
+  and re-keying row 3 to 7, the example EDITING.md gives, could never commit:
+  inserts ran first, then updates, then deletes. Deletes run first, an update
+  that takes a key another frees runs after it, and a duplicate or new row
+  that takes a freed key runs last. A swap of two keys is left for the
+  engine to refuse; the limits that remain are in EDITING.md.
+- **One rule reads a COMMIT's answer, in the grid and the Query view.** A
+  refusal, a `cancelled` answer and a request that never left mean nothing
+  landed; no answer, `internal` and an unknown code are in doubt, and the
+  held set is judged whole as before. DuckTable connects only to Harbor
+  0.44.2 or later, where a `COMMIT` answered `cancelled` kept nothing, and
+  says so on the failed-connect card for an older server.
+- **The Query view is there as soon as a database connects.** It lived inside
+  the Data grid, so a database with no tables could not be queried at all,
+  and ⌘3 did nothing until a table was clicked.
+- **EXPLAIN shows its plan whole** (#132), in a scrolling, preformatted view
+  with a copy tile, where the grid showed the plan's first line, a box border.
+- **The filter strip sorts.** A trailing `ORDER BY` is kept outside the
+  condition, and a filter that ends in a `--` comment can no longer comment
+  out the page limit and pull the whole table.
+- **Typing is never lost or misplaced.** No cell editor opens while a page is
+  loading, a page that lands never confirms an open editor, and an editor's
+  text survives a discard, a hidden column and a change to the table's
+  columns.
+- **An SSH tunnel is reachable only by its user.** It listened on a loopback
+  TCP port that any process on the Mac could use to query the remote
+  database. It forwards a socket in the private runtime directory, and quit
+  closes every tunnel and removes its socket.
+- **Smaller corrections.**
+  - Open Database URL called off by the quit dialog connects again as itself,
+    and saving the same remote twice succeeds.
+  - A connected server that has gone shows stopped, a tunneled remote once
+    its ssh has exited.
+  - A paging probe that got no answer is not run again bare.
+  - A lone statement that got no answer says it may have run; a read-only
+    one does not.
+  - The Query keep-alive renews its session without running a statement.
+  - The Query view splits statements with Harbor's lexer.
+  - The scratchpad saves off the UI thread, whole or not at all, and says
+    when it cannot.
+  - A BLOB cell checks its base64, and a JSON cell takes a number past a
+    double while refusing half a surrogate pair.
+  - Copy DDL keeps quoted names.
+  - A failed catalog refresh keeps the last good one.
+  - The servers DuckTable starts are reaped and log under `runtime/log`.
+- **Installers.** The installer checks that the downloaded bundle is signed
+  as DuckTable by its team before swapping it in; `install-local.sh` refuses
+  while DuckTable runs instead of killing it; the release script keeps the
+  update feed a prerelease on every run.
+
 ## 0.22.9 — 2026-10-04
 
 - **⌘Q and the close button ask before they lose anything.** EDITING.md
