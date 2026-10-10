@@ -89,7 +89,11 @@ HARBOR_LIVE_DB=/tmp/scratch.duckdb cargo test -p harbor-client --test live -- --
 the probes their own `HARBOR_HOME` under `$TMPDIR`: a unix socket path has
 104 bytes, and a scratchpad path runs past it.
 
-To try a change, run `target/release/ducktable <scratch.duckdb>`, or build
-the signed bundle with `scripts/macos-app.sh release`, which leaves
-`target/DuckTable.app`. Copy a bundle somewhere scratch before opening it,
-never over `/Applications/DuckTable.app`.
+To try a change, run `target/release/ducktable` with a scratch `HARBOR_HOME`
+whose config attaches a scratch database (`harbor <scratch.duckdb> attach`;
+DuckTable takes no path argument, and lists what the config attaches), and
+a scratch `HOME` for its own prefs, with `~/.ssh` linked into it, since ssh
+reads its `Include`s through `$HOME`. Or build the signed bundle with
+`scripts/macos-app.sh release`, which leaves `target/DuckTable.app`. Copy a
+bundle somewhere scratch before opening it, never over
+`/Applications/DuckTable.app`.
