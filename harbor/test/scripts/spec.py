@@ -124,16 +124,17 @@ CASES = [
     ("date-year-1",    "SELECT '0001-01-01'::DATE AS v",              "DATE", True, "0001-01-01"),
     ("date-year-9999", "SELECT '9999-12-31'::DATE AS v",              "DATE", True, "9999-12-31"),
     # Before 1 AD the year is ISO 8601's astronomical one: 1 BC is 0000. A
-    # year outside 0000-9999 takes the expanded form, a sign and six digits,
-    # the one a JavaScript Date reads (it reads -0043 as 2043): 44 BC is
-    # -000043, and 10000 is +010000.
+    # year before 0 takes the expanded form, a minus and six digits, which a
+    # JavaScript Date reads (it reads -0043 as 2043) and DuckDB reads back:
+    # 44 BC is -000043. A year past 9999 is its bare digits, as DuckDB writes
+    # it, since DuckDB refuses the +010000 JavaScript would want.
     ("date-1-bc",      "SELECT '0001-01-01 (BC)'::DATE AS v",         "DATE", True, "0000-01-01"),
     ("date-44-bc",     "SELECT '0044-03-15 (BC)'::DATE AS v",         "DATE", True, "-000043-03-15"),
     ("ts-44-bc",       "SELECT '0044-03-15 (BC) 12:00:00'::TIMESTAMP AS v",
                        "TIMESTAMP", True, "-000043-03-15T12:00:00"),
-    ("date-10000",     "SELECT '10000-01-01'::DATE AS v",             "DATE", True, "+010000-01-01"),
+    ("date-10000",     "SELECT '10000-01-01'::DATE AS v",             "DATE", True, "10000-01-01"),
     ("ts-10000",       "SELECT '10000-01-01 00:00:00'::TIMESTAMP AS v",
-                       "TIMESTAMP", True, "+010000-01-01T00:00:00"),
+                       "TIMESTAMP", True, "10000-01-01T00:00:00"),
     # DuckDB reads the negative form back (and refuses the + of the other).
     ("date-readback",  "SELECT '-000043-03-15T12:00:00'::TIMESTAMP = TIMESTAMP '0044-03-15 (BC) 12:00:00' AS v",
                        "BOOLEAN", True, True),

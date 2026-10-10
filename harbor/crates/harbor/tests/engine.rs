@@ -797,11 +797,11 @@ mod wire {
         row(eng, "SELECT TIMESTAMPTZ '2026-09-01 14:30:00+00'", r#""2026-09-01T14:30:00Z""#);
         row(eng, "SELECT DATE '1600-02-29'", r#""1600-02-29""#);
         // Before 1 AD the year is ISO 8601's: 1 BC is year 0, and one before
-        // that is in the expanded form, signed with six digits or more, as
-        // past 9999: 44 BC is -000043.
+        // that is in the expanded form, a minus and six digits or more: 44 BC
+        // is -000043. Past 9999 the year is its bare digits.
         row(eng, "SELECT DATE '0001-01-01 (BC)', DATE '0010-06-01 (BC)'", r#""0000-01-01","-000009-06-01""#);
         row(eng, "SELECT TIMESTAMP '0044-03-15 (BC) 12:00:00'", r#""-000043-03-15T12:00:00""#);
-        row(eng, "SELECT DATE '5877642-06-25 (BC)', DATE '10000-01-01'", r#""-5877641-06-25","+010000-01-01""#);
+        row(eng, "SELECT DATE '5877642-06-25 (BC)', DATE '10000-01-01'", r#""-5877641-06-25","10000-01-01""#);
         // An infinite date or timestamp is a sentinel in storage; it goes out
         // as the word, at every unit.
         row(

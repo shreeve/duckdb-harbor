@@ -1042,10 +1042,12 @@ and scale for `DECIMAL` and nested `child`/`fields` for `LIST` and `STRUCT`, so
 a typed client can reconstruct exactly what DuckDB had rather than a lossy JSON
 approximation. Values JSON cannot hold exactly are quoted rather than emitted
 as bare numbers, so an integer past 2^53 does not silently reprecision in a
-JavaScript client. Dates and timestamps are ISO 8601, and a year outside
-0000–9999 takes its expanded form, a sign and six digits (`-000043-03-15` is
-44 BC, `+010000-01-01`), the one form a JavaScript `Date` reads; it reads
-`-0043-03-15` as the year 2043. Where something genuinely cannot survive, the schema says so
+JavaScript client. Dates and timestamps are ISO 8601. A year before year 0
+takes the expanded form, a minus and six digits (`-000043-03-15` is 44 BC),
+which a JavaScript `Date` reads and DuckDB reads back; a `Date` reads
+`-0043-03-15` as the year 2043. A year past 9999 is its bare digits
+(`10000-01-01`), as DuckDB writes it, since DuckDB refuses the `+010000` form.
+Where something genuinely cannot survive, the schema says so
 with `"lossless": false` instead of returning a plausible wrong answer. The
 flag sits on the type that loses: for a `VARIANT[]`, a `STRUCT(v VARIANT)` or a
 `MAP(VARCHAR, VARIANT)` that is the `child`, the field or the `valueType`, and
