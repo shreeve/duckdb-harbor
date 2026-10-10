@@ -1554,10 +1554,12 @@ fn worker(
 /// load balancer never mistakes busy for dead; cancels and releases because
 /// they are how a saturated berth gets UN-saturated; /sessions and /info
 /// because an operator debugging the saturation needs them. All bounded,
-/// in-memory responses — this thread never streams and never borrows a
-/// connection, so a client that stops reading can wedge a worker but not the
-/// berth's last open door. Statements and /catalog get a fast honest 503
-/// instead of queueing invisibly behind the analytics.
+/// in-memory responses — this thread never reads a body, streams or borrows
+/// a connection, so a client that stops reading can wedge a worker but not
+/// the berth's last open door. A session's statement is relayed to a thread
+/// of its own (`relay`), since it runs on the session's connection; other
+/// statements and /catalog get a fast honest 503 instead of queueing
+/// invisibly behind the analytics.
 fn probe_worker(server: Arc<Server>, stop: Arc<AtomicBool>, log: bool) {
     while !stop.load(Ordering::SeqCst) {
         // Only join the accept queue when the workers are WEDGED — every one
