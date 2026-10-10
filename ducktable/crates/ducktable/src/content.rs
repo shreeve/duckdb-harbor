@@ -173,7 +173,7 @@ impl DuckTable {
                     },
                 ))
             })
-            .child(meta(t, "Uptime", crate::util::human(info.uptime_ms as f64 / 1000., "s")))
+            .child(meta(t, "Uptime", harbor_common::duration::humanize(std::time::Duration::from_millis(info.uptime_ms))))
             .child(meta(
                 t,
                 "Lifetime",

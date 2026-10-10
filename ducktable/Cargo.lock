@@ -1462,6 +1462,7 @@ dependencies = [
  "duckdb-lang",
  "gpui-kit",
  "harbor-client",
+ "harbor-common",
  "libc",
  "objc2 0.6.4",
  "serde",
