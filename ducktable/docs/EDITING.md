@@ -207,13 +207,15 @@ not change, and printable exotica (AltGr, IME) already land on rung 6.
   first: a pager click, a page-size change, a filter applied or cleared, the
   filter strip closed over an applied filter, a refresh, a switch to another
   table, and ⌘S from the review popover. So do a discard from the review
-  popover and hiding columns, and a page that lands while an editor is open:
-  ⌥↓ keeps the ring seated, so a key typed before the next page arrives opens
-  an editor on the page it flips from, and the text is confirmed against that
-  page before the new one replaces it. Text the column refuses keeps the
-  editor open with the reason, and the page, the strip, the columns and the
-  table where they are. ⌥↑/⌥↓ are not among them: with an editor open they
-  are the editor's keys and flip no page.
+  popover and hiding columns. Text the column refuses keeps the editor open
+  with the reason, and the page, the strip, the columns and the table where
+  they are. ⌥↑/⌥↓ are not among them: with an editor open they are the
+  editor's keys and flip no page.
+- While a page is on its way, the grid's own or another table's, no editor
+  opens: ⌥↓ keeps the ring seated, and a key typed before the next page
+  arrives is let go, as it is during a commit, rather than open an editor on
+  rows about to leave the screen. A page never confirms an editor when it
+  lands.
 - Staged changes belong to their table on their database, not to the
   connection. Leaving a database parks the grid's set with the rest of that
   database's: choosing another database or opening one by file or URL, Stop,

@@ -889,6 +889,10 @@ impl DuckTable {
         {
             return;
         }
+        // Until the page lands, no editor opens on the grid it replaces.
+        if let Some(grid) = &self.grid {
+            grid.update(cx, |grid, _| grid.replacing = true);
+        }
         // "main.tests" earns its prefix only when there is another schema
         // to distinguish it from.
         let title =
@@ -924,19 +928,23 @@ impl DuckTable {
                     return;
                 }
                 // A switch that would land during a commit, or under the
-                // quit dialog, waits for it.
+                // quit dialog, waits for it, and the grid on screen is
+                // itself again meanwhile.
                 if state.asking_to_quit || state.grid.as_ref().is_some_and(|g| g.read(cx).committing) {
                     state.deferred_select = Some((clone_str(&schema), clone_str(&name)));
+                    if let Some(grid) = &state.grid {
+                        grid.update(cx, |grid, _| grid.replacing = false);
+                    }
                     return;
                 }
-                // A key typed while the page was on its way opened an
-                // editor on the outgoing grid. Its text is staged first, to
-                // be parked with the rest; text the column refuses keeps
-                // the editor, its reason and its table, and the sidebar
-                // goes back to that table.
-                if let Some(old) = state.grid.clone()
-                    && !old.update(cx, |g, cx| g.settle_editor(cx))
+                // No editor opens on the outgoing grid while the page is on
+                // its way. Were one open, its text would be neither
+                // confirmed unasked nor parked: the switch yields, and the
+                // sidebar goes back to that table.
+                if let Some(old) = &state.grid
+                    && old.read(cx).is_editing()
                 {
+                    old.update(cx, |grid, _| grid.replacing = false);
                     state.selected_table = previous;
                     cx.notify();
                     return;

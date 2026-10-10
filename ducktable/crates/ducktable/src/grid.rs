@@ -132,6 +132,10 @@ pub(crate) struct Grid {
     /// lands, the rows on screen carry the identities they were fetched
     /// with, and a commit that re-keyed a row has made those stale.
     pub(crate) committing: bool,
+    /// Another table's first page is on its way to replace this grid
+    /// (`app::select_table`). Like a page of its own on its way, it keeps
+    /// editors shut until it lands (`open_editor`).
+    pub(crate) replacing: bool,
     /// The commit has answered and its page fetch is in flight; what the
     /// fetch's landing settles (`settle_commit`).
     post_commit: Option<PostCommit>,
@@ -735,6 +739,7 @@ impl Grid {
             parked: None,
             reshaped: false,
             committing: false,
+            replacing: false,
             post_commit: None,
             unrefreshed: false,
             commit_session: Default::default(),
@@ -819,22 +824,15 @@ impl Grid {
                 // The page query answered, whether its page is kept or
                 // dropped below: the database was read at this moment.
                 let read = outcome.is_ok();
-                let result = match outcome {
-                    // Edits staged against the columns on screen are keyed
-                    // and typed by them. They are not rebound to the table's
-                    // present shape, and its rows do not fit the view they
-                    // live in: the page is dropped and the view stays.
-                    Ok(_) if reshaped && grid.edits.as_ref().is_some_and(Edits::any_staged) => {
+                let staged = grid.edits.as_ref().is_some_and(Edits::any_staged);
+                let result = match (outcome, landing(grid.editor.is_some(), reshaped, staged)) {
+                    (Ok(_), Landing::Dropped) => None,
+                    (Ok(_), Landing::Reshaped) => {
                         grid.reshaped = true;
                         grid.error = stale_reason(true, false, grid.in_doubt()).map(str::to_string);
                         None
                     }
-                    // Text typed while the page was on its way is confirmed
-                    // against the page it was typed on, whose identities the
-                    // delegate still holds. Text the column refuses keeps the
-                    // editor, the reason and that page.
-                    Ok(_) if !grid.settle_editor(cx) => None,
-                    Ok((result, total)) => {
+                    (Ok((result, total)), Landing::Shown) => {
                         grid.reshaped = false;
                         grid.unrefreshed = false;
                         grid.error = None;
@@ -849,7 +847,7 @@ impl Grid {
                         grid.last_time_ms = result.time_ms;
                         Some(result)
                     }
-                    Err(message) => {
+                    (Err(message), _) => {
                         grid.error = Some(message);
                         None
                     }
@@ -1868,8 +1866,16 @@ impl Grid {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A read-only grid says why in the footer, not with a beep.
-        if self.edits.is_none() || self.committing || self.refuse_stale(cx) || self.refuse_generated(col, cx) {
+        // A read-only grid says why in the footer, not with a beep. While a
+        // page is on its way, the key is let go as it is during a commit:
+        // text typed now would belong to rows about to leave the screen.
+        if self.edits.is_none()
+            || self.committing
+            || self.replacing
+            || self.table.read(cx).delegate().loading
+            || self.refuse_stale(cx)
+            || self.refuse_generated(col, cx)
+        {
             return;
         }
         let (original, deleted) = {
@@ -4408,6 +4414,37 @@ fn orphaned(staged: usize) -> String {
 /// names and the same DuckDB types, in the same order. The types decide how
 /// every staged value is bound (`edits::placeholder_for`) and the names
 /// decide where, so a page that differs in either is another table's.
+/// What a page that answered does when it lands.
+#[derive(Debug, PartialEq)]
+enum Landing {
+    /// It is dropped, and the view stays as it is.
+    Dropped,
+    /// It is dropped, and the view stays, refusing to stage or commit
+    /// until its staged set is gone (`reshaped`).
+    Reshaped,
+    /// It replaces the page on screen, and a reshaped table's columns
+    /// with it.
+    Shown,
+}
+
+/// How a page lands, with an editor open or not, from a table that has
+/// other columns than the grid's or not, over staged changes or not. Every
+/// fetch begins with no editor open (`settle_editor`) and none opens while
+/// one is on its way (`open_editor`); were one open, its text would be
+/// neither confirmed unasked nor dropped: the page is, and the editor keeps
+/// the rows it was opened on. That comes first, so text in an editor is
+/// never staged into a set that a reshaped table's adoption then replaces.
+/// Edits staged against the columns on screen are keyed and typed by them:
+/// they are not rebound to the table's present shape, and its rows do not
+/// fit the view they live in.
+fn landing(editing: bool, reshaped: bool, staged: bool) -> Landing {
+    match (editing, reshaped && staged) {
+        (true, _) => Landing::Dropped,
+        (false, true) => Landing::Reshaped,
+        (false, false) => Landing::Shown,
+    }
+}
+
 fn same_columns(have: &[wire::Column], page: &[wire::Column]) -> bool {
     have.len() == page.len()
         && have
@@ -4963,6 +5000,20 @@ mod tests {
         for lost in ["query: Resource temporarily unavailable (os error 35)", "stream: connection closed mid-chunk", "HTTP 502"] {
             assert_eq!(commit_verdict(Err(Failure::Unanswered(lost.into()))), Committed::InDoubt(lost.into()));
         }
+    }
+
+    #[test]
+    fn a_page_never_lands_over_an_open_editor() {
+        use super::{landing, Landing};
+        // An editor open as a page lands: its text is not confirmed into a
+        // row leaving the screen, and a reshaped table is not adopted over
+        // it, where the fresh set would drop what it then staged.
+        for (reshaped, staged) in [(false, false), (true, false), (true, true)] {
+            assert_eq!(landing(true, reshaped, staged), Landing::Dropped, "{reshaped} {staged}");
+        }
+        assert_eq!(landing(false, true, true), Landing::Reshaped);
+        assert_eq!(landing(false, true, false), Landing::Shown);
+        assert_eq!(landing(false, false, true), Landing::Shown);
     }
 
     #[test]
