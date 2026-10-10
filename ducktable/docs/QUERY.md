@@ -233,11 +233,14 @@ A run costs at most the two queries the Data view pays for a table, and usually
 one. Page 0 fetches `size + 1` rows, and a result that fits the page is its own
 exact count; only the extra row's arrival proves there is more, and only then
 does `count(*)` run for the total. The page query doubles as the wrap probe: if
-it fails, because the statement is not really SELECT-shaped or does not parse,
-the statement runs bare, so an error always quotes the user's own SQL, never the
-wrapper's. A statement that cannot be wrapped keeps its whole result as one
-page, with the pager hidden. The costs are named: a big result runs its plan
-twice, and deep OFFSET pages re-skip rows, as table paging does.
+the engine refuses it, because the statement is not really SELECT-shaped or
+does not parse, the statement runs bare, so an engine error always quotes the
+user's own SQL, never the wrapper's. A probe that got no answer, or that
+Harbor cut short, may have run, and is the run's verdict: a SELECT that timed
+out does not run a second time, nor a `nextval` twice. A statement that cannot
+be wrapped keeps its whole result as one page, with the pager hidden. The
+costs are named: a big result runs its plan twice, and deep OFFSET pages
+re-skip rows, as table paging does.
 
 Inside a transaction every page of a result is read on the transaction's
 session, so later pages see what it has written, for as long as it is open.

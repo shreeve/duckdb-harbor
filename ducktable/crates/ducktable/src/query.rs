@@ -459,12 +459,7 @@ impl QueryView {
                                     };
                                     break 'run (Ok(result), total, true);
                                 }
-                                // Inside a transaction the probe's failure is
-                                // the verdict, unless the wrap merely failed
-                                // to parse: any other error has aborted the
-                                // transaction, or its session is gone, and the
-                                // bare run would only report that.
-                                Err(failure) if txn.is_some() && !never_ran(&failure) => {
+                                Err(failure) if !runs_bare(txn.is_some(), &failure) => {
                                     break 'run (Err(failure), None, false);
                                 }
                                 Err(_) => {}
@@ -1456,6 +1451,19 @@ fn ran(failure: &harbor_client::Failure) -> Ran {
     }
 }
 
+/// Whether a statement whose paging probe failed runs bare. Only the
+/// engine's refusal of the wrap says the statement may run unwrapped: it is
+/// not SELECT-shaped after all, or the wrap does not bind. Any other failure
+/// is the statement's verdict: no answer, a cancel or an internal error may
+/// mean the probe ran, and a SELECT that timed out, or a `nextval` call,
+/// must not run twice. Inside a transaction an engine error has aborted it
+/// unless the wrap merely failed to parse, and the bare run would only
+/// report that.
+fn runs_bare(in_transaction: bool, failure: &harbor_client::Failure) -> bool {
+    let refused = matches!(failure, harbor_client::Failure::Refused { code, .. } if code == "sql_error");
+    refused && (!in_transaction || never_ran(failure))
+}
+
 /// The statement did not run (`Ran::Never`).
 fn never_ran(failure: &harbor_client::Failure) -> bool {
     ran(failure) == Ran::Never
@@ -1978,6 +1986,31 @@ mod tests {
             assert!(!never_ran(&harbor(code)), "{code}");
         }
         assert_eq!(ran(&Failure::Unanswered("query: timed out".into())), Ran::Unknown);
+    }
+
+    #[test]
+    fn only_the_engines_refusal_of_the_wrap_sends_a_statement_bare() {
+        let binder = refused("Binder Error: subquery has no columns");
+        let parse = refused("Parser Error: syntax error at or near \"LIMIT\"");
+        // Outside a transaction the engine refusing the wrap sends it bare.
+        assert!(super::runs_bare(false, &binder));
+        assert!(super::runs_bare(false, &parse));
+        // Inside one, only a wrap that did not parse: anything else aborted it.
+        assert!(super::runs_bare(true, &parse));
+        assert!(!super::runs_bare(true, &binder));
+        // A probe with no answer, or one Harbor cut short, may have run, and
+        // is not run again; nor is one that could not be sent or found the
+        // session busy.
+        for failure in [
+            Failure::Unanswered("query: timed out".into()),
+            harbor("cancelled"),
+            harbor("internal"),
+            harbor("session_busy"),
+            Failure::Unsent("query: Connection refused (os error 61)".into()),
+        ] {
+            assert!(!super::runs_bare(false, &failure), "{failure:?}");
+            assert!(!super::runs_bare(true, &failure), "{failure:?}");
+        }
     }
 
     #[test]
