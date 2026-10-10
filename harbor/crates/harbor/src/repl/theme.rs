@@ -183,12 +183,14 @@ fn colorfgbg_appearance(v: &str) -> Option<Appearance> {
 /// A terminal that does not know OSC 11 says nothing, so no wait for it can
 /// tell a slow answer from none, and an answer that comes after the wait
 /// reaches the prompt as typed text. So the query is followed by DA1, which
-/// every terminal answers, and answers after whatever was asked before it:
-/// its answer ends the wait, however slow the line.
+/// a terminal answers after whatever was asked before it: its answer ends
+/// the wait. A terminal that has begun to answer within `FIRST` has until
+/// `PATIENCE` to finish; one that has said nothing by then (Emacs's shell, a
+/// serial console, a test's pty) answers nothing, and costs no more than
+/// `FIRST` at a start.
 #[cfg(unix)]
 fn osc11_appearance() -> Option<Appearance> {
     use std::io::{IsTerminal, Write};
-    use std::time::Duration;
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return None;
     }
@@ -198,11 +200,12 @@ fn osc11_appearance() -> Option<Appearance> {
         out.write_all(b"\x1b]11;?\x07\x1b[c").ok()?;
         out.flush().ok()?;
     }
-    let reply = read_reply(Duration::from_secs(1));
+    let reply = read_reply();
     // Whatever came and was not read goes now, while the terminal is raw,
     // rather than reaching the prompt as typed text.
     {
         use std::os::unix::io::AsRawFd;
+        // SAFETY: tcflush on stdin's descriptor, which outlives the call.
         unsafe { libc::tcflush(std::io::stdin().as_raw_fd(), libc::TCIFLUSH) };
     }
     luminance_of(&reply?).map(|l| if l > 0.5 { Appearance::Light } else { Appearance::Dark })
@@ -234,14 +237,20 @@ fn luminance_of(bytes: &[u8]) -> Option<f64> {
     Some(0.2126 * r + 0.7152 * g + 0.0722 * b)
 }
 
+/// How long a terminal has to begin answering, and to finish once it has.
 #[cfg(unix)]
-fn read_reply(timeout: std::time::Duration) -> Option<Vec<u8>> {
+const FIRST: std::time::Duration = std::time::Duration::from_millis(120);
+#[cfg(unix)]
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[cfg(unix)]
+fn read_reply() -> Option<Vec<u8>> {
     use std::os::unix::io::AsRawFd;
     use std::time::Instant;
     let fd = std::io::stdin().as_raw_fd();
     let start = Instant::now();
     let mut buf = Vec::new();
-    while let Some(rem) = timeout.checked_sub(start.elapsed()) {
+    while let Some(rem) = (if buf.is_empty() { FIRST } else { PATIENCE }).checked_sub(start.elapsed()) {
         let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
         let n = unsafe { libc::poll(&mut pfd, 1, rem.as_millis() as i32) };
         if n <= 0 {
@@ -261,6 +270,7 @@ fn read_reply(timeout: std::time::Duration) -> Option<Vec<u8>> {
 }
 
 /// Whether `buf` holds the terminal's answer to DA1, `ESC [ ? … c`.
+#[cfg(any(unix, test))]
 fn answered(buf: &[u8]) -> bool {
     (0..buf.len()).any(|i| {
         buf[i..].starts_with(b"\x1b[?")

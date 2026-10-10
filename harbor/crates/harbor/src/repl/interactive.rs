@@ -186,7 +186,7 @@ pub fn run_steps(steps: Vec<Step>, opts: &mut RenderOpts, transaction: &mut Tran
         let outcome = match step {
             Step::Sql(sql) => transaction.run(&sql, opts),
             Step::Dot(cmd) => match dot_command(&cmd, opts, transaction) {
-                DotResult::Handled => Outcome::Done,
+                DotResult::Handled(outcome) => outcome,
                 DotResult::Quit => return Outcome::Done,
                 DotResult::Open(_) | DotResult::Keymode(_) => {
                     eprintln!("harbor: .{cmd} works at the prompt, not in a script");
@@ -372,7 +372,7 @@ pub fn run(
                 if let Some(cmd) = stmt.strip_prefix('.') {
                     match dot_command(cmd, &mut opts, &mut transaction) {
                         DotResult::Quit => return std::process::ExitCode::SUCCESS,
-                        DotResult::Handled => continue,
+                        DotResult::Handled(_) => continue,
                         DotResult::Open(target) => {
                             match crate::repl::resolve(&target, &[]) {
                                 Ok((t, name)) => {
@@ -426,37 +426,52 @@ pub fn run(
 
 enum DotResult {
     Quit,
-    Handled,
+    /// Done here, with what became of it: a script stops on anything but
+    /// `Done`, as it does after a statement.
+    Handled(Outcome),
     Open(String),
     Keymode(bool),
 }
+
+/// How deep `.read` nests: a file that reads itself ends here, said, rather
+/// than when the stack runs out.
+const READ_DEPTH: usize = 32;
 
 fn dot_command(cmd: &str, opts: &mut RenderOpts, transaction: &mut Transaction) -> DotResult {
     // The argument is the rest of the line, so a path may hold a space.
     let (name, arg) = cmd.trim().split_once(char::is_whitespace).unwrap_or((cmd.trim(), ""));
     let arg = Some(arg.trim()).filter(|a| !a.is_empty());
+    // A mistake ends a script as a failed statement does: said, and the rest
+    // left unrun. At the prompt it is said, and the prompt goes on.
+    let failed = |why: String| {
+        eprintln!("harbor: {why}");
+        DotResult::Handled(Outcome::Failed)
+    };
+    let done = DotResult::Handled(Outcome::Done);
     // Short aliases (.q .exit .db .h) dispatch here but stay out of
     // DOT_COMMANDS on purpose: help and completion teach the long names.
     match name {
-        "quit" | "exit" | "q" => return DotResult::Quit,
+        "quit" | "exit" | "q" => DotResult::Quit,
         "open" => match arg {
-            Some(t) => return DotResult::Open(t.to_string()),
-            None => eprintln!("harbor: .open <name|path|url>"),
+            Some(t) => DotResult::Open(t.to_string()),
+            None => failed(".open <name|path|url>".into()),
         },
         "keymode" => match arg {
-            Some("vi") => return DotResult::Keymode(true),
-            Some("emacs") => return DotResult::Keymode(false),
-            _ => eprintln!("harbor: .keymode vi|emacs"),
+            Some("vi") => DotResult::Keymode(true),
+            Some("emacs") => DotResult::Keymode(false),
+            _ => failed(".keymode vi|emacs".into()),
         },
         "theme" => match arg {
             None => {
                 let (name, _) = crate::repl::theme::describe();
                 println!("theme: {name} ({})", crate::repl::theme::NAMES.join(" "));
+                done
             }
-            Some(name) if crate::repl::theme::set_theme(name) => eprintln!("harbor: theme {name}"),
-            Some(name) => {
-                eprintln!("harbor: unknown theme {name:?} ({})", crate::repl::theme::NAMES.join(" "))
+            Some(name) if crate::repl::theme::set_theme(name) => {
+                eprintln!("harbor: theme {name}");
+                done
             }
+            Some(name) => failed(format!("unknown theme {name:?} ({})", crate::repl::theme::NAMES.join(" "))),
         },
         "appearance" => {
             use crate::repl::theme::Appearance::{Dark, Light};
@@ -468,45 +483,79 @@ fn dot_command(cmd: &str, opts: &mut RenderOpts, transaction: &mut Transaction) 
                 Some("light") => crate::repl::theme::set_appearance(Light),
                 Some("dark") => crate::repl::theme::set_appearance(Dark),
                 Some("auto") => crate::repl::theme::set_appearance(crate::repl::theme::detect_appearance()),
-                Some(other) => eprintln!("harbor: .appearance auto|light|dark (got {other:?})"),
+                Some(other) => return failed(format!(".appearance auto|light|dark (got {other:?})")),
+            }
+            done
+        }
+        "read" => {
+            use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+            static DEPTH: AtomicUsize = AtomicUsize::new(0);
+            let Some(f) = arg else { return failed(".read <file.sql>".into()) };
+            if DEPTH.load(Relaxed) >= READ_DEPTH {
+                return failed(format!(".read {f}: files read inside each other more than {READ_DEPTH} deep"));
+            }
+            match std::fs::read_to_string(harbor_common::paths::expand(f)) {
+                // A failure or a Ctrl-C ends the file, and the script it is in.
+                Ok(text) => {
+                    DEPTH.fetch_add(1, Relaxed);
+                    let outcome = run_steps(script(&text), opts, transaction);
+                    DEPTH.fetch_sub(1, Relaxed);
+                    DotResult::Handled(outcome)
+                }
+                Err(e) => failed(format!(".read {f}: {e}")),
             }
         }
-        "read" => match arg {
-            // A failure or a Ctrl-C ends the file.
-            Some(f) => match std::fs::read_to_string(harbor_common::paths::expand(f)) {
-                Ok(text) => _ = run_steps(script(&text), opts, transaction),
-                Err(e) => eprintln!("harbor: .read {f}: {e}"),
-            },
-            None => eprintln!("harbor: .read <file.sql>"),
-        },
         "databases" | "db" => {
             // The same list bare `harbor` prints — one reconcile, not a
             // second one that agrees most of the time.
             let _ = crate::repl::list_main();
+            done
         }
-        "mode" => match arg {
-            None => println!("mode: {} (duckbox duckboxy markdown csv json jsonlines line list trash)", opts.mode.name()),
-            Some(m) => match Mode::parse(m) {
-                Some(m) => opts.mode = m,
-                None => eprintln!("harbor: unknown mode {m:?}"),
-            },
+        "mode" => match arg.map(|m| (m, Mode::parse(m))) {
+            None => {
+                println!("mode: {} (duckbox duckboxy markdown csv json jsonlines line list trash)", opts.mode.name());
+                done
+            }
+            Some((_, Some(m))) => {
+                opts.mode = m;
+                done
+            }
+            Some((m, None)) => failed(format!("unknown mode {m:?}")),
         },
-        "maxrows" => match arg.and_then(|n| n.parse::<usize>().ok()) {
-            Some(n) if n > 0 => opts.max_rows = n,
-            _ => println!("maxrows: {}", opts.max_rows),
+        "maxrows" => match arg.map(|n| (n, n.parse::<usize>())) {
+            None => {
+                println!("maxrows: {}", opts.max_rows);
+                done
+            }
+            Some((_, Ok(n))) if n > 0 => {
+                opts.max_rows = n;
+                done
+            }
+            Some((n, _)) => failed(format!(".maxrows takes a count above zero, not {n:?}")),
         },
-        "nullvalue" => match arg {
-            Some(s) => opts.null = s.to_string(),
-            None => println!("nullvalue: {:?}", opts.null),
-        },
+        "nullvalue" => {
+            match arg {
+                Some(s) => opts.null = s.to_string(),
+                None => println!("nullvalue: {:?}", opts.null),
+            }
+            done
+        }
         "timer" => match arg {
-            Some("on") => opts.timer = true,
-            Some("off") => opts.timer = false,
-            _ => println!("timer: {}", if opts.timer { "on" } else { "off" }),
+            Some("on") => {
+                opts.timer = true;
+                done
+            }
+            Some("off") => {
+                opts.timer = false;
+                done
+            }
+            None => {
+                println!("timer: {}", if opts.timer { "on" } else { "off" });
+                done
+            }
+            Some(other) => failed(format!(".timer on|off (got {other:?})")),
         },
-        "tables" => {
-            let _ = transaction.run("SHOW TABLES", opts);
-        }
+        "tables" => DotResult::Handled(transaction.run("SHOW TABLES", opts)),
         "schema" => {
             let sql = match arg {
                 Some(t) => format!(
@@ -515,7 +564,7 @@ fn dot_command(cmd: &str, opts: &mut RenderOpts, transaction: &mut Transaction) 
                 ),
                 None => "SELECT sql FROM duckdb_tables()".to_string(),
             };
-            let _ = transaction.run(&sql, &RenderOpts { mode: Mode::List, ..opts.clone() });
+            DotResult::Handled(transaction.run(&sql, &RenderOpts { mode: Mode::List, ..opts.clone() }))
         }
         "help" | "h" => {
             for (name, args, what) in DOT_COMMANDS {
@@ -523,13 +572,12 @@ fn dot_command(cmd: &str, opts: &mut RenderOpts, transaction: &mut Transaction) 
             }
             println!("  statements end with ;   Ctrl-C clears the line");
             println!("  Up/Down walk history; Down on the live line, or Ctrl-Space anywhere, lists completions; Tab accepts one");
+            done
         }
-        other => {
-            eprintln!("harbor: no such command .{other} (.help lists them)");
-        }
+        other => failed(format!("no such command .{other} (.help lists them)")),
     }
-    DotResult::Handled
 }
+
 
 #[cfg(test)]
 mod tests {
