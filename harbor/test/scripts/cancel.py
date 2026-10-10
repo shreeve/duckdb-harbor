@@ -16,6 +16,7 @@ that the accounting still balances when clients cancel things at random.
 """
 
 import argparse
+import http.client
 import json
 import os
 import random
@@ -513,9 +514,8 @@ def run_tests(h, db):
     # -----------------------------------------------------------------------
     section("A lease that runs past its deadline is taken back")
 
-    # Before cancellation the reaper skipped busy leases, so the one lease that
-    # most needed reclaiming — wedged inside a runaway statement — was the one
-    # it could never reclaim.
+    # The lease that most needs reclaiming is the one wedged inside a runaway
+    # statement.
     before = h.connections()
     st, doc, _ = h.open(ttl_ms=1000)
     sid = doc["sessionId"]
@@ -543,6 +543,46 @@ def run_tests(h, db):
     # that reuses one id per tab is not slowly poisoned.
     eq("the name is reusable once the statement is over", 200, h.sql("SELECT 1", query="dup")[0])
     eq("an over-long queryId is a clean 400", 400, h.sql("SELECT 1", query="x" * 129)[0])
+
+    # -----------------------------------------------------------------------
+    section("A cancel that comes after the statement finished stops nothing")
+
+    # The rows are all produced and waiting to be read when the cancel lands.
+    # It stopped nothing, so it says so, and the client reads every row.
+    told, whole = [], 0
+    for attempt in range(10):
+        conn = http.client.HTTPConnection("127.0.0.1", int(h.base.rsplit(":", 1)[1]), timeout=30)
+        conn.request("POST", "/sql", json.dumps({"sql": "SELECT range FROM range(6000)", "queryId": f"late{attempt}"}),
+                     {"Content-Type": "application/json"})
+        response = conn.getresponse()
+        time.sleep(0.3)
+        told.append(h.cancel(f"late{attempt}")[1].get("cancelled"))
+        lines = response.read().decode().splitlines()
+        conn.close()
+        whole += len(lines) == 6002 and json.loads(lines[-1]).get("type") == "end"
+    eq("the cancel says it stopped nothing", [False] * 10, told)
+    eq("and every stream arrives whole", 10, whole)
+
+    # -----------------------------------------------------------------------
+    section("A session needs no free worker")
+
+    # Every worker busy with a long scan: a session's statements, COMMIT
+    # included, run on the session's own connection all the same.
+    st, doc, _ = h.open()
+    sid = doc["sessionId"]
+    jobs = [Background(h, statement=LONG, query=f"busy{i}") for i in range(4)]
+    time.sleep(0.6)
+    answers = [h.sql(sql, session=sid, timeout=10)[0]
+               for sql in ("BEGIN", "INSERT INTO marks VALUES (94)", "COMMIT")]
+    busy = sum(job.thread.is_alive() for job in jobs)
+    eq("BEGIN, a write and COMMIT answer while the workers are busy", [200, 200, 200], answers)
+    eq("which they were, all four", 4, busy)
+    for i in range(4):
+        h.cancel(f"busy{i}")
+    for job in jobs:
+        job.wait()
+    eq("and the write is committed", 94, h.value("SELECT n FROM marks WHERE n = 94"))
+    eq("release", True, h.release(sid)[1].get("released"))
 
     # -----------------------------------------------------------------------
     section("Chaos: cancel everything, at random, and check the books")

@@ -5,7 +5,7 @@ and the two shutdown properties that make them safe to hand out at all.
 Runs its own server, because it needs a pool size the other suites do not use
 and it kills the server mid-transaction, which the shared one cannot survive.
 
-  test/scripts/sessions.py [--db PATH] [--keep]
+  test/scripts/sessions.py [--keep]
 
 A lease is a connection pinned across requests. The interesting failures are
 not "does BEGIN work" — they are the ones where a connection goes out and does
@@ -165,7 +165,6 @@ def start_server(db, pool_size, workers, port):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db")
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
 
@@ -224,7 +223,7 @@ def run_all(h, leases, proc, db, port):
     st, s, _ = h.open()
     eq("opening a lease is a 200", 200, st)
     sid = s["sessionId"]
-    ok("it names a session", sid[:12] + "…")
+    eq("it names a session", True, isinstance(sid, str) and len(sid) > 0)
     eq("and declares both clocks", True, "ttlMs" in s and "idleTtlMs" in s)
 
     h.sql("BEGIN", sid)
@@ -321,10 +320,9 @@ def run_all(h, leases, proc, db, port):
     def slow():
         # timeout: the v2 alpha engine intermittently loses a scheduler
         # wakeup and runs this aggregation ~20x slow (worker pool starved,
-        # everything trickling through 20ms-bounded waits — see
-        # misc/upstream-nap-race-report.md). The test's subject is the 409
-        # below, not engine speed, so give the slow mode room rather than
-        # flake on an upstream race. Drop back to the default timeout at GA.
+        # everything trickling through 20ms-bounded waits; duckdb#25282).
+        # The test's subject is the 409 below, not engine speed, so give the
+        # slow mode room rather than flake on an upstream race.
         result["slow"] = h.sql(
             "SELECT count(DISTINCT i) FROM range(200000000) t(i)", sid, timeout=120
         )[0]
@@ -538,7 +536,8 @@ def run_all(h, leases, proc, db, port):
     h.sql("COMMIT", sid)
     h.sql("BEGIN", sid)
     h.sql("UPDATE t SET n = 12345 WHERE id = 9", sid)   # left open, deliberately
-    ok("a lease is holding an open write transaction", "committed row 9, then began another")
+    held = [x for x in h.sessions()["sessions"] if x["sessionId"] == sid]
+    eq("a lease is holding an open write transaction", [True], [x["inTransaction"] for x in held])
 
     # And a SECOND lease, busy inside a statement long enough that SIGTERM is
     # guaranteed to land mid-flight. The idle case above is released outright;
@@ -560,7 +559,8 @@ def run_all(h, leases, proc, db, port):
     holder = threading.Thread(target=hold, daemon=True)
     holder.start()
     time.sleep(1.0)                 # let the statement actually start
-    ok("a second lease is busy inside a long statement", "cancelled, not waited on")
+    held = [x for x in h.sessions()["sessions"] if x["sessionId"] == busy_sid]
+    eq("a second lease is busy inside a long statement", [True], [x["busy"] for x in held])
 
     sent = time.monotonic()
     proc.send_signal(signal.SIGTERM)
@@ -588,8 +588,9 @@ def run_all(h, leases, proc, db, port):
          "SELECT n FROM t WHERE id = 9"],
         capture_output=True, text=True,
     ).stdout.strip()
-    eq("the committed row survived", "900", out)
-    ok("and the open transaction did not", "rolled back before the checkpoint")
+    # 900, not the 12345 the open transaction wrote: it was rolled back
+    # before the checkpoint.
+    eq("the committed row survived, and the open transaction did not", "900", out)
 
 
 if __name__ == "__main__":
