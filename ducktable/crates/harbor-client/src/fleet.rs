@@ -20,10 +20,13 @@ use harbor_common::State;
 use harbor_common::config;
 use harbor_common::paths::{self, runtime_dir};
 use std::io::Read;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// One sidebar row: a database's honest state, plus the size on disk only
 /// a GUI wants.
@@ -383,7 +386,8 @@ impl Conn {
         self
     }
 
-    fn tunneled(name: String, transport: Transport, tunnel: SshTunnel) -> Result<Self, String> {
+    fn tunneled(name: String, tunnel: SshTunnel) -> Result<Self, String> {
+        let transport = Transport::Unix(tunnel.sock.clone());
         let anchor = anchor(&transport).map_err(|e| format!("connecting to Harbor through SSH: {e}"))?;
         Ok(Self {
             name,
@@ -439,8 +443,7 @@ fn dial_remote(name: String, entry: &config::Connection) -> Result<Conn, String>
     let target = http_target(url)?;
     if !target.is_local() {
         validate_ssh_host(&target.host)?;
-        let (transport, tunnel) = open_tunnel(&target.host, target.port)?;
-        return Conn::tunneled(name, transport, tunnel);
+        return Conn::tunneled(name, open_tunnel(&target.host, target.port)?);
     }
     Conn::plain(name, Transport::Tcp(target.addr()), false)
 }
@@ -725,13 +728,20 @@ fn http_target(url: &str) -> Result<HttpTarget, String> {
     Ok(HttpTarget { host, port })
 }
 
-/// One app-owned OpenSSH process. It is shared by every clone of its Conn;
-/// the last clone kills and reaps it, which binds tunnel lifetime to the
+/// One app-owned OpenSSH process, forwarding a unix socket to Harbor's
+/// loopback port on the host. It is shared by every clone of its Conn; the
+/// last clone kills and reaps it, which binds tunnel lifetime to the
 /// matching database connection without a global registry.
+///
+/// The socket sits in the runtime directory, which is this user's alone
+/// (0700), so only this user's processes reach the database through it. A
+/// loopback TCP port would be open to every process and every user on the
+/// Mac, and Harbor's TCP door asks for no credential.
 struct SshTunnel {
     child: Mutex<Child>,
     stderr: Arc<Mutex<Vec<u8>>>,
     host: String,
+    sock: PathBuf,
 }
 
 impl SshTunnel {
@@ -750,6 +760,7 @@ impl Drop for SshTunnel {
             let _ = child.kill();
             let _ = child.wait();
         }
+        let _ = std::fs::remove_file(&self.sock);
     }
 }
 
@@ -765,7 +776,24 @@ fn ssh_failure(host: &str, status: String, stderr: &Arc<Mutex<Vec<u8>>>) -> Stri
     )
 }
 
-fn ssh_command(ssh_host: &str, remote_port: u16, local_port: u16) -> Command {
+/// Where a new tunnel listens. Its name is not `*.sock`, which discovery
+/// would take for a server of this machine.
+fn tunnel_socket(runtime: &Path) -> Result<PathBuf, String> {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let sock = runtime.join(format!("ssh-{}-{}.tunnel", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    // sun_path holds 104 bytes with its NUL.
+    if sock.as_os_str().len() > 103 {
+        return Err(format!(
+            "the runtime directory is too deep for a unix socket ({}): shorten $HARBOR_HOME",
+            runtime.display()
+        ));
+    }
+    Ok(sock)
+}
+
+fn ssh_command(ssh_host: &str, remote_port: u16, local: &Path) -> Command {
+    // ssh splits a forward at `:` and takes `\` as an escape.
+    let local = local.to_string_lossy().replace('\\', "\\\\").replace(':', "\\:");
     let mut command = Command::new("/usr/bin/ssh");
     command
         .arg("-N")
@@ -782,8 +810,12 @@ fn ssh_command(ssh_host: &str, remote_port: u16, local_port: u16) -> Command {
         .arg("ServerAliveCountMax=3")
         .arg("-o")
         .arg("TCPKeepAlive=yes")
+        // A socket of the same name left by an earlier run is replaced,
+        // not refused.
+        .arg("-o")
+        .arg("StreamLocalBindUnlink=yes")
         .arg("-L")
-        .arg(format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"))
+        .arg(format!("{local}:127.0.0.1:{remote_port}"))
         .arg(ssh_host)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -791,7 +823,7 @@ fn ssh_command(ssh_host: &str, remote_port: u16, local_port: u16) -> Command {
     command
 }
 
-fn capture_stderr(mut pipe: impl Read + Send + 'static, captured: Arc<Mutex<Vec<u8>>>) {
+fn capture_stderr(mut pipe: impl Read + Send + 'static, captured: Arc<Mutex<Vec<u8>>>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0_u8; 1024];
         while let Ok(n) = pipe.read(&mut buf) {
@@ -802,69 +834,45 @@ fn capture_stderr(mut pipe: impl Read + Send + 'static, captured: Arc<Mutex<Vec<
             let room = (64_usize * 1024).saturating_sub(out.len());
             out.extend_from_slice(&buf[..n.min(room)]);
         }
-    });
+    })
 }
 
-fn open_tunnel(ssh_host: &str, remote_port: u16) -> Result<(Transport, SshTunnel), String> {
-    for attempt in 0..5 {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
-            .map_err(|e| format!("choosing a local SSH port: {e}"))?;
-        let local_port = listener
-            .local_addr()
-            .map_err(|e| format!("reading the local SSH port: {e}"))?
-            .port();
-        drop(listener);
+/// Start ssh and wait until its socket takes connections. A slow ProxyJump
+/// chain gets twenty seconds.
+fn open_tunnel(ssh_host: &str, remote_port: u16) -> Result<SshTunnel, String> {
+    let runtime = runtime_dir()?;
+    harbor_common::perms::ensure_private_dir(&runtime)?;
+    let sock = tunnel_socket(&runtime)?;
+    let mut child = ssh_command(ssh_host, remote_port, &sock)
+        .spawn()
+        .map_err(|e| format!("cannot run /usr/bin/ssh: {e}"))?;
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let reader = child.stderr.take().map(|stderr| capture_stderr(stderr, Arc::clone(&captured)));
+    let tunnel = SshTunnel { child: Mutex::new(child), stderr: captured, host: ssh_host.to_string(), sock };
 
-        let mut child = ssh_command(ssh_host, remote_port, local_port)
-            .spawn()
-            .map_err(|e| format!("cannot run /usr/bin/ssh: {e}"))?;
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        if let Some(stderr) = child.stderr.take() {
-            capture_stderr(stderr, Arc::clone(&captured));
-        }
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|e| format!("checking SSH to {ssh_host}: {e}"))?
-            {
-                // Let the stderr reader consume the final bytes before the
-                // diagnostic is built.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let exited = tunnel.child.lock().map_err(|_| "SSH process lock failed")?.try_wait();
+        if let Some(status) = exited.map_err(|e| format!("checking SSH to {ssh_host}: {e}"))? {
+            // ssh is gone, so its stderr ends: read it to the end before the
+            // diagnostic is built, a moment at most, since a ProxyCommand
+            // ssh started may still hold the pipe.
+            let read = Instant::now() + Duration::from_secs(1);
+            while reader.as_ref().is_some_and(|r| !r.is_finished()) && Instant::now() < read {
                 std::thread::sleep(Duration::from_millis(10));
-                let message = ssh_failure(ssh_host, status.to_string(), &captured);
-                let port_race = message.contains("Address already in use")
-                    || message.contains("cannot listen to port");
-                if port_race && attempt < 4 {
-                    break;
-                }
-                return Err(message);
             }
-            let addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, local_port);
-            if std::net::TcpStream::connect_timeout(&addr.into(), Duration::from_millis(100))
-                .is_ok()
-            {
-                return Ok((
-                    Transport::Tcp(format!("127.0.0.1:{local_port}")),
-                    SshTunnel {
-                        child: Mutex::new(child),
-                        stderr: captured,
-                        host: ssh_host.to_string(),
-                    },
-                ));
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "SSH connection to {} timed out\n\nVerify the connection in Terminal:\n    ssh {}",
-                    ssh_host, ssh_host
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(50));
+            return Err(ssh_failure(ssh_host, status.to_string(), &tunnel.stderr));
         }
+        if UnixStream::connect(&tunnel.sock).is_ok() {
+            return Ok(tunnel);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "SSH connection to {ssh_host} timed out\n\nVerify the connection in Terminal:\n    ssh {ssh_host}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    Err("could not allocate a local SSH port after five attempts".into())
 }
 
 /// Validate and persist the dialog's port-based database without opening its
@@ -988,8 +996,9 @@ mod tests {
     }
 
     #[test]
-    fn ssh_command_is_loopback_only_unattended_and_owned() {
-        let command = ssh_command("foo.bar.com", 9494, 53172);
+    fn ssh_command_forwards_a_private_socket_unattended_and_owned() {
+        let sock = Path::new("/Users/me/.local/state/harbor/runtime/ssh-41-0.tunnel");
+        let command = ssh_command("foo.bar.com", 9494, sock);
         assert_eq!(command.get_program(), "/usr/bin/ssh");
         let args: Vec<_> = command
             .get_args()
@@ -1001,10 +1010,26 @@ mod tests {
         assert!(args.windows(2).any(|a| a == ["-o", "ServerAliveInterval=15"]));
         assert!(args.windows(2).any(|a| a == ["-o", "ServerAliveCountMax=3"]));
         assert!(args.windows(2).any(|a| a == ["-o", "TCPKeepAlive=yes"]));
+        assert!(args.windows(2).any(|a| a == ["-o", "StreamLocalBindUnlink=yes"]));
         assert!(args.windows(2).any(|a| {
-            a == ["-L", "127.0.0.1:53172:127.0.0.1:9494"]
+            a == ["-L", "/Users/me/.local/state/harbor/runtime/ssh-41-0.tunnel:127.0.0.1:9494"]
         }));
         assert_eq!(args.last().map(String::as_str), Some("foo.bar.com"));
+        // A path with ssh's separator or its escape in it stays one field.
+        let odd = ssh_command("h", 9494, Path::new("/odd:dir\\x/s.tunnel"));
+        assert!(odd.get_args().any(|a| a.to_string_lossy() == "/odd\\:dir\\\\x/s.tunnel:127.0.0.1:9494"));
+    }
+
+    #[test]
+    fn a_tunnel_socket_is_unique_private_to_its_directory_and_fits_sun_path() {
+        let runtime = Path::new("/Users/me/.local/state/harbor/runtime");
+        let (a, b) = (tunnel_socket(runtime).unwrap(), tunnel_socket(runtime).unwrap());
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), Some(runtime));
+        // Not a name discovery reads as a server's.
+        assert!(a.extension().is_some_and(|x| x == "tunnel"));
+        let deep = PathBuf::from(format!("/{}", "d".repeat(90)));
+        assert!(tunnel_socket(&deep).unwrap_err().contains("shorten $HARBOR_HOME"));
     }
 
     #[test]
@@ -1254,20 +1279,20 @@ mod tests {
         let server = accepting(&sock);
         let conn = Conn::tunneled(
             "remote".into(),
-            Transport::Unix(sock.clone()),
             SshTunnel {
                 child: Mutex::new(child),
                 stderr: Arc::new(Mutex::new(Vec::new())),
                 host: "remote".into(),
+                sock: sock.clone(),
             },
         )
         .unwrap();
         let last = conn.clone();
         drop(conn);
-        assert!(exists(&pid));
+        assert!(exists(&pid) && sock.exists());
         drop(last);
         assert!(!exists(&pid));
+        assert!(!sock.exists(), "the tunnel's socket goes with it");
         server.join().unwrap();
-        std::fs::remove_file(&sock).unwrap();
     }
 }
