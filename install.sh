@@ -50,11 +50,12 @@ uninstall() {
     fail "$NAME is not installed at $(tildify "$BIN/$NAME") (BIN=/LIB= if it lives elsewhere)"
   fi
   # A login item runs the binary by its path, and launchd or systemd would
-  # retry a missing one every ten seconds until logout. Each goes first,
-  # while there is still a harbor to take it down.
+  # retry a missing one every ten seconds until logout. Each that runs this
+  # copy goes first, while there is still a harbor to take it down; one that
+  # runs another copy, Homebrew's say, is that copy's business.
   items=""
   for item in "$HOME"/Library/LaunchAgents/harbor.*.plist "${XDG_CONFIG_HOME:-$HOME/.config}"/systemd/user/harbor-*.service; do
-    [ -e "$item" ] || continue
+    [ -e "$item" ] && grep -qF "$BIN/$NAME" "$item" || continue
     name=${item##*/}; name=${name#harbor.}; name=${name#harbor-}; name=${name%.plist}; name=${name%.service}
     items="$items  harbor $name autostart off stop\n"
   done
