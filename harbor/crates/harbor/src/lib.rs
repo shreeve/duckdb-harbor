@@ -1328,10 +1328,16 @@ fn stop_with(mut running: std::sync::MutexGuard<'_, Option<Running>>) -> Result<
     let Some(r) = running.take() else {
         return Err("harbor is not serving".to_string());
     };
-    // A client that arrives from here on is refused at connect, so it knows
-    // its request was never sent; one accepted and then left unanswered
-    // could not tell whether its statement ran.
-    r.server.close_doors();
+    // On a server only its unix socket reaches, a client that arrives from
+    // here on is refused at connect, so it knows its request was never sent;
+    // one accepted and then left unanswered could not tell whether its
+    // statement ran. The socket file stays until the server is gone, which
+    // is what a stop over it waits for. A TCP door stays open through the
+    // drain: a stop by URL reads a refused port as a server that is gone.
+    #[cfg(unix)]
+    if matches!(r.server.server_addr(), justhttp::ListenAddr::Unix(_)) {
+        r.server.close_doors();
+    }
     r.stop.store(true, Ordering::SeqCst);
     r.server.unblock();
 
