@@ -72,9 +72,11 @@ copied with is read from the source row again, so a DATE inside a `VARIANT` that
 was typed over and restored is still a DATE. Primary-key and generated columns
 are omitted so DuckDB can supply the new identity and derived values. A natural
 key without a default therefore stays `required`. The entire copied
-row is one undo step and is not written until ⌘S. Duplicates run first in the
-transaction, so the source row is read as the database holds it at ⌘S, even when
-the same commit updates or deletes it; a source row that is gone by then fails
+row is one undo step and is not written until ⌘S. A duplicate of a row the same
+commit updates or deletes runs first in the transaction, so the source row is
+read as the database holds it at ⌘S; one of a row the commit leaves alone runs
+after the deletes and updates, and so may take a key they free. A source row
+that is gone by then fails
 the commit, and nothing lands. A refresh does not help, because the draft still
 names that row: discard the duplicate (⌘Z, or the review popover) and the rest
 commits.
@@ -412,10 +414,23 @@ affected-exactly-one check are the backstop there, as everywhere.
 `BEGIN` → parameterized statements, each verified to have affected or returned
 **exactly one row** → `COMMIT` → release. The engine checks a key as each
 statement runs, so they run in the order that frees a key before another row
-takes it: duplicates, then deletes, then updates, each after the one whose key
-it takes, then new rows. A DELETE of 7 beside a re-key of 3 to 7 commits, as
-does a new row keyed like a deleted one, or a chain of re-keys; a swap of two
-keys has no such order, and the engine refuses it. Before opening
+takes it: duplicates of rows the commit changes, then deletes, then updates,
+each after the one whose key it takes, then the other duplicates and new rows.
+A DELETE of 7 beside a re-key of 3 to 7 commits, as does a new row or a
+duplicate keyed like a deleted one, or a chain of re-keys; a swap of two keys
+has no such order, and the engine refuses it, edits kept. The order has
+limits, each refused the same way, and each committed in two steps:
+
+- A duplicate of a row the commit changes runs before any key is freed, so it
+  cannot take one.
+- A chain of re-keys is seen as one only when each new key is typed as the
+  wire spells the old one: a `DATE`, a `TIMESTAMP` or a `DECIMAL` typed another
+  way (`1.5` for `1.50`) is not seen to take the other row's key.
+- Only the primary key is ordered. Moves on another `UNIQUE` column (`a` to
+  `b` while `b` goes to `c`) run in the order of their rows' keys, which need
+  not free a value before another row takes it.
+
+Before opening
 the session, DuckTable refuses a draft missing a `NOT NULL` column with no
 default. Any failure rolls the whole transaction back: an SQL error, a
 constraint, or a row its identity no longer names, because the row is gone,

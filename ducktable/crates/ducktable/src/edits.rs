@@ -816,15 +816,20 @@ impl Edits {
     /// binds the ORIGINAL key values for existing rows.
     ///
     /// The order is what lets a set commit whatever keys it moves, since
-    /// the engine checks a key as each statement runs. Duplicates come
-    /// first: one with `Bind::Source` cells selects them from its source
-    /// row, so the engine copies what the wire could not carry, and that
-    /// row is read as the database holds it, whatever else is staged on it;
-    /// a source row that is gone returns no row, which commit refuses. Then
-    /// deletes, which free their keys; then updates, each after the one
-    /// whose key it takes (`claim_order`); then new rows, which may take a
-    /// key either of those freed. A delete of 7 and a re-key of 3 to 7 runs
-    /// in that order, and so does a new row keyed 5 beside a delete of 5.
+    /// the engine checks a key as each statement runs. A duplicate with
+    /// `Bind::Source` cells selects them from its source row, so the engine
+    /// copies what the wire could not carry, and that row is read as the
+    /// database holds it, whatever else is staged on it; a source row that
+    /// is gone returns no row, which commit refuses. So a duplicate of a row
+    /// the set updates or deletes comes first, before its source changes.
+    /// Then deletes, which free their keys; then updates, each after the
+    /// one whose key it takes (`claim_order`); then the other duplicates,
+    /// whose sources read the same at any point, and new rows, which may
+    /// take a key any of those freed. A delete of 7 and a re-key of 3 to 7
+    /// runs in that order, and so does a new row, or a duplicate of an
+    /// untouched row, keyed 7 beside a delete of 7. A duplicate of a row the
+    /// set changes cannot take a key the set frees: it runs before the key
+    /// is free, and the engine refuses it.
     ///
     /// A held set (`in_doubt`) yields none: it may already be in the
     /// database, and is not sent again until it has been staged again.
@@ -850,8 +855,8 @@ impl Edits {
                 .join(" AND ");
             (self.source.clone(), clause)
         };
-        let (mut duplicates, mut deletes, mut updates, mut inserts) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut duplicates, mut deletes, mut updates, mut copies_late, mut inserts) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         // Each update's key before and after, for `claim_order`.
         let mut moves = Vec::new();
         for (key, identity, change) in self.entries() {
@@ -884,7 +889,11 @@ impl Edits {
                         format!("INSERT INTO {} ({names}) VALUES ({supplied}) RETURNING *", self.source)
                     };
                     let stmt = Statement { sql, params, expectation: StatementExpectation::ReturnedOne };
-                    if copies { duplicates.push(stmt) } else { inserts.push(stmt) }
+                    match (copies, self.changes.get(&key_of(identity)).map(|e| &e.change)) {
+                        (true, Some(RowChange::Update(_) | RowChange::Delete)) => duplicates.push(stmt),
+                        (true, _) => copies_late.push(stmt),
+                        (false, _) => inserts.push(stmt),
+                    }
                 }
                 RowChange::Update(cells) => {
                     let set = cells
@@ -911,11 +920,16 @@ impl Edits {
         }
         let mut updates: Vec<Option<Statement>> = updates.into_iter().map(Some).collect();
         let updates = claim_order(&moves).into_iter().filter_map(|ix| updates[ix].take());
-        duplicates.into_iter().chain(deletes).chain(updates).chain(inserts).collect()
+        duplicates.into_iter().chain(deletes).chain(updates).chain(copies_late).chain(inserts).collect()
     }
 
     /// The key an update gives its row, as `key_of` spells it, when the
     /// update changes a key column. A table keyed by rowid moves no key.
+    /// The typed value is compared as bound, not as the engine stores it, so
+    /// a key typed in another spelling than the wire's (a DATE, a DECIMAL's
+    /// `1.5` for `1.50`) is not seen to take another row's key, and a chain
+    /// of such moves may run out of order and be refused (EDITING.md,
+    /// "Commit").
     fn moved_key(&self, identity: &[Value], cells: &BTreeMap<usize, CellEdit>) -> Option<String> {
         if self.by_rowid {
             return None;
@@ -1753,6 +1767,22 @@ mod tests {
             vec![verb("INSERT", 8), verb("INSERT", 5), verb("DELETE", 8), verb("UPDATE", 5)]
         );
 
+        // A duplicate of a row the set leaves alone reads it the same at
+        // any point, so it runs after the deletes and updates and may take
+        // a key they free: row 1 copied as id 7 beside a delete of 7, and as
+        // id 8 beside a re-key of 8 to 9.
+        let mut e = edits();
+        e.stage_duplicate(vec![json!(1)], vec![(0, txt("7"), Bind::Value(json!(7))), (1, txt("a"), Bind::Source)]);
+        e.stage_delete(vec![json!(7)]);
+        e.stage_duplicate(vec![json!(1)], vec![(0, txt("8"), Bind::Value(json!(8))), (1, txt("a"), Bind::Source)]);
+        e.stage_cell(vec![json!(8)], 0, txt("8"), txt("9"), json!(9));
+        assert_eq!(
+            plan(&e),
+            vec![verb("DELETE", 7), verb("UPDATE", 8), verb("INSERT", 1), verb("INSERT", 1)]
+        );
+        let stmts = e.statements();
+        assert_eq!((stmts[2].params[0].clone(), stmts[3].params[0].clone()), (json!(7), json!(8)));
+
         // A composite key moves when any of its columns does.
         let mut e = Edits::new(
             "\"main\".\"t\"".into(),
@@ -2042,14 +2072,14 @@ mod tests {
         e.stage_duplicate(vec![json!(0.5), json!(0.5)], vec![(3, txt("a"), Bind::Source)]);
         let stmts = e.statements();
         let key = "WHERE \"k\" = ?::FLOAT AND \"d\" = ?";
+        assert_eq!(stmts[0].sql, format!("DELETE FROM \"main\".\"t\" {key}"));
+        assert_eq!(stmts[1].sql, format!("UPDATE \"main\".\"t\" SET \"k\" = ?, \"f\" = ? {key}"));
+        assert_eq!(stmts[1].params, vec![json!(2.2), json!(0.2), json!(1.1), json!(1.1)]);
         assert_eq!(
-            stmts[0].sql,
+            stmts[2].sql,
             format!("INSERT INTO \"main\".\"t\" (\"name\") SELECT \"name\" FROM \"main\".\"t\" {key} RETURNING *")
         );
-        assert_eq!(stmts[0].params, vec![json!(0.5), json!(0.5)]);
-        assert_eq!(stmts[1].sql, format!("DELETE FROM \"main\".\"t\" {key}"));
-        assert_eq!(stmts[2].sql, format!("UPDATE \"main\".\"t\" SET \"k\" = ?, \"f\" = ? {key}"));
-        assert_eq!(stmts[2].params, vec![json!(2.2), json!(0.2), json!(1.1), json!(1.1)]);
+        assert_eq!(stmts[2].params, vec![json!(0.5), json!(0.5)]);
 
         for ty in ["FLOAT", "float", "REAL", "FLOAT4"] {
             assert_eq!(key_placeholder_for(ty), "?::FLOAT", "{ty}");

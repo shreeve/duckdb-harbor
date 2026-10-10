@@ -5265,6 +5265,19 @@ mod tests {
             [(2, "one"), (4, "two"), (7, "three"), (9, "new"), (100, "three")]
                 .map(|(id, v)| vec![json!(id), json!(v)])
         );
+        // A duplicate of a row the set leaves alone takes a key it frees:
+        // 9 copied as 7 beside a delete of 7.
+        let mut e = Edits::new(
+            crate::sql::source("main", "_dt_order"),
+            vec!["id".into()],
+            vec!["id".into(), "v".into()],
+            vec!["INTEGER".into(), "VARCHAR".into()],
+        );
+        e.stage_delete(vec![json!(7)]);
+        e.stage_duplicate(vec![json!(9)], vec![(0, txt("7"), Bind::Value(json!(7))), (1, txt("new"), Bind::Source)]);
+        commit_live(&conn, &e).expect("the duplicate takes the freed key");
+        let rows = alone("SELECT id, v FROM _dt_order ORDER BY id").rows;
+        assert_eq!(rows, [(2, "one"), (4, "two"), (7, "new"), (9, "new"), (100, "three")].map(|(id, v)| vec![json!(id), json!(v)]));
 
         alone("CREATE OR REPLACE TABLE _dt_double(k DOUBLE PRIMARY KEY, v INTEGER)");
         alone("INSERT INTO _dt_double VALUES (924.2100000029881, 1)");
