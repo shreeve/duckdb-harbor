@@ -644,6 +644,12 @@ impl QueryView {
         self.running
     }
 
+    /// The app is ending: the scratchpad's newest text lands on disk before
+    /// it does (docs/QUERY.md law 1).
+    pub(crate) fn flush_scratch(&self) {
+        flush(&self.saving);
+    }
+
     /// The user chose to quit: what gives this view's session back, so the
     /// server rolls its transaction back at once instead of at its idle
     /// timeout. The session is the open transaction's, or that of one whose
@@ -668,10 +674,11 @@ impl QueryView {
 
     /// The footer's transient voice, which outranks the results grid's
     /// stats while it has something to say: the ticking elapsed line of
-    /// a slow run, a scratchpad that could not be saved, a note ("nothing
-    /// to run"), a plan's "plan", or a resultless statement's "ok". The
-    /// grid stats themselves come straight from the results grid — the
-    /// footer reads it through results_grid().
+    /// a slow run, or a note ("nothing to run"), a plan's "plan" or a
+    /// resultless statement's "ok", with a scratchpad that could not be
+    /// saved said beside it (`beside_unsaved`). The grid stats themselves
+    /// come straight from the results grid — the footer reads it through
+    /// results_grid().
     pub(crate) fn status_override(&self) -> Option<String> {
         let took = |ms: u64| crate::util::human(ms as f64 / 1000., "s");
         if self.show_running
@@ -679,16 +686,13 @@ impl QueryView {
         {
             return Some(format!("running\u{2026} {}", crate::util::human(t.elapsed().as_secs_f64(), "s")));
         }
-        if let Some(unsaved) = &self.unsaved {
-            return Some(unsaved.to_string());
-        }
-        if let Some(note) = &self.note {
-            return Some(note.to_string());
-        }
-        if let Some(plan) = &self.plan {
-            return Some(format!("plan \u{00b7} {}", took(plan.ms)));
-        }
-        self.ok_ms.map(|ms| format!("ok \u{00b7} {}", took(ms)))
+        let verdict = self
+            .note
+            .as_ref()
+            .map(|note| note.to_string())
+            .or_else(|| self.plan.as_ref().map(|plan| format!("plan \u{00b7} {}", took(plan.ms))))
+            .or_else(|| self.ok_ms.map(|ms| format!("ok \u{00b7} {}", took(ms))));
+        beside_unsaved(verdict, self.unsaved.as_deref())
     }
 
     /// The embedded results grid, for the footer's stats and pager.
@@ -962,6 +966,16 @@ fn shown(result: &harbor_client::QueryResult, effect: Option<TxnEffect>, sql: &s
         return Shown::Ok;
     }
     Shown::Grid
+}
+
+/// The status line's verdict with a failed scratchpad save beside it. A
+/// save that fails can go on failing, so it never hides the verdict of a
+/// run, nor a note such as `nothing to run`.
+fn beside_unsaved(verdict: Option<String>, unsaved: Option<&str>) -> Option<String> {
+    match (verdict, unsaved) {
+        (Some(verdict), Some(unsaved)) => Some(format!("{verdict} \u{00b7} {unsaved}")),
+        (verdict, unsaved) => verdict.or(unsaved.map(str::to_string)),
+    }
 }
 
 /// The text of the plan an EXPLAIN answered, read by the rule Harbor's REPL
@@ -1774,7 +1788,9 @@ struct Saving {
 /// Write the newest pending text to `path` until none is left, then stand
 /// down. One writer at a time, off the UI thread, always the newest text:
 /// a burst of keystrokes costs a write per landing, not one per key, and an
-/// older text never lands over a newer one. The last write's failure, if it
+/// older text never lands over a newer one. Each write goes to a file beside
+/// `path` and is renamed over it, so a quit that lands mid-write leaves the
+/// last whole text, never a truncated one. The last write's failure, if it
 /// failed, is the answer.
 fn write_newest(saving: &std::sync::Mutex<Saving>, path: &std::path::Path) -> Option<String> {
     let mut failed = None;
@@ -1789,8 +1805,19 @@ fn write_newest(saving: &std::sync::Mutex<Saving>, path: &std::path::Path) -> Op
                 }
             }
         };
+        let fresh = path.with_extension("sql.tmp");
         let dir = path.parent().map_or(Ok(()), std::fs::create_dir_all);
-        failed = dir.and_then(|()| std::fs::write(path, text)).err().map(|e| format!("scratch not saved: {e}"));
+        let written = dir.and_then(|()| std::fs::write(&fresh, text)).and_then(|()| std::fs::rename(&fresh, path));
+        failed = written.err().map(|e| format!("scratch not saved: {e}"));
+    }
+}
+
+/// Wait, a second at most, until no write of the scratchpad is under way.
+/// The writer runs off the UI thread, and a quit ends the process under it.
+fn flush(saving: &std::sync::Mutex<Saving>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while saving.lock().unwrap_or_else(|p| p.into_inner()).writing && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
 
@@ -2160,6 +2187,17 @@ mod tests {
             .map(|n| wire::Column { name: Some(n.to_string()), duckdb_type: "VARCHAR".into(), ..Default::default() })
             .collect();
         harbor_client::QueryResult { columns, row_count: rows.len() as u64, rows, time_ms: 3 }
+    }
+
+    #[test]
+    fn a_failed_save_is_said_beside_the_verdict_never_over_it() {
+        use super::beside_unsaved;
+        let unsaved = Some("scratch not saved: denied");
+        assert_eq!(beside_unsaved(Some("ok · 3ms".into()), unsaved).unwrap(), "ok · 3ms · scratch not saved: denied");
+        assert_eq!(beside_unsaved(Some("nothing to run".into()), unsaved).unwrap(), "nothing to run · scratch not saved: denied");
+        assert_eq!(beside_unsaved(None, unsaved).unwrap(), "scratch not saved: denied");
+        assert_eq!(beside_unsaved(Some("ok · 3ms".into()), None).unwrap(), "ok · 3ms");
+        assert_eq!(beside_unsaved(None, None), None);
     }
 
     #[test]
@@ -2557,10 +2595,24 @@ mod tests {
         let saving = std::sync::Mutex::new(Saving { pending: Some("SELECT 2".into()), writing: true });
         assert_eq!(write_newest(&saving, &path), None);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "SELECT 2");
+        // The text is renamed into place: nothing is left beside it.
+        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
         // The writer stands down once nothing is pending.
         let done = saving.lock().unwrap();
         assert!(done.pending.is_none() && !done.writing);
         drop(done);
+        // A quit waits for a writer under way to land the newest text.
+        let saving = std::sync::Arc::new(std::sync::Mutex::new(Saving { pending: Some("SELECT 3".into()), writing: true }));
+        let writer = {
+            let (saving, path) = (saving.clone(), path.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                write_newest(&saving, &path)
+            })
+        };
+        super::flush(&saving);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "SELECT 3");
+        assert_eq!(writer.join().unwrap(), None);
         // A path that cannot be written says why, and is not silent.
         let blocked = dir.join("scratch").join("a.sql").join("b.sql");
         let saving = std::sync::Mutex::new(Saving { pending: Some("x".into()), writing: true });

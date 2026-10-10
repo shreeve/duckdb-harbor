@@ -676,8 +676,12 @@ impl DuckTable {
         // ask nothing included: Quit from the Dock, a logout, the updater's
         // relaunch. The prefs are written too, with the window's frame a
         // move just before the quit left in memory. The hook does it all, so
-        // the future it hands back has nothing left to do.
+        // the future it hands back has nothing left to do. The scratchpad
+        // lands on disk first.
         cx.on_app_quit(|this, cx| {
+            if let Some(query) = &this.query {
+                query.read(cx).flush_scratch();
+            }
             this.release_for_quit(cx);
             crate::prefs::save(cx, |_| {});
             async {}
