@@ -130,11 +130,16 @@ fn lost_lock(log_path: &Path, from: u64) -> bool {
     {
         let _ = file.read_to_string(&mut said);
     }
+    // The engine names the holder by its executable's path, which for a
+    // process already exiting reads as `.` or nothing on Linux: that holder
+    // is on its way out too.
     said.split("Conflicting lock is held in ")
         .nth(1)
         .and_then(|rest| rest.split(" (PID").next())
-        .and_then(|holder| Path::new(holder).file_name())
-        .is_some_and(|program| program.to_string_lossy().starts_with("harbor"))
+        .is_some_and(|holder| {
+            matches!(holder.trim(), "" | ".")
+                || Path::new(holder).file_name().is_some_and(|program| program.to_string_lossy().starts_with("harbor"))
+        })
 }
 
 /// The log's last few lines, inlined: nobody should have to go and find
@@ -245,6 +250,11 @@ mod tests {
         assert!(lost_lock(&path, 0));
         std::fs::write(&path, refusal("/opt/homebrew/bin/duckdb")).unwrap();
         assert!(!lost_lock(&path, 0));
+        // A holder already exiting has no executable left to name.
+        for leaving in [".", ""] {
+            std::fs::write(&path, refusal(leaving)).unwrap();
+            assert!(lost_lock(&path, 0), "{leaving:?}");
+        }
         // Only what this start wrote is read, not an earlier start's refusal.
         let old = refusal("/usr/local/bin/harbor");
         std::fs::write(&path, format!("{old}harbor: serving x\n")).unwrap();
