@@ -465,7 +465,9 @@ irm https://raw.githubusercontent.com/shreeve/duckdb-harbor/main/install.ps1 | i
 ```
 
 Uninstall with `... | bash -s -- --uninstall` — the binary and `libduckdb`
-go; your databases, state, and config stay.
+go; your databases, state, and config stay. It refuses while a login item
+still runs that copy, since launchd or systemd would retry a missing binary
+until logout, and names the `autostart off stop` that takes each down.
 
 Homebrew has it too, as `duckdb-harbor`, which installs the `harbor` command:
 
@@ -486,9 +488,13 @@ the binary that ran it, so a copy outside `~/.local` updates in place (with
 release, older or newer. A running server keeps the code it started with
 until it is restarted, so the update ends by naming every server still on the
 old version and the `restart` that brings each forward; `--restart` runs
-them, and `--check` only says whether a newer release exists. Headless, as
-from cron, `--restart` restarts only servers with a login item, since a
-hand-started server's restart would serve in place, as `start` does there.
+them, and `--check` only says whether a newer release exists. Each restart
+runs out of reach of a hangup, so an ssh session that closes mid-update does
+not leave a server down, and its word is kept in
+`~/.local/state/harbor/runtime/log/update.log`. A server that cannot come
+back as it was is named with its own `restart` instead and left running: one
+whose config will not load, or one started by a harbor that kept no record
+of its options (below).
 
 Nothing there asks for root. `~/.local/bin` is where the XDG base directory
 spec puts user executables; Debian and Fedora already have it on `PATH`, macOS
@@ -524,7 +530,11 @@ is an alias for Invoke-WebRequest; call `curl.exe`.
 **`harbor <db.duckdb>` — the server is everyone's.** On a terminal it is the
 REPL — highlighting, completion (Down on the live line or Ctrl-Space lists,
 Tab accepts; Up and Down are history everywhere else), the duckdb-shell dot
-commands. With `-c` or stdin it runs statements and exits. Either way, if nothing serves the file
+commands. With `-c` or stdin it runs statements and exits; a dot command at
+the start of a line runs there as at the prompt, and one that fails — an
+unknown command, a bad argument, a `.read` of a file that is missing or whose
+statement fails — ends the script with exit 1, as a failed statement does.
+Either way, if nothing serves the file
 yet, a server is spawned behind the scenes: detached, refcounted, alive while
 anyone is connected. Every client holds one silent connection for its
 lifetime, so a human thinking at a prompt counts as presence; when the last
@@ -571,6 +581,26 @@ take the registration away and leave whatever is running to `stop` — though
 until logout the manager still restarts that server after a crash, since it
 holds the job it loaded.
 
+**`restart` brings a server back as it was.** Under its login item, re-reading
+config.toml; otherwise in the background, with the options it was started
+with, from the directory it was started in (so a relative path in an
+`--init` names the same file), and with the same lifetime — unless options
+are typed. A server keeps those options beside its socket, in
+`runtime/<base>-<hash>.args`, readable by its user alone, and never in
+`/info`, which answers anyone who reaches its TCP door: an `--init` can hold
+a secret. Everything the start will read is read before anything stops, so a
+restart that cannot start refuses and leaves the server running: a config
+that will not load, a typed option that does not parse, or a server started
+by a harbor older than this one, which kept no record of its options. That
+one is restarted with its options typed — the refusal names its `--port` —
+or stopped and started.
+
+A config.toml that will not load stops every start and summon, since it may
+hold `sealed`, a statement ceiling or the boot SQL, and a server that came up
+without them would look configured while being open. The refusal is one line
+with the file, the line and column, and the reason; a server already running
+is not touched.
+
 There is no registry. The socket **is** the runtime registration: its name is
 derived from the database's canonical path
 (`~/.local/state/harbor/runtime/<basename>-<hash>.sock`), so discovery is
@@ -614,7 +644,9 @@ rather than guessed. The verbs take the same spellings: `harbor labs stop`,
 A socket nothing answers on is a leftover from a `kill -9`, and the list
 unlinks it. Set `HARBOR_HOME` (absolute path) to collapse configuration and
 runtime state — sockets, logs, and history — into one directory; the test
-suites use it to keep their servers out of the real fleet view.
+suites use it to keep their servers out of the real fleet view. A relative
+or empty `HARBOR_HOME` is an error, never a quiet fall back to the real
+config and fleet.
 
 ### Output modes
 
@@ -623,7 +655,9 @@ prompt. The display modes — `duckbox` (the default at a terminal), `duckboxy`
 (the same without the type row), `markdown`, `line` and `list` — are for eyes.
 The data modes — `csv`, `json` and `jsonlines` (`--json` is shorthand) — are
 for programs, and boxed output on a pipe gets a hint to pick one. `trash`
-discards results and reports only errors.
+discards results and reports only errors. `csv` writes a `NULL` as an empty
+field, an empty string as `""` and the word `NULL` as itself: three values,
+as DuckDB's `COPY` writes them.
 
 The modes differ in how they treat a `VARIANT` or `JSON` cell, which the wire
 carries as JSON text. A display mode shows a `VARIANT` string bare — a value
@@ -790,6 +824,14 @@ nothing more, so the backup can be moved, renamed, copied to another machine
 or committed to a repo and still restore — an absolute path would have nailed
 it to the machine that wrote it.
 
+Each appears whole or not at all. A backup is written under
+`<dir>.partial-<pid>` and renamed into place as its last step, and a restore
+builds `<db>.restoring-<pid>` and moves it into place once its server has
+folded the WAL in; a Ctrl-C or a failure takes the partial one back out, and
+a kill leaves only that name, which restore refuses. `restore` also refuses a
+directory `EXPORT DATABASE` wrote itself: its `load.sql` reads a quoted
+`"NULL"` back as a null.
+
 `restore` always builds a **new** file and refuses one that exists. A restore
 that can overwrite is a restore that can be run at the wrong moment and take
 the very thing it was meant to protect; moving the restored file into place is
@@ -812,7 +854,9 @@ $ harbor http://127.0.0.1:9495 -c "SELECT count(*) FROM orders"
 An explicit start can also take its port from the matching
 `[connection.<name>]` entry in `~/.config/harbor/config.toml`; a summon stays
 on the Unix socket, so opening a database never silently adds a TCP listener.
-TCP binds IPv4 loopback only: `127.0.0.1`.
+TCP binds IPv4 loopback only: `127.0.0.1`. `harbor http://127.0.0.1:9495
+stop` stops a server by its URL — drained and checkpointed, as over its
+socket — which is the one clean stop a server on Windows has.
 
 Remote access is Caddy's job at the edge (TLS and access policy); harbor itself speaks
 plain HTTP over a unix socket or a loopback TCP port. A human reaches a
@@ -987,14 +1031,21 @@ terminate there.
 **One statement per request.** A second statement is rejected with `400`, and
 that check is load-bearing rather than decorative: the Rust DuckDB client
 *executes* every statement but the last while merely preparing one, so anything
-that gets past it runs. Use `params` for values.
+that gets past it runs. Use `params` for values. A `null` param is bound
+untyped, as DuckDB's own `EXECUTE p(NULL)` binds it: the statement types it,
+and where nothing does, as in `CREATE TABLE t AS SELECT ?`, the column takes
+the type a `NULL` literal gets, which holds nothing else. Cast it there
+(`?::INTEGER`).
 
 **Types survive the trip.** Every column carries its `duckdbType`, plus width
 and scale for `DECIMAL` and nested `child`/`fields` for `LIST` and `STRUCT`, so
 a typed client can reconstruct exactly what DuckDB had rather than a lossy JSON
 approximation. Values JSON cannot hold exactly are quoted rather than emitted
 as bare numbers, so an integer past 2^53 does not silently reprecision in a
-JavaScript client. Where something genuinely cannot survive, the schema says so
+JavaScript client. Dates and timestamps are ISO 8601, and a year outside
+0000–9999 takes its expanded form, a sign and six digits (`-000043-03-15` is
+44 BC, `+010000-01-01`), the one form a JavaScript `Date` reads; it reads
+`-0043-03-15` as the year 2043. Where something genuinely cannot survive, the schema says so
 with `"lossless": false` instead of returning a plausible wrong answer. The
 flag sits on the type that loses: for a `VARIANT[]`, a `STRUCT(v VARIANT)` or a
 `MAP(VARCHAR, VARIANT)` that is the `child`, the field or the `valueType`, and
