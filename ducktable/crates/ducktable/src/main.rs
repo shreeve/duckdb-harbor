@@ -497,29 +497,23 @@ impl Render for DuckTable {
 /// named View, which also forces an icon column that indents its
 /// neighbors. This AppKit default, registered before the menu is built,
 /// turns the injection off; the green traffic light still fullscreens.
-#[cfg(target_os = "macos")]
-// The objc crate's macros probe cfg(cargo-clippy), which rustc now
-// flags; the allow keeps OUR build warning-clean without touching the
-// vendored macro.
-#[allow(unexpected_cfgs)]
 fn suppress_fullscreen_menu_item() {
-    use objc::runtime::{Object, NO};
-    use objc::{class, msg_send, sel, sel_impl};
+    use objc2::runtime::{AnyObject, Bool};
+    use objc2::{class, msg_send};
+    // SAFETY: Foundation's class methods, each called with the argument
+    // types its selector takes; the objects are autoreleased, and
+    // `registerDefaults:` copies what it is given.
     unsafe {
-        let key: *mut Object = msg_send![
-            class!(NSString),
-            stringWithUTF8String: c"NSFullScreenMenuItemEverywhere".as_ptr()
-        ];
-        let no: *mut Object = msg_send![class!(NSNumber), numberWithBool: NO];
-        let dict: *mut Object =
-            msg_send![class!(NSDictionary), dictionaryWithObject: no forKey: key];
-        let defaults: *mut Object = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let key: *mut AnyObject =
+            msg_send![class!(NSString), stringWithUTF8String: c"NSFullScreenMenuItemEverywhere".as_ptr()];
+        let no: *mut AnyObject = msg_send![class!(NSNumber), numberWithBool: Bool::NO];
+        let dict: *mut AnyObject = msg_send![class!(NSDictionary), dictionaryWithObject: no, forKey: key];
+        let defaults: *mut AnyObject = msg_send![class!(NSUserDefaults), standardUserDefaults];
         let _: () = msg_send![defaults, registerDefaults: dict];
     }
 }
 
 fn main() {
-    #[cfg(target_os = "macos")]
     suppress_fullscreen_menu_item();
     let app = gpui_kit::application().with_assets(Assets);
 
