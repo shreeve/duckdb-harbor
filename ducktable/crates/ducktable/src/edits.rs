@@ -285,14 +285,27 @@ pub fn commit_outcome(failure: Option<&harbor_client::Failure>) -> CommitOutcome
         None => CommitOutcome::Landed,
         Some(Failure::Unsent(_)) => CommitOutcome::NotLanded,
         Some(Failure::Unanswered(_)) => CommitOutcome::InDoubt,
-        Some(Failure::Refused { code, .. }) => match code.as_str() {
-            "sql_error" | "cancelled" | "bad_request" | "not_found" | "forbidden" | "body_too_large"
-            | "no_such_session" | "session_busy" | "query_id_in_use" | "no_lease_connections"
-            | "no_lease_available" | "unavailable" | "unready" => CommitOutcome::NotLanded,
-            _ => CommitOutcome::InDoubt,
-        },
+        Some(Failure::Refused { code, .. }) if NOT_LANDED.contains(&code.as_str()) => CommitOutcome::NotLanded,
+        Some(Failure::Refused { .. }) => CommitOutcome::InDoubt,
     }
 }
+
+/// The codes a COMMIT is refused with when nothing since BEGIN was kept.
+const NOT_LANDED: [&str; 13] = [
+    wire::code::SQL_ERROR,
+    wire::code::CANCELLED,
+    wire::code::BAD_REQUEST,
+    wire::code::NOT_FOUND,
+    wire::code::FORBIDDEN,
+    wire::code::BODY_TOO_LARGE,
+    wire::code::NO_SUCH_SESSION,
+    wire::code::SESSION_BUSY,
+    wire::code::QUERY_ID_IN_USE,
+    wire::code::NO_LEASE_CONNECTIONS,
+    wire::code::NO_LEASE_AVAILABLE,
+    wire::code::UNAVAILABLE,
+    wire::code::UNREADY,
+];
 
 /// A row identity's map key: its canonical JSON. Values compare by
 /// serialization, which is exactly the equality the wire speaks.
@@ -3043,17 +3056,13 @@ mod tests {
         // engine (a rolled-back COMMIT of an aborted transaction among
         // them), or cancelled before it started: nothing was kept.
         assert_eq!(commit_outcome(Some(&Failure::Unsent("refused".into()))), CommitOutcome::NotLanded);
-        for code in [
-            "sql_error", "cancelled", "no_such_session", "session_busy", "unavailable", "unready",
-            "bad_request", "forbidden", "body_too_large", "not_found", "query_id_in_use",
-            "no_lease_connections", "no_lease_available",
-        ] {
+        for code in NOT_LANDED {
             assert_eq!(commit_outcome(Some(&refused(code))), CommitOutcome::NotLanded, "{code}");
         }
         // No answer, an error after the engine ran it, or a code this client
         // does not know: it may have landed.
         assert_eq!(commit_outcome(Some(&Failure::Unanswered("timed out".into()))), CommitOutcome::InDoubt);
-        for code in ["internal", "response_too_large", "some_later_code"] {
+        for code in [wire::code::INTERNAL, wire::code::RESPONSE_TOO_LARGE, "some_later_code"] {
             assert_eq!(commit_outcome(Some(&refused(code))), CommitOutcome::InDoubt, "{code}");
         }
     }
