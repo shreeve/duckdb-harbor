@@ -637,14 +637,16 @@ eq "rowCount agrees with the rows" "3|3" \
    "$(json 'SELECT i FROM range(3) t(i)' | js '"%s|%s" % (doc["rowCount"], len(rows))')"
 eq "an empty result is still a document" "0|[]" \
    "$(json 'SELECT 1 WHERE false' | js '"%s|%s" % (doc["rowCount"], rows)')"
+# Each check reads its whole input: under pipefail a `grep -q` that leaves
+# at its match kills the writer before it, and the pipeline then fails.
 eq "it declares Content-Length, not chunked" "True" \
    "$(curl -sS -m "$timeout" -D - -o /dev/null \
         -H 'Accept: application/json' --data '{"sql":"SELECT 1"}' "$base/sql" \
-      | tr -d '\r' | grep -qi '^content-length:' && echo True || echo False)"
+      | tr -d '\r' | grep -ci '^content-length:' >/dev/null && echo True || echo False)"
 eq "and says it is JSON" "True" \
    "$(curl -sS -m "$timeout" -D - -o /dev/null \
         -H 'Accept: application/json' --data '{"sql":"SELECT 1"}' "$base/sql" \
-      | tr -d '\r' | grep -qi '^content-type: application/json' && echo True || echo False)"
+      | tr -d '\r' | grep -ci '^content-type: application/json' >/dev/null && echo True || echo False)"
 
 # Values are produced by the same encoder in both shapes, so a difference here
 # would mean the framing had leaked into the encoding.
@@ -653,16 +655,14 @@ eq "values match the streamed shape exactly" "True" \
       b=$(json 'SELECT 1, 2.5, NULL, [1,2], {'"'"'x'"'"': 1}' | js 'json.dumps(rows)'); \
       [[ "$a" == "$b" ]] && echo True || echo False)"
 
-eq "streaming stays the default with no Accept" "True" \
-   "$(post 'SELECT 1' | head -c 20 | grep -q '"type":"schema"' && echo True || echo False)"
-eq "Accept: */* still streams" "True" \
-   "$(json 'SELECT 1' '*/*' | head -c 20 | grep -q '"type":"schema"' && echo True || echo False)"
-eq "asking for NDJSON explicitly streams" "True" \
-   "$(json 'SELECT 1' 'application/x-ndjson' | head -c 20 | grep -q '"type":"schema"' && echo True || echo False)"
+# streams <body>: whether it opens with a schema line, as a stream does.
+streams() { [[ ${1:0:20} == *'"type":"schema"'* ]] && echo True || echo False; }
+eq "streaming stays the default with no Accept" "True" "$(streams "$(post 'SELECT 1')")"
+eq "Accept: */* still streams" "True" "$(streams "$(json 'SELECT 1' '*/*')")"
+eq "asking for NDJSON explicitly streams" "True" "$(streams "$(json 'SELECT 1' 'application/x-ndjson')")"
 # Ambiguity resolves to the shape that cannot fail on size.
 eq "naming both shapes streams" "True" \
-   "$(json 'SELECT 1' 'application/json, application/x-ndjson' | head -c 20 \
-      | grep -q '"type":"schema"' && echo True || echo False)"
+   "$(streams "$(json 'SELECT 1' 'application/json, application/x-ndjson')")"
 
 # The reason one-shot defers its handshake: nothing has been sent, so a failure
 # is still a status code rather than a 200 with an apology in the body.
@@ -765,7 +765,7 @@ section "Abuse"
 eq "an oversized body does not take the server down" "True" \
    "$(python3 -c 'print("x" * 200000)' > "$work/huge.txt"; \
       curl -sS -m 30 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
-        --data-binary "@$work/huge.txt" "$base/sql" | grep -q '^4' && echo True || echo False)"
+        --data-binary "@$work/huge.txt" "$base/sql" | grep -c '^4' >/dev/null && echo True || echo False)"
 eq "a client that hangs up mid-stream does not wedge a worker" "200" \
    "$(curl -sS -m 1 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
         --data '{"sql":"SELECT i FROM range(5000000) t(i)"}' "$base/sql" >/dev/null 2>&1; \
@@ -773,7 +773,7 @@ eq "a client that hangs up mid-stream does not wedge a worker" "200" \
 eq "the server still answers correctly afterwards" "$exp_n_sites" \
    "$(scalar 'SELECT count(*) FROM sites')"
 eq "deeply nested SQL is handled, not crashed" "True" \
-   "$(status "$(python3 -c 'print("SELECT * FROM (" * 40 + "SELECT 1 AS x" + ") t" * 40)')" | grep -qE '^(200|400)$' && echo True || echo False)"
+   "$(status "$(python3 -c 'print("SELECT * FROM (" * 40 + "SELECT 1 AS x" + ") t" * 40)')" | grep -cE '^(200|400)$' >/dev/null && echo True || echo False)"
 
 # ---------------------------------------------------------------------------
 if [[ "$soak" -gt 0 ]]; then
