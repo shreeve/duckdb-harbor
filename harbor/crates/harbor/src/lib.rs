@@ -1868,7 +1868,7 @@ fn handle(req: Request, exec: Option<Executor>, log: bool) -> bool {
                 None => shed(req),
             },
             (Method::Post, "/sql") => match exec {
-                Some(exec) => run_sql_request(req, Some(exec)),
+                Some(exec) => run_sql_request(req, exec),
                 // A session's statement needs no worker: it runs on the
                 // session's own connection. The lane relays it, and sheds the
                 // rest.
@@ -1919,35 +1919,71 @@ impl LogLine {
 /// the body and runs a session's statement on the session's connection, and
 /// sheds anything else. The lane itself never reads a body or streams, so a
 /// client that stalls either holds this thread and not the berth's last open
-/// door. One thread at most per lease connection, which is as many
-/// statements as sessions can run at once.
+/// door.
+///
+/// Two counts bound these threads. A body is read on one of `RELAY_READERS`.
+/// A statement that names a session then runs in a seat, one per lease
+/// connection, which is as many statements as sessions can run at once, and
+/// gives its reader back. So bodies that stall, whatever they name, hold
+/// readers and never the seats sessions run in.
 fn relay(req: Request, line: Option<LogLine>) -> bool {
-    static RELAYS: AtomicUsize = AtomicUsize::new(0);
-    struct Seat;
-    impl Drop for Seat {
-        fn drop(&mut self) {
-            RELAYS.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-    let cap = LEASES.lock().unwrap().as_ref().map_or(0, |l| l.total);
-    let seat = Seat;
-    if RELAYS.fetch_add(1, Ordering::SeqCst) >= cap {
-        let (keep_going, status) = shed(req);
+    static READERS: AtomicUsize = AtomicUsize::new(0);
+    static SEATS: AtomicUsize = AtomicUsize::new(0);
+    let log = |line: Option<LogLine>, (keep_going, status): (bool, u16)| {
         if let Some(line) = line {
             line.write(status);
         }
-        return keep_going;
-    }
+        keep_going
+    };
+    let Some(reading) = Seat::take(&READERS, RELAY_READERS) else {
+        return log(line, shed(req));
+    };
     // A thread that cannot start drops the request, which justhttp answers
-    // with a 500, and the seat with it.
+    // with a 500, and the reader with it.
     let _ = thread::Builder::new().name("harbor-relay".to_string()).spawn(move || {
-        let _seat = seat;
-        let (_, status) = run_sql_request(req, None);
-        if let Some(line) = line {
-            line.write(status);
-        }
+        let mut req = req;
+        let answer = match read_request_body(&mut req)
+            .and_then(|body| parse_request(&body).map_err(Refusal::bad_request))
+        {
+            Err(refusal) => refuse(req, refusal),
+            Ok(parsed) if parsed.session.is_none() => shed(req),
+            Ok(parsed) => {
+                let cap = LEASES.lock().unwrap().as_ref().map_or(0, |l| l.total);
+                match Seat::take(&SEATS, cap) {
+                    Some(_seat) => {
+                        drop(reading);
+                        run_sql(req, parsed, None)
+                    }
+                    None => shed(req),
+                }
+            }
+        };
+        log(line, answer);
     });
     true
+}
+
+/// How many relay threads may read a body at once. A body lands in
+/// milliseconds, so a few are plenty, and the count keeps a client that
+/// pipelines requests from turning each into a thread.
+const RELAY_READERS: usize = 8;
+
+/// One of a bounded count of relay threads, given back when dropped.
+struct Seat(&'static AtomicUsize);
+
+impl Seat {
+    /// A seat when fewer than `cap` are taken. Built before the count is
+    /// raised, so every path, a refusal included, lowers it again.
+    fn take(count: &'static AtomicUsize, cap: usize) -> Option<Seat> {
+        let seat = Seat(count);
+        (count.fetch_add(1, Ordering::SeqCst) < cap).then_some(seat)
+    }
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Why a TCP request came from a web page, or `None` when it did not.
@@ -3125,21 +3161,20 @@ fn respond_ready(req: Request, ok: bool, message: &str) -> u16 {
 /// A worker's executor: its jobs channel and its cancellation slot.
 type Executor<'a> = (&'a mpsc::SyncSender<Job>, &'a Arc<SlotState>);
 
-/// `POST /sql`: the body read and parsed, then the statement run. `pooled`
-/// is the accepting worker's executor; a relay has none, and serves only a
-/// session's statement.
-fn run_sql_request(mut req: Request, pooled: Option<Executor>) -> (bool, u16) {
+/// `POST /sql` on a worker: the body read and parsed, then the statement run.
+fn run_sql_request(mut req: Request, exec: Executor) -> (bool, u16) {
     let parsed = read_request_body(&mut req)
         .and_then(|body| parse_request(&body).map_err(Refusal::bad_request));
     match parsed {
-        Ok(parsed) => run_sql(req, parsed, pooled),
+        Ok(parsed) => run_sql(req, parsed, Some(exec)),
         Err(refusal) => refuse(req, refusal),
     }
 }
 
 /// Returns (keep serving, status sent). The first is false when the worker's
 /// own executor is gone; see `handle`, which also writes the log line from
-/// the second.
+/// the second. `pooled` is the accepting worker's executor; a relay has
+/// none, and brings only a session's statement.
 fn run_sql(req: Request, mut parsed: SqlRequest, pooled: Option<Executor>) -> (bool, u16) {
     // `r.{a,b}` becomes `r.a, r.b` here, once, for every client: before the
     // guards below and the engine's statement count, which read the

@@ -577,6 +577,23 @@ def run_tests(h, db):
     busy = sum(job.thread.is_alive() for job in jobs)
     eq("BEGIN, a write and COMMIT answer while the workers are busy", [200, 200, 200], answers)
     eq("which they were, all four", 4, busy)
+    # As many pooled requests as there are lease connections, each body
+    # stalled after its first bytes: they hold the lane's readers, not the
+    # seats a session's statement runs in.
+    stalled = []
+    for _ in range(4):
+        s = socket.create_connection(("127.0.0.1", int(h.base.rsplit(":", 1)[1])))
+        body = json.dumps({"sql": "SELECT 1"}).encode()
+        s.sendall(b"POST /sql HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                  b"Content-Length: %d\r\n\r\n" % (len(body) + 2000) + body[:5])
+        stalled.append(s)
+    time.sleep(0.5)
+    st = h.sql("SELECT 1", session=sid, timeout=10)[0]
+    busy = sum(job.thread.is_alive() for job in jobs)
+    eq("a session's statement runs beside pooled bodies that stall, the workers busy",
+       (200, 4), (st, busy))
+    for s in stalled:
+        s.close()
     for i in range(4):
         h.cancel(f"busy{i}")
     for job in jobs:
