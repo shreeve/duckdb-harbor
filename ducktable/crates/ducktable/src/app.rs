@@ -388,16 +388,7 @@ fn connect(aim: Aim) -> Result<(Conn, wire::InfoResponse, harbor_client::Catalog
         Aim::Row { name, path: Some(path) } => fleet::connect_file(&name, &path)?,
         Aim::Row { name, path: None } => fleet::connect_remote(&name)?,
         Aim::File(path) => fleet::connect_path(&path)?,
-        Aim::Url { name, host, port } => {
-            // The name was free when the dialog checked it, so a name taken
-            // since is this address, saved by an earlier dial of this aim;
-            // a config refused is refused to the connect too.
-            let name = match fleet::validate_database(&name, &host, &port) {
-                Ok(()) => fleet::add_database(&name, &host, &port)?,
-                Err(_) => name,
-            };
-            fleet::connect_remote(&name)?
-        }
+        Aim::Url { name, host, port } => fleet::connect_remote(&fleet::add_database(&name, &host, &port)?)?,
     };
     let info = fleet::info(&conn)?;
     let catalog = harbor_client::catalog(&conn)?;

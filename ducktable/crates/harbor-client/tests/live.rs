@@ -102,6 +102,30 @@ fn the_fleet_lists_the_scratch_database() {
     assert!(row.is_some_and(|r| r.state.is_live()), "the scratch database is not a running row");
 }
 
+#[test]
+#[ignore]
+fn a_database_saved_twice_at_one_address_is_saved_once() {
+    if !own_fleet() {
+        return;
+    }
+    let name = format!("twice-{}", std::process::id());
+    // Two saves of one aim at once, the way a redial overtakes the save
+    // of the dial it replaces: both are the database saved.
+    let saves: Vec<_> = (0..2)
+        .map(|_| {
+            let name = name.clone();
+            std::thread::spawn(move || fleet::add_database(&name, "localhost", "9611"))
+        })
+        .collect();
+    for save in saves {
+        assert_eq!(save.join().unwrap(), Ok(name.clone()));
+    }
+    assert_eq!(fleet::add_database(&name, "127.0.0.1", "9611"), Ok(name.clone()));
+    let other = fleet::add_database(&name, "localhost", "9612");
+    assert!(other.is_err_and(|e| e.contains("already exists")));
+    fleet::remove_remote(&name).unwrap();
+}
+
 /// A database file's path as the fleet compares it: canonical.
 fn fleet_path(db: &std::path::Path) -> std::path::PathBuf {
     harbor_client::paths::canonical_db(db).expect("a database path")

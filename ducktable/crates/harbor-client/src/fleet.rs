@@ -877,10 +877,21 @@ fn open_tunnel(ssh_host: &str, remote_port: u16) -> Result<SshTunnel, String> {
 
 /// Validate and persist the dialog's port-based database without opening its
 /// network connection. The returned name is the normalized sidebar identity.
+/// A name that already holds this address is this database saved, so a
+/// second save of the same aim succeeds whichever of the two writes first;
+/// a name that holds another address is refused.
 pub fn add_database(name: &str, host: &str, port: &str) -> Result<String, String> {
     let name = harbor_common::normalize(name)?;
     let url = database_url(host, port)?;
-    harbor_common::membership::add_remote(&name, &url)
+    harbor_common::membership::add_remote(&name, &url).or_else(|refused| {
+        if holds(&load_config()?, &name, &url) { Ok(name) } else { Err(refused) }
+    })
+}
+
+/// Whether the config's remote called `name` is at the address `url` names.
+fn holds(cfg: &config::FileConfig, name: &str, url: &str) -> bool {
+    let saved = remote_entry(cfg, name).ok().and_then(|entry| entry.url.as_deref());
+    saved.and_then(|saved| http_target(saved).ok()).is_some_and(|saved| http_target(url) == Ok(saved))
 }
 
 /// Remove only a configured remote. The kind check prevents a stale UI action
@@ -983,6 +994,25 @@ mod tests {
 
     // The name law and the socket-naming rule live in harbor-common,
     // shared with harbor itself — no client-side copy to drift.
+
+    #[test]
+    fn a_name_holds_an_address_only_as_a_remote_at_that_host_and_port() {
+        let cfg = config::parse(
+            "[connection.prod]\nurl = \"http://db.example\"\n\
+             [connection.dev]\nurl = \"http://localhost:9600\"\n\
+             [connection.disk]\npath = \"/tmp/disk.duckdb\"\n",
+        )
+        .unwrap();
+        // The same address, however it is spelled.
+        assert!(holds(&cfg, "prod", "http://db.example:9495"));
+        assert!(holds(&cfg, "dev", "http://127.0.0.1:9600"));
+        // Another port or host under the name is another database.
+        assert!(!holds(&cfg, "prod", "http://db.example:9496"));
+        assert!(!holds(&cfg, "dev", "http://box:9600"));
+        // A file or nothing under the name holds no address.
+        assert!(!holds(&cfg, "disk", "http://localhost:9495"));
+        assert!(!holds(&cfg, "none", "http://db.example"));
+    }
 
     #[test]
     fn http_target_defaults_the_port_normalizes_localhost_and_refuses_tls() {
