@@ -24,11 +24,11 @@ pub(crate) struct QueryView {
     /// display toggles exactly like the Data view, and it is read-only
     /// by construction (no catalog structure, no key, no Edits).
     results: Option<Entity<crate::grid::Grid>>,
-    /// Bubbles the results grid's repaints (page flips, ticking loads)
-    /// up to the app footer, which reads that grid through us.
-    results_obs: Option<Subscription>,
     /// A resultless statement's verdict: the engine said ok in N ms.
     ok_ms: Option<u64>,
+    /// A plan EXPLAIN answered, shown as the engine drew it in place of a
+    /// results grid.
+    plan: Option<Plan>,
     /// A transient footer note ("nothing to run"), cleared by the next
     /// verdict.
     note: Option<SharedString>,
@@ -54,13 +54,20 @@ pub(crate) struct QueryView {
     run_started: Option<std::time::Instant>,
     /// True only after a run has held the floor for 300ms: fast queries
     /// swap atomically with no intermediate state at all; slow ones earn
-    /// a ticking "running" line and faded prior results (Steve's
-    /// three-phase ruling, 2026-08-31).
+    /// a ticking "running" line and faded prior results (DESIGN.md,
+    /// three-phase feedback).
     show_running: bool,
     /// Set by the carousel landing here; consumed by the next render.
     needs_focus: bool,
+    /// The gutter last computed, and the text's hash and the caret it was
+    /// computed for (`sync_send_mark`).
+    marks: Option<((u64, usize), Marks)>,
+    /// The scratchpad on its way to disk (`save_scratch`).
+    saving: std::sync::Arc<std::sync::Mutex<Saving>>,
+    /// Why the last write of the scratchpad failed, until one succeeds.
+    unsaved: Option<SharedString>,
     /// The editor/results divider — user-draggable, position persisted
-    /// (docs/QUERY.md's split, finally honored).
+    /// (docs/QUERY.md's split).
     split: Entity<gpui_kit::component::resizable::ResizableState>,
     _subscription: Subscription,
     /// Keystroke interceptor for ⌘Enter: it must run BEFORE the input's
@@ -92,7 +99,9 @@ impl QueryView {
         // ⌘Enter arrives as the input's secondary-enter — the send key.
         // Plain Enter stays a newline (the editor's own default).
         let subscription = cx.subscribe_in(&editor, window, Self::on_editor_event);
-        prune_history(berth);
+        // The history keeps its newest entries, pruned off the UI thread.
+        let pruned = berth.to_string();
+        cx.background_executor().spawn(async move { prune_history(&pruned) }).detach();
         // The editor's Enter handler ALWAYS inserts a newline in
         // multi-line mode, secondary included, before emitting its
         // event. Interceptors run before binding dispatch, so this one
@@ -144,8 +153,8 @@ impl QueryView {
             berth: berth.to_string(),
             editor,
             results: None,
-            results_obs: None,
             ok_ms: None,
+            plan: None,
             note: None,
             error: None,
             running: false,
@@ -156,6 +165,9 @@ impl QueryView {
             run_started: None,
             show_running: false,
             needs_focus: false,
+            marks: None,
+            saving: Default::default(),
+            unsaved: None,
             split,
             _subscription: subscription,
             _intercept: intercept,
@@ -179,77 +191,49 @@ impl QueryView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // value() already materializes the rope into a SharedString;
-        // it derefs to &str, so no second copy is taken (this runs at
-        // blink frequency — allocations here are pure heat).
+        // This runs on every editor notify, the cursor blink included, so
+        // the split is read again only when the text or the caret moved:
+        // a pasted dump re-splits once, not twice a second.
         let (text, caret) = {
             let e = editor.read(cx);
             (e.value(), e.cursor())
         };
-        // Numbers live only on statement lines, restarting at 1 on
-        // each statement — matching the engine's own "LINE n" — and
-        // the gap rows between statements carry none (label 0 = silent
-        // row). A blank line INSIDE a statement still counts: the
-        // engine counts it too.
-        let rows = text.matches('\n').count() + 1;
-        let mut labels = vec![0u32; rows];
-        let stmts = split_statements(&text);
+        let key = {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut h = std::hash::DefaultHasher::new();
+            text.hash(&mut h);
+            (h.finish(), caret)
+        };
+        let marks = match &self.marks {
+            Some((at, marks)) if *at == key => marks.clone(),
+            _ => {
+                let marks = gutter_marks(&text, caret);
+                self.marks = Some((key, marks.clone()));
+                marks
+            }
+        };
         // The mark's color is the header band's own background: the
         // marked statement's rail cells dim to it — what ⌘Enter will
         // send reads as a PLACE in the margin, not a sticker on it.
-        // Picked from the same lex as the labels below — one truth.
-        let mark = statement_pick(&stmts, caret.min(text.len())).map(|s| {
-            let start = text[..s.span.start].matches('\n').count();
-            let end = text[..s.span.end].matches('\n').count();
-            let shade = {
-                use gpui_kit::component::ActiveTheme as _;
-                cx.theme().table_head
-            };
-            (start..end + 1, shade)
+        let mark = marks.rows.map(|rows| {
+            use gpui_kit::component::ActiveTheme as _;
+            (rows, cx.theme().table_head)
         });
-        // Only a `;` closes a band — ANY band, not just the last. The
-        // open tail after the final `;` draws no closing hairline: the
-        // line would claim "done here" under a mid-air thought. It
-        // appears the moment the `;` does. end_rows lists the last row
-        // of each statement that earned one. Rows come from a running
-        // cursor — statements are ordered and disjoint, so one forward
-        // pass counts every newline exactly once (a prefix scan per
-        // statement goes quadratic on a pasted dump, and this runs at
-        // blink frequency).
-        let mut end_rows: Vec<u32> = Vec::new();
-        let (mut pos, mut row) = (0usize, 0usize);
-        for stmt in &stmts {
-            row += text[pos..stmt.span.start].matches('\n').count();
-            let r0 = row;
-            row += text[stmt.span.clone()].matches('\n').count();
-            let r1 = row;
-            pos = stmt.span.end;
-            for (i, r) in (r0..=r1).enumerate() {
-                if labels[r] == 0 {
-                    labels[r] = (i + 1) as u32;
-                }
-            }
-            if stmt.terminated {
-                end_rows.push(r1 as u32);
-            }
-        }
-        let max_label = labels.iter().copied().max().unwrap_or(1) as u64;
         // The rail obeys ⌥7 exactly like the grids: hidden means GONE
         // (the boundary line above the pane is all that remains).
         let show = crate::prefs::get(cx).row_numbers;
         editor.update(cx, |e, cx| e.set_line_number(show, window, cx));
         // One rail for the whole pane: top and bottom both take the
         // wider of the editor's labels and the results' visible row
-        // numbers — THIS pane's content, not the host table's (Steve's
-        // content-fit ruling, 2026-08-31), with gutter_width's 2-digit
-        // floor. Recompute from CURRENT content, rather than retaining
-        // an old width, so a small result after a large one shrinks
-        // both halves together.
+        // numbers — this pane's content, not the host table's, with
+        // gutter_width's 2-digit floor. Recompute from CURRENT content,
+        // rather than retaining an old width, so a small result after a
+        // large one shrinks both halves together.
         let results = self.results.clone();
         let results_last = results
             .as_ref()
             .map_or(0, |g| g.read(cx).last_visible_row(cx));
-        let shared_max = shared_gutter_max(max_label, results_last);
+        let shared_max = shared_gutter_max(marks.max_label, results_last);
         let rail = crate::grid::gutter_width(shared_max);
         if let Some(results) = results {
             results.update(cx, |grid, cx| grid.set_gutter_max(shared_max, cx));
@@ -265,34 +249,25 @@ impl QueryView {
             background: t.raised,
             row_line: t.grid_line,
             // The rail's edge, the band boundary, and the statement
-            // hairlines are all grid lines — the one slot (red-audit
-            // ruling, 2026-09-01).
+            // hairlines are all grid lines: the one slot.
             border: t.grid_line,
         };
         let stale = {
             let e = editor.read(cx);
             e.marked_rows != mark
                 || e.gutter_style.as_ref() != Some(&style)
-                || e.section_end_rows.as_deref().map(Vec::as_slice)
-                    != Some(end_rows.as_slice())
-                || e.line_labels.as_deref().map(Vec::as_slice)
-                    != Some(labels.as_slice())
+                || e.section_end_rows.as_ref() != Some(&marks.end_rows)
+                || e.line_labels.as_ref() != Some(&marks.labels)
         };
         if stale {
             editor.update(cx, |e, cx| {
                 e.marked_rows = mark;
                 e.gutter_style = Some(style);
-                e.section_end_rows = Some(std::rc::Rc::new(end_rows));
-                e.line_labels = Some(std::rc::Rc::new(labels));
+                e.section_end_rows = Some(marks.end_rows);
+                e.line_labels = Some(marks.labels);
                 cx.notify();
             });
         }
-    }
-
-    /// True when this view already speaks for `berth` — table switches
-    /// keep the scratchpad, reconnects rebuild it (docs/QUERY.md law 1).
-    pub(crate) fn is_for(&self, berth: &str) -> bool {
-        self.berth == berth
     }
 
     fn on_editor_event(
@@ -304,23 +279,33 @@ impl QueryView {
     ) {
         match event {
             InputEvent::PressEnter { secondary: true, .. } => self.run(window, cx),
-            InputEvent::Change { .. } => {
-                // Autosave rides the change event; a debounce can come
-                // later — scratch writes are tiny.
-                self.save_scratch(cx);
-            }
+            InputEvent::Change => self.save_scratch(cx),
             _ => {}
         }
     }
 
-    fn save_scratch(&self, cx: &App) {
-        let text = self.editor.read(cx).value().to_string();
-        if let Some(path) = scratch_path(&self.berth) {
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir).ok();
+    /// Autosave, on every change (docs/QUERY.md law 1): the text goes to
+    /// disk off the UI thread (`write_newest`), and a write that fails says
+    /// so in the status line until one succeeds.
+    fn save_scratch(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = scratch_path(&self.berth) else { return };
+        {
+            let mut saving = self.saving.lock().unwrap_or_else(|p| p.into_inner());
+            saving.pending = Some(self.editor.read(cx).value().to_string());
+            if std::mem::replace(&mut saving.writing, true) {
+                return;
             }
-            std::fs::write(path, text).ok();
         }
+        let saving = self.saving.clone();
+        cx.spawn(async move |this, cx| {
+            let failed = cx.background_executor().spawn(async move { write_newest(&saving, &path) }).await;
+            this.update(cx, |this, cx| {
+                this.unsaved = failed.map(SharedString::from);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// ⌘Enter: send the statement under the caret (docs/QUERY.md). In
@@ -392,16 +377,15 @@ impl QueryView {
         cx.spawn_in(window, async move |this, cx| {
             let sql_logged = sql.clone();
             // A send is at most the two queries the Data view gives a
-            // table — and usually just ONE (Steve's probe-row ruling,
-            // 2026-08-31): fetch page 0 of the wrapped statement with
+            // table, and usually just ONE: fetch page 0 of the wrapped statement with
             // LIMIT size+1. A result that fits the page IS its own
             // exact count — no second query. Only the extra row's
             // arrival proves there is more, and only then does
             // count(*) fire for the exact total. The page query
-            // doubles as the wrap probe: if it fails (not actually
-            // SELECT-shaped, or a syntax error), the statement runs
-            // bare, so error verdicts always quote the user's own
-            // SQL, never the wrapper's.
+            // doubles as the wrap probe: if the engine refuses it
+            // (not actually SELECT-shaped, or a syntax error), the
+            // statement runs bare, so an engine error always quotes
+            // the user's own SQL, never the wrapper's (`runs_bare`).
             let (outcome, total, paged, txn, fate) = cx
                 .background_executor()
                 .spawn(async move {
@@ -469,12 +453,7 @@ impl QueryView {
                                     };
                                     break 'run (Ok(result), total, true);
                                 }
-                                // Inside a transaction the probe's failure is
-                                // the verdict, unless the wrap merely failed
-                                // to parse: any other error has aborted the
-                                // transaction, or its session is gone, and the
-                                // bare run would only report that.
-                                Err(failure) if txn.is_some() && !never_ran(&failure) => {
+                                Err(failure) if !runs_bare(txn.is_some(), &failure) => {
                                     break 'run (Err(failure), None, false);
                                 }
                                 Err(_) => {}
@@ -524,52 +503,52 @@ impl QueryView {
                 match outcome {
                     Ok(result) => {
                         let ms = result.time_ms;
-                        // BEGIN, COMMIT and their kin answer with an empty
-                        // `Success` column; their verdict is the status
-                        // line's and the transaction mark's. Under EXPLAIN
-                        // ANALYZE they answer with the plan, which shows.
-                        if result.columns.is_empty() || effect.is_some() && result.rows.is_empty() {
-                            this.results = None;
-                            this.results_obs = None;
-                            this.ok_ms = Some(ms);
-                        } else {
-                            this.ok_ms = None;
-                            // A paged run holds page 0 of a paged grid
-                            // (total exact, or unknown if the count
-                            // failed); a bare run (unwrappable, or the
-                            // wrap probe failed) holds its entire
-                            // result as one inert page whose total is
-                            // its own length.
-                            let (grid_total, page_size) = if paged {
-                                (total, size)
-                            } else {
-                                (
-                                    Some(result.rows.len() as u64),
-                                    result.rows.len().max(1),
-                                )
-                            };
-                            let conn = this.conn.clone();
-                            // Later pages of a result read inside the
-                            // transaction are read inside it too, while
-                            // it lasts.
-                            let session = this.txn.clone();
-                            let grid = cx.new(|cx| {
-                                let mut grid = crate::grid::Grid::new_query(
-                                    conn,
-                                    &sql_logged,
-                                    Ok(result),
-                                    grid_total,
-                                    page_size,
-                                    paged,
-                                    window,
-                                    cx,
-                                );
-                                grid.session = session;
-                                grid
-                            });
-                            this.results_obs =
-                                Some(cx.observe(&grid, |_, _, cx| cx.notify()));
-                            this.results = Some(grid);
+                        this.results = None;
+                        this.ok_ms = None;
+                        this.plan = None;
+                        match shown(&result, effect) {
+                            Shown::Ok => this.ok_ms = Some(ms),
+                            Shown::Plan(text) => {
+                                let text = SharedString::from(text);
+                                let copy = cx.new(|_| crate::copy_button::CopyButton::new("Copy plan", text.clone()));
+                                this.plan = Some(Plan { text, ms, copy });
+                            }
+                            Shown::Grid => {
+                                // A paged run holds page 0 of a paged grid
+                                // (total exact, or unknown if the count
+                                // failed); a bare run (unwrappable, or the
+                                // wrap probe failed) holds its entire
+                                // result as one inert page whose total is
+                                // its own length.
+                                let (grid_total, page_size) = if paged {
+                                    (total, size)
+                                } else {
+                                    (
+                                        Some(result.rows.len() as u64),
+                                        result.rows.len().max(1),
+                                    )
+                                };
+                                let conn = this.conn.clone();
+                                // Later pages of a result read inside the
+                                // transaction are read inside it too, while
+                                // it lasts.
+                                let session = this.txn.clone();
+                                let grid = cx.new(|cx| {
+                                    let mut grid = crate::grid::Grid::new_query(
+                                        conn,
+                                        &sql_logged,
+                                        Ok(result),
+                                        grid_total,
+                                        page_size,
+                                        paged,
+                                        window,
+                                        cx,
+                                    );
+                                    grid.session = session;
+                                    grid
+                                });
+                                this.results = Some(grid);
+                            }
                         }
                     }
                     Err(message) => {
@@ -579,8 +558,8 @@ impl QueryView {
                         };
                         this.error = Some(SharedString::from(message));
                         this.results = None;
-                        this.results_obs = None;
                         this.ok_ms = None;
+                        this.plan = None;
                     }
                 }
                 // Arbitrary SQL may change any table. Request a catalog
@@ -597,9 +576,9 @@ impl QueryView {
 
     /// Keep the open transaction's session from idling out, and notice when
     /// it is gone. Harbor reclaims a session that sits thirty seconds between
-    /// statements, which a person composing the next one easily does, so a
-    /// trivial statement goes to it at a third of that interval while nothing
-    /// else is running on it. The session's fixed deadline cannot be
+    /// statements, which a person composing the next one easily does, so the
+    /// session is touched at a third of that interval while nothing else is
+    /// running on it (`Txn::touch`). The session's fixed deadline cannot be
     /// extended: when it passes, the server has rolled the transaction back,
     /// and the view says so. One watcher per transaction; it ends with it.
     fn watch_transaction(&mut self, cx: &mut Context<Self>) {
@@ -689,23 +668,27 @@ impl QueryView {
 
     /// The footer's transient voice, which outranks the results grid's
     /// stats while it has something to say: the ticking elapsed line of
-    /// a slow run, a note ("nothing to run"), or a resultless
-    /// statement's "ok". The grid stats themselves come straight from
-    /// the results grid — the footer reads it through results_grid().
+    /// a slow run, a scratchpad that could not be saved, a note ("nothing
+    /// to run"), a plan's "plan", or a resultless statement's "ok". The
+    /// grid stats themselves come straight from the results grid — the
+    /// footer reads it through results_grid().
     pub(crate) fn status_override(&self) -> Option<String> {
-        if self.show_running {
-            if let Some(t) = self.run_started {
-                return Some(format!(
-                    "running\u{2026} {}",
-                    crate::util::human(t.elapsed().as_secs_f64(), "s")
-                ));
-            }
+        let took = |ms: u64| crate::util::human(ms as f64 / 1000., "s");
+        if self.show_running
+            && let Some(t) = self.run_started
+        {
+            return Some(format!("running\u{2026} {}", crate::util::human(t.elapsed().as_secs_f64(), "s")));
+        }
+        if let Some(unsaved) = &self.unsaved {
+            return Some(unsaved.to_string());
         }
         if let Some(note) = &self.note {
             return Some(note.to_string());
         }
-        self.ok_ms
-            .map(|ms| format!("ok \u{00b7} {}", crate::util::human(ms as f64 / 1000., "s")))
+        if let Some(plan) = &self.plan {
+            return Some(format!("plan \u{00b7} {}", took(plan.ms)));
+        }
+        self.ok_ms.map(|ms| format!("ok \u{00b7} {}", took(ms)))
     }
 
     /// The embedded results grid, for the footer's stats and pager.
@@ -873,17 +856,41 @@ impl Render for QueryView {
                 });
                 // The run's verdict lives in the FOOTER's status line,
                 // the same widgets and ordering as the Data view — no
-                // mid-pane strip (Steve's unification ruling,
-                // 2026-08-31).
-                match self.results.clone() {
+                // mid-pane strip.
+                // A plan shows whole, preformatted, scrolling both ways in
+                // the value font, with its copy tile in the corner.
+                let answer = match (self.results.clone(), &self.plan) {
+                    (Some(grid), _) => Some(grid.into_any_element()),
+                    (None, Some(plan)) => Some(
+                        div()
+                            .size_full()
+                            .relative()
+                            .child(
+                                div()
+                                    .id("plan")
+                                    .size_full()
+                                    .overflow_scroll()
+                                    .p(px(crate::theme::PANE_INSET))
+                                    .whitespace_nowrap()
+                                    .font_family(value_font())
+                                    .text_size(px(CELL_TEXT * crate::prefs::get(cx).zoom_factor()))
+                                    .text_color(t.text)
+                                    .child(plan.text.clone()),
+                            )
+                            .child(div().absolute().top_2().right_3().child(plan.copy.clone()))
+                            .into_any_element(),
+                    ),
+                    (None, None) => None,
+                };
+                match answer {
                     // The results pane: a snapshot that snaps (law 5).
                     // While a slow run holds the floor, the prior
                     // snapshot fades — visibly stale, never blanked.
                     // The divider between the panes is the user's: a
                     // draggable 1px splitter whose position persists
-                    // (docs/QUERY.md's split), the handle's own line
-                    // standing in for the old border_t.
-                    Some(grid) => d.child(
+                    // (docs/QUERY.md's split); the handle's own line is
+                    // the border between them.
+                    Some(answer) => d.child(
                         gpui_kit::base::v_resizable("query-split")
                             .with_state(&self.split)
                             .child(
@@ -913,7 +920,7 @@ impl Render for QueryView {
                                         .size_full()
                                         .min_h_0()
                                         .when(self.show_running, |d| d.opacity(0.45))
-                                        .child(grid),
+                                        .child(answer),
                                 ),
                             ),
                     ),
@@ -921,6 +928,74 @@ impl Render for QueryView {
                 }
             })
     }
+}
+
+/// A plan EXPLAIN answered: its text, the engine's time, and its copy tile
+/// (DESIGN.md: explicit copy, never selection).
+struct Plan {
+    text: SharedString,
+    ms: u64,
+    copy: Entity<crate::copy_button::CopyButton>,
+}
+
+/// What a run's answer shows as.
+#[derive(Debug, PartialEq)]
+enum Shown {
+    /// The status line's `ok · N ms`, and no results.
+    Ok,
+    /// A plan, as the engine drew it.
+    Plan(String),
+    /// The results grid.
+    Grid,
+}
+
+/// How to show `result`. BEGIN, COMMIT and their kin answer with an empty
+/// `Success` column, and their verdict is the status line's and the
+/// transaction mark's; under EXPLAIN ANALYZE they answer with the plan, which
+/// shows. A plan is box art over many lines in one cell, which a grid shows
+/// as its first line, a border: it shows whole instead.
+fn shown(result: &harbor_client::QueryResult, effect: Option<TxnEffect>) -> Shown {
+    if let Some(text) = plan_text(result) {
+        return Shown::Plan(text);
+    }
+    if result.columns.is_empty() || effect.is_some() && result.rows.is_empty() {
+        return Shown::Ok;
+    }
+    Shown::Grid
+}
+
+/// The text of a plan EXPLAIN answered: rows of `explain_key` and
+/// `explain_value`, each plan under its own name when there are several,
+/// as Harbor's REPL prints it. This reads the wire's plan schema the way
+/// the REPL does; when that rule moves into `wire` as `wire::plan`, this
+/// calls it, and both clients detect a plan by one rule.
+fn plan_text(result: &harbor_client::QueryResult) -> Option<String> {
+    let name = |i: usize| result.columns.get(i).and_then(|c| c.name.as_deref());
+    let plan = result.columns.len() == 2
+        && name(0).is_some_and(|n| n.eq_ignore_ascii_case("explain_key"))
+        && name(1).is_some_and(|n| n.eq_ignore_ascii_case("explain_value"));
+    if !plan || result.rows.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for row in &result.rows {
+        let (Some(key), Some(value)) = (row.first()?.as_str(), row.get(1)?.as_str()) else { return None };
+        if result.rows.len() > 1 {
+            out.push_str(match key {
+                "logical_plan" => "Unoptimized Logical Plan",
+                "logical_opt" => "Optimized Logical Plan",
+                "physical_plan" => "Physical Plan",
+                "analyzed_plan" => "Analyzed Plan",
+                other => other,
+            });
+            out.push('\n');
+        }
+        out.push_str(value);
+        if !value.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    Some(out)
 }
 
 /// Statements the results grid can page by wrapping in a subquery —
@@ -984,8 +1059,12 @@ struct Held {
     over: std::sync::atomic::AtomicBool,
     /// Whether an error has aborted the transaction (`Health`), as the
     /// session last said when asked. Asked after any statement on it that
-    /// may have run and failed, by every keepalive, and before a COMMIT.
+    /// may have run and failed, by a keepalive while it is unconfirmed or
+    /// aborted, and before a COMMIT.
     health: std::sync::atomic::AtomicU8,
+    /// Whether the server renews the session without a statement. An older
+    /// one renews only backup sessions, and is kept by `SELECT 1` instead.
+    renews: std::sync::atomic::AtomicBool,
 }
 
 /// What is known of the transaction on a session. An aborted transaction
@@ -1047,6 +1126,25 @@ fn commit_gate(asked: Asked) -> Result<bool, harbor_client::Failure> {
     }
 }
 
+/// How a keepalive keeps the session.
+#[derive(Debug, PartialEq)]
+enum Keepalive {
+    /// Renew it, which runs nothing on it.
+    Renew,
+    /// Ask it `SELECT 1`, which keeps it too.
+    Ask,
+}
+
+/// A transaction confirmed sound is renewed: nothing but a statement on
+/// the session can change what the band says, and a renew runs none, so it
+/// neither counts among the session's statements nor overwrites its
+/// profiling. A band unconfirmed or aborted is asked, since only an answer to
+/// `SELECT 1` sets it; and so is a server that renews only backup sessions
+/// (`renews` false), where a statement is what keeps a session.
+fn keepalive(health: Health, renews: bool) -> Keepalive {
+    if health == Health::Fine && renews { Keepalive::Renew } else { Keepalive::Ask }
+}
+
 /// What a keepalive found.
 #[derive(Debug, PartialEq)]
 enum Touch {
@@ -1067,6 +1165,7 @@ impl Txn {
             gate: std::sync::Mutex::new(()),
             over: std::sync::atomic::AtomicBool::new(false),
             health: std::sync::atomic::AtomicU8::new(Health::Fine as u8),
+            renews: std::sync::atomic::AtomicBool::new(true),
         })))
     }
 
@@ -1153,13 +1252,27 @@ impl Txn {
         self.0.over.store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Reset the session's idle clock with a statement that changes
-    /// nothing, unless one is already running on it. It answers at once or
-    /// not at all, so it waits a few seconds and no longer: the gate it
-    /// holds meanwhile is the one the next run waits on.
+    /// Reset the session's idle clock (`keepalive`). A renew runs nothing,
+    /// so it needs no turn on the session and is answered while a statement
+    /// runs there. The question is a statement: it is asked only when no
+    /// other is running, and it answers at once or not at all, so it waits
+    /// a few seconds and no longer, since the gate it holds meanwhile is the
+    /// one the next run waits on.
     fn touch(&self) -> Touch {
         if self.over() {
             return Touch::Gone;
+        }
+        let renews = self.0.renews.load(std::sync::atomic::Ordering::Acquire);
+        if keepalive(self.health(), renews) == Keepalive::Renew {
+            match harbor_client::session_renew(&self.0.conn, &self.0.session.id) {
+                Ok(true) => return Touch::Alive,
+                Ok(false) => self.0.renews.store(false, std::sync::atomic::Ordering::Release),
+                Err(failure) if failure.session_gone() => {
+                    self.mark_over();
+                    return Touch::Gone;
+                }
+                Err(_) => return Touch::Alive,
+            }
         }
         let Ok(_turn) = self.0.gate.try_lock() else { return Touch::Alive };
         self.ask();
@@ -1300,9 +1413,15 @@ enum Fate {
     /// had ended it already, on a statement the view did not read as one
     /// that ends a transaction. Nothing was rolled back by this one.
     NoneActive,
+    /// A COMMIT Harbor answered `cancelled`: it never started, Harbor
+    /// aborted the transaction, and nothing since BEGIN was kept.
+    NotKept,
     /// An ending statement got no answer, so the transaction may have
     /// ended either way.
     InDoubt,
+    /// A statement sent on its own got no answer: it may have run, and on
+    /// its own it commits.
+    MaybeRan,
     /// Harbor no longer knows the session: it reclaimed it, at its idle
     /// timeout or its deadline, and rolled the transaction back. The
     /// statement did not run.
@@ -1321,6 +1440,9 @@ fn fate(
     let ends = effect.is_some_and(TxnEffect::ends);
     let doomed = aborted && effect == Some(TxnEffect::Commits);
     match (route, failure) {
+        // A statement sent on its own that got no answer may have run, and
+        // on its own it commits.
+        (Route::Alone, Some(failure)) if effect.is_none() && ran(failure) == Ran::Unknown => Fate::MaybeRan,
         (Route::Alone | Route::Refused, _) => Fate::Closed,
         (Route::Opening, None) => Fate::Open,
         (Route::Opening, Some(_)) => Fate::Closed,
@@ -1347,6 +1469,15 @@ fn fate(
             // doubt: it rolls back when it runs, and when its session is
             // released if it did not.
             Ran::Unknown if doomed => Fate::RolledBack,
+            // A COMMIT runs to its answer, so one Harbor answered `cancelled`
+            // never started: nothing since BEGIN was kept
+            // (`edits::commit_outcome`, the grid's rule too).
+            Ran::Unknown
+                if effect == Some(TxnEffect::Commits)
+                    && crate::edits::commit_outcome(Some(failure)) == crate::edits::CommitOutcome::NotLanded =>
+            {
+                Fate::NotKept
+            }
             Ran::Unknown => Fate::InDoubt,
         },
     }
@@ -1371,6 +1502,14 @@ impl Fate {
             ),
             // A rollback rolls back either way: by the statement, or by the
             // release of its session.
+            Fate::NotKept => Some(
+                "The COMMIT did not run, and nothing since BEGIN was kept. The session was \
+                 released.",
+            ),
+            Fate::MaybeRan => Some(
+                "No answer came back: the statement may have run, and on its own it commits. \
+                 Look before running it again.",
+            ),
             Fate::InDoubt if effect == Some(TxnEffect::RollsBack) => Some(
                 "No answer came back. The session was released, which rolls the transaction \
                  back if the statement had not already.",
@@ -1444,6 +1583,19 @@ fn ran(failure: &harbor_client::Failure) -> Ran {
     }
 }
 
+/// Whether a statement whose paging probe failed runs bare. Only the
+/// engine's refusal of the wrap says the statement may run unwrapped: it is
+/// not SELECT-shaped after all, or the wrap does not bind. Any other failure
+/// is the statement's verdict: no answer, a cancel or an internal error may
+/// mean the probe ran, and a SELECT that timed out, or a `nextval` call,
+/// must not run twice. Inside a transaction an engine error has aborted it
+/// unless the wrap merely failed to parse, and the bare run would only
+/// report that.
+fn runs_bare(in_transaction: bool, failure: &harbor_client::Failure) -> bool {
+    let refused = matches!(failure, harbor_client::Failure::Refused { code, .. } if code == "sql_error");
+    refused && (!in_transaction || never_ran(failure))
+}
+
 /// The statement did not run (`Ran::Never`).
 fn never_ran(failure: &harbor_client::Failure) -> bool {
     ran(failure) == Ran::Never
@@ -1493,138 +1645,100 @@ fn statement_at(text: &str, caret: usize) -> Option<String> {
         .map(|s| text[s.payload.clone()].to_string())
 }
 
+/// What the editor's gutter shows for a text and a caret.
+#[derive(Clone, Debug, PartialEq)]
+struct Marks {
+    /// The rows the send mark spans: the caret's statement's.
+    rows: Option<std::ops::Range<usize>>,
+    /// Each row's line number, 0 for a silent row.
+    labels: std::rc::Rc<Vec<u32>>,
+    /// The last row of each statement a `;` closed.
+    end_rows: std::rc::Rc<Vec<u32>>,
+    /// The widest label.
+    max_label: u64,
+}
+
+/// The gutter for `text` with the caret at `caret`. Numbers live only on
+/// statement lines, restarting at 1 on each statement to match the
+/// engine's own "LINE n", and the gap rows between statements carry none
+/// (label 0). A blank line INSIDE a statement still counts: the engine
+/// counts it too. Only a `;` closes a band, any band: the open tail after
+/// the final `;` draws no closing hairline, which would claim "done here"
+/// under a thought in mid-air. Rows come from a running cursor over the
+/// ordered, disjoint statements, so one forward pass counts every newline
+/// once (a prefix scan per statement goes quadratic on a pasted dump).
+fn gutter_marks(text: &str, caret: usize) -> Marks {
+    let stmts = split_statements(text);
+    // Picked from the same split as the labels: one truth.
+    let rows = statement_pick(&stmts, caret.min(text.len())).map(|s| {
+        let start = text[..s.span.start].matches('\n').count();
+        let end = text[..s.span.end].matches('\n').count();
+        start..end + 1
+    });
+    let mut labels = vec![0u32; text.matches('\n').count() + 1];
+    let mut end_rows: Vec<u32> = Vec::new();
+    let (mut pos, mut row) = (0usize, 0usize);
+    for stmt in &stmts {
+        row += text[pos..stmt.span.start].matches('\n').count();
+        let r0 = row;
+        row += text[stmt.span.clone()].matches('\n').count();
+        pos = stmt.span.end;
+        for (i, r) in (r0..=row).enumerate() {
+            if labels[r] == 0 {
+                labels[r] = (i + 1) as u32;
+            }
+        }
+        if stmt.terminated {
+            end_rows.push(row as u32);
+        }
+    }
+    let max_label = labels.iter().copied().max().unwrap_or(1) as u64;
+    Marks { rows, labels: std::rc::Rc::new(labels), end_rows: std::rc::Rc::new(end_rows), max_label }
+}
+
 /// The editor and its embedded results grid are one vertical pane, so
 /// their row-number rails have one width derived from current content.
 fn shared_gutter_max(top: u64, bottom: u64) -> u64 {
     top.max(bottom)
 }
 
-/// The statements of the buffer, in order. A tiny lexer, not a parser:
-/// it only needs to know what a boundary does NOT end — strings
-/// (''-doubled, and e'…' backslash-escaped), quoted identifiers, both
-/// comment forms (block comments nest, as in the engine), and
-/// dollar-quoted bodies (`$$…$$` and tagged `$tag$…$tag$`).
+/// The statements of the buffer, in order, cut where the engine's own
+/// parser would cut: at a top-level `;`, read from the spans of the one
+/// lexer the server and Harbor's own client use (`wire::scan`), so strings,
+/// quoted names, both comment forms and dollar quotes end where the engine
+/// ends them.
 ///
-/// ONE boundary exists (the semicolon ruling, 2026-08-31): a top-level
-/// `;` — the same authority DuckDB's own parser answers to, and the
-/// same mark that closes a statement's band in the gutter. Blank lines
-/// never divide: DuckDB's FROM-first syntax makes every keyword
-/// heuristic lie eventually (`from 22` IS a statement), and a wrong
-/// split can leave a runnable prefix — `delete from orders` above a
-/// pondered `where` clause must never become sendable on its own. A
-/// wrong merge, by contrast, is a loud syntax error. So scribble
-/// freely; the `;` says "done", splits the thought, and closes its
+/// ONE boundary exists: a top-level `;`, the same mark that closes a
+/// statement's band in the gutter. Blank lines never divide: DuckDB's
+/// FROM-first syntax makes every keyword heuristic lie eventually (`from 22`
+/// IS a statement), and a wrong split can leave a runnable prefix — `delete
+/// from orders` above a pondered `where` clause must never become sendable
+/// on its own. A wrong merge, by contrast, is a loud syntax error. So
+/// scribble freely; the `;` says "done", splits the thought, and closes its
 /// band in one keystroke.
 fn split_statements(text: &str) -> Vec<Stmt> {
+    use wire::scan::Kind;
     let bytes = text.as_bytes();
-    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let spans = wire::scan::scan(text);
     let mut raw: Vec<(std::ops::Range<usize>, usize, bool)> = Vec::new();
     let mut start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' | b'"' => {
-                let quote = bytes[i];
-                // e'…' escapes with backslashes; a plain '…' does not.
-                let estring = quote == b'\''
-                    && i > 0
-                    && matches!(bytes[i - 1], b'e' | b'E')
-                    && (i < 2 || !ident(bytes[i - 2]));
-                i += 1;
-                while i < bytes.len() {
-                    if estring && bytes[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == quote {
-                        // '' and "" are escapes, not terminators.
-                        if bytes.get(i + 1) == Some(&quote) {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-                continue;
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                // Block comments NEST (Postgres heritage): the first
-                // `*/` may close an inner comment, not this one.
-                let mut depth = 1usize;
-                i += 2;
-                while i + 1 < bytes.len() && depth > 0 {
-                    if bytes[i] == b'/' && bytes[i + 1] == b'*' {
-                        depth += 1;
-                        i += 2;
-                    } else if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                        depth -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                if depth > 0 {
-                    // Unterminated: the comment owns the rest of the
-                    // buffer — its final byte included (the loop's
-                    // two-byte window never examines it).
-                    i = bytes.len();
-                }
-                continue;
-            }
-            b'$' => {
-                // A dollar-quote delimiter is `$tag$` where tag is a
-                // (possibly empty) identifier not starting with a
-                // digit — `$1` is a parameter, not a quote. The body
-                // runs to the EXACT same delimiter.
-                let mut j = i + 1;
-                while j < bytes.len() && ident(bytes[j]) {
-                    j += 1;
-                }
-                if j < bytes.len() && bytes[j] == b'$' && !bytes[i + 1].is_ascii_digit() {
-                    let delim = &bytes[i..=j];
-                    let body = j + 1;
-                    i = match bytes[body..]
-                        .windows(delim.len())
-                        .position(|w| w == delim)
-                    {
-                        Some(k) => body + k + delim.len(),
-                        None => bytes.len(),
-                    };
-                    continue;
-                }
-            }
-            b';' => {
-                // The terminator BELONGS to its statement (Steve's
-                // ruling): a `;` on its own line is the statement's
-                // last row, not a stray gap row outside the band. So
-                // does a same-line trailing `-- comment` — the
-                // annotation rides the statement it annotates.
-                let payload_end = i;
-                let mut j = i + 1;
-                while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
-                    j += 1;
-                }
-                if bytes.get(j) == Some(&b'-') && bytes.get(j + 1) == Some(&b'-') {
-                    while j < bytes.len() && bytes[j] != b'\n' {
-                        j += 1;
-                    }
-                } else {
-                    j = i + 1;
-                }
-                raw.push((start..j, payload_end, true));
-                start = j;
-                i = j;
-                continue;
-            }
-            _ => {}
-        }
-        i += 1;
+    let semicolons = spans
+        .iter()
+        .filter(|s| s.kind == Kind::Code)
+        .flat_map(|s| (s.start..s.end).filter(|&i| bytes[i] == b';'));
+    for i in semicolons {
+        // The terminator BELONGS to its statement: a `;` on its own line is
+        // the statement's last row, not a stray gap row outside the band.
+        // So does a same-line trailing `-- comment`: the annotation rides
+        // the statement it annotates.
+        let after = i + 1 + bytes[i + 1..].iter().take_while(|&&b| matches!(b, b' ' | b'\t')).count();
+        let end = spans
+            .binary_search_by_key(&after, |s| s.start)
+            .ok()
+            .filter(|&at| spans[at].kind == Kind::LineComment)
+            .map_or(i + 1, |at| spans[at].end);
+        raw.push((start..end, i, true));
+        start = end;
     }
     if start < bytes.len() {
         raw.push((start..bytes.len(), bytes.len(), false));
@@ -1649,19 +1763,18 @@ fn split_statements(text: &str) -> Vec<Stmt> {
         .collect()
 }
 
-fn scratch_path(berth: &str) -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
+/// A database's scratchpad or history file, `dir/<name>.ext`, its name made
+/// safe for a file name.
+fn berth_file(dir: &str, berth: &str, ext: &str) -> Option<std::path::PathBuf> {
     let safe: String = berth
         .chars()
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect();
-    Some(
-        std::path::Path::new(&home)
-            .join(".config")
-            .join("ducktable")
-            .join("scratch")
-            .join(format!("{safe}.sql")),
-    )
+    Some(crate::prefs::config_dir()?.join(dir).join(format!("{safe}.{ext}")))
+}
+
+fn scratch_path(berth: &str) -> Option<std::path::PathBuf> {
+    berth_file("scratch", berth, "sql")
 }
 
 fn load_scratch(berth: &str) -> Option<String> {
@@ -1669,17 +1782,46 @@ fn load_scratch(berth: &str) -> Option<String> {
 }
 
 fn history_path(berth: &str) -> Option<std::path::PathBuf> {
-    let dir = scratch_path(berth)?;
-    let name = dir.file_stem()?.to_string_lossy().to_string();
-    Some(dir.parent()?.parent()?.join("history").join(format!("{name}.ndjson")))
+    berth_file("history", berth, "ndjson")
+}
+
+/// The scratchpad on its way to disk: the newest text not yet written, and
+/// whether a writer is at it.
+#[derive(Default)]
+struct Saving {
+    pending: Option<String>,
+    writing: bool,
+}
+
+/// Write the newest pending text to `path` until none is left, then stand
+/// down. One writer at a time, off the UI thread, always the newest text:
+/// a burst of keystrokes costs a write per landing, not one per key, and an
+/// older text never lands over a newer one. The last write's failure, if it
+/// failed, is the answer.
+fn write_newest(saving: &std::sync::Mutex<Saving>, path: &std::path::Path) -> Option<String> {
+    let mut failed = None;
+    loop {
+        let text = {
+            let mut saving = saving.lock().unwrap_or_else(|p| p.into_inner());
+            match saving.pending.take() {
+                Some(text) => text,
+                None => {
+                    saving.writing = false;
+                    return failed;
+                }
+            }
+        };
+        let dir = path.parent().map_or(Ok(()), std::fs::create_dir_all);
+        failed = dir.and_then(|()| std::fs::write(path, text)).err().map(|e| format!("scratch not saved: {e}"));
+    }
 }
 
 /// One line per run, appended on completion (docs/QUERY.md: capture
 /// before UI — history never captured is unrecoverable). NDJSON, not a
 /// shell-style flat file: SQL is multi-line, and a run's verdict —
 /// duration, rows, error — is what makes history a log of what
-/// happened rather than a pile of text. The v2 recall popover reads
-/// this; until then it is grep-food.
+/// happened rather than a pile of text. Nothing in the app reads it: it
+/// is there for grep, and for the history popover QUERY.md plans.
 fn append_history(
     berth: &str,
     sql: &str,
@@ -1743,7 +1885,7 @@ mod tests {
 
     #[test]
     fn semicolons_are_the_only_divider() {
-        // The semicolon ruling: blank lines never divide — DuckDB's
+        // Semicolons alone divide: blank lines never do — DuckDB's
         // FROM-first syntax means `from 22` opens a real statement, so
         // any keyword heuristic must eventually cut a sprawled query
         // in half. Only a `;` divides.
@@ -1813,6 +1955,15 @@ mod tests {
         );
         // e-strings escape with backslashes: the \' is content.
         assert_eq!(split(r"SELECT e'\';' ;"), [r"SELECT e'\';' ;"]);
+        // The splitter reads the lexer the engine-facing readers share
+        // (`wire::scan`): a CR ends a `--` comment, as it does for the
+        // engine, so two statements behind one are two payloads.
+        assert_eq!(split("-- note\rSELECT 1; SELECT 2;"), ["-- note\rSELECT 1;", "SELECT 2;"]);
+        // `$` continues a word, so `a$b$c` is one identifier, not a quote
+        // that would swallow the `;` after it.
+        assert_eq!(split("SELECT a$b$c; SELECT 2;"), ["SELECT a$b$c;", "SELECT 2;"]);
+        // And a trailing comment cut by a CR rides the statement above.
+        assert_eq!(split("SELECT 1; -- c\rSELECT 2;"), ["SELECT 1; -- c", "SELECT 2;"]);
     }
 
     #[test]
@@ -1969,6 +2120,31 @@ mod tests {
     }
 
     #[test]
+    fn only_the_engines_refusal_of_the_wrap_sends_a_statement_bare() {
+        let binder = refused("Binder Error: subquery has no columns");
+        let parse = refused("Parser Error: syntax error at or near \"LIMIT\"");
+        // Outside a transaction the engine refusing the wrap sends it bare.
+        assert!(super::runs_bare(false, &binder));
+        assert!(super::runs_bare(false, &parse));
+        // Inside one, only a wrap that did not parse: anything else aborted it.
+        assert!(super::runs_bare(true, &parse));
+        assert!(!super::runs_bare(true, &binder));
+        // A probe with no answer, or one Harbor cut short, may have run, and
+        // is not run again; nor is one that could not be sent or found the
+        // session busy.
+        for failure in [
+            Failure::Unanswered("query: timed out".into()),
+            harbor("cancelled"),
+            harbor("internal"),
+            harbor("session_busy"),
+            Failure::Unsent("query: Connection refused (os error 61)".into()),
+        ] {
+            assert!(!super::runs_bare(false, &failure), "{failure:?}");
+            assert!(!super::runs_bare(true, &failure), "{failure:?}");
+        }
+    }
+
+    #[test]
     fn only_the_sessions_own_answer_says_whether_it_is_aborted() {
         let ok = harbor_client::QueryResult { columns: vec![], rows: vec![], row_count: 1, time_ms: 0 };
         assert_eq!(asked(Ok(ok)), Asked::Is(Health::Fine));
@@ -1998,6 +2174,51 @@ mod tests {
             "transaction aborted by an error \u{b7} 4:32 left \u{b7} ROLLBACK ends it"
         );
         assert!(transaction_mark(Health::Unknown, left).starts_with("transaction open, its state unconfirmed"));
+    }
+
+    fn answer(names: &[&str], rows: Vec<Vec<serde_json::Value>>) -> harbor_client::QueryResult {
+        let columns = names
+            .iter()
+            .map(|n| wire::Column { name: Some(n.to_string()), duckdb_type: "VARCHAR".into(), ..Default::default() })
+            .collect();
+        harbor_client::QueryResult { columns, row_count: rows.len() as u64, rows, time_ms: 3 }
+    }
+
+    #[test]
+    fn a_plan_shows_whole_and_a_resultless_statement_says_ok() {
+        use super::{shown, Shown};
+        use serde_json::json;
+        let box_art = "┌───┐\n│ 1 │\n└───┘";
+        // EXPLAIN: one plan, shown as drawn, with no heading.
+        let plan = answer(&["explain_key", "explain_value"], vec![vec![json!("physical_plan"), json!(box_art)]]);
+        assert_eq!(shown(&plan, None), Shown::Plan(format!("{box_art}\n")));
+        // EXPLAIN ANALYZE COMMIT: the plan, though the statement ends the
+        // transaction. Several plans each go under their names.
+        assert_eq!(shown(&plan, Some(TxnEffect::Commits)), Shown::Plan(format!("{box_art}\n")));
+        let two = answer(
+            &["explain_key", "explain_value"],
+            vec![vec![json!("logical_opt"), json!("a\n")], vec![json!("physical_plan"), json!("b")]],
+        );
+        assert_eq!(shown(&two, None), Shown::Plan("Optimized Logical Plan\na\nPhysical Plan\nb\n".into()));
+        // The same two names under another shape, or no rows, are rows.
+        assert_eq!(shown(&answer(&["explain_key", "x"], vec![vec![json!("a"), json!("b")]]), None), Shown::Grid);
+        assert_eq!(shown(&answer(&["explain_key", "explain_value"], vec![vec![json!("a"), json!(1)]]), None), Shown::Grid);
+        assert_eq!(shown(&answer(&["v"], vec![vec![json!(1)]]), None), Shown::Grid);
+        // BEGIN and its kin, and a statement with no result set, say ok.
+        assert_eq!(shown(&answer(&["Success"], vec![]), Some(TxnEffect::Opens)), Shown::Ok);
+        assert_eq!(shown(&answer(&[], vec![]), None), Shown::Ok);
+        assert_eq!(shown(&answer(&["v"], vec![]), None), Shown::Grid);
+    }
+
+    #[test]
+    fn a_keepalive_renews_only_what_the_band_has_confirmed() {
+        use super::{keepalive, Keepalive};
+        assert_eq!(keepalive(Health::Fine, true), Keepalive::Renew);
+        // Only an answer to SELECT 1 sets the band, so an unconfirmed or
+        // aborted one is asked, and so is a server that cannot renew.
+        assert_eq!(keepalive(Health::Unknown, true), Keepalive::Ask);
+        assert_eq!(keepalive(Health::Aborted, true), Keepalive::Ask);
+        assert_eq!(keepalive(Health::Fine, false), Keepalive::Ask);
     }
 
     #[test]
@@ -2032,8 +2253,14 @@ mod tests {
         // rolls back when it runs or when its session is released.
         for failure in [Failure::Unanswered("query: timed out".into()), harbor("cancelled"), harbor("internal")] {
             assert_eq!(fate(Route::Held, commits, true, Some(&failure)), Fate::RolledBack, "{failure:?}");
+        }
+        // Not aborted: with no answer, or Harbor's `internal`, it may have
+        // committed; answered `cancelled`, it never started.
+        for failure in [Failure::Unanswered("query: timed out".into()), harbor("internal")] {
             assert_eq!(fate(Route::Held, commits, false, Some(&failure)), Fate::InDoubt, "{failure:?}");
         }
+        assert_eq!(fate(Route::Held, commits, false, Some(&harbor("cancelled"))), Fate::NotKept);
+        assert!(Fate::NotKept.note(commits).unwrap().starts_with("The COMMIT did not run, and nothing since BEGIN was kept."));
         // A ROLLBACK does what was asked either way, and says no more.
         assert_eq!(fate(Route::Held, rolls_back, true, None), Fate::Closed);
         assert_eq!(fate(Route::Held, rolls_back, false, None), Fate::Closed);
@@ -2063,9 +2290,17 @@ mod tests {
 
         // Alone, nothing is open before or after, whatever the verdict.
         for failure in [None, Some(&catalog), Some(&lost_answer)] {
-            assert_eq!(fate(Route::Alone, None, false, failure), Fate::Closed);
             assert_eq!(fate(Route::Alone, commits, false, failure), Fate::Closed);
         }
+        for failure in [None, Some(&catalog), Some(&parse), Some(&unsent)] {
+            assert_eq!(fate(Route::Alone, None, false, failure), Fate::Closed);
+        }
+        // A statement alone that got no answer may have run, and committed:
+        // the view says so, and a rerun is the user's to weigh.
+        for failure in [&lost_answer, &harbor("cancelled"), &harbor("internal")] {
+            assert_eq!(fate(Route::Alone, None, false, Some(failure)), Fate::MaybeRan, "{failure:?}");
+        }
+        assert!(Fate::MaybeRan.note(None).unwrap().contains("may have run, and on its own it commits"));
         // BEGIN opens one only if it succeeded; its session goes back otherwise.
         assert_eq!(fate(Route::Opening, opens, false, None), Fate::Open);
         assert_eq!(fate(Route::Opening, opens, false, Some(&catalog)), Fate::Closed);
@@ -2096,9 +2331,9 @@ mod tests {
             // One Harbor interrupted after the engine had it, at a deadline
             // or a cancel, or failed on after it ran, has no verdict either:
             // the transaction is not shown as open.
-            for code in ["cancelled", "internal"] {
-                assert_eq!(fate(Route::Held, ends, false, Some(&harbor(code))), Fate::InDoubt, "{code}");
-            }
+            assert_eq!(fate(Route::Held, ends, false, Some(&harbor("internal"))), Fate::InDoubt);
+            let cancelled = if ends == commits { Fate::NotKept } else { Fate::InDoubt };
+            assert_eq!(fate(Route::Held, ends, false, Some(&harbor("cancelled"))), cancelled);
             // The engine found no transaction to end: the view's mark was
             // wrong, and nothing is claimed to have been rolled back.
             for verb in ["commit", "rollback"] {
@@ -2242,12 +2477,13 @@ mod tests {
         let prepared = txn.exec("PREPARE _dt_p AS SELECT 1");
         println!("PREPARE on the aborted transaction: {:?}", prepared.as_ref().map(|_| "answered").map_err(ToString::to_string));
         assert_eq!(txn.health(), Health::Aborted);
-        // The COMMIT is sent in the same turn as the question, answers like
-        // any other, and what it did is roll back.
+        // The COMMIT is sent in the same turn as the question, and Harbor
+        // refuses it, saying it rolled the transaction back.
         let (aborted, answer) = txn.commit("COMMIT");
         assert!(aborted);
-        answer.expect("COMMIT answers");
-        assert_eq!(fate(Route::Held, commits, aborted, None), Fate::RolledBack);
+        let refused = answer.expect_err("Harbor refuses the COMMIT of an aborted transaction");
+        assert!(refused.to_string().contains("rolled back"), "{refused}");
+        assert_eq!(fate(Route::Held, commits, aborted, Some(&refused)), Fate::Failed);
         txn.release();
         assert_eq!(rows(), serde_json::json!(2), "the INSERT is gone");
 
@@ -2260,17 +2496,16 @@ mod tests {
         txn.exec("ROLLBACK").expect("ROLLBACK");
         txn.release();
 
-        // A parse error leaves it as it was. Harbor's own refusal of a
-        // protected setting reads like an engine error, so the session is
-        // asked in the same turn and the band never says aborted of it; the
+        // A parse error leaves it as it was, and so does Harbor's refusal of
+        // two statements in one request, which never reaches the engine; the
         // COMMIT that follows is known to have landed.
         let txn = super::Txn::open(&conn).expect("session");
         txn.exec("BEGIN").expect("BEGIN");
         txn.exec("INSERT INTO _dt_aborted_probe VALUES (3, '3')").expect("insert");
         assert!(txn.exec("SELEC 1").is_err());
         assert_eq!(txn.health(), Health::Fine);
-        let refused = txn.exec("SET memory_limit = '1GB'").unwrap_err();
-        println!("a protected setting: {refused}");
+        let refused = txn.exec("SELECT 1; SELECT 2").unwrap_err();
+        println!("two statements: {refused}");
         assert_eq!(txn.health(), Health::Fine, "asked at once, and found sound");
         let (aborted, answer) = txn.commit("COMMIT");
         assert!(!aborted);
@@ -2308,7 +2543,10 @@ mod tests {
         txn.release();
         assert_eq!(rows(), serde_json::json!(4));
 
-        // The keepalive learns of an abort it did not cause, within its wait.
+        // An abort another client causes on the session: the keepalive's
+        // renew runs nothing and leaves the band as last confirmed (a server
+        // that renews only backup sessions is asked instead, and the band
+        // learns of it), and the COMMIT, which asks first, finds it.
         let txn = super::Txn::open(&conn).expect("session");
         txn.exec("BEGIN").expect("BEGIN");
         let id = txn.0.session.id.clone();
@@ -2316,10 +2554,35 @@ mod tests {
         assert_eq!(txn.health(), Health::Fine);
         let began = std::time::Instant::now();
         assert_eq!(txn.touch(), super::Touch::Alive);
-        assert_eq!(txn.health(), Health::Aborted);
+        let renewed = txn.0.renews.load(std::sync::atomic::Ordering::Acquire);
+        println!("the keepalive {}", if renewed { "renewed" } else { "asked SELECT 1" });
+        assert_eq!(txn.health(), if renewed { Health::Fine } else { Health::Aborted });
         assert!(began.elapsed() < std::time::Duration::from_secs(5));
+        let (aborted, answer) = txn.commit("COMMIT");
+        assert!(aborted, "the COMMIT asks first, and finds the abort");
+        println!("COMMIT of the aborted transaction: {:?}", answer.map(|_| "answered").map_err(|f| f.to_string()));
         txn.release();
         alone("DROP TABLE _dt_aborted_probe").expect("drop");
+    }
+
+    #[test]
+    fn the_scratchpad_writes_its_newest_text_and_says_when_it_cannot() {
+        use super::{write_newest, Saving};
+        let dir = std::env::temp_dir().join(format!("dt-scratch-{}", std::process::id()));
+        let path = dir.join("scratch").join("a.sql");
+        let saving = std::sync::Mutex::new(Saving { pending: Some("SELECT 2".into()), writing: true });
+        assert_eq!(write_newest(&saving, &path), None);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "SELECT 2");
+        // The writer stands down once nothing is pending.
+        let done = saving.lock().unwrap();
+        assert!(done.pending.is_none() && !done.writing);
+        drop(done);
+        // A path that cannot be written says why, and is not silent.
+        let blocked = dir.join("scratch").join("a.sql").join("b.sql");
+        let saving = std::sync::Mutex::new(Saving { pending: Some("x".into()), writing: true });
+        let failed = write_newest(&saving, &blocked).expect("a write under a file fails");
+        assert!(failed.starts_with("scratch not saved: "), "{failed}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2345,6 +2608,15 @@ mod tests {
         assert_eq!((start, end + 1), (2, 4));
         // In the gap, the bar marks the statement above.
         assert_eq!(&text[statement_span(text, 10).unwrap()], "SELECT 1;");
+        // The gutter read in one pass: the mark's rows, line numbers that
+        // restart on each statement and skip the gap, and the closing rows.
+        let marks = super::gutter_marks(text, 13);
+        assert_eq!(marks.rows, Some(2..4));
+        assert_eq!(*marks.labels, [1, 0, 1, 2, 0]);
+        assert_eq!(*marks.end_rows, [0, 3]);
+        assert_eq!(marks.max_label, 2);
+        // An open tail after the last `;` earns no closing row.
+        assert_eq!(*super::gutter_marks("SELECT 1;\nSELECT", 0).end_rows, [0]);
     }
 
     #[test]
@@ -2370,7 +2642,7 @@ mod tests {
     /// deterministic xorshift builds thousands of nasty buffers —
     /// unterminated strings, comment edges, $$ bodies, stray `;;`,
     /// unicode — and every one must satisfy the invariants that ARE
-    /// the semicolon ruling, rather than any hand-picked example.
+    /// the one-boundary rule, rather than any hand-picked example.
     #[test]
     fn fuzz_splitter_invariants() {
         const TOKENS: &[&str] = &[

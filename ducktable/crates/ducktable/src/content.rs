@@ -1,5 +1,6 @@
-//! The content pane: table structure, berth identity, and the connect
-//! flow's states (idle, connecting with cancel, failed with retry).
+//! The content pane: a connected database's views (the Query view, or the
+//! selected table's grid) over the bottom bar, its identity card, and the
+//! connect flow's states (idle, connecting with cancel, failed with retry).
 
 use crate::app::{DuckTable, Phase};
 use crate::theme::{pal, Pal};
@@ -13,13 +14,29 @@ use harbor_client::Level;
 impl DuckTable {
     pub(crate) fn content(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let t = pal(cx);
-        if let (Phase::Connected { .. }, Some(grid)) = (&self.phase, &self.grid) {
+        // A connected database shows the view the switcher has chosen: the
+        // Query view, there from the connect on, or the selected table's
+        // grid, its Data or its Structure; before a table is chosen, the
+        // database's card. The bottom bar is under each.
+        if let Phase::Connected { .. } = &self.phase {
+            let view = crate::prefs::get(cx).view;
+            let surface = match (&self.query, &self.grid) {
+                (Some(query), _) if view == crate::prefs::ViewMode::Query => div()
+                    .size_full()
+                    .v_flex()
+                    .child(crate::chrome::title_strip("Query".to_string(), true, cx))
+                    .child(div().flex_1().min_h_0().w_full().child(query.clone())),
+                (_, Some(grid)) if view != crate::prefs::ViewMode::Query => div().size_full().child(grid.clone()),
+                _ => div().size_full().v_flex().items_center().justify_center().p_6().child(self.card(cx)),
+            };
             return div()
                 .flex_1()
                 .min_w_0()
                 .h_full()
                 .bg(t.surface)
-                .child(grid.clone())
+                .v_flex()
+                .child(div().flex_1().min_h_0().w_full().child(surface))
+                .child(self.footer(cx))
                 .into_any_element();
         }
         // While a connect is in flight, whatever is on screen keeps
@@ -27,11 +44,7 @@ impl DuckTable {
         // Only the idle and failed cards give way to a connecting card —
         // they hold nothing worth preserving, and it carries the cancel
         // affordance a cold summon needs.
-        let in_flight = match &self.phase {
-            Phase::Connected { .. } => None,
-            _ => self.connecting.as_deref(),
-        };
-        let body = if let Some(name) = in_flight {
+        let body = if let Some(name) = self.connecting.as_deref() {
             div()
                 .v_flex()
                 .gap_3()
@@ -47,20 +60,8 @@ impl DuckTable {
                         .label("Cancel")
                         .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                 )
-        } else {
-            match &self.phase {
-            Phase::Idle => div()
-                .v_flex()
-                .gap_2()
-                .items_center()
-                .child(div().text_lg().text_color(t.text).child("DuckTable"))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(t.muted)
-                        .child("Pick a database on the left. A stopped database starts on demand."),
-                ),
-            Phase::Failed { name, message, .. } => div()
+        } else if let Phase::Failed { name, message, .. } = &self.phase {
+            div()
                 .v_flex()
                 .gap_3()
                 .items_center()
@@ -77,85 +78,20 @@ impl DuckTable {
                     Button::new("retry")
                         .label("Retry")
                         .primary()
-                        .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
-                ),
-            Phase::Connected { conn, info, catalog } => {
-                let installed = self.installed_version.clone();
-                let stale = installed.as_deref().is_some_and(|iv| {
-                    harbor_client::fleet::version_older(&info.harbor_version, iv)
-                });
-                // A local server (its row carries a path) can be restarted from
-                // here; a remote one can only be noted as behind.
-                let is_local = conn.db.is_some();
-                div()
+                        .on_click(cx.listener(|this, _, window, cx| this.retry(window, cx))),
+                )
+        } else {
+            div()
                 .v_flex()
-                .gap_1()
-                .items_start()
-                .p_4()
-                .min_w(px(440.))
-                .max_w_full()
-                .overflow_hidden()
-                .bg(t.surface)
-                .border_1()
-                .border_color(t.border)
-                .rounded_lg()
+                .gap_2()
+                .items_center()
+                .child(div().text_lg().text_color(t.text).child("DuckTable"))
                 .child(
                     div()
-                        .h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(Self::dot(Level::Good, t))
-                        .child(div().text_lg().text_color(t.text).child(clone_str(&info.name))),
-                )
-                .child(meta(t, "DuckDB", clone_str(&info.duckdb_version)))
-                .child(harbor_meta(t, &info.harbor_version, stale, is_local, installed.as_deref()))
-                // The path row is the one worth copying (paste into a shell,
-                // a bug report, another tool), so it carries the same
-                // self-confirming copy tile the DDL block uses — painted
-                // labels have no OS text-selection, so this is the way out.
-                .child(
-                    div()
-                        .h_flex()
-                        .gap_2()
-                        .w_full()
-                        .items_center()
                         .text_sm()
-                        .child(div().w_20().flex_none().text_color(t.muted).child("Database"))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_color(t.text)
-                                .child(harbor_client::paths::shorten(std::path::Path::new(
-                                    &info.database,
-                                ))),
-                        )
-                        .when_some(self.path_copy.clone(), |d, btn| d.child(btn)),
+                        .text_color(t.muted)
+                        .child("Pick a database on the left. A stopped database starts on demand."),
                 )
-                .when_some(catalog.database_size_bytes, |d, data| {
-                    let h = |n: u64| crate::util::human(n as f64, "B");
-                    d.child(meta(
-                        t,
-                        "Size",
-                        match catalog.wal_size_bytes.unwrap_or(0) {
-                            0 => h(data),
-                            wal => format!("{} (WAL {})", h(data), h(wal)),
-                        },
-                    ))
-                })
-                .child(meta(
-                    t,
-                    "Uptime",
-                    crate::util::human(info.uptime_ms as f64 / 1000., "s"),
-                ))
-                .child(meta(
-                    t,
-                    "Lifetime",
-                    if conn.summoned { "started by this window".into() } else { "was already running".into() },
-                ))
-            }
-            }
         };
         div()
             .flex_1()
@@ -168,6 +104,81 @@ impl DuckTable {
             .p_6()
             .child(body)
             .into_any_element()
+    }
+
+    /// The connected database's identity card: what it is, where, and how
+    /// its server runs.
+    fn card(&self, cx: &App) -> Div {
+        let t = pal(cx);
+        let Phase::Connected { conn, info, catalog } = &self.phase else { return div() };
+        let installed = self.installed_version.clone();
+        let stale = installed
+            .as_deref()
+            .is_some_and(|iv| harbor_client::fleet::version_older(&info.harbor_version, iv));
+        // A local server (its row carries a path) can be restarted from
+        // here; a remote one can only be noted as behind.
+        let is_local = conn.db.is_some();
+        div()
+            .v_flex()
+            .gap_1()
+            .items_start()
+            .p_4()
+            .min_w(px(440.))
+            .max_w_full()
+            .overflow_hidden()
+            .bg(t.surface)
+            .border_1()
+            .border_color(t.border)
+            .rounded_lg()
+            .child(
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(Self::dot(Level::Good, t))
+                    .child(div().text_lg().text_color(t.text).child(clone_str(&info.name))),
+            )
+            .child(meta(t, "DuckDB", clone_str(&info.duckdb_version)))
+            .child(harbor_meta(t, &info.harbor_version, stale, is_local, installed.as_deref()))
+            // The path row is the one worth copying (paste into a shell,
+            // a bug report, another tool), so it carries the same
+            // self-confirming copy tile the DDL block uses — painted
+            // labels have no OS text-selection, so this is the way out.
+            .child(
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .w_full()
+                    .items_center()
+                    .text_sm()
+                    .child(div().w_20().flex_none().text_color(t.muted).child("Database"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(t.text)
+                            .child(harbor_client::paths::shorten(std::path::Path::new(&info.database))),
+                    )
+                    .when_some(self.path_copy.clone(), |d, btn| d.child(btn)),
+            )
+            .when_some(catalog.database_size_bytes, |d, data| {
+                let h = |n: u64| crate::util::human(n as f64, "B");
+                d.child(meta(
+                    t,
+                    "Size",
+                    match catalog.wal_size_bytes.unwrap_or(0) {
+                        0 => h(data),
+                        wal => format!("{} (WAL {})", h(data), h(wal)),
+                    },
+                ))
+            })
+            .child(meta(t, "Uptime", crate::util::human(info.uptime_ms as f64 / 1000., "s")))
+            .child(meta(
+                t,
+                "Lifetime",
+                if conn.summoned { "started by this window".into() } else { "was already running".into() },
+            ))
     }
 }
 

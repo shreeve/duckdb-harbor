@@ -1,7 +1,8 @@
-//! tree-sitter-duckdb: the first tree-sitter grammar for DuckDB SQL,
-//! derived from DuckDB's own PEG grammar (vendored under `upstream/`,
-//! pinned by `upstream/COMMIT`). Node names mirror the PEG rule names
-//! snake_cased; docs/QUERY.md in the workspace root tells the story.
+//! tree-sitter-duckdb: a tree-sitter grammar for DuckDB SQL, derived from
+//! DuckDB's own PEG grammar (`src/parser/peg/grammar/` in duckdb/duckdb at
+//! 8616efa9da99, the commit `grammar/grammar.js` names). Node names mirror
+//! the PEG rule names snake_cased; docs/QUERY.md in the workspace root tells
+//! the story.
 //!
 //! The parser is generated C (`grammar/src/parser.c`), checked in and
 //! compiled by build.rs — consumers need no tree-sitter CLI.
@@ -19,7 +20,7 @@ pub const LANGUAGE: LanguageFn = unsafe { LanguageFn::from_raw(tree_sitter_duckd
 /// Highlight query targeting gpui-component's recognized capture names.
 pub const HIGHLIGHTS: &str = include_str!("../queries/highlights.scm");
 
-/// Injections and locals: none yet (phase 2).
+/// Injections and locals: the grammar has none.
 pub const INJECTIONS: &str = "";
 pub const LOCALS: &str = "";
 
@@ -37,7 +38,7 @@ mod tests {
         parser.parse(sql, None).unwrap()
     }
 
-    /// The week-1 acceptance bar: the signature DuckDB-isms parse with
+    /// The acceptance bar: the signature DuckDB-isms parse with
     /// zero ERROR nodes. Each failure here is a grammar bug, not a
     /// corpus bug — these are all engine-valid statements.
     #[test]

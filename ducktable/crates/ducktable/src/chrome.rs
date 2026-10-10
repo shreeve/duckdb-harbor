@@ -180,3 +180,88 @@ where
             |el, delta| el.opacity(delta),
         )))
 }
+
+/// The content pane's title strip: the name of what fills the pane, and,
+/// over a view that shows rows (Data, Query), the display toggles and the
+/// inspector glyph. Data and Structure wear the table's name; Query wears
+/// its own, since it is about whatever you ask, not the selected table.
+pub(crate) fn title_strip(title: String, rows: bool, cx: &App) -> Div {
+    let t = crate::theme::pal(cx);
+    let p = crate::prefs::get(cx);
+    div()
+        .h_flex()
+        .h_8()
+        .relative()
+        // The strip spans the pane in every view: its canvas records the
+        // width the Structure view needs before the DDL's first paint
+        // (`structure::pane_width`).
+        .child(
+            div().absolute().inset_0().child(
+                canvas(move |b, _, _| crate::structure::record_pane_width(b.size.width), |_, _, _, _| {})
+                    .size_full(),
+            ),
+        )
+        // Left inset matches the grid text (PANE_INSET cell padding), so
+        // the title sits flush over the first column.
+        .pl(px(crate::theme::PANE_INSET))
+        .pr_3()
+        .gap_3()
+        .flex_none()
+        .items_center()
+        // A shade beyond raised: the column-header row below is raised,
+        // and two identical bands would merge.
+        .bg(t.strip)
+        .border_b_1()
+        // The grid's top frame line, in the grid-line color: the strip is
+        // chrome, but this edge is the grid's.
+        .border_color(t.grid_line)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(t.text)
+                .truncate()
+                .child(title),
+        )
+        // The display toggles: global prefs, set once and honored by every
+        // grid. A recessed track, macOS-toolbar style, of independent
+        // toggles, so no segment ever "wins" it.
+        .when(rows, |d| {
+            d.child(
+                div()
+                    .h_flex()
+                    .flex_none()
+                    .gap(px(2.))
+                    .p(px(2.))
+                    .rounded(px(6.))
+                    .bg(t.surface)
+                    .border_1()
+                    .border_color(t.pill)
+                    .child(toggle_tile("toggle-rows", "#", "Show row numbers (\u{2318}7 or \u{2325}7)", p.row_numbers, t, |_, _, cx| {
+                        crate::prefs::toggle(cx, |p| p.row_numbers = !p.row_numbers);
+                    }))
+                    .child(toggle_tile(
+                        "toggle-align",
+                        "\u{21e5}",
+                        "Right-align numeric columns (\u{2318}8 or \u{2325}8)",
+                        p.right_align,
+                        t,
+                        |_, _, cx| crate::prefs::toggle(cx, |p| p.right_align = !p.right_align),
+                    ))
+                    .child(toggle_tile("toggle-nulls", "\u{2205}", "Show NULL tags (\u{2318}9 or \u{2325}9)", p.null_tags, t, |_, _, cx| {
+                        crate::prefs::toggle(cx, |p| p.null_tags = !p.null_tags);
+                    })),
+            )
+            // The inspector's panel glyph (Finder and Xcode's), right of
+            // the track.
+            .child(
+                icon_tile("toggle-inspector", 22., true, t)
+                    .text_color(if p.inspector { t.accent } else { t.muted })
+                    .tooltip(|window, cx| Tooltip::new("Show inspector (\u{2318}I)").build(window, cx))
+                    .on_click(|_, _, cx| crate::prefs::toggle(cx, |p| p.inspector = !p.inspector))
+                    .child(gpui_kit::component::Icon::new(gpui_kit::component::IconName::PanelRight).size_4()),
+            )
+        })
+}

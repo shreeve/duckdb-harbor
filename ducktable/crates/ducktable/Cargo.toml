@@ -12,13 +12,11 @@ anyhow.workspace = true
 harbor-client = { path = "../harbor-client" }
 duckdb-lang = { path = "../duckdb-lang" }
 wire = { path = "../../../harbor/crates/wire" }
+serde = "1"
 serde_json = { version = "1", features = ["float_roundtrip"] }
 async-channel = "2"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-objc = "0.2"
-# The updater talks to the embedded Sparkle framework through objc2 (the
-# generation gpui itself uses) and loads it with dlopen.
+# AppKit and the embedded Sparkle framework are reached through objc2 (the
+# generation gpui itself uses), and Sparkle is loaded with dlopen.
 objc2 = "0.6"
 block2 = "0.6"
 libc = "0.2"

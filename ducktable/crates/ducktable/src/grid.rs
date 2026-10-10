@@ -2,7 +2,7 @@
 //! two-axis virtualization stress-checked by `examples/wide_probe.rs`, a
 //! plain-cell probe of the library — not of this delegate), DuckTable's
 //! delegate on top.
-//! This surface owns fetching (server-side pages via `POST /sql`), value
+//! This surface owns fetching (server-side pages via `POST /sl`), value
 //! presentation, its header/status strips, and inline editing (the cell
 //! editor and staging here, the edit model in `edits.rs`).
 //!
@@ -13,7 +13,6 @@
 //! its row's identity (`edits.rs`) and projected onto whatever page is
 //! showing, never stored by index.
 
-use crate::chrome::{icon_tile, toggle_tile};
 use crate::edits::{self, Edits};
 use crate::prefs::{self, ViewMode};
 use crate::theme::{
@@ -70,12 +69,6 @@ pub(crate) struct Grid {
     /// ran inside it: its later pages are read on the same session, so they
     /// see what the transaction has written. None everywhere else.
     pub(crate) session: Option<crate::query::Txn>,
-    /// The berth's Query view, injected by the app (berth-scoped, so it
-    /// outlives this table's grid); rendered by the Query segment.
-    pub(crate) query_view: Option<Entity<crate::query::QueryView>>,
-    /// Repaints the footer's status line as the query view's run state
-    /// ticks and settles; replaced whole when a berth swaps views in.
-    pub(crate) query_obs: Option<Subscription>,
     /// This grid is someone else's results pane (the Query view): it
     /// renders body only — no title strip, no filter, no footer. The
     /// host owns the chrome; the app footer reads THIS grid through it.
@@ -111,7 +104,7 @@ pub(crate) struct Grid {
     rowid: bool,
     /// Primary-key column names from the catalog — kept so an error-born
     /// grid can build its Edits when its first schema finally lands.
-    pk_cols: Vec<String>,
+    pub(crate) pk_cols: Vec<String>,
     /// NOT NULL per schema column (from the catalog, by name) — staging
     /// NULL into one refuses at the fingers, not at the server.
     not_null: Vec<bool>,
@@ -722,8 +715,6 @@ impl Grid {
             table,
             conn,
             session: None,
-            query_view: None,
-            query_obs: None,
             embedded,
             pageable,
             source,
@@ -1111,29 +1102,6 @@ impl Grid {
         self.table.update(cx, |state, _| {
             state.delegate_mut().pill_cols.insert(schema_ix);
         });
-    }
-
-    /// The grid the footer's stats and pager describe when the Query
-    /// view is up: the query view's embedded results grid.
-    pub(crate) fn query_results_grid(&self, cx: &App) -> Option<Entity<Grid>> {
-        self.query_view.as_ref().and_then(|q| q.read(cx).results_grid())
-    }
-
-    /// Route a pager action to the grid it belongs to: this one (Data),
-    /// or the Query view's results grid. Both are Grids — the whole
-    /// point of the unification — so one closure fits either.
-    pub(crate) fn pager_dispatch(
-        &mut self,
-        cx: &mut Context<Self>,
-        act: impl FnOnce(&mut Grid, &mut Context<Grid>),
-    ) {
-        if prefs::get(cx).view == ViewMode::Query {
-            if let Some(grid) = self.query_results_grid(cx) {
-                grid.update(cx, act);
-            }
-            return;
-        }
-        act(self, cx)
     }
 
     /// Open or close the raw-SQL filter strip. Closing clears an active
@@ -2566,7 +2534,6 @@ impl Grid {
     /// the server stopped or gone, or another database chosen. A stash
     /// parked here goes back as it came; a set of a commit in flight goes
     /// held (`surrender`). None when nothing is staged.
-    #[expect(dead_code, reason = "app.rs parks this when a connection goes")]
     pub(crate) fn surrender_edits(&mut self) -> Option<Edits> {
         if let Some(parked) = self.parked.take() {
             return Some(parked);
@@ -3899,23 +3866,15 @@ impl Render for Grid {
                 table.update(cx, |_, cx| cx.notify());
             });
         }
-        let view = p.view;
-        // The title band names what fills the pane. Structure and Data
-        // are about the selected table, so they wear its name; Query is
-        // about whatever you ask — the berth-scoped scratchpad — so it
-        // wears its own (the sidebar selection would be a lie there).
-        let title = if view == ViewMode::Query {
-            "Query".to_string()
-        } else {
-            self.title.clone()
-        };
+        // The table's own grid shows Data or Structure; the Query view is
+        // the content pane's, beside it (content.rs).
+        let structure = p.view == ViewMode::Structure;
         let error = self.error.clone();
         let editing_cell = self.editor.is_some();
         // Embedded (the Query view's results pane): body only. The host
         // owns the chrome — its editor above, the app footer below,
-        // which reads this grid's stats and pager state through it. The
-        // ViewMode switch below is the HOST grid's concern; an embedded
-        // grid is always its table.
+        // which reads this grid's stats and pager state. An embedded grid
+        // is always its table.
         if self.embedded {
             // The inspector rides query results exactly as it rides the
             // Data grid — row_kv is delegate data, and a result row is
@@ -3981,8 +3940,7 @@ impl Render for Grid {
         // never shifts it. It is row-level: here it accompanies Data; in
         // the Query view the EMBEDDED results grid carries its own
         // (the branch above).
-        let inspector = (p.inspector && p.view == ViewMode::Data)
-            .then(|| self.inspector(cx).into_any_element());
+        let inspector = (p.inspector && !structure).then(|| self.inspector(cx).into_any_element());
         div()
             .size_full()
             .min_w_0()
@@ -3998,130 +3956,10 @@ impl Render for Grid {
                 d.on_action(cx.listener(Self::on_editor_tab))
                     .on_action(cx.listener(Self::on_editor_shift_tab))
             })
-            .child(
-                div()
-                    .h_flex()
-                    .h_8()
-                    .relative()
-                    // The strip spans the pane in every view: its canvas
-                    // records the width the Structure view needs BEFORE
-                    // the DDL's first paint (see pane_width).
-                    .child(
-                        div().absolute().inset_0().child(
-                            canvas(
-                                move |b, _, _| {
-                                    crate::structure::record_pane_width(b.size.width)
-                                },
-                                |_, _, _, _| {},
-                            )
-                            .size_full(),
-                        ),
-                    )
-                    // Left inset matches the grid text (PANE_INSET cell
-                    // padding), so the title sits flush over the first
-                    // column.
-                    .pl(px(PANE_INSET))
-                    .pr_3()
-                    .gap_3()
-                    .flex_none()
-                    .items_center()
-                    // A shade beyond raised: the column-header row below
-                    // is raised, and two identical bands would merge.
-                    .bg(t.strip)
-                    .border_b_1()
-                    // The grid's top frame line, so it reads the slot —
-                    // the title strip is chrome but this edge is the
-                    // grid's, in the grid-line color.
-                    .border_color(t.grid_line)
-                    .child(
-                        // Semibold like the design proof's breadcrumb table
-                        // name (`.crumb b`, weight 600).
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(t.text)
-                            .truncate()
-                            .child(title),
-                    )
-                    // The display toggles ride every view that shows
-                    // rows — Data and Query alike (prefs are global, set
-                    // once, honored by every grid); the Structure view
-                    // drops them. The inspector glyph stays Data-only:
-                    // its panel is row-level.
-                    .when(matches!(view, ViewMode::Data | ViewMode::Query), |d| d.child(
-                        // Recessed track, macOS-toolbar style: a subtle
-                        // inset container; flat icon tiles with a 2px gap
-                        // (edges never touch); the ON state is an
-                        // accent-tinted fill. These are independent
-                        // toggles, so no segment ever "wins" the track.
-                        div()
-                            .h_flex()
-                            .flex_none()
-                            .gap(px(2.))
-                            .p(px(2.))
-                            .rounded(px(6.))
-                            // Surface track on the raised strip, the same
-                            // relationship the footer seg has to its bar.
-                            .bg(t.surface)
-                            .border_1()
-                            .border_color(t.pill)
-                            .child(toggle_tile(
-                                "toggle-rows",
-                                "#",
-                                "Show row numbers (\u{2318}7 or \u{2325}7)",
-                                p.row_numbers,
-                                t,
-                                cx.listener(|_, _, _, cx| {
-                                    // No explicit sync: the toggle
-                                    // refreshes every window and each
-                                    // grid self-heals its gutter at the
-                                    // top of its own render.
-                                    prefs::toggle(cx, |p| p.row_numbers = !p.row_numbers);
-                                }),
-                            ))
-                            .child(toggle_tile(
-                                "toggle-align",
-                                "\u{21e5}",
-                                "Right-align numeric columns (\u{2318}8 or \u{2325}8)",
-                                p.right_align,
-                                t,
-                                cx.listener(|_, _, _, cx| {
-                                    prefs::toggle(cx, |p| p.right_align = !p.right_align);
-                                }),
-                            ))
-                            .child(toggle_tile(
-                                "toggle-nulls",
-                                "\u{2205}",
-                                "Show NULL tags (\u{2318}9 or \u{2325}9)",
-                                p.null_tags,
-                                t,
-                                cx.listener(|_, _, _, cx| {
-                                    prefs::toggle(cx, |p| p.null_tags = !p.null_tags);
-                                }),
-                            )),
-                    ))
-                    .when(matches!(view, ViewMode::Data | ViewMode::Query), |d| d.child(
-                        // The inspector's panel glyph (Finder/Xcode
-                        // convention), right of the lozenge.
-                        icon_tile("toggle-inspector", 22., true, t)
-                            .text_color(if p.inspector { t.accent } else { t.muted })
-                            .tooltip(|window, cx| {
-                                Tooltip::new("Show inspector (\u{2318}I)").build(window, cx)
-                            })
-                            .on_click(cx.listener(|_, _, _, cx| {
-                                prefs::toggle(cx, |p| p.inspector = !p.inspector);
-                            }))
-                            .child(
-                                gpui_kit::component::Icon::new(
-                                    gpui_kit::component::IconName::PanelRight,
-                                )
-                                .size_4(),
-                            ),
-                    )),
-            )
-            .when(view == ViewMode::Data, |d| {
+            // The display toggles ride the views that show rows; the
+            // Structure view drops them.
+            .child(crate::chrome::title_strip(self.title.clone(), !structure, cx))
+            .when(!structure, |d| {
                 // The raw-SQL filter strip (DESIGN.md "Bottom bar"): one
                 // WHERE input, applied on Enter through the same
                 // fetch-first swap as everything else.
@@ -4167,59 +4005,30 @@ impl Render for Grid {
                         .child(message),
                 )
             })
-            .child(match view {
-                ViewMode::Data => {
-                    let table_el = self.table_body(cx);
-                    let body = div().flex_1().min_h_0().w_full();
-                    match inspector {
-                        // With the inspector open, the two panes share a
-                        // draggable divider; the saved width seeds it.
-                        Some(pane) => body.child(
-                            h_resizable("data-split")
-                                .with_state(&self.resize)
-                                .child(
-                                    resizable_panel()
-                                        .child(div().size_full().child(table_el)),
-                                )
-                                .child(
-                                    resizable_panel()
-                                        .size(px(p.inspector_width))
-                                        .size_range(
-                                            px(prefs::INSPECTOR_MIN)..px(prefs::INSPECTOR_MAX),
-                                        )
-                                        // Furniture, like the sidebar.
-                                        .fixed()
-                                        .child(pane),
-                                ),
-                        ),
-                        None => body.h_flex().child(
-                            div().flex_1().min_w_0().h_full().child(table_el),
-                        ),
-                    }
-                    .into_any_element()
-                }
-                ViewMode::Structure => div()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .child(self.structure_view(cx))
-                    .into_any_element(),
-                ViewMode::Query => {
-                    let body = div().flex_1().min_h_0().w_full();
-                    match self.query_view.clone() {
-                        Some(view) => body.child(view),
-                        None => body
-                            .v_flex()
-                            .items_center()
-                            .justify_center()
-                            .child(div().text_sm().text_color(t.muted).child(
-                                "Select a table once to open the query scratchpad.",
-                            )),
-                    }
-                    .into_any_element()
+            .child(if structure {
+                div().flex_1().min_h_0().w_full().child(self.structure_view(cx))
+            } else {
+                let table_el = self.table_body(cx);
+                let body = div().flex_1().min_h_0().w_full();
+                match inspector {
+                    // With the inspector open, the two panes share a
+                    // draggable divider; the saved width seeds it.
+                    Some(pane) => body.child(
+                        h_resizable("data-split")
+                            .with_state(&self.resize)
+                            .child(resizable_panel().child(div().size_full().child(table_el)))
+                            .child(
+                                resizable_panel()
+                                    .size(px(p.inspector_width))
+                                    .size_range(px(prefs::INSPECTOR_MIN)..px(prefs::INSPECTOR_MAX))
+                                    // Furniture, like the sidebar.
+                                    .fixed()
+                                    .child(pane),
+                            ),
+                    ),
+                    None => body.h_flex().child(div().flex_1().min_w_0().h_full().child(table_el)),
                 }
             })
-            .child(self.footer(cx))
             .into_any_element()
     }
 }
