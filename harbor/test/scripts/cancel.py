@@ -581,6 +581,9 @@ def run_tests(h, db):
         h.cancel(f"busy{i}")
     for job in jobs:
         job.wait()
+    # The probe lane may still be listening for a moment after the workers
+    # free up, and sheds what it takes with the 503 that says to retry.
+    until(lambda: h.sql("SELECT 1")[0], 200)
     eq("and the write is committed", 94, h.value("SELECT n FROM marks WHERE n = 94"))
     eq("release", True, h.release(sid)[1].get("released"))
 
