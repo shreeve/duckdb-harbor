@@ -115,13 +115,11 @@ CHECKPOINT;
 SQL
 fi
 
-# A fixture with a WAL beside it is a fixture that has not been checkpointed,
-# and copying only the .duckdb file — which every suite does — would silently
-# lose rows.
-# Fatal, not a warning. Every suite copies the .duckdb file alone, and every
-# oracle is then read from that same truncated copy — so oracle and server agree
-# on the wrong data and the whole run goes green over a fixture missing rows.
-# There is no downstream check that can catch this; it has to stop here.
+# A fixture with a WAL beside it has not been checkpointed. Fatal, not a
+# warning: every suite copies the .duckdb file alone, and every oracle is then
+# read from that same truncated copy — so oracle and server agree on the wrong
+# data and the whole run goes green over a fixture missing rows. No downstream
+# check can catch this; it has to stop here.
 if [[ -f "$out.wal" ]]; then
   echo "fixture: $out.wal remains after CHECKPOINT — the fixture is not safe to copy" >&2
   exit 1
