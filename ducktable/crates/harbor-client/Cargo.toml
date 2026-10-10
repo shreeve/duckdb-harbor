@@ -12,6 +12,7 @@ harbor-http = { path = "../../../harbor/crates/http" }
 harbor-common = { path = "../../../harbor/crates/common", default-features = false, features = ["config", "membership"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
+libc = "0.2"
 
 [dev-dependencies]
 toml = "1"

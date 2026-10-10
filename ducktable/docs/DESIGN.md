@@ -54,9 +54,10 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
   to that machine's Harbor loopback port, and keeps the tunnel inside the
   connection's reference-counted lifetime. No survey opens
   SSH; selecting the database does. The last connection clone kills and reaps
-  the process. `-S none` makes that process the owner, `BatchMode=yes` keeps
-  failures visible rather than interactive, and SSH keepalives detect a dead
-  path.
+  the process, and a quit closes every tunnel still open, process and socket.
+  A launch removes the sockets of tunnels whose app is no longer running.
+  `-S none` makes that process the owner, `BatchMode=yes` keeps failures
+  visible rather than interactive, and SSH keepalives detect a dead path.
 - **A connected berth is kept alive by presence, not pulses.** A held
   connection is the keepalive. The lifetime rule is Harbor's own: one `start`
   verb, two lifetimes. A plain start is persistent and runs until stopped; an

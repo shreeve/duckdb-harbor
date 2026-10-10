@@ -389,14 +389,12 @@ impl Conn {
     fn tunneled(name: String, tunnel: SshTunnel) -> Result<Self, String> {
         let transport = Transport::Unix(tunnel.sock.clone());
         let anchor = anchor(&transport).map_err(|e| format!("connecting to Harbor through SSH: {e}"))?;
-        Ok(Self {
-            name,
-            db: None,
-            transport,
-            anchor,
-            summoned: false,
-            tunnel: Some(Arc::new(tunnel)),
-        })
+        let tunnel = Arc::new(tunnel);
+        let mut open = TUNNELS.lock().unwrap_or_else(|p| p.into_inner());
+        open.retain(|t| t.strong_count() > 0);
+        open.push(Arc::downgrade(&tunnel));
+        drop(open);
+        Ok(Self { name, db: None, transport, anchor, summoned: false, tunnel: Some(tunnel) })
     }
 
     pub fn transport(&self) -> Result<&Transport, String> {
@@ -762,14 +760,71 @@ impl SshTunnel {
     }
 }
 
-impl Drop for SshTunnel {
-    fn drop(&mut self) {
-        if let Ok(child) = self.child.get_mut() {
+impl SshTunnel {
+    /// Kill and reap the SSH process and remove its socket.
+    fn close(&self) {
+        if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
             let _ = child.wait();
         }
         let _ = std::fs::remove_file(&self.sock);
     }
+}
+
+impl Drop for SshTunnel {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Every tunnel open in this process, for `close_tunnels`.
+static TUNNELS: Mutex<Vec<std::sync::Weak<SshTunnel>>> = Mutex::new(Vec::new());
+
+/// Close every tunnel this process has open: its SSH process killed and its
+/// socket removed. The app calls it as it quits, which ends the process
+/// without dropping what holds a connection, so no tunnel's last clone would
+/// otherwise close it.
+pub fn close_tunnels() {
+    close_each(std::mem::take(&mut *TUNNELS.lock().unwrap_or_else(|p| p.into_inner())));
+}
+
+fn close_each(tunnels: Vec<std::sync::Weak<SshTunnel>>) {
+    tunnels.iter().filter_map(std::sync::Weak::upgrade).for_each(|tunnel| tunnel.close());
+}
+
+/// Remove the sockets of tunnels whose process has ended without closing
+/// them (`ssh-<pid>-<n>.tunnel`, the pid no longer running), as a crash or a
+/// kill leaves them.
+pub fn sweep_tunnels() {
+    if let Ok(dir) = runtime_dir() {
+        sweep_tunnels_in(&dir);
+    }
+}
+
+fn sweep_tunnels_in(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        let pid = path.file_name().and_then(|n| n.to_str()).and_then(tunnel_pid);
+        if pid.is_some_and(|pid| pid != std::process::id() && !running(pid)) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// The process a tunnel socket's name says opened it.
+fn tunnel_pid(name: &str) -> Option<u32> {
+    let (pid, n) = name.strip_prefix("ssh-")?.strip_suffix(".tunnel")?.split_once('-')?;
+    n.parse::<u32>().ok()?;
+    pid.parse().ok()
+}
+
+/// Whether process `pid` is running: signal 0 reaches it, or it is there and
+/// another user's.
+fn running(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
+    // SAFETY: signal 0 checks for the process and sends nothing.
+    let signalled = unsafe { libc::kill(pid, 0) } == 0;
+    signalled || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 fn ssh_failure(host: &str, status: String, stderr: &Arc<Mutex<Vec<u8>>>) -> String {
@@ -799,9 +854,16 @@ fn tunnel_socket(runtime: &Path) -> Result<PathBuf, String> {
     Ok(sock)
 }
 
+/// A unix socket path as ssh's `-L` reads it back to the same path. ssh
+/// expands `%` tokens and `${VAR}` in it first, then splits the forward at
+/// `:` and takes `\` as an escape: `%%` is a `%`, and `$\{` a `${` that the
+/// expansion passed over (measured with `ssh -G`, OpenSSH 10.3).
+fn forward_path(local: &Path) -> String {
+    local.to_string_lossy().replace('\\', "\\\\").replace(':', "\\:").replace('%', "%%").replace("${", "$\\{")
+}
+
 fn ssh_command(ssh_host: &str, remote_port: u16, local: &Path) -> Command {
-    // ssh splits a forward at `:` and takes `\` as an escape.
-    let local = local.to_string_lossy().replace('\\', "\\\\").replace(':', "\\:");
+    let local = forward_path(local);
     let mut command = Command::new("/usr/bin/ssh");
     command
         .arg("-N")
@@ -1056,6 +1118,50 @@ mod tests {
         // A path with ssh's separator or its escape in it stays one field.
         let odd = ssh_command("h", 9494, Path::new("/odd:dir\\x/s.tunnel"));
         assert!(odd.get_args().any(|a| a.to_string_lossy() == "/odd\\:dir\\\\x/s.tunnel:127.0.0.1:9494"));
+        // ssh's `%` tokens and `${VAR}` expand nothing in it: `ssh -G -L
+        // '/tmp/a\\$\{b}%%c\:d\\e:127.0.0.1:9494'` prints the path
+        // `/tmp/a\${b}%c:d\e`.
+        assert_eq!(forward_path(Path::new("/tmp/a\\${b}%c:d\\e")), "/tmp/a\\\\$\\{b}%%c\\:d\\\\e");
+        assert_eq!(forward_path(Path::new("/h/%d/${HOME}/s.tunnel")), "/h/%%d/$\\{HOME}/s.tunnel");
+    }
+
+    #[test]
+    fn a_tunnel_socket_whose_process_has_ended_is_swept() {
+        assert_eq!(tunnel_pid("ssh-41-0.tunnel"), Some(41));
+        for not_one in ["ssh-41.tunnel", "ssh-x-0.tunnel", "ssh-41-0.sock", "a-41-0.tunnel", "ssh-41-x.tunnel"] {
+            assert_eq!(tunnel_pid(not_one), None, "{not_one}");
+        }
+        let mut ended = Command::new("/usr/bin/true").spawn().unwrap();
+        ended.wait().unwrap();
+        let (me, gone) = (std::process::id(), ended.id());
+        assert!(running(me) && !running(gone));
+
+        let dir = std::env::temp_dir().join(format!("dt-sweep-{me}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let names = [format!("ssh-{me}-0.tunnel"), format!("ssh-{gone}-3.tunnel"), "s-1.sock".into(), "ssh-x-1.tunnel".into()];
+        for name in &names {
+            std::fs::write(dir.join(name), "").unwrap();
+        }
+        sweep_tunnels_in(&dir);
+        let mut left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        left.sort();
+        assert_eq!(left, [&names[2], &names[0], &names[3]].map(std::ffi::OsString::from));
+
+        // At quit every open tunnel is closed, its process and its socket.
+        let sock = dir.join(format!("ssh-{me}-9.tunnel"));
+        std::fs::write(&sock, "").unwrap();
+        let child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let tunnel = Arc::new(SshTunnel {
+            child: Mutex::new(child),
+            stderr: Default::default(),
+            host: "h".into(),
+            sock: sock.clone(),
+        });
+        close_each(vec![Arc::downgrade(&tunnel)]);
+        assert!(!sock.exists() && !running(pid));
+        drop(tunnel);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1325,6 +1431,9 @@ mod tests {
             },
         )
         .unwrap();
+        // Open, it is among those a quit closes (`close_tunnels`).
+        let listed = |sock: &Path| TUNNELS.lock().unwrap().iter().any(|t| t.upgrade().is_some_and(|t| t.sock == sock));
+        assert!(listed(&sock));
         let last = conn.clone();
         drop(conn);
         assert!(exists(&pid) && sock.exists());
