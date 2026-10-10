@@ -40,14 +40,18 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
   consumes Harbor's `wire` protocol crate and `harbor-common` (features
   `config` and `membership`) as path dependencies on the sibling
   `../../../harbor/crates/*`, so the wire contract is checked on both sides of
-  every commit. The HTTP layer (blocking client, NDJSON streaming, chunked
-  decoding) is DuckTable's own `harbor-client` crate.
+  every commit. The HTTP layer (blocking client, chunked decoding, sessions,
+  summoning and stopping a server) is harbor's `harbor-http`, the one
+  harbor's own CLI speaks through; DuckTable's `harbor-client` adds results
+  read whole, the catalog and the fleet.
 - **A database can be opened by file or added by port.** File → Open Database
   File chooses a DuckDB path. File → Open Database URL saves a sidebar name and
   a Harbor host and port. `localhost` means a direct IPv4-loopback connection;
   any other host means SSH. DuckTable runs `/usr/bin/ssh` directly, forwards a
-  free local `127.0.0.1` port to that machine's Harbor loopback port, and keeps
-  the tunnel inside the connection's reference-counted lifetime. No survey opens
+  unix socket in Harbor's runtime directory (0700, so no other user of the
+  Mac reaches the database through it, as any could through a loopback port)
+  to that machine's Harbor loopback port, and keeps the tunnel inside the
+  connection's reference-counted lifetime. No survey opens
   SSH; selecting the database does. The last connection clone kills and reaps
   the process. `-S none` makes that process the owner, `BatchMode=yes` keeps
   failures visible rather than interactive, and SSH keepalives detect a dead
@@ -469,5 +473,3 @@ blocks them.
   shares the grid's one editing session, and a schema editor in Structure.
 - **Catalog.** Views, macros and attached catalogs in the TABLES tree once
   `/catalog` carries them.
-- **Other platforms.** Linux and Windows builds with native window chrome and
-  menus, and per-platform keymaps rather than a blind ⌘-to-Ctrl swap.
