@@ -77,7 +77,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     }
     if wanted.is_none() && newest == installed {
         eprintln!("harbor {installed} is the newest release");
-        return report(installed, restart);
+        return report(&exe, installed, restart);
     }
     if formula.is_some() {
         return Err(format!(
@@ -101,7 +101,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.trim().strip_prefix("harbor ").map(str::to_string))
         .unwrap_or(target);
-    report(&now, restart)
+    report(&exe, &now, restart)
 }
 
 /// The version `releases/latest` redirects to, without the `v`. The
@@ -156,8 +156,9 @@ fn installer(exe: &Path, version: &str) -> Command {
 
 /// Which running servers are not on `version`, and what to do about each.
 /// With `--restart`, do it: each goes through `harbor <db> restart`, run
-/// from the binary now installed, so a login-item server comes back under
-/// its login item and a hand-started one as it was, in the background.
+/// from `exe`, the path the binary was installed over, read before the
+/// install replaced the file, so a login-item server comes back under its
+/// login item and a hand-started one as it was, in the background.
 ///
 /// A restart outlives the terminal that asked for it. Over ssh the session
 /// can close mid-restart, and a restart cut off between its stop and its
@@ -165,7 +166,7 @@ fn installer(exe: &Path, version: &str) -> Command {
 /// own, which a hangup does not reach, with its output in a log, and this
 /// command ignores the hangup and goes on to the next; whatever reaches the
 /// terminal reaches it as well.
-fn report(version: &str, restart: bool) -> Result<ExitCode, String> {
+fn report(exe: &Path, version: &str, restart: bool) -> Result<ExitCode, String> {
     let behind: Vec<(String, PathBuf, String)> = harbor::repl::running()?
         .into_iter()
         .filter(|(_, _, v)| v != version)
@@ -185,7 +186,6 @@ fn report(version: &str, restart: bool) -> Result<ExitCode, String> {
         signal_hook::consts::SIGHUP,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
-    let exe = std::env::current_exe().map_err(|e| format!("cannot find this binary: {e}"))?;
     let log = harbor_common::log_file(&harbor_common::runtime_dir()?, "update");
     if let Some(dir) = log.parent() {
         harbor_common::create_dir_private(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -193,7 +193,7 @@ fn report(version: &str, restart: bool) -> Result<ExitCode, String> {
     let mut failed = false;
     for (name, db, running) in &behind {
         say(&format!("harbor: restarting {name} ({running} -> {version}) — its word is kept in {}", harbor_common::paths::shorten(&log)));
-        failed |= !restart_one(&exe, db, &log);
+        failed |= !restart_one(exe, db, &log);
     }
     Ok(if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS })
 }
