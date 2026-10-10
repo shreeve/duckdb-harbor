@@ -38,8 +38,8 @@ mod unbrace;
 /// into it. The SQL lexer both halves read with is `wire::scan`.
 pub mod repl;
 
-// The v2 C API engine, generated from DuckDB's api_spec. The only path to
-// the engine since 0.21's flip retired duckdb-rs.
+// The v2 C API engine, generated from DuckDB's api_spec: the one path to the
+// engine.
 pub mod engine;
 
 // ==========================================================================
@@ -63,11 +63,11 @@ pub mod engine;
 //   DELETE /sql/sessions/<id>   release that one
 //   DELETE /sql/queries/<id>    cancel a statement the caller named
 //
-// Legacy spellings served until the next deliberate break: POST
-// /sql/sessions/new, GET /sessions, DELETE /shutdown.
+// Also served: POST /sql/sessions/new, the route Rip's driver opens sessions
+// at; GET /sessions; DELETE /shutdown.
 //
-// The envelope is the one thing that must not drift from the v1 harbor,
-// because it is the contract every client already speaks:
+// The envelope is the one thing that must not drift, because it is the
+// contract every client speaks:
 //
 //   {"type":"schema","columns":[{"name":"id","duckdbType":"BIGINT","lossless":true}]}
 //   {"type":"row","values":[0,"row0"]}
@@ -432,7 +432,7 @@ fn next_job_id() -> u64 {
 /// which is what a console with a Stop button actually wants.
 fn configured_statement_timeout() -> Option<Duration> {
     // Read once: the env cannot legitimately change after start, and this is
-    // on the per-request path. (A runtime setenv no longer takes effect.)
+    // on the per-request path.
     static CONFIGURED: OnceLock<Option<Duration>> = OnceLock::new();
     *CONFIGURED.get_or_init(|| {
         match std::env::var("HARBOR_STATEMENT_TIMEOUT_MS").ok()?.trim().parse::<u64>() {
@@ -911,10 +911,9 @@ fn lease_release(id: &str) -> Released {
 ///
 /// A busy lease cannot be released out from under its statement, so an expired
 /// one is cancelled here and released on a later tick, once the statement it
-/// was running has come back. Before cancellation existed the reaper simply
-/// skipped busy leases — which meant a lease wedged inside a runaway statement,
-/// the one case where reclaiming actually matters, was the one case it could
-/// never reclaim. The idle clock deliberately does not apply to a busy lease:
+/// was running has come back: a lease wedged inside a runaway statement is the
+/// one case where reclaiming actually matters. The idle clock deliberately
+/// does not apply to a busy lease:
 /// a statement that has been running for a minute is working, not idle.
 fn lease_reap() {
     enum Action {
@@ -982,11 +981,9 @@ fn lease_drain() {
     let mut cancelling = false;
     for id in &ids {
         // A lease busy with a statement is interrupted by this call rather than
-        // waited on. It used to be left to the executor's own shutdown — its
-        // channel is dropped below and `execute_jobs` rolls back on the way out
-        // — but that only unwinds once the statement finishes, so a single long
-        // query held the whole shutdown, and with it the CHECKPOINT that folds
-        // the WAL.
+        // waited on: the executor's own shutdown unwinds only once the
+        // statement finishes, so a single long query would hold the whole
+        // shutdown, and with it the CHECKPOINT that folds the WAL.
         cancelling |= lease_release(id) == Released::Cancelling;
     }
 
@@ -1308,7 +1305,7 @@ pub fn stop() -> Result<String, String> {
     // here — which `RUNNING.lock().unwrap().take()` as a statement does, since
     // the guard is a temporary — leaves a window in which RUNNING is None while
     // the listener is still bound and the workers are still draining. A
-    // harbor_start arriving in that window sees no server, takes whichever
+    // start() arriving in that window sees no server, takes whichever
     // connections happen to be back in the pool, and then fails to bind a port
     // the old listener has not released yet.
     let mut running = RUNNING.lock().unwrap();
@@ -1345,7 +1342,7 @@ pub fn stop() -> Result<String, String> {
     *QUERIES.lock().unwrap() = None;
 
     // Workers hand their connection back as they exit, so a later
-    // harbor_start has a pool to draw from. A panicked worker forfeits its
+    // start() has a pool to draw from. A panicked worker forfeits its
     // connection rather than taking the shutdown down with it.
     //
     // Bounded patience, not join(): a worker whose client stopped reading is
@@ -1492,15 +1489,10 @@ pub fn wait() -> Result<String, String> {
 /// the rows come from a borrow chain rooted in a `Connection` that is not
 /// `Sync`. Putting the connection on its own thread and passing byte chunks
 /// through a bounded channel gives justhttp its reader and keeps the query
-/// streaming.
-///
-/// Before this, harbor took the raw socket with `into_writer()` and wrote the
-/// framing by hand, which forces `Connection: close`. That costs a client one
-/// ephemeral port per request, held for the TIME_WAIT interval — about
-/// 16k ports over 30s on macOS, so a single client hitting a few thousand
-/// requests per second runs out of ports in seconds and starts seeing
-/// `Can't assign requested address`. Reusing the connection removes the cost
-/// entirely.
+/// streaming. A connection closed after every response would cost a client
+/// an ephemeral port per request, held for the TIME_WAIT interval — about 16k
+/// ports over 30s on macOS — and one client at a few thousand requests a
+/// second would run out in seconds.
 fn worker(
     server: Arc<Server>,
     stop: Arc<AtomicBool>,
@@ -1528,10 +1520,9 @@ fn worker(
             // workers pull from one shared queue, so one that answers instantly
             // — which is what a worker with no executor does, 503 by return —
             // wins races against every worker still doing real work, and
-            // absorbs a growing share of the traffic. `/ready` reports that
-            // honestly now — it runs a real query, so a dead executor answers
-            // 503 rather than a cheerful hardcoded 200 — but reporting it is
-            // not enough: the worker still has to leave.
+            // absorbs a growing share of the traffic. `/ready` reports it — it
+            // runs a real query, so a dead executor answers 503 — but
+            // reporting it is not enough: the worker still has to leave.
             Ok(Some(req)) => {
                 if !handle(req, Some((&jobs_tx, &state)), log) {
                     break;
@@ -1541,10 +1532,9 @@ fn worker(
             // The listener is gone — justhttp only surfaces an accept error
             // once it has decided the socket itself is unusable (transient
             // failures are retried there). This berth will never accept
-            // another connection, and it used to leave without a word: the
-            // process stayed alive, holding the database and the flock, while
-            // every client saw connection-refused and every supervisor
-            // watching the pid saw a healthy berth.
+            // another connection, so it says so: a process alive and holding
+            // the database and the flock looks healthy to a supervisor
+            // watching the pid while every client sees connection-refused.
             Err(e) => {
                 eprintln!(
                     "harbor: the listener has failed ({e}); this berth can no longer \
@@ -1647,13 +1637,11 @@ const WEDGED_REQUEST_AGE: Duration = Duration::from_secs(5);
 /// Every worker occupied, and every one of them occupied long enough to mean
 /// it. See the probe loop for why age is the discriminator.
 ///
-/// "Occupied" is not "running a statement". It used to be, and that was the
-/// blind spot behind every denial of service found here: a worker held in a
-/// request body — draining one nobody read, or waiting on one dribbling in a
-/// byte at a time — has no job, so six stuck workers read as six idle ones and
-/// this returned false while the berth answered nothing at all. A worker is
-/// occupied from the moment it picks up a request; whether that request ever
-/// reaches DuckDB is a distinction the load balancer does not care about.
+/// "Occupied" is not "running a statement": a worker held in a request body —
+/// draining one nobody read, or waiting on one dribbling in a byte at a time —
+/// has no job, and six such workers are a berth that answers nothing. A worker
+/// is occupied from the moment it picks up a request; whether that request
+/// ever reaches DuckDB is a distinction the load balancer does not care about.
 fn workers_wedged(min_age: Duration) -> bool {
     let slots = WORKER_SLOTS.lock().unwrap();
     !slots.is_empty()
@@ -1680,8 +1668,8 @@ fn shed(req: Request) -> (bool, u16) {
 /// Identity document the embedding host sets before `start()`; GET /info
 /// serves it with `uptimeMs` spliced in. The host owns the static fields
 /// (name, database path, pid) because the core cannot know them.
-/// Unset, /info answers 404 — the pre-fleet behavior old clients still
-/// lean on as a version probe.
+/// Unset, /info answers 404, which a client reads as a server that does not
+/// speak it.
 static INFO: Mutex<Option<serde_json::Value>> = Mutex::new(None);
 static STARTED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 /// The workers' slots alone (SLOTS holds leases too), set at start(). The
@@ -1748,10 +1736,10 @@ fn handle(req: Request, exec: Option<Executor>, log: bool) -> bool {
     // undelivered body when a request is dropped — with a single
     // `vec![0; remaining]` — and it does so for EVERY response path, 404s
     // included. `take()` bounds what harbor buffers but not what the client
-    // may declare, and the declared length is attacker-chosen; a request
-    // declaring 1 GB and sending 9 bytes used to cost this process a 1 GB
-    // zeroed allocation. Refusing here, before anything else can respond,
-    // means the allocation never happens on any path.
+    // may declare, and the declared length is attacker-chosen: a request
+    // declaring 1 GB and sending 9 bytes would cost a 1 GB zeroed
+    // allocation. Refusing here, before anything else can respond, means the
+    // allocation never happens on any path.
     //
     // Every listener is machine-local: the unix socket is protected by its
     // 0700 runtime directory and TCP binds loopback only. Callers beyond this
@@ -1777,8 +1765,7 @@ fn handle(req: Request, exec: Option<Executor>, log: bool) -> bool {
             },
             // Open a transaction lease: POST to the collection, REST's create.
             // It consumes a connection, which is the scarcest thing here.
-            // `/new` is the legacy 0.22-era spelling, kept until the next
-            // deliberate break.
+            // `/new` is the route Rip's driver opens sessions at.
             (Method::Post, "/sql/sessions" | "/sql/sessions/new") => run_session_open(req),
             (Method::Post, p) if renewal_session_id(p).is_some() => {
                 match lease_renew(renewal_session_id(p).unwrap()) {
@@ -1821,16 +1808,16 @@ fn handle(req: Request, exec: Option<Executor>, log: bool) -> bool {
             // What is holding a connection, and for how long. The question an
             // operator asks when everything is suddenly waiting, and the reason
             // this exists at all: a pool you cannot see into is a pool you
-            // debug by guessing. Lives at the collection the ids live under;
-            // bare `/sessions` is the legacy spelling.
+            // debug by guessing. Lives at the collection the ids live under,
+            // and at bare `/sessions` too.
             (Method::Get, "/sql/sessions" | "/sessions") => {
                 let _ = req.respond(json_response(200, &sessions_report()));
                 (true, 200)
             }
             // Fleet shutdown returns before the drain begins. Running stop()
-            // on a fresh thread matters: this handler
-            // is itself one of the workers stop() waits to join. POST — an
-            // action, not a resource removal; DELETE is the legacy verb.
+            // on a fresh thread matters: this handler is itself one of the
+            // workers stop() waits to join. POST — an action, not a resource
+            // removal — and DELETE, which clients also send.
             (Method::Post | Method::Delete, "/shutdown") => {
                 let _ = req.respond(json_response(202, r#"{"stopping":true}"#));
                 let _ = thread::Builder::new()
@@ -2096,9 +2083,8 @@ fn parse_request(body: &str) -> Result<SqlRequest, String> {
     // default: a request may ask for *less*, but not for more, and `0` ("no
     // limit") is bounded by it too. Without the clamp, any caller could
     // send `timeoutMs:0` and pin a worker indefinitely — defeating the very
-    // knob a `--sealed` deployment leans on. When no cap is configured the cap
-    // is `None`, so the historical behaviour (0 = unlimited, N = exactly N) is
-    // unchanged.
+    // knob a `--sealed` deployment leans on. With no cap configured, 0 is
+    // unlimited and N is exactly N.
     let cap = configured_statement_timeout();
     let timeout = match v.get("timeoutMs") {
         None | Some(serde_json::Value::Null) => cap,
@@ -2198,8 +2184,8 @@ enum Shape {
     Json,
 }
 
-/// `Accept: application/json` asks for the whole result as one document, the
-/// way harbor v1 did. Anything else — no header, `*/*`, `application/x-ndjson`
+/// `Accept: application/json` asks for the whole result as one document.
+/// Anything else — no header, `*/*`, `application/x-ndjson`
 /// — streams.
 ///
 /// A header naming both wins for NDJSON: it is the shape that cannot fail on
@@ -2207,8 +2193,7 @@ enum Shape {
 /// is not a substring of `application/x-ndjson`, so a plain `contains` is not
 /// fooled by the streaming type.)
 fn wants_one_shot(req: &Request) -> bool {
-    // case-insensitive substring scan, allocation-free (same semantics as
-    // the lowercase-then-contains it replaced)
+    // case-insensitive substring scan, allocation-free
     fn contains_ignore_case(hay: &str, needle: &str) -> bool {
         hay.as_bytes()
             .windows(needle.len())
@@ -2719,9 +2704,8 @@ enum CatalogStyle {
 
 /// `?style=` from the request url. No query and no `style` mean full. An
 /// unknown *value* is refused loudly — a style the caller asked for and did
-/// not get would corrupt silently — while unknown *parameters* pass, because
-/// that tolerance is exactly what lets a 0.17 client send `style=lite` to a
-/// 0.16 server and still get a correct (full) answer.
+/// not get would corrupt silently — while unknown *parameters* pass, so a
+/// client may send one a server does not know and still get a correct answer.
 fn catalog_style(url: &str) -> Result<CatalogStyle, String> {
     let Some(query) = url.split_once('?').map(|x| x.1) else { return Ok(CatalogStyle::Full) };
     for pair in query.split('&') {
@@ -3557,9 +3541,8 @@ fn run_statement(
     let mut buf = String::with_capacity(4096);
     match shape {
         Shape::Ndjson => buf.push_str(r#"{"type":"schema","columns":["#),
-        // v1's envelope also carried `kind`, "select" or "write". It is
-        // not emitted here, because there is no definition of it that is
-        // right: DuckDB answers CREATE TABLE with a one-column `Count`
+        // No `kind` ("select" or "write") is emitted, because there is no
+        // definition of it that is right: DuckDB answers CREATE TABLE with a one-column `Count`
         // result, so "did the statement produce columns" calls a write a
         // select, and deciding from the leading keyword is a parser that
         // exists only to label something no client needs — `columns` and
@@ -3624,9 +3607,8 @@ fn run_statement(
         for row in 0..chunk.rows {
             // Encoded straight into `buf` behind a mark: a failing cell
             // discards the half-written row with truncate(). Cells are read
-            // from vector views — there is no per-row decoder to panic, so
-            // the guard the v1 path needed here is gone; an engine failure
-            // mid-cell surfaces as an Err and fails the stream honestly.
+            // from vector views, and an engine failure mid-cell surfaces as
+            // an Err and fails the stream honestly.
             let mark = buf.len();
             match shape {
                 Shape::Ndjson => buf.push_str(r#"{"type":"row","values":["#),
@@ -3862,17 +3844,13 @@ fn execute_jobs(
 
         // A panic below — an encoder invariant tripping, an FFI metadata
         // assert (the v2 paths return Err rather than panic, so this is the
-        // backstop, not the expectation) — used to unwind straight out of
-        // this thread. The worker then found the job channel
-        // closed on its next send, left the accept loop (a worker with no
-        // executor answers 503 by return and would win every race), and the
-        // slot was gone for the life of the process; a handful of such queries
-        // retire every worker until the berth answers only 503. The per-row
-        // guard inside `run_statement` catches the common value-decode panic;
-        // catching the whole statement here covers one in prepare, metadata, or
-        // schema too. On a panic the `OnSlot` guard drops — retiring the slot —
-        // the waiting worker is told (500), and this executor takes the next
-        // job. The connection itself is intact (the panic was in Rust-side
+        // backstop, not the expectation) — must not unwind out of this
+        // thread: the worker would find the job channel closed, leave the
+        // accept loop, and the slot would be gone for the life of the
+        // process, so a handful of such queries would retire every worker.
+        // On a panic the `OnSlot` guard drops — retiring the slot — the
+        // waiting worker is told (500), and this executor takes the next job.
+        // The connection itself is intact (the panic was in Rust-side
         // encoding, not DuckDB's engine), so the next job resets first.
         let ready_guard = ready.clone();
         needs_reset = match std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -3892,7 +3870,7 @@ fn execute_jobs(
         };
     }
     // And once more on the way out, so a connection going back to the pool for
-    // the next harbor_start is clean too. Unconditional here: this runs once
+    // the next start() is clean too. Unconditional here: this runs once
     // per server lifetime, so the extra statement costs nothing.
     reset_transaction(&mut conn);
     conn
@@ -4560,7 +4538,7 @@ UNION ALL SELECT 1::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FRO
 
     /// `indexes[].columns` exists to be joined against `columns[].name`, so
     /// an identifier that needed quoting has to arrive unquoted — three of
-    /// five names on an ordinary table failed to match before this. Anything
+    /// five names on an ordinary table need quoting. Anything
     /// that is not exactly one double-quoted identifier is an expression and
     /// is reported as one, so a computed index is never mistaken for a column
     /// with a peculiar name.
@@ -4704,15 +4682,15 @@ UNION ALL SELECT 1::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FRO
         for (m, p) in &non_routes {
             assert!(!route_exists(m, p), "should NOT be a route: {m:?} {p}");
         }
-        // The legacy spellings stay served until the next deliberate break:
-        // the Rails-ism, the stray collection path, and the DELETE verb.
-        let legacy = [
+        // The other spellings clients send: Rip's session route, the bare
+        // collection path, and the DELETE verb.
+        let aliases = [
             (Method::Post, "/sql/sessions/new"),
             (Method::Get, "/sessions"),
             (Method::Delete, "/shutdown"),
         ];
-        for (m, p) in &legacy {
-            assert!(route_exists(m, p), "legacy alias must stay served: {m:?} {p}");
+        for (m, p) in &aliases {
+            assert!(route_exists(m, p), "an alias must stay served: {m:?} {p}");
         }
     }
 

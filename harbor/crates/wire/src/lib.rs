@@ -1,11 +1,10 @@
 //! The Harbor wire contract — protocol 1.
 //!
 //! Everything a client and server must agree on lives here: endpoint paths,
-//! request bodies, the NDJSON envelope, and the error codes. Codes are the
-//! client interface (clients classify on `code`, never on HTTP status);
-//! renaming one is a breaking change. Protocol 1 is what harbor v0.9.1
-//! already speaks — fleet-era additions are new endpoints and optional
-//! fields, never changes to existing shapes.
+//! request bodies, the NDJSON envelope, the catalog document, and the error
+//! codes. Codes are the client interface (clients classify on `code`, never
+//! on HTTP status); renaming one is a breaking change. Protocol 1 grows only
+//! by endpoints and optional fields, never by a change to a shape it has.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -59,9 +58,9 @@ pub mod endpoint {
     pub const SQL: Route = Route::fixed("POST", "/sql");
     /// POST to the collection — open a session: a pinned connection that
     /// holds a transaction across requests. Release it with [`session`].
-    /// (Servers also accept the legacy `/sql/sessions/new` spelling.)
+    /// (Servers also accept `/sql/sessions/new`, the route Rip's driver uses.)
     pub const SESSIONS_CREATE: Route = Route::fixed("POST", "/sql/sessions");
-    /// GET the collection — the open sessions. (Legacy spelling: `/sessions`.)
+    /// GET the collection — the open sessions. (Also served at `/sessions`.)
     pub const SESSIONS: Route = Route::fixed("GET", "/sql/sessions");
     /// GET — the whole schema as one document, cheaper and more complete than
     /// walking `duckdb_*()` a table at a time.
@@ -69,7 +68,7 @@ pub mod endpoint {
     /// POST, not DELETE — shutdown is an action, and DELETE names a resource
     /// to remove that doesn't exist ("delete the shutdown"). Fleet managers
     /// use this on platforms without Unix signals; the response is sent
-    /// before draining. (Servers also accept the legacy DELETE.)
+    /// before draining. (Servers also accept DELETE.)
     pub const SHUTDOWN: Route = Route::fixed("POST", "/shutdown");
     /// GET — readiness backed by a real database probe.
     pub const READY: Route = Route::fixed("GET", "/ready");
@@ -118,7 +117,6 @@ pub mod code {
     pub const BODY_TOO_LARGE: &str = "body_too_large";
     pub const RESPONSE_TOO_LARGE: &str = "response_too_large";
     pub const CANCELLED: &str = "cancelled";
-    pub const UNSUPPORTED_TYPE: &str = "unsupported_type";
     pub const NO_SUCH_SESSION: &str = "no_such_session";
     pub const SESSION_BUSY: &str = "session_busy";
     pub const QUERY_ID_IN_USE: &str = "query_id_in_use";
@@ -271,20 +269,8 @@ impl Event {
     }
 }
 
-/// One-shot document (`Accept: application/json`), success shape. Failures
-/// are the `Event::Error` shape with a real HTTP status.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct OneShotResponse {
-    pub ok: bool,
-    pub columns: Vec<Column>,
-    pub data: Vec<Vec<Value>>,
-    pub row_count: u64,
-    pub time_ms: u64,
-}
-
-/// GET /info — fleet-era berth identity. Absent (404 `not_found`) on
-/// pre-fleet servers; that absence is the version probe.
+/// GET /info — berth identity. A server that answers it 404 `not_found` does
+/// not speak it, and that answer is the version probe.
 ///
 /// Lenient on read (`default`): a client usually wants one field of this,
 /// and a missing sibling must not turn the whole document unreadable.
@@ -316,7 +302,7 @@ mod tests {
 
     #[test]
     fn envelope_lines_round_trip() {
-        // Canned lines exactly as the v0.9.1 emitter writes them.
+        // Canned lines exactly as the server writes them.
         let schema = r#"{"type":"schema","columns":[{"name":"id","duckdbType":"BIGINT","lossless":true}]}"#;
         match Event::parse(schema).unwrap() {
             Event::Schema { columns } => {
