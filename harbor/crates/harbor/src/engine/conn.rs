@@ -213,6 +213,12 @@ impl Conn {
         Ok(ty)
     }
 
+    /// How many logical types this connection has made and keeps.
+    #[doc(hidden)]
+    pub fn types_kept(&self) -> usize {
+        self.types.len()
+    }
+
     pub fn engine_version(&self) -> &'static str {
         &self.eng.version
     }

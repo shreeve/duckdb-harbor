@@ -335,13 +335,19 @@ mod conn {
         ]);
 
         // A document costs its two casts, microseconds, and not the making of
-        // two types, which is over two milliseconds: 300 documents bind and
-        // run in about 10 ms, and would take most of a second otherwise.
+        // two types, which is over two milliseconds: the types are made once
+        // and kept, however many documents bind through them. In a release
+        // build 300 documents bind and run in about 10 ms, and would take
+        // most of a second otherwise; a debug build is too slow to time.
+        let kept = c.types_kept();
         let many = format!("SELECT count(*) FROM t WHERE doc IN ({})", vec!["?"; 300].join(", "));
         let began = Instant::now();
         assert_eq!(rows(&mut c, &many, &vec![doc(r#"{"a":1}"#); 300]).unwrap(), ["1"]);
         let took = began.elapsed();
-        assert!(took < Duration::from_millis(300), "300 documents took {took:?}");
+        assert_eq!(c.types_kept(), kept, "300 documents made no type of their own");
+        if !cfg!(debug_assertions) {
+            assert!(took < Duration::from_millis(300), "300 documents took {took:?}");
+        }
     }
 
     #[test]
