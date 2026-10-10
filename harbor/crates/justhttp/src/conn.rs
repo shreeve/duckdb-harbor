@@ -323,7 +323,14 @@ impl ClientConnection {
                     if headers.len() >= MAX_HEADERS {
                         return Err(ReadError::HeadTooLarge(StatusCode(431)));
                     }
-                    headers.push(match FromStr::from_str(line.trim()) {
+                    // A line that begins with whitespace continues the one
+                    // before it (obs-fold): a proxy may join the two, so it
+                    // is refused, never read as a header of its own (RFC
+                    // 9112 §5.2).
+                    if line.starts_with([' ', '\t']) {
+                        return Err(ReadError::WrongHeader(version));
+                    }
+                    headers.push(match FromStr::from_str(line) {
                         Ok(h) => h,
                         _ => return Err(ReadError::WrongHeader(version)),
                     });

@@ -427,6 +427,84 @@ mod head {
         }
     }
 
+    /// A header line a proxy could join to the one before it (obs-fold), or
+    /// split in two at a bare CR or LF, is refused, as is a NUL in a value.
+    #[test]
+    fn header_lines_parsers_could_read_two_ways_are_refused() {
+        for line in [
+            "X-A: a\r\n Transfer-Encoding: chunked",
+            "X-A: a\r\n\tTransfer-Encoding: chunked",
+            "X-A: a\nTransfer-Encoding: chunked",
+            "X-A: a\rTransfer-Encoding: chunked",
+            "X-A: a\0b",
+            ": a",
+        ] {
+            let (_server, mut client) = support::new_one_server_one_client();
+            write!(client, "POST / HTTP/1.1\r\nHost: localhost\r\n{line}\r\n\r\n0\r\n\r\n").unwrap();
+
+            let mut content = String::new();
+            let _ = client.read_to_string(&mut content);
+            assert!(
+                content.starts_with("HTTP/1.1 400"),
+                "{line:?}: expected 400, got {:?}",
+                content.lines().next()
+            );
+        }
+    }
+
+    /// A chunk size is `1*HEXDIG` and every chunk line ends in CRLF. A body
+    /// framed otherwise fails to read, and what follows it on the
+    /// connection is never parsed as a request; a well-formed one, with an
+    /// extension and a trailer, is read to its end and the next request
+    /// served.
+    #[test]
+    fn chunk_framing_parsers_could_read_two_ways_is_refused() {
+        let next = "GET /next HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        for (chunks, body) in [
+            ("+5\r\nhello\r\n0\r\n\r\n", None),
+            ("5;x\nhello\r\n0\r\n\r\n", None),
+            ("5\n\r\nhello\r\n0\r\n\r\n", None),
+            ("5\r\nhello\n0\r\n\r\n", None),
+            ("5;x=1\r\nhello\r\n0\r\nX-T: 1\r\n\r\n", Some("hello")),
+        ] {
+            let (server, mut client) = support::new_one_server_one_client();
+            let read = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = read.clone();
+            std::thread::spawn(move || {
+                while let Ok(Some(mut rq)) = server.recv_timeout(std::time::Duration::from_secs(5)) {
+                    let mut body = String::new();
+                    let got = rq.as_reader().read_to_string(&mut body).ok().map(|_| body);
+                    let status = if got.is_some() { 200 } else { 400 };
+                    seen.lock().unwrap().push((rq.url().to_string(), got));
+                    let _ = rq.respond(justhttp::Response::empty(status));
+                }
+            });
+            write!(
+                client,
+                "POST /chunked HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n{chunks}{next}"
+            )
+            .unwrap();
+
+            client.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut content = Vec::new();
+            let _ = client.read_to_end(&mut content);
+            let content = String::from_utf8_lossy(&content);
+            let read = read.lock().unwrap();
+            match body {
+                None => {
+                    assert!(content.starts_with("HTTP/1.1 400"), "{chunks:?}: got {content:?}");
+                    assert_eq!(content.matches("HTTP/1.1").count(), 1, "{chunks:?}: got {content:?}");
+                    assert_eq!(*read, [("/chunked".to_string(), None)], "{chunks:?}");
+                }
+                Some(body) => {
+                    assert_eq!(content.matches("HTTP/1.1 200").count(), 2, "{chunks:?}: got {content:?}");
+                    assert_eq!(read[0], ("/chunked".to_string(), Some(body.to_string())));
+                    assert_eq!(read[1].0, "/next");
+                }
+            }
+        }
+    }
+
     /// A chunked body the handler never reads must not be parsed as the next
     /// request. It has no declared length to skip by, so the connection
     /// ends after the response instead: one request, one response, then EOF,
