@@ -1868,7 +1868,7 @@ impl Grid {
     ) {
         // A read-only grid says why in the footer, not with a beep. While a
         // page is on its way, the key is let go as it is during a commit:
-        // text typed now would belong to rows about to leave the screen.
+        // text typed then would belong to rows about to leave the screen.
         if self.edits.is_none()
             || self.committing
             || self.replacing

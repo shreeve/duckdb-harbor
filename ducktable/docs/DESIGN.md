@@ -55,7 +55,7 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
   connection's reference-counted lifetime. No survey opens
   SSH; selecting the database does. The last connection clone kills and reaps
   the process, and a quit closes every tunnel still open, process and socket.
-  A launch removes the sockets of tunnels whose app is no longer running.
+  A launch removes the sockets of tunnels whose app is not running.
   `-S none` makes that process the owner, `BatchMode=yes` keeps failures
   visible rather than interactive, and SSH keepalives detect a dead path.
 - **A connected berth is kept alive by presence, not pulses.** A held

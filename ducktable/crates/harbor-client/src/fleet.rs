@@ -793,7 +793,7 @@ fn close_each(tunnels: Vec<std::sync::Weak<SshTunnel>>) {
 }
 
 /// Remove the sockets of tunnels whose process has ended without closing
-/// them (`ssh-<pid>-<n>.tunnel`, the pid no longer running), as a crash or a
+/// them (`ssh-<pid>-<n>.tunnel` whose pid is not running), as a crash or a
 /// kill leaves them.
 pub fn sweep_tunnels() {
     if let Ok(dir) = runtime_dir() {
