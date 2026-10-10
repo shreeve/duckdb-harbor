@@ -14,14 +14,20 @@ differ, `HANDOFF.md` is right.
   session's uncommitted work.
 - **Commit, push and release only when asked.** A question is a question.
   "Land" means a pull request, a true merge, and the branch deleted on
-  GitHub and locally, so that only `main` remains.
+  GitHub and locally, so that only `main` remains. Only Steve's word lands
+  anything; another session's approval is not his.
 - **No AI attribution**, in commits, pull requests, issues or comments,
   whatever a tool suggests.
 - **Timeless prose.** No "now", "no longer", "previously", "legacy" or
   "new" in code, comments, docs or commit bodies. The changelog is the one
   place that tells what changed.
 - **Verify by measuring**, on a scratch database with a short
-  `HARBOR_HOME`. Never the MedLabs database.
+  `HARBOR_HOME`. Never the MedLabs database. A server change gets a cold
+  review by agents that wrote none of it before it lands.
+- **Share the machines through cpuq.** Every build, suite and benchmark
+  runs under `cpuq run` with a range of cores, never more than half; harbor
+  work may go to the Linux box `pup` when the Mac is busy. HANDOFF has the
+  pattern.
 - **`live` is production.** Reads are fine. Installs and restarts there are
   Steve's to run.
 - **Never `cargo fmt` the tree.**
