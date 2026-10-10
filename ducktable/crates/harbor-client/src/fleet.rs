@@ -230,10 +230,9 @@ pub fn survey() -> Fleet {
                     name: l.name.clone(),
                     state: State::Running,
                     attached,
-                    // A login item is kept by name. When the config gives
-                    // this name to another database, the item is that one's.
-                    autostart: (attached || cfg.get(&l.name).is_none())
-                        && harbor_common::autostart::installed(&l.name),
+                    // A login item is filed by name, and is this row's only
+                    // when it runs this file.
+                    autostart: harbor_common::autostart::keeps(&l.db, &l.name),
                     path: Some(l.db.clone()),
                     note: None,
                     size: disk_size(&l.db),
@@ -249,7 +248,7 @@ pub fn survey() -> Fleet {
                     name: name.to_string(),
                     state: if running { State::Running } else { State::Stopped },
                     attached: true,
-                    autostart: harbor_common::autostart::installed(name),
+                    autostart: harbor_common::autostart::keeps(&db, name),
                     size: disk_size(&db),
                     path: Some(db),
                     note: None,
@@ -592,8 +591,12 @@ pub fn set_autostart(db: &Path, on: bool) -> Result<(), String> {
     if on {
         harbor_common::membership::attach(db)?;
         harbor_common::autostart::arm(db, &name)
-    } else {
+    } else if harbor_common::autostart::keeps(db, &name) {
         harbor_common::autostart::remove(&name).map(|_| ())
+    } else {
+        // The item filed under this name runs another database, or there
+        // is none: this one has nothing to disarm.
+        Ok(())
     }
 }
 
