@@ -59,6 +59,13 @@ pub(crate) struct QueryView {
     show_running: bool,
     /// Set by the carousel landing here; consumed by the next render.
     needs_focus: bool,
+    /// The gutter last computed, and the text's hash and the caret it was
+    /// computed for (`sync_send_mark`).
+    marks: Option<((u64, usize), Marks)>,
+    /// The scratchpad on its way to disk (`save_scratch`).
+    saving: std::sync::Arc<std::sync::Mutex<Saving>>,
+    /// Why the last write of the scratchpad failed, until one succeeds.
+    unsaved: Option<SharedString>,
     /// The editor/results divider — user-draggable, position persisted
     /// (docs/QUERY.md's split, finally honored).
     split: Entity<gpui_kit::component::resizable::ResizableState>,
@@ -92,7 +99,9 @@ impl QueryView {
         // ⌘Enter arrives as the input's secondary-enter — the send key.
         // Plain Enter stays a newline (the editor's own default).
         let subscription = cx.subscribe_in(&editor, window, Self::on_editor_event);
-        prune_history(berth);
+        // The history keeps its newest entries, pruned off the UI thread.
+        let pruned = berth.to_string();
+        cx.background_executor().spawn(async move { prune_history(&pruned) }).detach();
         // The editor's Enter handler ALWAYS inserts a newline in
         // multi-line mode, secondary included, before emitting its
         // event. Interceptors run before binding dispatch, so this one
@@ -156,6 +165,9 @@ impl QueryView {
             run_started: None,
             show_running: false,
             needs_focus: false,
+            marks: None,
+            saving: Default::default(),
+            unsaved: None,
             split,
             _subscription: subscription,
             _intercept: intercept,
@@ -179,77 +191,49 @@ impl QueryView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // value() already materializes the rope into a SharedString;
-        // it derefs to &str, so no second copy is taken (this runs at
-        // blink frequency — allocations here are pure heat).
+        // This runs on every editor notify, the cursor blink included, so
+        // the split is read again only when the text or the caret moved:
+        // a pasted dump re-splits once, not twice a second.
         let (text, caret) = {
             let e = editor.read(cx);
             (e.value(), e.cursor())
         };
-        // Numbers live only on statement lines, restarting at 1 on
-        // each statement — matching the engine's own "LINE n" — and
-        // the gap rows between statements carry none (label 0 = silent
-        // row). A blank line INSIDE a statement still counts: the
-        // engine counts it too.
-        let rows = text.matches('\n').count() + 1;
-        let mut labels = vec![0u32; rows];
-        let stmts = split_statements(&text);
+        let key = {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut h = std::hash::DefaultHasher::new();
+            text.hash(&mut h);
+            (h.finish(), caret)
+        };
+        let marks = match &self.marks {
+            Some((at, marks)) if *at == key => marks.clone(),
+            _ => {
+                let marks = gutter_marks(&text, caret);
+                self.marks = Some((key, marks.clone()));
+                marks
+            }
+        };
         // The mark's color is the header band's own background: the
         // marked statement's rail cells dim to it — what ⌘Enter will
         // send reads as a PLACE in the margin, not a sticker on it.
-        // Picked from the same lex as the labels below — one truth.
-        let mark = statement_pick(&stmts, caret.min(text.len())).map(|s| {
-            let start = text[..s.span.start].matches('\n').count();
-            let end = text[..s.span.end].matches('\n').count();
-            let shade = {
-                use gpui_kit::component::ActiveTheme as _;
-                cx.theme().table_head
-            };
-            (start..end + 1, shade)
+        let mark = marks.rows.map(|rows| {
+            use gpui_kit::component::ActiveTheme as _;
+            (rows, cx.theme().table_head)
         });
-        // Only a `;` closes a band — ANY band, not just the last. The
-        // open tail after the final `;` draws no closing hairline: the
-        // line would claim "done here" under a mid-air thought. It
-        // appears the moment the `;` does. end_rows lists the last row
-        // of each statement that earned one. Rows come from a running
-        // cursor — statements are ordered and disjoint, so one forward
-        // pass counts every newline exactly once (a prefix scan per
-        // statement goes quadratic on a pasted dump, and this runs at
-        // blink frequency).
-        let mut end_rows: Vec<u32> = Vec::new();
-        let (mut pos, mut row) = (0usize, 0usize);
-        for stmt in &stmts {
-            row += text[pos..stmt.span.start].matches('\n').count();
-            let r0 = row;
-            row += text[stmt.span.clone()].matches('\n').count();
-            let r1 = row;
-            pos = stmt.span.end;
-            for (i, r) in (r0..=r1).enumerate() {
-                if labels[r] == 0 {
-                    labels[r] = (i + 1) as u32;
-                }
-            }
-            if stmt.terminated {
-                end_rows.push(r1 as u32);
-            }
-        }
-        let max_label = labels.iter().copied().max().unwrap_or(1) as u64;
         // The rail obeys ⌥7 exactly like the grids: hidden means GONE
         // (the boundary line above the pane is all that remains).
         let show = crate::prefs::get(cx).row_numbers;
         editor.update(cx, |e, cx| e.set_line_number(show, window, cx));
         // One rail for the whole pane: top and bottom both take the
         // wider of the editor's labels and the results' visible row
-        // numbers — THIS pane's content, not the host table's (Steve's
-        // content-fit ruling, 2026-08-31), with gutter_width's 2-digit
-        // floor. Recompute from CURRENT content, rather than retaining
-        // an old width, so a small result after a large one shrinks
-        // both halves together.
+        // numbers — this pane's content, not the host table's, with
+        // gutter_width's 2-digit floor. Recompute from CURRENT content,
+        // rather than retaining an old width, so a small result after a
+        // large one shrinks both halves together.
         let results = self.results.clone();
         let results_last = results
             .as_ref()
             .map_or(0, |g| g.read(cx).last_visible_row(cx));
-        let shared_max = shared_gutter_max(max_label, results_last);
+        let shared_max = shared_gutter_max(marks.max_label, results_last);
         let rail = crate::grid::gutter_width(shared_max);
         if let Some(results) = results {
             results.update(cx, |grid, cx| grid.set_gutter_max(shared_max, cx));
@@ -265,25 +249,22 @@ impl QueryView {
             background: t.raised,
             row_line: t.grid_line,
             // The rail's edge, the band boundary, and the statement
-            // hairlines are all grid lines — the one slot (red-audit
-            // ruling, 2026-09-01).
+            // hairlines are all grid lines: the one slot.
             border: t.grid_line,
         };
         let stale = {
             let e = editor.read(cx);
             e.marked_rows != mark
                 || e.gutter_style.as_ref() != Some(&style)
-                || e.section_end_rows.as_deref().map(Vec::as_slice)
-                    != Some(end_rows.as_slice())
-                || e.line_labels.as_deref().map(Vec::as_slice)
-                    != Some(labels.as_slice())
+                || e.section_end_rows.as_ref() != Some(&marks.end_rows)
+                || e.line_labels.as_ref() != Some(&marks.labels)
         };
         if stale {
             editor.update(cx, |e, cx| {
                 e.marked_rows = mark;
                 e.gutter_style = Some(style);
-                e.section_end_rows = Some(std::rc::Rc::new(end_rows));
-                e.line_labels = Some(std::rc::Rc::new(labels));
+                e.section_end_rows = Some(marks.end_rows);
+                e.line_labels = Some(marks.labels);
                 cx.notify();
             });
         }
@@ -298,23 +279,33 @@ impl QueryView {
     ) {
         match event {
             InputEvent::PressEnter { secondary: true, .. } => self.run(window, cx),
-            InputEvent::Change { .. } => {
-                // Autosave rides the change event; a debounce can come
-                // later — scratch writes are tiny.
-                self.save_scratch(cx);
-            }
+            InputEvent::Change => self.save_scratch(cx),
             _ => {}
         }
     }
 
-    fn save_scratch(&self, cx: &App) {
-        let text = self.editor.read(cx).value().to_string();
-        if let Some(path) = scratch_path(&self.berth) {
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir).ok();
+    /// Autosave, on every change (docs/QUERY.md law 1): the text goes to
+    /// disk off the UI thread (`write_newest`), and a write that fails says
+    /// so in the status line until one succeeds.
+    fn save_scratch(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = scratch_path(&self.berth) else { return };
+        {
+            let mut saving = self.saving.lock().unwrap_or_else(|p| p.into_inner());
+            saving.pending = Some(self.editor.read(cx).value().to_string());
+            if std::mem::replace(&mut saving.writing, true) {
+                return;
             }
-            std::fs::write(path, text).ok();
         }
+        let saving = self.saving.clone();
+        cx.spawn(async move |this, cx| {
+            let failed = cx.background_executor().spawn(async move { write_newest(&saving, &path) }).await;
+            this.update(cx, |this, cx| {
+                this.unsaved = failed.map(SharedString::from);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// ⌘Enter: send the statement under the caret (docs/QUERY.md). In
@@ -678,15 +669,19 @@ impl QueryView {
 
     /// The footer's transient voice, which outranks the results grid's
     /// stats while it has something to say: the ticking elapsed line of
-    /// a slow run, a note ("nothing to run"), a plan's "plan", or a
-    /// resultless statement's "ok". The grid stats themselves come straight
-    /// from the results grid — the footer reads it through results_grid().
+    /// a slow run, a scratchpad that could not be saved, a note ("nothing
+    /// to run"), a plan's "plan", or a resultless statement's "ok". The
+    /// grid stats themselves come straight from the results grid — the
+    /// footer reads it through results_grid().
     pub(crate) fn status_override(&self) -> Option<String> {
         let took = |ms: u64| crate::util::human(ms as f64 / 1000., "s");
         if self.show_running
             && let Some(t) = self.run_started
         {
             return Some(format!("running\u{2026} {}", crate::util::human(t.elapsed().as_secs_f64(), "s")));
+        }
+        if let Some(unsaved) = &self.unsaved {
+            return Some(unsaved.to_string());
         }
         if let Some(note) = &self.note {
             return Some(note.to_string());
@@ -1652,6 +1647,57 @@ fn statement_at(text: &str, caret: usize) -> Option<String> {
         .map(|s| text[s.payload.clone()].to_string())
 }
 
+/// What the editor's gutter shows for a text and a caret.
+#[derive(Clone, Debug, PartialEq)]
+struct Marks {
+    /// The rows the send mark spans: the caret's statement's.
+    rows: Option<std::ops::Range<usize>>,
+    /// Each row's line number, 0 for a silent row.
+    labels: std::rc::Rc<Vec<u32>>,
+    /// The last row of each statement a `;` closed.
+    end_rows: std::rc::Rc<Vec<u32>>,
+    /// The widest label.
+    max_label: u64,
+}
+
+/// The gutter for `text` with the caret at `caret`. Numbers live only on
+/// statement lines, restarting at 1 on each statement to match the
+/// engine's own "LINE n", and the gap rows between statements carry none
+/// (label 0). A blank line INSIDE a statement still counts: the engine
+/// counts it too. Only a `;` closes a band, any band: the open tail after
+/// the final `;` draws no closing hairline, which would claim "done here"
+/// under a thought in mid-air. Rows come from a running cursor over the
+/// ordered, disjoint statements, so one forward pass counts every newline
+/// once (a prefix scan per statement goes quadratic on a pasted dump).
+fn gutter_marks(text: &str, caret: usize) -> Marks {
+    let stmts = split_statements(text);
+    // Picked from the same split as the labels: one truth.
+    let rows = statement_pick(&stmts, caret.min(text.len())).map(|s| {
+        let start = text[..s.span.start].matches('\n').count();
+        let end = text[..s.span.end].matches('\n').count();
+        start..end + 1
+    });
+    let mut labels = vec![0u32; text.matches('\n').count() + 1];
+    let mut end_rows: Vec<u32> = Vec::new();
+    let (mut pos, mut row) = (0usize, 0usize);
+    for stmt in &stmts {
+        row += text[pos..stmt.span.start].matches('\n').count();
+        let r0 = row;
+        row += text[stmt.span.clone()].matches('\n').count();
+        pos = stmt.span.end;
+        for (i, r) in (r0..=row).enumerate() {
+            if labels[r] == 0 {
+                labels[r] = (i + 1) as u32;
+            }
+        }
+        if stmt.terminated {
+            end_rows.push(row as u32);
+        }
+    }
+    let max_label = labels.iter().copied().max().unwrap_or(1) as u64;
+    Marks { rows, labels: std::rc::Rc::new(labels), end_rows: std::rc::Rc::new(end_rows), max_label }
+}
+
 /// The editor and its embedded results grid are one vertical pane, so
 /// their row-number rails have one width derived from current content.
 fn shared_gutter_max(top: u64, bottom: u64) -> u64 {
@@ -1719,19 +1765,18 @@ fn split_statements(text: &str) -> Vec<Stmt> {
         .collect()
 }
 
-fn scratch_path(berth: &str) -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
+/// A database's scratchpad or history file, `dir/<name>.ext`, its name made
+/// safe for a file name.
+fn berth_file(dir: &str, berth: &str, ext: &str) -> Option<std::path::PathBuf> {
     let safe: String = berth
         .chars()
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect();
-    Some(
-        std::path::Path::new(&home)
-            .join(".config")
-            .join("ducktable")
-            .join("scratch")
-            .join(format!("{safe}.sql")),
-    )
+    Some(crate::prefs::config_dir()?.join(dir).join(format!("{safe}.{ext}")))
+}
+
+fn scratch_path(berth: &str) -> Option<std::path::PathBuf> {
+    berth_file("scratch", berth, "sql")
 }
 
 fn load_scratch(berth: &str) -> Option<String> {
@@ -1739,17 +1784,46 @@ fn load_scratch(berth: &str) -> Option<String> {
 }
 
 fn history_path(berth: &str) -> Option<std::path::PathBuf> {
-    let dir = scratch_path(berth)?;
-    let name = dir.file_stem()?.to_string_lossy().to_string();
-    Some(dir.parent()?.parent()?.join("history").join(format!("{name}.ndjson")))
+    berth_file("history", berth, "ndjson")
+}
+
+/// The scratchpad on its way to disk: the newest text not yet written, and
+/// whether a writer is at it.
+#[derive(Default)]
+struct Saving {
+    pending: Option<String>,
+    writing: bool,
+}
+
+/// Write the newest pending text to `path` until none is left, then stand
+/// down. One writer at a time, off the UI thread, always the newest text:
+/// a burst of keystrokes costs a write per landing, not one per key, and an
+/// older text never lands over a newer one. The last write's failure, if it
+/// failed, is the answer.
+fn write_newest(saving: &std::sync::Mutex<Saving>, path: &std::path::Path) -> Option<String> {
+    let mut failed = None;
+    loop {
+        let text = {
+            let mut saving = saving.lock().unwrap_or_else(|p| p.into_inner());
+            match saving.pending.take() {
+                Some(text) => text,
+                None => {
+                    saving.writing = false;
+                    return failed;
+                }
+            }
+        };
+        let dir = path.parent().map_or(Ok(()), std::fs::create_dir_all);
+        failed = dir.and_then(|()| std::fs::write(path, text)).err().map(|e| format!("scratch not saved: {e}"));
+    }
 }
 
 /// One line per run, appended on completion (docs/QUERY.md: capture
 /// before UI — history never captured is unrecoverable). NDJSON, not a
 /// shell-style flat file: SQL is multi-line, and a run's verdict —
 /// duration, rows, error — is what makes history a log of what
-/// happened rather than a pile of text. The v2 recall popover reads
-/// this; until then it is grep-food.
+/// happened rather than a pile of text. Nothing in the app reads it: it
+/// is there for grep, and for the history popover QUERY.md plans.
 fn append_history(
     berth: &str,
     sql: &str,
@@ -2494,6 +2568,26 @@ mod tests {
     }
 
     #[test]
+    fn the_scratchpad_writes_its_newest_text_and_says_when_it_cannot() {
+        use super::{write_newest, Saving};
+        let dir = std::env::temp_dir().join(format!("dt-scratch-{}", std::process::id()));
+        let path = dir.join("scratch").join("a.sql");
+        let saving = std::sync::Mutex::new(Saving { pending: Some("SELECT 2".into()), writing: true });
+        assert_eq!(write_newest(&saving, &path), None);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "SELECT 2");
+        // The writer stands down once nothing is pending.
+        let done = saving.lock().unwrap();
+        assert!(done.pending.is_none() && !done.writing);
+        drop(done);
+        // A path that cannot be written says why, and is not silent.
+        let blocked = dir.join("scratch").join("a.sql").join("b.sql");
+        let saving = std::sync::Mutex::new(Saving { pending: Some("x".into()), writing: true });
+        let failed = write_newest(&saving, &blocked).expect("a write under a file fails");
+        assert!(failed.starts_with("scratch not saved: "), "{failed}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn query_rails_share_the_current_maximum() {
         assert_eq!(shared_gutter_max(6, 98_765), 98_765);
         assert_eq!(shared_gutter_max(6, 20), 20);
@@ -2516,6 +2610,15 @@ mod tests {
         assert_eq!((start, end + 1), (2, 4));
         // In the gap, the bar marks the statement above.
         assert_eq!(&text[statement_span(text, 10).unwrap()], "SELECT 1;");
+        // The gutter read in one pass: the mark's rows, line numbers that
+        // restart on each statement and skip the gap, and the closing rows.
+        let marks = super::gutter_marks(text, 13);
+        assert_eq!(marks.rows, Some(2..4));
+        assert_eq!(*marks.labels, [1, 0, 1, 2, 0]);
+        assert_eq!(*marks.end_rows, [0, 3]);
+        assert_eq!(marks.max_label, 2);
+        // An open tail after the last `;` earns no closing row.
+        assert_eq!(*super::gutter_marks("SELECT 1;\nSELECT", 0).end_rows, [0]);
     }
 
     #[test]

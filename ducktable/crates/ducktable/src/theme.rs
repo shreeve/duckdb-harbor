@@ -142,8 +142,7 @@ struct Themes {
 impl Global for Themes {}
 
 fn choice_file() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(std::path::Path::new(&home).join(".config").join("ducktable").join("theme"))
+    Some(crate::prefs::config_dir()?.join("theme"))
 }
 
 /// Load the bundled themes, apply the persisted choice (or the set's

@@ -129,9 +129,14 @@ impl Default for Prefs {
 
 impl Global for Prefs {}
 
+/// Where DuckTable keeps what it remembers, `~/.config/ducktable`: these
+/// prefs, the theme, and each database's scratchpad and history.
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    Some(std::path::PathBuf::from(std::env::var_os("HOME")?).join(".config").join("ducktable"))
+}
+
 fn file() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(std::path::Path::new(&home).join(".config").join("ducktable").join("prefs.json"))
+    Some(config_dir()?.join("prefs.json"))
 }
 
 pub fn init(cx: &mut App) {

@@ -278,11 +278,14 @@ results fade, stale but never blanked. Completion is always one atomic swap.
 ## Persistence
 
 - **Scratch:** `~/.config/ducktable/scratch/<berth>.sql`, written on every
-  change to the editor. The files are small, so the write is not debounced.
+  change to the editor, off the UI thread: one write at a time, always of the
+  newest text, so a burst of typing never lands an older text over a newer.
+  A write that fails says `scratch not saved: …` in the status line until one
+  succeeds.
 - **History:** `~/.config/ducktable/history/<berth>.ndjson`, one line per run
   with its text, time, duration and row count or error. It is captured before
   any UI reads it, because history never captured cannot be recovered. It keeps
-  the newest 10,000 entries, pruned when the view is created.
+  the newest 10,000 entries, pruned off the UI thread when the view is made.
 
 ## `crates/duckdb-lang`, the lens
 
