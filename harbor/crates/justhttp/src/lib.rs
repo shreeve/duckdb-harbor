@@ -373,13 +373,15 @@ impl Server {
     pub fn unblock(&self) {
         self.messages.unblock();
     }
-}
 
-impl Drop for Server {
-    fn drop(&mut self) {
+    /// Stops accepting connections, leaving those already accepted to be
+    /// answered: a client that arrives from here on is refused at connect,
+    /// and so knows its request was never sent. Unix socket paths stay on
+    /// disk until the server is dropped.
+    pub fn close_doors(&self) {
         self.close.store(true, Relaxed);
         // Connect briefly to each listener to unblock its accept thread,
-        // then sweep every unix socket path off disk.
+        // which then ends, and its listener with it.
         for addr in &self.listening_addrs {
             let maybe_stream = match addr {
                 ListenAddr::Ip(addr) => TcpStream::connect(addr).map(Connection::from),
@@ -391,7 +393,17 @@ impl Drop for Server {
             if let Ok(stream) = maybe_stream {
                 let _ = stream.shutdown(Shutdown::Both);
             }
+        }
+    }
+}
 
+impl Drop for Server {
+    fn drop(&mut self) {
+        if !self.close.load(Relaxed) {
+            self.close_doors();
+        }
+        // Then sweep every unix socket path off disk.
+        for addr in &self.listening_addrs {
             #[cfg(unix)]
             if let ListenAddr::Unix(addr) = addr {
                 if let Some(path) = addr.as_pathname() {

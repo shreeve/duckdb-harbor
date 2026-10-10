@@ -1328,6 +1328,10 @@ fn stop_with(mut running: std::sync::MutexGuard<'_, Option<Running>>) -> Result<
     let Some(r) = running.take() else {
         return Err("harbor is not serving".to_string());
     };
+    // A client that arrives from here on is refused at connect, so it knows
+    // its request was never sent; one accepted and then left unanswered
+    // could not tell whether its statement ran.
+    r.server.close_doors();
     r.stop.store(true, Ordering::SeqCst);
     r.server.unblock();
 

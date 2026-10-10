@@ -1359,6 +1359,27 @@ mod unblock {
         h1.join().unwrap();
         h2.join().unwrap();
     }
+
+    /// Closed doors refuse a client at connect, so it knows its request was
+    /// never sent, while one already accepted is still answered.
+    #[test]
+    fn closed_doors_refuse_newcomers_and_answer_the_rest() {
+        use std::io::{Read, Write};
+        let (server, mut client) = super::support::new_one_server_one_client();
+        let addr = super::support::addr(&server);
+        client.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        let rq = super::support::recv(&server);
+        server.close_doors();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::net::TcpStream::connect(("127.0.0.1", addr.port())).is_ok() {
+            assert!(Instant::now() < deadline, "still accepting after its doors closed");
+            thread::sleep(Duration::from_millis(10));
+        }
+        rq.respond(justhttp::Response::from_string("late")).unwrap();
+        let mut answer = String::new();
+        client.read_to_string(&mut answer).unwrap();
+        assert!(answer.ends_with("late"), "{answer}");
+    }
 }
 
 #[cfg(unix)]
