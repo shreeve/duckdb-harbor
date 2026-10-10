@@ -71,9 +71,13 @@ security regression, not a flake.
 5. **Unambiguous framing.** Two `Content-Length` headers that disagree, a
    `Content-Length` beside a `Transfer-Encoding`, a `Content-Length` that
    is not plain digits (`+5`, `2 3`), or a `Transfer-Encoding` that is not
-   exactly one `chunked` are all `400` and a close. Each is a
-   request-smuggling primitive: whenever this server and a proxy in front
-   of it can resolve a request differently, they eventually will.
+   exactly one `chunked` are all `400` and a close, and so is a header
+   line that begins with whitespace (obs-fold) or holds a CR, LF or NUL.
+   A chunked body is read as strictly: a chunk size is hex digits and
+   nothing else, every line ends in CRLF, and anything else fails the
+   read and ends the connection. Each is a request-smuggling primitive:
+   whenever this server and a proxy in front of it can resolve a request
+   differently, they eventually will.
 6. **The client does not choose the server's buffering.** A response's
    framing follows from its version, status and length alone; a request's
    `TE` header is not consulted. An unknown-length response is always
@@ -113,7 +117,7 @@ dependencies (`ascii`, `chunked_transfer`, `httpdate`):
 | `http.rs` | `Method`, `StatusCode`, `Header`, `HttpVersion` (strict, smuggling-hardened parsing) |
 | `stream.rs` | TCP/UDS listeners and the half-close connection stream |
 | `conn.rs` | per-connection request sequencing: keep-alive, pipelining, response ordering, request-head bounds and framing checks |
-| `request.rs` | `Request`, lazy body readers (the bounded drain lives here) |
+| `request.rs` | `Request`, lazy body readers (the bounded drain and the strict chunked decoder live here) |
 | `response.rs` | `Response`, transfer-encoding choice, chunked/identity framing |
 | `pool.rs` | the accept-side task pool and the message queue behind `recv_timeout()` |
 

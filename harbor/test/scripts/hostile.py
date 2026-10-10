@@ -323,6 +323,39 @@ def unread_chunked_body(port, head, well_formed):
         s.close()
 
 
+FRAMED_TWO_WAYS = {
+    "an obs-fold header": b"X-A: a\r\n Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    "a bare LF in a header": b"X-A: a\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    "a signed chunk size": b"Transfer-Encoding: chunked\r\n\r\n+5\r\nhello\r\n0\r\n\r\n",
+    "a bare LF after a chunk size": b"Transfer-Encoding: chunked\r\n\r\n5\n\r\nhello\r\n0\r\n\r\n",
+    "a bare LF after a chunk extension": b"Transfer-Encoding: chunked\r\n\r\n5;x\nhello\r\n0\r\n\r\n",
+}
+
+
+def framed_two_ways(port, framing):
+    """Oracle 4, lenient framing. A request a lenient parser would frame
+    differently, sent to a route that reads its body, with a request behind
+    it as bait: it is refused, and the bait is never answered. Returns the
+    statuses drawn."""
+    smuggled = b"GET /info HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+    s = socket.create_connection(("127.0.0.1", port), timeout=15)
+    try:
+        s.sendall(b"POST /sql HTTP/1.1\r\nHost: 127.0.0.1\r\n" + framing + smuggled)
+        s.settimeout(3)
+        seen = b""
+        while True:
+            try:
+                chunk = s.recv(8192)
+            except (socket.timeout, OSError):
+                break
+            if not chunk:
+                break
+            seen += chunk
+        return [seen[i + 9:i + 12].decode() for i in range(len(seen)) if seen.startswith(b"HTTP/1.1 ", i)]
+    finally:
+        s.close()
+
+
 # ---------------------------------------------------------------------------
 # Cases
 # ---------------------------------------------------------------------------
@@ -519,6 +552,12 @@ def main():
         else:
             bad("desync (chunked)",
                 f"responses per request {counts} — chunk data was answered as a request")
+        drawn = {name: framed_two_ways(port, framing) for name, framing in FRAMED_TWO_WAYS.items()}
+        if all(statuses == ["400"] for statuses in drawn.values()):
+            ok("framing a lenient parser reads another way is refused, and nothing behind it answered",
+               ", ".join(drawn))
+        else:
+            bad("desync (lenient framing)", f"statuses drawn {drawn}")
 
         section("No leak")
         # Every case above abandoned connections on purpose, and each has its

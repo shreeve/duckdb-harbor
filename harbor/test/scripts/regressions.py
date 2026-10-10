@@ -409,6 +409,21 @@ class Regressions(Harbor, unittest.TestCase):
         self.assertEqual(status, 200, doc)
         self.assertEqual(doc["data"], [[42]])
 
+    def test_params_are_read_once_each(self):
+        # A double past 64 bits is told from a whole number by its own text.
+        # Read from the whole body once per such param, 50,000 of them held
+        # a worker for twenty seconds, and the cost grew with their square.
+        body = '{"sql":"SELECT ?","params":[' + ",".join(["1e30"] * 50000) + "]}"
+        started = time.monotonic()
+        status, doc = self.request("POST", "/sql", body.encode())
+        self.assertLess(time.monotonic() - started, 5, doc)
+        self.assertEqual(status, 400, doc)
+        # Two `params` keys are refused, not read as the last one.
+        body = b'{"sql":"SELECT ?::HUGEINT","params":[1],"params":[123456789012345678901234]}'
+        status, doc = self.request("POST", "/sql", body)
+        self.assertEqual(status, 400, doc)
+        self.assertIn("duplicate field", doc["message"])
+
     def test_concurrent_membership_updates_keep_every_success(self):
         home = self.root / "config-writers"
         env = dict(self.env, HARBOR_HOME=str(home))

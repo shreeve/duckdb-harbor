@@ -388,6 +388,30 @@ def run_all(h, leases, proc, db, port):
     eq("a released session is not renewed", (404, "no_such_session"), (st, doc.get("code")))
     eq("nor one that never was", 404, h.call("POST", f"/sql/sessions/{'0' * 36}/renew")[0])
 
+    # With every worker waiting on a session's statement, a renewal is
+    # answered by the probe lane at once, not once a statement ends.
+    sids = [h.open()[1]["sessionId"] for _ in range(leases)]
+    answered = []
+    runs = [threading.Thread(target=lambda s=s: answered.append(
+        h.sql("SELECT count(*) FROM range(3000000000) t(i) WHERE i % 7 = 3", s, timeout=120)[0]))
+        for s in sids]
+    for t in runs:
+        t.start()
+    time.sleep(0.6)
+    started = time.monotonic()
+    st = h.call("POST", f"/sql/sessions/{sids[0]}/renew")[0]
+    took = time.monotonic() - started
+    eq("a renewal beside a statement on every worker is answered within a second, before any",
+       (200, True, []), (st, took < 1, answered))
+    for s in sids:
+        h.release(s)
+    for t in runs:
+        t.join()
+    # A release that cancels completes on the reaper's next tick.
+    deadline = time.time() + 5
+    while time.time() < deadline and h.connections()["free"] != leases:
+        time.sleep(0.1)
+
     # -----------------------------------------------------------------------
     section("A session is in a transaction only when one is open")
     # -----------------------------------------------------------------------

@@ -256,8 +256,11 @@ struct SlotRun {
     cancelled: bool,
     /// When this statement must stop, if anything asked for a limit.
     deadline: Option<Instant>,
-    /// When this worker began handling an HTTP request, whether or not that
-    /// request has become a statement yet.
+    /// While this worker handles an HTTP request with no statement of its
+    /// own running, when it counts as wedged: `WEDGED_REQUEST_AGE` after it
+    /// took the request, or `WEDGED_STATEMENT_AGE` after it handed the
+    /// statement to a session's connection, where it waits as a worker
+    /// running one does.
     ///
     /// A worker reading a request body has no job — `job` is still 0 — so to
     /// the probe thread it looked idle while being entirely stuck. That is not
@@ -265,7 +268,7 @@ struct SlotRun {
     /// worked by occupying workers BEFORE the statement starts, and the one
     /// thread whose purpose is staying reachable under saturation sat every
     /// one of them out because it was only ever looking at statements.
-    request: Option<Instant>,
+    wedged_at: Option<Instant>,
 }
 
 /// What a cancel request should do, decided from bookkeeping alone, so the
@@ -282,7 +285,7 @@ enum Cancel {
 
 impl SlotRun {
     fn idle() -> Self {
-        SlotRun { job: 0, last: 0, started: Instant::now(), pending: None, cancelled: false, deadline: None, request: None }
+        SlotRun { job: 0, last: 0, started: Instant::now(), pending: None, cancelled: false, deadline: None, wedged_at: None }
     }
 
     /// Claim this slot for `job`. Returns true when the statement was already
@@ -1340,6 +1343,19 @@ fn stop_with(mut running: std::sync::MutexGuard<'_, Option<Running>>) -> Result<
     }
     r.stop.store(true, Ordering::SeqCst);
     r.server.unblock();
+    // What still reaches the queue, through the TCP door or on a connection
+    // already open, is answered rather than left to the process's exit, and
+    // the answer says that nothing of it ran. The thread lets go of the
+    // server between requests, so it ends when the server does.
+    let server = Arc::downgrade(&r.server);
+    let _ = thread::Builder::new().name("harbor-stopping".to_string()).spawn(move || {
+        while let Some(next) = server.upgrade().and_then(|s| s.recv_timeout(Duration::from_millis(50)).ok()) {
+            if let Some(req) = next {
+                let _ = req.respond(error_response(503, code::UNAVAILABLE,
+                    "harbor is stopping; this statement did not run"));
+            }
+        }
+    });
 
     // Before anything else: roll back every live transaction. This is not
     // tidiness. An open write transaction makes CHECKPOINT fail outright —
@@ -1598,7 +1614,7 @@ fn probe_worker(server: Arc<Server>, stop: Arc<AtomicBool>, log: bool) {
         // this thread exists for, and statement age is what tells the two
         // apart. (Verified against the stress suite: 16 fast clients, zero
         // sheds; 6 slow scans, probe live within a quarter second.)
-        if !workers_wedged(Duration::from_millis(250)) {
+        if !workers_wedged() {
             thread::sleep(Duration::from_millis(25));
             continue;
         }
@@ -1650,6 +1666,10 @@ fn run_ready_control(req: Request) -> (bool, u16) {
     (true, respond_ready(req, ok, "not ready"))
 }
 
+/// How long a worker's statement must have run, on its own connection or on
+/// a session's, before the worker counts as wedged.
+const WEDGED_STATEMENT_AGE: Duration = Duration::from_millis(250);
+
 /// How long a worker must be stuck on a request that has NOT become a
 /// statement before it counts as wedged.
 ///
@@ -1670,14 +1690,14 @@ const WEDGED_REQUEST_AGE: Duration = Duration::from_secs(5);
 /// has no job, and six such workers are a berth that answers nothing. A worker
 /// is occupied from the moment it picks up a request; whether that request
 /// ever reaches DuckDB is a distinction the load balancer does not care about.
-fn workers_wedged(min_age: Duration) -> bool {
+fn workers_wedged() -> bool {
     let slots = WORKER_SLOTS.lock().unwrap();
     !slots.is_empty()
         && slots.iter().all(|s| {
             let run = s.run.lock().unwrap();
             match run.job != 0 {
-                true => run.started.elapsed() >= min_age,
-                false => run.request.is_some_and(|t| t.elapsed() >= WEDGED_REQUEST_AGE),
+                true => run.started.elapsed() >= WEDGED_STATEMENT_AGE,
+                false => run.wedged_at.is_some_and(|t| Instant::now() >= t),
             }
         })
 }
@@ -1760,14 +1780,10 @@ fn handle(req: Request, exec: Option<Executor>, log: bool) -> bool {
     // previous one's left on this worker thread.
     LAST_REASON.with(|c| c.set(""));
 
-    // One gate before any routing: the declared length. justhttp drains an
-    // undelivered body when a request is dropped — with a single
-    // `vec![0; remaining]` — and it does so for EVERY response path, 404s
-    // included. `take()` bounds what harbor buffers but not what the client
-    // may declare, and the declared length is attacker-chosen: a request
-    // declaring 1 GB and sending 9 bytes would cost a 1 GB zeroed
-    // allocation. Refusing here, before anything else can respond, means the
-    // allocation never happens on any path.
+    // One gate before any routing: the declared length. A body declared
+    // over the limit is refused here, so no handler reads or buffers any of
+    // it, whatever route it names; what the client sends of it is discarded
+    // by justhttp's drain, which is bounded in time and memory.
     //
     // Every listener is machine-local: the unix socket is protected by its
     // 0700 runtime directory and TCP binds loopback only. Callers beyond this
@@ -1864,11 +1880,11 @@ fn handle(req: Request, exec: Option<Executor>, log: bool) -> bool {
             // whatever the engine's catalog provides, and version differences
             // die in this process rather than in every client.
             (Method::Get, "/catalog") => match exec {
-                Some((jobs, _)) => run_catalog(req, jobs),
+                Some(exec) => run_catalog(req, exec),
                 None => shed(req),
             },
             (Method::Post, "/sql") => match exec {
-                Some(exec) => run_sql_request(req, Some(exec)),
+                Some(exec) => run_sql_request(req, exec),
                 // A session's statement needs no worker: it runs on the
                 // session's own connection. The lane relays it, and sheds the
                 // rest.
@@ -1919,35 +1935,71 @@ impl LogLine {
 /// the body and runs a session's statement on the session's connection, and
 /// sheds anything else. The lane itself never reads a body or streams, so a
 /// client that stalls either holds this thread and not the berth's last open
-/// door. One thread at most per lease connection, which is as many
-/// statements as sessions can run at once.
+/// door.
+///
+/// Two counts bound these threads. A body is read on one of `RELAY_READERS`.
+/// A statement that names a session then runs in a seat, one per lease
+/// connection, which is as many statements as sessions can run at once, and
+/// gives its reader back. So bodies that stall, whatever they name, hold
+/// readers and never the seats sessions run in.
 fn relay(req: Request, line: Option<LogLine>) -> bool {
-    static RELAYS: AtomicUsize = AtomicUsize::new(0);
-    struct Seat;
-    impl Drop for Seat {
-        fn drop(&mut self) {
-            RELAYS.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-    let cap = LEASES.lock().unwrap().as_ref().map_or(0, |l| l.total);
-    let seat = Seat;
-    if RELAYS.fetch_add(1, Ordering::SeqCst) >= cap {
-        let (keep_going, status) = shed(req);
+    static READERS: AtomicUsize = AtomicUsize::new(0);
+    static SEATS: AtomicUsize = AtomicUsize::new(0);
+    let log = |line: Option<LogLine>, (keep_going, status): (bool, u16)| {
         if let Some(line) = line {
             line.write(status);
         }
-        return keep_going;
-    }
+        keep_going
+    };
+    let Some(reading) = Seat::take(&READERS, RELAY_READERS) else {
+        return log(line, shed(req));
+    };
     // A thread that cannot start drops the request, which justhttp answers
-    // with a 500, and the seat with it.
+    // with a 500, and the reader with it.
     let _ = thread::Builder::new().name("harbor-relay".to_string()).spawn(move || {
-        let _seat = seat;
-        let (_, status) = run_sql_request(req, None);
-        if let Some(line) = line {
-            line.write(status);
-        }
+        let mut req = req;
+        let answer = match read_request_body(&mut req)
+            .and_then(|body| parse_request(&body).map_err(Refusal::bad_request))
+        {
+            Err(refusal) => refuse(req, refusal),
+            Ok(parsed) if parsed.session.is_none() => shed(req),
+            Ok(parsed) => {
+                let cap = LEASES.lock().unwrap().as_ref().map_or(0, |l| l.total);
+                match Seat::take(&SEATS, cap) {
+                    Some(_seat) => {
+                        drop(reading);
+                        run_sql(req, parsed, None)
+                    }
+                    None => shed(req),
+                }
+            }
+        };
+        log(line, answer);
     });
     true
+}
+
+/// How many relay threads may read a body at once. A body lands in
+/// milliseconds, so a few are plenty, and the count keeps a client that
+/// pipelines requests from turning each into a thread.
+const RELAY_READERS: usize = 8;
+
+/// One of a bounded count of relay threads, given back when dropped.
+struct Seat(&'static AtomicUsize);
+
+impl Seat {
+    /// A seat when fewer than `cap` are taken. Built before the count is
+    /// raised, so every path, a refusal included, lowers it again.
+    fn take(count: &'static AtomicUsize, cap: usize) -> Option<Seat> {
+        let seat = Seat(count);
+        (count.fetch_add(1, Ordering::SeqCst) < cap).then_some(seat)
+    }
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Why a TCP request came from a web page, or `None` when it did not.
@@ -2000,14 +2052,14 @@ struct OnRequest<'a> {
 
 impl<'a> OnRequest<'a> {
     fn enter(slot: &'a Arc<SlotState>) -> Self {
-        slot.run.lock().unwrap().request = Some(Instant::now());
+        slot.run.lock().unwrap().wedged_at = Some(Instant::now() + WEDGED_REQUEST_AGE);
         OnRequest { slot }
     }
 }
 
 impl Drop for OnRequest<'_> {
     fn drop(&mut self) {
-        self.slot.run.lock().unwrap().request = None;
+        self.slot.run.lock().unwrap().wedged_at = None;
     }
 }
 
@@ -2065,43 +2117,50 @@ struct SqlRequest {
 }
 
 fn parse_request(body: &str) -> Result<SqlRequest, String> {
-    let mut v: serde_json::Value = serde_json::from_str(body).map_err(|e| match e.to_string() {
-        // The parser stops reading at 127 levels, and nothing in a request
-        // nests but a document param, so its refusal is the one below in
-        // other words. Should the wording ever differ, the parser's own
-        // message goes out instead.
-        deep if deep.starts_with("recursion limit exceeded") => too_deep(),
-        other => other,
-    })?;
-    // take() moves the String serde already built instead of copying it
-    let sql = match v.get_mut("sql").map(serde_json::Value::take) {
-        Some(serde_json::Value::String(s)) => s,
+    /// The body in one pass. `params` stays as written, so each param's own
+    /// text can say whether it is a whole number, and a key given twice is
+    /// refused rather than read as one of its values.
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", expecting = "an object")]
+    struct Body<'a> {
+        sql: Option<serde_json::Value>,
+        #[serde(borrow)]
+        params: Option<&'a serde_json::value::RawValue>,
+        session_id: Option<serde_json::Value>,
+        query_id: Option<serde_json::Value>,
+        timeout_ms: Option<serde_json::Value>,
+    }
+    let v: Body = serde_json::from_str(body).map_err(json_error)?;
+    // The derive also reads an array of the fields in order, which is not a
+    // request.
+    let sql = match v.sql {
+        Some(serde_json::Value::String(s)) if body.trim_start().starts_with('{') => s,
         _ => return Err("missing \"sql\"".to_string()),
     };
     if sql.trim().is_empty() {
         return Err("\"sql\" is empty".to_string());
     }
-    let params = match v.get("params") {
-        None | Some(serde_json::Value::Null) => Vec::new(),
-        Some(serde_json::Value::Array(a)) => a
-            .iter()
-            .enumerate()
-            .map(|(i, param)| json_to_duckdb(param, || written_whole(body, i)))
+    let params = match v.params {
+        None => Vec::new(),
+        Some(raw) => serde_json::from_str::<Vec<&serde_json::value::RawValue>>(raw.get())
+            .map_err(|_| "\"params\" must be an array".to_string())?
+            .into_iter()
+            .map(|raw| {
+                let param = serde_json::from_str(raw.get()).map_err(json_error)?;
+                json_to_duckdb(param, || !raw.get().contains(['.', 'e', 'E']))
+            })
             .collect::<Result<_, _>>()?,
-        Some(_) => return Err("\"params\" must be an array".to_string()),
     };
-    let session = match v.get("sessionId") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::String(id)) if !id.is_empty() => Some(id.clone()),
+    let session = match v.session_id {
+        None => None,
+        Some(serde_json::Value::String(id)) if !id.is_empty() => Some(id),
         Some(_) => return Err("\"sessionId\" must be a non-empty string".to_string()),
     };
-    let query = match v.get("queryId") {
-        None | Some(serde_json::Value::Null) => None,
+    let query = match v.query_id {
+        None => None,
         // Bounded, because it becomes a key in a map that lives as long as the
         // server and is written by any caller.
-        Some(serde_json::Value::String(id)) if !id.is_empty() && id.len() <= 128 => {
-            Some(id.clone())
-        }
+        Some(serde_json::Value::String(id)) if !id.is_empty() && id.len() <= 128 => Some(id),
         Some(_) => {
             return Err("\"queryId\" must be a non-empty string of at most 128 characters"
                 .to_string());
@@ -2114,8 +2173,8 @@ fn parse_request(body: &str) -> Result<SqlRequest, String> {
     // knob a `--sealed` deployment leans on. With no cap configured, 0 is
     // unlimited and N is exactly N.
     let cap = configured_statement_timeout();
-    let timeout = match v.get("timeoutMs") {
-        None | Some(serde_json::Value::Null) => cap,
+    let timeout = match v.timeout_ms {
+        None => cap,
         Some(serde_json::Value::Number(n)) => match n.as_u64() {
             Some(0) => cap,
             Some(ms) => {
@@ -2130,12 +2189,14 @@ fn parse_request(body: &str) -> Result<SqlRequest, String> {
 }
 
 /// One JSON param as the value it binds. `whole` says whether the param was
-/// written as a whole number, asked only of one past what 64 bits hold.
-fn json_to_duckdb(v: &serde_json::Value, whole: impl FnOnce() -> bool) -> Result<Param, String> {
+/// written as a whole number, with no fraction and no exponent: one past 64
+/// bits parses to a double, so only its text can say. It is asked only of a
+/// number past what 64 bits hold.
+fn json_to_duckdb(v: serde_json::Value, whole: impl FnOnce() -> bool) -> Result<Param, String> {
     Ok(match v {
         serde_json::Value::Null => Param::Null,
-        serde_json::Value::Bool(b) => Param::Bool(*b),
-        serde_json::Value::String(s) => Param::Text(s.clone()),
+        serde_json::Value::Bool(b) => Param::Bool(b),
+        serde_json::Value::String(s) => Param::Text(s),
         // A fraction or an exponent binds as the double its text names, as
         // in SQL. A whole number past i64 and u64 reads as the nearest
         // double, a different number, so it is refused rather than stored
@@ -2157,24 +2218,22 @@ fn json_to_duckdb(v: &serde_json::Value, whole: impl FnOnce() -> bool) -> Result
         // its own and goes as its JSON text, for the statement to cast. A
         // string is never read this way, whatever it spells: a param that
         // looks like JSON is data, as one that looks like SQL is.
-        other if nests_within(other, DOCUMENT_LEVELS) => {
+        other if nests_within(&other, DOCUMENT_LEVELS) => {
             Param::Document { text: other.to_string(), variant: false }
         }
         _ => return Err(too_deep()),
     })
 }
 
-/// Whether param `i` of `body` is written as a whole number: no fraction and
-/// no exponent. The parsed value cannot say, since a whole number past 64
-/// bits parses to a double; the text can.
-fn written_whole(body: &str, i: usize) -> bool {
-    #[derive(serde::Deserialize)]
-    struct Params<'a> {
-        #[serde(borrow)]
-        params: Vec<&'a serde_json::value::RawValue>,
+/// A JSON parse failure in words. The parser stops reading at 127 levels,
+/// and nothing in a request nests but a document param, so its refusal is
+/// the one below in other words. Should the wording ever differ, the
+/// parser's own message goes out instead.
+fn json_error(e: serde_json::Error) -> String {
+    match e.to_string() {
+        deep if deep.starts_with("recursion limit exceeded") => too_deep(),
+        other => other,
     }
-    serde_json::from_str::<Params>(body)
-        .is_ok_and(|p| p.params.get(i).is_some_and(|raw| !raw.get().contains(['.', 'e', 'E'])))
 }
 
 fn too_deep() -> String {
@@ -2509,21 +2568,27 @@ enum CatalogFailure {
 /// hand back the rows parsed rather than streamed. The one-shot JSON shape is
 /// reused instead of a second reader being written: the executor already
 /// produces `{"ok":true,...,"data":[...]}`, and a catalog result is a few
-/// dozen rows, nowhere near the size that shape refuses.
+/// dozen rows, nowhere near the size that shape refuses. Watched for the
+/// client as a statement is, so a client that leaves, as DuckTable does
+/// when it moves to another database, stops the exact count over every
+/// table with it.
 fn catalog_rows(
-    jobs: &mpsc::SyncSender<Job>,
+    (jobs, slot): Executor,
+    peer: &justhttp::Peer,
     sql: &str,
 ) -> Result<Vec<Vec<serde_json::Value>>, CatalogFailure> {
     // The deployment default applies here as it does to any statement.
     let (job, ready_rx, body_rx) = Job::new(sql.to_string(), Vec::new(), Shape::Json, configured_statement_timeout());
+    let id = job.id;
     if jobs.send(job).is_err() {
         return Err(CatalogFailure::Gone);
     }
-    let verdict = ready_rx.recv();
+    let mut watch = Watch::new(Some(peer.clone()), Arc::clone(slot), id);
+    let verdict = watch.recv(&ready_rx);
     // Drain rather than drop, for the same reason `run_ready` does: a dropped
     // receiver reads as a client that hung up mid-stream and costs a rollback.
     let mut document = Vec::new();
-    while let Ok(chunk) = body_rx.recv() {
+    while let Ok(chunk) = watch.recv(&body_rx) {
         document.extend_from_slice(&chunk);
     }
     match verdict {
@@ -2823,7 +2888,8 @@ fn catalog_identifier(name: &str) -> String {
 /// ordinal position, indexes and sequences by name, unique constraints by
 /// their column lists, foreign keys by their referenced table and column
 /// lists. A stable database answers with byte-identical output.
-fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
+fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
+    let peer = req.peer();
     let style = match catalog_style(req.url()) {
         Ok(style) => style,
         Err(message) => {
@@ -2834,7 +2900,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
     // System and temp catalogs are excluded by anchoring every query to the
     // served database: `system` and `temp` are separate databases, so
     // current_database() never matches them.
-    let version_rows = match catalog_rows(jobs, "SELECT library_version FROM pragma_version()") {
+    let version_rows = match catalog_rows(exec, &peer, "SELECT library_version FROM pragma_version()") {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
     };
@@ -2850,7 +2916,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
              ORDER BY schema_name, table_name"
         }
     };
-    let table_rows = match catalog_rows(jobs, table_sql) {
+    let table_rows = match catalog_rows(exec, &peer, table_sql) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
     };
@@ -2880,7 +2946,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
     // engine's visibility information and therefore excludes deleted rows
     // that the physical storage cardinality still includes.
     let count_rows = if let Some(sql) = catalog_count_sql(&table_rows) {
-        match catalog_rows(jobs, &sql) {
+        match catalog_rows(exec, &peer, &sql) {
             Ok(rows) => rows,
             Err(failure) => return catalog_refuse(req, failure),
         }
@@ -2913,7 +2979,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
     };
 
     let column_rows = match catalog_rows(
-        jobs,
+        exec, &peer,
         "SELECT schema_name, table_name, column_name, data_type, is_nullable, column_default, \
                 is_generated, generation_expression \
          FROM duckdb_columns() \
@@ -2924,7 +2990,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         Err(failure) => return catalog_refuse(req, failure),
     };
     let constraint_rows = match catalog_rows(
-        jobs,
+        exec, &peer,
         "SELECT schema_name, table_name, constraint_type, constraint_column_names, \
                 referenced_table, referenced_column_names \
          FROM duckdb_constraints() \
@@ -2940,7 +3006,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
     // not in it, which is exactly the distinction the contract wants — that
     // constraint-borne uniqueness travels in uniqueConstraints above, not here.
     let index_rows = match catalog_rows(
-        jobs,
+        exec, &peer,
         "SELECT schema_name, table_name, index_name, is_unique, expressions \
          FROM duckdb_indexes() \
          WHERE database_name = current_database() \
@@ -2950,7 +3016,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         Err(failure) => return catalog_refuse(req, failure),
     };
     let sequence_rows = match catalog_rows(
-        jobs,
+        exec, &peer,
         "SELECT sequence_name, start_value FROM duckdb_sequences() \
          WHERE database_name = current_database() AND NOT temporary \
          ORDER BY sequence_name",
@@ -3118,21 +3184,20 @@ fn respond_ready(req: Request, ok: bool, message: &str) -> u16 {
 /// A worker's executor: its jobs channel and its cancellation slot.
 type Executor<'a> = (&'a mpsc::SyncSender<Job>, &'a Arc<SlotState>);
 
-/// `POST /sql`: the body read and parsed, then the statement run. `pooled`
-/// is the accepting worker's executor; a relay has none, and serves only a
-/// session's statement.
-fn run_sql_request(mut req: Request, pooled: Option<Executor>) -> (bool, u16) {
+/// `POST /sql` on a worker: the body read and parsed, then the statement run.
+fn run_sql_request(mut req: Request, exec: Executor) -> (bool, u16) {
     let parsed = read_request_body(&mut req)
         .and_then(|body| parse_request(&body).map_err(Refusal::bad_request));
     match parsed {
-        Ok(parsed) => run_sql(req, parsed, pooled),
+        Ok(parsed) => run_sql(req, parsed, Some(exec)),
         Err(refusal) => refuse(req, refusal),
     }
 }
 
 /// Returns (keep serving, status sent). The first is false when the worker's
 /// own executor is gone; see `handle`, which also writes the log line from
-/// the second.
+/// the second. `pooled` is the accepting worker's executor; a relay has
+/// none, and brings only a session's statement.
 fn run_sql(req: Request, mut parsed: SqlRequest, pooled: Option<Executor>) -> (bool, u16) {
     // `r.{a,b}` becomes `r.a, r.b` here, once, for every client: before the
     // guards below and the engine's statement count, which read the
@@ -3216,6 +3281,12 @@ fn run_sql(req: Request, mut parsed: SqlRequest, pooled: Option<Executor>) -> (b
             return refuse(req, Refusal { status: 503, code: code::UNAVAILABLE, message: "this session is gone".into() });
         }
         return (false, refuse(req, Refusal::not_serving()).1);
+    }
+    // A worker that waits on a session's statement is as busy as one running
+    // its own, and the probe lane, which answers the session's renewals,
+    // takes over from the same age.
+    if let (Some(_), Some((_, worker))) = (&claim, pooled) {
+        worker.run.lock().unwrap().wedged_at = Some(Instant::now() + WEDGED_STATEMENT_AGE);
     }
 
     let mut watch = Watch::new(Some(req.peer()), Arc::clone(slot), id);
@@ -3876,16 +3947,20 @@ fn execute_jobs(
         // thread: the worker would find the job channel closed, leave the
         // accept loop, and the slot would be gone for the life of the
         // process, so a handful of such queries would retire every worker.
-        // On a panic the `OnSlot` guard drops — retiring the slot — the
-        // waiting worker is told (500), and this executor takes the next job.
-        // The connection itself is intact (the panic was in Rust-side
-        // encoding, not DuckDB's engine), so the next job resets first.
+        // On a panic the slot is retired, the statement's transaction is
+        // left aborted, as any statement cut short leaves it, so a COMMIT
+        // after it is told; the waiting worker is told (500), and this
+        // executor takes the next job. The connection itself is intact (the
+        // panic was in Rust-side encoding, not DuckDB's engine), so the next
+        // job on a worker resets first.
         let ready_guard = ready.clone();
         needs_reset = match std::panic::catch_unwind(AssertUnwindSafe(|| {
             run_statement(&mut conn, &mut on_slot, sql, params, shape, ready, body, started)
         })) {
             Ok(next_reset) => next_reset,
             Err(_) => {
+                on_slot.finish();
+                conn.abort_transaction();
                 let _ = ready_guard.send(Err(Refusal {
                     status: 500,
                     code: code::INTERNAL,
@@ -4379,8 +4454,8 @@ mod tests {
             assert!(matches!(fits.params[..], [super::Param::Document { .. }]), "{open}");
             let err = request(nested(101)).err().unwrap();
             assert_eq!(err, "a document param nests at most 100 levels", "{open}");
-            // Past 125 the body parser refuses first, in the same words.
-            for n in [125, 126, 5000] {
+            // Past 127 the parser refuses first, in the same words.
+            for n in [125, 127, 128, 5000] {
                 assert_eq!(request(nested(n)).err().unwrap(), err, "{open} {n}");
             }
             // The deep branch need not be the first one.
@@ -4408,6 +4483,12 @@ mod tests {
         }
         assert!(matches!(request("-9223372036854775808").unwrap().params[1], super::Param::I64(i64::MIN)));
         assert!(matches!(request("18446744073709551615").unwrap().params[1], super::Param::U64(u64::MAX)));
+        // Two `params` have no one answer, and the second would otherwise
+        // bind its big number as the nearest double.
+        let twice = r#"{"sql":"SELECT ?","params":[1],"params":[123456789012345678901234]}"#;
+        assert!(super::parse_request(twice).err().unwrap().contains("duplicate field `params`"));
+        // The fields in order, without their names, are not a request.
+        assert_eq!(super::parse_request(r#"["SELECT 1",null,null,null,null]"#).err().unwrap(), "missing \"sql\"");
     }
 
     #[test]

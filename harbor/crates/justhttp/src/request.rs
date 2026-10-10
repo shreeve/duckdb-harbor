@@ -15,7 +15,7 @@ use crate::Response;
 use crate::http::{Header, HttpVersion, Method, StatusCode};
 use crate::stream::Socket;
 use budgeted_reader::BudgetedReader;
-use chunked_transfer::Decoder;
+use chunked::Decoder;
 use equal_reader::EqualReader;
 use fused_reader::FusedReader;
 
@@ -497,6 +497,183 @@ mod budgeted_reader {
             let mut s = String::new();
             r.read_to_string(&mut s).unwrap();
             assert_eq!(s, "hi");
+        }
+    }
+}
+
+mod chunked {
+    use std::io::{Error, ErrorKind, Read, Result};
+
+    /// The longest chunk-size or trailer line, and the most trailer lines:
+    /// the bounds a request head has (conn.rs).
+    const MAX_LINE: usize = 8 * 1024;
+    const MAX_TRAILERS: usize = 128;
+
+    /// A `Transfer-Encoding: chunked` body, read strictly (RFC 9112 §7.1).
+    ///
+    /// Each leniency a decoder allows is a place where this server and a
+    /// proxy in front of it can disagree on where the body ends, which is
+    /// how a request is smuggled. So a chunk size is hex digits and nothing
+    /// else, every line ends in CRLF and nothing else, and an extension holds
+    /// no control character but HTAB. Trailer lines are read and dropped.
+    pub struct Decoder<R> {
+        inner: R,
+        /// Bytes still to come in the chunk being read.
+        left: usize,
+        /// A chunk has been read, so a CRLF ends its data.
+        begun: bool,
+        done: bool,
+    }
+
+    impl<R: Read> Decoder<R> {
+        pub fn new(inner: R) -> Self {
+            Decoder { inner, left: 0, begun: false, done: false }
+        }
+
+        fn byte(&mut self) -> Result<u8> {
+            let mut b = [0];
+            loop {
+                match self.inner.read(&mut b) {
+                    Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+                    Ok(_) => return Ok(b[0]),
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        /// One line, without its CRLF. A CR or LF anywhere else is refused.
+        fn line(&mut self) -> Result<Vec<u8>> {
+            let mut line = Vec::new();
+            loop {
+                match self.byte()? {
+                    b'\r' if self.byte()? == b'\n' => return Ok(line),
+                    b'\r' | b'\n' => return Err(malformed("a line ends in CRLF only")),
+                    b if line.len() < MAX_LINE => line.push(b),
+                    _ => return Err(malformed("a chunk line is too long")),
+                }
+            }
+        }
+
+        /// A chunk-size line: `1*HEXDIG`, then nothing or an extension that
+        /// begins with `;`, after optional SP or HTAB.
+        fn size(&mut self) -> Result<usize> {
+            let line = self.line()?;
+            let digits = line.iter().take_while(|b| b.is_ascii_hexdigit()).count();
+            let (size, extension) = line.split_at(digits);
+            let opens = extension.iter().find(|b| !matches!(b, b' ' | b'\t'));
+            if digits == 0
+                || !matches!(opens, None | Some(b';'))
+                || extension.iter().any(|&b| b != b'\t' && b.is_ascii_control())
+            {
+                return Err(malformed("a chunk size is hex digits, then an extension or nothing"));
+            }
+            // ASCII hex digits, so UTF-8; too many of them for a usize is
+            // the one way left to fail.
+            usize::from_str_radix(std::str::from_utf8(size).unwrap(), 16)
+                .map_err(|_| malformed("a chunk size is too large"))
+        }
+    }
+
+    fn malformed(why: &str) -> Error {
+        Error::new(ErrorKind::InvalidData, format!("malformed chunked body: {why}"))
+    }
+
+    impl<R: Read> Read for Decoder<R> {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+            if self.done || buf.is_empty() {
+                return Ok(0);
+            }
+            if self.left == 0 {
+                if self.begun && !self.line()?.is_empty() {
+                    return Err(malformed("a chunk's data runs past its size"));
+                }
+                self.begun = true;
+                self.left = self.size()?;
+                if self.left == 0 {
+                    for _ in 0..=MAX_TRAILERS {
+                        if self.line()?.is_empty() {
+                            self.done = true;
+                            return Ok(0);
+                        }
+                    }
+                    return Err(malformed("too many trailer lines"));
+                }
+            }
+            let want = buf.len().min(self.left);
+            let n = self.inner.read(&mut buf[..want])?;
+            if n == 0 {
+                return Err(ErrorKind::UnexpectedEof.into());
+            }
+            self.left -= n;
+            Ok(n)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Decoder;
+        use std::io::{Cursor, ErrorKind, Read};
+
+        /// The body, and what is left on the stream after it.
+        fn decode(input: &str) -> std::io::Result<(String, String)> {
+            let mut stream = Cursor::new(input.as_bytes().to_vec());
+            let mut body = String::new();
+            Decoder::new(&mut stream).read_to_string(&mut body)?;
+            let mut rest = String::new();
+            stream.read_to_string(&mut rest).unwrap();
+            Ok((body, rest))
+        }
+
+        #[test]
+        fn a_well_formed_body_is_read_to_its_end_and_no_further() {
+            for (input, body) in [
+                ("5\r\nhello\r\n0\r\n\r\nNEXT", "hello"),
+                ("5;name=value\r\nhello\r\n6 ; x\r\n world\r\n0\r\n\r\nNEXT", "hello world"),
+                ("A\r\n0123456789\r\n0\r\nX-T: 1\r\nX-U: 2\r\n\r\nNEXT", "0123456789"),
+                ("5\t;x\r\nhello\r\n000\r\n\r\nNEXT", "hello"),
+            ] {
+                assert_eq!(decode(input).unwrap(), (body.to_string(), "NEXT".to_string()), "{input:?}");
+            }
+        }
+
+        #[test]
+        fn framing_a_lenient_parser_would_read_another_way_is_refused() {
+            for input in [
+                "+5\r\nhello\r\n0\r\n\r\n",
+                "-5\r\nhello\r\n0\r\n\r\n",
+                " 5\r\nhello\r\n0\r\n\r\n",
+                "0x5\r\nhello\r\n0\r\n\r\n",
+                "5 x\r\nhello\r\n0\r\n\r\n",
+                "5\nhello\r\n0\r\n\r\n",
+                "5;x\nhello\r\n0\r\n\r\n",
+                "5\n\r\nhello\r\n0\r\n\r\n",
+                "5\rx\r\nhello\r\n0\r\n\r\n",
+                "5;a\x01b\r\nhello\r\n0\r\n\r\n",
+                "5\r\nhello\n0\r\n\r\n",
+                "5\r\nhelloX\r\n0\r\n\r\n",
+                "\r\nhello\r\n0\r\n\r\n",
+                "10000000000000000\r\nhello\r\n0\r\n\r\n",
+                "0\r\nX-T: 1\n\r\n",
+            ] {
+                let err = decode(input).unwrap_err();
+                assert_eq!(err.kind(), ErrorKind::InvalidData, "{input:?}: {err}");
+            }
+        }
+
+        #[test]
+        fn a_body_cut_short_is_an_error_and_not_an_end() {
+            for input in ["5\r\nhel", "5\r\nhello\r\n", "5\r\nhello\r\n0\r\n", "5"] {
+                assert_eq!(decode(input).unwrap_err().kind(), ErrorKind::UnexpectedEof, "{input:?}");
+            }
+        }
+
+        #[test]
+        fn lines_and_trailers_are_bounded() {
+            let long = format!("5;{}\r\nhello\r\n0\r\n\r\n", "x".repeat(9000));
+            assert_eq!(decode(&long).unwrap_err().kind(), ErrorKind::InvalidData);
+            let many = format!("0\r\n{}\r\n", "X-T: 1\r\n".repeat(200));
+            assert_eq!(decode(&many).unwrap_err().kind(), ErrorKind::InvalidData);
         }
     }
 }
