@@ -183,6 +183,132 @@ check "a size DuckDB will not take is refused by the client" 1 "power of two" \
 if [[ -f $work/other.duckdb ]]; then bad "a refused size still conjured a file"; else ok "a refused size conjures no file"; fi
 "$harbor" "$work/sized.duckdb" stop >/dev/null 2>&1
 
+echo "— the client reads a script as the duckdb shell does, and writes for programs"
+# csv is the program format: NULL, the word NULL and the empty string are
+# three values there, the way DuckDB's COPY writes them.
+check "csv writes NULL as an empty field and an empty string quoted" 0 ',NULL,"",1' \
+  "$harbor" "$work/x.duckdb" --mode csv -c "SELECT NULL::VARCHAR AS a, 'NULL' AS b, '' AS c, 1 AS d"
+check "markdown escapes a bar inside a cell, and --mode=markdown is --mode markdown" 0 '| a\|b |' \
+  "$harbor" "$work/x.duckdb" --mode=markdown -c "SELECT 'a|b' AS v"
+out=$("$harbor" "$work/x.duckdb" -c "CREATE OR REPLACE TABLE ddl(i INT)" 2>&1)
+[[ $out != *Count* && $out != *"0 rows"* ]] && ok "a statement that changes only the schema draws nothing" \
+                                            || bad "a schema change drew a frame: $out"
+# A reader that leaves early is the Unix goodbye. The plan goes out in one
+# write, and nothing after a closed pipe runs: its reader is gone.
+plan_sql="EXPLAIN SELECT 1 $(printf 'UNION ALL SELECT %d ' $(seq 400))"
+rc=$("$harbor" "$work/x.duckdb" -c "$plan_sql" 2>"$work/epipe.err" | head -1 >/dev/null; echo "${PIPESTATUS[0]}")
+[[ $rc == 0 && $(cat "$work/epipe.err") != *panicked* ]] && ok "a plan into a closed pipe ends quietly" \
+                                                        || bad "a plan into a closed pipe: exit $rc, $(cat "$work/epipe.err")"
+"$harbor" "$work/x.duckdb" --mode csv \
+  -c "SELECT * FROM range(200000); CREATE TABLE after_pipe AS SELECT 1 AS x" 2>/dev/null | head -1 >/dev/null
+check "a closed output stops the script, so nothing after it runs" 0 "0" \
+  "$harbor" "$work/x.duckdb" --mode csv -c "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'after_pipe'"
+check "a mistyped mode is refused before anything opens" 1 'unknown mode "bogus"' \
+  "$harbor" "$work/typo.duckdb" --mode bogus -c "SELECT 1"
+[[ -e $work/typo.duckdb ]] && bad "a mistyped mode conjured a file" || ok "and conjures no file"
+check "dot commands run in a piped script" 0 "one
+1
+(none)" \
+  bash -c "printf '.mode csv\nSELECT 1 AS one;\n.nullvalue (none)\n.mode list\nSELECT NULL;\n' | '$harbor' '$work/x.duckdb'"
+printf '.mode csv\nSELECT 2 AS two;\n' >"$work/a script.sql"
+check ".read runs a file's dot commands too, from a path with a space" 0 "two
+2" \
+  bash -c "printf '.read %s\n' '$work/a script.sql' | '$harbor' '$work/x.duckdb'"
+check "an empty -c is refused" 1 "no SQL given" "$harbor" "$work/x.duckdb" -c ""
+check "as is one that is only a comment" 1 "no SQL given" "$harbor" "$work/x.duckdb" -c "-- nothing"
+check "a second -c is refused, not dropped" 1 "-c is given once" \
+  "$harbor" "$work/x.duckdb" -c "SELECT 1" -c "SELECT 2"
+check "stdin that is not UTF-8 says so" 1 "not UTF-8" \
+  bash -c "printf 'SELECT \\xff;' | '$harbor' '$work/x.duckdb'"
+check "a scheme in capitals is a URL, not a file" 1 "cannot reach harbor" \
+  "$harbor" "HTTP://127.0.0.1:1" -c "SELECT 1"
+# The REPL's history holds whatever was typed, so it is made where only its
+# user can read it. A URL with nothing behind it is enough to reach the prompt.
+mkdir -m 755 "$work/home"
+history=0
+HARBOR_HOME="$work/home" python3 - "$harbor" "$work/home" <<'PY' >"$work/history.log" 2>&1 || history=$?
+import os, pty, select, sys, time
+harbor, home = sys.argv[1], sys.argv[2]
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm"
+    os.execv(harbor, [harbor, "http://127.0.0.1:1"])
+    os._exit(1)
+buf = b""
+def drain(seconds):
+    global buf
+    end = time.time() + seconds
+    while time.time() < end:
+        if not select.select([fd], [], [], 0.2)[0]:
+            continue
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            return
+        if not chunk:
+            return
+        buf += chunk
+        if b"\x1b]11;?" in chunk: os.write(fd, b"\x1b]11;rgb:1c1c/1c1c/1c1c\x07")
+        if b"\x1b[6n" in chunk:   os.write(fd, b"\x1b[1;1R")
+        if b"\x1b[c" in chunk:    os.write(fd, b"\x1b[?62;22c")
+drain(3)
+os.write(fd, b".mode csv\r"); drain(1)
+os.write(fd, b".mode\r");     drain(1)
+os.write(fd, b".quit\r");     drain(2)
+for close in (lambda: os.close(fd), lambda: os.waitpid(pid, 0)):
+    try: close()
+    except Exception: pass
+out = buf.decode("utf8", "replace")
+print(out[-2000:])
+mode = os.stat(home).st_mode & 0o777
+print(f"home mode {mode:o}")
+sys.exit(0 if "mode: csv" in out and mode == 0o700 else 1)
+PY
+(( history == 0 )) && ok "the prompt's history lives in a directory only its user can read" \
+                   || bad "the history directory stayed open, or the prompt misbehaved (see $work/history.log)"
+# A terminal over a slow line answers the background-color query late. Its
+# answer must not reach the prompt as typed text: the REPL waits for the
+# answer to DA1, which a terminal sends after it, however late that is.
+late=0
+HARBOR_HOME="$work/home" python3 - "$harbor" <<'PY' >"$work/late.log" 2>&1 || late=$?
+import os, pty, select, sys, time
+harbor = sys.argv[1]
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm"
+    os.execv(harbor, [harbor, "http://127.0.0.1:1"])
+    os._exit(1)
+buf, due = b"", None
+def drain(seconds):
+    global buf, due
+    end = time.time() + seconds
+    while time.time() < end:
+        if due and time.time() >= due:
+            os.write(fd, b"\x1b]11;rgb:1c1c/1c1c/1c1c\x07\x1b[?62;22c"); due = None
+        if not select.select([fd], [], [], 0.05)[0]:
+            continue
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            return
+        if not chunk:
+            return
+        buf += chunk
+        if b"\x1b]11;?" in chunk: due = time.time() + 0.4
+        if b"\x1b[6n" in chunk:   os.write(fd, b"\x1b[1;1R")
+drain(3)
+os.write(fd, b".mode\r"); drain(1.5)
+os.write(fd, b".quit\r"); drain(1.5)
+for close in (lambda: os.close(fd), lambda: os.waitpid(pid, 0)):
+    try: close()
+    except Exception: pass
+out = buf.decode("utf8", "replace")
+print(out[-2000:])
+sys.exit(0 if "mode: duckbox" in out and "rgb:" not in out.split("\x1b]11;?")[-1] else 1)
+PY
+(( late == 0 )) && ok "a late answer to the background query never reaches the prompt" \
+                || bad "a late terminal answer was typed into the prompt (see $work/late.log)"
+
 echo "— the server is everyone's: it lives while anyone is connected"
 sock=$(live_sock)
 # The mooring belongs to the CLIENT, so only the shipped client can prove it
@@ -217,6 +343,7 @@ def drain(seconds):          # read, and answer the queries a terminal owes
         buf += chunk
         if b"\x1b]11;?" in chunk: os.write(fd, b"\x1b]11;rgb:1c1c/1c1c/1c1c\x07")
         if b"\x1b[6n" in chunk:   os.write(fd, b"\x1b[1;1R")
+        if b"\x1b[c" in chunk:    os.write(fd, b"\x1b[?62;22c")
 drain(5)
 os.write(fd, b"SELECT 1 AS early;\r"); drain(3)
 # A transaction left open across the pause: the prompt keeps its session past
@@ -460,8 +587,8 @@ cp -R "$work/bk.out" "$work/bk.hand"
 printf 'id\ts\n1\tNULL\n2\t"NULL"\n3\t""\n4\t\n' > "$work/bk.hand/t.csv"
 check "hand-written NULL, \"NULL\", \"\" and a bare field all read as documented" 0 "1,true,~
 2,false,NULL
-3,false,
-4,false," \
+3,false,\"\"
+4,false,\"\"" \
   bash -c '"$1" "$2" restore "$3" >/dev/null 2>&1
            "$1" "$2" --mode csv -c "SELECT id, s IS NULL, coalesce(s, '"'"'~'"'"') FROM t ORDER BY id" | tail -n +2' \
   _ "$harbor" "$work/hand.duckdb" "$work/bk.hand"
