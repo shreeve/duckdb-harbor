@@ -31,7 +31,8 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
   DuckTable reads a `COMMIT`'s answer as Harbor 0.44.2 gives it: a `COMMIT`
   of an aborted transaction is rolled back and answered `400` saying so, and
   a `COMMIT` runs to its answer, so a `499` means nothing was kept. Older
-  servers answer neither way, and DuckTable requires that one or later.
+  servers answer neither way, so DuckTable refuses to connect to one: the
+  failed-connect card names the version `/info` reports and the floor.
 - **A berth is a file on this machine or a named remote.** Connection works
   the way `harbor`'s own does: a local database is dialed by its file, whose
   server Harbor's socket discovery finds and opening it spawns on demand, and

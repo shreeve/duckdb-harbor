@@ -275,7 +275,7 @@ pub enum CommitOutcome {
 /// `400 sql_error`, Harbor's answer too for a COMMIT of a transaction an
 /// earlier error aborted, which it rolls back and says so; and a `499
 /// cancelled`, since a COMMIT runs to its answer and a cancel lands before
-/// it starts or not at all (Harbor 0.44.2, the floor DuckTable requires).
+/// it starts or not at all (Harbor 0.44.2, the floor `app::connect` keeps).
 /// In doubt: no answer, Harbor's `500 internal`, which it sends for a
 /// statement the engine had already run, and any code this client does not
 /// know, since nothing is assumed not to have run.

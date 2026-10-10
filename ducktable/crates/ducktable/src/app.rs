@@ -403,8 +403,31 @@ fn connect(aim: Aim) -> Result<(Conn, wire::InfoResponse, harbor_client::Catalog
         Aim::Url { name, host, port } => fleet::connect_remote(&fleet::add_database(&name, &host, &port)?)?,
     };
     let info = fleet::info(&conn)?;
+    new_enough(&info.harbor_version)?;
     let catalog = harbor_client::catalog(&conn)?;
     Ok((conn, info, catalog))
+}
+
+/// The oldest Harbor whose answers DuckTable reads truly (docs/DESIGN.md):
+/// from it on, a COMMIT answered `499` kept nothing, and before it one
+/// interrupted as it finished could have landed.
+const MIN_HARBOR: &str = "0.44.2";
+
+/// Refuse a server older than [`MIN_HARBOR`], saying what it runs. A version
+/// that does not read as one is older too: every Harbor since the floor
+/// reports its own.
+fn new_enough(harbor_version: &str) -> Result<(), String> {
+    if !fleet::version_older(harbor_version, MIN_HARBOR) {
+        return Ok(());
+    }
+    let runs = match harbor_version.trim() {
+        "" => "does not say which Harbor it runs".to_string(),
+        v => format!("runs Harbor {v}"),
+    };
+    Err(format!(
+        "DuckTable needs Harbor {MIN_HARBOR} or later, and this server {runs}. Upgrade Harbor on its \
+         machine (harbor update) and restart the server."
+    ))
 }
 
 pub(crate) enum Phase {
@@ -1829,6 +1852,20 @@ mod tests {
         assert_eq!(notes.len(), 3);
         assert_eq!(notes[0], "The Query view holds a transaction open on orders, and the restart rolls it back.");
         assert!(notes[2].starts_with("A commit is still running on orders"));
+    }
+
+    #[test]
+    fn a_harbor_older_than_the_floor_is_refused_by_name() {
+        use super::new_enough;
+        for ok in ["0.44.2", "0.44.3", "0.45.0", "1.0.0", "v0.44.2", "0.44.2-dev"] {
+            assert_eq!(new_enough(ok), Ok(()), "{ok}");
+        }
+        let old = new_enough("0.44.1").unwrap_err();
+        assert!(old.starts_with("DuckTable needs Harbor 0.44.2 or later, and this server runs Harbor 0.44.1."), "{old}");
+        assert!(new_enough("0.39.0").is_err());
+        let unknown = new_enough("").unwrap_err();
+        assert!(unknown.contains("this server does not say which Harbor it runs."), "{unknown}");
+        assert!(new_enough("garbage").is_err());
     }
 
     #[test]
