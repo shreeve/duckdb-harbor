@@ -96,6 +96,10 @@ jobs:
       - name: Build harbor
         run: cargo build -p harbor --release
 
+      - name: Test native path handling
+        shell: bash
+        run: cargo test --release -p harbor-common --all-features --locked paths::tests
+
       - name: The list says what Windows cannot show, and the URL form works
         run: |
           set -euo pipefail

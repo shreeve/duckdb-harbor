@@ -366,8 +366,11 @@ mod tests {
 
     #[test]
     fn harbor_home_is_absolute_or_an_error() {
+        // An absolute path is spelled per platform: "/tmp/h" has no drive,
+        // so Windows rightly calls it relative.
+        let root = std::env::temp_dir();
         assert_eq!(home_from(None), Ok(None));
-        assert_eq!(home_from(Some("/tmp/h".into())), Ok(Some(PathBuf::from("/tmp/h"))));
+        assert_eq!(home_from(Some(root.join("h").into())), Ok(Some(root.join("h"))));
         // Relative or empty, it would quietly mean the real fleet.
         for bad in ["relative/harbor", ""] {
             let e = home_from(Some(bad.into())).unwrap_err();
@@ -375,7 +378,7 @@ mod tests {
         }
         // The XDG variables keep the spec's rule: a relative one is ignored.
         assert_eq!(absolute("relative/state".into()), None);
-        assert_eq!(absolute("/srv/state".into()), Some(PathBuf::from("/srv/state")));
+        assert_eq!(absolute(root.join("state").into()), Some(root.join("state")));
     }
 
     #[cfg(unix)]
