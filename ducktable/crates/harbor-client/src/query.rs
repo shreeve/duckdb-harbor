@@ -65,10 +65,7 @@ pub fn exec_within(
     .map_err(|e| Failure::Unsent(e.to_string()))?;
     // A tunnel that has died takes its route with it: nothing can be sent.
     let transport = conn.transport().map_err(Failure::Unsent)?;
-    let resp = http::request(transport, &endpoint::SQL, Some(&body), Some(patience)).map_err(|e| {
-        let message = format!("query: {e}");
-        if http::was_not_sent(&e) { Failure::Unsent(message) } else { Failure::Unanswered(message) }
-    })?;
+    let resp = http::request(transport, &endpoint::SQL, Some(&body), Some(patience)).map_err(Failure::from)?;
 
     // Status first: a non-2xx or a proxy's HTML body must answer as itself, not
     // as "bad wire line" from trying to decode it as NDJSON.
