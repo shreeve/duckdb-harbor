@@ -14,7 +14,16 @@ pub(crate) struct ChunkedReader<R: BufRead> {
     state: ChunkState,
     line: Vec<u8>,  // partial size/CRLF/trailer line, kept across WouldBlock
     remaining: u64, // payload bytes left in the current chunk
+    trailers: usize,
 }
+
+/// The most a size, CRLF or trailer line may hold, how many trailer lines may
+/// follow the last chunk, and how much of a bad line an error quotes: what
+/// answers on a port that is not Harbor's must not grow a line, the error
+/// that names it, or the wait for the body's end without bound.
+const LINE: usize = 4096;
+const TRAILERS: usize = 100;
+const QUOTED: usize = 64;
 
 #[derive(PartialEq)]
 enum ChunkState {
@@ -27,25 +36,30 @@ enum ChunkState {
 
 impl<R: BufRead> ChunkedReader<R> {
     pub(crate) fn new(inner: R) -> Self {
-        Self { inner, state: ChunkState::Size, line: Vec::new(), remaining: 0 }
+        Self { inner, state: ChunkState::Size, line: Vec::new(), remaining: 0, trailers: 0 }
     }
 
-    /// Append to self.line until `\n` (kept) or EOF. WouldBlock propagates
-    /// with the partial line intact. Returns whether a full line arrived.
+    /// Append to self.line until `\n` (kept) or EOF, refusing a line past
+    /// `LINE`. WouldBlock propagates with the partial line intact. Returns
+    /// whether a full line arrived.
     fn fill_line(&mut self) -> io::Result<bool> {
         loop {
             let avail = self.inner.fill_buf()?;
             if avail.is_empty() {
                 return Ok(false); // EOF
             }
-            if let Some(pos) = avail.iter().position(|&c| c == b'\n') {
-                self.line.extend_from_slice(&avail[..=pos]);
-                self.inner.consume(pos + 1);
+            let (n, eol) = match avail.iter().position(|&c| c == b'\n') {
+                Some(pos) => (pos + 1, true),
+                None => (avail.len(), false),
+            };
+            self.line.extend_from_slice(&avail[..n]);
+            self.inner.consume(n);
+            if self.line.len() > LINE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "a chunked body's line runs past 4 KiB"));
+            }
+            if eol {
                 return Ok(true);
             }
-            let n = avail.len();
-            self.line.extend_from_slice(avail);
-            self.inner.consume(n);
         }
     }
 }
@@ -67,10 +81,11 @@ impl<R: BufRead> Read for ChunkedReader<R> {
                         ));
                     }
                     let text = String::from_utf8_lossy(&self.line).into_owned();
+                    let shown = String::from_utf8_lossy(&self.line[..self.line.len().min(QUOTED)]).into_owned();
                     self.line.clear();
                     let size_part = text.trim().split(';').next().unwrap_or("").trim();
                     let size = u64::from_str_radix(size_part, 16).map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, format!("bad chunk size: {text:?}"))
+                        io::Error::new(io::ErrorKind::InvalidData, format!("bad chunk size: {shown:?}"))
                     })?;
                     if size == 0 {
                         self.state = ChunkState::Trailers;
@@ -115,6 +130,10 @@ impl<R: BufRead> Read for ChunkedReader<R> {
                     if blank || !eol {
                         self.state = ChunkState::Done;
                         return Ok(0);
+                    }
+                    self.trailers += 1;
+                    if self.trailers > TRAILERS {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "a chunked body has more than 100 trailer lines"));
                     }
                 }
             }
@@ -215,6 +234,28 @@ mod tests {
         assert_eq!(r.read(&mut []).unwrap(), 0);
         let mut out = String::new();
         r.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "ok");
+    }
+
+    #[test]
+    fn a_framing_line_that_runs_on_is_refused_and_quoted_short() {
+        let size_line = format!("{}\r\n", "1".repeat(1 << 20));
+        let mut r = ChunkedReader::new(BufReader::new(Cursor::new(size_line.into_bytes())));
+        let err = r.read_to_end(&mut Vec::new()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().len() < 100, "{err}");
+        // A bad size within the cap is quoted, but no more than 64 bytes of it.
+        let bad = format!("{}\r\n", "z".repeat(1000));
+        let mut r = ChunkedReader::new(BufReader::new(Cursor::new(bad.into_bytes())));
+        let err = r.read_to_end(&mut Vec::new()).unwrap_err().to_string();
+        assert!(err.starts_with("bad chunk size") && err.len() < 100, "{err}");
+        // Trailers end, as the head does, at a hundred lines.
+        let many = format!("2\r\nok\r\n0\r\n{}\r\n", "x: 1\r\n".repeat(101));
+        let mut r = ChunkedReader::new(BufReader::new(Cursor::new(many.into_bytes())));
+        assert_eq!(r.read_to_end(&mut Vec::new()).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let some = format!("2\r\nok\r\n0\r\n{}\r\n", "x: 1\r\n".repeat(100));
+        let mut out = String::new();
+        ChunkedReader::new(BufReader::new(Cursor::new(some.into_bytes()))).read_to_string(&mut out).unwrap();
         assert_eq!(out, "ok");
     }
 }

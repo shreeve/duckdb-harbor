@@ -33,7 +33,7 @@ pub fn summon(
     let exe = exe.as_ref();
     let transport = Transport::Unix(sock.to_path_buf());
     let log_path = log_of(sock)?;
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + PATIENCE;
     loop {
         let from = std::fs::metadata(&log_path).map_or(0, |m| m.len());
         let log = std::fs::OpenOptions::new()
@@ -74,8 +74,13 @@ pub fn summon(
                     false => Err(Some(format!("the server did not start ({status}) — {}", log_tail(&log_path)))),
                 };
             }
+            // A start that has not answered by now is reported failed, so it
+            // is stopped too: it must not come up later as a server the user
+            // was told did not start. Its process group is its own.
             if Instant::now() >= deadline {
-                break Err(Some(format!("{} did not come up in 15s — {}", db.display(), log_tail(&log_path))));
+                // SAFETY: a plain kill of the group this child leads.
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGTERM) };
+                break Err(Some(format!("{} did not come up in {}s and was stopped — {}", db.display(), PATIENCE.as_secs(), log_tail(&log_path))));
             }
             std::thread::sleep(Duration::from_millis(100));
         };
@@ -87,6 +92,10 @@ pub fn summon(
         }
     }
 }
+
+/// How long a start has to answer. The unit tests wait for one that never
+/// does, and wait less.
+const PATIENCE: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 15 });
 
 /// Past this a summoned server's log starts again at its next start rather
 /// than growing for as long as the database is used.
@@ -204,6 +213,25 @@ mod tests {
         });
         summon(&exe, Path::new("/data/x.duckdb"), &sock, &[], true).unwrap();
         assert_eq!(std::fs::read_to_string(&tries).unwrap().lines().count(), 3);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_start_that_never_answers_is_stopped_when_reported_failed() {
+        let dir = std::env::temp_dir().join(format!("hh-mute-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (exe, pid) = (dir.join("harbor"), dir.join("pid"));
+        std::fs::write(&exe, format!("#!/bin/sh\necho $$ > {}\nexec sleep 60\n", pid.display())).unwrap();
+        harbor_common::perms::chmod(&exe, 0o755).unwrap();
+        let err = summon(&exe, Path::new("/data/x.duckdb"), &dir.join("x.sock"), &[], false).unwrap_err();
+        assert!(err.contains("was stopped"), "{err}");
+        let pid: libc::pid_t = std::fs::read_to_string(&pid).unwrap().trim().parse().unwrap();
+        let gone = (0..50).any(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            // SAFETY: signal 0 only asks whether the process exists.
+            unsafe { libc::kill(pid, 0) != 0 }
+        });
+        assert!(gone, "the start that was reported failed is still running");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
