@@ -1,12 +1,15 @@
 #
-# Full suite — every suite (make test), including the slow resilience ones the
-# quick gate skips: fuzz, stress (restarts the server repeatedly), deployment,
-# asserts. Runs after a merge to main and nightly — NOT on pull requests, which
-# get the quick gate (Tests.yml). Kept out of the PR event on purpose, so it
-# never shows up as a skipped check on a PR.
+# Full suite — every suite (make test), including the slow ones the quick
+# gate leaves out: roundtrip, asserts, fuzz, hostile, deployment and stress
+# (sustained load from many clients). Runs after a merge to main and
+# nightly — NOT on pull requests, which get the quick gate (Tests.yml). Kept
+# out of the PR event on purpose, so it never shows up as a skipped check on
+# a PR.
 #
 # Same engine as the quick gate (the shared .github/actions/duckdb composite
-# action); the suite list lives in test/scripts/check.sh.
+# action); the suite list lives in test/scripts/check.sh. Its rust-cache,
+# saved from main under the key the quick gate shares, is the one every PR
+# restores.
 #
 name: Full suite
 
@@ -15,8 +18,8 @@ on:
     branches: [main]
   schedule:
     # Odd minute on purpose: the :00 stampede is when shared runners are most
-    # starved (a 07:00 run flunked stress purely on runner congestion). 23:41
-    # UTC has a healthy track record here and dodges both stampede and peak.
+    # starved, enough to fail stress on runner congestion alone. 23:41 UTC
+    # dodges both the stampede and the peak.
     - cron: '41 23 * * *'
   workflow_dispatch:
 
@@ -43,17 +46,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: harbor
+          shared-key: harbor-linux
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - uses: ./.github/actions/duckdb
 
-      - name: Build the fixture database
-        run: test/scripts/fixture.sh sample.duckdb
-
       - name: All suites
         run: make test
-
-      - name: Server log on failure
-        if: failure()
-        run: cat /tmp/harbor-check.*/server.log 2>/dev/null || true

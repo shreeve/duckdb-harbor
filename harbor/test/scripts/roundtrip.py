@@ -342,8 +342,8 @@ def text_gives_way_to_parquet(work):
     refused = run(neg, "backup", neg_dir, "--format", "parquet", expect=None)
     run(neg, "stop")
     if refused.returncode == 0:
-        bad("parquet wrote a negative interval — it used to refuse, so this "
-            "check is out of date")
+        bad("parquet wrote a negative interval — this check expects the "
+            "engine to refuse one, and is out of date")
     elif neg_dir.exists():
         bad("a failed parquet backup left its directory behind")
     else:
