@@ -2,10 +2,9 @@
 
 Read this first. It says what the repo is, how its owner works, how the
 pieces fit, how to build, test and release, and what is open. Everything
-here was true on 2026-10-10, when the revamp landed on `main` carrying
-harbor 0.45.0 and DuckTable 0.23.0 in their changelogs, unreleased; harbor
-v0.44.2 and DuckTable v0.22.9 are the releases in use. The changelogs and git history
-are the record after that.
+here was true on 2026-10-10 at harbor v0.45.0 and DuckTable v0.23.0, the
+releases that carry the revamp; the changelogs and git history are the
+record after that.
 
 ## What this is
 
@@ -524,15 +523,10 @@ and DuckTable 0.23.0 record.
 
 ## Open items
 
-- **Release the revamp.** `main` carries harbor 0.45.0 and DuckTable 0.23.0
-  in their changelogs, unreleased: the version-bump pull request for harbor
-  first, its tag, `harbor update` here and the Homebrew formula; then
-  DuckTable's release script, the cask and the checks of every way in. The
-  revamp was verified on macOS arm64 and Linux x86_64 (the full suite on
-  `pup`), with DuckTable's live probes green and its SSH tunnel, version
-  floor and quit watched on screen against `live`. `live` runs 0.44.2 until
-  Steve runs `ssh -t live 'harbor update --restart'`; its config passes the
-  checks a start makes.
+- **`live` runs harbor 0.44.2** until Steve runs `ssh -t live 'harbor
+  update --restart'`; its configuration passes the checks a 0.45 start
+  makes. This Mac runs 0.45.0, and the local medlabs server keeps 0.44.2
+  until it restarts.
 - **Port to DuckDB's reworked v2 C API**, then set the `DUCKDB_LIB_BUILD`
   repository variable to `latest`. "The engine" above has the measured size
   of the port and what it waits for.
