@@ -1557,132 +1557,43 @@ fn shared_gutter_max(top: u64, bottom: u64) -> u64 {
     top.max(bottom)
 }
 
-/// The statements of the buffer, in order. A tiny lexer, not a parser:
-/// it only needs to know what a boundary does NOT end — strings
-/// (''-doubled, and e'…' backslash-escaped), quoted identifiers, both
-/// comment forms (block comments nest, as in the engine), and
-/// dollar-quoted bodies (`$$…$$` and tagged `$tag$…$tag$`).
+/// The statements of the buffer, in order, cut where the engine's own
+/// parser would cut: at a top-level `;`, read from the spans of the one
+/// lexer the server and Harbor's own client use (`wire::scan`), so strings,
+/// quoted names, both comment forms and dollar quotes end where the engine
+/// ends them.
 ///
-/// ONE boundary exists (the semicolon ruling, 2026-08-31): a top-level
-/// `;` — the same authority DuckDB's own parser answers to, and the
-/// same mark that closes a statement's band in the gutter. Blank lines
-/// never divide: DuckDB's FROM-first syntax makes every keyword
-/// heuristic lie eventually (`from 22` IS a statement), and a wrong
-/// split can leave a runnable prefix — `delete from orders` above a
-/// pondered `where` clause must never become sendable on its own. A
-/// wrong merge, by contrast, is a loud syntax error. So scribble
-/// freely; the `;` says "done", splits the thought, and closes its
+/// ONE boundary exists: a top-level `;`, the same mark that closes a
+/// statement's band in the gutter. Blank lines never divide: DuckDB's
+/// FROM-first syntax makes every keyword heuristic lie eventually (`from 22`
+/// IS a statement), and a wrong split can leave a runnable prefix — `delete
+/// from orders` above a pondered `where` clause must never become sendable
+/// on its own. A wrong merge, by contrast, is a loud syntax error. So
+/// scribble freely; the `;` says "done", splits the thought, and closes its
 /// band in one keystroke.
 fn split_statements(text: &str) -> Vec<Stmt> {
+    use wire::scan::Kind;
     let bytes = text.as_bytes();
-    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let spans = wire::scan::scan(text);
     let mut raw: Vec<(std::ops::Range<usize>, usize, bool)> = Vec::new();
     let mut start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' | b'"' => {
-                let quote = bytes[i];
-                // e'…' escapes with backslashes; a plain '…' does not.
-                let estring = quote == b'\''
-                    && i > 0
-                    && matches!(bytes[i - 1], b'e' | b'E')
-                    && (i < 2 || !ident(bytes[i - 2]));
-                i += 1;
-                while i < bytes.len() {
-                    if estring && bytes[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == quote {
-                        // '' and "" are escapes, not terminators.
-                        if bytes.get(i + 1) == Some(&quote) {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-                continue;
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                // Block comments NEST (Postgres heritage): the first
-                // `*/` may close an inner comment, not this one.
-                let mut depth = 1usize;
-                i += 2;
-                while i + 1 < bytes.len() && depth > 0 {
-                    if bytes[i] == b'/' && bytes[i + 1] == b'*' {
-                        depth += 1;
-                        i += 2;
-                    } else if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                        depth -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                if depth > 0 {
-                    // Unterminated: the comment owns the rest of the
-                    // buffer — its final byte included (the loop's
-                    // two-byte window never examines it).
-                    i = bytes.len();
-                }
-                continue;
-            }
-            b'$' => {
-                // A dollar-quote delimiter is `$tag$` where tag is a
-                // (possibly empty) identifier not starting with a
-                // digit — `$1` is a parameter, not a quote. The body
-                // runs to the EXACT same delimiter.
-                let mut j = i + 1;
-                while j < bytes.len() && ident(bytes[j]) {
-                    j += 1;
-                }
-                if j < bytes.len() && bytes[j] == b'$' && !bytes[i + 1].is_ascii_digit() {
-                    let delim = &bytes[i..=j];
-                    let body = j + 1;
-                    i = match bytes[body..]
-                        .windows(delim.len())
-                        .position(|w| w == delim)
-                    {
-                        Some(k) => body + k + delim.len(),
-                        None => bytes.len(),
-                    };
-                    continue;
-                }
-            }
-            b';' => {
-                // The terminator BELONGS to its statement (Steve's
-                // ruling): a `;` on its own line is the statement's
-                // last row, not a stray gap row outside the band. So
-                // does a same-line trailing `-- comment` — the
-                // annotation rides the statement it annotates.
-                let payload_end = i;
-                let mut j = i + 1;
-                while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
-                    j += 1;
-                }
-                if bytes.get(j) == Some(&b'-') && bytes.get(j + 1) == Some(&b'-') {
-                    while j < bytes.len() && bytes[j] != b'\n' {
-                        j += 1;
-                    }
-                } else {
-                    j = i + 1;
-                }
-                raw.push((start..j, payload_end, true));
-                start = j;
-                i = j;
-                continue;
-            }
-            _ => {}
-        }
-        i += 1;
+    let semicolons = spans
+        .iter()
+        .filter(|s| s.kind == Kind::Code)
+        .flat_map(|s| (s.start..s.end).filter(|&i| bytes[i] == b';'));
+    for i in semicolons {
+        // The terminator BELONGS to its statement: a `;` on its own line is
+        // the statement's last row, not a stray gap row outside the band.
+        // So does a same-line trailing `-- comment`: the annotation rides
+        // the statement it annotates.
+        let after = i + 1 + bytes[i + 1..].iter().take_while(|&&b| matches!(b, b' ' | b'\t')).count();
+        let end = spans
+            .binary_search_by_key(&after, |s| s.start)
+            .ok()
+            .filter(|&at| spans[at].kind == Kind::LineComment)
+            .map_or(i + 1, |at| spans[at].end);
+        raw.push((start..end, i, true));
+        start = end;
     }
     if start < bytes.len() {
         raw.push((start..bytes.len(), bytes.len(), false));
@@ -1871,6 +1782,15 @@ mod tests {
         );
         // e-strings escape with backslashes: the \' is content.
         assert_eq!(split(r"SELECT e'\';' ;"), [r"SELECT e'\';' ;"]);
+        // The splitter reads the lexer the engine-facing readers share
+        // (`wire::scan`): a CR ends a `--` comment, as it does for the
+        // engine, so two statements behind one are two payloads.
+        assert_eq!(split("-- note\rSELECT 1; SELECT 2;"), ["-- note\rSELECT 1;", "SELECT 2;"]);
+        // `$` continues a word, so `a$b$c` is one identifier, not a quote
+        // that would swallow the `;` after it.
+        assert_eq!(split("SELECT a$b$c; SELECT 2;"), ["SELECT a$b$c;", "SELECT 2;"]);
+        // And a trailing comment cut by a CR rides the statement above.
+        assert_eq!(split("SELECT 1; -- c\rSELECT 2;"), ["SELECT 1; -- c", "SELECT 2;"]);
     }
 
     #[test]

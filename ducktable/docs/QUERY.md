@@ -73,8 +73,9 @@ moves with the caret in the same frame.
 
 **Splitting** happens in the client, because the wire takes one statement per
 request, and there is one boundary: a top-level `;`, aware of quotes, comments
-and dollar quotes, exactly where the engine's own parser would cut. Blank lines
-never divide: FROM-first syntax makes every keyword heuristic lie eventually,
+and dollar quotes, exactly where the engine's own parser would cut, read with
+the one lexer Harbor's server and client use (`wire::scan`). Blank lines never
+divide: FROM-first syntax makes every keyword heuristic lie eventually,
 and a wrong split can leave a runnable prefix. The terminator belongs to its
 statement, and the payload sheds it along with any same-line trailing comment.
 
