@@ -300,7 +300,10 @@ corner, and neither a page flip nor a table switch moves a click target. The
 column count sits beside the row range it describes.
 
 The filter is one raw SQL `WHERE` strip under the header, applied on Enter,
-which refetches page 1 with a fresh count.
+which refetches page 1 with a fresh count. An `ORDER BY` that ends it sorts
+the pages (`x > 0 ORDER BY name`, or `ORDER BY name` alone); the grid has no
+sort of its own. The condition is wrapped in parentheses and the ordering
+follows them, so the strip cannot reach past the page's `LIMIT`.
 
 ### Inspector
 
