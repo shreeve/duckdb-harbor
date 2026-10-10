@@ -1,6 +1,7 @@
 //! DuckDB keywords, vendored from the PEG grammar keyword lists
-//! (src/parser/peg/grammar/keywords/*.list) at duckdb f8e1c96a53.
-//! Regenerate with scripts/sync-keywords. Sorted for binary search.
+//! (src/parser/peg/grammar/keywords/*.list) at duckdb f8e1c96a53: every
+//! word in them, upper-cased, de-duplicated and sorted, one to a line.
+//! Sorted for binary search, which the test below holds it to.
 
 pub const KEYWORDS: &[&str] = &[
     "ABORT",
@@ -502,3 +503,11 @@ pub const KEYWORDS: &[&str] = &[
     "YES",
     "ZONE",
 ];
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_keywords_are_sorted_for_binary_search() {
+        assert!(super::KEYWORDS.windows(2).all(|w| w[0] < w[1]));
+    }
+}

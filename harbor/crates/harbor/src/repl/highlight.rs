@@ -1,6 +1,6 @@
 //! Live syntax highlighting (tier 1): a lexical pass, no
-//! grammar. Colors come from the active theme (theme.rs) — resolved once at
-//! startup for the terminal's light/dark background and switchable live with
+//! grammar. Colors come from the active theme (theme.rs) — set at startup
+//! for the terminal's light/dark background and switchable live with
 //! `.theme`/`.appearance`. The default `duck` theme follows the duckdb shell:
 //! keywords green, literals yellow, comments dim, unterminated literals red.
 //! String/comment/dollar-quote boundaries come from the shared scanner
@@ -136,7 +136,7 @@ mod tests {
         // unterminated string goes red
         let s = spans("SELECT 'oops");
         assert_eq!(s.last().unwrap().0, Some(Color::Red));
-        // dollar-quotes are literals (the old scanner missed these)
+        // dollar-quotes are literals
         let s = spans("SELECT $t$ hi $t$;");
         assert_eq!(s.iter().find(|(_, t)| t == "$t$ hi $t$").unwrap().0, Some(Color::Yellow));
         // reconstruction: spans concatenate back to the source line
@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn multibyte_never_panics_and_reconstructs() {
-        // These inputs panicked the old byte-sliced highlighter.
+        // Multi-byte characters around words and quotes.
         for line in ["SELECT tあ", "SELECT “x”", "SELECT ‘x’", "sélect café", "a€b"] {
             let joined: String = spans(line).into_iter().map(|(_, t)| t).collect();
             assert_eq!(joined, line);
