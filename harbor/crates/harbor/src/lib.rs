@@ -256,8 +256,11 @@ struct SlotRun {
     cancelled: bool,
     /// When this statement must stop, if anything asked for a limit.
     deadline: Option<Instant>,
-    /// When this worker began handling an HTTP request, whether or not that
-    /// request has become a statement yet.
+    /// While this worker handles an HTTP request with no statement of its
+    /// own running, when it counts as wedged: `WEDGED_REQUEST_AGE` after it
+    /// took the request, or `WEDGED_STATEMENT_AGE` after it handed the
+    /// statement to a session's connection, where it waits as a worker
+    /// running one does.
     ///
     /// A worker reading a request body has no job — `job` is still 0 — so to
     /// the probe thread it looked idle while being entirely stuck. That is not
@@ -265,7 +268,7 @@ struct SlotRun {
     /// worked by occupying workers BEFORE the statement starts, and the one
     /// thread whose purpose is staying reachable under saturation sat every
     /// one of them out because it was only ever looking at statements.
-    request: Option<Instant>,
+    wedged_at: Option<Instant>,
 }
 
 /// What a cancel request should do, decided from bookkeeping alone, so the
@@ -282,7 +285,7 @@ enum Cancel {
 
 impl SlotRun {
     fn idle() -> Self {
-        SlotRun { job: 0, last: 0, started: Instant::now(), pending: None, cancelled: false, deadline: None, request: None }
+        SlotRun { job: 0, last: 0, started: Instant::now(), pending: None, cancelled: false, deadline: None, wedged_at: None }
     }
 
     /// Claim this slot for `job`. Returns true when the statement was already
@@ -1611,7 +1614,7 @@ fn probe_worker(server: Arc<Server>, stop: Arc<AtomicBool>, log: bool) {
         // this thread exists for, and statement age is what tells the two
         // apart. (Verified against the stress suite: 16 fast clients, zero
         // sheds; 6 slow scans, probe live within a quarter second.)
-        if !workers_wedged(Duration::from_millis(250)) {
+        if !workers_wedged() {
             thread::sleep(Duration::from_millis(25));
             continue;
         }
@@ -1663,6 +1666,10 @@ fn run_ready_control(req: Request) -> (bool, u16) {
     (true, respond_ready(req, ok, "not ready"))
 }
 
+/// How long a worker's statement must have run, on its own connection or on
+/// a session's, before the worker counts as wedged.
+const WEDGED_STATEMENT_AGE: Duration = Duration::from_millis(250);
+
 /// How long a worker must be stuck on a request that has NOT become a
 /// statement before it counts as wedged.
 ///
@@ -1683,14 +1690,14 @@ const WEDGED_REQUEST_AGE: Duration = Duration::from_secs(5);
 /// has no job, and six such workers are a berth that answers nothing. A worker
 /// is occupied from the moment it picks up a request; whether that request
 /// ever reaches DuckDB is a distinction the load balancer does not care about.
-fn workers_wedged(min_age: Duration) -> bool {
+fn workers_wedged() -> bool {
     let slots = WORKER_SLOTS.lock().unwrap();
     !slots.is_empty()
         && slots.iter().all(|s| {
             let run = s.run.lock().unwrap();
             match run.job != 0 {
-                true => run.started.elapsed() >= min_age,
-                false => run.request.is_some_and(|t| t.elapsed() >= WEDGED_REQUEST_AGE),
+                true => run.started.elapsed() >= WEDGED_STATEMENT_AGE,
+                false => run.wedged_at.is_some_and(|t| Instant::now() >= t),
             }
         })
 }
@@ -2049,14 +2056,14 @@ struct OnRequest<'a> {
 
 impl<'a> OnRequest<'a> {
     fn enter(slot: &'a Arc<SlotState>) -> Self {
-        slot.run.lock().unwrap().request = Some(Instant::now());
+        slot.run.lock().unwrap().wedged_at = Some(Instant::now() + WEDGED_REQUEST_AGE);
         OnRequest { slot }
     }
 }
 
 impl Drop for OnRequest<'_> {
     fn drop(&mut self) {
-        self.slot.run.lock().unwrap().request = None;
+        self.slot.run.lock().unwrap().wedged_at = None;
     }
 }
 
@@ -3271,6 +3278,12 @@ fn run_sql(req: Request, mut parsed: SqlRequest, pooled: Option<Executor>) -> (b
             return refuse(req, Refusal { status: 503, code: code::UNAVAILABLE, message: "this session is gone".into() });
         }
         return (false, refuse(req, Refusal::not_serving()).1);
+    }
+    // A worker that waits on a session's statement is as busy as one running
+    // its own, and the probe lane, which answers the session's renewals,
+    // takes over from the same age.
+    if let (Some(_), Some((_, worker))) = (&claim, pooled) {
+        worker.run.lock().unwrap().wedged_at = Some(Instant::now() + WEDGED_STATEMENT_AGE);
     }
 
     let mut watch = Watch::new(Some(req.peer()), Arc::clone(slot), id);
