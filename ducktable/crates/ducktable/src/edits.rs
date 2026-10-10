@@ -275,7 +275,7 @@ pub enum CommitOutcome {
 /// `400 sql_error`, Harbor's answer too for a COMMIT of a transaction an
 /// earlier error aborted, which it rolls back and says so; and a `499
 /// cancelled`, since a COMMIT runs to its answer and a cancel lands before
-/// it starts or not at all (Harbor 0.44.2, the floor DuckTable requires).
+/// it starts or not at all (Harbor 0.44.2, the floor `app::connect` keeps).
 /// In doubt: no answer, Harbor's `500 internal`, which it sends for a
 /// statement the engine had already run, and any code this client does not
 /// know, since nothing is assumed not to have run.
@@ -285,14 +285,27 @@ pub fn commit_outcome(failure: Option<&harbor_client::Failure>) -> CommitOutcome
         None => CommitOutcome::Landed,
         Some(Failure::Unsent(_)) => CommitOutcome::NotLanded,
         Some(Failure::Unanswered(_)) => CommitOutcome::InDoubt,
-        Some(Failure::Refused { code, .. }) => match code.as_str() {
-            "sql_error" | "cancelled" | "bad_request" | "not_found" | "forbidden" | "body_too_large"
-            | "no_such_session" | "session_busy" | "query_id_in_use" | "no_lease_connections"
-            | "no_lease_available" | "unavailable" | "unready" => CommitOutcome::NotLanded,
-            _ => CommitOutcome::InDoubt,
-        },
+        Some(Failure::Refused { code, .. }) if NOT_LANDED.contains(&code.as_str()) => CommitOutcome::NotLanded,
+        Some(Failure::Refused { .. }) => CommitOutcome::InDoubt,
     }
 }
+
+/// The codes a COMMIT is refused with when nothing since BEGIN was kept.
+const NOT_LANDED: [&str; 13] = [
+    wire::code::SQL_ERROR,
+    wire::code::CANCELLED,
+    wire::code::BAD_REQUEST,
+    wire::code::NOT_FOUND,
+    wire::code::FORBIDDEN,
+    wire::code::BODY_TOO_LARGE,
+    wire::code::NO_SUCH_SESSION,
+    wire::code::SESSION_BUSY,
+    wire::code::QUERY_ID_IN_USE,
+    wire::code::NO_LEASE_CONNECTIONS,
+    wire::code::NO_LEASE_AVAILABLE,
+    wire::code::UNAVAILABLE,
+    wire::code::UNREADY,
+];
 
 /// A row identity's map key: its canonical JSON. Values compare by
 /// serialization, which is exactly the equality the wire speaks.
@@ -803,15 +816,20 @@ impl Edits {
     /// binds the ORIGINAL key values for existing rows.
     ///
     /// The order is what lets a set commit whatever keys it moves, since
-    /// the engine checks a key as each statement runs. Duplicates come
-    /// first: one with `Bind::Source` cells selects them from its source
-    /// row, so the engine copies what the wire could not carry, and that
-    /// row is read as the database holds it, whatever else is staged on it;
-    /// a source row that is gone returns no row, which commit refuses. Then
-    /// deletes, which free their keys; then updates, each after the one
-    /// whose key it takes (`claim_order`); then new rows, which may take a
-    /// key either of those freed. A delete of 7 and a re-key of 3 to 7 runs
-    /// in that order, and so does a new row keyed 5 beside a delete of 5.
+    /// the engine checks a key as each statement runs. A duplicate with
+    /// `Bind::Source` cells selects them from its source row, so the engine
+    /// copies what the wire could not carry, and that row is read as the
+    /// database holds it, whatever else is staged on it; a source row that
+    /// is gone returns no row, which commit refuses. So a duplicate of a row
+    /// the set updates or deletes comes first, before its source changes.
+    /// Then deletes, which free their keys; then updates, each after the
+    /// one whose key it takes (`claim_order`); then the other duplicates,
+    /// whose sources read the same at any point, and new rows, which may
+    /// take a key any of those freed. A delete of 7 and a re-key of 3 to 7
+    /// runs in that order, and so does a new row, or a duplicate of an
+    /// untouched row, keyed 7 beside a delete of 7. A duplicate of a row the
+    /// set changes cannot take a key the set frees: it runs before the key
+    /// is free, and the engine refuses it.
     ///
     /// A held set (`in_doubt`) yields none: it may already be in the
     /// database, and is not sent again until it has been staged again.
@@ -837,8 +855,8 @@ impl Edits {
                 .join(" AND ");
             (self.source.clone(), clause)
         };
-        let (mut duplicates, mut deletes, mut updates, mut inserts) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut duplicates, mut deletes, mut updates, mut copies_late, mut inserts) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         // Each update's key before and after, for `claim_order`.
         let mut moves = Vec::new();
         for (key, identity, change) in self.entries() {
@@ -871,7 +889,11 @@ impl Edits {
                         format!("INSERT INTO {} ({names}) VALUES ({supplied}) RETURNING *", self.source)
                     };
                     let stmt = Statement { sql, params, expectation: StatementExpectation::ReturnedOne };
-                    if copies { duplicates.push(stmt) } else { inserts.push(stmt) }
+                    match (copies, self.changes.get(&key_of(identity)).map(|e| &e.change)) {
+                        (true, Some(RowChange::Update(_) | RowChange::Delete)) => duplicates.push(stmt),
+                        (true, _) => copies_late.push(stmt),
+                        (false, _) => inserts.push(stmt),
+                    }
                 }
                 RowChange::Update(cells) => {
                     let set = cells
@@ -898,11 +920,16 @@ impl Edits {
         }
         let mut updates: Vec<Option<Statement>> = updates.into_iter().map(Some).collect();
         let updates = claim_order(&moves).into_iter().filter_map(|ix| updates[ix].take());
-        duplicates.into_iter().chain(deletes).chain(updates).chain(inserts).collect()
+        duplicates.into_iter().chain(deletes).chain(updates).chain(copies_late).chain(inserts).collect()
     }
 
     /// The key an update gives its row, as `key_of` spells it, when the
     /// update changes a key column. A table keyed by rowid moves no key.
+    /// The typed value is compared as bound, not as the engine stores it, so
+    /// a key typed in another spelling than the wire's (a DATE, a DECIMAL's
+    /// `1.5` for `1.50`) is not seen to take another row's key, and a chain
+    /// of such moves may run out of order and be refused (EDITING.md,
+    /// "Commit").
     fn moved_key(&self, identity: &[Value], cells: &BTreeMap<usize, CellEdit>) -> Option<String> {
         if self.by_rowid {
             return None;
@@ -1479,9 +1506,35 @@ fn check_json(text: &str, variant: bool) -> Result<(), String> {
         false => serde_json::from_str::<serde::de::IgnoredAny>(text).map(drop),
     };
     match parsed {
+        Ok(()) if lone_surrogate(text) => {
+            Err(format!("{text:?} is not JSON \u{2014} a \\u escape names half a surrogate pair"))
+        }
         Ok(()) => Ok(()),
         Err(_) => Err(format!("{text:?} is not JSON \u{2014} text needs quotes, like \"Morel\"")),
     }
+}
+
+/// Whether a `\u` escape in `text` names half of a surrogate pair alone.
+/// serde passes over an escape it is not asked to build, and the engine's
+/// JSON refuses one (measured: `'"\ud800"'::JSON` fails, and so do a low
+/// half first and a high half before anything but a low one).
+fn lone_surrogate(text: &str) -> bool {
+    let b = text.as_bytes();
+    let unit = |i: usize| {
+        let hex = b.get(i..i + 6).filter(|e| e.starts_with(b"\\u"))?;
+        u16::from_str_radix(std::str::from_utf8(&hex[2..]).ok()?, 16).ok()
+    };
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], unit(i)) {
+            (_, Some(0xD800..=0xDBFF)) if matches!(unit(i + 6), Some(0xDC00..=0xDFFF)) => i += 12,
+            (_, Some(0xD800..=0xDFFF)) => return true,
+            // Any other escape, `\\` among them, passes as its two bytes.
+            (b'\\', _) => i += 2,
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 /// The most brackets open at once in `text`, outside any string.
@@ -1713,6 +1766,22 @@ mod tests {
             plan(&e),
             vec![verb("INSERT", 8), verb("INSERT", 5), verb("DELETE", 8), verb("UPDATE", 5)]
         );
+
+        // A duplicate of a row the set leaves alone reads it the same at
+        // any point, so it runs after the deletes and updates and may take
+        // a key they free: row 1 copied as id 7 beside a delete of 7, and as
+        // id 8 beside a re-key of 8 to 9.
+        let mut e = edits();
+        e.stage_duplicate(vec![json!(1)], vec![(0, txt("7"), Bind::Value(json!(7))), (1, txt("a"), Bind::Source)]);
+        e.stage_delete(vec![json!(7)]);
+        e.stage_duplicate(vec![json!(1)], vec![(0, txt("8"), Bind::Value(json!(8))), (1, txt("a"), Bind::Source)]);
+        e.stage_cell(vec![json!(8)], 0, txt("8"), txt("9"), json!(9));
+        assert_eq!(
+            plan(&e),
+            vec![verb("DELETE", 7), verb("UPDATE", 8), verb("INSERT", 1), verb("INSERT", 1)]
+        );
+        let stmts = e.statements();
+        assert_eq!((stmts[2].params[0].clone(), stmts[3].params[0].clone()), (json!(7), json!(8)));
 
         // A composite key moves when any of its columns does.
         let mut e = Edits::new(
@@ -2003,14 +2072,14 @@ mod tests {
         e.stage_duplicate(vec![json!(0.5), json!(0.5)], vec![(3, txt("a"), Bind::Source)]);
         let stmts = e.statements();
         let key = "WHERE \"k\" = ?::FLOAT AND \"d\" = ?";
+        assert_eq!(stmts[0].sql, format!("DELETE FROM \"main\".\"t\" {key}"));
+        assert_eq!(stmts[1].sql, format!("UPDATE \"main\".\"t\" SET \"k\" = ?, \"f\" = ? {key}"));
+        assert_eq!(stmts[1].params, vec![json!(2.2), json!(0.2), json!(1.1), json!(1.1)]);
         assert_eq!(
-            stmts[0].sql,
+            stmts[2].sql,
             format!("INSERT INTO \"main\".\"t\" (\"name\") SELECT \"name\" FROM \"main\".\"t\" {key} RETURNING *")
         );
-        assert_eq!(stmts[0].params, vec![json!(0.5), json!(0.5)]);
-        assert_eq!(stmts[1].sql, format!("DELETE FROM \"main\".\"t\" {key}"));
-        assert_eq!(stmts[2].sql, format!("UPDATE \"main\".\"t\" SET \"k\" = ?, \"f\" = ? {key}"));
-        assert_eq!(stmts[2].params, vec![json!(2.2), json!(0.2), json!(1.1), json!(1.1)]);
+        assert_eq!(stmts[2].params, vec![json!(0.5), json!(0.5)]);
 
         for ty in ["FLOAT", "float", "REAL", "FLOAT4"] {
             assert_eq!(key_placeholder_for(ty), "?::FLOAT", "{ty}");
@@ -2079,6 +2148,15 @@ mod tests {
             match ty.eq_ignore_ascii_case("VARIANT") {
                 true => assert!(parse_value(wide, ty).unwrap_err().contains("is not JSON"), "{ty}"),
                 false => assert_eq!(parse_value(wide, ty), Ok(json!(wide)), "{ty}"),
+            }
+            // Half a surrogate pair alone is refused, as the engine's JSON
+            // refuses it; a whole pair and an escaped backslash are not.
+            for text in [r#""\ud800""#, r#"{"a":"\udc00x"}"#, r#""\uD800A""#, r#""x\uDBFF""#] {
+                let err = parse_value(text, ty).unwrap_err();
+                assert!(err.contains("is not JSON"), "{ty} {text}: {err}");
+            }
+            for text in [r#""😀""#, r#""\\ud800""#, r#""􏿿""#, r#""A""#] {
+                assert_eq!(parse_value(text, ty), Ok(json!(text)), "{ty} {text}");
             }
 
             // A document nests 100 levels and no deeper, and says so.
@@ -3008,17 +3086,13 @@ mod tests {
         // engine (a rolled-back COMMIT of an aborted transaction among
         // them), or cancelled before it started: nothing was kept.
         assert_eq!(commit_outcome(Some(&Failure::Unsent("refused".into()))), CommitOutcome::NotLanded);
-        for code in [
-            "sql_error", "cancelled", "no_such_session", "session_busy", "unavailable", "unready",
-            "bad_request", "forbidden", "body_too_large", "not_found", "query_id_in_use",
-            "no_lease_connections", "no_lease_available",
-        ] {
+        for code in NOT_LANDED {
             assert_eq!(commit_outcome(Some(&refused(code))), CommitOutcome::NotLanded, "{code}");
         }
         // No answer, an error after the engine ran it, or a code this client
         // does not know: it may have landed.
         assert_eq!(commit_outcome(Some(&Failure::Unanswered("timed out".into()))), CommitOutcome::InDoubt);
-        for code in ["internal", "response_too_large", "some_later_code"] {
+        for code in [wire::code::INTERNAL, wire::code::RESPONSE_TOO_LARGE, "some_later_code"] {
             assert_eq!(commit_outcome(Some(&refused(code))), CommitOutcome::InDoubt, "{code}");
         }
     }

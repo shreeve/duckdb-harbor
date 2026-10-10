@@ -31,7 +31,8 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
   DuckTable reads a `COMMIT`'s answer as Harbor 0.44.2 gives it: a `COMMIT`
   of an aborted transaction is rolled back and answered `400` saying so, and
   a `COMMIT` runs to its answer, so a `499` means nothing was kept. Older
-  servers answer neither way, and DuckTable requires that one or later.
+  servers answer neither way, so DuckTable refuses to connect to one: the
+  failed-connect card names the version `/info` reports and the floor.
 - **A berth is a file on this machine or a named remote.** Connection works
   the way `harbor`'s own does: a local database is dialed by its file, whose
   server Harbor's socket discovery finds and opening it spawns on demand, and
@@ -53,9 +54,10 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
   to that machine's Harbor loopback port, and keeps the tunnel inside the
   connection's reference-counted lifetime. No survey opens
   SSH; selecting the database does. The last connection clone kills and reaps
-  the process. `-S none` makes that process the owner, `BatchMode=yes` keeps
-  failures visible rather than interactive, and SSH keepalives detect a dead
-  path.
+  the process, and a quit closes every tunnel still open, process and socket.
+  A launch removes the sockets of tunnels whose app is not running.
+  `-S none` makes that process the owner, `BatchMode=yes` keeps failures
+  visible rather than interactive, and SSH keepalives detect a dead path.
 - **A connected berth is kept alive by presence, not pulses.** A held
   connection is the keepalive. The lifetime rule is Harbor's own: one `start`
   verb, two lifetimes. A plain start is persistent and runs until stopped; an
@@ -300,7 +302,10 @@ corner, and neither a page flip nor a table switch moves a click target. The
 column count sits beside the row range it describes.
 
 The filter is one raw SQL `WHERE` strip under the header, applied on Enter,
-which refetches page 1 with a fresh count.
+which refetches page 1 with a fresh count. An `ORDER BY` that ends it sorts
+the pages (`x > 0 ORDER BY name`, or `ORDER BY name` alone); the grid has no
+sort of its own. The condition is wrapped in parentheses and the ordering
+follows them, so the strip cannot reach past the page's `LIMIT`.
 
 ### Inspector
 

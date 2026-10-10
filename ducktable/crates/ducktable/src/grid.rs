@@ -132,6 +132,10 @@ pub(crate) struct Grid {
     /// lands, the rows on screen carry the identities they were fetched
     /// with, and a commit that re-keyed a row has made those stale.
     pub(crate) committing: bool,
+    /// Another table's first page is on its way to replace this grid
+    /// (`app::select_table`). Like a page of its own on its way, it keeps
+    /// editors shut until it lands (`open_editor`).
+    pub(crate) replacing: bool,
     /// The commit has answered and its page fetch is in flight; what the
     /// fetch's landing settles (`settle_commit`).
     post_commit: Option<PostCommit>,
@@ -735,6 +739,7 @@ impl Grid {
             parked: None,
             reshaped: false,
             committing: false,
+            replacing: false,
             post_commit: None,
             unrefreshed: false,
             commit_session: Default::default(),
@@ -819,22 +824,15 @@ impl Grid {
                 // The page query answered, whether its page is kept or
                 // dropped below: the database was read at this moment.
                 let read = outcome.is_ok();
-                let result = match outcome {
-                    // Edits staged against the columns on screen are keyed
-                    // and typed by them. They are not rebound to the table's
-                    // present shape, and its rows do not fit the view they
-                    // live in: the page is dropped and the view stays.
-                    Ok(_) if reshaped && grid.edits.as_ref().is_some_and(Edits::any_staged) => {
+                let staged = grid.edits.as_ref().is_some_and(Edits::any_staged);
+                let result = match (outcome, landing(grid.editor.is_some(), reshaped, staged)) {
+                    (Ok(_), Landing::Dropped) => None,
+                    (Ok(_), Landing::Reshaped) => {
                         grid.reshaped = true;
                         grid.error = stale_reason(true, false, grid.in_doubt()).map(str::to_string);
                         None
                     }
-                    // Text typed while the page was on its way is confirmed
-                    // against the page it was typed on, whose identities the
-                    // delegate still holds. Text the column refuses keeps the
-                    // editor, the reason and that page.
-                    Ok(_) if !grid.settle_editor(cx) => None,
-                    Ok((result, total)) => {
+                    (Ok((result, total)), Landing::Shown) => {
                         grid.reshaped = false;
                         grid.unrefreshed = false;
                         grid.error = None;
@@ -849,7 +847,7 @@ impl Grid {
                         grid.last_time_ms = result.time_ms;
                         Some(result)
                     }
-                    Err(message) => {
+                    (Err(message), _) => {
                         grid.error = Some(message);
                         None
                     }
@@ -1868,8 +1866,16 @@ impl Grid {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A read-only grid says why in the footer, not with a beep.
-        if self.edits.is_none() || self.committing || self.refuse_stale(cx) || self.refuse_generated(col, cx) {
+        // A read-only grid says why in the footer, not with a beep. While a
+        // page is on its way, the key is let go as it is during a commit:
+        // text typed then would belong to rows about to leave the screen.
+        if self.edits.is_none()
+            || self.committing
+            || self.replacing
+            || self.table.read(cx).delegate().loading
+            || self.refuse_stale(cx)
+            || self.refuse_generated(col, cx)
+        {
             return;
         }
         let (original, deleted) = {
@@ -4185,7 +4191,8 @@ enum Committed {
     /// Nothing landed: a statement failed or was refused, and releasing the
     /// session rolled the transaction back. The reason.
     Refused(String),
-    /// The COMMIT was sent and no verdict came back. The reason.
+    /// The COMMIT was sent and no verdict came back: no answer, or one that
+    /// does not settle it. What came, as the status line says it.
     InDoubt(String),
 }
 
@@ -4194,9 +4201,11 @@ enum Committed {
 enum PostCommit {
     /// The commit landed and the staged set is cleared.
     Landed,
-    /// The COMMIT got no answer; the staged set is kept, and held.
-    /// `unsettled` is the commit's session when it was not seen to be over
-    /// before the page was read: the commit may still be running.
+    /// The COMMIT got no answer, or one that does not say whether it
+    /// landed; the staged set is kept, and held. `message` says which, as
+    /// the status line begins (`commit_verdict`). `unsettled` is the
+    /// commit's session when it was not seen to be over before the page
+    /// was read: the commit may still be running.
     InDoubt { message: String, unsettled: Option<String> },
 }
 
@@ -4326,7 +4335,14 @@ fn commit_verdict(answer: Result<harbor_client::QueryResult, harbor_client::Fail
     match edits::commit_outcome(failure.as_ref()) {
         edits::CommitOutcome::Landed => Committed::Landed,
         edits::CommitOutcome::NotLanded => Committed::Refused(message),
-        edits::CommitOutcome::InDoubt => Committed::InDoubt(message),
+        // Harbor's `internal`, or a code this client does not know, is an
+        // answer that does not settle the outcome: it is not called none.
+        edits::CommitOutcome::InDoubt => Committed::InDoubt(match failure {
+            Some(harbor_client::Failure::Refused { .. }) => {
+                format!("COMMIT was answered ({message}), but not with whether it landed")
+            }
+            _ => format!("COMMIT got no answer ({message})"),
+        }),
     }
 }
 
@@ -4342,25 +4358,25 @@ fn commit_status(after: &PostCommit, page: Page) -> Option<String> {
              what was typed, not what the database stored · refresh (⌘R) before editing"
         )),
         (PostCommit::InDoubt { message, unsettled: None }, Page::Read) => Some(format!(
-            "COMMIT got no answer ({message}), so the changes may or may not have landed · the \
+            "{message}, so the changes may or may not have landed · the \
              commit is over, and this page was read after it · {HELD}"
         )),
         (PostCommit::InDoubt { message, unsettled: Some(_) }, Page::Read) => Some(format!(
-            "COMMIT got no answer ({message}) and may still be running, so this page may not \
+            "{message} and may still be running, so this page may not \
              show its outcome yet · the staged changes are held, off the page · refresh (⌘R) \
              until the commit is over"
         )),
         (PostCommit::InDoubt { message, unsettled: None }, Page::Reshaped) => Some(format!(
-            "COMMIT got no answer ({message}), so the changes may or may not have landed · \
+            "{message}, so the changes may or may not have landed · \
              {HELD_RESHAPED}"
         )),
         (PostCommit::InDoubt { message, unsettled: Some(_) }, Page::Reshaped) => Some(format!(
-            "COMMIT got no answer ({message}) and may still be running · this table’s columns \
+            "{message} and may still be running · this table’s columns \
              changed in the database, so the staged changes are held and cannot be staged again \
              · refresh (⌘R) until the commit is over, then click the count and discard them all"
         )),
         (PostCommit::InDoubt { message, .. }, Page::Failed(why)) => Some(format!(
-            "COMMIT got no answer ({message}), so the changes may or may not have landed, and \
+            "{message}, so the changes may or may not have landed, and \
              this page could not be read again ({why}) · the staged changes are held, off the \
              page · refresh (⌘R)"
         )),
@@ -4408,6 +4424,37 @@ fn orphaned(staged: usize) -> String {
 /// names and the same DuckDB types, in the same order. The types decide how
 /// every staged value is bound (`edits::placeholder_for`) and the names
 /// decide where, so a page that differs in either is another table's.
+/// What a page that answered does when it lands.
+#[derive(Debug, PartialEq)]
+enum Landing {
+    /// It is dropped, and the view stays as it is.
+    Dropped,
+    /// It is dropped, and the view stays, refusing to stage or commit
+    /// until its staged set is gone (`reshaped`).
+    Reshaped,
+    /// It replaces the page on screen, and a reshaped table's columns
+    /// with it.
+    Shown,
+}
+
+/// How a page lands, with an editor open or not, from a table that has
+/// other columns than the grid's or not, over staged changes or not. Every
+/// fetch begins with no editor open (`settle_editor`) and none opens while
+/// one is on its way (`open_editor`); were one open, its text would be
+/// neither confirmed unasked nor dropped: the page is, and the editor keeps
+/// the rows it was opened on. That comes first, so text in an editor is
+/// never staged into a set that a reshaped table's adoption then replaces.
+/// Edits staged against the columns on screen are keyed and typed by them:
+/// they are not rebound to the table's present shape, and its rows do not
+/// fit the view they live in.
+fn landing(editing: bool, reshaped: bool, staged: bool) -> Landing {
+    match (editing, reshaped && staged) {
+        (true, _) => Landing::Dropped,
+        (false, true) => Landing::Reshaped,
+        (false, false) => Landing::Shown,
+    }
+}
+
 fn same_columns(have: &[wire::Column], page: &[wire::Column]) -> bool {
     have.len() == page.len()
         && have
@@ -4953,16 +5000,35 @@ mod tests {
         // A cancel lands before a COMMIT starts or not at all.
         let cancelled = Failure::Refused { code: "cancelled".into(), message: "cancelled".into() };
         assert!(matches!(commit_verdict(Err(cancelled)), Committed::Refused(_)));
-        // Harbor's internal error comes after the engine ran the statement.
+        // Harbor's internal error comes after the engine ran the statement:
+        // an answer, which is not called none, that does not settle it.
         let internal = Failure::Refused { code: "internal".into(), message: "recovered".into() };
-        assert_eq!(commit_verdict(Err(internal)), Committed::InDoubt("internal: recovered".into()));
+        assert_eq!(
+            commit_verdict(Err(internal)),
+            Committed::InDoubt("COMMIT was answered (internal: recovered), but not with whether it landed".into())
+        );
         // A COMMIT that could not be sent did nothing: there is no doubt.
         let unsent = "query: Connection refused (os error 61)";
         assert_eq!(commit_verdict(Err(Failure::Unsent(unsent.into()))), Committed::Refused(unsent.into()));
         // A timeout or a dropped tunnel after it was sent is no verdict at all.
         for lost in ["query: Resource temporarily unavailable (os error 35)", "stream: connection closed mid-chunk", "HTTP 502"] {
-            assert_eq!(commit_verdict(Err(Failure::Unanswered(lost.into()))), Committed::InDoubt(lost.into()));
+            let told = format!("COMMIT got no answer ({lost})");
+            assert_eq!(commit_verdict(Err(Failure::Unanswered(lost.into()))), Committed::InDoubt(told));
         }
+    }
+
+    #[test]
+    fn a_page_never_lands_over_an_open_editor() {
+        use super::{landing, Landing};
+        // An editor open as a page lands: its text is not confirmed into a
+        // row leaving the screen, and a reshaped table is not adopted over
+        // it, where the fresh set would drop what it then staged.
+        for (reshaped, staged) in [(false, false), (true, false), (true, true)] {
+            assert_eq!(landing(true, reshaped, staged), Landing::Dropped, "{reshaped} {staged}");
+        }
+        assert_eq!(landing(false, true, true), Landing::Reshaped);
+        assert_eq!(landing(false, true, false), Landing::Shown);
+        assert_eq!(landing(false, false, true), Landing::Shown);
     }
 
     #[test]
@@ -4975,7 +5041,7 @@ mod tests {
         assert!(!stale.contains("held"), "the staged set was cleared: {stale}");
 
         let doubt = |running: bool| PostCommit::InDoubt {
-            message: "query: timed out".into(),
+            message: "COMMIT got no answer (query: timed out)".into(),
             unsettled: running.then(|| "session-1".to_string()),
         };
         // The commit's session was seen to end before the page was read: the
@@ -4990,6 +5056,14 @@ mod tests {
         assert!(running.contains("may still be running") && running.contains("may not show its outcome yet"));
         assert!(!running.contains("read after it") && !running.contains("say whether"));
         assert!(running.ends_with("refresh (⌘R) until the commit is over"));
+        // An answer that does not settle it is not called no answer.
+        let answered = PostCommit::InDoubt {
+            message: "COMMIT was answered (internal: recovered), but not with whether it landed".into(),
+            unsettled: None,
+        };
+        let said = commit_status(&answered, Page::Read).unwrap();
+        assert!(said.starts_with("COMMIT was answered (internal: recovered), but not with whether it landed, so"));
+        assert!(!said.contains("no answer"), "{said}");
         let unread = commit_status(&doubt(false), Page::Failed("HTTP 503")).unwrap();
         assert!(unread.contains("could not be read again (HTTP 503)") && !unread.contains("read after it"));
         // Every one of them says the set is held.
@@ -5191,6 +5265,19 @@ mod tests {
             [(2, "one"), (4, "two"), (7, "three"), (9, "new"), (100, "three")]
                 .map(|(id, v)| vec![json!(id), json!(v)])
         );
+        // A duplicate of a row the set leaves alone takes a key it frees:
+        // 9 copied as 7 beside a delete of 7.
+        let mut e = Edits::new(
+            crate::sql::source("main", "_dt_order"),
+            vec!["id".into()],
+            vec!["id".into(), "v".into()],
+            vec!["INTEGER".into(), "VARCHAR".into()],
+        );
+        e.stage_delete(vec![json!(7)]);
+        e.stage_duplicate(vec![json!(9)], vec![(0, txt("7"), Bind::Value(json!(7))), (1, txt("new"), Bind::Source)]);
+        commit_live(&conn, &e).expect("the duplicate takes the freed key");
+        let rows = alone("SELECT id, v FROM _dt_order ORDER BY id").rows;
+        assert_eq!(rows, [(2, "one"), (4, "two"), (7, "new"), (9, "new"), (100, "three")].map(|(id, v)| vec![json!(id), json!(v)]));
 
         alone("CREATE OR REPLACE TABLE _dt_double(k DOUBLE PRIMARY KEY, v INTEGER)");
         alone("INSERT INTO _dt_double VALUES (924.2100000029881, 1)");

@@ -28,9 +28,11 @@ pub(crate) fn query_source(sql: &str) -> String {
 /// The SELECT for one page of `source` under an optional filter. The
 /// filter text splices in verbatim BY DESIGN: the strip is a raw SQL
 /// surface and the berth is the user's own database — the author of the
-/// WHERE clause is the person it could affect. It sits in parentheses on
-/// lines of its own, so a filter ending in a line comment cannot reach the
-/// LIMIT after it, and the page stays bounded.
+/// WHERE clause is the person it could affect. Its condition sits in
+/// parentheses on lines of its own, and an ORDER BY that ends it
+/// ([`split_order`]) on lines of its own after them, so a filter ending in
+/// a line comment cannot reach the LIMIT after it, and the page stays
+/// bounded.
 ///
 /// `rowid` prepends the editing identity for a table without a primary
 /// key (docs/EDITING.md): DuckDB's implicit rowid paired with a hash of
@@ -46,21 +48,64 @@ pub(crate) fn page_sql(
     size: usize,
 ) -> String {
     let cols = if rowid { "[rowid::UBIGINT, hash(*COLUMNS(*))] AS rowid, *" } else { "*" };
+    let (cond, order) = filter.as_deref().map_or(("", None), split_order);
+    let order = order.map_or(String::new(), |o| format!("\nORDER BY {}\n", o.trim()));
     format!(
-        "SELECT {cols} FROM {source}{} LIMIT {size} OFFSET {}",
-        where_part(filter),
+        "SELECT {cols} FROM {source}{}{order} LIMIT {size} OFFSET {}",
+        where_part(cond),
         page * size
     )
 }
 
+/// The count under a filter counts what its condition keeps; its ORDER BY
+/// orders nothing a count reads.
 pub(crate) fn count_sql(source: &str, filter: &Option<String>) -> String {
-    format!("SELECT count(*) FROM {source}{}", where_part(filter))
+    let cond = filter.as_deref().map_or("", |f| split_order(f).0);
+    format!("SELECT count(*) FROM {source}{}", where_part(cond))
 }
 
-fn where_part(filter: &Option<String>) -> String {
-    match filter {
-        Some(f) => format!(" WHERE (\n{f}\n)"),
-        None => String::new(),
+fn where_part(cond: &str) -> String {
+    let mut end = 0;
+    wire::statement::skip_trivia(cond.as_bytes(), &mut end);
+    if end == cond.len() { String::new() } else { format!(" WHERE (\n{cond}\n)") }
+}
+
+/// A filter cut at an ORDER BY at its top level: the condition before it,
+/// and the ordering after it. The grid has no sort of its own, so the strip
+/// is where a Data view is sorted: `x > 0 ORDER BY name`, or `ORDER BY
+/// name` alone. The cut is read in code only (`wire::scan`), so an ORDER BY
+/// in a string, a comment or a parenthesis (a window, an aggregate, a
+/// subquery) stays in the condition. A filter whose parentheses close more
+/// than they open is not cut: whole inside the parentheses, it is the
+/// engine's syntax error, and never a way past the page's LIMIT.
+pub(crate) fn split_order(filter: &str) -> (&str, Option<&str>) {
+    use wire::{scan::space_len, statement::bare_word};
+    let b = filter.as_bytes();
+    let (mut depth, mut cut) = (0i32, None);
+    for span in wire::scan::scan(filter).into_iter().filter(|s| s.kind == wire::scan::Kind::Code) {
+        let mut i = span.start;
+        while i < span.end {
+            match b[i] {
+                _ if space_len(&b[i..]) > 0 => i += space_len(&b[i..]),
+                b'(' => (depth, i) = (depth + 1, i + 1),
+                b')' if depth == 0 => return (filter, None),
+                b')' => (depth, i) = (depth - 1, i + 1),
+                c if c.is_ascii_punctuation() && !matches!(c, b'_' | b'$') => i += 1,
+                _ => {
+                    let at = i;
+                    if bare_word(b, &mut i) == "ORDER" && depth == 0 {
+                        let mut by = i;
+                        if bare_word(b, &mut by) == "BY" {
+                            cut = Some((at, by));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    match cut {
+        Some((at, by)) => (filter[..at].trim_end(), Some(&filter[by..])),
+        None => (filter, None),
     }
 }
 
@@ -88,7 +133,7 @@ pub(crate) fn total_rows(conn: &Conn, schema: &str, name: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_sql, page_sql, query_source};
+    use super::{count_sql, page_sql, query_source, split_order};
 
     #[test]
     fn a_filter_ending_in_a_comment_keeps_the_page_bounded() {
@@ -111,5 +156,44 @@ mod tests {
         assert!(sql.ends_with(") LIMIT 5000 OFFSET 5000"), "{sql}");
         // And the comment's own semicolon stays: it is comment text.
         assert!(sql.contains("'%s%';"), "{sql}");
+    }
+
+    #[test]
+    fn an_order_by_ending_the_filter_sorts_outside_its_parentheses() {
+        let filter = Some("x > 0 ORDER BY name DESC".to_string());
+        assert_eq!(
+            page_sql("t", false, &filter, 1, 5),
+            "SELECT * FROM t WHERE (\nx > 0\n)\nORDER BY name DESC\n LIMIT 5 OFFSET 5"
+        );
+        // The count counts what the condition keeps, unordered.
+        assert_eq!(count_sql("t", &filter), "SELECT count(*) FROM t WHERE (\nx > 0\n)");
+        // A line comment after the ordering ends at its line, before the LIMIT.
+        let commented = Some("x > 0 ORDER BY name -- by name".to_string());
+        let sql = page_sql("t", false, &commented, 0, 5);
+        assert!(sql.ends_with("ORDER BY name -- by name\n LIMIT 5 OFFSET 0"), "{sql}");
+        // An ordering alone sorts the whole table, with no WHERE.
+        let alone = Some("order /* c */ by id".to_string());
+        assert_eq!(page_sql("t", false, &alone, 0, 5), "SELECT * FROM t\nORDER BY id\n LIMIT 5 OFFSET 0");
+        assert_eq!(count_sql("t", &alone), "SELECT count(*) FROM t");
+    }
+
+    #[test]
+    fn only_an_order_by_at_the_top_level_of_code_is_cut() {
+        for whole in [
+            "row_number() OVER (ORDER BY id) < 3",
+            "name = 'x ORDER BY y'",
+            "\"ORDER BY\" = 1",
+            "x > 0 -- ORDER BY y",
+            "x > 0 /* ORDER BY y */",
+            "border BY 1",
+            "id IN (SELECT id FROM u ORDER BY id LIMIT 3)",
+            // Parentheses that close more than they open stay whole, the
+            // engine's syntax error inside the page's parentheses.
+            "x) ORDER BY (y",
+        ] {
+            assert_eq!(split_order(whole), (whole, None), "{whole}");
+        }
+        assert_eq!(split_order("a ORDER BY b ORDER BY c"), ("a ORDER BY b", Some(" c")));
+        assert_eq!(split_order("x -- c\nORDER\u{a0}BY y"), ("x -- c", Some(" y")));
     }
 }

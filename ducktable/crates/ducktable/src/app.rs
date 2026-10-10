@@ -35,7 +35,8 @@ fn active_key<'a>(connecting: Option<&'a DbKey>, connected: Option<&'a DbKey>) -
 }
 
 /// The state a row shows. The survey's word stands for a file and for a
-/// remote on this machine, whose servers it probes. It never dials a
+/// remote on this machine, whose servers it probes (a miss of the one on
+/// screen is checked again, `lost`). It never dials a
 /// tunnel, so for the tunneled remote on screen (`tunnel_up` is `Some`)
 /// the tunnel's SSH process answers: running, the row is; exited, it is not.
 fn shown_state(surveyed: State, tunnel_up: Option<bool>) -> State {
@@ -44,6 +45,15 @@ fn shown_state(surveyed: State, tunnel_up: Option<bool>) -> State {
         Some(false) => State::Stopped,
         None => surveyed,
     }
+}
+
+/// Whether the connection on screen has lost its server. For a tunneled
+/// remote the survey's word stands: the tunnel's SSH process gave it. For
+/// any other the survey gives each server two seconds, which a busy one can
+/// miss, so a miss is checked with `/ready` on the connection's own
+/// transport, and only a server that fails that too has stopped.
+fn lost(surveyed_live: bool, tunneled: bool, ready: impl FnOnce() -> bool) -> bool {
+    !surveyed_live && (tunneled || !ready())
 }
 
 /// What runs when the quit dialog is cancelled.
@@ -176,6 +186,21 @@ impl QuitRisks {
         self.question_for(&Leaving::Quit)
     }
 
+    /// What is at risk here that was not in `accepted`: what a connect that
+    /// began over `accepted` (nothing, or what the dialog asked about and
+    /// the user left anyway) would end unasked when it lands.
+    fn since(&self, accepted: &QuitRisks) -> QuitRisks {
+        QuitRisks {
+            staged: self.staged.saturating_sub(accepted.staged),
+            tables: self.tables,
+            held: self.held.saturating_sub(accepted.held),
+            editing: self.editing && !accepted.editing,
+            committing: self.committing && !accepted.committing,
+            transaction: self.transaction && !accepted.transaction,
+            running: self.running && !accepted.running,
+        }
+    }
+
     /// The same question, asked of what is about to happen. Installing an
     /// update quits too, so the facts are the same; only the question and
     /// its button name the relaunch, and Cancel's outcome is said, since the
@@ -285,6 +310,51 @@ impl QuitRisks {
             Leaving::Switch { from, .. } => (format!("Leave {from}?"), "Leave Anyway"),
         };
         Some(QuitQuestion { message, detail: detail.join(" "), confirm })
+    }
+}
+
+/// What the window holds for the database on screen, as `risks_of` reads it.
+#[derive(Default)]
+struct OnScreen<'a> {
+    /// The grid's staged and held sets.
+    sets: Vec<&'a crate::edits::Edits>,
+    committing: bool,
+    editing: bool,
+    /// The Query view's transaction, and a statement running there.
+    transaction: bool,
+    running: bool,
+}
+
+/// What going ahead with `leaving` puts at risk. A quit risks everything:
+/// what is on screen and every database's parked sets. Leaving one database
+/// risks the sets parked for it, and what is on screen only when it is the
+/// one connected (`left` is `connected`); a switch with nothing connected
+/// risks nothing. The sets of a commit in flight are not counted as staged:
+/// `committing` says what becomes of them.
+fn risks_of(
+    leaving: &Leaving,
+    left: Option<&DbKey>,
+    connected: Option<&DbKey>,
+    screen: OnScreen<'_>,
+    parked: &crate::edits::Parked<DbKey>,
+) -> QuitRisks {
+    let quitting = matches!(leaving, Leaving::Quit | Leaving::Relaunch);
+    let parked: Vec<_> = match (quitting, left) {
+        (true, _) => parked.sets().collect(),
+        (false, Some(db)) => parked.at(db).collect(),
+        (false, None) => return QuitRisks::default(),
+    };
+    let screen = if quitting || left == connected { screen } else { OnScreen::default() };
+    let on_screen = if screen.committing { Vec::new() } else { screen.sets };
+    let tally = crate::edits::Tally::of(parked.into_iter().chain(on_screen));
+    QuitRisks {
+        staged: tally.staged,
+        tables: tally.tables,
+        held: tally.held,
+        editing: screen.editing,
+        committing: screen.committing,
+        transaction: screen.transaction,
+        running: screen.running,
     }
 }
 
@@ -403,8 +473,31 @@ fn connect(aim: Aim) -> Result<(Conn, wire::InfoResponse, harbor_client::Catalog
         Aim::Url { name, host, port } => fleet::connect_remote(&fleet::add_database(&name, &host, &port)?)?,
     };
     let info = fleet::info(&conn)?;
+    new_enough(&info.harbor_version)?;
     let catalog = harbor_client::catalog(&conn)?;
     Ok((conn, info, catalog))
+}
+
+/// The oldest Harbor whose answers DuckTable reads truly (docs/DESIGN.md):
+/// from it on, a COMMIT answered `499` kept nothing, and before it one
+/// interrupted as it finished could have landed.
+const MIN_HARBOR: &str = "0.44.2";
+
+/// Refuse a server older than [`MIN_HARBOR`], saying what it runs. A version
+/// that does not read as one is older too: every Harbor since the floor
+/// reports its own.
+fn new_enough(harbor_version: &str) -> Result<(), String> {
+    if !fleet::version_older(harbor_version, MIN_HARBOR) {
+        return Ok(());
+    }
+    let runs = match harbor_version.trim() {
+        "" => "does not say which Harbor it runs".to_string(),
+        v => format!("runs Harbor {v}"),
+    };
+    Err(format!(
+        "DuckTable needs Harbor {MIN_HARBOR} or later, and this server {runs}. Upgrade Harbor on its \
+         machine (harbor update) and restart the server."
+    ))
 }
 
 pub(crate) enum Phase {
@@ -583,13 +676,23 @@ impl DuckTable {
         // ask nothing included: Quit from the Dock, a logout, the updater's
         // relaunch. The prefs are written too, with the window's frame a
         // move just before the quit left in memory. The hook does it all, so
-        // the future it hands back has nothing left to do.
+        // the future it hands back has nothing left to do. The scratchpad
+        // lands on disk first, and every SSH tunnel closes last, once the
+        // sessions given back through it are: the quit drops nothing that
+        // holds a connection, so no tunnel would close itself.
         cx.on_app_quit(|this, cx| {
+            if let Some(query) = &this.query {
+                query.read(cx).flush_scratch();
+            }
             this.release_for_quit(cx);
             crate::prefs::save(cx, |_| {});
+            fleet::close_tunnels();
             async {}
         })
         .detach();
+        // A run that ended without its quit (a crash, a kill) left its
+        // tunnels' sockets behind.
+        cx.background_executor().spawn(async { fleet::sweep_tunnels() }).detach();
         this.refresh(cx);
         this
     }
@@ -603,35 +706,16 @@ impl DuckTable {
     /// everything the window holds; for a database left behind, the sets
     /// parked for it and, when it is the one connected, what is on screen.
     pub(crate) fn risks(&self, leaving: &Leaving, cx: &App) -> QuitRisks {
-        let connected = self.connected_key();
-        let db = match leaving {
-            Leaving::Quit | Leaving::Relaunch => None,
-            Leaving::Switch { .. } if connected.is_none() => return QuitRisks::default(),
-            Leaving::Switch { .. } => connected.clone(),
-            Leaving::Stop { name, path } => Some(self.key_of(name, Some(path))),
-            Leaving::Remove { name } => Some(DbKey::Remote(clone_str(name))),
-        };
-        let here = db.is_none() || db == connected;
-        let grid = self.grid.as_ref().filter(|_| here).map(|g| g.read(cx));
-        let query = self.query.as_ref().filter(|_| here).map(|q| q.read(cx));
-        let committing = grid.is_some_and(|g| g.committing);
-        // The grid's own staged set, unless a commit has it in flight, and
-        // those parked: for the database, or for every one.
-        let on_screen = grid.filter(|_| !committing).into_iter().flat_map(|g| g.staged_sets());
-        let parked: Vec<&crate::edits::Edits> = match &db {
-            Some(db) => self.staged.at(db).collect(),
-            None => self.staged.sets().collect(),
-        };
-        let tally = crate::edits::Tally::of(parked.into_iter().chain(on_screen));
-        QuitRisks {
-            staged: tally.staged,
-            tables: tally.tables,
-            held: tally.held,
+        let grid = self.grid.as_ref().map(|g| g.read(cx));
+        let query = self.query.as_ref().map(|q| q.read(cx));
+        let screen = OnScreen {
+            sets: grid.into_iter().flat_map(|g| g.staged_sets()).collect(),
+            committing: grid.is_some_and(|g| g.committing),
             editing: grid.is_some_and(|g| g.is_editing()),
-            committing,
             transaction: query.is_some_and(|q| q.in_transaction()),
             running: query.is_some_and(|q| q.is_running()),
-        }
+        };
+        risks_of(leaving, self.left_by(leaving).as_ref(), self.connected_key().as_ref(), screen, &self.staged)
     }
 
     /// The database on screen, if one is connected.
@@ -642,17 +726,26 @@ impl DuckTable {
         }
     }
 
+    /// The database `leaving` leaves: for a switch the connected one, if
+    /// any; for a stop or a removal the row's. A quit leaves every one, and
+    /// reads as the connected one here.
+    fn left_by(&self, leaving: &Leaving) -> Option<DbKey> {
+        match leaving {
+            Leaving::Quit | Leaving::Relaunch | Leaving::Switch { .. } => self.connected_key(),
+            Leaving::Stop { name, path } => Some(self.key_of(name, Some(path))),
+            Leaving::Remove { name } => Some(DbKey::Remote(clone_str(name))),
+        }
+    }
+
     /// Before the connected database is left (`Leaving::Switch`, or a Stop
     /// or Remove of it), text in an open cell editor is staged, to be
     /// parked with the rest. False when its column refuses it: the editor
     /// stays open with the reason, and nothing is left.
     pub(crate) fn settle_before(&mut self, leaving: &Leaving, cx: &mut Context<Self>) -> bool {
-        let db = match leaving {
-            Leaving::Quit | Leaving::Relaunch => return true,
-            Leaving::Switch { .. } => self.connected_key(),
-            Leaving::Stop { name, path } => Some(self.key_of(name, Some(path))),
-            Leaving::Remove { name } => Some(DbKey::Remote(clone_str(name))),
-        };
+        if matches!(leaving, Leaving::Quit | Leaving::Relaunch) {
+            return true;
+        }
+        let db = self.left_by(leaving);
         match self.grid.clone() {
             Some(grid) if db.is_some() && db == self.connected_key() => grid.update(cx, |g, cx| g.settle_editor(cx)),
             _ => true,
@@ -705,10 +798,11 @@ impl DuckTable {
 
     /// What the dialog held back runs (`after_quit_dialog`), and the fleet
     /// is reconciled, which drops a connection whose server stopped
-    /// meanwhile.
+    /// meanwhile. A connect called off is a switch like any other: when the
+    /// database on screen holds something it would end, it asks first.
     fn resume(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match after_quit_dialog(self.called_off.take(), self.deferred_select.take()) {
-            Resume::Dial(aim) => self.dial(aim, window, cx),
+            Resume::Dial(aim) => crate::leave_asking(self.switch_to(aim), cx),
             Resume::Select(schema, name) => self.select_table(schema, name, window, cx),
             Resume::Nothing => {}
         }
@@ -801,6 +895,10 @@ impl DuckTable {
         {
             return;
         }
+        // Until the page lands, no editor opens on the grid it replaces.
+        if let Some(grid) = &self.grid {
+            grid.update(cx, |grid, _| grid.replacing = true);
+        }
         // "main.tests" earns its prefix only when there is another schema
         // to distinguish it from.
         let title =
@@ -836,19 +934,23 @@ impl DuckTable {
                     return;
                 }
                 // A switch that would land during a commit, or under the
-                // quit dialog, waits for it.
+                // quit dialog, waits for it, and the grid on screen is
+                // itself again meanwhile.
                 if state.asking_to_quit || state.grid.as_ref().is_some_and(|g| g.read(cx).committing) {
                     state.deferred_select = Some((clone_str(&schema), clone_str(&name)));
+                    if let Some(grid) = &state.grid {
+                        grid.update(cx, |grid, _| grid.replacing = false);
+                    }
                     return;
                 }
-                // A key typed while the page was on its way opened an
-                // editor on the outgoing grid. Its text is staged first, to
-                // be parked with the rest; text the column refuses keeps
-                // the editor, its reason and its table, and the sidebar
-                // goes back to that table.
-                if let Some(old) = state.grid.clone()
-                    && !old.update(cx, |g, cx| g.settle_editor(cx))
+                // No editor opens on the outgoing grid while the page is on
+                // its way. Were one open, its text would be neither
+                // confirmed unasked nor parked: the switch yields, and the
+                // sidebar goes back to that table.
+                if let Some(old) = &state.grid
+                    && old.read(cx).is_editing()
                 {
+                    old.update(cx, |grid, _| grid.replacing = false);
                     state.selected_table = previous;
                     cx.notify();
                     return;
@@ -1044,6 +1146,10 @@ impl DuckTable {
             }
             _ => None,
         };
+        let conn = match &self.phase {
+            Phase::Connected { conn, .. } => Some(conn.clone()),
+            _ => None,
+        };
         cx.spawn(async move |this, cx| {
             // survey() answers liveness from each server's own socket:
             // a listening socket is the registration, so a running
@@ -1114,6 +1220,22 @@ impl DuckTable {
             for task in tasks {
                 rows.push(task.await);
             }
+            // The connection on screen, if its server is gone (`lost`). One
+            // that a busy server's missed survey would have dropped is asked
+            // again on its own transport, and its row shows what it answers.
+            let lost = match (connected, conn) {
+                (Some((key, _, tunnel_up)), Some(conn)) => {
+                    let surveyed = rows.iter().any(|r| r.key == key && r.state.is_live());
+                    let ready = move || conn.transport().is_ok_and(harbor_client::http::ready);
+                    let tunneled = tunnel_up.is_some();
+                    let gone = cx.background_executor().spawn(async move { lost(surveyed, tunneled, ready) }).await;
+                    if !gone && !surveyed {
+                        rows.iter_mut().filter(|r| r.key == key).for_each(|r| r.state = State::Running);
+                    }
+                    gone.then_some(key)
+                }
+                _ => None,
+            };
             this.update(cx, |state, cx| {
                 if state.refresh_seq != fence {
                     return;
@@ -1141,11 +1263,11 @@ impl DuckTable {
                 state.rows = rows;
                 state.warning = warning;
                 state.installed_version = installed_version;
-                // Reconcile the connection against the survey's truth: if we
-                // still think we're connected to a berth the survey no longer
-                // shows running, its server exited out from under us. Drop it
-                // cleanly and point the way back, rather than leaving a dead
-                // connection to fail the next catalog or query with an OS error.
+                // Reconcile the connection: one whose server exited out from
+                // under it (`lost`) is dropped cleanly with the way back
+                // pointed out, rather than left to fail the next catalog or
+                // query with an OS error. A connection made since the survey
+                // began is not the one it judged.
                 let connected = match &state.phase {
                     Phase::Connected { conn, .. } => {
                         Some((clone_str(&conn.name), DbKey::of_conn(conn), conn.tunnel_up().is_some()))
@@ -1158,7 +1280,7 @@ impl DuckTable {
                 // follows a cancel reconciles.
                 if let Some((name, key, tunneled)) = connected
                     && !state.asking_to_quit
-                    && !state.rows.iter().any(|r| r.key == key && r.state.is_live())
+                    && lost.as_ref() == Some(&key)
                 {
                     state.drop_connection(cx);
                     let gone = if tunneled { "lost its SSH tunnel" } else { "stopped" };
@@ -1299,10 +1421,11 @@ impl DuckTable {
         if connected_here {
             self.drop_connection(cx);
         }
-        // The database is forgotten, and what was staged for it with it:
-        // the one dialog asked first (`Leaving::Remove`).
-        self.staged.forget(&DbKey::Remote(clone_str(&name)));
-        self.fleet_then_refresh(move || fleet::remove_remote(&name), cx);
+        // The database is forgotten, and what was staged for it with it,
+        // once the config has let it go: the one dialog asked first
+        // (`Leaving::Remove`). A removal the config refuses keeps both.
+        let db = DbKey::Remote(clone_str(&name));
+        self.fleet_then(move || fleet::remove_remote(&name), move |state| state.staged.forget(&db), cx);
     }
 
     /// Connect to what `aim` names: the current content keeps rendering
@@ -1347,6 +1470,9 @@ impl DuckTable {
             Aim::Url { name, .. } => DbKey::Remote(clone_str(name)),
         });
         self.connecting_aim = Some(aim.clone());
+        // What the database on screen holds at risk as the connect begins:
+        // nothing, or what the dialog asked about and was told to leave.
+        let accepted = self.risks(&self.switch_to(aim.clone()), cx);
         cx.notify();
         let target = aim.clone();
         cx.spawn_in(window, async move |this, cx| {
@@ -1372,6 +1498,17 @@ impl DuckTable {
                 state.connecting = None;
                 state.connecting_key = None;
                 state.connecting_aim = None;
+                // The landing replaces the grid and the Query view, and a
+                // failed one too. Something put at risk while the connect
+                // ran (a BEGIN typed, a statement started) is asked about
+                // first, as a fresh switch: this outcome is let go, and
+                // Leave Anyway dials again.
+                let leaving = state.switch_to(aim.clone());
+                if state.risks(&leaving, cx).since(&accepted).question_for(&leaving).is_some() {
+                    cx.notify();
+                    crate::leave_asking(leaving, cx);
+                    return;
+                }
                 state.selected_table = None;
                 state.park_grid(cx);
                 state.deferred_select = None;
@@ -1536,11 +1673,23 @@ impl DuckTable {
         op: impl FnOnce() -> Result<(), String> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        self.fleet_then(op, |_| {}, cx);
+    }
+
+    /// `fleet_then_refresh`, with `done` run on the app once the call has
+    /// succeeded.
+    fn fleet_then(
+        &self,
+        op: impl FnOnce() -> Result<(), String> + Send + 'static,
+        done: impl FnOnce(&mut Self) + 'static,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
             let outcome = cx.background_executor().spawn(async move { op() }).await;
             this.update(cx, |state, cx| {
-                if let Err(message) = outcome {
-                    state.warning = Some(message);
+                match outcome {
+                    Ok(()) => done(state),
+                    Err(message) => state.warning = Some(message),
                 }
                 state.refresh(cx);
                 cx.notify();
@@ -1615,6 +1764,30 @@ mod tests {
         // SSH process says whether it is up.
         assert_eq!(shown_state(State::Stopped, Some(true)), State::Running);
         assert_eq!(shown_state(State::Stopped, Some(false)), State::Stopped);
+    }
+
+    #[test]
+    fn a_missed_survey_drops_a_connection_only_when_its_server_fails_ready_too() {
+        use super::lost;
+        let asked = std::cell::Cell::new(0);
+        let answers = |up: bool| {
+            let asked = &asked;
+            move || {
+                asked.set(asked.get() + 1);
+                up
+            }
+        };
+        // Seen running: nothing is asked.
+        assert!(!lost(true, false, answers(false)));
+        assert_eq!(asked.get(), 0);
+        // Missed by a survey, yet answering on its own transport: kept.
+        assert!(!lost(false, false, answers(true)));
+        // Missed, and not answering either: gone.
+        assert!(lost(false, false, answers(false)));
+        assert_eq!(asked.get(), 2);
+        // A tunnel whose SSH process exited is gone without asking.
+        assert!(lost(false, true, answers(true)));
+        assert_eq!(asked.get(), 2);
     }
 
     #[test]
@@ -1829,6 +2002,87 @@ mod tests {
         assert_eq!(notes.len(), 3);
         assert_eq!(notes[0], "The Query view holds a transaction open on orders, and the restart rolls it back.");
         assert!(notes[2].starts_with("A commit is still running on orders"));
+    }
+
+    #[test]
+    fn a_connect_landing_asks_only_about_what_was_put_at_risk_while_it_ran() {
+        use super::Leaving;
+        let switch = Leaving::Switch { from: "a".into(), to: Aim::File("/tmp/b.duckdb".into()) };
+        let nothing = QuitRisks::default();
+        // Dialed with nothing at risk, it lands over a BEGIN typed since.
+        let open = QuitRisks { transaction: true, ..Default::default() };
+        let asked = open.since(&nothing).question_for(&switch).unwrap();
+        assert_eq!((asked.message.as_str(), asked.confirm), ("Leave a?", "Leave Anyway"));
+        // Left anyway over that transaction: the landing does not ask again.
+        assert_eq!(open.since(&open).question_for(&switch), None);
+        // But a statement started since is new.
+        let running = QuitRisks { transaction: true, running: true, ..Default::default() };
+        let asked = running.since(&open);
+        assert!(!asked.transaction && asked.running);
+        assert!(asked.question_for(&switch).is_some());
+        // Staged sets are parked by a switch, and never a reason to ask.
+        let staged = QuitRisks { staged: 4, tables: 1, held: 2, ..Default::default() };
+        assert_eq!(staged.since(&nothing).question_for(&switch), None);
+    }
+
+    #[test]
+    fn what_is_at_risk_depends_on_what_is_left() {
+        use super::{Leaving, OnScreen, risks_of};
+        use crate::edits::{Edits, Parked};
+        let set = |table: &str, n: i64| {
+            let mut e = Edits::new(
+                format!("\"main\".\"{table}\""),
+                vec!["id".into()],
+                vec!["id".into()],
+                vec!["INTEGER".into()],
+            );
+            for id in 0..n {
+                e.stage_delete(vec![serde_json::json!(id)]);
+            }
+            e
+        };
+        let (a, b) = (DbKey::File("/data/a.duckdb".into()), DbKey::Remote("b".into()));
+        let mut parked = Parked::default();
+        parked.park(a.clone(), set("t", 2));
+        parked.park(b.clone(), set("u", 3));
+        let grid = set("v", 1);
+        let screen = |committing: bool| OnScreen {
+            sets: vec![&grid],
+            committing,
+            editing: true,
+            transaction: true,
+            running: false,
+        };
+        let quit = risks_of(&Leaving::Quit, Some(&a), Some(&a), screen(false), &parked);
+        assert_eq!((quit.staged, quit.tables, quit.editing, quit.transaction), (6, 3, true, true));
+        // A commit in flight has the grid's set: it is not counted staged.
+        let committing = risks_of(&Leaving::Quit, Some(&a), Some(&a), screen(true), &parked);
+        assert_eq!((committing.staged, committing.tables, committing.committing), (5, 2, true));
+        // Stopping the database on screen: its parked sets and the screen.
+        let stop = Leaving::Stop { name: "a".into(), path: "/data/a.duckdb".into() };
+        let here = risks_of(&stop, Some(&a), Some(&a), screen(false), &parked);
+        assert_eq!((here.staged, here.tables, here.transaction), (3, 2, true));
+        // Removing another: its parked sets alone, nothing on screen.
+        let remove = Leaving::Remove { name: "b".into() };
+        let there = risks_of(&remove, Some(&b), Some(&a), screen(false), &parked);
+        assert_eq!(there, QuitRisks { staged: 3, tables: 1, ..Default::default() });
+        // A switch with nothing connected risks nothing.
+        let switch = Leaving::Switch { from: String::new(), to: Aim::File("/tmp/c.duckdb".into()) };
+        assert_eq!(risks_of(&switch, None, None, screen(false), &parked), QuitRisks::default());
+    }
+
+    #[test]
+    fn a_harbor_older_than_the_floor_is_refused_by_name() {
+        use super::new_enough;
+        for ok in ["0.44.2", "0.44.3", "0.45.0", "1.0.0", "v0.44.2", "0.44.2-dev"] {
+            assert_eq!(new_enough(ok), Ok(()), "{ok}");
+        }
+        let old = new_enough("0.44.1").unwrap_err();
+        assert!(old.starts_with("DuckTable needs Harbor 0.44.2 or later, and this server runs Harbor 0.44.1."), "{old}");
+        assert!(new_enough("0.39.0").is_err());
+        let unknown = new_enough("").unwrap_err();
+        assert!(unknown.contains("this server does not say which Harbor it runs."), "{unknown}");
+        assert!(new_enough("garbage").is_err());
     }
 
     #[test]
