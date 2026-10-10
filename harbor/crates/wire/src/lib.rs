@@ -9,9 +9,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub mod catalog;
 pub mod scan;
 pub mod statement;
+pub mod catalog;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
