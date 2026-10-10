@@ -15,7 +15,8 @@ use std::borrow::Cow;
 use crate::repl::complete::SqlCompleter;
 use crate::repl::render::{Mode, RenderOpts};
 use wire::scan::{Kind, scan};
-use crate::repl::{Conn, Outcome, Transaction};
+use crate::repl::http::{Anchor, Transport};
+use crate::repl::{Outcome, Transaction};
 
 struct BerthPrompt {
     name: String,
@@ -114,6 +115,92 @@ pub fn split_statements(buf: &str) -> Vec<String> {
     out
 }
 
+/// One step of a script: a statement, or a dot command.
+#[derive(Debug, PartialEq)]
+pub enum Step {
+    Sql(String),
+    /// The command's line without its dot: `mode csv`.
+    Dot(String),
+}
+
+/// A script as the duckdb shell reads one: statements split as the REPL
+/// splits a buffer, and a line that begins with `.` where a statement would
+/// begin is a dot command, the rest of its line its argument. Blank lines and
+/// `--` comment lines before it go with it.
+pub fn script(text: &str) -> Vec<Step> {
+    let mut steps = Vec::new();
+    let mut at = 0;
+    while at < text.len() {
+        if let Some(dot) = dot_ahead(text, at) {
+            let end = line_end(text, dot);
+            steps.push(Step::Dot(text[dot..end].trim().trim_start_matches('.').to_string()));
+            at = end;
+            continue;
+        }
+        // The statements up to the first terminator a dot command follows.
+        // A dot command can hold what the scanner would read as an open
+        // string (`.read o'brien.sql`), so what follows one is scanned anew.
+        let rest = &text[at..];
+        let mut cut = rest.len();
+        'find: for sp in scan(rest).iter().filter(|sp| sp.kind == Kind::Code) {
+            for (off, &c) in rest.as_bytes()[sp.start..sp.end].iter().enumerate() {
+                if c == b';' && dot_ahead(rest, sp.start + off + 1).is_some() {
+                    cut = sp.start + off + 1;
+                    break 'find;
+                }
+            }
+        }
+        steps.extend(split_statements(&rest[..cut]).into_iter().map(Step::Sql));
+        at += cut;
+    }
+    steps
+}
+
+/// Where the line holding byte `at` ends, past its newline.
+fn line_end(text: &str, at: usize) -> usize {
+    text[at..].find('\n').map_or(text.len(), |p| at + p + 1)
+}
+
+/// The start of the dot command's line when one comes next after `at`, past
+/// the rest of the line `at` is on and any lines with nothing for the engine.
+fn dot_ahead(text: &str, mut at: usize) -> Option<usize> {
+    let mut fresh = at == 0 || text[..at].ends_with('\n');
+    while at < text.len() {
+        let end = line_end(text, at);
+        let line = text[at..end].trim();
+        if fresh && line.starts_with('.') {
+            return Some(at);
+        }
+        if !(line.is_empty() || line.starts_with("--")) {
+            return None;
+        }
+        (at, fresh) = (end, true);
+    }
+    None
+}
+
+/// Run a script's steps in order, the dot commands as the prompt runs them,
+/// stopping at the first statement that does not finish. `.quit` ends it.
+pub fn run_steps(steps: Vec<Step>, opts: &mut RenderOpts, transaction: &mut Transaction) -> Outcome {
+    for step in steps {
+        let outcome = match step {
+            Step::Sql(sql) => transaction.run(&sql, opts),
+            Step::Dot(cmd) => match dot_command(&cmd, opts, transaction) {
+                DotResult::Handled => Outcome::Done,
+                DotResult::Quit => return Outcome::Done,
+                DotResult::Open(_) | DotResult::Keymode(_) => {
+                    eprintln!("harbor: .{cmd} works at the prompt, not in a script");
+                    Outcome::Failed
+                }
+            },
+        };
+        if outcome != Outcome::Done {
+            return outcome;
+        }
+    }
+    Outcome::Done
+}
+
 /// Anything besides whitespace and comments?
 fn has_code(s: &str) -> bool {
     scan(s).iter().any(|sp| match sp.kind {
@@ -143,9 +230,8 @@ pub const DOT_COMMANDS: &[(&str, &str, &str)] = &[
 ];
 
 fn bind_completion_keys(kb: &mut Keybindings) {
-    // The inline gray suggestion is a history hint. Right accepts it in
-    // Reedline's defaults, which makes ordinary cursor movement surprising;
-    // Tab is the conventional and more reachable acceptance key.
+    // Tab accepts: the completion picked in an open panel, or else the
+    // inline gray suggestion, which is a history hint.
     kb.add_binding(
         KeyModifiers::NONE,
         KeyCode::Tab,
@@ -191,8 +277,9 @@ fn bind_completion_keys(kb: &mut Keybindings) {
         );
     }
 
-    // Right navigates an open panel first. With no panel, it accepts the inline
-    // history suggestion when one exists, then falls back to cursor movement.
+    // Right moves within an open panel and accepts nothing there. With no
+    // panel it accepts the history hint, which shows only at the end of the
+    // line, and anywhere else it moves the cursor.
     kb.add_binding(
         KeyModifiers::NONE,
         KeyCode::Right,
@@ -218,7 +305,11 @@ fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
     // that cannot extend an identifier or a qualified name ends it, so a
     // stale menu never intercepts a later Enter. `_` and `.` keep it open.
     let menu = ColumnarMenu::default().with_name("completion_menu").with_word_chars("_.");
-    let history = harbor_common::history_file().ok();
+    // The history holds whatever was typed, a `CREATE SECRET` among it, so
+    // its directory is the user's alone before the file is made in it.
+    let history = harbor_common::history_file()
+        .ok()
+        .filter(|p| p.parent().is_none_or(|dir| harbor_common::perms::ensure_private_dir(dir).is_ok()));
     Reedline::create()
         .with_validator(Box::new(SqlValidator))
         .with_highlighter(Box::new(crate::repl::highlight::SqlHighlighter))
@@ -228,10 +319,9 @@ fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
         .with_edit_mode(edit_mode)
         .with_history({
             // A read-only or unwritable HARBOR_HOME (restrictive perms, a path
-            // component that is a file) must not crash the REPL on startup:
-            // reedline's with_file creates the parent and can fail. Fall back to
-            // in-memory history and say so, rather than .expect() panicking with
-            // a backtrace before the prompt is even drawn.
+            // component that is a file) must not end the REPL at startup:
+            // reedline's with_file creates the parent and can fail. History is
+            // then kept in memory, and the REPL says so.
             let history: Box<dyn reedline::History> =
                 match history.map(|p| FileBackedHistory::with_file(1000, p)) {
                     Some(Ok(h)) => Box::new(h),
@@ -245,23 +335,22 @@ fn make_editor(completer: &SqlCompleter, vi: bool) -> Reedline {
 }
 
 pub fn run(
-    conn: &Conn,
+    transport: &Transport,
     name: &str,
     mut opts: RenderOpts,
-    mut _anchor: Option<crate::repl::http::Anchor>,
+    mut _anchor: Option<Anchor>,
 ) -> std::process::ExitCode {
-    let mut conn = conn.clone();
     let mut vi = false;
     // One completer for the session: its catalog cache loads lazily on the
     // first Tab and survives editor rebuilds (.keymode), refreshing on .open.
-    let completer = SqlCompleter::new(conn.clone());
+    let completer = SqlCompleter::new(transport.clone());
     let mut line_editor = make_editor(&completer, vi);
     // No greeting: the prompt appearing IS the connection confirmed, and
     // its name says to what. Discovery lives in .help; fanfare helps no one.
     let mut prompt = BerthPrompt { name: name.to_string() };
     // One transaction for the prompt and for `.read`: a file may open what
     // the next line typed commits.
-    let mut transaction = Transaction::new(&conn, true);
+    let mut transaction = Transaction::new(transport, true);
 
     loop {
         match line_editor.read_line(&prompt) {
@@ -286,20 +375,19 @@ pub fn run(
                         DotResult::Handled => continue,
                         DotResult::Open(target) => {
                             match crate::repl::resolve(&target, &[]) {
-                                Ok((c, name)) => {
+                                Ok((t, name)) => {
                                     // Moor at the new server before letting
                                     // the old mooring go: the switch must
                                     // never be the moment both lifetimes hit
                                     // zero clients.
-                                    let moored = crate::repl::http::hold(&c.transport).ok();
+                                    let moored = crate::repl::http::hold(&t).ok();
                                     // A transaction belongs to the server it
                                     // was opened on, and ends with the visit:
                                     // released while that server is still
                                     // held up, as at exit.
-                                    transaction = Transaction::new(&c, true);
+                                    transaction = Transaction::new(&t, true);
                                     _anchor = moored;
-                                    conn = c;
-                                    completer.reconnect(conn.clone());
+                                    completer.reconnect(t);
                                     // The prompt changing name announces the switch.
                                     prompt = BerthPrompt { name };
                                 }
@@ -344,21 +432,23 @@ enum DotResult {
 }
 
 fn dot_command(cmd: &str, opts: &mut RenderOpts, transaction: &mut Transaction) -> DotResult {
-    let mut parts = cmd.split_whitespace();
+    // The argument is the rest of the line, so a path may hold a space.
+    let (name, arg) = cmd.trim().split_once(char::is_whitespace).unwrap_or((cmd.trim(), ""));
+    let arg = Some(arg.trim()).filter(|a| !a.is_empty());
     // Short aliases (.q .exit .db .h) dispatch here but stay out of
     // DOT_COMMANDS on purpose: help and completion teach the long names.
-    match parts.next().unwrap_or("") {
+    match name {
         "quit" | "exit" | "q" => return DotResult::Quit,
-        "open" => match parts.next() {
+        "open" => match arg {
             Some(t) => return DotResult::Open(t.to_string()),
             None => eprintln!("harbor: .open <name|path|url>"),
         },
-        "keymode" => match parts.next() {
+        "keymode" => match arg {
             Some("vi") => return DotResult::Keymode(true),
             Some("emacs") => return DotResult::Keymode(false),
             _ => eprintln!("harbor: .keymode vi|emacs"),
         },
-        "theme" => match parts.next() {
+        "theme" => match arg {
             None => {
                 let (name, _) = crate::repl::theme::describe();
                 println!("theme: {name} ({})", crate::repl::theme::NAMES.join(" "));
@@ -370,7 +460,7 @@ fn dot_command(cmd: &str, opts: &mut RenderOpts, transaction: &mut Transaction) 
         },
         "appearance" => {
             use crate::repl::theme::Appearance::{Dark, Light};
-            match parts.next() {
+            match arg {
                 None => {
                     let (_, a) = crate::repl::theme::describe();
                     println!("appearance: {}", if a == Light { "light" } else { "dark" });
@@ -381,15 +471,10 @@ fn dot_command(cmd: &str, opts: &mut RenderOpts, transaction: &mut Transaction) 
                 Some(other) => eprintln!("harbor: .appearance auto|light|dark (got {other:?})"),
             }
         }
-        "read" => match parts.next() {
+        "read" => match arg {
+            // A failure or a Ctrl-C ends the file.
             Some(f) => match std::fs::read_to_string(harbor_common::paths::expand(f)) {
-                Ok(text) => {
-                    for stmt in split_statements(&text) {
-                        if transaction.run(&stmt, opts) != Outcome::Done {
-                            break; // a failure or a Ctrl-C aborts the script
-                        }
-                    }
-                }
+                Ok(text) => _ = run_steps(script(&text), opts, transaction),
                 Err(e) => eprintln!("harbor: .read {f}: {e}"),
             },
             None => eprintln!("harbor: .read <file.sql>"),
@@ -399,22 +484,22 @@ fn dot_command(cmd: &str, opts: &mut RenderOpts, transaction: &mut Transaction) 
             // second one that agrees most of the time.
             let _ = crate::repl::list_main();
         }
-        "mode" => match parts.next() {
+        "mode" => match arg {
             None => println!("mode: {} (duckbox duckboxy markdown csv json jsonlines line list trash)", opts.mode.name()),
             Some(m) => match Mode::parse(m) {
                 Some(m) => opts.mode = m,
                 None => eprintln!("harbor: unknown mode {m:?}"),
             },
         },
-        "maxrows" => match parts.next().and_then(|n| n.parse::<usize>().ok()) {
+        "maxrows" => match arg.and_then(|n| n.parse::<usize>().ok()) {
             Some(n) if n > 0 => opts.max_rows = n,
             _ => println!("maxrows: {}", opts.max_rows),
         },
-        "nullvalue" => match parts.next() {
+        "nullvalue" => match arg {
             Some(s) => opts.null = s.to_string(),
             None => println!("nullvalue: {:?}", opts.null),
         },
-        "timer" => match parts.next() {
+        "timer" => match arg {
             Some("on") => opts.timer = true,
             Some("off") => opts.timer = false,
             _ => println!("timer: {}", if opts.timer { "on" } else { "off" }),
@@ -423,7 +508,7 @@ fn dot_command(cmd: &str, opts: &mut RenderOpts, transaction: &mut Transaction) 
             let _ = transaction.run("SHOW TABLES", opts);
         }
         "schema" => {
-            let sql = match parts.next() {
+            let sql = match arg {
                 Some(t) => format!(
                     "SELECT sql FROM duckdb_tables() WHERE table_name = '{}'",
                     t.replace('\'', "''")
@@ -513,6 +598,26 @@ mod tests {
             vec!["SELECT 1", "SELECT 2"]
         );
         assert_eq!(split_statements("/* all\ncomment */"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_script_runs_dot_commands_where_a_statement_would_begin() {
+        use super::{Step, script};
+        let sql = |s: &str| Step::Sql(s.to_string());
+        let dot = |s: &str| Step::Dot(s.to_string());
+        assert_eq!(
+            script(".mode csv\nselect 1;\n  .nullvalue (none)\n-- note\n.timer on\nselect 2; select 3"),
+            vec![dot("mode csv"), sql("select 1"), dot("nullvalue (none)"), dot("timer on"), sql("select 2"), sql("select 3")]
+        );
+        // Mid-statement, or after code on its line, a dot is SQL's.
+        assert_eq!(script("select\n.5;"), vec![sql("select\n.5")]);
+        assert_eq!(script("select 1; .mode csv"), vec![sql("select 1"), sql(".mode csv")]);
+        // A dot line inside a string is the string's.
+        assert_eq!(script("select '\n.mode csv\n';"), vec![sql("select '\n.mode csv\n'")]);
+        // An argument the scanner would read as an open string ends with its line.
+        assert_eq!(script(".read o'brien.sql\nselect 1;"), vec![dot("read o'brien.sql"), sql("select 1")]);
+        assert_eq!(script(""), vec![]);
+        assert_eq!(script("-- only a comment\n"), vec![]);
     }
 
     #[test]

@@ -13,7 +13,7 @@
 //! it; .open swaps the connection and marks it stale.
 
 use crate::repl::keywords::KEYWORDS;
-use crate::repl::{Conn, http};
+use crate::repl::http::{self, Transport};
 use wire::{Event, SqlRequest, endpoint};
 use reedline::{Completer, CompletionResult, Span, Suggestion};
 use std::io::BufRead;
@@ -26,21 +26,24 @@ pub struct SqlCompleter {
 }
 
 struct Inner {
-    conn: Conn,
+    transport: Transport,
     /// Table, column, and schema names from GET /catalog; None = not yet
     /// fetched (or stale after .open).
     catalog: Option<Vec<String>>,
+    /// Whether the server could load `sql_auto_complete`. A server that
+    /// could not is not asked again at every Tab.
+    autocomplete: bool,
 }
 
 impl SqlCompleter {
-    pub fn new(conn: Conn) -> Self {
-        Self { inner: Arc::new(Mutex::new(Inner { conn, catalog: None })) }
+    pub fn new(transport: Transport) -> Self {
+        Self { inner: Arc::new(Mutex::new(Inner { transport, catalog: None, autocomplete: false })) }
     }
 
     /// Point at a different berth (.open): drop the cache, refill lazily.
-    pub fn reconnect(&self, conn: Conn) {
+    pub fn reconnect(&self, transport: Transport) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.conn = conn;
+        inner.transport = transport;
         inner.catalog = None;
     }
 }
@@ -53,24 +56,21 @@ impl Inner {
         // either: whether an extension may be fetched is the server's own
         // setting to decide. Failures are fine — lane C covers a berth
         // without it.
-        let _ = quiet_sql(&self.conn, "LOAD autocomplete");
-        self.catalog = Some(fetch_catalog_names(&self.conn).unwrap_or_default());
+        self.autocomplete = quiet_sql(&self.transport, "LOAD autocomplete").is_some();
+        self.catalog = Some(fetch_catalog_names(&self.transport).unwrap_or_default());
     }
 
     fn server_suggestions(&self, prefix: &str, pos: usize) -> Option<Vec<Suggestion>> {
+        if !self.autocomplete {
+            return None;
+        }
         let req = SqlRequest {
             sql: "SELECT suggestion, suggestion_start FROM sql_auto_complete(?)".into(),
             params: Some(vec![serde_json::Value::String(prefix.to_string())]),
             ..Default::default()
         };
         let body = serde_json::to_string(&req).ok()?;
-        let resp = http::request(
-            &self.conn.transport,
-            &endpoint::SQL,
-            Some(&body),
-            Some(Duration::from_millis(150)),
-        )
-        .ok()?;
+        let resp = http::request(&self.transport, &endpoint::SQL, Some(&body), Some(Duration::from_millis(150))).ok()?;
         if resp.status >= 300 {
             return None; // no sql_auto_complete on this berth → lane C
         }
@@ -143,10 +143,7 @@ fn suggest(value: String, kind: &str, start: usize, end: usize) -> Suggestion {
 
 impl Completer for SqlCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
-        // Clamped once, then used everywhere. `prefix` was clamped and
-        // `cache_suggestions` was handed the raw value, which then sliced
-        // `&line[..pos]` unguarded — if the clamp is worth having it is worth
-        // having on both paths.
+        // Clamped once, here, so every path below slices within the line.
         let pos = pos.min(line.len());
         let prefix = &line[..pos];
         let list: Vec<Suggestion> = if prefix.trim_start().starts_with('.') {
@@ -171,14 +168,8 @@ impl Completer for SqlCompleter {
     }
 }
 
-fn fetch_catalog_names(conn: &Conn) -> Option<Vec<String>> {
-    let resp = http::request(
-        &conn.transport,
-        &endpoint::CATALOG,
-        None,
-        Some(Duration::from_secs(2)),
-    )
-    .ok()?;
+fn fetch_catalog_names(transport: &Transport) -> Option<Vec<String>> {
+    let resp = http::request(transport, &endpoint::CATALOG, None, Some(Duration::from_secs(2))).ok()?;
     if resp.status != 200 {
         return None;
     }
@@ -208,15 +199,9 @@ fn fetch_catalog_names(conn: &Conn) -> Option<Vec<String>> {
 
 /// Run one statement, succeed quietly or return None. For setup steps whose
 /// failure is acceptable.
-fn quiet_sql(conn: &Conn, sql: &str) -> Option<()> {
+fn quiet_sql(transport: &Transport, sql: &str) -> Option<()> {
     let body = serde_json::to_string(&SqlRequest { sql: sql.into(), ..Default::default() }).ok()?;
-    let resp = http::request(
-        &conn.transport,
-        &endpoint::SQL,
-        Some(&body),
-        Some(Duration::from_secs(5)),
-    )
-    .ok()?;
+    let resp = http::request(transport, &endpoint::SQL, Some(&body), Some(Duration::from_secs(5))).ok()?;
     if resp.status >= 300 {
         return None;
     }
@@ -237,15 +222,15 @@ fn quiet_sql(conn: &Conn, sql: &str) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repl::http::Transport;
 
     #[test]
     fn word_boundary_is_char_safe() {
         // An em dash (or any multi-byte delimiter) before the word must not
-        // slice mid-char — this input panicked the old byte-arithmetic.
+        // slice mid-char.
         let inner = Inner {
-            conn: Conn { transport: Transport::Tcp("127.0.0.1:1".into()) },
+            transport: Transport::Tcp("127.0.0.1:1".into()),
             catalog: Some(vec!["people".into()]),
+            autocomplete: false,
         };
         for line in ["select —peo", "select “peo", "select peo"] {
             let s = inner.cache_suggestions(line, line.len());
