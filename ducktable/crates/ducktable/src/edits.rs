@@ -1479,9 +1479,35 @@ fn check_json(text: &str, variant: bool) -> Result<(), String> {
         false => serde_json::from_str::<serde::de::IgnoredAny>(text).map(drop),
     };
     match parsed {
+        Ok(()) if lone_surrogate(text) => {
+            Err(format!("{text:?} is not JSON \u{2014} a \\u escape names half a surrogate pair"))
+        }
         Ok(()) => Ok(()),
         Err(_) => Err(format!("{text:?} is not JSON \u{2014} text needs quotes, like \"Morel\"")),
     }
+}
+
+/// Whether a `\u` escape in `text` names half of a surrogate pair alone.
+/// serde passes over an escape it is not asked to build, and the engine's
+/// JSON refuses one (measured: `'"\ud800"'::JSON` fails, and so do a low
+/// half first and a high half before anything but a low one).
+fn lone_surrogate(text: &str) -> bool {
+    let b = text.as_bytes();
+    let unit = |i: usize| {
+        let hex = b.get(i..i + 6).filter(|e| e.starts_with(b"\\u"))?;
+        u16::from_str_radix(std::str::from_utf8(&hex[2..]).ok()?, 16).ok()
+    };
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], unit(i)) {
+            (_, Some(0xD800..=0xDBFF)) if matches!(unit(i + 6), Some(0xDC00..=0xDFFF)) => i += 12,
+            (_, Some(0xD800..=0xDFFF)) => return true,
+            // Any other escape, `\\` among them, passes as its two bytes.
+            (b'\\', _) => i += 2,
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 /// The most brackets open at once in `text`, outside any string.
@@ -2079,6 +2105,15 @@ mod tests {
             match ty.eq_ignore_ascii_case("VARIANT") {
                 true => assert!(parse_value(wide, ty).unwrap_err().contains("is not JSON"), "{ty}"),
                 false => assert_eq!(parse_value(wide, ty), Ok(json!(wide)), "{ty}"),
+            }
+            // Half a surrogate pair alone is refused, as the engine's JSON
+            // refuses it; a whole pair and an escaped backslash are not.
+            for text in [r#""\ud800""#, r#"{"a":"\udc00x"}"#, r#""\uD800A""#, r#""x\uDBFF""#] {
+                let err = parse_value(text, ty).unwrap_err();
+                assert!(err.contains("is not JSON"), "{ty} {text}: {err}");
+            }
+            for text in [r#""😀""#, r#""\\ud800""#, r#""􏿿""#, r#""A""#] {
+                assert_eq!(parse_value(text, ty), Ok(json!(text)), "{ty} {text}");
             }
 
             // A document nests 100 levels and no deeper, and says so.
