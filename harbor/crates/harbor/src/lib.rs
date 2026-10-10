@@ -1884,7 +1884,7 @@ fn handle(req: Request, exec: Option<Executor>, log: bool) -> bool {
             // whatever the engine's catalog provides, and version differences
             // die in this process rather than in every client.
             (Method::Get, "/catalog") => match exec {
-                Some((jobs, _)) => run_catalog(req, jobs),
+                Some(exec) => run_catalog(req, exec),
                 None => shed(req),
             },
             (Method::Post, "/sql") => match exec {
@@ -2572,21 +2572,27 @@ enum CatalogFailure {
 /// hand back the rows parsed rather than streamed. The one-shot JSON shape is
 /// reused instead of a second reader being written: the executor already
 /// produces `{"ok":true,...,"data":[...]}`, and a catalog result is a few
-/// dozen rows, nowhere near the size that shape refuses.
+/// dozen rows, nowhere near the size that shape refuses. Watched for the
+/// client as a statement is, so a client that leaves, as DuckTable does
+/// when it moves to another database, stops the exact count over every
+/// table with it.
 fn catalog_rows(
-    jobs: &mpsc::SyncSender<Job>,
+    (jobs, slot): Executor,
+    peer: &justhttp::Peer,
     sql: &str,
 ) -> Result<Vec<Vec<serde_json::Value>>, CatalogFailure> {
     // The deployment default applies here as it does to any statement.
     let (job, ready_rx, body_rx) = Job::new(sql.to_string(), Vec::new(), Shape::Json, configured_statement_timeout());
+    let id = job.id;
     if jobs.send(job).is_err() {
         return Err(CatalogFailure::Gone);
     }
-    let verdict = ready_rx.recv();
+    let mut watch = Watch::new(Some(peer.clone()), Arc::clone(slot), id);
+    let verdict = watch.recv(&ready_rx);
     // Drain rather than drop, for the same reason `run_ready` does: a dropped
     // receiver reads as a client that hung up mid-stream and costs a rollback.
     let mut document = Vec::new();
-    while let Ok(chunk) = body_rx.recv() {
+    while let Ok(chunk) = watch.recv(&body_rx) {
         document.extend_from_slice(&chunk);
     }
     match verdict {
@@ -2886,7 +2892,8 @@ fn catalog_identifier(name: &str) -> String {
 /// ordinal position, indexes and sequences by name, unique constraints by
 /// their column lists, foreign keys by their referenced table and column
 /// lists. A stable database answers with byte-identical output.
-fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
+fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
+    let peer = req.peer();
     let style = match catalog_style(req.url()) {
         Ok(style) => style,
         Err(message) => {
@@ -2897,7 +2904,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
     // System and temp catalogs are excluded by anchoring every query to the
     // served database: `system` and `temp` are separate databases, so
     // current_database() never matches them.
-    let version_rows = match catalog_rows(jobs, "SELECT library_version FROM pragma_version()") {
+    let version_rows = match catalog_rows(exec, &peer, "SELECT library_version FROM pragma_version()") {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
     };
@@ -2913,7 +2920,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
              ORDER BY schema_name, table_name"
         }
     };
-    let table_rows = match catalog_rows(jobs, table_sql) {
+    let table_rows = match catalog_rows(exec, &peer, table_sql) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
     };
@@ -2943,7 +2950,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
     // engine's visibility information and therefore excludes deleted rows
     // that the physical storage cardinality still includes.
     let count_rows = if let Some(sql) = catalog_count_sql(&table_rows) {
-        match catalog_rows(jobs, &sql) {
+        match catalog_rows(exec, &peer, &sql) {
             Ok(rows) => rows,
             Err(failure) => return catalog_refuse(req, failure),
         }
@@ -2976,7 +2983,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
     };
 
     let column_rows = match catalog_rows(
-        jobs,
+        exec, &peer,
         "SELECT schema_name, table_name, column_name, data_type, is_nullable, column_default, \
                 is_generated, generation_expression \
          FROM duckdb_columns() \
@@ -2987,7 +2994,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         Err(failure) => return catalog_refuse(req, failure),
     };
     let constraint_rows = match catalog_rows(
-        jobs,
+        exec, &peer,
         "SELECT schema_name, table_name, constraint_type, constraint_column_names, \
                 referenced_table, referenced_column_names \
          FROM duckdb_constraints() \
@@ -3003,7 +3010,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
     // not in it, which is exactly the distinction the contract wants — that
     // constraint-borne uniqueness travels in uniqueConstraints above, not here.
     let index_rows = match catalog_rows(
-        jobs,
+        exec, &peer,
         "SELECT schema_name, table_name, index_name, is_unique, expressions \
          FROM duckdb_indexes() \
          WHERE database_name = current_database() \
@@ -3013,7 +3020,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         Err(failure) => return catalog_refuse(req, failure),
     };
     let sequence_rows = match catalog_rows(
-        jobs,
+        exec, &peer,
         "SELECT sequence_name, start_value FROM duckdb_sequences() \
          WHERE database_name = current_database() AND NOT temporary \
          ORDER BY sequence_name",
