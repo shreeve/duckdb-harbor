@@ -548,21 +548,50 @@ def run_tests(h, db, proc):
     # -----------------------------------------------------------------------
     section("A cancel that comes after the statement finished stops nothing")
 
-    # The rows are all produced and waiting to be read when the cancel lands.
-    # It stopped nothing, so it says so, and the client reads every row.
-    told, whole = [], 0
+    # The statement is over, and its answer waits on the connection behind
+    # one the client pipelined ahead of it, when the cancel lands. It stopped
+    # nothing, so it says so, and the answer arrives whole.
+    def post(body, last=False):
+        close = "Connection: close\r\n" if last else ""
+        return (f"POST /sql HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                f"Accept: application/json\r\n{close}Content-Length: {len(body)}\r\n\r\n{body}").encode()
+
+    def answers(data):
+        """(status, document) of each response on a connection."""
+        out = []
+        while data:
+            head, _, data = data.partition(b"\r\n\r\n")
+            lines = head.split(b"\r\n")
+            fields = dict(line.lower().split(b": ", 1) for line in lines[1:])
+            if b"content-length" in fields:
+                length = int(fields[b"content-length"])
+                body, data = data[:length], data[length:]
+            else:
+                body = b""
+                while True:
+                    size, _, data = data.partition(b"\r\n")
+                    length = int(size, 16)
+                    body, data = body + data[:length], data[length + 2:]
+                    if length == 0:
+                        break
+            out.append((int(lines[0].split()[1]), json.loads(body)))
+        return out
+
+    told, drawn = [], []
     for attempt in range(10):
-        conn = http.client.HTTPConnection("127.0.0.1", int(h.base.rsplit(":", 1)[1]), timeout=30)
-        conn.request("POST", "/sql", json.dumps({"sql": "SELECT range FROM range(6000)", "queryId": f"late{attempt}"}),
-                     {"Content-Type": "application/json"})
-        response = conn.getresponse()
-        time.sleep(0.3)
+        s = socket.create_connection(("127.0.0.1", int(h.base.rsplit(":", 1)[1])), timeout=30)
+        s.sendall(post(json.dumps({"sql": LONG, "queryId": f"ahead{attempt}"}))
+                  + post(json.dumps({"sql": "SELECT range FROM range(6000)", "queryId": f"late{attempt}"}), last=True))
+        time.sleep(0.5)
         told.append(h.cancel(f"late{attempt}")[1].get("cancelled"))
-        lines = response.read().decode().splitlines()
-        conn.close()
-        whole += len(lines) == 6002 and json.loads(lines[-1]).get("type") == "end"
+        h.cancel(f"ahead{attempt}")
+        data = b""
+        while chunk := s.recv(65536):
+            data += chunk
+        s.close()
+        drawn.append([(status, doc.get("rowCount")) for status, doc in answers(data)])
     eq("the cancel says it stopped nothing", [False] * 10, told)
-    eq("and every stream arrives whole", 10, whole)
+    eq("and every answer arrives whole", [[(499, None), (200, 6000)]] * 10, drawn)
 
     # -----------------------------------------------------------------------
     section("A session needs no free worker")
