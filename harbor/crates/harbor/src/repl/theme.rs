@@ -177,8 +177,14 @@ fn colorfgbg_appearance(v: &str) -> Option<Appearance> {
 }
 
 /// Ask the terminal for its background with OSC 11 and classify by luminance.
-/// Returns None if not a tty, the terminal doesn't answer in time, or the reply
-/// can't be parsed — the caller then falls back.
+/// Returns None if not a tty, the terminal doesn't answer, or the reply can't
+/// be parsed — the caller then falls back.
+///
+/// A terminal that does not know OSC 11 says nothing, so no wait for it can
+/// tell a slow answer from none, and an answer that comes after the wait
+/// reaches the prompt as typed text. So the query is followed by DA1, which
+/// every terminal answers, and answers after whatever was asked before it:
+/// its answer ends the wait, however slow the line.
 #[cfg(unix)]
 fn osc11_appearance() -> Option<Appearance> {
     use std::io::{IsTerminal, Write};
@@ -189,13 +195,12 @@ fn osc11_appearance() -> Option<Appearance> {
     let _raw = RawMode::enable()?; // restores on drop
     {
         let mut out = std::io::stdout();
-        out.write_all(b"\x1b]11;?\x07").ok()?;
+        out.write_all(b"\x1b]11;?\x07\x1b[c").ok()?;
         out.flush().ok()?;
     }
-    let reply = read_reply(Duration::from_millis(120));
-    // Whatever of a reply has come and was not read — the tail of a slow
-    // one, over ssh or tmux — goes now, while the terminal is raw, rather
-    // than reaching the prompt as typed text.
+    let reply = read_reply(Duration::from_secs(1));
+    // Whatever came and was not read goes now, while the terminal is raw,
+    // rather than reaching the prompt as typed text.
     {
         use std::os::unix::io::AsRawFd;
         unsafe { libc::tcflush(std::io::stdin().as_raw_fd(), libc::TCIFLUSH) };
@@ -248,12 +253,19 @@ fn read_reply(timeout: std::time::Duration) -> Option<Vec<u8>> {
             break;
         }
         buf.extend_from_slice(&tmp[..r as usize]);
-        // Reply ends with BEL or ST (ESC \). Stop as soon as one arrives.
-        if buf.contains(&0x07) || buf.windows(2).any(|w| w == [0x1b, 0x5c]) || buf.len() > 256 {
+        if answered(&buf) || buf.len() > 256 {
             break;
         }
     }
     (!buf.is_empty()).then_some(buf)
+}
+
+/// Whether `buf` holds the terminal's answer to DA1, `ESC [ ? … c`.
+fn answered(buf: &[u8]) -> bool {
+    (0..buf.len()).any(|i| {
+        buf[i..].starts_with(b"\x1b[?")
+            && buf[i + 3..].iter().find(|b| !(b.is_ascii_digit() || **b == b';')) == Some(&b'c')
+    })
 }
 
 /// RAII raw-mode guard around the OSC query, so the reply is not line-buffered
@@ -293,6 +305,14 @@ mod tests {
         assert!(l8 > 0.5);
         // Garbage is None (caller falls back), never a panic.
         assert!(luminance_of(b"not a reply").is_none());
+    }
+
+    #[test]
+    fn the_wait_ends_at_the_answer_to_da1() {
+        assert!(answered(b"\x1b]11;rgb:0000/0000/0000\x07\x1b[?62;22c"));
+        assert!(answered(b"\x1b[?1;2c"));
+        assert!(!answered(b"\x1b]11;rgb:0000/0000/0000\x07"));
+        assert!(!answered(b"\x1b[?62;22"));
     }
 
     #[test]

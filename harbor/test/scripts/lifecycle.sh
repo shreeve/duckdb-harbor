@@ -250,6 +250,7 @@ def drain(seconds):
         buf += chunk
         if b"\x1b]11;?" in chunk: os.write(fd, b"\x1b]11;rgb:1c1c/1c1c/1c1c\x07")
         if b"\x1b[6n" in chunk:   os.write(fd, b"\x1b[1;1R")
+        if b"\x1b[c" in chunk:    os.write(fd, b"\x1b[?62;22c")
 drain(3)
 os.write(fd, b".mode csv\r"); drain(1)
 os.write(fd, b".mode\r");     drain(1)
@@ -265,6 +266,48 @@ sys.exit(0 if "mode: csv" in out and mode == 0o700 else 1)
 PY
 (( history == 0 )) && ok "the prompt's history lives in a directory only its user can read" \
                    || bad "the history directory stayed open, or the prompt misbehaved (see $work/history.log)"
+# A terminal over a slow line answers the background-color query late. Its
+# answer must not reach the prompt as typed text: the REPL waits for the
+# answer to DA1, which a terminal sends after it, however late that is.
+late=0
+HARBOR_HOME="$work/home" python3 - "$harbor" <<'PY' >"$work/late.log" 2>&1 || late=$?
+import os, pty, select, sys, time
+harbor = sys.argv[1]
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm"
+    os.execv(harbor, [harbor, "http://127.0.0.1:1"])
+    os._exit(1)
+buf, due = b"", None
+def drain(seconds):
+    global buf, due
+    end = time.time() + seconds
+    while time.time() < end:
+        if due and time.time() >= due:
+            os.write(fd, b"\x1b]11;rgb:1c1c/1c1c/1c1c\x07\x1b[?62;22c"); due = None
+        if not select.select([fd], [], [], 0.05)[0]:
+            continue
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            return
+        if not chunk:
+            return
+        buf += chunk
+        if b"\x1b]11;?" in chunk: due = time.time() + 0.4
+        if b"\x1b[6n" in chunk:   os.write(fd, b"\x1b[1;1R")
+drain(3)
+os.write(fd, b".mode\r"); drain(1.5)
+os.write(fd, b".quit\r"); drain(1.5)
+for close in (lambda: os.close(fd), lambda: os.waitpid(pid, 0)):
+    try: close()
+    except Exception: pass
+out = buf.decode("utf8", "replace")
+print(out[-2000:])
+sys.exit(0 if "mode: duckbox" in out and "rgb:" not in out.split("\x1b]11;?")[-1] else 1)
+PY
+(( late == 0 )) && ok "a late answer to the background query never reaches the prompt" \
+                || bad "a late terminal answer was typed into the prompt (see $work/late.log)"
 
 echo "— the server is everyone's: it lives while anyone is connected"
 sock=$(live_sock)
@@ -300,6 +343,7 @@ def drain(seconds):          # read, and answer the queries a terminal owes
         buf += chunk
         if b"\x1b]11;?" in chunk: os.write(fd, b"\x1b]11;rgb:1c1c/1c1c/1c1c\x07")
         if b"\x1b[6n" in chunk:   os.write(fd, b"\x1b[1;1R")
+        if b"\x1b[c" in chunk:    os.write(fd, b"\x1b[?62;22c")
 drain(5)
 os.write(fd, b"SELECT 1 AS early;\r"); drain(3)
 # A transaction left open across the pause: the prompt keeps its session past
