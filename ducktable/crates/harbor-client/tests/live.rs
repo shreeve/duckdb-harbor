@@ -2,7 +2,7 @@
 //! say nothing in CI. They create and drop tables, so they run only against
 //! the database file `HARBOR_LIVE_DB` names, and skip without it; nothing is
 //! ever chosen from the machine's fleet. Run explicitly:
-//! `HARBOR_LIVE_DB=/tmp/scratch.duckdb cargo test -p harbor-client --test live -- --ignored --nocapture`
+//! `HARBOR_HOME=/tmp/dt-home HARBOR_LIVE_DB=/tmp/scratch.duckdb cargo test -p harbor-client --test live -- --ignored --nocapture`
 //!
 //! One probe takes another variable: `an_open_database_outlives_harbors_linger`
 //! starts a server of its own on a copy of the file `HARBOR_FIXTURE` names
