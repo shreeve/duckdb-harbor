@@ -461,7 +461,7 @@ impl QueryView {
                         }
                         (exec(&sql), None, false)
                     };
-                    let fate = fate(route, effect, aborted, outcome.as_ref().err());
+                    let fate = fate(route, effect, aborted, outcome.as_ref().err(), reads_only(&sql));
                     // A transaction that is over gives its session back
                     // here, before the verdict shows: releasing rolls back
                     // whatever a failed ending left open.
@@ -1375,6 +1375,18 @@ enum Route {
     Refused,
 }
 
+/// Whether a statement only reads, by the keyword the engine acts on
+/// (`wire::statement`): a query, a description of one, or an EXPLAIN that
+/// does not run what it explains. Anything else may write, a statement in
+/// parentheses included.
+fn reads_only(sql: &str) -> bool {
+    matches!(
+        wire::statement::acting_keyword(sql).as_str(),
+        "SELECT" | "FROM" | "WITH" | "VALUES" | "TABLE" | "DESCRIBE" | "DESC" | "SUMMARIZE" | "SHOW"
+            | "EXPLAIN" | "PIVOT" | "UNPIVOT"
+    )
+}
+
 /// Where a statement runs. `lost` is the latch the watcher raises when it
 /// finds the transaction gone between statements; the run that reads it
 /// lowers it, so the refusal is said once and the run after it goes ahead.
@@ -1421,20 +1433,25 @@ enum Fate {
 }
 
 /// `aborted` is what the session answered when asked just before a COMMIT
-/// (`Txn::commit`); it matters to no other statement.
+/// (`Txn::commit`); it matters to no other statement. `reads` says the
+/// statement only reads (`reads_only`).
 fn fate(
     route: Route,
     effect: Option<TxnEffect>,
     aborted: bool,
     failure: Option<&harbor_client::Failure>,
+    reads: bool,
 ) -> Fate {
     use harbor_client::Failure;
     let ends = effect.is_some_and(TxnEffect::ends);
     let doomed = aborted && effect == Some(TxnEffect::Commits);
     match (route, failure) {
         // A statement sent on its own that got no answer may have run, and
-        // on its own it commits.
-        (Route::Alone, Some(failure)) if effect.is_none() && ran(failure) == Ran::Unknown => Fate::MaybeRan,
+        // on its own it commits. A read commits nothing, and is safe to run
+        // again.
+        (Route::Alone, Some(failure)) if effect.is_none() && !reads && ran(failure) == Ran::Unknown => {
+            Fate::MaybeRan
+        }
         (Route::Alone | Route::Refused, _) => Fate::Closed,
         (Route::Opening, None) => Fate::Open,
         (Route::Opening, Some(_)) => Fate::Closed,
@@ -2072,7 +2089,7 @@ mod tests {
         // an UPDATE would commit on its own.
         for effect in [None, Some(TxnEffect::Opens), Some(TxnEffect::Commits), Some(TxnEffect::RollsBack)] {
             assert_eq!(route(false, true, effect), Route::Refused, "{effect:?}");
-            assert_eq!(fate(Route::Refused, effect, false, None), Fate::Closed, "{effect:?}");
+            assert_eq!(fate(Route::Refused, effect, false, None, false), Fate::Closed, "{effect:?}");
         }
         // The run reads the latch and lowers it, as `QueryView::run` does, so
         // the same statement sent again goes ahead on its own.
@@ -2257,10 +2274,10 @@ mod tests {
         assert!(matches!(&unconfirmed, Failure::Unsent(why)
             if why.starts_with("could not confirm the transaction's state (session_busy: busy)")
                 && why.ends_with("try again")));
-        assert_eq!(fate(Route::Held, Some(TxnEffect::Commits), false, Some(&unconfirmed)), Fate::Open);
+        assert_eq!(fate(Route::Held, Some(TxnEffect::Commits), false, Some(&unconfirmed), false), Fate::Open);
         // A session that is gone is reported as that.
         let gone = commit_gate(Asked::Gone(harbor("no_such_session"))).unwrap_err();
-        assert_eq!(fate(Route::Held, Some(TxnEffect::Commits), false, Some(&gone)), Fate::Lost);
+        assert_eq!(fate(Route::Held, Some(TxnEffect::Commits), false, Some(&gone), false), Fate::Lost);
     }
 
     #[test]
@@ -2268,26 +2285,26 @@ mod tests {
         let (commits, rolls_back) = (Some(TxnEffect::Commits), Some(TxnEffect::RollsBack));
         // The reviewer's case: BEGIN; INSERT; a SELECT whose count hits a
         // Conversion Error; COMMIT. The COMMIT answers, and rolled back.
-        assert_eq!(fate(Route::Held, commits, true, None), Fate::RolledBack);
+        assert_eq!(fate(Route::Held, commits, true, None, false), Fate::RolledBack);
         // Not aborted, it committed.
-        assert_eq!(fate(Route::Held, commits, false, None), Fate::Closed);
+        assert_eq!(fate(Route::Held, commits, false, None, false), Fate::Closed);
         // With no verdict on the COMMIT there is still no doubt: aborted, it
         // rolls back when it runs or when its session is released.
         for failure in [Failure::Unanswered("query: timed out".into()), harbor("cancelled"), harbor("internal")] {
-            assert_eq!(fate(Route::Held, commits, true, Some(&failure)), Fate::RolledBack, "{failure:?}");
+            assert_eq!(fate(Route::Held, commits, true, Some(&failure), false), Fate::RolledBack, "{failure:?}");
         }
         // Not aborted: with no answer, or Harbor's `internal`, it may have
         // committed; answered `cancelled`, it never started.
         for failure in [Failure::Unanswered("query: timed out".into()), harbor("internal")] {
-            assert_eq!(fate(Route::Held, commits, false, Some(&failure)), Fate::InDoubt, "{failure:?}");
+            assert_eq!(fate(Route::Held, commits, false, Some(&failure), false), Fate::InDoubt, "{failure:?}");
         }
-        assert_eq!(fate(Route::Held, commits, false, Some(&harbor("cancelled"))), Fate::NotKept);
+        assert_eq!(fate(Route::Held, commits, false, Some(&harbor("cancelled")), false), Fate::NotKept);
         assert!(Fate::NotKept.note(commits).unwrap().starts_with("The COMMIT did not run, and nothing since BEGIN was kept."));
         // A ROLLBACK does what was asked either way, and says no more.
-        assert_eq!(fate(Route::Held, rolls_back, true, None), Fate::Closed);
-        assert_eq!(fate(Route::Held, rolls_back, false, None), Fate::Closed);
+        assert_eq!(fate(Route::Held, rolls_back, true, None, false), Fate::Closed);
+        assert_eq!(fate(Route::Held, rolls_back, false, None, false), Fate::Closed);
         // Outside a held transaction the flag means nothing.
-        assert_eq!(fate(Route::Alone, commits, true, None), Fate::Closed);
+        assert_eq!(fate(Route::Alone, commits, true, None, false), Fate::Closed);
         // The view's own message stands in for "ok", and needs no note.
         assert_eq!(Fate::RolledBack.note(commits), None);
         assert!(super::ROLLED_BACK.contains("rolled back: an earlier error aborted the transaction"));
@@ -2312,61 +2329,69 @@ mod tests {
 
         // Alone, nothing is open before or after, whatever the verdict.
         for failure in [None, Some(&catalog), Some(&lost_answer)] {
-            assert_eq!(fate(Route::Alone, commits, false, failure), Fate::Closed);
+            assert_eq!(fate(Route::Alone, commits, false, failure, false), Fate::Closed);
         }
         for failure in [None, Some(&catalog), Some(&parse), Some(&unsent)] {
-            assert_eq!(fate(Route::Alone, None, false, failure), Fate::Closed);
+            assert_eq!(fate(Route::Alone, None, false, failure, false), Fate::Closed);
         }
         // A statement alone that got no answer may have run, and committed:
         // the view says so, and a rerun is the user's to weigh.
         for failure in [&lost_answer, &harbor("cancelled"), &harbor("internal")] {
-            assert_eq!(fate(Route::Alone, None, false, Some(failure)), Fate::MaybeRan, "{failure:?}");
+            assert_eq!(fate(Route::Alone, None, false, Some(failure), false), Fate::MaybeRan, "{failure:?}");
         }
         assert!(Fate::MaybeRan.note(None).unwrap().contains("may have run, and on its own it commits"));
+        // A read that got no answer committed nothing: no warning.
+        assert_eq!(fate(Route::Alone, None, false, Some(&lost_answer), true), Fate::Closed);
+        for read in ["SELECT 1", " from t", "WITH x AS (SELECT 1) SELECT * FROM x", "EXPLAIN SELECT 1", "describe t"] {
+            assert!(super::reads_only(read), "{read}");
+        }
+        for write in ["INSERT INTO t VALUES (1)", "EXPLAIN ANALYZE DELETE FROM t", "(SELECT 1)", "CALL f()", "COPY t TO 'x'"] {
+            assert!(!super::reads_only(write), "{write}");
+        }
         // BEGIN opens one only if it succeeded; its session goes back otherwise.
-        assert_eq!(fate(Route::Opening, opens, false, None), Fate::Open);
-        assert_eq!(fate(Route::Opening, opens, false, Some(&catalog)), Fate::Closed);
-        assert_eq!(fate(Route::Opening, opens, false, Some(&lost_answer)), Fate::Closed);
+        assert_eq!(fate(Route::Opening, opens, false, None, false), Fate::Open);
+        assert_eq!(fate(Route::Opening, opens, false, Some(&catalog), false), Fate::Closed);
+        assert_eq!(fate(Route::Opening, opens, false, Some(&lost_answer), false), Fate::Closed);
 
         // Inside one, an ordinary statement leaves it open, failed or not:
         // an aborted transaction is still open until ROLLBACK or COMMIT.
         for failure in [None, Some(&parse), Some(&catalog), Some(&busy), Some(&unsent), Some(&lost_answer)] {
-            assert_eq!(fate(Route::Held, None, false, failure), Fate::Open);
-            assert_eq!(fate(Route::Held, opens, false, failure), Fate::Open);
+            assert_eq!(fate(Route::Held, None, false, failure, false), Fate::Open);
+            assert_eq!(fate(Route::Held, opens, false, failure, false), Fate::Open);
         }
         for ends in [commits, rolls_back] {
             // COMMIT and ROLLBACK end it. One that did not parse never ran;
             // one the engine refused ended it rolled back; one with no
             // answer may have gone either way.
-            assert_eq!(fate(Route::Held, ends, false, None), Fate::Closed);
-            assert_eq!(fate(Route::Held, ends, false, Some(&parse)), Fate::Open);
-            assert_eq!(fate(Route::Held, ends, false, Some(&conflict)), Fate::Failed);
-            assert_eq!(fate(Route::Held, ends, false, Some(&lost_answer)), Fate::InDoubt);
+            assert_eq!(fate(Route::Held, ends, false, None, false), Fate::Closed);
+            assert_eq!(fate(Route::Held, ends, false, Some(&parse), false), Fate::Open);
+            assert_eq!(fate(Route::Held, ends, false, Some(&conflict), false), Fate::Failed);
+            assert_eq!(fate(Route::Held, ends, false, Some(&lost_answer), false), Fate::InDoubt);
             // One Harbor refused before the engine saw it, or that could not
             // be sent, leaves the transaction open and the session held: the
             // statement before it is still running there, or the server is
             // not serving. Releasing the session would cancel that statement
             // and roll everything back.
             for failure in [&busy, &unavailable, &unsent] {
-                assert_eq!(fate(Route::Held, ends, false, Some(failure)), Fate::Open, "{failure:?}");
+                assert_eq!(fate(Route::Held, ends, false, Some(failure), false), Fate::Open, "{failure:?}");
             }
             // One Harbor interrupted after the engine had it, at a deadline
             // or a cancel, or failed on after it ran, has no verdict either:
             // the transaction is not shown as open.
-            assert_eq!(fate(Route::Held, ends, false, Some(&harbor("internal"))), Fate::InDoubt);
+            assert_eq!(fate(Route::Held, ends, false, Some(&harbor("internal")), false), Fate::InDoubt);
             let cancelled = if ends == commits { Fate::NotKept } else { Fate::InDoubt };
-            assert_eq!(fate(Route::Held, ends, false, Some(&harbor("cancelled"))), cancelled);
+            assert_eq!(fate(Route::Held, ends, false, Some(&harbor("cancelled")), false), cancelled);
             // The engine found no transaction to end: the view's mark was
             // wrong, and nothing is claimed to have been rolled back.
             for verb in ["commit", "rollback"] {
                 let none = refused(&format!("TransactionContext Error: cannot {verb} - no transaction is active"));
-                assert_eq!(fate(Route::Held, ends, false, Some(&none)), Fate::NoneActive);
+                assert_eq!(fate(Route::Held, ends, false, Some(&none), false), Fate::NoneActive);
             }
         }
         // A session the server reclaimed is gone for every statement, and
         // none of them is then run outside it.
         for effect in [None, opens, commits, rolls_back] {
-            assert_eq!(fate(Route::Held, effect, false, Some(&gone)), Fate::Lost, "{effect:?}");
+            assert_eq!(fate(Route::Held, effect, false, Some(&gone), false), Fate::Lost, "{effect:?}");
         }
 
         // Only an outcome the engine's message leaves unsaid earns a note.
@@ -2505,7 +2530,7 @@ mod tests {
         assert!(aborted);
         let refused = answer.expect_err("Harbor refuses the COMMIT of an aborted transaction");
         assert!(refused.to_string().contains("rolled back"), "{refused}");
-        assert_eq!(fate(Route::Held, commits, aborted, Some(&refused)), Fate::Failed);
+        assert_eq!(fate(Route::Held, commits, aborted, Some(&refused), false), Fate::Failed);
         txn.release();
         assert_eq!(rows(), serde_json::json!(2), "the INSERT is gone");
 
@@ -2532,7 +2557,7 @@ mod tests {
         let (aborted, answer) = txn.commit("COMMIT");
         assert!(!aborted);
         answer.expect("COMMIT");
-        assert_eq!(fate(Route::Held, commits, aborted, None), Fate::Closed);
+        assert_eq!(fate(Route::Held, commits, aborted, None, false), Fate::Closed);
         txn.release();
         assert_eq!(rows(), serde_json::json!(3), "this one committed");
 
@@ -2556,7 +2581,7 @@ mod tests {
         let unconfirmed = answer.unwrap_err();
         println!("COMMIT on a busy session: {unconfirmed}");
         assert!(!aborted && matches!(&unconfirmed, harbor_client::Failure::Unsent(_)));
-        assert_eq!(fate(Route::Held, commits, aborted, Some(&unconfirmed)), Fate::Open);
+        assert_eq!(fate(Route::Held, commits, aborted, Some(&unconfirmed), false), Fate::Open);
         assert_eq!(rows(), serde_json::json!(3), "nothing was committed");
         slow.join().expect("the slow statement's thread").expect("it finished");
         let (aborted, answer) = txn.commit("COMMIT");

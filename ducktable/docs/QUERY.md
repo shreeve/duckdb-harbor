@@ -85,7 +85,9 @@ and nothing else carries to the next run: a temp table is gone by then. What
 does carry is a transaction, below. A run that gets no answer (a timeout, a
 dropped stream, Harbor's `cancelled` or `internal`) may have run and
 committed, and the view says so under the error, so that a rerun of an
-`INSERT` is a choice and not an accident.
+`INSERT` is a choice and not an accident. A query (`SELECT`, `FROM`,
+`WITH`, `DESCRIBE`, a plain `EXPLAIN` and their kin) commits nothing, and
+gets no such warning.
 
 **One run at a time.** ⌘Enter during a run answers `already running…` rather
 than queueing, so no result is ever in flight behind another.
@@ -280,8 +282,10 @@ results fade, stale but never blanked. Completion is always one atomic swap.
 - **Scratch:** `~/.config/ducktable/scratch/<berth>.sql`, written on every
   change to the editor, off the UI thread: one write at a time, always of the
   newest text, so a burst of typing never lands an older text over a newer.
-  A write that fails says `scratch not saved: …` in the status line until one
-  succeeds.
+  Each write goes to a file beside it, renamed over it, and a quit waits a
+  second at most for one under way, so the file holds a whole text, never a
+  truncated one. A write that fails says `scratch not saved: …` in the status
+  line, beside the run's verdict, until one succeeds.
 - **History:** `~/.config/ducktable/history/<berth>.ndjson`, one line per run
   with its text, time, duration and row count or error. It is captured before
   any UI reads it, because history never captured cannot be recovered. It keeps
