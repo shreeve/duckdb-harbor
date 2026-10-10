@@ -2065,43 +2065,50 @@ struct SqlRequest {
 }
 
 fn parse_request(body: &str) -> Result<SqlRequest, String> {
-    let mut v: serde_json::Value = serde_json::from_str(body).map_err(|e| match e.to_string() {
-        // The parser stops reading at 127 levels, and nothing in a request
-        // nests but a document param, so its refusal is the one below in
-        // other words. Should the wording ever differ, the parser's own
-        // message goes out instead.
-        deep if deep.starts_with("recursion limit exceeded") => too_deep(),
-        other => other,
-    })?;
-    // take() moves the String serde already built instead of copying it
-    let sql = match v.get_mut("sql").map(serde_json::Value::take) {
-        Some(serde_json::Value::String(s)) => s,
+    /// The body in one pass. `params` stays as written, so each param's own
+    /// text can say whether it is a whole number, and a key given twice is
+    /// refused rather than read as one of its values.
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", expecting = "an object")]
+    struct Body<'a> {
+        sql: Option<serde_json::Value>,
+        #[serde(borrow)]
+        params: Option<&'a serde_json::value::RawValue>,
+        session_id: Option<serde_json::Value>,
+        query_id: Option<serde_json::Value>,
+        timeout_ms: Option<serde_json::Value>,
+    }
+    let v: Body = serde_json::from_str(body).map_err(json_error)?;
+    // The derive also reads an array of the fields in order, which is not a
+    // request.
+    let sql = match v.sql {
+        Some(serde_json::Value::String(s)) if body.trim_start().starts_with('{') => s,
         _ => return Err("missing \"sql\"".to_string()),
     };
     if sql.trim().is_empty() {
         return Err("\"sql\" is empty".to_string());
     }
-    let params = match v.get("params") {
-        None | Some(serde_json::Value::Null) => Vec::new(),
-        Some(serde_json::Value::Array(a)) => a
-            .iter()
-            .enumerate()
-            .map(|(i, param)| json_to_duckdb(param, || written_whole(body, i)))
+    let params = match v.params {
+        None => Vec::new(),
+        Some(raw) => serde_json::from_str::<Vec<&serde_json::value::RawValue>>(raw.get())
+            .map_err(|_| "\"params\" must be an array".to_string())?
+            .into_iter()
+            .map(|raw| {
+                let param = serde_json::from_str(raw.get()).map_err(json_error)?;
+                json_to_duckdb(param, || !raw.get().contains(['.', 'e', 'E']))
+            })
             .collect::<Result<_, _>>()?,
-        Some(_) => return Err("\"params\" must be an array".to_string()),
     };
-    let session = match v.get("sessionId") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::String(id)) if !id.is_empty() => Some(id.clone()),
+    let session = match v.session_id {
+        None => None,
+        Some(serde_json::Value::String(id)) if !id.is_empty() => Some(id),
         Some(_) => return Err("\"sessionId\" must be a non-empty string".to_string()),
     };
-    let query = match v.get("queryId") {
-        None | Some(serde_json::Value::Null) => None,
+    let query = match v.query_id {
+        None => None,
         // Bounded, because it becomes a key in a map that lives as long as the
         // server and is written by any caller.
-        Some(serde_json::Value::String(id)) if !id.is_empty() && id.len() <= 128 => {
-            Some(id.clone())
-        }
+        Some(serde_json::Value::String(id)) if !id.is_empty() && id.len() <= 128 => Some(id),
         Some(_) => {
             return Err("\"queryId\" must be a non-empty string of at most 128 characters"
                 .to_string());
@@ -2114,8 +2121,8 @@ fn parse_request(body: &str) -> Result<SqlRequest, String> {
     // knob a `--sealed` deployment leans on. With no cap configured, 0 is
     // unlimited and N is exactly N.
     let cap = configured_statement_timeout();
-    let timeout = match v.get("timeoutMs") {
-        None | Some(serde_json::Value::Null) => cap,
+    let timeout = match v.timeout_ms {
+        None => cap,
         Some(serde_json::Value::Number(n)) => match n.as_u64() {
             Some(0) => cap,
             Some(ms) => {
@@ -2130,12 +2137,14 @@ fn parse_request(body: &str) -> Result<SqlRequest, String> {
 }
 
 /// One JSON param as the value it binds. `whole` says whether the param was
-/// written as a whole number, asked only of one past what 64 bits hold.
-fn json_to_duckdb(v: &serde_json::Value, whole: impl FnOnce() -> bool) -> Result<Param, String> {
+/// written as a whole number, with no fraction and no exponent: one past 64
+/// bits parses to a double, so only its text can say. It is asked only of a
+/// number past what 64 bits hold.
+fn json_to_duckdb(v: serde_json::Value, whole: impl FnOnce() -> bool) -> Result<Param, String> {
     Ok(match v {
         serde_json::Value::Null => Param::Null,
-        serde_json::Value::Bool(b) => Param::Bool(*b),
-        serde_json::Value::String(s) => Param::Text(s.clone()),
+        serde_json::Value::Bool(b) => Param::Bool(b),
+        serde_json::Value::String(s) => Param::Text(s),
         // A fraction or an exponent binds as the double its text names, as
         // in SQL. A whole number past i64 and u64 reads as the nearest
         // double, a different number, so it is refused rather than stored
@@ -2157,24 +2166,22 @@ fn json_to_duckdb(v: &serde_json::Value, whole: impl FnOnce() -> bool) -> Result
         // its own and goes as its JSON text, for the statement to cast. A
         // string is never read this way, whatever it spells: a param that
         // looks like JSON is data, as one that looks like SQL is.
-        other if nests_within(other, DOCUMENT_LEVELS) => {
+        other if nests_within(&other, DOCUMENT_LEVELS) => {
             Param::Document { text: other.to_string(), variant: false }
         }
         _ => return Err(too_deep()),
     })
 }
 
-/// Whether param `i` of `body` is written as a whole number: no fraction and
-/// no exponent. The parsed value cannot say, since a whole number past 64
-/// bits parses to a double; the text can.
-fn written_whole(body: &str, i: usize) -> bool {
-    #[derive(serde::Deserialize)]
-    struct Params<'a> {
-        #[serde(borrow)]
-        params: Vec<&'a serde_json::value::RawValue>,
+/// A JSON parse failure in words. The parser stops reading at 127 levels,
+/// and nothing in a request nests but a document param, so its refusal is
+/// the one below in other words. Should the wording ever differ, the
+/// parser's own message goes out instead.
+fn json_error(e: serde_json::Error) -> String {
+    match e.to_string() {
+        deep if deep.starts_with("recursion limit exceeded") => too_deep(),
+        other => other,
     }
-    serde_json::from_str::<Params>(body)
-        .is_ok_and(|p| p.params.get(i).is_some_and(|raw| !raw.get().contains(['.', 'e', 'E'])))
 }
 
 fn too_deep() -> String {
@@ -4379,8 +4386,8 @@ mod tests {
             assert!(matches!(fits.params[..], [super::Param::Document { .. }]), "{open}");
             let err = request(nested(101)).err().unwrap();
             assert_eq!(err, "a document param nests at most 100 levels", "{open}");
-            // Past 125 the body parser refuses first, in the same words.
-            for n in [125, 126, 5000] {
+            // Past 127 the parser refuses first, in the same words.
+            for n in [125, 127, 128, 5000] {
                 assert_eq!(request(nested(n)).err().unwrap(), err, "{open} {n}");
             }
             // The deep branch need not be the first one.
@@ -4408,6 +4415,12 @@ mod tests {
         }
         assert!(matches!(request("-9223372036854775808").unwrap().params[1], super::Param::I64(i64::MIN)));
         assert!(matches!(request("18446744073709551615").unwrap().params[1], super::Param::U64(u64::MAX)));
+        // Two `params` have no one answer, and the second would otherwise
+        // bind its big number as the nearest double.
+        let twice = r#"{"sql":"SELECT ?","params":[1],"params":[123456789012345678901234]}"#;
+        assert!(super::parse_request(twice).err().unwrap().contains("duplicate field `params`"));
+        // The fields in order, without their names, are not a request.
+        assert_eq!(super::parse_request(r#"["SELECT 1",null,null,null,null]"#).err().unwrap(), "missing \"sql\"");
     }
 
     #[test]
