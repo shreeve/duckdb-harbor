@@ -9,22 +9,23 @@ HTTP over a socket.
 justhttp is the HTTP layer under [`harbor`](../../README.md), created and
 maintained here as a first-party workspace crate. Harbor depends directly on
 this crate by path; justhttp is not vendored and has no upstream HTTP crate to
-track. Its historical ancestry is recorded only for attribution in **Lineage
-and license** below.
+track. Its ancestry is recorded only for attribution in **Lineage and license**
+below.
 
 ## What it does
 
 - `Server::http("127.0.0.1:9495")` / `Server::http_unix(path)` — one
   listener, TCP or UDS; `Server::serve(listeners)` — several, one queue
-- `recv_timeout()` hands out requests, and `unblock()` wakes a waiting
-  worker for shutdown: each `Request` carries method, url, headers, and a
-  lazy body reader
+- `recv_timeout()` hands out requests: each `Request` carries method, url,
+  headers, and a lazy body reader; for shutdown, `close_doors()` stops
+  accepting and `unblock()` wakes a waiting worker
 - `request.respond(response)` — responses stream from any `Read` impl;
   unknown-length responses are framed chunked, so a client reads row one
   while the server produces row N
 - `request.peer()` — a cheap handle whose `closed()` turns true once the
-  client has closed or reset the connection, so a handler can stop work
-  nobody will read; a quiet or pipelining client is not a departure
+  client has closed or reset the connection, or shut down its sending side,
+  so a handler can stop work nobody will read; a quiet or pipelining client
+  is not a departure
 - Keep-alive and pipelining handled internally: requests from one
   connection are answered in order, connections are reused, and a
   half-closed socket is shut down cleanly
@@ -33,8 +34,9 @@ and license** below.
 
 TLS (`https` is the edge proxy's job), `Connection: upgrade` /
 websockets, HTTP/2 and /3, routing, cookies, multipart, compression
-negotiation. Every one of these is either another program's job or a
-layer above.
+negotiation, test scaffolding, and every API harbor does not call. Every one
+of these is either another program's job or a layer above, and surface is
+added only when harbor needs it.
 
 ## Hardening carried in the source
 
@@ -61,11 +63,11 @@ security regression, not a flake.
    The line buffer grows a byte at a time, so without the cap one socket
    sending `X-Junk: ` and never stopping takes RSS from 30 MB to 1.5 GB in
    under five seconds, before routing or application handling.
-4. **Read timeout.** Every accepted socket gets a 5 s read timeout, and
-   the whole request head gets 10 s from its first byte. Before the first
-   byte the connection is only idle, so it waits on the connection clocks
-   below; after it, a client cannot hold a serving thread at one byte per
-   minute.
+4. **Read timeout.** Every accepted socket gets a 5 s read timeout, the
+   whole request head gets 10 s from its first byte, and a body the handler
+   reads gets 30 s in all. Before the first byte the connection is only
+   idle, so it waits on the connection clocks below; after it, a client
+   cannot hold a serving thread at one byte per minute.
 5. **Unambiguous framing.** Two `Content-Length` headers that disagree, a
    `Content-Length` beside a `Transfer-Encoding`, a `Content-Length` that
    is not plain digits (`+5`, `2 3`), or a `Transfer-Encoding` that is not
@@ -97,23 +99,23 @@ security regression, not a flake.
    closes the listening socket for the life of the process; the server
    then sits there alive, accepting nothing. Only a failure meaning the
    listener is *gone* ends the loop, and that one is surfaced through
-   `recv()` so the host can say so — as does a transient failure that has
-   persisted for a full minute, which is not a storm.
+   `recv_timeout()` so the host can say so — as does a transient failure
+   that has persisted for a full minute, which is not a storm.
 
 ## Layout
 
-Seven one-word files, ~2,700 lines, edition 2024, `forbid(unsafe_code)`,
-three tiny dependencies (`ascii`, `chunked_transfer`, `httpdate`):
+Seven one-word files, edition 2024, `forbid(unsafe_code)`, three tiny
+dependencies (`ascii`, `chunked_transfer`, `httpdate`):
 
 | File | Owns |
 |---|---|
-| `lib.rs` | `Server`, the accept loop (socket timeouts and accept retry live here), `recv_timeout`/`unblock` |
+| `lib.rs` | `Server`, the accept loop (socket timeouts and accept retry live here), `recv_timeout`/`unblock`/`close_doors` |
 | `http.rs` | `Method`, `StatusCode`, `Header`, `HttpVersion` (strict, smuggling-hardened parsing) |
 | `stream.rs` | TCP/UDS listeners and the half-close connection stream |
 | `conn.rs` | per-connection request sequencing: keep-alive, pipelining, response ordering, request-head bounds and framing checks |
 | `request.rs` | `Request`, lazy body readers (the bounded drain lives here) |
 | `response.rs` | `Response`, transfer-encoding choice, chunked/identity framing |
-| `pool.rs` | the accept-side task pool and the message queue behind `recv()` |
+| `pool.rs` | the accept-side task pool and the message queue behind `recv_timeout()` |
 
 ## Tests
 
@@ -129,24 +131,8 @@ global allocator must not see other tests' allocations.
 
 ## Lineage and license
 
-justhttp was originally derived from the synchronous HTTP/1.1 core of
-tiny_http 0.12.0 (MIT OR Apache-2.0) and relicensed here under its MIT option.
-That is lineage, not a dependency, a vendoring relationship or a
-synchronization policy: justhttp carries none of that crate's other surface,
-is maintained here, and keeps the HTTP semantics its tests pin. See [LICENSE](LICENSE) for
-combined attribution.
-
-## Maintenance
-
-- **Every hardening behavior has a regression test** — `tests/drain.rs`
-  (a dropped request with `Content-Length: 1 GiB` must allocate < 1 MiB;
-  measured via a global allocator) and the `stall` module in
-  `tests/suite.rs` (a client that stops reading its response cannot pin a
-  worker; the 10s write timeout frees it), plus the `head` module in
-  `tests/suite.rs` for the request-head bounds, the framing checks, and the
-  `TE`/HTTP-1.0 streaming properties. If any of these fails, that is a
-  security regression, not a flake.
-- **What justhttp deliberately lacks** (do not "fix"): TLS (the edge
-  proxy's job), websocket upgrades, HTTP/2 and /3, `TestRequest`/test
-  scaffolding, and every API harbor doesn't call. New surface should be
-  added only when harbor needs it.
+justhttp began from the synchronous HTTP/1.1 core of tiny_http 0.12.0 (MIT OR
+Apache-2.0), relicensed here under its MIT option. That is lineage, not a
+dependency, a vendoring relationship or a synchronization policy: justhttp
+carries none of that crate's other surface, is maintained here, and keeps the
+HTTP semantics its tests pin. See [LICENSE](LICENSE) for combined attribution.
