@@ -1153,9 +1153,9 @@ impl DuckTable {
                     _ => None,
                 };
                 // Under the quit dialog the connection is left as it is:
-                // dropping it clears the grid and every staged edit, and
-                // Cancel must find them. The refresh that follows a cancel
-                // reconciles.
+                // dropping it takes the grid and the Query view down, and
+                // Cancel must find them where they were. The refresh that
+                // follows a cancel reconciles.
                 if let Some((name, key, tunneled)) = connected
                     && !state.asking_to_quit
                     && !state.rows.iter().any(|r| r.key == key && r.state.is_live())
