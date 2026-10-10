@@ -506,7 +506,7 @@ impl QueryView {
                         this.results = None;
                         this.ok_ms = None;
                         this.plan = None;
-                        match shown(&result, effect) {
+                        match shown(&result, effect, &sql_logged) {
                             Shown::Ok => this.ok_ms = Some(ms),
                             Shown::Plan(text) => {
                                 let text = SharedString::from(text);
@@ -949,13 +949,13 @@ enum Shown {
     Grid,
 }
 
-/// How to show `result`. BEGIN, COMMIT and their kin answer with an empty
-/// `Success` column, and their verdict is the status line's and the
-/// transaction mark's; under EXPLAIN ANALYZE they answer with the plan, which
-/// shows. A plan is box art over many lines in one cell, which a grid shows
-/// as its first line, a border: it shows whole instead.
-fn shown(result: &harbor_client::QueryResult, effect: Option<TxnEffect>) -> Shown {
-    if let Some(text) = plan_text(result) {
+/// How to show `result`, the answer to `sql`. BEGIN, COMMIT and their kin
+/// answer with an empty `Success` column, and their verdict is the status
+/// line's and the transaction mark's; under EXPLAIN ANALYZE they answer with
+/// the plan, which shows. A plan is box art over many lines in one cell,
+/// which a grid shows as its first line, a border: it shows whole instead.
+fn shown(result: &harbor_client::QueryResult, effect: Option<TxnEffect>, sql: &str) -> Shown {
+    if let Some(text) = plan_text(result, sql) {
         return Shown::Plan(text);
     }
     if result.columns.is_empty() || effect.is_some() && result.rows.is_empty() {
@@ -964,38 +964,16 @@ fn shown(result: &harbor_client::QueryResult, effect: Option<TxnEffect>) -> Show
     Shown::Grid
 }
 
-/// The text of a plan EXPLAIN answered: rows of `explain_key` and
-/// `explain_value`, each plan under its own name when there are several,
-/// as Harbor's REPL prints it. This reads the wire's plan schema the way
-/// the REPL does; when that rule moves into `wire` as `wire::plan`, this
-/// calls it, and both clients detect a plan by one rule.
-fn plan_text(result: &harbor_client::QueryResult) -> Option<String> {
-    let name = |i: usize| result.columns.get(i).and_then(|c| c.name.as_deref());
-    let plan = result.columns.len() == 2
-        && name(0).is_some_and(|n| n.eq_ignore_ascii_case("explain_key"))
-        && name(1).is_some_and(|n| n.eq_ignore_ascii_case("explain_value"));
-    if !plan || result.rows.is_empty() {
+/// The text of the plan an EXPLAIN answered, read by the rule Harbor's REPL
+/// reads it by (`wire::plan`). The statement must be an EXPLAIN too: a query
+/// of the user's whose columns carry the plan's two names is rows.
+fn plan_text(result: &harbor_client::QueryResult, sql: &str) -> Option<String> {
+    let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_deref().unwrap_or("")).collect();
+    if !wire::plan::is_plan(&names) || wire::statement::bare_word(sql.as_bytes(), &mut 0) != "EXPLAIN" {
         return None;
     }
-    let mut out = String::new();
-    for row in &result.rows {
-        let (Some(key), Some(value)) = (row.first()?.as_str(), row.get(1)?.as_str()) else { return None };
-        if result.rows.len() > 1 {
-            out.push_str(match key {
-                "logical_plan" => "Unoptimized Logical Plan",
-                "logical_opt" => "Optimized Logical Plan",
-                "physical_plan" => "Physical Plan",
-                "analyzed_plan" => "Analyzed Plan",
-                other => other,
-            });
-            out.push('\n');
-        }
-        out.push_str(value);
-        if !value.ends_with('\n') {
-            out.push('\n');
-        }
-    }
-    Some(out)
+    let rows: Option<Vec<Vec<&str>>> = result.rows.iter().map(|row| row.iter().map(|v| v.as_str()).collect()).collect();
+    wire::plan::text(&rows?)
 }
 
 /// Statements the results grid can page by wrapping in a subquery —
@@ -2190,24 +2168,30 @@ mod tests {
         use serde_json::json;
         let box_art = "┌───┐\n│ 1 │\n└───┘";
         // EXPLAIN: one plan, shown as drawn, with no heading.
+        let explain = "EXPLAIN SELECT 1";
         let plan = answer(&["explain_key", "explain_value"], vec![vec![json!("physical_plan"), json!(box_art)]]);
-        assert_eq!(shown(&plan, None), Shown::Plan(format!("{box_art}\n")));
+        assert_eq!(shown(&plan, None, explain), Shown::Plan(format!("{box_art}\n")));
         // EXPLAIN ANALYZE COMMIT: the plan, though the statement ends the
         // transaction. Several plans each go under their names.
-        assert_eq!(shown(&plan, Some(TxnEffect::Commits)), Shown::Plan(format!("{box_art}\n")));
+        let analyzed = "/* why */ explain analyze COMMIT";
+        assert_eq!(shown(&plan, Some(TxnEffect::Commits), analyzed), Shown::Plan(format!("{box_art}\n")));
         let two = answer(
             &["explain_key", "explain_value"],
             vec![vec![json!("logical_opt"), json!("a\n")], vec![json!("physical_plan"), json!("b")]],
         );
-        assert_eq!(shown(&two, None), Shown::Plan("Optimized Logical Plan\na\nPhysical Plan\nb\n".into()));
+        assert_eq!(shown(&two, None, explain), Shown::Plan("Optimized Logical Plan\na\nPhysical Plan\nb\n".into()));
+        // The plan's two names on a query of the user's own are its rows.
+        let own = "SELECT 'k' AS explain_key, 'v' AS explain_value";
+        assert_eq!(shown(&plan, None, own), Shown::Grid);
         // The same two names under another shape, or no rows, are rows.
-        assert_eq!(shown(&answer(&["explain_key", "x"], vec![vec![json!("a"), json!("b")]]), None), Shown::Grid);
-        assert_eq!(shown(&answer(&["explain_key", "explain_value"], vec![vec![json!("a"), json!(1)]]), None), Shown::Grid);
-        assert_eq!(shown(&answer(&["v"], vec![vec![json!(1)]]), None), Shown::Grid);
+        assert_eq!(shown(&answer(&["explain_key", "x"], vec![vec![json!("a"), json!("b")]]), None, explain), Shown::Grid);
+        let number = answer(&["explain_key", "explain_value"], vec![vec![json!("a"), json!(1)]]);
+        assert_eq!(shown(&number, None, explain), Shown::Grid);
+        assert_eq!(shown(&answer(&["v"], vec![vec![json!(1)]]), None, "SELECT 1"), Shown::Grid);
         // BEGIN and its kin, and a statement with no result set, say ok.
-        assert_eq!(shown(&answer(&["Success"], vec![]), Some(TxnEffect::Opens)), Shown::Ok);
-        assert_eq!(shown(&answer(&[], vec![]), None), Shown::Ok);
-        assert_eq!(shown(&answer(&["v"], vec![]), None), Shown::Grid);
+        assert_eq!(shown(&answer(&["Success"], vec![]), Some(TxnEffect::Opens), "BEGIN"), Shown::Ok);
+        assert_eq!(shown(&answer(&[], vec![]), None, "SET x = 1"), Shown::Ok);
+        assert_eq!(shown(&answer(&["v"], vec![]), None, "SELECT 1 WHERE false"), Shown::Grid);
     }
 
     #[test]
