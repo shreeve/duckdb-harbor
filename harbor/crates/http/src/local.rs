@@ -16,12 +16,13 @@ pub struct Found {
 }
 
 /// Every server listening in `runtime`, in socket order: `readdir` for
-/// `*.sock`, and `GET /info` on each. The listening socket is the
-/// registration, so a socket nothing listens on is litter, not state, and
-/// `sweep` unlinks it. Only on proof: a refusal, and a second one a beat
-/// later, since a server whose listen queue is full refuses for a moment
-/// too. Any other error proves nothing, and an unlink on nothing is how a
-/// live server loses its front door.
+/// `*.sock`, and `GET /info` on each, all at once, so a server that hangs
+/// costs its timeout once rather than once for every socket after it. The
+/// listening socket is the registration, so a socket nothing listens on is
+/// litter, not state, and `sweep` unlinks it. Only on proof: a refusal, and
+/// a second one a beat later, since a server whose listen queue is full
+/// refuses for a moment too. Any other error proves nothing, and an unlink
+/// on nothing is how a live server loses its front door.
 pub fn discover(runtime: &Path, sweep: bool) -> Vec<Found> {
     let Ok(entries) = std::fs::read_dir(runtime) else { return Vec::new() };
     let mut socks: Vec<PathBuf> = entries
@@ -29,26 +30,31 @@ pub fn discover(runtime: &Path, sweep: bool) -> Vec<Found> {
         .filter(|p| p.extension().is_some_and(|x| x == "sock"))
         .collect();
     socks.sort();
-    let info = |t: &Transport| request(t, &endpoint::INFO, None, Some(Duration::from_secs(2)));
-    let mut found = Vec::new();
-    for sock in socks {
-        let transport = Transport::Unix(sock.clone());
-        match info(&transport) {
-            Ok(r) if r.status == 200 => {
-                let info = r.body_string().ok().and_then(|body| serde_json::from_str(body.trim()).ok());
-                found.push(Found { sock, info });
-            }
-            Ok(_) => found.push(Found { sock, info: None }),
-            Err(e) if sweep && e.kind() == ErrorKind::ConnectionRefused => {
-                std::thread::sleep(Duration::from_millis(200));
-                if info(&transport).is_err_and(|e| e.kind() == ErrorKind::ConnectionRefused) {
-                    let _ = std::fs::remove_file(&sock);
-                }
-            }
-            Err(_) => {}
+    std::thread::scope(|scope| {
+        let asking: Vec<_> = socks.into_iter().map(|sock| scope.spawn(move || ask(sock, sweep))).collect();
+        asking.into_iter().filter_map(|t| t.join().ok().flatten()).collect()
+    })
+}
+
+/// What one socket said to `/info`, or `None` when nothing answered.
+fn ask(sock: PathBuf, sweep: bool) -> Option<Found> {
+    let transport = Transport::Unix(sock.clone());
+    let info = || request(&transport, &endpoint::INFO, None, Some(Duration::from_secs(2)));
+    match info() {
+        Ok(r) if r.status == 200 => {
+            let info = r.body_string().ok().and_then(|body| serde_json::from_str(body.trim()).ok());
+            Some(Found { sock, info })
         }
+        Ok(_) => Some(Found { sock, info: None }),
+        Err(e) if sweep && e.kind() == ErrorKind::ConnectionRefused => {
+            std::thread::sleep(Duration::from_millis(200));
+            if info().is_err_and(|e| e.kind() == ErrorKind::ConnectionRefused) {
+                let _ = std::fs::remove_file(&sock);
+            }
+            None
+        }
+        Err(_) => None,
     }
-    found
 }
 
 /// Stop the server listening on `sock` and wait until it has gone. A server

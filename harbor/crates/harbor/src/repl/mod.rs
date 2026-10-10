@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Set when this invocation spawned the server it is talking to, rather
 /// than joining one already up. Only `--block-size` reads it, and only to
@@ -422,35 +422,15 @@ pub fn sock_ready(sock: &Path) -> bool {
     http::ready(&Transport::Unix(sock.to_path_buf()))
 }
 
-/// Stop the server for a database FILE, if one is running. Never spawns —
-/// stopping a stopped berth is a quiet no-op. Returns whether a server was
-/// actually there to stop. The `stop` verb's whole implementation.
+/// Stop the server for a database FILE, if one is running, and return once
+/// it has gone, so a `start` that follows, by hand or inside `restart`, meets
+/// a database that is free. Never spawns — stopping a stopped berth is a
+/// quiet no-op. Returns whether a server was actually there to stop. The
+/// `stop` verb's whole implementation.
 #[cfg(unix)]
 pub fn shutdown(db: &Path) -> Result<bool, String> {
     let (_, canon, sock) = harbor_common::paths::socket_of(db)?;
-    let transport = Transport::Unix(sock.clone());
-    if !http::ready(&transport) {
-        return Ok(false); // nothing answering on its socket
-    }
-    // POST /shutdown drains, checkpoints, and exits. The server can close the
-    // socket as it goes, so a dropped connection right after the request is
-    // success, not failure. Either way, `stop` means stopped: the server
-    // unlinks its socket as the last thing before it exits and releases the
-    // database lock, so wait for the file to be gone — then a `start` that
-    // follows, by hand or inside `restart`, meets a database that is free.
-    if let Err(e) = http::request(&transport, &endpoint::SHUTDOWN, None, Some(Duration::from_secs(30)))
-        && http::ready(&transport)
-    {
-        return Err(format!("stop: {e}"));
-    }
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while sock.exists() || http::ready(&transport) {
-        if Instant::now() > deadline {
-            return Err(format!("stop: {} is still shutting down after 60s", canon.display()));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    Ok(true)
+    http::shutdown(&sock).map_err(|e| format!("stop {}: {e}", canon.display()))
 }
 
 #[cfg(windows)]
@@ -566,38 +546,24 @@ impl SurveyRow {
 }
 
 /// The fleet, in footnote order: every server that answered, then every
-/// attached database nothing is serving. Readdir the runtime dir for
-/// sockets, ask each for /info, and unlink the ones nothing answers on — the
+/// attached database nothing is serving. Every socket in the runtime dir is
+/// asked for /info, and the ones nothing listens on are unlinked — the
 /// registry IS the listening socket, so a stale file is litter, not state.
-/// Then config.toml's berths, less the ones a live row already claimed by
-/// socket, name, or file: the socket decides running, config decides mine,
-/// and a bare `harbor` answers both. Both faces of the fleet read this: the
-/// list renders it, and a bare-name or footnote target resolves against it.
+/// One that answers without an /info this client can read is alive all the
+/// same: it has a row, and claims nothing. Then config.toml's berths, less
+/// the ones a live row already claimed by socket, name, or file: the socket
+/// decides running, config decides mine, and a bare `harbor` answers both.
+/// Both faces of the fleet read this: the list renders it, and a bare-name
+/// or footnote target resolves against it.
 fn survey() -> Result<Vec<SurveyRow>, String> {
     let runtime = harbor_common::runtime_dir()?;
-    let mut socks: Vec<PathBuf> = match std::fs::read_dir(&runtime) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "sock"))
-            .collect(),
-        Err(_) => Vec::new(), // no runtime dir yet: nothing has ever served
-    };
-    socks.sort();
-
-    // Asked all at once: a server that hangs costs its two seconds once,
-    // not once for every server listed after it.
-    let answers: Vec<_> = std::thread::scope(|scope| {
-        let asking: Vec<_> = socks.iter().map(|sock| scope.spawn(move || probe(sock))).collect();
-        asking.into_iter().map(|t| t.join().unwrap_or(Probe::Silent)).collect()
-    });
+    #[cfg(unix)]
+    let mut rows: Vec<SurveyRow> = http::discover(&runtime, true)
+        .into_iter()
+        .map(|found| SurveyRow { sock: found.sock, info: found.info, stopped: None })
+        .collect();
+    #[cfg(windows)]
     let mut rows: Vec<SurveyRow> = Vec::new();
-    for (sock, answer) in socks.into_iter().zip(answers) {
-        match answer {
-            Probe::Info(info) => rows.push(SurveyRow { sock, info: Some(info), stopped: None }),
-            Probe::Mute => rows.push(SurveyRow { sock, info: None, stopped: None }),
-            Probe::Silent => {}
-        }
-    }
 
     // A config that will not load is reported, not fatal: the running half
     // of the fleet is still the truth, and a broken file must not hide it.
@@ -637,50 +603,6 @@ fn survey() -> Result<Vec<SurveyRow>, String> {
         });
     }
     Ok(rows)
-}
-
-/// What a socket in the runtime directory said to `/info`.
-enum Probe {
-    Info(serde_json::Value),
-    /// It answered, just not with an /info this client could read. Alive is
-    /// alive — the row is shown, and claims nothing.
-    Mute,
-    /// Nothing answered.
-    Silent,
-}
-
-fn probe(sock: &Path) -> Probe {
-    #[cfg(unix)]
-    {
-        let transport = Transport::Unix(sock.to_path_buf());
-        let ask = || http::request(&transport, &endpoint::INFO, None, Some(Duration::from_secs(2)));
-        match ask() {
-            Ok(r) if r.status == 200 => {
-                Probe::Info(serde_json::from_str(r.body_string().unwrap_or_default().trim()).unwrap_or_default())
-            }
-            Ok(_) => Probe::Mute,
-            // Refused means nothing listens: a leftover from a kill -9 or a
-            // crash. Anything else (a transient error, a permission oddity)
-            // proves nothing, and an unlink on "proves nothing" is how a live
-            // server loses its front door. A server whose listen queue is
-            // full refuses too, for a moment, so one refusal proves nothing
-            // either: the socket goes only when a second try, a beat later,
-            // is refused as well.
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                std::thread::sleep(Duration::from_millis(200));
-                if ask().is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused) {
-                    let _ = std::fs::remove_file(sock);
-                }
-                Probe::Silent
-            }
-            Err(_) => Probe::Silent,
-        }
-    }
-    #[cfg(windows)]
-    {
-        let _ = sock;
-        Probe::Silent
-    }
 }
 
 /// Every server that answered `/info`: its name, the file it serves, and the
