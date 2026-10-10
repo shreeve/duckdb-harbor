@@ -597,10 +597,8 @@ fn main() {
             KeyBinding::new("cmd-9", ToggleNullTags, None),
             KeyBinding::new("cmd-t", ToggleColumnCards, None),
         ]);
-        // File→Open: the platform picker, then app.open_path — the same
-        // door a drag-drop uses. .duckdb is what it speaks today; the
-        // open-anything dispatcher (CSV, Parquet, Sheets URLs…) grows on
-        // this trunk. The picker offers no extension filter (gpui's
+        // File→Open: the platform picker, then the same door a drag-drop
+        // uses (`Aim::File`). It opens a DuckDB file. The picker offers no extension filter (gpui's
         // PathPromptOptions has none), and none is enforced here: a wrong
         // file fails honestly in the connect card with harbor's own error.
         cx.on_action(|_: &OpenDatabase, cx| {

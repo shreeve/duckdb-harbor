@@ -54,8 +54,8 @@ pub(crate) struct QueryView {
     run_started: Option<std::time::Instant>,
     /// True only after a run has held the floor for 300ms: fast queries
     /// swap atomically with no intermediate state at all; slow ones earn
-    /// a ticking "running" line and faded prior results (Steve's
-    /// three-phase ruling, 2026-08-31).
+    /// a ticking "running" line and faded prior results (DESIGN.md,
+    /// three-phase feedback).
     show_running: bool,
     /// Set by the carousel landing here; consumed by the next render.
     needs_focus: bool,
@@ -67,7 +67,7 @@ pub(crate) struct QueryView {
     /// Why the last write of the scratchpad failed, until one succeeds.
     unsaved: Option<SharedString>,
     /// The editor/results divider — user-draggable, position persisted
-    /// (docs/QUERY.md's split, finally honored).
+    /// (docs/QUERY.md's split).
     split: Entity<gpui_kit::component::resizable::ResizableState>,
     _subscription: Subscription,
     /// Keystroke interceptor for ⌘Enter: it must run BEFORE the input's
@@ -377,16 +377,15 @@ impl QueryView {
         cx.spawn_in(window, async move |this, cx| {
             let sql_logged = sql.clone();
             // A send is at most the two queries the Data view gives a
-            // table — and usually just ONE (Steve's probe-row ruling,
-            // 2026-08-31): fetch page 0 of the wrapped statement with
+            // table, and usually just ONE: fetch page 0 of the wrapped statement with
             // LIMIT size+1. A result that fits the page IS its own
             // exact count — no second query. Only the extra row's
             // arrival proves there is more, and only then does
             // count(*) fire for the exact total. The page query
-            // doubles as the wrap probe: if it fails (not actually
-            // SELECT-shaped, or a syntax error), the statement runs
-            // bare, so error verdicts always quote the user's own
-            // SQL, never the wrapper's.
+            // doubles as the wrap probe: if the engine refuses it
+            // (not actually SELECT-shaped, or a syntax error), the
+            // statement runs bare, so an engine error always quotes
+            // the user's own SQL, never the wrapper's (`runs_bare`).
             let (outcome, total, paged, txn, fate) = cx
                 .background_executor()
                 .spawn(async move {
@@ -857,8 +856,7 @@ impl Render for QueryView {
                 });
                 // The run's verdict lives in the FOOTER's status line,
                 // the same widgets and ordering as the Data view — no
-                // mid-pane strip (Steve's unification ruling,
-                // 2026-08-31).
+                // mid-pane strip.
                 // A plan shows whole, preformatted, scrolling both ways in
                 // the value font, with its copy tile in the corner.
                 let answer = match (self.results.clone(), &self.plan) {
@@ -1887,7 +1885,7 @@ mod tests {
 
     #[test]
     fn semicolons_are_the_only_divider() {
-        // The semicolon ruling: blank lines never divide — DuckDB's
+        // Semicolons alone divide: blank lines never do — DuckDB's
         // FROM-first syntax means `from 22` opens a real statement, so
         // any keyword heuristic must eventually cut a sprawled query
         // in half. Only a `;` divides.
@@ -2644,7 +2642,7 @@ mod tests {
     /// deterministic xorshift builds thousands of nasty buffers —
     /// unterminated strings, comment edges, $$ bodies, stray `;;`,
     /// unicode — and every one must satisfy the invariants that ARE
-    /// the semicolon ruling, rather than any hand-picked example.
+    /// the one-boundary rule, rather than any hand-picked example.
     #[test]
     fn fuzz_splitter_invariants() {
         const TOKENS: &[&str] = &[

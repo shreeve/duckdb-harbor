@@ -229,8 +229,8 @@ impl DuckTable {
                         })
                         // Same grammar as the table rows below: name with
                         // its count hugging it, magnitude on the right.
-                        // (The dot alone says stopped; "on demand" gave
-                        // way to the size, known even for stopped files.)
+                        // The dot alone says stopped, and the size shows
+                        // whether it runs or not.
                         .child(named_count(&row.name, row.tables, t))
                         .when_some(row.size, |d, s| {
                             d.child(dim(t, crate::util::human(s as f64, "B")))

@@ -2,7 +2,7 @@
 //!
 //! These are appearance settings, not table state: one value for the whole
 //! app, saved to `~/.config/ducktable/prefs.json`, applied by whichever
-//! surface cares (today: the grid).
+//! surface cares.
 
 use gpui_kit::{App, Global};
 use serde_json::{json, Value};
@@ -90,8 +90,7 @@ pub const INSPECTOR_MIN: f32 = 180.;
 pub const INSPECTOR_MAX: f32 = 600.;
 
 /// Sidebar width bounds — same double duty. The floor is the sidebar's
-/// classic fixed width (Steve's ruling: today's size is the minimum;
-/// the divider only ever grants more room).
+/// classic fixed width: the divider only ever grants more room.
 pub const SIDEBAR_MIN: f32 = 224.;
 pub const SIDEBAR_MAX: f32 = 480.;
 

@@ -97,7 +97,7 @@ fn compute_pal(cx: &App) -> Pal {
         row_selected: t.list_active,
         row_active: t.primary.opacity(if t.background.l < 0.5 { 0.17 } else { 0.10 }),
         row_hover: t.list_hover,
-        // ONE hairline color, exactly (Steve's ruling, 2026-09-01): the
+        // ONE hairline color, exactly: the
         // chrome border, so every line in the app — grid mesh, rail,
         // frames, divider handles — is literally the same color. Proven
         // by the red audit: paint this slot #FF0000 and every hairline
