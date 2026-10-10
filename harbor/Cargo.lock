@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "harbor"
-version = "0.44.2"
+version = "0.45.0"
 dependencies = [
  "crossterm",
  "getrandom 0.2.17",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "harbor-common"
-version = "0.44.2"
+version = "0.45.0"
 dependencies = [
  "libc",
  "serde",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "harbor-http"
-version = "0.44.2"
+version = "0.45.0"
 dependencies = [
  "harbor-common",
  "libc",
@@ -340,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "justhttp"
-version = "0.44.2"
+version = "0.45.0"
 dependencies = [
  "ascii",
  "chunked_transfer",
@@ -951,7 +951,7 @@ dependencies = [
 
 [[package]]
 name = "wire"
-version = "0.44.2"
+version = "0.45.0"
 dependencies = [
  "serde",
  "serde_json",
