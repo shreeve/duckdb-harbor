@@ -13,14 +13,16 @@ use std::{
     panic::AssertUnwindSafe,
     sync::{
         Arc, Condvar, Mutex, OnceLock, mpsc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use justhttp::{Header, Method, Request, Response, Server};
-use wire::statement::{acting_keyword, bare_word, transaction_effect};
+use wire::catalog::{Catalog, Column, ForeignKey, Index, Inventory, Named, Sequence, Table, Unique};
+use wire::code;
+use wire::statement::{acting_keyword, bare_word, commits, transaction_effect};
 
 use crate::engine::conn::{Conn as Connection, Interrupt as InterruptHandle, Param};
 
@@ -36,8 +38,8 @@ mod unbrace;
 /// into it. The SQL lexer both halves read with is `wire::scan`.
 pub mod repl;
 
-// The v2 C API engine, generated from DuckDB's api_spec. The only path to
-// the engine since 0.21's flip retired duckdb-rs.
+// The v2 C API engine, generated from DuckDB's api_spec: the one path to the
+// engine.
 pub mod engine;
 
 // ==========================================================================
@@ -61,11 +63,11 @@ pub mod engine;
 //   DELETE /sql/sessions/<id>   release that one
 //   DELETE /sql/queries/<id>    cancel a statement the caller named
 //
-// Legacy spellings served until the next deliberate break: POST
-// /sql/sessions/new, GET /sessions, DELETE /shutdown.
+// Also served: POST /sql/sessions/new, the route Rip's driver opens sessions
+// at; GET /sessions; DELETE /shutdown.
 //
-// The envelope is the one thing that must not drift from the v1 harbor,
-// because it is the contract every client already speaks:
+// The envelope is the one thing that must not drift, because it is the
+// contract every client speaks:
 //
 //   {"type":"schema","columns":[{"name":"id","duckdbType":"BIGINT","lossless":true}]}
 //   {"type":"row","values":[0,"row0"]}
@@ -192,17 +194,18 @@ static STOPPED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 //
 // A statement that has entered DuckDB does not come back until it is done.
 // Harbor executes a small, bounded number of statements at once, so one query
-// that runs forever is not a slow request — it is a worker permanently removed
-// from service, and eight of them are the whole server. Three things can ask a
+// that runs forever is not a slow request — it is a worker removed from
+// service, and six of them are the whole server. Four things can ask a
 // statement to stop:
 //
 //   1. The client, by naming its own `queryId` and sending DELETE to it, or by
 //      releasing a session whose statement is still running.
-//   2. A deadline, when one was asked for.
-//   3. The reaper, when a lease has outlived its TTL while busy. Before this
-//      existed the reaper skipped busy leases, which meant the one lease that
-//      most needed reclaiming — the one wedged inside a runaway statement —
-//      was the one lease it could never take back.
+//   2. The client, by hanging up: the statement it can no longer be told
+//      about is stopped, whether or not a row of it has been written.
+//   3. A deadline, when one was asked for.
+//   4. The reaper, when a lease has outlived its TTL while busy: the lease
+//      that most needs reclaiming is the one wedged inside a runaway
+//      statement.
 //
 // `duckdb_interrupt` is per connection, not per database (`InterruptHandle`
 // wraps a `duckdb_connection`), so interrupting one statement cannot disturb
@@ -230,6 +233,10 @@ struct SlotRun {
     /// cancel that arrives late matches nothing rather than matching the wrong
     /// statement.
     job: u64,
+    /// The last statement this slot began. An executor begins its jobs in the
+    /// order their ids were minted, so an id at or below this one that is not
+    /// running has finished, and one above it has not begun.
+    last: u64,
     /// When that statement began; meaningless while job == 0. The probe
     /// thread reads it to tell wedged workers from merely busy ones.
     started: Instant,
@@ -261,12 +268,8 @@ struct SlotRun {
     request: Option<Instant>,
 }
 
-/// What a cancel request should do, decided from bookkeeping alone.
-///
-/// Split out from `SlotState` so the part that is easy to get wrong can be
-/// tested without a database: this crate links libduckdb dynamically, so a
-/// bare `cargo test` (no DUCKDB_LIB on the linker path) cannot construct a
-/// `Connection` — and therefore an `InterruptHandle` — at all.
+/// What a cancel request should do, decided from bookkeeping alone, so the
+/// part that is easy to get wrong is tested without an engine.
 #[derive(Debug, PartialEq, Eq)]
 enum Cancel {
     /// Interrupt the connection now.
@@ -278,10 +281,15 @@ enum Cancel {
 }
 
 impl SlotRun {
+    fn idle() -> Self {
+        SlotRun { job: 0, last: 0, started: Instant::now(), pending: None, cancelled: false, deadline: None, request: None }
+    }
+
     /// Claim this slot for `job`. Returns true when the statement was already
     /// cancelled before it began, in which case it must not run at all.
     fn begin(&mut self, job: u64, deadline: Option<Instant>) -> bool {
         self.job = job;
+        self.last = job;
         self.started = Instant::now();
         self.deadline = deadline;
         // Any held cancel is consumed here whether or not it matches: it named
@@ -299,9 +307,11 @@ impl SlotRun {
 
     fn arm(&mut self, job: Option<u64>) -> Cancel {
         match job {
-            // Named a statement this slot is not running. If it has not started
-            // yet, hold the cancel for it; if it is long gone, `begin` discards
-            // it on the next statement and nothing is interrupted.
+            // Named a statement this slot has finished: there is nothing to
+            // stop, and the client is told so, whatever it is still reading.
+            Some(want) if self.job != want && want <= self.last => Cancel::Nothing,
+            // Named one it has not begun: held for it, so it never runs. One
+            // that never reaches this slot is discarded by the next `begin`.
             Some(want) if self.job != want => {
                 self.pending = Some(want);
                 Cancel::Held
@@ -320,6 +330,10 @@ impl SlotRun {
 }
 
 impl SlotState {
+    fn new(interrupt: Arc<InterruptHandle>) -> Arc<Self> {
+        Arc::new(SlotState { interrupt, run: Mutex::new(SlotRun::idle()) })
+    }
+
     fn begin(&self, job: u64, deadline: Option<Instant>) -> bool {
         self.run.lock().unwrap().begin(job, deadline)
     }
@@ -338,7 +352,8 @@ impl SlotState {
     }
 
     /// Interrupt the running statement if it is still `job` — or whatever is
-    /// running, when `job` is None. Returns whether the cancel was accepted.
+    /// running, when `job` is None. Returns whether it stopped, or will stop,
+    /// a statement.
     fn cancel(&self, job: Option<u64>) -> bool {
         let mut run = self.run.lock().unwrap();
         match run.arm(job) {
@@ -417,7 +432,7 @@ fn next_job_id() -> u64 {
 /// which is what a console with a Stop button actually wants.
 fn configured_statement_timeout() -> Option<Duration> {
     // Read once: the env cannot legitimately change after start, and this is
-    // on the per-request path. (A runtime setenv no longer takes effect.)
+    // on the per-request path.
     static CONFIGURED: OnceLock<Option<Duration>> = OnceLock::new();
     *CONFIGURED.get_or_init(|| {
         match std::env::var("HARBOR_STATEMENT_TIMEOUT_MS").ok()?.trim().parse::<u64>() {
@@ -439,11 +454,7 @@ impl Cancellable {
     fn register(id: &str, slot: &Arc<SlotState>, job: u64) -> Result<Self, Refusal> {
         let mut guard = QUERIES.lock().unwrap();
         let Some(queries) = guard.as_mut() else {
-            return Err(Refusal {
-                status: 503,
-                code: "unavailable",
-                message: "harbor is not serving".to_string(),
-            });
+            return Err(Refusal::not_serving());
         };
         if queries.contains_key(id) {
             // Refuse rather than overwrite. Two live statements under one name
@@ -451,7 +462,7 @@ impl Cancellable {
             // would make the first uncancellable for as long as it runs.
             return Err(Refusal {
                 status: 409,
-                code: "query_id_in_use",
+                code: code::QUERY_ID_IN_USE,
                 message: format!("queryId {id:?} is already running a statement. Choose another."),
             });
         }
@@ -493,8 +504,7 @@ fn cancel_expired() {
         // By id, never "whatever is running": between noticing the expiry and
         // firing, the expired statement can finish and a fresh one begin, and
         // a cancel(None) would kill that innocent — the exact race the job-id
-        // machinery exists to close (see SlotRun). A stale id is harmless: it
-        // is held as pending and discarded when the next statement begins.
+        // machinery exists to close (see SlotRun). A stale id finds nothing.
         if let Some(job) = slot.expired_job(now) {
             slot.cancel(Some(job));
         }
@@ -645,41 +655,28 @@ fn new_lease_id() -> String {
 /// the lock across it would serialise every other lease behind whatever this
 /// connection is doing.
 fn quiesce(conn: &LeaseConn) {
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), Refusal>>(1);
-    let (body_tx, body_rx) = mpsc::sync_channel::<Vec<u8>>(BODY_QUEUE);
-    let job = Job {
-        sql: String::new(),
-        params: Vec::new(),
-        shape: Shape::Ndjson,
-        id: next_job_id(),
-        deadline: None,
-        reset: true,
-        ready: ready_tx,
-        body: body_tx,
-    };
+    let (mut job, ready, _) = Job::new(String::new(), Vec::new(), Shape::Ndjson, None);
+    job.reset = true;
     if conn.jobs.send(job).is_err() {
         return;
     }
-    // Wait for it. A connection is not free until it is clean, and the caller
-    // is about to put it back in the free list.
-    let _ = ready_rx.recv();
-    while body_rx.recv().is_ok() {}
+    // Wait for it: a connection is not free until it is clean. Not forever,
+    // since the reaper and the shutdown wait here too: a statement that does
+    // not unwind in 5 s is left to finish, and the reset queued behind it
+    // runs before anything the connection's next holder sends.
+    let _ = ready.recv_timeout(Duration::from_secs(5));
 }
 
 /// Open a lease, or say why not. `Err` carries the status and body to send.
 fn lease_open(requested_ttl: Option<Duration>, backup: bool) -> Result<(String, Duration, Duration), Refusal> {
     let mut guard = LEASES.lock().unwrap();
     let Some(leases) = guard.as_mut() else {
-        return Err(Refusal {
-            status: 503,
-            code: "unavailable",
-            message: "harbor is not serving".to_string(),
-        });
+        return Err(Refusal::not_serving());
     };
     if leases.total == 0 {
         return Err(Refusal {
             status: 503,
-            code: "no_lease_connections",
+            code: code::NO_LEASE_CONNECTIONS,
             message: "this harbor has no connections left over for transactions: every one is a \
                       worker. Raise HARBOR_POOL_SIZE above the worker count, or lower workers."
                 .to_string(),
@@ -691,7 +688,7 @@ fn lease_open(requested_ttl: Option<Duration>, backup: bool) -> Result<(String, 
     let Some(conn) = leases.free.pop() else {
         return Err(Refusal {
             status: 503,
-            code: "no_lease_available",
+            code: code::NO_LEASE_AVAILABLE,
             message: format!(
                 "all {} transaction connections are in use. Retry, or raise HARBOR_POOL_SIZE.",
                 leases.total
@@ -723,17 +720,13 @@ fn lease_open(requested_ttl: Option<Duration>, backup: bool) -> Result<(String, 
 /// statement. Released or expired leases stay dead: one that has idled out
 /// is gone even before the reaper takes it.
 fn lease_renew(id: &str) -> Result<(), Refusal> {
-    let missing = || Refusal {
-        status: 404, code: "no_such_session",
-        message: "no such session: it was released, timed out, or never existed".into(),
-    };
     let mut guard = LEASES.lock().unwrap();
-    let leases = guard.as_mut().ok_or_else(missing)?;
+    let leases = guard.as_mut().ok_or_else(Refusal::no_session)?;
     let idle_ttl = leases.idle_ttl;
-    let lease = leases.live.get_mut(id).ok_or_else(missing)?;
+    let lease = leases.live.get_mut(id).ok_or_else(Refusal::no_session)?;
     if lease.doomed || !lease.lifetime.renew(Instant::now(), &mut lease.last, lease.busy, idle_ttl) {
         lease.doomed = true;
-        return Err(missing());
+        return Err(Refusal::no_session());
     }
     Ok(())
 }
@@ -790,7 +783,7 @@ fn lease_claim(id: &str) -> Result<(mpsc::SyncSender<Job>, Arc<SlotState>), Refu
     let deadline = Instant::now() + CLAIM_WAIT;
     loop {
         match try_lease_claim(id) {
-            Err(refusal) if refusal.code == "session_busy" && Instant::now() < deadline => {
+            Err(refusal) if refusal.code == code::SESSION_BUSY && Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(1));
             }
             other => return other,
@@ -801,23 +794,10 @@ fn lease_claim(id: &str) -> Result<(mpsc::SyncSender<Job>, Arc<SlotState>), Refu
 fn try_lease_claim(id: &str) -> Result<(mpsc::SyncSender<Job>, Arc<SlotState>), Refusal> {
     let mut guard = LEASES.lock().unwrap();
     let Some(leases) = guard.as_mut() else {
-        return Err(Refusal {
-            status: 503,
-            code: "unavailable",
-            message: "harbor is not serving".to_string(),
-        });
+        return Err(Refusal::not_serving());
     };
     let Some(lease) = leases.live.get_mut(id) else {
-        // Deliberately the same answer whether it never existed, was released,
-        // or timed out: from the client's side those are one situation — the
-        // transaction is gone and the work has to start again.
-        return Err(Refusal {
-            status: 404,
-            code: "no_such_session",
-            message: "no such session: it was released, timed out, or never existed. Open a new \
-                      one and retry the transaction from the beginning."
-                .to_string(),
-        });
+        return Err(Refusal::no_session());
     };
     if lease.doomed || lease.lifetime.expired(Instant::now(), lease.last, lease.busy, leases.idle_ttl) {
         lease.doomed = true;
@@ -825,18 +805,12 @@ fn try_lease_claim(id: &str) -> Result<(mpsc::SyncSender<Job>, Arc<SlotState>), 
         // the cancel unwinds would let a "released" session that keeps sending
         // short statements stay busy at every reaper tick — held, with its
         // open transaction, forever. Same answer as absent: it is gone.
-        return Err(Refusal {
-            status: 404,
-            code: "no_such_session",
-            message: "no such session: it was released, timed out, or never existed. Open a new \
-                      one and retry the transaction from the beginning."
-                .to_string(),
-        });
+        return Err(Refusal::no_session());
     }
     if lease.busy {
         return Err(Refusal {
             status: 409,
-            code: "session_busy",
+            code: code::SESSION_BUSY,
             message: "this session is already running a statement. A transaction is a sequence, \
                       not a pool; send its statements one after another."
                 .to_string(),
@@ -908,11 +882,11 @@ fn lease_release(id: &str) -> Released {
         match leases.live.get_mut(id) {
             Some(l) if l.busy => {
                 l.doomed = true;
-                let state = Arc::clone(&l.conn.state);
-                // Outside the registry lock would be tidier, but `cancel` only
-                // takes the slot's own lock and sets a flag through the C API,
-                // so the nesting is one level deep and cannot cycle back here.
-                state.cancel(None);
+                // By id, as every cancel is (an idle slot's 0 names nothing).
+                // One claimed but not yet begun is the reaper's on its next
+                // tick. `cancel` takes only the slot's own lock, so the
+                // nesting cannot cycle back here.
+                l.conn.state.cancel(Some(l.conn.state.current_job()));
                 return Released::Cancelling;
             }
             Some(_) => {}
@@ -937,10 +911,9 @@ fn lease_release(id: &str) -> Released {
 ///
 /// A busy lease cannot be released out from under its statement, so an expired
 /// one is cancelled here and released on a later tick, once the statement it
-/// was running has come back. Before cancellation existed the reaper simply
-/// skipped busy leases — which meant a lease wedged inside a runaway statement,
-/// the one case where reclaiming actually matters, was the one case it could
-/// never reclaim. The idle clock deliberately does not apply to a busy lease:
+/// was running has come back: a lease wedged inside a runaway statement is the
+/// one case where reclaiming actually matters. The idle clock deliberately
+/// does not apply to a busy lease:
 /// a statement that has been running for a minute is working, not idle.
 fn lease_reap() {
     enum Action {
@@ -1008,11 +981,9 @@ fn lease_drain() {
     let mut cancelling = false;
     for id in &ids {
         // A lease busy with a statement is interrupted by this call rather than
-        // waited on. It used to be left to the executor's own shutdown — its
-        // channel is dropped below and `execute_jobs` rolls back on the way out
-        // — but that only unwinds once the statement finishes, so a single long
-        // query held the whole shutdown, and with it the CHECKPOINT that folds
-        // the WAL.
+        // waited on: the executor's own shutdown unwinds only once the
+        // statement finishes, so a single long query would hold the whole
+        // shutdown, and with it the CHECKPOINT that folds the WAL.
         cancelling |= lease_release(id) == Released::Cancelling;
     }
 
@@ -1053,8 +1024,8 @@ struct Running {
     /// channel is dropped, which is what `stop` does after draining.
     leases: Vec<JoinHandle<Option<Connection>>>,
     reaper: Option<JoinHandle<()>>,
-    /// The saturation-proof lane: answers /ready when every worker is busy,
-    /// and overflow requests on a borrowed lease connection. See probe_worker.
+    /// The saturation-proof lane: answers /ready and the control plane when
+    /// every worker is busy, and relays sessions' statements. See probe_worker.
     probe: Option<JoinHandle<()>>,
     addr: String,
 }
@@ -1063,20 +1034,11 @@ struct Running {
 pub fn open_pool(mut con: Connection) -> Result<(), String> {
     let mut pool = POOL.lock().unwrap();
 
-    // Once per process, not once per load. POOL and CONTROL are process-wide,
-    // but the entrypoint runs once per *database instance* — a host that opens
-    // two DuckDB databases and loads harbor into both would otherwise append
-    // eight more connections to the same vector and overwrite CONTROL with the
-    // second database's. `start()` drains from the tail, so harbor_start on the
-    // first instance would then serve the second one's data, and the shutdown
-    // CHECKPOINT would run against whichever loaded last. Refusing is the only
-    // honest answer: harbor is a process singleton and cannot serve two.
+    // Once per process: POOL and CONTROL are process-wide, and a second
+    // database's pool beside the first would leave the shutdown CHECKPOINT on
+    // whichever opened last.
     if !pool.is_empty() {
-        return Err(
-            "harbor is already loaded in this process and serves a single database; \
-             loading it into a second one is not supported"
-                .to_string(),
-        );
+        return Err("harbor's pool is already open in this process, which serves one database".to_string());
     }
 
     lock_operator_settings(&mut con)?;
@@ -1086,17 +1048,7 @@ pub fn open_pool(mut con: Connection) -> Result<(), String> {
     }
     // The handle has to be taken while the connection is still here, exactly
     // as `start()` does for the workers.
-    *CONTROL_SLOT.lock().unwrap() = Some(Arc::new(SlotState {
-        interrupt: con.interrupt_handle(),
-        run: Mutex::new(SlotRun {
-            job: 0,
-            started: Instant::now(),
-            pending: None,
-            cancelled: false,
-            deadline: None,
-            request: None,
-        }),
-    }));
+    *CONTROL_SLOT.lock().unwrap() = Some(SlotState::new(con.interrupt_handle()));
     *CONTROL.lock().unwrap() = Some(con);
     Ok(())
 }
@@ -1203,38 +1155,52 @@ pub fn start(listen: Listen, workers: usize, log: bool) -> Result<String, String
     // a fresh instance must not inherit a stale verdict from its predecessor.
     *LAST_READY.lock().unwrap() = None;
     let server = Arc::new(server);
-    let stop = Arc::new(AtomicBool::new(false));
+    *STOPPED.0.lock().unwrap() = false;
+    let mut r = Running {
+        server: Arc::clone(&server),
+        stop: Arc::new(AtomicBool::new(false)),
+        workers: Vec::new(),
+        leases: Vec::new(),
+        reaper: None,
+        probe: None,
+        addr: addr.clone(),
+    };
+    let spawned = spawn_threads(&mut r, conns, lease_conns, log);
+    *running = Some(r);
+    *SERVER.lock().unwrap() = Some(server);
+    if let Err(e) = spawned {
+        // What did start stops the ordinary way, so nothing is left serving
+        // that nothing can stop, and the connections go back to the pool.
+        drop(running);
+        let _ = stop();
+        return Err(format!("harbor: cannot start a thread: {e}"));
+    }
+    Ok(addr)
+}
 
+/// Every thread of a server, into `r` as each starts: the workers, an
+/// executor per lease connection, the reaper and the probe lane.
+fn spawn_threads(
+    r: &mut Running,
+    conns: Vec<Connection>,
+    lease_conns: Vec<Connection>,
+    log: bool,
+) -> std::io::Result<()> {
     // Every executor gets a slot before it gets a thread. The interrupt handle
     // has to be taken from the connection while it is still here — an executor
     // owns its connection for the life of the server and nothing else can
     // reach it afterwards.
+    let workers = conns.len();
     let mut slots: Vec<Arc<SlotState>> = Vec::with_capacity(workers + lease_conns.len());
-    let new_slot = |conn: &Connection| {
-        Arc::new(SlotState {
-            interrupt: conn.interrupt_handle(),
-            run: Mutex::new(SlotRun {
-                job: 0,
-                started: Instant::now(),
-                pending: None,
-                cancelled: false,
-                deadline: None,
-                request: None,
-            }),
-        })
-    };
-
-    let mut handles = Vec::with_capacity(workers);
     for (i, conn) in conns.into_iter().enumerate() {
-        let server = Arc::clone(&server);
-        let stop = Arc::clone(&stop);
-        let state = new_slot(&conn);
+        let server = Arc::clone(&r.server);
+        let stop = Arc::clone(&r.stop);
+        let state = SlotState::new(conn.interrupt_handle());
         slots.push(Arc::clone(&state));
-        handles.push(
+        r.workers.push(
             thread::Builder::new()
                 .name(format!("harbor-{i}"))
-                .spawn(move || worker(server, stop, conn, state, log))
-                .map_err(|e| e.to_string())?,
+                .spawn(move || worker(server, stop, conn, state, log))?,
         );
     }
 
@@ -1243,21 +1209,20 @@ pub fn start(listen: Listen, workers: usize, log: bool) -> Result<String, String
     // from whichever worker accepted the request and are answered here, which
     // is what keeps a transaction on one connection without taking a worker
     // out of the accept loop to babysit it.
-    let mut lease_handles = Vec::with_capacity(lease_conns.len());
     let mut free = Vec::with_capacity(lease_conns.len());
     for (slot, conn) in lease_conns.into_iter().enumerate() {
         // Capacity 1 for the same reason as the worker executors: one job
         // outstanding by construction, so the slot only skips a double park.
         let (tx, rx) = mpsc::sync_channel::<Job>(1);
-        let state = new_slot(&conn);
+        let state = SlotState::new(conn.interrupt_handle());
         slots.push(Arc::clone(&state));
         let exec_state = Arc::clone(&state);
-        let handle = thread::Builder::new()
-            .name(format!("harbor-lease-{slot}"))
-            .stack_size(EXEC_STACK)
-            .spawn(move || Some(execute_jobs(conn, rx, true, exec_state)))
-            .map_err(|e| e.to_string())?;
-        lease_handles.push(handle);
+        r.leases.push(
+            thread::Builder::new()
+                .name(format!("harbor-lease-{slot}"))
+                .stack_size(EXEC_STACK)
+                .spawn(move || Some(execute_jobs(conn, rx, true, exec_state)))?,
+        );
         free.push(LeaseConn { slot, jobs: tx, state });
     }
     *WORKER_SLOTS.lock().unwrap() = slots[..workers].to_vec();
@@ -1281,23 +1246,16 @@ pub fn start(listen: Listen, workers: usize, log: bool) -> Result<String, String
 
     // The reaper is what makes a lease safe to hand out at all: without it an
     // abandoned transaction holds its connection until the process exits, and
-    // blocks every checkpoint in between.
-    // Unconditional now, where it used to be skipped when there were no lease
-    // connections: it also enforces statement deadlines, and those apply to
-    // workers, which always exist.
-    let reaper = {
-        let stop = Arc::clone(&stop);
-        thread::Builder::new()
-            .name("harbor-reaper".to_string())
-            .spawn(move || {
-                while !stop.load(Ordering::SeqCst) {
-                    thread::sleep(REAP_INTERVAL);
-                    cancel_expired();
-                    lease_reap();
-                }
-            })
-            .ok()
-    };
+    // blocks every checkpoint in between. It also enforces statement
+    // deadlines, which apply to the workers as well.
+    let stop = Arc::clone(&r.stop);
+    r.reaper = Some(thread::Builder::new().name("harbor-reaper".to_string()).spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            thread::sleep(REAP_INTERVAL);
+            cancel_expired();
+            lease_reap();
+        }
+    })?);
 
     // One thread the fleet can always reach. Workers pair 1:1 with
     // connections and stream whole responses, so when every worker is busy an
@@ -1305,53 +1263,81 @@ pub fn start(listen: Listen, workers: usize, log: bool) -> Result<String, String
     // 5 seconds under a saturating analytical load — and a load balancer with
     // an ordinary timeout marks a busy-but-healthy berth dead precisely when
     // killing it hurts most. This thread never runs a statement of its own:
-    // /ready is answered from the CONTROL connection, and anything else gets
-    // a borrowed lease connection when one is free or an immediate honest 503
-    // when the berth is truly saturated — shedding load instead of queueing
-    // it invisibly.
-    let probe = {
-        let server = Arc::clone(&server);
-        let stop = Arc::clone(&stop);
+    // /ready is answered from the CONTROL connection, a session's statement
+    // is relayed to the session's own connection, and work that needs a
+    // worker gets an immediate honest 503 — shedding load instead of
+    // queueing it invisibly.
+    let (server, stop) = (Arc::clone(&r.server), Arc::clone(&r.stop));
+    r.probe = Some(
         thread::Builder::new()
             .name("harbor-probe".to_string())
-            .spawn(move || probe_worker(server, stop, log))
-            .ok()
-    };
-
-    *STOPPED.0.lock().unwrap() = false;
-    *running = Some(Running {
-        server,
-        stop,
-        workers: handles,
-        leases: lease_handles,
-        reaper,
-        probe,
-        addr: addr.clone(),
-    });
-    Ok(addr)
+            .spawn(move || probe_worker(server, stop, log))?,
+    );
+    Ok(())
 }
 
-/// Live client connections on the running server, or None when nothing
-/// is serving. This is the whole lifetime signal for a refcounted
-/// (spawned-on-use) server: the host polls it and leaves when it has
-/// been zero past the grace windows. Idle keep-alive connections count
-/// — an attached client, even a quiet one, is a claim.
-pub fn connection_count() -> Option<usize> {
-    RUNNING.lock().unwrap().as_ref().map(|r| r.server.connection_count())
+/// The running server, readable apart from RUNNING, which a stop holds for
+/// as long as it drains.
+static SERVER: Mutex<Option<Arc<Server>>> = Mutex::new(None);
+
+/// Client connections on the running server: (live now, accepted since it
+/// started), or None when nothing is serving. This is the whole lifetime
+/// signal for a refcounted (spawned-on-use) server: the host leaves once none
+/// has been live past the grace windows — the startup one until a first
+/// client has come, however briefly. Idle keep-alive connections count — an
+/// attached client, even a quiet one, is a claim.
+pub fn connections() -> Option<(usize, usize)> {
+    SERVER.lock().unwrap().as_ref().map(|s| (s.connection_count(), s.accepted_count()))
+}
+
+/// The TCP door's port, when the server has one: the port asked for, or the
+/// one the system chose for port 0.
+pub fn tcp_port() -> Option<u16> {
+    match SERVER.lock().unwrap().as_ref()?.server_addr() {
+        justhttp::ListenAddr::Ip(addr) => Some(addr.port()),
+        #[cfg(unix)]
+        justhttp::ListenAddr::Unix(_) => None,
+    }
 }
 
 pub fn stop() -> Result<String, String> {
+    stop_with(RUNNING.lock().unwrap())
+}
+
+/// Stop the server only if no client has connected since `accepted` had been
+/// accepted and none is connected now: a refcounted server's departure. The
+/// last look and the start of the stop are one step under the server's lock,
+/// so a client that arrived since the host last looked keeps the server.
+pub fn stop_if_idle(accepted: usize) -> bool {
+    let running = RUNNING.lock().unwrap();
+    if connections() != Some((0, accepted)) {
+        return false;
+    }
+    let _ = stop_with(running);
+    true
+}
+
+fn stop_with(mut running: std::sync::MutexGuard<'_, Option<Running>>) -> Result<String, String> {
     // Held for the whole of the shutdown, not just the take(). Releasing it
     // here — which `RUNNING.lock().unwrap().take()` as a statement does, since
     // the guard is a temporary — leaves a window in which RUNNING is None while
     // the listener is still bound and the workers are still draining. A
-    // harbor_start arriving in that window sees no server, takes whichever
+    // start() arriving in that window sees no server, takes whichever
     // connections happen to be back in the pool, and then fails to bind a port
     // the old listener has not released yet.
-    let mut running = RUNNING.lock().unwrap();
     let Some(r) = running.take() else {
         return Err("harbor is not serving".to_string());
     };
+    // On a server only its unix socket reaches, a client that arrives from
+    // here on is refused at connect, so it knows its request was never sent;
+    // one accepted and then left unanswered could not tell whether its
+    // statement ran. The socket file stays until the server is gone, which
+    // is what a stop over it waits for. A TCP door stays open through the
+    // drain: a stop by URL reads a refused port as a server that is gone.
+    #[cfg(unix)]
+    if matches!(r.server.server_addr(), justhttp::ListenAddr::Unix(_)) {
+        r.server.close_doors();
+    }
     r.stop.store(true, Ordering::SeqCst);
     r.server.unblock();
 
@@ -1382,7 +1368,7 @@ pub fn stop() -> Result<String, String> {
     *QUERIES.lock().unwrap() = None;
 
     // Workers hand their connection back as they exit, so a later
-    // harbor_start has a pool to draw from. A panicked worker forfeits its
+    // start() has a pool to draw from. A panicked worker forfeits its
     // connection rather than taking the shutdown down with it.
     //
     // Bounded patience, not join(): a worker whose client stopped reading is
@@ -1448,6 +1434,7 @@ pub fn stop() -> Result<String, String> {
         );
     }
 
+    *SERVER.lock().unwrap() = None;
     let (lock, cv) = &STOPPED;
     *lock.lock().unwrap() = true;
     cv.notify_all();
@@ -1455,7 +1442,8 @@ pub fn stop() -> Result<String, String> {
     Ok(r.addr)
 }
 
-/// Turn SIGTERM and SIGINT into a clean `stop()`.
+/// Turn SIGTERM, SIGINT and SIGHUP — on Windows, Ctrl-C and Ctrl-Break —
+/// into a clean `stop()`.
 ///
 /// Registered from `wait()` and nowhere else. `wait()` is what makes the
 /// process a daemon — nothing else is going to happen on the main thread —
@@ -1463,41 +1451,41 @@ pub fn stop() -> Result<String, String> {
 /// to make. In an ordinary interactive session the CLI keeps its own Ctrl-C,
 /// which cancels a query rather than shutting the database down.
 ///
-/// Without this, a `kill` runs the default handler: the process dies with the
-/// WAL unfolded and the next open has to replay it.
-#[cfg(unix)]
+/// Without this, a `kill`, or the hangup of a closed terminal or a dropped
+/// ssh session, runs the default handler: the process dies with the WAL
+/// unfolded and the next open has to replay it.
 fn install_signal_handler() {
-    use signal_hook::{
-        consts::{SIGINT, SIGTERM},
-        iterator::Signals,
-    };
+    use signal_hook::consts::{SIGINT, SIGTERM};
 
     static INSTALLED: AtomicBool = AtomicBool::new(false);
     if INSTALLED.swap(true, Ordering::SeqCst) {
         return;
     }
-
-    if let Ok(mut signals) = Signals::new([SIGTERM, SIGINT]) {
-        let _ = thread::Builder::new().name("harbor-signals".to_string()).spawn(move || {
-            // No `break`. Breaking out ends the thread, which drops `Signals`
-            // and restores the default disposition — so the *second* signal did
-            // exactly what this function exists to prevent: killed the process
-            // with the WAL unfolded. A supervisor escalating after a timeout,
-            // or an impatient second Ctrl-C, both land in that window, and the
-            // launcher's CHECKPOINT runs after wait() returns — precisely then.
-            // stop() is idempotent enough to call again: the second call finds
-            // RUNNING empty and returns an error nobody reads.
-            for _ in signals.forever() {
+    #[cfg(unix)]
+    let signals = [SIGTERM, SIGINT, signal_hook::consts::SIGHUP];
+    #[cfg(windows)]
+    let signals = [SIGTERM, SIGINT, signal_hook::consts::SIGBREAK];
+    let asked = Arc::new(AtomicBool::new(false));
+    for signal in signals {
+        let _ = signal_hook::flag::register(signal, Arc::clone(&asked));
+    }
+    // The handlers stay registered for the life of the process, so a second
+    // signal — a supervisor escalating after a timeout, an impatient second
+    // Ctrl-C — asks again rather than killing the process with the WAL
+    // unfolded while the launcher's CHECKPOINT runs after wait() returns.
+    // stop() is idempotent enough to call again: the second call finds
+    // RUNNING empty and returns an error nobody reads.
+    let _ = thread::Builder::new().name("harbor-signals".to_string()).spawn(move || {
+        loop {
+            thread::sleep(Duration::from_millis(100));
+            if asked.swap(false, Ordering::SeqCst) {
                 // stop() drains the workers and checkpoints, then wakes
                 // wait(), which lets the main thread exit normally.
                 let _ = stop();
             }
-        });
-    }
+        }
+    });
 }
-
-#[cfg(not(unix))]
-fn install_signal_handler() {}
 
 /// Block until the server stops. Returns the address it was serving on.
 pub fn wait() -> Result<String, String> {
@@ -1527,15 +1515,10 @@ pub fn wait() -> Result<String, String> {
 /// the rows come from a borrow chain rooted in a `Connection` that is not
 /// `Sync`. Putting the connection on its own thread and passing byte chunks
 /// through a bounded channel gives justhttp its reader and keeps the query
-/// streaming.
-///
-/// Before this, harbor took the raw socket with `into_writer()` and wrote the
-/// framing by hand, which forces `Connection: close`. That costs a client one
-/// ephemeral port per request, held for the TIME_WAIT interval — about
-/// 16k ports over 30s on macOS, so a single client hitting a few thousand
-/// requests per second runs out of ports in seconds and starts seeing
-/// `Can't assign requested address`. Reusing the connection removes the cost
-/// entirely.
+/// streaming. A connection closed after every response would cost a client
+/// an ephemeral port per request, held for the TIME_WAIT interval — about 16k
+/// ports over 30s on macOS — and one client at a few thousand requests a
+/// second would run out in seconds.
 fn worker(
     server: Arc<Server>,
     stop: Arc<AtomicBool>,
@@ -1563,10 +1546,9 @@ fn worker(
             // workers pull from one shared queue, so one that answers instantly
             // — which is what a worker with no executor does, 503 by return —
             // wins races against every worker still doing real work, and
-            // absorbs a growing share of the traffic. `/ready` reports that
-            // honestly now — it runs a real query, so a dead executor answers
-            // 503 rather than a cheerful hardcoded 200 — but reporting it is
-            // not enough: the worker still has to leave.
+            // absorbs a growing share of the traffic. `/ready` reports it — it
+            // runs a real query, so a dead executor answers 503 — but
+            // reporting it is not enough: the worker still has to leave.
             Ok(Some(req)) => {
                 if !handle(req, Some((&jobs_tx, &state)), log) {
                     break;
@@ -1576,10 +1558,9 @@ fn worker(
             // The listener is gone — justhttp only surfaces an accept error
             // once it has decided the socket itself is unusable (transient
             // failures are retried there). This berth will never accept
-            // another connection, and it used to leave without a word: the
-            // process stayed alive, holding the database and the flock, while
-            // every client saw connection-refused and every supervisor
-            // watching the pid saw a healthy berth.
+            // another connection, so it says so: a process alive and holding
+            // the database and the flock looks healthy to a supervisor
+            // watching the pid while every client sees connection-refused.
             Err(e) => {
                 eprintln!(
                     "harbor: the listener has failed ({e}); this berth can no longer \
@@ -1599,10 +1580,12 @@ fn worker(
 /// load balancer never mistakes busy for dead; cancels and releases because
 /// they are how a saturated berth gets UN-saturated; /sessions and /info
 /// because an operator debugging the saturation needs them. All bounded,
-/// in-memory responses — this thread never streams and never borrows a
-/// connection, so a client that stops reading can wedge a worker but not the
-/// berth's last open door. Statements and /catalog get a fast honest 503
-/// instead of queueing invisibly behind the analytics.
+/// in-memory responses — this thread never reads a body, streams or borrows
+/// a connection, so a client that stops reading can wedge a worker but not
+/// the berth's last open door. A session's statement is relayed to a thread
+/// of its own (`relay`), since it runs on the session's connection; other
+/// statements and /catalog get a fast honest 503 instead of queueing
+/// invisibly behind the analytics.
 fn probe_worker(server: Arc<Server>, stop: Arc<AtomicBool>, log: bool) {
     while !stop.load(Ordering::SeqCst) {
         // Only join the accept queue when the workers are WEDGED — every one
@@ -1682,13 +1665,11 @@ const WEDGED_REQUEST_AGE: Duration = Duration::from_secs(5);
 /// Every worker occupied, and every one of them occupied long enough to mean
 /// it. See the probe loop for why age is the discriminator.
 ///
-/// "Occupied" is not "running a statement". It used to be, and that was the
-/// blind spot behind every denial of service found here: a worker held in a
-/// request body — draining one nobody read, or waiting on one dribbling in a
-/// byte at a time — has no job, so six stuck workers read as six idle ones and
-/// this returned false while the berth answered nothing at all. A worker is
-/// occupied from the moment it picks up a request; whether that request ever
-/// reaches DuckDB is a distinction the load balancer does not care about.
+/// "Occupied" is not "running a statement": a worker held in a request body —
+/// draining one nobody read, or waiting on one dribbling in a byte at a time —
+/// has no job, and six such workers are a berth that answers nothing. A worker
+/// is occupied from the moment it picks up a request; whether that request
+/// ever reaches DuckDB is a distinction the load balancer does not care about.
 fn workers_wedged(min_age: Duration) -> bool {
     let slots = WORKER_SLOTS.lock().unwrap();
     !slots.is_empty()
@@ -1704,7 +1685,7 @@ fn workers_wedged(min_age: Duration) -> bool {
 /// The probe thread's answer to work it cannot take: immediate and honest,
 /// instead of an invisible seat in the queue behind the analytics.
 fn shed(req: Request) -> (bool, u16) {
-    let _ = req.respond(error_response(503, "unavailable", "every worker is busy; retry shortly"));
+    let _ = req.respond(error_response(503, code::UNAVAILABLE, "every worker is busy; retry shortly"));
     (true, 503)
 }
 
@@ -1715,8 +1696,8 @@ fn shed(req: Request) -> (bool, u16) {
 /// Identity document the embedding host sets before `start()`; GET /info
 /// serves it with `uptimeMs` spliced in. The host owns the static fields
 /// (name, database path, pid) because the core cannot know them.
-/// Unset, /info answers 404 — the pre-fleet behavior old clients still
-/// lean on as a version probe.
+/// Unset, /info answers 404, which a client reads as a server that does not
+/// speak it.
 static INFO: Mutex<Option<serde_json::Value>> = Mutex::new(None);
 static STARTED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 /// The workers' slots alone (SLOTS holds leases too), set at start(). The
@@ -1738,15 +1719,15 @@ fn run_info(req: Request) -> (bool, u16) {
                 obj.insert("uptimeMs".to_string(), serde_json::Value::from(up));
                 // Live clients right now — the refcount a spawned server's
                 // lifetime rides on, and worth showing in any list.
-                if let Some(n) = connection_count() {
-                    obj.insert("clients".to_string(), serde_json::Value::from(n));
+                if let Some((live, _)) = connections() {
+                    obj.insert("clients".to_string(), serde_json::Value::from(live));
                 }
             }
             let _ = req.respond(json_response(200, &v.to_string()));
             (true, 200)
         }
         None => {
-            let _ = req.respond(error_response(404, "not_found", "no such endpoint"));
+            let _ = req.respond(error_response(404, code::NOT_FOUND, "no such endpoint"));
             (true, 404)
         }
     }
@@ -1754,15 +1735,12 @@ fn run_info(req: Request) -> (bool, u16) {
 
 /// One request. `exec` is the accepting thread's executor — its jobs channel
 /// and cancellation slot. The probe thread passes None: it owns no
-/// connection, so the arms that stream (/sql, /catalog, the workers' /ready)
-/// shed load with an immediate 503 instead, and every control-plane verb —
-/// session open/release, query cancel, /sessions, /info — works exactly as
-/// it does on a worker, because none of them touch an executor.
-fn handle(
-    mut req: Request,
-    exec: Option<(&mpsc::SyncSender<Job>, &Arc<SlotState>)>,
-    log: bool,
-) -> bool {
+/// connection, so /catalog sheds load with an immediate 503, /ready is
+/// answered from CONTROL, a session's statement is relayed to the session's
+/// own connection, and every control-plane verb — session open, renew and
+/// release, query cancel, /sessions, /info — works exactly as it does on a
+/// worker, because none of them touch an executor.
+fn handle(req: Request, exec: Option<Executor>, log: bool) -> bool {
     let path = req.url().split('?').next().unwrap_or("/").to_string();
     let method = req.method().clone();
     // Only a worker marks a slot: the probe thread owns no connection and is
@@ -1772,11 +1750,12 @@ fn handle(
     // Only when logging. A clock read and a peer-address format are small, but
     // they are paid on every request by every caller, including the ones that
     // asked for a query endpoint and nothing else.
-    let started = log.then(Instant::now);
-    let peer = match log {
-        true => req.remote_addr().map_or_else(|| "-".to_string(), |a| a.ip().to_string()),
-        false => String::new(),
-    };
+    let line = log.then(|| LogLine {
+        started: Instant::now(),
+        peer: req.remote_addr().map_or_else(|| "-".to_string(), |a| a.ip().to_string()),
+        method: method.clone(),
+        path: path.clone(),
+    });
     // Cleared here so the reason logged below is this request's, never a
     // previous one's left on this worker thread.
     LAST_REASON.with(|c| c.set(""));
@@ -1785,10 +1764,10 @@ fn handle(
     // undelivered body when a request is dropped — with a single
     // `vec![0; remaining]` — and it does so for EVERY response path, 404s
     // included. `take()` bounds what harbor buffers but not what the client
-    // may declare, and the declared length is attacker-chosen; a request
-    // declaring 1 GB and sending 9 bytes used to cost this process a 1 GB
-    // zeroed allocation. Refusing here, before anything else can respond,
-    // means the allocation never happens on any path.
+    // may declare, and the declared length is attacker-chosen: a request
+    // declaring 1 GB and sending 9 bytes would cost a 1 GB zeroed
+    // allocation. Refusing here, before anything else can respond, means the
+    // allocation never happens on any path.
     //
     // Every listener is machine-local: the unix socket is protected by its
     // 0700 runtime directory and TCP binds loopback only. Callers beyond this
@@ -1799,15 +1778,10 @@ fn handle(
     // logged: it is the request body, it can be enormous, and on this endpoint
     // it is as likely to hold customer data as anything else in the database.
     let (keep_going, status) = if let Some(n) = req.body_length().filter(|n| *n > MAX_BODY) {
-        let _ = req.respond(error_response(
-            413,
-            "body_too_large",
-            &format!("body is {n} bytes; the limit is {MAX_BODY}"),
-        ));
-        (true, 413)
+        let message = format!("body is {n} bytes; the limit is {MAX_BODY}");
+        refuse(req, Refusal { status: 413, code: code::BODY_TOO_LARGE, message })
     } else if let Some(why) = from_a_browser(&req) {
-        let _ = req.respond(error_response(403, "forbidden", why));
-        (true, 403)
+        refuse(req, Refusal { status: 403, code: code::FORBIDDEN, message: why.into() })
     } else {
         match (&method, path.as_str()) {
             // Workers answer readiness down the full query path; the probe thread —
@@ -1819,8 +1793,7 @@ fn handle(
             },
             // Open a transaction lease: POST to the collection, REST's create.
             // It consumes a connection, which is the scarcest thing here.
-            // `/new` is the legacy 0.22-era spelling, kept until the next
-            // deliberate break.
+            // `/new` is the route Rip's driver opens sessions at.
             (Method::Post, "/sql/sessions" | "/sql/sessions/new") => run_session_open(req),
             (Method::Post, p) if renewal_session_id(p).is_some() => {
                 match lease_renew(renewal_session_id(p).unwrap()) {
@@ -1828,10 +1801,7 @@ fn handle(
                         let _ = req.respond(json_response(200, r#"{"renewed":true}"#));
                         (true, 200)
                     }
-                    Err(e) => {
-                        let _ = req.respond(error_response(e.status, e.code, &e.message));
-                        (true, e.status)
-                    }
+                    Err(refusal) => refuse(req, refusal),
                 }
             }
             // Release one. Idempotent by design: a client retrying a DELETE it
@@ -1844,37 +1814,38 @@ fn handle(
             // so a client that wants its transaction stopped has one verb for
             // it, and a client polling for the connection can tell them apart.
             (Method::Delete, p) if p.starts_with("/sql/sessions/") => {
-                let id = p.trim_start_matches("/sql/sessions/").to_string();
-                let body = match lease_release(&id) {
-                    Released::Yes => r#"{"released":true}"#.to_string(),
-                    Released::No => r#"{"released":false}"#.to_string(),
-                    Released::Cancelling => r#"{"released":false,"cancelling":true}"#.to_string(),
+                let released = lease_release(p.trim_start_matches("/sql/sessions/"));
+                let body = wire::ReleasedResponse {
+                    released: released == Released::Yes,
+                    cancelling: (released == Released::Cancelling).then_some(true),
                 };
-                let _ = req.respond(json_response(200, &body));
+                let _ = req.respond(json_response(200, &serde_json::to_string(&body).unwrap()));
                 (true, 200)
             }
             // Stop a statement the client named when it sent it. Idempotent and
             // deliberately unexciting: cancelling something that already
             // finished is `false`, not an error, because by the time a Stop
-            // button is pressed the query it refers to may well be over.
+            // button is pressed the query it refers to may well be over —
+            // its rows may still be on their way, and they all arrive.
             (Method::Delete, p) if p.starts_with("/sql/queries/") => {
                 let cancelled = cancel_query(&percent_decoded(&p["/sql/queries/".len()..]));
-                let _ = req.respond(json_response(200, &format!(r#"{{"cancelled":{cancelled}}}"#)));
+                let body = serde_json::to_string(&wire::CancelledResponse { cancelled }).unwrap();
+                let _ = req.respond(json_response(200, &body));
                 (true, 200)
             }
             // What is holding a connection, and for how long. The question an
             // operator asks when everything is suddenly waiting, and the reason
             // this exists at all: a pool you cannot see into is a pool you
-            // debug by guessing. Lives at the collection the ids live under;
-            // bare `/sessions` is the legacy spelling.
+            // debug by guessing. Lives at the collection the ids live under,
+            // and at bare `/sessions` too.
             (Method::Get, "/sql/sessions" | "/sessions") => {
                 let _ = req.respond(json_response(200, &sessions_report()));
                 (true, 200)
             }
             // Fleet shutdown returns before the drain begins. Running stop()
-            // on a fresh thread matters: this handler
-            // is itself one of the workers stop() waits to join. POST — an
-            // action, not a resource removal; DELETE is the legacy verb.
+            // on a fresh thread matters: this handler is itself one of the
+            // workers stop() waits to join. POST — an action, not a resource
+            // removal — and DELETE, which clients also send.
             (Method::Post | Method::Delete, "/shutdown") => {
                 let _ = req.respond(json_response(202, r#"{"stopping":true}"#));
                 let _ = thread::Builder::new()
@@ -1897,46 +1868,86 @@ fn handle(
                 None => shed(req),
             },
             (Method::Post, "/sql") => match exec {
-                Some((jobs, state)) => {
-                    match read_request_body(&mut req) {
-                        Ok(body) => run_sql(req, jobs, state, &body),
-                        Err(e) => {
-                            let _ = req.respond(error_response(e.status, e.code, &e.message));
-                            (true, e.status)
-                        }
-                    }
-                }
-                None => shed(req),
+                Some(exec) => run_sql_request(req, Some(exec)),
+                // A session's statement needs no worker: it runs on the
+                // session's own connection. The lane relays it, and sheds the
+                // rest.
+                None => return relay(req, line),
             },
-            _ => {
-                let _ = req.respond(error_response(404, "not_found", "no such endpoint"));
-                (true, 404)
-            }
+            _ => refuse(req, Refusal { status: 404, code: code::NOT_FOUND, message: "no such endpoint".into() }),
         }
     };
 
-    // After respond(), not before: justhttp writes the body from the reader
-    // inside that call, so for a streamed result this elapsed time covers the
-    // whole query and the whole transfer rather than just the headers.
-    if let Some(t) = started {
-        // On a failure, name why: the refusal code turns an unexplained spike
-        // of 4xx/5xx in the berth's own log into something diagnosable. The SQL
-        // and the message still stay out of the log (privacy, and the message
-        // can be large); the code is a fixed vocabulary and is enough to act on.
-        let reason = LAST_REASON.with(|c| c.get());
-        let reason = if status >= 400 && !reason.is_empty() {
-            format!(" {reason}")
-        } else {
-            String::new()
-        };
-        eprintln!(
-            "harbor: {} {peer} {} {path} {status}{reason} {}ms",
-            utc_now(),
-            method.as_str(),
-            t.elapsed().as_millis()
-        );
+    if let Some(line) = line {
+        line.write(status);
     }
     keep_going
+}
+
+/// One request's access-log line, written once it is answered.
+struct LogLine {
+    started: Instant,
+    peer: String,
+    method: Method,
+    path: String,
+}
+
+impl LogLine {
+    /// After respond(), not before: justhttp writes the body from the reader
+    /// inside that call, so for a streamed result the elapsed time covers the
+    /// whole query and the whole transfer rather than just the headers.
+    ///
+    /// On a failure, name why: the refusal code turns an unexplained spike of
+    /// 4xx/5xx in the berth's own log into something diagnosable. The SQL and
+    /// the message stay out of the log (privacy, and the message can be
+    /// large); the code is a fixed vocabulary and is enough to act on.
+    fn write(self, status: u16) {
+        let reason = LAST_REASON.with(|c| c.get());
+        let reason = if status >= 400 && !reason.is_empty() { format!(" {reason}") } else { String::new() };
+        eprintln!(
+            "harbor: {} {} {} {} {status}{reason} {}ms",
+            utc_now(),
+            self.peer,
+            self.method.as_str(),
+            self.path,
+            self.started.elapsed().as_millis()
+        );
+    }
+}
+
+/// How the probe lane runs `POST /sql`: on a thread of its own, which reads
+/// the body and runs a session's statement on the session's connection, and
+/// sheds anything else. The lane itself never reads a body or streams, so a
+/// client that stalls either holds this thread and not the berth's last open
+/// door. One thread at most per lease connection, which is as many
+/// statements as sessions can run at once.
+fn relay(req: Request, line: Option<LogLine>) -> bool {
+    static RELAYS: AtomicUsize = AtomicUsize::new(0);
+    struct Seat;
+    impl Drop for Seat {
+        fn drop(&mut self) {
+            RELAYS.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let cap = LEASES.lock().unwrap().as_ref().map_or(0, |l| l.total);
+    let seat = Seat;
+    if RELAYS.fetch_add(1, Ordering::SeqCst) >= cap {
+        let (keep_going, status) = shed(req);
+        if let Some(line) = line {
+            line.write(status);
+        }
+        return keep_going;
+    }
+    // A thread that cannot start drops the request, which justhttp answers
+    // with a 500, and the seat with it.
+    let _ = thread::Builder::new().name("harbor-relay".to_string()).spawn(move || {
+        let _seat = seat;
+        let (_, status) = run_sql_request(req, None);
+        if let Some(line) = line {
+            line.write(status);
+        }
+    });
+    true
 }
 
 /// Why a TCP request came from a web page, or `None` when it did not.
@@ -2072,7 +2083,11 @@ fn parse_request(body: &str) -> Result<SqlRequest, String> {
     }
     let params = match v.get("params") {
         None | Some(serde_json::Value::Null) => Vec::new(),
-        Some(serde_json::Value::Array(a)) => a.iter().map(json_to_duckdb).collect::<Result<_, _>>()?,
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .enumerate()
+            .map(|(i, param)| json_to_duckdb(param, || written_whole(body, i)))
+            .collect::<Result<_, _>>()?,
         Some(_) => return Err("\"params\" must be an array".to_string()),
     };
     let session = match v.get("sessionId") {
@@ -2096,9 +2111,8 @@ fn parse_request(body: &str) -> Result<SqlRequest, String> {
     // default: a request may ask for *less*, but not for more, and `0` ("no
     // limit") is bounded by it too. Without the clamp, any caller could
     // send `timeoutMs:0` and pin a worker indefinitely — defeating the very
-    // knob a `--sealed` deployment leans on. When no cap is configured the cap
-    // is `None`, so the historical behaviour (0 = unlimited, N = exactly N) is
-    // unchanged.
+    // knob a `--sealed` deployment leans on. With no cap configured, 0 is
+    // unlimited and N is exactly N.
     let cap = configured_statement_timeout();
     let timeout = match v.get("timeoutMs") {
         None | Some(serde_json::Value::Null) => cap,
@@ -2115,22 +2129,29 @@ fn parse_request(body: &str) -> Result<SqlRequest, String> {
     Ok(SqlRequest { sql, params, session, query, timeout })
 }
 
-fn json_to_duckdb(v: &serde_json::Value) -> Result<Param, String> {
+/// One JSON param as the value it binds. `whole` says whether the param was
+/// written as a whole number, asked only of one past what 64 bits hold.
+fn json_to_duckdb(v: &serde_json::Value, whole: impl FnOnce() -> bool) -> Result<Param, String> {
     Ok(match v {
         serde_json::Value::Null => Param::Null,
         serde_json::Value::Bool(b) => Param::Bool(*b),
         serde_json::Value::String(s) => Param::Text(s.clone()),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Param::I64(i)
-            } else if let Some(u) = n.as_u64() {
-                Param::U64(u)
-            } else if let Some(f) = n.as_f64() {
-                Param::F64(f)
-            } else {
-                return Err("unrepresentable number in \"params\"".to_string());
+        // A fraction or an exponent binds as the double its text names, as
+        // in SQL. A whole number past i64 and u64 reads as the nearest
+        // double, a different number, so it is refused rather than stored
+        // as one: JSON numbers do not carry it exactly through most clients
+        // either, and a string cast in the statement does.
+        serde_json::Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
+            (Some(i), _, _) => Param::I64(i),
+            (_, Some(u), _) => Param::U64(u),
+            (_, _, Some(f)) if f.fract() == 0.0 && f.abs() >= 9_223_372_036_854_775_808.0 && whole() => {
+                return Err("a whole number param past what 64 bits hold would bind as a different \
+                            number: send it as a string and cast it in the statement, as ?::HUGEINT"
+                    .to_string());
             }
-        }
+            (_, _, Some(f)) => Param::F64(f),
+            _ => return Err("unrepresentable number in \"params\"".to_string()),
+        },
         // An object or an array is a document. Aimed at a VARIANT it is bound
         // as one (`Conn::bind`); everywhere else it has no SQL type of
         // its own and goes as its JSON text, for the statement to cast. A
@@ -2141,6 +2162,19 @@ fn json_to_duckdb(v: &serde_json::Value) -> Result<Param, String> {
         }
         _ => return Err(too_deep()),
     })
+}
+
+/// Whether param `i` of `body` is written as a whole number: no fraction and
+/// no exponent. The parsed value cannot say, since a whole number past 64
+/// bits parses to a double; the text can.
+fn written_whole(body: &str, i: usize) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Params<'a> {
+        #[serde(borrow)]
+        params: Vec<&'a serde_json::value::RawValue>,
+    }
+    serde_json::from_str::<Params>(body)
+        .is_ok_and(|p| p.params.get(i).is_some_and(|raw| !raw.get().contains(['.', 'e', 'E'])))
 }
 
 fn too_deep() -> String {
@@ -2178,8 +2212,8 @@ enum Shape {
     Json,
 }
 
-/// `Accept: application/json` asks for the whole result as one document, the
-/// way harbor v1 did. Anything else — no header, `*/*`, `application/x-ndjson`
+/// `Accept: application/json` asks for the whole result as one document.
+/// Anything else — no header, `*/*`, `application/x-ndjson`
 /// — streams.
 ///
 /// A header naming both wins for NDJSON: it is the shape that cannot fail on
@@ -2187,8 +2221,7 @@ enum Shape {
 /// is not a substring of `application/x-ndjson`, so a plain `contains` is not
 /// fooled by the streaming type.)
 fn wants_one_shot(req: &Request) -> bool {
-    // case-insensitive substring scan, allocation-free (same semantics as
-    // the lowercase-then-contains it replaced)
+    // case-insensitive substring scan, allocation-free
     fn contains_ignore_case(hay: &str, needle: &str) -> bool {
         hay.as_bytes()
             .windows(needle.len())
@@ -2222,7 +2255,29 @@ impl Refusal {
     /// The engine rejected the statement. By far the common case, so it gets
     /// the short spelling.
     fn sql(message: impl Into<String>) -> Self {
-        Self { status: 400, code: "sql_error", message: message.into() }
+        Self { status: 400, code: code::SQL_ERROR, message: message.into() }
+    }
+
+    /// The request itself is malformed.
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self { status: 400, code: code::BAD_REQUEST, message: message.into() }
+    }
+
+    fn not_serving() -> Self {
+        Self { status: 503, code: code::UNAVAILABLE, message: "harbor is not serving".into() }
+    }
+
+    /// The same answer whether the session never existed, was released, or
+    /// timed out: from the client's side those are one situation — the
+    /// transaction is gone and the work has to start again.
+    fn no_session() -> Self {
+        Self {
+            status: 404,
+            code: code::NO_SUCH_SESSION,
+            message: "no such session: it was released, timed out, or never existed. Open a new \
+                      one and retry the transaction from the beginning."
+                .into(),
+        }
     }
 
     /// Somebody stopped this statement on purpose.
@@ -2236,7 +2291,7 @@ impl Refusal {
     fn cancelled() -> Self {
         Self {
             status: 499,
-            code: "cancelled",
+            code: code::CANCELLED,
             message: "this statement was cancelled before it finished".to_string(),
         }
     }
@@ -2282,6 +2337,22 @@ struct Job {
     body: mpsc::SyncSender<Vec<u8>>,
 }
 
+impl Job {
+    /// A job with a fresh id, and the ends its executor answers on.
+    fn new(
+        sql: String,
+        params: Vec<Param>,
+        shape: Shape,
+        timeout: Option<Duration>,
+    ) -> (Job, mpsc::Receiver<Result<(), Refusal>>, mpsc::Receiver<Vec<u8>>) {
+        let (ready, ready_rx) = mpsc::sync_channel(1);
+        let (body, body_rx) = mpsc::sync_channel(BODY_QUEUE);
+        let deadline = timeout.map(|t| Instant::now() + t);
+        let job = Job { sql, params, shape, id: next_job_id(), deadline, reset: false, ready, body };
+        (job, ready_rx, body_rx)
+    }
+}
+
 /// How many body batches may be in flight before the query has to wait.
 const BODY_QUEUE: usize = 4;
 
@@ -2310,23 +2381,16 @@ fn read_request_body(req: &mut Request) -> Result<String, Refusal> {
 
 fn read_body(reader: impl Read, capacity: usize) -> Result<String, Refusal> {
     let mut body = Vec::with_capacity(capacity);
-    reader.take(MAX_BODY as u64 + 1).read_to_end(&mut body).map_err(|e| Refusal {
-        status: 400,
-        code: "bad_request",
-        message: format!("the request body could not be read: {e}"),
-    })?;
+    reader.take(MAX_BODY as u64 + 1).read_to_end(&mut body)
+        .map_err(|e| Refusal::bad_request(format!("the request body could not be read: {e}")))?;
     if body.len() > MAX_BODY {
         return Err(Refusal {
             status: 413,
-            code: "body_too_large",
+            code: code::BODY_TOO_LARGE,
             message: format!("body exceeds the limit of {MAX_BODY} bytes"),
         });
     }
-    String::from_utf8(body).map_err(|_| Refusal {
-        status: 400,
-        code: "bad_request",
-        message: "the request body is not valid UTF-8".into(),
-    })
+    String::from_utf8(body).map_err(|_| Refusal::bad_request("the request body is not valid UTF-8"))
 }
 
 /// `POST /sql/sessions` — take a connection out of the pool and hold it.
@@ -2336,25 +2400,18 @@ fn read_body(reader: impl Read, capacity: usize) -> Result<String, Refusal> {
 fn run_session_open(mut req: Request) -> (bool, u16) {
     let body = match read_request_body(&mut req) {
         Ok(body) => body,
-        Err(e) => {
-            let _ = req.respond(error_response(e.status, e.code, &e.message));
-            return (true, e.status);
-        }
+        Err(refusal) => return refuse(req, refusal),
     };
     let requested = if body.trim().is_empty() {
         wire::SessionNewRequest::default()
     } else {
         match serde_json::from_str::<wire::SessionNewRequest>(&body) {
             Ok(v) => v,
-            Err(e) => {
-                let _ = req.respond(error_response(400, "bad_request", &e.to_string()));
-                return (true, 400);
-            }
+            Err(e) => return refuse(req, Refusal::bad_request(e.to_string())),
         }
     };
     if requested.ttl_ms == Some(0) {
-        let _ = req.respond(error_response(400, "bad_request", "\"ttlMs\" must be a positive integer"));
-        return (true, 400);
+        return refuse(req, Refusal::bad_request("\"ttlMs\" must be a positive integer"));
     }
     let backup = requested.purpose == Some(wire::SessionPurpose::Backup);
 
@@ -2376,7 +2433,7 @@ fn run_session_open(mut req: Request) -> (bool, u16) {
         // same situation with the one useful number attached.
         Err(refusal) => {
             let mut response = error_response(refusal.status, refusal.code, &refusal.message);
-            if refusal.code == "no_lease_available" {
+            if refusal.code == code::NO_LEASE_AVAILABLE {
                 response.add_header(
                     Header::from_bytes(&b"Retry-After"[..], &b"1"[..]).unwrap(),
                 );
@@ -2457,19 +2514,8 @@ fn catalog_rows(
     jobs: &mpsc::SyncSender<Job>,
     sql: &str,
 ) -> Result<Vec<Vec<serde_json::Value>>, CatalogFailure> {
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), Refusal>>(1);
-    let (body_tx, body_rx) = mpsc::sync_channel::<Vec<u8>>(BODY_QUEUE);
-    let job = Job {
-        sql: sql.to_string(),
-        params: Vec::new(),
-        shape: Shape::Json,
-        id: next_job_id(),
-        // The deployment default applies here as it does to any statement.
-        deadline: configured_statement_timeout().map(|t| Instant::now() + t),
-        reset: false,
-        ready: ready_tx,
-        body: body_tx,
-    };
+    // The deployment default applies here as it does to any statement.
+    let (job, ready_rx, body_rx) = Job::new(sql.to_string(), Vec::new(), Shape::Json, configured_statement_timeout());
     if jobs.send(job).is_err() {
         return Err(CatalogFailure::Gone);
     }
@@ -2490,7 +2536,7 @@ fn catalog_rows(
         Err(e) => {
             return Err(CatalogFailure::Refused(Refusal {
                 status: 500,
-                code: "internal",
+                code: code::INTERNAL,
                 message: format!("a catalog result did not parse: {e}"),
             }));
         }
@@ -2507,7 +2553,7 @@ fn catalog_refuse(req: Request, failure: CatalogFailure) -> (bool, u16) {
             (true, r.status)
         }
         CatalogFailure::Gone => {
-            let _ = req.respond(error_response(503, "unavailable", "harbor is shutting down"));
+            let _ = req.respond(error_response(503, code::UNAVAILABLE, "harbor is shutting down"));
             (false, 503)
         }
     }
@@ -2659,63 +2705,6 @@ fn index_columns(expressions: &str) -> Vec<String> {
     items
 }
 
-struct CatalogColumn {
-    name: String,
-    ty: String,
-    not_null: bool,
-    default: Option<String>,
-    generated: bool,
-    generation_expression: Option<String>,
-    primary: bool,
-}
-
-struct CatalogIndex {
-    name: String,
-    columns: Vec<String>,
-    expressions: Vec<String>,
-    unique: bool,
-}
-
-struct CatalogFk {
-    columns: Vec<String>,
-    ref_table: String,
-    ref_schema: String,
-    ref_columns: Vec<String>,
-}
-
-struct CatalogTable {
-    schema: String,
-    name: String,
-    row_count: u64,
-    ddl: Option<String>,
-    columns: Vec<CatalogColumn>,
-    primary_key: Vec<String>,
-    unique_constraints: Vec<Vec<String>>,
-    indexes: Vec<CatalogIndex>,
-    foreign_keys: Vec<CatalogFk>,
-}
-
-/// The document's opening run, shared by both styles: versions and sizes,
-/// with the object left open for the style's own `tables` emission.
-fn catalog_header(duckdb_version: &str) -> String {
-    let (database_size, wal_size) = database_disk_sizes();
-    let mut out = String::from("{\"harborVersion\":");
-    push_json_string(&mut out, env!("CARGO_PKG_VERSION"));
-    out.push_str(",\"duckdbVersion\":");
-    push_json_string(&mut out, duckdb_version);
-    out.push_str(",\"databaseSizeBytes\":");
-    match database_size {
-        Some(bytes) => out.push_str(&bytes.to_string()),
-        None => out.push_str("null"),
-    }
-    out.push_str(",\"walSizeBytes\":");
-    match wal_size {
-        Some(bytes) => out.push_str(&bytes.to_string()),
-        None => out.push_str("null"),
-    }
-    out
-}
-
 /// The served file's actual bytes on disk, from the one process that can
 /// stat them. `(data, wal)` — a checkpointed database legitimately has no
 /// WAL file, which is 0 bytes of WAL, not an unknown. A berth serving no
@@ -2743,9 +2732,8 @@ enum CatalogStyle {
 
 /// `?style=` from the request url. No query and no `style` mean full. An
 /// unknown *value* is refused loudly — a style the caller asked for and did
-/// not get would corrupt silently — while unknown *parameters* pass, because
-/// that tolerance is exactly what lets a 0.17 client send `style=lite` to a
-/// 0.16 server and still get a correct (full) answer.
+/// not get would corrupt silently — while unknown *parameters* pass, so a
+/// client may send one a server does not know and still get a correct answer.
 fn catalog_style(url: &str) -> Result<CatalogStyle, String> {
     let Some(query) = url.split_once('?').map(|x| x.1) else { return Ok(CatalogStyle::Full) };
     for pair in query.split('&') {
@@ -2839,7 +2827,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
     let style = match catalog_style(req.url()) {
         Ok(style) => style,
         Err(message) => {
-            let _ = req.respond(error_response(400, "bad_request", &message));
+            let _ = req.respond(error_response(400, code::BAD_REQUEST, &message));
             return (true, 400);
         }
     };
@@ -2867,24 +2855,21 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         Err(failure) => return catalog_refuse(req, failure),
     };
     let duckdb_version = version_rows.first().map(|r| cell_str(r, 0)).unwrap_or_default();
+    let harbor_version = env!("CARGO_PKG_VERSION").to_string();
+    let (database_size_bytes, wal_size_bytes) = database_disk_sizes();
 
     // The lite style stops here: everything it answers is already in hand,
     // and the count plus four shape queries below never run.
     if let CatalogStyle::Lite = style {
-        let mut out = catalog_header(&duckdb_version);
-        out.push_str(",\"tables\":[");
-        for (i, row) in table_rows.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push_str("{\"name\":");
-            push_json_string(&mut out, &cell_str(row, 1));
-            out.push_str(",\"schema\":");
-            push_json_string(&mut out, &cell_str(row, 0));
-            out.push('}');
-        }
-        out.push_str("]}");
-        let _ = req.respond(json_response(200, &out));
+        let tables = table_rows.iter().map(|row| Named { name: cell_str(row, 1), schema: cell_str(row, 0) });
+        let inventory = Inventory {
+            harbor_version,
+            duckdb_version,
+            database_size_bytes,
+            wal_size_bytes,
+            tables: tables.collect(),
+        };
+        let _ = req.respond(json_response(200, &serde_json::to_string(&inventory).unwrap()));
         return (true, 200);
     }
 
@@ -2921,7 +2906,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
             req,
             CatalogFailure::Refused(Refusal {
                 status: 500,
-                code: "internal",
+                code: code::INTERNAL,
                 message: "the catalog row-count query returned an invalid shape".to_string(),
             }),
         );
@@ -2977,29 +2962,19 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
     // Assembled in the order the queries delivered — every ORDER BY above is
     // load-bearing — and looked up by (schema, name), never iterated from the
     // map, so nothing about the output depends on hash order.
-    let mut tables: Vec<CatalogTable> = Vec::new();
+    let mut tables: Vec<Table> = Vec::new();
     let mut index_of: HashMap<(String, String), usize> = HashMap::new();
     for (row, row_count) in table_rows.iter().zip(row_counts) {
         let schema = cell_str(row, 0);
         let name = cell_str(row, 1);
         index_of.insert((schema.clone(), name.clone()), tables.len());
-        tables.push(CatalogTable {
-            schema,
-            name,
-            row_count,
-            ddl: cell_opt_str(row, 2),
-            columns: Vec::new(),
-            primary_key: Vec::new(),
-            unique_constraints: Vec::new(),
-            indexes: Vec::new(),
-            foreign_keys: Vec::new(),
-        });
+        tables.push(Table { schema, name, row_count: Some(row_count), ddl: cell_opt_str(row, 2), ..Table::default() });
     }
     for row in &column_rows {
         let Some(&t) = index_of.get(&(cell_str(row, 0), cell_str(row, 1))) else { continue };
-        tables[t].columns.push(CatalogColumn {
+        tables[t].columns.push(Column {
             name: cell_str(row, 2),
-            ty: cell_str(row, 3),
+            duck_type: cell_str(row, 3),
             not_null: !cell_bool(row, 4),
             default: cell_opt_str(row, 5),
             generated: cell_bool(row, 6),
@@ -3020,11 +2995,11 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
                 tables[t].primary_key = columns;
             }
             "UNIQUE" => {
-                tables[t].unique_constraints.push(columns);
+                tables[t].unique_constraints.push(Unique { columns });
             }
             "FOREIGN KEY" => {
                 let ref_schema = tables[t].schema.clone();
-                tables[t].foreign_keys.push(CatalogFk {
+                tables[t].foreign_keys.push(ForeignKey {
                     columns,
                     ref_table: cell_str(row, 4),
                     ref_schema,
@@ -3043,7 +3018,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
                 IndexPart::Expression(text) => expressions.push(text),
             }
         }
-        tables[t].indexes.push(CatalogIndex {
+        tables[t].indexes.push(Index {
             name: cell_str(row, 2),
             columns,
             expressions,
@@ -3053,7 +3028,7 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
     for table in tables.iter_mut() {
         // A unique constraint has no name in this shape either, so the same
         // rule: pin its position to its column list, never to storage order.
-        table.unique_constraints.sort();
+        table.unique_constraints.sort_by(|a, b| a.columns.cmp(&b.columns));
         // A foreign key has no name in this shape, so its position cannot be
         // inherited from catalog storage order; pin it to what the entry says.
         table.foreign_keys.sort_by(|a, b| {
@@ -3061,147 +3036,14 @@ fn run_catalog(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         });
     }
 
-    let mut out = catalog_header(&duckdb_version);
-    out.push_str(",\"tables\":[");
-    for (i, table) in tables.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push_str("{\"name\":");
-        push_json_string(&mut out, &table.name);
-        out.push_str(",\"schema\":");
-        push_json_string(&mut out, &table.schema);
-        out.push_str(",\"rowCount\":");
-        out.push_str(&table.row_count.to_string());
-        out.push_str(",\"columns\":[");
-        for (j, column) in table.columns.iter().enumerate() {
-            if j > 0 {
-                out.push(',');
-            }
-            out.push_str("{\"name\":");
-            push_json_string(&mut out, &column.name);
-            out.push_str(",\"type\":");
-            push_json_string(&mut out, &column.ty);
-            out.push_str(",\"notNull\":");
-            out.push_str(if column.not_null { "true" } else { "false" });
-            out.push_str(",\"default\":");
-            match &column.default {
-                Some(expression) => push_json_string(&mut out, expression),
-                None => out.push_str("null"),
-            }
-            out.push_str(",\"generated\":");
-            out.push_str(if column.generated { "true" } else { "false" });
-            out.push_str(",\"generationExpression\":");
-            match &column.generation_expression {
-                Some(expression) => push_json_string(&mut out, expression),
-                None => out.push_str("null"),
-            }
-            out.push_str(",\"primary\":");
-            out.push_str(if column.primary { "true" } else { "false" });
-            out.push('}');
-        }
-        out.push_str("],\"primaryKey\":[");
-        for (j, name) in table.primary_key.iter().enumerate() {
-            if j > 0 {
-                out.push(',');
-            }
-            push_json_string(&mut out, name);
-        }
-        out.push_str("],\"uniqueConstraints\":[");
-        for (j, unique) in table.unique_constraints.iter().enumerate() {
-            if j > 0 {
-                out.push(',');
-            }
-            out.push_str("{\"columns\":[");
-            for (k, column) in unique.iter().enumerate() {
-                if k > 0 {
-                    out.push(',');
-                }
-                push_json_string(&mut out, column);
-            }
-            out.push_str("]}");
-        }
-        out.push_str("],\"indexes\":[");
-        for (j, index) in table.indexes.iter().enumerate() {
-            if j > 0 {
-                out.push(',');
-            }
-            out.push_str("{\"name\":");
-            push_json_string(&mut out, &index.name);
-            out.push_str(",\"columns\":[");
-            for (k, column) in index.columns.iter().enumerate() {
-                if k > 0 {
-                    out.push(',');
-                }
-                push_json_string(&mut out, column);
-            }
-            // Kept apart from `columns` on purpose: an entry here is
-            // computed, not a column, and a differ that joined it against
-            // `columns[].name` would be matching on a rendering.
-            out.push_str("],\"expressions\":[");
-            for (k, expression) in index.expressions.iter().enumerate() {
-                if k > 0 {
-                    out.push(',');
-                }
-                push_json_string(&mut out, expression);
-            }
-            out.push_str("],\"unique\":");
-            out.push_str(if index.unique { "true" } else { "false" });
-            out.push('}');
-        }
-        out.push_str("],\"foreignKeys\":[");
-        for (j, fk) in table.foreign_keys.iter().enumerate() {
-            if j > 0 {
-                out.push(',');
-            }
-            out.push_str("{\"columns\":[");
-            for (k, column) in fk.columns.iter().enumerate() {
-                if k > 0 {
-                    out.push(',');
-                }
-                push_json_string(&mut out, column);
-            }
-            out.push_str("],\"refTable\":");
-            push_json_string(&mut out, &fk.ref_table);
-            out.push_str(",\"refSchema\":");
-            push_json_string(&mut out, &fk.ref_schema);
-            out.push_str(",\"refColumns\":[");
-            for (k, column) in fk.ref_columns.iter().enumerate() {
-                if k > 0 {
-                    out.push(',');
-                }
-                push_json_string(&mut out, column);
-            }
-            out.push_str("]}");
-        }
-        // Last in the object on purpose: the engine's own CREATE TABLE text
-        // runs long, and the fields a reader scans for stay up front.
-        out.push_str("],\"ddl\":");
-        match &table.ddl {
-            Some(sql) => push_json_string(&mut out, sql),
-            None => out.push_str("null"),
-        }
-        out.push('}');
-    }
-    out.push_str("],\"sequences\":[");
-    for (i, row) in sequence_rows.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push_str("{\"name\":");
-        push_json_string(&mut out, &cell_str(row, 0));
-        out.push_str(",\"start\":");
+    let sequences = sequence_rows
+        .iter()
         // The executor already applied harbor's integer policy — bare within
-        // JSON's exact range, quoted past it — so the value re-emits as is.
-        match row.get(1) {
-            Some(value) => out.push_str(&value.to_string()),
-            None => out.push_str("null"),
-        }
-        out.push('}');
-    }
-    out.push_str("]}");
-
-    let _ = req.respond(json_response(200, &out));
+        // JSON's exact range, quoted past it — so the value goes out as is.
+        .map(|row| Sequence { name: cell_str(row, 0), start: row.get(1).cloned().unwrap_or_default() })
+        .collect();
+    let catalog = Catalog { harbor_version, duckdb_version, database_size_bytes, wal_size_bytes, tables, sequences };
+    let _ = req.respond(json_response(200, &serde_json::to_string(&catalog).unwrap()));
     (true, 200)
 }
 
@@ -3220,28 +3062,17 @@ fn run_ready(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
         return (true, respond_ready(req, ok, "not ready"));
     }
 
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), Refusal>>(1);
-    let (body_tx, body_rx) = mpsc::sync_channel::<Vec<u8>>(BODY_QUEUE);
-    let job = Job {
-        sql: "SELECT 1".to_string(),
-        params: Vec::new(),
-        shape: Shape::Ndjson,
-        id: next_job_id(),
-        // No deadline. A readiness probe that can time out would report the
-        // database unready because harbor cancelled the probe, which is a
-        // self-inflicted outage rather than a measurement.
-        deadline: None,
-        reset: false,
-        ready: ready_tx,
-        body: body_tx,
-    };
+    // No deadline. A readiness probe that can time out would report the
+    // database unready because harbor cancelled the probe, which is a
+    // self-inflicted outage rather than a measurement.
+    let (job, ready_rx, body_rx) = Job::new("SELECT 1".to_string(), Vec::new(), Shape::Ndjson, None);
 
     // The executor being gone is the failure this endpoint exists to catch, and
     // the one condition the worker must act on rather than merely report: it
     // returns `false` so the accept loop is left, exactly as `run_sql` does.
     if jobs.send(job).is_err() {
         *LAST_READY.lock().unwrap() = Some((Instant::now(), false));
-        let _ = req.respond(error_response(503, "unready", "harbor is shutting down"));
+        let _ = req.respond(error_response(503, code::UNREADY, "harbor is shutting down"));
         return (false, 503);
     }
 
@@ -3261,12 +3092,12 @@ fn run_ready(req: Request, jobs: &mpsc::SyncSender<Job>) -> (bool, u16) {
             // Whatever the refusal's own status would be, a database that
             // cannot answer SELECT 1 is unready — that is the question asked.
             *LAST_READY.lock().unwrap() = Some((Instant::now(), false));
-            let _ = req.respond(error_response(503, "unready", &refusal.message));
+            let _ = req.respond(error_response(503, code::UNREADY, &refusal.message));
             (true, 503)
         }
         Err(_) => {
             *LAST_READY.lock().unwrap() = Some((Instant::now(), false));
-            let _ = req.respond(error_response(503, "unready", "the executor thread is gone"));
+            let _ = req.respond(error_response(503, code::UNREADY, "the executor thread is gone"));
             (false, 503)
         }
     }
@@ -3279,37 +3110,37 @@ fn respond_ready(req: Request, ok: bool, message: &str) -> u16 {
         let _ = req.respond(json_response(200, r#"{"status":"ready"}"#));
         200
     } else {
-        let _ = req.respond(error_response(503, "unready", message));
+        let _ = req.respond(error_response(503, code::UNREADY, message));
         503
     }
 }
 
-/// Returns (keep serving, status sent). The first is false when the executor is
-/// gone; see `handle`, which also writes the log line from the second.
-fn run_sql(
-    req: Request,
-    jobs: &mpsc::SyncSender<Job>,
-    state: &Arc<SlotState>,
-    body: &str,
-) -> (bool, u16) {
-    let mut parsed = match parse_request(body) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = req.respond(error_response(400, "bad_request", &e));
-            return (true, 400);
-        }
-    };
+/// A worker's executor: its jobs channel and its cancellation slot.
+type Executor<'a> = (&'a mpsc::SyncSender<Job>, &'a Arc<SlotState>);
 
+/// `POST /sql`: the body read and parsed, then the statement run. `pooled`
+/// is the accepting worker's executor; a relay has none, and serves only a
+/// session's statement.
+fn run_sql_request(mut req: Request, pooled: Option<Executor>) -> (bool, u16) {
+    let parsed = read_request_body(&mut req)
+        .and_then(|body| parse_request(&body).map_err(Refusal::bad_request));
+    match parsed {
+        Ok(parsed) => run_sql(req, parsed, pooled),
+        Err(refusal) => refuse(req, refusal),
+    }
+}
+
+/// Returns (keep serving, status sent). The first is false when the worker's
+/// own executor is gone; see `handle`, which also writes the log line from
+/// the second.
+fn run_sql(req: Request, mut parsed: SqlRequest, pooled: Option<Executor>) -> (bool, u16) {
     // `r.{a,b}` becomes `r.a, r.b` here, once, for every client: before the
     // guards below and the engine's statement count, which read the
     // statement the engine will run.
     match unbrace::expand(&parsed.sql) {
         Ok(std::borrow::Cow::Owned(expanded)) => parsed.sql = expanded,
         Ok(std::borrow::Cow::Borrowed(_)) => {}
-        Err(e) => {
-            let _ = req.respond(error_response(400, "bad_request", &e));
-            return (true, 400);
-        }
+        Err(e) => return refuse(req, Refusal::bad_request(e)),
     }
 
     // `USE` sets the CURRENT DATABASE on the connection it runs on, and
@@ -3333,8 +3164,7 @@ fn run_sql(
     if parsed.session.is_none()
         && let Some(lost) = lost_without_session(&parsed.sql)
     {
-        let _ = req.respond(error_response(400, "sql_error", lost));
-        return (true, 400);
+        return refuse(req, Refusal::sql(lost));
     }
 
     let shape = if wants_one_shot(&req) { Shape::Json } else { Shape::Ndjson };
@@ -3350,20 +3180,19 @@ fn run_sql(
             Ok((target, state)) => {
                 Some(Claim { id: id.to_string(), sql: parsed.sql.clone(), target, state, ran: Default::default() })
             }
-            Err(refusal) => {
-                let _ = req.respond(error_response(refusal.status, refusal.code, &refusal.message));
-                return (true, refusal.status);
-            }
+            Err(refusal) => return refuse(req, refusal),
         },
     };
-    let target = claim.as_ref().map_or(jobs, |c| &c.target);
-    // A lease statement runs on the lease's connection; everything else runs on
-    // this worker's own. Cancellation has to name the one that will actually be
-    // executing, not the one that accepted the request.
-    let slot = claim.as_ref().map_or(state, |c| &c.state);
+    // Cancellation has to name the connection that will be executing, not
+    // the one that accepted the request.
+    let (target, slot) = match (&claim, pooled) {
+        (Some(c), _) => (&c.target, &c.state),
+        (None, Some(pooled)) => pooled,
+        (None, None) => return shed(req),
+    };
 
-    let id = next_job_id();
-    let deadline = parsed.timeout.map(|t| Instant::now() + t);
+    let (job, ready, body) = Job::new(parsed.sql, parsed.params, shape, parsed.timeout);
+    let id = job.id;
 
     // Registered before the job is sent, so a Stop pressed the instant the
     // query goes out has something to find. `Cancellable` deregisters on drop,
@@ -3372,126 +3201,81 @@ fn run_sql(
         None => None,
         Some(name) => match Cancellable::register(name, slot, id) {
             Ok(guard) => Some(guard),
-            Err(refusal) => {
-                let _ = req.respond(error_response(refusal.status, refusal.code, &refusal.message));
-                return (true, refusal.status);
-            }
+            Err(refusal) => return refuse(req, refusal),
         },
-    };
-
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), Refusal>>(1);
-    let (body_tx, body_rx) = mpsc::sync_channel::<Vec<u8>>(BODY_QUEUE);
-    let job = Job {
-        sql: parsed.sql,
-        params: parsed.params,
-        shape,
-        id,
-        deadline,
-        reset: false,
-        ready: ready_tx,
-        body: body_tx,
     };
 
     if target.send(job).is_err() {
         // A lease whose executor is gone can never serve another statement, so
         // it is not merely a failed request — the lease itself is finished.
         // The worker keeps serving; only the lease dies.
-        if let Some(c) = &claim {
+        if let Some(c) = claim {
             let id = c.id.clone();
-            drop(claim);
+            drop(c);
             lease_release(&id);
-            let _ = req.respond(error_response(503, "unavailable", "this session is gone"));
-            return (true, 503);
+            return refuse(req, Refusal { status: 503, code: code::UNAVAILABLE, message: "this session is gone".into() });
         }
-        let _ = req.respond(error_response(503, "unavailable", "harbor is shutting down"));
-        return (false, 503);
+        return (false, refuse(req, Refusal::not_serving()).1);
     }
 
-    let answer = ready_rx.recv();
+    let mut watch = Watch::new(Some(req.peer()), Arc::clone(slot), id);
+    let answer = watch.recv(&ready);
     if let (Some(c), Ok(outcome)) = (&claim, &answer) {
         c.ran.set(match outcome {
             Ok(()) => true,
-            Err(refusal) => refusal.code == "sql_error" && !refusal.message.starts_with("Parser Error"),
+            Err(refusal) => refusal.code == code::SQL_ERROR && !refusal.message.starts_with("Parser Error"),
         });
     }
-    match answer {
-        Ok(Ok(())) => {
-            if shape == Shape::Json {
-                // One message, because that is what the executor sends in this
-                // shape — but drain the channel rather than assume it, so a
-                // future change to how the document is chunked cannot silently
-                // truncate a response.
-                let mut document = Vec::new();
-                while let Ok(chunk) = body_rx.recv() {
-                    document.extend_from_slice(&chunk);
-                }
-                let headers = vec![
-                    Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
-                    Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..]).unwrap(),
-                ];
-                let length = document.len();
-                let _ = req.respond(Response::new(
-                    200.into(),
-                    headers,
-                    std::io::Cursor::new(document),
-                    Some(length),
-                ));
-                return (true, 200);
-            }
-            // data_length: None makes justhttp chunk the body and keep the
-            // connection alive.
-            let mut headers = vec![
-                Header::from_bytes(&b"Content-Type"[..], &b"application/x-ndjson"[..]).unwrap(),
-                Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..]).unwrap(),
-            ];
-            // The response is written by reading the body channel to its end.
-            // A write that fails stops that early, with the executor still at
-            // work on rows nobody will read, and it would not learn so before
-            // its next flush. Whether the channel was read to its end is what
-            // tells a statement that finished from a client that left; the
-            // one that left has its statement interrupted here, by job id.
-            //
-            // On a pooled connection only. A session's abandoned statement
-            // ends at its next flush, where its executor leaves the
-            // transaction aborted, slot retired first; an interrupt from
-            // here would race that.
-            let ended = Arc::new(AtomicBool::new(false));
-            let pooled = claim.is_none();
-            let abandon = |ended: &AtomicBool| {
-                if pooled && !ended.load(Ordering::Relaxed) {
-                    slot.cancel(Some(id));
-                }
-            };
-            if wants_zstd(&req) {
-                if let Ok(reader) = ZstdReader::new(body_rx, Arc::clone(&ended)) {
-                    headers.push(
-                        Header::from_bytes(&b"Content-Encoding"[..], &b"zstd"[..]).unwrap(),
-                    );
-                    let _ = req.respond(Response::new(200.into(), headers, reader, None));
-                    abandon(&ended);
-                    return (true, 200);
-                }
-                // Encoder setup failed (it does not, short of OOM): the
-                // channel was consumed constructing it, so this request is
-                // already lost either way — fall through is impossible,
-                // answer plainly.
-                let _ = req.respond(error_response(500, "internal", "could not start encoder"));
-                return (true, 500);
-            }
-            let reader = ChannelReader::new(body_rx, Arc::clone(&ended));
-            let _ = req.respond(Response::new(200.into(), headers, reader, None));
-            abandon(&ended);
-            (true, 200)
-        }
-        Ok(Err(refusal)) => {
-            let _ = req.respond(error_response(refusal.status, refusal.code, &refusal.message));
-            (true, refusal.status)
-        }
+    let refusal = match answer {
+        Ok(Ok(())) => None,
+        Ok(Err(refusal)) => Some(refusal),
         Err(_) => {
-            let _ = req.respond(error_response(500, "internal", "the executor thread is gone"));
-            (false, 500)
+            let gone = Refusal { status: 500, code: code::INTERNAL, message: "the executor thread is gone".into() };
+            // Only the worker's own executor gone ends the worker.
+            return (claim.is_some(), refuse(req, gone).1);
         }
+    };
+    if let Some(refusal) = refusal {
+        return refuse(req, refusal);
     }
+    let mut headers = vec![
+        Header::from_bytes(&b"Content-Type"[..], match shape {
+            Shape::Json => wire::CONTENT_JSON,
+            Shape::Ndjson => wire::CONTENT_NDJSON,
+        }.as_bytes()).unwrap(),
+        Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..]).unwrap(),
+    ];
+    if shape == Shape::Json {
+        // One message, because that is what the executor sends in this
+        // shape — but drain the channel rather than assume it, so a
+        // future change to how the document is chunked cannot silently
+        // truncate a response.
+        let mut document = Vec::new();
+        while let Ok(chunk) = watch.recv(&body) {
+            document.extend_from_slice(&chunk);
+        }
+        let length = document.len();
+        let _ = req.respond(Response::new(200.into(), headers, std::io::Cursor::new(document), Some(length)));
+        return (true, 200);
+    }
+    // data_length: None makes justhttp chunk the body and keep the
+    // connection alive. The response is written by reading the body channel
+    // to its end, and the watch goes with the reader: a client that leaves,
+    // or a write that fails, stops the statement (see `Watch`).
+    if wants_zstd(&req) {
+        headers.push(Header::from_bytes(&b"Content-Encoding"[..], &b"zstd"[..]).unwrap());
+        return match ZstdReader::new(body, watch) {
+            Ok(reader) => {
+                let _ = req.respond(Response::new(200.into(), headers, reader, None));
+                (true, 200)
+            }
+            // Encoder setup fails only short of memory, and the statement
+            // has been stopped with the watch.
+            Err(e) => refuse(req, Refusal { status: 500, code: code::INTERNAL, message: format!("could not start encoder: {e}") }),
+        };
+    }
+    let _ = req.respond(Response::new(200.into(), headers, ChannelReader::new(body, watch), None));
+    (true, 200)
 }
 
 /// A block size as bytes: `65536`, or a `k`/`kb`/`kib` suffix on the number
@@ -3633,6 +3417,21 @@ impl OnSlot<'_> {
         self.done = true;
         self.slot.end()
     }
+
+    /// Retire a statement that did not run, and say why: cancelled when a
+    /// canceller reached it, which leaves its transaction aborted — a 499
+    /// inside a transaction means the transaction is over, whenever the
+    /// cancel arrived — else the engine's `message`. Retired first, so no
+    /// interrupt is aimed at the statement that does the aborting.
+    fn refuse(&mut self, conn: &mut Connection, message: String) -> Refusal {
+        match self.finish() {
+            true => {
+                conn.abort_transaction();
+                Refusal::cancelled()
+            }
+            false => Refusal::sql(message),
+        }
+    }
 }
 
 impl Drop for OnSlot<'_> {
@@ -3664,7 +3463,6 @@ fn run_statement(
     ready: mpsc::SyncSender<Result<(), Refusal>>,
     body: mpsc::SyncSender<Vec<u8>>,
     started: Instant,
-    abandoned: &mut bool,
 ) -> bool {
     // Decided from the statement text before it runs, then widened below by
     // any path that ends the job early.
@@ -3679,17 +3477,13 @@ fn run_statement(
     let stmts = match conn.statements(&sql) {
         Ok(s) => s,
         Err(e) => {
-            let _ = ready.send(Err(refusal_for(on_slot.finish(), e.into_text())));
+            let _ = ready.send(Err(on_slot.refuse(conn, e.into_text())));
             return true;
         }
     };
     let Some((last, front)) = stmts.split_last() else {
-        // Whitespace and comments parse to no statements at all. v1's
-        // prepare() refused the same way.
-        let _ = ready.send(Err(refusal_for(
-            on_slot.finish(),
-            "No statements to prepare from".to_string(),
-        )));
+        // Whitespace and comments parse to no statements at all.
+        let _ = ready.send(Err(on_slot.refuse(conn, "No statements to prepare from".to_string())));
         return true;
     };
 
@@ -3700,7 +3494,7 @@ fn run_statement(
         on_slot.finish();
         let _ = ready.send(Err(Refusal {
             status: 400,
-            code: "bad_request",
+            code: code::BAD_REQUEST,
             message: "exactly one SQL statement is allowed per request".into(),
         }));
         return needs_reset;
@@ -3708,23 +3502,17 @@ fn run_statement(
     // A document aimed at a VARIANT is bound as one. Finding that out is a
     // bind pass and making it one is a cast, and an interrupt that lands
     // during either is dropped by the engine. So the values are built first
-    // and the slot is asked again once they are, before anything runs. A
-    // cancel found here leaves the transaction aborted, as one that lands
-    // during execution does: a 499 inside a transaction means the transaction
-    // is over, whenever the cancel arrived. The slot is retired first, so no
-    // interrupt is aimed at the statement that does the aborting.
+    // and the slot is asked again once they are, before anything runs.
     let mut params = params;
     let bound = match conn.bind(last, &mut params) {
         Ok(b) => b,
         Err(e) => {
-            let _ = ready.send(Err(refusal_for(on_slot.finish(), e.into_text())));
+            let _ = ready.send(Err(on_slot.refuse(conn, e.into_text())));
             return true;
         }
     };
     if on_slot.slot.cancelled() {
-        on_slot.finish();
-        conn.abort_transaction();
-        let _ = ready.send(Err(Refusal::cancelled()));
+        let _ = ready.send(Err(on_slot.refuse(conn, String::new())));
         return needs_reset;
     }
     // A COMMIT runs to its answer. An interrupt that reaches one as it
@@ -3734,7 +3522,7 @@ fn run_statement(
     // retired before a COMMIT starts and nothing is aimed at it: a cancel
     // either arrived by now, and is answered as one with nothing kept, or
     // finds no statement to stop. The answer is then the engine's own.
-    if matches!(acting_keyword(&sql).as_str(), "COMMIT" | "END") && on_slot.finish() {
+    if commits(&sql) && on_slot.finish() {
         conn.abort_transaction();
         let _ = ready.send(Err(Refusal::cancelled()));
         return needs_reset;
@@ -3742,7 +3530,7 @@ fn run_statement(
     let mut stream = match conn.execute(last, bound) {
         Ok(s) => s,
         Err(e) => {
-            let _ = ready.send(Err(refusal_for(on_slot.finish(), e.into_text())));
+            let _ = ready.send(Err(on_slot.refuse(conn, e.into_text())));
             return true;
         }
     };
@@ -3756,7 +3544,8 @@ fn run_statement(
         Ok(j) => Some(j),
         Err(e) => {
             if columns.iter().any(|(_, ty)| crate::engine::encode::holds_variant(ty)) {
-                let _ = ready.send(Err(refusal_for(on_slot.finish(), e.into_text())));
+                drop(stream);
+                let _ = ready.send(Err(on_slot.refuse(conn, e.into_text())));
                 return needs_reset;
             }
             None
@@ -3780,9 +3569,8 @@ fn run_statement(
     let mut buf = String::with_capacity(4096);
     match shape {
         Shape::Ndjson => buf.push_str(r#"{"type":"schema","columns":["#),
-        // v1's envelope also carried `kind`, "select" or "write". It is
-        // not emitted here, because there is no definition of it that is
-        // right: DuckDB answers CREATE TABLE with a one-column `Count`
+        // No `kind` ("select" or "write") is emitted, because there is no
+        // definition of it that is right: DuckDB answers CREATE TABLE with a one-column `Count`
         // result, so "did the statement produce columns" calls a write a
         // select, and deciding from the leading keyword is a parser that
         // exists only to label something no client needs — `columns` and
@@ -3803,6 +3591,9 @@ fn run_statement(
 
     let mut count: u64 = 0;
     let mut gone = false;
+    // The statement stopped short of its end by a cancel or by its reader
+    // leaving, which in a transaction is a statement missing from it.
+    let mut cut_short = false;
     // Set when the result cannot be completed. In NDJSON it has already
     // been written into the stream by the time it is set; in one-shot it is
     // what the request fails with.
@@ -3823,17 +3614,16 @@ fn run_statement(
                 // client is told depends on the answer: the same DuckDB
                 // error means "your SQL failed" or "you cancelled this",
                 // and only the slot knows which.
-                let refusal = refusal_for(on_slot.finish(), e.into_text());
+                let cancelled = on_slot.finish();
+                cut_short |= cancelled;
+                let refusal = refusal_for(cancelled, e.into_text());
                 if shape == Shape::Ndjson {
                     // Mid-stream failures cannot change the status code —
                     // the headers are long gone. Say so in the stream, so a
                     // client never mistakes a truncated result for a
                     // complete one.
-                    buf.push_str(r#"{"type":"error","code":""#);
-                    buf.push_str(refusal.code);
-                    buf.push_str(r#"","message":"#);
-                    push_json_string(&mut buf, &refusal.message);
-                    buf.push_str("}\n");
+                    push_error(&mut buf, refusal.code, &refusal.message);
+                    buf.push('\n');
                     let _ = body.send(std::mem::take(&mut buf).into_bytes());
                     gone = true;
                 }
@@ -3845,9 +3635,8 @@ fn run_statement(
         for row in 0..chunk.rows {
             // Encoded straight into `buf` behind a mark: a failing cell
             // discards the half-written row with truncate(). Cells are read
-            // from vector views — there is no per-row decoder to panic, so
-            // the guard the v1 path needed here is gone; an engine failure
-            // mid-cell surfaces as an Err and fails the stream honestly.
+            // from vector views, and an engine failure mid-cell surfaces as
+            // an Err and fails the stream honestly.
             let mark = buf.len();
             match shape {
                 Shape::Ndjson => buf.push_str(r#"{"type":"row","values":["#),
@@ -3870,13 +3659,14 @@ fn run_statement(
             }
             if let Some(e) = cell_err {
                 buf.truncate(mark);
-                let refusal = refusal_for(on_slot.finish(), e.into_text());
+                // The statement's own error, when one waits behind the cell's.
+                let e = stream.error_after(e);
+                let cancelled = on_slot.finish();
+                cut_short |= cancelled;
+                let refusal = refusal_for(cancelled, e.into_text());
                 if shape == Shape::Ndjson {
-                    buf.push_str(r#"{"type":"error","code":""#);
-                    buf.push_str(refusal.code);
-                    buf.push_str(r#"","message":"#);
-                    push_json_string(&mut buf, &refusal.message);
-                    buf.push_str("}\n");
+                    push_error(&mut buf, refusal.code, &refusal.message);
+                    buf.push('\n');
                     let _ = body.send(std::mem::take(&mut buf).into_bytes());
                     gone = true;
                 }
@@ -3898,7 +3688,7 @@ fn run_statement(
                         // computing a result nobody will read.
                         if body.send(std::mem::take(&mut buf).into_bytes()).is_err() {
                             gone = true;
-                            *abandoned = true;
+                            cut_short = true;
                             break 'stream;
                         }
                         buf = String::with_capacity(FLUSH_AT + 8192);
@@ -3919,7 +3709,7 @@ fn run_statement(
                         // message names the one that would work.
                         failure = Some(Refusal {
                             status: 406,
-                            code: "response_too_large",
+                            code: code::RESPONSE_TOO_LARGE,
                             message: format!(
                                 "this result is larger than the {} MiB harbor will hold \
                                  in memory for a single JSON document. Ask for NDJSON \
@@ -3938,6 +3728,16 @@ fn run_statement(
     // The cursor releases the connection for whatever runs next; the tail
     // below only writes bytes.
     drop(stream);
+    // A statement cut short inside a transaction is missing from it. The
+    // interrupt that ends the cursor aborts the transaction only when it
+    // lands inside the engine, which is a matter of timing; it is left
+    // aborted every time, so the COMMIT that follows is told. In autocommit
+    // this leaves nothing behind. Retired first, so no interrupt is aimed at
+    // the statement that does the aborting.
+    if cut_short {
+        on_slot.finish();
+        conn.abort_transaction();
+    }
 
     // An abandoned or failed stream is the case that poisons a connection.
     needs_reset = needs_reset || gone || failure.is_some();
@@ -4006,7 +3806,7 @@ fn execute_jobs(
             if let Err(e) = conn.reset() {
                 let _ = ready.send(Err(Refusal {
                     status: 503,
-                    code: "unavailable",
+                    code: code::UNAVAILABLE,
                     message: format!("cannot reset connection: {e}"),
                 }));
                 continue;
@@ -4046,7 +3846,7 @@ fn execute_jobs(
         // aimed at it; a cancel that arrived in between has had its effect,
         // an aborted transaction, and is answered as a cancel.
         if pinned
-            && matches!(acting_keyword(&sql).as_str(), "COMMIT" | "END")
+            && commits(&sql)
             && conn.transaction_aborted()
             && !state.cancelled()
         {
@@ -4066,34 +3866,29 @@ fn execute_jobs(
                     e.into_text()
                 ),
             };
-            let _ = ready.send(Err(Refusal { status: 400, code: "sql_error", message }));
+            let _ = ready.send(Err(Refusal { status: 400, code: code::SQL_ERROR, message }));
             continue;
         }
 
         // A panic below — an encoder invariant tripping, an FFI metadata
         // assert (the v2 paths return Err rather than panic, so this is the
-        // backstop, not the expectation) — used to unwind straight out of
-        // this thread. The worker then found the job channel
-        // closed on its next send, left the accept loop (a worker with no
-        // executor answers 503 by return and would win every race), and the
-        // slot was gone for the life of the process; a handful of such queries
-        // retire every worker until the berth answers only 503. The per-row
-        // guard inside `run_statement` catches the common value-decode panic;
-        // catching the whole statement here covers one in prepare, metadata, or
-        // schema too. On a panic the `OnSlot` guard drops — retiring the slot —
-        // the waiting worker is told (500), and this executor takes the next
-        // job. The connection itself is intact (the panic was in Rust-side
+        // backstop, not the expectation) — must not unwind out of this
+        // thread: the worker would find the job channel closed, leave the
+        // accept loop, and the slot would be gone for the life of the
+        // process, so a handful of such queries would retire every worker.
+        // On a panic the `OnSlot` guard drops — retiring the slot — the
+        // waiting worker is told (500), and this executor takes the next job.
+        // The connection itself is intact (the panic was in Rust-side
         // encoding, not DuckDB's engine), so the next job resets first.
         let ready_guard = ready.clone();
-        let mut abandoned = false;
         needs_reset = match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            run_statement(&mut conn, &mut on_slot, sql, params, shape, ready, body, started, &mut abandoned)
+            run_statement(&mut conn, &mut on_slot, sql, params, shape, ready, body, started)
         })) {
             Ok(next_reset) => next_reset,
             Err(_) => {
                 let _ = ready_guard.send(Err(Refusal {
                     status: 500,
-                    code: "internal",
+                    code: code::INTERNAL,
                     message: "harbor recovered from an internal error while \
                               handling this statement"
                         .to_string(),
@@ -4101,24 +3896,63 @@ fn execute_jobs(
                 true
             }
         };
-        // A statement its client stopped reading, inside a transaction, is a
-        // statement missing from it. The interrupt that ends the abandoned
-        // cursor aborts the transaction only when it lands inside the engine,
-        // which is a matter of timing; the transaction is left aborted
-        // whenever the statement was cut short, as a cancel leaves it, so
-        // the COMMIT that follows is told. The slot is retired first, so no
-        // interrupt is aimed at the statement that does the aborting. In
-        // autocommit this leaves nothing behind.
-        if pinned && abandoned {
-            on_slot.finish();
-            conn.abort_transaction();
-        }
     }
     // And once more on the way out, so a connection going back to the pool for
-    // the next harbor_start is clean too. Unconditional here: this runs once
+    // the next start() is clean too. Unconditional here: this runs once
     // per server lifetime, so the extra statement costs nothing.
     reset_transaction(&mut conn);
     conn
+}
+
+/// How often a wait on a statement looks at its client.
+const WATCH_EVERY: Duration = Duration::from_millis(100);
+
+/// A client's statement, watched for the client: the waits for its answer
+/// and its rows look at the connection between batches, and a client that
+/// has hung up has its statement stopped, by id — before any row of it was
+/// written, in the minutes a plan computes before its first row, as well as
+/// mid-stream. Dropped before the body channel was read to its end, as when
+/// a response write failed, it stops the statement too. A statement that has
+/// finished is found by neither, and a COMMIT has given up its slot before it
+/// runs, so it runs to its answer.
+struct Watch {
+    peer: Option<justhttp::Peer>,
+    slot: Arc<SlotState>,
+    id: u64,
+    /// The body channel was read to its end: the statement is over.
+    ended: bool,
+}
+
+impl Watch {
+    fn new(peer: Option<justhttp::Peer>, slot: Arc<SlotState>, id: u64) -> Self {
+        Self { peer, slot, id, ended: false }
+    }
+
+    /// `rx.recv()`, stopping the statement once its client is gone.
+    fn recv<T>(&mut self, rx: &mpsc::Receiver<T>) -> Result<T, mpsc::RecvError> {
+        loop {
+            match rx.recv_timeout(WATCH_EVERY) {
+                Ok(v) => return Ok(v),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.ended = true;
+                    return Err(mpsc::RecvError);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if self.peer.take_if(|p| p.closed()).is_some() {
+                        self.slot.cancel(Some(self.id));
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.slot.cancel(Some(self.id));
+        }
+    }
 }
 
 /// Adapts the body channel to the `Read` justhttp wants. Returning `Ok(0)`
@@ -4127,28 +3961,24 @@ struct ChannelReader {
     rx: mpsc::Receiver<Vec<u8>>,
     current: Vec<u8>,
     pos: usize,
-    /// Set when the executor closed the channel: the statement is over.
-    ended: Arc<AtomicBool>,
+    watch: Watch,
 }
 
 impl ChannelReader {
-    fn new(rx: mpsc::Receiver<Vec<u8>>, ended: Arc<AtomicBool>) -> Self {
-        Self { rx, current: Vec::new(), pos: 0, ended }
+    fn new(rx: mpsc::Receiver<Vec<u8>>, watch: Watch) -> Self {
+        Self { rx, current: Vec::new(), pos: 0, watch }
     }
 }
 
 impl Read for ChannelReader {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         while self.pos >= self.current.len() {
-            match self.rx.recv() {
+            match self.watch.recv(&self.rx) {
                 Ok(next) => {
                     self.current = next;
                     self.pos = 0;
                 }
-                Err(_) => {
-                    self.ended.store(true, Ordering::Relaxed);
-                    return Ok(0);
-                }
+                Err(_) => return Ok(0),
             }
         }
         let n = (self.current.len() - self.pos).min(out.len());
@@ -4193,17 +4023,16 @@ struct ZstdReader {
     enc: Option<zstd::stream::Encoder<'static, Vec<u8>>>,
     tail: Vec<u8>,
     pos: usize,
-    /// Set when the executor closed the channel: the statement is over.
-    ended: Arc<AtomicBool>,
+    watch: Watch,
 }
 
 impl ZstdReader {
-    fn new(rx: mpsc::Receiver<Vec<u8>>, ended: Arc<AtomicBool>) -> std::io::Result<Self> {
+    fn new(rx: mpsc::Receiver<Vec<u8>>, watch: Watch) -> std::io::Result<Self> {
         // Level 1: the fast end. The stream is envelope-heavy NDJSON,
         // which crushes at any level; what matters is staying off the
         // encode critical path.
         let enc = zstd::stream::Encoder::new(Vec::new(), 1)?;
-        Ok(Self { rx, enc: Some(enc), tail: Vec::new(), pos: 0, ended })
+        Ok(Self { rx, enc: Some(enc), tail: Vec::new(), pos: 0, watch })
     }
 }
 
@@ -4226,17 +4055,14 @@ impl Read for ZstdReader {
             };
             enc.get_mut().clear();
             self.pos = 0;
-            match self.rx.recv() {
+            match self.watch.recv(&self.rx) {
                 Ok(chunk) => {
                     enc.write_all(&chunk)?;
                     enc.flush()?;
                 }
                 // Sender gone: end the frame. finish() returns the buffer
                 // with the last block and frame footer appended.
-                Err(_) => {
-                    self.ended.store(true, Ordering::Relaxed);
-                    self.tail = self.enc.take().expect("checked above").finish()?;
-                }
+                Err(_) => self.tail = self.enc.take().expect("checked above").finish()?,
             }
         }
     }
@@ -4250,7 +4076,7 @@ impl Read for ZstdReader {
 fn json_response(status: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     Response::from_string(body)
         .with_status_code(status)
-        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap())
+        .with_header(Header::from_bytes(&b"Content-Type"[..], wire::CONTENT_JSON.as_bytes()).unwrap())
 }
 
 // The last refusal code produced on this worker thread. `handle` reads it to
@@ -4267,12 +4093,24 @@ thread_local! {
 fn error_response(status: u16, code: &'static str, message: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     LAST_REASON.with(|c| c.set(code));
     let mut s = String::new();
-    s.push_str(r#"{"type":"error","code":"#);
-    push_json_string(&mut s, code);
-    s.push_str(r#","message":"#);
-    push_json_string(&mut s, message);
-    s.push('}');
+    push_error(&mut s, code, message);
     json_response(status, &s)
+}
+
+/// The error envelope: the body of every refusal, and the last line of a
+/// stream that failed.
+fn push_error(out: &mut String, code: &str, message: &str) {
+    out.push_str(r#"{"type":"error","code":"#);
+    push_json_string(out, code);
+    out.push_str(r#","message":"#);
+    push_json_string(out, message);
+    out.push('}');
+}
+
+/// Answer a request with a refusal: (keep serving, status sent).
+fn refuse(req: Request, r: Refusal) -> (bool, u16) {
+    let _ = req.respond(error_response(r.status, r.code, &r.message));
+    (true, r.status)
 }
 
 // ---------------------------------------------------------------------------
@@ -4280,7 +4118,6 @@ fn error_response(status: u16, code: &'static str, message: &str) -> Response<st
 #[cfg(test)]
 mod tests {
     use super::Method;
-    use crate::encode::civil_from_days;
     use super::lost_without_session;
 
     /// USE outside a session is refused, not silently discarded: one request
@@ -4329,33 +4166,9 @@ mod tests {
         }
     }
 
-    /// The effect is the engine's, measured: an analyzed EXPLAIN runs the
-    /// statement behind it, in each spelling the engine takes.
-    #[test]
-    fn a_transaction_ends_where_the_engine_ends_it() {
-        use super::transaction_effect;
-        for sql in [
-            "COMMIT", "commit;", "END", "ROLLBACK", "ABORT", "COMMIT--x", "COMMIT/**/", "-- c\rCOMMIT",
-            "EXPLAIN ANALYZE COMMIT", "EXPLAIN ANALYSE COMMIT", "EXPLAIN (ANALYZE) COMMIT",
-            "EXPLAIN (ANALYZE, FORMAT JSON) COMMIT", "EXPLAIN (FORMAT JSON, ANALYZE) COMMIT",
-            "EXPLAIN ANALYZE (FORMAT JSON) COMMIT", "EXPLAIN (ANALYZE false) COMMIT", "EXPLAIN ANALYZE ROLLBACK",
-        ] {
-            assert_eq!(transaction_effect(sql), Some(false), "{sql:?}");
-        }
-        for sql in [
-            "EXPLAIN COMMIT", "EXPLAIN (FORMAT JSON) COMMIT", "EXPLAIN (FORMAT JSON) ANALYZE COMMIT",
-            "COMMIT_X", "COMMIT1", "COMMIT$x", "COMMIT\u{e9}", "\"COMMIT\"", "(COMMIT)", "SELECT 'COMMIT'", "",
-        ] {
-            assert_eq!(transaction_effect(sql), None, "{sql:?}");
-        }
-        assert_eq!(transaction_effect("EXPLAIN ANALYZE BEGIN"), Some(true));
-        assert_eq!(transaction_effect("\u{feff}BEGIN"), Some(true));
-    }
-
     use super::route_exists;
     use super::index_columns;
     use super::{IndexPart, catalog_count_sql, index_parts};
-    use crate::encode::varint_to_decimal;
     use super::{Cancel, SlotRun};
     use std::time::{Duration, Instant};
 
@@ -4392,16 +4205,14 @@ mod tests {
     fn engine_statement_count_is_checked_before_any_execution() {
         if crate::engine::engine().is_err() { return; }
         let mut conn = crate::engine::conn::open(std::path::Path::new(":memory:"), &[]).unwrap();
-        let state = super::SlotState {
-            interrupt: conn.interrupt_handle(), run: std::sync::Mutex::new(idle()),
-        };
+        let state = super::SlotState::new(conn.interrupt_handle());
         state.begin(1, None);
         let mut slot = super::OnSlot { slot: &state, done: false };
         let (ready, result) = std::sync::mpsc::sync_channel(1);
         let (body, _output) = std::sync::mpsc::sync_channel(1);
         super::run_statement(&mut conn, &mut slot,
             "CREATE TABLE must_not_exist(x INTEGER); SELECT 1".into(), vec![],
-            super::Shape::Json, ready, body, Instant::now(), &mut false);
+            super::Shape::Json, ready, body, Instant::now());
         assert_eq!(result.recv().unwrap().err().unwrap().status, 400);
         assert!(conn.execute_batch("SELECT * FROM must_not_exist").is_err());
     }
@@ -4414,9 +4225,7 @@ mod tests {
         use std::sync::{Arc, mpsc::sync_channel};
         if crate::engine::engine().is_err() { return; }
         let conn = crate::engine::conn::open(std::path::Path::new(":memory:"), &[]).unwrap();
-        let state = Arc::new(super::SlotState {
-            interrupt: conn.interrupt_handle(), run: std::sync::Mutex::new(idle()),
-        });
+        let state = super::SlotState::new(conn.interrupt_handle());
         let (jobs, queue) = sync_channel::<super::Job>(1);
         let executor = {
             let state = Arc::clone(&state);
@@ -4496,14 +4305,12 @@ mod tests {
     /// before an executor had picked the statement up.
     #[test]
     fn an_early_cancel_aborts_the_transaction_it_lands_in() {
-        use std::sync::{Arc, mpsc::sync_channel};
+        use std::sync::mpsc::sync_channel;
         if crate::engine::engine().is_err() { return; }
         let open = || {
             let mut conn = crate::engine::conn::open(std::path::Path::new(":memory:"), &[]).unwrap();
             conn.execute_batch("CREATE TABLE m(n INTEGER); BEGIN; INSERT INTO m VALUES (1)").unwrap();
-            let state = Arc::new(super::SlotState {
-                interrupt: conn.interrupt_handle(), run: std::sync::Mutex::new(idle()),
-            });
+            let state = super::SlotState::new(conn.interrupt_handle());
             (conn, state)
         };
         let count = |conn: &mut super::Connection| {
@@ -4521,7 +4328,7 @@ mod tests {
             let (ready, result) = sync_channel(1);
             let (body, _output) = sync_channel(1);
             super::run_statement(conn, &mut slot, sql.into(), vec![], super::Shape::Json,
-                ready, body, Instant::now(), &mut false);
+                ready, body, Instant::now());
             result.recv().unwrap().err().unwrap().status
         };
         assert_eq!(cancelled(&mut conn, 1, "INSERT INTO m VALUES (2)"), 499);
@@ -4586,6 +4393,23 @@ mod tests {
         assert!(matches!(text.params[..], [super::Param::Text(_)]));
     }
 
+    /// A whole number past 64 bits is refused, not bound as the nearest
+    /// double; a double past them, written as one, binds as itself.
+    #[test]
+    fn a_number_param_binds_as_itself_or_is_refused() {
+        let request = |param: &str| super::parse_request(&format!(r#"{{"sql":"SELECT ?","params":[1, {param}]}}"#));
+        for whole in ["123456789012345678901234", "-9223372036854775809", "18446744073709551616"] {
+            assert!(request(whole).err().unwrap().contains("send it as a string"), "{whole}");
+        }
+        for (text, want) in [("1.5e30", 1.5e30), ("123456789012345678901234.0", 1.2345678901234568e23),
+            ("-976.7280889488817", -976.7280889488817), ("1e19", 1e19)] {
+            let params = request(text).unwrap().params;
+            assert!(matches!(params[1], super::Param::F64(f) if f == want), "{text}");
+        }
+        assert!(matches!(request("-9223372036854775808").unwrap().params[1], super::Param::I64(i64::MIN)));
+        assert!(matches!(request("18446744073709551615").unwrap().params[1], super::Param::U64(u64::MAX)));
+    }
+
     #[test]
     fn wrappers_and_local_mutations_require_connection_reset() {
         for sql in ["EXPLAIN ANALYZE BEGIN", "CALL f()", "EXECUTE s", "SET VARIABLE x=1",
@@ -4593,8 +4417,6 @@ mod tests {
             assert!(super::needs_connection_reset(sql), "{sql}");
         }
         assert!(!super::needs_connection_reset("INSERT INTO t VALUES (1)"));
-        assert_eq!(super::transaction_effect("EXPLAIN /* x */ ANALYZE BEGIN"), Some(true));
-        assert_eq!(super::transaction_effect("EXPLAIN BEGIN"), None);
     }
 
     #[test]
@@ -4607,33 +4429,45 @@ mod tests {
         assert_eq!(listener.local_addr().unwrap().ip(), std::net::Ipv4Addr::LOCALHOST);
     }
 
-    fn idle() -> SlotRun {
-        SlotRun { job: 0, started: Instant::now(), pending: None, cancelled: false, deadline: None, request: None }
-    }
-
     /// The bug this design exists to prevent: a cancel decided for one
     /// statement must not fire on the next one to run on that connection.
     /// Without the id, "is something running?" is true in both cases and the
     /// interrupt lands on an innocent query.
     #[test]
     fn a_cancel_never_lands_on_the_next_statement() {
-        let mut run = idle();
+        let mut run = SlotRun::idle();
         run.begin(7, None);
         // Job 7 finishes before the cancel is decided.
         assert!(!run.end());
         // The next statement starts on the same connection.
         run.begin(8, None);
-        // A cancel aimed at 7 arrives now. It must not touch 8.
-        assert_eq!(run.arm(Some(7)), Cancel::Held);
+        // A cancel aimed at 7 arrives now. It must not touch 8, and it
+        // stopped nothing, so it says so.
+        assert_eq!(run.arm(Some(7)), Cancel::Nothing);
         assert!(!run.cancelled, "job 8 was marked cancelled by a cancel aimed at job 7");
         assert!(!run.end(), "job 8 reported itself cancelled");
+    }
+
+    /// A cancel that lands once its statement has finished, while the client
+    /// is still reading the result, stopped nothing: it answers false and
+    /// holds nothing for later.
+    #[test]
+    fn a_cancel_after_its_statement_finished_stops_nothing() {
+        let mut run = SlotRun::idle();
+        run.begin(5, None);
+        assert!(!run.end());
+        assert_eq!(run.arm(Some(5)), Cancel::Nothing);
+        assert_eq!(run.pending, None);
+        // One for a statement still to come is held for it.
+        assert_eq!(run.arm(Some(6)), Cancel::Held);
+        assert!(run.begin(6, None));
     }
 
     /// And the held cancel must not survive to ambush a later statement
     /// either — it named an id that will never run again.
     #[test]
     fn a_held_cancel_is_discarded_by_the_next_statement() {
-        let mut run = idle();
+        let mut run = SlotRun::idle();
         run.arm(Some(7));
         assert_eq!(run.pending, Some(7));
         assert!(!run.begin(9, None), "job 9 inherited a cancel meant for job 7");
@@ -4645,21 +4479,21 @@ mod tests {
     /// job up. The statement must not run.
     #[test]
     fn a_cancel_that_beats_its_statement_still_cancels_it() {
-        let mut run = idle();
+        let mut run = SlotRun::idle();
         assert_eq!(run.arm(Some(4)), Cancel::Held);
         assert!(run.begin(4, None), "job 4 ran despite being cancelled before it started");
     }
 
     #[test]
     fn cancelling_an_idle_slot_does_nothing() {
-        let mut run = idle();
+        let mut run = SlotRun::idle();
         assert_eq!(run.arm(None), Cancel::Nothing);
         assert!(!run.cancelled);
     }
 
     #[test]
     fn cancelling_whatever_is_running_does_not_need_an_id() {
-        let mut run = idle();
+        let mut run = SlotRun::idle();
         run.begin(3, None);
         assert_eq!(run.arm(None), Cancel::Fire);
         assert!(run.end(), "the statement did not report itself cancelled");
@@ -4670,7 +4504,7 @@ mod tests {
     /// subsequent query on that worker as cancelled.
     #[test]
     fn the_cancelled_flag_does_not_outlive_its_statement() {
-        let mut run = idle();
+        let mut run = SlotRun::idle();
         run.begin(1, None);
         run.arm(None);
         assert!(run.end());
@@ -4682,7 +4516,7 @@ mod tests {
     fn a_deadline_only_expires_while_something_is_running() {
         let now = Instant::now();
         let past = now - Duration::from_secs(1);
-        let mut run = idle();
+        let mut run = SlotRun::idle();
         // Nothing running: a deadline in the past is not an expiry.
         run.deadline = Some(past);
         assert!(!run.expired(now));
@@ -4693,52 +4527,6 @@ mod tests {
         // And a statement with no deadline never expires.
         run.begin(3, None);
         assert!(!run.expired(now + Duration::from_secs(86_400)));
-    }
-
-    /// `civil_from_days` backs both DATE formatting and the log timestamp, and
-    /// it was never covered. Pin it to dates whose answers are known
-    /// independently: the epoch, both sides of a leap day, the 1900/2000
-    /// century rules, and dates before the epoch, where the sign correction on
-    /// the era division matters and a plain truncating divide is a day out.
-    #[test]
-    fn converts_days_to_civil_dates() {
-        for (days, want) in [
-            (0_i64, (1970_i64, 1_u32, 1_u32)),
-            (59, (1970, 3, 1)),      // 1970 is not a leap year
-            (-1, (1969, 12, 31)),    // before the epoch
-            (-719_468, (0, 3, 1)),   // start of the era
-            (11_016, (2000, 2, 29)), // 2000 is a leap year: the /400 rule
-            (11_017, (2000, 3, 1)),
-            (-25_508, (1900, 3, 1)), // 1900 is not: the /100 rule
-            (20_677, (2026, 8, 12)),
-            (2_932_896, (9999, 12, 31)),
-        ] {
-            assert_eq!(civil_from_days(days), want, "days={days}");
-        }
-    }
-
-    /// The byte strings here are what DuckDB v1.5.5 actually put on the wire
-    /// for these values, captured from a running server rather than derived
-    /// from the format description — a decoder tested only against its own
-    /// author's reading of the spec proves nothing about the encoder.
-    #[test]
-    fn decodes_bignum_wire_format() {
-        fn hex(s: &str) -> Vec<u8> {
-            (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
-        }
-        for (bytes, want) in [
-            ("80000100", "0"),
-            ("80000101", "1"),
-            ("7ffffefe", "-1"),
-            ("8000017f", "127"),
-            ("7ffffe80", "-127"),
-            ("800001ff", "255"),
-            ("7ffffe00", "-255"),
-            ("80000d018ee90ff6c373e0ee4e3f0ad2", "123456789012345678901234567890"),
-            ("7ffff2fe7116f0093c8c1f11b1c0f52d", "-123456789012345678901234567890"),
-        ] {
-            assert_eq!(varint_to_decimal(&hex(bytes)).as_deref(), Some(want), "for {bytes}");
-        }
     }
 
     /// Every rendering here is what duckdb_indexes() actually produced for
@@ -4778,7 +4566,7 @@ UNION ALL SELECT 1::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FRO
 
     /// `indexes[].columns` exists to be joined against `columns[].name`, so
     /// an identifier that needed quoting has to arrive unquoted — three of
-    /// five names on an ordinary table failed to match before this. Anything
+    /// five names on an ordinary table need quoting. Anything
     /// that is not exactly one double-quoted identifier is an expression and
     /// is reported as one, so a computed index is never mistaken for a column
     /// with a peculiar name.
@@ -4812,17 +4600,6 @@ UNION ALL SELECT 1::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FRO
             split(r#"[plain, '"a b"', '(lower("n"))']"#),
             (vec!["plain".to_string(), "a b".to_string()], vec![r#"(lower("n"))"#.to_string()])
         );
-    }
-
-    /// Malformed input must return None so the caller can fall back, rather
-    /// than produce a confidently wrong number from garbage.
-    #[test]
-    fn rejects_malformed_bignum() {
-        // Too short to hold a header at all.
-        assert_eq!(varint_to_decimal(&[]), None);
-        assert_eq!(varint_to_decimal(&[0x80, 0x00]), None);
-        // Header claims four magnitude bytes; only one follows.
-        assert_eq!(varint_to_decimal(&[0x80, 0x00, 0x04, 0x01]), None);
     }
 
     #[test]
@@ -4933,21 +4710,24 @@ UNION ALL SELECT 1::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FRO
         for (m, p) in &non_routes {
             assert!(!route_exists(m, p), "should NOT be a route: {m:?} {p}");
         }
-        // The legacy spellings stay served until the next deliberate break:
-        // the Rails-ism, the stray collection path, and the DELETE verb.
-        let legacy = [
+        // The other spellings clients send: Rip's session route, the bare
+        // collection path, and the DELETE verb.
+        let aliases = [
             (Method::Post, "/sql/sessions/new"),
             (Method::Get, "/sessions"),
             (Method::Delete, "/shutdown"),
         ];
-        for (m, p) in &legacy {
-            assert!(route_exists(m, p), "legacy alias must stay served: {m:?} {p}");
+        for (m, p) in &aliases {
+            assert!(route_exists(m, p), "an alias must stay served: {m:?} {p}");
         }
     }
 
     #[test]
     fn zstd_reader_round_trips_the_stream() {
         use std::io::Read;
+        if crate::engine::engine().is_err() { return; }
+        let conn = crate::engine::conn::open(std::path::Path::new(":memory:"), &[]).unwrap();
+        let watch = super::Watch::new(None, super::SlotState::new(conn.interrupt_handle()), 0);
         // Chunks shaped like the executor's sends: several FLUSH_AT-sized
         // bodies, then a small tail, then the channel closes.
         let mut chunks: Vec<Vec<u8>> = Vec::new();
@@ -4969,15 +4749,13 @@ UNION ALL SELECT 1::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FRO
         drop(tx);
 
         let mut compressed = Vec::new();
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-        let ended = Arc::new(AtomicBool::new(false));
-        let mut reader = super::ZstdReader::new(rx, Arc::clone(&ended)).unwrap();
+        let mut reader = super::ZstdReader::new(rx, watch).unwrap();
         let mut first = [0u8; 16];
         let n = reader.read(&mut first).unwrap();
         compressed.extend_from_slice(&first[..n]);
-        assert!(!ended.load(Ordering::Relaxed), "a body still being read has not ended");
+        assert!(!reader.watch.ended, "a body still being read has not ended");
         reader.read_to_end(&mut compressed).unwrap();
-        assert!(ended.load(Ordering::Relaxed), "reading to the end is what marks it ended");
+        assert!(reader.watch.ended, "reading to the end is what marks it ended");
         assert!(compressed.len() < expected.len() / 3, "row envelopes should crush");
 
         let mut recovered = Vec::new();

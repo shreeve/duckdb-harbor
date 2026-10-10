@@ -6,9 +6,9 @@ edition = "2024"
 description = "The Harbor wire contract: request shapes, NDJSON envelope, error codes"
 license = "MIT"
 
-# Pilot's Harbor protocol types. Harbor implements its
-# encoder and request parser directly, so cross-side tests—not a shared Rust
-# dependency—pin compatibility. No I/O here, ever: types and codes only.
+# Harbor's protocol types, shared by the server, its CLI and DuckTable, so
+# the two sides of the wire are checked by one compiler. No I/O here, ever:
+# types, codes and the reading of a statement's text.
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 # float_roundtrip: a double read off the wire is the one its text names.

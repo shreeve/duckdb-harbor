@@ -898,7 +898,7 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool, background: bool) -> R
     // GET /info: identity, with uptime and the live client count spliced in
     // by the core. This is the whole registry — the list dials it.
     harbor::set_info(serde_json::json!({
-        "protocolVersion": 1,
+        "protocolVersion": wire::PROTOCOL_VERSION,
         // The name clients label this server with and the CLI resolves a
         // bare word against: the config key that lists this file when one
         // does, else its stem — the same rule the login item and the stopped
@@ -917,8 +917,9 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool, background: bool) -> R
         "args": typed,
         // The TCP door, when one is open (the unix socket needs no
         // advertising — finding it is how a client got here). Always
-        // loopback, so the port alone spells the door.
-        "port": o.port,
+        // loopback, so the port alone spells the door: the bound one, which
+        // for `--port 0` is the system's choice.
+        "port": harbor::tcp_port(),
     }));
 
     eprintln!(
@@ -942,26 +943,30 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool, background: bool) -> R
             .ok().and_then(|v| v.parse().ok())
             .map_or(Duration::from_secs(3), Duration::from_millis);
         std::thread::spawn(move || {
-            let mut ever_connected = false;
-            let mut zero_since: Option<Instant> = None;
+            // Since when nobody has been connected, and how many had been
+            // accepted then.
+            let mut quiet: Option<(Instant, usize)> = None;
             loop {
                 std::thread::sleep(Duration::from_millis(200));
-                match harbor::connection_count() {
+                match harbor::connections() {
                     // Stopped by someone else; nothing left to decide.
                     None => break,
-                    Some(0) => {
-                        let since = *zero_since.get_or_insert_with(Instant::now);
-                        let allowed = if ever_connected { linger } else { startup };
-                        if since.elapsed() >= allowed {
+                    // Counted at accept, so a client that came and went
+                    // between two looks is a client all the same, and the
+                    // linger starts again from it.
+                    Some((0, accepted)) => {
+                        if quiet.is_none_or(|(_, seen)| seen != accepted) {
+                            quiet = Some((Instant::now(), accepted));
+                        }
+                        let allowed = if accepted > 0 { linger } else { startup };
+                        if quiet.is_some_and(|(since, _)| since.elapsed() >= allowed)
+                            && harbor::stop_if_idle(accepted)
+                        {
                             eprintln!("harbor: no clients — leaving");
-                            let _ = harbor::stop();
                             break;
                         }
                     }
-                    Some(_) => {
-                        ever_connected = true;
-                        zero_since = None;
-                    }
+                    Some(_) => quiet = None,
                 }
             }
         });
