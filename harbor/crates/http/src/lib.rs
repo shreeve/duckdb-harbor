@@ -293,7 +293,9 @@ fn request_inner(
             let s = connect_unix(p, connect_timeout).map_err(not_sent)?;
             s.set_read_timeout(timeout).map_err(not_sent)?;
             s.set_write_timeout(write_timeout).map_err(not_sent)?;
-            (Box::new(s), "harbor".to_string())
+            // A socket may be an SSH forward to a server's TCP door, which
+            // takes only a loopback Host; a unix listener reads none.
+            (Box::new(s), "localhost".to_string())
         }
         Transport::Tcp(addr) => {
             let s = match connect_timeout {
@@ -460,6 +462,30 @@ mod tests {
         assert!(was_not_sent(&e), "{e}");
         assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
         drop((listener, queued));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A request over a unix socket names a loopback host, so one that an
+    /// SSH forward carries to a server's TCP door is let in there.
+    #[cfg(unix)]
+    #[test]
+    fn a_request_over_a_socket_names_a_loopback_host() {
+        let path = PathBuf::from(format!("/tmp/hh-host-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && s.read(&mut byte).unwrap() == 1 {
+                head.push(byte[0]);
+            }
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").unwrap();
+            String::from_utf8(head).unwrap()
+        });
+        request(&Transport::Unix(path.clone()), &wire::endpoint::READY, None, None).unwrap();
+        let head = server.join().unwrap();
+        assert!(head.contains("\r\nHost: localhost\r\n"), "{head}");
         std::fs::remove_file(&path).unwrap();
     }
 
