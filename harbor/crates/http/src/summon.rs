@@ -164,6 +164,22 @@ fn log_tail(log_path: &Path) -> String {
 mod tests {
     use super::*;
 
+    /// Write a shell script and make it executable, from a child process.
+    /// Written here, the file would be open for writing in this process
+    /// while another test forks, and the fork's copy of that descriptor
+    /// makes the script's own exec fail with "Text file busy".
+    fn script(path: &std::path::Path, text: &str) {
+        use std::io::Write;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
     #[test]
     fn a_server_that_cannot_start_says_why() {
         let dir = std::env::temp_dir().join(format!("hh-summon-{}", std::process::id()));
@@ -171,8 +187,7 @@ mod tests {
         let sock = dir.join("x.sock");
         // A stand-in for harbor that says why it will not serve and leaves.
         let exe = dir.join("harbor");
-        std::fs::write(&exe, "#!/bin/sh\necho \"refusing $1 $2\" >&2\nexit 3\n").unwrap();
-        harbor_common::perms::chmod(&exe, 0o755).unwrap();
+        script(&exe, "#!/bin/sh\necho \"refusing $1 $2\" >&2\nexit 3\n");
         let err = summon(&exe, Path::new("/data/x.duckdb"), &sock, &[], true).unwrap_err();
         assert!(err.contains("did not start"), "{err}");
         assert!(err.contains("refusing /data/x.duckdb start"), "{err}");
@@ -191,15 +206,14 @@ mod tests {
         // A stand-in that loses the lock twice, then stays up while the
         // test answers on its socket for it.
         let (exe, tries, up) = (dir.join("harbor"), dir.join("tries"), dir.join("up"));
-        let script = format!(
+        let text = format!(
             "#!/bin/sh\necho x >> {tries}\n\
              if [ $(wc -l < {tries}) -le 2 ]; then echo 'IO Error: Conflicting lock is held in /opt/bin/harbor (PID 7) by user u' >&2; exit 1; fi\n\
              touch {up}; sleep 3\n",
             tries = tries.display(),
             up = up.display(),
         );
-        std::fs::write(&exe, script).unwrap();
-        harbor_common::perms::chmod(&exe, 0o755).unwrap();
+        script(&exe, &text);
         let serving = sock.clone();
         std::thread::spawn(move || {
             while !up.exists() {
@@ -226,8 +240,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hh-mute-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (exe, pid) = (dir.join("harbor"), dir.join("pid"));
-        std::fs::write(&exe, format!("#!/bin/sh\necho $$ > {}\nexec sleep 60\n", pid.display())).unwrap();
-        harbor_common::perms::chmod(&exe, 0o755).unwrap();
+        script(&exe, &format!("#!/bin/sh\necho $$ > {}\nexec sleep 60\n", pid.display()));
         let err = summon(&exe, Path::new("/data/x.duckdb"), &dir.join("x.sock"), &[], false).unwrap_err();
         assert!(err.contains("was stopped"), "{err}");
         let pid: libc::pid_t = std::fs::read_to_string(&pid).unwrap().trim().parse().unwrap();
