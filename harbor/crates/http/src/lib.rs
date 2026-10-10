@@ -215,7 +215,7 @@ impl<T: Read + Write + Send> Stream for T {}
 
 /// The route carries its own verb, so a caller cannot pair `GET` with a path
 /// harbor only answers to `POST`, the mistake that reads as a 404. `timeout`
-/// bounds each read of the answer; a write, and a TCP connect, get at least
+/// bounds a TCP connect and each read of the answer; a write gets at least
 /// five seconds.
 pub fn request(
     transport: &Transport,
@@ -274,8 +274,10 @@ fn request_inner(
     keep_alive: bool,
 ) -> io::Result<Response> {
     // A server that stopped reading must not hold a write forever, and a
-    // short read tick is no measure of how long a write may take.
+    // short read tick is no measure of how long a write, or a streaming
+    // request's connect, may take.
     let write_timeout = timeout.map(|t| t.max(Duration::from_secs(5)));
+    let connect_timeout = if on_tick.is_some() { write_timeout } else { timeout };
     let (mut stream, host): (Box<dyn Stream>, String) = match transport {
         #[cfg(unix)]
         Transport::Unix(p) => {
@@ -285,7 +287,7 @@ fn request_inner(
             (Box::new(s), "harbor".to_string())
         }
         Transport::Tcp(addr) => {
-            let s = match write_timeout {
+            let s = match connect_timeout {
                 Some(patience) => {
                     let mut result = Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "no server address"));
                     for address in addr.to_socket_addrs().map_err(not_sent)? {
