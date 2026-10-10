@@ -131,6 +131,26 @@ impl Leaving {
     }
 }
 
+/// What restarting the connected database `name` onto a newer harbor ends:
+/// its Query transaction, a statement running there, a commit in flight.
+/// The staged changes on screen stay, since the connection does.
+fn restart_notes(name: &str, risks: &QuitRisks) -> Vec<String> {
+    let mut notes = Vec::new();
+    if risks.transaction {
+        notes.push(format!("The Query view holds a transaction open on {name}, and the restart rolls it back."));
+    }
+    if risks.running {
+        notes.push(format!("A statement is still running on {name}, and the restart cuts it off unreported."));
+    }
+    if risks.committing {
+        notes.push(format!(
+            "A commit is still running on {name}: its changes land only if the server has its COMMIT before \
+             it stops."
+        ));
+    }
+    notes
+}
+
 /// `text` with its first letter in capitals, to begin a sentence.
 fn sentence(text: &str) -> String {
     let mut chars = text.chars();
@@ -391,8 +411,8 @@ pub(crate) enum Phase {
         info: wire::InfoResponse,
         /// The one snapshot everything schema-shaped renders from: tables,
         /// columns, DDL, exact row counts, and the file's size on disk all
-        /// arrive in this single document (harbor 0.18+).
-        catalog: harbor_client::Catalog,
+        /// arrive in this single document (`/catalog`).
+        catalog: Box<harbor_client::Catalog>,
     },
     Failed { name: String, message: String, aim: Aim },
 }
@@ -903,12 +923,11 @@ impl DuckTable {
         input
     }
 
-    /// Open (focused) or close the sidebar's table filter.
     /// ⌥←/⌥→: the previous/next table, walking the sidebar's own order
     /// and filter (sidebar.rs visible_tables) — with rollover, so the
     /// tables read as a ring you can circle rather than a hall that
-    /// dead-ends (Steve's ruling). With nothing selected yet, either
-    /// arrow lands on the nearest end.
+    /// dead-ends. With no table selected, either arrow lands on the
+    /// nearest end.
     pub(crate) fn step_table(
         &mut self,
         delta: i32,
@@ -940,6 +959,7 @@ impl DuckTable {
         self.select_table(schema, name, window, cx);
     }
 
+    /// Open (focused) or close the sidebar's table filter.
     pub(crate) fn toggle_table_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.table_filter.take().is_none() {
             self.table_filter = Some(Self::new_filter("Filter tables", window, cx));
@@ -979,7 +999,7 @@ impl DuckTable {
                 match outcome {
                     Ok(new_catalog) => {
                         if let Phase::Connected { catalog, .. } = &mut state.phase {
-                            *catalog = new_catalog;
+                            **catalog = new_catalog;
                         }
                     }
                     // The fetch failed — most often because the server departed
@@ -1153,16 +1173,9 @@ impl DuckTable {
     /// The local, running servers older than the installed binary — the ones a
     /// one-click upgrade would restart. Empty when the version is unknown, so a
     /// failed probe never nags.
-    pub(crate) fn outdated(&self) -> Vec<&RowVm> {
-        let Some(installed) = self.installed_version.as_deref() else { return Vec::new() };
-        self.rows.iter().filter(|r| r.upgradable(installed)).collect()
-    }
-
-    /// How many local servers are outdated — the upgrade badge's number,
-    /// counted without allocating on every sidebar paint.
-    pub(crate) fn outdated_count(&self) -> usize {
-        let Some(installed) = self.installed_version.as_deref() else { return 0 };
-        self.rows.iter().filter(|r| r.upgradable(installed)).count()
+    pub(crate) fn outdated(&self) -> impl Iterator<Item = &RowVm> {
+        let installed = self.installed_version.as_deref();
+        self.rows.iter().filter(move |r| installed.is_some_and(|v| r.upgradable(v)))
     }
 
     /// Upgrade every outdated local server: restart each onto the installed
@@ -1170,11 +1183,8 @@ impl DuckTable {
     /// they come back current. Runs on a background thread; the first failure
     /// is surfaced, the rest still attempted.
     pub(crate) fn upgrade_outdated(&mut self, cx: &mut Context<Self>) {
-        let targets: Vec<(std::path::PathBuf, bool)> = self
-            .outdated()
-            .iter()
-            .filter_map(|r| r.path.clone().map(|p| (p, r.ephemeral)))
-            .collect();
+        let targets: Vec<(std::path::PathBuf, bool)> =
+            self.outdated().filter_map(|r| r.path.clone().map(|p| (p, r.ephemeral))).collect();
         if targets.is_empty() {
             return;
         }
@@ -1195,17 +1205,28 @@ impl DuckTable {
     /// The upgrade badge's action: name the count, confirm once, and on yes
     /// restart every outdated local server onto the installed binary.
     pub(crate) fn prompt_upgrade(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let n = self.outdated().len();
+        let n = self.outdated().count();
         if n == 0 {
             return;
         }
         let installed = self.installed_version.clone().unwrap_or_default();
         let noun = if n == 1 { "database".to_string() } else { format!("{n} databases") };
         let title = format!("Upgrade {noun}");
-        let body = format!(
+        let mut body = format!(
             "Restart {noun} onto harbor {installed}. Each server stops and comes \
              back in the same mode; any connected clients reconnect."
         );
+        // The database on screen among them: what its restart ends is said.
+        let connected = self.connected_key();
+        if let Some(row) = self.outdated().find(|r| Some(&r.key) == connected.as_ref())
+            && let Some(path) = row.path.clone()
+        {
+            let leaving = Leaving::Stop { name: clone_str(&row.name), path };
+            for note in restart_notes(&row.name, &self.risks(&leaving, cx)) {
+                body.push(' ');
+                body.push_str(&note);
+            }
+        }
         let answer =
             window.prompt(PromptLevel::Info, &title, Some(&body), &["Upgrade", "Cancel"], cx);
         cx.spawn(async move |this, cx| {
@@ -1365,7 +1386,7 @@ impl DuckTable {
                     query
                 });
                 state.phase = match outcome {
-                    Ok((conn, info, catalog)) => Phase::Connected { conn, info, catalog },
+                    Ok((conn, info, catalog)) => Phase::Connected { conn, info, catalog: Box::new(catalog) },
                     Err(message) => Phase::Failed { name: clone_str(&shown), message, aim },
                 };
                 state.sync_path_copy(cx);
@@ -1782,6 +1803,18 @@ mod tests {
             ("Stop orders?", "Nothing is left that stopping orders would lose.", "Stop")
         );
         assert_eq!(Leaving::Quit.plain_question().detail, "Nothing is left that quitting would lose.");
+    }
+
+    #[test]
+    fn an_upgrade_says_what_restarting_the_database_on_screen_ends() {
+        use super::restart_notes;
+        // Staged changes stay on screen through a restart: nothing to say.
+        assert!(restart_notes("orders", &QuitRisks { staged: 3, tables: 1, ..Default::default() }).is_empty());
+        let all = QuitRisks { transaction: true, running: true, committing: true, ..Default::default() };
+        let notes = restart_notes("orders", &all);
+        assert_eq!(notes.len(), 3);
+        assert_eq!(notes[0], "The Query view holds a transaction open on orders, and the restart rolls it back.");
+        assert!(notes[2].starts_with("A commit is still running on orders"));
     }
 
     #[test]

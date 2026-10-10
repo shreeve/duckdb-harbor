@@ -138,8 +138,8 @@ impl DuckTable {
                     // an older harbor than the one installed. Click to restart
                     // them onto the current binary. Refresh (below) keeps its
                     // plain meaning; upgrading is this deliberate, separate tap.
-                    .when(self.outdated_count() > 0, |d| {
-                        let n = self.outdated_count();
+                    .when(self.outdated().next().is_some(), |d| {
+                        let n = self.outdated().count();
                         d.child(
                             div()
                                 .id("upgrade-badge")
