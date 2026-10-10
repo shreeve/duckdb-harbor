@@ -138,16 +138,17 @@ transaction is open.
 - **The server bounds it.** A session lives five minutes from its `BEGIN`,
   whatever runs on it, and the band counts that down. Harbor also reclaims a
   session that sits thirty seconds between statements, which composing the
-  next statement easily takes, so while nothing is running the view sends
-  `SELECT 1` to the session at a third of that interval, waiting five seconds
-  for its answer and no longer. At the five-minute deadline the server rolls
-  the transaction back, and the view says so: `The transaction is gone: the
-  server reclaimed its session and rolled back everything since BEGIN.` The
-  view checks every second, so a loss a results page runs into shows within
-  one. The keepalive is a timer in the app, and whether macOS delays it while
-  the window is hidden (App Nap) is not measured: a transaction left open
-  behind a hidden window may be found gone on return, and is then reported as
-  any lost one is.
+  next statement easily takes, so at a third of that interval the view
+  renews the session, which runs nothing on it, waiting five seconds for the
+  answer and no longer. A server that renews only backup sessions gets
+  `SELECT 1` instead, sent while nothing else is running. At the five-minute
+  deadline the server rolls the transaction back, and the view says so: `The
+  transaction is gone: the server reclaimed its session and rolled back
+  everything since BEGIN.` The view checks every second, so a loss a results
+  page runs into shows within one. The keepalive is a timer in the app, and
+  whether macOS delays it while the window is hidden (App Nap) is not
+  measured: a transaction left open behind a hidden window may be found gone
+  on return, and is then reported as any lost one is.
 - **A statement typed for a lost transaction never runs on its own
   unannounced.** One sent to a session that is gone is not run outside it
   instead; it fails with that message and `This statement did not run.` When
@@ -173,9 +174,15 @@ transaction is open.
   some answer on an aborted transaction (measured: `PREPARE` does). So after
   any statement on the session that may have run and failed, the view asks
   `SELECT 1` at once, in the same turn on the session, and the band says what
-  came back. The keepalive asks too. The band is therefore not a guess, and
-  does not say aborted of a statement Harbor itself turned away, such as a
-  protected `SET`. When the question cannot be answered, the band reads
+  came back. While the band is unconfirmed or aborted the keepalive asks too,
+  in place of the renew; a renew cannot change the band, since only a
+  statement on the session can abort its transaction, and one another client
+  sends there is found by the next statement or the `COMMIT`, which asks
+  first. The band is therefore not a guess, and does not say aborted of a
+  statement Harbor itself turned away, such as two statements sent as one.
+  A protected `SET` is the engine's refusal (measured: the locked
+  configuration answers `Invalid Input Error`), and aborts the transaction
+  like any other. When the question cannot be answered, the band reads
   `transaction open, its state unconfirmed after an error`.
 - **A `COMMIT` that rolled back says so.** Before a `COMMIT` the view asks
   once more, and sends the `COMMIT` in the same turn, so no results page or

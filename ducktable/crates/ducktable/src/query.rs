@@ -578,9 +578,9 @@ impl QueryView {
 
     /// Keep the open transaction's session from idling out, and notice when
     /// it is gone. Harbor reclaims a session that sits thirty seconds between
-    /// statements, which a person composing the next one easily does, so a
-    /// trivial statement goes to it at a third of that interval while nothing
-    /// else is running on it. The session's fixed deadline cannot be
+    /// statements, which a person composing the next one easily does, so the
+    /// session is touched at a third of that interval while nothing else is
+    /// running on it (`Txn::touch`). The session's fixed deadline cannot be
     /// extended: when it passes, the server has rolled the transaction back,
     /// and the view says so. One watcher per transaction; it ends with it.
     fn watch_transaction(&mut self, cx: &mut Context<Self>) {
@@ -965,8 +965,12 @@ struct Held {
     over: std::sync::atomic::AtomicBool,
     /// Whether an error has aborted the transaction (`Health`), as the
     /// session last said when asked. Asked after any statement on it that
-    /// may have run and failed, by every keepalive, and before a COMMIT.
+    /// may have run and failed, by a keepalive while it is unconfirmed or
+    /// aborted, and before a COMMIT.
     health: std::sync::atomic::AtomicU8,
+    /// Whether the server renews the session without a statement. An older
+    /// one renews only backup sessions, and is kept by `SELECT 1` instead.
+    renews: std::sync::atomic::AtomicBool,
 }
 
 /// What is known of the transaction on a session. An aborted transaction
@@ -1028,6 +1032,25 @@ fn commit_gate(asked: Asked) -> Result<bool, harbor_client::Failure> {
     }
 }
 
+/// How a keepalive keeps the session.
+#[derive(Debug, PartialEq)]
+enum Keepalive {
+    /// Renew it, which runs nothing on it.
+    Renew,
+    /// Ask it `SELECT 1`, which keeps it too.
+    Ask,
+}
+
+/// A transaction confirmed sound is renewed: nothing but a statement on
+/// the session can change what the band says, and a renew runs none, so it
+/// neither counts among the session's statements nor overwrites its
+/// profiling. A band unconfirmed or aborted is asked, since only an answer to
+/// `SELECT 1` sets it; and so is a server that renews only backup sessions
+/// (`renews` false), where a statement is what keeps a session.
+fn keepalive(health: Health, renews: bool) -> Keepalive {
+    if health == Health::Fine && renews { Keepalive::Renew } else { Keepalive::Ask }
+}
+
 /// What a keepalive found.
 #[derive(Debug, PartialEq)]
 enum Touch {
@@ -1048,6 +1071,7 @@ impl Txn {
             gate: std::sync::Mutex::new(()),
             over: std::sync::atomic::AtomicBool::new(false),
             health: std::sync::atomic::AtomicU8::new(Health::Fine as u8),
+            renews: std::sync::atomic::AtomicBool::new(true),
         })))
     }
 
@@ -1134,13 +1158,27 @@ impl Txn {
         self.0.over.store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Reset the session's idle clock with a statement that changes
-    /// nothing, unless one is already running on it. It answers at once or
-    /// not at all, so it waits a few seconds and no longer: the gate it
-    /// holds meanwhile is the one the next run waits on.
+    /// Reset the session's idle clock (`keepalive`). A renew runs nothing,
+    /// so it needs no turn on the session and is answered while a statement
+    /// runs there. The question is a statement: it is asked only when no
+    /// other is running, and it answers at once or not at all, so it waits
+    /// a few seconds and no longer, since the gate it holds meanwhile is the
+    /// one the next run waits on.
     fn touch(&self) -> Touch {
         if self.over() {
             return Touch::Gone;
+        }
+        let renews = self.0.renews.load(std::sync::atomic::Ordering::Acquire);
+        if keepalive(self.health(), renews) == Keepalive::Renew {
+            match harbor_client::session_renew(&self.0.conn, &self.0.session.id) {
+                Ok(true) => return Touch::Alive,
+                Ok(false) => self.0.renews.store(false, std::sync::atomic::Ordering::Release),
+                Err(failure) if failure.session_gone() => {
+                    self.mark_over();
+                    return Touch::Gone;
+                }
+                Err(_) => return Touch::Alive,
+            }
         }
         let Ok(_turn) = self.0.gate.try_lock() else { return Touch::Alive };
         self.ask();
@@ -2046,6 +2084,17 @@ mod tests {
     }
 
     #[test]
+    fn a_keepalive_renews_only_what_the_band_has_confirmed() {
+        use super::{keepalive, Keepalive};
+        assert_eq!(keepalive(Health::Fine, true), Keepalive::Renew);
+        // Only an answer to SELECT 1 sets the band, so an unconfirmed or
+        // aborted one is asked, and so is a server that cannot renew.
+        assert_eq!(keepalive(Health::Unknown, true), Keepalive::Ask);
+        assert_eq!(keepalive(Health::Aborted, true), Keepalive::Ask);
+        assert_eq!(keepalive(Health::Fine, false), Keepalive::Ask);
+    }
+
+    #[test]
     fn a_commit_is_sent_only_when_the_sessions_state_is_confirmed() {
         // Confirmed sound, it is sent, and will commit.
         assert_eq!(commit_gate(Asked::Is(Health::Fine)), Ok(false));
@@ -2301,12 +2350,13 @@ mod tests {
         let prepared = txn.exec("PREPARE _dt_p AS SELECT 1");
         println!("PREPARE on the aborted transaction: {:?}", prepared.as_ref().map(|_| "answered").map_err(ToString::to_string));
         assert_eq!(txn.health(), Health::Aborted);
-        // The COMMIT is sent in the same turn as the question, answers like
-        // any other, and what it did is roll back.
+        // The COMMIT is sent in the same turn as the question, and Harbor
+        // refuses it, saying it rolled the transaction back.
         let (aborted, answer) = txn.commit("COMMIT");
         assert!(aborted);
-        answer.expect("COMMIT answers");
-        assert_eq!(fate(Route::Held, commits, aborted, None), Fate::RolledBack);
+        let refused = answer.expect_err("Harbor refuses the COMMIT of an aborted transaction");
+        assert!(refused.to_string().contains("rolled back"), "{refused}");
+        assert_eq!(fate(Route::Held, commits, aborted, Some(&refused)), Fate::Failed);
         txn.release();
         assert_eq!(rows(), serde_json::json!(2), "the INSERT is gone");
 
@@ -2319,17 +2369,16 @@ mod tests {
         txn.exec("ROLLBACK").expect("ROLLBACK");
         txn.release();
 
-        // A parse error leaves it as it was. Harbor's own refusal of a
-        // protected setting reads like an engine error, so the session is
-        // asked in the same turn and the band never says aborted of it; the
+        // A parse error leaves it as it was, and so does Harbor's refusal of
+        // two statements in one request, which never reaches the engine; the
         // COMMIT that follows is known to have landed.
         let txn = super::Txn::open(&conn).expect("session");
         txn.exec("BEGIN").expect("BEGIN");
         txn.exec("INSERT INTO _dt_aborted_probe VALUES (3, '3')").expect("insert");
         assert!(txn.exec("SELEC 1").is_err());
         assert_eq!(txn.health(), Health::Fine);
-        let refused = txn.exec("SET memory_limit = '1GB'").unwrap_err();
-        println!("a protected setting: {refused}");
+        let refused = txn.exec("SELECT 1; SELECT 2").unwrap_err();
+        println!("two statements: {refused}");
         assert_eq!(txn.health(), Health::Fine, "asked at once, and found sound");
         let (aborted, answer) = txn.commit("COMMIT");
         assert!(!aborted);
@@ -2367,7 +2416,10 @@ mod tests {
         txn.release();
         assert_eq!(rows(), serde_json::json!(4));
 
-        // The keepalive learns of an abort it did not cause, within its wait.
+        // An abort another client causes on the session: the keepalive's
+        // renew runs nothing and leaves the band as last confirmed (a server
+        // that renews only backup sessions is asked instead, and the band
+        // learns of it), and the COMMIT, which asks first, finds it.
         let txn = super::Txn::open(&conn).expect("session");
         txn.exec("BEGIN").expect("BEGIN");
         let id = txn.0.session.id.clone();
@@ -2375,8 +2427,13 @@ mod tests {
         assert_eq!(txn.health(), Health::Fine);
         let began = std::time::Instant::now();
         assert_eq!(txn.touch(), super::Touch::Alive);
-        assert_eq!(txn.health(), Health::Aborted);
+        let renewed = txn.0.renews.load(std::sync::atomic::Ordering::Acquire);
+        println!("the keepalive {}", if renewed { "renewed" } else { "asked SELECT 1" });
+        assert_eq!(txn.health(), if renewed { Health::Fine } else { Health::Aborted });
         assert!(began.elapsed() < std::time::Duration::from_secs(5));
+        let (aborted, answer) = txn.commit("COMMIT");
+        assert!(aborted, "the COMMIT asks first, and finds the abort");
+        println!("COMMIT of the aborted transaction: {:?}", answer.map(|_| "answered").map_err(|f| f.to_string()));
         txn.release();
         alone("DROP TABLE _dt_aborted_probe").expect("drop");
     }
