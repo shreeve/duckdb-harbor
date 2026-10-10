@@ -1235,7 +1235,7 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
     // A JSON column holds JSON text, and `null` is a JSON value there,
     // distinct from SQL NULL — so this comes before the `null` rule below.
     if ty == "JSON" {
-        check_json(text)?;
+        check_json(text, false)?;
         return Ok(Value::String(text.to_string()));
     }
     // Typing the literal `null` into a non-text column means SQL NULL —
@@ -1252,7 +1252,7 @@ pub fn parse_value(text: &str, duck_type: &str) -> Result<Value, String> {
     // already said. The text is bound as typed, never re-serialized: a
     // round trip through serde would rewrite 12.340 and any wide integer.
     if ty == "VARIANT" {
-        check_json(text)?;
+        check_json(text, true)?;
         return Ok(Value::String(text.to_string()));
     }
     // A BLOB cell is base64 both ways (`placeholder_for`). The engine decodes
@@ -1464,12 +1464,22 @@ const JSON_DEPTH: usize = 100;
 /// `{"x":NaN}`, which no JSON reader accepts, and the whole document reaches
 /// a client as a string. So serde's verdict is the verdict. Depth is
 /// measured first, so that a document refused for its depth is told so.
-fn check_json(text: &str) -> Result<(), String> {
+///
+/// A JSON column keeps the text as typed, so a number past a double
+/// (`{"x": 1e400}`) is stored as written, and the check builds nothing. A
+/// VARIANT reads its numbers as doubles and stores that one as the string
+/// "Infinity" (measured), so there it is refused, as a number serde's
+/// `Value` cannot hold.
+fn check_json(text: &str, variant: bool) -> Result<(), String> {
     if json_depth(text) > JSON_DEPTH {
         return Err(format!("this JSON nests deeper than {JSON_DEPTH} levels"));
     }
-    match serde_json::from_str::<Value>(text) {
-        Ok(_) => Ok(()),
+    let parsed = match variant {
+        true => serde_json::from_str::<Value>(text).map(drop),
+        false => serde_json::from_str::<serde::de::IgnoredAny>(text).map(drop),
+    };
+    match parsed {
+        Ok(()) => Ok(()),
         Err(_) => Err(format!("{text:?} is not JSON \u{2014} text needs quotes, like \"Morel\"")),
     }
 }
@@ -2061,6 +2071,15 @@ mod tests {
             }
             // Inside a string they are the string's own business.
             assert_eq!(parse_value("\"NaN and Infinity\"", ty), Ok(json!("\"NaN and Infinity\"")));
+            // A trailing comma is not JSON either.
+            assert!(parse_value("[1, 2,]", ty).unwrap_err().contains("is not JSON"), "{ty}");
+            // A number past a double: a JSON column keeps it as written, and
+            // a VARIANT would store it as "Infinity", so it is refused there.
+            let wide = "{\"x\": 1e400}";
+            match ty.eq_ignore_ascii_case("VARIANT") {
+                true => assert!(parse_value(wide, ty).unwrap_err().contains("is not JSON"), "{ty}"),
+                false => assert_eq!(parse_value(wide, ty), Ok(json!(wide)), "{ty}"),
+            }
 
             // A document nests 100 levels and no deeper, and says so.
             let nested = |depth: usize, open: &str, close: &str| {
