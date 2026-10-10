@@ -460,8 +460,8 @@ cp -R "$work/bk.out" "$work/bk.hand"
 printf 'id\ts\n1\tNULL\n2\t"NULL"\n3\t""\n4\t\n' > "$work/bk.hand/t.csv"
 check "hand-written NULL, \"NULL\", \"\" and a bare field all read as documented" 0 "1,true,~
 2,false,NULL
-3,false,
-4,false," \
+3,false,\"\"
+4,false,\"\"" \
   bash -c '"$1" "$2" restore "$3" >/dev/null 2>&1
            "$1" "$2" --mode csv -c "SELECT id, s IS NULL, coalesce(s, '"'"'~'"'"') FROM t ORDER BY id" | tail -n +2' \
   _ "$harbor" "$work/hand.duckdb" "$work/bk.hand"
