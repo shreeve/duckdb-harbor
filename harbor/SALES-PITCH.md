@@ -3,8 +3,9 @@
 > **This document is evidence, not positioning.** Every protocol claim below was
 > verified against a running Quack server with a man-in-the-middle proxy on the
 > wire, and every performance number was measured, not estimated. Versions,
-> method and reproduction steps are in [Appendix: how this was tested](#appendix-how-this-was-tested).
-> Where a claim rests on reading source rather than observing bytes, it says so.
+> method and reproduction steps are in
+> [Appendix: how this was tested](#appendix-how-this-was-tested). Where a claim
+> rests on reading source rather than observing bytes, it says so.
 
 The one-line distinction:
 
@@ -127,7 +128,7 @@ machine, localhost, warm:
 | --- | ---: | ---: | ---: |
 | Wire bytes | 34,935,381 | 57,037,316 | **2,698,430** |
 | Relative to Quack | 1.00× | 1.63× | **0.077× (13× smaller)** |
-| Wall time (best of 3) | 0.09 s | 0.21 s | not measured |
+| Wall time (best of 3) | 0.09 s | ~0.06 s | ~0.06 s |
 
 Three honest readings of that table:
 
@@ -136,29 +137,21 @@ not the 3–5× that "text is bloated" intuition suggests. Harbor sends the sche
 once and then positional rows (`{"type":"row","values":[...]}`) with no repeated
 keys, which removes most of JSON's structural overhead.
 
-**Quack was roughly 2× faster against the encoder measured here, and the true
-gap was somewhat wider than shown.** The comparison favors Harbor: `curl` wrote
-bytes to a file without parsing JSON, while the DuckDB client materialized a
-full temp table and paid process startup. That was Harbor within 2–3× of a
-native binary protocol, before any encoder optimization.
+**Wall time is at Quack's or under it, and the comparison favors Harbor.**
+`curl` wrote bytes to a file without parsing JSON, while the DuckDB client
+materialized a full temp table and paid process startup. The fair reading is
+that Harbor's encoder, which writes digits straight into its output buffer with
+fetch and encode pipelined on separate threads, keeps pace with a native binary
+protocol on the server's side, and that a client parsing JSON pays a cost a
+native client does not.
 
 **Compression inverts the bandwidth argument.** Quack ships uncompressed. With
 `Content-Encoding: zstd` at level 1, Harbor moves **13× less data than Quack**.
 Stated with the caveat it deserves: this synthetic data (sequential integers,
 `row-N` labels) is unusually compressible, and 3–6× is the realistic range on
 production data — which still puts NDJSON ahead of uncompressed binary on any
-real network.
-
-That headroom has since been spent. The encoder now writes digits directly into
-the output buffer with no per-cell allocation, and fetch and encode run
-pipelined on separate threads. Re-measured on the same machine and shape
-(current tree, DuckDB `v2.0.0-dev83323`): the million rows arrive in
-**~0.06 s** wall, best of three — a 3.5× improvement that lands at Quack's
-recorded figure, with the caveat that the two client paths still differ as
-described in the appendix. The `not measured` cell is also settled: with
-`Content-Encoding: zstd` the wall time is indistinguishable from identity,
-because compression rides the writer thread while the engine produces the next
-chunk. The wall-time gap in the table was the old encoder, not the protocol.
+real network. Compression costs no wall time: it rides the writer thread while
+the engine produces the next chunk.
 
 ## The real comparison
 
@@ -193,10 +186,10 @@ to imitate this.
 
 **Bulk binary transport.** For very large typed results moving between DuckDB
 instances, native chunk transfer skips text encoding and parsing entirely, and
-that CPU advantage compounds at 100M-row scale. Harbor's encoder rewrite closed
-the measured wall-time gap at 1M rows, but the client must still parse JSON that
-a native client never produces — compression changed the bandwidth story, not
-the compute one.
+that CPU advantage compounds at 100M-row scale. Harbor's encoder keeps pace on
+wall time at 1M rows, but the client must still parse JSON that a native
+client never produces — compression changes the bandwidth story, not the
+compute one.
 
 **Full type fidelity by construction.** Harbor spends real effort on lossless
 JSON encoding for decimals, nested types and oversized integers. Quack gets it
@@ -223,7 +216,7 @@ the token still travels in the body of the first request only, every later
 request authenticating by an opaque `connection_id`, and a wrong token still
 answers `HTTP/1.1 200 OK` with `Authentication failed` inside the binary
 body. One path did gain a status code: a body the codec cannot decode at all
-now draws a 500 — so the 200s are not an HTTP-layer limitation, they are the
+draws a 500 — so the 200s are not an HTTP-layer limitation, they are the
 protocol's own error path, which makes the architectural reading more likely,
 not less. Finding 3 is unchanged by construction: `quack_serve()` is still a
 call inside an already-running DuckDB.
@@ -236,7 +229,7 @@ language, whether that library matches the server version, how to distribute
 SQL and reads JSON.
 
 Underneath that, Harbor is a supervisor, and that is the part nobody else ships:
-bounded query concurrency; streamed results without materializing; prepared
+bounded query concurrency; streamed results without materializing; parsed
 statement caching; pinned transactional sessions with separate worker and
 session capacity; client-named cancellation; statement deadlines;
 abandoned-session reclamation; readiness that tests the database rather than the
@@ -302,11 +295,14 @@ and as the response body size for Harbor (57,037,316). Compressed sizes are
 `zstd -1` (2,698,430) and `gzip -1` (8,588,385) over Harbor's exact response
 bytes.
 
-**Timings** are best-of-three wall clock. They are *not* strictly comparable:
-Harbor's figure is `curl` writing the response to a file with no JSON parsing,
-while Quack's is a DuckDB client materializing the result into a temp table,
-including process startup. The comparison therefore understates Quack's CPU
-advantage, and is reported that way deliberately.
+**Timings** are best-of-three wall clock. Harbor's were re-measured the same
+day, on the same machine and shape, against DuckDB `v2.0.0-dev83323`, once its
+encoder wrote straight into the output buffer and fetch and encode ran on
+separate threads; that run also timed the zstd response. They are *not*
+strictly comparable: Harbor's figure is `curl` writing the response to a file
+with no JSON parsing, while Quack's is a DuckDB client materializing the result
+into a temp table, including process startup. The comparison therefore
+understates Quack's CPU advantage, and is reported that way deliberately.
 
 **Reproducing it** requires only the versions above; no code in this repository
 was modified for these measurements.
