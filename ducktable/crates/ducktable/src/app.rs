@@ -34,6 +34,18 @@ fn active_key<'a>(connecting: Option<&'a DbKey>, connected: Option<&'a DbKey>) -
     connecting.or(connected)
 }
 
+/// The state a row shows. The survey's word stands for a file and for a
+/// remote on this machine, whose servers it probes. It never dials a
+/// tunnel, so for the tunneled remote on screen (`tunnel_up` is `Some`)
+/// the tunnel's SSH process answers: running, the row is; exited, it is not.
+fn shown_state(surveyed: State, tunnel_up: Option<bool>) -> State {
+    match tunnel_up {
+        Some(true) => State::Running,
+        Some(false) => State::Stopped,
+        None => surveyed,
+    }
+}
+
 /// What runs when the quit dialog is cancelled.
 #[derive(Debug, PartialEq)]
 enum Resume {
@@ -1026,9 +1038,9 @@ impl DuckTable {
         let fence = self.refresh_seq;
         // The connected berth's catalog is already in hand; its row must
         // not pay a second connect + catalog download just for a count.
-        let connected: Option<(DbKey, usize)> = match &self.phase {
+        let connected: Option<(DbKey, usize, Option<bool>)> = match &self.phase {
             Phase::Connected { conn, catalog, .. } => {
-                Some((DbKey::of_conn(conn), catalog.tables.len()))
+                Some((DbKey::of_conn(conn), catalog.tables.len(), conn.tunnel_up()))
             }
             _ => None,
         };
@@ -1055,10 +1067,10 @@ impl DuckTable {
                         // The connection is this row only if it is the same
                         // database: the same file, or the same remote.
                         let key = DbKey::of_row(&row.name, row.path.as_deref());
-                        let here = known.filter(|(connected, _)| *connected == key);
-                        let connected_here = here.is_some();
+                        let here = known.filter(|(connected, ..)| *connected == key);
+                        let tunnel_up = here.as_ref().and_then(|(.., tunnel_up)| *tunnel_up);
                         let tables = match here {
-                            Some((_, count)) => Some(count),
+                            Some((_, count, _)) => Some(count),
                             None => row
                                 .state
                                 .is_live()
@@ -1080,13 +1092,10 @@ impl DuckTable {
                                 .flatten(),
                         };
                         RowVm {
-                            // The survey cannot see a tunneled remote, which it never
-                            // dials, and a connection does not say whether it is
-                            // tunneled, so for a remote the connection says it is
-                            // running. A file's server it sees, and its word stands:
-                            // a server that exited under the connection shows as
-                            // stopped, and the reconciliation below lets it go.
-                            state: if connected_here && row.path.is_none() { State::Running } else { row.state },
+                            // A server that exited under the connection, or its
+                            // tunnel, shows as stopped, and the reconciliation
+                            // below lets the connection go.
+                            state: shown_state(row.state, tunnel_up),
                             attached: row.attached,
                             autostart: row.autostart,
                             path: row.path,
@@ -1139,7 +1148,7 @@ impl DuckTable {
                 // connection to fail the next catalog or query with an OS error.
                 let connected = match &state.phase {
                     Phase::Connected { conn, .. } => {
-                        Some((clone_str(&conn.name), DbKey::of_conn(conn)))
+                        Some((clone_str(&conn.name), DbKey::of_conn(conn), conn.tunnel_up().is_some()))
                     }
                     _ => None,
                 };
@@ -1147,12 +1156,13 @@ impl DuckTable {
                 // dropping it clears the grid and every staged edit, and
                 // Cancel must find them. The refresh that follows a cancel
                 // reconciles.
-                if let Some((name, key)) = connected
+                if let Some((name, key, tunneled)) = connected
                     && !state.asking_to_quit
                     && !state.rows.iter().any(|r| r.key == key && r.state.is_live())
                 {
                     state.drop_connection(cx);
-                    state.warning = Some(format!("{name} stopped — click it to reconnect"));
+                    let gone = if tunneled { "lost its SSH tunnel" } else { "stopped" };
+                    state.warning = Some(format!("{name} {gone} — click it to reconnect"));
                 }
                 cx.notify();
             })
@@ -1592,7 +1602,20 @@ impl DuckTable {
 
 #[cfg(test)]
 mod tests {
-    use super::{active_key, after_quit_dialog, catalog_refresh_is_current, Aim, DbKey, QuitRisks, Resume};
+    use super::{active_key, after_quit_dialog, catalog_refresh_is_current, shown_state};
+    use super::{Aim, DbKey, QuitRisks, Resume, State};
+
+    #[test]
+    fn a_row_shows_the_survey_unless_it_is_the_tunnel_on_screen() {
+        // A file, or a remote on this machine: the survey's probe stands,
+        // connected or not, so a server gone under the connection is stopped.
+        assert_eq!(shown_state(State::Stopped, None), State::Stopped);
+        assert_eq!(shown_state(State::Running, None), State::Running);
+        // The tunneled remote on screen, which the survey never dials: its
+        // SSH process says whether it is up.
+        assert_eq!(shown_state(State::Stopped, Some(true)), State::Running);
+        assert_eq!(shown_state(State::Stopped, Some(false)), State::Stopped);
+    }
 
     #[test]
     fn a_cancelled_quit_dialog_resumes_what_it_held_back() {

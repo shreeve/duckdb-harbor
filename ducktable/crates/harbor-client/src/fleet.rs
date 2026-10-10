@@ -405,6 +405,14 @@ impl Conn {
         }
         Ok(&self.transport)
     }
+
+    /// Whether this connection's SSH tunnel still runs, or `None` when it
+    /// reaches its server without one. The survey never dials a tunnel, so
+    /// for a tunneled remote this is what says it is up: once the SSH
+    /// process exits, every request on the connection fails.
+    pub fn tunnel_up(&self) -> Option<bool> {
+        self.tunnel.as_ref().map(|tunnel| tunnel.ensure_running().is_ok())
+    }
 }
 
 /// Connect to the configured remote called `name`, and to nothing else: a
