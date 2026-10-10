@@ -296,7 +296,15 @@ mod tests {
     /// passed over: the engine after it still loads.
     #[test]
     fn the_search_keeps_going_past_a_candidate_that_fails() {
-        let Ok(good) = engine() else { return };
+        // Without an engine there is nothing to search for, except where
+        // one is promised: CI, or a library named outright.
+        let good = match engine() {
+            Ok(good) => good,
+            Err(e) if ["HARBOR_LIBDUCKDB", "CI"].iter().any(|v| std::env::var_os(v).is_some()) => {
+                panic!("no engine: {e}")
+            }
+            Err(_) => return,
+        };
         let dir = std::env::temp_dir().join(format!("harbor-search-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let bad = dir.join(LIB_NAME);

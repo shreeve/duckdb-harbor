@@ -55,11 +55,21 @@ fn export_passes_share_a_snapshot_and_failures_rollback() {
         .spawn()
         .unwrap();
     let mut server = Server { child, dir };
-    let mut said = BufReader::new(server.child.stderr.take().unwrap());
-    let mut line = String::new();
+    // Read on a thread of its own, to the end, so a full pipe never stalls
+    // the server, and a server that hangs before it says where it serves
+    // fails the test at the deadline.
+    let said = BufReader::new(server.child.stderr.take().unwrap());
+    let (lines, heard) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in said.lines().map_while(Result::ok) {
+            let _ = lines.send(line);
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
     let address = loop {
-        line.clear();
-        assert!(said.read_line(&mut line).unwrap() > 0, "server exited during startup");
+        let line = heard
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("the server exited, or did not say where it serves in 10s");
         // `harbor X: serving <db> on 127.0.0.1:<port>[ + <socket>] (duckdb …)`
         if let Some((_, serving)) = line.split_once(": serving ")
             && let Some((_, on)) = serving.split_once(" on ")
@@ -68,8 +78,6 @@ fn export_passes_share_a_snapshot_and_failures_rollback() {
             break address.to_string();
         }
     };
-    // Whatever else it says goes nowhere, so a full pipe never stalls it.
-    std::thread::spawn(move || std::io::copy(&mut said, &mut std::io::sink()));
     let target = format!("http://{address}");
     let quiet = |sql: &[&str]| harbor::repl::exec_quiet(&target, sql, &[]).unwrap();
     quiet(&["CREATE TABLE t(x INTEGER)", "INSERT INTO t VALUES (1)"]);

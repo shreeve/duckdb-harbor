@@ -33,7 +33,7 @@ pub fn summon(
     let exe = exe.as_ref();
     let transport = Transport::Unix(sock.to_path_buf());
     let log_path = log_of(sock)?;
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + PATIENCE;
     loop {
         let from = std::fs::metadata(&log_path).map_or(0, |m| m.len());
         let log = std::fs::OpenOptions::new()
@@ -74,8 +74,13 @@ pub fn summon(
                     false => Err(Some(format!("the server did not start ({status}) — {}", log_tail(&log_path)))),
                 };
             }
+            // A start that has not answered by now is reported failed, so it
+            // is stopped too: it must not come up later as a server the user
+            // was told did not start. Its process group is its own.
             if Instant::now() >= deadline {
-                break Err(Some(format!("{} did not come up in 15s — {}", db.display(), log_tail(&log_path))));
+                // SAFETY: a plain kill of the group this child leads.
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGTERM) };
+                break Err(Some(format!("{} did not come up in {}s and was stopped — {}", db.display(), PATIENCE.as_secs(), log_tail(&log_path))));
             }
             std::thread::sleep(Duration::from_millis(100));
         };
@@ -87,6 +92,10 @@ pub fn summon(
         }
     }
 }
+
+/// How long a start has to answer. The unit tests wait for one that never
+/// does, and wait less.
+const PATIENCE: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 15 });
 
 /// Past this a summoned server's log starts again at its next start rather
 /// than growing for as long as the database is used.
@@ -121,11 +130,16 @@ fn lost_lock(log_path: &Path, from: u64) -> bool {
     {
         let _ = file.read_to_string(&mut said);
     }
+    // The engine names the holder by its executable's path, which for a
+    // process already exiting reads as `.` or nothing on Linux: that holder
+    // is on its way out too.
     said.split("Conflicting lock is held in ")
         .nth(1)
         .and_then(|rest| rest.split(" (PID").next())
-        .and_then(|holder| Path::new(holder).file_name())
-        .is_some_and(|program| program.to_string_lossy().starts_with("harbor"))
+        .is_some_and(|holder| {
+            matches!(holder.trim(), "" | ".")
+                || Path::new(holder).file_name().is_some_and(|program| program.to_string_lossy().starts_with("harbor"))
+        })
 }
 
 /// The log's last few lines, inlined: nobody should have to go and find
@@ -208,6 +222,25 @@ mod tests {
     }
 
     #[test]
+    fn a_start_that_never_answers_is_stopped_when_reported_failed() {
+        let dir = std::env::temp_dir().join(format!("hh-mute-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (exe, pid) = (dir.join("harbor"), dir.join("pid"));
+        std::fs::write(&exe, format!("#!/bin/sh\necho $$ > {}\nexec sleep 60\n", pid.display())).unwrap();
+        harbor_common::perms::chmod(&exe, 0o755).unwrap();
+        let err = summon(&exe, Path::new("/data/x.duckdb"), &dir.join("x.sock"), &[], false).unwrap_err();
+        assert!(err.contains("was stopped"), "{err}");
+        let pid: libc::pid_t = std::fs::read_to_string(&pid).unwrap().trim().parse().unwrap();
+        let gone = (0..50).any(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            // SAFETY: signal 0 only asks whether the process exists.
+            unsafe { libc::kill(pid, 0) != 0 }
+        });
+        assert!(gone, "the start that was reported failed is still running");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn only_a_lock_another_harbor_holds_is_waited_for() {
         let path = std::env::temp_dir().join(format!("hh-lock-{}.log", std::process::id()));
         let refusal = |holder: &str| {
@@ -217,6 +250,11 @@ mod tests {
         assert!(lost_lock(&path, 0));
         std::fs::write(&path, refusal("/opt/homebrew/bin/duckdb")).unwrap();
         assert!(!lost_lock(&path, 0));
+        // A holder already exiting has no executable left to name.
+        for leaving in [".", ""] {
+            std::fs::write(&path, refusal(leaving)).unwrap();
+            assert!(lost_lock(&path, 0), "{leaving:?}");
+        }
         // Only what this start wrote is read, not an earlier start's refusal.
         let old = refusal("/usr/local/bin/harbor");
         std::fs::write(&path, format!("{old}harbor: serving x\n")).unwrap();

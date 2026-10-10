@@ -13,3 +13,6 @@ wire = { path = "../wire" }
 harbor-common = { path = "../common", default-features = false }
 serde = "1"
 serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

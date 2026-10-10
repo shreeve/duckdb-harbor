@@ -2910,6 +2910,7 @@ name = "harbor-http"
 version = "0.44.2"
 dependencies = [
  "harbor-common",
+ "libc",
  "serde",
  "serde_json",
  "wire",

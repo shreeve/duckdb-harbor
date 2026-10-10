@@ -223,6 +223,7 @@ FENCE_FRAGMENTS = [
     "--", "-- c", "/*", "*/", "/* c", "c */", "/*/*", "*/*/", "'", "''", "'a",
     "e'", "E'", "\\", "\\'", '"', '""', '"a', "$", "$$", "$t$", "$1$", "$_$",
     "a", "1", "_", "a$b", "$b$", " ", "\t", "\n", "\r", "\r\n", "\x0b", "\x0c",
+    "1_0", "1e5", ".5", " ", "　",
     ";", "x'41'", "b'1'", "u&'a'", "LIKE", "ESCAPE", "date", "time", "\u00e9", "\u3042",
     "SELECT", "1", "AS", "(", ")", ",",
 ]
@@ -238,8 +239,9 @@ def fuzz_statement_fence(args, rng, n, failures):
     still run behind an answer.
 
     The oracle is a side effect, never an opinion: a canary table that only a
-    second statement can drop. Harbor answering 200 with the canary gone is a
-    bypass. Over-rejection is counted but is not a failure — refusing a
+    second statement can drop. The canary gone is a bypass, whatever harbor
+    answered: a refusal that came after the second statement ran is no
+    fence. Over-rejection is counted but is not a failure — refusing a
     statement someone could have written differently is the safe direction.
     """
     bypasses = 0
@@ -251,9 +253,9 @@ def fuzz_statement_fence(args, rng, n, failures):
         _, rows, _ = request(args.host, args.port,
                              "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'canary'")
         alive = bool(rows) and rows[0][0] == 1
-        if status == 200 and not alive:
+        if not alive:
             bypasses += 1
-            failures.append(("fence", "accepted, but the engine ran a second statement: %r" % probe))
+            failures.append(("fence", "answered %s, and the engine ran a second statement: %r" % (status, probe)))
             if bypasses > 20:
                 return
 

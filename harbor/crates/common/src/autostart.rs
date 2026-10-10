@@ -59,7 +59,16 @@ struct Item {
 impl Item {
     /// Is this the item for the canonical file `canon` under `home`?
     fn is_for(&self, canon: &Path, home: Option<&Path>) -> bool {
-        self.home.as_deref() == home && paths::canonical_db(&self.db).is_ok_and(|c| c == canon)
+        self.under(home) && paths::canonical_db(&self.db).is_ok_and(|c| c == canon)
+    }
+
+    /// Does it carry `home`, however either is spelled (`/tmp/h` is
+    /// `/private/tmp/h` on macOS)?
+    fn under(&self, home: Option<&Path>) -> bool {
+        match (self.home.as_deref(), home) {
+            (Some(a), Some(b)) => a == b || a.canonicalize().is_ok_and(|a| b.canonicalize().is_ok_and(|b| a == b)),
+            (a, b) => a == b,
+        }
     }
 }
 
@@ -79,7 +88,14 @@ pub fn keeps(db: &Path, name: &str) -> bool {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn installed(name: &str) -> bool {
     let Ok(home) = paths::harbor_home() else { return false };
-    item(name).is_ok_and(|i| i.is_some_and(|i| i.home == home))
+    item(name).is_ok_and(|i| i.is_some_and(|i| i.under(home.as_deref())))
+}
+
+/// Refuse, before anything is attached, a name whose login item runs some
+/// other database: `autostart` would attach this one and then refuse.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn claimable(db: &Path, name: &str) -> Result<(), String> {
+    claim(&paths::canonical_db(db)?, name)
 }
 
 /// The item filed under `name`, read back; `None` when there is none, and an
@@ -497,16 +513,32 @@ fn item_body(name: &str, exe: &str, db: &str, log: &str, env: &[(String, String)
     )
 }
 
-/// What a unit runs: the second word of its ExecStart, and the HARBOR_HOME
-/// among its Environment assignments, each read back through the escapes
-/// `item_body` writes and the bare words a unit edited by hand may hold.
+/// What a unit runs: the word before the `start` its ExecStart ends with,
+/// and the HARBOR_HOME among its Environment assignments, each read back
+/// through the escapes `item_body` writes and the bare words a unit edited
+/// by hand may hold. The database is the word before `start` wherever the
+/// command begins, so a unit that runs harbor through a wrapper (`env X=1
+/// harbor …`) is still read, and a database given by its config name is
+/// that entry's file.
 #[cfg(target_os = "linux")]
 fn parse_item(text: &str) -> Option<Item> {
     let (mut db, mut home) = (None, None);
     for line in text.lines().map(str::trim) {
         if let Some(command) = line.strip_prefix("ExecStart=") {
             let command = command.trim_start_matches(['-', '@', ':', '+', '!']);
-            db = words(command).into_iter().nth(1).map(|w| w.replace("$$", "$"));
+            let words = words(command);
+            db = words
+                .iter()
+                .rposition(|w| w == "start")
+                .and_then(|at| words.get(at.checked_sub(1)?))
+                .map(|w| w.replace("$$", "$"))
+                .map(|w| match paths::looks_like_path(&w) {
+                    true => w,
+                    false => crate::config::load()
+                        .ok()
+                        .and_then(|cfg| cfg.connection.get(&paths::normalize(&w).ok()?)?.database())
+                        .map_or(w, |p| p.display().to_string()),
+                });
         } else if let Some(assignments) = line.strip_prefix("Environment=") {
             for word in words(assignments) {
                 if let Some(v) = word.strip_prefix("HARBOR_HOME=") {
@@ -551,6 +583,11 @@ fn words(s: &str) -> Vec<String> {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn arm(_db: &Path, _name: &str) -> Result<(), String> {
+    Err("autostart is only supported on macOS and Linux".into())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn claimable(_db: &Path, _name: &str) -> Result<(), String> {
     Err("autostart is only supported on macOS and Linux".into())
 }
 
@@ -723,6 +760,9 @@ mod tests {
             parse_item(text),
             Some(Item { db: "/home/s/src/medlabs/api/db/medlabs.duckdb".into(), home: Some("/srv/h".into()) })
         );
+        // Through a wrapper, the database is still the word before `start`.
+        let wrapped = "[Service]\nExecStart=/usr/bin/env RUST_LOG=1 /opt/harbor \"/d/m.duckdb\" start\n";
+        assert_eq!(parse_item(wrapped), Some(Item { db: "/d/m.duckdb".into(), home: None }));
         assert_eq!(parse_item("[Service]\nType=simple\n"), None);
     }
 
@@ -745,6 +785,9 @@ mod tests {
         assert!(!real.is_for(&root.join("a/medlabs.duckdb"), Some(Path::new("/tmp/hr"))));
         let scratch = Item { db: root.join("b/medlabs.duckdb"), home: Some("/tmp/hr".into()) };
         assert!(scratch.is_for(&root.join("b/medlabs.duckdb"), Some(Path::new("/tmp/hr"))));
+        // A home is the same home however it is spelled.
+        let spelled = Item { db: root.join("b/medlabs.duckdb"), home: Some(root.join("a/../b")) };
+        assert!(spelled.is_for(&root.join("b/medlabs.duckdb"), Some(&root.join("b"))));
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

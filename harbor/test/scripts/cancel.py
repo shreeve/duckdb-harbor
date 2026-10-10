@@ -4,7 +4,7 @@
 Runs its own server, because most of what is below needs a query that takes
 seconds and a pool small enough to saturate on purpose.
 
-  test/scripts/cancel.py [--db PATH] [--keep]
+  test/scripts/cancel.py [--keep]
 
 A statement inside DuckDB does not come back until it is done, so a runaway
 query is not a slow request — it is a connection permanently out of service.
@@ -235,14 +235,11 @@ def stop_server(proc):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db")
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
 
     work = tempfile.mkdtemp(prefix="harbor-cancel-")
     db = os.path.join(work, "cancel.duckdb")
-    if args.db and os.path.exists(args.db):
-        shutil.copy(args.db, db)
 
     # Eight connections: four workers, four leases. Small enough that the
     # saturation test can block every worker without running eight slow

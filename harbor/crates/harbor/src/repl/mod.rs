@@ -57,8 +57,10 @@ enum Outcome {
     Done,
     Cancelled,
     Failed,
-    /// The output's reader has gone (`harbor … | head`): nothing after this
-    /// statement has anyone to answer to, so nothing after it runs.
+    /// A write met a closed pipe (`harbor … | head`): its reader has gone,
+    /// so nothing after this statement runs. Output small enough to land in
+    /// the pipe before the reader leaves meets no closed pipe, and the run
+    /// goes on; only a write that fails can end it.
     Closed,
 }
 
@@ -285,15 +287,8 @@ pub fn deref_db(target: &str) -> Result<PathBuf, String> {
 /// when the fleet resolved the target (so `harbor 1` prompts `ducks>`, not
 /// `1>`), the target's own stem otherwise.
 fn resolve(target: &str, spawn: &[String]) -> Result<(Transport, String), String> {
-    // A scheme is case-insensitive: `HTTP://host` is a URL, never a file.
-    let target = &match target.split_once("://") {
-        Some((scheme, rest)) if ["http", "https"].iter().any(|s| scheme.eq_ignore_ascii_case(s)) => {
-            format!("{}://{rest}", scheme.to_ascii_lowercase())
-        }
-        _ => target.to_string(),
-    };
-    if target.starts_with("http://") || target.starts_with("https://") {
-        return Ok((url_transport(target)?, prompt_name(target)));
+    if let Some(addr) = url_server(target) {
+        return Ok((Transport::Tcp(addr?), prompt_name(target)));
     }
     if !harbor_common::looks_like_path(target) {
         // A bare word reaches what is listed — running, or attached — never
@@ -438,7 +433,17 @@ pub fn shutdown(_db: &Path) -> Result<bool, String> {
     Err("a TCP server is stopped by its own SIGTERM, not over a socket".into())
 }
 
-fn url_transport(url: &str) -> Result<Transport, String> {
+/// The `host:port` a URL names, or `None` when `target` is no URL. A scheme
+/// is case-insensitive: `HTTP://host` is a URL, never a file.
+pub fn url_server(target: &str) -> Option<Result<String, String>> {
+    let (scheme, rest) = target.split_once("://")?;
+    ["http", "https"]
+        .iter()
+        .any(|s| scheme.eq_ignore_ascii_case(s))
+        .then(|| url_addr(&format!("{}://{rest}", scheme.to_ascii_lowercase())))
+}
+
+fn url_addr(url: &str) -> Result<String, String> {
     if let Some(rest) = url.strip_prefix("http://") {
         let (addr, extra) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
         if !extra.is_empty() {
@@ -446,11 +451,10 @@ fn url_transport(url: &str) -> Result<Transport, String> {
         }
         // A port follows the host; an IPv6 host is bracketed, so its own
         // colons are inside the brackets.
-        let addr = match addr.rsplit_once(':') {
+        return Ok(match addr.rsplit_once(':') {
             Some((_, port)) if !port.contains(']') => addr.to_string(),
             _ => format!("{addr}:9495"),
-        };
-        return Ok(Transport::Tcp(addr));
+        });
     }
     if url.starts_with("https://") {
         return Err(
@@ -1084,9 +1088,9 @@ fn run_sql(
     (err("stream ended without an end event"), None)
 }
 
-/// What a write of the output came to. A closed pipe (`harbor … | head`) is
-/// the Unix goodbye, not an error: the reader has what it wanted, and the run
-/// ends there.
+/// What a write of the output came to. A write that meets a closed pipe
+/// (`harbor … | head`) is the Unix goodbye, not an error: the reader has what
+/// it wanted, and the run ends there.
 fn written(result: std::io::Result<()>) -> Outcome {
     match result {
         Ok(()) => Outcome::Done,
@@ -1141,7 +1145,14 @@ fn clear_spinner() {
 
 /// A statement the server reports cancelled: this client's own interrupt, or
 /// a stop it did not ask for, which is a failure with its likely causes named.
+/// Set by a caller about to stop the server under its own statement, as a
+/// restore's Ctrl-C does: that statement's cancel is the caller's to tell.
+pub static STOPPING: AtomicBool = AtomicBool::new(false);
+
 fn stopped(interrupted: &AtomicBool) -> Outcome {
+    if STOPPING.load(Ordering::Relaxed) {
+        return Outcome::Cancelled;
+    }
     if interrupted.load(Ordering::Relaxed) {
         eprintln!("Interrupted.");
         return Outcome::Cancelled;
@@ -1162,7 +1173,7 @@ fn fail(msg: &str) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Transport, brief, http, pick, resolve, unreached, url_transport};
+    use super::{Transport, brief, http, pick, resolve, unreached, url_server};
     use crate::transaction_effect;
 
     #[test]
@@ -1206,12 +1217,10 @@ mod tests {
 
     #[test]
     fn a_url_without_a_port_gets_harbors_own() {
-        let tcp = |url: &str| url_transport(url).map(|t| match t {
-            Transport::Tcp(addr) => addr,
-            #[cfg(unix)]
-            Transport::Unix(_) => unreachable!(),
-        });
+        let tcp = |url: &str| url_server(url).unwrap();
         assert_eq!(tcp("http://db.lan").unwrap(), "db.lan:9495");
+        assert_eq!(tcp("HTTP://db.lan").unwrap(), "db.lan:9495");
+        assert!(url_server("./db.lan").is_none());
         assert_eq!(tcp("http://db.lan:8080").unwrap(), "db.lan:8080");
         assert_eq!(tcp("http://[::1]").unwrap(), "[::1]:9495");
         assert_eq!(tcp("http://[::1]:8080/").unwrap(), "[::1]:8080");

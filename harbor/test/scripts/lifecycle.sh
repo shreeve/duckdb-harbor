@@ -214,6 +214,18 @@ printf '.mode csv\nSELECT 2 AS two;\n' >"$work/a script.sql"
 check ".read runs a file's dot commands too, from a path with a space" 0 "two
 2" \
   bash -c "printf '.read %s\n' '$work/a script.sql' | '$harbor' '$work/x.duckdb'"
+# A dot command that fails ends a script, as a statement that fails does.
+printf 'SELECT * FROM no_such_table;\n' >"$work/bad.sql"
+check "a .read whose statement fails fails the script" 1 "no_such_table" \
+  bash -c "printf '.read %s\nCREATE TABLE after_read(x INT);\n' '$work/bad.sql' | '$harbor' '$work/x.duckdb'"
+check "and nothing after it runs" 0 "0" \
+  "$harbor" "$work/x.duckdb" --mode csv -c "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'after_read'"
+for dot in ".read $work/no-such-file.sql" ".mdoe csv" ".mode cvs"; do
+  check "$dot fails a script" 1 "harbor:" bash -c "printf '%s\nSELECT 1;\n' '$dot' | '$harbor' '$work/x.duckdb'"
+done
+printf '.read %s\n' "$work/self.sql" >"$work/self.sql"
+check "a file that reads itself ends, and says why" 1 "more than 32 deep" \
+  bash -c "printf '.read %s\n' '$work/self.sql' | '$harbor' '$work/x.duckdb'"
 check "an empty -c is refused" 1 "no SQL given" "$harbor" "$work/x.duckdb" -c ""
 check "as is one that is only a comment" 1 "no SQL given" "$harbor" "$work/x.duckdb" -c "-- nothing"
 check "a second -c is refused, not dropped" 1 "-c is given once" \
@@ -266,9 +278,9 @@ sys.exit(0 if "mode: csv" in out and mode == 0o700 else 1)
 PY
 (( history == 0 )) && ok "the prompt's history lives in a directory only its user can read" \
                    || bad "the history directory stayed open, or the prompt misbehaved (see $work/history.log)"
-# A terminal over a slow line answers the background-color query late. Its
-# answer must not reach the prompt as typed text: the REPL waits for the
-# answer to DA1, which a terminal sends after it, however late that is.
+# A terminal over a slow line answers the background-color query slowly. Its
+# answer must not reach the prompt as typed text: once a terminal has begun
+# to answer, the REPL waits for the answer to DA1, which it sends last.
 late=0
 HARBOR_HOME="$work/home" python3 - "$harbor" <<'PY' >"$work/late.log" 2>&1 || late=$?
 import os, pty, select, sys, time
@@ -278,14 +290,14 @@ if pid == 0:
     os.environ["TERM"] = "xterm"
     os.execv(harbor, [harbor, "http://127.0.0.1:1"])
     os._exit(1)
-buf, due = b"", None
+buf, due = b"", []
 def drain(seconds):
     global buf, due
     end = time.time() + seconds
     while time.time() < end:
-        if due and time.time() >= due:
-            os.write(fd, b"\x1b]11;rgb:1c1c/1c1c/1c1c\x07\x1b[?62;22c"); due = None
-        if not select.select([fd], [], [], 0.05)[0]:
+        if due and time.time() >= due[0][0]:
+            os.write(fd, due.pop(0)[1])
+        if not select.select([fd], [], [], 0.02)[0]:
             continue
         try:
             chunk = os.read(fd, 65536)
@@ -294,7 +306,9 @@ def drain(seconds):
         if not chunk:
             return
         buf += chunk
-        if b"\x1b]11;?" in chunk: due = time.time() + 0.4
+        if b"\x1b]11;?" in chunk:
+            now = time.time()
+            due = [(now + 0.05, b"\x1b]11;rgb:1c1c/1c1c/1c1c"), (now + 0.4, b"\x07\x1b[?62;22c")]
         if b"\x1b[6n" in chunk:   os.write(fd, b"\x1b[1;1R")
 drain(3)
 os.write(fd, b".mode\r"); drain(1.5)
@@ -306,8 +320,45 @@ out = buf.decode("utf8", "replace")
 print(out[-2000:])
 sys.exit(0 if "mode: duckbox" in out and "rgb:" not in out.split("\x1b]11;?")[-1] else 1)
 PY
-(( late == 0 )) && ok "a late answer to the background query never reaches the prompt" \
-                || bad "a late terminal answer was typed into the prompt (see $work/late.log)"
+(( late == 0 )) && ok "a slow answer to the background query never reaches the prompt" \
+                || bad "a slow terminal answer was typed into the prompt (see $work/late.log)"
+# A terminal that answers neither query (Emacs's shell, a serial console)
+# costs the short wait for a first byte at every start, not the long one.
+silent=0
+HARBOR_HOME="$work/home" python3 - "$harbor" <<'PY' >"$work/silent.log" 2>&1 || silent=$?
+import os, pty, select, sys, time
+harbor = sys.argv[1]
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm"
+    os.execv(harbor, [harbor, "http://127.0.0.1:1"])
+    os._exit(1)
+asked = waited = None
+end = time.time() + 5
+while time.time() < end and waited is None:
+    if not select.select([fd], [], [], 0.01)[0]:
+        continue
+    try:
+        chunk = os.read(fd, 65536)
+    except OSError:
+        break
+    now = time.time()
+    if asked is not None and chunk:
+        waited = now - asked
+    if b"\x1b]11;?" in chunk:
+        asked = now
+    if b"\x1b[6n" in chunk:
+        os.write(fd, b"\x1b[1;1R")
+os.write(fd, b".quit\r")
+time.sleep(0.5)
+for close in (lambda: os.close(fd), lambda: os.waitpid(pid, 0)):
+    try: close()
+    except Exception: pass
+print(f"waited {waited}")
+sys.exit(0 if waited is not None and waited < 0.5 else 1)
+PY
+(( silent == 0 )) && ok "a terminal that answers nothing costs a start no more than a moment" \
+                  || bad "a silent terminal held the start (see $work/silent.log)"
 
 echo "— the server is everyone's: it lives while anyone is connected"
 sock=$(live_sock)
@@ -485,7 +536,7 @@ printf '[connection.typo]\npath = "%s/typo.duckdb"\npth = 1\n' "$work" > "$work/
 chmod 600 "$work/config.toml"
 check "a start refuses, naming the file and the key" 1 "config.toml is not valid" \
   "$harbor" "$work/typo.duckdb" start
-check "and so does the server a client summons" 1 "pth" \
+check "and so does the server a client summons, saying where on one line" 1 "config.toml is not valid: line 3, column 1: unknown field \`pth\`" \
   "$harbor" "$work/typo.duckdb" -c "SELECT 1"
 printf '[defaults]\nmode = "csv"\n' > "$work/config.toml"
 check "a [defaults] section is refused with the fix" 1 "delete that section" \
@@ -498,15 +549,47 @@ mv "$work/config.good" "$work/config.toml"
 
 echo "— a restart brings a server back as it was"
 wait_gone
+mkdir -p "$work/from" "$work/elsewhere"
 check "a restart with options brings one up in the background" 0 "serving" \
-  "$harbor" "$work/again.duckdb" restart --port 9532 --sealed
+  "$harbor" "$work/again.duckdb" restart --port 9532 --sealed --init "SELECT 'hunter2'"
 check "a bare restart" 0 "stopped" "$harbor" "$work/again.duckdb" restart
 check "keeps the port it was started with" 0 "9" \
   "$harbor" http://127.0.0.1:9532 --mode csv -c "SELECT 9 AS nine"
 check "and stays sealed" 0 "false" \
   "$harbor" "$work/again.duckdb" --mode csv -c "SELECT current_setting('enable_external_access')"
-check "a server is stopped by its URL" 0 "stopped" "$harbor" http://127.0.0.1:9532 stop
-[[ -z $(live_sock) ]] && ok "drained, with its socket gone" || bad "the URL stop left a server: $(live_sock)"
+( cd "$work/from" && "$harbor" "$work/cwd.duckdb" restart --init "ATTACH 'beside.duckdb' AS beside" >/dev/null 2>&1 )
+( cd "$work/elsewhere" && "$harbor" "$work/cwd.duckdb" restart >/dev/null 2>&1 )
+check "a restart reads a relative path from where the server was started" 0 "$work_real/from/beside.duckdb" \
+  "$harbor" "$work/cwd.duckdb" --mode csv -c "SELECT path FROM duckdb_databases() WHERE database_name = 'beside'"
+"$harbor" "$work/cwd.duckdb" stop >/dev/null 2>&1
+# The options can hold a secret, and /info answers whoever reaches the port.
+info=$(curl -s --max-time 2 http://127.0.0.1:9532/info)
+[[ $info == *'"pid"'* && $info != *hunter2* && $info != *'"args"'* ]] \
+  && ok "/info over TCP publishes no start options" || bad "/info shows the start options: $info"
+args_file=$(ls "$work"/runtime/*.args 2>/dev/null | head -1)
+mode=$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$args_file" 2>/dev/null)
+[[ $mode == 0o600 && $(cat "$args_file") == *hunter2* ]] && ok "they are kept beside the socket, for its user alone" \
+                                                        || bad "the options are not kept privately: ${args_file:-none} $mode"
+# A restart that could not start again stops nothing.
+cp "$work/config.toml" "$work/config.good"
+printf '[connection.typo]\npath = "%s/typo.duckdb"\npth = 1\n' "$work" > "$work/config.toml"
+check "a restart under a config that will not load refuses, naming the line" 1 "line 3, column 1" \
+  "$harbor" "$work/again.duckdb" restart
+check "and stops nothing" 0 "9" "$harbor" http://127.0.0.1:9532 --mode csv -c "SELECT 9 AS nine"
+mv "$work/config.good" "$work/config.toml"
+check "nor does one whose typed option will not parse" 1 "was not stopped" \
+  "$harbor" "$work/again.duckdb" restart --port nine
+# A server that kept no record of its options, as one started by an older
+# harbor, is not restarted on a guess: it would come back open, or without
+# its port.
+mv "$args_file" "$work/args.kept"
+check "a server with no record of its options is refused, its port named" 1 "--port 9532" \
+  "$harbor" "$work/again.duckdb" restart
+check "and left running" 0 "9" "$harbor" http://127.0.0.1:9532 --mode csv -c "SELECT 9 AS nine"
+mv "$work/args.kept" "$args_file"
+check "a server is stopped by its URL, read as the client reads one" 0 "stopped" "$harbor" HTTP://127.0.0.1:9532/ stop
+[[ -z $(live_sock) && -z $(ls "$work"/runtime/*.args 2>/dev/null) ]] && ok "drained, with its socket and its options gone" \
+                                                                   || bad "the URL stop left a server: $(ls "$work"/runtime)"
 "$harbor" "$work/again.duckdb" detach restart >/dev/null 2>&1
 "$harbor" "$work/again.duckdb" restart >/dev/null 2>&1
 eph=$(curl -s --max-time 2 --unix-socket "$(live_sock)" http://harbor/info \
@@ -523,6 +606,16 @@ check "detaching another file with the same stem" 0 "was not attached" \
 grep -q "a/data.duckdb" "$work/config.toml" && ok "leaves the attached one's entry" \
                                           || bad "it removed a/data.duckdb's entry"
 check "detaching the file itself" 0 "detached data" "$harbor" "$work/a/data.duckdb" detach
+# A login item filed under a name another file's item holds is refused
+# before the attach `autostart` implies, which would otherwise stay. The
+# item is a stand-in in a scratch home, read and never loaded.
+mkdir -p "$work/fakehome/Library/LaunchAgents" "$work/xdg/systemd/user"
+printf '<plist><dict><key>ProgramArguments</key><array><string>/x/harbor</string><string>%s/elsewhere/kx.duckdb</string><string>start</string></array></dict></plist>\n' \
+  "$work" >"$work/fakehome/Library/LaunchAgents/harbor.kx.plist"
+printf '[Service]\nExecStart=/x/harbor %s/elsewhere/kx.duckdb start\n' "$work" >"$work/xdg/systemd/user/harbor-kx.service"
+check "autostart under another file's login item is refused" 1 "frees the name" \
+  env HOME="$work/fakehome" XDG_CONFIG_HOME="$work/xdg" "$harbor" "$work/kx.duckdb" autostart
+grep -q '^\[connection\.kx\]' "$work/config.toml" && bad "and its attach stayed" || ok "and attaches nothing"
 check "attach refuses a name the CLI reads as a verb" 1 "reads as a verb" \
   "$harbor" "$work/start.duckdb" attach
 check "a stem past the name law still opens" 0 "42" \
@@ -552,6 +645,9 @@ check "backup writes a directory of tab-separated files" 0 "backed up 1 table" \
   || bad "the backup directory is missing a file: $(ls "$work/bk.out" 2>&1)"
 check "and refuses to write into a directory that is there" 1 "already exists" \
   "$harbor" "$work/bk.duckdb" backup "$work/bk.out"
+check "a directory named with a trailing slash is that directory" 0 "backed up 1 table" \
+  "$harbor" "$work/bk.duckdb" backup "$work/slash.out/"
+[[ -f $work/slash.out/load.sql ]] && ok "and it holds the backup" || bad "a trailing slash: $(ls -a "$work/slash.out" 2>&1)"
 # Each COPY names its file and nothing more. An absolute path would nail the
 # directory to the machine that wrote it, which is the opposite of the point.
 grep -q "FROM 't.csv'" "$work/bk.out/load.sql" \

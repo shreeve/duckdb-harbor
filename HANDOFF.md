@@ -113,8 +113,9 @@ Facts that shape everything:
   `harbor <db> start` is an owned server that runs until `stop`.
 - **Paths.** `~/.config/harbor/config.toml` is desired state (what is
   attached, per-connection options); `~/.local/state/harbor/runtime/` holds
-  each server's `.sock` and `.log`, named `<basename>-<fnv1a32(path)>`.
-  `harbor` alone lists what is running and attached.
+  each server's `.sock` and the `.args` a restart reads, named
+  `<basename>-<fnv1a32(path)>`, and `runtime/log/` the logs, a login item's
+  named for its database. `harbor` alone lists what is running and attached.
 - **Wire.** `POST /sql` takes one statement and streams NDJSON: a schema
   line per column, then rows. A `VARIANT` cell crosses as JSON text with
   `"encoding":"json"`; a `JSON` column by its type. Bodies cap at 8 MiB.

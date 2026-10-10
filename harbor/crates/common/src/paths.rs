@@ -5,10 +5,11 @@
 //! ```text
 //! ~/.config/harbor/config.toml    desired state — you edit this
 //! ~/.local/state/harbor/          actual state — harbor writes this
-//!     runtime/<base>-<hash>.sock  a server's listening socket
-//!     runtime/<base>-<hash>.log   the log of a server started by hand or on use
-//!     runtime/log/<name>.log      the log of a server its login item runs
-//!     history                     the repl's command history
+//!     runtime/<base>-<hash>.sock      a server's listening socket
+//!     runtime/<base>-<hash>.args      the options it was started with, for a restart
+//!     runtime/log/<base>-<hash>.log   the log of a server started by hand or on use
+//!     runtime/log/<name>.log          the log of a server its login item runs
+//!     history                         the repl's command history
 //! ```
 //!
 //! Runtime state does not belong under `~/.config/harbor/`: a config
@@ -106,12 +107,6 @@ pub fn runtime_dir() -> Result<PathBuf, String> {
     Ok(state_root()?.join("runtime"))
 }
 
-/// A socket named for a berth rather than derived from its file, which
-/// DuckTable still dials as a fallback.
-pub fn sock_file(runtime: &Path, name: &str) -> PathBuf {
-    runtime.join(format!("{name}.sock"))
-}
-
 /// The one true socket for a database file — identity derived, never
 /// registered. The canonical path (see [`canonical_db`]) is hashed so every
 /// spelling of the same file lands on the same server, and two `data.duckdb`
@@ -207,7 +202,8 @@ pub fn display_path(path: &Path) -> String {
     text
 }
 
-/// The log a login item's server writes.
+/// A server's log: a login item's, named for its database, or a server's
+/// started by hand or on use, named for its socket.
 pub fn log_file(runtime: &Path, name: &str) -> PathBuf {
     runtime.join("log").join(format!("{name}.log"))
 }

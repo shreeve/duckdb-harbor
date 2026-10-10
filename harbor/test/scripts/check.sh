@@ -230,7 +230,7 @@ run sessions "$here/test/scripts/sessions.py"
 
 # So does cancel.py, and for a sharper reason: it saturates the worker pool on
 # purpose, which no suite may do to a server the other suites are sharing.
-run cancel "$here/test/scripts/cancel.py" --db "$db"
+run cancel "$here/test/scripts/cancel.py"
 
 # ---------------------------------------------------------------------------
 

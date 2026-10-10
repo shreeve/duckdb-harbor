@@ -290,7 +290,7 @@ fn request_inner(
     let (mut stream, host): (Box<dyn Stream>, String) = match transport {
         #[cfg(unix)]
         Transport::Unix(p) => {
-            let s = UnixStream::connect(p).map_err(not_sent)?;
+            let s = connect_unix(p, connect_timeout).map_err(not_sent)?;
             s.set_read_timeout(timeout).map_err(not_sent)?;
             s.set_write_timeout(write_timeout).map_err(not_sent)?;
             (Box::new(s), "harbor".to_string())
@@ -363,7 +363,9 @@ fn request_inner(
     let mut content_length: Option<u64> = None;
     for count in 0.. {
         let mut line = String::new();
-        read_line(&mut reader, &mut line)?;
+        if read_line(&mut reader, &mut line)? == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the answer ended inside its head"));
+        }
         let line = line.trim_end();
         if line.is_empty() {
             break;
@@ -391,9 +393,83 @@ fn request_inner(
     Ok(Response { status, body })
 }
 
+/// A unix connect that waits at most `patience`. A server that has stopped
+/// accepting fills its listen queue, and Linux holds a blocking connect to it
+/// until a place frees, which for a wedged server is never; it gives up at
+/// the socket's send timeout instead, so that is set first. macOS refuses
+/// such a connect at once.
+#[cfg(unix)]
+fn connect_unix(path: &std::path::Path, patience: Option<Duration>) -> io::Result<UnixStream> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let Some(patience) = patience else { return UnixStream::connect(path) };
+    // SAFETY: an all-zero sockaddr_un is a valid, empty address.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() >= addr.sun_path.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "a unix socket path holds at most 103 bytes"));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (to, from) in addr.sun_path.iter_mut().zip(bytes) {
+        *to = *from as libc::c_char;
+    }
+    // SAFETY: socket returns a descriptor of its own or -1, and once checked
+    // the stream owns it, closing it on every way out.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    // SAFETY: fcntl and connect on the descriptor the stream owns, with an
+    // address that outlives the call.
+    unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    stream.set_write_timeout(Some(patience))?;
+    let len = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+    if unsafe { libc::connect(stream.as_raw_fd(), (&raw const addr).cast(), len) } == 0 {
+        return Ok(stream);
+    }
+    match io::Error::last_os_error() {
+        e if e.kind() == io::ErrorKind::WouldBlock => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{} did not take the connection in {patience:?}", path.display()),
+        )),
+        e => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A listener that never accepts fills its queue, and a connect behind
+    /// it costs its patience, then fails having sent nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_that_never_accepts_costs_its_patience() {
+        let path = PathBuf::from(format!("/tmp/hh-wedged-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let patience = Some(Duration::from_millis(200));
+        let mut queued = Vec::new();
+        while let Ok(stream) = connect_unix(&path, patience) {
+            queued.push(stream);
+            assert!(queued.len() < 100_000, "the queue never filled");
+        }
+        let began = std::time::Instant::now();
+        let e = request(&Transport::Unix(path.clone()), &wire::endpoint::READY, None, patience).err().unwrap();
+        assert!(was_not_sent(&e), "{e}");
+        assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
+        drop((listener, queued));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_head_cut_off_is_no_answer() {
+        let (transport, server) = one_shot("HTTP/1.1 200 OK\r\n");
+        let e = request(&transport, &wire::endpoint::READY, None, None).err().unwrap();
+        assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof, "{e}");
+        server.join().unwrap();
+    }
 
     /// Read one request whole, and answer it with `reply` (or hang up when
     /// it is empty). Returns the request's first line.

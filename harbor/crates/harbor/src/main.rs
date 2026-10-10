@@ -20,7 +20,7 @@
 //! Unix sockets; TCP, when `--port` adds it, binds IPv4 loopback only. Remote
 //! reach and policy belong to an edge proxy.
 
-use std::io::{IsTerminal, Read, Write};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -91,9 +91,10 @@ fn main() -> ExitCode {
 fn dispatch(db: &str, verb_words: &[String], flags: Vec<String>) -> Result<(), String> {
     // A URL names a server, wherever it runs, and no file this machine can
     // act on. Stopping it is the one verb that needs nothing but the server.
-    if db.starts_with("http://") || db.starts_with("https://") {
+    // It is read as the client reads one: `HTTP://[::1]` is `[::1]:9495`.
+    if let Some(addr) = harbor::repl::url_server(db) {
         return match (verb_words, flags.is_empty()) {
-            ([stop], true) if stop == "stop" => stop_url(db),
+            ([stop], true) if stop == "stop" => stop_url(db, &addr?),
             _ => Err(format!(
                 "{db} names a server, not a database file: `harbor {db} stop` is the verb it takes — \
                  the rest need the file, on the machine that holds it"
@@ -152,6 +153,11 @@ fn wants_help(args: &[String]) -> bool {
 /// what a start's lifetime keys off — then the login item, then the running
 /// axis.
 fn enact(db: &Path, plan: &Plan, flags: Vec<String>) -> Result<(), String> {
+    // A login item under a name another database's item holds is refused
+    // before the attach `autostart` implies, which would otherwise stay.
+    if plan.autostart == Some(true) {
+        autostart::claimable(db, &membership::name_for(db)?)?;
+    }
     let filed = match plan.attach {
         Some(true) => {
             let (name, how) = membership::attach(db)?;
@@ -277,42 +283,112 @@ fn stop(db: &Path) -> Result<bool, String> {
 
 /// Stop and start again, as it was. A database with a login item comes back
 /// under it, the manager re-reading config.toml. Any other comes back in the
-/// background with the options the running server was started with and the
-/// same lifetime — what its `/info` says — unless options are typed here or
-/// `attach`/`detach` says otherwise. `--foreground` is how a server ran, not
-/// what it is, so it is not carried over.
+/// background with the options the running server was started with, from
+/// the directory it was started in, and with the same lifetime, unless
+/// options are typed here or `attach`/`detach` says otherwise. Everything
+/// the start reads is read first: a restart that cannot start stops nothing.
 fn restart(db: &Path, name: &str, flags: Vec<String>, plan: &Plan) -> Result<(), String> {
-    let item = autostart::keeps(db, name);
-    if item && !flags.is_empty() {
-        return Err(format!(
-            "{name} starts at login from config.toml, not flags — put {} under [connection.{name}]",
-            flags.join(" ")
-        ));
-    }
-    let was = running_info(db);
+    let back = comeback(db, name, flags, plan.attach)?;
     stop(db)?;
-    if item {
+    if back.item {
         autostart::unload(name);
         autostart::install(db, name, false)?;
         let sock = wait_serving(db, name)?;
         eprintln!("harbor: {name} restarted, serving on {} — it will start at every login", sock.display());
         return Ok(());
     }
-    let ephemeral = match plan.attach {
+    if let Some(dir) = &back.cwd
+        && let Err(e) = std::env::set_current_dir(dir)
+    {
+        eprintln!("harbor: it was started in {}, which is gone ({e}) — starting it from here", dir.display());
+    }
+    start(back.canon, back.flags, back.ephemeral, true)
+}
+
+/// What a restart brings back, settled while the server still runs.
+pub(crate) struct Comeback {
+    canon: PathBuf,
+    /// Under its login item, which reads config.toml itself.
+    item: bool,
+    ephemeral: bool,
+    flags: Vec<String>,
+    /// The directory it was started in, so a relative path in its options
+    /// names the same file.
+    cwd: Option<PathBuf>,
+}
+
+/// Settle a restart before anything stops: the options, and a config and
+/// options that a start takes. A refusal leaves the server as it is, and
+/// says so. A server started by a harbor that records no options cannot be
+/// brought back as it was, so it is refused unless the options are typed:
+/// guessing would bring a `--sealed` server back open, or a `--port` one
+/// without its door.
+pub(crate) fn comeback(db: &Path, name: &str, flags: Vec<String>, attach: Option<bool>) -> Result<Comeback, String> {
+    let canon = harbor_common::paths::canonical_db(db)?;
+    let item = autostart::keeps(db, name);
+    let was = running_info(db);
+    let refuse = |e: String| match &was {
+        Some(_) => format!("not restarting {name}: {e} — it was not stopped"),
+        None => format!("not starting {name}: {e}"),
+    };
+    if item && !flags.is_empty() {
+        return Err(refuse(format!(
+            "it starts at login from config.toml, not flags — put {} under [connection.{name}]",
+            flags.join(" ")
+        )));
+    }
+    let ephemeral = match attach {
         Some(attached) => !attached,
         None => was.as_ref().is_some_and(|i| i["ephemeral"] == true),
     };
-    let flags = if flags.is_empty() {
-        let started: Vec<String> = was
-            .as_ref()
-            .and_then(|i| i["args"].as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-            .unwrap_or_default();
-        started.into_iter().filter(|a| a != "--foreground").collect()
-    } else {
-        flags
+    let (flags, cwd) = match &was {
+        Some(info) if !item && flags.is_empty() => started_with(db, info).ok_or_else(|| {
+            let port = info["port"].as_u64().map_or(String::new(), |p| format!(" --port {p}"));
+            let shown = harbor_common::paths::shorten(&canon);
+            refuse(format!(
+                "it runs harbor {}, which keeps no record of the options it was started with; give them \
+                 (`harbor {shown} restart{port} …`), or `harbor {shown} stop` and `start` it",
+                info["harborVersion"].as_str().unwrap_or("older than this one")
+            ))
+        })?,
+        _ => (flags, None),
     };
-    start(db.to_path_buf(), flags, ephemeral, true)
+    let mut o = default_opts(canon.clone());
+    apply_berth_config(&mut o, &canon, ephemeral && !item).map_err(refuse)?;
+    parse_opts(o, flags.clone()).map_err(refuse)?;
+    Ok(Comeback { canon, item, ephemeral, flags, cwd })
+}
+
+/// Where a server keeps the options it was started with and the directory
+/// it was started in: beside its socket, in the runtime directory only its
+/// user may enter, readable by its user alone, since an `--init` can hold a
+/// secret. Never in `/info`, which answers whoever reaches the TCP door.
+/// Written once it serves, removed when it stops, and marked with its pid,
+/// so a record a killed server left is not read for the next.
+#[cfg(unix)]
+fn started_file(sock: &Path) -> PathBuf {
+    sock.with_extension("args")
+}
+
+/// The options and directory the server answering for `db`, whose `/info`
+/// is `info`, recorded at its start; `None` when it recorded none.
+/// `--foreground` is how a server ran, not what it is, so it is left out.
+fn started_with(db: &Path, info: &serde_json::Value) -> Option<(Vec<String>, Option<PathBuf>)> {
+    #[cfg(unix)]
+    {
+        let (_, _, sock) = harbor_common::paths::socket_of(db).ok()?;
+        let record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(started_file(&sock)).ok()?).ok()?;
+        if record["pid"] != info["pid"] {
+            return None;
+        }
+        let args = record["args"].as_array()?.iter().filter_map(|a| a.as_str()).filter(|a| *a != "--foreground");
+        Some((args.map(str::to_string).collect(), record["cwd"].as_str().map(PathBuf::from)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (db, info);
+        None
+    }
 }
 
 /// A bare word in front of a verb means a LISTED database (`harbor medlabs
@@ -392,52 +468,34 @@ fn running_info(db: &Path) -> Option<serde_json::Value> {
 
 #[cfg(unix)]
 fn info(sock: &Path) -> Option<serde_json::Value> {
-    let stream = std::os::unix::net::UnixStream::connect(sock).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    match ask(stream, "GET", "/info")? {
-        (200, body) => serde_json::from_str(&body).ok(),
-        _ => None,
+    let transport = harbor_http::Transport::Unix(sock.to_path_buf());
+    let answer = harbor_http::request(&transport, &wire::endpoint::INFO, None, Some(Duration::from_secs(2))).ok()?;
+    if answer.status != 200 {
+        return None;
     }
-}
-
-/// One request on a fresh connection, for the two the verbs make before any
-/// client exists: a running server's `/info`, and a stop over TCP. The status
-/// and the body.
-fn ask(mut stream: impl Read + Write, method: &str, path: &str) -> Option<(u16, String)> {
-    write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").ok()?;
-    let mut text = String::new();
-    stream.read_to_string(&mut text).ok()?;
-    let (head, body) = text.split_once("\r\n\r\n")?;
-    Some((head.split(' ').nth(1)?.parse().ok()?, body.to_string()))
+    serde_json::from_str(answer.body_string().ok()?.trim()).ok()
 }
 
 /// `harbor http://host:port stop`: the server drains, folds its WAL and
 /// exits, the same as a stop over its socket. The one clean stop a server
 /// without a unix socket has, which on Windows is every server.
-fn stop_url(url: &str) -> Result<(), String> {
-    let addr = url.trim_start_matches("http://").trim_end_matches('/');
-    if url.starts_with("https://") || addr.contains('/') {
-        return Err(format!("{url}: stop takes the server's own http://host:port"));
-    }
-    let addr = if addr.contains(':') { addr.to_string() } else { format!("{addr}:9495") };
-    let connect = || std::net::TcpStream::connect(&addr);
-    let stream = match connect() {
-        Ok(s) => s,
+fn stop_url(url: &str, addr: &str) -> Result<(), String> {
+    let transport = harbor_http::Transport::Tcp(addr.to_string());
+    match harbor_http::request(&transport, &wire::endpoint::SHUTDOWN, None, Some(Duration::from_secs(30))) {
+        Ok(answer) if answer.status == 202 => {}
+        Ok(answer) => {
+            let status = answer.status;
+            return Err(format!("{url} refused the stop: HTTP {status} {}", answer.body_string().unwrap_or_default().trim()));
+        }
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
             eprintln!("harbor: nothing is serving on {url}");
             return Ok(());
         }
-        Err(e) => return Err(format!("{url}: {e}")),
-    };
-    stream.set_read_timeout(Some(Duration::from_secs(30))).map_err(|e| e.to_string())?;
-    match ask(stream, "POST", "/shutdown") {
-        Some((202, _)) => {}
-        Some((status, body)) => return Err(format!("{url} refused the stop: HTTP {status} {}", body.trim())),
-        None => return Err(format!("{url} did not answer the stop")),
+        Err(e) => return Err(format!("{url} did not answer the stop: {e}")),
     }
     // Stopped means the port is free: the drain and the CHECKPOINT come first.
     let deadline = Instant::now() + Duration::from_secs(60);
-    while connect().is_ok() {
+    while std::net::TcpStream::connect(addr).is_ok() {
         if Instant::now() > deadline {
             return Err(format!("{url} is still shutting down after 60s"));
         }
@@ -473,8 +531,11 @@ usage:
   harbor <db.duckdb> restart   stop and start again in the background, as it
                                was: under the login item when there is one,
                                re-reading config.toml; otherwise with the
-                               options and lifetime it was started with,
-                               unless new options are given
+                               options, directory and lifetime it was started
+                               with, unless new options are given. Refuses,
+                               stopping nothing, a server that cannot come
+                               back: a config that will not load, or options
+                               an older harbor kept no record of
   harbor <db.duckdb> attach    add this database to your list (config.toml) —
                                a listed database is persistent when started
   harbor <db.duckdb> detach    remove it from your list (and its login item)
@@ -520,8 +581,9 @@ an ephemeral one (it leaves when its last client does); `attach` alone just
 lists it. At most one of attach/detach and one of start/stop/restart. A login
 item runs a bare `start`, so its options live in config.toml under
 [connection.<name>] — statement-timeout, memory-limit, workers, threads, init.
-A config.toml that will not load stops a start, with the reason; only a
-missing one means no settings.
+A config.toml that will not load stops a start, and a restart before it
+stops anything, with the reason; a server already running is not touched,
+and only a missing config means no settings.
 
 The two lifetimes, in one breath — bare: the server is everyone's, it lives
 while anyone is connected. start: the server is yours, it lives until you
@@ -607,20 +669,21 @@ fn attached_names() -> Vec<String> {
 }
 
 /// Fill server options from this database's `[connection.*]` entry, if it has
-/// one — the standing settings a bare start should honor. A config that is
+/// one — the standing settings a bare start should honor — and return the
+/// `[settings]` keys it ignores, for the start to name. A config that is
 /// there but will not load stops the start: it may hold `sealed`, a
 /// statement ceiling or the boot SQL, and a server that came up without them
-/// would look configured while being open. The error names the file and the
-/// reason. Only a missing file means no settings. `port` IS a config key, but
-/// only an explicit start honors it: a summon (`ephemeral`) stays on the unix
-/// socket, so opening a database never silently opens its TCP door — and the
-/// summoning client is waiting on that socket anyway.
-fn apply_berth_config(o: &mut Opts, canon: &Path, ephemeral: bool) -> Result<(), String> {
+/// would look configured while being open. The error names the file, the
+/// line and the reason. Only a missing file means no settings. `port` IS a
+/// config key, but only an explicit start honors it: a summon (`ephemeral`)
+/// stays on the unix socket, so opening a database never silently opens its
+/// TCP door — and the summoning client is waiting on that socket anyway.
+fn apply_berth_config(o: &mut Opts, canon: &Path, ephemeral: bool) -> Result<Vec<String>, String> {
     use harbor_common::config;
     let cfg = match config::load() {
         Ok(c) => c,
-        Err(config::Error::Missing(_)) => return Ok(()),
-        Err(e) => return Err(format!("not starting, since its settings are in a config that will not load: {e}")),
+        Err(config::Error::Missing(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
     };
     // The entry whose database file is the one being started.
     let entry = cfg.berths().into_iter().find(|(_, c)| {
@@ -628,7 +691,7 @@ fn apply_berth_config(o: &mut Opts, canon: &Path, ephemeral: bool) -> Result<(),
             .and_then(|p| harbor_common::paths::canonical_db(&p).ok())
             .is_some_and(|p| p == *canon)
     });
-    let Some((key, c)) = entry else { return Ok(()) };
+    let Some((key, c)) = entry else { return Ok(Vec::new()) };
     let bad = |what: &str, e: String| format!("[connection.{key}] {what} in config.toml: {e}");
 
     if !ephemeral
@@ -651,12 +714,6 @@ fn apply_berth_config(o: &mut Opts, canon: &Path, ephemeral: bool) -> Result<(),
     if let Some(v) = &c.block_size {
         o.block_size = Some(harbor::parse_block_size(v).map_err(|e| bad("block-size", e))?);
     }
-    for key in c.rejected_settings() {
-        eprintln!(
-            "harbor: [settings] {key} is ignored — it is chosen when the database is \
-             opened, so a SET cannot reach it; use the `block-size` key instead"
-        );
-    }
     if let Some(v) = &c.statement_timeout {
         o.statement_timeout = Some(parse_duration(v).map_err(|e| bad("statement-timeout", e))?);
     }
@@ -678,7 +735,7 @@ fn apply_berth_config(o: &mut Opts, canon: &Path, ephemeral: bool) -> Result<(),
     let mut init = c.init.clone().unwrap_or_default();
     init.extend(c.setting_statements());
     o.init = init;
-    Ok(())
+    Ok(c.rejected_settings().into_iter().map(str::to_string).collect())
 }
 
 fn parse_opts(mut o: Opts, rest: Vec<String>) -> Result<Opts, String> {
@@ -748,7 +805,15 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool, background: bool) -> R
     // explicit flags parsed next override whatever the entry set.
     let canon = harbor_common::paths::canonical_db(&db)?;
     let mut o = default_opts(db);
-    apply_berth_config(&mut o, &canon, ephemeral)?;
+    let ignored = apply_berth_config(&mut o, &canon, ephemeral).map_err(|e| {
+        format!("not starting: {e} — fix config.toml and start again; a server already running is not affected")
+    })?;
+    for key in ignored {
+        eprintln!(
+            "harbor: [settings] {key} is ignored — it is chosen when the database is \
+             opened, so a SET cannot reach it; use the `block-size` key instead"
+        );
+    }
     let typed = rest.clone();
     let mut o = parse_opts(o, rest)?;
     o.ephemeral = ephemeral;
@@ -894,6 +959,30 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool, background: bool) -> R
     let addr = harbor::start(listen, o.workers, o.log)?;
     #[cfg(unix)]
     let _ = chmod(&sock_path, 0o600);
+    // The record a restart reads (`started_file`). Without it a restart
+    // refuses rather than guesses, so a record that cannot be written is
+    // said and the server serves on.
+    #[cfg(unix)]
+    let started = started_file(&sock_path);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let record = serde_json::json!({
+            "pid": std::process::id(),
+            "args": typed,
+            "cwd": std::env::current_dir().ok(),
+        });
+        let _ = std::fs::remove_file(&started);
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&started)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, record.to_string().as_bytes()));
+        if let Err(e) = written {
+            eprintln!("harbor: {}: {e} — a restart will need this server's options typed", started.display());
+        }
+    }
 
     // GET /info: identity, with uptime and the live client count spliced in
     // by the core. This is the whole registry — the list dials it.
@@ -909,12 +998,10 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool, background: bool) -> R
         "database": canon.display().to_string(),
         "databases": databases,
         "pid": std::process::id(),
-        // The lifetime and the options it was started with, so a restart —
-        // by hand, or `update --restart` bringing it onto a new binary —
-        // brings it back the way it was running. The options are the ones
-        // typed; the config entry is read afresh at every start.
+        // The lifetime, which a restart keeps. The options it was started
+        // with are not published: an `--init` can hold a secret, and this
+        // answers anyone who reaches the TCP door (`started_file`).
         "ephemeral": o.ephemeral,
-        "args": typed,
         // The TCP door, when one is open (the unix socket needs no
         // advertising — finding it is how a client got here). Always
         // loopback, so the port alone spells the door: the bound one, which
@@ -976,7 +1063,10 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool, background: bool) -> R
     // departure finishes drain + CHECKPOINT.
     let farewell = harbor::wait()?;
     #[cfg(unix)]
-    let _ = std::fs::remove_file(&sock_path);
+    {
+        let _ = std::fs::remove_file(&started);
+        let _ = std::fs::remove_file(&sock_path);
+    }
     eprintln!("harbor: {} closed ({farewell})", harbor_common::paths::display_path(&canon));
     Ok(())
 }

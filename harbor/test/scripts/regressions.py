@@ -514,6 +514,45 @@ class CommitRaces(Harbor, unittest.TestCase):
         self.assertGreater(cancelled, 0)
         self.assertEqual(self.sql("SELECT count(*) FROM raced")["data"], [[landed]])
 
+    def test_a_string_after_a_number_is_never_brace_expanded(self):
+        # The engine ends `1_0` and `1e5` before an `e'`, which opens an
+        # E-string, so the brace group in the string after it is text.
+        for sql in (r"SELECT 1_0e'\'' , '{a,b}' AS y", r"SELECT 1e5e'\'' , '{a,b}' AS y"):
+            with self.subTest(sql=sql):
+                row = self.sql(sql)["data"][0]
+                self.assertEqual((len(row), row[1]), (2, "{a,b}"), row)
+
+    def test_a_null_param_is_typed_as_the_engine_types_a_null(self):
+        # Bound untyped, as the engine's own EXECUTE p(NULL) binds it: the
+        # statement types it, and where nothing does, a table made from it
+        # has the column a NULL literal makes. A cast says what it is.
+        self.sql("CREATE TABLE null_literal AS SELECT NULL AS c")
+        for sql in ("CREATE TABLE null_param AS SELECT ? AS c", "CREATE TABLE null_cast AS SELECT ?::INTEGER AS c"):
+            status, doc = self.request("POST", "/sql", {"sql": sql, "params": [None]})
+            self.assertEqual(status, 200, (sql, doc))
+        typed = lambda t: self.sql(f"SELECT data_type FROM information_schema.columns WHERE table_name = '{t}'")["data"]
+        self.assertEqual(typed("null_param"), typed("null_literal"))
+        self.assertEqual(typed("null_cast"), [["INTEGER"]])
+        status, doc = self.request("POST", "/sql", {"sql": "SELECT coalesce(?, 'x') AS v", "params": [None]})
+        self.assertEqual((status, doc["data"]), (200, [["x"]]), doc)
+
+    def test_an_open_transaction_is_reported_as_the_engine_holds_it(self):
+        # `COMMIT` and a final U+00A0 is no COMMIT to the engine, whose
+        # pre-pass never looks at a text's last two bytes: it reads a table
+        # name, fails, and the transaction stays open, aborted.
+        self.sql("CREATE TABLE unspaced(x INTEGER)")
+        sid = self.session()
+        try:
+            self.sql("BEGIN", sid)
+            self.sql("INSERT INTO unspaced VALUES (1)", sid)
+            self.sql("COMMIT ", sid, status=400)
+            sessions = self.request("GET", "/sessions")[1]["sessions"]
+            self.assertEqual([s["inTransaction"] for s in sessions if s["sessionId"] == sid], [True])
+            self.assertIn("aborted", self.sql("SELECT 1", sid, status=400)["message"])
+        finally:
+            self.release(sid)
+        self.assertEqual(self.sql("SELECT count(*) FROM unspaced")["data"], [[0]])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

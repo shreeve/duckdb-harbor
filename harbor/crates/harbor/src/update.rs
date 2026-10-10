@@ -192,6 +192,13 @@ fn report(exe: &Path, version: &str, restart: bool) -> Result<ExitCode, String> 
     }
     let mut failed = false;
     for (name, db, running) in &behind {
+        // One that cannot come back as it was is named, not stopped: its
+        // config will not load, or its harbor kept no record of its options.
+        if let Err(why) = crate::comeback(db, name, Vec::new(), None) {
+            say(&format!("harbor: {why}"));
+            failed = true;
+            continue;
+        }
         say(&format!("harbor: restarting {name} ({running} -> {version}) — its word is kept in {}", harbor_common::paths::shorten(&log)));
         failed |= !restart_one(exe, db, &log);
     }
@@ -199,13 +206,16 @@ fn report(exe: &Path, version: &str, restart: bool) -> Result<ExitCode, String> 
 }
 
 /// `harbor <db> restart` from `exe`, out of reach of a hangup, its output
-/// appended to `log` and then repeated here. Whether it succeeded.
+/// appended to `log` and then repeated here. Whether it succeeded. A log that
+/// cannot be opened is said, and the restart's word comes here instead.
 fn restart_one(exe: &Path, db: &Path, log: &Path) -> bool {
     let from = std::fs::metadata(log).map_or(0, |m| m.len());
-    let Ok(out) = std::fs::OpenOptions::new().append(true).create(true).open(log) else { return false };
-    let Ok(err) = out.try_clone() else { return false };
     let mut cmd = Command::new(exe);
-    cmd.arg(db).arg("restart").stdin(Stdio::null()).stdout(out).stderr(err);
+    cmd.arg(db).arg("restart").stdin(Stdio::null());
+    match std::fs::OpenOptions::new().append(true).create(true).open(log).and_then(|f| Ok((f.try_clone()?, f))) {
+        Ok((out, err)) => _ = cmd.stdout(out).stderr(err),
+        Err(e) => say(&format!("harbor: {}: {e} — its word follows here instead", log.display())),
+    }
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let ok = cmd.status().is_ok_and(|s| s.success());

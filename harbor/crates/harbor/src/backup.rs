@@ -271,9 +271,10 @@ pub fn backup(db: &Path, args: &[String]) -> Result<(), String> {
 }
 
 /// `<path>.<what>-<pid>`: the name a backup or a restore builds under before
-/// it is moved to `path`.
+/// it is moved to `path`, in the directory that holds `path`.
 fn beside(path: &Path, what: &str) -> PathBuf {
-    PathBuf::from(format!("{}.{what}-{}", path.display(), std::process::id()))
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!("{name}.{what}-{}", std::process::id()))
 }
 
 /// A path as one shell word, for a command printed to be pasted.
@@ -384,17 +385,24 @@ pub fn restore(db: &Path, args: &[String]) -> Result<(), String> {
     let target = building.display().to_string();
     let done = interruptible(&building, || harbor::repl::exec_quiet(&target, &sql, &spawn))
         .and_then(|()| harbor::repl::shutdown(&building))
-        .and_then(|_| {
-            if building_wal.exists() {
-                fs::rename(&building_wal, &wal).map_err(|e| format!("{}: {e}", wal.display()))?;
-            }
-            place(&building, &db)
-        });
+        .and_then(|_| place(&building, &db));
     if let Err(e) = done {
         let _ = harbor::repl::shutdown(&building);
         let _ = fs::remove_file(&building);
         let _ = fs::remove_file(&building_wal);
+        // Interrupted is no failure: a Ctrl-C exits as one does.
+        if e == INTERRUPTED {
+            eprintln!("harbor: {e}");
+            std::process::exit(130);
+        }
         return Err(e);
+    }
+    // A WAL the shutdown left follows the file it belongs to, and never goes
+    // ahead of it, where it would sit beside a file a racing restore placed.
+    if building_wal.exists() {
+        fs::rename(&building_wal, &wal).map_err(|e| {
+            format!("{} is restored, but its WAL could not follow it from {}: {e}", db.display(), building_wal.display())
+        })?;
     }
 
     let bytes = fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
@@ -425,10 +433,13 @@ fn place(from: &Path, to: &Path) -> Result<(), String> {
     }
 }
 
+/// What `interruptible` answers when the Ctrl-C was the user's.
+const INTERRUPTED: &str = "interrupted — nothing was restored";
+
 /// Run `work` with Ctrl-C bound to stopping the server that builds
-/// `building`: the statement under way is cancelled by the stop, `work`
-/// returns its error, and the caller takes the file back out. A second
-/// Ctrl-C leaves at once.
+/// `building`: the statement under way is cancelled by the stop, quietly,
+/// since the cancel is this run's own, and the caller takes the file back
+/// out. A second Ctrl-C leaves at once.
 fn interruptible(building: &Path, work: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -441,8 +452,11 @@ fn interruptible(building: &Path, work: impl FnOnce() -> Result<(), String>) -> 
         let (interrupted, finished, building) = (interrupted.clone(), finished.clone(), building.to_path_buf());
         std::thread::spawn(move || {
             while !finished.load(Ordering::Relaxed) {
-                if interrupted.load(Ordering::Relaxed) && harbor::repl::shutdown(&building).unwrap_or(false) {
-                    return;
+                if interrupted.load(Ordering::Relaxed) {
+                    harbor::repl::STOPPING.store(true, Ordering::Relaxed);
+                    if harbor::repl::shutdown(&building).unwrap_or(false) {
+                        return;
+                    }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
@@ -452,7 +466,7 @@ fn interruptible(building: &Path, work: impl FnOnce() -> Result<(), String>) -> 
     finished.store(true, Ordering::Relaxed);
     let _ = watcher.join();
     if interrupted.load(Ordering::Relaxed) {
-        return Err("interrupted — nothing was restored".into());
+        return Err(INTERRUPTED.into());
     }
     done
 }
@@ -1240,10 +1254,11 @@ fn size(bytes: u64) -> String {
 
 /// The server has its own working directory, so a relative path given here
 /// would land somewhere else entirely. Absolute, always — without requiring
-/// the path to exist, which for a backup directory it must not.
+/// the path to exist, which for a backup directory it must not — and with no
+/// trailing `/`, so `dir/` names `dir` and not a place inside it.
 fn absolute(p: &str) -> Result<PathBuf, String> {
     let p = harbor_common::paths::expand(p);
-    std::path::absolute(&p).map_err(|e| format!("{}: {e}", p.display()))
+    Ok(std::path::absolute(&p).map_err(|e| format!("{}: {e}", p.display()))?.components().collect())
 }
 
 /// A path as a SQL string literal.
@@ -1254,6 +1269,17 @@ fn quote(p: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `out/` names `out`, and what is built for it is built beside it, never
+    /// inside it, where it would make `out` before the backup is done.
+    #[cfg(unix)]
+    #[test]
+    fn a_trailing_slash_names_the_directory() {
+        assert_eq!(absolute("/tmp/out/").unwrap(), PathBuf::from("/tmp/out"));
+        let built = format!("/tmp/out.partial-{}", std::process::id());
+        assert_eq!(beside(Path::new("/tmp/out/"), "partial"), PathBuf::from(&built));
+        assert_eq!(beside(&absolute("/tmp/./out/").unwrap(), "partial"), PathBuf::from(&built));
+    }
 
     #[test]
     fn a_restore_takes_only_what_a_harbor_backup_writes() {

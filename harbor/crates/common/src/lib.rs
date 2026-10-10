@@ -27,7 +27,7 @@ pub mod ui;
 
 pub use paths::{
     config_file, config_root, expand, history_file, log_file, looks_like_path, normalize,
-    runtime_dir, sock_file, socket_for, state_root,
+    runtime_dir, socket_for, state_root,
 };
 pub use state::{Level, State};
 pub use perms::{chmod, create_dir_private, exposed};

@@ -37,7 +37,9 @@ pub fn session_renew(transport: &Transport, id: &str) -> Result<bool, Failure> {
 }
 
 /// The servers that renew only backup sessions, so `session_touch` asks
-/// each of them once.
+/// each of them once. Kept for the life of the process: a server restarted
+/// onto a release that renews is touched with `SELECT 1` until the client
+/// ends, which costs a counted statement and is never a wrong answer.
 static RENEWS_ONLY_BACKUPS: Mutex<Vec<Transport>> = Mutex::new(Vec::new());
 
 /// Keep a session's idle clock from running out: renew it, or, on a server

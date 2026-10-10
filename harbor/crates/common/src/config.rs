@@ -239,7 +239,17 @@ pub fn parse(text: &str) -> Result<FileConfig, String> {
         Err(_) if text.parse::<toml::Table>().is_ok_and(|t| t.contains_key("defaults")) => {
             Err("its [defaults] section is read by nothing: delete that section".into())
         }
-        Err(e) => Err(e.to_string()),
+        // One line, where the parser's own text runs to five with a drawing
+        // of the line: a server's refusal is read from the last lines of its
+        // log, and the place and the reason must both be in them.
+        Err(e) => Err(match e.span() {
+            Some(at) => {
+                let before = text.get(..at.start).unwrap_or(text);
+                let column = before.chars().rev().take_while(|&c| c != '\n').count() + 1;
+                format!("line {}, column {column}: {}", before.matches('\n').count() + 1, e.message())
+            }
+            None => e.message().to_string(),
+        }),
     }
 }
 
@@ -366,6 +376,8 @@ mod tests {
         // years. A misspelled key here is a hard error naming the key.
         let e = parse("[connection.x]\npth = \"/a.duckdb\"\n").unwrap_err();
         assert!(e.contains("pth"), "{e}");
+        // On one line, with where: a server's log is read by its last lines.
+        assert!(e.starts_with("line 2, column 1: unknown field `pth`") && !e.contains('\n'), "{e}");
     }
 
     /// A section nothing reads is refused like any unknown key, and the
