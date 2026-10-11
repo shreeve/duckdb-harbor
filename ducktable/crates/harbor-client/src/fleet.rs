@@ -58,6 +58,9 @@ pub struct Survey {
     /// Whether a running server self-retires when its last client leaves — the
     /// mode a restart must preserve. Meaningless for stopped or remote rows.
     pub ephemeral: bool,
+    /// The workspace (`paths::workspace`), where a file that is not a
+    /// DuckDB database opens: listed first, whether it runs or not.
+    pub workspace: bool,
 }
 
 /// The whole survey: the rows, and the one thing a GUI must not eat — a
@@ -218,6 +221,7 @@ pub fn survey() -> Fleet {
                     size: disk_size(&l.db),
                     version: Some(l.version.clone()),
                     ephemeral: l.ephemeral,
+                    workspace: false,
                 }
             }
             // No live server named this file in its `/info`. It is running
@@ -236,6 +240,7 @@ pub fn survey() -> Fleet {
                     // reports no version — treat it as unknown, never outdated.
                     version: None,
                     ephemeral: false,
+                    workspace: false,
                 }
             }
             // Remotes have no local state at all; a probe answers for them.
@@ -272,6 +277,7 @@ pub fn survey() -> Fleet {
                     size: None,
                     version,
                     ephemeral: false,
+                    workspace: false,
                 }
             }
         });
@@ -283,7 +289,34 @@ pub fn survey() -> Fleet {
     {
         warning = Some(clash);
     }
+    if let Ok(ws) = paths::workspace() {
+        workspace_first(&mut out, &ws);
+    }
     Fleet { rows: out, warning }
+}
+
+/// The workspace's row moved to the top and marked: the row a live server
+/// or the config gives it, or, when neither does and its file exists, a
+/// stopped row of its own, so it is there to click once a file has been
+/// opened in it.
+fn workspace_first(rows: &mut Vec<Survey>, ws: &Path) {
+    let row = match rows.iter().position(|r| r.path.as_deref().is_some_and(|p| same_file(p, ws))) {
+        Some(ix) => rows.remove(ix),
+        None if ws.exists() => Survey {
+            name: "workspace".to_string(),
+            state: State::Stopped,
+            attached: false,
+            autostart: harbor_common::autostart::keeps(ws, "workspace"),
+            path: Some(paths::canonical_db(ws).unwrap_or_else(|_| ws.to_path_buf())),
+            note: None,
+            size: disk_size(ws),
+            version: None,
+            ephemeral: false,
+            workspace: true,
+        },
+        None => return,
+    };
+    rows.insert(0, Survey { workspace: true, ..row });
 }
 
 /// Rows that share a name are different databases. Each says which it is in
@@ -1219,7 +1252,31 @@ mod tests {
             size: None,
             version: None,
             ephemeral: false,
+            workspace: false,
         }
+    }
+
+    #[test]
+    fn the_workspace_is_listed_first_once_it_exists() {
+        let names = |rows: &[Survey]| rows.iter().map(|r| (r.name.clone(), r.workspace)).collect::<Vec<_>>();
+        // Its server runs: that row moves to the top, marked.
+        let mut rows = vec![row("a", Some("/nonexistent-dt/a.duckdb")), row("workspace", Some("/nonexistent-dt/ws.duckdb"))];
+        workspace_first(&mut rows, Path::new("/nonexistent-dt/ws.duckdb"));
+        assert_eq!(names(&rows), [("workspace".to_string(), true), ("a".to_string(), false)]);
+        // Neither running nor in the config, and never made: no row.
+        let mut rows = vec![row("a", Some("/nonexistent-dt/a.duckdb"))];
+        workspace_first(&mut rows, Path::new("/nonexistent-dt/ws.duckdb"));
+        assert_eq!(names(&rows), [("a".to_string(), false)]);
+        // Made, and stopped: a stopped row of its own.
+        let dir = std::env::temp_dir().join(format!("dt-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = dir.join("workspace.duckdb");
+        std::fs::write(&ws, b"").unwrap();
+        workspace_first(&mut rows, &ws);
+        assert_eq!(names(&rows), [("workspace".to_string(), true), ("a".to_string(), false)]);
+        assert_eq!(rows[0].state, State::Stopped);
+        assert_eq!(rows[0].path.as_deref(), Some(paths::canonical_db(&ws).unwrap().as_path()));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
