@@ -134,11 +134,13 @@ pub struct RemoveView {
     pub(crate) rel: sql::Rel,
 }
 
-/// Right-click → Detach on an attached catalog (a SQLite file).
+/// Right-click → Detach on an attached catalog (a SQLite file), or on one
+/// the workspace records and could not attach (`attached` false).
 #[derive(Clone, Default, PartialEq, Debug, Action)]
 #[action(namespace = ducktable, no_json)]
 pub struct DetachCatalog {
     pub(crate) name: String,
+    pub(crate) attached: bool,
 }
 
 /// Right-click → Save As on a table or view: every row of it written to a
@@ -799,8 +801,8 @@ fn main() {
             on_view_in(cx, move |this, window, cx| this.remove_view(rel, window, cx));
         });
         cx.on_action(|a: &DetachCatalog, cx| {
-            let name = a.name.clone();
-            on_view_in(cx, move |this, window, cx| this.detach_catalog(name, window, cx));
+            let (name, attached) = (a.name.clone(), a.attached);
+            on_view_in(cx, move |this, window, cx| this.detach_catalog(name, attached, window, cx));
         });
         cx.on_action(|a: &SaveAs, cx| save_as(a.rel.clone(), a.format, cx));
         cx.on_action(|_: &OpenDatabaseUrl, cx| {

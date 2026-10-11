@@ -533,10 +533,12 @@ fn open_files(conn: &Conn, files: &[(std::path::PathBuf, Kind)]) -> Openings {
 
 /// The catalog, with what its views need to be read. A view over `ST_Read`
 /// does not bind in a server that has not loaded `spatial`, which the
-/// engine does not load on demand: such a view's error is the catalog's
-/// first answer, and the extension is loaded and the catalog read again.
-/// An extension that will not load leaves the view's error to say so.
-/// Blocks.
+/// engine does not load on demand. A workspace server loads it before it
+/// serves; one that has not (a Harbor that does not, or a database other
+/// than the workspace) answers such a view with its error, and the
+/// extension is loaded here and the catalog read again. Nothing is asked
+/// of a server whose views all read. An extension that will not load
+/// leaves the view's error to say so. Blocks.
 fn read_catalog(conn: &Conn) -> Result<harbor_client::Catalog, String> {
     let catalog = harbor_client::catalog(conn)?;
     let needed = harbor_client::workspace::needed_extensions(&catalog);
@@ -2018,15 +2020,19 @@ impl DuckTable {
         );
     }
 
-    /// Detach an attached catalog, leaving its file as it is. What was
-    /// staged on its tables is parked with the rest of the database's.
-    pub(crate) fn detach_catalog(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// Detach an attached catalog, leaving its file as it is, and in the
+    /// workspace let go of its record, so the workspace does not attach it
+    /// again; one the workspace could not attach (`attached` false) has
+    /// only its record. What was staged on its tables is parked with the
+    /// rest of the database's.
+    pub(crate) fn detach_catalog(&mut self, name: String, attached: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.asking_to_quit {
             return;
         }
         let detached = clone_str(&name);
+        let workspace = self.on_workspace();
         self.on_connection(
-            move |conn| harbor_client::workspace::detach(conn, &detached),
+            move |conn| harbor_client::workspace::detach(conn, &detached, attached, workspace),
             move |state, outcome, _, cx| match outcome {
                 Ok(()) => state.let_go_of(|selected| selected.catalog.as_deref() == Some(name.as_str()), cx),
                 Err(why) => crate::open::alert(format!("{name} was not detached"), why, cx),
@@ -2424,8 +2430,10 @@ mod tests {
     /// `Aim::Workspace`), read back from the catalog the sidebar draws
     /// (`sidebar::tree_lines`), paged as the grid pages, a SQLite table
     /// edited through its attachment as ⌘S commits, a view imported as a
-    /// table, removed, a catalog detached, and a spatial view read again
-    /// by a server that had not loaded `spatial`.
+    /// table, removed; a SQLite file attached again by a restarted server
+    /// from the workspace's record, detached and forgotten, and listed with
+    /// why when it is gone at a start; and a spatial view read by a fresh
+    /// server with nothing loaded by DuckTable.
     ///
     /// Live and scratch only: needs `HARBOR_HOME` set to a short scratch
     /// directory (the workspace is made there), `HARBOR_BIN` naming the
@@ -2601,23 +2609,63 @@ mod tests {
         let catalog = super::read_catalog(&conn).expect("catalog");
         let sales = crate::structure::structure_of(&catalog, &Rel::own("main", "sales")).unwrap();
         assert!(!sales.view && sales.keyed_by_rowid());
-        // Remove and Detach leave the files as they were.
+        // The SQLite file is in the workspace's record from the moment it
+        // is attached, before any server stops.
+        let record = |conn: &harbor_client::Conn| {
+            let sql = format!("SELECT name, path FROM {}.{} ORDER BY name", wire::open::RECORD_SCHEMA, wire::open::RECORD_TABLE);
+            harbor_client::query(conn, &sql).expect("record").rows
+        };
+        assert_eq!(record(&conn), [[json!("app"), json!(at("app.sqlite"))]]);
+
+        // A workspace server started again attaches the file again, and has
+        // loaded `spatial` for the view over the GeoJSON before anyone asks.
+        drop(conn);
+        harbor_client::fleet::stop(&ws).expect("stop");
+        let conn = harbor_client::fleet::connect_path(&ws).expect("connect again");
+        let catalog = harbor_client::catalog(&conn).expect("catalog");
+        assert!(workspace::needed_extensions(&catalog).is_empty());
+        assert_eq!(catalog.views.iter().find(|v| v.name == "parks").map(|v| v.error.clone()), Some(None));
+        let app: Vec<&str> = catalog.attached.iter().flat_map(|a| a.tables.iter().map(|t| t.name.as_str())).collect();
+        assert_eq!(app, ["notes", "people"]);
+        let people = "SELECT name FROM app.main.people ORDER BY id";
+        assert_eq!(harbor_client::query(&conn, people).expect("people").rows.len(), 4);
+
+        // Remove and Detach leave the files as they were; Detach lets go of
+        // the record, so no server attaches the file again.
         workspace::remove_view(&conn, "main", "book").expect("remove");
-        workspace::detach(&conn, "app").expect("detach");
+        workspace::detach(&conn, "app", true, true).expect("detach");
         let catalog = super::read_catalog(&conn).expect("catalog");
         assert!(catalog.views.iter().all(|v| v.name != "book") && catalog.attached.is_empty());
         assert!(dir.join("book.xlsx").exists() && dir.join("app.sqlite").exists());
+        assert!(record(&conn).is_empty());
 
-        // A workspace server started again has not loaded `spatial`: the
-        // view over the GeoJSON reads once the catalog has loaded it.
+        // A recorded file that is gone when the server starts is listed,
+        // holding nothing, with why; the sidebar greys it, and its Detach
+        // deletes the record's row alone.
+        let reopened = super::open_files(&conn, &[(dir.join("app.sqlite"), wire::open::Kind::Sqlite)]);
+        assert!(reopened[0].as_ref().is_ok_and(|o| o.name == "app" && o.made), "{reopened:?}");
         drop(conn);
         harbor_client::fleet::stop(&ws).expect("stop");
-        let fresh = harbor_client::fleet::connect_path(&ws).expect("connect again");
-        let first = harbor_client::catalog(&fresh).expect("catalog");
-        let parks = |c: &harbor_client::Catalog| c.views.iter().find(|v| v.name == "parks").map(|v| v.error.clone());
-        assert!(parks(&first).flatten().is_some(), "a fresh server cannot read the view yet");
-        assert_eq!(parks(&super::read_catalog(&fresh).expect("catalog")), Some(None));
-        drop(fresh);
+        std::fs::rename(dir.join("app.sqlite"), dir.join("app-away.sqlite")).unwrap();
+        let conn = harbor_client::fleet::connect_path(&ws).expect("connect again");
+        let catalog = super::read_catalog(&conn).expect("catalog");
+        let gone = catalog.attached.iter().find(|a| a.name == "app").expect("the missing file is listed");
+        let error = gone.error.clone().expect("with why");
+        assert!(error.contains("no such file") && gone.tables.is_empty(), "{error}");
+        let lines = tree_lines(&catalog, false, &None);
+        assert!(lines.contains(&Line::Catalog { name: "app".into(), storage: "sqlite".into(), error: Some(error) }));
+        assert!(!lines.iter().any(|l| l.rel().is_some_and(|r| r.catalog.as_deref() == Some("app"))));
+        workspace::detach(&conn, "app", false, true).expect("detach the missing file");
+        assert!(record(&conn).is_empty());
+        assert!(super::read_catalog(&conn).expect("catalog").attached.is_empty());
+
+        // Back where it was, the file stays unattached: the record let go.
+        std::fs::rename(dir.join("app-away.sqlite"), dir.join("app.sqlite")).unwrap();
+        drop(conn);
+        harbor_client::fleet::stop(&ws).expect("stop");
+        let conn = harbor_client::fleet::connect_path(&ws).expect("connect again");
+        assert!(harbor_client::catalog(&conn).expect("catalog").attached.is_empty());
+        drop(conn);
         harbor_client::fleet::stop(&ws).expect("stop");
     }
 

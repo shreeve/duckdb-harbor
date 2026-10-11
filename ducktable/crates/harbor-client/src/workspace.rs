@@ -14,7 +14,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use wire::catalog::Catalog;
-use wire::open::{self, Entry, Kind, Reader};
+use wire::open::{self, Entry, Kind, Reader, Record};
 
 /// The workspace database, its directory made when it is not there.
 pub fn path() -> Result<PathBuf, String> {
@@ -97,47 +97,70 @@ fn view(conn: &Conn, path: &str, shown: &str, reader: Reader) -> Result<Opened, 
 }
 
 fn attach(conn: &Conn, path: &str, shown: &str) -> Result<Opened, String> {
-    let existing =
-        rows(conn, &format!("SELECT database_name FROM duckdb_databases() WHERE path = {}", open::quote_literal(path)))?;
+    let existing = rows(
+        conn,
+        &format!("SELECT database_name, readonly FROM duckdb_databases() WHERE path = {}", open::quote_literal(path)),
+    )?;
     if let Some(row) = existing.first() {
         let name = text(row, 0).to_string();
+        record_attachment(conn, &name, path, row.get(1).and_then(Value::as_bool).unwrap_or_default())?;
         let line = format!("{name}: the SQLite database {shown}, attached already");
         return Ok(Opened { name, attached: true, made: false, line });
     }
     // A catalog's name must not be a database's, a schema's or a reserved
-    // word, or `name.table` would mean something else.
-    let taken = names(
+    // word, or `name.table` would mean something else; nor one the record
+    // keeps for another file that its server could not attach, whose row
+    // it would write over. The record is not there until a first
+    // attachment.
+    let mut taken = names(
         conn,
         "SELECT database_name FROM duckdb_databases() \
          UNION ALL SELECT schema_name FROM duckdb_schemas() \
          UNION ALL SELECT keyword_name FROM duckdb_keywords() WHERE keyword_category = 'reserved'",
     )?;
+    taken.extend(names(conn, &Record::names_sql(path)).unwrap_or_default());
     let name = open::free_name(&open::view_name(path), |n| taken.iter().any(|t| t.eq_ignore_ascii_case(n)));
     rows(conn, &open::attach_sql(&name, path))?;
-    record_attachment(conn, &name, path)?;
+    record_attachment(conn, &name, path, false)?;
     let line = format!("{name}: the SQLite database {shown}, attached");
     Ok(Opened { name, attached: true, made: true, line })
 }
 
-/// Where the workspace keeps an attachment for its next start, so a
-/// restarted workspace server attaches the file again. The record and the
-/// restore are the workspace server's, which harbor's start-up reads; this
-/// is the one place DuckTable writes it, and it writes nothing until that
-/// record exists.
-fn record_attachment(_conn: &Conn, _name: &str, _path: &str) -> Result<(), String> {
-    Ok(())
+/// Record the attachment in the workspace (`wire::open::Record`), so every
+/// server that opens it attaches the file again. The server rewrites the
+/// record from what is attached when it stops; writing it here, as the
+/// file is attached, keeps it through a server that does not stop cleanly.
+fn record_attachment(conn: &Conn, name: &str, path: &str, read_only: bool) -> Result<(), String> {
+    for ddl in open::RECORD_DDL {
+        rows(conn, ddl)?;
+    }
+    let record = Record { name: name.into(), path: path.into(), storage: "sqlite".into(), read_only };
+    rows(conn, &record.insert_sql()).map(drop)
 }
 
-/// The record of [`record_attachment`], let go when the catalog is
-/// detached.
-fn forget_attachment(_conn: &Conn, _name: &str) -> Result<(), String> {
-    Ok(())
+/// The statements Detach runs for the catalog `name`: `DETACH` when it is
+/// `attached`, and, in the `workspace`, its row deleted from the record, so
+/// no later server attaches it again. A catalog the workspace records and
+/// could not attach (its file gone) has nothing to detach, only its row.
+pub fn detach_statements(name: &str, attached: bool, workspace: bool) -> Vec<String> {
+    let mut sql = Vec::new();
+    if attached {
+        sql.push(format!("DETACH {}", open::quote_ident(name)));
+    }
+    if workspace {
+        sql.extend(open::RECORD_DDL.iter().map(|s| s.to_string()));
+        sql.push(Record::delete_sql(name));
+    }
+    sql
 }
 
-/// Detach the catalog `name`. The file is untouched.
-pub fn detach(conn: &Conn, name: &str) -> Result<(), String> {
-    rows(conn, &format!("DETACH {}", open::quote_ident(name)))?;
-    forget_attachment(conn, name)
+/// Detach the catalog `name` ([`detach_statements`]). The file is
+/// untouched.
+pub fn detach(conn: &Conn, name: &str, attached: bool, workspace: bool) -> Result<(), String> {
+    for sql in detach_statements(name, attached, workspace) {
+        rows(conn, &sql)?;
+    }
+    Ok(())
 }
 
 /// Drop the view `name` in schema `schema`. The file it reads is untouched.
@@ -322,6 +345,19 @@ mod tests {
         let attached = Attached { views: vec![view("CREATE VIEW p AS SELECT * FROM st_read('/p.shp');", &unread)], ..Default::default() };
         let catalog = Catalog { attached: vec![attached], ..Default::default() };
         assert_eq!(needed_extensions(&catalog), ["spatial"]);
+    }
+
+    #[test]
+    fn detach_lets_go_of_the_catalog_and_its_record() {
+        let ddl = open::RECORD_DDL.map(String::from);
+        let forget = "DELETE FROM _harbor.attached WHERE name = 'o''x'".to_string();
+        let attached = detach_statements("o'x", true, true);
+        assert_eq!(attached[0], "DETACH \"o'x\"");
+        assert_eq!(attached[1..], [ddl[0].clone(), ddl[1].clone(), forget.clone()]);
+        // Recorded and not attached: only its row.
+        assert_eq!(detach_statements("o'x", false, true), [ddl[0].clone(), ddl[1].clone(), forget]);
+        // Another database keeps no record.
+        assert_eq!(detach_statements("o'x", true, false), ["DETACH \"o'x\""]);
     }
 
     #[test]

@@ -517,8 +517,12 @@ impl crate::app::DuckTable {
                 .text_color(t.muted)
                 .child(name)
                 .into_any_element(),
-            Line::Catalog { name, storage } => {
+            Line::Catalog { name, storage, error } => {
                 let detach = clone_str(&name);
+                let attached = error.is_none();
+                // One the workspace records and could not attach is
+                // greyed, holds nothing, and says why on hover.
+                let color = if attached { t.muted } else { t.muted.opacity(0.5) };
                 div()
                     .id(SharedString::from(format!("catalog-{name}")))
                     .pl_2()
@@ -528,10 +532,14 @@ impl crate::app::DuckTable {
                     .h_flex()
                     .gap_1()
                     .items_center()
-                    .child(div().flex_1().min_w_0().truncate().text_xs().font_weight(FontWeight::BOLD).text_color(t.muted).child(name))
-                    .child(dim(t, storage))
+                    .child(div().flex_1().min_w_0().truncate().text_xs().font_weight(FontWeight::BOLD).text_color(color).child(name))
+                    .child(div().text_xs().text_color(color).child(storage))
+                    .when_some(error, |row, error| {
+                        let error = SharedString::from(error);
+                        row.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(error.clone()).build(window, cx))
+                    })
                     .context_menu(move |menu, _, _| {
-                        menu.menu("Detach", Box::new(crate::DetachCatalog { name: clone_str(&detach) }))
+                        menu.menu("Detach", Box::new(crate::DetachCatalog { name: clone_str(&detach), attached }))
                     })
                     .into_any_element()
             }
@@ -626,9 +634,10 @@ pub(crate) enum Line {
     /// one, or within an attached catalog that has more than one
     /// (`nested`).
     Schema { name: String, nested: bool },
-    /// An attached catalog's heading, and its engine's name for its
-    /// storage (`sqlite`).
-    Catalog { name: String, storage: String },
+    /// An attached catalog's heading, its engine's name for its storage
+    /// (`sqlite`), and why it is not attached when the workspace records it
+    /// and could not attach it (its file gone), holding nothing.
+    Catalog { name: String, storage: String, error: Option<String> },
     /// A table, its column count and its exact row count where the
     /// catalog has one.
     Table { rel: Rel, columns: usize, rows: Option<u64> },
@@ -682,7 +691,7 @@ pub(crate) fn tree_lines(catalog: &harbor_client::Catalog, family_sort: bool, fi
         relations(&mut out, None, catalog.tables_in(schema), catalog.views_in(schema), schema);
     }
     for attached in &catalog.attached {
-        out.push(Line::Catalog { name: attached.name.clone(), storage: attached.storage.clone() });
+        out.push(Line::Catalog { name: attached.name.clone(), storage: attached.storage.clone(), error: attached.error.clone() });
         let schemas = attached.schemas();
         for schema in &schemas {
             if schemas.len() > 1 {
@@ -788,12 +797,15 @@ mod tests {
                 view("gone", "CREATE VIEW gone AS SELECT * FROM read_csv('/x/gone.csv');", Some("IO Error: No files found")),
                 view("calc", "CREATE VIEW calc AS SELECT 1;", None),
             ],
-            attached: vec![Attached {
-                name: "app".into(),
-                storage: "sqlite".into(),
-                tables: vec![table("main", "people")],
-                ..Default::default()
-            }],
+            attached: vec![
+                Attached { name: "app".into(), storage: "sqlite".into(), tables: vec![table("main", "people")], ..Default::default() },
+                Attached {
+                    name: "gone".into(),
+                    storage: "sqlite".into(),
+                    error: Some("/x/gone.sqlite: no such file".into()),
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         };
         let lines = tree_lines(&catalog, false, &None);
@@ -817,7 +829,13 @@ mod tests {
         }));
         assert!(lines.contains(&Line::View { rel: Rel::own("main", "calc"), columns: 0, error: None, file: false }));
         // The attached catalog has a heading of its own; one schema needs none.
-        assert_eq!(lines[5], Line::Catalog { name: "app".into(), storage: "sqlite".into() });
+        assert_eq!(lines[5], Line::Catalog { name: "app".into(), storage: "sqlite".into(), error: None });
+        // One the workspace records and could not attach heads nothing,
+        // and says why.
+        assert_eq!(
+            lines[7..],
+            [Line::Catalog { name: "gone".into(), storage: "sqlite".into(), error: Some("/x/gone.sqlite: no such file".into()) }]
+        );
         assert!(!lines.iter().any(|l| matches!(l, Line::Schema { .. })));
         // Family sort puts a base table ahead of its children.
         assert_eq!(rels(&tree_lines(&catalog, true, &None))[..2], [Rel::own("main", "orders"), Rel::own("main", "order_items")]);
@@ -825,7 +843,7 @@ mod tests {
         let lines = tree_lines(&catalog, false, &Some("e".into()));
         assert_eq!(rels(&lines), [Rel::own("main", "order_items"), Rel::own("main", "orders"), Rel::own("main", "gone"), Rel::own("main", "sales"), Rel::of("app", "main", "people")]);
         let lines = tree_lines(&catalog, false, &Some("zzz".into()));
-        assert!(rels(&lines).is_empty() && lines.len() == 1);
+        assert!(rels(&lines).is_empty() && lines.len() == 2);
     }
 
     #[test]
@@ -842,7 +860,7 @@ mod tests {
             [
                 &Line::Schema { name: "main".into(), nested: false },
                 &Line::Schema { name: "audit".into(), nested: false },
-                &Line::Catalog { name: "app".into(), storage: String::new() },
+                &Line::Catalog { name: "app".into(), storage: String::new(), error: None },
                 &Line::Schema { name: "main".into(), nested: true },
                 &Line::Schema { name: "x".into(), nested: true },
             ]
