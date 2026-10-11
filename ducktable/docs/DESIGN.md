@@ -45,8 +45,9 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
   summoning and stopping a server) is harbor's `harbor-http`, the one
   harbor's own CLI speaks through; DuckTable's `harbor-client` adds results
   read whole, the catalog and the fleet.
-- **A database can be opened by file or added by port.** File → Open Database
-  File chooses a DuckDB path. File → Open Database URL saves a sidebar name and
+- **A database can be opened by file or added by port.** File → Open… chooses
+  a DuckDB path, or files DuckDB reads, which open in the workspace
+  (Opening anything, below). File → Open Database URL saves a sidebar name and
   a Harbor host and port. `localhost` means a direct IPv4-loopback connection;
   any other host means SSH. DuckTable runs `/usr/bin/ssh` directly, forwards a
   unix socket in Harbor's runtime directory (0700, so no other user of the
@@ -192,9 +193,8 @@ and TABLES although the code says berth.
 
 Menus:
 
-- **File:** Open Database File…, Open Database URL…; Export Table and Export
-  Results, each a submenu of CSV…, Parquet…, JSON… and Excel… (Copy and
-  export, below).
+- **File:** Open…, Open Database URL…; Export Table and Export Results, each
+  a submenu of CSV…, Parquet…, JSON… and Excel… (Copy and export, below).
 - **Edit:** New Row, Duplicate Row, Delete Row, which act on the Data grid
   (EDITING.md); Copy as CSV, Copy as Markdown, Copy as SQL INSERT.
 - **View:** Structure, Data, Query; Refresh Tables; Previous and Next Table;
@@ -252,18 +252,35 @@ per axis, only the move that applies: **Start** or **Stop**, **Attach** or
 **Detach**, and the **Autostart** checkmark. A tunneled row says "Connects
 over SSH to <host>" in its tooltip, and its menu offers **Remove Database**.
 
-**TABLES** shows the connected berth's tables from Harbor's `/catalog` as a
-flat list, with schema headings only when there is more than one schema. Each
-row carries its column count and an SI-rounded row count (13k, 4.6M).
-Sequences follow in their own SEQUENCES section. A filter field appears past
-ten tables. **Refresh Tables** (⌘R, or the View menu) refetches the catalog and
+The workspace (docs/OPEN.md) is listed first, as **Workspace**, whether its
+server runs or not, once its file exists. A row's count is its tables and
+views.
+
+**TABLES** shows the connected berth's catalog from Harbor's `/catalog`, line
+by line (`sidebar::tree_lines`): its tables, then its views, with schema
+headings only when there is more than one schema; then each attached catalog
+(a SQLite file in the workspace) under a heading of its own that names its
+storage, its tables and views in the same order. Each table carries its
+column count and an SI-rounded row count (13k, 4.6M) where the catalog has
+one; an attached SQLite file's has none, since counting reads every row. A
+view carries its column count and the word `view`; one that does not read
+(a file gone, an extension not loaded) shows its name in the warning color
+and the engine's reason in its tooltip. Sequences follow in their own
+SEQUENCES section. A filter field appears past ten tables and views.
+
+Right-click on a table or view offers **Save As**, a submenu of the four
+export formats; on a workspace view that reads a file, **Import as Table**
+and **Remove from Workspace** too; on an attached catalog's heading,
+**Detach** (docs/OPEN.md). **Refresh Tables** (⌘R, or the View menu) refetches the catalog and
 the open Data page and swaps them in one frame; it never blanks the tree, and a
 failed refresh keeps the old one. A successful commit and every completed
 Query run refresh the same way. When refreshes overlap, only the newest may
 replace a snapshot.
 
-A single click selects a table and keeps the current view. A double click
-selects it and switches to Data.
+A single click selects a table or view and keeps the current view. A double
+click selects it and switches to Data. A view's grid is read-only, has no
+total, and its footer says it is a view. ⌥←/⌥→ walk the tree's tables and
+views in its order.
 
 ### Grid
 
@@ -464,7 +481,7 @@ arrows, ⌘S, ⌘Z, ⌘⌫, ⌃⇧N, ⌘⇧⌫) is EDITING.md's; the Query view'
 
 | Key | Does |
 | --- | --- |
-| ⌘O | Open Database File |
+| ⌘O | Open…: a database, or files that open in the workspace |
 | ⌘C | in a grid, copy the selection as TSV (Copy and export) |
 | ⌘R | Refresh Tables: the catalog and the open Data page |
 | ⌘1 / ⌘2 / ⌘3 | Structure / Data / Query |
@@ -572,6 +589,14 @@ display and scroll foundation, and no column-windowing wrapper is needed.
   renumbers the rest, which is why a keyless table's identity pairs the rowid
   with a hash of the row (EDITING.md).
 
+## Opening anything
+
+A file that is not a DuckDB database opens in the workspace, as a view over
+the file or an attached SQLite catalog, through one function that every way
+in reaches: Finder and the Dock (`on_open_urls`, through the bundle's
+document types), a drop on the window, the command line and File → Open….
+docs/OPEN.md is the authority.
+
 ## Code layout
 
 One file per surface, one owner per piece of state. `app.rs` is the root entity
@@ -581,8 +606,10 @@ The surfaces (`sidebar.rs`, `content.rs`, `grid.rs`, `structure.rs`,
 methods, never mutating it themselves. `edits.rs` is the staging model,
 `sql.rs` every hand-written query and `copy.rs` a selection written as
 text; all three are pure. `export.rs` writes files through the engine's
-`COPY`, its decisions in pure functions, and `query/complete.rs` is the
-Query editor's completion (QUERY.md). A copy's or an export's word in
+`COPY`, its decisions in pure functions, `open.rs` is every way a path
+reaches the app and what it opens (OPEN.md), and `query/complete.rs` is the
+Query editor's completion (QUERY.md). harbor-client's `workspace.rs` makes
+and finds the workspace's views and attachments. A copy's or an export's word in
 the status line is `footer::say`. All colors resolve through `theme.rs`. `main.rs` is the entry point, menus and key bindings.
 
 The rule this protects: one type that owns every surface decays into an
@@ -613,5 +640,4 @@ blocks them.
   deferred until it clears an adversarial review (EDITING.md).
 - **Inspector and Structure editing.** A row editor in the inspector that
   shares the grid's one editing session, and a schema editor in Structure.
-- **Catalog.** Views, macros and attached catalogs in the TABLES tree once
-  `/catalog` carries them.
+- **Catalog.** Macros in the TABLES tree once `/catalog` carries them.

@@ -290,7 +290,11 @@ affected-exactly-one check are the backstop there, as everywhere.
   until commit; `INSERT … RETURNING *` verifies that exactly one row landed,
   and the post-commit refetch acquires its real primary key or rowid. A
   duplicate also carries the identity of the row it copies, which its INSERT
-  names in a WHERE like any other.
+  names in a WHERE like any other. A table of a SQLite file attached in the
+  workspace edits by the same rules, keyed by its primary key or by rowid
+  and hash; SQLite refuses `RETURNING` (measured), so its INSERT is checked
+  by its affected-row count instead, and a duplicate whose source is gone
+  counts 0 and is refused.
 - Statements are parameterized (`?` + bound params), never assembled
   from strings. Identifiers are quoted.
 - A value is bound as what it is. Harbor binds text as VARCHAR, and for most

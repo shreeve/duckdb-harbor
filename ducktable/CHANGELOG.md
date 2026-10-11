@@ -17,6 +17,28 @@ date, newest first.
 - **The Query editor completes.** DuckDB's own completer answers through
   Harbor, and the sidebar's catalog fills in what it leaves out and answers
   alone when the server cannot.
+- **Anything DuckDB reads opens.** A CSV, a folder of Parquet, a JSON file,
+  an Excel workbook, a GeoJSON file, a shapefile or a SQLite file opens in
+  the workspace `harbor <data file>` uses, as a view that reads the file
+  where it lies or, for SQLite, an attached catalog, so a large file opens at
+  once and nothing is copied until asked. Before, DuckTable opened only
+  DuckDB files, and any other was a failed connect.
+- **Every way in opens it.** Finder's double-click and Open With, a drop on
+  the Dock icon or the window, `ducktable a.csv data/` and File → Open… all
+  reach one function that reads what each path holds and opens it, a drop
+  of several files together. The bundle declares a document type for each
+  kind, owning DuckDB's and an alternate for the kinds other apps have, so it
+  is offered without taking CSV or Excel from them.
+- **The sidebar shows views and attached databases.** The TABLES tree lists
+  a database's views after its tables, read-only and marked, with the
+  engine's reason when one does not read, and each attached SQLite file under
+  its own heading, its tables editable with the grid's rules. The workspace
+  is listed first, as Workspace.
+- **Import as Table and Save As.** A workspace view becomes a table of its
+  name in one transaction, asking first above 100 MB and saying the size,
+  and any table or view saves to CSV, Parquet, JSON or Excel from its
+  right-click menu. Remove from Workspace and Detach let a file go without
+  touching it.
 
 ## 0.23.0 — 2026-10-10
 
