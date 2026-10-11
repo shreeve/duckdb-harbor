@@ -102,6 +102,10 @@ pub(crate) struct QuitRisks {
     pub(crate) transaction: bool,
     /// A statement is running in the Query view.
     pub(crate) running: bool,
+    /// An export is writing its file (export.rs). Only the app's end cuts
+    /// it off: it holds a connection of its own, which leaving a database
+    /// does not close.
+    pub(crate) exporting: bool,
 }
 
 /// The one dialog (docs/EDITING.md, "Dialogs"): its message, its detail,
@@ -198,6 +202,7 @@ impl QuitRisks {
             committing: self.committing && !accepted.committing,
             transaction: self.transaction && !accepted.transaction,
             running: self.running && !accepted.running,
+            exporting: self.exporting && !accepted.exporting,
         }
     }
 
@@ -278,12 +283,16 @@ impl QuitRisks {
                 sentence(&going)
             ));
         }
+        if self.exporting {
+            detail.push(format!("An export is still writing its file. {} stops it, and no file is written.", sentence(&going)));
+        }
         if detail.is_empty() {
             return None;
         }
         // Staged changes alone are the common case, and the question names
         // them; anything else is asked plainly, with the facts below it.
-        let only_staged = !(held > 0 || self.editing || self.committing || self.transaction || self.running);
+        let only_staged =
+            !(held > 0 || self.editing || self.committing || self.transaction || self.running || self.exporting);
         let discard =
             |what: &str| changes.as_ref().filter(|_| only_staged).map(|c| format!("Discard {c} and {what}?"));
         let (message, confirm) = match leaving {
@@ -323,6 +332,8 @@ struct OnScreen<'a> {
     /// The Query view's transaction, and a statement running there.
     transaction: bool,
     running: bool,
+    /// An export writing its file, whatever database it reads.
+    exporting: bool,
 }
 
 /// What going ahead with `leaving` puts at risk. A quit risks everything:
@@ -355,6 +366,7 @@ fn risks_of(
         committing: screen.committing,
         transaction: screen.transaction,
         running: screen.running,
+        exporting: quitting && screen.exporting,
     }
 }
 
@@ -685,6 +697,7 @@ impl DuckTable {
                 query.read(cx).flush_scratch();
             }
             this.release_for_quit(cx);
+            crate::export::abandon(cx);
             crate::prefs::save(cx, |_| {});
             fleet::close_tunnels();
             async {}
@@ -714,6 +727,7 @@ impl DuckTable {
             editing: grid.is_some_and(|g| g.is_editing()),
             transaction: query.is_some_and(|q| q.in_transaction()),
             running: query.is_some_and(|q| q.is_running()),
+            exporting: crate::export::running(cx),
         };
         risks_of(leaving, self.left_by(leaving).as_ref(), self.connected_key().as_ref(), screen, &self.staged)
     }
@@ -1888,6 +1902,7 @@ mod tests {
             committing: true,
             transaction: true,
             running: true,
+            exporting: false,
         }
         .question()
         .unwrap();
@@ -1917,6 +1932,12 @@ mod tests {
         assert_eq!((typing.message.as_str(), typing.confirm), ("Quit DuckTable?", "Quit Anyway"));
         let running = QuitRisks { running: true, ..Default::default() }.question().unwrap();
         assert!(running.detail.starts_with("A statement is still running in the Query view."));
+        // So is an export writing its file: the quit stops it.
+        let exporting = QuitRisks { exporting: true, ..Default::default() }.question().unwrap();
+        assert_eq!((exporting.message.as_str(), exporting.confirm), ("Quit DuckTable?", "Quit Anyway"));
+        assert_eq!(exporting.detail, "An export is still writing its file. Quitting stops it, and no file is written.");
+        let staged = QuitRisks { staged: 1, tables: 1, exporting: true, ..Default::default() }.question().unwrap();
+        assert_eq!((staged.message.as_str(), staged.confirm), ("Quit DuckTable?", "Quit Anyway"));
     }
 
     #[test]
@@ -2052,9 +2073,15 @@ mod tests {
             editing: true,
             transaction: true,
             running: false,
+            exporting: true,
         };
         let quit = risks_of(&Leaving::Quit, Some(&a), Some(&a), screen(false), &parked);
         assert_eq!((quit.staged, quit.tables, quit.editing, quit.transaction), (6, 3, true, true));
+        // An export holds a connection of its own: only the app's end
+        // stops it, so leaving a database does not count it.
+        assert!(quit.exporting);
+        let relaunch = risks_of(&Leaving::Relaunch, Some(&a), Some(&a), screen(false), &parked);
+        assert!(relaunch.exporting);
         // A commit in flight has the grid's set: it is not counted staged.
         let committing = risks_of(&Leaving::Quit, Some(&a), Some(&a), screen(true), &parked);
         assert_eq!((committing.staged, committing.tables, committing.committing), (5, 2, true));

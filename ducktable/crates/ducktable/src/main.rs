@@ -9,6 +9,7 @@ mod content;
 mod copy;
 mod copy_button;
 mod edits;
+mod export;
 mod footer;
 mod grid;
 mod inspector;
@@ -43,6 +44,15 @@ actions!(
 #[action(namespace = ducktable, no_json)]
 pub struct CopyAs {
     pub(crate) format: copy::Format,
+}
+
+/// File → Export Table or Export Results, in one format; the save panel
+/// asks where (export.rs).
+#[derive(Clone, Default, PartialEq, Debug, Action)]
+#[action(namespace = ducktable, no_json)]
+pub struct Export {
+    pub(crate) results: bool,
+    pub(crate) format: export::Format,
 }
 
 /// Pick a theme by its index in `theme::list` — carried as data so one
@@ -217,6 +227,12 @@ fn app_menus(can_update: bool) -> Vec<Menu> {
             // ⌘O advertises itself from the keymap binding.
             MenuItem::action("Open Database File…", OpenDatabase),
             MenuItem::action("Open Database URL…", OpenDatabaseUrl),
+            MenuItem::separator(),
+            // The save panel has no format picker, so the format is
+            // chosen here; a name typed with another format's extension
+            // takes that one (export::format_for).
+            MenuItem::submenu(Menu::new("Export Table").items(export_items(false))),
+            MenuItem::submenu(Menu::new("Export Results").items(export_items(true))),
         ]),
         Menu::new("Edit").items([
             MenuItem::action("New Row", AddRow),
@@ -265,6 +281,15 @@ fn app_menus(can_update: bool) -> Vec<Menu> {
     ]
 }
 
+/// One export submenu: the four formats, for the table or the result.
+fn export_items(results: bool) -> Vec<MenuItem> {
+    use export::Format;
+    [("CSV…", Format::Csv), ("Parquet…", Format::Parquet), ("JSON…", Format::Json), ("Excel…", Format::Excel)]
+        .into_iter()
+        .map(|(label, format)| MenuItem::action(label, Export { results, format }))
+        .collect()
+}
+
 /// The grid a copy reads: the one whose table has the keyboard, or with
 /// none, the grid the view shows (the Structure view's columns, the Data
 /// table, or the Query result).
@@ -298,6 +323,28 @@ fn copy_selection(format: copy::Format, cx: &mut App) {
             }
             Err(why) => {
                 footer::say(cx, why, true, Some(std::time::Duration::from_secs(4)));
+            }
+        }
+    });
+}
+
+/// File → Export Table (the Data view's table, under its filter and
+/// ordering) or Export Results (the statement behind the Query result).
+fn export_grid(results: bool, format: export::Format, cx: &mut App) {
+    if asking_to_quit(cx) {
+        return;
+    }
+    on_view(cx, move |this, cx| {
+        let grid = if results { this.query.as_ref().and_then(|q| q.read(cx).results_grid()) } else { this.grid.clone() };
+        let Some(grid) = grid else {
+            let why = if results { "run a query to export its result" } else { "choose a table to export" };
+            footer::say(cx, why, true, Some(std::time::Duration::from_secs(4)));
+            return;
+        };
+        match grid.read(cx).export_plan(results) {
+            Ok(plan) => export::start(plan, format, cx),
+            Err(why) => {
+                footer::say(cx, why, true, Some(std::time::Duration::from_secs(8)));
             }
         }
     });
@@ -729,6 +776,7 @@ fn main() {
         // context, grid::init); the Edit menu's copies from anywhere.
         cx.on_action(|_: &CopyCells, cx| copy_selection(copy::Format::Tsv, cx));
         cx.on_action(|a: &CopyAs, cx| copy_selection(a.format, cx));
+        cx.on_action(|a: &Export, cx| export_grid(a.results, a.format, cx));
         // One command behind both the View menu and Cmd+R. The sidebar
         // glyph calls the same refresh_tables method directly from its
         // DuckTable context, so every entrance has identical semantics.

@@ -45,7 +45,8 @@ impl Global for Word {}
 
 /// Say `text` in the status line, in the danger color when `bad`, for
 /// `hold` or until the next word replaces it. Returns the word's number,
-/// by which its sayer knows whether it is still the one said.
+/// by which its sayer knows whether it is still the one said
+/// (`says_another`).
 pub(crate) fn say(cx: &mut App, text: impl Into<SharedString>, bad: bool, hold: Option<std::time::Duration>) -> u64 {
     let word = cx.default_global::<Word>();
     word.seq += 1;
@@ -66,6 +67,11 @@ pub(crate) fn say(cx: &mut App, text: impl Into<SharedString>, bad: bool, hold: 
         .detach();
     }
     seq
+}
+
+/// Whether the status line says a word other than word `seq`.
+pub(crate) fn says_another(cx: &App, seq: u64) -> bool {
+    cx.try_global::<Word>().is_some_and(|w| w.seq != seq && w.text.is_some())
 }
 
 /// What the status line says now, and whether it says it in the danger
