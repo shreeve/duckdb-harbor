@@ -27,16 +27,24 @@ DuckTable looked at, never guessed at.
 
 ## The workspace
 
-A data file has no database of its own, so it opens in the **workspace**: a
-DuckDB database DuckTable keeps at `~/.local/share/ducktable/workspace.duckdb`,
-served by Harbor like any other and shown first in the sidebar as
-**Workspace**. Opening a file there:
+A data file has no database of its own, so it opens in the **workspace**:
+one DuckDB database, Harbor's, at `~/.local/share/harbor/workspace.duckdb`
+(`$XDG_DATA_HOME/harbor/` or `$HARBOR_HOME` when set), served by Harbor like
+any other and shown first in the sidebar as **Workspace**. DuckTable reads
+its path from `harbor_common::paths::workspace()`, the function the `harbor`
+command line uses, so `harbor sales.csv` and a drop on DuckTable land in the
+same place, and a view made by either is there for both. Opening a file
+there:
 
 - creates a view named for the file's stem (`sales.csv` → `sales`, a second
   `sales` → `sales_2`) that reads the file where it lies, so a 10 GB Parquet
   file opens at once and the grid reads only the page it shows;
 - records the path and the reader in the view's own SQL, so the workspace
   outlives a restart and a file that has moved says so when it is opened;
+- attaches a SQLite file and writes its row in the workspace's record,
+  `_harbor.attached` (`name`, `path`, `type`, `read_only`; the statements
+  are `wire::open::RECORD_DDL` and `Record::insert_sql`), so the attachment
+  outlives the server;
 - leaves the file untouched. Nothing DuckTable does writes to a data file.
 
 Views in the workspace can be joined with each other, queried in the Query
@@ -52,7 +60,20 @@ into data DuckTable can edit and keep:
 Remove on a workspace entry drops the view or table; it never touches the
 file. A SQLite file is attached in the workspace read-write, and its tables
 are edited in place with the same rules as a DuckDB table; Detach removes the
-attachment.
+attachment, with a plain `DETACH`.
+
+Every server that opens the workspace makes it whole before it serves, for
+any client: it loads `spatial` when a view calls an `ST_` function, since
+`spatial` does not load on demand (`excel`, `json`, `parquet` and `sqlite`
+do), and attaches again each file the record names. When it stops it
+rewrites the record from what is attached then, so an `ATTACH` or `DETACH`
+from any client lasts; writing the row at the attach keeps it through a
+server that does not stop cleanly. The record is Harbor's, and `/catalog`
+does not list it. A recorded file that is gone at the start is listed among
+`attached` with no tables and its reason in `error`; DuckTable shows it so,
+greyed, with the reason, and Detach on it deletes the row
+(`DELETE FROM _harbor.attached WHERE name = …`), since there is nothing
+attached to detach.
 
 ## Every way in
 
@@ -76,7 +97,7 @@ Workspace, asking first only about what cannot be parked, as any switch does.
 
 ## Harbor's half
 
-Two server changes make the workspace possible:
+Three server changes make the workspace possible:
 
 - **`/catalog` lists views and attached catalogs.** It lists tables in the
   current database only (`viewsSomeday` is the placeholder). Views come with
@@ -90,6 +111,9 @@ Two server changes make the workspace possible:
   the same rule DuckTable uses, so `SELECT * FROM sales` works at once.
   `harbor x.duckdb` is unchanged; only paths that classify as data or SQLite
   go to the workspace.
+- **The workspace is whole at every start**: the extensions its views need
+  loaded and its recorded files attached, before the server serves, as
+  above.
 
 A workspace server is never `--sealed`: reading files and loading
 extensions is its job. A sealed server refuses `read_csv` and `INSTALL`, and
