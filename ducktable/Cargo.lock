@@ -1464,6 +1464,7 @@ dependencies = [
  "harbor-client",
  "harbor-common",
  "libc",
+ "lsp-types",
  "objc2 0.6.4",
  "serde",
  "serde_json",

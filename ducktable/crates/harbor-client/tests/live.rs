@@ -1625,3 +1625,37 @@ fn a_statement_on_a_stopped_server_was_not_sent() {
     drop(other);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The engine's completer answers through Harbor on a pooled connection, in
+/// well under the Query editor's wait: a keyword, a table of the catalog,
+/// and a column after its table's name. After a bare `table.` it names no
+/// column, which is why the editor takes a qualified name's members from
+/// the catalog.
+#[test]
+#[ignore]
+fn the_engine_completes_keywords_tables_and_columns() {
+    use harbor_client::complete::{load, suggest, Suggestion};
+    use std::time::{Duration, Instant};
+    let Some(conn) = scratch() else { return };
+    load(&conn, Duration::from_secs(30)).expect("LOAD autocomplete");
+    harbor_client::query(&conn, "CREATE OR REPLACE TABLE _dt_complete_probe (id INTEGER, email VARCHAR)")
+        .expect("create");
+    let ask = |sql: &str| {
+        let began = Instant::now();
+        let answer = suggest(&conn, sql, Duration::from_millis(250)).expect("an answer");
+        let first: Vec<_> = answer.iter().take(4).map(|s| format!("{}@{} {}", s.text, s.start, s.kind)).collect();
+        println!("{sql:?} in {:?}: {} suggestions, first {first:?}", began.elapsed(), answer.len());
+        answer
+    };
+    let has = |answer: &[Suggestion], text: &str, start: usize, kind: &str| {
+        answer.iter().any(|s| s.text == text && s.start == start && s.kind == kind)
+    };
+    assert!(has(&ask("SEL"), "SELECT", 0, "keyword"));
+    assert!(has(&ask("select * fr"), "from", 9, "keyword"));
+    assert!(has(&ask("SELECT * FROM _dt_complete_pr"), "_dt_complete_probe", 14, "table"));
+    assert!(has(&ask("SELECT _dt_complete_probe.em"), "email", 26, "column"));
+    assert!(!ask("SELECT _dt_complete_probe.").iter().any(|s| s.kind == "column"));
+    // Offsets count bytes, as the editor's do.
+    assert!(has(&ask("SELECT 'é', _dt_complete_probe.em"), "email", 32, "column"));
+    harbor_client::query(&conn, "DROP TABLE _dt_complete_probe").expect("drop");
+}
