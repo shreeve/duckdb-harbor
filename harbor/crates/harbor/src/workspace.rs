@@ -106,6 +106,11 @@ pub fn rewrite(current: &[Record], kept: &[String], exists: bool, catalog: &str)
 /// Set when this server serves the workspace: what it could not attach.
 static SERVING: Mutex<Option<Vec<Unattached>>> = Mutex::new(None);
 
+/// The databases attached before the workspace was opened, by the
+/// operator's `--init`: theirs to attach at every start, so never recorded,
+/// and a recorded row of one of their names stays as it is.
+static INIT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 /// Whether this server serves the workspace.
 pub fn serving() -> bool {
     SERVING.lock().unwrap().is_some()
@@ -134,6 +139,15 @@ pub fn open(con: &mut Conn) {
         .query_strings("SELECT database_name FROM duckdb_databases() WHERE NOT internal")
         .unwrap_or_default();
     let plan = plan(&views, &records, &attached, |path| std::path::Path::new(path).is_file());
+    let catalog = served(con);
+    let init: Vec<String> = attached.into_iter().filter(|name| *name != catalog).collect();
+    for record in records.iter().filter(|r| init.iter().any(|name| name.eq_ignore_ascii_case(&r.name))) {
+        eprintln!(
+            "harbor: workspace: {} is attached by --init, so the file the workspace records for it, {}, is not",
+            record.name, record.path
+        );
+    }
+    *INIT.lock().unwrap() = init;
 
     // Installed by whoever made the view, and loaded here from the disk. One
     // that is not installed (a fresh extension directory, an engine of
@@ -237,7 +251,8 @@ fn record_exists(con: &mut Conn) -> bool {
 }
 
 /// Rewrite the record from what is attached on `con` as the server stops
-/// ([`rewrite`]). A failure is said and leaves the record as it was.
+/// ([`rewrite`]), less what `--init` attached, whose rows stay as they are.
+/// A failure is said and leaves the record as it was.
 pub fn record(con: &mut Conn) {
     let Some(unattached) = SERVING.lock().unwrap().clone() else { return };
     // An executor abandoned at the stop may still be attaching or detaching.
@@ -248,11 +263,13 @@ pub fn record(con: &mut Conn) {
          WHERE NOT internal AND database_name <> current_database() AND path IS NOT NULL \
          ORDER BY database_name",
     );
+    let init = INIT.lock().unwrap().clone();
+    let by_init = |name: &str| init.iter().any(|n| n.eq_ignore_ascii_case(name));
     let current: Vec<Record> = match current {
         Ok(rows) => rows
             .iter()
             .filter_map(|row| serde_json::from_str::<Record>(row).ok())
-            .filter(|r| Record::kept(&r.storage, &r.path))
+            .filter(|r| Record::kept(&r.storage, &r.path) && !by_init(&r.name))
             .collect(),
         Err(e) => {
             eprintln!("harbor: workspace: what is attached could not be read, and the record stays as it was: {e}");
@@ -263,6 +280,7 @@ pub fn record(con: &mut Conn) {
         .into_iter()
         .map(|u| u.record.name)
         .filter(|name| !current.iter().any(|r| r.name.eq_ignore_ascii_case(name)))
+        .chain(init)
         .collect();
     let exists = record_exists(con);
     let catalog = served(con);

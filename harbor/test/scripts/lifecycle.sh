@@ -965,6 +965,21 @@ workspace_start
 check "and detaches" 0 "" "$harbor" "$work/workspace.duckdb" -c "DETACH _harbor"
 workspace_stop
 
+echo "— a database --init attaches is the operator's"
+workspace_start --init "ATTACH '$work/i2.duckdb' AS initdb"
+[[ $(catalog_lines) == *"attached initdb [] None"* ]] && ok "it is attached" || bad "--init's database: $(catalog_lines)"
+workspace_stop
+check "and not recorded at the stop" 0 "0" \
+  "$harbor" "$work/workspace.duckdb" --mode csv -c "SELECT count(*) FROM _harbor.attached WHERE name = 'initdb'"
+wait_gone
+workspace_start --init "ATTACH '$work/i3.duckdb' AS notsq"
+grep -q "notsq is attached by --init" "$work/ws.log" && ok "a recorded name --init takes is said in the log" \
+  || bad "the log: $(cat "$work/ws.log")"
+workspace_stop
+check "and its row stays as it was" 0 "$work/files/ab.csv" \
+  "$harbor" "$work/workspace.duckdb" --mode csv -c "SELECT path FROM _harbor.attached WHERE name = 'notsq'"
+wait_gone
+
 if (( spatial )); then
   echo "— an extension the workspace needs and does not have"
   # An install is a download, and never stands between the database and the

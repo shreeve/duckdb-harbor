@@ -619,26 +619,29 @@ name another relation or a reserved word has gets `_2`, `_3`; opening the same
 file again finds the view the first opening made. The `excel`, `sqlite` and
 `spatial` extensions install on first use.
 
-Every server that opens the workspace makes it whole before it serves
-anyone, whichever client summoned it: it loads `spatial` when a view calls an
-`ST_` function, since `spatial` does not load on demand (`excel`, `json`,
-`parquet` and `sqlite` do), and installs it in the background when it is not
-installed, never between the database and the socket, since an install is a
-download (the views that need it say why they do not read until it loads);
-and it attaches again each database file the
-workspace records. The record is the table `_harbor.attached` (`name`,
-`path`, `type`, `read_only`) in the workspace itself: `harbor <SQLite file>`
-writes its row, and the server rewrites it from what is attached when it
-stops, so a plain `ATTACH` or `DETACH` of a SQLite or DuckDB file, from any
-client, lasts past the server; one that ends without stopping (a crash, a
-`kill -9`) leaves the record as last written. `/catalog` does not list it. A recorded file
-that is gone at the start is not attached, since attaching a missing path
-would make an empty database there, and one whose catalog does not read once
-attached (not SQLite after all, or locked by another program) is detached
-again, since it would fail every catalog read of the server; the server's log
-and `/catalog` say so, the server starts all the same, and the row stays, so
-the file is attached again at a later start once it reads. Deleting the row forgets it. The verbs (`start`,
-`backup`, …) act on databases and refuse a data file.
+Every server that opens the workspace makes it whole before it serves anyone,
+whichever client summoned it: it loads `spatial` when a view calls an `ST_`
+function, since `spatial` does not load on demand (`excel`, `json`, `parquet`
+and `sqlite` do), and installs it in the background when it is not installed,
+never between the database and the socket, since an install is a download (the
+views that need it say why they do not read until it loads); and it attaches
+again each database file the workspace records. The record is the table
+`_harbor.attached` (`name`, `path`, `type`, `read_only`) in the workspace
+itself: `harbor <SQLite file>` writes its row, and the server rewrites it from
+what is attached when it stops, so a plain `ATTACH` or `DETACH` of a SQLite or
+DuckDB file, from any client, lasts past the server; one that ends without
+stopping (a crash, a `kill -9`) leaves the record as last written. A database
+`--init` attaches is the operator's, attached by each start that passes it,
+and is never recorded; a recorded file of the same name is not attached beside
+it, and its row stays as it is. `/catalog` does not list the record. A
+recorded file that is gone at the start is not attached, since attaching a
+missing path would make an empty database there, and one whose catalog does
+not read once attached (not SQLite after all, or locked by another program) is
+detached again, since it would fail every catalog read of the server; the
+server's log and `/catalog` say so, the server starts all the same, and the
+row stays, so the file is attached again at a later start once it reads.
+Deleting the row forgets it. The verbs (`start`, `backup`, …) act on databases
+and refuse a data file.
 
 **`harbor <db.duckdb> start` — the server is yours.** No refcount: it lives
 until you stop it. At a terminal the server comes up in the background and
