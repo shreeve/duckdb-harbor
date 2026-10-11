@@ -616,7 +616,10 @@ file again finds the view the first opening made. The `excel`, `sqlite` and
 Every server that opens the workspace makes it whole before it serves
 anyone, whichever client summoned it: it loads `spatial` when a view calls an
 `ST_` function, since `spatial` does not load on demand (`excel`, `json`,
-`parquet` and `sqlite` do), and it attaches again each database file the
+`parquet` and `sqlite` do), and installs it in the background when it is not
+installed, never between the database and the socket, since an install is a
+download (the views that need it say why they do not read until it loads);
+and it attaches again each database file the
 workspace records. The record is the table `_harbor.attached` (`name`,
 `path`, `type`, `read_only`) in the workspace itself: `harbor <SQLite file>`
 writes its row, and the server rewrites it from what is attached when it

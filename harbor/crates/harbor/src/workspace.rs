@@ -7,7 +7,8 @@
 //! reads with `ST_Read` reads only in a server that has loaded `spatial`,
 //! which the engine does not load on demand. So a server that opens the
 //! workspace, before it serves anyone, loads the extensions its views call
-//! into and attaches each recorded file again ([`open`]), and when it stops
+//! into (installing in the background one that is not installed) and
+//! attaches each recorded file again ([`open`]), and when it stops
 //! it rewrites the record from what is attached then ([`record`]), so an
 //! `ATTACH` or `DETACH` from any client lasts as the client meant it.
 //!
@@ -133,15 +134,22 @@ pub fn open(con: &mut Conn) {
         .unwrap_or_default();
     let plan = plan(&views, &records, &attached, |path| std::path::Path::new(path).is_file());
 
-    for extension in &plan.loads {
-        // Installed by whoever made the view; installed here when it is not,
-        // once, from DuckDB's repository.
-        let loaded = con
-            .execute_batch(&format!("LOAD {extension}"))
-            .or_else(|_| con.execute_batch(&format!("INSTALL {extension}; LOAD {extension}")));
-        if let Err(e) = loaded {
-            eprintln!("harbor: workspace: {extension} did not load, and the views that need it say so: {e}");
+    // Installed by whoever made the view, and loaded here from the disk. One
+    // that is not installed (a fresh extension directory, an engine of
+    // another version) is installed in the background, since an install is
+    // a download, and a repository that does not answer would
+    // hold the start, and every client waiting on it, for as long as a
+    // connection takes to time out. Until it is loaded, the views that need
+    // it say so in the engine's words.
+    let mut install = Vec::new();
+    for &extension in &plan.loads {
+        if let Err(e) = con.execute_batch(&format!("LOAD {extension}")) {
+            eprintln!("harbor: workspace: {extension} did not load, and is installed in the background: {e}");
+            install.push(extension);
         }
+    }
+    if !install.is_empty() {
+        install_later(con, install);
     }
     let mut unattached = plan.unattached;
     for record in plan.attaches {
@@ -153,6 +161,30 @@ pub fn open(con: &mut Conn) {
         eprintln!("harbor: workspace: {} is not attached — {}", u.record.name, u.reason);
     }
     *SERVING.lock().unwrap() = Some(unattached);
+}
+
+/// Install and load `extensions` on a connection of their own, on a thread
+/// of their own: a load is the whole instance's. Said in the server's log,
+/// done or not.
+fn install_later(con: &Conn, extensions: Vec<&'static str>) {
+    let mut own = match con.try_clone() {
+        Ok(own) => own,
+        Err(e) => {
+            eprintln!("harbor: workspace: no connection to install {} on: {e}", extensions.join(", "));
+            return;
+        }
+    };
+    let spawned = std::thread::Builder::new().name("harbor-install".to_string()).spawn(move || {
+        for extension in extensions {
+            match own.execute_batch(&format!("INSTALL {extension}; LOAD {extension}")) {
+                Ok(()) => eprintln!("harbor: workspace: {extension} installed and loaded"),
+                Err(e) => eprintln!("harbor: workspace: {extension} did not install, and the views that need it say so: {e}"),
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        eprintln!("harbor: workspace: no thread to install on: {e}");
+    }
 }
 
 /// Attach a recorded file again, and read its catalog. Attaching a SQLite
