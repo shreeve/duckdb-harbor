@@ -296,6 +296,21 @@ pub const RECORD_DDL: [&str; 2] = [
      (name VARCHAR PRIMARY KEY, path VARCHAR NOT NULL, type VARCHAR NOT NULL, read_only BOOLEAN NOT NULL)",
 ];
 
+/// The record's table named in `catalog`, the workspace's own. The server
+/// names it so: a database attached as `_harbor` makes `_harbor.attached`
+/// name two things, and the engine refuses the ambiguity.
+pub fn record_in(catalog: &str) -> String {
+    format!("{}.{RECORD_SCHEMA}.{RECORD_TABLE}", quote_ident(catalog))
+}
+
+/// [`RECORD_DDL`], in `catalog` ([`record_in`]).
+pub fn record_ddl_in(catalog: &str) -> [String; 2] {
+    [
+        format!("CREATE SCHEMA IF NOT EXISTS {}.{RECORD_SCHEMA}", quote_ident(catalog)),
+        RECORD_DDL[1].replacen("_harbor.attached", &record_in(catalog), 1),
+    ]
+}
+
 /// A database file attached in the workspace, as the workspace records it
 /// so that every server that opens the workspace attaches it again: an
 /// `ATTACH` lasts only as long as the server that ran it.
@@ -344,8 +359,13 @@ impl Record {
 
     /// The record's row for this file, written over any row of its name.
     pub fn insert_sql(&self) -> String {
+        self.insert_into(&format!("{RECORD_SCHEMA}.{RECORD_TABLE}"))
+    }
+
+    /// [`Record::insert_sql`], into `table` ([`record_in`]).
+    pub fn insert_into(&self, table: &str) -> String {
         format!(
-            "INSERT OR REPLACE INTO {RECORD_SCHEMA}.{RECORD_TABLE} (name, path, type, read_only) VALUES ({}, {}, {}, {})",
+            "INSERT OR REPLACE INTO {table} (name, path, type, read_only) VALUES ({}, {}, {}, {})",
             quote_literal(&self.name),
             quote_literal(&self.path),
             quote_literal(&self.storage),
@@ -587,6 +607,14 @@ mod tests {
         assert!(!Record::kept("postgres", "dbname=x password=y"));
         assert_eq!(Record::delete_sql("o'x"), "DELETE FROM _harbor.attached WHERE name = 'o''x'");
         assert_eq!(Record::names_sql("/x/o'brien.sqlite"), "SELECT name FROM _harbor.attached WHERE path <> '/x/o''brien.sqlite'");
+        assert_eq!(record_in("work\"space"), "\"work\"\"space\"._harbor.attached");
+        assert_eq!(
+            app.insert_into(&record_in("workspace")),
+            "INSERT OR REPLACE INTO \"workspace\"._harbor.attached (name, path, type, read_only) VALUES ('app', '/x/o''brien.sqlite', 'sqlite', false)"
+        );
+        let ddl = record_ddl_in("workspace");
+        assert_eq!(ddl[0], "CREATE SCHEMA IF NOT EXISTS \"workspace\"._harbor");
+        assert!(ddl[1].starts_with("CREATE TABLE IF NOT EXISTS \"workspace\"._harbor.attached (name VARCHAR PRIMARY KEY"), "{}", ddl[1]);
         // The record's schema is no name a file's view or catalog takes.
         assert_eq!(view_name("/x/_harbor.sqlite"), "harbor");
     }

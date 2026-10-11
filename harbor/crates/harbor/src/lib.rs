@@ -2927,7 +2927,8 @@ fn unattached_now(
     if unattached.is_empty() {
         return Ok(unattached);
     }
-    let sql = format!("SELECT name FROM {}.{}", wire::open::RECORD_SCHEMA, wire::open::RECORD_TABLE);
+    let served = databases.iter().find(|d| d.served).map(|d| d.name.as_str()).unwrap_or_default();
+    let sql = format!("SELECT name FROM {}", wire::open::record_in(served));
     let recorded: Vec<String> = match catalog_rows(exec, peer, &sql) {
         Ok(rows) => rows.iter().map(|row| cell_str(row, 0)).collect(),
         // The record dropped: nothing is recorded.

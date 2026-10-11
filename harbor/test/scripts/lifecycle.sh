@@ -950,6 +950,21 @@ check "and it opens again once it reads" 0 "app: the SQLite database" \
   "$harbor" "$work/files/app.sqlite" --mode csv -c "DETACH app"
 workspace_stop
 
+echo "— a database attached as the record's schema"
+# The record is _harbor.attached, which a catalog named _harbor makes
+# ambiguous; the server names it in the workspace's own catalog.
+workspace_start
+check "a database attaches as _harbor" 0 "" \
+  "$harbor" "$work/workspace.duckdb" -c "ATTACH '$work/hx.duckdb' AS _harbor"
+workspace_stop
+grep -q "could not be written" "$work/ws.log" && bad "the record at the stop: $(cat "$work/ws.log")" \
+  || ok "the record is written at the stop beside it"
+workspace_start
+[[ $(catalog_lines) == *"attached _harbor [] None"* ]] && ok "and the database is attached again at the start" \
+  || bad "a database named _harbor after a restart: $(catalog_lines)"
+check "and detaches" 0 "" "$harbor" "$work/workspace.duckdb" -c "DETACH _harbor"
+workspace_stop
+
 if (( spatial )); then
   echo "— an extension the workspace needs and does not have"
   # An install is a download, and never stands between the database and the

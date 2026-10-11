@@ -22,7 +22,7 @@
 
 use std::sync::Mutex;
 
-use wire::open::{self, Record, RECORD_DDL, RECORD_SCHEMA, RECORD_TABLE};
+use wire::open::{self, Record, RECORD_SCHEMA, RECORD_TABLE};
 
 use crate::engine::conn::Conn;
 
@@ -84,20 +84,21 @@ pub fn plan(views: &[String], records: &[Record], attached: &[String], exists: i
 /// else but `kept`, the names the server could not attach when it started,
 /// whose rows stay as they are. In one transaction, after the record is
 /// made where it is not; nothing when nothing is attached and the record
-/// does not exist.
-pub fn rewrite(current: &[Record], kept: &[String], exists: bool) -> Option<String> {
+/// does not exist. The record is named in `catalog`, the workspace's own.
+pub fn rewrite(current: &[Record], kept: &[String], exists: bool, catalog: &str) -> Option<String> {
     if current.is_empty() && !exists {
         return None;
     }
+    let table = open::record_in(catalog);
     let mut keep: Vec<String> = current.iter().map(|r| open::quote_literal(&r.name)).collect();
     keep.extend(kept.iter().map(|name| open::quote_literal(name)));
-    let mut sql: Vec<String> = RECORD_DDL.iter().map(|s| s.to_string()).collect();
+    let mut sql: Vec<String> = open::record_ddl_in(catalog).into();
     sql.insert(0, "BEGIN".into());
     sql.push(match keep.is_empty() {
-        true => format!("DELETE FROM {RECORD_SCHEMA}.{RECORD_TABLE}"),
-        false => format!("DELETE FROM {RECORD_SCHEMA}.{RECORD_TABLE} WHERE name NOT IN ({})", keep.join(", ")),
+        true => format!("DELETE FROM {table}"),
+        false => format!("DELETE FROM {table} WHERE name NOT IN ({})", keep.join(", ")),
     });
-    sql.extend(current.iter().map(Record::insert_sql));
+    sql.extend(current.iter().map(|r| r.insert_into(&table)));
     sql.push("COMMIT".into());
     Some(sql.join(";\n"))
 }
@@ -203,14 +204,20 @@ fn attach(con: &mut Conn, record: &Record) -> Result<(), String> {
     Err(e.to_string())
 }
 
+/// The served database's name, which names the record ([`open::record_in`]).
+fn served(con: &mut Conn) -> String {
+    con.query_strings("SELECT current_database()").ok().and_then(|mut rows| rows.pop()).unwrap_or_default()
+}
+
 /// The record's rows, or none when it has not been made.
 fn read_records(con: &mut Conn) -> Vec<Record> {
     if !record_exists(con) {
         return Vec::new();
     }
+    let table = open::record_in(&served(con));
     let rows = con.query_strings(&format!(
         "SELECT json_object('name', name, 'path', path, 'type', type, 'read_only', read_only)::VARCHAR \
-         FROM {RECORD_SCHEMA}.{RECORD_TABLE} ORDER BY name"
+         FROM {table} ORDER BY name"
     ));
     match rows {
         Ok(rows) => rows.iter().filter_map(|row| serde_json::from_str(row).ok()).collect(),
@@ -258,7 +265,8 @@ pub fn record(con: &mut Conn) {
         .filter(|name| !current.iter().any(|r| r.name.eq_ignore_ascii_case(name)))
         .collect();
     let exists = record_exists(con);
-    let Some(sql) = rewrite(&current, &kept, exists) else { return };
+    let catalog = served(con);
+    let Some(sql) = rewrite(&current, &kept, exists, &catalog) else { return };
     if let Err(e) = con.execute_batch(&sql) {
         let _ = con.execute_batch("ROLLBACK");
         eprintln!("harbor: workspace: the record of attached files could not be written, and stays as it was: {e}");
@@ -315,22 +323,23 @@ mod tests {
     fn the_record_is_rewritten_from_what_is_attached_at_the_stop() {
         // Nothing attached and no record: nothing is written, and the
         // workspace gains no schema.
-        assert_eq!(rewrite(&[], &[], false), None);
+        assert_eq!(rewrite(&[], &[], false, "workspace"), None);
         let app = rec("app", "/x/o'b.sqlite", "sqlite");
-        let sql = rewrite(&[app.clone()], &["gone".into()], false).unwrap();
+        let sql = rewrite(&[app.clone()], &["gone".into()], false, "workspace").unwrap();
+        let ddl = open::record_ddl_in("workspace");
         assert_eq!(
             sql.split(";\n").collect::<Vec<_>>(),
             [
                 "BEGIN",
-                RECORD_DDL[0],
-                RECORD_DDL[1],
-                "DELETE FROM _harbor.attached WHERE name NOT IN ('app', 'gone')",
-                app.insert_sql().as_str(),
+                ddl[0].as_str(),
+                ddl[1].as_str(),
+                "DELETE FROM \"workspace\"._harbor.attached WHERE name NOT IN ('app', 'gone')",
+                app.insert_into("\"workspace\"._harbor.attached").as_str(),
                 "COMMIT",
             ]
         );
         // Everything detached: the record is emptied, not dropped.
-        let sql = rewrite(&[], &[], true).unwrap();
-        assert!(sql.contains("DELETE FROM _harbor.attached;\n") && !sql.contains("INSERT"), "{sql}");
+        let sql = rewrite(&[], &[], true, "workspace").unwrap();
+        assert!(sql.contains("DELETE FROM \"workspace\"._harbor.attached;\n") && !sql.contains("INSERT"), "{sql}");
     }
 }
