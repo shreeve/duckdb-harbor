@@ -607,7 +607,11 @@ def run_views(base, work):
     o = attached.get("other", {})
     eq("an attached database's keys",
        ["name", "path", "type", "readOnly", "error", "tables", "views"], list(o.keys()))
-    eq("its path, type and read-only flag", (other, "duckdb", True), (o.get("path"), o.get("type"), o.get("readOnly")))
+    # The engine reports a DuckDB file's path resolved (macOS's /var is
+    # /private/var), so the two are compared as the same file.
+    real = lambda p: os.path.realpath(p) if p else p
+    eq("its path, type and read-only flag", (real(other), "duckdb", True),
+       (real(o.get("path")), o.get("type"), o.get("readOnly")))
     items = (o.get("tables") or [{}])[0]
     eq("its tables in the full shape, counted exactly",
        ("items", 3, ["id"], [("id", "INTEGER"), ("label", "VARCHAR")]),

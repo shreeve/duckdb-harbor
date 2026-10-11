@@ -17,7 +17,10 @@ here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 harbor=${LIFECYCLE_HARBOR:-$here/target/release/harbor}
 [[ -x $harbor ]] || { echo "lifecycle: build first (make harbor)" >&2; exit 77; }
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/harbor-lifecycle.XXXXXX")
+# macOS's TMPDIR ends in a slash; a doubled one would make every path this
+# suite compares against the server's differ from the server's spelling.
+tmp=${TMPDIR:-/tmp}
+work=$(mktemp -d "${tmp%/}/harbor-lifecycle.XXXXXX")
 # Servers hold the canonical spelling (macOS resolves /var to /private/var),
 # which is too long for a unix socket to live under, so $work stays as typed
 # and cleanup matches either form when it inspects a command line.
