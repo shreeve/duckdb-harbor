@@ -1552,9 +1552,10 @@ impl Grid {
     }
 
     /// What an export of this grid reads, or why it cannot: the table under
-    /// its filter and ordering, or the statement behind a result
+    /// its filter, in the order the grid shows it (the header sort with its
+    /// tie-break, or the strip's ORDER BY), or the statement behind a result
     /// (`export::refusal` says when neither can be written here).
-    pub(crate) fn export_plan(&self, results: bool) -> Result<crate::export::Plan, &'static str> {
+    pub(crate) fn export_plan(&self, results: bool, cx: &App) -> Result<crate::export::Plan, &'static str> {
         if let Some(reason) =
             crate::export::refusal(self.conn.db.is_some(), results, self.pageable, self.session.is_some())
         {
@@ -1562,7 +1563,7 @@ impl Grid {
         }
         Ok(crate::export::Plan {
             conn: self.conn.clone(),
-            select: crate::export::table_select(&self.source, &self.filter),
+            select: crate::export::table_select(&self.source, &self.filter, &self.sort, &self.tiebreak(cx)),
             stem: if results || self.title.is_empty() { "results".to_string() } else { self.title.clone() },
         })
     }

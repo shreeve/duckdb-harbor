@@ -332,9 +332,9 @@ grid the view shows. What is copied is one rule (`copy::span`):
 - Otherwise the ring's cell is copied alone, and with no ring, the one
   selected row.
 
-Rows are copied under a header line of column names, every visible column
-in display order; a single cell is its value alone, with no header and no
-line break. Markdown always has its header, which a table needs, and an
+Rows are copied in the order the grid shows them, its header sort's,
+under a header line of column names, every visible column in display
+order; a single cell is its value alone, with no header and no line break. Markdown always has its header, which a table needs, and an
 INSERT always names its columns. Values are the text Harbor sent, whole,
 never the cell's ellipsized drawing; a staged cell is copied as staged, and a
 new row's untouched cell as its default, since the copy is of what the grid
@@ -365,8 +365,10 @@ rows as TSV: only this page is loaded`). Export writes the rest.
 '<path>' (FORMAT …)`, through Harbor on a pooled connection, so nothing
 pages through the client and a table of any size exports at the engine's
 speed. File → Export Table writes the Data view's table, every column,
-under the filter strip's condition and ordering, the rows the grid pages
-without their LIMIT (a test holds the two together); staged changes are not
+under the filter strip's condition and in the order the grid shows: the
+header sort with its tie-break, or else the strip's `ORDER BY`. These are
+the rows the grid pages without their LIMIT: one function builds both
+(`sql::ordered_sql`), and a test holds them together. Staged changes are not
 in it, since the file holds what the database holds. Export Results runs the
 statement behind the Query result again, read as the grid reads it, so only
 a result the grid pages can be exported, and not one read inside a

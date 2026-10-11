@@ -65,15 +65,25 @@ pub(crate) fn sorted_page_sql(
     page: usize,
     size: usize,
 ) -> String {
+    format!("{} LIMIT {size} OFFSET {}", ordered_sql(source, rowid, filter, sort, tiebreak), page * size)
+}
+
+/// Every row the grid pages, in the order it shows them, with no page
+/// window: a page is this with a LIMIT and OFFSET ([`sorted_page_sql`]),
+/// and Export Table writes it whole (`export::table_select`), so the file
+/// holds the rows the grid shows in the order it shows them.
+pub(crate) fn ordered_sql(
+    source: &str,
+    rowid: bool,
+    filter: &Option<String>,
+    sort: &[SortKey],
+    tiebreak: &[String],
+) -> String {
     let cols = if rowid { "[rowid::UBIGINT, hash(*COLUMNS(*))] AS rowid, *" } else { "*" };
     let (cond, strip) = filter.as_deref().map_or(("", None), split_order);
     let order = order_by(sort, tiebreak).or_else(|| strip.map(|o| o.trim().to_string()));
     let order = order.map_or(String::new(), |o| format!("\nORDER BY {o}\n"));
-    format!(
-        "SELECT {cols} FROM {source}{}{order} LIMIT {size} OFFSET {}",
-        where_part(cond),
-        page * size
-    )
+    format!("SELECT {cols} FROM {source}{}{order}", where_part(cond))
 }
 
 /// One key of a header sort: a column of the table, by name, and its

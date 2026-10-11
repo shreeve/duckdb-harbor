@@ -76,15 +76,17 @@ pub(crate) fn refusal(local: bool, results: bool, pageable: bool, in_transaction
 }
 
 /// The SELECT an export reads: every column of `source` under the filter
-/// strip's condition and ordering, the rows the grid pages without the
-/// page's LIMIT (`sql::page_sql`, which a test holds this to).
-pub(crate) fn table_select(source: &str, filter: &Option<String>) -> String {
-    let (cond, order) = filter.as_deref().map_or(("", None), crate::sql::split_order);
-    let mut end = 0;
-    wire::statement::skip_trivia(cond.as_bytes(), &mut end);
-    let condition = if end == cond.len() { String::new() } else { format!(" WHERE (\n{cond}\n)") };
-    let order = order.map_or(String::new(), |o| format!("\nORDER BY {}\n", o.trim()));
-    format!("SELECT * FROM {source}{condition}{order}")
+/// strip's condition, in the order the grid shows, the header sort's with
+/// its tie-break or else the strip's ORDER BY. These are the rows the grid
+/// pages without the page's LIMIT (`sql::sorted_page_sql`, which a test
+/// holds this to); a result's grid has no header sort, and passes none.
+pub(crate) fn table_select(
+    source: &str,
+    filter: &Option<String>,
+    sort: &[crate::sql::SortKey],
+    tiebreak: &[String],
+) -> String {
+    crate::sql::ordered_sql(source, false, filter, sort, tiebreak)
 }
 
 /// The file name, lowercased, without a compression suffix the engine
@@ -340,23 +342,39 @@ mod tests {
 
     #[test]
     fn an_export_reads_the_rows_the_grid_pages() {
+        use crate::sql::SortKey;
+        let key = |column: &str, desc: bool| SortKey { column: column.to_string(), desc };
+        let ties = vec!["id".to_string()];
         // The grid's page query is the export's SELECT with a LIMIT on it,
-        // for every shape of filter: when paging learns to read rows in
-        // another order, this fails until the export reads them that way.
-        for filter in [
-            None,
-            Some("x > 0".to_string()),
-            Some("x > 0 ORDER BY name DESC".to_string()),
-            Some("ORDER BY name -- by name".to_string()),
-            Some("id > 0 -- only positive".to_string()),
-            Some("   ".to_string()),
-        ] {
-            let page = crate::sql::page_sql("\"main\".\"t\"", false, &filter, 0, 500);
-            assert_eq!(page, format!("{} LIMIT 500 OFFSET 0", table_select("\"main\".\"t\"", &filter)), "{filter:?}");
+        // for every shape of filter under every shape of header sort: when
+        // paging learns to read rows in another order, this fails until the
+        // export reads them that way.
+        for sort in [vec![], vec![key("name", true)], vec![key("x", false), key("id", true)]] {
+            for filter in [
+                None,
+                Some("x > 0".to_string()),
+                Some("x > 0 ORDER BY name DESC".to_string()),
+                Some("ORDER BY name -- by name".to_string()),
+                Some("id > 0 -- only positive".to_string()),
+                Some("   ".to_string()),
+            ] {
+                let page = crate::sql::sorted_page_sql("\"main\".\"t\"", false, &filter, &sort, &ties, 0, 500);
+                let select = table_select("\"main\".\"t\"", &filter, &sort, &ties);
+                assert_eq!(page, format!("{select} LIMIT 500 OFFSET 0"), "{filter:?} {sort:?}");
+            }
         }
+        // The header sort, its tie-break after it, sets the strip's ORDER BY
+        // aside, as on screen; with no header sort the strip's orders, as
+        // typed.
+        let filter = Some("x > 0 ORDER BY name".to_string());
+        assert_eq!(
+            table_select("t", &filter, &[key("v", true)], &ties),
+            "SELECT * FROM t WHERE (\nx > 0\n)\nORDER BY \"v\" DESC NULLS LAST, \"id\" ASC\n"
+        );
+        assert_eq!(table_select("t", &filter, &[], &ties), "SELECT * FROM t WHERE (\nx > 0\n)\nORDER BY name\n");
         // A result is its statement, read as the grid reads it.
         let source = crate::sql::query_source("from t -- all of it");
-        assert_eq!(table_select(&source, &None), "SELECT * FROM (\nfrom t -- all of it\n)");
+        assert_eq!(table_select(&source, &None, &[], &[]), "SELECT * FROM (\nfrom t -- all of it\n)");
     }
 
     #[test]
@@ -425,12 +443,12 @@ mod tests {
         let one = |sql: &str| run(sql).rows.remove(0);
         run("CREATE OR REPLACE TABLE _dt_export AS SELECT i::INTEGER i, \
              CASE WHEN i % 7 = 0 THEN NULL ELSE 'row ' || i || ', \"q\"' || chr(10) || 'it''s' END s, \
-             DATE '2024-01-01' + i::INTEGER d, i / 4 x FROM range(1000) r(i)");
+             DATE '2024-01-01' + i::INTEGER d, i / 4 x, (i % 3)::INTEGER g FROM range(1000) r(i)");
         let dir = std::env::temp_dir().join(format!("ducktable-export-probe-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let source = "\"main\".\"_dt_export\"";
         let filter = Some("i % 2 = 0 ORDER BY i DESC".to_string());
-        let select = table_select(source, &filter);
+        let select = table_select(source, &filter, &[], &[]);
         let want = one("SELECT count(*), sum(i), count(s), max(d)::VARCHAR FROM _dt_export WHERE i % 2 = 0");
         assert_eq!(want[0], 500);
 
@@ -460,9 +478,36 @@ mod tests {
             assert_eq!(lost[0], 0, "{name}");
         }
 
+        // Under a header sort the file is in the order the grid's pages
+        // show, the sort's ties broken as the pages break them (this keyless
+        // table's rowid), the strip's ORDER BY set aside.
+        let sort = [crate::sql::SortKey { column: "g".to_string(), desc: true }];
+        let ties = ["rowid".to_string()];
+        let sorted = table_select(source, &filter, &sort, &ties);
+        let mut shown = Vec::new();
+        for page in 0..4 {
+            let sql = crate::sql::sorted_page_sql(source, true, &filter, &sort, &ties, page, 128);
+            shown.extend(run(&sql).rows.into_iter().map(|r| r[1].clone()));
+        }
+        assert_eq!(shown.len(), 500);
+        for (name, format, reader) in [
+            ("sorted.csv", Format::Csv, "read_csv"),
+            ("sorted.parquet", Format::Parquet, "read_parquet"),
+            ("sorted.json", Format::Json, "read_json"),
+            ("sorted.xlsx", Format::Excel, "read_xlsx"),
+        ] {
+            let path = dir.join(name);
+            assert_eq!(write(&conn, &sorted, format, &path, &temp_path(&path, 1, 5)), Ok(500), "{name}");
+            let file = crate::util::qlit(path.to_str().unwrap());
+            let order: Vec<_> =
+                run(&format!("SELECT i::INTEGER FROM {reader}({file})")).rows.into_iter().map(|r| r[0].clone()).collect();
+            assert_eq!(order, shown, "{name}: the file's rows in the grid's order");
+        }
+
         // A result exports its statement, a trailing comment and all.
         let path = dir.join("results.csv");
-        let statement = table_select(&crate::sql::query_source("FROM _dt_export WHERE i < 10 -- the first ten"), &None);
+        let statement =
+            table_select(&crate::sql::query_source("FROM _dt_export WHERE i < 10 -- the first ten"), &None, &[], &[]);
         assert_eq!(write(&conn, &statement, Format::Csv, &path, &temp_path(&path, 1, 2)), Ok(10));
 
         // A COPY that fails part way, in every format: the engine removes a

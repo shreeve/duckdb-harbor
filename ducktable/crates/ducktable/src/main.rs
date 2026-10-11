@@ -328,8 +328,9 @@ fn copy_selection(format: copy::Format, cx: &mut App) {
     });
 }
 
-/// File → Export Table (the Data view's table, under its filter and
-/// ordering) or Export Results (the statement behind the Query result).
+/// File → Export Table (the Data view's table, under its filter, in the
+/// order the grid shows) or Export Results (the statement behind the Query
+/// result).
 fn export_grid(results: bool, format: export::Format, cx: &mut App) {
     if asking_to_quit(cx) {
         return;
@@ -341,7 +342,7 @@ fn export_grid(results: bool, format: export::Format, cx: &mut App) {
             footer::say(cx, why, true, Some(std::time::Duration::from_secs(4)));
             return;
         };
-        match grid.read(cx).export_plan(results) {
+        match grid.read(cx).export_plan(results, cx) {
             Ok(plan) => export::start(plan, format, cx),
             Err(why) => {
                 footer::say(cx, why, true, Some(std::time::Duration::from_secs(8)));
