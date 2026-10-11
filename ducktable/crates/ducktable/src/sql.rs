@@ -185,16 +185,33 @@ pub(crate) fn count_of(result: &harbor_client::QueryResult) -> Option<u64> {
     result.rows.first()?.first()?.as_u64()
 }
 
-/// Fetch a table's first page; app.rs calls this before it builds the
-/// grid (DESIGN.md: fetch first, commit over the old value).
+/// Fetch a table's first page under the sort remembered for it; app.rs
+/// calls this before it builds the grid (DESIGN.md: fetch first, commit
+/// over the old value). A sort the table cannot take, one naming a
+/// column another client dropped since the catalog was read, does not keep
+/// the table from opening: the page is read again unsorted, and taken when
+/// it lacks a column the sort names ([`sort_column_gone`]). The sort
+/// returned is the one the page was read under.
 pub(crate) fn first_page(
     conn: &Conn,
     schema: &str,
     name: &str,
     rowid: bool,
+    sort: Vec<SortKey>,
+    tiebreak: &[String],
     limit: usize,
-) -> Result<harbor_client::QueryResult, String> {
-    harbor_client::query(conn, &page_sql(&source(schema, name), rowid, &None, 0, limit))
+) -> (Result<harbor_client::QueryResult, String>, Vec<SortKey>) {
+    let source = source(schema, name);
+    let read = |sort: &[SortKey]| {
+        harbor_client::query(conn, &sorted_page_sql(&source, rowid, &None, sort, tiebreak, 0, limit))
+    };
+    match read(&sort) {
+        Err(message) if !sort.is_empty() => match read(&[]) {
+            Ok(page) if sort_column_gone(&sort, &page.columns) => (Ok(page), Vec::new()),
+            _ => (Err(message), sort),
+        },
+        page => (page, sort),
+    }
 }
 
 /// The table's exact row count, for the status line.
@@ -348,6 +365,14 @@ mod tests {
             };
             assert_eq!(text(&paged), text(&whole), "{table}: the pages are the table");
         }
+        // A remembered sort opens the table under it; one naming a column
+        // the table does not have opens it unsorted, and is dropped.
+        let ties = names(&["id"]);
+        let (page, kept) = super::first_page(&conn, "main", "_dt_sort_key", false, sort.to_vec(), &ties, 3);
+        assert_eq!((page.expect("sorted").rows.len(), kept), (3, sort.to_vec()));
+        let gone = vec![key("gone", false)];
+        let (page, kept) = super::first_page(&conn, "main", "_dt_sort_key", false, gone, &ties, 3);
+        assert_eq!((page.expect("unsorted").rows.len(), kept), (3, Vec::new()));
         for table in ["_dt_sort_key", "_dt_sort_rowid", "_dt_sort_shadow"] {
             alone(&format!("DROP TABLE {table}"));
         }

@@ -212,6 +212,12 @@ pub(crate) struct Grid {
 
 impl EventEmitter<crate::app::CatalogRefreshRequested> for Grid {}
 impl EventEmitter<crate::app::CommitSettled> for Grid {}
+impl EventEmitter<SortChanged> for Grid {}
+
+/// The header sort a page landed under differs from the one before it.
+/// The root keeps it for the table, for the session, and a grid built for
+/// the table again opens under it.
+pub(crate) struct SortChanged(pub(crate) Vec<SortKey>);
 
 /// Everything a fetch commits along with its rows. The delegate is not
 /// touched until the data arrives — the footer, funnel, and gutter always
@@ -893,6 +899,7 @@ impl Grid {
                 // dropped below: the database was read at this moment.
                 let read = outcome.is_ok();
                 let staged = grid.edits.as_ref().is_some_and(Edits::any_staged);
+                let mut sort_changed = false;
                 let result = match (outcome, landing(grid.editor.is_some(), reshaped, staged)) {
                     (Ok(_), Landing::Dropped) => None,
                     (Ok(_), Landing::Reshaped) => {
@@ -909,7 +916,11 @@ impl Grid {
                         if let FilterChange::Set(f) = filter {
                             grid.filter = f;
                         }
-                        grid.sort = if unsorted { Vec::new() } else { sort };
+                        let sort = if unsorted { Vec::new() } else { sort };
+                        if grid.sort != sort {
+                            grid.sort = sort;
+                            sort_changed = true;
+                        }
                         if let Some(t) = total {
                             grid.total_rows = t;
                         }
@@ -988,6 +999,9 @@ impl Grid {
                     // The catalog the sidebar and the next grid read from
                     // describes the table as it was.
                     cx.emit(crate::app::CatalogRefreshRequested);
+                }
+                if sort_changed {
+                    cx.emit(SortChanged(grid.sort.clone()));
                 }
                 // Staged changes are identity-keyed; the new page gets
                 // them projected wherever (and whether) its rows match.
@@ -4919,13 +4933,19 @@ pub(crate) fn identity_columns(structure: Option<&crate::structure::TableStructu
     }
 }
 
+/// The sort a table opens under: the one remembered for it this session,
+/// while the table has every column it names, and none once one is gone.
+pub(crate) fn remembered_sort(sort: Vec<SortKey>, columns: &[String]) -> Vec<SortKey> {
+    if sort.iter().all(|k| columns.contains(&k.column)) { sort } else { Vec::new() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ClickKind, DraftHint, Lead, RowSelection, duplicate_cells, tag_width, duplicate_refusal, orphaned, same_columns, should_reconcile_selection,
         wrapped_step, Committed, Page, PostCommit, commit_status, commit_verdict, settle_fetch,
         stale_reason, verdict_refusal, ring_step, first_entry_column, last_page_of, has_next_page,
-        divider_at, identity_columns, sort_after_filter, sort_click, sort_marks,
+        divider_at, identity_columns, remembered_sort, sort_after_filter, sort_click, sort_marks,
         strip_order_set_aside,
     };
     use crate::sql::SortKey;
@@ -4999,6 +5019,15 @@ mod tests {
         assert!(strip_order_set_aside(&sort, &ordered));
         assert!(!strip_order_set_aside(&[], &ordered));
         assert!(!strip_order_set_aside(&sort, &plain));
+    }
+
+    #[test]
+    fn a_remembered_sort_opens_only_while_its_columns_are_there() {
+        let cols = ["id".to_string(), "v".to_string()];
+        let sort = keys(&[("v", true), ("id", false)]);
+        assert_eq!(remembered_sort(sort.clone(), &cols), sort);
+        assert_eq!(remembered_sort(keys(&[("v", true), ("gone", false)]), &cols), keys(&[]));
+        assert_eq!(remembered_sort(sort, &[]), keys(&[]));
     }
 
     #[test]

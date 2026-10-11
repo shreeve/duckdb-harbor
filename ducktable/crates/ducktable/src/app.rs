@@ -575,6 +575,9 @@ pub struct DuckTable {
     /// connection that goes parks its grid's. Handed back when the table's
     /// grid is built on that database again.
     staged: crate::edits::Parked<DbKey>,
+    /// Each table's header sort, by database and source, for the session:
+    /// a grid built for the table again opens under it (`grid::SortChanged`).
+    sorts: std::collections::HashMap<(DbKey, String), Vec<crate::sql::SortKey>>,
     /// The sidebar/content divider (DESIGN.md: divider positions persist —
     /// the width saves at the end of each drag).
     pub(crate) sidebar_resize: Entity<gpui_kit::component::resizable::ResizableState>,
@@ -666,6 +669,7 @@ impl DuckTable {
             warning: None,
             query: None,
             staged: Default::default(),
+            sorts: Default::default(),
             sidebar_resize,
             stopping: std::collections::HashSet::new(),
             leaving: std::collections::HashSet::new(),
@@ -907,6 +911,18 @@ impl DuckTable {
         self.select_seq += 1;
         let fence = self.select_seq;
         let page_size = crate::prefs::get(cx).page_size;
+        // The table opens under the sort it had this session, while it has
+        // the columns the sort names, with its ties broken as the grid
+        // breaks them.
+        let source = crate::sql::source(&schema, &name);
+        let columns: Vec<String> =
+            structure.iter().flat_map(|s| s.cols.iter().map(|c| c.name.clone())).collect();
+        let sort = crate::grid::remembered_sort(
+            self.sorts.get(&(db.clone(), clone_str(&source))).cloned().unwrap_or_default(),
+            &columns,
+        );
+        let tiebreak =
+            crate::sql::tiebreak(&crate::grid::identity_columns(structure.as_ref()), &columns);
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             // Two independent queries (each on its own connection), so they
@@ -918,13 +934,15 @@ impl DuckTable {
             let rowid = structure.as_ref().is_some_and(|s| s.keyed_by_rowid());
             let page_task = cx.background_executor().spawn({
                 let (conn, schema, name) = (conn.clone(), clone_str(&schema), clone_str(&name));
-                async move { crate::sql::first_page(&conn, &schema, &name, rowid, page_size) }
+                async move {
+                    crate::sql::first_page(&conn, &schema, &name, rowid, sort, &tiebreak, page_size)
+                }
             });
             let total_task = cx.background_executor().spawn({
                 let (conn, schema, name) = (conn.clone(), clone_str(&schema), clone_str(&name));
                 async move { crate::sql::total_rows(&conn, &schema, &name) }
             });
-            let outcome = page_task.await;
+            let (outcome, sort) = page_task.await;
             let total = if outcome.is_ok() { total_task.await } else { None };
             this.update_in(cx, |state, window, cx| {
                 if state.select_seq != fence {
@@ -963,16 +981,30 @@ impl DuckTable {
                 {
                     state.staged.park(db.clone(), edits);
                 }
+                // A sort the first page could not be read under is gone
+                // from the table's memory too.
+                let key = (db.clone(), clone_str(&source));
+                if sort.is_empty() {
+                    state.sorts.remove(&key);
+                }
                 // The Data/Structure choice is a browsing mode, not table
                 // state (prefs.view): it survives this table switch.
                 let grid = cx.new(|cx| {
                     crate::grid::Grid::new(
-                        conn, &schema, &name, title, outcome, total, page_size, structure,
-                        Vec::new(), window, cx,
+                        conn, &schema, &name, title, outcome, total, page_size, structure, sort,
+                        window, cx,
                     )
                 });
                 cx.subscribe(&grid, |state, _, _: &CatalogRefreshRequested, cx| {
                     state.refresh_catalog(cx)
+                })
+                .detach();
+                cx.subscribe(&grid, move |state, _, e: &crate::grid::SortChanged, _| {
+                    if e.0.is_empty() {
+                        state.sorts.remove(&key);
+                    } else {
+                        state.sorts.insert(key.clone(), e.0.clone());
+                    }
                 })
                 .detach();
                 cx.subscribe_in(&grid, window, |state, _, _: &CommitSettled, window, cx| {
@@ -993,7 +1025,6 @@ impl DuckTable {
                 // failed has no columns to judge them by, keeps them until
                 // a fetch brings some, and surrenders them again through
                 // `take_edits` if it is replaced first.
-                let source = crate::sql::source(&schema, &name);
                 if let Some(stash) = state.staged.take(&db, &source) {
                     grid.update(cx, |g, cx| g.adopt_edits(stash, cx));
                 }
