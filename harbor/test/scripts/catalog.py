@@ -576,7 +576,7 @@ def run_views(base, work):
        ([("main", "t")], 3), ([(t["schema"], t["name"]) for t in doc["tables"]], len(doc["views"])))
     o = attached.get("other", {})
     eq("an attached database's keys",
-       ["name", "path", "type", "readOnly", "tables", "views"], list(o.keys()))
+       ["name", "path", "type", "readOnly", "error", "tables", "views"], list(o.keys()))
     eq("its path, type and read-only flag", (other, "duckdb", True), (o.get("path"), o.get("type"), o.get("readOnly")))
     items = (o.get("tables") or [{}])[0]
     eq("its tables in the full shape, counted exactly",

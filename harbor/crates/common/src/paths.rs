@@ -10,7 +10,7 @@
 //!     runtime/log/<base>-<hash>.log   the log of a server started by hand or on use
 //!     runtime/log/<name>.log          the log of a server its login item runs
 //!     history                         the repl's command history
-//! ~/.local/share/harbor/workspace.duckdb   where `harbor <data file>` opens one
+//! ~/.local/share/harbor/workspace.duckdb   where `harbor <data file>` and DuckTable open one
 //! ```
 //!
 //! Runtime state does not belong under `~/.config/harbor/`: a config
@@ -218,9 +218,12 @@ pub fn history_file() -> Result<PathBuf, String> {
 }
 
 /// The workspace: the DuckDB database `harbor <data file>` opens a data file
-/// in, as a view, or a SQLite file in, attached. Data, not state, so it sits
-/// in the XDG data home (`~/.local/share/harbor/`), or in `$HARBOR_HOME`
-/// with everything else.
+/// in, as a view, or a SQLite file in, attached. DuckTable opens files in
+/// the same one, so a file opened from either is there for both, and a
+/// server that serves this path makes it whole at its start (the harbor
+/// crate's `workspace` module). Data, not state, so it sits in the XDG data
+/// home (`~/.local/share/harbor/`), or in `$HARBOR_HOME` with everything
+/// else.
 pub fn workspace() -> Result<PathBuf, String> {
     if let Some(h) = harbor_home()? {
         return Ok(h.join("workspace.duckdb"));
