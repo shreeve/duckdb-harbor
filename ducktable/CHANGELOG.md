@@ -3,6 +3,21 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by release
 date, newest first.
 
+## 0.24.0 — 2026-10-11
+
+- **Column headers sort.** A click sorts the Data view by a column and
+  cycles ascending, descending, none; ⇧-click adds further keys, numbered in
+  the header. Rows the keys tie are ordered by the table's key, so every row
+  is on exactly one page, and each table keeps its sort for the session.
+- **Copy and export.** ⌘C copies a grid's selection as TSV, and the Edit
+  menu copies it as CSV, Markdown or SQL INSERT. File → Export Table and
+  Export Results write CSV, Parquet, JSON or Excel through the engine's own
+  COPY, in the order the grid shows, for databases on this Mac, and a
+  failed export leaves no partial file.
+- **The Query editor completes.** DuckDB's own completer answers through
+  Harbor, and the sidebar's catalog fills in what it leaves out and answers
+  alone when the server cannot.
+
 ## 0.23.0 — 2026-10-10
 
 - **Staged changes are kept per database.** Choosing another database,

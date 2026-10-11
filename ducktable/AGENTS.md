@@ -18,14 +18,20 @@ read it first.
 - `crates/ducktable`: the app. `app.rs` is the root entity and the only
   mutator of connection state; the surfaces (`sidebar.rs`, `content.rs`,
   `grid.rs`, `structure.rs`, `inspector.rs`, `query.rs`, `footer.rs`) read
-  state and call back into it. `edits.rs` (the staging model) and `sql.rs`
-  (every hand-written query) are pure. Colors resolve through `theme.rs`.
-  `main.rs` holds the entry point, menus, key bindings and the quit dialog;
-  `updater.rs` is the Sparkle glue.
-- `crates/harbor-client`: results read whole, the catalog, and the fleet
-  (which databases exist, which server serves each, and the SSH tunnel to a
-  remote), on harbor's `harbor-http`, the transport, sessions and summon
-  harbor's own CLI speaks through.
+  state and call back into it. `edits.rs` (the staging model), `sql.rs`
+  (every hand-written query) and `copy.rs` (a grid's selection written as
+  TSV, CSV, Markdown or SQL) are pure. `export.rs` writes a table or a
+  result to a file through the engine's `COPY`, its decisions in pure
+  functions. `query/complete.rs` is the Query editor's completion: the
+  engine's completer first, the sidebar's catalog when it cannot answer.
+  Colors resolve through `theme.rs`. `main.rs` holds the entry point,
+  menus, key bindings and the quit dialog; `updater.rs` is the Sparkle
+  glue.
+- `crates/harbor-client`: results read whole, the catalog, the engine's
+  completer (`complete.rs`, DuckDB's `sql_auto_complete` on a pooled
+  connection), and the fleet (which databases exist, which server serves
+  each, and the SSH tunnel to a remote), on harbor's `harbor-http`, the
+  transport, sessions and summon harbor's own CLI speaks through.
 - `crates/duckdb-lang`: the tree-sitter grammar the Query editor highlights
   with.
 - Harbor's `wire`, `common` and `http` crates are built from the sibling

@@ -581,7 +581,8 @@ The surfaces (`sidebar.rs`, `content.rs`, `grid.rs`, `structure.rs`,
 methods, never mutating it themselves. `edits.rs` is the staging model,
 `sql.rs` every hand-written query and `copy.rs` a selection written as
 text; all three are pure. `export.rs` writes files through the engine's
-`COPY`, its decisions in pure functions. A copy's or an export's word in
+`COPY`, its decisions in pure functions, and `query/complete.rs` is the
+Query editor's completion (QUERY.md). A copy's or an export's word in
 the status line is `footer::say`. All colors resolve through `theme.rs`. `main.rs` is the entry point, menus and key bindings.
 
 The rule this protects: one type that owns every surface decays into an
