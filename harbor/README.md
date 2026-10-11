@@ -635,13 +635,14 @@ stopping (a crash, a `kill -9`) leaves the record as last written. A database
 and is never recorded; a recorded file of the same name is not attached beside
 it, and its row stays as it is. `/catalog` does not list the record. A
 recorded file that is gone at the start is not attached, since attaching a
-missing path would make an empty database there, and one whose catalog does
-not read once attached (not SQLite after all, or locked by another program) is
-detached again, since it would fail every catalog read of the server; the
-server's log and `/catalog` say so, the server starts all the same, and the
-row stays, so the file is attached again at a later start once it reads.
-Deleting the row forgets it. The verbs (`start`, `backup`, …) act on databases
-and refuse a data file.
+missing path would make an empty database there, nor is a row whose path is
+not absolute, which would name a file in whichever directory a server starts
+in; one whose catalog does not read once attached (not SQLite after all, or
+locked by another program) is detached again, since it would fail every
+catalog read of the server; the server's log and `/catalog` say so, the server
+starts all the same, and the row stays, so the file is attached again at a
+later start once it reads. Deleting the row forgets it. The verbs (`start`,
+`backup`, …) act on databases and refuse a data file.
 
 **`harbor <db.duckdb> start` — the server is yours.** No refcount: it lives
 until you stop it. At a terminal the server comes up in the background and

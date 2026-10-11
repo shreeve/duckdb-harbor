@@ -50,7 +50,7 @@ pub struct Plan {
 /// there. A record whose name is attached already is passed over; one whose
 /// file is gone is not attached, since attaching a missing path makes an
 /// empty database there; one that is neither a SQLite nor a DuckDB file is
-/// refused, as the server never records one.
+/// refused, as the server never records one, and so is a relative path.
 pub fn plan(views: &[String], records: &[Record], attached: &[String], exists: impl Fn(&str) -> bool) -> Plan {
     let mut plan = Plan::default();
     for sql in views {
@@ -68,6 +68,11 @@ pub fn plan(views: &[String], records: &[Record], attached: &[String], exists: i
             _ if !Record::kept(&record.storage, &record.path) => {
                 format!("{}: a {} database, which the workspace does not attach", record.path, record.storage)
             }
+            _ if !absolute(&record.path) => format!(
+                "{}: not an absolute path, which the workspace does not attach, since it would name a file \
+                 in whichever directory a server starts in",
+                record.path
+            ),
             _ if !exists(&record.path) => format!("{}: no such file", record.path),
             _ => {
                 plan.attaches.push(record.clone());
@@ -77,6 +82,14 @@ pub fn plan(views: &[String], records: &[Record], attached: &[String], exists: i
         plan.unattached.push(Unattached { record: record.clone(), reason });
     }
     plan
+}
+
+/// Whether a recorded path names one file wherever a server starts: rooted,
+/// or led by a drive.
+fn absolute(path: &str) -> bool {
+    let b = path.as_bytes();
+    path.starts_with(['/', '\\'])
+        || (b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\'))
 }
 
 /// The statements that rewrite the record when the server stops: a row for
@@ -323,16 +336,23 @@ mod tests {
             rec("init", "/x/init.duckdb", "duckdb"),
             rec("other", "/x/other.duckdb", "duckdb"),
             rec("pg", "dbname=x", "postgres"),
+            rec("rel", "mk.duckdb", "duckdb"),
+            rec("win", "C:\\x\\w.sqlite", "sqlite"),
         ];
         let p = plan(&[], &records, &["workspace".into(), "INIT".into()], |path| path != "/x/gone.sqlite");
         assert!(p.loads.is_empty());
-        assert_eq!(p.attaches, [records[0].clone(), records[3].clone()]);
+        assert_eq!(p.attaches, [records[0].clone(), records[3].clone(), records[6].clone()]);
         let why: Vec<(&str, &str)> = p.unattached.iter().map(|u| (u.record.name.as_str(), u.reason.as_str())).collect();
         assert_eq!(
             why,
             [
                 ("gone", "/x/gone.sqlite: no such file"),
                 ("pg", "dbname=x: a postgres database, which the workspace does not attach"),
+                (
+                    "rel",
+                    "mk.duckdb: not an absolute path, which the workspace does not attach, since it would \
+                     name a file in whichever directory a server starts in"
+                ),
             ]
         );
     }
