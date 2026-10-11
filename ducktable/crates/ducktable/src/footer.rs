@@ -153,12 +153,15 @@ pub(crate) fn status(view: ViewMode, facts: Option<&FooterFacts>, says: Option<S
 }
 
 /// Why a table's grid takes no edits, said where the eye rests
-/// (docs/EDITING.md: a refusal is stated, never a mystery). `pk_cols` is
-/// the identity the grid asked for: the table's key, `rowid` for a table
-/// without one, or nothing for a keyless table with a column of its own
-/// named `rowid`, which hides DuckDB's.
-pub(crate) fn read_only_reason(pk_cols: &[String]) -> &'static str {
-    if pk_cols.is_empty() {
+/// (docs/EDITING.md: a refusal is stated, never a mystery). A view's rows
+/// have no identity, and Import as Table makes them a table's. For a table,
+/// `pk_cols` is the identity the grid asked for: the table's key, `rowid`
+/// for a table without one, or nothing for a keyless table with a column
+/// of its own named `rowid`, which hides DuckDB's.
+pub(crate) fn read_only_reason(view: bool, pk_cols: &[String]) -> &'static str {
+    if view {
+        "read-only \u{00b7} a view"
+    } else if pk_cols.is_empty() {
         "read-only \u{00b7} no key, and a column named rowid"
     } else {
         "read-only \u{00b7} its key is not among the columns read"
@@ -233,7 +236,7 @@ impl Grid {
                 } else if inserts + updates + deletes > 0 {
                     d.child(div().ml_2().child(self.staged_popover(inserts, updates, deletes, cx)))
                 } else if self.edits.is_none() && cols > 0 && !(loading && count == 0) {
-                    d.child(note(read_only_reason(&self.pk_cols)).text_color(t.muted.opacity(0.8)))
+                    d.child(note(read_only_reason(self.view, &self.pk_cols)).text_color(t.muted.opacity(0.8)))
                 } else {
                     d
                 }
@@ -923,7 +926,8 @@ mod tests {
 
     #[test]
     fn a_read_only_table_says_why() {
-        assert_eq!(read_only_reason(&[]), "read-only \u{b7} no key, and a column named rowid");
-        assert_eq!(read_only_reason(&["id".to_string()]), "read-only \u{b7} its key is not among the columns read");
+        assert_eq!(read_only_reason(false, &[]), "read-only \u{b7} no key, and a column named rowid");
+        assert_eq!(read_only_reason(false, &["id".to_string()]), "read-only \u{b7} its key is not among the columns read");
+        assert_eq!(read_only_reason(true, &[]), "read-only \u{b7} a view");
     }
 }

@@ -26,15 +26,21 @@ pub(crate) struct TableStructure {
     /// The engine's own CREATE TABLE, as the catalog gives it: what Copy
     /// DDL copies. The view shows it reformatted (`pretty_ddl`).
     pub(crate) ddl: Option<String>,
+    /// A view: its rows have no identity, so it is read-only, and Import
+    /// as Table is how its rows become a table's (docs/OPEN.md).
+    pub(crate) view: bool,
+    /// A table of another engine's catalog attached to the database (a
+    /// SQLite file's), which takes no `INSERT … RETURNING`.
+    pub(crate) foreign: bool,
 }
 
 impl TableStructure {
     /// Whether rows are named by DuckDB's implicit rowid (docs/EDITING.md):
     /// the table has no key of its own. A column of its own called `rowid`
     /// shadows the implicit one in every query, so such a table has no
-    /// identity at all and is read-only.
+    /// identity at all and is read-only. A view has no rowid.
     pub(crate) fn keyed_by_rowid(&self) -> bool {
-        !self.cols.iter().any(|c| c.primary || c.name.eq_ignore_ascii_case("rowid"))
+        !self.view && !self.cols.iter().any(|c| c.primary || c.name.eq_ignore_ascii_case("rowid"))
     }
 }
 
@@ -42,7 +48,29 @@ impl TableStructure {
 /// connection already holds — no query, so the Structure view is as
 /// current as the sidebar and never a frame behind it.
 pub(crate) fn table_structure(table: &harbor_client::Table) -> TableStructure {
-    TableStructure { cols: table.columns.clone(), ddl: table.ddl.clone() }
+    TableStructure { cols: table.columns.clone(), ddl: table.ddl.clone(), view: false, foreign: false }
+}
+
+/// A view's structure, as the catalog read it: the columns it binds to,
+/// and its CREATE VIEW.
+pub(crate) fn view_structure(view: &wire::catalog::View) -> TableStructure {
+    TableStructure { cols: view.columns.clone(), ddl: view.ddl.clone(), view: true, foreign: false }
+}
+
+/// The structure of `rel` in `catalog`: a table's or a view's, of the
+/// database itself or of a catalog attached to it. None when the catalog
+/// does not list it.
+pub(crate) fn structure_of(catalog: &harbor_client::Catalog, rel: &crate::sql::Rel) -> Option<TableStructure> {
+    let (tables, views, foreign) = match &rel.catalog {
+        None => (&catalog.tables, &catalog.views, false),
+        Some(name) => {
+            let attached = catalog.attached.iter().find(|a| &a.name == name)?;
+            (&attached.tables, &attached.views, attached.storage != "duckdb")
+        }
+    };
+    let table = tables.iter().find(|t| t.schema == rel.schema && t.name == rel.name).map(table_structure);
+    let found = table.or_else(|| views.iter().find(|v| v.schema == rel.schema && v.name == rel.name).map(view_structure));
+    found.map(|s| TableStructure { foreign, ..s })
 }
 
 /// Reformat DuckDB's one-line CREATE TABLE into an indented definition:
@@ -51,6 +79,10 @@ pub(crate) fn table_structure(table: &harbor_client::Table) -> TableStructure {
 /// quoted identifiers and strings are opaque to the scan.
 pub(crate) fn pretty_ddl(sql: &str) -> String {
     let sql = sql.trim();
+    // A view's parentheses are its query's, not a definition list.
+    if sql.get(..11).is_some_and(|head| head.eq_ignore_ascii_case("CREATE VIEW")) {
+        return sql.to_string();
+    }
     let Some(open) = top_level_open(sql) else {
         return sql.to_string();
     };
@@ -498,6 +530,51 @@ mod tests {
             out,
             "CREATE TABLE qq (\n  \"a\"\"b\"   INTEGER,\n  \"é wide\" VARCHAR,\n  c        INTEGER\n);"
         );
+    }
+
+    #[test]
+    fn a_views_sql_is_shown_as_the_engine_wrote_it() {
+        let ddl = "CREATE VIEW sales AS SELECT * FROM read_csv('/x/a, b.csv');";
+        assert_eq!(pretty_ddl(ddl), ddl);
+    }
+
+    #[test]
+    fn a_relation_is_found_in_its_own_catalog_as_a_table_or_a_view() {
+        use crate::sql::Rel;
+        use wire::catalog::{Attached, Catalog, Column, Table, View};
+        let col = |name: &str, primary: bool| Column { name: name.into(), primary, ..Default::default() };
+        let table = |name: &str| Table {
+            name: name.into(),
+            schema: "main".into(),
+            columns: vec![col("id", true)],
+            ..Default::default()
+        };
+        let view = View { name: "sales".into(), schema: "main".into(), columns: vec![col("id", false)], ..Default::default() };
+        let catalog = Catalog {
+            tables: vec![table("orders")],
+            views: vec![view.clone()],
+            attached: vec![Attached {
+                name: "app".into(),
+                storage: "sqlite".into(),
+                tables: vec![table("people")],
+                views: vec![view],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let orders = super::structure_of(&catalog, &Rel::own("main", "orders")).unwrap();
+        assert!(!orders.view && !orders.foreign && !orders.keyed_by_rowid());
+        let sales = super::structure_of(&catalog, &Rel::own("main", "sales")).unwrap();
+        // A view has no identity at all: no key, and no rowid.
+        assert!(sales.view && !sales.keyed_by_rowid());
+        assert!(crate::grid::identity_columns(Some(&sales)).is_empty());
+        // A SQLite file's table is another engine's.
+        assert!(super::structure_of(&catalog, &Rel::of("app", "main", "people")).is_some_and(|s| !s.view && s.foreign));
+        assert!(super::structure_of(&catalog, &Rel::of("app", "main", "sales")).is_some_and(|s| s.view));
+        // Each catalog holds its own: the database's orders is not app's.
+        assert!(super::structure_of(&catalog, &Rel::of("app", "main", "orders")).is_none());
+        assert!(super::structure_of(&catalog, &Rel::own("main", "people")).is_none());
+        assert!(super::structure_of(&catalog, &Rel::of("gone", "main", "people")).is_none());
     }
 
     #[test]

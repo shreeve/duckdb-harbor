@@ -115,6 +115,9 @@ pub(crate) struct Grid {
     /// Primary-key column names from the catalog — kept so an error-born
     /// grid can build its Edits when its first schema finally lands.
     pub(crate) pk_cols: Vec<String>,
+    /// The source is a view, read-only by having no identity, which the
+    /// footer says rather than a key's absence.
+    pub(crate) view: bool,
     /// NOT NULL per schema column (from the catalog, by name) — staging
     /// NULL into one refuses at the fingers, not at the server.
     not_null: Vec<bool>,
@@ -407,8 +410,8 @@ impl Grid {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         conn: Conn,
-        schema: &str,
-        name: &str,
+        // The table's or view's FROM target (`sql::Rel::source`).
+        source: String,
         title: String,
         outcome: Result<harbor_client::QueryResult, String>,
         total_rows: Option<u64>,
@@ -422,7 +425,6 @@ impl Grid {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let source = crate::sql::source(schema, name);
         let mut grid = Self::build(
             conn, source, title, outcome, total_rows, page_size, structure, false,
             true, window, cx,
@@ -490,6 +492,7 @@ impl Grid {
         // and only the WHERE clauses see it.
         let rowid = structure.as_ref().is_some_and(|s| s.keyed_by_rowid());
         let pk_cols = identity_columns(structure.as_ref());
+        let view = structure.as_ref().is_some_and(|s| s.view);
         let mut delegate = GridDelegate {
             cols: Vec::new(),
             schema_cols: Vec::new(),
@@ -535,7 +538,7 @@ impl Grid {
             }
             Err(message) => (Some(message), 0),
         };
-        let edits = delegate.new_edits(&source, &pk_cols, rowid);
+        let edits = delegate.new_edits(&source, &pk_cols, rowid, !structure.as_ref().is_some_and(|s| s.foreign));
         let (not_null, defaults, generated, hints, types) =
             insert_metadata(&delegate.names, structure.as_ref());
         delegate.draft_hints = hints;
@@ -783,6 +786,7 @@ impl Grid {
             editor: None,
             rowid,
             pk_cols,
+            view,
             not_null,
             defaults,
             generated,
@@ -1086,7 +1090,7 @@ impl Grid {
     fn settle_schema(&mut self, cx: &mut Context<Self>) {
         let d = self.table.read(cx).delegate();
         let names = d.names.clone();
-        self.edits = d.new_edits(&self.source, &self.pk_cols, self.rowid);
+        self.edits = d.new_edits(&self.source, &self.pk_cols, self.rowid, !self.structure.as_ref().is_some_and(|s| s.foreign));
         let (not_null, defaults, generated, hints, types) =
             insert_metadata(&names, self.structure.as_ref());
         self.not_null = not_null;
@@ -3236,7 +3240,7 @@ impl GridDelegate {
     /// the whole key: the catalog's, or the hidden rowid of a table
     /// without one. None for a source without an identity, which is
     /// read-only.
-    fn new_edits(&self, source: &str, pk_cols: &[String], rowid: bool) -> Option<Edits> {
+    fn new_edits(&self, source: &str, pk_cols: &[String], rowid: bool, returning: bool) -> Option<Edits> {
         if self.pk_ix.is_empty() {
             return None;
         }
@@ -3246,7 +3250,8 @@ impl GridDelegate {
             self.names.iter().map(|n| n.to_string()).collect(),
             self.schema_cols.iter().map(|c| c.duckdb_type.clone()).collect(),
         );
-        Some(if rowid { edits.keyed_by_rowid() } else { edits })
+        let edits = if rowid { edits.keyed_by_rowid() } else { edits };
+        Some(if returning { edits } else { edits.without_returning() })
     }
 
     /// Clear the selection, the ring, the Tab run and the editor's cell:
@@ -4563,7 +4568,7 @@ enum Page<'a> {
 /// in it, each checked for the one row it must touch. The first that fails
 /// stops the run with the reason, and nothing has landed: the caller's
 /// release of the session rolls the transaction back.
-fn run_statements(conn: &Conn, sid: &str, stmts: &[edits::Statement]) -> Result<(), String> {
+pub(crate) fn run_statements(conn: &Conn, sid: &str, stmts: &[edits::Statement]) -> Result<(), String> {
     harbor_client::exec(conn, "BEGIN", None, Some(sid))?;
     for stmt in stmts {
         let r = harbor_client::exec(conn, &stmt.sql, Some(stmt.params.clone()), Some(sid))?;
@@ -5148,11 +5153,11 @@ mod tests {
             primary,
             ..Default::default()
         };
-        let keyed = TableStructure { cols: vec![col("a", true), col("b", true), col("v", false)], ddl: None };
+        let keyed = TableStructure { cols: vec![col("a", true), col("b", true), col("v", false)], ddl: None, view: false, foreign: false };
         assert_eq!(identity_columns(Some(&keyed)), ["a", "b"]);
-        let keyless = TableStructure { cols: vec![col("v", false)], ddl: None };
+        let keyless = TableStructure { cols: vec![col("v", false)], ddl: None, view: false, foreign: false };
         assert_eq!(identity_columns(Some(&keyless)), ["rowid"]);
-        let shadowed = TableStructure { cols: vec![col("ROWID", false), col("v", false)], ddl: None };
+        let shadowed = TableStructure { cols: vec![col("ROWID", false), col("v", false)], ddl: None, view: false, foreign: false };
         assert!(identity_columns(Some(&shadowed)).is_empty());
         assert!(identity_columns(None).is_empty());
     }
@@ -5197,6 +5202,8 @@ mod tests {
                 col("n", false, None, false),
             ],
             ddl: None,
+            view: false,
+            foreign: false,
         };
         let names: Vec<SharedString> = ["g", "d", "r", "n", "rowid"].map(Into::into).into();
         let (_, _, _, hints, types) = super::insert_metadata(&names, Some(&structure));

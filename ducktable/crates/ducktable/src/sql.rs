@@ -11,6 +11,52 @@ pub(crate) fn source(schema: &str, name: &str) -> String {
     format!("{}.{}", qident(schema), qident(name))
 }
 
+/// A table or a view the sidebar lists and a grid pages: one of the
+/// connected database's, or of a catalog attached to it (a SQLite file in
+/// the workspace), which then qualifies it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct Rel {
+    pub(crate) catalog: Option<String>,
+    pub(crate) schema: String,
+    pub(crate) name: String,
+}
+
+impl Rel {
+    /// One of the connected database's own.
+    pub(crate) fn own(schema: &str, name: &str) -> Self {
+        Rel { catalog: None, schema: schema.to_string(), name: name.to_string() }
+    }
+
+    /// One of the attached catalog `catalog`.
+    pub(crate) fn of(catalog: &str, schema: &str, name: &str) -> Self {
+        Rel { catalog: Some(catalog.to_string()), schema: schema.to_string(), name: name.to_string() }
+    }
+
+    /// Its FROM target, every part quoted.
+    pub(crate) fn source(&self) -> String {
+        match &self.catalog {
+            Some(catalog) => format!("{}.{}", qident(catalog), source(&self.schema, &self.name)),
+            None => source(&self.schema, &self.name),
+        }
+    }
+
+    /// What the grid's title calls it: its name, led by its schema when
+    /// the database has another to tell it from, and by its catalog when it
+    /// is an attached one's (`app.people`, `app.audit.log`).
+    pub(crate) fn title(&self, solo_schema: bool) -> String {
+        let schema = match self.catalog.is_some() {
+            true => self.schema != "main",
+            false => !solo_schema,
+        };
+        let mut parts: Vec<&str> = self.catalog.iter().map(String::as_str).collect();
+        if schema {
+            parts.push(&self.schema);
+        }
+        parts.push(&self.name);
+        parts.join(".")
+    }
+}
+
 /// A query's FROM target: the user's statement, parenthesized. The Query
 /// view's results grid is "a Data window with a custom query preceding
 /// it" — the same page_sql machinery pages any SELECT-shaped statement
@@ -204,16 +250,14 @@ pub(crate) fn count_of(result: &harbor_client::QueryResult) -> Option<u64> {
 /// returned is the one the page was read under.
 pub(crate) fn first_page(
     conn: &Conn,
-    schema: &str,
-    name: &str,
+    source: &str,
     rowid: bool,
     sort: Vec<SortKey>,
     tiebreak: &[String],
     limit: usize,
 ) -> (Result<harbor_client::QueryResult, String>, Vec<SortKey>) {
-    let source = source(schema, name);
     let read = |sort: &[SortKey]| {
-        harbor_client::query(conn, &sorted_page_sql(&source, rowid, &None, sort, tiebreak, 0, limit))
+        harbor_client::query(conn, &sorted_page_sql(source, rowid, &None, sort, tiebreak, 0, limit))
     };
     match read(&sort) {
         Err(message) if !sort.is_empty() => match read(&[]) {
@@ -225,8 +269,8 @@ pub(crate) fn first_page(
 }
 
 /// The table's exact row count, for the status line.
-pub(crate) fn total_rows(conn: &Conn, schema: &str, name: &str) -> Option<u64> {
-    count_of(&harbor_client::query(conn, &count_sql(&source(schema, name), &None)).ok()?)
+pub(crate) fn total_rows(conn: &Conn, source: &str) -> Option<u64> {
+    count_of(&harbor_client::query(conn, &count_sql(source, &None)).ok()?)
 }
 
 #[cfg(test)]
@@ -241,6 +285,20 @@ mod tests {
 
     fn names(names: &[&str]) -> Vec<String> {
         names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn a_relation_is_qualified_by_its_catalog_and_titled_by_what_tells_it_apart() {
+        use super::Rel;
+        let own = Rel::own("main", "orders");
+        assert_eq!(own.source(), "\"main\".\"orders\"");
+        assert_eq!((own.title(true), own.title(false)), ("orders".into(), "main.orders".into()));
+        let people = Rel::of("app", "main", "people");
+        assert_eq!(people.source(), "\"app\".\"main\".\"people\"");
+        assert_eq!((people.title(true), people.title(false)), ("app.people".into(), "app.people".into()));
+        let log = Rel::of("my \"db\"", "audit", "log");
+        assert_eq!(log.source(), "\"my \"\"db\"\"\".\"audit\".\"log\"");
+        assert_eq!(log.title(true), "my \"db\".audit.log");
     }
 
     #[test]
@@ -378,10 +436,10 @@ mod tests {
         // A remembered sort opens the table under it; one naming a column
         // the table does not have opens it unsorted, and is dropped.
         let ties = names(&["id"]);
-        let (page, kept) = super::first_page(&conn, "main", "_dt_sort_key", false, sort.to_vec(), &ties, 3);
+        let (page, kept) = super::first_page(&conn, &super::source("main", "_dt_sort_key"), false, sort.to_vec(), &ties, 3);
         assert_eq!((page.expect("sorted").rows.len(), kept), (3, sort.to_vec()));
         let gone = vec![key("gone", false)];
-        let (page, kept) = super::first_page(&conn, "main", "_dt_sort_key", false, gone, &ties, 3);
+        let (page, kept) = super::first_page(&conn, &super::source("main", "_dt_sort_key"), false, gone, &ties, 3);
         assert_eq!((page.expect("unsorted").rows.len(), kept), (3, Vec::new()));
         for table in ["_dt_sort_key", "_dt_sort_rowid", "_dt_sort_shadow"] {
             alone(&format!("DROP TABLE {table}"));
