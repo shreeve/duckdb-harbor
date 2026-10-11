@@ -968,7 +968,7 @@ impl DuckTable {
                 let grid = cx.new(|cx| {
                     crate::grid::Grid::new(
                         conn, &schema, &name, title, outcome, total, page_size, structure,
-                        window, cx,
+                        Vec::new(), window, cx,
                     )
                 });
                 cx.subscribe(&grid, |state, _, _: &CatalogRefreshRequested, cx| {

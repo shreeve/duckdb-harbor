@@ -47,14 +47,80 @@ pub(crate) fn page_sql(
     page: usize,
     size: usize,
 ) -> String {
+    sorted_page_sql(source, rowid, filter, &[], &[], page, size)
+}
+
+/// [`page_sql`] under a header sort. The page has one ordering: the header
+/// sort's ([`order_by`]) when it has keys, and the strip's own ORDER BY,
+/// as typed, when it has none. The two are not joined. The strip's is raw
+/// SQL that may take no key after it (`ORDER BY ALL`), and a header sort
+/// that only broke the strip's ties would not be the order its arrows
+/// show. The grid marks a strip ORDER BY the header sort sets aside.
+pub(crate) fn sorted_page_sql(
+    source: &str,
+    rowid: bool,
+    filter: &Option<String>,
+    sort: &[SortKey],
+    tiebreak: &[String],
+    page: usize,
+    size: usize,
+) -> String {
     let cols = if rowid { "[rowid::UBIGINT, hash(*COLUMNS(*))] AS rowid, *" } else { "*" };
-    let (cond, order) = filter.as_deref().map_or(("", None), split_order);
-    let order = order.map_or(String::new(), |o| format!("\nORDER BY {}\n", o.trim()));
+    let (cond, strip) = filter.as_deref().map_or(("", None), split_order);
+    let order = order_by(sort, tiebreak).or_else(|| strip.map(|o| o.trim().to_string()));
+    let order = order.map_or(String::new(), |o| format!("\nORDER BY {o}\n"));
     format!(
         "SELECT {cols} FROM {source}{}{order} LIMIT {size} OFFSET {}",
         where_part(cond),
         page * size
     )
+}
+
+/// One key of a header sort: a column of the table, by name, and its
+/// direction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SortKey {
+    pub(crate) column: String,
+    pub(crate) desc: bool,
+}
+
+/// The ORDER BY a header sort reads as, or None when it has no keys. Each
+/// key is its column quoted, its direction and `NULLS LAST`, which is
+/// DuckDB's default in both directions, spelled out so that a
+/// `default_null_order` set on the server cannot turn an arrow around. The
+/// tie-break follows, ascending: each column of `tiebreak` ([`tiebreak`])
+/// the keys do not already name. Rows the keys tie then keep one order
+/// from one page's query to the next, so a page boundary falls in one
+/// place and every row is on exactly one page.
+pub(crate) fn order_by(sort: &[SortKey], tiebreak: &[String]) -> Option<String> {
+    if sort.is_empty() {
+        return None;
+    }
+    let keys = sort.iter().map(|k| {
+        format!("{} {} NULLS LAST", qident(&k.column), if k.desc { "DESC" } else { "ASC" })
+    });
+    let ties = tiebreak
+        .iter()
+        .filter(|c| !sort.iter().any(|k| &k.column == *c))
+        .map(|c| format!("{} ASC", qident(c)));
+    Some(keys.chain(ties).collect::<Vec<_>>().join(", "))
+}
+
+/// Whether a page read without the sort lacks a column the sort names:
+/// what tells a sort the table cannot take from a failure of
+/// another kind, which a page read again unsorted would hide.
+pub(crate) fn sort_column_gone(sort: &[SortKey], columns: &[wire::Column]) -> bool {
+    sort.iter().any(|k| !columns.iter().any(|c| c.name.as_deref() == Some(k.column.as_str())))
+}
+
+/// What breaks a header sort's ties: the table's identity when it has one,
+/// its primary key or the `rowid` a keyless table is edited by, and every
+/// column when it has neither (a keyless table with a column of its own
+/// named `rowid`). Rows equal in every column cannot be told apart, so the
+/// order of the values a page shows is fixed even where the order of the
+/// rows is not.
+pub(crate) fn tiebreak(identity: &[String], columns: &[String]) -> Vec<String> {
+    if identity.is_empty() { columns.to_vec() } else { identity.to_vec() }
 }
 
 /// The count under a filter counts what its condition keeps; its ORDER BY
@@ -71,9 +137,9 @@ fn where_part(cond: &str) -> String {
 }
 
 /// A filter cut at an ORDER BY at its top level: the condition before it,
-/// and the ordering after it. The grid has no sort of its own, so the strip
-/// is where a Data view is sorted: `x > 0 ORDER BY name`, or `ORDER BY
-/// name` alone. The cut is read in code only (`wire::scan`), so an ORDER BY
+/// and the ordering after it, which sorts the page while the header has no
+/// sort of its own: `x > 0 ORDER BY name`, or `ORDER BY name` alone. The
+/// cut is read in code only (`wire::scan`), so an ORDER BY
 /// in a string, a comment or a parenthesis (a window, an aggregate, a
 /// subquery) stays in the condition. A filter whose parentheses close more
 /// than they open is not cut: whole inside the parentheses, it is the
@@ -138,7 +204,154 @@ pub(crate) fn total_rows(conn: &Conn, schema: &str, name: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_sql, page_sql, query_source, split_order};
+    use super::{
+        count_sql, order_by, page_sql, query_source, sorted_page_sql, split_order, tiebreak, SortKey,
+    };
+
+    fn key(column: &str, desc: bool) -> SortKey {
+        SortKey { column: column.to_string(), desc }
+    }
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn a_header_sort_quotes_its_keys_states_nulls_and_ends_in_the_tiebreak() {
+        assert_eq!(order_by(&[], &names(&["id"])), None);
+        assert_eq!(
+            order_by(&[key("Name", true), key("a\"b", false)], &names(&["id"])),
+            Some("\"Name\" DESC NULLS LAST, \"a\"\"b\" ASC NULLS LAST, \"id\" ASC".into())
+        );
+        // A tie-break column the keys already name is not named again.
+        assert_eq!(
+            order_by(&[key("b", true)], &names(&["a", "b"])),
+            Some("\"b\" DESC NULLS LAST, \"a\" ASC".into())
+        );
+        // The identity breaks ties; with none, every column does.
+        assert_eq!(tiebreak(&names(&["id"]), &names(&["id", "v"])), names(&["id"]));
+        assert_eq!(tiebreak(&names(&["rowid"]), &names(&["rowid", "v"])), names(&["rowid"]));
+        assert_eq!(tiebreak(&[], &names(&["rowid", "v"])), names(&["rowid", "v"]));
+    }
+
+    #[test]
+    fn a_sort_is_given_up_only_for_a_column_the_page_lacks() {
+        let cols: Vec<wire::Column> = ["id", "v"]
+            .map(|n| wire::Column { name: Some(n.to_string()), ..Default::default() })
+            .to_vec();
+        assert!(!super::sort_column_gone(&[key("v", true), key("id", false)], &cols));
+        assert!(super::sort_column_gone(&[key("v", true), key("gone", false)], &cols));
+    }
+
+    #[test]
+    fn the_header_sort_sets_the_strips_order_aside_and_never_reaches_the_count() {
+        let sort = [key("v", false)];
+        let ties = names(&["id"]);
+        // No strip: the header's ordering alone, on lines of its own.
+        assert_eq!(
+            sorted_page_sql("t", false, &None, &sort, &ties, 2, 5),
+            "SELECT * FROM t\nORDER BY \"v\" ASC NULLS LAST, \"id\" ASC\n LIMIT 5 OFFSET 10"
+        );
+        // A strip with a condition and an ORDER BY: the condition filters,
+        // the header orders, and the strip's ORDER BY is not joined to it.
+        let filter = Some("x > 0 ORDER BY ALL -- all".to_string());
+        assert_eq!(
+            sorted_page_sql("t", true, &filter, &sort, &ties, 0, 5),
+            "SELECT [rowid::UBIGINT, hash(*COLUMNS(*))] AS rowid, * FROM t WHERE (\nx > 0\n)\nORDER BY \"v\" ASC NULLS LAST, \"id\" ASC\n LIMIT 5 OFFSET 0"
+        );
+        // With no header keys the strip's ORDER BY sorts, as typed, with no
+        // tie-break appended to the user's own SQL.
+        assert_eq!(
+            sorted_page_sql("t", false, &filter, &[], &ties, 0, 5),
+            page_sql("t", false, &filter, 0, 5)
+        );
+        assert!(page_sql("t", false, &filter, 0, 5).ends_with("ORDER BY ALL -- all\n LIMIT 5 OFFSET 0"));
+        // The count counts what the condition keeps, whatever orders it.
+        assert_eq!(count_sql("t", &filter), "SELECT count(*) FROM t WHERE (\nx > 0\n)");
+    }
+
+    /// A sorted table paged with ties on its sort key, NULLs among them,
+    /// shows every row exactly once, in the order the arrows say, for each
+    /// kind of tie-break: a primary key, the rowid identity of a keyless
+    /// table, and every column of a keyless table whose own `rowid` column
+    /// shadows DuckDB's. Live: needs `HARBOR_LIVE_DB`, a scratch database
+    /// file, as the probes in harbor-client's `tests/live.rs` do.
+    #[test]
+    #[ignore]
+    fn a_sorted_table_with_ties_pages_every_row_exactly_once() {
+        let Some(db) = std::env::var_os("HARBOR_LIVE_DB") else {
+            println!("set HARBOR_LIVE_DB to a scratch database file; skipping");
+            return;
+        };
+        let conn = harbor_client::fleet::connect_path(std::path::Path::new(&db)).expect("connect");
+        let alone = |sql: &str| harbor_client::query(&conn, sql).expect(sql);
+        // 300,000 rows over 7 values of g and NULL, inserted out of order:
+        // enough for the engine to sort in parallel, where rows that tie
+        // come back in another order from one run of a query to the next.
+        let rows = "SELECT (i * 7919) % 300000 AS id, CASE WHEN i % 8 = 0 THEN NULL ELSE i % 7 END AS g, \
+                    i % 3 AS h FROM range(300000) r(i)";
+        alone("CREATE OR REPLACE TABLE _dt_sort_key(id INTEGER PRIMARY KEY, g INTEGER, h INTEGER)");
+        alone(&format!("INSERT INTO _dt_sort_key {rows}"));
+        alone(&format!("CREATE OR REPLACE TABLE _dt_sort_rowid AS SELECT g, h FROM ({rows})"));
+        alone(&format!("CREATE OR REPLACE TABLE _dt_sort_shadow AS SELECT id AS rowid, g, h FROM ({rows})"));
+        // Rows equal in every column, for the shadowed table to tell apart
+        // by value only.
+        alone("INSERT INTO _dt_sort_shadow SELECT * FROM _dt_sort_shadow WHERE rowid < 100");
+
+        let sort = [key("g", true), key("h", false)];
+        for (table, rowid, identity, size) in [
+            ("_dt_sort_key", false, names(&["id"]), 50_000),
+            ("_dt_sort_rowid", true, names(&["rowid"]), 37_000),
+            ("_dt_sort_shadow", false, Vec::new(), 64_000),
+        ] {
+            let source = super::source("main", table);
+            let columns: Vec<String> = alone(&format!("SELECT * FROM {source} LIMIT 0"))
+                .columns
+                .iter()
+                .filter_map(|c| c.name.clone())
+                .collect();
+            let ties = tiebreak(&identity, &columns);
+            let total = super::count_of(&alone(&count_sql(&source, &None))).expect("count") as usize;
+            let mut paged = Vec::new();
+            for page in 0..total.div_ceil(size) + 1 {
+                let sql = sorted_page_sql(&source, rowid, &None, &sort, &ties, page, size);
+                paged.extend(alone(&sql).rows);
+            }
+            assert_eq!(paged.len(), total, "{table}: every row once, and no more");
+            // The order the arrows say: g descending with NULLs last, then h.
+            // A keyless table's page leads with the hidden identity column.
+            let at = |r: &Vec<serde_json::Value>, name: &str| {
+                let ix = columns.iter().position(|c| c == name).unwrap() + rowid as usize;
+                r[ix].as_i64()
+            };
+            for pair in paged.windows(2) {
+                let (a, b) = (&pair[0], &pair[1]);
+                let (ga, gb) = (at(a, "g"), at(b, "g"));
+                let ordered = match (ga, gb) {
+                    (Some(x), Some(y)) => x > y || (x == y && at(a, "h") <= at(b, "h")),
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => at(a, "h") <= at(b, "h"),
+                };
+                assert!(ordered, "{table}: {a:?} before {b:?}");
+            }
+            // Every row exactly once: the pages hold the table's multiset.
+            let whole = alone(&format!(
+                "SELECT {} FROM {source}",
+                if rowid { "[rowid::UBIGINT, hash(*COLUMNS(*))] AS rowid, *" } else { "*" }
+            ))
+            .rows;
+            let text = |rows: &[Vec<serde_json::Value>]| {
+                let mut t: Vec<String> = rows.iter().map(|r| serde_json::to_string(r).unwrap()).collect();
+                t.sort();
+                t
+            };
+            assert_eq!(text(&paged), text(&whole), "{table}: the pages are the table");
+        }
+        for table in ["_dt_sort_key", "_dt_sort_rowid", "_dt_sort_shadow"] {
+            alone(&format!("DROP TABLE {table}"));
+        }
+    }
 
     #[test]
     fn a_filter_ending_in_a_comment_keeps_the_page_bounded() {
