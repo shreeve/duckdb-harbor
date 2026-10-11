@@ -422,7 +422,13 @@ columns are the ones it reads as when the catalog is asked, since each view is
 bound first (a CSV's sample, a Parquet footer; a GeoJSON file whole, for GDAL
 parses it to open it). A view that does not bind — its file gone, or its
 extension not loaded — has no columns and the engine's reason in `error`, and
-the rest of the document is unaffected. `attached` lists every database
+the rest of the document is unaffected. Views are bound on a connection of
+their own, never a worker's, each within two seconds: one that takes longer
+(a mount that hangs, a slow URL) is reported unbound with why, and one over a
+pipe, a socket or a device is not bound at all, since a read of it waits on
+another program. A view over one file, as `harbor <file>` makes one, is bound
+again only once the file changes (its size, its modification time or its
+inode), so a GeoJSON file is parsed once, not at every catalog read. `attached` lists every database
 attached beside the served one, `system` and `temp` never, with its path
 (`null` in memory), its storage `type`, whether it is read-only, and its tables
 and views in the same shapes. A DuckDB catalog's tables carry exact counts;

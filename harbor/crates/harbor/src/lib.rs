@@ -49,6 +49,9 @@ pub mod engine;
 // at its stop.
 pub mod workspace;
 
+// The catalog's views, bound off the pool and within a budget.
+mod binder;
+
 // ==========================================================================
 //
 // The HTTP server
@@ -1056,6 +1059,7 @@ pub fn open_pool(mut con: Connection) -> Result<(), String> {
     for _ in 0..configured_pool_size() {
         pool.push(con.try_clone().map_err(|e| format!("harbor: {e}"))?);
     }
+    binder::keep_source(con.try_clone().map_err(|e| format!("harbor: {e}"))?);
     // The handle has to be taken while the connection is still here, exactly
     // as `start()` does for the workers.
     *CONTROL_SLOT.lock().unwrap() = Some(SlotState::new(con.interrupt_handle()));
@@ -1427,6 +1431,7 @@ fn stop_with(mut running: std::sync::MutexGuard<'_, Option<Running>>) -> Result<
         );
     }
     drop(pool);
+    binder::stop();
     if let Some(h) = r.reaper {
         // Prompt: the reaper sleeps in short ticks and checks the stop flag.
         let _ = h.join();
@@ -2981,6 +2986,22 @@ fn catalog_listing(
     ))))
 }
 
+/// Bind the view a `duckdb_views()` row names (database, schema, name,
+/// sql): None when it reads, else why it does not. A client that leaves
+/// ends the catalog read.
+fn bind_view(peer: &justhttp::Peer, row: &[serde_json::Value]) -> Result<Option<String>, CatalogFailure> {
+    let key: RelationKey = (cell_str(row, 0), cell_str(row, 1), cell_str(row, 2));
+    let probe = format!("SELECT * FROM {} LIMIT 0", qualified(&key.0, &key.1, &key.2));
+    match binder::bind(peer, &key, &cell_str(row, 3), probe) {
+        Ok(Ok(())) => Ok(None),
+        Ok(Err(refusal)) => match view_error(&refusal) {
+            Some(error) => Ok(Some(error)),
+            None => Err(CatalogFailure::Refused(refusal)),
+        },
+        Err(binder::Departed) => Err(CatalogFailure::Refused(Refusal::cancelled())),
+    }
+}
+
 /// Why a view does not read, from the refusal its probe met, or None when
 /// the refusal is not the view's to carry: a cancel, a client gone, a
 /// server stopping. The engine's message stands as written, less any
@@ -3041,7 +3062,9 @@ fn view_error(refusal: &Refusal) -> Option<String> {
 /// reads as when the catalog is asked; the engine keeps the shape a view
 /// last bound to and reports that otherwise. A view that does not bind, its file gone or its
 /// extension not loaded, is listed with no columns and the engine's reason,
-/// and the rest of the document is unaffected.
+/// and the rest of the document is unaffected. Views are bound off the pool,
+/// each within a budget, and a view over one file only when the file
+/// changed (`binder`).
 ///
 /// Every database attached beside the served one is listed under
 /// `attached`, `system` and `temp` never, with its path, its storage type
@@ -3235,19 +3258,14 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
     }
 
     // Each view bound, one statement apiece, so one that does not bind
-    // costs only itself. Binding comes before the columns are read: the
-    // engine records the shape a view binds to, so duckdb_columns() then
-    // answers with the shape each view reads as at this moment.
+    // costs only itself, and off the pool, each within a budget (`binder`).
+    // Binding comes before the columns are read: the engine records the
+    // shape a view binds to, so duckdb_columns() then answers with the
+    // shape each view reads as at this moment.
     let mut view_errors: Vec<Option<String>> = Vec::with_capacity(view_rows.len());
     for row in &view_rows {
-        let (database, schema, name) = key_of(row);
-        let probe = format!("SELECT * FROM {} LIMIT 0", qualified(&database, &schema, &name));
-        match catalog_rows(exec, &peer, &probe) {
-            Ok(_) => view_errors.push(None),
-            Err(CatalogFailure::Refused(refusal)) => match view_error(&refusal) {
-                Some(error) => view_errors.push(Some(error)),
-                None => return catalog_refuse(req, CatalogFailure::Refused(refusal)),
-            },
+        match bind_view(&peer, row) {
+            Ok(error) => view_errors.push(error),
             Err(failure) => return catalog_refuse(req, failure),
         }
     }
@@ -3464,12 +3482,10 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         if view.error.is_none() || !present.contains(&key_of(row)) {
             continue;
         }
-        let (database, schema, name) = key_of(row);
-        let probe = format!("SELECT * FROM {} LIMIT 0", qualified(&database, &schema, &name));
-        match catalog_rows(exec, &peer, &probe) {
-            Ok(_) => view.error = None,
-            Err(CatalogFailure::Refused(refusal)) if view_error(&refusal).is_some() => {
-                view.error = view_error(&refusal);
+        match bind_view(&peer, row) {
+            Ok(None) => view.error = None,
+            Ok(error) => {
+                view.error = error;
                 view.columns.clear();
             }
             Err(failure) => return catalog_refuse(req, failure),

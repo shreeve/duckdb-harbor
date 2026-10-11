@@ -544,6 +544,36 @@ def run_views(base, work):
     eq("a file that came back reads again", (None, [("id", "BIGINT")]),
        (views["gone"]["error"], cols(views["gone"])))
 
+    if hasattr(os, "mkfifo"):
+        # A read of a pipe waits on its writer, out of the engine's reach:
+        # the catalog does not read one, and waits on any view's bind only so
+        # long, so no catalog read holds a worker on a file.
+        import threading
+        pipe = os.path.join(work, "pipe.csv")
+        write_csv(pipe, "id\n1\n")
+        sql(base, f"CREATE VIEW pipe AS SELECT * FROM read_csv('{pipe}')")
+        sql(base, f"CREATE VIEW pipe_where AS SELECT * FROM read_csv('{pipe}') WHERE id > 0")
+        os.remove(pipe)
+        os.mkfifo(pipe)
+        began = time.time()
+        st, body, _ = fetch(base, "/catalog")
+        took = time.time() - began
+        views = {v["name"]: v for v in json.loads(body).get("views", [])} if st == 200 else {}
+        eq("a catalog with a view over a pipe answers", 200, st)
+        eq("the view over the pipe alone is not bound, and says why",
+           (True, []), ("a pipe, a socket or a device" in (views.get("pipe", {}).get("error") or ""),
+                        views.get("pipe", {}).get("columns")))
+        eq("one of another shape is bound within its budget, and says so", True,
+           "took more than 2 s" in (views.get("pipe_where", {}).get("error") or ""))
+        eq("so the read takes seconds, not for ever", True, took < 8)
+        eq("and the workers still answer", None, sql(base, "SELECT 42"))
+        def release():
+            with open(pipe, "w") as w:
+                w.write("id\n1\n")
+        threading.Thread(target=release, daemon=True).start()
+        sql(base, "DROP VIEW pipe")
+        sql(base, "DROP VIEW pipe_where")
+
     # -----------------------------------------------------------------------
     section("Attached databases: each its own catalog")
     # -----------------------------------------------------------------------
