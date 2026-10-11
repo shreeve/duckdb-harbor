@@ -3,6 +3,16 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by release
 date, newest first.
 
+## 0.24.1 — 2026-10-11
+
+- **DuckTable draws with gpui-kit 0.7.1.** The kit's fixes are rebuilt on
+  upstream gpui-kit 0.7.1 and its GPUI snapshot (`gpui-pre` 0.3.8), with
+  upstream's own fixes along: a completion list that latched at the first
+  place it opened asks again wherever typing goes, a context menu takes the
+  keyboard before its first frame, and panels stop redrawing state that did
+  not change. Typing over a selection in the Query editor opens the
+  completion list too.
+
 ## 0.24.0 — 2026-10-11
 
 - **Column headers sort.** A click sorts the Data view by a column and
