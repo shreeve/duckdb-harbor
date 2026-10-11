@@ -11,11 +11,13 @@
 //! it rewrites the record from what is attached then ([`record`]), so an
 //! `ATTACH` or `DETACH` from any client lasts as the client meant it.
 //!
-//! A recorded file that is gone, or that the engine will not attach, is
-//! said in the server's log and in `/catalog`, as an attached database with
-//! its reason in `error` ([`unattached`]); the server starts all the same,
-//! and the row stays, so the file is attached again once it is back. A row
-//! deleted from the record is forgotten.
+//! A recorded file that is gone, that the engine will not attach, or whose
+//! catalog does not read once attached (not SQLite after all, or locked by
+//! another program), is said in the server's log and in `/catalog`, as an
+//! attached database with its reason in `error` ([`unattached`]); the
+//! server starts all the same, and the row stays, so the file is attached
+//! again at a later start once it reads. A row deleted from the record is
+//! forgotten.
 
 use std::sync::Mutex;
 
@@ -143,8 +145,7 @@ pub fn open(con: &mut Conn) {
     }
     let mut unattached = plan.unattached;
     for record in plan.attaches {
-        if let Err(e) = con.execute_batch(&record.attach_sql()) {
-            let reason = e.to_string();
+        if let Err(reason) = attach(con, &record) {
             unattached.push(Unattached { record, reason });
         }
     }
@@ -152,6 +153,22 @@ pub fn open(con: &mut Conn) {
         eprintln!("harbor: workspace: {} is not attached — {}", u.record.name, u.reason);
     }
     *SERVING.lock().unwrap() = Some(unattached);
+}
+
+/// Attach a recorded file again, and read its catalog. Attaching a SQLite
+/// file reads nothing of it, so a file that is not SQLite, or one another
+/// program holds locked, attaches; and then every catalog read of the
+/// server fails, since the engine reads every attached database's catalog
+/// for any of them. One whose catalog does not read is detached again, with
+/// the engine's reason.
+fn attach(con: &mut Conn, record: &Record) -> Result<(), String> {
+    con.execute_batch(&record.attach_sql()).map_err(|e| e.to_string())?;
+    let read = con.query_strings("SELECT count(*)::VARCHAR FROM duckdb_tables()");
+    let Err(e) = read else { return Ok(()) };
+    if let Err(detach) = con.execute_batch(&format!("DETACH {}", open::quote_ident(&record.name))) {
+        eprintln!("harbor: workspace: {} could not be detached again: {detach}", record.name);
+    }
+    Err(e.to_string())
 }
 
 /// The record's rows, or none when it has not been made.

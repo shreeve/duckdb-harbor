@@ -264,9 +264,21 @@ pub fn view_sql(name: &str, reader: Reader, path: &str) -> String {
     format!("CREATE VIEW {} AS SELECT * FROM {}", quote_ident(name), reader.source(path))
 }
 
-/// `ATTACH` for a SQLite file, read-write, as the catalog `name`.
+/// How long a statement waits on a SQLite file another program has locked,
+/// in milliseconds, before it fails with `database is locked`. The engine
+/// reads every attached database's catalog for any catalog read, and waits
+/// five seconds by default, so one locked file would hold every catalog read
+/// of the server that long. A second rides over a writer's commit.
+pub const SQLITE_BUSY_MS: u32 = 1000;
+
+/// `ATTACH` for a SQLite file, read-write, as the catalog `name`, waiting
+/// [`SQLITE_BUSY_MS`] on a lock.
 pub fn attach_sql(name: &str, path: &str) -> String {
-    format!("ATTACH {} AS {} (TYPE sqlite)", quote_literal(path), quote_ident(name))
+    format!(
+        "ATTACH {} AS {} (TYPE sqlite, BUSY_TIMEOUT {SQLITE_BUSY_MS})",
+        quote_literal(path),
+        quote_ident(name)
+    )
 }
 
 /// The schema of the workspace's record of what is attached in it
@@ -314,11 +326,16 @@ impl Record {
         matches!(storage, "sqlite" | "duckdb") && !path.is_empty() && path != ":memory:"
     }
 
-    /// `ATTACH` for this file, as it was attached.
+    /// `ATTACH` for this file, as it was attached, and a SQLite file
+    /// waiting [`SQLITE_BUSY_MS`] on a lock.
     pub fn attach_sql(&self) -> String {
         let read_only = if self.read_only { ", READ_ONLY" } else { "" };
+        let busy = match self.storage.as_str() {
+            "sqlite" => format!(", BUSY_TIMEOUT {SQLITE_BUSY_MS}"),
+            _ => String::new(),
+        };
         format!(
-            "ATTACH {} AS {} (TYPE {}{read_only})",
+            "ATTACH {} AS {} (TYPE {}{read_only}{busy})",
             quote_literal(&self.path),
             quote_ident(&self.name),
             quote_ident(&self.storage)
@@ -548,7 +565,7 @@ mod tests {
         );
         assert_eq!(
             attach_sql("app", "/x/o'brien db.sqlite"),
-            "ATTACH '/x/o''brien db.sqlite' AS \"app\" (TYPE sqlite)"
+            "ATTACH '/x/o''brien db.sqlite' AS \"app\" (TYPE sqlite, BUSY_TIMEOUT 1000)"
         );
         assert_eq!(Reader::Xlsx.source("/b[1].xlsx"), "read_xlsx('/b[[]1].xlsx')");
         assert_eq!(Reader::Json.source("/j.json"), "read_json('/j.json')");
@@ -558,7 +575,7 @@ mod tests {
     #[test]
     fn a_record_attaches_its_file_again_as_it_was_attached() {
         let app = Record { name: "app".into(), path: "/x/o'brien.sqlite".into(), storage: "sqlite".into(), read_only: false };
-        assert_eq!(app.attach_sql(), "ATTACH '/x/o''brien.sqlite' AS \"app\" (TYPE \"sqlite\")");
+        assert_eq!(app.attach_sql(), "ATTACH '/x/o''brien.sqlite' AS \"app\" (TYPE \"sqlite\", BUSY_TIMEOUT 1000)");
         assert_eq!(
             app.insert_sql(),
             "INSERT OR REPLACE INTO _harbor.attached (name, path, type, read_only) VALUES ('app', '/x/o''brien.sqlite', 'sqlite', false)"

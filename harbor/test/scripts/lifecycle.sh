@@ -850,7 +850,7 @@ for a in d["attached"]: print("attached", a["name"], [t["name"] for t in a["tabl
 for t in d["tables"]: print("table", t["schema"], t["name"])'
 }
 workspace_start() {
-  "$harbor" "$work/workspace.duckdb" start >"$work/ws.log" 2>&1 &
+  "$harbor" "$work/workspace.duckdb" start "$@" >"$work/ws.log" 2>&1 &
   srv=$!
   for _ in $(seq 1 100); do [[ -n $(live_sock) ]] && return; sleep 0.1; done
   bad "the workspace never came up: $(cat "$work/ws.log")"
@@ -890,6 +890,64 @@ check "a plain DETACH" 0 "" "$harbor" "$work/workspace.duckdb" -c "DETACH app"
 workspace_stop
 workspace_start
 [[ $(catalog_lines) != *"attached app"* ]] && ok "lasts past the stop" || bad "detached, then: $(catalog_lines)"
+workspace_stop
+
+echo "— an attached SQLite file whose catalog does not read"
+# Attaching a SQLite file reads nothing of it, and the engine reads every
+# attached database's catalog for any catalog read: one that does not read
+# would fail them all.
+printf 'a,b\n1,2\n' > "$work/files/ab.csv"
+workspace_start --init "INSERT INTO _harbor.attached VALUES ('notsq', '$work/files/ab.csv', 'sqlite', false)"
+lines=$(catalog_lines)
+[[ $lines == *"attached notsq [] "*"file is not a database"* ]] \
+  && ok "a recorded file that is not SQLite is detached at the start, and the catalog says why" \
+  || bad "a recorded non-SQLite file: $lines"
+[[ $lines == *"view it_s_q1 reads"* ]] && ok "and the rest of the catalog reads" || bad "the catalog beside it: $lines"
+grep -q "notsq is not attached" "$work/ws.log" && ok "and the log says so" || bad "the log: $(cat "$work/ws.log")"
+workspace_stop
+check "its row stays in the record" 0 "1" \
+  "$harbor" "$work/workspace.duckdb" --mode csv -c "SELECT count(*) FROM _harbor.attached WHERE name = 'notsq'"
+wait_gone
+# A writer that holds a SQLite file locked: a catalog read fails, naming the
+# file, in about the second harbor's attachment waits, not the engine's five.
+lock_sqlite() { # lock_sqlite <file>: hold it locked until killed; returns once held
+  python3 -c '
+import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1], isolation_level=None)
+c.execute("BEGIN EXCLUSIVE")
+print("locked", flush=True)
+time.sleep(60)' "$1" > "$work/lock.out" 2>&1 &
+  locker=$!
+  for _ in $(seq 1 50); do grep -q locked "$work/lock.out" 2>/dev/null && return; sleep 0.1; done
+}
+workspace_start
+check "a SQLite file attaches in the workspace again" 0 "app: the SQLite database" \
+  "$harbor" "$work/files/app.sqlite" --mode csv -c "SELECT count(*) FROM app.people"
+lock_sqlite "$work/files/app.sqlite"
+read -r status secs < <(curl -s -o "$work/cat.json" -w '%{http_code} %{time_total}\n' --max-time 20 \
+  --unix-socket "$(live_sock)" http://harbor/catalog)
+body=$(cat "$work/cat.json")
+[[ $status == 400 && $body == *"app ($work/files/app.sqlite)"*"database is locked"* ]] \
+  && ok "a locked one fails the catalog with a 400 that names it" || bad "the catalog of a locked file: $status $body"
+python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 4 else 1)" "$secs" \
+  && ok "in about a second (${secs}s)" || bad "the catalog of a locked file took ${secs}s"
+kill "$locker" 2>/dev/null; wait "$locker" 2>/dev/null
+[[ $(catalog_lines) == *"attached app ['people'] None"* ]] && ok "and reads again once the lock is gone" \
+  || bad "after the lock: $(catalog_lines)"
+workspace_stop
+lock_sqlite "$work/files/app.sqlite"
+started=$(python3 -c 'import time; print(time.time())')
+workspace_start
+took=$(python3 -c "import time, sys; print(round(time.time() - float(sys.argv[1]), 2))" "$started")
+lines=$(catalog_lines)
+[[ $lines == *"attached app [] "*"database is locked"* ]] \
+  && ok "a recorded file locked at the start is detached again, and the catalog says why" \
+  || bad "a file locked at the start: $lines"
+python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 5 else 1)" "$took" \
+  && ok "and the start waits about a second on it (${took}s)" || bad "the start took ${took}s"
+kill "$locker" 2>/dev/null; wait "$locker" 2>/dev/null
+check "and it opens again once it reads" 0 "app: the SQLite database" \
+  "$harbor" "$work/files/app.sqlite" --mode csv -c "DETACH app"
 workspace_stop
 
 echo

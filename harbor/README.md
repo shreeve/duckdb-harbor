@@ -428,8 +428,16 @@ attached beside the served one, `system` and `temp` never, with its path
 and views in the same shapes. A DuckDB catalog's tables carry exact counts;
 another engine's carry `rowCount: null`, since a count there reads every row.
 On the workspace, a file it records as attached and could not attach at its
-start is listed too, holding nothing, with why in `error` (`"/data/app.sqlite:
-no such file"`); `error` is `null` for a database that is attached.
+start, or whose catalog did not read once attached, is listed too, holding
+nothing, with why in `error` (`"/data/app.sqlite: no such file"`); `error` is
+`null` for a database that is attached. An attached SQLite file whose catalog
+does not read — not SQLite after all, or held locked by another program —
+fails the whole read with a `400` that names it and says why, since the
+engine reads every attached database's catalog together and lists none while
+one does not; it reads again once that file does, or once it is detached. A
+SQLite file harbor attaches waits a second on a lock (`BUSY_TIMEOUT 1000`;
+the engine's own default is five), so a locked one fails a read in about a
+second rather than holding it.
 A table or view another client drops, or a database it detaches, while the
 catalog is being read is left out; it never fails the read. An `ATTACH` or
 `DETACH` runs alone against every statement that reads the catalog — `/catalog`
@@ -593,7 +601,7 @@ workspace> SELECT region, sum(amount) FROM sales GROUP BY ALL;
 | `.json` `.ndjson` `.jsonl` | a view over `read_json` |
 | `.xlsx` | a view over `read_xlsx`, its first sheet |
 | `.geojson` `.shp` `.gpkg` | a view over `ST_Read`, with `spatial` installed and loaded first |
-| SQLite (`.sqlite`, `.db`, …) | attached: `ATTACH … (TYPE sqlite)` |
+| SQLite (`.sqlite`, `.db`, …) | attached: `ATTACH … (TYPE sqlite, BUSY_TIMEOUT 1000)` |
 
 A file is known by its first bytes where its kind has a signature (DuckDB,
 SQLite, Parquet, Excel's zip, gzip, a shapefile) and by its name where it has
@@ -616,9 +624,11 @@ stops, so a plain `ATTACH` or `DETACH` of a SQLite or DuckDB file, from any
 client, lasts past the server; one that ends without stopping (a crash, a
 `kill -9`) leaves the record as last written. `/catalog` does not list it. A recorded file
 that is gone at the start is not attached, since attaching a missing path
-would make an empty database there; the server's log and `/catalog` say so,
-the server starts all the same, and the row stays, so the file is attached
-again once it is back. Deleting the row forgets it. The verbs (`start`,
+would make an empty database there, and one whose catalog does not read once
+attached (not SQLite after all, or locked by another program) is detached
+again, since it would fail every catalog read of the server; the server's log
+and `/catalog` say so, the server starts all the same, and the row stays, so
+the file is attached again at a later start once it reads. Deleting the row forgets it. The verbs (`start`,
 `backup`, …) act on databases and refuse a data file.
 
 **`harbor <db.duckdb> start` — the server is yours.** No refcount: it lives

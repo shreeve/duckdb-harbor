@@ -2936,6 +2936,51 @@ fn unattached_now(
         .collect())
 }
 
+/// One of the catalog functions' listings, which read every attached
+/// database's catalog at once: one database whose catalog does not read
+/// fails the listing of all of them, and the engine names the statement it
+/// sent the database and not the database. A SQLite file that is not
+/// SQLite, or that another program holds locked, does that, and attaching
+/// one reads nothing of it. So a listing that fails asks each attached
+/// SQLite database alone, and names in its refusal each one that does not
+/// read, with its reason; one that does not wait on a lock is not slowed.
+fn catalog_listing(
+    exec: Executor,
+    peer: &justhttp::Peer,
+    sql: &str,
+    databases: &[CatalogDatabase],
+) -> Result<Vec<Vec<serde_json::Value>>, CatalogFailure> {
+    let refusal = match catalog_rows(exec, peer, sql) {
+        Err(CatalogFailure::Refused(refusal)) if refusal.code == code::SQL_ERROR => refusal,
+        other => return other,
+    };
+    let mut unreadable = Vec::new();
+    for database in databases.iter().filter(|d| !d.served && d.storage == "sqlite") {
+        let probe = format!(
+            "SELECT count(*) FROM sqlite_query({}, 'SELECT count(*) FROM sqlite_master')",
+            wire::open::quote_literal(&database.name)
+        );
+        match catalog_rows(exec, peer, &probe) {
+            Ok(_) => {}
+            Err(CatalogFailure::Refused(why)) if why.code == code::SQL_ERROR => {
+                let why = why.message.split("\nLINE ").next().unwrap_or_default().trim().to_string();
+                let path = database.path.as_deref().unwrap_or_default();
+                unreadable.push(format!("{} ({path}): {why}", database.name));
+            }
+            Err(failure) => return Err(failure),
+        }
+    }
+    if unreadable.is_empty() {
+        return Err(CatalogFailure::Refused(refusal));
+    }
+    Err(CatalogFailure::Refused(Refusal::sql(format!(
+        "the catalog does not read while an attached database's does not, since the engine reads \
+         every attached database's catalog together: {}. It reads again once that one does, or \
+         once it is detached",
+        unreadable.join("; ")
+    ))))
+}
+
 /// Why a view does not read, from the refusal its probe met, or None when
 /// the refusal is not the view's to carry: a cancel, a client gone, a
 /// server stopping. The engine's message stands as written, less any
@@ -3006,7 +3051,9 @@ fn view_error(refusal: &Refusal) -> Option<String> {
 /// since a count there reads every row of the file. On the workspace, a
 /// file it records and could not attach at its start is listed there too,
 /// holding nothing, with why in `error`, and the record itself, in the
-/// `_harbor` schema, is not listed (`workspace`).
+/// `_harbor` schema, is not listed (`workspace`). An attached database whose
+/// own catalog does not read fails every listing, and the refusal names it
+/// (`catalog_listing`).
 ///
 /// Ordering is part of the contract: tables and views by (schema, name),
 /// attached databases by name, columns in ordinal position, indexes and
@@ -3062,15 +3109,16 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
              ORDER BY database_name, schema_name, table_name"
         }
     };
-    let table_rows = match catalog_rows(exec, &peer, table_sql) {
+    let table_rows = match catalog_listing(exec, &peer, table_sql, &databases) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
     };
-    let view_rows = match catalog_rows(
+    let view_rows = match catalog_listing(
         exec, &peer,
         "SELECT database_name, schema_name, view_name, sql FROM duckdb_views() \
          WHERE NOT internal AND NOT temporary \
          ORDER BY database_name, schema_name, view_name",
+        &databases,
     ) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
@@ -3204,24 +3252,26 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         }
     }
 
-    let column_rows = match catalog_rows(
+    let column_rows = match catalog_listing(
         exec, &peer,
         "SELECT database_name, schema_name, table_name, column_name, data_type, is_nullable, \
                 column_default, is_generated, generation_expression \
          FROM duckdb_columns() \
          WHERE NOT internal \
          ORDER BY database_name, schema_name, table_name, column_index",
+        &databases,
     ) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
     };
-    let constraint_rows = match catalog_rows(
+    let constraint_rows = match catalog_listing(
         exec, &peer,
         "SELECT database_name, schema_name, table_name, constraint_type, constraint_column_names, \
                 referenced_table, referenced_column_names \
          FROM duckdb_constraints() \
          WHERE constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY') \
          ORDER BY database_name, schema_name, table_name, constraint_index",
+        &databases,
     ) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
@@ -3230,11 +3280,12 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
     // ART indexes that implement PRIMARY KEY and UNIQUE column constraints are
     // not in it, which is exactly the distinction the contract wants — that
     // constraint-borne uniqueness travels in uniqueConstraints above, not here.
-    let index_rows = match catalog_rows(
+    let index_rows = match catalog_listing(
         exec, &peer,
         "SELECT database_name, schema_name, table_name, index_name, is_unique, expressions \
          FROM duckdb_indexes() \
          ORDER BY database_name, schema_name, table_name, index_name",
+        &databases,
     ) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
@@ -3356,13 +3407,14 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
     // queries above ran is left out, rather than shown half described or
     // failing the whole document. A table whose count failed and that is
     // still here fails it with the count's own error.
-    let present_rows = match catalog_rows(
+    let present_rows = match catalog_listing(
         exec, &peer,
         "SELECT database_name, schema_name, table_name FROM duckdb_tables() \
          WHERE NOT internal AND NOT temporary \
          UNION ALL SELECT database_name, schema_name, view_name FROM duckdb_views() \
          WHERE NOT internal AND NOT temporary \
          UNION ALL SELECT database_name, NULL, NULL FROM duckdb_databases() WHERE NOT internal",
+        &databases,
     ) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
@@ -3864,7 +3916,8 @@ enum Gate {
 /// `EXPLAIN`. A statement reads the catalog when it is a `SHOW`, `DESCRIBE`,
 /// `SUMMARIZE` or `PRAGMA`, or names, in its code or as a quoted name, a
 /// catalog function or schema: `duckdb_…`, `pragma_…`, `pg_…`,
-/// `information_schema` or `sql_auto_complete`. A name in a string or a
+/// `information_schema`, `sql_auto_complete` or `sqlite_query`, which reads
+/// an attached SQLite database by its name. A name in a string or a
 /// comment does not count. A view whose body calls one is not seen; it is
 /// read as the plain query it looks like.
 fn catalog_gate(sql: &str) -> Gate {
@@ -3878,6 +3931,7 @@ fn catalog_gate(sql: &str) -> Gate {
         ["duckdb_", "pragma_", "pg_"].iter().any(|p| word.starts_with(p.as_bytes()))
             || word == b"information_schema"
             || word == b"sql_auto_complete"
+            || word == b"sqlite_query"
     };
     let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
     let bytes = sql.as_bytes();
@@ -4755,6 +4809,7 @@ mod tests {
             "SUMMARIZE t",
             "PRAGMA show_tables",
             "SELECT library_version FROM pragma_version()",
+            "SELECT * FROM sqlite_query('a', 'SELECT 1')",
         ] {
             assert_eq!(catalog_gate(sql), Gate::Reads, "{sql}");
         }

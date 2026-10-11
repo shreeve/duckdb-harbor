@@ -14,7 +14,7 @@ and the CLI). Two kinds follow from that:
 | Kind | Files | Opens as | Editable |
 |---|---|---|---|
 | Database | `.duckdb`, `.ddb`, and `.db` whose header says DuckDB | itself, served by Harbor | in place |
-| Database | `.sqlite`, `.sqlite3`, `.db` whose header says SQLite | an attached catalog in the workspace (`ATTACH … (TYPE sqlite)`) | in place |
+| Database | `.sqlite`, `.sqlite3`, `.db` whose header says SQLite | an attached catalog in the workspace (`ATTACH … (TYPE sqlite, BUSY_TIMEOUT 1000)`) | in place |
 | Data | `.csv`, `.tsv`, `.txt`, `.csv.gz` | a view over `read_csv` | through Import |
 | Data | `.parquet`, or a folder of them, partitions included | a view over `read_parquet('dir/**/*.parquet', hive_partitioning = true)` | through Import |
 | Data | `.json`, `.ndjson`, `.jsonl` | a view over `read_json` | through Import |
