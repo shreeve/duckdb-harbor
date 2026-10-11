@@ -788,6 +788,37 @@ check "nor with each other" 1 "runs alone" \
   "$harbor" "$work/bk.duckdb" backup restore
 wait_gone
 
+echo "— a data file opens in the workspace"
+# A name with a quote, a space, a bracket and a star, beside a decoy its
+# glob would match: the view reads the one file named, and no other.
+mkdir -p "$work/files"
+data="$work/files/it's [q1]*.csv"
+printf 'id,name\n1,ann\n2,bob\n' > "$data"
+printf 'id,name\n9,decoy\n' > "$work/files/it's [q1]x.csv"
+check "a CSV opens as a view named for it, and says so" 0 "it_s_q1: a view over" \
+  "$harbor" "$data" --mode csv -c "SELECT 1"
+check "the view reads that file and no other" 0 "ann,bob" \
+  "$harbor" "$data" --mode csv -c "SELECT string_agg(name, ',' ORDER BY id) AS names FROM it_s_q1"
+check "a second opening finds the view the first made" 0 "already in the workspace" \
+  "$harbor" "$data" --mode csv -c "SELECT 1"
+check "in the workspace database, under HARBOR_HOME" 0 "1" \
+  "$harbor" "$work/workspace.duckdb" --mode csv -c "SELECT count(*) FROM duckdb_views() WHERE view_name = 'it_s_q1'"
+printf 'id,name\n1,x\n' > "$work/files/order.csv"
+check "a reserved word is passed over for the next free name" 0 "order_2: a view over" \
+  "$harbor" "$work/files/order.csv" --mode csv -c "SELECT * FROM order_2"
+check "a missing data file is refused, not made a database" 1 "no such file" \
+  "$harbor" "$work/files/nope.csv" -c "SELECT 1"
+[[ ! -e $work/files/nope.csv ]] && ok "and nothing is made there" || bad "a database was made at nope.csv"
+printf 'hello' > "$work/files/notes.bin"
+check "a file of no kind harbor opens is refused with what was looked at" 1 'begins "hello"' \
+  "$harbor" "$work/files/notes.bin" -c "SELECT 1"
+printf 'id\n1\n' > "$work/files/fake.parquet"
+check "and so is one its bytes contradict" 1 "not Parquet" \
+  "$harbor" "$work/files/fake.parquet" -c "SELECT 1"
+check "a verb refuses a data file" 1 "opens it in the workspace" \
+  "$harbor" "$work/files/order.csv" start
+wait_gone
+
 echo
 if ((fails)); then
   echo "lifecycle: $fails failing"
