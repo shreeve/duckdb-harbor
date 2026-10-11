@@ -265,13 +265,15 @@ column count and an SI-rounded row count (13k, 4.6M) where the catalog has
 one; an attached SQLite file's has none, since counting reads every row. A
 view carries its column count and the word `view`; one that does not read
 (a file gone, an extension not loaded) shows its name in the warning color
-and the engine's reason in its tooltip. Sequences follow in their own
+and the engine's reason in its tooltip. A catalog the workspace records and
+its server could not attach at its start (its file gone) is a heading
+alone, greyed, its reason in its tooltip. Sequences follow in their own
 SEQUENCES section. A filter field appears past ten tables and views.
 
 Right-click on a table or view offers **Save As**, a submenu of the four
 export formats; on a workspace view that reads a file, **Import as Table**
 and **Remove from Workspace** too; on an attached catalog's heading,
-**Detach** (docs/OPEN.md). **Refresh Tables** (⌘R, or the View menu) refetches the catalog and
+**Detach**, which in the workspace deletes its record too (docs/OPEN.md). **Refresh Tables** (⌘R, or the View menu) refetches the catalog and
 the open Data page and swaps them in one frame; it never blanks the tree, and a
 failed refresh keeps the old one. A successful commit and every completed
 Query run refresh the same way. When refreshes overlap, only the newest may

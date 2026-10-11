@@ -24,20 +24,24 @@ and the CLI). Two kinds follow from that:
 `excel`, `sqlite` and `spatial` are extensions the engine installs on first
 use, once, from DuckDB's repository; all three load on the pinned engine
 (measured 2026-10-10). `excel` and `sqlite` load themselves; `spatial` does
-not, so opening a spatial file loads it, and DuckTable loads it again when
-the catalog of a server that has not (a workspace server started since)
-reports a view over `ST_Read` it cannot read. A file whose kind cannot be
-told is refused with what was looked at, never guessed at.
+not, so opening a spatial file loads it, and a server that opens the
+workspace loads it before it serves (below). DuckTable loads it too when the
+catalog of a server that has not, a Harbor that does not or a database other
+than the workspace, reports a view over `ST_Read` it cannot read; a catalog
+whose views all read asks nothing more. A file whose kind cannot be told is
+refused with what was looked at, never guessed at.
 
 ## The workspace
 
 A data file has no database of its own, so it opens in the **workspace**:
-the DuckDB database `harbor <data file>` opens too, at
-`~/.local/share/harbor/workspace.duckdb` (`$HARBOR_HOME/workspace.duckdb`
-under a `HARBOR_HOME`; `paths::workspace`). One workspace serves the CLI and
-DuckTable, so a file opened in either is there in the other. Harbor serves
-it like any other database, and DuckTable lists it first in the sidebar as
-**Workspace**, running or not, once it exists. Opening a file there:
+one DuckDB database, Harbor's, at `~/.local/share/harbor/workspace.duckdb`
+(`$HARBOR_HOME/workspace.duckdb` when `HARBOR_HOME` is set, else
+`$XDG_DATA_HOME/harbor/` when that is). DuckTable reads its path from
+`harbor_common::paths::workspace()`, the function the `harbor` command line
+uses, so `harbor sales.csv` and a drop on DuckTable land in the same place,
+and a view made by either is there for both. Harbor serves it like any other
+database, and DuckTable lists it first in the sidebar as **Workspace**,
+running or not, once it exists. Opening a file there:
 
 - creates a view named for the file's stem (`sales.csv` → `sales`, a second
   `sales` → `sales_2`; a reserved word or a name a table or view already has
@@ -46,18 +50,38 @@ it like any other database, and DuckTable lists it first in the sidebar as
 - records the path and the reader in the view's own SQL, so the workspace
   outlives a restart and a file that has moved says so in the sidebar, the
   engine's words in the view's tooltip;
-- finds, on a second opening of the same file, the view the first made, and
-  says it is already in the workspace;
+- attaches a SQLite file and writes its row in the workspace's record, so
+  the attachment outlives the server (below);
+- finds, on a second opening of the same file, the view or the attachment
+  the first made, and says it is already in the workspace;
 - leaves the file untouched. Nothing DuckTable does writes to a data file.
 
 A SQLite file is attached under a name made the same way, one no database,
-schema or reserved word has. It is attached read-write, its tables edited in
-place with the grid's rules (EDITING.md), keyed by their primary key or by
-rowid and hash. SQLite refuses `INSERT … RETURNING`, so an insert there is
-checked by its count. The attachment lasts as long as the workspace server;
-recording it for the server's next start is the workspace's own (harbor's
-start-up), and DuckTable writes that record in one place
-(`workspace::record_attachment`).
+schema or reserved word has, nor one the record keeps for another file. It
+is attached read-write, its tables edited in place with the grid's rules
+(EDITING.md), keyed by their primary key or by rowid and hash. SQLite
+refuses `INSERT … RETURNING`, so an insert there is checked by its count.
+
+An `ATTACH` lasts only as long as the server that ran it, so the workspace
+records its attachments in itself: the table `_harbor.attached` (`name`,
+`path`, `type`, `read_only`), made where it is not by
+`wire::open::RECORD_DDL`, in a schema no view or catalog name made here can
+take. Whoever attaches a file writes its row as it attaches it
+(`Record::insert_sql`: the CLI, and DuckTable in one place,
+`workspace::record_attachment`), which keeps it through a server that does
+not stop cleanly; and a server serving the workspace rewrites the record
+from what is attached when it stops, so an `ATTACH` or `DETACH` from any
+client lasts. The record is Harbor's, and `/catalog` does not list it.
+
+Every server that opens the workspace makes it whole before it serves, for
+any client: it loads `spatial` when a view calls an `ST_` function, since
+`spatial` does not load on demand (`excel`, `json`, `parquet` and `sqlite`
+do), and attaches again each file the record names. A recorded file that is
+gone at the start is not attached, since attaching a missing path makes an
+empty database there; it is listed among `attached` with no tables and its
+reason in `error`, and its row stays, so the file is attached again once it
+is back. DuckTable shows it as a greyed heading, the reason in its
+tooltip.
 
 Views in the workspace can be joined with each other, queried in the Query
 view, sorted, filtered and exported like any table. A view's grid is
@@ -76,8 +100,12 @@ turn it into data DuckTable keeps or sends on:
   same rules as File → Export Table.
 
 **Remove from Workspace** on a workspace view drops it; the file is left as
-it is. **Detach** on an attached catalog's heading detaches it, and what was
-staged on its tables is parked with the rest of the workspace's.
+it is. **Detach** on an attached catalog's heading detaches it with a plain
+`DETACH` and deletes its row from the record (`Record::delete_sql`), so no
+later server attaches it again; what was staged on its tables is parked with
+the rest of the workspace's. On a greyed heading it deletes the row alone,
+since nothing is attached. In a database other than the workspace, Detach
+is the `DETACH` alone.
 
 ## Every way in
 
@@ -126,6 +154,9 @@ the table on screen gives way as any table switch makes it.
   the workspace with a view `sales` over the file, the same rule DuckTable
   uses, so `SELECT * FROM sales` works at once. `harbor x.duckdb` is
   unchanged; only paths that classify as data or SQLite go to the workspace.
+- **The workspace is whole at every start**: the extension its views call
+  into loaded and its recorded files attached before the server serves, as
+  above.
 
 A workspace server is never `--sealed`: reading files and loading
 extensions is its job. A sealed server refuses `read_csv` and `INSTALL`, and

@@ -39,6 +39,11 @@ date, newest first.
   and any table or view saves to CSV, Parquet, JSON or Excel from its
   right-click menu. Remove from Workspace and Detach let a file go without
   touching it.
+- **The workspace keeps its SQLite files.** A SQLite file opened in the
+  workspace is written to the workspace's record as it is attached, so the
+  workspace server attaches it again at every start, and Detach deletes the
+  record's row. A recorded file that has gone is listed greyed under its
+  heading, the reason in its tooltip, until it is back or detached.
 
 ## 0.23.0 — 2026-10-10
 
