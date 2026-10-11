@@ -90,6 +90,22 @@ def fetch(base, path):
         return e.code, e.read(), dict(e.headers)
 
 
+def sql(base, text):
+    """Run one statement; None when it succeeded, else the error message."""
+    body = json.dumps({"sql": text}).encode()
+    req = urllib.request.Request(base + "/sql", data=body, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            for line in r.read().decode().splitlines():
+                event = json.loads(line)
+                if event.get("type") == "error":
+                    return event.get("message", "")
+            return None
+    except urllib.error.HTTPError as e:
+        return json.loads(e.read() or b"{}").get("message", f"HTTP {e.code}")
+
+
 def free_port():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -177,6 +193,31 @@ DELETE FROM posts WHERE id = 4;
 """
 
 
+# Views over files, one of whose files is removed before the server starts,
+# and a view over nothing but SQL in a schema of its own.
+VIEWS_FIXTURE = """
+CREATE TABLE t (i INTEGER);
+CREATE VIEW sales AS SELECT * FROM read_csv('{work}/sales.csv');
+CREATE VIEW gone AS SELECT * FROM read_csv('{work}/gone.csv');
+CREATE SCHEMA s2;
+CREATE VIEW s2.calc AS SELECT 1 AS a, 2.5::DECIMAL(4,1) AS b;
+CHECKPOINT;
+"""
+
+# A DuckDB file attached read-only beside it.
+OTHER_FIXTURE = """
+CREATE TABLE items (id INTEGER PRIMARY KEY, label VARCHAR);
+INSERT INTO items VALUES (1, 'a'), (2, 'b'), (3, 'c');
+CREATE VIEW labels AS SELECT label FROM items;
+CHECKPOINT;
+"""
+
+
+def write_csv(path, text):
+    with open(path, "w") as f:
+        f.write(text)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true")
@@ -200,6 +241,22 @@ def main():
     proc, base, log = start_server(empty, free_port())
     try:
         run_empty(base)
+    finally:
+        stop_server(proc)
+        log.close()
+
+    views = os.path.join(work, "views.duckdb")
+    write_csv(os.path.join(work, "sales.csv"), "id,name\n1,ann\n2,bob\n")
+    write_csv(os.path.join(work, "gone.csv"), "id\n1\n")
+    subprocess.run(["duckdb", "-no-init", views, "-c", VIEWS_FIXTURE.format(work=work)],
+                   check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["duckdb", "-no-init", os.path.join(work, "other.duckdb"), "-c", OTHER_FIXTURE],
+                   check=True, stdout=subprocess.DEVNULL)
+    os.remove(os.path.join(work, "gone.csv"))
+    proc, base, log = start_server(views, free_port())
+    try:
+        run_views(base, work)
+        run_race(base, work)
     finally:
         stop_server(proc)
         log.close()
@@ -401,7 +458,7 @@ def run_fixture(base):
     eq("lite is a 200", 200, st)
     lite = json.loads(lbody)
     eq("its keys are the inventory alone",
-       ["harborVersion", "duckdbVersion", "databaseSizeBytes", "walSizeBytes", "tables"],
+       ["harborVersion", "duckdbVersion", "databaseSizeBytes", "walSizeBytes", "tables", "views", "attached"],
        list(lite.keys()))
     eq("a lite table is name and schema — nothing else",
        [], [t for t in lite["tables"] if sorted(t.keys()) != ["name", "schema"]])
@@ -446,11 +503,150 @@ def run_empty(base):
     doc = json.loads(body)
     eq("no tables", [], doc.get("tables"))
     eq("no sequences", [], doc.get("sequences"))
+    eq("no views", [], doc.get("views"))
+    eq("nothing attached", [], doc.get("attached"))
     eq("but its file still has a size", True,
        isinstance(doc.get("databaseSizeBytes"), int) and doc["databaseSizeBytes"] > 0)
     eq("but the versions still say who answered", True,
        bool(doc.get("harborVersion")) and bool(doc.get("duckdbVersion")))
     eq("and it too answers byte-identical documents", body, fetch(base, "/catalog")[1])
+
+
+def run_views(base, work):
+    # -----------------------------------------------------------------------
+    section("Views: their columns as they read, no count, and why one does not")
+    # -----------------------------------------------------------------------
+    st, body, _ = fetch(base, "/catalog")
+    eq("a catalog with views is a 200", 200, st)
+    doc = json.loads(body)
+    eq("tables are still tables alone", [("main", "t")], [(t["schema"], t["name"]) for t in doc["tables"]])
+    eq("views are ordered by (schema, name)",
+       [("main", "gone"), ("main", "sales"), ("s2", "calc")],
+       [(v["schema"], v["name"]) for v in doc["views"]])
+    views = {v["name"]: v for v in doc["views"]}
+    eq("a view's keys", ["name", "schema", "columns", "error", "ddl"], list(views["sales"].keys()))
+    cols = lambda v: [(c["name"], c["type"]) for c in v["columns"]]
+    eq("a view over a CSV has the CSV's columns", [("id", "BIGINT"), ("name", "VARCHAR")], cols(views["sales"]))
+    eq("and no error", None, views["sales"]["error"])
+    eq("and the engine's DDL", True, (views["sales"]["ddl"] or "").startswith("CREATE VIEW"))
+    eq("a view over SQL has its types", [("a", "INTEGER"), ("b", "DECIMAL(4,1)")], cols(views["calc"]))
+    eq("a view over a missing file has no columns", [], views["gone"]["columns"])
+    error = views["gone"]["error"] or ""
+    eq("and says why, naming the file", True, "gone.csv" in error)
+    eq("in the engine's words, without a LINE excerpt", False, "LINE" in error)
+    eq("a stable database answers byte-identical documents", body, fetch(base, "/catalog")[1])
+
+    write_csv(os.path.join(work, "sales.csv"), "id,name,amount\n1,ann,2.5\n")
+    write_csv(os.path.join(work, "gone.csv"), "id\n1\n")
+    views = {v["name"]: v for v in json.loads(fetch(base, "/catalog")[1])["views"]}
+    eq("a file that changed shape shows its shape",
+       [("id", "BIGINT"), ("name", "VARCHAR"), ("amount", "DOUBLE")], cols(views["sales"]))
+    eq("a file that came back reads again", (None, [("id", "BIGINT")]),
+       (views["gone"]["error"], cols(views["gone"])))
+
+    # -----------------------------------------------------------------------
+    section("Attached databases: each its own catalog")
+    # -----------------------------------------------------------------------
+    other = os.path.join(work, "other.duckdb")
+    eq("a DuckDB file attaches", None, sql(base, f"ATTACH '{other}' AS other (READ_ONLY)"))
+    app = os.path.join(work, "app.sqlite")
+    import sqlite3
+    con = sqlite3.connect(app)
+    con.executescript("CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT);"
+                      "INSERT INTO people (name) VALUES ('ann'), ('bob');"
+                      "CREATE VIEW names AS SELECT name FROM people;")
+    con.commit()
+    con.close()
+    # The sqlite extension installs on first use, from DuckDB's repository.
+    # Offline, that is the one failure taken as a skip, and said so.
+    refused = sql(base, f"ATTACH '{app}' AS app (TYPE sqlite)")
+    sqlite_ok = refused is None
+    if refused and any(w in refused for w in ("download", "HTTP", "Failed to", "extension")):
+        print(f"  \033[33m-\033[0m SQLite skipped: the sqlite extension did not install \033[2m{refused.splitlines()[0]}\033[0m")
+    elif refused:
+        bad("a SQLite file attaches", refused)
+
+    st, body, _ = fetch(base, "/catalog")
+    eq("still a 200", 200, st)
+    doc = json.loads(body)
+    attached = {a["name"]: a for a in doc["attached"]}
+    eq("attached databases by name, never system or temp",
+       ["app", "other"] if sqlite_ok else ["other"], [a["name"] for a in doc["attached"]])
+    eq("the served database's own lists hold only its own",
+       ([("main", "t")], 3), ([(t["schema"], t["name"]) for t in doc["tables"]], len(doc["views"])))
+    o = attached.get("other", {})
+    eq("an attached database's keys",
+       ["name", "path", "type", "readOnly", "tables", "views"], list(o.keys()))
+    eq("its path, type and read-only flag", (other, "duckdb", True), (o.get("path"), o.get("type"), o.get("readOnly")))
+    items = (o.get("tables") or [{}])[0]
+    eq("its tables in the full shape, counted exactly",
+       ("items", 3, ["id"], [("id", "INTEGER"), ("label", "VARCHAR")]),
+       (items.get("name"), items.get("rowCount"), items.get("primaryKey"),
+        [(c["name"], c["type"]) for c in items.get("columns", [])]))
+    eq("and its views", [("labels", [("label", "VARCHAR")], None)],
+       [(v["name"], cols(v), v["error"]) for v in o.get("views", [])])
+    if sqlite_ok:
+        a = attached["app"]
+        eq("a SQLite file is type sqlite, read-write", (app, "sqlite", False), (a["path"], a["type"], a["readOnly"]))
+        people = (a["tables"] or [{}])[0]
+        eq("its tables carry columns and keys, and no count",
+           ("people", None, ["id"], ["id", "name"]),
+           (people.get("name"), people.get("rowCount"), people.get("primaryKey"),
+            [c["name"] for c in people.get("columns", [])]))
+        eq("and its views", ["names"], [v["name"] for v in a["views"]])
+    eq("two calls, one answer, attachments and all", body, fetch(base, "/catalog")[1])
+
+    lite = json.loads(fetch(base, "/catalog?style=lite")[1])
+    eq("lite names the views", [(v["schema"], v["name"]) for v in doc["views"]],
+       [(v["schema"], v["name"]) for v in lite["views"]])
+    eq("and each attached database with what it holds, by name",
+       [(a["name"], a["type"], a["readOnly"], [t["name"] for t in a["tables"]], [v["name"] for v in a["views"]])
+        for a in doc["attached"]],
+       [(a["name"], a["type"], a["readOnly"], [t["name"] for t in a["tables"]], [v["name"] for v in a["views"]])
+        for a in lite["attached"]])
+
+    eq("detached, it is gone from the catalog", None, sql(base, "DETACH other"))
+    eq("and the catalog says so", False, "other" in [a["name"] for a in json.loads(fetch(base, "/catalog")[1])["attached"]])
+    if sqlite_ok:
+        sql(base, "DETACH app")
+
+
+def run_race(base, work, rounds=200):
+    # -----------------------------------------------------------------------
+    section("A relation dropped while the catalog is read is left out")
+    # -----------------------------------------------------------------------
+    # The catalog lists, then counts and binds: a table, a view or an
+    # attachment another client takes away in between must cost only itself.
+    # One client churns all three while this one reads the catalog; every
+    # read must answer.
+    import threading
+    churn = os.path.join(work, "churn.duckdb")
+    subprocess.run(["duckdb", "-no-init", churn, "-c", "CREATE TABLE c (i INTEGER); CHECKPOINT;"],
+                   check=True, stdout=subprocess.DEVNULL)
+    stop = threading.Event()
+    churned = [0]
+
+    def churner():
+        while not stop.is_set():
+            for statement in ("CREATE TABLE race (i INTEGER)", "CREATE VIEW race_v AS SELECT 1 AS x",
+                              f"ATTACH '{churn}' AS churn (READ_ONLY)",
+                              "DROP VIEW race_v", "DROP TABLE race", "DETACH churn"):
+                sql(base, statement)
+            churned[0] += 1
+
+    thread = threading.Thread(target=churner, daemon=True)
+    thread.start()
+    failures = []
+    for _ in range(rounds):
+        st, body, _ = fetch(base, "/catalog")
+        if st != 200:
+            failures.append(json.loads(body or b"{}").get("message", f"HTTP {st}"))
+    stop.set()
+    thread.join(timeout=30)
+    eq(f"reads that failed, of {rounds} raced against {churned[0]} rounds of DROP and DETACH",
+       0, len(failures))
+    if failures:
+        print(f"     \033[2mfirst: {failures[0]}\033[0m")
 
 
 def harbor_version():

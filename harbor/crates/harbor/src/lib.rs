@@ -20,7 +20,9 @@ use std::{
 };
 
 use justhttp::{Header, Method, Request, Response, Server};
-use wire::catalog::{Catalog, Column, ForeignKey, Index, Inventory, Named, Sequence, Table, Unique};
+use wire::catalog::{
+    Attached, AttachedInventory, Catalog, Column, ForeignKey, Index, Inventory, Named, Sequence, Table, Unique, View,
+};
 use wire::code;
 use wire::statement::{acting_keyword, bare_word, commits, transaction_effect};
 
@@ -2820,29 +2822,94 @@ fn catalog_style(url: &str) -> Result<CatalogStyle, String> {
 /// travels through the result and is sorted explicitly: UNION ALL preserves
 /// duplicates, not branch order, and the caller must never attach a count to
 /// the wrong table. Identifiers come only from DuckDB's catalog and are still
-/// quoted as SQL identifiers, including embedded double quotes.
-fn catalog_count_sql(table_rows: &[Vec<serde_json::Value>]) -> Option<String> {
-    if table_rows.is_empty() {
+/// quoted as SQL identifiers, including embedded double quotes, and every
+/// table is named by its catalog too, since an attached database's tables
+/// are counted in the same statement.
+fn catalog_count_sql(tables: &[RelationKey]) -> Option<String> {
+    if tables.is_empty() {
         return None;
     }
     let mut sql = String::from("SELECT table_ordinal, row_count FROM (");
-    for (i, row) in table_rows.iter().enumerate() {
+    for (i, (database, schema, table)) in tables.iter().enumerate() {
         if i > 0 {
             sql.push_str(" UNION ALL ");
         }
-        let schema = catalog_identifier(&cell_str(row, 0));
-        let table = catalog_identifier(&cell_str(row, 1));
         let _ = write!(
             sql,
-            "SELECT {i}::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FROM {schema}.{table}"
+            "SELECT {i}::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FROM {}",
+            qualified(database, schema, table)
         );
     }
     sql.push_str(") AS exact_counts ORDER BY table_ordinal");
     Some(sql)
 }
 
-fn catalog_identifier(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+/// One table's exact count: `Ok(Err(..))` is the engine's refusal, which the
+/// caller weighs (the table may be gone), and `Err` the failures every
+/// catalog query shares.
+fn count_alone(
+    exec: Executor,
+    peer: &justhttp::Peer,
+    key: &RelationKey,
+) -> Result<Result<u64, Refusal>, CatalogFailure> {
+    let sql = catalog_count_sql(std::slice::from_ref(key)).unwrap_or_default();
+    match catalog_rows(exec, peer, &sql) {
+        Ok(rows) => match rows.first().and_then(|row| cell_opt_u64(row, 1)) {
+            Some(count) => Ok(Ok(count)),
+            None => Err(invalid_count_shape()),
+        },
+        Err(CatalogFailure::Refused(refusal)) if refusal.code == code::SQL_ERROR => Ok(Err(refusal)),
+        Err(failure) => Err(failure),
+    }
+}
+
+fn invalid_count_shape() -> CatalogFailure {
+    CatalogFailure::Refused(Refusal {
+        status: 500,
+        code: code::INTERNAL,
+        message: "the catalog row-count query returned an invalid shape".to_string(),
+    })
+}
+
+/// Whether a table is listed, by (database, schema, name).
+fn table_listed(exec: Executor, peer: &justhttp::Peer, (database, schema, name): &RelationKey) -> Result<bool, CatalogFailure> {
+    let quote = wire::open::quote_literal;
+    let sql = format!(
+        "SELECT count(*) FROM duckdb_tables() WHERE database_name = {} AND schema_name = {} AND table_name = {}",
+        quote(database), quote(schema), quote(name)
+    );
+    Ok(catalog_rows(exec, peer, &sql)?.first().and_then(|row| cell_opt_u64(row, 0)).unwrap_or(0) > 0)
+}
+
+/// A relation by (database, schema, name), as the catalog functions name it.
+type RelationKey = (String, String, String);
+
+/// `"database"."schema"."name"`.
+fn qualified(database: &str, schema: &str, name: &str) -> String {
+    let quote = wire::open::quote_ident;
+    format!("{}.{}.{}", quote(database), quote(schema), quote(name))
+}
+
+/// A database the catalog describes: the served one, or one attached
+/// beside it.
+struct CatalogDatabase {
+    name: String,
+    path: Option<String>,
+    storage: String,
+    read_only: bool,
+    served: bool,
+}
+
+/// Why a view does not read, from the refusal its probe met, or None when
+/// the refusal is not the view's to carry: a cancel, a client gone, a
+/// server stopping. The engine's message stands as written, less any
+/// `LINE` excerpt, which would quote the probe and not the view.
+fn view_error(refusal: &Refusal) -> Option<String> {
+    if refusal.code != code::SQL_ERROR {
+        return None;
+    }
+    let message = refusal.message.split("\nLINE ").next().unwrap_or_default();
+    Some(message.trim().to_string())
 }
 
 /// `GET /catalog` — the complete schema shape a migration differ needs, as
@@ -2877,17 +2944,36 @@ fn catalog_identifier(name: &str) -> String {
 /// served file by the one process sitting next to it — exact bytes, never
 /// the engine's pretty-printed strings, and null for a berth serving no file.
 ///
-/// `?style=lite` answers the inventory alone: the versions, the sizes, and
-/// each table's name and schema — enough to draw a database list without
+/// `?style=lite` answers the inventory alone: the versions, the sizes, each
+/// table's and view's name and schema, and each attached database with its
+/// tables and views named the same way — enough to draw a database list without
 /// paying for counts, columns, constraints, indexes, DDL, or sequences, in
 /// queries here or in bytes on the wire. It is the same document family at
 /// lower fidelity, not a second contract: a field a style omits is absent,
 /// never differently shaped.
 ///
-/// Ordering is part of the contract: tables by (schema, name), columns in
-/// ordinal position, indexes and sequences by name, unique constraints by
-/// their column lists, foreign keys by their referenced table and column
-/// lists. A stable database answers with byte-identical output.
+/// Views come with their columns and their DDL and without a count, since
+/// counting a view over a file reads the file. Each view is bound before
+/// the columns are read (`SELECT * … LIMIT 0`, which reads what binding a
+/// reader reads: a CSV's sample, a Parquet footer, the whole of a GeoJSON
+/// file, for GDAL parses it to open it), so its columns are the ones it
+/// reads as when the catalog is asked; the engine keeps the shape a view
+/// last bound to and reports that otherwise. A view that does not bind, its file gone or its
+/// extension not loaded, is listed with no columns and the engine's reason,
+/// and the rest of the document is unaffected.
+///
+/// Every database attached beside the served one is listed under
+/// `attached`, `system` and `temp` never, with its path, its storage type
+/// and whether it is read-only, and its tables and views in the same
+/// shapes. A DuckDB catalog's tables are counted exactly with the served
+/// database's, in the one statement; another engine's are not counted,
+/// since a count there reads every row of the file.
+///
+/// Ordering is part of the contract: tables and views by (schema, name),
+/// attached databases by name, columns in ordinal position, indexes and
+/// sequences by name, unique constraints by their column lists, foreign keys
+/// by their referenced table and column lists. A stable database answers
+/// with byte-identical output.
 fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
     let peer = req.peer();
     let style = match catalog_style(req.url()) {
@@ -2897,43 +2983,96 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
             return (true, 400);
         }
     };
-    // System and temp catalogs are excluded by anchoring every query to the
-    // served database: `system` and `temp` are separate databases, so
-    // current_database() never matches them.
     let version_rows = match catalog_rows(exec, &peer, "SELECT library_version FROM pragma_version()") {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
     };
+    // `system` and `temp` are the internal databases; every other one is the
+    // served database, which current_database() names, or one attached
+    // beside it. Relations of any database not in this list are passed over
+    // below, wherever a catalog function reports them.
+    let database_rows = match catalog_rows(
+        exec, &peer,
+        "SELECT database_name, path, type, readonly, database_name = current_database() \
+         FROM duckdb_databases() WHERE NOT internal ORDER BY database_name",
+    ) {
+        Ok(rows) => rows,
+        Err(failure) => return catalog_refuse(req, failure),
+    };
+    let databases: Vec<CatalogDatabase> = database_rows
+        .iter()
+        .map(|row| CatalogDatabase {
+            name: cell_str(row, 0),
+            path: cell_opt_str(row, 1).filter(|p| !p.is_empty()),
+            storage: cell_str(row, 2),
+            read_only: cell_bool(row, 3),
+            served: cell_bool(row, 4),
+        })
+        .collect();
+    let database_of: HashMap<String, usize> =
+        databases.iter().enumerate().map(|(i, d)| (d.name.clone(), i)).collect();
     let table_sql = match style {
         CatalogStyle::Full => {
-            "SELECT schema_name, table_name, sql FROM duckdb_tables() \
-             WHERE database_name = current_database() AND NOT internal AND NOT temporary \
-             ORDER BY schema_name, table_name"
+            "SELECT database_name, schema_name, table_name, sql FROM duckdb_tables() \
+             WHERE NOT internal AND NOT temporary \
+             ORDER BY database_name, schema_name, table_name"
         }
         CatalogStyle::Lite => {
-            "SELECT schema_name, table_name FROM duckdb_tables() \
-             WHERE database_name = current_database() AND NOT internal AND NOT temporary \
-             ORDER BY schema_name, table_name"
+            "SELECT database_name, schema_name, table_name FROM duckdb_tables() \
+             WHERE NOT internal AND NOT temporary \
+             ORDER BY database_name, schema_name, table_name"
         }
     };
     let table_rows = match catalog_rows(exec, &peer, table_sql) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
     };
+    let view_rows = match catalog_rows(
+        exec, &peer,
+        "SELECT database_name, schema_name, view_name, sql FROM duckdb_views() \
+         WHERE NOT internal AND NOT temporary \
+         ORDER BY database_name, schema_name, view_name",
+    ) {
+        Ok(rows) => rows,
+        Err(failure) => return catalog_refuse(req, failure),
+    };
+    let table_rows: Vec<_> = table_rows.into_iter().filter(|row| database_of.contains_key(&cell_str(row, 0))).collect();
+    let view_rows: Vec<_> = view_rows.into_iter().filter(|row| database_of.contains_key(&cell_str(row, 0))).collect();
     let duckdb_version = version_rows.first().map(|r| cell_str(r, 0)).unwrap_or_default();
     let harbor_version = env!("CARGO_PKG_VERSION").to_string();
     let (database_size_bytes, wal_size_bytes) = database_disk_sizes();
 
     // The lite style stops here: everything it answers is already in hand,
-    // and the count plus four shape queries below never run.
+    // and the count, the views' binding and the four shape queries below
+    // never run.
     if let CatalogStyle::Lite = style {
-        let tables = table_rows.iter().map(|row| Named { name: cell_str(row, 1), schema: cell_str(row, 0) });
+        let named_in = |rows: &[Vec<serde_json::Value>], database: &str| -> Vec<Named> {
+            rows.iter()
+                .filter(|row| cell_str(row, 0) == database)
+                .map(|row| Named { name: cell_str(row, 2), schema: cell_str(row, 1) })
+                .collect()
+        };
+        let served = databases.iter().find(|d| d.served).map(|d| d.name.as_str()).unwrap_or_default();
+        let attached = databases
+            .iter()
+            .filter(|d| !d.served)
+            .map(|d| AttachedInventory {
+                name: d.name.clone(),
+                path: d.path.clone(),
+                storage: d.storage.clone(),
+                read_only: d.read_only,
+                tables: named_in(&table_rows, &d.name),
+                views: named_in(&view_rows, &d.name),
+            })
+            .collect();
         let inventory = Inventory {
             harbor_version,
             duckdb_version,
             database_size_bytes,
             wal_size_bytes,
-            tables: tables.collect(),
+            tables: named_in(&table_rows, served),
+            views: named_in(&view_rows, served),
+            attached,
         };
         let _ = req.respond(json_response(200, &serde_json::to_string(&inventory).unwrap()));
         return (true, 200);
@@ -2944,59 +3083,84 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
     // exactly, then let one UNION ALL statement count every table under one
     // query snapshot. COUNT(*) projects no application columns; it reads the
     // engine's visibility information and therefore excludes deleted rows
-    // that the physical storage cardinality still includes.
-    let count_rows = if let Some(sql) = catalog_count_sql(&table_rows) {
+    // that the physical storage cardinality still includes. Only DuckDB's
+    // own storage is counted: another engine's count reads its whole file.
+    let key_of = |row: &Vec<serde_json::Value>| -> RelationKey { (cell_str(row, 0), cell_str(row, 1), cell_str(row, 2)) };
+    let counted: Vec<usize> = (0..table_rows.len())
+        .filter(|&i| databases[database_of[&cell_str(&table_rows[i], 0)]].storage == "duckdb")
+        .collect();
+    let counted_keys: Vec<RelationKey> = counted.iter().map(|&i| key_of(&table_rows[i])).collect();
+    // A table can be dropped, or its database detached, between the listing
+    // and the count, by any other client; the one statement then fails for
+    // all of them. Each is then counted alone, and a count that fails is set
+    // aside until the relations are listed again at the end: a table gone by
+    // then is left out of the document, and one listed again is counted
+    // again.
+    let mut row_counts: Vec<Option<u64>> = vec![None; table_rows.len()];
+    let mut count_failures: Vec<usize> = Vec::new();
+    if let Some(sql) = catalog_count_sql(&counted_keys) {
         match catalog_rows(exec, &peer, &sql) {
-            Ok(rows) => rows,
+            Ok(rows) => {
+                if rows.len() != counted.len() {
+                    return catalog_refuse(req, invalid_count_shape());
+                }
+                for (ordinal, (row, &i)) in rows.iter().zip(&counted).enumerate() {
+                    if cell_opt_u64(row, 0) != Some(ordinal as u64) {
+                        return catalog_refuse(req, invalid_count_shape());
+                    }
+                    let Some(count) = cell_opt_u64(row, 1) else { return catalog_refuse(req, invalid_count_shape()) };
+                    row_counts[i] = Some(count);
+                }
+            }
+            Err(CatalogFailure::Refused(refusal)) if refusal.code == code::SQL_ERROR => {
+                for (&i, key) in counted.iter().zip(&counted_keys) {
+                    match count_alone(exec, &peer, key) {
+                        Ok(Ok(count)) => row_counts[i] = Some(count),
+                        Ok(Err(_)) => count_failures.push(i),
+                        Err(failure) => return catalog_refuse(req, failure),
+                    }
+                }
+            }
             Err(failure) => return catalog_refuse(req, failure),
         }
-    } else {
-        Vec::new()
-    };
-    let row_counts = if count_rows.len() == table_rows.len() {
-        count_rows
-            .iter()
-            .enumerate()
-            .map(|(i, row)| {
-                if cell_opt_u64(row, 0) != Some(i as u64) {
-                    return None;
-                }
-                cell_opt_u64(row, 1)
-            })
-            .collect::<Option<Vec<_>>>()
-    } else {
-        None
-    };
-    let Some(row_counts) = row_counts else {
-        return catalog_refuse(
-            req,
-            CatalogFailure::Refused(Refusal {
-                status: 500,
-                code: code::INTERNAL,
-                message: "the catalog row-count query returned an invalid shape".to_string(),
-            }),
-        );
-    };
+    }
+
+    // Each view bound, one statement apiece, so one that does not bind
+    // costs only itself. Binding comes before the columns are read: the
+    // engine records the shape a view binds to, so duckdb_columns() then
+    // answers with the shape each view reads as at this moment.
+    let mut view_errors: Vec<Option<String>> = Vec::with_capacity(view_rows.len());
+    for row in &view_rows {
+        let (database, schema, name) = key_of(row);
+        let probe = format!("SELECT * FROM {} LIMIT 0", qualified(&database, &schema, &name));
+        match catalog_rows(exec, &peer, &probe) {
+            Ok(_) => view_errors.push(None),
+            Err(CatalogFailure::Refused(refusal)) => match view_error(&refusal) {
+                Some(error) => view_errors.push(Some(error)),
+                None => return catalog_refuse(req, CatalogFailure::Refused(refusal)),
+            },
+            Err(failure) => return catalog_refuse(req, failure),
+        }
+    }
 
     let column_rows = match catalog_rows(
         exec, &peer,
-        "SELECT schema_name, table_name, column_name, data_type, is_nullable, column_default, \
-                is_generated, generation_expression \
+        "SELECT database_name, schema_name, table_name, column_name, data_type, is_nullable, \
+                column_default, is_generated, generation_expression \
          FROM duckdb_columns() \
-         WHERE database_name = current_database() AND NOT internal \
-         ORDER BY schema_name, table_name, column_index",
+         WHERE NOT internal \
+         ORDER BY database_name, schema_name, table_name, column_index",
     ) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
     };
     let constraint_rows = match catalog_rows(
         exec, &peer,
-        "SELECT schema_name, table_name, constraint_type, constraint_column_names, \
+        "SELECT database_name, schema_name, table_name, constraint_type, constraint_column_names, \
                 referenced_table, referenced_column_names \
          FROM duckdb_constraints() \
-         WHERE database_name = current_database() \
-           AND constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY') \
-         ORDER BY schema_name, table_name, constraint_index",
+         WHERE constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY') \
+         ORDER BY database_name, schema_name, table_name, constraint_index",
     ) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
@@ -3007,10 +3171,9 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
     // constraint-borne uniqueness travels in uniqueConstraints above, not here.
     let index_rows = match catalog_rows(
         exec, &peer,
-        "SELECT schema_name, table_name, index_name, is_unique, expressions \
+        "SELECT database_name, schema_name, table_name, index_name, is_unique, expressions \
          FROM duckdb_indexes() \
-         WHERE database_name = current_database() \
-         ORDER BY schema_name, table_name, index_name",
+         ORDER BY database_name, schema_name, table_name, index_name",
     ) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
@@ -3026,32 +3189,51 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
     };
 
     // Assembled in the order the queries delivered — every ORDER BY above is
-    // load-bearing — and looked up by (schema, name), never iterated from the
-    // map, so nothing about the output depends on hash order.
-    let mut tables: Vec<Table> = Vec::new();
-    let mut index_of: HashMap<(String, String), usize> = HashMap::new();
-    for (row, row_count) in table_rows.iter().zip(row_counts) {
-        let schema = cell_str(row, 0);
-        let name = cell_str(row, 1);
-        index_of.insert((schema.clone(), name.clone()), tables.len());
-        tables.push(Table { schema, name, row_count: Some(row_count), ddl: cell_opt_str(row, 2), ..Table::default() });
+    // load-bearing — and looked up by (database, schema, name), never
+    // iterated from the map, so nothing about the output depends on hash
+    // order. A table and a view cannot share a name in one schema, so one map
+    // finds either.
+    enum Relation {
+        Table(usize),
+        View(usize),
     }
+    let mut tables: Vec<Table> = Vec::new();
+    let mut views: Vec<View> = Vec::new();
+    let mut index_of: HashMap<RelationKey, Relation> = HashMap::new();
+    for (row, row_count) in table_rows.iter().zip(row_counts) {
+        let (_, schema, name) = key_of(row);
+        index_of.insert(key_of(row), Relation::Table(tables.len()));
+        tables.push(Table { schema, name, row_count, ddl: cell_opt_str(row, 3), ..Table::default() });
+    }
+    for (row, error) in view_rows.iter().zip(view_errors) {
+        let (_, schema, name) = key_of(row);
+        index_of.insert(key_of(row), Relation::View(views.len()));
+        views.push(View { schema, name, columns: Vec::new(), error, ddl: cell_opt_str(row, 3) });
+    }
+    let table_at = |row: &Vec<serde_json::Value>| match index_of.get(&key_of(row)) {
+        Some(&Relation::Table(t)) => Some(t),
+        _ => None,
+    };
     for row in &column_rows {
-        let Some(&t) = index_of.get(&(cell_str(row, 0), cell_str(row, 1))) else { continue };
-        tables[t].columns.push(Column {
-            name: cell_str(row, 2),
-            duck_type: cell_str(row, 3),
-            not_null: !cell_bool(row, 4),
-            default: cell_opt_str(row, 5),
-            generated: cell_bool(row, 6),
-            generation_expression: cell_opt_str(row, 7),
+        let column = Column {
+            name: cell_str(row, 3),
+            duck_type: cell_str(row, 4),
+            not_null: !cell_bool(row, 5),
+            default: cell_opt_str(row, 6),
+            generated: cell_bool(row, 7),
+            generation_expression: cell_opt_str(row, 8),
             primary: false,
-        });
+        };
+        match index_of.get(&key_of(row)) {
+            Some(&Relation::Table(t)) => tables[t].columns.push(column),
+            Some(&Relation::View(v)) => views[v].columns.push(column),
+            None => {}
+        }
     }
     for row in &constraint_rows {
-        let Some(&t) = index_of.get(&(cell_str(row, 0), cell_str(row, 1))) else { continue };
-        let columns = cell_list(row, 3);
-        match cell_str(row, 2).as_str() {
+        let Some(t) = table_at(row) else { continue };
+        let columns = cell_list(row, 4);
+        match cell_str(row, 3).as_str() {
             "PRIMARY KEY" => {
                 for column in tables[t].columns.iter_mut() {
                     if columns.contains(&column.name) {
@@ -3067,28 +3249,28 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
                 let ref_schema = tables[t].schema.clone();
                 tables[t].foreign_keys.push(ForeignKey {
                     columns,
-                    ref_table: cell_str(row, 4),
+                    ref_table: cell_str(row, 5),
                     ref_schema,
-                    ref_columns: cell_list(row, 5),
+                    ref_columns: cell_list(row, 6),
                 });
             }
             _ => {}
         }
     }
     for row in &index_rows {
-        let Some(&t) = index_of.get(&(cell_str(row, 0), cell_str(row, 1))) else { continue };
+        let Some(t) = table_at(row) else { continue };
         let (mut columns, mut expressions) = (Vec::new(), Vec::new());
-        for part in index_parts(&cell_str(row, 4)) {
+        for part in index_parts(&cell_str(row, 5)) {
             match part {
                 IndexPart::Column(name) => columns.push(name),
                 IndexPart::Expression(text) => expressions.push(text),
             }
         }
         tables[t].indexes.push(Index {
-            name: cell_str(row, 2),
+            name: cell_str(row, 3),
             columns,
             expressions,
-            unique: cell_bool(row, 3),
+            unique: cell_bool(row, 4),
         });
     }
     for table in tables.iter_mut() {
@@ -3108,7 +3290,120 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         // JSON's exact range, quoted past it — so the value goes out as is.
         .map(|row| Sequence { name: cell_str(row, 0), start: row.get(1).cloned().unwrap_or_default() })
         .collect();
-    let catalog = Catalog { harbor_version, duckdb_version, database_size_bytes, wal_size_bytes, tables, sequences };
+
+    // Listed again, last: what another client dropped or detached while the
+    // queries above ran is left out, rather than shown half described or
+    // failing the whole document. A table whose count failed and that is
+    // still here fails it with the count's own error.
+    let present_rows = match catalog_rows(
+        exec, &peer,
+        "SELECT database_name, schema_name, table_name FROM duckdb_tables() \
+         WHERE NOT internal AND NOT temporary \
+         UNION ALL SELECT database_name, schema_name, view_name FROM duckdb_views() \
+         WHERE NOT internal AND NOT temporary \
+         UNION ALL SELECT database_name, NULL, NULL FROM duckdb_databases() WHERE NOT internal",
+    ) {
+        Ok(rows) => rows,
+        Err(failure) => return catalog_refuse(req, failure),
+    };
+    let mut present: std::collections::HashSet<RelationKey> = present_rows.iter().map(key_of).collect();
+    // A table whose count failed and that is listed again — its
+    // database detached and attached again, say — is counted again, and
+    // looked for again when that fails too. Three tries: a table still
+    // listed after three failed counts fails the document with the engine's
+    // error, as the one statement would have for a table that cannot be
+    // counted.
+    for i in count_failures {
+        let key = key_of(&table_rows[i]);
+        let mut tries = 0;
+        while present.contains(&key) {
+            tries += 1;
+            match count_alone(exec, &peer, &key) {
+                Ok(Ok(count)) => {
+                    tables[i].row_count = Some(count);
+                    break;
+                }
+                Ok(Err(refusal)) if tries >= 3 => return catalog_refuse(req, CatalogFailure::Refused(refusal)),
+                Ok(Err(_)) => match table_listed(exec, &peer, &key) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        present.remove(&key);
+                    }
+                    Err(failure) => return catalog_refuse(req, failure),
+                },
+                Err(failure) => return catalog_refuse(req, failure),
+            }
+        }
+    }
+    // A table always has a column, so one with none was gone when the
+    // columns were read.
+    for (i, table) in tables.iter().enumerate() {
+        if table.columns.is_empty() {
+            present.remove(&key_of(&table_rows[i]));
+        }
+    }
+    // A view whose binding failed and that is listed still is bound once
+    // more, since what failed may have been its database, detached and
+    // attached again while it was bound. One that still does not read has
+    // no columns: the ones the engine kept are the shape it last read as,
+    // not one it reads as.
+    for (row, view) in view_rows.iter().zip(views.iter_mut()) {
+        if view.error.is_none() || !present.contains(&key_of(row)) {
+            continue;
+        }
+        let (database, schema, name) = key_of(row);
+        let probe = format!("SELECT * FROM {} LIMIT 0", qualified(&database, &schema, &name));
+        match catalog_rows(exec, &peer, &probe) {
+            Ok(_) => view.error = None,
+            Err(CatalogFailure::Refused(refusal)) if view_error(&refusal).is_some() => {
+                view.error = view_error(&refusal);
+                view.columns.clear();
+            }
+            Err(failure) => return catalog_refuse(req, failure),
+        }
+    }
+    let still_attached = |name: &str| present.contains(&(name.to_string(), String::new(), String::new()));
+
+    // Each relation to its database, in the order delivered: by database
+    // name, then (schema, name), so each database's lists stay in order.
+    let mut attached: Vec<Attached> = Vec::new();
+    let mut slot: Vec<Option<usize>> = vec![None; databases.len()];
+    for (i, database) in databases.iter().enumerate().filter(|(_, d)| !d.served && still_attached(&d.name)) {
+        slot[i] = Some(attached.len());
+        attached.push(Attached {
+            name: database.name.clone(),
+            path: database.path.clone(),
+            storage: database.storage.clone(),
+            read_only: database.read_only,
+            ..Attached::default()
+        });
+    }
+    let served = |row: &Vec<serde_json::Value>| databases[database_of[&cell_str(row, 0)]].served;
+    let (mut served_tables, mut served_views) = (Vec::new(), Vec::new());
+    for (row, table) in table_rows.iter().zip(tables).filter(|(row, _)| present.contains(&key_of(row))) {
+        match slot[database_of[&cell_str(row, 0)]] {
+            Some(a) => attached[a].tables.push(table),
+            None if served(row) => served_tables.push(table),
+            None => {}
+        }
+    }
+    for (row, view) in view_rows.iter().zip(views).filter(|(row, _)| present.contains(&key_of(row))) {
+        match slot[database_of[&cell_str(row, 0)]] {
+            Some(a) => attached[a].views.push(view),
+            None if served(row) => served_views.push(view),
+            None => {}
+        }
+    }
+    let catalog = Catalog {
+        harbor_version,
+        duckdb_version,
+        database_size_bytes,
+        wal_size_bytes,
+        tables: served_tables,
+        sequences,
+        views: served_views,
+        attached,
+    };
     let _ = req.respond(json_response(200, &serde_json::to_string(&catalog).unwrap()));
     (true, 200)
 }
@@ -4629,17 +4924,15 @@ mod tests {
 
     #[test]
     fn exact_catalog_counts_quote_every_relation() {
-        let rows = vec![
-            vec![serde_json::json!("main"), serde_json::json!("orders")],
-            vec![serde_json::json!("odd schema"), serde_json::json!("say \"hi\"")],
-        ];
+        let key = |d: &str, s: &str, n: &str| (d.to_string(), s.to_string(), n.to_string());
+        let rows = vec![key("shop", "main", "orders"), key("app's", "odd schema", "say \"hi\"")];
         assert_eq!(
             catalog_count_sql(&rows).as_deref(),
             Some(
                 "SELECT table_ordinal, row_count FROM (\
-SELECT 0::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FROM \"main\".\"orders\" \
+SELECT 0::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FROM \"shop\".\"main\".\"orders\" \
 UNION ALL SELECT 1::UBIGINT AS table_ordinal, count(*)::UBIGINT AS row_count FROM \
-\"odd schema\".\"say \"\"hi\"\"\") AS exact_counts ORDER BY table_ordinal"
+\"app's\".\"odd schema\".\"say \"\"hi\"\"\") AS exact_counts ORDER BY table_ordinal"
             )
         );
         assert_eq!(catalog_count_sql(&[]), None);
