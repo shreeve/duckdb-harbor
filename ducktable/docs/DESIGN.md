@@ -45,8 +45,9 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
   summoning and stopping a server) is harbor's `harbor-http`, the one
   harbor's own CLI speaks through; DuckTable's `harbor-client` adds results
   read whole, the catalog and the fleet.
-- **A database can be opened by file or added by port.** File → Open Database
-  File chooses a DuckDB path. File → Open Database URL saves a sidebar name and
+- **A database can be opened by file or added by port.** File → Open… chooses
+  a DuckDB path, or files DuckDB reads, which open in the workspace
+  (Opening anything, below). File → Open Database URL saves a sidebar name and
   a Harbor host and port. `localhost` means a direct IPv4-loopback connection;
   any other host means SSH. DuckTable runs `/usr/bin/ssh` directly, forwards a
   unix socket in Harbor's runtime directory (0700, so no other user of the
@@ -82,7 +83,9 @@ Client architecture:
 - **Selection indices are display positions, not row identities.** Any sort
   or per-column value filter makes them diverge. Every read or mutation of a
   selected row resolves through one display-to-identity mapping. Commits are
-  keyed by row identity, never by display position.
+  keyed by row identity, never by display position. The header sort is the
+  server's, so it reorders by replacing the page, and the selection is
+  cleared with the rows it indexed.
 - **A refresh never clears the cache it is refreshing.** Fetch first, commit
   over the old value. "Has data" and "needs refetch" are separate states; a
   loading flag that discards data is a blank screen.
@@ -190,9 +193,10 @@ and TABLES although the code says berth.
 
 Menus:
 
-- **File:** Open Database File…, Open Database URL…
+- **File:** Open…, Open Database URL…; Export Table and Export Results, each
+  a submenu of CSV…, Parquet…, JSON… and Excel… (Copy and export, below).
 - **Edit:** New Row, Duplicate Row, Delete Row, which act on the Data grid
-  (EDITING.md).
+  (EDITING.md); Copy as CSV, Copy as Markdown, Copy as SQL INSERT.
 - **View:** Structure, Data, Query; Refresh Tables; Previous and Next Table;
   Row Numbers, Right-Align Numbers, NULL Tags, Column Tooltips; Toggle
   Inspector; Zoom In, Zoom Out, Actual Size; Fit Column Widths; Toggle Full
@@ -248,18 +252,37 @@ per axis, only the move that applies: **Start** or **Stop**, **Attach** or
 **Detach**, and the **Autostart** checkmark. A tunneled row says "Connects
 over SSH to <host>" in its tooltip, and its menu offers **Remove Database**.
 
-**TABLES** shows the connected berth's tables from Harbor's `/catalog` as a
-flat list, with schema headings only when there is more than one schema. Each
-row carries its column count and an SI-rounded row count (13k, 4.6M).
-Sequences follow in their own SEQUENCES section. A filter field appears past
-ten tables. **Refresh Tables** (⌘R, or the View menu) refetches the catalog and
+The workspace (docs/OPEN.md) is listed first, as **Workspace**, whether its
+server runs or not, once its file exists. A row's count is its tables and
+views.
+
+**TABLES** shows the connected berth's catalog from Harbor's `/catalog`, line
+by line (`sidebar::tree_lines`): its tables, then its views, with schema
+headings only when there is more than one schema; then each attached catalog
+(a SQLite file in the workspace) under a heading of its own that names its
+storage, its tables and views in the same order. Each table carries its
+column count and an SI-rounded row count (13k, 4.6M) where the catalog has
+one; an attached SQLite file's has none, since counting reads every row. A
+view carries its column count and the word `view`; one that does not read
+(a file gone, an extension not loaded) shows its name in the warning color
+and the engine's reason in its tooltip. A catalog the workspace records and
+its server could not attach at its start (its file gone) is a heading
+alone, greyed, its reason in its tooltip. Sequences follow in their own
+SEQUENCES section. A filter field appears past ten tables and views.
+
+Right-click on a table or view offers **Save As**, a submenu of the four
+export formats; on a workspace view that reads a file, **Import as Table**
+and **Remove from Workspace** too; on an attached catalog's heading,
+**Detach**, which in the workspace deletes its record too (docs/OPEN.md). **Refresh Tables** (⌘R, or the View menu) refetches the catalog and
 the open Data page and swaps them in one frame; it never blanks the tree, and a
 failed refresh keeps the old one. A successful commit and every completed
 Query run refresh the same way. When refreshes overlap, only the newest may
 replace a snapshot.
 
-A single click selects a table and keeps the current view. A double click
-selects it and switches to Data.
+A single click selects a table or view and keeps the current view. A double
+click selects it and switches to Data. A view's grid is read-only, has no
+total, and its footer says it is a view. ⌥←/⌥→ walk the tree's tables and
+views in its order.
 
 ### Grid
 
@@ -278,11 +301,133 @@ Display preferences are global: row numbers, right-aligned numbers and NULL
 tags, toggled from the grid's header strip, the View menu, or ⌘7/⌘8/⌘9, and
 kept in `~/.config/ducktable/prefs.json`.
 
+A click on a column header sorts the Data view by that column alone, and
+clicking it again cycles ascending, descending, none. ⇧-click adds the
+column as a further key, turns an ascending key descending where it
+stands, or takes a descending one out, the keys after it moving up. Each
+key's header carries an arrow in the accent color, ↑ or ↓, and its place
+when there are several (↑1, ↓2), on the side away from the name's aligned
+edge; a sortable column's fitted width keeps room for the mark, so sorting
+never moves a column. The sort is the page query's `ORDER BY`: each key
+quoted, with `NULLS LAST` in both directions, DuckDB's default, spelled
+out so that a `default_null_order` set on the server cannot turn an arrow
+around; then a tie-break, the primary key, the rowid of a keyless table,
+or every column of a table with neither. Rows the keys tie keep one order
+from one page's query to the next, so a page boundary falls in one place
+and every row is on exactly one page; without the tie-break, DuckDB's
+parallel sort returns tied rows in another order on each run. The count is
+never ordered: a sort reads page 1 again with the total it had. A sort
+replaces the page as a page change does, so it confirms an open editor
+first and clears the selection, and staged changes follow their rows by
+identity wherever the sort puts them (EDITING.md). The rows and the header
+marks change together when the page lands; a page that fails leaves both.
+
+The sort belongs to its table for the session: back on the table, the
+grid opens sorted as it was left, unless the table has lost a column the
+sort names, which clears it. A sort kept on a table whose column another
+client drops clears itself on the next page, and the status line says so.
+The Query view's results are ordered by their statement and the Structure
+grid by the table's columns; neither sorts.
+
 The Structure view shows the table's columns (key and NOT NULL chips,
 defaults) and its DDL, all from the `/catalog` document. Structure and Data
 never render side by side: a schema change reshapes the data.
 
 What can be edited, and how, is EDITING.md.
+
+### Copy and export
+
+**Copy** takes the grid's selection to the clipboard. ⌘C, while a grid has
+the keyboard (the Data table, the Query result, or the Structure view's
+columns), writes it as TSV, what spreadsheets paste; a cell editor, the
+filter strip and the Query editor keep ⌘C for their own text. The Edit
+menu's Copy as CSV, Copy as Markdown and Copy as SQL INSERT write the same
+selection another way, from the grid with the keyboard or, with none, the
+grid the view shows. What is copied is one rule (`copy::span`):
+
+- `#`, the whole page selected, copies every row on the page.
+- Two or more selected rows copy those rows.
+- One row selected from its number in the gutter copies that row.
+- Otherwise the ring's cell is copied alone, and with no ring, the one
+  selected row.
+
+Rows are copied in the order the grid shows them, its header sort's,
+under a header line of column names, every visible column in display
+order; a single cell is its value alone, with no header and no line break. Markdown always has its header, which a table needs, and an
+INSERT always names its columns. Values are the text Harbor sent, whole,
+never the cell's ellipsized drawing; a staged cell is copied as staged, and a
+new row's untouched cell as its default, since the copy is of what the grid
+shows. NULL is an empty field in TSV and CSV and `NULL` in Markdown and SQL;
+CSV writes the empty string `""`, as DuckDB does, so the two stay apart, and
+TSV leaves both empty, as a spreadsheet would. A TSV field holding a tab, a
+line break or a quote is quoted; Markdown escapes a pipe and writes a line
+break as `<br>`.
+
+SQL INSERT is one statement, a row of VALUES per row, into the table (a
+result's rows go into `"results"`, to rename). Identifiers are quoted
+(`qident`) and every literal is written so the engine stores the value the
+cell shows, measured for every type the grid renders by copying a row of
+each and inserting it back (`copy::tests`, live): a string quoted
+(`qlit`), a number bare where the parser reads it exactly and a cast string
+where it does not (`'NaN'::DOUBLE`, a 39-digit `UHUGEINT`), a `BLOB` through
+`from_base64`, a `JSON` or `VARIANT` through `::JSON`, an `INTERVAL` in
+months, days and microseconds, and lists, structs, maps and unions built as
+literals from their parts with their types, a union member cast to the whole
+union. A staged nested value typed in DuckDB's own form is a string for the
+engine to cast, as the editor binds it.
+
+The client holds one page, so a copy reaches no further: `#` on a longer
+table copies this page, and the status line says so (`copied 500 of 5,410
+rows as TSV: only this page is loaded`). Export writes the rest.
+
+**Export** writes a file with the engine's own `COPY (SELECT …) TO
+'<path>' (FORMAT …)`, through Harbor on a pooled connection, so nothing
+pages through the client and a table of any size exports at the engine's
+speed. File → Export Table writes the Data view's table, every column,
+under the filter strip's condition and in the order the grid shows: the
+header sort with its tie-break, or else the strip's `ORDER BY`. These are
+the rows the grid pages without their LIMIT: one function builds both
+(`sql::ordered_sql`), and a test holds them together. Staged changes are not
+in it, since the file holds what the database holds. Export Results runs the
+statement behind the Query result again, read as the grid reads it, so only
+a result the grid pages can be exported, and not one read inside a
+transaction, whose writes the COPY on its own connection would not see.
+
+- **Format.** The save panel has no format picker, so each export menu
+  lists the four: CSV with a header row, Parquet, JSON as one array of
+  objects, and Excel (`.xlsx`) with a header row. A name typed with another
+  format's extension is written in that format, and `.ndjson` or `.jsonl`
+  writes an object per line; `.gz` or `.zst` on the name compresses, the
+  engine's own reading of it. Excel comes from DuckDB's `excel` extension,
+  which a COPY does not load on its own (measured): the first Excel export
+  loads it, installing it first when it is missing, and says why if either
+  fails. A sheet holds 1,048,576 rows, the header among them, and past that
+  the engine's refusal is the message (measured).
+- **Only a database on this Mac.** The server writes the file, to its own
+  disk. A database opened by URL may be served from another machine, a
+  tunnel's or a forwarded port's, and its COPY would write there, so export
+  is refused for it with that reason, and open its file on this Mac to
+  export. Streaming the rows through the client would work for CSV alone,
+  and at the client's speed, so it is not done.
+- **No partial file.** The COPY writes to a hidden name beside the file,
+  `.ducktable-export-<pid>-<n>-<name>`, which ends with the whole name so
+  the engine reads the same compression from it, and the file takes its
+  place by a rename only once the COPY has succeeded. A file already there
+  is untouched until then. A failure removes the hidden file: the engine
+  removes what a failed CSV, Parquet or JSON COPY wrote, but leaves a failed
+  Excel COPY's partial file (measured). A client that hangs up mid-COPY is
+  cancelled by Harbor, and a quit removes the hidden file itself.
+- **Status.** One export at a time. The status line says `exporting
+  orders.csv…`, then the time it has run each second, then `exported 5,410
+  rows to orders.csv · 1.2s` for eight seconds, or `orders.csv was not
+  exported:` and the engine's reason, in the danger color, for twenty; a
+  word too long for the line is cut, the whole in its tooltip. A copy's word
+  holds four seconds. Either outranks the grid's row range in every view.
+  The panel opens where the last export went, else in Downloads.
+- **Quitting** while an export runs asks first (EDITING.md, "Dialogs"): the
+  quit stops it, and no file is written. Leaving a database does not, since
+  the export holds a connection of its own; stopping the server it reads
+  fails the export, which says so and leaves nothing.
 
 ### Bottom bar
 
@@ -303,9 +448,17 @@ column count sits beside the row range it describes.
 
 The filter is one raw SQL `WHERE` strip under the header, applied on Enter,
 which refetches page 1 with a fresh count. An `ORDER BY` that ends it sorts
-the pages (`x > 0 ORDER BY name`, or `ORDER BY name` alone); the grid has no
-sort of its own. The condition is wrapped in parentheses and the ordering
-follows them, so the strip cannot reach past the page's `LIMIT`.
+the pages (`x > 0 ORDER BY name`, or `ORDER BY name` alone), as typed: no
+tie-break is added to the user's SQL. The condition is wrapped in
+parentheses and the ordering follows them, so the strip cannot reach past
+the page's `LIMIT`.
+
+A page has one ordering, the one last asked for. Applying a strip that ends
+in an `ORDER BY` clears the header sort; a header click afterwards sets the
+strip's ordering aside, and the strip says so beside its field, until the
+header sort has no keys again. The two are never joined: the strip's
+ordering may take no key after it (`ORDER BY ALL`), and header keys that
+only broke its ties would not be the order their arrows show.
 
 ### Inspector
 
@@ -330,7 +483,8 @@ arrows, ⌘S, ⌘Z, ⌘⌫, ⌃⇧N, ⌘⇧⌫) is EDITING.md's; the Query view'
 
 | Key | Does |
 | --- | --- |
-| ⌘O | Open Database File |
+| ⌘O | Open…: a database, or files that open in the workspace |
+| ⌘C | in a grid, copy the selection as TSV (Copy and export) |
 | ⌘R | Refresh Tables: the catalog and the open Data page |
 | ⌘1 / ⌘2 / ⌘3 | Structure / Data / Query |
 | ⌥← / ⌥→ | previous / next table in the sidebar, rolling over at the ends |
@@ -437,15 +591,28 @@ display and scroll foundation, and no column-windowing wrapper is needed.
   renumbers the rest, which is why a keyless table's identity pairs the rowid
   with a hash of the row (EDITING.md).
 
+## Opening anything
+
+A file that is not a DuckDB database opens in the workspace, as a view over
+the file or an attached SQLite catalog, through one function that every way
+in reaches: Finder and the Dock (`on_open_urls`, through the bundle's
+document types), a drop on the window, the command line and File → Open….
+docs/OPEN.md is the authority.
+
 ## Code layout
 
 One file per surface, one owner per piece of state. `app.rs` is the root entity
 and the only mutator of connection state (phase, attempt fence, selection).
 The surfaces (`sidebar.rs`, `content.rs`, `grid.rs`, `structure.rs`,
 `inspector.rs`, `query.rs`, `footer.rs`) read state and call back into `app.rs`
-methods, never mutating it themselves. `edits.rs` is the staging model and
-`sql.rs` every hand-written query; both are pure. All colors resolve through
-`theme.rs`. `main.rs` is the entry point, menus and key bindings.
+methods, never mutating it themselves. `edits.rs` is the staging model,
+`sql.rs` every hand-written query and `copy.rs` a selection written as
+text; all three are pure. `export.rs` writes files through the engine's
+`COPY`, its decisions in pure functions, `open.rs` is every way a path
+reaches the app and what it opens (OPEN.md), and `query/complete.rs` is the
+Query editor's completion (QUERY.md). harbor-client's `workspace.rs` makes
+and finds the workspace's views and attachments. A copy's or an export's word in
+the status line is `footer::say`. All colors resolve through `theme.rs`. `main.rs` is the entry point, menus and key bindings.
 
 The rule this protects: one type that owns every surface decays into an
 extension-file sprawl nobody can navigate, and a surface that mutates shared
@@ -466,15 +633,13 @@ blocks them.
   carry between panes. An optional run-all goes top to bottom as a
   convenience, never as enforced dataflow. A notebook is a named, saved
   document that opens as an ordinary tab.
-- **Grid.** Header sorting (click cycles ascending, descending, none;
-  shift-click adds a key with a priority number), a follow arrow on
-  single-column foreign keys, a JSON view beside Data and Structure, and
-  per-column structured filters over the raw strip.
+- **Grid.** A follow arrow on single-column foreign keys, a JSON view
+  beside Data and Structure, and per-column structured filters over the raw
+  strip.
 - **Live edit mode.** Each confirmed cell runs a single-row conditional
   UPDATE, matching both the identity and the value the grid last saw; zero rows
   affected is a conflict that shows both values and takes the server's. It is
   deferred until it clears an adversarial review (EDITING.md).
 - **Inspector and Structure editing.** A row editor in the inspector that
   shares the grid's one editing session, and a schema editor in Structure.
-- **Catalog.** Views, macros and attached catalogs in the TABLES tree once
-  `/catalog` carries them.
+- **Catalog.** Macros in the TABLES tree once `/catalog` carries them.

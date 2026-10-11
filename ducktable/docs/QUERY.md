@@ -259,6 +259,15 @@ error has aborted the transaction, and running the statement bare would only
 report that. Such an error quotes the wrapped statement, whose line numbers
 are one higher than the statement's own.
 
+**Copy and export.** A result's selection copies as the Data grid's does,
+and File → Export Results writes the whole result to a file: the
+statement runs again inside the engine's `COPY`, on a pooled connection,
+read as the grid reads it (`SELECT * FROM (statement)`), so the file holds
+what a rerun returns. Only a result the grid pages can be exported, and not
+one read inside a transaction, whose writes that connection would not see:
+the status line says which, and COMMIT then a rerun exports it. DESIGN.md,
+"Copy and export", has the formats and the rest.
+
 **A statement with no result set** reports `ok · 2 ms` in the status line
 rather than showing an empty grid.
 
@@ -276,6 +285,51 @@ line reads `plan · 3 ms`.
 changes, so a fast query's verdict and results land together in one frame. A
 run still going at 300ms earns a ticking `running… 1.2 s` line, and the prior
 results fade, stale but never blanked. Completion is always one atomic swap.
+
+## Completion
+
+The engine completes. DuckTable asks DuckDB's own completer,
+`sql_auto_complete` from the `autocomplete` extension, through Harbor about
+the caret's statement up to the caret, and shows its answer in the editor's
+own popup. The question is one request on a pooled connection, never the
+transaction's session, where it would be a statement and an error in it could
+abort the transaction. The extension is loaded (`LOAD autocomplete`) on the
+first question; whether the server may download one it lacks is the server's
+setting. Measured on the pinned engine, where it is built in: an answer takes
+a millisecond or two over the local socket, and a pooled connection's first
+question after the catalog changed about a hundred.
+
+- **What opens the list.** Typing a name's character, or a `.` after a name.
+  ⌃Space opens it wherever the caret is, unless macOS has that key for
+  switching input sources. Nothing opens inside a string, a dollar quote, a
+  comment or a number, each read by the one lexer (`wire::scan`).
+- **Its keys.** ↑ and ↓ move through the list, Tab or a click takes the
+  selection, and Escape closes it. Enter always inserts a newline and closes
+  the list, so a statement is never finished by accident, and ⌘Enter runs
+  the marked statement and closes it.
+- **What it shows.** The engine's suggestions that continue what is typed,
+  in the engine's order, then the table, schema and column names of the
+  sidebar's catalog that the engine left out: it answers about twenty for a
+  typed prefix. The engine also offers names that merely contain what is
+  typed (`depends` for `pe`); they show only when nothing continues it, as
+  guesses at a typo. After `table.`, `alias.` or `schema.` the
+  list is that table's columns or that schema's tables, from the catalog,
+  since after a bare `table.` the engine names operators. An alias is the
+  name after its table that follows `FROM`, `JOIN` or a comma. Each entry
+  says what it names (keyword, table, column, function, schema). A catalog
+  name that is not a plain identifier goes in quoted, and a name typed inside
+  quotes is replaced whole, its closing quote included.
+- **What it costs.** A question waits for an 80 ms pause in typing, so a
+  burst of keys asks once. While a name grows, the list on screen narrows at
+  once to what still continues it, and the answer replaces it. An answer
+  lands only when it is for the newest question and the text and caret are
+  still those it asked about; any other is dropped.
+- **When the engine cannot.** An answer gets 300 ms, and the catalog answers
+  the keystroke that waited longer. A server that cannot load the extension,
+  or answers that it has no `sql_auto_complete`, is not asked again while the
+  view lasts, and neither is one that missed three answers in a row: the
+  catalog completes alone. A statement longer than 64 KiB is the catalog's
+  to complete.
 
 ## Persistence
 
@@ -331,14 +385,10 @@ Designed, not built.
 - **Several results.** One result per completed statement of a run-all, as
   chips above the grid (`2 · SELECT · 500 rows · 12 ms`). An error would carry
   its statement and position, and clicking it would move the caret there.
-- **Completion.** Local at keystroke time, so popovers cost no round trip:
-  keywords from DuckDB's own lists, functions fetched once at connect,
-  schema objects and columns from the catalog. `.` after a name opens its
-  members, ⌃Space summons, Tab accepts, and Enter always inserts a newline. The
-  engine's `sql_auto_complete` would join as a re-ranker that never removes
-  what is showing. The logic would live in a pure `sql-intel` crate: a context
-  classifier over the PEG-named tree, a ranking tuple, and idle-time
-  diagnostics through `json_serialize_sql`.
+- **Completion with no round trip.** Keywords from DuckDB's own lists and
+  functions fetched once at connect, so the list opens without asking a
+  server that is slow or far, through a context classifier over the PEG-named
+  tree; and idle-time diagnostics through `json_serialize_sql`.
 - **Editing keys.** ⌘/ toggles `--` comments; ⇧⌥F formats through the engine's
   own `duckdb_format_sql`; ⌃R opens a history popover that inserts, never
   runs.

@@ -3,6 +3,48 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by release
 date, newest first.
 
+## 0.24.0 — 2026-10-11
+
+- **Column headers sort.** A click sorts the Data view by a column and
+  cycles ascending, descending, none; ⇧-click adds further keys, numbered in
+  the header. Rows the keys tie are ordered by the table's key, so every row
+  is on exactly one page, and each table keeps its sort for the session.
+- **Copy and export.** ⌘C copies a grid's selection as TSV, and the Edit
+  menu copies it as CSV, Markdown or SQL INSERT. File → Export Table and
+  Export Results write CSV, Parquet, JSON or Excel through the engine's own
+  COPY, in the order the grid shows, for databases on this Mac, and a
+  failed export leaves no partial file.
+- **The Query editor completes.** DuckDB's own completer answers through
+  Harbor, and the sidebar's catalog fills in what it leaves out and answers
+  alone when the server cannot.
+- **Anything DuckDB reads opens.** A CSV, a folder of Parquet, a JSON file,
+  an Excel workbook, a GeoJSON file, a shapefile or a SQLite file opens in
+  the workspace `harbor <data file>` uses, as a view that reads the file
+  where it lies or, for SQLite, an attached catalog, so a large file opens at
+  once and nothing is copied until asked. Before, DuckTable opened only
+  DuckDB files, and any other was a failed connect.
+- **Every way in opens it.** Finder's double-click and Open With, a drop on
+  the Dock icon or the window, `ducktable a.csv data/` and File → Open… all
+  reach one function that reads what each path holds and opens it, a drop
+  of several files together. The bundle declares a document type for each
+  kind, owning DuckDB's and an alternate for the kinds other apps have, so it
+  is offered without taking CSV or Excel from them.
+- **The sidebar shows views and attached databases.** The TABLES tree lists
+  a database's views after its tables, read-only and marked, with the
+  engine's reason when one does not read, and each attached SQLite file under
+  its own heading, its tables editable with the grid's rules. The workspace
+  is listed first, as Workspace.
+- **Import as Table and Save As.** A workspace view becomes a table of its
+  name in one transaction, asking first above 100 MB and saying the size,
+  and any table or view saves to CSV, Parquet, JSON or Excel from its
+  right-click menu. Remove from Workspace and Detach let a file go without
+  touching it.
+- **The workspace keeps its SQLite files.** A SQLite file opened in the
+  workspace is written to the workspace's record as it is attached, so the
+  workspace server attaches it again at every start, and Detach deletes the
+  record's row. A recorded file that has gone is listed greyed under its
+  heading, the reason in its tooltip, until it is back or detached.
+
 ## 0.23.0 — 2026-10-10
 
 - **Staged changes are kept per database.** Choosing another database,

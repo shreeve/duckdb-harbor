@@ -75,6 +75,9 @@ pub enum StatementExpectation {
     AffectedOne,
     /// INSERT ... RETURNING * must return exactly one row.
     ReturnedOne,
+    /// An INSERT into a table of another engine's catalog, which takes no
+    /// RETURNING (SQLite's, measured): its affected-row count must be 1.
+    CountedInsert,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -116,6 +119,9 @@ pub struct Edits {
     /// WHERE checks both. A row moved or changed since the fetch is named
     /// by nothing, and commit refuses instead of writing to its neighbor.
     by_rowid: bool,
+    /// The table's engine takes `INSERT … RETURNING`: DuckDB's own does,
+    /// and an attached SQLite file's refuses it.
+    returning: bool,
     /// All schema column names, in result order (for SET clauses).
     columns: Vec<String>,
     /// Each column's DuckDB type, parallel to `columns`: what decides how
@@ -319,6 +325,7 @@ impl Edits {
             source,
             pk_cols,
             by_rowid: false,
+            returning: true,
             columns,
             types,
             changes: HashMap::new(),
@@ -329,6 +336,13 @@ impl Edits {
             unsettled: None,
             unread: false,
         }
+    }
+
+    /// Write this set's INSERTs without RETURNING, for a table of another
+    /// engine's catalog, and check each by its count instead.
+    pub fn without_returning(mut self) -> Self {
+        self.returning = false;
+        self
     }
 
     /// Key this set by the rowid-and-hash pair a keyless page fetches.
@@ -857,15 +871,19 @@ impl Edits {
         };
         let (mut duplicates, mut deletes, mut updates, mut copies_late, mut inserts) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (returning, inserted) = match self.returning {
+            true => (" RETURNING *", StatementExpectation::ReturnedOne),
+            false => ("", StatementExpectation::CountedInsert),
+        };
         // Each update's key before and after, for `claim_order`.
         let mut moves = Vec::new();
         for (key, identity, change) in self.entries() {
             let mut params = Vec::new();
             match change {
                 RowChange::Insert(cells) if cells.is_empty() => inserts.push(Statement {
-                    sql: format!("INSERT INTO {} DEFAULT VALUES RETURNING *", self.source),
+                    sql: format!("INSERT INTO {} DEFAULT VALUES{returning}", self.source),
                     params,
-                    expectation: StatementExpectation::ReturnedOne,
+                    expectation: inserted,
                 }),
                 RowChange::Insert(cells) => {
                     let names = cells
@@ -882,13 +900,13 @@ impl Edits {
                     let sql = if copies {
                         params.extend(self.bound_identity(identity));
                         format!(
-                            "INSERT INTO {} ({names}) SELECT {supplied} FROM {target} WHERE {where_clause} RETURNING *",
+                            "INSERT INTO {} ({names}) SELECT {supplied} FROM {target} WHERE {where_clause}{returning}",
                             self.source
                         )
                     } else {
-                        format!("INSERT INTO {} ({names}) VALUES ({supplied}) RETURNING *", self.source)
+                        format!("INSERT INTO {} ({names}) VALUES ({supplied}){returning}", self.source)
                     };
-                    let stmt = Statement { sql, params, expectation: StatementExpectation::ReturnedOne };
+                    let stmt = Statement { sql, params, expectation: inserted };
                     match (copies, self.changes.get(&key_of(identity)).map(|e| &e.change)) {
                         (true, Some(RowChange::Update(_) | RowChange::Delete)) => duplicates.push(stmt),
                         (true, _) => copies_late.push(stmt),
@@ -1673,6 +1691,35 @@ mod tests {
         assert!(e.is_empty());
         assert!(e.undo(), "nothing is more than one keystroke from recovery");
         assert_eq!(e.staged_text(&key, 1), Some(txt("b")));
+    }
+
+    #[test]
+    fn a_table_of_another_engine_inserts_without_returning_and_is_counted() {
+        // An attached SQLite file's table refuses INSERT … RETURNING.
+        let mut e = Edits::new(
+            "\"app\".\"main\".\"people\"".into(),
+            vec!["id".into()],
+            vec!["id".into(), "name".into()],
+            vec!["BIGINT".into(), "VARCHAR".into()],
+        )
+        .without_returning();
+        e.stage_insert();
+        let draft = e.stage_insert().unwrap();
+        e.stage_insert_cell(&draft, 1, txt("dee"), json!("dee"));
+        e.stage_duplicate(vec![json!(1)], vec![(1, txt("ann"), Bind::Source)]);
+        e.stage_cell(vec![json!(2)], 1, txt("bob"), txt("rob"), json!("rob"));
+        let stmts = e.statements();
+        let sqls: Vec<&str> = stmts.iter().map(|s| s.sql.as_str()).collect();
+        assert!(sqls.contains(&"INSERT INTO \"app\".\"main\".\"people\" DEFAULT VALUES"), "{sqls:?}");
+        assert!(sqls.contains(&"INSERT INTO \"app\".\"main\".\"people\" (\"name\") VALUES (?)"), "{sqls:?}");
+        assert!(sqls.contains(
+            &"INSERT INTO \"app\".\"main\".\"people\" (\"name\") SELECT \"name\" FROM \"app\".\"main\".\"people\" WHERE \"id\" = ?"
+        ), "{sqls:?}");
+        assert!(!sqls.iter().any(|s| s.contains("RETURNING")));
+        for stmt in &stmts {
+            let want = if stmt.sql.starts_with("INSERT") { StatementExpectation::CountedInsert } else { StatementExpectation::AffectedOne };
+            assert_eq!(stmt.expectation, want, "{}", stmt.sql);
+        }
     }
 
     #[test]

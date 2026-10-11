@@ -136,7 +136,10 @@ impl DuckTable {
                     .gap_2()
                     .items_center()
                     .child(Self::dot(Level::Good, t))
-                    .child(div().text_lg().text_color(t.text).child(clone_str(&info.name))),
+                    .child(div().text_lg().text_color(t.text).child(match self.on_workspace() {
+                        true => "Workspace".to_string(),
+                        false => clone_str(&info.name),
+                    })),
             )
             .child(meta(t, "DuckDB", clone_str(&info.duckdb_version)))
             .child(harbor_meta(t, &info.harbor_version, stale, is_local, installed.as_deref()))

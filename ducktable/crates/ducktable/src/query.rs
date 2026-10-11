@@ -7,6 +7,9 @@
 //! through the subquery wrap (probe row + on-demand count). A statement
 //! that opens a transaction gets a Harbor session, and every run goes
 //! through that session until a statement ends the transaction (`Txn`).
+//! Completion is `complete`'s.
+
+mod complete;
 
 use crate::theme::{pal, value_font, CELL_TEXT};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -69,6 +72,12 @@ pub(crate) struct QueryView {
     /// The editor/results divider — user-draggable, position persisted
     /// (docs/QUERY.md's split).
     split: Entity<gpui_kit::component::resizable::ResizableState>,
+    /// Completion in the editor, on a pooled connection of the berth's,
+    /// never the transaction's session.
+    complete: complete::Completer,
+    /// The keys completion takes first: Tab, Enter while the list is up,
+    /// and ⌃Space.
+    _complete_keys: Subscription,
     _subscription: Subscription,
     /// Keystroke interceptor for ⌘Enter: it must run BEFORE the input's
     /// own binding, which would insert a newline first (send means send,
@@ -96,6 +105,10 @@ impl QueryView {
             }
             state
         });
+        // Completion's keys come first, so the ⌘Enter interceptor below
+        // has the last word on whether the keystroke goes on.
+        let complete = complete::Completer::new(conn.clone(), &editor, cx);
+        let complete_keys = complete.keys(cx);
         // ⌘Enter arrives as the input's secondary-enter — the send key.
         // Plain Enter stays a newline (the editor's own default).
         let subscription = cx.subscribe_in(&editor, window, Self::on_editor_event);
@@ -169,6 +182,8 @@ impl QueryView {
             saving: Default::default(),
             unsaved: None,
             split,
+            complete,
+            _complete_keys: complete_keys,
             _subscription: subscription,
             _intercept: intercept,
         };
@@ -279,7 +294,10 @@ impl QueryView {
     ) {
         match event {
             InputEvent::PressEnter { secondary: true, .. } => self.run(window, cx),
-            InputEvent::Change => self.save_scratch(cx),
+            InputEvent::Change => {
+                self.save_scratch(cx);
+                self.complete.changed(window, cx);
+            }
             _ => {}
         }
     }

@@ -4,6 +4,47 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 0.46.0 — 2026-10-11
+
+- **`harbor <file>` opens anything DuckDB reads.** A CSV, TSV, Parquet file
+  or folder of them (Hive partitions included), JSON, Excel workbook,
+  GeoJSON, shapefile or GeoPackage opens in the workspace, a DuckDB database
+  at `~/.local/share/harbor/workspace.duckdb`, as a view named for the file
+  that reads it where it lies, so `harbor sales.csv` answers `SELECT * FROM
+  sales` at once and a large Parquet file opens without being copied. A
+  SQLite file is attached there, read-write. A file is told by its first
+  bytes where it has a signature and by its name where it does not, and one
+  whose contents contradict its name, or that cannot be told, is refused
+  with what was looked at. Paths are glob-escaped before a reader sees them,
+  so `[`, `*` and `?` in a file name name that file alone. DuckTable opens
+  the same workspace, so a file opened in either is there in the other.
+- **The workspace keeps what was opened in it.** Views live in the
+  workspace's own SQL; attached SQLite files are recorded in it and attached
+  again when a server opens it; a file that has gone, or no longer reads as
+  a database, is listed with the reason instead of failing the start. A
+  server opening the workspace loads `spatial` when a view needs it, since
+  that extension does not load on demand, and never waits on a download to
+  start serving: a missing extension installs in the background.
+- **`/catalog` lists views and attached databases.** Each view comes with its
+  columns and its SQL, and no row count, since counting a view over a file
+  reads the file; a view whose file is missing is listed with the engine's
+  error instead of failing the read. Each attached database comes with its
+  path, type, tables and views. The fields are new; nothing existing
+  changed. Views are bound off the worker pool, each within two seconds and
+  again only when its file changes, so a view over a slow or blocking file
+  cannot hold the server, and a SQLite file another process has locked
+  fails the read in about two seconds, naming the file.
+- **`/catalog` survives a table dropped while it reads.** It listed the
+  tables and then counted each, so a table another client dropped in between
+  failed the whole read: 68 of 200 reads under concurrent DDL. A relation
+  that disappears is left out: 0 of 1,000.
+- **Attaching and detaching cannot crash the server.** An `ATTACH` or
+  `DETACH` of a SQLite database that ran beside a read of the catalog could
+  crash DuckDB or mark the database invalid until a restart, through
+  `/catalog` or through statements such as `SHOW ALL TABLES` and
+  `information_schema`: 11 of 11 runs of a 20-second churn. Harbor runs an
+  `ATTACH` or `DETACH` alone against every catalog read; 0 of 11.
+
 ## 0.45.0 — 2026-10-10
 
 The server

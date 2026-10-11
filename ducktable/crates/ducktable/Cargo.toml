@@ -16,6 +16,8 @@ harbor-common = { path = "../../../harbor/crates/common", default-features = fal
 serde = "1"
 serde_json = { version = "1", features = ["float_roundtrip"] }
 async-channel = "2"
+# The kit's completion popup takes LSP completion items.
+lsp-types = "0.97"
 # AppKit and the embedded Sparkle framework are reached through objc2 (the
 # generation gpui itself uses), and Sparkle is loaded with dlopen.
 objc2 = "0.6"

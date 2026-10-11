@@ -6,6 +6,8 @@
 //!   harbor <db.duckdb>            open it — REPL, -c "SQL", or stdin; if
 //!                                 nothing serves the file, a server is
 //!                                 spawned that lives while anyone is connected
+//!   harbor <data file>            open a CSV, Parquet, JSON, Excel, spatial or
+//!                                 SQLite file in the workspace database
 //!   harbor <path/to.sock>         connect to a server by its socket
 //!   harbor http://host:port       connect to a server over TCP
 //!   harbor <name> | <footnote>    a listed database, by its name or its
@@ -100,6 +102,13 @@ fn dispatch(db: &str, verb_words: &[String], flags: Vec<String>) -> Result<(), S
                  the rest need the file, on the machine that holds it"
             )),
         };
+    }
+
+    if harbor::repl::opens_in_workspace(db)? {
+        return Err(format!(
+            "{db} is not a database: `harbor {db}` opens it in the workspace, and {} acts on a database",
+            verb_words.join(" ")
+        ));
     }
 
     // The one-shots come off first. They act on the database's CONTENTS, not
@@ -513,6 +522,11 @@ usage:
   harbor <db.duckdb>           open a database: the REPL on a terminal, or
                                SQL from -c \"...\" / stdin on a pipe. No server
                                behind the file yet? One is spawned for it.
+  harbor <data file>           open a CSV, TSV, Parquet file or folder, JSON,
+                               Excel, GeoJSON, shapefile or GeoPackage as a
+                               view, or a SQLite file attached, in the
+                               workspace database
+                               (~/.local/share/harbor/workspace.duckdb)
   harbor <path/to.sock>        connect to a server by its unix socket
   harbor http://host:port      connect to a server over TCP
   harbor <name> | <footnote>   a database by its name (medlabs) or its number
@@ -929,9 +943,17 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool, background: bool) -> R
     for sql in &o.init {
         con.execute_batch(sql).map_err(|e| format!("--init {sql:?}: {e}"))?;
     }
+    // The workspace makes itself whole before anyone is served, for every
+    // client alike: the extensions its views call into are loaded, and the
+    // files it records as attached are attached again.
+    let workspace = harbor_common::paths::workspace().and_then(|w| harbor_common::paths::canonical_db(&w));
+    if workspace.is_ok_and(|w| w == canon) {
+        harbor::workspace::open(&mut con);
+    }
     // The ATTACHED CATALOG NAMES, which is what a client must qualify its
     // queries with. Read once, here, because this runs AFTER the boot SQL
-    // above — so an ATTACH in --init is included. A later runtime ATTACH is
+    // and the workspace's attaching above — so an ATTACH in --init, or one
+    // the workspace records, is included. A later runtime ATTACH is
     // not; /info is a pure in-memory read and must stay one, since it has to
     // keep answering when every worker is busy.
     let databases: Vec<String> = con

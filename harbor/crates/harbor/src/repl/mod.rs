@@ -8,6 +8,8 @@
 //! like the duckdb shell, except everyone else can be in it too.
 //!
 //!   harbor <db.duckdb>              the REPL (or stdin/-c on a pipe)
+//!   harbor <data file>              the same, on the workspace, with a view
+//!                                   over the file (or SQLite attached)
 //!   harbor <path/to.sock>           a harbor unix socket
 //!   harbor http://host:port         a harbor TCP listener
 //!   harbor <name> | <footnote>      a listed database, by name or list number
@@ -20,6 +22,7 @@ mod highlight;
 pub mod installs;
 mod interactive;
 mod keywords;
+mod open;
 mod theme;
 mod snapshot;
 pub use snapshot::with_snapshot;
@@ -151,6 +154,20 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
     if steps.as_ref().is_some_and(Vec::is_empty) {
         return fail("no SQL given: use -c \"...\" or pipe on stdin");
     }
+    // A data file or a SQLite file opens in the workspace; what it holds is
+    // read before anything is spawned, so a file that cannot be opened
+    // leaves no server behind.
+    let opening = match open::plan(&target) {
+        Ok(opening) => opening,
+        Err(e) => return fail(&e),
+    };
+    let target = match &opening {
+        open::Opening::AsIs => target,
+        open::Opening::Workspace { .. } => match open::workspace() {
+            Ok(db) => db.to_string_lossy().into_owned(),
+            Err(e) => return fail(&e),
+        },
+    };
     let spawn: Vec<String> = match &block_size {
         Some(v) => vec!["--block-size".into(), v.clone()],
         None => Vec::new(),
@@ -183,6 +200,12 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
         transport = again;
         anchor = http::hold(&transport).ok();
     }
+    if let open::Opening::Workspace { file, kind } = &opening {
+        match open::into_workspace(&transport, file, *kind) {
+            Ok(made) => eprintln!("{made}"),
+            Err(e) => return fail(&e),
+        }
+    }
 
     let Some(steps) = steps else {
         // Resolve the highlight colors now, while we own the tty: the
@@ -212,6 +235,13 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
         Outcome::Cancelled => ExitCode::from(130), // the shell convention for SIGINT
         Outcome::Failed => ExitCode::FAILURE,
     }
+}
+
+/// Whether `target` names a file that opens in the workspace (a data file,
+/// a SQLite file) rather than a database: the verbs act on a database, and
+/// refuse it.
+pub fn opens_in_workspace(target: &str) -> Result<bool, String> {
+    Ok(!matches!(open::kind_of(target)?, wire::open::Kind::Duckdb))
 }
 
 /// Which database a bare word means, over the survey's footnote order. All
@@ -259,8 +289,23 @@ fn pick(names: &[Option<String>], target: &str) -> Result<usize, String> {
 fn fleet_find(target: &str) -> Result<SurveyRow, String> {
     let mut rows = survey()?;
     let names: Vec<Option<String>> = rows.iter().map(SurveyRow::name).collect();
-    let i = pick(&names, target)?;
+    let i = pick(&names, target).map_err(|e| spelled_here(Path::new("."), target, e))?;
     Ok(rows.swap_remove(i))
+}
+
+/// A refusal of a bare word that is also the name of a file or a folder in
+/// `dir`, the working directory, saying how to open that: a bare word is a
+/// name, never a file, and `harbor lake` for the folder `lake` is
+/// `harbor ./lake`.
+fn spelled_here(dir: &Path, target: &str, refusal: String) -> String {
+    let here = dir.join(target);
+    let what = match () {
+        _ if target.chars().all(|c| c.is_ascii_digit()) => return refusal,
+        _ if here.is_dir() => "folder",
+        _ if here.exists() => "file",
+        _ => return refusal,
+    };
+    format!("{refusal}. The {what} {target} here opens as ./{target}")
 }
 
 /// The database file behind a bare-word argument in the verb grammar
@@ -1266,6 +1311,20 @@ mod tests {
         let n = names(&[Some("medlabs")]);
         let e = pick(&n, "scratch").unwrap_err();
         assert!(e.contains("names nothing running or attached"), "{e}");
+    }
+
+    #[test]
+    fn a_bare_word_that_is_a_folder_here_is_spelled_with_its_dot() {
+        let dir = std::env::temp_dir().join(format!("harbor-spelled-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("lake")).unwrap();
+        std::fs::write(dir.join("notes"), "x").unwrap();
+        let lake = super::spelled_here(&dir, "lake", "\"lake\" names nothing".into());
+        let notes = super::spelled_here(&dir, "notes", "\"notes\" names nothing".into());
+        let gone = super::spelled_here(&dir, "gone", "\"gone\" names nothing".into());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(lake, "\"lake\" names nothing. The folder lake here opens as ./lake");
+        assert_eq!(notes, "\"notes\" names nothing. The file notes here opens as ./notes");
+        assert_eq!(gone, "\"gone\" names nothing");
     }
 
     #[test]

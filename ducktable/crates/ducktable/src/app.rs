@@ -6,9 +6,11 @@
 //! (the connect attempt, the connection, the table selection, the
 //! refreshes): a late completion compares its own and discards itself.
 
+use crate::sql::Rel;
 use crate::util::clone_str;
 use gpui_kit::*;
 use harbor_client::{fleet, Conn, State};
+use wire::open::Kind;
 
 fn catalog_refresh_is_current(
     current_connection: u64,
@@ -27,6 +29,12 @@ pub(crate) struct CatalogRefreshRequested;
 /// A grid's commit has landed or failed: its staged set is now either empty
 /// or kept, and a table switch that waited on it can run.
 pub(crate) struct CommitSettled;
+
+/// What a database row counts: the tables and views its TABLES tree
+/// lists as the database's own.
+fn relations(catalog: &harbor_client::Catalog) -> usize {
+    catalog.tables.len() + catalog.views.len()
+}
 
 /// The row the sidebar lights: the database being dialed while a connect is
 /// in flight, the connected one otherwise.
@@ -62,17 +70,17 @@ enum Resume {
     /// The connect the dialog called off when it opened.
     Dial(Aim),
     /// The table switch that waited under it.
-    Select(String, String),
+    Select(Rel),
     Nothing,
 }
 
 /// What the quit dialog held back, in the order it resumes. A connect that
 /// was called off comes first and alone: it replaces the grid a waiting
 /// table switch was for.
-fn after_quit_dialog(called_off: Option<Aim>, deferred: Option<(String, String)>) -> Resume {
+fn after_quit_dialog(called_off: Option<Aim>, deferred: Option<Rel>) -> Resume {
     match (called_off, deferred) {
         (Some(aim), _) => Resume::Dial(aim),
-        (None, Some((schema, name))) => Resume::Select(schema, name),
+        (None, Some(rel)) => Resume::Select(rel),
         (None, None) => Resume::Nothing,
     }
 }
@@ -102,6 +110,10 @@ pub(crate) struct QuitRisks {
     pub(crate) transaction: bool,
     /// A statement is running in the Query view.
     pub(crate) running: bool,
+    /// An export is writing its file (export.rs). Only the app's end cuts
+    /// it off: it holds a connection of its own, which leaving a database
+    /// does not close.
+    pub(crate) exporting: bool,
 }
 
 /// The one dialog (docs/EDITING.md, "Dialogs"): its message, its detail,
@@ -198,6 +210,7 @@ impl QuitRisks {
             committing: self.committing && !accepted.committing,
             transaction: self.transaction && !accepted.transaction,
             running: self.running && !accepted.running,
+            exporting: self.exporting && !accepted.exporting,
         }
     }
 
@@ -278,12 +291,16 @@ impl QuitRisks {
                 sentence(&going)
             ));
         }
+        if self.exporting {
+            detail.push(format!("An export is still writing its file. {} stops it, and no file is written.", sentence(&going)));
+        }
         if detail.is_empty() {
             return None;
         }
         // Staged changes alone are the common case, and the question names
         // them; anything else is asked plainly, with the facts below it.
-        let only_staged = !(held > 0 || self.editing || self.committing || self.transaction || self.running);
+        let only_staged =
+            !(held > 0 || self.editing || self.committing || self.transaction || self.running || self.exporting);
         let discard =
             |what: &str| changes.as_ref().filter(|_| only_staged).map(|c| format!("Discard {c} and {what}?"));
         let (message, confirm) = match leaving {
@@ -323,6 +340,8 @@ struct OnScreen<'a> {
     /// The Query view's transaction, and a statement running there.
     transaction: bool,
     running: bool,
+    /// An export writing its file, whatever database it reads.
+    exporting: bool,
 }
 
 /// What going ahead with `leaving` puts at risk. A quit risks everything:
@@ -355,6 +374,7 @@ fn risks_of(
         committing: screen.committing,
         transaction: screen.transaction,
         running: screen.running,
+        exporting: quitting && screen.exporting,
     }
 }
 
@@ -433,6 +453,8 @@ pub(crate) struct RowVm {
     /// Whether a running server self-retires with its last client — the mode
     /// an upgrade restart preserves.
     pub(crate) ephemeral: bool,
+    /// The workspace (docs/OPEN.md): listed first, and called Workspace.
+    pub(crate) workspace: bool,
 }
 
 impl RowVm {
@@ -461,21 +483,73 @@ pub(crate) enum Aim {
     /// File → Open Database URL: the name to save the address under, and
     /// the address. Dialed again, it saves again (`DuckTable::dial`).
     Url { name: String, host: String, port: String },
+    /// Files that open in the workspace (docs/OPEN.md), each by its path
+    /// and its kind: a data file as a view, a SQLite file attached. Dialed
+    /// again, each finds what the first opening made.
+    Workspace(Vec<(std::path::PathBuf, Kind)>),
 }
 
-/// Reach the database `aim` names and read what the pane shows of it. Blocks;
-/// `DuckTable::dial` runs it off the main thread.
-fn connect(aim: Aim) -> Result<(Conn, wire::InfoResponse, harbor_client::Catalog), String> {
+impl Aim {
+    /// The database file the aim names, when it names one by its path.
+    fn file(&self) -> Option<std::path::PathBuf> {
+        match self {
+            Aim::File(path) => Some(path.clone()),
+            Aim::Workspace(_) => harbor_client::paths::workspace().ok(),
+            Aim::Row { .. } | Aim::Url { .. } => None,
+        }
+    }
+}
+
+/// What opening each file of an `Aim::Workspace` made or found, or why it
+/// did not open, in the order the files came.
+pub(crate) type Openings = Vec<Result<harbor_client::workspace::Opened, String>>;
+
+/// Reach the database `aim` names and read what the pane shows of it, and
+/// open in it the files an `Aim::Workspace` brings. Blocks; `DuckTable::dial`
+/// runs it off the main thread.
+fn connect(aim: Aim) -> Result<(Conn, wire::InfoResponse, harbor_client::Catalog, Openings), String> {
+    let mut files = Vec::new();
     let conn = match aim {
         Aim::Row { name, path: Some(path) } => fleet::connect_file(&name, &path)?,
         Aim::Row { name, path: None } => fleet::connect_remote(&name)?,
         Aim::File(path) => fleet::connect_path(&path)?,
         Aim::Url { name, host, port } => fleet::connect_remote(&fleet::add_database(&name, &host, &port)?)?,
+        Aim::Workspace(opening) => {
+            files = opening;
+            fleet::connect_path(&harbor_client::workspace::path()?)?
+        }
     };
     let info = fleet::info(&conn)?;
     new_enough(&info.harbor_version)?;
-    let catalog = harbor_client::catalog(&conn)?;
-    Ok((conn, info, catalog))
+    let opened = open_files(&conn, &files);
+    let catalog = read_catalog(&conn)?;
+    Ok((conn, info, catalog, opened))
+}
+
+/// Open each of `files` in the workspace `conn` serves. Blocks.
+fn open_files(conn: &Conn, files: &[(std::path::PathBuf, Kind)]) -> Openings {
+    files.iter().map(|(file, kind)| harbor_client::workspace::open(conn, file, *kind)).collect()
+}
+
+/// The catalog, with what its views need to be read. A view over `ST_Read`
+/// does not bind in a server that has not loaded `spatial`, which the
+/// engine does not load on demand. A workspace server loads it before it
+/// serves; one that has not (a Harbor that does not, or a database other
+/// than the workspace) answers such a view with its error, and the
+/// extension is loaded here and the catalog read again. Nothing is asked
+/// of a server whose views all read. An extension that will not load
+/// leaves the view's error to say so. Blocks.
+fn read_catalog(conn: &Conn) -> Result<harbor_client::Catalog, String> {
+    let catalog = harbor_client::catalog(conn)?;
+    let needed = harbor_client::workspace::needed_extensions(&catalog);
+    if needed.is_empty() {
+        return Ok(catalog);
+    }
+    let loaded = needed.iter().filter(|e| harbor_client::workspace::load_extension(conn, e).is_ok()).count();
+    if loaded == 0 {
+        return Ok(catalog);
+    }
+    harbor_client::catalog(conn)
 }
 
 /// The oldest Harbor whose answers DuckTable reads truly (docs/DESIGN.md):
@@ -523,7 +597,7 @@ pub struct DuckTable {
     /// catalog refresh of one that has gone discards itself. A connect
     /// called off leaves it as it was.
     connection: u64,
-    pub(crate) selected_table: Option<(String, String)>,
+    pub(crate) selected_table: Option<Rel>,
     pub(crate) grid: Option<Entity<crate::grid::Grid>>,
     /// A connect in flight (berth name). The current phase keeps rendering
     /// until the outcome lands — a berth click never blanks the pane.
@@ -551,7 +625,7 @@ pub struct DuckTable {
     /// would park a staged set whose statements are already running: back
     /// on the table, it would come back staged, and ⌘S would write it twice.
     /// The switch runs when the commit settles (`CommitSettled`).
-    deferred_select: Option<(String, String)>,
+    deferred_select: Option<Rel>,
     /// Fence for the berth-list refresh: overlapping sweeps (a manual
     /// click racing the one connect fires) commit newest-wins instead of
     /// arbitrary order.
@@ -575,6 +649,9 @@ pub struct DuckTable {
     /// connection that goes parks its grid's. Handed back when the table's
     /// grid is built on that database again.
     staged: crate::edits::Parked<DbKey>,
+    /// Each table's header sort, by database and source, for the session:
+    /// a grid built for the table again opens under it (`grid::SortChanged`).
+    sorts: std::collections::HashMap<(DbKey, String), Vec<crate::sql::SortKey>>,
     /// The sidebar/content divider (DESIGN.md: divider positions persist —
     /// the width saves at the end of each drag).
     pub(crate) sidebar_resize: Entity<gpui_kit::component::resizable::ResizableState>,
@@ -666,6 +743,7 @@ impl DuckTable {
             warning: None,
             query: None,
             staged: Default::default(),
+            sorts: Default::default(),
             sidebar_resize,
             stopping: std::collections::HashSet::new(),
             leaving: std::collections::HashSet::new(),
@@ -685,6 +763,7 @@ impl DuckTable {
                 query.read(cx).flush_scratch();
             }
             this.release_for_quit(cx);
+            crate::export::abandon(cx);
             crate::prefs::save(cx, |_| {});
             fleet::close_tunnels();
             async {}
@@ -714,6 +793,7 @@ impl DuckTable {
             editing: grid.is_some_and(|g| g.is_editing()),
             transaction: query.is_some_and(|q| q.in_transaction()),
             running: query.is_some_and(|q| q.is_running()),
+            exporting: crate::export::running(cx),
         };
         risks_of(leaving, self.left_by(leaving).as_ref(), self.connected_key().as_ref(), screen, &self.staged)
     }
@@ -803,7 +883,7 @@ impl DuckTable {
     fn resume(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match after_quit_dialog(self.called_off.take(), self.deferred_select.take()) {
             Resume::Dial(aim) => crate::leave_asking(self.switch_to(aim), cx),
-            Resume::Select(schema, name) => self.select_table(schema, name, window, cx),
+            Resume::Select(rel) => self.select_table(rel, window, cx),
             Resume::Nothing => {}
         }
         self.refresh(cx);
@@ -862,23 +942,13 @@ impl DuckTable {
     /// skeleton or columns popping in (DESIGN.md: fetch first, commit over
     /// the old value). The fence discards a stale fetch when the user has
     /// already clicked elsewhere.
-    pub(crate) fn select_table(
-        &mut self,
-        schema: String,
-        name: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn select_table(&mut self, rel: Rel, window: &mut Window, cx: &mut Context<Self>) {
         let (db, conn, solo_schema, structure) = match &self.phase {
             Phase::Connected { conn, catalog, .. } => (
                 DbKey::of_conn(conn),
                 conn.clone(),
                 catalog.schemas().len() <= 1,
-                catalog
-                    .tables
-                    .iter()
-                    .find(|t| t.schema == schema && t.name == name)
-                    .map(crate::structure::table_structure),
+                crate::structure::structure_of(catalog, &rel),
             ),
             _ => return,
         };
@@ -900,13 +970,25 @@ impl DuckTable {
             grid.update(cx, |grid, _| grid.replacing = true);
         }
         // "main.tests" earns its prefix only when there is another schema
-        // to distinguish it from.
-        let title =
-            if solo_schema { clone_str(&name) } else { format!("{schema}.{name}") };
-        let previous = self.selected_table.replace((clone_str(&schema), clone_str(&name)));
+        // to distinguish it from, and an attached catalog's table its
+        // catalog's name.
+        let title = rel.title(solo_schema);
+        let previous = self.selected_table.replace(rel.clone());
         self.select_seq += 1;
         let fence = self.select_seq;
         let page_size = crate::prefs::get(cx).page_size;
+        // The table opens under the sort it had this session, while it has
+        // the columns the sort names, with its ties broken as the grid
+        // breaks them.
+        let source = rel.source();
+        let columns: Vec<String> =
+            structure.iter().flat_map(|s| s.cols.iter().map(|c| c.name.clone())).collect();
+        let sort = crate::grid::remembered_sort(
+            self.sorts.get(&(db.clone(), clone_str(&source))).cloned().unwrap_or_default(),
+            &columns,
+        );
+        let tiebreak =
+            crate::sql::tiebreak(&crate::grid::identity_columns(structure.as_ref()), &columns);
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             // Two independent queries (each on its own connection), so they
@@ -916,15 +998,18 @@ impl DuckTable {
             // Keyless tables fetch DuckDB's implicit rowid as their
             // editing identity — the same predicate Grid::new applies.
             let rowid = structure.as_ref().is_some_and(|s| s.keyed_by_rowid());
+            // A view is not counted: counting a view over a file reads the
+            // whole file, and the grid pages without a total.
+            let counted = !structure.as_ref().is_some_and(|s| s.view);
             let page_task = cx.background_executor().spawn({
-                let (conn, schema, name) = (conn.clone(), clone_str(&schema), clone_str(&name));
-                async move { crate::sql::first_page(&conn, &schema, &name, rowid, page_size) }
+                let (conn, source) = (conn.clone(), clone_str(&source));
+                async move { crate::sql::first_page(&conn, &source, rowid, sort, &tiebreak, page_size) }
             });
             let total_task = cx.background_executor().spawn({
-                let (conn, schema, name) = (conn.clone(), clone_str(&schema), clone_str(&name));
-                async move { crate::sql::total_rows(&conn, &schema, &name) }
+                let (conn, source) = (conn.clone(), clone_str(&source));
+                async move { if counted { crate::sql::total_rows(&conn, &source) } else { None } }
             });
-            let outcome = page_task.await;
+            let (outcome, sort) = page_task.await;
             let total = if outcome.is_ok() { total_task.await } else { None };
             this.update_in(cx, |state, window, cx| {
                 if state.select_seq != fence {
@@ -937,7 +1022,7 @@ impl DuckTable {
                 // quit dialog, waits for it, and the grid on screen is
                 // itself again meanwhile.
                 if state.asking_to_quit || state.grid.as_ref().is_some_and(|g| g.read(cx).committing) {
-                    state.deferred_select = Some((clone_str(&schema), clone_str(&name)));
+                    state.deferred_select = Some(rel.clone());
                     if let Some(grid) = &state.grid {
                         grid.update(cx, |grid, _| grid.replacing = false);
                     }
@@ -963,16 +1048,30 @@ impl DuckTable {
                 {
                     state.staged.park(db.clone(), edits);
                 }
+                // A sort the first page could not be read under is gone
+                // from the table's memory too.
+                let key = (db.clone(), clone_str(&source));
+                if sort.is_empty() {
+                    state.sorts.remove(&key);
+                }
                 // The Data/Structure choice is a browsing mode, not table
                 // state (prefs.view): it survives this table switch.
                 let grid = cx.new(|cx| {
                     crate::grid::Grid::new(
-                        conn, &schema, &name, title, outcome, total, page_size, structure,
+                        conn, clone_str(&source), title, outcome, total, page_size, structure, sort,
                         window, cx,
                     )
                 });
                 cx.subscribe(&grid, |state, _, _: &CatalogRefreshRequested, cx| {
                     state.refresh_catalog(cx)
+                })
+                .detach();
+                cx.subscribe(&grid, move |state, _, e: &crate::grid::SortChanged, _| {
+                    if e.0.is_empty() {
+                        state.sorts.remove(&key);
+                    } else {
+                        state.sorts.insert(key.clone(), e.0.clone());
+                    }
                 })
                 .detach();
                 cx.subscribe_in(&grid, window, |state, _, _: &CommitSettled, window, cx| {
@@ -983,8 +1082,8 @@ impl DuckTable {
                     if state.asking_to_quit {
                         return;
                     }
-                    if let Some((schema, name)) = state.deferred_select.take() {
-                        state.select_table(schema, name, window, cx);
+                    if let Some(rel) = state.deferred_select.take() {
+                        state.select_table(rel, window, cx);
                     }
                 })
                 .detach();
@@ -993,7 +1092,6 @@ impl DuckTable {
                 // failed has no columns to judge them by, keeps them until
                 // a fetch brings some, and surrenders them again through
                 // `take_edits` if it is replaced first.
-                let source = crate::sql::source(&schema, &name);
                 if let Some(stash) = state.staged.take(&db, &source) {
                     grid.update(cx, |g, cx| g.adopt_edits(stash, cx));
                 }
@@ -1060,8 +1158,7 @@ impl DuckTable {
         if Some(&list[next]) == self.selected_table.as_ref() {
             return; // a one-table ring goes nowhere
         }
-        let (schema, name) = list[next].clone();
-        self.select_table(schema, name, window, cx);
+        self.select_table(list[next].clone(), window, cx);
     }
 
     /// Open (focused) or close the sidebar's table filter.
@@ -1095,7 +1192,7 @@ impl DuckTable {
         cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_executor()
-                .spawn(async move { harbor_client::catalog(&conn) })
+                .spawn(async move { read_catalog(&conn) })
                 .await;
             this.update(cx, |state, cx| {
                 if !catalog_refresh_is_current(state.connection, state.catalog_seq, connection, refresh) {
@@ -1142,7 +1239,7 @@ impl DuckTable {
         // not pay a second connect + catalog download just for a count.
         let connected: Option<(DbKey, usize, Option<bool>)> = match &self.phase {
             Phase::Connected { conn, catalog, .. } => {
-                Some((DbKey::of_conn(conn), catalog.tables.len(), conn.tunnel_up()))
+                Some((DbKey::of_conn(conn), relations(catalog), conn.tunnel_up()))
             }
             _ => None,
         };
@@ -1193,7 +1290,7 @@ impl DuckTable {
                                     // Lite: this sweep only counts tables,
                                     // so it never pays for columns or DDL.
                                     let cat = harbor_client::catalog_lite(&conn).ok()?;
-                                    Some(cat.tables.len())
+                                    Some(relations(&cat))
                                 })
                                 .flatten(),
                         };
@@ -1212,6 +1309,7 @@ impl DuckTable {
                             name: row.name,
                             version: row.version,
                             ephemeral: row.ephemeral,
+                            workspace: row.workspace,
                         }
                     })
                 })
@@ -1462,11 +1560,15 @@ impl DuckTable {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string()),
+            Aim::Workspace(_) => "Workspace".to_string(),
         };
         self.connecting = Some(clone_str(&shown));
         self.connecting_key = Some(match &aim {
             Aim::Row { name, path } => self.key_of(name, path.as_deref()),
-            Aim::File(path) => self.key_of("", Some(path)),
+            Aim::File(_) | Aim::Workspace(_) => match aim.file() {
+                Some(path) => self.key_of("", Some(&path)),
+                None => DbKey::Remote(String::new()),
+            },
             Aim::Url { name, .. } => DbKey::Remote(clone_str(name)),
         });
         self.connecting_aim = Some(aim.clone());
@@ -1479,8 +1581,7 @@ impl DuckTable {
             // A file opened by one spelling of its path may have a row under
             // another (/tmp and /private/tmp): the row to light is found by
             // the canonical path, which is read off this thread.
-            if let Aim::File(path) = &target {
-                let path = path.clone();
+            if let Some(path) = target.file() {
                 let key = cx.background_executor().spawn(async move { DbKey::of_file(&path) }).await;
                 this.update(cx, |state, cx| {
                     if state.attempt == fence {
@@ -1516,19 +1617,24 @@ impl DuckTable {
                 state.connection += 1;
                 // The database's one Query scratchpad (docs/QUERY.md law 1)
                 // is there as soon as it connects, tables or none.
-                state.query = outcome.as_ref().ok().map(|(conn, info, _)| {
+                state.query = outcome.as_ref().ok().map(|(conn, info, ..)| {
                     let (conn, name) = (conn.clone(), clone_str(&info.name));
                     let query = cx.new(|cx| crate::query::QueryView::new(conn, &name, window, cx));
                     cx.subscribe(&query, |state, _, _: &CatalogRefreshRequested, cx| state.refresh_tables(cx))
                         .detach();
                     query
                 });
+                let mut opened = Vec::new();
                 state.phase = match outcome {
-                    Ok((conn, info, catalog)) => Phase::Connected { conn, info, catalog: Box::new(catalog) },
+                    Ok((conn, info, catalog, openings)) => {
+                        opened = openings;
+                        Phase::Connected { conn, info, catalog: Box::new(catalog) }
+                    }
                     Err(message) => Phase::Failed { name: clone_str(&shown), message, aim },
                 };
                 state.sync_path_copy(cx);
                 state.refresh(cx);
+                state.opened(opened, window, cx);
                 cx.notify();
             })
             .ok();
@@ -1726,6 +1832,226 @@ impl DuckTable {
         self.fleet_then_refresh(move || fleet::set_autostart(&path, on), cx);
     }
 
+    /// Open what `plan` says (`open::plan`): files that open in the
+    /// workspace, in it, and a DuckDB database as itself. Opening switches
+    /// to the workspace, or to the database, as any switch does, asking
+    /// first when leaving the database on screen would end something
+    /// (`Leaving::Switch`); on the workspace already, the files open in it
+    /// where it is. `workspace` is the workspace's key, read off this
+    /// thread.
+    pub(crate) fn open_planned(&mut self, plan: crate::open::Plan, workspace: Option<DbKey>, cx: &mut Context<Self>) {
+        if !plan.workspace.is_empty() {
+            let here = workspace.is_some() && self.connected_key() == workspace && self.connecting.is_none();
+            match here {
+                true => crate::on_view_in(cx, move |app, window, cx| app.open_in_workspace(plan.workspace, window, cx)),
+                false => crate::leave_asking(self.switch_to(Aim::Workspace(plan.workspace)), cx),
+            }
+        } else if let Some(db) = plan.database {
+            crate::leave_asking(self.switch_to(Aim::File(db)), cx);
+        }
+    }
+
+    /// Open `files` in the workspace on screen, then read its catalog again
+    /// and show the first of them (`opened`).
+    pub(crate) fn open_in_workspace(
+        &mut self,
+        files: Vec<(std::path::PathBuf, Kind)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Under the quit dialog nothing replaces what is behind it.
+        if self.asking_to_quit {
+            return;
+        }
+        self.on_connection(move |conn| open_files(conn, &files), |state, opened, window, cx| state.opened(opened, window, cx), window, cx);
+    }
+
+    /// Files have opened in the workspace on screen: the first of them is
+    /// shown, the status line says what opened, and an alert what did not.
+    fn opened(&mut self, opened: Openings, window: &mut Window, cx: &mut Context<Self>) {
+        if opened.is_empty() {
+            return;
+        }
+        let (said, refused) = crate::open::report(&opened);
+        if let Some(said) = said {
+            crate::footer::say(cx, said, false, Some(std::time::Duration::from_secs(8)));
+        }
+        if !refused.is_empty() {
+            crate::open::alert("DuckTable could not open everything", refused.join("\n\n"), cx);
+        }
+        let first = match &self.phase {
+            Phase::Connected { catalog, .. } => crate::open::first_opened(catalog, &opened),
+            _ => None,
+        };
+        if let Some(rel) = first {
+            self.select_table(rel, window, cx);
+        }
+    }
+
+    /// Run `work` on the connection on screen off this thread, read the
+    /// catalog again, and swap it in; then `done`, with what `work` gave
+    /// back. A connection gone or replaced meanwhile drops it all. Opening,
+    /// importing, removing and detaching each change the catalog, and the
+    /// sidebar shows the change before anything is selected in it.
+    fn on_connection<T: Send + 'static>(
+        &mut self,
+        work: impl FnOnce(&Conn) -> T + Send + 'static,
+        done: impl FnOnce(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Phase::Connected { conn, .. } = &self.phase else { return };
+        let conn = conn.clone();
+        let connection = self.connection;
+        self.catalog_seq += 1;
+        let refresh = self.catalog_seq;
+        cx.spawn_in(window, async move |this, cx| {
+            let (outcome, catalog) = cx
+                .background_executor()
+                .spawn(async move {
+                    let outcome = work(&conn);
+                    (outcome, read_catalog(&conn))
+                })
+                .await;
+            this.update_in(cx, |state, window, cx| {
+                if state.connection != connection {
+                    return;
+                }
+                if let (Ok(new_catalog), true) = (catalog, state.catalog_seq == refresh)
+                    && let Phase::Connected { catalog, .. } = &mut state.phase
+                {
+                    **catalog = new_catalog;
+                }
+                done(state, outcome, window, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Import as Table (docs/OPEN.md): copy a workspace view's rows into a
+    /// table of its name, editable, and drop the view. A file larger than
+    /// `open::ASK_ABOVE` asks first, saying its size.
+    pub(crate) fn import_view(&mut self, rel: Rel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.asking_to_quit {
+            return;
+        }
+        let Phase::Connected { catalog, .. } = &self.phase else { return };
+        let Some(view) = catalog.views.iter().find(|v| rel.catalog.is_none() && v.schema == rel.schema && v.name == rel.name)
+        else {
+            return;
+        };
+        let source = view.ddl.as_deref().and_then(harbor_client::workspace::view_source);
+        cx.spawn_in(window, async move |this, cx| {
+            let measured = source.clone();
+            let bytes = cx
+                .background_executor()
+                .spawn(async move { measured.as_deref().and_then(harbor_client::workspace::size_on_disk) })
+                .await;
+            let question = source.as_deref().and_then(|s| crate::open::import_question(&rel.name, s, bytes));
+            let go = match question {
+                None => true,
+                Some((message, detail)) => {
+                    let answer = this
+                        .update_in(cx, |_, window, cx| {
+                            window.prompt(PromptLevel::Info, &message, Some(&detail), &["Import", "Cancel"], cx)
+                        })
+                        .ok();
+                    match answer {
+                        Some(answer) => answer.await == Ok(0),
+                        None => false,
+                    }
+                }
+            };
+            if go {
+                this.update_in(cx, |state, window, cx| state.run_import(rel, window, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    fn run_import(&mut self, rel: Rel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.asking_to_quit {
+            return;
+        }
+        // The word holds until the import's own replaces it.
+        crate::footer::say(cx, format!("importing {}\u{2026}", rel.name), false, None);
+        let (schema, name) = (clone_str(&rel.schema), clone_str(&rel.name));
+        self.on_connection(
+            move |conn| harbor_client::workspace::import(conn, &schema, &name),
+            move |state, outcome, window, cx| {
+                match outcome {
+                    Ok(rows) => {
+                        let rows = format!("{} {}", crate::util::commas(rows), if rows == 1 { "row" } else { "rows" });
+                        crate::footer::say(cx, format!("imported {rows} into the table {}", rel.name), false, Some(std::time::Duration::from_secs(8)));
+                        // The grid on the view is read-only: the table's is not.
+                        if state.selected_table.as_ref() == Some(&rel) {
+                            state.select_table(rel, window, cx);
+                        }
+                    }
+                    Err(why) => {
+                        let word = format!("{} was not imported", rel.name);
+                        crate::footer::say(cx, clone_str(&word), true, Some(std::time::Duration::from_secs(20)));
+                        crate::open::alert(word, why, cx);
+                    }
+                }
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Remove a workspace view: drop it, leaving the file it reads as it
+    /// is.
+    pub(crate) fn remove_view(&mut self, rel: Rel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.asking_to_quit {
+            return;
+        }
+        let (schema, name) = (clone_str(&rel.schema), clone_str(&rel.name));
+        self.on_connection(
+            move |conn| harbor_client::workspace::remove_view(conn, &schema, &name),
+            move |state, outcome, _, cx| match outcome {
+                Ok(()) => state.let_go_of(|selected| selected == &rel, cx),
+                Err(why) => crate::open::alert(format!("{} was not removed", rel.name), why, cx),
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Detach an attached catalog, leaving its file as it is, and in the
+    /// workspace let go of its record, so the workspace does not attach it
+    /// again; one the workspace could not attach (`attached` false) has
+    /// only its record. What was staged on its tables is parked with the
+    /// rest of the database's.
+    pub(crate) fn detach_catalog(&mut self, name: String, attached: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.asking_to_quit {
+            return;
+        }
+        let detached = clone_str(&name);
+        let workspace = self.on_workspace();
+        self.on_connection(
+            move |conn| harbor_client::workspace::detach(conn, &detached, attached, workspace),
+            move |state, outcome, _, cx| match outcome {
+                Ok(()) => state.let_go_of(|selected| selected.catalog.as_deref() == Some(name.as_str()), cx),
+                Err(why) => crate::open::alert(format!("{name} was not detached"), why, cx),
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// The table on screen is gone from the catalog when `gone` says so:
+    /// its grid goes, its staged set parked, and nothing is selected.
+    fn let_go_of(&mut self, gone: impl Fn(&Rel) -> bool, cx: &mut Context<Self>) {
+        if self.selected_table.as_ref().is_some_and(&gone) {
+            self.park_grid(cx);
+            self.selected_table = None;
+            self.select_seq += 1;
+        }
+    }
+
     /// Abort the in-flight connect. The current phase never changed, so
     /// whatever was on screen simply stays (a cancelled connect is not a
     /// failed connect).
@@ -1752,7 +2078,7 @@ impl DuckTable {
 #[cfg(test)]
 mod tests {
     use super::{active_key, after_quit_dialog, catalog_refresh_is_current, shown_state};
-    use super::{Aim, DbKey, QuitRisks, Resume, State};
+    use super::{Aim, DbKey, QuitRisks, Rel, Resume, State};
 
     #[test]
     fn a_row_shows_the_survey_unless_it_is_the_tunnel_on_screen() {
@@ -1793,7 +2119,7 @@ mod tests {
     #[test]
     fn a_cancelled_quit_dialog_resumes_what_it_held_back() {
         let row = Aim::Row { name: "a".into(), path: Some("/data/a.duckdb".into()) };
-        let switch = Some(("main".to_string(), "orders".to_string()));
+        let switch = Some(Rel::own("main", "orders"));
         // A connect the dialog called off is dialed again, to the same aim.
         assert_eq!(after_quit_dialog(Some(row.clone()), None), Resume::Dial(row.clone()));
         let file = Aim::File("/tmp/x.duckdb".into());
@@ -1805,7 +2131,7 @@ mod tests {
         // A table switch that waited under it runs.
         assert_eq!(
             after_quit_dialog(None, switch.clone()),
-            Resume::Select("main".into(), "orders".into())
+            Resume::Select(Rel::own("main", "orders"))
         );
         // With both, the connect: it replaces the grid the switch was for.
         assert_eq!(after_quit_dialog(Some(row.clone()), switch), Resume::Dial(row));
@@ -1888,6 +2214,7 @@ mod tests {
             committing: true,
             transaction: true,
             running: true,
+            exporting: false,
         }
         .question()
         .unwrap();
@@ -1917,6 +2244,12 @@ mod tests {
         assert_eq!((typing.message.as_str(), typing.confirm), ("Quit DuckTable?", "Quit Anyway"));
         let running = QuitRisks { running: true, ..Default::default() }.question().unwrap();
         assert!(running.detail.starts_with("A statement is still running in the Query view."));
+        // So is an export writing its file: the quit stops it.
+        let exporting = QuitRisks { exporting: true, ..Default::default() }.question().unwrap();
+        assert_eq!((exporting.message.as_str(), exporting.confirm), ("Quit DuckTable?", "Quit Anyway"));
+        assert_eq!(exporting.detail, "An export is still writing its file. Quitting stops it, and no file is written.");
+        let staged = QuitRisks { staged: 1, tables: 1, exporting: true, ..Default::default() }.question().unwrap();
+        assert_eq!((staged.message.as_str(), staged.confirm), ("Quit DuckTable?", "Quit Anyway"));
     }
 
     #[test]
@@ -2052,9 +2385,15 @@ mod tests {
             editing: true,
             transaction: true,
             running: false,
+            exporting: true,
         };
         let quit = risks_of(&Leaving::Quit, Some(&a), Some(&a), screen(false), &parked);
         assert_eq!((quit.staged, quit.tables, quit.editing, quit.transaction), (6, 3, true, true));
+        // An export holds a connection of its own: only the app's end
+        // stops it, so leaving a database does not count it.
+        assert!(quit.exporting);
+        let relaunch = risks_of(&Leaving::Relaunch, Some(&a), Some(&a), screen(false), &parked);
+        assert!(relaunch.exporting);
         // A commit in flight has the grid's set: it is not counted staged.
         let committing = risks_of(&Leaving::Quit, Some(&a), Some(&a), screen(true), &parked);
         assert_eq!((committing.staged, committing.tables, committing.committing), (5, 2, true));
@@ -2083,6 +2422,255 @@ mod tests {
         let unknown = new_enough("").unwrap_err();
         assert!(unknown.contains("this server does not say which Harbor it runs."), "{unknown}");
         assert!(new_enough("garbage").is_err());
+    }
+
+    /// Every kind of file opens in a scratch workspace through the functions
+    /// the window calls: classified (`workspace::kind_of`), planned
+    /// (`open::plan`), opened as a connect does (`connect` with
+    /// `Aim::Workspace`), read back from the catalog the sidebar draws
+    /// (`sidebar::tree_lines`), paged as the grid pages, a SQLite table
+    /// edited through its attachment as ⌘S commits, a view imported as a
+    /// table, removed; a SQLite file attached again by a restarted server
+    /// from the workspace's record, detached and forgotten, and listed with
+    /// why when it is gone at a start; and a spatial view read by a fresh
+    /// server with nothing loaded by DuckTable.
+    ///
+    /// Live and scratch only: needs `HARBOR_HOME` set to a short scratch
+    /// directory (the workspace is made there), `HARBOR_BIN` naming the
+    /// harbor to run, and `DUCKTABLE_OPEN_PROBE` naming an empty scratch
+    /// directory for the files; `sqlite3` makes the SQLite file.
+    #[test]
+    #[ignore]
+    fn every_kind_of_file_opens_in_a_scratch_workspace() {
+        use crate::sidebar::{tree_lines, Line};
+        use harbor_client::workspace;
+        use serde_json::json;
+        let (Some(home), Some(dir)) = (std::env::var_os("HARBOR_HOME"), std::env::var_os("DUCKTABLE_OPEN_PROBE")) else {
+            println!("set HARBOR_HOME and DUCKTABLE_OPEN_PROBE to scratch directories; skipping");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let ws = workspace::path().expect("workspace");
+        assert!(ws.starts_with(&home), "the workspace must be the scratch one: {}", ws.display());
+        let _ = std::fs::remove_file(&ws);
+        let _ = std::fs::remove_file(ws.with_extension("duckdb.wal"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // The files, made by the workspace's own engine where it can.
+        let (conn, ..) = super::connect(Aim::Workspace(Vec::new())).expect("connect");
+        let run = |sql: &str| harbor_client::exec(&conn, sql, None, None).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let at = |name: &str| dir.join(name).to_str().unwrap().to_string();
+        std::fs::write(dir.join("sales.csv"), "id,name,amount\n1,apple,1.5\n2,banana,2.25\n3,cherry,\n").unwrap();
+        std::fs::write(
+            dir.join("parks.geojson"),
+            r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"Central"},"geometry":{"type":"Point","coordinates":[-73.97,40.78]}}]}"#,
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(dir.join("lake"));
+        run(&format!(
+            "COPY (SELECT range AS id, range % 2 + 2024 AS year FROM range(10)) TO '{}' (FORMAT parquet, PARTITION_BY (year))",
+            at("lake")
+        ));
+        workspace::load_extension(&conn, "excel").expect("excel");
+        run(&format!("COPY (SELECT range AS n, 'x' || range AS s FROM range(4)) TO '{}' (FORMAT xlsx, HEADER true)", at("book.xlsx")));
+        let _ = std::fs::remove_file(dir.join("app.sqlite"));
+        let made = std::process::Command::new("sqlite3")
+            .arg(dir.join("app.sqlite"))
+            .arg(
+                "CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INT); \
+                 INSERT INTO people VALUES (1,'ann',30),(2,'bob',41),(3,'cy',22); \
+                 CREATE TABLE notes(body TEXT, n INT); INSERT INTO notes VALUES ('hi',1),('yo',2);",
+            )
+            .status()
+            .expect("sqlite3");
+        assert!(made.success());
+        std::fs::write(dir.join("notes.bin"), b"\x7fELF\x02\x01").unwrap();
+        drop(conn);
+
+        // Classified and planned as a drop of all of them is.
+        let dropped = ["sales.csv", "lake", "book.xlsx", "app.sqlite", "parks.geojson", "notes.bin"].map(|n| dir.join(n));
+        let plan = crate::open::plan(dropped.iter().map(|p| (p.clone(), workspace::kind_of(p))).collect());
+        assert_eq!(plan.workspace.len(), 5);
+        assert!(plan.refused[0].contains("notes.bin") && plan.refused[0].contains("7f 45 4c 46"), "{:?}", plan.refused);
+        let (conn, _, catalog, opened) = super::connect(Aim::Workspace(plan.workspace.clone())).expect("open");
+        let names: Vec<_> = opened.iter().map(|o| o.as_ref().map(|o| (o.name.as_str(), o.made)).unwrap()).collect();
+        assert_eq!(names, [("sales", true), ("lake", true), ("book", true), ("app", true), ("parks", true)]);
+        assert_eq!(crate::open::first_opened(&catalog, &opened), Some(Rel::own("main", "sales")));
+
+        // The sidebar's tree: every view reads, spatial's among them, and
+        // the SQLite file is a catalog of its own.
+        let lines = tree_lines(&catalog, false, &None);
+        for line in &lines {
+            if let Line::View { rel, error, columns, file } = line {
+                assert!(error.is_none() && *columns > 0 && *file, "{rel:?}: {error:?}");
+            }
+        }
+        let rels: Vec<Rel> = lines.iter().filter_map(|l| l.rel().cloned()).collect();
+        assert_eq!(
+            rels,
+            [
+                Rel::own("main", "book"),
+                Rel::own("main", "lake"),
+                Rel::own("main", "parks"),
+                Rel::own("main", "sales"),
+                Rel::of("app", "main", "notes"),
+                Rel::of("app", "main", "people"),
+            ]
+        );
+
+        // Paged and sorted as the grid pages a view: read-only, no count,
+        // every column breaking ties.
+        let lake = crate::structure::structure_of(&catalog, &Rel::own("main", "lake")).unwrap();
+        assert!(lake.view && crate::grid::identity_columns(Some(&lake)).is_empty());
+        let columns: Vec<String> = lake.cols.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(columns, ["id", "year"]);
+        let sort = vec![crate::sql::SortKey { column: "year".into(), desc: true }];
+        let ties = crate::sql::tiebreak(&[], &columns);
+        let (page, kept) = crate::sql::first_page(&conn, &Rel::own("main", "lake").source(), false, sort.clone(), &ties, 3);
+        assert_eq!(kept, sort);
+        assert_eq!(page.unwrap().rows, [[json!(1), json!(2025)], [json!(3), json!(2025)], [json!(5), json!(2025)]]);
+        for rel in &rels {
+            let page = crate::sql::first_page(&conn, &rel.source(), false, Vec::new(), &[], 500).0;
+            assert!(page.is_ok_and(|p| !p.rows.is_empty()), "{rel:?}");
+        }
+
+        // A SQLite table edits through its attachment as ⌘S commits it:
+        // keyed by its primary key, and a keyless one by rowid and hash.
+        let commit = |e: &crate::edits::Edits| {
+            let sid = harbor_client::session_new(&conn).expect("session");
+            let outcome = crate::grid::run_statements(&conn, &sid, &e.statements())
+                .and_then(|()| harbor_client::exec(&conn, "COMMIT", None, Some(&sid)).map(drop));
+            harbor_client::session_release(&conn, &sid);
+            outcome
+        };
+        let txt = |s: &str| Some(gpui_kit::SharedString::from(s.to_string()));
+        let people = crate::structure::structure_of(&catalog, &Rel::of("app", "main", "people")).unwrap();
+        assert_eq!(crate::grid::identity_columns(Some(&people)), ["id"]);
+        // SQLite takes no INSERT … RETURNING (measured), so the grid's
+        // set for it counts its INSERTs instead.
+        assert!(people.foreign);
+        let mut e = crate::edits::Edits::new(
+            Rel::of("app", "main", "people").source(),
+            vec!["id".into()],
+            vec!["id".into(), "name".into(), "age".into()],
+            vec!["BIGINT".into(), "VARCHAR".into(), "BIGINT".into()],
+        )
+        .without_returning();
+        e.stage_cell(vec![json!(2)], 1, txt("bob"), txt("robert"), json!("robert"));
+        e.stage_delete(vec![json!(3)]);
+        let draft = e.stage_insert().unwrap();
+        e.stage_insert_cell(&draft, 0, txt("9"), json!(9));
+        e.stage_insert_cell(&draft, 1, txt("dee"), json!("dee"));
+        e.stage_duplicate(vec![json!(1)], vec![(0, txt("10"), crate::edits::Bind::Value(json!(10))), (1, txt("ann"), crate::edits::Bind::Source)]);
+        commit(&e).expect("the SQLite table takes the commit");
+        let read = std::process::Command::new("sqlite3").arg(dir.join("app.sqlite")).arg("SELECT id, name FROM people ORDER BY id").output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&read.stdout), "1|ann\n2|robert\n9|dee\n10|ann\n");
+        // A duplicate of a row that is gone inserts nothing, and is refused.
+        let mut e = crate::edits::Edits::new(
+            Rel::of("app", "main", "people").source(),
+            vec!["id".into()],
+            vec!["id".into(), "name".into(), "age".into()],
+            vec!["BIGINT".into(), "VARCHAR".into(), "BIGINT".into()],
+        )
+        .without_returning();
+        e.stage_duplicate(vec![json!(3)], vec![(1, txt("cy"), crate::edits::Bind::Source)]);
+        assert!(commit(&e).unwrap_err().contains("source is gone"));
+        let notes = crate::structure::structure_of(&catalog, &Rel::of("app", "main", "notes")).unwrap();
+        assert!(notes.keyed_by_rowid());
+        let source = Rel::of("app", "main", "notes").source();
+        let page = harbor_client::query(&conn, &crate::sql::page_sql(&source, true, &None, 0, 10)).expect("page");
+        let mut e = crate::edits::Edits::new(
+            source,
+            vec![],
+            vec!["rowid".into(), "body".into(), "n".into()],
+            vec!["UBIGINT[]".into(), "VARCHAR".into(), "BIGINT".into()],
+        )
+        .keyed_by_rowid();
+        e.stage_cell(vec![page.rows[1][0].clone()], 1, txt("yo"), txt("hey"), json!("hey"));
+        commit(&e).expect("the keyless SQLite table takes the commit");
+        let read = std::process::Command::new("sqlite3").arg(dir.join("app.sqlite")).arg("SELECT body FROM notes ORDER BY n").output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&read.stdout), "hi\nhey\n");
+
+        // Opened again, each file finds what the first opening made.
+        let again = super::open_files(&conn, &plan.workspace);
+        assert!(again.iter().all(|o| o.as_ref().is_ok_and(|o| !o.made && o.line.contains("already"))), "{again:?}");
+
+        // Save As writes any table or view through Export's COPY.
+        for (rel, file) in [(Rel::own("main", "parks"), "parks-out.csv"), (Rel::of("app", "main", "people"), "people-out.parquet")] {
+            let path = dir.join(file);
+            let format = crate::export::format_for(&path, crate::export::Format::Csv);
+            let sql = crate::export::copy_sql(&format!("SELECT * FROM {}", rel.source()), path.to_str().unwrap(), crate::export::copy_options(format, &path));
+            run_on(&conn, &sql);
+            assert!(std::fs::metadata(&path).is_ok_and(|m| m.len() > 0), "{file}");
+        }
+
+        // Import as Table: the view becomes a table of its name, editable.
+        assert_eq!(workspace::import(&conn, "main", "sales"), Ok(3));
+        let catalog = super::read_catalog(&conn).expect("catalog");
+        let sales = crate::structure::structure_of(&catalog, &Rel::own("main", "sales")).unwrap();
+        assert!(!sales.view && sales.keyed_by_rowid());
+        // The SQLite file is in the workspace's record from the moment it
+        // is attached, before any server stops.
+        let record = |conn: &harbor_client::Conn| {
+            let sql = format!("SELECT name, path FROM {}.{} ORDER BY name", wire::open::RECORD_SCHEMA, wire::open::RECORD_TABLE);
+            harbor_client::query(conn, &sql).expect("record").rows
+        };
+        assert_eq!(record(&conn), [[json!("app"), json!(at("app.sqlite"))]]);
+
+        // A workspace server started again attaches the file again, and has
+        // loaded `spatial` for the view over the GeoJSON before anyone asks.
+        drop(conn);
+        harbor_client::fleet::stop(&ws).expect("stop");
+        let conn = harbor_client::fleet::connect_path(&ws).expect("connect again");
+        let catalog = harbor_client::catalog(&conn).expect("catalog");
+        assert!(workspace::needed_extensions(&catalog).is_empty());
+        assert_eq!(catalog.views.iter().find(|v| v.name == "parks").map(|v| v.error.clone()), Some(None));
+        let app: Vec<&str> = catalog.attached.iter().flat_map(|a| a.tables.iter().map(|t| t.name.as_str())).collect();
+        assert_eq!(app, ["notes", "people"]);
+        let people = "SELECT name FROM app.main.people ORDER BY id";
+        assert_eq!(harbor_client::query(&conn, people).expect("people").rows.len(), 4);
+
+        // Remove and Detach leave the files as they were; Detach lets go of
+        // the record, so no server attaches the file again.
+        workspace::remove_view(&conn, "main", "book").expect("remove");
+        workspace::detach(&conn, "app", true, true).expect("detach");
+        let catalog = super::read_catalog(&conn).expect("catalog");
+        assert!(catalog.views.iter().all(|v| v.name != "book") && catalog.attached.is_empty());
+        assert!(dir.join("book.xlsx").exists() && dir.join("app.sqlite").exists());
+        assert!(record(&conn).is_empty());
+
+        // A recorded file that is gone when the server starts is listed,
+        // holding nothing, with why; the sidebar greys it, and its Detach
+        // deletes the record's row alone.
+        let reopened = super::open_files(&conn, &[(dir.join("app.sqlite"), wire::open::Kind::Sqlite)]);
+        assert!(reopened[0].as_ref().is_ok_and(|o| o.name == "app" && o.made), "{reopened:?}");
+        drop(conn);
+        harbor_client::fleet::stop(&ws).expect("stop");
+        std::fs::rename(dir.join("app.sqlite"), dir.join("app-away.sqlite")).unwrap();
+        let conn = harbor_client::fleet::connect_path(&ws).expect("connect again");
+        let catalog = super::read_catalog(&conn).expect("catalog");
+        let gone = catalog.attached.iter().find(|a| a.name == "app").expect("the missing file is listed");
+        let error = gone.error.clone().expect("with why");
+        assert!(error.contains("no such file") && gone.tables.is_empty(), "{error}");
+        let lines = tree_lines(&catalog, false, &None);
+        assert!(lines.contains(&Line::Catalog { name: "app".into(), storage: "sqlite".into(), error: Some(error) }));
+        assert!(!lines.iter().any(|l| l.rel().is_some_and(|r| r.catalog.as_deref() == Some("app"))));
+        workspace::detach(&conn, "app", false, true).expect("detach the missing file");
+        assert!(record(&conn).is_empty());
+        assert!(super::read_catalog(&conn).expect("catalog").attached.is_empty());
+
+        // Back where it was, the file stays unattached: the record let go.
+        std::fs::rename(dir.join("app-away.sqlite"), dir.join("app.sqlite")).unwrap();
+        drop(conn);
+        harbor_client::fleet::stop(&ws).expect("stop");
+        let conn = harbor_client::fleet::connect_path(&ws).expect("connect again");
+        assert!(harbor_client::catalog(&conn).expect("catalog").attached.is_empty());
+        drop(conn);
+        harbor_client::fleet::stop(&ws).expect("stop");
+    }
+
+    fn run_on(conn: &harbor_client::Conn, sql: &str) {
+        harbor_client::exec(conn, sql, None, None).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 
     #[test]

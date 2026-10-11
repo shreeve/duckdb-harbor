@@ -27,6 +27,59 @@ fn vtext(v: &serde_json::Value) -> String {
     }
 }
 
+/// The widest a copy's or an export's word runs in the status line before
+/// it is cut, leaving the switcher and the Data view's controls their room
+/// at the window's narrowest.
+const STATUS_WORD_MAX: f32 = 420.;
+
+/// The status line's word for a copy or an export (`say`): it outranks the
+/// grid's row range while it speaks, in every view, since what it reports
+/// is the app's and not one grid's.
+#[derive(Default)]
+struct Word {
+    text: Option<(SharedString, bool)>,
+    seq: u64,
+}
+
+impl Global for Word {}
+
+/// Say `text` in the status line, in the danger color when `bad`, for
+/// `hold` or until the next word replaces it. Returns the word's number,
+/// by which its sayer knows whether it is still the one said
+/// (`says_another`).
+pub(crate) fn say(cx: &mut App, text: impl Into<SharedString>, bad: bool, hold: Option<std::time::Duration>) -> u64 {
+    let word = cx.default_global::<Word>();
+    word.seq += 1;
+    word.text = Some((text.into(), bad));
+    let seq = word.seq;
+    cx.refresh_windows();
+    if let Some(hold) = hold {
+        cx.spawn(async move |cx| {
+            cx.background_executor().timer(hold).await;
+            cx.update(|cx| {
+                let word = cx.default_global::<Word>();
+                if word.seq == seq {
+                    word.text = None;
+                    cx.refresh_windows();
+                }
+            });
+        })
+        .detach();
+    }
+    seq
+}
+
+/// Whether the status line says a word other than word `seq`.
+pub(crate) fn says_another(cx: &App, seq: u64) -> bool {
+    cx.try_global::<Word>().is_some_and(|w| w.seq != seq && w.text.is_some())
+}
+
+/// What the status line says now, and whether it says it in the danger
+/// color.
+fn word(cx: &App) -> Option<(SharedString, bool)> {
+    cx.try_global::<Word>().and_then(|w| w.text.clone())
+}
+
 /// What the footer's right-anchored cluster renders from, read off the grid
 /// the view shows.
 #[derive(Clone, Debug, Default)]
@@ -55,9 +108,10 @@ pub(crate) struct Status {
 }
 
 /// The status line for `view`, from its grid's facts (None when it has no
-/// grid: no table chosen, or no result yet) and the Query view's own word
-/// (`QueryView::status_override`: a ticking run, a note, a resultless
-/// statement's "ok"), which outranks the grid's stats while it speaks.
+/// grid: no table chosen, or no result yet) and a word that outranks the
+/// grid's stats while it speaks: a copy's or an export's (`say`) in
+/// any view, else the Query view's own (`QueryView::status_override`: a
+/// ticking run, a note, a resultless statement's "ok").
 pub(crate) fn status(view: ViewMode, facts: Option<&FooterFacts>, says: Option<String>) -> Status {
     let rows = |f: &FooterFacts| {
         let base = f.page * f.page_size;
@@ -83,9 +137,8 @@ pub(crate) fn status(view: ViewMode, facts: Option<&FooterFacts>, says: Option<S
     Status {
         prefix: match view {
             ViewMode::Data if loading => Some("loading...".to_string()),
-            ViewMode::Data => verdict,
-            ViewMode::Query => says.or(verdict),
-            ViewMode::Structure => None,
+            ViewMode::Data | ViewMode::Query => says.or(verdict),
+            ViewMode::Structure => says,
         },
         // Structure lists its columns with nothing beside them; while the
         // Query view's word speaks, the grid's column count stays quiet.
@@ -100,12 +153,15 @@ pub(crate) fn status(view: ViewMode, facts: Option<&FooterFacts>, says: Option<S
 }
 
 /// Why a table's grid takes no edits, said where the eye rests
-/// (docs/EDITING.md: a refusal is stated, never a mystery). `pk_cols` is
-/// the identity the grid asked for: the table's key, `rowid` for a table
-/// without one, or nothing for a keyless table with a column of its own
-/// named `rowid`, which hides DuckDB's.
-pub(crate) fn read_only_reason(pk_cols: &[String]) -> &'static str {
-    if pk_cols.is_empty() {
+/// (docs/EDITING.md: a refusal is stated, never a mystery). A view's rows
+/// have no identity, and Import as Table makes them a table's. For a table,
+/// `pk_cols` is the identity the grid asked for: the table's key, `rowid`
+/// for a table without one, or nothing for a keyless table with a column
+/// of its own named `rowid`, which hides DuckDB's.
+pub(crate) fn read_only_reason(view: bool, pk_cols: &[String]) -> &'static str {
+    if view {
+        "read-only \u{00b7} a view"
+    } else if pk_cols.is_empty() {
         "read-only \u{00b7} no key, and a column named rowid"
     } else {
         "read-only \u{00b7} its key is not among the columns read"
@@ -180,7 +236,7 @@ impl Grid {
                 } else if inserts + updates + deletes > 0 {
                     d.child(div().ml_2().child(self.staged_popover(inserts, updates, deletes, cx)))
                 } else if self.edits.is_none() && cols > 0 && !(loading && count == 0) {
-                    d.child(note(read_only_reason(&self.pk_cols)).text_color(t.muted.opacity(0.8)))
+                    d.child(note(read_only_reason(self.view, &self.pk_cols)).text_color(t.muted.opacity(0.8)))
                 } else {
                     d
                 }
@@ -198,9 +254,14 @@ impl DuckTable {
             Some(query) => query.results_grid(),
             None => self.grid.clone().filter(|_| view != ViewMode::Query),
         };
-        let says = query.and_then(|q| q.status_override());
+        let notice = word(cx);
+        let says = notice.as_ref().map(|(text, _)| text.to_string()).or_else(|| query.and_then(|q| q.status_override()));
         let facts = shown.as_ref().map(|g| g.read(cx).footer_facts(cx));
         let status = status(view, facts.as_ref(), says);
+        // A failed export says so in the danger color, and a long word is
+        // cut to the line's width with the whole of it in a tooltip.
+        let bad = notice.as_ref().is_some_and(|(_, bad)| *bad);
+        let whole = notice.map(|(text, _)| text);
         let facts = facts.unwrap_or_default();
         let controls = match (&self.grid, view) {
             (Some(grid), ViewMode::Data) => Some(grid.update(cx, |g, cx| g.data_controls(cx))),
@@ -269,7 +330,18 @@ impl DuckTable {
                     .gap_2()
                     .text_xs()
                     .text_color(t.muted)
-                    .when_some(status.prefix, |d, text| d.child(div().child(text)))
+                    .when_some(status.prefix, |d, text| match whole {
+                        Some(whole) => d.child(
+                            div()
+                                .id("status-word")
+                                .max_w(px(STATUS_WORD_MAX))
+                                .truncate()
+                                .when(bad, |d| d.text_color(t.bad))
+                                .tooltip(move |window, cx| Tooltip::new(whole.clone()).build(window, cx))
+                                .child(text),
+                        ),
+                        None => d.child(div().child(text)),
+                    })
                     .when_some(status.columns, |d, text| {
                         d.when(dotted, |d| d.child(div().child("\u{00b7}"))).child(div().child(text))
                     })
@@ -841,11 +913,21 @@ mod tests {
         assert!(!status(ViewMode::Query, Some(&whole), None).pager);
         assert_eq!(status(ViewMode::Query, None, Some("ok \u{b7} 2ms".into())).prefix.as_deref(), Some("ok \u{b7} 2ms"));
         assert_eq!(status(ViewMode::Data, Some(&page(0, Some(0))), None).prefix.as_deref(), Some("1ms \u{b7} 0 rows"));
+        // A copy's or an export's word speaks in the Data and Structure
+        // views too, in place of the row range, beside the column count.
+        let copied = status(ViewMode::Data, Some(&rows), Some("copied 3 rows as TSV".into()));
+        assert_eq!(
+            copied,
+            Status { prefix: Some("copied 3 rows as TSV".into()), columns: Some("9 columns".into()), pager: true }
+        );
+        let structure = status(ViewMode::Structure, Some(&rows), Some("copied 1 cell as TSV".into()));
+        assert_eq!(structure.prefix.as_deref(), Some("copied 1 cell as TSV"));
     }
 
     #[test]
     fn a_read_only_table_says_why() {
-        assert_eq!(read_only_reason(&[]), "read-only \u{b7} no key, and a column named rowid");
-        assert_eq!(read_only_reason(&["id".to_string()]), "read-only \u{b7} its key is not among the columns read");
+        assert_eq!(read_only_reason(false, &[]), "read-only \u{b7} no key, and a column named rowid");
+        assert_eq!(read_only_reason(false, &["id".to_string()]), "read-only \u{b7} its key is not among the columns read");
+        assert_eq!(read_only_reason(true, &[]), "read-only \u{b7} a view");
     }
 }

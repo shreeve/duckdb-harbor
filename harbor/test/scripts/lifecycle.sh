@@ -17,7 +17,10 @@ here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 harbor=${LIFECYCLE_HARBOR:-$here/target/release/harbor}
 [[ -x $harbor ]] || { echo "lifecycle: build first (make harbor)" >&2; exit 77; }
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/harbor-lifecycle.XXXXXX")
+# macOS's TMPDIR ends in a slash; a doubled one would make every path this
+# suite compares against the server's differ from the server's spelling.
+tmp=${TMPDIR:-/tmp}
+work=$(mktemp -d "${tmp%/}/harbor-lifecycle.XXXXXX")
 # Servers hold the canonical spelling (macOS resolves /var to /private/var),
 # which is too long for a unix socket to live under, so $work stays as typed
 # and cleanup matches either form when it inspects a command line.
@@ -787,6 +790,215 @@ check "neither verb combines with a lifetime verb" 1 "combines with nothing" \
 check "nor with each other" 1 "runs alone" \
   "$harbor" "$work/bk.duckdb" backup restore
 wait_gone
+
+echo "— a data file opens in the workspace"
+# A name with a quote, a space, a bracket and a star, beside a decoy its
+# glob would match: the view reads the one file named, and no other.
+mkdir -p "$work/files"
+data="$work/files/it's [q1]*.csv"
+printf 'id,name\n1,ann\n2,bob\n' > "$data"
+printf 'id,name\n9,decoy\n' > "$work/files/it's [q1]x.csv"
+check "a CSV opens as a view named for it, and says so" 0 "it_s_q1: a view over" \
+  "$harbor" "$data" --mode csv -c "SELECT 1"
+check "the view reads that file and no other" 0 "ann,bob" \
+  "$harbor" "$data" --mode csv -c "SELECT string_agg(name, ',' ORDER BY id) AS names FROM it_s_q1"
+check "a second opening finds the view the first made" 0 "already in the workspace" \
+  "$harbor" "$data" --mode csv -c "SELECT 1"
+check "in the workspace database, under HARBOR_HOME" 0 "1" \
+  "$harbor" "$work/workspace.duckdb" --mode csv -c "SELECT count(*) FROM duckdb_views() WHERE view_name = 'it_s_q1'"
+printf 'id,name\n1,x\n' > "$work/files/order.csv"
+check "a reserved word is passed over for the next free name" 0 "order_2: a view over" \
+  "$harbor" "$work/files/order.csv" --mode csv -c "SELECT * FROM order_2"
+check "a missing data file is refused, not made a database" 1 "no such file" \
+  "$harbor" "$work/files/nope.csv" -c "SELECT 1"
+[[ ! -e $work/files/nope.csv ]] && ok "and nothing is made there" || bad "a database was made at nope.csv"
+printf 'hello' > "$work/files/notes.bin"
+check "a file of no kind harbor opens is refused with what was looked at" 1 'begins "hello"' \
+  "$harbor" "$work/files/notes.bin" -c "SELECT 1"
+printf 'id\n1\n' > "$work/files/fake.parquet"
+check "and so is one its bytes contradict" 1 "not Parquet" \
+  "$harbor" "$work/files/fake.parquet" -c "SELECT 1"
+check "a verb refuses a data file" 1 "opens it in the workspace" \
+  "$harbor" "$work/files/order.csv" start
+wait_gone
+
+echo "— the workspace is whole at every start"
+# An ATTACH lasts as long as the server that ran it, and ST_Read reads only
+# where spatial is loaded: a server that opens the workspace attaches what it
+# records and loads what its views call into, before it serves anyone.
+mkdir -p "$work/files/b"
+"$harbor" "$work/mk.duckdb" -c "ATTACH '$work/files/app.sqlite' AS app (TYPE sqlite); CREATE TABLE app.people AS SELECT 1 AS id;
+  ATTACH '$work/files/b/app.sqlite' AS b (TYPE sqlite); CREATE TABLE b.t AS SELECT 1 AS id" >/dev/null 2>&1
+wait_gone
+check "a SQLite file attaches in the workspace" 0 "app: the SQLite database" \
+  "$harbor" "$work/files/app.sqlite" --mode csv -c "SELECT count(*) FROM app.people"
+printf '{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"elm"},"geometry":{"type":"Point","coordinates":[1,2]}}]}' \
+  > "$work/files/parks.geojson"
+spatial=1
+out=$("$harbor" "$work/files/parks.geojson" --mode csv -c "SELECT name FROM parks" 2>&1) || spatial=0
+if (( spatial )); then
+  [[ $out == *elm* ]] && ok "a GeoJSON file opens as a view" || bad "the GeoJSON view did not read: $out"
+else
+  echo "  - spatial did not install here, so the GeoJSON view is not checked: $out"
+fi
+wait_gone
+# The views and the attachment a fresh server shows, one line each, and any
+# relation listed in the record's schema.
+catalog_lines() {
+  curl -s --max-time 10 --unix-socket "$(live_sock)" http://harbor/catalog | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for v in d["views"]: print("view", v["name"], "reads" if v["columns"] and not v["error"] else v["error"])
+for a in d["attached"]: print("attached", a["name"], [t["name"] for t in a["tables"]], a["error"])
+for t in d["tables"]: print("table", t["schema"], t["name"])'
+}
+workspace_start() {
+  "$harbor" "$work/workspace.duckdb" start "$@" >"$work/ws.log" 2>&1 &
+  srv=$!
+  for _ in $(seq 1 100); do [[ -n $(live_sock) ]] && return; sleep 0.1; done
+  bad "the workspace never came up: $(cat "$work/ws.log")"
+}
+workspace_stop() {
+  "$harbor" "$work/workspace.duckdb" stop >/dev/null 2>&1
+  wait "$srv" 2>/dev/null
+  srv=""
+}
+workspace_start
+lines=$(catalog_lines)
+[[ $lines == *"view it_s_q1 reads"* && $lines == *"view order_2 reads"* ]] \
+  && ok "after a restart, the CSV views read" || bad "the CSV views after a restart: $lines"
+if (( spatial )); then
+  [[ $lines == *"view parks reads"* ]] && ok "the GeoJSON view reads, spatial loaded at the start" \
+                                       || bad "the GeoJSON view after a restart: $lines"
+fi
+[[ $lines == *"attached app ['people'] None"* ]] && ok "the SQLite file is attached again" \
+                                                  || bad "the SQLite file after a restart: $lines"
+[[ $lines != *"table "* ]] && ok "and the record of it is not listed" || bad "the catalog lists a table: $lines"
+workspace_stop
+mv "$work/files/app.sqlite" "$work/files/app.away"
+workspace_start
+lines=$(catalog_lines)
+[[ $lines == *"attached app [] $work/files/app.sqlite: no such file"* ]] \
+  && ok "a recorded file that is gone is said in the catalog, and the server serves" \
+  || bad "a gone file after a restart: $lines"
+grep -q "app is not attached" "$work/ws.log" && ok "and in its log" || bad "the log does not say so: $(cat "$work/ws.log")"
+check "another file of its stem takes the next name, not the gone one's" 0 "app_2: the SQLite database" \
+  "$harbor" "$work/files/b/app.sqlite" -c "DETACH app_2"
+workspace_stop
+mv "$work/files/app.away" "$work/files/app.sqlite"
+workspace_start
+[[ $(catalog_lines) == *"attached app ['people'] None"* ]] && ok "and it is attached again once it is back" \
+                                                          || bad "the file back: $(catalog_lines)"
+check "a plain DETACH" 0 "" "$harbor" "$work/workspace.duckdb" -c "DETACH app"
+workspace_stop
+workspace_start
+[[ $(catalog_lines) != *"attached app"* ]] && ok "lasts past the stop" || bad "detached, then: $(catalog_lines)"
+workspace_stop
+
+echo "— an attached SQLite file whose catalog does not read"
+# Attaching a SQLite file reads nothing of it, and the engine reads every
+# attached database's catalog for any catalog read: one that does not read
+# would fail them all.
+printf 'a,b\n1,2\n' > "$work/files/ab.csv"
+workspace_start --init "INSERT INTO _harbor.attached VALUES ('notsq', '$work/files/ab.csv', 'sqlite', false)"
+lines=$(catalog_lines)
+[[ $lines == *"attached notsq [] "*"file is not a database"* ]] \
+  && ok "a recorded file that is not SQLite is detached at the start, and the catalog says why" \
+  || bad "a recorded non-SQLite file: $lines"
+[[ $lines == *"view it_s_q1 reads"* ]] && ok "and the rest of the catalog reads" || bad "the catalog beside it: $lines"
+grep -q "notsq is not attached" "$work/ws.log" && ok "and the log says so" || bad "the log: $(cat "$work/ws.log")"
+workspace_stop
+check "its row stays in the record" 0 "1" \
+  "$harbor" "$work/workspace.duckdb" --mode csv -c "SELECT count(*) FROM _harbor.attached WHERE name = 'notsq'"
+wait_gone
+# A writer that holds a SQLite file locked: a catalog read fails, naming the
+# file, in about the second harbor's attachment waits, not the engine's five.
+lock_sqlite() { # lock_sqlite <file>: hold it locked until killed; returns once held
+  python3 -c '
+import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1], isolation_level=None)
+c.execute("BEGIN EXCLUSIVE")
+print("locked", flush=True)
+time.sleep(60)' "$1" > "$work/lock.out" 2>&1 &
+  locker=$!
+  for _ in $(seq 1 50); do grep -q locked "$work/lock.out" 2>/dev/null && return; sleep 0.1; done
+}
+workspace_start
+check "a SQLite file attaches in the workspace again" 0 "app: the SQLite database" \
+  "$harbor" "$work/files/app.sqlite" --mode csv -c "SELECT count(*) FROM app.people"
+lock_sqlite "$work/files/app.sqlite"
+read -r status secs < <(curl -s -o "$work/cat.json" -w '%{http_code} %{time_total}\n' --max-time 20 \
+  --unix-socket "$(live_sock)" http://harbor/catalog)
+body=$(cat "$work/cat.json")
+[[ $status == 400 && $body == *"app ($work/files/app.sqlite)"*"database is locked"* ]] \
+  && ok "a locked one fails the catalog with a 400 that names it" || bad "the catalog of a locked file: $status $body"
+python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 4 else 1)" "$secs" \
+  && ok "in about a second (${secs}s)" || bad "the catalog of a locked file took ${secs}s"
+kill "$locker" 2>/dev/null; wait "$locker" 2>/dev/null
+[[ $(catalog_lines) == *"attached app ['people'] None"* ]] && ok "and reads again once the lock is gone" \
+  || bad "after the lock: $(catalog_lines)"
+workspace_stop
+lock_sqlite "$work/files/app.sqlite"
+started=$(python3 -c 'import time; print(time.time())')
+workspace_start
+took=$(python3 -c "import time, sys; print(round(time.time() - float(sys.argv[1]), 2))" "$started")
+lines=$(catalog_lines)
+[[ $lines == *"attached app [] "*"database is locked"* ]] \
+  && ok "a recorded file locked at the start is detached again, and the catalog says why" \
+  || bad "a file locked at the start: $lines"
+python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 5 else 1)" "$took" \
+  && ok "and the start waits about a second on it (${took}s)" || bad "the start took ${took}s"
+kill "$locker" 2>/dev/null; wait "$locker" 2>/dev/null
+check "and it opens again once it reads" 0 "app: the SQLite database" \
+  "$harbor" "$work/files/app.sqlite" --mode csv -c "DETACH app"
+workspace_stop
+
+echo "— a database attached as the record's schema"
+# The record is _harbor.attached, which a catalog named _harbor makes
+# ambiguous; the server names it in the workspace's own catalog.
+workspace_start
+check "a database attaches as _harbor" 0 "" \
+  "$harbor" "$work/workspace.duckdb" -c "ATTACH '$work/hx.duckdb' AS _harbor"
+workspace_stop
+grep -q "could not be written" "$work/ws.log" && bad "the record at the stop: $(cat "$work/ws.log")" \
+  || ok "the record is written at the stop beside it"
+workspace_start
+[[ $(catalog_lines) == *"attached _harbor [] None"* ]] && ok "and the database is attached again at the start" \
+  || bad "a database named _harbor after a restart: $(catalog_lines)"
+check "and detaches" 0 "" "$harbor" "$work/workspace.duckdb" -c "DETACH _harbor"
+workspace_stop
+
+echo "— a database --init attaches is the operator's"
+workspace_start --init "ATTACH '$work/i2.duckdb' AS initdb"
+[[ $(catalog_lines) == *"attached initdb [] None"* ]] && ok "it is attached" || bad "--init's database: $(catalog_lines)"
+workspace_stop
+check "and not recorded at the stop" 0 "0" \
+  "$harbor" "$work/workspace.duckdb" --mode csv -c "SELECT count(*) FROM _harbor.attached WHERE name = 'initdb'"
+wait_gone
+workspace_start --init "ATTACH '$work/i3.duckdb' AS notsq"
+grep -q "notsq is attached by --init" "$work/ws.log" && ok "a recorded name --init takes is said in the log" \
+  || bad "the log: $(cat "$work/ws.log")"
+workspace_stop
+check "and its row stays as it was" 0 "$work/files/ab.csv" \
+  "$harbor" "$work/workspace.duckdb" --mode csv -c "SELECT path FROM _harbor.attached WHERE name = 'notsq'"
+wait_gone
+
+if (( spatial )); then
+  echo "— an extension the workspace needs and does not have"
+  # An install is a download, and never stands between the database and the
+  # socket: a repository that does not answer holds the start for as long as
+  # a connection takes to time out.
+  mkdir -p "$work/noext"
+  started=$(python3 -c 'import time; print(time.time())')
+  workspace_start --init "SET extension_directory='$work/noext'; SET custom_extension_repository='http://10.255.255.1'"
+  took=$(python3 -c "import time, sys; print(round(time.time() - float(sys.argv[1]), 2))" "$started")
+  python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 5 else 1)" "$took" \
+    && ok "a start whose extension repository does not answer serves at once (${took}s)" \
+    || bad "the start took ${took}s"
+  [[ $(catalog_lines) == *"view parks "*"spatial"* ]] && ok "and the view that needs it says why it does not read" \
+    || bad "the spatial view without spatial: $(catalog_lines)"
+  workspace_stop
+fi
 
 echo
 if ((fails)); then

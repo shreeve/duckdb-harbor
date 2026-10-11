@@ -10,6 +10,7 @@
 //!     runtime/log/<base>-<hash>.log   the log of a server started by hand or on use
 //!     runtime/log/<name>.log          the log of a server its login item runs
 //!     history                         the repl's command history
+//! ~/.local/share/harbor/workspace.duckdb   where `harbor <data file>` and DuckTable open one
 //! ```
 //!
 //! Runtime state does not belong under `~/.config/harbor/`: a config
@@ -21,8 +22,9 @@
 //! macOS and ten by systemd-tmpfiles, and would take a long-running berth's
 //! socket with it.
 //!
-//! `$HARBOR_HOME` collapses both roots into that one directory. That is the
-//! self-contained form tests, containers and unit files want, and it is the
+//! `$HARBOR_HOME` collapses both roots, and the workspace, into that one
+//! directory. That is the self-contained form tests, containers and unit
+//! files want, and it is the
 //! single escape hatch — there is no per-directory override. It must be an
 //! absolute path: a relative or empty one is an error, never a quiet fall
 //! back to the real config and fleet.
@@ -213,6 +215,29 @@ pub fn log_file(runtime: &Path, name: &str) -> PathBuf {
 /// step around it.
 pub fn history_file() -> Result<PathBuf, String> {
     Ok(state_root()?.join("history"))
+}
+
+/// The workspace: the DuckDB database `harbor <data file>` opens a data file
+/// in, as a view, or a SQLite file in, attached. DuckTable opens files in
+/// the same one, so a file opened from either is there for both, and a
+/// server that serves this path makes it whole at its start (the harbor
+/// crate's `workspace` module). Data, not state, so it sits in the XDG data
+/// home (`~/.local/share/harbor/`), or in `$HARBOR_HOME` with everything
+/// else.
+pub fn workspace() -> Result<PathBuf, String> {
+    if let Some(h) = harbor_home()? {
+        return Ok(h.join("workspace.duckdb"));
+    }
+    if let Some(x) = abs_env("XDG_DATA_HOME") {
+        return Ok(x.join(APP).join("workspace.duckdb"));
+    }
+    #[cfg(windows)]
+    {
+        if let Some(x) = abs_env("LOCALAPPDATA") {
+            return Ok(x.join(APP).join("workspace.duckdb"));
+        }
+    }
+    Ok(home()?.join(".local").join("share").join(APP).join("workspace.duckdb"))
 }
 
 /// Berth names are registry filenames: `[a-z0-9_-]`, 1..=64.

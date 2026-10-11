@@ -12,6 +12,12 @@ pub fn qident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+/// A DuckDB string literal, single-quoted with embedded quotes doubled.
+/// A backslash is an ordinary character in one, and so is a line break.
+pub fn qlit(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
 /// An exact count with thousands separators: 1117569 -> "1,117,569".
 pub fn commas(n: u64) -> String {
     let digits = n.to_string();

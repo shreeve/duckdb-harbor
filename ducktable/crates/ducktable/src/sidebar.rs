@@ -1,6 +1,7 @@
 //! The sidebar: berth rows with live-state dots, and the catalog tree.
 
 use crate::app::{DuckTable, Phase};
+use crate::sql::Rel;
 use crate::chrome::head_glyph;
 use crate::theme::{pal, Pal};
 use crate::util::clone_str;
@@ -231,7 +232,7 @@ impl DuckTable {
                         // its count hugging it, magnitude on the right.
                         // The dot alone says stopped, and the size shows
                         // whether it runs or not.
-                        .child(named_count(&row.name, row.tables, t))
+                        .child(named_count(if row.workspace { "Workspace" } else { &row.name }, row.tables, t))
                         .when_some(row.size, |d, s| {
                             d.child(dim(t, crate::util::human(s as f64, "B")))
                         })
@@ -370,15 +371,15 @@ impl DuckTable {
         let Phase::Connected { catalog, .. } = &self.phase else {
             return div().id("catalog").flex_1();
         };
-        let schemas = catalog.schemas();
-        let many_schemas = schemas.len() > 1;
         let filter = self
             .table_filter
             .as_ref()
             .map(|i| i.read(cx).value().to_string().to_lowercase())
             .filter(|s| !s.is_empty());
         let filter_open = self.table_filter.is_some();
-        let table_total = catalog.tables.len();
+        let table_total = catalog.tables.len()
+            + catalog.views.len()
+            + catalog.attached.iter().map(|a| a.tables.len() + a.views.len()).sum::<usize>();
         let mut tree = div().id("catalog").flex_1().min_h_0().overflow_y_scroll().v_flex().gap_px();
         tree = tree.child(
             div()
@@ -448,57 +449,13 @@ impl DuckTable {
         if let Some(input) = &self.table_filter {
             tree = tree.child(filter_row(input));
         }
-        if filter.is_some()
-            && !catalog.tables.iter().any(|table| matches(&table.name, &filter))
-        {
+        let lines = tree_lines(catalog, family_sort, &filter);
+        if filter.is_some() && !lines.iter().any(|line| line.rel().is_some()) {
             tree = tree.child(empty_note(t, "No matching tables"));
         }
-        for schema in schemas {
-            if many_schemas {
-                tree = tree.child(
-                    div().px_2().py_1().text_xs().text_color(t.muted).child(clone_str(schema)),
-                );
-            }
-            for table in tables_in_order(catalog, schema, family_sort) {
-                if !matches(&table.name, &filter) {
-                    continue;
-                }
-                let key = (clone_str(schema), clone_str(&table.name));
-                let selected = self.selected_table.as_ref() == Some(&key);
-                tree = tree.child(
-                    list_row(
-                        SharedString::from(format!("t-{schema}-{}", table.name)),
-                        selected,
-                        t,
-                    )
-                    // Text starts on the database names' axis: their
-                    // rows indent 8px pad + 8px dot + 8px gap = 24.
-                    .pl(px(24.))
-                    .pr_2()
-                    // "users (35)" — the column count hugs the name; a
-                    // long name truncates but keeps its count visible.
-                    .child(named_count(&table.name, Some(table.columns.len()), t))
-                    // Exact row count in compact SI form — rows are what a
-                    // scan of a database cares about; column counts
-                    // live in the footer status and Structure view.
-                    .when_some(table.row_count, |d, n| {
-                        d.child(dim(t, crate::util::human(n as f64, "")))
-                    })
-                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                        if event.click_count() == 2 {
-                            crate::prefs::toggle(cx, |prefs| {
-                                prefs.view = crate::prefs::ViewMode::Data;
-                            });
-                        }
-                        this.select_table(
-                            clone_str(&key.0),
-                            clone_str(&key.1),
-                            window,
-                            cx,
-                        );
-                    })),
-                );
-            }
+        let workspace = self.on_workspace();
+        for line in lines {
+            tree = tree.child(self.tree_line(line, workspace, t, cx));
         }
         if !catalog.sequences.is_empty() {
             tree = tree.child(
@@ -530,7 +487,7 @@ impl crate::app::DuckTable {
     /// The sidebar's table list, in the exact order and under the exact
     /// filter the tree renders — ⌥←/⌥→ (App::step_table) walks THIS
     /// list, so arrow order always agrees with what the eye sees.
-    pub(crate) fn visible_tables(&self, cx: &App) -> Vec<(String, String)> {
+    pub(crate) fn visible_tables(&self, cx: &App) -> Vec<Rel> {
         let crate::app::Phase::Connected { catalog, .. } = &self.phase else {
             return Vec::new();
         };
@@ -540,31 +497,210 @@ impl crate::app::DuckTable {
             .map(|i| i.read(cx).value().to_string().to_lowercase())
             .filter(|s| !s.is_empty());
         let family_sort = crate::prefs::get(cx).family_sort;
-        let mut out = Vec::new();
-        for schema in catalog.schemas() {
-            for table in tables_in_order(catalog, schema, family_sort) {
-                if matches(&table.name, &filter) {
-                    out.push((schema.to_string(), table.name.clone()));
-                }
+        tree_lines(catalog, family_sort, &filter).into_iter().filter_map(|line| line.rel().cloned()).collect()
+    }
+
+    /// Whether the database on screen is the workspace, whose views read
+    /// files and can be imported or removed.
+    pub(crate) fn on_workspace(&self) -> bool {
+        let connected = self.connected_key();
+        self.rows.iter().any(|r| r.workspace && Some(&r.key) == connected.as_ref())
+    }
+
+    /// One line of the TABLES tree, drawn.
+    fn tree_line(&self, line: Line, workspace: bool, t: Pal, cx: &mut Context<Self>) -> AnyElement {
+        match line {
+            Line::Schema { name, nested } => div()
+                .pl(px(if nested { 24. } else { 8. }))
+                .py_1()
+                .text_xs()
+                .text_color(t.muted)
+                .child(name)
+                .into_any_element(),
+            Line::Catalog { name, storage, error } => {
+                let detach = clone_str(&name);
+                let attached = error.is_none();
+                // One the workspace records and could not attach is
+                // greyed, holds nothing, and says why on hover.
+                let color = if attached { t.muted } else { t.muted.opacity(0.5) };
+                div()
+                    .id(SharedString::from(format!("catalog-{name}")))
+                    .pl_2()
+                    .pr_2()
+                    .pt_2()
+                    .pb_1()
+                    .h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(div().flex_1().min_w_0().truncate().text_xs().font_weight(FontWeight::BOLD).text_color(color).child(name))
+                    .child(div().text_xs().text_color(color).child(storage))
+                    .when_some(error, |row, error| {
+                        let error = SharedString::from(error);
+                        row.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(error.clone()).build(window, cx))
+                    })
+                    .context_menu(move |menu, _, _| {
+                        menu.menu("Detach", Box::new(crate::DetachCatalog { name: clone_str(&detach), attached }))
+                    })
+                    .into_any_element()
+            }
+            Line::Table { rel, columns, rows } => {
+                let selected = self.selected_table.as_ref() == Some(&rel);
+                let menu_rel = rel.clone();
+                self.relation_row(&rel, selected, t, cx)
+                    .child(named_count(&rel.name, Some(columns), t))
+                    // Exact row count in compact SI form — rows are what a
+                    // scan of a database cares about; column counts
+                    // live in the footer status and Structure view.
+                    .when_some(rows, |d, n| d.child(dim(t, crate::util::human(n as f64, ""))))
+                    .context_menu(move |menu, window, cx| save_as_menu(menu, &menu_rel, window, cx))
+                    .into_any_element()
+            }
+            Line::View { rel, columns, error, file } => {
+                let selected = self.selected_table.as_ref() == Some(&rel);
+                let menu_rel = rel.clone();
+                // A view in the workspace that reads a file can become a
+                // table, and leave the workspace; any other view is the
+                // database's own, and only saved.
+                let own = workspace && rel.catalog.is_none() && file;
+                let row = self.relation_row(&rel, selected, t, cx);
+                let row = match &error {
+                    // A view that does not read says why, and shows no
+                    // columns it does not have.
+                    Some(error) => {
+                        let error = clone_str(error);
+                        row.child(div().flex_1().min_w_0().truncate().text_sm().text_color(t.warn).child(clone_str(&rel.name)))
+                            .tooltip(move |window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new(clone_str(&error)).build(window, cx)
+                            })
+                    }
+                    None => row.child(named_count(&rel.name, Some(columns), t)),
+                };
+                // Read-only, said where a table says its rows.
+                row.child(dim(t, "view".to_string()))
+                    .context_menu(move |menu, window, cx| {
+                        let menu = match own {
+                            true => menu.menu("Import as Table", Box::new(crate::ImportView { rel: menu_rel.clone() })),
+                            false => menu,
+                        };
+                        let menu = save_as_menu(menu, &menu_rel, window, cx);
+                        match own {
+                            true => menu
+                                .separator()
+                                .menu("Remove from Workspace", Box::new(crate::RemoveView { rel: menu_rel.clone() })),
+                            false => menu,
+                        }
+                    })
+                    .into_any_element()
             }
         }
-        out
+    }
+
+    /// A table's or a view's row: selected on a click, and on a double
+    /// click shown in the Data view.
+    fn relation_row(&self, rel: &Rel, selected: bool, t: Pal, cx: &mut Context<Self>) -> Stateful<Div> {
+        let key = rel.clone();
+        let id = format!("t-{}-{}-{}", rel.catalog.as_deref().unwrap_or(""), rel.schema, rel.name);
+        list_row(SharedString::from(id), selected, t)
+            // Text starts on the database names' axis: their
+            // rows indent 8px pad + 8px dot + 8px gap = 24.
+            .pl(px(24.))
+            .pr_2()
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                if event.click_count() == 2 {
+                    crate::prefs::toggle(cx, |prefs| {
+                        prefs.view = crate::prefs::ViewMode::Data;
+                    });
+                }
+                this.select_table(key.clone(), window, cx);
+            }))
     }
 }
 
-/// The catalog's tables for one schema, in the sidebar's chosen order.
-/// Both renderers of that order (the tree and visible_tables) come
-/// through here, so the keyboard can never disagree with the eye.
-fn tables_in_order<'a>(
-    catalog: &'a harbor_client::Catalog,
-    schema: &str,
-    family_sort: bool,
-) -> Vec<&'a harbor_client::catalog::Table> {
-    let mut tables = catalog.tables_in(schema);
-    if family_sort {
-        tables.sort_by(|a, b| family_cmp(&a.name, &b.name));
+/// Save As, a submenu of the four formats Export writes.
+fn save_as_menu(menu: PopupMenu, rel: &Rel, window: &mut Window, cx: &mut Context<PopupMenu>) -> PopupMenu {
+    let rel = rel.clone();
+    menu.submenu("Save As", window, cx, move |menu, _, _| {
+        use crate::export::Format;
+        [("CSV\u{2026}", Format::Csv), ("Parquet\u{2026}", Format::Parquet), ("JSON\u{2026}", Format::Json), ("Excel\u{2026}", Format::Excel)]
+            .into_iter()
+            .fold(menu, |menu, (label, format)| menu.menu(label, Box::new(crate::SaveAs { rel: rel.clone(), format })))
+    })
+}
+
+/// One line of the TABLES tree.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Line {
+    /// A schema's heading: among the database's own when it has more than
+    /// one, or within an attached catalog that has more than one
+    /// (`nested`).
+    Schema { name: String, nested: bool },
+    /// An attached catalog's heading, its engine's name for its storage
+    /// (`sqlite`), and why it is not attached when the workspace records it
+    /// and could not attach it (its file gone), holding nothing.
+    Catalog { name: String, storage: String, error: Option<String> },
+    /// A table, its column count and its exact row count where the
+    /// catalog has one.
+    Table { rel: Rel, columns: usize, rows: Option<u64> },
+    /// A view, read-only: its column count, why it does not read when it
+    /// does not, and whether it reads a file (`workspace::view_source`).
+    View { rel: Rel, columns: usize, error: Option<String>, file: bool },
+}
+
+impl Line {
+    /// The relation the line selects, for a table or a view.
+    pub(crate) fn rel(&self) -> Option<&Rel> {
+        match self {
+            Line::Table { rel, .. } | Line::View { rel, .. } => Some(rel),
+            Line::Schema { .. } | Line::Catalog { .. } => None,
+        }
     }
-    tables
+}
+
+/// The TABLES tree, line by line: the database's own tables, then its
+/// views, schema by schema with a heading when there is more than one
+/// schema; then each attached catalog under a heading of its own, its
+/// tables and views in the same order. The tree and ⌥←/⌥→
+/// (`visible_tables`) both read it, so the keyboard walks what the eye
+/// sees. A filter keeps the tables and views whose names hold it, and
+/// every heading.
+pub(crate) fn tree_lines(catalog: &harbor_client::Catalog, family_sort: bool, filter: &Option<String>) -> Vec<Line> {
+    let mut out = Vec::new();
+    let order = |a: &str, b: &str| if family_sort { family_cmp(a, b) } else { a.cmp(b) };
+    let relations = |out: &mut Vec<Line>, catalog_name: Option<&str>, tables: Vec<&harbor_client::Table>, views: Vec<&wire::catalog::View>, schema: &str| {
+        let rel = |name: &str| match catalog_name {
+            Some(c) => Rel::of(c, schema, name),
+            None => Rel::own(schema, name),
+        };
+        let mut tables = tables;
+        tables.sort_by(|a, b| order(&a.name, &b.name));
+        for t in tables.into_iter().filter(|t| matches(&t.name, filter)) {
+            out.push(Line::Table { rel: rel(&t.name), columns: t.columns.len(), rows: t.row_count });
+        }
+        let mut views = views;
+        views.sort_by(|a, b| order(&a.name, &b.name));
+        for v in views.into_iter().filter(|v| matches(&v.name, filter)) {
+            let file = v.ddl.as_deref().and_then(harbor_client::workspace::view_source).is_some();
+            out.push(Line::View { rel: rel(&v.name), columns: v.columns.len(), error: v.error.clone(), file });
+        }
+    };
+    let schemas = catalog.schemas();
+    for schema in &schemas {
+        if schemas.len() > 1 {
+            out.push(Line::Schema { name: schema.to_string(), nested: false });
+        }
+        relations(&mut out, None, catalog.tables_in(schema), catalog.views_in(schema), schema);
+    }
+    for attached in &catalog.attached {
+        out.push(Line::Catalog { name: attached.name.clone(), storage: attached.storage.clone(), error: attached.error.clone() });
+        let schemas = attached.schemas();
+        for schema in &schemas {
+            if schemas.len() > 1 {
+                out.push(Line::Schema { name: schema.to_string(), nested: true });
+            }
+            relations(&mut out, Some(&attached.name), attached.tables_in(schema), attached.views_in(schema), schema);
+        }
+    }
+    out
 }
 
 /// Family collation: `_` sorts after the alphabet instead of before it,
@@ -632,4 +768,103 @@ fn filter_row(input: &Entity<gpui_kit::component::input::InputState>) -> Div {
 /// too-narrow query just blanks the list.
 fn empty_note(t: Pal, text: &'static str) -> Div {
     div().px_2().py_1().text_xs().text_color(t.muted).child(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{tree_lines, Line};
+    use crate::sql::Rel;
+    use wire::catalog::{Attached, Catalog, Table, View};
+
+    fn table(schema: &str, name: &str) -> Table {
+        Table { name: name.into(), schema: schema.into(), row_count: Some(3), ..Default::default() }
+    }
+
+    fn view(name: &str, ddl: &str, error: Option<&str>) -> View {
+        View { name: name.into(), schema: "main".into(), ddl: Some(ddl.into()), error: error.map(Into::into), ..Default::default() }
+    }
+
+    fn rels(lines: &[Line]) -> Vec<Rel> {
+        lines.iter().filter_map(|l| l.rel().cloned()).collect()
+    }
+
+    #[test]
+    fn the_tree_lists_tables_then_views_then_each_attached_catalog() {
+        let catalog = Catalog {
+            tables: vec![table("main", "orders"), table("main", "order_items")],
+            views: vec![
+                view("sales", "CREATE VIEW sales AS SELECT * FROM read_csv('/x/sales.csv');", None),
+                view("gone", "CREATE VIEW gone AS SELECT * FROM read_csv('/x/gone.csv');", Some("IO Error: No files found")),
+                view("calc", "CREATE VIEW calc AS SELECT 1;", None),
+            ],
+            attached: vec![
+                Attached { name: "app".into(), storage: "sqlite".into(), tables: vec![table("main", "people")], ..Default::default() },
+                Attached {
+                    name: "gone".into(),
+                    storage: "sqlite".into(),
+                    error: Some("/x/gone.sqlite: no such file".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let lines = tree_lines(&catalog, false, &None);
+        assert_eq!(
+            rels(&lines),
+            [
+                Rel::own("main", "order_items"),
+                Rel::own("main", "orders"),
+                Rel::own("main", "calc"),
+                Rel::own("main", "gone"),
+                Rel::own("main", "sales"),
+                Rel::of("app", "main", "people"),
+            ]
+        );
+        // A view says why it does not read, and whether it reads a file.
+        assert!(lines.contains(&Line::View {
+            rel: Rel::own("main", "gone"),
+            columns: 0,
+            error: Some("IO Error: No files found".into()),
+            file: true
+        }));
+        assert!(lines.contains(&Line::View { rel: Rel::own("main", "calc"), columns: 0, error: None, file: false }));
+        // The attached catalog has a heading of its own; one schema needs none.
+        assert_eq!(lines[5], Line::Catalog { name: "app".into(), storage: "sqlite".into(), error: None });
+        // One the workspace records and could not attach heads nothing,
+        // and says why.
+        assert_eq!(
+            lines[7..],
+            [Line::Catalog { name: "gone".into(), storage: "sqlite".into(), error: Some("/x/gone.sqlite: no such file".into()) }]
+        );
+        assert!(!lines.iter().any(|l| matches!(l, Line::Schema { .. })));
+        // Family sort puts a base table ahead of its children.
+        assert_eq!(rels(&tree_lines(&catalog, true, &None))[..2], [Rel::own("main", "orders"), Rel::own("main", "order_items")]);
+        // A filter keeps what matches, tables and views alike, and the headings.
+        let lines = tree_lines(&catalog, false, &Some("e".into()));
+        assert_eq!(rels(&lines), [Rel::own("main", "order_items"), Rel::own("main", "orders"), Rel::own("main", "gone"), Rel::own("main", "sales"), Rel::of("app", "main", "people")]);
+        let lines = tree_lines(&catalog, false, &Some("zzz".into()));
+        assert!(rels(&lines).is_empty() && lines.len() == 2);
+    }
+
+    #[test]
+    fn schemas_are_headed_only_where_there_is_more_than_one() {
+        let catalog = Catalog {
+            tables: vec![table("main", "a"), table("audit", "log")],
+            attached: vec![Attached { name: "app".into(), tables: vec![table("main", "p"), table("x", "q")], ..Default::default() }],
+            ..Default::default()
+        };
+        let lines = tree_lines(&catalog, false, &None);
+        let heads: Vec<_> = lines.iter().filter(|l| l.rel().is_none()).collect();
+        assert_eq!(
+            heads,
+            [
+                &Line::Schema { name: "main".into(), nested: false },
+                &Line::Schema { name: "audit".into(), nested: false },
+                &Line::Catalog { name: "app".into(), storage: String::new(), error: None },
+                &Line::Schema { name: "main".into(), nested: true },
+                &Line::Schema { name: "x".into(), nested: true },
+            ]
+        );
+        assert_eq!(rels(&lines)[3], Rel::of("app", "x", "q"));
+    }
 }

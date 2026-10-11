@@ -6,11 +6,14 @@ mod app;
 mod add_database;
 mod chrome;
 mod content;
+mod copy;
 mod copy_button;
 mod edits;
+mod export;
 mod footer;
 mod grid;
 mod inspector;
+mod open;
 mod prefs;
 mod query;
 mod sql;
@@ -29,11 +32,29 @@ actions!(
     [
         ToggleInspector, About, Quit, ZoomIn, ZoomOut, ZoomReset, FitColumns, RefreshTables,
         AddRow, DuplicateRow, DeleteRow, TablePrev, TableNext, View1, View2, View3, ToggleFullScreen,
-        ToggleRowNumbers, ToggleRightAlign, ToggleNullTags, ToggleColumnCards, OpenDatabase,
+        ToggleRowNumbers, ToggleRightAlign, ToggleNullTags, ToggleColumnCards, OpenFile,
         OpenDatabaseUrl,
-        CheckForUpdates
+        CheckForUpdates, CopyCells
     ]
 );
+
+/// Edit → Copy as CSV, Markdown or SQL INSERT: the selection of the grid
+/// with the keyboard, or of the view's grid, written as `format`. ⌘C is
+/// `CopyCells`, the same copy as TSV.
+#[derive(Clone, Default, PartialEq, Debug, Action)]
+#[action(namespace = ducktable, no_json)]
+pub struct CopyAs {
+    pub(crate) format: copy::Format,
+}
+
+/// File → Export Table or Export Results, in one format; the save panel
+/// asks where (export.rs).
+#[derive(Clone, Default, PartialEq, Debug, Action)]
+#[action(namespace = ducktable, no_json)]
+pub struct Export {
+    pub(crate) results: bool,
+    pub(crate) format: export::Format,
+}
 
 /// Pick a theme by its index in `theme::list` — carried as data so one
 /// action serves every theme the sidebar picker lists. `no_json`:
@@ -98,6 +119,39 @@ pub struct RemoveRemoteDatabase {
     pub name: String,
 }
 
+/// Right-click → Import as Table on a workspace view (docs/OPEN.md).
+#[derive(Clone, Default, PartialEq, Debug, Action)]
+#[action(namespace = ducktable, no_json)]
+pub struct ImportView {
+    pub(crate) rel: sql::Rel,
+}
+
+/// Right-click → Remove from Workspace on a workspace view: the view is
+/// dropped, and the file it reads left as it is.
+#[derive(Clone, Default, PartialEq, Debug, Action)]
+#[action(namespace = ducktable, no_json)]
+pub struct RemoveView {
+    pub(crate) rel: sql::Rel,
+}
+
+/// Right-click → Detach on an attached catalog (a SQLite file), or on one
+/// the workspace records and could not attach (`attached` false).
+#[derive(Clone, Default, PartialEq, Debug, Action)]
+#[action(namespace = ducktable, no_json)]
+pub struct DetachCatalog {
+    pub(crate) name: String,
+    pub(crate) attached: bool,
+}
+
+/// Right-click → Save As on a table or view: every row of it written to a
+/// file in one format, through Export (export.rs).
+#[derive(Clone, Default, PartialEq, Debug, Action)]
+#[action(namespace = ducktable, no_json)]
+pub struct SaveAs {
+    pub(crate) rel: sql::Rel,
+    pub(crate) format: export::Format,
+}
+
 /// ⌥←/⌥→: the previous/next table in the sidebar (App::step_table).
 /// App-level, like the view keys, so it works from any view; text
 /// inputs stay safe — their own alt-arrow bindings (word jump) sit
@@ -127,7 +181,8 @@ fn on_view(cx: &mut App, f: impl FnOnce(&mut DuckTable, &mut Context<DuckTable>)
 fn on_view_in(cx: &mut App, f: impl FnOnce(&mut DuckTable, &mut Window, &mut Context<DuckTable>) + 'static) {
     let Some(view) = app_view(cx) else { return };
     cx.defer(move |cx| {
-        if let Some(w) = cx.active_window() {
+        // A path opened from Finder arrives while another app is active.
+        if let Some(w) = cx.active_window().or_else(|| cx.windows().first().copied()) {
             w.update(cx, |_, window, cx| view.update(cx, |this, cx| f(this, window, cx))).ok();
         }
     });
@@ -203,15 +258,26 @@ fn app_menus(can_update: bool) -> Vec<Menu> {
     vec![
         Menu::new("DuckTable").items(app_menu),
         Menu::new("File").items([
-            // The platform picker, then the same door a drop uses.
+            // The platform picker, then the same door a drop uses: a
+            // database, or anything that opens in the workspace (open.rs).
             // ⌘O advertises itself from the keymap binding.
-            MenuItem::action("Open Database File…", OpenDatabase),
+            MenuItem::action("Open\u{2026}", OpenFile),
             MenuItem::action("Open Database URL…", OpenDatabaseUrl),
+            MenuItem::separator(),
+            // The save panel has no format picker, so the format is
+            // chosen here; a name typed with another format's extension
+            // takes that one (export::format_for).
+            MenuItem::submenu(Menu::new("Export Table").items(export_items(false))),
+            MenuItem::submenu(Menu::new("Export Results").items(export_items(true))),
         ]),
         Menu::new("Edit").items([
             MenuItem::action("New Row", AddRow),
             MenuItem::action("Duplicate Row", DuplicateRow),
             MenuItem::action("Delete Row", DeleteRow),
+            MenuItem::separator(),
+            MenuItem::action("Copy as CSV", CopyAs { format: copy::Format::Csv }),
+            MenuItem::action("Copy as Markdown", CopyAs { format: copy::Format::Markdown }),
+            MenuItem::action("Copy as SQL INSERT", CopyAs { format: copy::Format::SqlInsert }),
         ]),
         // macOS shows each item's key equivalent from the keymap, so this
         // menu is also where the zoom shortcuts advertise themselves.
@@ -249,6 +315,93 @@ fn app_menus(can_update: bool) -> Vec<Menu> {
             MenuItem::action("Toggle Full Screen", ToggleFullScreen),
         ]),
     ]
+}
+
+/// One export submenu: the four formats, for the table or the result.
+fn export_items(results: bool) -> Vec<MenuItem> {
+    use export::Format;
+    [("CSV…", Format::Csv), ("Parquet…", Format::Parquet), ("JSON…", Format::Json), ("Excel…", Format::Excel)]
+        .into_iter()
+        .map(|(label, format)| MenuItem::action(label, Export { results, format }))
+        .collect()
+}
+
+/// The grid a copy reads: the one whose table has the keyboard, or with
+/// none, the grid the view shows (the Structure view's columns, the Data
+/// table, or the Query result).
+fn copy_source(this: &DuckTable, window: &Window, cx: &App) -> Option<Entity<grid::Grid>> {
+    let data = this.grid.clone();
+    let columns = data.as_ref().and_then(|g| g.read(cx).structure_grid.clone());
+    let results = this.query.as_ref().and_then(|q| q.read(cx).results_grid());
+    let focused = [&data, &columns, &results]
+        .into_iter()
+        .flatten()
+        .find(|g| g.read(cx).table.focus_handle(cx).contains_focused(window, cx))
+        .cloned();
+    focused.or(match prefs::get(cx).view {
+        prefs::ViewMode::Structure => columns,
+        prefs::ViewMode::Data => data,
+        prefs::ViewMode::Query => results,
+    })
+}
+
+/// Copy the selection as `format` (copy.rs), and say so in the status line.
+fn copy_selection(format: copy::Format, cx: &mut App) {
+    on_view_in(cx, move |this, window, cx| {
+        let Some(grid) = copy_source(this, window, cx) else {
+            footer::say(cx, "nothing to copy", true, Some(std::time::Duration::from_secs(4)));
+            return;
+        };
+        match grid.read(cx).copy_selection(format, cx) {
+            Ok((text, word)) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                footer::say(cx, word, false, Some(std::time::Duration::from_secs(4)));
+            }
+            Err(why) => {
+                footer::say(cx, why, true, Some(std::time::Duration::from_secs(4)));
+            }
+        }
+    });
+}
+
+/// File → Export Table (the Data view's table, under its filter, in the
+/// order the grid shows) or Export Results (the statement behind the Query
+/// result).
+fn export_grid(results: bool, format: export::Format, cx: &mut App) {
+    if asking_to_quit(cx) {
+        return;
+    }
+    on_view(cx, move |this, cx| {
+        let grid = if results { this.query.as_ref().and_then(|q| q.read(cx).results_grid()) } else { this.grid.clone() };
+        let Some(grid) = grid else {
+            let why = if results { "run a query to export its result" } else { "choose a table to export" };
+            footer::say(cx, why, true, Some(std::time::Duration::from_secs(4)));
+            return;
+        };
+        match grid.read(cx).export_plan(results, cx) {
+            Ok(plan) => export::start(plan, format, cx),
+            Err(why) => {
+                footer::say(cx, why, true, Some(std::time::Duration::from_secs(8)));
+            }
+        }
+    });
+}
+
+/// Save As on a sidebar table or view: every row of it, in the order the
+/// engine reads them, through Export.
+fn save_as(rel: sql::Rel, format: export::Format, cx: &mut App) {
+    if asking_to_quit(cx) {
+        return;
+    }
+    on_view(cx, move |this, cx| {
+        let app::Phase::Connected { conn, .. } = &this.phase else { return };
+        if let Some(why) = export::refusal(conn.db.is_some(), false, true, false) {
+            footer::say(cx, why, true, Some(std::time::Duration::from_secs(8)));
+            return;
+        }
+        let plan = export::Plan { conn: conn.clone(), select: format!("SELECT * FROM {}", rel.source()), stem: rel.name.clone() };
+        export::start(plan, format, cx);
+    });
 }
 
 /// Quit, or leave the connected database, stop a server or remove a saved
@@ -461,13 +614,11 @@ impl Render for DuckTable {
             .size_full()
             .h_flex()
             .font_family(theme::ui_font())
-            // Drop a database file anywhere on the window: the same door
-            // as File→Open. First path wins — a multi-file drop opening N
-            // databases would be N-1 surprises.
-            .on_drop(cx.listener(|this, dropped: &ExternalPaths, _, cx| {
-                if let Some(path) = dropped.paths().first().cloned() {
-                    leave_asking(this.switch_to(app::Aim::File(path)), cx);
-                }
+            // Drop files anywhere on the window: the same door as File →
+            // Open…. Every path opens: the data files of a drop together
+            // in the workspace, or one database by itself (`open::plan`).
+            .on_drop(cx.listener(|_, dropped: &ExternalPaths, _, cx| {
+                open::open_paths(dropped.paths().to_vec(), cx);
             }))
             // The sidebar/content divider drags rightward from its
             // classic fixed width, the floor: the divider only grants more
@@ -516,6 +667,19 @@ fn suppress_fullscreen_menu_item() {
 fn main() {
     suppress_fullscreen_menu_item();
     let app = gpui_kit::application().with_assets(Assets);
+    // Every path that arrives from outside the window, in one queue the app
+    // reads once its window is up: Finder's double-click and Open With, a
+    // drop on the Dock icon and `open -a` hand the app file URLs, which can
+    // come before it has finished launching; a command line names paths.
+    let (arrived, arrivals) = async_channel::unbounded::<Vec<std::path::PathBuf>>();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let named = open::paths_from_args(std::env::args_os(), &cwd);
+    if !named.is_empty() {
+        let _ = arrived.try_send(named);
+    }
+    app.on_open_urls(move |urls| {
+        let _ = arrived.try_send(open::paths_from_urls(&urls));
+    });
 
     app.run(move |cx| {
         gpui_kit::init(cx);
@@ -565,7 +729,7 @@ fn main() {
         }
         cx.bind_keys([
             KeyBinding::new("cmd-i", ToggleInspector, None),
-            KeyBinding::new("cmd-o", OpenDatabase, None),
+            KeyBinding::new("cmd-o", OpenFile, None),
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-r", RefreshTables, None),
             KeyBinding::new("cmd-n", AddRow, None),
@@ -597,36 +761,50 @@ fn main() {
             KeyBinding::new("cmd-9", ToggleNullTags, None),
             KeyBinding::new("cmd-t", ToggleColumnCards, None),
         ]);
-        // File→Open: the platform picker, then the same door a drag-drop
-        // uses (`Aim::File`). It opens a DuckDB file. The picker offers no extension filter (gpui's
-        // PathPromptOptions has none), and none is enforced here: a wrong
-        // file fails honestly in the connect card with harbor's own error.
-        cx.on_action(|_: &OpenDatabase, cx| {
-            // Under the quit dialog a database is not opened: Cancel must
-            // find everything as it was.
+        // File → Open…: the platform picker, then the same door a drop
+        // uses (`open::open_paths`): a database, files and folders that open
+        // in the workspace, several at once. The picker offers no extension
+        // filter (gpui's PathPromptOptions has none); a file that cannot be
+        // opened says why, with what was looked at.
+        cx.on_action(|_: &OpenFile, cx| {
+            // Under the quit dialog nothing is opened: Cancel must find
+            // everything as it was.
             if asking_to_quit(cx) {
                 return;
             }
             let rx = cx.prompt_for_paths(PathPromptOptions {
                 files: true,
-                directories: false,
-                multiple: false,
+                directories: true,
+                multiple: true,
                 prompt: Some("Open".into()),
             });
             cx.spawn(async move |cx| {
-                if let Ok(Ok(Some(mut paths))) = rx.await
-                    && let Some(path) = paths.pop()
-                {
-                    cx.update(|cx| {
-                        if let Some(view) = app_view(cx) {
-                            let leaving = view.read(cx).switch_to(app::Aim::File(path));
-                            leave_asking(leaving, cx);
-                        }
-                    });
+                if let Ok(Ok(Some(paths))) = rx.await {
+                    cx.update(|cx| open::open_paths(paths, cx));
                 }
             })
             .detach();
         });
+        // The paths from outside the window, as they come.
+        cx.spawn(async move |cx| {
+            while let Ok(paths) = arrivals.recv().await {
+                cx.update(|cx| open::open_paths(paths, cx));
+            }
+        })
+        .detach();
+        cx.on_action(|a: &ImportView, cx| {
+            let rel = a.rel.clone();
+            on_view_in(cx, move |this, window, cx| this.import_view(rel, window, cx));
+        });
+        cx.on_action(|a: &RemoveView, cx| {
+            let rel = a.rel.clone();
+            on_view_in(cx, move |this, window, cx| this.remove_view(rel, window, cx));
+        });
+        cx.on_action(|a: &DetachCatalog, cx| {
+            let (name, attached) = (a.name.clone(), a.attached);
+            on_view_in(cx, move |this, window, cx| this.detach_catalog(name, attached, window, cx));
+        });
+        cx.on_action(|a: &SaveAs, cx| save_as(a.rel.clone(), a.format, cx));
         cx.on_action(|_: &OpenDatabaseUrl, cx| {
             if asking_to_quit(cx) {
                 return;
@@ -673,6 +851,11 @@ fn main() {
         cx.on_action(|_: &DeleteRow, cx| {
             run_row_action(grid::Grid::delete_row, cx)
         });
+        // ⌘C reaches here only from a focused table (its binding's
+        // context, grid::init); the Edit menu's copies from anywhere.
+        cx.on_action(|_: &CopyCells, cx| copy_selection(copy::Format::Tsv, cx));
+        cx.on_action(|a: &CopyAs, cx| copy_selection(a.format, cx));
+        cx.on_action(|a: &Export, cx| export_grid(a.results, a.format, cx));
         // One command behind both the View menu and Cmd+R. The sidebar
         // glyph calls the same refresh_tables method directly from its
         // DuckTable context, so every entrance has identical semantics.

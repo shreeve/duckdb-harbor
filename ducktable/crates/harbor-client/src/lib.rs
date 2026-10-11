@@ -4,14 +4,16 @@
 //! the transport, sessions and summon from `harbor-http`, the client half
 //! harbor's own CLI speaks through, so this crate cannot drift from what
 //! harbor means by a name, a socket, a state, or an answer. What lives here
-//! is what a GUI wants on top: results read whole, the catalog, and the
-//! fleet — every database a live socket or the config knows, discovered the
-//! same way bare `harbor` discovers them.
+//! is what a GUI wants on top: results read whole, the catalog, the engine's
+//! completer, and the fleet — every database a live socket or the config
+//! knows, discovered the same way bare `harbor` discovers them.
 
 pub mod catalog;
+pub mod complete;
 pub mod fleet;
 pub use harbor_http as http;
 pub mod query;
+pub mod workspace;
 
 pub use catalog::{catalog, catalog_lite, Catalog, Table};
 pub use fleet::{connect_file, connect_remote, info, Conn};

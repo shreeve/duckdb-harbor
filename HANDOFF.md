@@ -537,6 +537,19 @@ and DuckTable 0.23.0 record.
   `x y` (`Parser::StripUnicodeSpaces`, `parser.cpp` at 394f547866;
   measured on alpha42779). `wire::statement` mirrors the pre-pass, quirks
   included, so harbor reads the statement as the engine runs it.
+- **Upstream bug to file (Steve's voice): ATTACH/DETACH of a SQLite
+  database beside a catalog read.** Two connections, one looping `ATTACH
+  '/tmp/s.db' AS s (TYPE sqlite); DETACH s;`, the other `SELECT * FROM
+  duckdb_tables();`: within 20 s, 5 of 5 runs end in an internal error, a
+  database invalidated for every later statement, or a segfault
+  (alpha42289, linux_amd64; `duckdb_databases()` as the reader survives).
+  Harbor serializes the two (0.46.0), but a view whose body calls a catalog
+  function is not recognized as a catalog read.
+- **An attached SQLite file that stops reading fails `/catalog`.** The
+  engine's catalog functions walk every attached database together, so one
+  locked or replaced file fails the whole read (named, in about two
+  seconds) until it is detached; the workspace start detaches such a file,
+  but a running server does not.
 - **The old community extension** `harbor` v0.4.0 is still listed in DuckDB's
   community extensions, pointing at a commit no longer in this repository
   (#145 is a user who found it). Asking DuckDB to retire the listing or point

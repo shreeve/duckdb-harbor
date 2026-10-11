@@ -403,9 +403,60 @@ at the top:
  …}
 ```
 
+Views and attached databases follow the tables:
+
+```json
+ "views":[{"name":"sales","schema":"main",
+           "columns":[{"name":"id","type":"BIGINT",…},…],
+           "error":null,
+           "ddl":"CREATE VIEW sales AS SELECT * FROM read_csv('/data/sales.csv');"},
+          {"name":"gone","schema":"main","columns":[],
+           "error":"IO Error: No files found that match the pattern \"/data/gone.csv\"",
+           "ddl":"…"}],
+ "attached":[{"name":"app","path":"/data/app.sqlite","type":"sqlite",
+              "readOnly":false,"error":null,"tables":[…],"views":[…]}]
+```
+
+A view has no `rowCount`: counting a view over a file reads the file. Its
+columns are the ones it reads as when the catalog is asked, since each view is
+bound first (a CSV's sample, a Parquet footer; a GeoJSON file whole, for GDAL
+parses it to open it). A view that does not bind — its file gone, or its
+extension not loaded — has no columns and the engine's reason in `error`, and
+the rest of the document is unaffected. Views are bound on a connection of
+their own, never a worker's, each within two seconds: one that takes longer
+(a mount that hangs, a slow URL) is reported unbound with why, and one over a
+pipe, a socket or a device is not bound at all, since a read of it waits on
+another program. A view over one file, as `harbor <file>` makes one, is bound
+again only once the file changes (its size, its modification time or its
+inode), so a GeoJSON file is parsed once, not at every catalog read. `attached` lists every database
+attached beside the served one, `system` and `temp` never, with its path
+(`null` in memory), its storage `type`, whether it is read-only, and its tables
+and views in the same shapes. A DuckDB catalog's tables carry exact counts;
+another engine's carry `rowCount: null`, since a count there reads every row.
+On the workspace, a file it records as attached and could not attach at its
+start, or whose catalog did not read once attached, is listed too, holding
+nothing, with why in `error` (`"/data/app.sqlite: no such file"`); `error` is
+`null` for a database that is attached. An attached SQLite file whose catalog
+does not read — not SQLite after all, or held locked by another program —
+fails the whole read with a `400` that names it and says why, since the
+engine reads every attached database's catalog together and lists none while
+one does not; it reads again once that file does, or once it is detached. A
+SQLite file harbor attaches waits a second on a lock (`BUSY_TIMEOUT 1000`;
+the engine's own default is five), so a locked one fails a read in about a
+second rather than holding it.
+A table or view another client drops, or a database it detaches, while the
+catalog is being read is left out; it never fails the read. An `ATTACH` or
+`DETACH` runs alone against every statement that reads the catalog — `/catalog`
+itself, the `duckdb_…` and `pragma_…` functions, `information_schema`, `SHOW`,
+`DESCRIBE` and the engine's completer — waiting for those running and holding
+back those that come after, since the engine brings itself down when a SQLite
+database is detached while a catalog read walks it. A view whose body reads the
+catalog is not seen as reading it.
+
 The document is stable — same database, same bytes — so clients can diff it.
 A client that only wants an inventory asks `GET /catalog?style=lite` and gets
-the versions, the sizes, and `{name, schema}` per table: what exists, without
+the versions, the sizes, `{name, schema}` per table and view, and each attached
+database with its tables and views named the same way: what exists, without
 counting it or describing how it is built, at a fraction of the work and bytes.
 An unknown style value is a loud `400`; unknown parameters pass.
 
@@ -537,6 +588,62 @@ its socket, and exits a few seconds later. A second `harbor` on the same file �
 any spelling of the same path — joins the same server instead of reporting
 "database is locked".
 
+**`harbor <data file>` — the workspace.** A CSV, a folder of Parquet, a
+spreadsheet or a SQLite file opens the same way, in the workspace: a DuckDB
+database at `~/.local/share/harbor/workspace.duckdb` (in `$XDG_DATA_HOME` or
+`$HARBOR_HOME` when one is set). Before the prompt, harbor makes a view over
+the file, named for it, or attaches the SQLite file, and says what it made:
+
+```text
+$ harbor ~/x/sales.csv
+sales: a view over ~/x/sales.csv
+workspace> SELECT region, sum(amount) FROM sales GROUP BY ALL;
+```
+
+| The file | Opens as |
+|---|---|
+| `.csv` `.tsv` `.txt` `.csv.gz` | a view over `read_csv` |
+| `.parquet`, or a folder of them | a view over `read_parquet` (a folder's `**/*.parquet`, `key=value` directories as columns) |
+| `.json` `.ndjson` `.jsonl` | a view over `read_json` |
+| `.xlsx` | a view over `read_xlsx`, its first sheet |
+| `.geojson` `.shp` `.gpkg` | a view over `ST_Read`, with `spatial` installed and loaded first |
+| SQLite (`.sqlite`, `.db`, …) | attached: `ATTACH … (TYPE sqlite, BUSY_TIMEOUT 1000)` |
+
+A file is known by its first bytes where its kind has a signature (DuckDB,
+SQLite, Parquet, Excel's zip, gzip, a shapefile) and by its name where it has
+none. A DuckDB file, a path ending `.duckdb`, and a path that does not exist yet
+open as databases, as above; a file harbor cannot tell is refused, naming what
+it looked at. The view reads the file where it lies, by its absolute path, so
+the file is never copied or changed and a 10 GB Parquet file opens at once. A
+name another relation or a reserved word has gets `_2`, `_3`; opening the same
+file again finds the view the first opening made. The `excel`, `sqlite` and
+`spatial` extensions install on first use.
+
+Every server that opens the workspace makes it whole before it serves anyone,
+whichever client summoned it: it loads `spatial` when a view calls an `ST_`
+function, since `spatial` does not load on demand (`excel`, `json`, `parquet`
+and `sqlite` do), and installs it in the background when it is not installed,
+never between the database and the socket, since an install is a download (the
+views that need it say why they do not read until it loads); and it attaches
+again each database file the workspace records. The record is the table
+`_harbor.attached` (`name`, `path`, `type`, `read_only`) in the workspace
+itself: `harbor <SQLite file>` writes its row, and the server rewrites it from
+what is attached when it stops, so a plain `ATTACH` or `DETACH` of a SQLite or
+DuckDB file, from any client, lasts past the server; one that ends without
+stopping (a crash, a `kill -9`) leaves the record as last written. A database
+`--init` attaches is the operator's, attached by each start that passes it,
+and is never recorded; a recorded file of the same name is not attached beside
+it, and its row stays as it is. `/catalog` does not list the record. A
+recorded file that is gone at the start is not attached, since attaching a
+missing path would make an empty database there, nor is a row whose path is
+not absolute, which would name a file in whichever directory a server starts
+in; one whose catalog does not read once attached (not SQLite after all, or
+locked by another program) is detached again, since it would fail every
+catalog read of the server; the server's log and `/catalog` say so, the server
+starts all the same, and the row stays, so the file is attached again at a
+later start once it reads. Deleting the row forgets it. The verbs (`start`,
+`backup`, …) act on databases and refuse a data file.
+
 **`harbor <db.duckdb> start` — the server is yours.** No refcount: it lives
 until you stop it. At a terminal the server comes up in the background and
 `start` returns — under the database's login item when it has one, so the
@@ -631,14 +738,16 @@ $ harbor 1                                                         # its footnot
 
 A name or a footnote reaches what is listed — a running server by the name
 it declares, an attached database by its config key — and a bare word never
-becomes a file. A name two running databases share is refused as ambiguous
+becomes a file: a folder of Parquet in the current directory is `harbor
+./lake`, and `harbor lake`, naming nothing listed, says so. A name two running databases share is refused as ambiguous
 rather than guessed. The verbs take the same spellings: `harbor labs stop`,
 `harbor 3 start`; opening a stopped one summons it the way its path would.
 
 A socket nothing answers on is a leftover from a `kill -9`, and the list
-unlinks it. Set `HARBOR_HOME` (absolute path) to collapse configuration and
-runtime state — sockets, logs, and history — into one directory; the test
-suites use it to keep their servers out of the real fleet view. A relative
+unlinks it. Set `HARBOR_HOME` (absolute path) to collapse configuration,
+runtime state — sockets, logs, and history — and the workspace into one
+directory; the test suites use it to keep their servers out of the real fleet
+view. A relative
 or empty `HARBOR_HOME` is an error, never a quiet fall back to the real
 config and fleet.
 

@@ -175,8 +175,19 @@ fn fetch_catalog_names(transport: &Transport) -> Option<Vec<String>> {
     }
     let doc: serde_json::Value = serde_json::from_str(&resp.body_string().ok()?).ok()?;
     let mut names = Vec::new();
-    if let Some(tables) = doc["tables"].as_array() {
-        for t in tables {
+    // Tables and views, the served database's and each attached one's, with
+    // the attached databases' own names.
+    let mut catalogs = vec![&doc];
+    if let Some(attached) = doc["attached"].as_array() {
+        for a in attached {
+            if let Some(n) = a["name"].as_str() {
+                names.push(n.to_string());
+            }
+            catalogs.push(a);
+        }
+    }
+    for catalog in catalogs {
+        for t in ["tables", "views"].iter().filter_map(|key| catalog[*key].as_array()).flatten() {
             if let Some(n) = t["name"].as_str() {
                 names.push(n.to_string());
             }

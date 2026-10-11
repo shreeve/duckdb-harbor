@@ -9,7 +9,8 @@ landed that did not; every rule below serves that or the native feel.
 
 `docs/DESIGN.md` is the product and the code layout, `docs/EDITING.md` the
 grid's laws and its one dialog, `docs/QUERY.md` the Query view and its
-transactions, and `docs/UPDATES.md` releasing and Sparkle. The repository's
+transactions, `docs/OPEN.md` opening files that are not DuckDB databases,
+and `docs/UPDATES.md` releasing and Sparkle. The repository's
 `HANDOFF.md` covers both products, how the owner works, and what is open:
 read it first.
 
@@ -18,14 +19,23 @@ read it first.
 - `crates/ducktable`: the app. `app.rs` is the root entity and the only
   mutator of connection state; the surfaces (`sidebar.rs`, `content.rs`,
   `grid.rs`, `structure.rs`, `inspector.rs`, `query.rs`, `footer.rs`) read
-  state and call back into it. `edits.rs` (the staging model) and `sql.rs`
-  (every hand-written query) are pure. Colors resolve through `theme.rs`.
-  `main.rs` holds the entry point, menus, key bindings and the quit dialog;
-  `updater.rs` is the Sparkle glue.
-- `crates/harbor-client`: results read whole, the catalog, and the fleet
-  (which databases exist, which server serves each, and the SSH tunnel to a
-  remote), on harbor's `harbor-http`, the transport, sessions and summon
-  harbor's own CLI speaks through.
+  state and call back into it. `edits.rs` (the staging model), `sql.rs`
+  (every hand-written query) and `copy.rs` (a grid's selection written as
+  TSV, CSV, Markdown or SQL) are pure. `export.rs` writes a table or a
+  result to a file through the engine's `COPY`, its decisions in pure
+  functions. `open.rs` is every way a path reaches the app (Finder, the
+  Dock, a drop, the command line, File → Open…) and what it opens
+  (`docs/OPEN.md`). `query/complete.rs` is the Query editor's completion:
+  the engine's completer first, the sidebar's catalog when it cannot answer.
+  Colors resolve through `theme.rs`. `main.rs` holds the entry point,
+  menus, key bindings and the quit dialog; `updater.rs` is the Sparkle
+  glue.
+- `crates/harbor-client`: results read whole, the catalog, the engine's
+  completer (`complete.rs`, DuckDB's `sql_auto_complete` on a pooled
+  connection), the workspace (`workspace.rs`: the views and attachments a
+  file opens as), and the fleet (which databases exist, which server serves
+  each, and the SSH tunnel to a remote), on harbor's `harbor-http`, the
+  transport, sessions and summon harbor's own CLI speaks through.
 - `crates/duckdb-lang`: the tree-sitter grammar the Query editor highlights
   with.
 - Harbor's `wire`, `common` and `http` crates are built from the sibling
@@ -85,13 +95,25 @@ the file `HARBOR_LIVE_DB` names:
 HARBOR_LIVE_DB=/tmp/scratch.duckdb cargo test -p harbor-client --test live -- --ignored
 ```
 
-`an_open_database_outlives_harbors_linger` also needs `HARBOR_FIXTURE`. Give
+`an_open_database_outlives_harbors_linger` also needs `HARBOR_FIXTURE`.
+`every_kind_of_file_opens_in_a_scratch_workspace` (in the app crate) opens
+each kind of file in the workspace under a scratch `HARBOR_HOME`, with
+`HARBOR_BIN` naming the harbor to run and `DUCKTABLE_OPEN_PROBE` an empty
+scratch directory for its files:
+
+```bash
+HARBOR_HOME=/tmp/dt-open HARBOR_BIN=../harbor/target/release/harbor \
+  DUCKTABLE_OPEN_PROBE=/tmp/dt-open-files cargo test -p ducktable every_kind_of_file -- --ignored
+```
+
+Give
 the probes their own `HARBOR_HOME` under `$TMPDIR`: a unix socket path has
 104 bytes, and a scratchpad path runs past it.
 
 To try a change, run `target/release/ducktable` with a scratch `HARBOR_HOME`
-whose config attaches a scratch database (`harbor <scratch.duckdb> attach`;
-DuckTable takes no path argument, and lists what the config attaches), and
+whose config attaches a scratch database (`harbor <scratch.duckdb> attach`),
+or with the paths to open (`ducktable sales.csv`, which opens in the
+scratch workspace under that `HARBOR_HOME`), and
 a scratch `HOME` for its own prefs, with `~/.ssh` linked into it, since ssh
 reads its `Include`s through `$HOME`. Or build the signed bundle with
 `scripts/macos-app.sh release`, which leaves `target/DuckTable.app`. Copy a
