@@ -2,9 +2,8 @@
 
 Read this first. It says what the repo is, how its owner works, how the
 pieces fit, how to build, test and release, and what is open. Everything
-here was true on 2026-10-10 at harbor v0.45.0 and DuckTable v0.23.0, the
-releases that carry the revamp; the changelogs and git history are the
-record after that.
+here was true on 2026-10-11 at harbor v0.46.0 and DuckTable v0.24.0; the
+changelogs and git history are the record after that.
 
 ## What this is
 
@@ -523,10 +522,10 @@ and DuckTable 0.23.0 record.
 
 ## Open items
 
-- **`live` runs harbor 0.44.2** until Steve runs `ssh -t live 'harbor
-  update --restart'`; its configuration passes the checks a 0.45 start
-  makes. This Mac runs 0.45.0, and the local medlabs server keeps 0.44.2
-  until it restarts.
+- **`live` runs harbor 0.45.0** until Steve runs `ssh -t live 'harbor
+  update --restart'`; its configuration passes the checks a start makes.
+  This Mac runs 0.46.0; the local medlabs server keeps the code it started
+  with until it restarts.
 - **Port to DuckDB's reworked v2 C API**, then set the `DUCKDB_LIB_BUILD`
   repository variable to `latest`. "The engine" above has the measured size
   of the port and what it waits for.
