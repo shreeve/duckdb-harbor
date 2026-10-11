@@ -289,8 +289,23 @@ fn pick(names: &[Option<String>], target: &str) -> Result<usize, String> {
 fn fleet_find(target: &str) -> Result<SurveyRow, String> {
     let mut rows = survey()?;
     let names: Vec<Option<String>> = rows.iter().map(SurveyRow::name).collect();
-    let i = pick(&names, target)?;
+    let i = pick(&names, target).map_err(|e| spelled_here(Path::new("."), target, e))?;
     Ok(rows.swap_remove(i))
+}
+
+/// A refusal of a bare word that is also the name of a file or a folder in
+/// `dir`, the working directory, saying how to open that: a bare word is a
+/// name, never a file, and `harbor lake` for the folder `lake` is
+/// `harbor ./lake`.
+fn spelled_here(dir: &Path, target: &str, refusal: String) -> String {
+    let here = dir.join(target);
+    let what = match () {
+        _ if target.chars().all(|c| c.is_ascii_digit()) => return refusal,
+        _ if here.is_dir() => "folder",
+        _ if here.exists() => "file",
+        _ => return refusal,
+    };
+    format!("{refusal}. The {what} {target} here opens as ./{target}")
 }
 
 /// The database file behind a bare-word argument in the verb grammar
@@ -1296,6 +1311,20 @@ mod tests {
         let n = names(&[Some("medlabs")]);
         let e = pick(&n, "scratch").unwrap_err();
         assert!(e.contains("names nothing running or attached"), "{e}");
+    }
+
+    #[test]
+    fn a_bare_word_that_is_a_folder_here_is_spelled_with_its_dot() {
+        let dir = std::env::temp_dir().join(format!("harbor-spelled-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("lake")).unwrap();
+        std::fs::write(dir.join("notes"), "x").unwrap();
+        let lake = super::spelled_here(&dir, "lake", "\"lake\" names nothing".into());
+        let notes = super::spelled_here(&dir, "notes", "\"notes\" names nothing".into());
+        let gone = super::spelled_here(&dir, "gone", "\"gone\" names nothing".into());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(lake, "\"lake\" names nothing. The folder lake here opens as ./lake");
+        assert_eq!(notes, "\"notes\" names nothing. The file notes here opens as ./notes");
+        assert_eq!(gone, "\"gone\" names nothing");
     }
 
     #[test]

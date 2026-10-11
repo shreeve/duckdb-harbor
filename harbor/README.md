@@ -738,7 +738,8 @@ $ harbor 1                                                         # its footnot
 
 A name or a footnote reaches what is listed — a running server by the name
 it declares, an attached database by its config key — and a bare word never
-becomes a file. A name two running databases share is refused as ambiguous
+becomes a file: a folder of Parquet in the current directory is `harbor
+./lake`, and `harbor lake`, naming nothing listed, says so. A name two running databases share is refused as ambiguous
 rather than guessed. The verbs take the same spellings: `harbor labs stop`,
 `harbor 3 start`; opening a stopped one summons it the way its path would.
 
