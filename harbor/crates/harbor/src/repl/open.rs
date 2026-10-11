@@ -137,13 +137,7 @@ fn attach(transport: &Transport, path: &str, shown: &str) -> Result<String, Stri
          UNION ALL SELECT schema_name FROM duckdb_schemas() \
          UNION ALL SELECT keyword_name FROM duckdb_keywords() WHERE keyword_category = 'reserved'",
     )?;
-    let recorded = format!(
-        "SELECT name FROM {}.{} WHERE path <> {}",
-        open::RECORD_SCHEMA,
-        open::RECORD_TABLE,
-        open::quote_literal(path)
-    );
-    taken.extend(names(transport, &recorded).unwrap_or_default());
+    taken.extend(names(transport, &open::Record::names_sql(path)).unwrap_or_default());
     let name = open::free_name(&open::view_name(path), |n| taken.iter().any(|t| t.eq_ignore_ascii_case(n)));
     rows(transport, &open::attach_sql(&name, path))?;
     remember(transport, &name, path, false)?;

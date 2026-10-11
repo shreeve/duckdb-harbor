@@ -331,6 +331,19 @@ impl Record {
             self.read_only
         )
     }
+
+    /// The record's row for the catalog `name` deleted, so no server that
+    /// opens the workspace attaches its file again.
+    pub fn delete_sql(name: &str) -> String {
+        format!("DELETE FROM {RECORD_SCHEMA}.{RECORD_TABLE} WHERE name = {}", quote_literal(name))
+    }
+
+    /// The names the record holds for files other than `path`. A catalog
+    /// for `path` takes none of them, or it would write over the row of a
+    /// file its server could not attach.
+    pub fn names_sql(path: &str) -> String {
+        format!("SELECT name FROM {RECORD_SCHEMA}.{RECORD_TABLE} WHERE path <> {}", quote_literal(path))
+    }
 }
 
 /// The extensions a statement calls into that the engine does not load on
@@ -551,6 +564,8 @@ mod tests {
         assert!(Record::kept("sqlite", "/a.sqlite") && Record::kept("duckdb", "/o.duckdb"));
         assert!(!Record::kept("duckdb", "") && !Record::kept("duckdb", ":memory:"));
         assert!(!Record::kept("postgres", "dbname=x password=y"));
+        assert_eq!(Record::delete_sql("o'x"), "DELETE FROM _harbor.attached WHERE name = 'o''x'");
+        assert_eq!(Record::names_sql("/x/o'brien.sqlite"), "SELECT name FROM _harbor.attached WHERE path <> '/x/o''brien.sqlite'");
         // The record's schema is no name a file's view or catalog takes.
         assert_eq!(view_name("/x/_harbor.sqlite"), "harbor");
     }
