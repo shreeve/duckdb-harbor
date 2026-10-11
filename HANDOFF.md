@@ -2,7 +2,7 @@
 
 Read this first. It says what the repo is, how its owner works, how the
 pieces fit, how to build, test and release, and what is open. Everything
-here was true on 2026-10-11 at harbor v0.46.0 and DuckTable v0.24.0; the
+here was true on 2026-10-11 at harbor v0.46.0 and DuckTable v0.24.1; the
 changelogs and git history are the record after that.
 
 ## What this is
