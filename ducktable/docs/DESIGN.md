@@ -82,7 +82,9 @@ Client architecture:
 - **Selection indices are display positions, not row identities.** Any sort
   or per-column value filter makes them diverge. Every read or mutation of a
   selected row resolves through one display-to-identity mapping. Commits are
-  keyed by row identity, never by display position.
+  keyed by row identity, never by display position. The header sort is the
+  server's, so it reorders by replacing the page, and the selection is
+  cleared with the rows it indexed.
 - **A refresh never clears the cache it is refreshing.** Fetch first, commit
   over the old value. "Has data" and "needs refetch" are separate states; a
   loading flag that discards data is a blank screen.
@@ -278,6 +280,34 @@ Display preferences are global: row numbers, right-aligned numbers and NULL
 tags, toggled from the grid's header strip, the View menu, or ⌘7/⌘8/⌘9, and
 kept in `~/.config/ducktable/prefs.json`.
 
+A click on a column header sorts the Data view by that column alone, and
+clicking it again cycles ascending, descending, none. ⇧-click adds the
+column as a further key, turns an ascending key descending where it
+stands, or takes a descending one out, the keys after it moving up. Each
+key's header carries an arrow in the accent color, ↑ or ↓, and its place
+when there are several (↑1, ↓2), on the side away from the name's aligned
+edge; a sortable column's fitted width keeps room for the mark, so sorting
+never moves a column. The sort is the page query's `ORDER BY`: each key
+quoted, with `NULLS LAST` in both directions, DuckDB's default, spelled
+out so that a `default_null_order` set on the server cannot turn an arrow
+around; then a tie-break, the primary key, the rowid of a keyless table,
+or every column of a table with neither. Rows the keys tie keep one order
+from one page's query to the next, so a page boundary falls in one place
+and every row is on exactly one page; without the tie-break, DuckDB's
+parallel sort returns tied rows in another order on each run. The count is
+never ordered: a sort reads page 1 again with the total it had. A sort
+replaces the page as a page change does, so it confirms an open editor
+first and clears the selection, and staged changes follow their rows by
+identity wherever the sort puts them (EDITING.md). The rows and the header
+marks change together when the page lands; a page that fails leaves both.
+
+The sort belongs to its table for the session: back on the table, the
+grid opens sorted as it was left, unless the table has lost a column the
+sort names, which clears it. A sort kept on a table whose column another
+client drops clears itself on the next page, and the status line says so.
+The Query view's results are ordered by their statement and the Structure
+grid by the table's columns; neither sorts.
+
 The Structure view shows the table's columns (key and NOT NULL chips,
 defaults) and its DDL, all from the `/catalog` document. Structure and Data
 never render side by side: a schema change reshapes the data.
@@ -303,9 +333,17 @@ column count sits beside the row range it describes.
 
 The filter is one raw SQL `WHERE` strip under the header, applied on Enter,
 which refetches page 1 with a fresh count. An `ORDER BY` that ends it sorts
-the pages (`x > 0 ORDER BY name`, or `ORDER BY name` alone); the grid has no
-sort of its own. The condition is wrapped in parentheses and the ordering
-follows them, so the strip cannot reach past the page's `LIMIT`.
+the pages (`x > 0 ORDER BY name`, or `ORDER BY name` alone), as typed: no
+tie-break is added to the user's SQL. The condition is wrapped in
+parentheses and the ordering follows them, so the strip cannot reach past
+the page's `LIMIT`.
+
+A page has one ordering, the one last asked for. Applying a strip that ends
+in an `ORDER BY` clears the header sort; a header click afterwards sets the
+strip's ordering aside, and the strip says so beside its field, until the
+header sort has no keys again. The two are never joined: the strip's
+ordering may take no key after it (`ORDER BY ALL`), and header keys that
+only broke its ties would not be the order their arrows show.
 
 ### Inspector
 
@@ -466,10 +504,9 @@ blocks them.
   carry between panes. An optional run-all goes top to bottom as a
   convenience, never as enforced dataflow. A notebook is a named, saved
   document that opens as an ordinary tab.
-- **Grid.** Header sorting (click cycles ascending, descending, none;
-  shift-click adds a key with a priority number), a follow arrow on
-  single-column foreign keys, a JSON view beside Data and Structure, and
-  per-column structured filters over the raw strip.
+- **Grid.** A follow arrow on single-column foreign keys, a JSON view
+  beside Data and Structure, and per-column structured filters over the raw
+  strip.
 - **Live edit mode.** Each confirmed cell runs a single-row conditional
   UPDATE, matching both the identity and the value the grid last saw; zero rows
   affected is a conflict that shows both values and takes the server's. It is

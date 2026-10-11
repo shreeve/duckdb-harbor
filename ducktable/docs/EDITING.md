@@ -33,8 +33,8 @@ The `+` button in the Data footer creates a draft row at the top of the
 current grid and opens its first required writable cell. The `+` in its row
 number rail is its identity: it is staged, not yet a database row. Additional
 clicks create additional drafts. Drafts stay above the fetched page through
-filter and page changes because hiding an uncommitted insert would be data
-loss disguised as navigation.
+filter, sort and page changes because hiding an uncommitted insert would be
+data loss disguised as navigation.
 
 An untouched draft cell means SQL `DEFAULT`, not NULL. DuckTable omits it from
 the INSERT so DuckDB can apply declared defaults, sequences, and generated
@@ -119,7 +119,9 @@ mode names, no status chip, no mid-edit toggle.
 
 A click selects one row (and, in the body, seats the ring on the clicked cell). The macOS list grammar builds on it: ⌘-click toggles a row in or out, ⇧-click selects the span from the anchor through the clicked row, replacing whatever was selected. The anchor is the last row clicked without ⇧, so a second ⇧-click re-spans from the same place. The gutter and the body cells select the same way.
 
-The selection has a lead: the row the ring, the inspector, and ⌘D act on. It is the row last clicked into the selection; ⌘-clicking the lead away hands the role to the last remaining row. ⌘⌫ acts on every selected row as one gesture: one ⌘Z brings them all back, while the review popover still lists and discards them one by one. Esc, a page change, and a commit clear the selection whole.
+The selection has a lead: the row the ring, the inspector, and ⌘D act on. It is the row last clicked into the selection; ⌘-clicking the lead away hands the role to the last remaining row. ⌘⌫ acts on every selected row as one gesture: one ⌘Z brings them all back, while the review popover still lists and discards them one by one. Esc, a page change, a sort, and a commit clear the selection whole.
+
+The selection is a set of positions on the page, and a sort is the server's: it reads page 1 again under the order clicked and replaces the rows, so the positions are cleared with the rows they indexed rather than left on whichever rows the sort put there. Until that page lands the old rows, and the selection on them, stay as they were, and ⌘⌫ or ⌘D act on the rows shown. Staged changes are keyed by identity, so a sort moves none of them: each is drawn on its row wherever the sort puts it, or waits, still counted, while its row is on another page.
 
 ⇧-click in the body takes a seat that cell ranges would want (TablePro spans cells there and keeps row spans on its gutter); if cell ranges ship, body ⇧-click moves to them and the gutter keeps the row span.
 
@@ -207,12 +209,12 @@ not change, and printable exotica (AltGr, IME) already land on rung 6.
   would turn the DELETE into an UPDATE.
 - A gesture that replaces the page, or the grid, confirms an open editor
   first: a pager click, a page-size change, a filter applied or cleared, the
-  filter strip closed over an applied filter, a refresh, a switch to another
-  table, and ⌘S from the review popover. So do a discard from the review
-  popover and hiding columns. Text the column refuses keeps the editor open
-  with the reason, and the page, the strip, the columns and the table where
-  they are. ⌥↑/⌥↓ are not among them: with an editor open they are the
-  editor's keys and flip no page.
+  filter strip closed over an applied filter, a header sort, a refresh, a
+  switch to another table, and ⌘S from the review popover. So do a discard
+  from the review popover and hiding columns. Text the column refuses keeps
+  the editor open with the reason, and the page, the strip, the sort, the
+  columns and the table where they are. ⌥↑/⌥↓ are not among them: with an
+  editor open they are the editor's keys and flip no page.
 - While a page is on its way, the grid's own or another table's, no editor
   opens: ⌥↓ keeps the ring seated, and a key typed before the next page
   arrives is let go, as it is during a commit, rather than open an editor on
