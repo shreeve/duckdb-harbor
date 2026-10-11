@@ -202,7 +202,8 @@ pub fn load_extension(conn: &Conn, extension: &str) -> Result<(), String> {
 /// literal, its quotes undoubled and its glob brackets undone, and for a
 /// folder of Parquet the folder. None when the view reads no file.
 pub fn view_source(ddl: &str) -> Option<PathBuf> {
-    let lower = ddl.to_lowercase();
+    // ASCII alone, so an offset in `lower` is the same offset in `ddl`.
+    let lower = ddl.to_ascii_lowercase();
     let call = ["read_csv(", "read_parquet(", "read_json(", "read_xlsx(", "st_read("]
         .iter()
         .filter_map(|f| lower.find(f).map(|at| at + f.len()))
@@ -321,6 +322,9 @@ mod tests {
         let shp = "CREATE VIEW pts AS SELECT * FROM st_read('/p [x].shp');";
         assert_eq!(view_source(shp), Some(PathBuf::from("/p [x].shp")));
         assert_eq!(view_source("CREATE VIEW v AS SELECT 42;"), None);
+        // A name whose lowercase is longer in bytes, before the call.
+        let dotted = "CREATE VIEW \"\u{130}\u{130}\" AS SELECT * FROM read_csv('/x/a.csv');";
+        assert_eq!(view_source(dotted), Some(PathBuf::from("/x/a.csv")));
         assert_eq!(view_source("CREATE VIEW v AS SELECT * FROM read_csv(x);"), None);
     }
 

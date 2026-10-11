@@ -187,9 +187,13 @@ fn file_name(path: &str) -> &str {
     trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed)
 }
 
-/// The extension, lowercased, with `.csv.gz` kept whole.
+/// The extension, lowercased, with `.csv.gz` kept whole. Lowercased in
+/// ASCII alone: every extension matched is ASCII, and the stem is cut from
+/// the name by the extension's length in bytes, which full Unicode
+/// lowercasing changes (`K`, the Kelvin sign, is `k`; `İ` is two
+/// characters).
 fn extension(name: &str) -> String {
-    let lower = name.to_lowercase();
+    let lower = name.to_ascii_lowercase();
     if lower.ends_with(".csv.gz") && lower.len() > ".csv.gz".len() {
         return "csv.gz".to_string();
     }
@@ -605,6 +609,12 @@ mod tests {
         assert_eq!(view_name("/x/---.csv"), "data");
         assert_eq!(view_name("/x/.hidden"), "hidden");
         assert_eq!(view_name("/x/noext"), "noext");
+        // Names whose lowercase is longer or shorter in bytes.
+        assert_eq!(view_name("/x/lake.\u{212a}"), "lake");
+        assert_eq!(view_name("/x/\u{e9}.\u{130}"), "\u{e9}");
+        assert_eq!(view_name("/x/\u{130}stanbul.CSV"), "\u{130}stanbul");
+        assert_eq!(classify("/x/lake.\u{212a}", Entry::Dir), Ok(Kind::Data(Reader::ParquetFolder)));
+        assert_eq!(file("/x/\u{e9}.\u{130}", SQLITE), Ok(Kind::Sqlite));
     }
 
     #[test]
