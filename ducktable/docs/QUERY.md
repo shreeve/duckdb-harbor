@@ -259,6 +259,15 @@ error has aborted the transaction, and running the statement bare would only
 report that. Such an error quotes the wrapped statement, whose line numbers
 are one higher than the statement's own.
 
+**Copy and export.** A result's selection copies as the Data grid's does,
+and File → Export Results writes the whole result to a file: the
+statement runs again inside the engine's `COPY`, on a pooled connection,
+read as the grid reads it (`SELECT * FROM (statement)`), so the file holds
+what a rerun returns. Only a result the grid pages can be exported, and not
+one read inside a transaction, whose writes that connection would not see:
+the status line says which, and COMMIT then a rerun exports it. DESIGN.md,
+"Copy and export", has the formats and the rest.
+
 **A statement with no result set** reports `ok · 2 ms` in the status line
 rather than showing an empty grid.
 

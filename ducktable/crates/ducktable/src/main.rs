@@ -6,8 +6,10 @@ mod app;
 mod add_database;
 mod chrome;
 mod content;
+mod copy;
 mod copy_button;
 mod edits;
+mod export;
 mod footer;
 mod grid;
 mod inspector;
@@ -31,9 +33,27 @@ actions!(
         AddRow, DuplicateRow, DeleteRow, TablePrev, TableNext, View1, View2, View3, ToggleFullScreen,
         ToggleRowNumbers, ToggleRightAlign, ToggleNullTags, ToggleColumnCards, OpenDatabase,
         OpenDatabaseUrl,
-        CheckForUpdates
+        CheckForUpdates, CopyCells
     ]
 );
+
+/// Edit → Copy as CSV, Markdown or SQL INSERT: the selection of the grid
+/// with the keyboard, or of the view's grid, written as `format`. ⌘C is
+/// `CopyCells`, the same copy as TSV.
+#[derive(Clone, Default, PartialEq, Debug, Action)]
+#[action(namespace = ducktable, no_json)]
+pub struct CopyAs {
+    pub(crate) format: copy::Format,
+}
+
+/// File → Export Table or Export Results, in one format; the save panel
+/// asks where (export.rs).
+#[derive(Clone, Default, PartialEq, Debug, Action)]
+#[action(namespace = ducktable, no_json)]
+pub struct Export {
+    pub(crate) results: bool,
+    pub(crate) format: export::Format,
+}
 
 /// Pick a theme by its index in `theme::list` — carried as data so one
 /// action serves every theme the sidebar picker lists. `no_json`:
@@ -207,11 +227,21 @@ fn app_menus(can_update: bool) -> Vec<Menu> {
             // ⌘O advertises itself from the keymap binding.
             MenuItem::action("Open Database File…", OpenDatabase),
             MenuItem::action("Open Database URL…", OpenDatabaseUrl),
+            MenuItem::separator(),
+            // The save panel has no format picker, so the format is
+            // chosen here; a name typed with another format's extension
+            // takes that one (export::format_for).
+            MenuItem::submenu(Menu::new("Export Table").items(export_items(false))),
+            MenuItem::submenu(Menu::new("Export Results").items(export_items(true))),
         ]),
         Menu::new("Edit").items([
             MenuItem::action("New Row", AddRow),
             MenuItem::action("Duplicate Row", DuplicateRow),
             MenuItem::action("Delete Row", DeleteRow),
+            MenuItem::separator(),
+            MenuItem::action("Copy as CSV", CopyAs { format: copy::Format::Csv }),
+            MenuItem::action("Copy as Markdown", CopyAs { format: copy::Format::Markdown }),
+            MenuItem::action("Copy as SQL INSERT", CopyAs { format: copy::Format::SqlInsert }),
         ]),
         // macOS shows each item's key equivalent from the keymap, so this
         // menu is also where the zoom shortcuts advertise themselves.
@@ -249,6 +279,75 @@ fn app_menus(can_update: bool) -> Vec<Menu> {
             MenuItem::action("Toggle Full Screen", ToggleFullScreen),
         ]),
     ]
+}
+
+/// One export submenu: the four formats, for the table or the result.
+fn export_items(results: bool) -> Vec<MenuItem> {
+    use export::Format;
+    [("CSV…", Format::Csv), ("Parquet…", Format::Parquet), ("JSON…", Format::Json), ("Excel…", Format::Excel)]
+        .into_iter()
+        .map(|(label, format)| MenuItem::action(label, Export { results, format }))
+        .collect()
+}
+
+/// The grid a copy reads: the one whose table has the keyboard, or with
+/// none, the grid the view shows (the Structure view's columns, the Data
+/// table, or the Query result).
+fn copy_source(this: &DuckTable, window: &Window, cx: &App) -> Option<Entity<grid::Grid>> {
+    let data = this.grid.clone();
+    let columns = data.as_ref().and_then(|g| g.read(cx).structure_grid.clone());
+    let results = this.query.as_ref().and_then(|q| q.read(cx).results_grid());
+    let focused = [&data, &columns, &results]
+        .into_iter()
+        .flatten()
+        .find(|g| g.read(cx).table.focus_handle(cx).contains_focused(window, cx))
+        .cloned();
+    focused.or(match prefs::get(cx).view {
+        prefs::ViewMode::Structure => columns,
+        prefs::ViewMode::Data => data,
+        prefs::ViewMode::Query => results,
+    })
+}
+
+/// Copy the selection as `format` (copy.rs), and say so in the status line.
+fn copy_selection(format: copy::Format, cx: &mut App) {
+    on_view_in(cx, move |this, window, cx| {
+        let Some(grid) = copy_source(this, window, cx) else {
+            footer::say(cx, "nothing to copy", true, Some(std::time::Duration::from_secs(4)));
+            return;
+        };
+        match grid.read(cx).copy_selection(format, cx) {
+            Ok((text, word)) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                footer::say(cx, word, false, Some(std::time::Duration::from_secs(4)));
+            }
+            Err(why) => {
+                footer::say(cx, why, true, Some(std::time::Duration::from_secs(4)));
+            }
+        }
+    });
+}
+
+/// File → Export Table (the Data view's table, under its filter and
+/// ordering) or Export Results (the statement behind the Query result).
+fn export_grid(results: bool, format: export::Format, cx: &mut App) {
+    if asking_to_quit(cx) {
+        return;
+    }
+    on_view(cx, move |this, cx| {
+        let grid = if results { this.query.as_ref().and_then(|q| q.read(cx).results_grid()) } else { this.grid.clone() };
+        let Some(grid) = grid else {
+            let why = if results { "run a query to export its result" } else { "choose a table to export" };
+            footer::say(cx, why, true, Some(std::time::Duration::from_secs(4)));
+            return;
+        };
+        match grid.read(cx).export_plan(results) {
+            Ok(plan) => export::start(plan, format, cx),
+            Err(why) => {
+                footer::say(cx, why, true, Some(std::time::Duration::from_secs(8)));
+            }
+        }
+    });
 }
 
 /// Quit, or leave the connected database, stop a server or remove a saved
@@ -673,6 +772,11 @@ fn main() {
         cx.on_action(|_: &DeleteRow, cx| {
             run_row_action(grid::Grid::delete_row, cx)
         });
+        // ⌘C reaches here only from a focused table (its binding's
+        // context, grid::init); the Edit menu's copies from anywhere.
+        cx.on_action(|_: &CopyCells, cx| copy_selection(copy::Format::Tsv, cx));
+        cx.on_action(|a: &CopyAs, cx| copy_selection(a.format, cx));
+        cx.on_action(|a: &Export, cx| export_grid(a.results, a.format, cx));
         // One command behind both the View menu and Cmd+R. The sidebar
         // glyph calls the same refresh_tables method directly from its
         // DuckTable context, so every entrance has identical semantics.

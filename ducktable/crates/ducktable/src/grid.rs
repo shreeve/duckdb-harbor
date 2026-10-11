@@ -47,6 +47,10 @@ pub(crate) fn init(cx: &mut App) {
         ["home", "end", "pageup", "pagedown", "tab", "shift-tab"]
             .map(|key| KeyBinding::new(key, NoAction {}, Some("DataTable"))),
     );
+    // ⌘C copies the selection while a table has the keyboard. Bound in the
+    // table's context, so an input inside it, a cell editor or the filter
+    // strip, keeps its own ⌘C for its text.
+    cx.bind_keys([KeyBinding::new("cmd-c", crate::CopyCells, Some("DataTable"))]);
 }
 
 // 7 is Menlo's digit advance at GUTTER_TEXT (11px); 16 is the gutter's
@@ -343,6 +347,10 @@ pub(crate) struct GridDelegate {
     /// and the next divider double-click fits the whole table. Any
     /// ordinary cell or row click disarms it.
     all_selected: bool,
+    /// The selection was last made from the row numbers, so a copy takes
+    /// whole rows even when it is one row with the ring on it
+    /// (`copy::span`). Any other way a row is selected lowers it.
+    whole_rows: bool,
     /// The active cell (row, data column), Sheets-style: the clicked cell
     /// carries an accent ring on top of the row tint, and keyboard row
     /// moves carry the ring to the same column of the new row.
@@ -512,6 +520,7 @@ impl Grid {
             rows: Vec::new(),
             selection: RowSelection::default(),
             all_selected: false,
+            whole_rows: false,
             active_cell: None,
             loading: false,
             sortable: !embedded,
@@ -1489,6 +1498,73 @@ impl Grid {
                 })
                 .collect(),
         )
+    }
+
+    // ------------------------------------------------------------------
+    // Copy and export (docs/DESIGN.md "Copy and export"): the selection as
+    // text, and what an export of this grid reads.
+    // ------------------------------------------------------------------
+
+    /// The selection as `format`, with the status line's word on it. What
+    /// is copied is `copy::span`'s rule, over the rows on this page: the
+    /// client holds no others, so a page-wide selection of a longer table
+    /// copies this page and the word says so.
+    pub(crate) fn copy_selection(&self, format: crate::copy::Format, cx: &App) -> Result<(String, String), &'static str> {
+        use crate::copy::{Sheet, Span};
+        let d = self.table.read(cx).delegate();
+        let span = crate::copy::span(&d.selection.rows, d.all_selected, d.whole_rows, d.active_cell, d.rows.len());
+        let column = |ix: usize| Some((d.names.get(ix)?.as_ref(), d.schema_cols.get(ix)?));
+        let (columns, rows, header) = match &span {
+            Span::Nothing => return Err("select a cell or rows to copy"),
+            Span::Cell(row, col) => (vec![*col], vec![*row], false),
+            Span::Rows(rows) => (d.visible.clone(), rows.clone(), true),
+        };
+        let columns: Vec<(usize, (&str, &wire::Column))> =
+            columns.into_iter().filter_map(|ix| Some((ix, column(ix)?))).collect();
+        let sheet = Sheet {
+            columns: columns.iter().map(|(_, c)| *c).collect(),
+            rows: rows.iter().map(|&row| columns.iter().map(|&(col, _)| d.shown_cell(row, col)).collect()).collect(),
+            header,
+        };
+        // The INSERT's target: the table, or a name for a result to rename.
+        let table = if self.embedded { crate::util::qident("results") } else { self.source.clone() };
+        let text = crate::copy::render(format, &sheet, &table);
+        let more = self.total_rows.is_some_and(|total| total > d.fetched_count() as u64) || self.has_next(cx);
+        let word = match span {
+            Span::Cell(..) => format!("copied 1 cell as {}", format.label()),
+            Span::Rows(rows) if d.all_selected && more => {
+                let of = self.total_rows.map(|total| format!(" of {}", crate::util::commas(total))).unwrap_or_default();
+                format!(
+                    "copied {} rows{of} as {}: only this page is loaded",
+                    crate::util::commas(rows.len() as u64),
+                    format.label()
+                )
+            }
+            Span::Rows(rows) => format!(
+                "copied {} {} as {}",
+                crate::util::commas(rows.len() as u64),
+                if rows.len() == 1 { "row" } else { "rows" },
+                format.label()
+            ),
+            Span::Nothing => unreachable!("refused above"),
+        };
+        Ok((text, word))
+    }
+
+    /// What an export of this grid reads, or why it cannot: the table under
+    /// its filter and ordering, or the statement behind a result
+    /// (`export::refusal` says when neither can be written here).
+    pub(crate) fn export_plan(&self, results: bool) -> Result<crate::export::Plan, &'static str> {
+        if let Some(reason) =
+            crate::export::refusal(self.conn.db.is_some(), results, self.pageable, self.session.is_some())
+        {
+            return Err(reason);
+        }
+        Ok(crate::export::Plan {
+            conn: self.conn.clone(),
+            select: crate::export::table_select(&self.source, &self.filter),
+            stem: if results || self.title.is_empty() { "results".to_string() } else { self.title.clone() },
+        })
     }
 
     // ------------------------------------------------------------------
@@ -2983,6 +3059,9 @@ fn select_row(
     cx: &mut Context<TableState<GridDelegate>>,
 ) {
     state.delegate_mut().selection.lead_on(Some(row));
+    // A row selected any way but by its number copies as the ring's cell;
+    // the gutter's click raises this again after it comes through here.
+    state.delegate_mut().whole_rows = false;
     if state.delegate().row_dirty(row) {
         state.clear_selection(cx);
         state.delegate_mut().selection.lead_on(Some(row));
@@ -3123,6 +3202,23 @@ impl GridDelegate {
 
     fn draft_key(&self, row: usize) -> Option<&str> {
         self.draft_keys.get(row).map(String::as_str)
+    }
+
+    /// A cell as the grid shows it, for a copy: its staged text over the
+    /// fetched one, and a new row's untouched cell as the default it is.
+    fn shown_cell(&self, row: usize, col: usize) -> crate::copy::Cell<'_> {
+        let staged = match self.draft_key(row) {
+            Some(_) => match self.draft_cells.get(&(row, col)) {
+                Some(cell) => Some(cell),
+                None => return crate::copy::Cell::Default,
+            },
+            None => self.staged.get(&row).and_then(|cells| cells.get(&col)),
+        };
+        let shown = match staged {
+            Some(cell) => cell.as_ref(),
+            None => self.rows.get(row).and_then(|r| r.get(col)).and_then(Option::as_ref),
+        };
+        shown.map_or(crate::copy::Cell::Null, |text| crate::copy::Cell::Text(text.as_ref()))
     }
 
     /// The cell a gesture at (row, schema col) stages into, when the row
@@ -3436,6 +3532,8 @@ impl TableDelegate for GridDelegate {
                     cx.listener(move |state, e: &MouseDownEvent, _, cx| {
                         state.delegate_mut().all_selected = false;
                         click_row(state, row_ix, ClickKind::of(&e.modifiers), cx);
+                        // Rows chosen by their numbers copy whole.
+                        state.delegate_mut().whole_rows = true;
                         // The Table's row select stops the event; the
                         // table's focus-on-click and the grid's body click
                         // above still need it.
