@@ -27,6 +27,51 @@ pub struct Catalog {
     pub tables: Vec<Table>,
     /// By name.
     pub sequences: Vec<Sequence>,
+    /// By (schema, name).
+    pub views: Vec<View>,
+    /// The other databases attached to the served one, by name; never
+    /// `system` or `temp`.
+    pub attached: Vec<Attached>,
+}
+
+/// A view: what it reads as, without a row count, since counting a view
+/// over a file reads the whole file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct View {
+    pub name: String,
+    pub schema: String,
+    /// In ordinal position, as the view reads when the catalog is asked:
+    /// bound then, so a file that changed shape shows its shape. Empty when
+    /// it does not read, and `error` says why. A view's columns carry no
+    /// constraints, defaults or generation.
+    pub columns: Vec<Column>,
+    /// Why the view does not read, in the engine's words: a file it reads
+    /// is gone, an extension it needs is not loaded. None when it reads.
+    pub error: Option<String>,
+    /// The engine's own CREATE VIEW text, last, as for a table.
+    pub ddl: Option<String>,
+}
+
+/// A database attached beside the served one: a DuckDB file, a SQLite
+/// file, anything `ATTACH` takes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Attached {
+    /// The catalog's name, which qualifies its relations in SQL.
+    pub name: String,
+    /// As attached; None for an in-memory database.
+    pub path: Option<String>,
+    /// The engine's name for its storage: `duckdb`, `sqlite`, ….
+    #[serde(rename = "type")]
+    pub storage: String,
+    pub read_only: bool,
+    /// By (schema, name), in the served database's shape. `rowCount` is
+    /// exact for a DuckDB catalog, and None for another engine's, where a
+    /// count reads every row of the file.
+    pub tables: Vec<Table>,
+    /// By (schema, name).
+    pub views: Vec<View>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -111,6 +156,8 @@ pub struct Inventory {
     pub database_size_bytes: Option<u64>,
     pub wal_size_bytes: Option<u64>,
     pub tables: Vec<Named>,
+    pub views: Vec<Named>,
+    pub attached: Vec<AttachedInventory>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,24 +166,72 @@ pub struct Named {
     pub schema: String,
 }
 
+/// An attached database in the lite style: what it is and what it holds,
+/// by name.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachedInventory {
+    pub name: String,
+    pub path: Option<String>,
+    #[serde(rename = "type")]
+    pub storage: String,
+    pub read_only: bool,
+    pub tables: Vec<Named>,
+    pub views: Vec<Named>,
+}
+
 impl Catalog {
-    /// Schemas in display order, `main` first the way DuckDB presents it.
+    /// Schemas in display order, `main` first the way DuckDB presents it:
+    /// every schema that holds a table or a view.
     pub fn schemas(&self) -> Vec<&str> {
-        let mut v: Vec<&str> = self.tables.iter().map(|t| t.schema.as_str()).collect();
-        v.sort_unstable();
-        v.dedup();
-        if let Some(pos) = v.iter().position(|s| *s == "main") {
-            let main = v.remove(pos);
-            v.insert(0, main);
-        }
-        v
+        schemas_of(&self.tables, &self.views)
     }
 
     pub fn tables_in(&self, schema: &str) -> Vec<&Table> {
-        let mut v: Vec<&Table> = self.tables.iter().filter(|t| t.schema == schema).collect();
-        v.sort_by(|a, b| a.name.cmp(&b.name));
-        v
+        tables_in(&self.tables, schema)
     }
+
+    pub fn views_in(&self, schema: &str) -> Vec<&View> {
+        views_in(&self.views, schema)
+    }
+}
+
+impl Attached {
+    /// As [`Catalog::schemas`], for this database.
+    pub fn schemas(&self) -> Vec<&str> {
+        schemas_of(&self.tables, &self.views)
+    }
+
+    pub fn tables_in(&self, schema: &str) -> Vec<&Table> {
+        tables_in(&self.tables, schema)
+    }
+
+    pub fn views_in(&self, schema: &str) -> Vec<&View> {
+        views_in(&self.views, schema)
+    }
+}
+
+fn schemas_of<'a>(tables: &'a [Table], views: &'a [View]) -> Vec<&'a str> {
+    let mut v: Vec<&str> = tables.iter().map(|t| t.schema.as_str()).chain(views.iter().map(|w| w.schema.as_str())).collect();
+    v.sort_unstable();
+    v.dedup();
+    if let Some(pos) = v.iter().position(|s| *s == "main") {
+        let main = v.remove(pos);
+        v.insert(0, main);
+    }
+    v
+}
+
+fn tables_in<'a>(tables: &'a [Table], schema: &str) -> Vec<&'a Table> {
+    let mut v: Vec<&Table> = tables.iter().filter(|t| t.schema == schema).collect();
+    v.sort_by(|a, b| a.name.cmp(&b.name));
+    v
+}
+
+fn views_in<'a>(views: &'a [View], schema: &str) -> Vec<&'a View> {
+    let mut v: Vec<&View> = views.iter().filter(|w| w.schema == schema).collect();
+    v.sort_by(|a, b| a.name.cmp(&b.name));
+    v
 }
 
 #[cfg(test)]
@@ -184,21 +279,64 @@ mod tests {
         let full = Catalog { tables: vec![table], ..Default::default() };
         assert_eq!(
             serde_json::to_string(&full).unwrap(),
-            r#"{"harborVersion":"","duckdbVersion":"","databaseSizeBytes":null,"walSizeBytes":null,"tables":[{"name":"t","schema":"main","rowCount":0,"columns":[],"primaryKey":[],"uniqueConstraints":[],"indexes":[],"foreignKeys":[],"ddl":null}],"sequences":[]}"#
+            r#"{"harborVersion":"","duckdbVersion":"","databaseSizeBytes":null,"walSizeBytes":null,"tables":[{"name":"t","schema":"main","rowCount":0,"columns":[],"primaryKey":[],"uniqueConstraints":[],"indexes":[],"foreignKeys":[],"ddl":null}],"sequences":[],"views":[],"attached":[]}"#
         );
+        let named = |name: &str| Named { name: name.into(), schema: "main".into() };
         let lite = Inventory {
             harbor_version: "1".into(),
             duckdb_version: "v2".into(),
             database_size_bytes: Some(1),
             wal_size_bytes: Some(0),
-            tables: vec![Named { name: "t".into(), schema: "main".into() }],
+            tables: vec![named("t")],
+            views: vec![named("v")],
+            attached: vec![AttachedInventory {
+                name: "app".into(),
+                path: Some("/x/app.sqlite".into()),
+                storage: "sqlite".into(),
+                read_only: false,
+                tables: vec![named("people")],
+                views: vec![],
+            }],
         };
         let text = serde_json::to_string(&lite).unwrap();
         assert_eq!(
             text,
-            r#"{"harborVersion":"1","duckdbVersion":"v2","databaseSizeBytes":1,"walSizeBytes":0,"tables":[{"name":"t","schema":"main"}]}"#
+            r#"{"harborVersion":"1","duckdbVersion":"v2","databaseSizeBytes":1,"walSizeBytes":0,"tables":[{"name":"t","schema":"main"}],"views":[{"name":"v","schema":"main"}],"attached":[{"name":"app","path":"/x/app.sqlite","type":"sqlite","readOnly":false,"tables":[{"name":"people","schema":"main"}],"views":[]}]}"#
         );
         let read: Catalog = serde_json::from_str(&text).unwrap();
         assert_eq!((read.tables[0].row_count, read.tables[0].columns.len()), (None, 0));
+        assert_eq!((read.views[0].name.as_str(), read.views[0].error.as_deref()), ("v", None));
+        assert_eq!(read.attached[0].tables_in("main")[0].name, "people");
+    }
+
+    /// A view and an attached database, as the full style writes them: a
+    /// view that reads has its columns, one that does not has its reason,
+    /// and an attached catalog holds tables and views of the same shapes.
+    #[test]
+    fn views_and_attached_databases_round_trip() {
+        let column = Column { name: "id".into(), duck_type: "BIGINT".into(), ..Default::default() };
+        let view = View { name: "sales".into(), schema: "main".into(), columns: vec![column], error: None, ddl: Some("CREATE VIEW sales AS SELECT 1;".into()) };
+        let gone = View { name: "gone".into(), schema: "main".into(), error: Some("IO Error: No files found".into()), ..Default::default() };
+        let people = Table { name: "people".into(), schema: "main".into(), ..Default::default() };
+        let full = Catalog {
+            views: vec![gone, view],
+            attached: vec![Attached {
+                name: "app".into(),
+                path: None,
+                storage: "sqlite".into(),
+                read_only: true,
+                tables: vec![people],
+                views: vec![],
+            }],
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&full).unwrap();
+        assert!(text.ends_with(
+            r#""sequences":[],"views":[{"name":"gone","schema":"main","columns":[],"error":"IO Error: No files found","ddl":null},{"name":"sales","schema":"main","columns":[{"name":"id","type":"BIGINT","notNull":false,"default":null,"generated":false,"generationExpression":null,"primary":false}],"error":null,"ddl":"CREATE VIEW sales AS SELECT 1;"}],"attached":[{"name":"app","path":null,"type":"sqlite","readOnly":true,"tables":[{"name":"people","schema":"main","rowCount":null,"columns":[],"primaryKey":[],"uniqueConstraints":[],"indexes":[],"foreignKeys":[],"ddl":null}],"views":[]}]}"#
+        ), "{text}");
+        let read: Catalog = serde_json::from_str(&text).unwrap();
+        assert_eq!(read, full);
+        assert_eq!(read.schemas(), vec!["main"]);
+        assert_eq!(read.views_in("main").iter().map(|v| v.name.as_str()).collect::<Vec<_>>(), ["gone", "sales"]);
     }
 }
