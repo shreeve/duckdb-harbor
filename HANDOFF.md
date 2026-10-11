@@ -523,10 +523,10 @@ and DuckTable 0.23.0 record.
 
 ## Open items
 
-- **`live` runs harbor 0.45.0** until Steve runs `ssh -t live 'harbor
-  update --restart'`; its configuration passes the checks a start makes.
-  This Mac runs 0.46.0; the local medlabs server keeps the code it started
-  with until it restarts.
+- **Installed:** `live` and this Mac run harbor 0.46.0 (`live` upgraded
+  2026-10-11 with `harbor update --restart`, which printed its last lines
+  over ssh). The local medlabs server keeps the code it started with until
+  it restarts.
 - **Port to DuckDB's reworked v2 C API**, then set the `DUCKDB_LIB_BUILD`
   repository variable to `latest`. "The engine" above has the measured size
   of the port and what it waits for.
