@@ -190,9 +190,11 @@ and TABLES although the code says berth.
 
 Menus:
 
-- **File:** Open Database File…, Open Database URL…
+- **File:** Open Database File…, Open Database URL…; Export Table and Export
+  Results, each a submenu of CSV…, Parquet…, JSON… and Excel… (Copy and
+  export, below).
 - **Edit:** New Row, Duplicate Row, Delete Row, which act on the Data grid
-  (EDITING.md).
+  (EDITING.md); Copy as CSV, Copy as Markdown, Copy as SQL INSERT.
 - **View:** Structure, Data, Query; Refresh Tables; Previous and Next Table;
   Row Numbers, Right-Align Numbers, NULL Tags, Column Tooltips; Toggle
   Inspector; Zoom In, Zoom Out, Actual Size; Fit Column Widths; Toggle Full
@@ -284,6 +286,98 @@ never render side by side: a schema change reshapes the data.
 
 What can be edited, and how, is EDITING.md.
 
+### Copy and export
+
+**Copy** takes the grid's selection to the clipboard. ⌘C, while a grid has
+the keyboard (the Data table, the Query result, or the Structure view's
+columns), writes it as TSV, what spreadsheets paste; a cell editor, the
+filter strip and the Query editor keep ⌘C for their own text. The Edit
+menu's Copy as CSV, Copy as Markdown and Copy as SQL INSERT write the same
+selection another way, from the grid with the keyboard or, with none, the
+grid the view shows. What is copied is one rule (`copy::span`):
+
+- `#`, the whole page selected, copies every row on the page.
+- Two or more selected rows copy those rows.
+- One row selected from its number in the gutter copies that row.
+- Otherwise the ring's cell is copied alone, and with no ring, the one
+  selected row.
+
+Rows are copied under a header line of column names, every visible column
+in display order; a single cell is its value alone, with no header and no
+line break. Markdown always has its header, which a table needs, and an
+INSERT always names its columns. Values are the text Harbor sent, whole,
+never the cell's ellipsized drawing; a staged cell is copied as staged, and a
+new row's untouched cell as its default, since the copy is of what the grid
+shows. NULL is an empty field in TSV and CSV and `NULL` in Markdown and SQL;
+CSV writes the empty string `""`, as DuckDB does, so the two stay apart, and
+TSV leaves both empty, as a spreadsheet would. A TSV field holding a tab, a
+line break or a quote is quoted; Markdown escapes a pipe and writes a line
+break as `<br>`.
+
+SQL INSERT is one statement, a row of VALUES per row, into the table (a
+result's rows go into `"results"`, to rename). Identifiers are quoted
+(`qident`) and every literal is written so the engine stores the value the
+cell shows, measured for every type the grid renders by copying a row of
+each and inserting it back (`copy::tests`, live): a string quoted
+(`qlit`), a number bare where the parser reads it exactly and a cast string
+where it does not (`'NaN'::DOUBLE`, a 39-digit `UHUGEINT`), a `BLOB` through
+`from_base64`, a `JSON` or `VARIANT` through `::JSON`, an `INTERVAL` in
+months, days and microseconds, and lists, structs, maps and unions built as
+literals from their parts with their types, a union member cast to the whole
+union. A staged nested value typed in DuckDB's own form is a string for the
+engine to cast, as the editor binds it.
+
+The client holds one page, so a copy reaches no further: `#` on a longer
+table copies this page, and the status line says so (`copied 500 of 5,410
+rows as TSV: only this page is loaded`). Export writes the rest.
+
+**Export** writes a file with the engine's own `COPY (SELECT …) TO
+'<path>' (FORMAT …)`, through Harbor on a pooled connection, so nothing
+pages through the client and a table of any size exports at the engine's
+speed. File → Export Table writes the Data view's table, every column,
+under the filter strip's condition and ordering, the rows the grid pages
+without their LIMIT (a test holds the two together); staged changes are not
+in it, since the file holds what the database holds. Export Results runs the
+statement behind the Query result again, read as the grid reads it, so only
+a result the grid pages can be exported, and not one read inside a
+transaction, whose writes the COPY on its own connection would not see.
+
+- **Format.** The save panel has no format picker, so each export menu
+  lists the four: CSV with a header row, Parquet, JSON as one array of
+  objects, and Excel (`.xlsx`) with a header row. A name typed with another
+  format's extension is written in that format, and `.ndjson` or `.jsonl`
+  writes an object per line; `.gz` or `.zst` on the name compresses, the
+  engine's own reading of it. Excel comes from DuckDB's `excel` extension,
+  which a COPY does not load on its own (measured): the first Excel export
+  loads it, installing it first when it is missing, and says why if either
+  fails. A sheet holds 1,048,576 rows, the header among them, and past that
+  the engine's refusal is the message (measured).
+- **Only a database on this Mac.** The server writes the file, to its own
+  disk. A database opened by URL may be served from another machine, a
+  tunnel's or a forwarded port's, and its COPY would write there, so export
+  is refused for it with that reason, and open its file on this Mac to
+  export. Streaming the rows through the client would work for CSV alone,
+  and at the client's speed, so it is not done.
+- **No partial file.** The COPY writes to a hidden name beside the file,
+  `.ducktable-export-<pid>-<n>-<name>`, which ends with the whole name so
+  the engine reads the same compression from it, and the file takes its
+  place by a rename only once the COPY has succeeded. A file already there
+  is untouched until then. A failure removes the hidden file: the engine
+  removes what a failed CSV, Parquet or JSON COPY wrote, but leaves a failed
+  Excel COPY's partial file (measured). A client that hangs up mid-COPY is
+  cancelled by Harbor, and a quit removes the hidden file itself.
+- **Status.** One export at a time. The status line says `exporting
+  orders.csv…`, then the time it has run each second, then `exported 5,410
+  rows to orders.csv · 1.2s` for eight seconds, or `orders.csv was not
+  exported:` and the engine's reason, in the danger color, for twenty; a
+  word too long for the line is cut, the whole in its tooltip. A copy's word
+  holds four seconds. Either outranks the grid's row range in every view.
+  The panel opens where the last export went, else in Downloads.
+- **Quitting** while an export runs asks first (EDITING.md, "Dialogs"): the
+  quit stops it, and no file is written. Leaving a database does not, since
+  the export holds a connection of its own; stopping the server it reads
+  fails the export, which says so and leaves nothing.
+
 ### Bottom bar
 
 The view switcher sits at the left, under every view, the database's card
@@ -331,6 +425,7 @@ arrows, ⌘S, ⌘Z, ⌘⌫, ⌃⇧N, ⌘⇧⌫) is EDITING.md's; the Query view'
 | Key | Does |
 | --- | --- |
 | ⌘O | Open Database File |
+| ⌘C | in a grid, copy the selection as TSV (Copy and export) |
 | ⌘R | Refresh Tables: the catalog and the open Data page |
 | ⌘1 / ⌘2 / ⌘3 | Structure / Data / Query |
 | ⌥← / ⌥→ | previous / next table in the sidebar, rolling over at the ends |
@@ -443,9 +538,11 @@ One file per surface, one owner per piece of state. `app.rs` is the root entity
 and the only mutator of connection state (phase, attempt fence, selection).
 The surfaces (`sidebar.rs`, `content.rs`, `grid.rs`, `structure.rs`,
 `inspector.rs`, `query.rs`, `footer.rs`) read state and call back into `app.rs`
-methods, never mutating it themselves. `edits.rs` is the staging model and
-`sql.rs` every hand-written query; both are pure. All colors resolve through
-`theme.rs`. `main.rs` is the entry point, menus and key bindings.
+methods, never mutating it themselves. `edits.rs` is the staging model,
+`sql.rs` every hand-written query and `copy.rs` a selection written as
+text; all three are pure. `export.rs` writes files through the engine's
+`COPY`, its decisions in pure functions. A copy's or an export's word in
+the status line is `footer::say`. All colors resolve through `theme.rs`. `main.rs` is the entry point, menus and key bindings.
 
 The rule this protects: one type that owns every surface decays into an
 extension-file sprawl nobody can navigate, and a surface that mutates shared

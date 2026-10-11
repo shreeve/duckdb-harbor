@@ -379,8 +379,8 @@ mod tests {
         assert_eq!(span(&set(&[4]), false, false, None, 10), Span::Rows(vec![4]));
         assert_eq!(span(&set(&[]), false, false, None, 10), Span::Nothing);
         assert_eq!(span(&set(&[]), true, false, None, 0), Span::Nothing);
-        // A ring with nothing selected is still its cell; one on a row the
-        // page no longer has is nothing.
+        // A ring with nothing selected is still its cell; one on a row past
+        // the page is nothing.
         assert_eq!(span(&set(&[]), false, false, Some((0, 1)), 10), Span::Cell(0, 1));
         assert_eq!(span(&set(&[]), false, false, Some((12, 1)), 10), Span::Nothing);
     }

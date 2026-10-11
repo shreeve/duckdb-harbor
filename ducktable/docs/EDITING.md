@@ -110,6 +110,7 @@ One meaning per key. No contextual double-agents.
 | ⌘S | commits all staged changes — one transaction, all or nothing | confirms the cell, then commits (⌘Enter is its equal) |
 | ⌥Enter | — | reserved for a line break, the Sheets-hand twin of ⇧Enter |
 | ⌘Enter | commits all staged changes | confirms the cell, then commits: ⌘Enter means send, as it does in a chat composer, and ⇧Enter or ⌥Enter mean newline |
+| ⌘C | copies the ring's cell, or the selected rows under a header, as TSV (DESIGN.md, "Copy and export") | copies the selected text |
 
 The replace-vs-kept-value arrow split is Sheets' own physics, unnamed:
 the entry gesture *is* the state, your finger chose it a second ago. No
@@ -564,6 +565,9 @@ none does:
 - **A transaction open in the Query view** (QUERY.md). Quitting rolls it back.
 - **A statement running in the Query view.** Quitting leaves its outcome
   unreported.
+- **An export writing its file** (DESIGN.md, "Copy and export"). Quitting
+  stops it, and no file is written. Leaving a database does not ask about
+  it: the export holds a connection of its own.
 
 With more than staged changes at stake the dialog asks `Quit DuckTable?` and
 lists each fact. There are two buttons. **Cancel** is the default: Return and
