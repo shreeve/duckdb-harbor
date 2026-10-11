@@ -331,6 +331,50 @@ mod tests {
         );
     }
 
+    /// The bundle declares a document type for every kind of file DuckTable
+    /// opens (`scripts/macos-app.sh`), so Finder hands it each one: owning
+    /// DuckDB's, and an alternate to the app that has the common kinds.
+    #[test]
+    fn the_bundle_declares_every_kind_it_opens() {
+        let script = include_str!("../../../scripts/macos-app.sh");
+        let declared = |rank: &str, uti: &str| {
+            script.lines().any(|l| l.trim_start().starts_with("doc_type \"") && l.contains(&format!(" {rank} ")) && l.split_whitespace().any(|w| w == uti))
+        };
+        let imported = |uti: &str, ext: &str| {
+            script.lines().any(|l| l.trim_start().starts_with(&format!("imported {uti} ")) && l.split_whitespace().any(|w| w == ext))
+        };
+        const SQLITE: &[u8] = b"SQLite format 3\0";
+        // Each extension, the type Finder knows it by (the system's, or one
+        // the bundle imports), the rank, and a file of the kind.
+        let kinds: [(&str, &str, bool, &str, &[u8]); 16] = [
+            ("duckdb", "org.duckdb.database", true, "Owner", b""),
+            ("ddb", "org.duckdb.database", true, "Owner", b""),
+            ("sqlite", "org.sqlite.database", true, "Alternate", SQLITE),
+            ("sqlite3", "org.sqlite.database", true, "Alternate", SQLITE),
+            ("db", "org.sqlite.database", true, "Alternate", SQLITE),
+            ("csv", "public.comma-separated-values-text", false, "Alternate", b"a,b"),
+            ("tsv", "public.tab-separated-values-text", false, "Alternate", b"a\tb"),
+            ("json", "public.json", false, "Alternate", b"{}"),
+            ("ndjson", "public.ndjson", false, "Alternate", b"{}"),
+            ("jsonl", "org.jsonlines.jsonl", true, "Alternate", b"{}"),
+            ("xlsx", "org.openxmlformats.spreadsheetml.sheet", false, "Alternate", b"PK\x03\x04"),
+            ("geojson", "public.geojson", false, "Alternate", b"{}"),
+            ("parquet", "org.apache.parquet", true, "Default", b"PAR1"),
+            ("shp", "com.esri.shapefile", true, "Default", b"\x00\x00\x27\x0a"),
+            ("gpkg", "org.opengeospatial.geopackage", true, "Default", SQLITE),
+            ("folder", "public.folder", false, "Alternate", b""),
+        ];
+        for (ext, uti, import, rank, head) in kinds {
+            assert!(declared(rank, uti), "{ext}: no {rank} document type for {uti}");
+            assert!(!import || imported(uti, ext), "{ext}: {uti} is not imported with it");
+            let kind = match ext {
+                "folder" => wire::open::classify("/x/lake", wire::open::Entry::Dir),
+                _ => wire::open::classify(&format!("/x/f.{ext}"), wire::open::Entry::File(head)),
+            };
+            assert!(kind.is_ok(), "{ext}: {kind:?}");
+        }
+    }
+
     #[test]
     fn a_large_import_asks_first_saying_the_size() {
         let source = Path::new("/data/big.csv");

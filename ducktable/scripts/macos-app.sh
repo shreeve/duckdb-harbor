@@ -66,6 +66,54 @@ for extra in XPCServices Headers PrivateHeaders Modules; do
     rm -rf "$framework/$extra" "$framework/Versions/B/$extra"
 done
 
+# The kinds of file DuckTable opens (docs/OPEN.md), so Finder offers it for
+# them and hands it the paths: double-click, Open With, a drop on the Dock
+# icon, `open -a`. It owns DuckDB's own files. For files other apps open
+# too, it ranks Alternate (CSV, JSON, Excel and the rest stay with the app
+# that has them) or Default where the system knows no type at all; a folder
+# is a folder of Parquet. Types the system does not declare are imported
+# here, by their extensions. The crate's `open::tests` checks this list
+# against the kinds DuckTable opens.
+doc_type() { # name role rank uti...
+    name=$1 role=$2 rank=$3
+    shift 3
+    printf '        <dict>\n            <key>CFBundleTypeName</key><string>%s</string>\n' "$name"
+    printf '            <key>CFBundleTypeRole</key><string>%s</string>\n' "$role"
+    printf '            <key>LSHandlerRank</key><string>%s</string>\n' "$rank"
+    printf '            <key>LSItemContentTypes</key><array>'
+    for uti in "$@"; do printf '<string>%s</string>' "$uti"; done
+    printf '</array>\n        </dict>\n'
+}
+imported() { # uti description extension...
+    uti=$1 description=$2
+    shift 2
+    printf '        <dict>\n            <key>UTTypeIdentifier</key><string>%s</string>\n' "$uti"
+    printf '            <key>UTTypeDescription</key><string>%s</string>\n' "$description"
+    printf '            <key>UTTypeConformsTo</key><array><string>public.data</string></array>\n'
+    printf '            <key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array>'
+    for ext in "$@"; do printf '<string>%s</string>' "$ext"; done
+    printf '</array></dict>\n        </dict>\n'
+}
+document_types=$(
+    doc_type "DuckDB Database" Editor Owner org.duckdb.database
+    doc_type "SQLite Database" Editor Alternate org.sqlite.database
+    doc_type "CSV" Viewer Alternate public.comma-separated-values-text public.tab-separated-values-text
+    doc_type "JSON" Viewer Alternate public.json public.ndjson org.jsonlines.jsonl
+    doc_type "Excel Workbook" Viewer Alternate org.openxmlformats.spreadsheetml.sheet
+    doc_type "Parquet" Viewer Default org.apache.parquet
+    doc_type "GeoJSON" Viewer Alternate public.geojson
+    doc_type "Geospatial Data" Viewer Default com.esri.shapefile org.opengeospatial.geopackage
+    doc_type "Folder of Parquet" Viewer Alternate public.folder
+)
+imported_types=$(
+    imported org.duckdb.database "DuckDB database" duckdb ddb
+    imported org.sqlite.database "SQLite database" sqlite sqlite3 db
+    imported org.apache.parquet "Apache Parquet file" parquet
+    imported org.jsonlines.jsonl "JSON Lines" jsonl
+    imported com.esri.shapefile "Esri shapefile" shp
+    imported org.opengeospatial.geopackage "GeoPackage" gpkg
+)
+
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -82,6 +130,14 @@ cat > "$app/Contents/Info.plist" <<PLIST
     <key>LSMinimumSystemVersion</key><string>12.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSLocalNetworkUsageDescription</key><string>DuckTable opens SSH tunnels to Harbor database servers on the hosts you add, which can be on your local network.</string>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+$document_types
+    </array>
+    <key>UTImportedTypeDeclarations</key>
+    <array>
+$imported_types
+    </array>
 $sparkle_keys
 </dict>
 </plist>
