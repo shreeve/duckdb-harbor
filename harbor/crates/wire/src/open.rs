@@ -17,6 +17,11 @@
 //! handed to one of DuckDB's multi-file readers has its glob characters
 //! bracketed, since those readers take their argument as a pattern: `a*.csv`
 //! would read `ab.csv` too, and `s[ab].csv` would read `sa.csv` instead.
+//!
+//! A view is kept in the workspace's own catalog; an attachment is kept in
+//! its [`Record`], from which every server that opens the workspace attaches
+//! the file again, after loading the extensions its views call into
+//! ([`extensions`]).
 
 /// How many leading bytes [`classify`] looks at: SQLite's header string is
 /// the longest signature.
@@ -57,7 +62,8 @@ pub enum Reader {
     Xlsx,
     /// `.geojson`, `.shp`, `.gpkg`: `ST_Read`, the first layer. The
     /// `spatial` extension does not load on demand, so the caller loads it
-    /// first ([`Reader::extension`]).
+    /// first ([`Reader::extension`]), and so does every server that opens the
+    /// workspace ([`extensions`]).
     Spatial,
 }
 
@@ -259,6 +265,103 @@ pub fn attach_sql(name: &str, path: &str) -> String {
     format!("ATTACH {} AS {} (TYPE sqlite)", quote_literal(path), quote_ident(name))
 }
 
+/// The schema of the workspace's record of what is attached in it
+/// ([`Record`]). No name [`view_name`] makes can be it, since that trims a
+/// leading `_`, so a file's view or catalog never takes it.
+pub const RECORD_SCHEMA: &str = "_harbor";
+
+/// The record's table, in [`RECORD_SCHEMA`].
+pub const RECORD_TABLE: &str = "attached";
+
+/// The statements that make the record where it is not, in order.
+pub const RECORD_DDL: [&str; 2] = [
+    "CREATE SCHEMA IF NOT EXISTS _harbor",
+    "CREATE TABLE IF NOT EXISTS _harbor.attached \
+     (name VARCHAR PRIMARY KEY, path VARCHAR NOT NULL, type VARCHAR NOT NULL, read_only BOOLEAN NOT NULL)",
+];
+
+/// A database file attached in the workspace, as the workspace records it
+/// so that every server that opens the workspace attaches it again: an
+/// `ATTACH` lasts only as long as the server that ran it.
+///
+/// Whoever attaches a file writes its row ([`Record::insert_sql`]), and the
+/// server rewrites the record from what is attached when it stops, so a
+/// plain `ATTACH` or `DETACH` from any client is recorded too. A row whose
+/// file is gone when the server starts stays, and is reported, until the
+/// file is back or the row is deleted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Record {
+    /// The catalog's name.
+    pub name: String,
+    /// The file, absolute.
+    pub path: String,
+    /// The engine's name for its storage: `sqlite` or `duckdb`.
+    #[serde(rename = "type")]
+    pub storage: String,
+    pub read_only: bool,
+}
+
+impl Record {
+    /// Whether a database the engine lists is one the workspace records: a
+    /// SQLite or DuckDB file. An in-memory database has nothing to attach
+    /// again, and another engine's path can be a connection string, which
+    /// may hold a password.
+    pub fn kept(storage: &str, path: &str) -> bool {
+        matches!(storage, "sqlite" | "duckdb") && !path.is_empty() && path != ":memory:"
+    }
+
+    /// `ATTACH` for this file, as it was attached.
+    pub fn attach_sql(&self) -> String {
+        let read_only = if self.read_only { ", READ_ONLY" } else { "" };
+        format!(
+            "ATTACH {} AS {} (TYPE {}{read_only})",
+            quote_literal(&self.path),
+            quote_ident(&self.name),
+            quote_ident(&self.storage)
+        )
+    }
+
+    /// The record's row for this file, written over any row of its name.
+    pub fn insert_sql(&self) -> String {
+        format!(
+            "INSERT OR REPLACE INTO {RECORD_SCHEMA}.{RECORD_TABLE} (name, path, type, read_only) VALUES ({}, {}, {}, {})",
+            quote_literal(&self.name),
+            quote_literal(&self.path),
+            quote_literal(&self.storage),
+            self.read_only
+        )
+    }
+}
+
+/// The extensions a statement calls into that the engine does not load on
+/// demand: `spatial`, for any `ST_` function. Read from the code only, so a
+/// path or a name that spells `st_read(` does not count. The engine loads
+/// `excel`, `json`, `parquet` and `sqlite` when a statement needs them.
+pub fn extensions(sql: &str) -> Vec<&'static str> {
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
+    let mut out = Vec::new();
+    for span in crate::scan::scan(sql).iter().filter(|s| s.kind == crate::scan::Kind::Code) {
+        let code = &sql.as_bytes()[span.start..span.end];
+        let mut i = 0;
+        while i < code.len() {
+            if !word(code[i]) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < code.len() && word(code[i]) {
+                i += 1;
+            }
+            let called = code[i..].iter().find(|c| !c.is_ascii_whitespace()) == Some(&b'(');
+            let name = &code[start..i];
+            if called && name.len() > 3 && name[..3].eq_ignore_ascii_case(b"st_") && !out.contains(&"spatial") {
+                out.push("spatial");
+            }
+        }
+    }
+    out
+}
+
 /// Whether a view's SQL, as the engine renders it in `duckdb_views()`,
 /// reads `path` with `reader`: the view a second opening of the same file
 /// finds and keeps rather than making another. The engine keeps a string
@@ -433,6 +536,32 @@ mod tests {
         assert_eq!(Reader::Xlsx.source("/b[1].xlsx"), "read_xlsx('/b[[]1].xlsx')");
         assert_eq!(Reader::Json.source("/j.json"), "read_json('/j.json')");
         assert_eq!(Reader::Parquet.source("/p.parquet"), "read_parquet('/p.parquet')");
+    }
+
+    #[test]
+    fn a_record_attaches_its_file_again_as_it_was_attached() {
+        let app = Record { name: "app".into(), path: "/x/o'brien.sqlite".into(), storage: "sqlite".into(), read_only: false };
+        assert_eq!(app.attach_sql(), "ATTACH '/x/o''brien.sqlite' AS \"app\" (TYPE \"sqlite\")");
+        assert_eq!(
+            app.insert_sql(),
+            "INSERT OR REPLACE INTO _harbor.attached (name, path, type, read_only) VALUES ('app', '/x/o''brien.sqlite', 'sqlite', false)"
+        );
+        let other = Record { name: "o\"x".into(), path: "/o.duckdb".into(), storage: "duckdb".into(), read_only: true };
+        assert_eq!(other.attach_sql(), "ATTACH '/o.duckdb' AS \"o\"\"x\" (TYPE \"duckdb\", READ_ONLY)");
+        assert!(Record::kept("sqlite", "/a.sqlite") && Record::kept("duckdb", "/o.duckdb"));
+        assert!(!Record::kept("duckdb", "") && !Record::kept("duckdb", ":memory:"));
+        assert!(!Record::kept("postgres", "dbname=x password=y"));
+        // The record's schema is no name a file's view or catalog takes.
+        assert_eq!(view_name("/x/_harbor.sqlite"), "harbor");
+    }
+
+    #[test]
+    fn a_spatial_function_in_the_code_needs_spatial() {
+        assert_eq!(extensions("CREATE VIEW p AS SELECT * FROM st_read('/p.shp');"), ["spatial"]);
+        assert_eq!(extensions("SELECT ST_Area (geom), ST_Centroid(geom) FROM t"), ["spatial"]);
+        assert!(extensions("CREATE VIEW s AS SELECT * FROM read_csv('/x/st_read(.csv');").is_empty());
+        assert!(extensions("SELECT * FROM read_xlsx('/b.xlsx') -- st_read(").is_empty());
+        assert!(extensions("SELECT st_x, first_st_y(1), \"st_read\"(1) FROM t").is_empty());
     }
 
     #[test]

@@ -44,6 +44,10 @@ pub mod repl;
 // engine.
 pub mod engine;
 
+// The workspace database: what a server that opens it does at its start and
+// at its stop.
+pub mod workspace;
+
 // ==========================================================================
 //
 // The HTTP server
@@ -1443,13 +1447,18 @@ fn stop_with(mut running: std::sync::MutexGuard<'_, Option<Running>>) -> Result<
     // slower and the operator should know why, so surface it instead of
     // reporting a clean "drained and checkpointed" shutdown that did not fully
     // happen.
-    if let Some(c) = CONTROL.lock().unwrap().as_mut()
-        && let Err(e) = c.execute_batch("CHECKPOINT")
-    {
-        eprintln!(
-            "harbor: shutdown CHECKPOINT failed ({e}); the WAL is intact and \
-             will replay on next open (no data lost, slower restart)"
-        );
+    if let Some(c) = CONTROL.lock().unwrap().as_mut() {
+        // The workspace records what is attached in it before the checkpoint
+        // folds that in too.
+        if workspace::serving() {
+            workspace::record(c);
+        }
+        if let Err(e) = c.execute_batch("CHECKPOINT") {
+            eprintln!(
+                "harbor: shutdown CHECKPOINT failed ({e}); the WAL is intact and \
+                 will replay on next open (no data lost, slower restart)"
+            );
+        }
     }
 
     *SERVER.lock().unwrap() = None;
@@ -2900,6 +2909,32 @@ struct CatalogDatabase {
     served: bool,
 }
 
+/// What the workspace recorded and could not attach when it started, each
+/// still in its record and not attached since: listed among the attached
+/// databases with its reason. Nothing, and no query, on any other server.
+fn unattached_now(
+    exec: Executor,
+    peer: &justhttp::Peer,
+    databases: &[CatalogDatabase],
+) -> Result<Vec<workspace::Unattached>, CatalogFailure> {
+    let unattached = workspace::unattached();
+    if unattached.is_empty() {
+        return Ok(unattached);
+    }
+    let sql = format!("SELECT name FROM {}.{}", wire::open::RECORD_SCHEMA, wire::open::RECORD_TABLE);
+    let recorded: Vec<String> = match catalog_rows(exec, peer, &sql) {
+        Ok(rows) => rows.iter().map(|row| cell_str(row, 0)).collect(),
+        // The record dropped: nothing is recorded.
+        Err(CatalogFailure::Refused(refusal)) if refusal.code == code::SQL_ERROR => Vec::new(),
+        Err(failure) => return Err(failure),
+    };
+    Ok(unattached
+        .into_iter()
+        .filter(|u| recorded.contains(&u.record.name))
+        .filter(|u| !databases.iter().any(|d| d.name.eq_ignore_ascii_case(&u.record.name)))
+        .collect())
+}
+
 /// Why a view does not read, from the refusal its probe met, or None when
 /// the refusal is not the view's to carry: a cancel, a client gone, a
 /// server stopping. The engine's message stands as written, less any
@@ -2967,7 +3002,10 @@ fn view_error(refusal: &Refusal) -> Option<String> {
 /// and whether it is read-only, and its tables and views in the same
 /// shapes. A DuckDB catalog's tables are counted exactly with the served
 /// database's, in the one statement; another engine's are not counted,
-/// since a count there reads every row of the file.
+/// since a count there reads every row of the file. On the workspace, a
+/// file it records and could not attach at its start is listed there too,
+/// holding nothing, with why in `error`, and the record itself, in the
+/// `_harbor` schema, is not listed (`workspace`).
 ///
 /// Ordering is part of the contract: tables and views by (schema, name),
 /// attached databases by name, columns in ordinal position, indexes and
@@ -3036,8 +3074,19 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
     };
-    let table_rows: Vec<_> = table_rows.into_iter().filter(|row| database_of.contains_key(&cell_str(row, 0))).collect();
-    let view_rows: Vec<_> = view_rows.into_iter().filter(|row| database_of.contains_key(&cell_str(row, 0))).collect();
+    // The workspace's record of what is attached in it is Harbor's, and is
+    // not listed among the user's relations.
+    let hidden = workspace::serving();
+    let listed = |row: &Vec<serde_json::Value>| match database_of.get(&cell_str(row, 0)) {
+        Some(&i) => !(hidden && databases[i].served && cell_str(row, 1) == wire::open::RECORD_SCHEMA),
+        None => false,
+    };
+    let table_rows: Vec<_> = table_rows.into_iter().filter(listed).collect();
+    let view_rows: Vec<_> = view_rows.into_iter().filter(listed).collect();
+    let unattached = match unattached_now(exec, &peer, &databases) {
+        Ok(unattached) => unattached,
+        Err(failure) => return catalog_refuse(req, failure),
+    };
     let duckdb_version = version_rows.first().map(|r| cell_str(r, 0)).unwrap_or_default();
     let harbor_version = env!("CARGO_PKG_VERSION").to_string();
     let (database_size_bytes, wal_size_bytes) = database_disk_sizes();
@@ -3053,7 +3102,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
                 .collect()
         };
         let served = databases.iter().find(|d| d.served).map(|d| d.name.as_str()).unwrap_or_default();
-        let attached = databases
+        let mut attached: Vec<AttachedInventory> = databases
             .iter()
             .filter(|d| !d.served)
             .map(|d| AttachedInventory {
@@ -3061,10 +3110,21 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
                 path: d.path.clone(),
                 storage: d.storage.clone(),
                 read_only: d.read_only,
+                error: None,
                 tables: named_in(&table_rows, &d.name),
                 views: named_in(&view_rows, &d.name),
             })
             .collect();
+        attached.extend(unattached.into_iter().map(|u| AttachedInventory {
+            name: u.record.name,
+            path: Some(u.record.path),
+            storage: u.record.storage,
+            read_only: u.record.read_only,
+            error: Some(u.reason),
+            tables: Vec::new(),
+            views: Vec::new(),
+        }));
+        attached.sort_by(|a, b| a.name.cmp(&b.name));
         let inventory = Inventory {
             harbor_version,
             duckdb_version,
@@ -3394,6 +3454,15 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
             None => {}
         }
     }
+    attached.extend(unattached.into_iter().map(|u| Attached {
+        name: u.record.name,
+        path: Some(u.record.path),
+        storage: u.record.storage,
+        read_only: u.record.read_only,
+        error: Some(u.reason),
+        ..Attached::default()
+    }));
+    attached.sort_by(|a, b| a.name.cmp(&b.name));
     let catalog = Catalog {
         harbor_version,
         duckdb_version,

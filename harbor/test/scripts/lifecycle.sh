@@ -819,6 +819,79 @@ check "a verb refuses a data file" 1 "opens it in the workspace" \
   "$harbor" "$work/files/order.csv" start
 wait_gone
 
+echo "— the workspace is whole at every start"
+# An ATTACH lasts as long as the server that ran it, and ST_Read reads only
+# where spatial is loaded: a server that opens the workspace attaches what it
+# records and loads what its views call into, before it serves anyone.
+mkdir -p "$work/files/b"
+"$harbor" "$work/mk.duckdb" -c "ATTACH '$work/files/app.sqlite' AS app (TYPE sqlite); CREATE TABLE app.people AS SELECT 1 AS id;
+  ATTACH '$work/files/b/app.sqlite' AS b (TYPE sqlite); CREATE TABLE b.t AS SELECT 1 AS id" >/dev/null 2>&1
+wait_gone
+check "a SQLite file attaches in the workspace" 0 "app: the SQLite database" \
+  "$harbor" "$work/files/app.sqlite" --mode csv -c "SELECT count(*) FROM app.people"
+printf '{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"elm"},"geometry":{"type":"Point","coordinates":[1,2]}}]}' \
+  > "$work/files/parks.geojson"
+spatial=1
+out=$("$harbor" "$work/files/parks.geojson" --mode csv -c "SELECT name FROM parks" 2>&1) || spatial=0
+if (( spatial )); then
+  [[ $out == *elm* ]] && ok "a GeoJSON file opens as a view" || bad "the GeoJSON view did not read: $out"
+else
+  echo "  - spatial did not install here, so the GeoJSON view is not checked: $out"
+fi
+wait_gone
+# The views and the attachment a fresh server shows, one line each, and any
+# relation listed in the record's schema.
+catalog_lines() {
+  curl -s --max-time 10 --unix-socket "$(live_sock)" http://harbor/catalog | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for v in d["views"]: print("view", v["name"], "reads" if v["columns"] and not v["error"] else v["error"])
+for a in d["attached"]: print("attached", a["name"], [t["name"] for t in a["tables"]], a["error"])
+for t in d["tables"]: print("table", t["schema"], t["name"])'
+}
+workspace_start() {
+  "$harbor" "$work/workspace.duckdb" start >"$work/ws.log" 2>&1 &
+  srv=$!
+  for _ in $(seq 1 100); do [[ -n $(live_sock) ]] && return; sleep 0.1; done
+  bad "the workspace never came up: $(cat "$work/ws.log")"
+}
+workspace_stop() {
+  "$harbor" "$work/workspace.duckdb" stop >/dev/null 2>&1
+  wait "$srv" 2>/dev/null
+  srv=""
+}
+workspace_start
+lines=$(catalog_lines)
+[[ $lines == *"view it_s_q1 reads"* && $lines == *"view order_2 reads"* ]] \
+  && ok "after a restart, the CSV views read" || bad "the CSV views after a restart: $lines"
+if (( spatial )); then
+  [[ $lines == *"view parks reads"* ]] && ok "the GeoJSON view reads, spatial loaded at the start" \
+                                       || bad "the GeoJSON view after a restart: $lines"
+fi
+[[ $lines == *"attached app ['people'] None"* ]] && ok "the SQLite file is attached again" \
+                                                  || bad "the SQLite file after a restart: $lines"
+[[ $lines != *"table "* ]] && ok "and the record of it is not listed" || bad "the catalog lists a table: $lines"
+workspace_stop
+mv "$work/files/app.sqlite" "$work/files/app.away"
+workspace_start
+lines=$(catalog_lines)
+[[ $lines == *"attached app [] $work/files/app.sqlite: no such file"* ]] \
+  && ok "a recorded file that is gone is said in the catalog, and the server serves" \
+  || bad "a gone file after a restart: $lines"
+grep -q "app is not attached" "$work/ws.log" && ok "and in its log" || bad "the log does not say so: $(cat "$work/ws.log")"
+check "another file of its stem takes the next name, not the gone one's" 0 "app_2: the SQLite database" \
+  "$harbor" "$work/files/b/app.sqlite" -c "DETACH app_2"
+workspace_stop
+mv "$work/files/app.away" "$work/files/app.sqlite"
+workspace_start
+[[ $(catalog_lines) == *"attached app ['people'] None"* ]] && ok "and it is attached again once it is back" \
+                                                          || bad "the file back: $(catalog_lines)"
+check "a plain DETACH" 0 "" "$harbor" "$work/workspace.duckdb" -c "DETACH app"
+workspace_stop
+workspace_start
+[[ $(catalog_lines) != *"attached app"* ]] && ok "lasts past the stop" || bad "detached, then: $(catalog_lines)"
+workspace_stop
+
 echo
 if ((fails)); then
   echo "lifecycle: $fails failing"

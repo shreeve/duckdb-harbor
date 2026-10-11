@@ -943,9 +943,17 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool, background: bool) -> R
     for sql in &o.init {
         con.execute_batch(sql).map_err(|e| format!("--init {sql:?}: {e}"))?;
     }
+    // The workspace makes itself whole before anyone is served, for every
+    // client alike: the extensions its views call into are loaded, and the
+    // files it records as attached are attached again.
+    let workspace = harbor_common::paths::workspace().and_then(|w| harbor_common::paths::canonical_db(&w));
+    if workspace.is_ok_and(|w| w == canon) {
+        harbor::workspace::open(&mut con);
+    }
     // The ATTACHED CATALOG NAMES, which is what a client must qualify its
     // queries with. Read once, here, because this runs AFTER the boot SQL
-    // above — so an ATTACH in --init is included. A later runtime ATTACH is
+    // and the workspace's attaching above — so an ATTACH in --init, or one
+    // the workspace records, is included. A later runtime ATTACH is
     // not; /info is a pure in-memory read and must stay one, since it has to
     // keep answering when every worker is busy.
     let databases: Vec<String> = con

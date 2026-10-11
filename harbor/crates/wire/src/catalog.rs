@@ -66,6 +66,11 @@ pub struct Attached {
     #[serde(rename = "type")]
     pub storage: String,
     pub read_only: bool,
+    /// Why it is not attached, when it is a file the workspace records and
+    /// its server could not attach at its start: the file gone, or the
+    /// engine's refusal. It then holds nothing. None for a database that is
+    /// attached.
+    pub error: Option<String>,
     /// By (schema, name), in the served database's shape. `rowCount` is
     /// exact for a DuckDB catalog, and None for another engine's, where a
     /// count reads every row of the file.
@@ -176,6 +181,7 @@ pub struct AttachedInventory {
     #[serde(rename = "type")]
     pub storage: String,
     pub read_only: bool,
+    pub error: Option<String>,
     pub tables: Vec<Named>,
     pub views: Vec<Named>,
 }
@@ -294,6 +300,7 @@ mod tests {
                 path: Some("/x/app.sqlite".into()),
                 storage: "sqlite".into(),
                 read_only: false,
+                error: None,
                 tables: vec![named("people")],
                 views: vec![],
             }],
@@ -301,7 +308,7 @@ mod tests {
         let text = serde_json::to_string(&lite).unwrap();
         assert_eq!(
             text,
-            r#"{"harborVersion":"1","duckdbVersion":"v2","databaseSizeBytes":1,"walSizeBytes":0,"tables":[{"name":"t","schema":"main"}],"views":[{"name":"v","schema":"main"}],"attached":[{"name":"app","path":"/x/app.sqlite","type":"sqlite","readOnly":false,"tables":[{"name":"people","schema":"main"}],"views":[]}]}"#
+            r#"{"harborVersion":"1","duckdbVersion":"v2","databaseSizeBytes":1,"walSizeBytes":0,"tables":[{"name":"t","schema":"main"}],"views":[{"name":"v","schema":"main"}],"attached":[{"name":"app","path":"/x/app.sqlite","type":"sqlite","readOnly":false,"error":null,"tables":[{"name":"people","schema":"main"}],"views":[]}]}"#
         );
         let read: Catalog = serde_json::from_str(&text).unwrap();
         assert_eq!((read.tables[0].row_count, read.tables[0].columns.len()), (None, 0));
@@ -320,19 +327,29 @@ mod tests {
         let people = Table { name: "people".into(), schema: "main".into(), ..Default::default() };
         let full = Catalog {
             views: vec![gone, view],
-            attached: vec![Attached {
-                name: "app".into(),
-                path: None,
-                storage: "sqlite".into(),
-                read_only: true,
-                tables: vec![people],
-                views: vec![],
-            }],
+            attached: vec![
+                Attached {
+                    name: "app".into(),
+                    path: None,
+                    storage: "sqlite".into(),
+                    read_only: true,
+                    error: None,
+                    tables: vec![people],
+                    views: vec![],
+                },
+                Attached {
+                    name: "gone".into(),
+                    path: Some("/x/gone.sqlite".into()),
+                    storage: "sqlite".into(),
+                    error: Some("/x/gone.sqlite: no such file".into()),
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         };
         let text = serde_json::to_string(&full).unwrap();
         assert!(text.ends_with(
-            r#""sequences":[],"views":[{"name":"gone","schema":"main","columns":[],"error":"IO Error: No files found","ddl":null},{"name":"sales","schema":"main","columns":[{"name":"id","type":"BIGINT","notNull":false,"default":null,"generated":false,"generationExpression":null,"primary":false}],"error":null,"ddl":"CREATE VIEW sales AS SELECT 1;"}],"attached":[{"name":"app","path":null,"type":"sqlite","readOnly":true,"tables":[{"name":"people","schema":"main","rowCount":null,"columns":[],"primaryKey":[],"uniqueConstraints":[],"indexes":[],"foreignKeys":[],"ddl":null}],"views":[]}]}"#
+            r#""sequences":[],"views":[{"name":"gone","schema":"main","columns":[],"error":"IO Error: No files found","ddl":null},{"name":"sales","schema":"main","columns":[{"name":"id","type":"BIGINT","notNull":false,"default":null,"generated":false,"generationExpression":null,"primary":false}],"error":null,"ddl":"CREATE VIEW sales AS SELECT 1;"}],"attached":[{"name":"app","path":null,"type":"sqlite","readOnly":true,"error":null,"tables":[{"name":"people","schema":"main","rowCount":null,"columns":[],"primaryKey":[],"uniqueConstraints":[],"indexes":[],"foreignKeys":[],"ddl":null}],"views":[]},{"name":"gone","path":"/x/gone.sqlite","type":"sqlite","readOnly":false,"error":"/x/gone.sqlite: no such file","tables":[],"views":[]}]}"#
         ), "{text}");
         let read: Catalog = serde_json::from_str(&text).unwrap();
         assert_eq!(read, full);

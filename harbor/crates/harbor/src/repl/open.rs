@@ -6,7 +6,9 @@
 //! else DuckDB reads opens in the workspace database
 //! (`harbor_common::paths::workspace`), as a view named for the file or, for
 //! SQLite, an attached catalog, made before the prompt and said in one line.
-//! Opening the same file again finds what the first opening made.
+//! Opening the same file again finds what the first opening made. An
+//! attachment is written to the workspace's record (`wire::open::Record`),
+//! from which every server that opens the workspace attaches it again.
 
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
@@ -116,22 +118,48 @@ fn view(transport: &Transport, path: &str, shown: &str, reader: Reader) -> Resul
 fn attach(transport: &Transport, path: &str, shown: &str) -> Result<String, String> {
     let existing = rows(
         transport,
-        &format!("SELECT database_name FROM duckdb_databases() WHERE path = {}", open::quote_literal(path)),
+        &format!(
+            "SELECT database_name, readonly FROM duckdb_databases() WHERE path = {}",
+            open::quote_literal(path)
+        ),
     )?;
     if let Some(row) = existing.first() {
+        remember(transport, text(row, 0), path, row.get(1).and_then(Value::as_bool).unwrap_or_default())?;
         return Ok(format!("{}: the SQLite database {shown}, attached already", text(row, 0)));
     }
     // A catalog's name must not be a database's, a schema's or a reserved
-    // word, or `name.table` would mean something else.
-    let taken = names(
+    // word, or `name.table` would mean something else; nor one the record
+    // keeps for another file that its server could not attach, which would
+    // be written over. The record is not there until a first attachment.
+    let mut taken = names(
         transport,
         "SELECT database_name FROM duckdb_databases() \
          UNION ALL SELECT schema_name FROM duckdb_schemas() \
          UNION ALL SELECT keyword_name FROM duckdb_keywords() WHERE keyword_category = 'reserved'",
     )?;
+    let recorded = format!(
+        "SELECT name FROM {}.{} WHERE path <> {}",
+        open::RECORD_SCHEMA,
+        open::RECORD_TABLE,
+        open::quote_literal(path)
+    );
+    taken.extend(names(transport, &recorded).unwrap_or_default());
     let name = open::free_name(&open::view_name(path), |n| taken.iter().any(|t| t.eq_ignore_ascii_case(n)));
     rows(transport, &open::attach_sql(&name, path))?;
+    remember(transport, &name, path, false)?;
     Ok(format!("{name}: the SQLite database {shown}, attached"))
+}
+
+/// Record the attachment in the workspace, so every server that opens it
+/// attaches the file again. The server rewrites the record from what is
+/// attached when it stops; writing it here keeps it through a server that
+/// does not stop cleanly.
+fn remember(transport: &Transport, name: &str, path: &str, read_only: bool) -> Result<(), String> {
+    for ddl in open::RECORD_DDL {
+        rows(transport, ddl)?;
+    }
+    let record = open::Record { name: name.into(), path: path.into(), storage: "sqlite".into(), read_only };
+    rows(transport, &record.insert_sql()).map(drop)
 }
 
 fn text(row: &[Value], i: usize) -> &str {

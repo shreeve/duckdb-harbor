@@ -414,7 +414,7 @@ Views and attached databases follow the tables:
            "error":"IO Error: No files found that match the pattern \"/data/gone.csv\"",
            "ddl":"…"}],
  "attached":[{"name":"app","path":"/data/app.sqlite","type":"sqlite",
-              "readOnly":false,"tables":[…],"views":[…]}]
+              "readOnly":false,"error":null,"tables":[…],"views":[…]}]
 ```
 
 A view has no `rowCount`: counting a view over a file reads the file. Its
@@ -427,6 +427,9 @@ attached beside the served one, `system` and `temp` never, with its path
 (`null` in memory), its storage `type`, whether it is read-only, and its tables
 and views in the same shapes. A DuckDB catalog's tables carry exact counts;
 another engine's carry `rowCount: null`, since a count there reads every row.
+On the workspace, a file it records as attached and could not attach at its
+start is listed too, holding nothing, with why in `error` (`"/data/app.sqlite:
+no such file"`); `error` is `null` for a database that is attached.
 A table or view another client drops, or a database it detaches, while the
 catalog is being read is left out; it never fails the read.
 
@@ -594,11 +597,23 @@ it looked at. The view reads the file where it lies, by its absolute path, so
 the file is never copied or changed and a 10 GB Parquet file opens at once. A
 name another relation or a reserved word has gets `_2`, `_3`; opening the same
 file again finds the view the first opening made. The `excel`, `sqlite` and
-`spatial` extensions install on first use; `spatial` does not load on demand,
-so a later session that reads a spatial view runs `LOAD spatial` first, and
-`/catalog` says so in the view's `error` until it does. An attachment lasts as
-long as the workspace's server. The verbs (`start`, `backup`, …) act on
-databases and refuse a data file.
+`spatial` extensions install on first use.
+
+Every server that opens the workspace makes it whole before it serves
+anyone, whichever client summoned it: it loads `spatial` when a view calls an
+`ST_` function, since `spatial` does not load on demand (`excel`, `json`,
+`parquet` and `sqlite` do), and it attaches again each database file the
+workspace records. The record is the table `_harbor.attached` (`name`,
+`path`, `type`, `read_only`) in the workspace itself: `harbor <SQLite file>`
+writes its row, and the server rewrites it from what is attached when it
+stops, so a plain `ATTACH` or `DETACH` of a SQLite or DuckDB file, from any
+client, lasts past the server; one that ends without stopping (a crash, a
+`kill -9`) leaves the record as last written. `/catalog` does not list it. A recorded file
+that is gone at the start is not attached, since attaching a missing path
+would make an empty database there; the server's log and `/catalog` say so,
+the server starts all the same, and the row stays, so the file is attached
+again once it is back. Deleting the row forgets it. The verbs (`start`,
+`backup`, …) act on databases and refuse a data file.
 
 **`harbor <db.duckdb> start` — the server is yours.** No refcount: it lives
 until you stop it. At a terminal the server comes up in the background and
