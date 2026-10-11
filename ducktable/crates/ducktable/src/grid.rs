@@ -4590,6 +4590,17 @@ fn run_statements(conn: &Conn, sid: &str, stmts: &[edits::Statement]) -> Result<
                 return Err(format!("insert returned {} rows instead of 1", r.rows.len()));
             }
             edits::StatementExpectation::ReturnedOne => {}
+            // Counted, for a table that takes no RETURNING: a duplicate
+            // whose source is gone inserts nothing.
+            edits::StatementExpectation::CountedInsert => match crate::sql::count_of(&r) {
+                Some(1) => {}
+                Some(0) => {
+                    return Err("a duplicated row's source is gone — discard that duplicate \
+                                (⌘Z, or the review popover)"
+                        .to_string());
+                }
+                n => return Err(format!("insert wrote {} rows instead of 1", n.unwrap_or(0))),
+            },
         }
     }
     Ok(())
