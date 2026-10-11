@@ -15,6 +15,7 @@
 
 use crate::edits::{self, Edits};
 use crate::prefs::{self, ViewMode};
+use crate::sql::SortKey;
 use crate::theme::{
     pal, ui_font, value_font, CELL_TEXT, GUTTER_TEXT, HEADER_TEXT, PANE_INSET, TAG_TEXT,
 };
@@ -86,6 +87,11 @@ pub(crate) struct Grid {
     pub(crate) page_size: usize,
     /// Raw SQL WHERE clause text, verbatim from the filter strip.
     pub(crate) filter: Option<String>,
+    /// The header sort the rows on screen were read under, its keys in
+    /// priority order (`sort_click`). Committed with a page, as the filter
+    /// is; the Data view's only, since a results grid is ordered by its
+    /// statement.
+    pub(crate) sort: Vec<SortKey>,
     /// Exact server-side row count (under the current filter), when the
     /// count query succeeded.
     pub(crate) total_rows: Option<u64>,
@@ -206,6 +212,12 @@ pub(crate) struct Grid {
 
 impl EventEmitter<crate::app::CatalogRefreshRequested> for Grid {}
 impl EventEmitter<crate::app::CommitSettled> for Grid {}
+impl EventEmitter<SortChanged> for Grid {}
+
+/// The header sort a page landed under differs from the one before it.
+/// The root keeps it for the table, for the session, and a grid built for
+/// the table again opens under it.
+pub(crate) struct SortChanged(pub(crate) Vec<SortKey>);
 
 /// Everything a fetch commits along with its rows. The delegate is not
 /// touched until the data arrives — the footer, funnel, and gutter always
@@ -215,6 +227,8 @@ struct PageReq {
     page: usize,
     size: usize,
     filter: FilterChange,
+    /// A header sort to commit with the rows; None keeps the current one.
+    sort: Option<Vec<SortKey>>,
     recount: bool,
 }
 
@@ -336,6 +350,18 @@ pub(crate) struct GridDelegate {
     /// Set while a fetch is in flight; the TableDelegate `loading` hook
     /// reads it, so it lives here rather than on Grid.
     loading: bool,
+    /// The headers take sort clicks: the Data view's grid. A results grid
+    /// is ordered by its statement, and the Structure grid by the table's
+    /// column order.
+    sortable: bool,
+    /// Each schema column's header mark under the sort on screen, derived
+    /// when a sort or a schema lands (`sort_marks`): None, or its arrow
+    /// and, among several keys, its place.
+    sort_marks: Vec<Option<SharedString>>,
+    /// A header click waiting for the grid, which observes the table: the
+    /// schema column and whether ⇧ was down. The delegate renders inside
+    /// the table and cannot reach the grid that fetches.
+    sort_click: Option<(usize, bool)>,
 }
 
 impl Grid {
@@ -383,14 +409,22 @@ impl Grid {
         // (a mismatch makes the first next-click skip rows).
         page_size: usize,
         structure: Option<crate::structure::TableStructure>,
+        // The header sort the first page was read under (`sql::first_page`).
+        sort: Vec<SortKey>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let source = crate::sql::source(schema, name);
-        Self::build(
+        let mut grid = Self::build(
             conn, source, title, outcome, total_rows, page_size, structure, false,
             true, window, cx,
-        )
+        );
+        grid.table.update(cx, |state, _| {
+            let d = state.delegate_mut();
+            d.sort_marks = sort_marks(&sort, &d.names);
+        });
+        grid.sort = sort;
+        grid
     }
 
     /// A results grid for the Query view: the user's statement IS the
@@ -446,12 +480,8 @@ impl Grid {
         // keyless table edits like any other: pages fetch the rowid paired
         // with the row's hash (`sql::page_sql`), the column stays hidden,
         // and only the WHERE clauses see it.
-        let pk_cols: Vec<String> = structure
-            .as_ref()
-            .map(|s| s.cols.iter().filter(|c| c.primary).map(|c| c.name.clone()).collect())
-            .unwrap_or_default();
         let rowid = structure.as_ref().is_some_and(|s| s.keyed_by_rowid());
-        let pk_cols = if rowid { vec!["rowid".to_string()] } else { pk_cols };
+        let pk_cols = identity_columns(structure.as_ref());
         let mut delegate = GridDelegate {
             cols: Vec::new(),
             schema_cols: Vec::new(),
@@ -484,6 +514,9 @@ impl Grid {
             all_selected: false,
             active_cell: None,
             loading: false,
+            sortable: !embedded,
+            sort_marks: Vec::new(),
+            sort_click: None,
         };
         let (error, last_time_ms) = match outcome {
             Ok(page) => {
@@ -627,7 +660,14 @@ impl Grid {
         // also clears and moves its selection on its own (Escape, a
         // header click). Reconcile on every table notify instead; the
         // comparison makes it a no-op when already in sync.
-        cx.observe(&table, |_, table, cx| {
+        cx.observe(&table, |grid, table, cx| {
+            // A header click the delegate recorded (render_th) is the
+            // grid's to fetch.
+            if let Some((schema_ix, shift)) =
+                table.update(cx, |state, _| state.delegate_mut().sort_click.take())
+            {
+                grid.sort_column(schema_ix, shift, cx);
+            }
             table.update(cx, |state, cx| {
                 let real = state.selected_row();
                 let d = state.delegate_mut();
@@ -726,6 +766,7 @@ impl Grid {
             page: 0,
             page_size,
             filter: None,
+            sort: Vec::new(),
             total_rows,
             error,
             last_time_ms,
@@ -776,11 +817,35 @@ impl Grid {
         };
         let conn = self.conn.clone();
         let session = self.session.clone();
-        let sql =
-            crate::sql::page_sql(&self.source, self.rowid, &filter, req.page, req.size);
+        // The header sort the page is read under: the one asked for, or the
+        // one on screen. A strip applied with an ORDER BY of its own asks
+        // for that order instead (`sort_after_filter`).
+        let kept = req.sort.is_none();
+        let mut sort = req.sort.clone().unwrap_or_else(|| self.sort.clone());
+        if let FilterChange::Set(new) = &req.filter {
+            sort = sort_after_filter(sort, new);
+        }
+        let sql = crate::sql::sorted_page_sql(
+            &self.source,
+            self.rowid,
+            &filter,
+            &sort,
+            &self.tiebreak(cx),
+            req.page,
+            req.size,
+        );
+        // A sort kept from an earlier page can name a column another
+        // client has since dropped, and would then fail every page after
+        // it: such a page is read again unsorted, and taken, the sort
+        // cleared, when it lacks a column the sort names.
+        let unsorted = (kept && !sort.is_empty()).then(|| {
+            let plain = crate::sql::page_sql(&self.source, self.rowid, &filter, req.page, req.size);
+            (sort.clone(), plain)
+        });
         // The fetch a commit is waiting on counts again, since the commit
         // changed the count, and so does any fetch that supersedes it: a
         // page flipped in that window must not leave the total as it was.
+        // The count is never ordered: a sort changes no total.
         let recount = req.recount || self.post_commit.is_some();
         let count_sql = recount.then(|| crate::sql::count_sql(&self.source, &filter));
         let PageReq { page, size, filter, .. } = req;
@@ -790,7 +855,7 @@ impl Grid {
         let unsettled = self.edits.as_ref().and_then(|e| e.unsettled().map(str::to_string));
         self.table.update(cx, |state, _| state.delegate_mut().loading = true);
         cx.spawn(async move |this, cx| {
-            let (outcome, over) = cx
+            let (outcome, over, unsorted) = cx
                 .background_executor()
                 .spawn(async move {
                     let over = unsettled.map(|id| {
@@ -801,12 +866,21 @@ impl Grid {
                         Some(txn) => txn.page(sql),
                         None => harbor_client::query(&conn, sql),
                     };
-                    let outcome = run(&sql).map(|result| {
+                    let (outcome, unsorted) = match (run(&sql), unsorted) {
+                        (Err(message), Some((sort, plain))) => match run(&plain) {
+                            Ok(page) if crate::sql::sort_column_gone(&sort, &page.columns) => {
+                                (Ok(page), true)
+                            }
+                            _ => (Err(message), false),
+                        },
+                        (outcome, _) => (outcome, false),
+                    };
+                    let outcome = outcome.map(|result| {
                         let total =
                             count_sql.map(|c| run(&c).ok().and_then(|r| crate::sql::count_of(&r)));
                         (result, total)
                     });
-                    (outcome, over)
+                    (outcome, over, unsorted)
                 })
                 .await;
             this.update(cx, |grid, cx| {
@@ -825,6 +899,7 @@ impl Grid {
                 // dropped below: the database was read at this moment.
                 let read = outcome.is_ok();
                 let staged = grid.edits.as_ref().is_some_and(Edits::any_staged);
+                let mut sort_changed = false;
                 let result = match (outcome, landing(grid.editor.is_some(), reshaped, staged)) {
                     (Ok(_), Landing::Dropped) => None,
                     (Ok(_), Landing::Reshaped) => {
@@ -835,11 +910,16 @@ impl Grid {
                     (Ok((result, total)), Landing::Shown) => {
                         grid.reshaped = false;
                         grid.unrefreshed = false;
-                        grid.error = None;
+                        grid.error = unsorted.then(|| SORT_CLEARED.to_string());
                         grid.page = page;
                         grid.page_size = size;
                         if let FilterChange::Set(f) = filter {
                             grid.filter = f;
+                        }
+                        let sort = if unsorted { Vec::new() } else { sort };
+                        if grid.sort != sort {
+                            grid.sort = sort;
+                            sort_changed = true;
                         }
                         if let Some(t) = total {
                             grid.total_rows = t;
@@ -860,6 +940,7 @@ impl Grid {
                 // stale seat for some later, unrelated fetch to restore.
                 let ring_keep = grid.ring_keep.take();
                 let mut born = false;
+                let sort = &grid.sort;
                 grid.table.update(cx, |state, cx| {
                     state.delegate_mut().loading = false;
                     if let Some(result) = result {
@@ -876,6 +957,9 @@ impl Grid {
                             } else {
                                 d.adopt_rows(result.rows, base);
                             }
+                            // The headers mark the sort these rows were
+                            // read under, by the columns they arrived with.
+                            d.sort_marks = sort_marks(sort, &d.names);
                             d.reset_cursor();
                         }
                         let d = state.delegate();
@@ -915,6 +999,9 @@ impl Grid {
                     // The catalog the sidebar and the next grid read from
                     // describes the table as it was.
                     cx.emit(crate::app::CatalogRefreshRequested);
+                }
+                if sort_changed {
+                    cx.emit(SortChanged(grid.sort.clone()));
                 }
                 // Staged changes are identity-keyed; the new page gets
                 // them projected wherever (and whether) its rows match.
@@ -1037,7 +1124,10 @@ impl Grid {
             return;
         }
         let size = self.page_size;
-        self.fetch(PageReq { page, size, filter: FilterChange::Keep, recount: false }, cx);
+        self.fetch(
+            PageReq { page, size, filter: FilterChange::Keep, sort: None, recount: false },
+            cx,
+        );
     }
 
     pub(crate) fn jump_first(&mut self, cx: &mut Context<Self>) {
@@ -1092,7 +1182,36 @@ impl Grid {
         let ix = prefs::PAGE_SIZES.iter().position(|s| *s == current).unwrap_or(0);
         let next = prefs::PAGE_SIZES[(ix + 1) % prefs::PAGE_SIZES.len()];
         prefs::toggle(cx, |p| p.page_size = next);
-        self.fetch(PageReq { page: 0, size: next, filter: FilterChange::Keep, recount: false }, cx);
+        self.fetch(
+            PageReq { page: 0, size: next, filter: FilterChange::Keep, sort: None, recount: false },
+            cx,
+        );
+    }
+
+    /// A header click (`sort_click`): page 1 again under the sort it
+    /// makes, with the count as it was, since a sort changes no total. The
+    /// sort replaces the page, so text in an open editor is staged first,
+    /// and text its column refuses keeps the editor, the page and the sort
+    /// where they are. The sort commits with the rows it orders: a page
+    /// that fails leaves both as they were.
+    fn sort_column(&mut self, schema_ix: usize, shift: bool, cx: &mut Context<Self>) {
+        let names = &self.table.read(cx).delegate().names;
+        let Some(column) = names.get(schema_ix).map(|n| n.to_string()) else { return };
+        if !self.settle_editor(cx) {
+            return;
+        }
+        let sort = Some(sort_click(&self.sort, &column, shift));
+        let size = self.page_size;
+        self.fetch(PageReq { page: 0, size, filter: FilterChange::Keep, sort, recount: false }, cx);
+    }
+
+    /// The columns that break a header sort's ties (`sql::tiebreak`), from
+    /// the columns on screen.
+    fn tiebreak(&self, cx: &App) -> Vec<String> {
+        let d = self.table.read(cx).delegate();
+        let columns: Vec<String> =
+            d.names.iter().skip(d.identity as usize).map(|n| n.to_string()).collect();
+        crate::sql::tiebreak(&self.pk_cols, &columns)
     }
 
     /// Mark a schema column as pill-rendered (see GridDelegate::pill_cols).
@@ -1117,7 +1236,13 @@ impl Grid {
             if self.filter.is_some() {
                 let size = self.page_size;
                 self.fetch(
-                    PageReq { page: 0, size, filter: FilterChange::Set(None), recount: true },
+                    PageReq {
+                        page: 0,
+                        size,
+                        filter: FilterChange::Set(None),
+                        sort: None,
+                        recount: true,
+                    },
                     cx,
                 );
             }
@@ -1140,6 +1265,7 @@ impl Grid {
                         page: 0,
                         size,
                         filter: FilterChange::Set((!text.is_empty()).then_some(text)),
+                        sort: None,
                         recount: true,
                     },
                     cx,
@@ -1177,6 +1303,7 @@ impl Grid {
                                 page: 0,
                                 size,
                                 filter: FilterChange::Set(None),
+                                sort: None,
                                 recount: true,
                             },
                             cx,
@@ -2816,7 +2943,7 @@ impl Grid {
     fn fetch_page_now(&mut self, page: usize, cx: &mut Context<Self>) {
         let size = self.page_size;
         self.fetch(
-            PageReq { page, size, filter: FilterChange::Keep, recount: true },
+            PageReq { page, size, filter: FilterChange::Keep, sort: None, recount: true },
             cx,
         );
     }
@@ -3220,7 +3347,11 @@ impl GridDelegate {
         let name_len =
             self.schema_cols[schema_ix].name.as_deref().map_or(4, |n| n.chars().count());
         let content = chars.min(CAP) as f32 * advance;
-        let header = name_len as f32 * header_advance;
+        // A sortable header keeps room for a mark of two glyphs and its gap
+        // whether or not it is sorted, so a sort never truncates the name
+        // of a column fitted to it, and never resizes one.
+        let mark = if self.sortable { 2. * header_advance + 4. } else { 0. };
+        let header = name_len as f32 * header_advance + mark;
         px((content.max(header) + PANE_INSET + 16.).clamp(60. * zoom, 460. * zoom))
     }
 
@@ -3716,7 +3847,27 @@ impl TableDelegate for GridDelegate {
         // text's edge, PANE_INSET + 1px divider in: the wrapper already
         // padded `comp` of it, and the margin supplies the difference
         // (negative when the wrapper alone overshoots).
+        //
+        // A sorted column's mark (`sort_marks`) sits on the side away from
+        // that edge, so the name keeps its place, and the name truncates
+        // before the mark does.
+        let mark = self.sort_marks.get(data_col).cloned().flatten().map(|mark| {
+            div()
+                .flex_none()
+                .font_family(ui_font())
+                .text_color(t.accent)
+                .map(|d| if right { d.mr(px(4.)) } else { d.ml(px(4.)) })
+                .child(mark)
+        });
+        let name = div()
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .when(right, |d| d.text_right().mr(px(PANE_INSET + 1.) - comp))
+            .child(self.cols[col_ix].name.clone());
+        let (before, after) = if right { (mark, None) } else { (None, mark) };
         div()
+            .id(("th-sort", col_ix))
             .relative()
             .h_flex()
             .items_center()
@@ -3725,14 +3876,19 @@ impl TableDelegate for GridDelegate {
             .text_size(px(HEADER_TEXT * p.zoom_factor()))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(t.text)
-            .child(
-                div()
-                    .w_full()
-                    .truncate()
-                    .when(right, |d| d.text_right().mr(px(PANE_INSET + 1.) - comp))
-                    .child(self.cols[col_ix].name.clone()),
-            )
+            .children(before)
+            .child(name)
+            .children(after)
             .child(edge(t.grid_line))
+            // A click sorts; the resize bands on either edge occlude the
+            // header cell, so a drag or a divider double-click never
+            // reaches here. The grid fetches (`sort_column`).
+            .when(self.sortable && data_col != usize::MAX, |d| {
+                d.on_click(cx.listener(move |state, e: &ClickEvent, _, cx| {
+                    state.delegate_mut().sort_click = Some((data_col, e.modifiers().shift));
+                    cx.notify();
+                }))
+            })
             .into_any_element()
     }
 
@@ -3996,7 +4152,20 @@ impl Render for Grid {
                                         .xsmall()
                                         .cleanable(true),
                                 ),
-                            ),
+                            )
+                            // The page has one ordering, and the header's
+                            // sets the strip's aside (`sql::sorted_page_sql`):
+                            // the strip says so rather than show an ORDER BY
+                            // the rows do not follow.
+                            .when(strip_order_set_aside(&self.sort, &self.filter), |d| {
+                                d.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(11.))
+                                        .text_color(t.muted)
+                                        .child("ORDER BY set aside for the header sort"),
+                                )
+                            }),
                     )
                 })
             })
@@ -4688,14 +4857,195 @@ fn should_reconcile_selection(
         && !(table_selection.is_none() && mirror.is_some() && mirror_is_dirty)
 }
 
+/// The status line after a page read unsorted because the sort it kept
+/// failed (`Grid::fetch`).
+const SORT_CLEARED: &str = "the sort named a column this table does not have, so it is cleared";
+
+/// A header click on `column`, as the keys it leaves (docs/DESIGN.md
+/// "Grid"). A plain click sorts by the column alone: on the only key it
+/// cycles ascending, descending, none, and anywhere else it starts
+/// ascending, any other key dropped. A ⇧-click changes the column's place
+/// among the keys and leaves the rest be: absent, it joins as the last
+/// key, ascending; ascending, it turns descending where it stands;
+/// descending, it leaves, and the keys after it move up.
+fn sort_click(keys: &[SortKey], column: &str, shift: bool) -> Vec<SortKey> {
+    let at = keys.iter().position(|k| k.column == column);
+    let only = keys.len() == 1 && at.is_some();
+    if !shift && !only {
+        return vec![SortKey { column: column.to_string(), desc: false }];
+    }
+    let mut keys = keys.to_vec();
+    match at {
+        None => keys.push(SortKey { column: column.to_string(), desc: false }),
+        Some(i) if !keys[i].desc => keys[i].desc = true,
+        Some(i) => {
+            keys.remove(i);
+        }
+    }
+    keys
+}
+
+/// Each schema column's header mark under `sort`: ↑ ascending, ↓
+/// descending, and among several keys the key's place after it (↑1, ↓2);
+/// None for a column the sort does not name.
+fn sort_marks(sort: &[SortKey], names: &[SharedString]) -> Vec<Option<SharedString>> {
+    names
+        .iter()
+        .map(|name| {
+            let place = sort.iter().position(|k| k.column == name.as_ref())?;
+            let arrow = if sort[place].desc { '\u{2193}' } else { '\u{2191}' };
+            Some(SharedString::from(if sort.len() > 1 {
+                format!("{arrow}{}", place + 1)
+            } else {
+                arrow.to_string()
+            }))
+        })
+        .collect()
+}
+
+/// Whether an applied strip ends in an ORDER BY of its own.
+fn strip_orders(filter: &Option<String>) -> bool {
+    filter.as_deref().is_some_and(|f| crate::sql::split_order(f).1.is_some())
+}
+
+/// The header sort once the strip is applied. A strip that ends in an
+/// ORDER BY asks for that order, the latest one asked for, and clears the
+/// header sort; one without leaves it be. Clicking a header afterwards
+/// sets the strip's ORDER BY aside, until the header sort has no keys.
+fn sort_after_filter(sort: Vec<SortKey>, filter: &Option<String>) -> Vec<SortKey> {
+    if strip_orders(filter) { Vec::new() } else { sort }
+}
+
+/// Whether the header sort has set the applied strip's ORDER BY aside, so
+/// the strip says so.
+fn strip_order_set_aside(sort: &[SortKey], filter: &Option<String>) -> bool {
+    !sort.is_empty() && strip_orders(filter)
+}
+
+/// The columns that name a row for editing (docs/EDITING.md): the
+/// catalog's primary key, `rowid` for a table keyed by DuckDB's implicit
+/// one, and none for a table with neither.
+pub(crate) fn identity_columns(structure: Option<&crate::structure::TableStructure>) -> Vec<String> {
+    match structure {
+        Some(s) if s.keyed_by_rowid() => vec!["rowid".to_string()],
+        Some(s) => s.cols.iter().filter(|c| c.primary).map(|c| c.name.clone()).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// The sort a table opens under: the one remembered for it this session,
+/// while the table has every column it names, and none once one is gone.
+pub(crate) fn remembered_sort(sort: Vec<SortKey>, columns: &[String]) -> Vec<SortKey> {
+    if sort.iter().all(|k| columns.contains(&k.column)) { sort } else { Vec::new() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ClickKind, DraftHint, Lead, RowSelection, duplicate_cells, tag_width, duplicate_refusal, orphaned, same_columns, should_reconcile_selection,
         wrapped_step, Committed, Page, PostCommit, commit_status, commit_verdict, settle_fetch,
         stale_reason, verdict_refusal, ring_step, first_entry_column, last_page_of, has_next_page,
-        divider_at,
+        divider_at, identity_columns, remembered_sort, sort_after_filter, sort_click, sort_marks,
+        strip_order_set_aside,
     };
+    use crate::sql::SortKey;
+
+    fn keys(spec: &[(&str, bool)]) -> Vec<SortKey> {
+        spec.iter().map(|(c, desc)| SortKey { column: c.to_string(), desc: *desc }).collect()
+    }
+
+    #[test]
+    fn a_plain_header_click_sorts_by_its_column_alone_and_cycles_it() {
+        let none = keys(&[]);
+        let asc = sort_click(&none, "a", false);
+        assert_eq!(asc, keys(&[("a", false)]));
+        let desc = sort_click(&asc, "a", false);
+        assert_eq!(desc, keys(&[("a", true)]));
+        assert_eq!(sort_click(&desc, "a", false), none);
+        // Another column, or a key among several, starts over ascending.
+        assert_eq!(sort_click(&desc, "b", false), keys(&[("b", false)]));
+        let two = keys(&[("a", true), ("b", false)]);
+        assert_eq!(sort_click(&two, "b", false), keys(&[("b", false)]));
+        assert_eq!(sort_click(&two, "a", false), keys(&[("a", false)]));
+    }
+
+    #[test]
+    fn a_shift_click_adds_turns_or_removes_one_key_and_keeps_the_rest() {
+        let one = keys(&[("a", false)]);
+        let two = sort_click(&one, "b", true);
+        assert_eq!(two, keys(&[("a", false), ("b", false)]));
+        let three = sort_click(&two, "c", true);
+        assert_eq!(three, keys(&[("a", false), ("b", false), ("c", false)]));
+        // Ascending turns descending in its place.
+        let turned = sort_click(&three, "b", true);
+        assert_eq!(turned, keys(&[("a", false), ("b", true), ("c", false)]));
+        // Descending leaves, and the keys after it move up.
+        assert_eq!(sort_click(&turned, "b", true), keys(&[("a", false), ("c", false)]));
+        // On no sort, a shift-click starts one.
+        assert_eq!(sort_click(&[], "a", true), one);
+        assert_eq!(sort_click(&sort_click(&one, "a", true), "a", true), keys(&[]));
+    }
+
+    #[test]
+    fn a_header_marks_its_direction_and_its_place_among_several_keys() {
+        let names: Vec<SharedString> = ["rowid", "a", "b", "c"].map(SharedString::from).to_vec();
+        let marks = |sort: &[SortKey]| -> Vec<Option<String>> {
+            sort_marks(sort, &names).into_iter().map(|m| m.map(|m| m.to_string())).collect()
+        };
+        assert_eq!(marks(&[]), [None, None, None, None]);
+        assert_eq!(marks(&keys(&[("b", true)])), [None, None, Some("\u{2193}".into()), None]);
+        assert_eq!(
+            marks(&keys(&[("c", false), ("a", true)])),
+            [None, Some("\u{2193}2".into()), None, Some("\u{2191}1".into())]
+        );
+        // A key whose column is not among these marks nothing.
+        assert_eq!(marks(&keys(&[("gone", false)])), [None, None, None, None]);
+    }
+
+    #[test]
+    fn the_latest_ordering_asked_for_wins_and_a_set_aside_one_is_said() {
+        let sort = keys(&[("a", false)]);
+        let ordered = Some("x > 0 ORDER BY b".to_string());
+        let plain = Some("x > 0".to_string());
+        // Applying a strip that orders clears the header sort; one that
+        // does not, or clearing the strip, keeps it.
+        assert_eq!(sort_after_filter(sort.clone(), &ordered), keys(&[]));
+        assert_eq!(sort_after_filter(sort.clone(), &plain), sort);
+        assert_eq!(sort_after_filter(sort.clone(), &None), sort);
+        // An ORDER BY inside the condition is not the strip's ordering.
+        let window = Some("row_number() OVER (ORDER BY id) < 3".to_string());
+        assert_eq!(sort_after_filter(sort.clone(), &window), sort);
+        // A header sort over a strip that orders sets the strip's aside.
+        assert!(strip_order_set_aside(&sort, &ordered));
+        assert!(!strip_order_set_aside(&[], &ordered));
+        assert!(!strip_order_set_aside(&sort, &plain));
+    }
+
+    #[test]
+    fn a_remembered_sort_opens_only_while_its_columns_are_there() {
+        let cols = ["id".to_string(), "v".to_string()];
+        let sort = keys(&[("v", true), ("id", false)]);
+        assert_eq!(remembered_sort(sort.clone(), &cols), sort);
+        assert_eq!(remembered_sort(keys(&[("v", true), ("gone", false)]), &cols), keys(&[]));
+        assert_eq!(remembered_sort(sort, &[]), keys(&[]));
+    }
+
+    #[test]
+    fn the_identity_is_the_key_or_the_rowid_or_nothing() {
+        use crate::structure::TableStructure;
+        let col = |name: &str, primary: bool| harbor_client::catalog::Column {
+            name: name.into(),
+            primary,
+            ..Default::default()
+        };
+        let keyed = TableStructure { cols: vec![col("a", true), col("b", true), col("v", false)], ddl: None };
+        assert_eq!(identity_columns(Some(&keyed)), ["a", "b"]);
+        let keyless = TableStructure { cols: vec![col("v", false)], ddl: None };
+        assert_eq!(identity_columns(Some(&keyless)), ["rowid"]);
+        let shadowed = TableStructure { cols: vec![col("ROWID", false), col("v", false)], ddl: None };
+        assert!(identity_columns(Some(&shadowed)).is_empty());
+        assert!(identity_columns(None).is_empty());
+    }
     use crate::edits::{self, Bind, CellEdit, Edits};
     use gpui_kit::{Modifiers, SharedString};
     use serde_json::json;
