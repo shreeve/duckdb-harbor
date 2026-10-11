@@ -12,7 +12,8 @@ use std::{
     io::Read,
     panic::AssertUnwindSafe,
     sync::{
-        Arc, Condvar, Mutex, OnceLock, mpsc,
+        Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError,
+        mpsc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
@@ -3827,6 +3828,115 @@ fn needs_connection_reset(sql: &str) -> bool {
     )
 }
 
+// ---------------------------------------------------------------------------
+// The catalog gate
+//
+// The engine's catalog functions walk every attached database, and a DETACH
+// of a SQLite database that lands during the walk brings the engine down: a
+// segfault of the process, or `FATAL … database has been invalidated`, after
+// which every statement fails until a restart. Measured on alpha42289, one
+// client attaching and detaching a SQLite file while two read the catalog:
+// duckdb_tables(), duckdb_columns(), duckdb_schemas(), information_schema,
+// SHOW ALL TABLES, sql_auto_complete and /catalog each broke the server
+// within ten seconds, and a plain query or duckdb_databases() never did. The
+// bug is the engine's; the server keeps the two apart. A statement that
+// attaches or detaches runs alone against every statement that reads the
+// catalog, and those run beside each other and beside everything else.
+// ---------------------------------------------------------------------------
+
+/// Held exclusively by a statement that attaches or detaches, and shared by
+/// one that reads the catalog, for as long as it runs.
+static CATALOG_GATE: RwLock<()> = RwLock::new(());
+
+/// What a statement is to the catalog gate.
+#[derive(Debug, PartialEq, Eq)]
+enum Gate {
+    /// Neither attaches nor reads the catalog.
+    Open,
+    /// Reads the catalog: shares the gate.
+    Reads,
+    /// Attaches or detaches a database: holds the gate alone.
+    Changes,
+}
+
+/// The gate a statement passes, from its text. `ATTACH` and `DETACH` are
+/// read as the keyword the engine acts on, through comments and an analyzed
+/// `EXPLAIN`. A statement reads the catalog when it is a `SHOW`, `DESCRIBE`,
+/// `SUMMARIZE` or `PRAGMA`, or names, in its code or as a quoted name, a
+/// catalog function or schema: `duckdb_…`, `pragma_…`, `pg_…`,
+/// `information_schema` or `sql_auto_complete`. A name in a string or a
+/// comment does not count. A view whose body calls one is not seen; it is
+/// read as the plain query it looks like.
+fn catalog_gate(sql: &str) -> Gate {
+    match acting_keyword(sql).as_str() {
+        "ATTACH" | "DETACH" => return Gate::Changes,
+        "SHOW" | "DESCRIBE" | "SUMMARIZE" | "PRAGMA" => return Gate::Reads,
+        _ => {}
+    }
+    let catalog = |word: &[u8]| {
+        let word = word.to_ascii_lowercase();
+        ["duckdb_", "pragma_", "pg_"].iter().any(|p| word.starts_with(p.as_bytes()))
+            || word == b"information_schema"
+            || word == b"sql_auto_complete"
+    };
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
+    let bytes = sql.as_bytes();
+    for span in wire::scan::scan(sql) {
+        let text = &bytes[span.start..span.end];
+        match span.kind {
+            wire::scan::Kind::Code => {
+                if text.split(|&c| !is_word(c)).any(catalog) {
+                    return Gate::Reads;
+                }
+            }
+            wire::scan::Kind::Str if text.first() == Some(&b'"') => {
+                let name = text[1..].strip_suffix(b"\"").unwrap_or(&text[1..]);
+                if catalog(name) {
+                    return Gate::Reads;
+                }
+            }
+            _ => {}
+        }
+    }
+    Gate::Open
+}
+
+/// The gate as a statement holds it: one guard or the other, or neither.
+/// Held, never read; dropped when the statement is over.
+#[allow(dead_code)]
+enum Passed {
+    Open,
+    Reading(RwLockReadGuard<'static, ()>),
+    Changing(RwLockWriteGuard<'static, ()>),
+}
+
+/// Pass the gate for the statement running on `slot`. A reader waits on an
+/// attach or detach, and gives up when the statement is cancelled while it
+/// waits: by its client, by leaving or by a deadline. One that attaches or
+/// detaches waits for the readers running, each a catalog read the engine
+/// answers from memory or a database's file, and readers that come after it
+/// wait for it.
+fn pass_gate(gate: Gate, slot: &SlotState) -> Option<Passed> {
+    match gate {
+        Gate::Open => Some(Passed::Open),
+        Gate::Changes => Some(Passed::Changing(CATALOG_GATE.write().unwrap_or_else(PoisonError::into_inner))),
+        Gate::Reads => loop {
+            match CATALOG_GATE.try_read() {
+                Ok(guard) => return Some(Passed::Reading(guard)),
+                Err(TryLockError::Poisoned(p)) => return Some(Passed::Reading(p.into_inner())),
+                Err(TryLockError::WouldBlock) if slot.cancelled() => return None,
+                Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
+            }
+        },
+    }
+}
+
+/// The gate shared, for harbor's own reads of the catalog off the pool's
+/// executors: the workspace's record, written as the server stops.
+pub(crate) fn reading_catalog() -> RwLockReadGuard<'static, ()> {
+    CATALOG_GATE.read().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Final rollback during server shutdown, before returning connections.
 fn reset_transaction(conn: &mut Connection) {
     let _ = conn.execute_batch("ROLLBACK");
@@ -4305,6 +4415,16 @@ fn execute_jobs(
             continue;
         }
 
+        // An ATTACH or DETACH runs alone against the catalog's readers
+        // (CATALOG_GATE). A reader cancelled while it waits did not run, and
+        // its transaction is left aborted, as for a cancel before it began.
+        let Some(_passed) = pass_gate(catalog_gate(&sql), &state) else {
+            on_slot.finish();
+            conn.abort_transaction();
+            let _ = ready.send(Err(Refusal::cancelled()));
+            continue;
+        };
+
         // A panic below — an encoder invariant tripping, an FFI metadata
         // assert (the v2 paths return Err rather than panic, so this is the
         // backstop, not the expectation) — must not unwind out of this
@@ -4610,6 +4730,46 @@ mod tests {
     use super::{IndexPart, catalog_count_sql, index_parts};
     use super::{Cancel, SlotRun};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn attaching_and_reading_the_catalog_pass_the_gate_apart() {
+        use super::{Gate, catalog_gate};
+        for sql in [
+            "ATTACH '/x/a.sqlite' AS a (TYPE sqlite)",
+            "  /* c */ detach a",
+            "EXPLAIN ANALYZE ATTACH '/x/a.db'",
+            "DETACH DATABASE IF EXISTS a",
+        ] {
+            assert_eq!(catalog_gate(sql), Gate::Changes, "{sql}");
+        }
+        for sql in [
+            "SELECT * FROM duckdb_tables()",
+            "select database_name from DUCKDB_COLUMNS() where 1",
+            "SELECT * FROM information_schema.tables",
+            "SELECT * FROM sql_auto_complete('SELECT * FROM t')",
+            "SELECT * FROM pg_catalog.pg_class",
+            "SELECT * FROM pragma_table_info('t')",
+            "SELECT * FROM \"duckdb_schemas\"()",
+            "SHOW ALL TABLES",
+            "describe t",
+            "SUMMARIZE t",
+            "PRAGMA show_tables",
+            "SELECT library_version FROM pragma_version()",
+        ] {
+            assert_eq!(catalog_gate(sql), Gate::Reads, "{sql}");
+        }
+        for sql in [
+            "SELECT 42",
+            "SELECT * FROM a.main.t",
+            "SELECT 'duckdb_tables()' AS s",
+            "SELECT 1 -- information_schema",
+            "SELECT my_duckdb_tables FROM t",
+            "SELECT * FROM \"say duckdb_tables\"",
+            "INSERT INTO attached VALUES (1)",
+        ] {
+            assert_eq!(catalog_gate(sql), Gate::Open, "{sql}");
+        }
+    }
 
     #[test]
     fn delivered_body_limit_checks_the_extra_byte() {

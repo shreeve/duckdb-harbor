@@ -431,7 +431,13 @@ On the workspace, a file it records as attached and could not attach at its
 start is listed too, holding nothing, with why in `error` (`"/data/app.sqlite:
 no such file"`); `error` is `null` for a database that is attached.
 A table or view another client drops, or a database it detaches, while the
-catalog is being read is left out; it never fails the read.
+catalog is being read is left out; it never fails the read. An `ATTACH` or
+`DETACH` runs alone against every statement that reads the catalog — `/catalog`
+itself, the `duckdb_…` and `pragma_…` functions, `information_schema`, `SHOW`,
+`DESCRIBE` and the engine's completer — waiting for those running and holding
+back those that come after, since the engine brings itself down when a SQLite
+database is detached while a catalog read walks it. A view whose body reads the
+catalog is not seen as reading it.
 
 The document is stable — same database, same bytes — so clients can diff it.
 A client that only wants an inventory asks `GET /catalog?style=lite` and gets

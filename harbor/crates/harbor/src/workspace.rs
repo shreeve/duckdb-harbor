@@ -184,6 +184,8 @@ fn record_exists(con: &mut Conn) -> bool {
 /// ([`rewrite`]). A failure is said and leaves the record as it was.
 pub fn record(con: &mut Conn) {
     let Some(unattached) = SERVING.lock().unwrap().clone() else { return };
+    // An executor abandoned at the stop may still be attaching or detaching.
+    let _reading = crate::reading_catalog();
     let current = con.query_strings(
         "SELECT json_object('name', database_name, 'path', path, 'type', type, 'read_only', readonly)::VARCHAR \
          FROM duckdb_databases() \

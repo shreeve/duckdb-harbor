@@ -255,8 +255,8 @@ def main():
     os.remove(os.path.join(work, "gone.csv"))
     proc, base, log = start_server(views, free_port())
     try:
-        run_views(base, work)
-        run_race(base, work)
+        sqlite_ok = run_views(base, work)
+        run_race(base, work, sqlite_ok)
     finally:
         stop_server(proc)
         log.close()
@@ -609,9 +609,10 @@ def run_views(base, work):
     eq("and the catalog says so", False, "other" in [a["name"] for a in json.loads(fetch(base, "/catalog")[1])["attached"]])
     if sqlite_ok:
         sql(base, "DETACH app")
+    return sqlite_ok
 
 
-def run_race(base, work, rounds=200):
+def run_race(base, work, sqlite_ok, rounds=200):
     # -----------------------------------------------------------------------
     section("A relation dropped while the catalog is read is left out")
     # -----------------------------------------------------------------------
@@ -619,12 +620,19 @@ def run_race(base, work, rounds=200):
     # attachment another client takes away in between must cost only itself.
     # One client churns all three while this one reads the catalog; every
     # read must answer.
+    #
+    # A second client attaches and detaches a SQLite file, which the engine
+    # cannot take while it walks its catalog: it segfaults, or invalidates
+    # the database for every statement after. The server keeps the two
+    # apart, so the catalog read, the inventory, a catalog function and the
+    # engine's completer all answer through it, and the server outlives it.
     import threading
     churn = os.path.join(work, "churn.duckdb")
     subprocess.run(["duckdb", "-no-init", churn, "-c", "CREATE TABLE c (i INTEGER); CHECKPOINT;"],
                    check=True, stdout=subprocess.DEVNULL)
+    app = os.path.join(work, "app.sqlite")
     stop = threading.Event()
-    churned = [0]
+    churned = [0, 0]
 
     def churner():
         while not stop.is_set():
@@ -634,19 +642,49 @@ def run_race(base, work, rounds=200):
                 sql(base, statement)
             churned[0] += 1
 
-    thread = threading.Thread(target=churner, daemon=True)
-    thread.start()
+    def sqlite_churner():
+        while not stop.is_set():
+            sql(base, f"ATTACH '{app}' AS lite_churn (TYPE sqlite)")
+            sql(base, "DETACH lite_churn")
+            churned[1] += 1
+
+    threads = [threading.Thread(target=churner, daemon=True)]
+    if sqlite_ok:
+        threads.append(threading.Thread(target=sqlite_churner, daemon=True))
+    else:
+        print("  \033[33m-\033[0m SQLite churn skipped: the sqlite extension did not install")
+    for thread in threads:
+        thread.start()
+    reads = ("/catalog", "/catalog?style=lite",
+             "SELECT database_name, table_name, column_name FROM duckdb_columns()",
+             "SELECT * FROM sql_auto_complete('SELECT * FROM lite_')")
     failures = []
-    for _ in range(rounds):
-        st, body, _ = fetch(base, "/catalog")
-        if st != 200:
-            failures.append(json.loads(body or b"{}").get("message", f"HTTP {st}"))
+    for i in range(rounds):
+        read = reads[i % len(reads)]
+        try:
+            if read.startswith("/"):
+                st, body, _ = fetch(base, read)
+                if st != 200:
+                    failures.append(json.loads(body or b"{}").get("message", f"HTTP {st}"))
+            else:
+                refused = sql(base, read)
+                if refused is not None:
+                    failures.append(refused)
+        except (urllib.error.URLError, ConnectionError, OSError) as e:
+            failures.append(f"{read}: {e}")
+            break
     stop.set()
-    thread.join(timeout=30)
-    eq(f"reads that failed, of {rounds} raced against {churned[0]} rounds of DROP and DETACH",
-       0, len(failures))
+    for thread in threads:
+        thread.join(timeout=30)
+    what = f"{churned[0]} rounds of DROP and DETACH" + (f" and {churned[1]} of a SQLite DETACH" if sqlite_ok else "")
+    eq(f"reads that failed, of {rounds} raced against {what}", 0, len(failures))
     if failures:
-        print(f"     \033[2mfirst: {failures[0]}\033[0m")
+        print(f"     \033[2mfirst: {failures[0][:300]}\033[0m")
+    try:
+        alive = sql(base, "SELECT 42")
+    except (urllib.error.URLError, ConnectionError, OSError) as e:
+        alive = str(e)
+    eq("and the server answers after", None, alive)
 
 
 def harbor_version():
