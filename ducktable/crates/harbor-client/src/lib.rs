@@ -13,6 +13,7 @@ pub mod complete;
 pub mod fleet;
 pub use harbor_http as http;
 pub mod query;
+pub mod workspace;
 
 pub use catalog::{catalog, catalog_lite, Catalog, Table};
 pub use fleet::{connect_file, connect_remote, info, Conn};
