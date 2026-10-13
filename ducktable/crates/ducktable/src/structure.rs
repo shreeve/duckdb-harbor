@@ -17,9 +17,12 @@ use gpui_kit::component::StyledExt as _;
 /// What the DDL card spends beside its text, horizontally: its border
 /// (1 + 1), the editor's insets (6 left, 10 right), the code editor's
 /// numberless gutter (6), and the margin the editor keeps right of the
-/// wrap (10). The card is the longest line plus this; the wrap width is
-/// the card minus this.
+/// wrap (10). The card is the longest line plus this.
 const DDL_CHROME: f32 = 34.;
+
+/// The editor's margin right of the wrap, part of `DDL_CHROME`. `prewrap`
+/// keeps it itself, as layout does, so it is given the card less the rest.
+const WRAP_MARGIN: f32 = 10.;
 
 pub(crate) struct TableStructure {
     pub(crate) cols: Vec<harbor_client::catalog::Column>,
@@ -359,8 +362,8 @@ impl Grid {
             // Cap at the pane width recorded LAST frame (the title
             // strip's canvas — present in every view, so it is already
             // known before the Structure view's first paint), and seed
-            // the editor's wrap width with the exact value its layout
-            // will derive: card − DDL_CHROME. The wrapper re-wraps
+            // the editor's wrap with the text width its layout will
+            // use: card − (DDL_CHROME − WRAP_MARGIN). The wrapper re-wraps
             // synchronously, so the row count read below is
             // FIRST-FRAME correct — drawn
             // right, not repainted right. A cold start
@@ -378,7 +381,7 @@ impl Grid {
                     s.prewrap(
                         font(value_font()),
                         px(CELL_TEXT * z),
-                        px(card_w - DDL_CHROME),
+                        px(card_w - (DDL_CHROME - WRAP_MARGIN)),
                         cx,
                     );
                 });
@@ -388,6 +391,7 @@ impl Grid {
             // nothing to scroll.
             let rows = state
                 .read(cx)
+                .display_map()
                 .wrap_row_count()
                 .max(state.read(cx).value().lines().count())
                 .max(2);
