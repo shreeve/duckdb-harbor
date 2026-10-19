@@ -24,10 +24,6 @@ differ, `HANDOFF.md` is right.
 - **Verify by measuring**, on a scratch database with a short
   `HARBOR_HOME`. Never the MedLabs database. A server change gets a cold
   review by agents that wrote none of it before it lands.
-- **Share the machines through cpuq.** Every build, suite and benchmark
-  runs under `cpuq run` with a range of cores, never more than half; harbor
-  work may go to the Linux box `pup` when the Mac is busy. HANDOFF has the
-  pattern.
 - **`live` is production.** Reads are fine. Installs and restarts there are
   Steve's to run.
 - **Never `cargo fmt` the tree.**

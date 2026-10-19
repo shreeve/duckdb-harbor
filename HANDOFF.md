@@ -77,16 +77,6 @@ These are standing rules, not preferences to weigh.
   out under his name: his voice, plain, and posted on his word. An issue he
   asks for says what happens, what would be better, and "Not urgent; noted
   to come back to." (#132, #133).
-- **The machines are shared through cpuq.** Every build, test suite and
-  benchmark runs under `cpuq run --label harbor:<task> --cores 2-6 -- sh -c
-  'CARGO_BUILD_JOBS="$CPUQ_CORES" …'` (single quotes, so the grant expands
-  inside the job). An integration suite does its work in servers that leave
-  the job's process tree, so it runs `--cores 2-4 --opaque`. Never more than
-  half the CPUs, and benchmarks only on a quiet machine. When the Mac's
-  queue is long, harbor's builds and suites run on the Linux box `pup`
-  (`ssh pup`, 22 CPUs) through its own cpuq; DuckTable builds only on the
-  Mac. The cpuq session owns machine load and says how; its rules are in
-  `~/Data/Code/cpuq/AGENTS.md`.
 - **Scratch only.** Probes run on a scratch database with a short
   `HARBOR_HOME` (`/tmp/x`: a unix socket path has about a hundred bytes),
   stopped when done. Never the MedLabs database, here or on `live`.
