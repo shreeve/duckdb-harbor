@@ -4117,8 +4117,9 @@ fn run_statement(
     }
     // A document aimed at a VARIANT is bound as one. Finding that out is a
     // bind pass and making it one is a cast, and an interrupt that lands
-    // during either is dropped by the engine. So the values are built first
-    // and the slot is asked again once they are, before anything runs.
+    // during either is dropped by the engine, as is one that lands before
+    // the statement is submitted. So the slot is asked once more after
+    // submission, before anything runs (`Conn::execute`).
     let mut params = params;
     let bound = match conn.bind(last, &mut params) {
         Ok(b) => b,
@@ -4127,10 +4128,6 @@ fn run_statement(
             return true;
         }
     };
-    if on_slot.slot.cancelled() {
-        let _ = ready.send(Err(on_slot.refuse(conn, String::new())));
-        return needs_reset;
-    }
     // A COMMIT runs to its answer. An interrupt that reaches one as it
     // finishes is reported by the engine on the fetch that follows, after
     // the transaction is durable, and the client would be told 499 for work
@@ -4143,8 +4140,20 @@ fn run_statement(
         let _ = ready.send(Err(Refusal::cancelled()));
         return needs_reset;
     }
-    let mut stream = match conn.execute(last, bound) {
-        Ok(s) => s,
+    // The VARIANT caster, one per connection, made before the statement
+    // runs: making it looks JSON up in the connection's catalog, which must
+    // not meet the fetch thread stepping the same connection. Every engine
+    // harbor ships has the cast route; one that lacks it can still answer
+    // any statement whose result holds no VARIANT, and refuses the rest
+    // rather than send display text under a schema line that promised JSON.
+    let json = conn.json();
+    let wanted = || !on_slot.slot.cancelled();
+    let mut stream = match conn.execute(last, bound, wanted) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            let _ = ready.send(Err(on_slot.refuse(conn, String::new())));
+            return needs_reset;
+        }
         Err(e) => {
             let _ = ready.send(Err(on_slot.refuse(conn, e.into_text())));
             return true;
@@ -4152,11 +4161,7 @@ fn run_statement(
     };
     let columns = std::mem::take(&mut stream.columns);
     let api = conn.api();
-    // The VARIANT caster, one per connection. Every engine harbor ships has
-    // the cast route; one that lacks it can still answer any statement whose
-    // result holds no VARIANT, and refuses the rest rather than send display
-    // text under a schema line that promised JSON.
-    let json = match conn.json() {
+    let json = match json {
         Ok(j) => Some(j),
         Err(e) => {
             if columns.iter().any(|(_, ty)| crate::engine::encode::holds_variant(ty)) {

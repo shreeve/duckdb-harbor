@@ -176,13 +176,15 @@ fn search(tried: &[PathBuf]) -> Result<Engine, String> {
 fn boot(path: &Path) -> Result<Engine, String> {
     let lib = open_lib(path, false).map_err(|e| e.to_string())?;
     let (api, symbols) = unsafe { ffi::Api::fill(&lib) };
-    // Both symbols gate together: an engine odd enough to export one
-    // without the other must not reach the unwrap-free calls below.
-    let version_fn = match (api.create_environment, api.library_version) {
+    // The factory is the 2.0.0 API's own: a build before it exports v2
+    // symbols harbor cannot open a database with. Both symbols gate
+    // together, so an engine odd enough to export one without the other
+    // never reaches the unwrap-free call below.
+    let version_fn = match (api.instance_get_factory, api.library_version) {
         (Some(_), Some(f)) => f,
         _ => {
             return Err(format!(
-                "engine has no v2 C API ({symbols} v2 symbols) — needs DuckDB v2.0.0 or later"
+                "engine lacks the v2 C API of DuckDB 2.0.0 ({symbols} v2 symbols) — needs DuckDB v2.0.0 or later"
             ));
         }
     };

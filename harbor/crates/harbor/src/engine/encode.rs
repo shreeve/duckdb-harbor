@@ -7,6 +7,8 @@
 //! integer rule — live in src/encode.rs, which holds nothing of the engine;
 //! this module owns everything that touches a vector view.
 
+use std::cell::OnceCell;
+
 use super::ffi;
 use super::{Error, destroy_value, str_view};
 use crate::encode::{
@@ -288,8 +290,66 @@ pub struct Reader {
     view: ffi::vector_view_t,
     constant: bool,
     children: Vec<Reader>,
-    /// Kept for the single-cell value bridge (VARIANT, GEOMETRY).
+    /// Kept for the single-cell value bridge (GEOMETRY and the like) and
+    /// for the cast of a VARIANT vector.
     vector: ffi::vector_handle,
+    /// A VARIANT vector as JSON, cast whole on its first cell; None when the
+    /// cast failed, and its cells are read one at a time.
+    json: OnceCell<Option<Cast>>,
+}
+
+/// A vector cast whole into a chunk of its own, which this owns.
+struct Cast {
+    /// The cast's vector. Built after the cast, so it reads what the cast
+    /// wrote.
+    reader: Box<Reader>,
+    /// How many rows the cast holds.
+    rows: usize,
+    /// Whether a row did not convert: such a row is NULL in the cast, and is
+    /// read on its own, which fails it with the engine's reason.
+    failed: bool,
+    /// The chunk the cast's vector lives in, dropped after the reader.
+    _chunk: Owned,
+}
+
+/// An engine data chunk, destroyed on drop.
+struct Owned {
+    raw: ffi::data_chunk_handle,
+    destroy: Option<unsafe extern "C" fn(*mut ffi::data_chunk_handle) -> ffi::ERROR>,
+}
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        if let Some(f) = self.destroy {
+            unsafe { f(&mut self.raw) };
+        }
+    }
+}
+
+impl Cast {
+    /// `source`, every row of it, cast to `json`'s type: one engine call for
+    /// the vector in place of three for each of its cells. The engine's cast
+    /// may fail the whole vector for one row's sake; the caller then reads
+    /// it cell by cell, so the rows before that one still go out and the
+    /// error is that row's.
+    fn to_json(api: &ffi::Api, source: ffi::vector_handle, json: Json) -> Result<Cast, Error> {
+        let mut chunk = Owned { raw: std::ptr::null_mut(), destroy: api.data_chunk_destroy };
+        call!(api, data_chunk_create(json.factory, &json.ty, 1, &mut chunk.raw));
+        let mut target: ffi::vector_handle = std::ptr::null_mut();
+        call!(api, data_chunk_get_vector(chunk.raw, 0, &mut target));
+        let mut converted = false;
+        let mut why: ffi::error_info_handle = std::ptr::null_mut();
+        call!(api, vector_cast(json.factory, source, target, ffi::CAST_MODE_TRY, &mut converted, &mut why));
+        // The reason is the row's to give when it is read on its own.
+        let failed = !why.is_null();
+        if failed {
+            drop(Error::take(api, ffi::ERROR_INPUT_INVALID, why));
+        }
+        let mut rows: ffi::idx_t = 0;
+        call!(api, vector_get_size(target, &mut rows));
+        let reader = Box::new(Reader::of(api, target)?);
+        Ok(Cast { reader, rows: rows as usize, failed, _chunk: chunk })
+    }
 }
 
 impl Reader {
@@ -320,7 +380,7 @@ impl Reader {
             call!(api, vector_get_child(vector, i, &mut child));
             children.push(Reader::of(api, child)?);
         }
-        Ok(Reader { view, constant: vtype == ffi::VECTOR_TYPE_CONSTANT, children, vector })
+        Ok(Reader { view, constant: vtype == ffi::VECTOR_TYPE_CONSTANT, children, vector, json: OnceCell::new() })
     }
 
     /// The physical index behind a logical row: through the selection vector
@@ -348,14 +408,15 @@ impl Reader {
     }
 }
 
-/// The one cast the encoder performs itself: a VARIANT to JSON, through the
-/// connection whose result holds the value. A connection makes one lazily
+/// The one cast the encoder performs itself: a VARIANT to JSON, by the
+/// factory of the connection whose result holds the value, with its cast
+/// functions and settings. A connection makes one lazily
 /// ([`Conn::json`](super::conn::Conn::json)) and hands it to [`emit_cell`];
 /// without one, a VARIANT goes out as the engine's display text.
 #[derive(Clone, Copy)]
 pub struct Json {
-    pub conn: ffi::connection_handle,
-    /// The JSON logical type, made on `conn` and owned by whoever made it.
+    pub factory: ffi::factory_handle,
+    /// The JSON logical type, owned by whoever made it.
     pub ty: ffi::logical_type_handle,
 }
 
@@ -600,18 +661,22 @@ pub fn emit_cell(
                 out.push(']');
             }
             LOGICAL_TYPE_ID_MAP => {
-                // Pairs, with the key and value types carried through,
-                // straight off the flattened key and value children.
+                // Pairs, with the key and value types carried through. The
+                // one child is the entries, a STRUCT(key, value) indexed as
+                // a list's elements are, and its two children the keys and
+                // the values, indexed as a struct's fields are.
                 let entry: ffi::list_entry_t = r.get(phys);
+                let entries = &r.children[0];
                 out.push('[');
                 for j in 0..entry.length {
                     if j > 0 {
                         out.push(',');
                     }
+                    let at = entries.phys((entry.offset + j) as usize);
                     out.push('[');
-                    emit_cell(out, api, json, &r.children[0], &ty.children[0].1, (entry.offset + j) as usize)?;
+                    emit_cell(out, api, json, &entries.children[0], &ty.children[0].1, at)?;
                     out.push(',');
-                    emit_cell(out, api, json, &r.children[1], &ty.children[1].1, (entry.offset + j) as usize)?;
+                    emit_cell(out, api, json, &entries.children[1], &ty.children[1].1, at)?;
                     out.push(']');
                 }
                 out.push(']');
@@ -634,14 +699,28 @@ pub fn emit_cell(
                 emit_cell(out, api, json, &r.children[1 + tag], member_ty, phys)?;
                 out.push('}');
             }
-            // No committed view layout — the single-cell value bridge is the
-            // committed way in. A VARIANT goes out as JSON text, the one
-            // rendering a client can parse back: the engine casts the value
-            // on the connection that produced it, and the schema line says
-            // "json". Without a caster (internal helpers) it falls back to
-            // the display text, which cannot tell 42 from '42'.
-            LOGICAL_TYPE_ID_VARIANT if json.is_some() => {
-                push_json_string(out, &quote_nonfinite(&cell_text(api, r, row, json)?))
+            // No committed view layout. A VARIANT goes out as JSON text, the
+            // one rendering a client can parse back: the engine casts the
+            // vector to JSON on its first cell, by the factory of the
+            // connection that produced it, and the schema line says "json".
+            // Without a caster (internal helpers) it falls back to the
+            // display text, which cannot tell 42 from '42'.
+            LOGICAL_TYPE_ID_VARIANT if let Some(j) = json => {
+                let cast = r.json.get_or_init(|| Cast::to_json(api, r.vector, j).ok());
+                // What the cast cannot answer is read on its own: a vector
+                // whose cast failed, a row past it, and a row it left NULL.
+                let at = cast.as_ref().filter(|c| row < c.rows).map(|c| (c, c.reader.phys(row)));
+                let Some((cast, at)) = at.filter(|(c, at)| c.reader.is_valid(*at) || !c.failed) else {
+                    return Ok(push_json_string(out, &quote_nonfinite(&cell_text(api, r, row, json)?)));
+                };
+                if !cast.reader.is_valid(at) {
+                    return Ok(out.push_str("null"));
+                }
+                let text = std::str::from_utf8(bytes(&cast.reader, at)).map_err(|_| Error {
+                    code: ffi::ERROR_API,
+                    message: "a VARIANT cast to JSON text that is not UTF-8".into(),
+                })?;
+                push_json_string(out, &quote_nonfinite(text))
             }
             // GEOMETRY, TYPE, and any type with no view layout or JSON form
             // of its own go out as the engine's text rendering, which is
@@ -663,7 +742,7 @@ fn cell_text(api: &ffi::Api, r: &Reader, row: usize, json: Option<Json>) -> Resu
         Some(j) => {
             let mut cast: ffi::value_handle = std::ptr::null_mut();
             let done = (|| -> Result<(), Error> {
-                call!(api, value_cast_with_connection(j.conn, value, j.ty, &mut cast));
+                call!(api, value_cast(j.factory, value, j.ty, &mut cast));
                 Ok(())
             })();
             let text = done.and_then(|()| sized_text(api, api.value_to_string, "value_to_string", cast));
