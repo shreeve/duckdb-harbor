@@ -393,9 +393,9 @@ checks it before it stops anything.
 
 DuckTable draws its UI with gpui-kit (GPUI, gpui-pre 0.3.9, and Longbridge's
 component library), and never vendors it. It builds against Steve's fork,
-`shreeve/gpui-kit`: the branch `patched/0.7.3` is Longbridge's main with the
-fork's fixes on top, each tagged `v0.7.3-patched.N`; DuckTable pins
-`v0.7.3-patched.2`. The fork's checkout,
+`shreeve/gpui-kit`: the branch `patched/0.8.0` is Longbridge's main with the
+fork's fixes on top, each tagged `v0.8.0-patched.N`; DuckTable pins
+`v0.8.0-patched.1`. The fork's checkout,
 `~/Data/Code/gpui-kit`, belongs to the GPUI session, which owns the branch,
 its tags and the upstream pull requests, and tracks them in
 `.upstream/TRACKING.md` there. Other sessions read it and change nothing in

@@ -61,7 +61,7 @@ A rule with a decision in it belongs in a pure function, with a unit test.
   parser of its own. Only an answer to `SELECT 1` on the session sets the
   transaction band.
 - gpui-kit is never vendored. DuckTable pins the shreeve/gpui-kit fork by
-  the commit of a `v0.7.3-patched.N` tag, the same rev for all five kit
+  the commit of a `v0.8.0-patched.N` tag, the same rev for all five kit
   crates in `[patch.crates-io]`, or they do not resolve together. A change
   DuckTable needs from the kit is made in the fork, generic rather than
   DuckTable's, by the GPUI session that owns it; DuckTable does not patch

@@ -3,7 +3,22 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by release
 date, newest first.
 
-## 0.24.1 — 2026-10-11
+## 0.24.2 — 2026-10-21
+
+- **DuckTable draws with gpui-kit 0.8.0.** The kit moves from 0.7.1 to
+  upstream gpui-kit 0.8.0 and its GPUI snapshot (`gpui-pre` 0.3.9). Every
+  change DuckTable needed from the kit is now upstream except the
+  host-styled line-number gutter, which the fork carries on top.
+- **Scrolling bounces at its ends on macOS.** Under a trackpad or Magic
+  Mouse, the grid, lists and code editors stretch past their ends and spring
+  back, as native scroll views do; a line-scrolling mouse wheel scrolls
+  without bouncing. The Structure view's DDL card fits its text, so a scroll
+  over it still moves the pane.
+- **Upstream's fixes come along.** A horizontal strip scrolls under a plain
+  mouse wheel, a press over an element that covers a scrollbar goes to that
+  element, a textarea's scrollbar drags to the end of its content, the caret
+  stays in view in a short editor, and dialogs animate out as they animate
+  in.
 
 - **DuckTable draws with gpui-kit 0.7.1.** The kit's fixes are rebuilt on
   upstream gpui-kit 0.7.1 and its GPUI snapshot (`gpui-pre` 0.3.8), with

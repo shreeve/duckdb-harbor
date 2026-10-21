@@ -2040,8 +2040,8 @@ dependencies = [
 
 [[package]]
 name = "gpui-base"
-version = "0.7.3"
-source = "git+https://github.com/shreeve/gpui-kit?rev=2b39d1748e0677455ba9ef3180931ebc7365fa40#2b39d1748e0677455ba9ef3180931ebc7365fa40"
+version = "0.8.0"
+source = "git+https://github.com/shreeve/gpui-kit?rev=c7c1596c98364bc1401b87c2fbaf39557a51a89f#c7c1596c98364bc1401b87c2fbaf39557a51a89f"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2080,8 +2080,8 @@ dependencies = [
 
 [[package]]
 name = "gpui-component"
-version = "0.7.3"
-source = "git+https://github.com/shreeve/gpui-kit?rev=2b39d1748e0677455ba9ef3180931ebc7365fa40#2b39d1748e0677455ba9ef3180931ebc7365fa40"
+version = "0.8.0"
+source = "git+https://github.com/shreeve/gpui-kit?rev=c7c1596c98364bc1401b87c2fbaf39557a51a89f#c7c1596c98364bc1401b87c2fbaf39557a51a89f"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2128,8 +2128,8 @@ dependencies = [
 
 [[package]]
 name = "gpui-component-macros"
-version = "0.7.3"
-source = "git+https://github.com/shreeve/gpui-kit?rev=2b39d1748e0677455ba9ef3180931ebc7365fa40#2b39d1748e0677455ba9ef3180931ebc7365fa40"
+version = "0.8.0"
+source = "git+https://github.com/shreeve/gpui-kit?rev=c7c1596c98364bc1401b87c2fbaf39557a51a89f#c7c1596c98364bc1401b87c2fbaf39557a51a89f"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -2139,8 +2139,8 @@ dependencies = [
 
 [[package]]
 name = "gpui-kit"
-version = "0.7.3"
-source = "git+https://github.com/shreeve/gpui-kit?rev=2b39d1748e0677455ba9ef3180931ebc7365fa40#2b39d1748e0677455ba9ef3180931ebc7365fa40"
+version = "0.8.0"
+source = "git+https://github.com/shreeve/gpui-kit?rev=c7c1596c98364bc1401b87c2fbaf39557a51a89f#c7c1596c98364bc1401b87c2fbaf39557a51a89f"
 dependencies = [
  "gpui-base",
  "gpui-component",
@@ -2153,8 +2153,8 @@ dependencies = [
 
 [[package]]
 name = "gpui-kit-assets"
-version = "0.7.3"
-source = "git+https://github.com/shreeve/gpui-kit?rev=2b39d1748e0677455ba9ef3180931ebc7365fa40#2b39d1748e0677455ba9ef3180931ebc7365fa40"
+version = "0.8.0"
+source = "git+https://github.com/shreeve/gpui-kit?rev=c7c1596c98364bc1401b87c2fbaf39557a51a89f#c7c1596c98364bc1401b87c2fbaf39557a51a89f"
 dependencies = [
  "anyhow",
  "gpui-pre",

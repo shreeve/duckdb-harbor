@@ -64,9 +64,9 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
   verb, two lifetimes. A plain start is persistent and runs until stopped; an
   ephemeral start (the way opening a database summons one) leaves once its last
   client disconnects.
-- **UI stack.** gpui-kit 0.7.3: GPUI (an exact `gpui-pre` snapshot of Zed's)
+- **UI stack.** gpui-kit 0.8.0: GPUI (an exact `gpui-pre` snapshot of Zed's)
   with gpui-base and gpui-component supplying the virtualized table and the
-  code editor. The kit comes from the `patched/0.7.3` branch of
+  code editor. The kit comes from the `patched/0.8.0` branch of
   [shreeve/gpui-kit](https://github.com/shreeve/gpui-kit), a fork shared by
   every app built on it that adds general-purpose changes on top of the
   release, each a candidate for upstream (DuckTable's are listed in the
