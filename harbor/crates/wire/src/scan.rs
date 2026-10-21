@@ -5,7 +5,8 @@
 //! and highlighter, backup's reading of the SQL it generates, and the keyword
 //! reader in [`crate::statement`] all take their boundaries from here, so no
 //! two of them can disagree about where a literal ends. The rules, each
-//! measured against the engine: `''` and `""` escape a quote; a `'` string
+//! measured against the engine: a name is quoted in `"` or `` ` ``, and a
+//! doubled quote escapes itself in a name or a `'` string; a `'` string
 //! takes backslash escapes when an `E` begins the word before it; `--` runs
 //! to LF or CR; `/* */` nests; `$tag$` quotes, where the tag is empty or an
 //! ASCII letter, `_` or non-ASCII byte followed by those and digits, and opens
@@ -22,7 +23,7 @@
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind {
     Code,
-    Str,    // 'single' or "double" quoted
+    Str,    // 'single', "double" or `backtick` quoted
     Dollar, // $tag$ ... $tag$
     LineComment,
     BlockComment,
@@ -121,7 +122,7 @@ pub(crate) fn is_word_byte(c: u8) -> bool {
 }
 
 /// Where the number that starts at `s` (a digit, or a `.`) ends, as the
-/// engine's tokenizer reads one: digits and `.`, a `_` before a digit, an
+/// engine's tokenizer reads one: digits and `.`, a `_` between two digits, an
 /// `e` once a digit has been seen and not right after another `e`, and a
 /// sign right after the `e`. Whatever it took past its last digit or `.` it
 /// gives back, so in `1e5e'x'` the number is `1e5` and `e'x'` an E-string.
@@ -131,7 +132,7 @@ fn number_end(b: &[u8], s: usize) -> usize {
     while let Some(&c) = b.get(i) {
         let more = match c {
             b'0'..=b'9' | b'.' => true,
-            b'_' => b.get(i + 1).is_some_and(|&d| d.is_ascii_digit() || d == b'.'),
+            b'_' => b[i - 1].is_ascii_digit() && b.get(i + 1).is_some_and(u8::is_ascii_digit),
             b'+' | b'-' => e(b[i - 1]),
             c if e(c) => !e(b[i - 1]) && (b[s].is_ascii_digit() || b[i - 1].is_ascii_digit()),
             _ => false,
@@ -180,7 +181,7 @@ pub(crate) fn comment_at(b: &[u8], i: usize) -> Option<Span> {
 /// word, so the backslash in `LIKE'\'` is data.
 fn quote_at(b: &[u8], i: usize, word: Option<usize>) -> Option<Span> {
     let (kind, end, terminated) = match b[i] {
-        q @ (b'\'' | b'"') => {
+        q @ (b'\'' | b'"' | b'`') => {
             let escapes = q == b'\'' && i > 0 && word == Some(i - 1) && (b[i - 1] | 0x20) == b'e';
             let mut j = i + 1;
             loop {
@@ -384,6 +385,32 @@ mod tests {
         assert_eq!(kinds(r"SELECT 1e+e'\'';'")[1], (Kind::Str, r"'\''", true));
         // Inside a word a digit is the word's: `a1e'\'` is a plain string.
         assert_eq!(kinds(r"SELECT a1e'\'")[1], (Kind::Str, r"'\'", true));
+        // A `_` joins a number only between two digits: after the `.` it
+        // begins a word, and the word keeps its `$`s.
+        assert!(kinds("SELECT 1._5$t$x$t$").iter().all(|k| k.0 == Kind::Code));
+        assert_eq!(kinds("SELECT 1_5$t$x$t$")[1], (Kind::Dollar, "$t$x$t$", true));
+    }
+
+    /// The engine quotes a name in backticks as it does in double quotes,
+    /// a doubled backtick escaping itself, so a quote inside one is data and
+    /// brace expansion leaves the string after it alone.
+    #[test]
+    fn a_backtick_quotes_a_name() {
+        assert_eq!(
+            kinds("SELECT 1 AS `it's`, '{a,b}' AS y, 2 AS `'`"),
+            vec![
+                (Kind::Code, "SELECT 1 AS ", true),
+                (Kind::Str, "`it's`", true),
+                (Kind::Code, ", ", true),
+                (Kind::Str, "'{a,b}'", true),
+                (Kind::Code, " AS y, 2 AS ", true),
+                (Kind::Str, "`'`", true),
+            ]
+        );
+        assert_eq!(kinds("SELECT `a``b;c` x")[1], (Kind::Str, "`a``b;c`", true));
+        // No backslash escapes in a name, and a word ends at a backtick.
+        assert_eq!(kinds(r"SELECT e`\`")[1], (Kind::Str, r"`\`", true));
+        assert!(!kinds("SELECT `oops").last().unwrap().2);
     }
 
     /// CR ends a `--` comment for the engine, so it ends one here too: the
