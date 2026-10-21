@@ -3,7 +3,7 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by release
 date, newest first.
 
-## 0.24.2 — 2026-10-21
+## 2.0.0 — 2026-10-21
 
 - **DuckTable draws with gpui-kit 0.8.0.** The kit moves from 0.7.1 to
   upstream gpui-kit 0.8.0 and its GPUI snapshot (`gpui-pre` 0.3.9). Every
