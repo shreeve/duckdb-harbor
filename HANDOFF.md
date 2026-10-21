@@ -199,7 +199,7 @@ make harbor            # cargo build -p harbor --release → target/release/harb
 make unit              # cargo test --release --workspace --all-features
 make test              # test/scripts/check.sh: unit plus the thirteen integration suites
 make test SUITES="regressions spec"      # a subset
-DUCKDB_LIB_BUILD=alpha42289 make fetch-duckdb   # the pinned engine and its CLI into ~/.duckdb/cli/2.0.0
+make fetch-duckdb      # DuckDB v2.0.0 and its CLI into ~/.duckdb/cli/2.0.0
 make install           # copy the binary to ~/.local/bin
 ```
 
@@ -232,7 +232,7 @@ What bites locally:
 
 On `pup`, a checkout without `.git` works: `rsync -a --exclude target
 harbor/ pup:hr/<name>/harbor/`, the engine fetched there with `DEST=$HOME/hr/engine
-DUCKDB_LIB_BUILD=alpha42289 bash scripts/fetch-duckdb.sh`, and the suites
+bash scripts/fetch-duckdb.sh`, and the suites
 run with `HARBOR_LIBDUCKDB` and `PATH` pointing at it. Remove `~/hr/<name>`
 when done.
 
@@ -249,52 +249,48 @@ For a scratch database, use a file in a scratch directory
 
 ## The engine
 
-Harbor binds DuckDB's **v2 C API**; DuckDB 2.0 is the floor. `ffi.rs` is
-generated from DuckDB's `api_spec/v2` by `scripts/gen-v2-ffi.rb <commit>
-[path/to/duckdb]`, which reads the spec at that DuckDB commit and records
-the commit in `ffi.rs`'s header; it is never transcribed from the header
-file. `ffi.rs` regenerates byte for byte from 8b255c3ee6, and every function,
-struct and enum harbor calls is identical at 394f547866, the pinned engine's
-commit.
+Harbor binds DuckDB's **v2 C API** and runs on **DuckDB v2.0.0**
+(d54cbbe3df). `ffi.rs` is generated from DuckDB's `api_spec/v2` by
+`scripts/gen-v2-ffi.rb <commit> [path/to/duckdb]`, which reads the spec at
+that DuckDB commit and records the commit in `ffi.rs`'s header; it is never
+transcribed from the header file. It regenerates byte for byte from
+`v2.0.0`.
 
-**The engine is pinned.** On 2026-09-17 the nightly reworked the v2 API
-(duckdb/duckdb#25751) and harbor's loader refuses it ("engine has no v2 C
-API"). The repository variable `DUCKDB_LIB_BUILD=alpha42289` makes
-`scripts/fetch-duckdb.sh` take both `libduckdb` and the `duckdb` CLI from
-the `engine-alpha42289` release of this repository (`libduckdb-<plat>` and
-`duckdb-cli-<plat>` for five platforms, checked against
-`engine-alpha42289-checksums.txt`; a prerelease, so `/releases/latest` never
-points at it) and nothing from DuckDB's channel. The libraries are the ones
-every release since 0.39.0 carries; the CLIs come from DuckDB's own CI run
-for that build (duckdb/duckdb run 35206247008) and its libraries match the
-release's byte for byte. `Tests.yml`, `FullSuite.yml` and `Release.yml` all
-honor the variable, and so does a local `DUCKDB_LIB_BUILD=alpha42289 make
-fetch-duckdb`. `latest`, or no value, is the channel, whose engine harbor
-cannot load until the port.
+A database opens as an environment, an instance made with the startup
+options (`instance_create_with_options`), the file attached as the default
+database (`instance_attach`), and connections made from the instance.
+Values, types and casts go through each connection's factory
+(`connection_get_factory`): the instance's factory knows only built-in
+types, and JSON, which VARIANT is cast through, is not one. A VARIANT
+vector is cast to JSON once per chunk (`vector_cast`), not cell by cell.
 
-The fetch script decides "can this engine serve harbor" by looking for
-`duckdb_v2_create_environment`, the symbol the loader gates on in
-`engine/mod.rs`. The port changes what the loader gates on, and that grep
-changes with it.
+`scripts/fetch-duckdb.sh` takes `libduckdb` and the `duckdb` CLI from
+DuckDB's own v2.0.0 release (`duckdb-shared-libs-<plat>` and
+`duckdb-cli-<plat>`, six platforms, each checked against the SHA-256 the
+script records), and `Tests.yml`, `FullSuite.yml` and `Release.yml` fetch
+through it. Moving to another DuckDB release is one pull request: the
+version and checksums in the script, `ffi.rs` regenerated at the release's tag,
+and the spec of every function harbor calls diffed against the one before,
+text included, since a function can keep its signature and change what it
+does (MAP's vector children did at 2.0.0). The loader gates on
+`instance_get_factory`, and the fetch script greps for the same symbol.
 
-**The port to the reworked API**, measured on 2026-10-09 against the 2.0
-branch: harbor calls 55 functions; 45 are unchanged, two pass a `str_t` by
-pointer, and eight are gone, all of them opening and closing (environment,
-open, connect, options → `instance_create`, `instance_attach`,
-`connection_create`, options by name). The open duckdb/duckdb#26820
-(2026-10-09) would remove nine more, every value constructor harbor binds
-with and `connection_create_type_from_text`, in favour of a factory handle,
-and the result API rework (draft #25865) was closed on 2026-10-07 for "a
-slightly different route". So the port waits for #26820 and the result API
-to settle, or for 2.0.0 (scheduled 2026-10-21), and is then mostly
-`engine/conn.rs`'s opening, the value constructors, a regenerated
-`ffi.rs`, and the variable set to `latest`. Once settled, the v2 API's
-`parse_sql` may also hand back the engine's own tokens (duckdb/duckdb#26289),
-which could replace `wire::scan`'s rules. A clone of DuckDB for reading the
-source is at `~/Data/Code/duckdb`. Upstream issues harbor has filed and
-watches: duckdb#25282 (nap race), duckdb#25301 (prepare cost), duckdb#25967
-(deeply nested VARIANT: quadratic `UPDATE`, segfault in the cast).
-duckdb-rs#841 is resolved. A DuckDB VARIANT cast bug we hit is duckdb#25873.
+The engine's tokenizer and its Unicode-space pre-pass are what `wire::scan`
+and `wire::statement` mirror, so a DuckDB move also diffs
+`src/parser/peg/tokenizer/` and `Parser::StripUnicodeSpaces`: at 2.0.0 the
+tokenizer quotes names in backticks, which brace expansion must leave
+alone, while the pre-pass does not know them, so a U+00A0 inside a
+backtick name turns into a space and a `'` inside one misleads the
+pre-pass about the rest of the text; `plain_spaces` follows it there too. The v2
+API's `parse_sql` may one day hand back the engine's own tokens
+(duckdb/duckdb#26289), which could replace `wire::scan`'s rules.
+
+A clone of DuckDB for reading the source is at `~/Data/Code/duckdb`.
+Upstream issues harbor has filed and watches: duckdb#25282 (nap race),
+duckdb#25301 (prepare cost), duckdb#25967 (deeply nested VARIANT: quadratic
+`UPDATE`, segfault in the cast). duckdb-rs#841 is resolved, and so is
+duckdb#25873 (a SQL NULL VARIANT cast to JSON as the text `null`), fixed in
+2.0.0.
 
 ## Releasing
 
@@ -483,10 +479,11 @@ stored as a string and every path into it is NULL, silently. harbor closes
 that for one case only: an object or array in `params` aimed at a VARIANT is
 bound as the document (`Conn::bind`: one bind pass, skipped unless a param is
 an object or array, then two casts through JSON and VARIANT types the
-connection makes once; `run_statement` asks its slot for a cancel between
-`bind` and `execute`, because the engine drops an interrupt that lands during
-either, and a cancel found there leaves the transaction aborted as a later
-one would: `Conn::abort_transaction`). A string param is never read as JSON — a client
+connection makes once; `Conn::execute` asks the slot for a cancel once the
+statement is submitted and before any of it runs, because the engine drops
+an interrupt that lands during the bind, the casts or the submission, and a
+cancel found there leaves the transaction aborted as a later one would:
+`Conn::abort_transaction`). A string param is never read as JSON — a client
 holding JSON text casts it, which is what Rip's ORM and DuckTable do. Deeply
 nested JSON is the one input that hurts the engine through a VARIANT
 (duckdb#25967, measured on the alpha42779 CLI): an `UPDATE` of a VARIANT
@@ -517,16 +514,24 @@ and DuckTable 0.23.0 record.
   2026-10-11 with `harbor update --restart`, which printed its last lines
   over ssh). The local medlabs server keeps the code it started with until
   it restarts.
-- **Port to DuckDB's reworked v2 C API**, then set the `DUCKDB_LIB_BUILD`
-  repository variable to `latest`. "The engine" above has the measured size
-  of the port and what it waits for.
+- **Left from the port to DuckDB 2.0.0:** harbor tracks DuckDB's official
+  releases. The `engine-alpha42289` release stays as history, and the
+  `DUCKDB_LIB_BUILD` repository variable is read by nothing; removing the
+  variable is Steve's call. A workspace start that attaches
+  a recorded SQLite file waits on the engine's on-demand install of
+  `sqlite_scanner` when that extension is missing and the repository does
+  not answer; `spatial` is installed in the background, and the SQLite
+  attachment could be too.
 - **Upstream bug to file (Steve's voice):** DuckDB's parser strips Unicode
   spaces only where its own pre-pass thinks it is in code, and a `'` inside
   a comment or after an `E'\''` string misleads it into rewriting a
   U+00A0 inside a real string: `SELECT /* don't */ 'x<U+00A0>y'` returns
   `x y` (`Parser::StripUnicodeSpaces`, `parser.cpp` at 394f547866;
-  measured on alpha42779). `wire::statement` mirrors the pre-pass, quirks
-  included, so harbor reads the statement as the engine runs it.
+  measured on alpha42779). The same pre-pass at v2.0.0 does not know the
+  backtick names its tokenizer reads, so `` SELECT 1 AS `a<U+00A0>b` ``
+  names its column `a b`, and a `'` inside one misleads it as a comment's
+  does. `wire::statement` mirrors the pre-pass, quirks included, so harbor
+  reads the statement as the engine runs it.
 - **Upstream bug to file (Steve's voice): ATTACH/DETACH of a SQLite
   database beside a catalog read.** Two connections, one looping `ATTACH
   '/tmp/s.db' AS s (TYPE sqlite); DETACH s;`, the other `SELECT * FROM
@@ -578,9 +583,10 @@ and DuckTable 0.23.0 record.
   older baseline would run on older distributions without changing harbor,
   and is deliberately not scheduled (#56).
 - **Left on purpose:** workflow actions pinned by tag, not commit; the
-  engine layer's types that can outlive what they point to, which is why
-  `cargo clippy` fails on harbor, and its slow VARIANT cell path, both of
-  which the port rewrites.
+  engine layer's types that can outlive what they point to (`Stream`,
+  `Chunk`, `Reader`, `Stmt`, `Json` hold raw handles with no borrow of
+  their owner), which is why `cargo clippy` fails on harbor. Giving them
+  lifetimes is a change of its own.
 - **Optional polish:** a distinct color for braces in the highlighter; the
   brace expander could take aliases inside a group if a syntax that does
   not collide with the struct-literal colon is chosen.
