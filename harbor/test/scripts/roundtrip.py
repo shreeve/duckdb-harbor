@@ -419,7 +419,7 @@ def variant_as_json(work):
     if same:
         bad("the JSON round trip changed a value", same)
     elif typed != ("UINT64,VARCHAR,DOUBLE,BOOL_TRUE,VARIANT_NULL,VARCHAR,VARCHAR,VARCHAR,"
-                   "OBJECT(n, s, l),ARRAY(0),OBJECT(),VARCHAR"):
+                   "OBJECT(l, n, s),ARRAY(0),OBJECT(),VARCHAR"):
         bad("the inner types did not come back", typed)
     else:
         ok("every value that entered as JSON returns with its inner type")
@@ -490,23 +490,14 @@ def variant_as_json(work):
             bad("the restored CHECK does not check", refused.stderr)
         else:
             ok("it restores: every document a document, the SQL NULL a NULL, the CHECK in force")
-    # The engine writes a SQL NULL VARIANT as the JSON text `null`
-    # (duckdb#25873). A file that holds the null marker there instead, as one
-    # written once that is fixed would, restores to the same NULL.
-    marked = work / "checked.marked"
-    shutil.copytree(checked_backup, marked)
-    text = (marked / "g.csv").read_text()
-    if "2\tnull\tNULL\n" not in text:
-        bad("the SQL NULL VARIANT is not written the way this test assumes", text)
-    (marked / "g.csv").write_text(text.replace("2\tnull\tNULL\n", "2\tNULL\tNULL\n"))
-    marked_dst = work / "checked_marked.duckdb"
-    remarked = run(marked_dst, "restore", marked, expect=None)
-    after = sql(marked_dst, shape)[0]["t"] if remarked.returncode == 0 else remarked.stderr
-    run(marked_dst, "stop")
-    if after == before:
-        ok("a SQL NULL VARIANT written as the null marker restores to the same NULL")
+    # A SQL NULL VARIANT is written as the null marker, not as the JSON text
+    # `null`, which is a document of its own, and the restore above read it
+    # back as the same NULL.
+    text = (checked_backup / "g.csv").read_text()
+    if "2\tNULL\tNULL\n" in text:
+        ok("a SQL NULL VARIANT is written as the null marker")
     else:
-        bad("the null marker in a VARIANT column did not restore to NULL", f"{before}\n{after}")
+        bad("the SQL NULL VARIANT is not written as the null marker", text)
     # Stock DuckDB cannot do this: IMPORT DATABASE lands the strings, and the
     # CHECK refuses them before after.sql has its turn.
     plain = work / "checked_plain.duckdb"
