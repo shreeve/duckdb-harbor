@@ -1327,7 +1327,8 @@ pub fn open_pool(mut con: Connection) -> Result<(), String> {
     // What --init and the workspace attached are in place, and attaching in
     // the background may still be under way. A SQLite file locked at the
     // start leaves the names to a later chance, not the start to its wait.
-    *LEARNER.lock().unwrap_or_else(PoisonError::into_inner) = Some((con.try_clone().map_err(|e| format!("harbor: {e}"))?, None));
+    *LEARNER.lock().unwrap_or_else(PoisonError::into_inner) =
+        Some(Learner::new(con.try_clone().map_err(|e| format!("harbor: {e}"))?));
     learn_again(changing_catalog());
 
     for _ in 0..configured_pool_size() {
@@ -4902,6 +4903,13 @@ fn try_share() -> Option<Share> {
     (!state.alone && state.keeping == 0).then(|| Share { number: state.give() })
 }
 
+/// The gate shared now, unless it is held alone: for harbor's own short
+/// reads that an ATTACH or DETACH that keeps new shares out waits for.
+fn share_beside() -> Option<Share> {
+    let mut state = gate_state();
+    (!state.alone).then(|| Share { number: state.give() })
+}
+
 /// The gate held alone, by a statement on `slot` or harbor's own (`None`),
 /// once every share is let go of: new shares are kept out once `keep` says
 /// so, asked while they are not. None once the statement was cancelled
@@ -5433,9 +5441,48 @@ fn let_unread_go(names: &CatalogNames, reshaped: u64) {
 }
 
 /// The connection the views and macros are learned on after the pool
-/// opens: one of its own, outside every session's transaction; and when
-/// `learn_again` last found a SQLite file busy.
-static LEARNER: Mutex<Option<(Connection, Option<Instant>)>> = Mutex::new(None);
+/// opens: one of its own, outside every session's transaction.
+static LEARNER: Mutex<Option<Learner>> = Mutex::new(None);
+
+struct Learner {
+    conn: Connection,
+    /// When a probe last found a SQLite file busy.
+    busy_at: Option<Instant>,
+    /// The attached SQLite files' probes, by path: hidden attachments of
+    /// their own, which the engine's listing does not read, kept while the
+    /// names are not all known, so a probe asks whether a file reads beside
+    /// the statements running, with the gate shared, and is attached and
+    /// detached only with it held alone (`busy_sqlite`, `let_probes_go`).
+    probes: Vec<(String, String)>,
+}
+
+impl Learner {
+    fn new(conn: Connection) -> Self {
+        Learner { conn, busy_at: None, probes: Vec::new() }
+    }
+
+    fn asked_lately(&self) -> bool {
+        self.busy_at.is_some_and(|at| at.elapsed() < ASK_AGAIN)
+    }
+
+    /// Say a file found busy, as `why`, once until the names are read.
+    fn found_busy(&mut self, why: &str) {
+        self.busy_at = Some(Instant::now());
+        if !UNLISTED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "harbor: the views and macros that read the catalog are not read while {why}, and until they \
+                 are, an ATTACH or DETACH waits for every statement running"
+            );
+        }
+    }
+
+    /// Detach every probe, under the gate held alone.
+    fn let_probes_go(&mut self) {
+        for (_, probe) in std::mem::take(&mut self.probes) {
+            let _ = self.conn.execute_batch(&format!("DETACH {}", wire::open::quote_ident(&probe)));
+        }
+    }
+}
 
 /// How long `learn_again` waits after it found a SQLite file busy before it
 /// asks again.
@@ -5453,36 +5500,22 @@ const PROBE: &str = "harbor_probe_";
 /// again no sooner than [`ASK_AGAIN`], so a client attaching and detaching
 /// over and over does not hold the gate for the asking. Then the gate is
 /// shared for the listing: statements run beside it, and only an ATTACH or
-/// DETACH waits.
+/// DETACH waits. When the names are complete, the probes kept are let go.
 pub(crate) fn learn_again(alone: Alone) {
-    learn_again_waiting(alone, PROBE_BUSY_MS);
-}
-
-/// `learn_again`, each SQLite file asked waiting `busy_ms` on a lock.
-fn learn_again_waiting(alone: Alone, busy_ms: u32) {
-    if CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner).complete {
-        return;
-    }
     {
         let mut learner = LEARNER.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some((conn, busy_at)) = learner.as_mut() else { return };
-        if busy_at.is_some_and(|at| at.elapsed() < ASK_AGAIN) {
+        let Some(learner) = learner.as_mut() else { return };
+        if names_complete() {
+            learner.let_probes_go();
             return;
         }
-        *busy_at = None;
-        let busy = busy_sqlite(conn, busy_ms);
-        if busy.is_none() {
-            UNREAD_BESIDE.store(false, Ordering::SeqCst);
-        }
-        if let Some(why) = busy {
-            *busy_at = Some(Instant::now());
-            if !UNLISTED.swap(true, Ordering::Relaxed) {
-                eprintln!(
-                    "harbor: the views and macros that read the catalog are not read while {why}, and until they \
-                     are, an ATTACH or DETACH waits for every statement running"
-                );
-            }
+        if learner.asked_lately() {
             return;
+        }
+        learner.busy_at = None;
+        match busy_sqlite(learner, true) {
+            Ok(None) => UNREAD_BESIDE.store(false, Ordering::SeqCst),
+            Ok(Some(why)) | Err(why) => return learner.found_busy(&why),
         }
     }
     // The learner is let go first: a statement holding the gate shared may
@@ -5494,6 +5527,30 @@ fn learn_again_waiting(alone: Alone, busy_ms: u32) {
     let _learning = Learning::begin();
     let _reading = alone.share();
     learn_on_learner();
+}
+
+/// Learn again beside the statements running, sharing the gate even
+/// beside an ATTACH or DETACH that keeps new shares out, which waits for
+/// what this learns: when every attached SQLite file has a probe kept, and
+/// each reads. Whether it asked; it did not when a file has no probe.
+fn learn_on_probes() -> bool {
+    let Some(_reading) = share_beside() else { return false };
+    let mut learner = LEARNER.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(learner) = learner.as_mut() else { return true };
+    if names_complete() || learner.asked_lately() {
+        return true;
+    }
+    match busy_sqlite(learner, false) {
+        Ok(None) => UNREAD_BESIDE.store(false, Ordering::SeqCst),
+        Ok(Some(why)) => {
+            learner.found_busy(&why);
+            return true;
+        }
+        Err(_) => return false,
+    }
+    let _learning = Learning::begin();
+    learn_catalog_names(&mut learner.conn);
+    true
 }
 
 /// How often harbor asks again on its own while the names are not all
@@ -5510,30 +5567,33 @@ const LEARN_PATIENCE: Duration = Duration::from_millis(20);
 /// Learn again on harbor's own, until `stop`, each [`LEARN_EVERY`] while
 /// the names are not all known, so they are known again soon after a
 /// SQLite file that did not read reads again, without waiting for a
-/// client's ATTACH, DETACH or `/catalog`. Asked as `learn_again` asks, each
-/// SQLite file without waiting on its lock, once the gate is free for it
-/// within [`LEARN_PATIENCE`]; after a listing that failed, asked half as
-/// often each time, up to [`LEARN_LONGEST`].
+/// client's ATTACH, DETACH or `/catalog`: on the probes kept, beside the
+/// statements running (`learn_on_probes`), or as `learn_again` asks, once
+/// the gate is free for it within [`LEARN_PATIENCE`]. After a listing that
+/// failed, asked half as often each time, up to [`LEARN_LONGEST`]. Once the
+/// names are complete, the probes kept are let go when the gate is free.
 fn learn_while_unknown(stop: Arc<AtomicBool>) {
     let mut every = LEARN_EVERY;
     let mut asked = Instant::now();
     while !stop.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(100));
-        if names_complete() {
-            every = LEARN_EVERY;
-            continue;
-        }
         if asked.elapsed() < every {
             continue;
         }
         asked = Instant::now();
-        let Some(alone) = hold_alone(None, Some(LEARN_PATIENCE), || true) else { continue };
-        learn_again_waiting(alone, 0);
-        let busy = LEARNER
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(|(_, busy_at)| busy_at.is_some_and(|at| at.elapsed() < ASK_AGAIN));
+        if names_complete() {
+            every = LEARN_EVERY;
+            let kept = LEARNER.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(|l| !l.probes.is_empty());
+            if kept && let Some(alone) = hold_alone(None, Some(LEARN_PATIENCE), || true) {
+                learn_again(alone);
+            }
+            continue;
+        }
+        if !learn_on_probes() {
+            let Some(alone) = hold_alone(None, Some(LEARN_PATIENCE), || true) else { continue };
+            learn_again(alone);
+        }
+        let busy = LEARNER.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(Learner::asked_lately);
         every = match names_complete() || busy {
             true => LEARN_EVERY,
             false => (every * 2).min(LEARN_LONGEST),
@@ -5588,16 +5648,16 @@ fn learn_beside() -> bool {
     }
     let Some(_reading) = try_share() else { return true };
     let Ok(mut learner) = LEARNER.try_lock() else { return true };
-    let Some((conn, busy_at)) = learner.as_mut() else { return false };
+    let Some(learner) = learner.as_mut() else { return false };
     if names_complete() {
         return true;
     }
-    if busy_at.is_some_and(|at| at.elapsed() < ASK_AGAIN) {
+    if learner.asked_lately() {
         return false;
     }
-    learn_catalog_names(conn);
+    learn_catalog_names(&mut learner.conn);
     if !names_complete() {
-        *busy_at = Some(Instant::now());
+        learner.busy_at = Some(Instant::now());
         UNREAD_BESIDE.store(true, Ordering::SeqCst);
         return false;
     }
@@ -5621,37 +5681,58 @@ fn learn_after_reading() {
 /// Learn on [`LEARNER`], under the gate the caller holds.
 fn learn_on_learner() {
     let mut learner = LEARNER.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some((conn, _)) = learner.as_mut() {
-        learn_catalog_names(conn);
+    if let Some(learner) = learner.as_mut() {
+        learn_catalog_names(&mut learner.conn);
     }
 }
 
 /// An attached SQLite file that does not read for the moment, and why: each
-/// asked as `reads_alone` asks it, on an attachment of its own that waits
-/// `busy_ms` on a lock, under the gate held alone.
-fn busy_sqlite(conn: &mut Connection, busy_ms: u32) -> Option<String> {
+/// asked as `reads_alone` asks it, on a probe of its own that waits
+/// [`PROBE_BUSY_MS`] on a lock, kept in `learner.probes`. With the gate
+/// held alone (`alone`), a file without a probe has one attached, and a
+/// probe whose file is no longer attached is detached; with it shared, a
+/// file without a probe is an `Err`.
+fn busy_sqlite(learner: &mut Learner, alone: bool) -> Result<Option<String>, String> {
+    let conn = &mut learner.conn;
     let paths = match conn.query_strings(
         "SELECT path FROM duckdb_databases() WHERE type = 'sqlite' AND path IS NOT NULL AND path NOT IN ('', ':memory:')",
     ) {
         Ok(paths) => paths,
-        Err(e) => return Some(format!("the attached databases do not list: {}", e.into_text())),
+        Err(e) => return Ok(Some(format!("the attached databases do not list: {}", e.into_text()))),
     };
     let quote = wire::open::quote_literal;
-    paths.iter().find_map(|path| {
-        let probe = format!("{PROBE}{}", next_job_id());
-        let name = wire::open::quote_ident(&probe);
-        let attach = format!("ATTACH {} AS {name} (TYPE sqlite, READ_ONLY, BUSY_TIMEOUT {busy_ms}, HIDDEN)", quote(path));
-        let read = conn.execute_batch(&attach).and_then(|()| {
-            let read = conn.query_strings(&format!(
-                "SELECT count(*)::VARCHAR FROM sqlite_query({}, 'SELECT count(*) FROM sqlite_master')",
-                quote(&probe)
-            ));
-            let _ = conn.execute_batch(&format!("DETACH {name}"));
-            read
-        });
-        let why = |e: crate::engine::Error| e.into_text().split("\nLINE ").next().unwrap_or_default().trim().to_string();
-        read.err().map(|e| format!("{path} does not read ({})", why(e)))
-    })
+    if alone {
+        let (kept, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut learner.probes).into_iter().partition(|(p, _)| paths.contains(p));
+        for (_, probe) in gone {
+            let _ = conn.execute_batch(&format!("DETACH {}", wire::open::quote_ident(&probe)));
+        }
+        learner.probes = kept;
+    }
+    let why = |e: crate::engine::Error| e.into_text().split("\nLINE ").next().unwrap_or_default().trim().to_string();
+    for path in &paths {
+        let probe = match learner.probes.iter().find(|(p, _)| p == path) {
+            Some((_, probe)) => probe.clone(),
+            None if !alone => return Err(format!("{path} has no probe")),
+            None => {
+                let probe = format!("{PROBE}{}", next_job_id());
+                let name = wire::open::quote_ident(&probe);
+                let attach = format!("ATTACH {} AS {name} (TYPE sqlite, READ_ONLY, BUSY_TIMEOUT {PROBE_BUSY_MS}, HIDDEN)", quote(path));
+                if let Err(e) = conn.execute_batch(&attach) {
+                    return Ok(Some(format!("{path} does not read ({})", why(e))));
+                }
+                learner.probes.push((path.clone(), probe.clone()));
+                probe
+            }
+        };
+        let read = conn.query_strings(&format!(
+            "SELECT count(*)::VARCHAR FROM sqlite_query({}, 'SELECT count(*) FROM sqlite_master')",
+            quote(&probe)
+        ));
+        if let Err(e) = read {
+            return Ok(Some(format!("{path} does not read ({})", why(e))));
+        }
+    }
+    Ok(None)
 }
 
 /// Whether a statement brings views and macros the engine makes, read from
