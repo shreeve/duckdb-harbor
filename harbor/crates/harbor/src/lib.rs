@@ -5029,6 +5029,7 @@ fn learn_listed(began: u64, listed: Result<Vec<String>, String>) {
     names.learn_all(learned);
     if names.unsettled == began {
         names.complete = true;
+        UNREAD_BESIDE.store(false, Ordering::SeqCst);
         if UNLISTED.swap(false, Ordering::Relaxed) {
             eprintln!("harbor: the views and macros that read the catalog are read from it");
         }
@@ -5068,7 +5069,11 @@ pub(crate) fn learn_again(alone: RwLockWriteGuard<'static, ()>) {
             return;
         }
         *busy_at = None;
-        if let Some(why) = busy_sqlite(conn) {
+        let busy = busy_sqlite(conn);
+        if busy.is_none() {
+            UNREAD_BESIDE.store(false, Ordering::SeqCst);
+        }
+        if let Some(why) = busy {
             *busy_at = Some(Instant::now());
             if !UNLISTED.swap(true, Ordering::Relaxed) {
                 eprintln!(
@@ -5089,6 +5094,11 @@ pub(crate) fn learn_again(alone: RwLockWriteGuard<'static, ()>) {
     let _reading = reading_catalog();
     learn_on_learner();
 }
+
+/// How long an ATTACH or DETACH that waits while the names are not all
+/// known lets readers in beside it and asks for the names, before it waits
+/// for the readers running and keeps out the ones that come after.
+const ASK_BESIDE: Duration = Duration::from_secs(1);
 
 /// How many listings `learn_again` has begun and not ended.
 static LEARNING: AtomicUsize = AtomicUsize::new(0);
@@ -5120,24 +5130,40 @@ fn names_complete() -> bool {
 /// listing that succeeds makes the names complete, and the statements that
 /// come after it, the catalog not read, pass the gate by rather than wait
 /// for the ATTACH. Asked no more often than [`ASK_AGAIN`] after a listing or
-/// a probe found a SQLite file busy, and never while an ATTACH or DETACH
-/// waits or another listing runs.
-fn learn_beside() {
+/// a probe found a SQLite file busy, never while an ATTACH or DETACH waits
+/// or another listing runs, and not again after a listing here failed until
+/// a probe finds every SQLite file reads (`UNREAD_BESIDE`): a listing waits
+/// out a locked file, and the ATTACH with it. Whether asking again may yet
+/// learn them.
+fn learn_beside() -> bool {
+    if UNREAD_BESIDE.load(Ordering::SeqCst) {
+        return false;
+    }
     let _reading = match CATALOG_GATE.try_read() {
         Ok(guard) => guard,
         Err(TryLockError::Poisoned(p)) => p.into_inner(),
-        Err(TryLockError::WouldBlock) => return,
+        Err(TryLockError::WouldBlock) => return true,
     };
-    let Ok(mut learner) = LEARNER.try_lock() else { return };
-    let Some((conn, busy_at)) = learner.as_mut() else { return };
-    if names_complete() || busy_at.is_some_and(|at| at.elapsed() < ASK_AGAIN) {
-        return;
+    let Ok(mut learner) = LEARNER.try_lock() else { return true };
+    let Some((conn, busy_at)) = learner.as_mut() else { return false };
+    if names_complete() {
+        return true;
+    }
+    if busy_at.is_some_and(|at| at.elapsed() < ASK_AGAIN) {
+        return false;
     }
     learn_catalog_names(conn);
     if !names_complete() {
         *busy_at = Some(Instant::now());
+        UNREAD_BESIDE.store(true, Ordering::SeqCst);
+        return false;
     }
+    true
 }
+
+/// Whether a listing beside the statements running failed, and neither a
+/// probe has found every SQLite file reads since nor a listing read.
+static UNREAD_BESIDE: AtomicBool = AtomicBool::new(false);
 
 /// Learn again, when the names are not complete, after a `/catalog` read
 /// that succeeded, which read every attached database's catalog.
@@ -5461,24 +5487,29 @@ enum Passed {
 /// reader after it, for as long as it runs. So a reader waits for a listing
 /// begun (`LEARNING`) and passes as the names it learned say; and an ATTACH
 /// or DETACH does not keep readers out while it waits, but asks for the
-/// names beside them (`learn_beside`), and waits as any once they are known.
+/// names beside them (`learn_beside`), and waits as any once they are
+/// known, once asking cannot learn them for now, or once it has asked for
+/// [`ASK_BESIDE`]: readers that overlap would otherwise keep it out for as
+/// long as they came, and the names may not read for longer, while a SQLite
+/// file stays locked.
 fn pass_gate(sql: &str, slot: &SlotState) -> Option<Passed> {
     let gate = catalog_gate(sql);
     let mut unknown = gate == Gate::Reads && !names_complete();
+    let asking = Instant::now();
     match gate {
         Gate::Open => Some(Passed::Open),
         Gate::Changes => loop {
-            if names_complete() {
+            if names_complete() || asking.elapsed() >= ASK_BESIDE {
                 return Some(Passed::Changing(CATALOG_GATE.write().unwrap_or_else(PoisonError::into_inner)));
             }
             match CATALOG_GATE.try_write() {
                 Ok(guard) => return Some(Passed::Changing(guard)),
                 Err(TryLockError::Poisoned(p)) => return Some(Passed::Changing(p.into_inner())),
                 Err(TryLockError::WouldBlock) if slot.cancelled() => return None,
-                Err(TryLockError::WouldBlock) => {
-                    learn_beside();
-                    thread::sleep(Duration::from_millis(1));
+                Err(TryLockError::WouldBlock) if !learn_beside() => {
+                    return Some(Passed::Changing(CATALOG_GATE.write().unwrap_or_else(PoisonError::into_inner)));
                 }
+                Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
             }
         },
         Gate::Reads => loop {
