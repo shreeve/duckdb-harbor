@@ -191,9 +191,10 @@ Facts that shape everything:
   from `wire::scan`, which must agree with the engine's tokenizer: a
   disagreement there is a way to rewrite a string. The statement is read
   once, each alternative is cut from the source, and a result that would
-  read differently (a string gaining or losing escapes, say) goes to the
-  engine as written; the `braces` suite checks expansion against the
-  engine's own parser.
+  read differently (a string gaining or losing escapes, say), or a cast
+  whose type a term would split (`::DECIMAL (10,2)`, `::DOUBLE PRECISION`),
+  is refused with a 400 naming the fix; the `braces` suite checks expansion
+  against the engine's own parser.
 
 ## Build, test, run
 

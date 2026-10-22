@@ -367,10 +367,14 @@ anywhere in a term — `orders_{2025,2026}`, `{first,last}Name`,
 parenthesis or a semicolon, whitespace being whatever the engine takes for it,
 the vertical tab and the Unicode spaces it strips among it. A cast's type
 parameters written right after its type name stay in the term, so
-`r.{a,b}::DECIMAL(10,2)` casts both; written after a space, or with a type of
-several words such as `TIMESTAMP WITH TIME ZONE`, they reach only the last
-alternative, and `CAST(r.{a,b} AS …)` puts both inside the one `CAST`, which
-the engine refuses. Two groups in one term multiply, as in a shell:
+`r.{a,b}::DECIMAL(10,2)` casts both. A type the engine reads on past a space
+or comment, parameters or array bounds after one (`::DECIMAL (10,2)`,
+`::INT []`) or a type of several words (`::TIMESTAMP WITH TIME ZONE`,
+`::DOUBLE PRECISION`), would reach only the last alternative, so the
+statement is refused with a `400` that gives the one-word spelling where there
+is one, or says to cast each alternative on its own. `CAST(r.{a,b} AS …)` puts
+both inside the one `CAST`, which the engine refuses. Two groups in one term
+multiply, as in a shell:
 `r.{a,b}.{x,y}` is four paths. The alternatives are joined with `, `, which is
 what a select list, a `FROM` list and an argument list all take.
 
@@ -381,8 +385,10 @@ comments are never touched: the statement is read once, as the engine reads
 it, and only a group in code expands. An expansion the engine would read
 another way than the statement it came from, as when a quote its parser
 misreads is repeated or an `E` comes to begin the word before a string and
-make it take backslash escapes, leaves the statement as it came, as does a
-brace that never closes; the engine then reports the syntax error at it.
+make it take backslash escapes, is refused with a `400` that says what to
+write instead: most often a space between the group and the quote, or a plain
+space for a Unicode one. A brace that never closes leaves the statement as it
+came; the engine then reports the syntax error at it.
 
 The expansion happens in the server, once, for every client: the REPL,
 `curl`, a Rip app. `EXPLAIN` and the engine's error messages show the

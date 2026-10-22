@@ -276,7 +276,7 @@ where
                 TransferEncoding::Chunked => {
                     use chunked_transfer::Encoder;
 
-                    let mut writer = Encoder::new(writer);
+                    let mut writer = Encoder::new(Halting { inner: writer, failed: false });
                     io::copy(&mut reader, &mut writer)?;
                 }
 
@@ -291,6 +291,48 @@ where
         }
 
         Ok(())
+    }
+}
+
+/// A writer that refuses every write after one fails. The chunked encoder
+/// writes its last chunk and the terminator as it drops, after an error too,
+/// and to a peer that stopped reading each would wait out another write
+/// timeout, holding the responding thread that much longer.
+struct Halting<W> {
+    inner: W,
+    failed: bool,
+}
+
+impl<W: Write> Halting<W> {
+    fn check<T>(&mut self, result: IoResult<T>) -> IoResult<T> {
+        if let Err(e) = &result
+            && e.kind() != io::ErrorKind::Interrupted
+        {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn halted() -> io::Error {
+        io::Error::new(io::ErrorKind::BrokenPipe, "an earlier write to this response failed")
+    }
+}
+
+impl<W: Write> Write for Halting<W> {
+    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+        if self.failed {
+            return Err(Self::halted());
+        }
+        let result = self.inner.write(buf);
+        self.check(result)
+    }
+
+    fn flush(&mut self) -> IoResult<()> {
+        if self.failed {
+            return Err(Self::halted());
+        }
+        let result = self.inner.flush();
+        self.check(result)
     }
 }
 

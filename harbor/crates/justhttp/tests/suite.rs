@@ -1501,7 +1501,11 @@ mod stall {
     // Regression test for the response write timeout carried in this crate: a
     // client that stops reading its response must not pin a server thread inside
     // `write` forever. Slow by design: the timeout under test is 10 s, and it
-    // fires only once the kernel's socket buffers stop taking bytes.
+    // fires only once the kernel's socket buffers stop taking bytes. Measured
+    // on macOS, about 25 s: some 5 s before the buffers stop, a write that
+    // makes progress and one that makes none. The chunked encoder's last
+    // chunk and terminator, written as it drops, are refused at once rather
+    // than waiting out a third.
 
     use std::io::{Cursor, Write};
     use std::time::{Duration, Instant};

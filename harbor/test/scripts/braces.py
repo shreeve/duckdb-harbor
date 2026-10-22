@@ -25,9 +25,13 @@ expansion that repeats one of those near a Unicode space is refused, rightly:
     A  Unicode spaces, and none of what the pre-pass misreads
     B  what the pre-pass misreads, and ASCII spaces only
 
-and a third set of cases whose expansion the engine would read another way
-than written (an `E` that comes to begin the word before a string, a dollar
-quote that opens only after a brace): those must come back as they went in.
+and two sets of cases harbor must refuse: an expansion the engine would
+read another way than written (an `E` that comes to begin the word before a
+string, a dollar quote that opens only after a brace), and a cast whose type
+the engine reads on past a space or comment (`::DECIMAL (10,2)`, `::INT []`,
+`::DOUBLE PRECISION`), which a group's term or item would split. Beside them,
+the same casts after a group of one alternative, which split nothing and
+expand.
 
 Every failure prints the seed. Exit 77 when there is no duckdb CLI to parse
 with: the suite could not run, which is not a pass.
@@ -123,12 +127,13 @@ class Grammar:
         return p, p
 
     def statement(self, extra=None):
-        """A statement, and the expansion it stands for. An `extra` term is
-        set among the others as written."""
+        """A statement, and the expansion it stands for. An `extra` term, or
+        an `extra` pair of a term and its expansion, is set among the
+        others."""
         r = self.r
         terms = [self.term() for _ in range(r.randint(1, 5))]
         if extra:
-            terms.insert(r.randint(0, len(terms)), (extra, extra))
+            terms.insert(r.randint(0, len(terms)), extra if isinstance(extra, tuple) else (extra, extra))
         braced = expanded = "SELECT" + self.sep()
         for k, (tb, te) in enumerate(terms):
             if k:
@@ -140,16 +145,42 @@ class Grammar:
         return braced + tail, expanded + tail
 
 
-# Statements the engine would read another way once expanded: each goes out
-# exactly as it came, whatever surrounds it.
+# Statements the engine would read another way once expanded: each is
+# refused, whatever surrounds it.
 MISREAD = [
     "{E}'a\\tb'", "{e}'a\\tb'", "t.{d,e}'a\\tb'", "t.{d,E}'x'", "{x,y}e'a\\tb'", "{x}E'\\'''{a,b}'",
     "r.{a,b}$$x.{c,d}$$", "{'a' x}'b'", "{a,b}.E'\\'', 'x" + NBSP + "y'",
 ]
 
 
+MISREAD_REFUSALS = ("would read a Unicode space", "would gain or lose backslash escapes", "would begin or end elsewhere")
+
+# A cast whose type the engine reads on past a space or comment, written
+# after a group of several alternatives, or inside one item of a group.
+# `{gap}` is a space, a comment or a Unicode space.
+SPLIT_CASTS = [
+    "::DECIMAL{gap}(10,2)", "::VARCHAR{gap}(20)", "::STRUCT{gap}(k INT)", "::INT{gap}[]", "::INT[]{gap}[2]",
+    "::INT{gap}ARRAY", "::DECIMAL(9,3){gap}ARRAY", "::DOUBLE{gap}PRECISION", "::TIMESTAMP{gap}WITH TIME ZONE",
+    "::time{gap}without time zone", "::CHARACTER{gap}VARYING", "::NATIONAL{gap}CHARACTER", "::BIT{gap}VARYING",
+    "::INTERVAL{gap}YEAR", "::INTERVAL{gap}day to second",
+]
+GAPS = [" ", "\t", "\n", "/* c */", " -- c\n", NBSP, IDEO]
+
+
 def misread(rng):
     return Grammar(rng, "A").statement(rng.choice(MISREAD))[0]
+
+
+def split_cast(rng):
+    """A statement with a cast a group would split, which is refused, and
+    one with the same cast after a group of one alternative, which expands:
+    (statement, (braced, expanded))."""
+    cast = rng.choice(SPLIT_CASTS).format(gap=rng.choice(GAPS))
+    path = rng.choice(["r.", '"my col".', "t.r."])
+    split = rng.choice([path + "{a,b}" + cast, path + "{a b.{c,d}}" + cast,
+                        path + "{a" + cast + ", b}", path + "{b, a" + cast + "}"])
+    g = Grammar(rng, "A")
+    return g.statement(split)[0], g.statement((path + "{a}" + cast, path + "a" + cast))
 
 
 def duckdb_cli():
@@ -219,7 +250,8 @@ def positionless(tree):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--count", type=int, default=3000, help="cases per mode, and a tenth as many misread ones")
+    ap.add_argument("--count", type=int, default=3000,
+                    help="cases per mode, and a tenth as many of each of misread, split and one")
     ap.add_argument("--seed", type=int, default=None)
     args = ap.parse_args()
     seed = args.seed if args.seed is not None else random.randrange(2**31)
@@ -236,6 +268,9 @@ def main():
         g = Grammar(rng, mode)
         cases += [(mode,) + g.statement() for _ in range(args.count)]
     cases += [("misread", s, s) for s in (misread(rng) for _ in range(max(1, args.count // 10)))]
+    for _ in range(max(1, args.count // 10)):
+        split, (braced, want) = split_cast(rng)
+        cases += [("split", split, split), ("one", braced, want)]
 
     failures, counts = [], {}
     with tempfile.TemporaryDirectory(prefix="hb-braces-", dir="/tmp") as work:
@@ -244,10 +279,14 @@ def main():
         trees = parse(cli, [(out, want) for (_, out), (_, _, want) in zip(results, cases)], work)
         for (mode, braced, want), (tag, out), (got_tree, want_tree) in zip(cases, results, trees):
             counts[(mode, tag)] = counts.get((mode, tag), 0) + 1
-            if mode == "misread" or braced == want:
+            if mode == "misread":
+                ok = tag == "R" and any(m in out for m in MISREAD_REFUSALS)
+            elif mode == "split":
+                ok = tag == "R" and "would split" in out
+            elif braced == want:
                 ok = tag == "S" and out == braced
             elif tag != "X":
-                ok = False  # nothing in modes A and B needs refusing
+                ok = False  # nothing in modes A, B and one needs refusing
             elif want_tree.get("error"):
                 ok = False  # the grammar wrote what the engine cannot parse
             else:
