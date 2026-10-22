@@ -543,11 +543,12 @@ def run_tests(h, db, proc):
     eq("an over-long queryId is a clean 400", 400, h.sql("SELECT 1", query="x" * 129)[0])
 
     # -----------------------------------------------------------------------
-    section("A cancel that comes after the statement finished stops nothing")
+    section("A cancel of a statement waiting its turn stops nothing")
 
-    # The statement is over, and its answer waits on the connection behind
-    # one the client pipelined ahead of it, when the cancel lands. It stopped
-    # nothing, so it says so, and the answer arrives whole.
+    # The statement is pipelined behind one of the client's own, and has not
+    # begun when the cancel lands: it runs in its turn, once the answer ahead
+    # of it is written. The cancel stopped nothing, so it says so, and every
+    # answer arrives whole.
     def post(body, last=False):
         close = "Connection: close\r\n" if last else ""
         return (f"POST /sql HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
