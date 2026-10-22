@@ -189,7 +189,11 @@ Facts that shape everything:
   `:` at its top level), strings, quoted identifiers, dollar quotes,
   comments and unbalanced braces are left alone, their boundaries taken
   from `wire::scan`, which must agree with the engine's tokenizer: a
-  disagreement there is a way to rewrite a string.
+  disagreement there is a way to rewrite a string. The statement is read
+  once, each alternative is cut from the source, and a result that would
+  read differently (a string gaining or losing escapes, say) goes to the
+  engine as written; the `braces` suite checks expansion against the
+  engine's own parser.
 
 ## Build, test, run
 
@@ -197,7 +201,7 @@ Facts that shape everything:
 cd harbor
 make harbor            # cargo build -p harbor --release → target/release/harbor
 make unit              # cargo test --release --workspace --all-features
-make test              # test/scripts/check.sh: unit plus the thirteen integration suites
+make test              # test/scripts/check.sh: unit plus the fourteen integration suites
 make test SUITES="regressions spec"      # a subset
 make fetch-duckdb      # DuckDB v2.0.0 and its CLI into ~/.duckdb/cli/2.0.0
 make install           # copy the binary to ~/.local/bin
@@ -206,7 +210,8 @@ make install           # copy the binary to ~/.local/bin
 The suites live in `test/scripts/` and each file's header says what it
 proves. The ones to reach for: `regressions` (request isolation, settings,
 limits), `spec` (the wire encoding, spelled out), `types` (every DuckDB
-type), `hostile` (adversarial HTTP input, request smuggling), `roundtrip`
+type), `braces` (brace expansion against the engine's own parser),
+`hostile` (adversarial HTTP input, request smuggling), `roundtrip`
 (backup/restore fidelity), `asserts` (answers checked against an independent
 oracle, curl in and NDJSON out), `sessions`, `cancel`, `catalog`, `lifecycle`,
 `stress`, `fuzz`, `deployment`. `check.sh` builds `sample.duckdb` when it
@@ -510,18 +515,16 @@ and DuckTable 0.23.0 record.
 
 ## Open items
 
-- **Installed:** `live` and this Mac run harbor 0.46.0 (`live` upgraded
-  2026-10-11 with `harbor update --restart`, which printed its last lines
-  over ssh). The local medlabs server keeps the code it started with until
-  it restarts.
+- **Installed:** `live` and this Mac run harbor 2.0.0 (`live` upgraded
+  2026-10-21 with `harbor update --restart`, after a `backup`). The local
+  medlabs server runs under its login item and keeps the code it started
+  with until it restarts; a login item written before 2.0.1 runs at
+  launchd's Background priority until `harbor medlabs autostart restart`
+  rewrites it.
 - **Left from the port to DuckDB 2.0.0:** harbor tracks DuckDB's official
   releases. The `engine-alpha42289` release stays as history, and the
   `DUCKDB_LIB_BUILD` repository variable is read by nothing; removing the
-  variable is Steve's call. A workspace start that attaches
-  a recorded SQLite file waits on the engine's on-demand install of
-  `sqlite_scanner` when that extension is missing and the repository does
-  not answer; `spatial` is installed in the background, and the SQLite
-  attachment could be too.
+  variable is Steve's call.
 - **Upstream bug to file (Steve's voice):** DuckDB's parser strips Unicode
   spaces only where its own pre-pass thinks it is in code, and a `'` inside
   a comment or after an `E'\''` string misleads it into rewriting a
@@ -538,13 +541,8 @@ and DuckTable 0.23.0 record.
   duckdb_tables();`: within 20 s, 5 of 5 runs end in an internal error, a
   database invalidated for every later statement, or a segfault
   (alpha42289, linux_amd64; `duckdb_databases()` as the reader survives).
-  Harbor serializes the two (0.46.0), but a view whose body calls a catalog
-  function is not recognized as a catalog read.
-- **An attached SQLite file that stops reading fails `/catalog`.** The
-  engine's catalog functions walk every attached database together, so one
-  locked or replaced file fails the whole read (named, in about two
-  seconds) until it is detached; the workspace start detaches such a file,
-  but a running server does not.
+  Harbor serializes the two, views and macros whose bodies read the catalog
+  included (2.0.1).
 - **The old community extension** `harbor` v0.4.0 is still listed in DuckDB's
   community extensions, pointing at a commit no longer in this repository
   (#145 is a user who found it). Asking DuckDB to retire the listing or point
@@ -563,10 +561,6 @@ and DuckTable 0.23.0 record.
   - DuckTable's commit order does not recognize a key move typed differently
     from the wire's spelling of it, or a UNIQUE column that is not the key
     (EDITING.md says so).
-  - Ctrl-C during a restore's final shutdown-and-move step is not honored;
-    the restore completes.
-  - A `GEOMETRY[]` column reports `lossless: true` on the list while its
-    child says `false`; a question of wire semantics.
 - **DuckTable** keeps its Sparkle signing key in the login keychain under
   the account `ducktable`, with a backup in the gitignored, untracked
   `notes.txt` at the repo root. Never read or commit that file. Paths

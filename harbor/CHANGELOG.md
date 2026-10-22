@@ -4,6 +4,83 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 2.0.1 — 2026-10-22
+
+- **A cancel tells the truth.** DuckDB runs every statement but a SELECT to
+  its end, and in autocommit commits it, before the first row comes back,
+  so a `DELETE /sql/queries/<id>` aimed at an `INSERT … RETURNING` while
+  its rows streamed, or at a write as it committed, was answered
+  `{"cancelled":true}` while the rows were kept. A cancel answers `true`
+  only when the engine's interrupt stopped the statement and nothing of it
+  was kept; a write that had already run is answered `false`, with its
+  rows, and a write that fails with an error of its own after a cancel
+  gets that error and a `false`. Waiting for the engine's word holds no
+  worker, and not the lane that answers `/ready`, renewals and releases. A
+  SELECT that a cancel reached before its end ends with the cancel (499,
+  the error record in NDJSON) instead of an ordinary end; inside a session
+  that aborts the transaction, so a Ctrl-C landing as a SELECT finishes
+  leaves the next COMMIT answered 400 and rolled back. A cancel is fired
+  again every half second while its statement runs, a stop included, since
+  the engine now and then loses one. In a race of 2,000 cancels against
+  autocommit writes, 2.0.0 answered wrongly 611 times and 2.0.1 never.
+- **Brace expansion leaves strings alone.** Expansion read each term again
+  on its own, so a quote, a `$$` after a word, a Unicode space or an
+  unterminated quote could make the inside of a string look like code:
+  ``{x}E'\'''{a,b}'`` rewrote the string `'{a,b}'`. A vertical tab, a
+  Unicode space or a comment did not end a term, so `r.{a,b}-- c` copied
+  the comment into each alternative. The statement is read once, as the
+  engine reads it, each alternative is cut from the source so every byte
+  keeps its reading, and a result the engine would read differently, a
+  string that would gain or lose backslash escapes among them, is sent as
+  written. Of 200,000 generated statements 2.0.0 expanded 49,701 wrongly;
+  2.0.1 expands 1,000,000 with none.
+- **Brace expansion keeps a cast's type parameters with every
+  alternative.** `x.{a,b}::DECIMAL(10,2)` cast the first column to the
+  bare `DECIMAL`; both are `DECIMAL(10,2)`. A `braces` suite checks
+  expansion against the engine's own parser.
+- **A list, array, struct, map or union is `lossless` only when its members
+  are.** The schema line called every container lossless, so a
+  `GEOMETRY[]` said `true` while its child said `false`.
+- **Every catalog read waits its turn beside a SQLite ATTACH or DETACH.**
+  Harbor keeps the two apart, since the engine can crash when they meet,
+  but a catalog read through a view, a macro, `query()` or `query_table()`,
+  a prepared statement, or a view made by `IMPORT DATABASE` or `COPY FROM
+  DATABASE` went unseen, and a DuckDB file attached `AS sqlite` counted as
+  SQLite. Each of these killed 2.0.0 within a second beside an
+  ATTACH/DETACH loop and ran 60 s clean on 2.0.1. Twenty thousand views
+  start in 0.4 s.
+- **One unreadable SQLite file no longer fails every `/catalog`.** One gone
+  for good (replaced by a file that is not SQLite, or a read-only file
+  deleted) is detached and listed under `attached` with why; the workspace
+  attaches it again from its record once it reads, and one a client
+  attached is the client's to attach again. One only busy stays attached,
+  and `/catalog` answers as last read, the file's entry saying it is busy
+  and may be stale; before any good read it answers the 400 naming the
+  file, as 2.0.0 did.
+- **A workspace start does not wait on an extension download.** With
+  `sqlite_scanner` or `spatial` not installed and the extension repository
+  not answering, a start waited on the engine's install before serving. The
+  server serves at once, installs what is missing in the background, and
+  attaches recorded SQLite files after; until then `/catalog` lists them
+  with the reason.
+- **Ctrl-C stops a restore up to its final move.** The stop of the server
+  before the move ignored Ctrl-C, so the restore completed. Ctrl-C there
+  stops it with the database untouched; once the move has begun it
+  finishes.
+- **`autostart` waits for a slow start, and starts at standard priority.**
+  A macOS login item ran at launchd's Background priority, which throttles
+  CPU and disk, and on a busy Mac a large database took longer than the
+  15 s `autostart` waits; it reported failure and unloaded a server that
+  was about to serve. The item runs at Standard priority, and the wait goes
+  on, up to 120 s, while the server's process is alive. `harbor <db>
+  autostart restart` rewrites an existing item and restarts it under the
+  new priority.
+- **Two changes DuckDB 2.0.0 made, for anyone coming from 0.46.0.** A
+  VARIANT object reads back with its keys sorted, so `{"p":1,"a":2}` comes
+  back `{"a":2,"p":1}`, the values unchanged. A bare table name is not a
+  statement: `orders` alone is a Parser Error, where the alpha engine read
+  it as `FROM orders`; DuckDB keeps that shorthand in its own CLI.
+
 ## 2.0.0 — 2026-10-21
 
 - **Harbor runs on DuckDB v2.0.0.** The engine is DuckDB's own 2.0.0
