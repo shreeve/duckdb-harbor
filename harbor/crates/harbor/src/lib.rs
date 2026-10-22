@@ -3277,8 +3277,8 @@ const SET_ASIDE: &str = "detached by the server, since an attached database whos
 /// Why an attached SQLite database is listed as the server last read it,
 /// after the engine's reason (`catalog_stale`).
 const STALE: &str = "its catalog does not read for the moment, and the engine reads every attached database's catalog \
-                     together, so this catalog is the one the server last read, and may be stale; it is read \
-                     anew once this one reads";
+                     together, so the whole document, every database in it, is the catalog the server last read, \
+                     and may be stale; it is read anew once this one reads";
 
 /// An attached SQLite database whose catalog does not read for the moment, and
 /// the engine's reason: a lock another connection or program holds on its
@@ -3499,8 +3499,9 @@ fn stale_attached<E: AttachedEntry>(
 /// read, and detaching one would take it from every connection using it,
 /// the server's own among them, as a long write to it holds its lock. So
 /// the read is answered with the catalog the server last read in the same
-/// style (the lite one from the full one when it has read only that), each
-/// busy database's entry saying why (`STALE`), the databases attached and
+/// style (the lite one from the full one when it has read only that), its
+/// `stale` saying so (`stale_note`), each busy database's entry saying why
+/// (`STALE`), the databases attached and
 /// unattached as this read finds them, and the sizes as it stats them. With no
 /// catalog read yet, the read is refused, naming each busy database.
 fn catalog_stale(
@@ -3525,22 +3526,37 @@ fn catalog_stale(
         Err(failure) => return catalog_refuse(req, failure),
     };
     let (database_size_bytes, wal_size_bytes) = database_disk_sizes();
+    let stale = Some(stale_note(&busy));
     let body = match style {
         CatalogStyle::Full => {
             let mut catalog = full.unwrap_or_default();
             catalog.attached = stale_attached(&catalog.attached, databases, &busy, unattached);
             (catalog.database_size_bytes, catalog.wal_size_bytes) = (database_size_bytes, wal_size_bytes);
+            catalog.stale = stale;
             serde_json::to_string(&catalog).unwrap()
         }
         CatalogStyle::Lite => {
             let Some(mut inventory) = lite else { return catalog_refuse(req, CatalogFailure::Busy(busy)) };
             inventory.attached = stale_attached(&inventory.attached, databases, &busy, unattached);
             (inventory.database_size_bytes, inventory.wal_size_bytes) = (database_size_bytes, wal_size_bytes);
+            inventory.stale = stale;
             serde_json::to_string(&inventory).unwrap()
         }
     };
     let _ = req.respond(json_response(200, &body));
     (true, 200)
+}
+
+/// What a document answered as last read says of itself (`stale`): which
+/// attached databases do not read.
+fn stale_note(busy: &[Busy]) -> String {
+    let named: Vec<String> = busy.iter().map(|b| format!("{} ({})", b.name, b.path)).collect();
+    format!(
+        "this is the catalog the server last read, since the catalog of {} does not read for the moment, and the \
+         engine reads every attached database's together: every database in it may be stale, and it is read anew \
+         once that one reads",
+        named.join(", ")
+    )
 }
 
 /// The lite style of a full catalog: what it names.
@@ -3568,6 +3584,7 @@ fn inventory_of(catalog: &Catalog) -> Inventory {
                 views: views(&a.views),
             })
             .collect(),
+        stale: catalog.stale.clone(),
     }
 }
 
@@ -3770,7 +3787,7 @@ fn view_error(refusal: &Refusal) -> Option<String> {
 /// again by a later read once it reads when the workspace attached it
 /// (`catalog_listing`, `take_back`); one that is busy stays attached, and
 /// the read is answered with the catalog last read, the busy one saying
-/// why (`catalog_stale`).
+/// why and the document's `stale` saying so (`catalog_stale`).
 ///
 /// Ordering is part of the contract: tables and views by (schema, name),
 /// attached databases by name, columns in ordinal position, indexes and
@@ -3912,6 +3929,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
             tables: named_in(&table_rows, served),
             views: named_in(&view_rows, served),
             attached,
+            stale: None,
         };
         LAST_CATALOG.lock().unwrap().1 = Some(inventory.clone());
         BUSY.lock().unwrap().clear();
@@ -4259,6 +4277,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         sequences,
         views: served_views,
         attached,
+        stale: None,
     };
     let body = serde_json::to_string(&catalog).unwrap();
     LAST_CATALOG.lock().unwrap().0 = Some(catalog);

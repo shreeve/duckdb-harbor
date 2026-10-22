@@ -712,6 +712,9 @@ def run_busy(base, work):
            (200, [t["name"] for t in doc.get("tables", [])], "app", ["people"], True, True),
            (st, ["own"], a.get("name"), [t["name"] for t in a.get("tables", [])],
             "database is locked" in error, "may be stale" in error))
+        stale = doc.get("stale") or ""
+        eq(f"and the document says it may be stale{style}, naming the busy one, last",
+           (True, True, "stale"), ("may be stale" in stale, f"app ({app})" in stale, list(doc)[-1]))
         if not style:
             eq("and its columns as last read", last["attached"][0]["tables"], a.get("tables"))
     started = time.time()
@@ -726,7 +729,8 @@ def run_busy(base, work):
     eq("where reading it waits on its lock", (True, False), ("locked" in refused, "does not exist" in refused))
     release()
     st, body, _ = fetch(base, "/catalog")
-    eq("the lock gone, it is read anew", (200, None), (st, json.loads(body)["attached"][0]["error"]))
+    eq("the lock gone, it is read anew", (200, None, False),
+       (st, json.loads(body)["attached"][0]["error"], "stale" in json.loads(body)))
     eq("and reads", None, sql(base, "SELECT count(*) FROM app.people"))
     locker.close()
 

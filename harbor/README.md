@@ -461,8 +461,10 @@ client's `DETACH` of its name forgets it. The workspace records either as
 attached. One that is only busy — held locked by a long write, harbor's own or
 another program's — stays attached, since detaching it would take it from
 every connection using it: the read answers with the catalog the server last
-read, the busy file's entry saying why in `error` and that the document may be
-stale, or, when the server has read none yet, a `400` that names the file.
+read, the busy file's entry saying why in `error`, and a `stale` field at the
+document's end saying that every database in it may be stale (a document read
+anew has no `stale`), or, when the server has read none yet, a `400` that names
+the file.
 The read that meets a lock waits out the file's own wait on it, and a read
 while it stays busy asks the file alone, waiting a tenth of a second. A SQLite
 file harbor attaches waits a second on a lock (`BUSY_TIMEOUT 1000`; the
