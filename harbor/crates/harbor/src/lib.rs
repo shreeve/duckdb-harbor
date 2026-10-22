@@ -1549,6 +1549,16 @@ fn spawn_threads(
         }
     })?);
 
+    // While the names of the views and macros are not all known, every
+    // statement that names anything is kept apart from an ATTACH or DETACH,
+    // so they are asked for again on a thread of their own, not only when a
+    // client attaches or detaches.
+    let stop = Arc::clone(&r.stop);
+    r.learner = Some(thread::Builder::new().name("harbor-learner".to_string()).spawn(move || learn_while_unknown(stop))?);
+
+    static SERVING: AtomicU64 = AtomicU64::new(1);
+    r.answering = spawn_answering(SERVING.fetch_add(1, Ordering::SeqCst))?;
+
     // One thread the fleet can always reach. Workers pair 1:1 with
     // connections and stream whole responses, so when every worker is busy an
     // accepted /ready sits in justhttp's queue until one frees — measured at
@@ -1559,12 +1569,6 @@ fn spawn_threads(
     // is relayed to the session's own connection, and work that needs a
     // worker gets an immediate honest 503 — shedding load instead of
     // queueing it invisibly.
-    let stop = Arc::clone(&r.stop);
-    r.learner = Some(thread::Builder::new().name("harbor-learner".to_string()).spawn(move || learn_while_unknown(stop))?);
-
-    static SERVING: AtomicU64 = AtomicU64::new(1);
-    r.answering = spawn_answering(SERVING.fetch_add(1, Ordering::SeqCst))?;
-
     let (server, stop) = (Arc::clone(&r.server), Arc::clone(&r.stop));
     r.probe = Some(
         thread::Builder::new()
