@@ -54,10 +54,12 @@ Harbor releases, and are not included here.
   SQLite. Each of these killed 2.0.0 within a second beside an
   ATTACH/DETACH loop and ran 60 s clean on 2.0.1. So did a view attached,
   or present at the start, while an attached SQLite file was locked, when
-  the server cannot read which views read the catalog: until it can,
-  every statement waits its turn beside an ATTACH or DETACH, and it reads
-  them again at the next ATTACH, DETACH or `/catalog`, without holding
-  the others for the lock's five-second wait. `query` and `query_table`
+  the server cannot read which views read the catalog: until it can, an
+  ATTACH or DETACH waits for every statement running, and while it waits
+  reads them again beside them, so the statements that come after it do
+  not wait for it; they are read again at each ATTACH, DETACH and
+  `/catalog` too, without holding the others for the lock's five-second
+  wait. `query` and `query_table`
   count only when called, so a column named `query` costs nothing. Twenty
   thousand views start in 0.4 s.
 - **One unreadable SQLite file no longer fails every `/catalog`.** One gone
@@ -91,7 +93,10 @@ Harbor releases, and are not included here.
   write timeout sooner.** After the 10 s write timeout ended a chunked
   answer, its last chunk and terminator waited out another 10 s. They are
   refused at once: measured, a 64 MiB answer to a reader that never reads
-  frees its thread in 25 s, where it took 35 s.
+  frees its thread in 25 s, where it took 35 s. The connection ends where
+  the answer was cut, so a client that reads again finds the end at once,
+  where it waited out the idle timeout inside a chunk, and an answer
+  pipelined behind it is not written after the cut.
 - **Two changes DuckDB 2.0.0 made, for anyone coming from 0.46.0.** A
   VARIANT object reads back with its keys sorted, so `{"p":1,"a":2}` comes
   back `{"a":2,"p":1}`, the values unchanged. A bare table name is not a
