@@ -12,7 +12,7 @@ use std::{
     io::Read,
     panic::AssertUnwindSafe,
     sync::{
-        Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError,
+        Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock,
         mpsc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
@@ -4733,9 +4733,212 @@ fn needs_connection_reset(sql: &str) -> bool {
 // catalog, and those run beside each other and beside everything else.
 // ---------------------------------------------------------------------------
 
-/// Held exclusively by a statement that attaches or detaches, and shared by
-/// one that reads the catalog, for as long as it runs.
-static CATALOG_GATE: RwLock<()> = RwLock::new(());
+/// Shared by each statement that reads the catalog, and held alone by each
+/// that attaches or detaches, for as long as it runs ([`Share`],
+/// [`Alone`]); and the signal that it was let go of.
+static CATALOG_GATE: (Mutex<GateState>, Condvar) = (Mutex::new(GateState::new()), Condvar::new());
+
+/// How often a statement that waits at the gate looks whether it was
+/// cancelled: by its client, by leaving or by a deadline.
+const GATE_LOOK: Duration = Duration::from_millis(10);
+
+/// How long a statement waits for an ATTACH or DETACH that keeps new shares
+/// out, before it shares the gate beside it, while what the ATTACH waits for
+/// is a share it found when it began to keep them out: a long statement that
+/// came first holds the ATTACH, and then the statements after it would wait
+/// for as long as it runs.
+const PASS_BESIDE: Duration = Duration::from_millis(500);
+
+/// Who holds the catalog gate, and who waits for it.
+struct GateState {
+    /// Shares held.
+    shares: usize,
+    /// Held alone.
+    alone: bool,
+    /// The statements that wait to hold it alone and keep new shares out.
+    keeping: usize,
+    /// How many shares were given: the next share's number.
+    given: u64,
+    /// The first share given since `keeping` became more than none.
+    kept_from: u64,
+    /// While `keeping`, the shares held that were given before `kept_from`.
+    older: usize,
+    /// The shares of statements in autocommit held only because the names
+    /// were not all known, with their statements, to be let go of once the
+    /// names say a statement reads nothing (`let_unread_go`).
+    unknown: Vec<Unknown>,
+}
+
+/// A share held only because the names were not all known.
+struct Unknown {
+    number: u64,
+    sql: Arc<str>,
+    /// [`RESHAPED`] as the statement passed the gate.
+    reshaped: u64,
+    /// Still counted in `GateState::shares`.
+    held: bool,
+}
+
+impl GateState {
+    const fn new() -> Self {
+        GateState { shares: 0, alone: false, keeping: 0, given: 0, kept_from: 0, older: 0, unknown: Vec::new() }
+    }
+
+    /// A share, numbered.
+    fn give(&mut self) -> u64 {
+        self.shares += 1;
+        self.given += 1;
+        self.given - 1
+    }
+
+    /// Share `number` is let go of.
+    fn let_go(&mut self, number: u64) {
+        self.shares -= 1;
+        if self.keeping > 0 && number < self.kept_from {
+            self.older = self.older.saturating_sub(1);
+        }
+    }
+
+    /// Whether a statement that has waited `waited` may share it now.
+    fn shares_now(&self, waited: Duration) -> bool {
+        !self.alone && (self.keeping == 0 || (self.older > 0 && waited >= PASS_BESIDE))
+    }
+
+    /// Held alone, when nothing holds it.
+    fn take_alone(&mut self) -> bool {
+        let free = !self.alone && self.shares == 0;
+        self.alone |= free;
+        free
+    }
+
+    /// A statement waiting to hold it alone keeps new shares out.
+    fn keep(&mut self) {
+        self.keeping += 1;
+        if self.keeping == 1 {
+            self.kept_from = self.given;
+            self.older = self.shares;
+        }
+    }
+}
+
+fn gate_state() -> std::sync::MutexGuard<'static, GateState> {
+    CATALOG_GATE.0.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Wait at most `look` for the gate to be let go of.
+fn gate_wait(state: std::sync::MutexGuard<'static, GateState>, look: Duration) -> std::sync::MutexGuard<'static, GateState> {
+    CATALOG_GATE.1.wait_timeout(state, look).unwrap_or_else(PoisonError::into_inner).0
+}
+
+/// The catalog gate shared, until dropped.
+pub(crate) struct Share {
+    number: u64,
+}
+
+impl Drop for Share {
+    fn drop(&mut self) {
+        let mut state = gate_state();
+        let held = match state.unknown.iter().position(|u| u.number == self.number) {
+            Some(at) => state.unknown.swap_remove(at).held,
+            None => true,
+        };
+        if held {
+            state.let_go(self.number);
+        }
+        drop(state);
+        CATALOG_GATE.1.notify_all();
+    }
+}
+
+/// The catalog gate held alone, until dropped or shared (`Alone::share`).
+pub(crate) struct Alone {
+    held: bool,
+}
+
+impl Alone {
+    /// The gate shared in place of alone, with nothing let in between.
+    fn share(mut self) -> Share {
+        let mut state = gate_state();
+        state.alone = false;
+        self.held = false;
+        let number = state.give();
+        drop(state);
+        CATALOG_GATE.1.notify_all();
+        Share { number }
+    }
+}
+
+impl Drop for Alone {
+    fn drop(&mut self) {
+        if self.held {
+            gate_state().alone = false;
+            CATALOG_GATE.1.notify_all();
+        }
+    }
+}
+
+/// The gate shared now, unless it is held alone or kept.
+fn try_share() -> Option<Share> {
+    let mut state = gate_state();
+    (!state.alone && state.keeping == 0).then(|| Share { number: state.give() })
+}
+
+/// The gate held alone, by a statement on `slot` or harbor's own (`None`),
+/// once every share is let go of: new shares are kept out once `keep` says
+/// so, asked while they are not. None once the statement was cancelled
+/// while it waits, or once `patience` has passed.
+fn hold_alone(slot: Option<&SlotState>, patience: Option<Duration>, mut keep: impl FnMut() -> bool) -> Option<Alone> {
+    let began = Instant::now();
+    let mut keeping = false;
+    let mut state = gate_state();
+    loop {
+        if state.take_alone() {
+            state.keeping -= keeping as usize;
+            return Some(Alone { held: true });
+        }
+        if slot.is_some_and(SlotState::cancelled) || patience.is_some_and(|p| began.elapsed() >= p) {
+            state.keeping -= keeping as usize;
+            drop(state);
+            CATALOG_GATE.1.notify_all();
+            return None;
+        }
+        if !keeping {
+            drop(state);
+            keeping = keep();
+            state = gate_state();
+            if keeping {
+                state.keep();
+            }
+            if !state.alone && state.shares == 0 {
+                continue;
+            }
+        }
+        state = gate_wait(state, GATE_LOOK);
+    }
+}
+
+/// The gate shared, by a statement on `slot` or harbor's own (`None`), as
+/// a share in `unknown` when given one: once nothing holds it alone, and
+/// nothing keeps new shares out, or for [`PASS_BESIDE`] while an ATTACH
+/// that does waits for a share it found. None once the statement was
+/// cancelled while it waits.
+fn wait_share(slot: Option<&SlotState>, unknown: Option<(Arc<str>, u64)>) -> Option<Share> {
+    let began = Instant::now();
+    let mut state = gate_state();
+    loop {
+        if state.shares_now(began.elapsed()) {
+            let number = state.give();
+            if let Some((sql, reshaped)) = unknown {
+                state.unknown.push(Unknown { number, sql, reshaped, held: true });
+            }
+            return Some(Share { number });
+        }
+        if slot.is_some_and(SlotState::cancelled) {
+            return None;
+        }
+        state = gate_wait(state, GATE_LOOK);
+    }
+}
 
 /// What a statement is to the catalog gate.
 #[derive(Debug, PartialEq, Eq)]
@@ -5050,17 +5253,19 @@ const LISTING: &str = "SELECT json_array(view_name, sql)::VARCHAR FROM duckdb_vi
 /// not complete until a listing succeeds.
 fn learn_catalog_names(conn: &mut Connection) {
     let began = CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner).unsettled;
+    let reshaped = RESHAPED.load(Ordering::SeqCst);
     let listed = conn.query_strings(LISTING).map_err(|e| e.into_text());
-    learn_listed(began, listed);
+    learn_listed(began, reshaped, listed);
 }
 
 /// Whether the last listing failed, so the next that succeeds says so.
 static UNLISTED: AtomicBool = AtomicBool::new(false);
 
 /// Learn the rows of a listing begun when the names had been unsettled
-/// `began` times: complete when it succeeded and nothing unsettled them
-/// since.
-fn learn_listed(began: u64, listed: Result<Vec<String>, String>) {
+/// `began` times, and [`RESHAPED`] was `reshaped`: complete when it
+/// succeeded and nothing unsettled them since, and then the statements it
+/// says read nothing are let go of (`let_unread_go`).
+fn learn_listed(began: u64, reshaped: u64, listed: Result<Vec<String>, String>) {
     let rows = match listed {
         Ok(rows) => rows,
         Err(e) => {
@@ -5088,6 +5293,74 @@ fn learn_listed(began: u64, listed: Result<Vec<String>, String>) {
         if UNLISTED.swap(false, Ordering::Relaxed) {
             eprintln!("harbor: the views and macros that read the catalog are read from it");
         }
+        let_unread_go(&names, reshaped);
+    }
+}
+
+/// How many times a statement that may drop, replace or rename a view or
+/// a macro (`reshapes`) began or ended, so a listing knows whether the
+/// views a statement running reads may be ones it did not see.
+static RESHAPED: AtomicU64 = AtomicU64::new(0);
+
+/// How many such statements have begun and not ended.
+static RESHAPING: AtomicUsize = AtomicUsize::new(0);
+
+/// A statement that may drop, replace or rename a view or a macro, counted
+/// from when it has passed the gate until it has ended.
+struct Reshaping;
+
+impl Reshaping {
+    fn begin() -> Self {
+        RESHAPING.fetch_add(1, Ordering::SeqCst);
+        RESHAPED.fetch_add(1, Ordering::SeqCst);
+        Reshaping
+    }
+}
+
+impl Drop for Reshaping {
+    fn drop(&mut self) {
+        RESHAPED.fetch_add(1, Ordering::SeqCst);
+        RESHAPING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Whether a statement may drop, replace or rename a view or a macro, or
+/// make visible a transaction's that did: every statement but those that
+/// read or write rows, begin a transaction, or set a setting.
+fn reshapes(sql: &str) -> bool {
+    !matches!(
+        acting_keyword(sql).as_str(),
+        "SELECT" | "WITH" | "VALUES" | "FROM" | "TABLE" | "INSERT" | "UPDATE" | "DELETE" | "BEGIN" | "START"
+            | "SHOW" | "DESCRIBE" | "SUMMARIZE" | "PIVOT" | "UNPIVOT" | "EXPLAIN" | "CHECKPOINT" | "ANALYZE"
+            | "VACUUM" | "SET" | "RESET" | "USE"
+    )
+}
+
+/// Let go of the shares held only because the names were not all known,
+/// by statements in autocommit the names, now complete by a listing begun
+/// when [`RESHAPED`] was `reshaped`, say read nothing: a statement that
+/// passes the gate open now. Only those that passed the gate when it was
+/// `reshaped`, and while nothing has reshaped since nor is reshaping: each
+/// began its transaction after the last view it may read was made, and the
+/// listing read every one of them.
+fn let_unread_go(names: &CatalogNames, reshaped: u64) {
+    if RESHAPING.load(Ordering::SeqCst) != 0 || RESHAPED.load(Ordering::SeqCst) != reshaped {
+        return;
+    }
+    let mut state = gate_state();
+    let mut let_go = Vec::new();
+    for u in state.unknown.iter_mut().filter(|u| u.held && u.reshaped == reshaped) {
+        if gate_of(&u.sql, names) == Gate::Open {
+            u.held = false;
+            let_go.push(u.number);
+        }
+    }
+    for number in &let_go {
+        state.let_go(*number);
+    }
+    drop(state);
+    if !let_go.is_empty() {
+        CATALOG_GATE.1.notify_all();
     }
 }
 
@@ -5113,7 +5386,7 @@ const PROBE: &str = "harbor_probe_";
 /// over and over does not hold the gate for the asking. Then the gate is
 /// shared for the listing: statements run beside it, and only an ATTACH or
 /// DETACH waits.
-pub(crate) fn learn_again(alone: RwLockWriteGuard<'static, ()>) {
+pub(crate) fn learn_again(alone: Alone) {
     if CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner).complete {
         return;
     }
@@ -5140,13 +5413,13 @@ pub(crate) fn learn_again(alone: RwLockWriteGuard<'static, ()>) {
         }
     }
     // The learner is let go first: a statement holding the gate shared may
-    // wait for it, and a share asked for while an ATTACH waits is not given.
-    // A statement that would share the gate only because the names are not
-    // all known waits for the listing (`LEARNING`), and then for what it
-    // learned, rather than hold the gate for as long as it runs.
+    // wait for it. The gate is shared in place of alone, so the listing
+    // waits for nothing. A statement that would share the gate only because
+    // the names are not all known waits for the listing (`LEARNING`), and
+    // then for what it learned, rather than hold the gate for as long as it
+    // runs.
     let _learning = Learning::begin();
-    drop(alone);
-    let _reading = reading_catalog();
+    let _reading = alone.share();
     learn_on_learner();
 }
 
@@ -5195,11 +5468,7 @@ fn learn_beside() -> bool {
     if UNREAD_BESIDE.load(Ordering::SeqCst) {
         return false;
     }
-    let _reading = match CATALOG_GATE.try_read() {
-        Ok(guard) => guard,
-        Err(TryLockError::Poisoned(p)) => p.into_inner(),
-        Err(TryLockError::WouldBlock) => return true,
-    };
+    let Some(_reading) = try_share() else { return true };
     let Ok(mut learner) = LEARNER.try_lock() else { return true };
     let Some((conn, busy_at)) = learner.as_mut() else { return false };
     if names_complete() {
@@ -5522,59 +5791,50 @@ fn names_in_order(sql: &str, tokens: &mut Vec<Token>) {
     }
 }
 
-/// The gate as a statement holds it: one guard or the other, or neither.
+/// The gate as a statement holds it: shared, alone, or neither.
 /// Held, and asked only which it is; dropped when the statement is over.
 #[allow(dead_code)]
 enum Passed {
     Open,
-    Reading(RwLockReadGuard<'static, ()>),
-    Changing(RwLockWriteGuard<'static, ()>),
+    Reading(Share),
+    Changing(Alone),
 }
 
-/// Pass the gate for `sql`, the statement running on `slot`. A reader
-/// waits on an attach or detach, and gives up when the statement is
-/// cancelled while it waits: by its client, by leaving or by a deadline.
-/// One that attaches or detaches waits for the readers running, each a
-/// catalog read the engine answers from memory or a database's file, and
-/// readers that come after it wait for it.
+/// Pass the gate for `sql`, the statement running on `slot`, in
+/// autocommit when `autocommit`. A reader waits on an attach or detach,
+/// and gives up when the statement is cancelled while it waits: by its
+/// client, by leaving or by a deadline. One that attaches or detaches
+/// waits for the readers running, each a catalog read the engine answers
+/// from memory or a database's file, and keeps readers that come after it
+/// out, each for at most [`PASS_BESIDE`] while it waits for a reader it
+/// found; it gives up as a reader does.
 ///
 /// While the names are not all known (`CatalogNames::complete`), every
-/// statement is a reader, and a long one would hold an ATTACH, and every
-/// reader after it, for as long as it runs. So a reader waits for a listing
-/// begun (`LEARNING`) and passes as the names it learned say; and an ATTACH
-/// or DETACH does not keep readers out while it waits, but asks for the
-/// names beside them (`learn_beside`), and waits as any once they are
-/// known, or once it has asked for [`ASK_BESIDE`] and asking cannot learn
-/// them for now: readers that overlap would otherwise keep it out for as
-/// long as they came, and the names may not read for longer, while a SQLite
-/// file stays locked.
-fn pass_gate(sql: &str, slot: &SlotState) -> Option<Passed> {
+/// statement is a reader, and a long one would hold an ATTACH for as long
+/// as it runs. So a reader waits for a listing begun (`LEARNING`) and
+/// passes as the names it learned say, and one in autocommit is let go of once a listing
+/// says it reads nothing (`let_unread_go`); and an ATTACH or DETACH does
+/// not keep readers out while it waits, but asks for the names beside them (`learn_beside`), and
+/// keeps them out once they are known, or once it has asked for
+/// [`ASK_BESIDE`] and asking cannot learn them for now: readers that
+/// overlap would otherwise keep it out for as long as they came, and the
+/// names may not read for longer, while a SQLite file stays locked.
+fn pass_gate(sql: &str, slot: &SlotState, autocommit: bool) -> Option<Passed> {
     let gate = catalog_gate(sql);
-    let mut unknown = gate == Gate::Reads && !names_complete();
-    let asking = Instant::now();
     match gate {
         Gate::Open => Some(Passed::Open),
-        Gate::Changes => loop {
-            if names_complete() {
-                return Some(Passed::Changing(CATALOG_GATE.write().unwrap_or_else(PoisonError::into_inner)));
-            }
-            match CATALOG_GATE.try_write() {
-                Ok(guard) => return Some(Passed::Changing(guard)),
-                Err(TryLockError::Poisoned(p)) => return Some(Passed::Changing(p.into_inner())),
-                Err(TryLockError::WouldBlock) if slot.cancelled() => return None,
-                Err(TryLockError::WouldBlock) if !learn_beside() && asking.elapsed() >= ASK_BESIDE => {
-                    return Some(Passed::Changing(CATALOG_GATE.write().unwrap_or_else(PoisonError::into_inner)));
-                }
-                Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
-            }
-        },
-        Gate::Reads => loop {
-            if unknown && LEARNING.load(Ordering::SeqCst) > 0 {
+        Gate::Changes => {
+            let asking = Instant::now();
+            let keep = || names_complete() || (!learn_beside() && asking.elapsed() >= ASK_BESIDE);
+            hold_alone(Some(slot), None, keep).map(Passed::Changing)
+        }
+        Gate::Reads => {
+            let mut unknown = !names_complete();
+            while unknown && LEARNING.load(Ordering::SeqCst) > 0 {
                 if slot.cancelled() {
                     return None;
                 }
                 thread::sleep(Duration::from_millis(1));
-                continue;
             }
             if unknown && names_complete() {
                 unknown = false;
@@ -5582,26 +5842,22 @@ fn pass_gate(sql: &str, slot: &SlotState) -> Option<Passed> {
                     return Some(Passed::Open);
                 }
             }
-            match CATALOG_GATE.try_read() {
-                Ok(guard) => return Some(Passed::Reading(guard)),
-                Err(TryLockError::Poisoned(p)) => return Some(Passed::Reading(p.into_inner())),
-                Err(TryLockError::WouldBlock) if slot.cancelled() => return None,
-                Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
-            }
-        },
+            let unknown = (unknown && autocommit).then(|| (Arc::from(sql), RESHAPED.load(Ordering::SeqCst)));
+            wait_share(Some(slot), unknown).map(Passed::Reading)
+        }
     }
 }
 
 /// The gate shared, for harbor's own reads of the catalog off the pool's
 /// executors: the workspace's record, written as the server stops.
-pub(crate) fn reading_catalog() -> RwLockReadGuard<'static, ()> {
-    CATALOG_GATE.read().unwrap_or_else(PoisonError::into_inner)
+pub(crate) fn reading_catalog() -> Share {
+    wait_share(None, None).expect("a share harbor asks for is not cancelled")
 }
 
 /// The gate held alone, for harbor's own attaching off the pool's
 /// executors: the workspace's SQLite files, attached in the background.
-pub(crate) fn changing_catalog() -> RwLockWriteGuard<'static, ()> {
-    CATALOG_GATE.write().unwrap_or_else(PoisonError::into_inner)
+pub(crate) fn changing_catalog() -> Alone {
+    hold_alone(None, None, || true).expect("harbor's own wait is not cancelled")
 }
 
 /// Final rollback during server shutdown, before returning connections.
@@ -6146,12 +6402,13 @@ fn execute_jobs(
         learn_from_statement(&sql);
         let brings = brings_views(&sql);
         let probe = detached_name(&sql).or_else(|| attached_name(&sql)).is_some_and(|n| n.starts_with(PROBE.as_bytes()));
-        let Some(passed) = pass_gate(&sql, &state) else {
+        let Some(passed) = pass_gate(&sql, &state, !pinned) else {
             on_slot.finish();
             conn.abort_transaction();
             let _ = ready.send(Err(Refusal::cancelled()));
             continue;
         };
+        let _reshaping = reshapes(&sql).then(Reshaping::begin);
         if brings && matches!(passed, Passed::Changing(_)) {
             CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner).unsettle();
         }
