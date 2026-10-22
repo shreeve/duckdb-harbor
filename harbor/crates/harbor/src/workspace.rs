@@ -19,10 +19,12 @@
 //! attached database with its reason in `error` ([`unattached`]); the
 //! server starts all the same, and the row stays, so the file is attached
 //! again at a later start once it reads. A row deleted from the record is
-//! forgotten. A SQLite file that stops reading while the server runs is
-//! detached by the catalog read that finds it, on any server, and set
-//! aside ([`set_aside`]) until a later read attaches it again; the record
-//! written at the stop holds it as attached.
+//! forgotten. A SQLite file whose catalog stops reading for good while the
+//! server runs, gone or not SQLite, is detached by the catalog read that
+//! finds it, on any server, and set aside ([`set_aside`]); one this server
+//! attached from the record is attached again by a later read once it
+//! reads ([`ours`]), and the record written at the stop holds either as
+//! attached. One that is only busy is not detached.
 
 use std::sync::Mutex;
 
@@ -138,20 +140,52 @@ pub fn unattached() -> Vec<Unattached> {
     SERVING.lock().unwrap().clone().unwrap_or_default()
 }
 
-/// A SQLite file a catalog read found attached and not reading, and
-/// detached, on any server: the engine reads every attached database's
+/// A SQLite file a catalog read found attached and not reading for good,
+/// and detached, on any server: the engine reads every attached database's
 /// catalog together, so one that does not read fails every catalog read.
-/// Listed in `/catalog` with why, and attached again by the first catalog
-/// read that finds it reads.
+/// Listed in `/catalog` with why; attached again by the first catalog read
+/// that finds it reads when this server attached it from the record
+/// ([`ours`]), and otherwise left for a client to attach.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetAside {
     pub unattached: Unattached,
     /// Its name was in the workspace's record when it was set aside: a row
     /// deleted since forgets it, as it forgets a file attached.
     pub recorded: bool,
+    /// This server attached it from the record ([`ours`]), so attaching it
+    /// again as the record does keeps it as it was.
+    pub ours: bool,
 }
 
 static SET_ASIDE: Mutex<Vec<SetAside>> = Mutex::new(Vec::new());
+
+/// The names this server attached from the record, at its start or in the
+/// background, and no client has detached since.
+static OURS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Held by a catalog read while it attaches a file set aside again, and by
+/// a client's `DETACH` of its name as it forgets it, so one does not undo
+/// the other.
+static TAKING: Mutex<()> = Mutex::new(());
+
+/// Whether this server attached `name` from the record, with the options
+/// the record attaches it with, and no client has detached it since.
+pub fn ours(name: &str) -> bool {
+    OURS.lock().unwrap().iter().any(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// Held while a file set aside is attached again ([`TAKING`]).
+pub fn taking() -> std::sync::MutexGuard<'static, ()> {
+    TAKING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A client detaches or attaches `name`: it is not this server's to attach
+/// again, and a file set aside under it is forgotten.
+pub fn claimed(name: &str) {
+    let _taking = taking();
+    OURS.lock().unwrap().retain(|n| !n.eq_ignore_ascii_case(name));
+    taken_back(name);
+}
 
 /// Set aside a file detached, in place of any of its name.
 pub fn set_aside(aside: SetAside) {
@@ -230,8 +264,9 @@ pub fn open(con: &mut Conn) {
     }
     let mut unattached = plan.unattached;
     for record in at_start {
-        if let Err(reason) = attach(con, &record) {
-            unattached.push(Unattached { record, reason });
+        match attach(con, &record) {
+            Ok(()) => OURS.lock().unwrap().push(record.name.clone()),
+            Err(reason) => unattached.push(Unattached { record, reason }),
         }
     }
     for u in &unattached {
@@ -301,7 +336,10 @@ fn install_later(con: &Conn, extensions: Vec<&'static str>, records: Vec<Record>
                 Err(reason) => Err(reason.clone()),
             };
             match &attached {
-                Ok(()) => eprintln!("harbor: workspace: {} is attached", record.name),
+                Ok(()) => {
+                    OURS.lock().unwrap().push(record.name.clone());
+                    eprintln!("harbor: workspace: {} is attached", record.name)
+                }
                 Err(reason) => eprintln!("harbor: workspace: {} is not attached — {reason}", record.name),
             }
             attached_or(&record.name, attached.err());

@@ -260,6 +260,14 @@ def main():
     finally:
         stop_server(proc)
         log.close()
+    busy = os.path.join(work, "busy.duckdb")
+    proc, base, log = start_server(busy, free_port())
+    try:
+        if sqlite_ok:
+            run_busy(base, work)
+    finally:
+        stop_server(proc)
+        log.close()
         if args.keep:
             print(f"\nkept: {work}")
         else:
@@ -644,6 +652,105 @@ def run_views(base, work):
     if sqlite_ok:
         sql(base, "DETACH app")
     return sqlite_ok
+
+
+def run_busy(base, work):
+    # -----------------------------------------------------------------------
+    section("An attached SQLite file that is busy, or gone for good")
+    # -----------------------------------------------------------------------
+    # The engine reads every attached database's catalog together, so one
+    # SQLite file locked, or not SQLite any more, fails every listing. A
+    # busy one stays attached, since the lock may be any connection's, the
+    # server's own long write among them, and the catalog is answered as
+    # the server last read it, the busy one saying why; with nothing read
+    # yet, the read is refused, naming it. One gone for good is detached
+    # and listed with why, and a client's is left for the client to attach.
+    import sqlite3
+    app = os.path.join(work, "busy.sqlite")
+    con = sqlite3.connect(app)
+    con.executescript("CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO people (name) VALUES ('ann');")
+    con.commit()
+    con.close()
+    eq("a table of its own", None, sql(base, "CREATE TABLE own (i INTEGER)"))
+    eq("a SQLite file attaches, waiting two seconds on a lock", None,
+       sql(base, f"ATTACH '{app}' AS app (TYPE sqlite, BUSY_TIMEOUT 2000)"))
+    locker = sqlite3.connect(app, isolation_level=None)
+
+    def lock():
+        locker.execute("BEGIN EXCLUSIVE")
+
+    def release():
+        locker.execute("ROLLBACK")
+
+    def attached_now():
+        """None when app is attached, else why not."""
+        return sql(base, "SELECT CASE WHEN count(*) = 0 THEN error('app is not attached') END "
+                         "FROM duckdb_databases() WHERE database_name = 'app'")
+
+    lock()
+    st, body, _ = fetch(base, "/catalog")
+    message = json.loads(body or b"{}").get("message", "")
+    eq("locked before any catalog is read: a 400 that names it",
+       (400, True, True), (st, "app (" in message, "database is locked" in message))
+    release()
+    st, body, _ = fetch(base, "/catalog")
+    doc = json.loads(body)
+    eq("read once the lock is gone",
+       (200, [("app", ["people"], None)]), (st, [(a["name"], [t["name"] for t in a["tables"]], a["error"]) for a in doc["attached"]]))
+    last = doc
+
+    lock()
+    for style in ("", "?style=lite"):
+        started = time.time()
+        st, body, _ = fetch(base, "/catalog" + style)
+        took = time.time() - started
+        doc = json.loads(body)
+        a = (doc.get("attached") or [{}])[0]
+        error = a.get("error") or ""
+        eq(f"locked again{style}: a 200, as last read, the busy one saying why",
+           (200, [t["name"] for t in doc.get("tables", [])], "app", ["people"], True, True),
+           (st, ["own"], a.get("name"), [t["name"] for t in a.get("tables", [])],
+            "database is locked" in error, "may be stale" in error))
+        if not style:
+            eq("and its columns as last read", last["attached"][0]["tables"], a.get("tables"))
+    started = time.time()
+    fetch(base, "/catalog")
+    took = time.time() - started
+    if took < 1:
+        ok("a read while it stays busy waits on it no longer", f"{took:.2f}s")
+    else:
+        bad("a read while it stays busy waits on it no longer", f"{took:.2f}s")
+    eq("and it stays attached for every connection", None, attached_now())
+    refused = sql(base, "SELECT count(*) FROM app.people") or ""
+    eq("where reading it waits on its lock", (True, False), ("locked" in refused, "does not exist" in refused))
+    release()
+    st, body, _ = fetch(base, "/catalog")
+    eq("the lock gone, it is read anew", (200, None), (st, json.loads(body)["attached"][0]["error"]))
+    eq("and reads", None, sql(base, "SELECT count(*) FROM app.people"))
+    locker.close()
+
+    os.rename(app, app + ".away")
+    write_csv(app, "not a SQLite file, and long enough to be read as one: " * 4)
+    st, body, _ = fetch(base, "/catalog")
+    a = json.loads(body)["attached"][0]
+    eq("replaced by a file that is not SQLite: a 200, it detached and listed with why",
+       (200, "app", [], True, True),
+       (st, a["name"], a["tables"], "file is not a database" in (a["error"] or ""), "attach it again" in (a["error"] or "")))
+    eq("and gone from every connection", True, "app is not attached" in (attached_now() or ""))
+    os.replace(app + ".away", app)
+    a = json.loads(fetch(base, "/catalog")[1])["attached"][0]
+    eq("a client's attachment is not attached again by the server once it reads", (False, []),
+       (a["error"] is None, a["tables"]))
+    eq("a client's DETACH of it", None, sql(base, "DETACH IF EXISTS app"))
+    eq("forgets it", [], json.loads(fetch(base, "/catalog")[1])["attached"])
+    eq("and it attaches again", None, sql(base, f"ATTACH '{app}' AS app (TYPE sqlite, READ_ONLY)"))
+    eq("and lists", [["people"]], [[t["name"] for t in a["tables"]] for a in json.loads(fetch(base, "/catalog")[1])["attached"]])
+    os.rename(app, app + ".away")
+    a = json.loads(fetch(base, "/catalog")[1])["attached"][0]
+    eq("a read-only file deleted is detached and listed with why", (True, []),
+       ("unable to open" in (a["error"] or ""), a["tables"]))
+    os.replace(app + ".away", app)
+    sql(base, "DETACH IF EXISTS app")
 
 
 def run_race(base, work, sqlite_ok, rounds=200):
