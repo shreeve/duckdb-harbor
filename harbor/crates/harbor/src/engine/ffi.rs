@@ -3266,6 +3266,11 @@ impl Api {
     /// the whole binary. Sound because Api is repr(C) and every field is an
     /// `Option` of an `extern "C" fn` pointer: 620 consecutive slots, each
     /// pointer-sized with the null niche, in exactly SYMBOL_NAMES order.
+    ///
+    /// # Safety
+    /// `lib` must be a DuckDB build whose `duckdb_v2_` symbols have the
+    /// signatures declared here, and it must stay loaded for as long as the
+    /// table is used: every pointer filled points into it.
     pub unsafe fn fill(lib: &Library) -> (Api, usize) {
         // All-zero bytes is `None` for every `Option<extern "C" fn>` field.
         let mut api: Api = unsafe { std::mem::zeroed() };
