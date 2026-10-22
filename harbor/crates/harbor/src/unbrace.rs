@@ -55,7 +55,7 @@
 
 use std::borrow::Cow;
 
-use wire::scan::{Kind, is_space, plain_spaces, spans};
+use wire::scan::{Kind, each_span, is_space, plain_spaces};
 
 /// How much text one statement's expansion may write or re-read: twice the
 /// 8 MiB a request body may be, so what it produces is never much larger
@@ -73,11 +73,31 @@ pub fn expand(sql: &str) -> Result<Cow<'_, str>, String> {
     if !sql.contains('{') {
         return Ok(Cow::Borrowed(sql));
     }
+    let Some(out) = expansion(sql)? else {
+        return Ok(Cow::Borrowed(sql));
+    };
+    if out.src == sql.as_bytes() {
+        return Ok(Cow::Borrowed(sql));
+    }
+    // Every cut falls on an ASCII byte or a whole Unicode space, so the text
+    // is UTF-8; and it goes out only if the engine reads it as it was built.
+    match String::from_utf8(out.src) {
+        Ok(expanded) => match misread(&expanded, &out.read) {
+            None => Ok(Cow::Owned(expanded)),
+            Some(why) => Err(why.into()),
+        },
+        Err(_) => Err(QUOTE.into()),
+    }
+}
+
+/// The statement with its groups expanded, beside the reading each byte was
+/// built with; `None` when a brace is unbalanced.
+fn expansion(sql: &str) -> Result<Option<Piece>, String> {
     let mut budget = BUDGET;
     let read = reading(sql);
     let text = Text { src: sql.as_bytes(), read: &read };
     if !text.balanced() {
-        return Ok(Cow::Borrowed(sql));
+        return Ok(None);
     }
     let mut out = Piece::default();
     let mut term_start = 0;
@@ -127,26 +147,24 @@ pub fn expand(sql: &str) -> Result<Cow<'_, str>, String> {
         i += 1;
     }
     push_term(&mut out, text.slice(term_start, text.len()), braced, &mut budget)?;
-    if out.src == sql.as_bytes() {
-        return Ok(Cow::Borrowed(sql));
-    }
-    // Every cut falls on an ASCII byte or a whole Unicode space, so the text
-    // is UTF-8; and it goes out only if the engine reads it as it was built.
-    match String::from_utf8(out.src) {
-        Ok(expanded) if reading(&expanded) == out.read => Ok(Cow::Owned(expanded)),
-        Ok(expanded) => Err(misread(&out.read, &reading(&expanded)).into()),
-        Err(_) => Err(QUOTE.into()),
-    }
+    Ok(Some(out))
 }
 
-/// Why the engine would read an expansion another way than it was built,
-/// from the first byte where the two readings part.
-fn misread(built: &[u8], read: &[u8]) -> &'static str {
-    match built.iter().zip(read).map(|(a, b)| a ^ b).find(|&d| d != 0) {
-        Some(STRIPPED) => UNICODE_SPACE,
-        Some(ESCAPES) => STRING_ESCAPES,
+/// Why the engine would read `src` another way than `built`, the reading it
+/// was built with, from the first byte where the two part; `None` when they
+/// agree.
+fn misread(src: &str, built: &[u8]) -> Option<&'static str> {
+    let mut first = None;
+    reading_each(src.as_bytes(), |i, read| {
+        if first.is_none() && read != built[i] {
+            first = Some(read ^ built[i]);
+        }
+    });
+    first.map(|differ| match differ {
+        STRIPPED => UNICODE_SPACE,
+        ESCAPES => STRING_ESCAPES,
         _ => QUOTE,
-    }
+    })
 }
 
 const UNICODE_SPACE: &str = "brace expansion refused: the engine would read a Unicode space in this statement another way \
@@ -158,70 +176,121 @@ const QUOTE: &str = "brace expansion refused: a string or dollar quote beside a 
 
 /// Writes a term's expansion to `out`; returns how many alternatives it
 /// stands for.
+///
+/// A term with no group stands for itself. One group is resolved at a time,
+/// depth first, from a stack rather than by recursion: a term can hold
+/// thousands of groups, one item each, that multiply nothing and would each
+/// be a frame. Each alternative is written to `out` as it is made, and a
+/// group's items wait as places in the text they came from, so what is held
+/// at once is one text for each group being resolved, not every alternative
+/// built. Each piece is charged its length before it is built, since it is
+/// built once, scanned once and written at most once: a group of many items
+/// behind a long prefix is refused before its alternatives take any memory.
 fn push_term(out: &mut Piece, term: Text, braced: bool, budget: &mut usize) -> Result<usize, String> {
     if !braced {
         out.push(term);
         return Ok(1);
     }
-    let alts = alternatives(term, budget)?;
-    for (k, alt) in alts.iter().enumerate() {
-        if k > 0 {
-            out.push(Text { src: b", ", read: &[CODE, CODE] });
-        }
-        out.push(alt.text());
-    }
-    Ok(alts.len())
-}
-
-/// Every piece of text a term stands for, in order. A term with no group
-/// stands for itself. One group is resolved at a time, depth first, from a
-/// stack rather than by recursion: a term can hold thousands of groups, one
-/// item each, that multiply nothing and would each be a frame. Each piece is
-/// charged its length before it is built, since it is built once, scanned
-/// once and written at most once: a group of many items behind a long prefix
-/// is refused before its alternatives take any memory.
-fn alternatives(term: Text, budget: &mut usize) -> Result<Vec<Piece>, String> {
-    let mut spend = |cost: usize| {
-        *budget = budget.checked_sub(cost).ok_or_else(|| {
-            format!(
-                "brace expansion refused: this statement would expand past {} MiB",
-                BUDGET >> 20
-            )
-        })?;
-        Ok::<(), String>(())
+    spend(budget, term.len())?;
+    let Some(group) = term.first_group() else {
+        out.push(term);
+        return Ok(1);
     };
-    spend(term.len())?;
-    let mut out = Vec::new();
-    let mut pending = vec![Piece::of(term)];
-    while let Some(piece) = pending.pop() {
-        let text = piece.text();
-        let Some((lbrace, rbrace)) = text.first_group() else {
-            out.push(piece);
+    let items = term.items(group.0 + 1, group.1)?;
+    if items.is_empty() {
+        // `x.{}` stands for nothing; the engine can say so.
+        out.push(term);
+        return Ok(1);
+    }
+    let mut frames = vec![Frame::new(Whole::Term(term), group, items, budget)?];
+    let mut alts = 0;
+    while let Some(frame) = frames.last_mut() {
+        let mark = out.len();
+        if alts > 0 {
+            out.push(JOIN);
+        }
+        let start = out.len();
+        frame.write(frame.next, out);
+        frame.next += 1;
+        if frame.next == frame.items.len() {
+            frames.pop();
+        }
+        let alt = out.text().slice(start, out.len());
+        let Some(group) = alt.first_group() else {
+            alts += 1;
             continue;
         };
-        let items = text.items(lbrace + 1, rbrace)?;
+        let items = alt.items(group.0 + 1, group.1)?;
         if items.is_empty() {
-            // `x.{}` stands for nothing; the engine can say so.
-            out.push(piece);
+            alts += 1;
             continue;
         }
-        let (prefix, suffix) = (text.slice(0, lbrace), text.slice(rbrace + 1, text.len()));
-        let each = prefix.len() + suffix.len();
-        spend(items.iter().fold(0usize, |sum, item| sum.saturating_add(each + item.len())))?;
-        let next: Vec<Piece> = items
-            .iter()
-            .rev()
-            .map(|item| {
-                let mut alt = Piece::default();
-                for part in [prefix, *item, suffix] {
-                    alt.push(part);
-                }
-                alt
-            })
-            .collect();
-        pending.extend(next);
+        let alt = out.split_off(start);
+        out.truncate(mark);
+        frames.push(Frame::new(Whole::Alt(alt), group, items, budget)?);
     }
-    Ok(out)
+    Ok(alts)
+}
+
+/// `, `, read as code.
+const JOIN: Text = Text { src: b", ", read: &[CODE, CODE] };
+
+/// Charges `cost` to the budget, or refuses the statement.
+fn spend(budget: &mut usize, cost: usize) -> Result<(), String> {
+    *budget = budget
+        .checked_sub(cost)
+        .ok_or_else(|| format!("brace expansion refused: this statement would expand past {} MiB", BUDGET >> 20))?;
+    Ok(())
+}
+
+/// A group being resolved: the text it sits in, where it opens and closes,
+/// its items, and the next of them to write.
+struct Frame<'a> {
+    whole: Whole<'a>,
+    group: (usize, usize),
+    items: Vec<Item>,
+    next: usize,
+}
+
+/// The text a group sits in: the term itself, or an alternative of it.
+enum Whole<'a> {
+    Term(Text<'a>),
+    Alt(Piece),
+}
+
+/// Where an item sits in the text of its group.
+#[derive(Clone, Copy)]
+struct Item {
+    start: usize,
+    end: usize,
+}
+
+impl<'a> Frame<'a> {
+    /// The frame for the group at `group` in `whole`, charged what its
+    /// alternatives will write.
+    fn new(whole: Whole<'a>, group: (usize, usize), items: Vec<Item>, budget: &mut usize) -> Result<Self, String> {
+        let each = whole.text().len() - (group.1 + 1 - group.0);
+        spend(budget, items.iter().fold(0usize, |sum, item| sum.saturating_add(each + item.end - item.start)))?;
+        Ok(Frame { whole, group, items, next: 0 })
+    }
+
+    /// Writes the alternative item `k` makes: the text before the group,
+    /// the item, and the text after it.
+    fn write(&self, k: usize, out: &mut Piece) {
+        let (text, (lbrace, rbrace), item) = (self.whole.text(), self.group, self.items[k]);
+        out.push(text.slice(0, lbrace));
+        out.push(text.slice(item.start, item.end));
+        out.push(text.slice(rbrace + 1, text.len()));
+    }
+}
+
+impl Whole<'_> {
+    fn text(&self) -> Text<'_> {
+        match self {
+            Whole::Term(text) => *text,
+            Whole::Alt(piece) => piece.text(),
+        }
+    }
 }
 
 // How the engine reads a byte, packed in one: the kind of span it falls in,
@@ -241,28 +310,37 @@ const ESCAPES: u8 = 32;
 /// The engine's reading of each byte of `src`. Two texts with the same bytes
 /// that agree here are one statement to the engine.
 fn reading(src: &str) -> Vec<u8> {
-    let plain = plain_spaces(src.as_bytes());
-    let mut read = vec![CODE; src.len()];
-    for span in spans(&plain) {
+    let mut read = Vec::with_capacity(src.len());
+    reading_each(src.as_bytes(), |_, r| read.push(r));
+    read
+}
+
+/// The engine's reading of each byte of `src`, given to `each` in order with
+/// its offset, so a reader that compares need not hold it all.
+fn reading_each(src: &[u8], mut each: impl FnMut(usize, u8)) {
+    let plain = plain_spaces(src);
+    for span in each_span(&plain) {
         let kind = match span.kind {
-            Kind::Code => continue,
+            Kind::Code => CODE,
             Kind::Str => STR,
             Kind::Dollar => DOLLAR,
             Kind::LineComment => LINE_COMMENT,
             Kind::BlockComment => BLOCK_COMMENT,
         };
-        read[span.start..span.end].fill(kind);
-        read[span.start] |= BEGINS;
-        if span.escapes {
-            read[span.start] |= ESCAPES;
+        for i in span.start..span.end {
+            let mut read = kind;
+            if i == span.start && kind != CODE {
+                read |= BEGINS;
+                if span.escapes {
+                    read |= ESCAPES;
+                }
+            }
+            if src[i] != plain[i] {
+                read |= STRIPPED;
+            }
+            each(i, read);
         }
     }
-    for (r, (a, b)) in read.iter_mut().zip(src.bytes().zip(plain.iter())) {
-        if a != *b {
-            *r |= STRIPPED;
-        }
-    }
-    read
 }
 
 /// What a byte is to the expansion: code it reads, a space or comment that
@@ -291,13 +369,23 @@ struct Piece {
 }
 
 impl Piece {
-    fn of(text: Text) -> Self {
-        Piece { src: text.src.to_vec(), read: text.read.to_vec() }
-    }
-
     fn push(&mut self, text: Text) {
         self.src.extend_from_slice(text.src);
         self.read.extend_from_slice(text.read);
+    }
+
+    fn len(&self) -> usize {
+        self.src.len()
+    }
+
+    /// The piece from `at` on, taken off this one.
+    fn split_off(&mut self, at: usize) -> Piece {
+        Piece { src: self.src.split_off(at), read: self.read.split_off(at) }
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.src.truncate(len);
+        self.read.truncate(len);
     }
 
     fn text(&self) -> Text<'_> {
@@ -525,7 +613,7 @@ impl<'a> Text<'a> {
     /// and commas; a nested group travels whole inside its item, as do a
     /// cast's type parameters. An error when an item ends inside a cast's
     /// type ([`Text::cast_beyond`]).
-    fn items(&self, from: usize, to: usize) -> Result<Vec<Text<'a>>, String> {
+    fn items(&self, from: usize, to: usize) -> Result<Vec<Item>, String> {
         let mut items = Vec::new();
         let mut depth = 0usize;
         let mut start = from;
@@ -561,14 +649,14 @@ impl<'a> Text<'a> {
                     {
                         return Err(refusal);
                     }
-                    items.push(self.slice(start, i));
+                    items.push(Item { start, end: i });
                 }
                 start = i + 1;
             }
             i += 1;
         }
         if to > start {
-            items.push(self.slice(start, to));
+            items.push(Item { start, end: to });
         }
         Ok(items)
     }
@@ -608,6 +696,7 @@ const INTERVAL_UNITS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wire::scan::spans;
 
     fn x(sql: &str) -> String {
         expand(sql).unwrap().into_owned()
