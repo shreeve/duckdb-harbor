@@ -877,6 +877,31 @@ mod tests {
         assert!(expanded > 2_000 && refused > 1_000, "{expanded} expanded, {refused} refused");
     }
 
+    /// Harbor's half of `test/scripts/braces.py`, which has the engine
+    /// parse what this writes: each NUL-ended statement in the file
+    /// `UNBRACE_IN`, expanded into the file `UNBRACE_OUT`, NUL-ended and led
+    /// by `X` (expanded), `S` (left as it came) or `R` (refused, and the
+    /// refusal). Without the two names it does nothing.
+    #[test]
+    #[ignore]
+    fn expand_a_file() {
+        let (Ok(input), Ok(output)) = (std::env::var("UNBRACE_IN"), std::env::var("UNBRACE_OUT")) else {
+            return;
+        };
+        let input = std::fs::read(input).unwrap();
+        let mut out = Vec::new();
+        for sql in input.strip_suffix(b"\0").unwrap_or(&input).split(|&b| b == 0) {
+            let sql = std::str::from_utf8(sql).unwrap();
+            match expand(sql) {
+                Ok(Cow::Owned(expanded)) => out.extend([b"X", expanded.as_bytes()].concat()),
+                Ok(Cow::Borrowed(same)) => out.extend([b"S", same.as_bytes()].concat()),
+                Err(refusal) => out.extend([b"R", refusal.as_bytes()].concat()),
+            }
+            out.push(0);
+        }
+        std::fs::write(output, out).unwrap();
+    }
+
     /// The long run: `UNBRACE_FUZZ=<count>[:<seed>] cargo test --release -p
     /// harbor unbrace -- --ignored --nocapture`.
     #[test]
