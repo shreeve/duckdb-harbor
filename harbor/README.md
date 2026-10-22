@@ -359,18 +359,24 @@ select id, raw_request.requisitionNumber, raw_request.visitDate,
   from orders where raw_request.patient.lastName ilike 'morel';
 ```
 
-Items are separated by commas. Whitespace alone separates them too, so the
-comma is never required, only clearer. A group nests. It can sit
+Items are separated by commas. Whitespace or a comment alone separates them
+too, so the comma is never required, only clearer. A group nests. It can sit
 anywhere in a term — `orders_{2025,2026}`, `{first,last}Name`,
-`r.{a,b}::VARCHAR` — and two groups in one term multiply, as in a shell:
+`r.{a,b}::VARCHAR` — where a term ends at whitespace, a comment, a comma, a
+parenthesis or a semicolon, whitespace being whatever the engine takes for it,
+the vertical tab and the Unicode spaces it strips among it. Two groups in one
+term multiply, as in a shell:
 `r.{a,b}.{x,y}` is four paths. The alternatives are joined with `, `, which is
 what a select list, a `FROM` list and an argument list all take.
 
 A struct literal is DuckDB's own use of braces, and it always carries a lone
 `:` at its top level — never the `::` of a cast — so `{'a': 1}` is left as it
 came, and so is an empty `{}`. Strings, quoted identifiers, dollar quotes and
-comments are never touched. A brace that never closes leaves the statement as
-it came, and the engine reports the syntax error at it.
+comments are never touched: the statement is read once, as the engine reads
+it, and only a group in code expands. An expansion the engine would read
+another way than the statement it came from, as when a quote its parser
+misreads is repeated, leaves the statement as it came, as does a brace that
+never closes; the engine then reports the syntax error at it.
 
 The expansion happens in the server, once, for every client: the REPL,
 `curl`, a Rip app. `EXPLAIN` and the engine's error messages show the

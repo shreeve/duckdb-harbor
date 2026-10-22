@@ -548,6 +548,23 @@ class CommitRaces(Harbor, unittest.TestCase):
         self.assertEqual([c["name"] for c in doc["columns"]], ["it's", "y", "'", "{c,d}"])
         self.assertEqual(doc["data"], [[1, "{a,b}", 2, 3]])
 
+    def test_a_brace_group_ends_where_the_engine_ends_a_word(self):
+        # A vertical tab, a Unicode space the engine strips and a comment end
+        # a term as a space does. Carried into each alternative, the line
+        # comment would hide every one after the first.
+        for gap in ("\v", " ", "　", "-- c\n", "/* c */"):
+            with self.subTest(gap=gap):
+                doc = self.sql("SELECT r.{a,b}" + gap + "FROM (SELECT {'a': 1, 'b': 2} AS r)")
+                self.assertEqual(doc["data"], [[1, 2]])
+
+    def test_a_string_is_never_rewritten_by_an_expansion_read_afresh(self):
+        # `}E'` begins an E-string and `xE'` does not: read afresh, the
+        # expansion of `{x}` would turn the string after it into a group.
+        # The statement goes to the engine as it came, and its refusal
+        # quotes it.
+        sql = r"SELECT {x}E'\'''{a,b}'"
+        self.assertIn(sql, self.sql(sql, status=400)["message"])
+
     def test_a_null_param_is_typed_as_the_engine_types_a_null(self):
         # Bound untyped, as the engine's own EXECUTE p(NULL) binds it: the
         # statement types it, and where nothing does, a table made from it
