@@ -3,6 +3,25 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by release
 date, newest first.
 
+## 2.0.1 — 2026-10-22
+
+- **Detach lets go of a catalog Harbor lists with an error.** Harbor 2.0.1
+  lists an attached SQLite file that is busy with a write, or one it set
+  aside because its catalog stopped reading, with an error under its
+  heading. Detach read that error as "not attached" and sent nothing, so the
+  file stayed attached or listed, and the workspace's record came back at
+  the server's next stop. Detach sends `DETACH IF EXISTS` on any heading: a
+  busy file is detached, Harbor forgets one it set aside, and the
+  workspace's record goes as before.
+- **A tunneled remote whose server stops shows dim.** The row took its state
+  from the SSH process alone, so a server that exited on its machine while
+  ssh stayed up showed green until the next request failed. The remote on
+  screen is asked `/ready` through its tunnel every fifteen seconds, each
+  answer given ten; two misses in a row show the row dim and say it is not
+  answering, and the next answer shows it green. A slow link that answers
+  stays green, and the connection is kept, so a server restarted on its
+  machine comes back without a reconnect.
+
 ## 2.0.0 — 2026-10-21
 
 - **DuckTable draws with gpui-kit 0.8.0.** The kit moves from 0.7.1 to

@@ -557,9 +557,6 @@ and DuckTable 0.23.0 record.
   stopping a Windows server, and macOS symbol promotion with a real
   extension loaded.
 - **Small, known, deferred:**
-  - A tunneled remote in DuckTable whose server exits while ssh stays up
-    shows green until its next request fails; probing through the tunnel on
-    each refresh would misread a slow link.
   - DuckTable's commit order does not recognize a key move typed differently
     from the wire's spelling of it, or a UNIQUE column that is not the key
     (EDITING.md says so).
