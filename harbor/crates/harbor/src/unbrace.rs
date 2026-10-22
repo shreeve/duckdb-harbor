@@ -19,7 +19,10 @@
 //! being whatever the engine takes for one: the ASCII spaces, the vertical
 //! tab among them, and the Unicode spaces it strips before it parses. A
 //! cast's type parameters, the `(10,2)` right after `::DECIMAL`, stay in
-//! the term, so `x.{a,b}::DECIMAL(10,2)` casts both. Items
+//! the term, so `x.{a,b}::DECIMAL(10,2)` casts both. A type the engine
+//! reads on past a space or comment, as in `::DECIMAL (10,2)`, `::INT []`
+//! or `::DOUBLE PRECISION`, would reach only the last alternative, so a
+//! term or an item that ends inside one is refused. Items
 //! in a group are separated by commas; spaces and comments alone separate
 //! them too, so a comma is never required, only clearer. A group nests; two
 //! groups in one term multiply, as they do in a shell. The alternatives a
@@ -41,7 +44,9 @@
 //! byte for byte as the statement it came from (a string's bytes taken for
 //! code, two strings run into one, a string that takes backslash escapes in
 //! one and not in the other, a space stripped in one and kept in the other)
-//! leaves the whole statement as it came.
+//! is refused, with what to write instead: sent as written, its braces
+//! would reach the engine, which reads them as a struct literal or not at
+//! all.
 //!
 //! Each group multiplies, so a short statement can stand for an enormous one:
 //! thirty two-item groups in a term are a billion alternatives. Expansion
@@ -61,7 +66,9 @@ use wire::scan::{Kind, is_space, plain_spaces, spans};
 pub const BUDGET: usize = 16 << 20;
 
 /// The expanded statement, or the input itself when there was nothing to do.
-/// An error when the expansion would outrun [`BUDGET`].
+/// An error when the expansion would outrun [`BUDGET`], or could not be made
+/// as written: one the engine would read another way, or a cast whose type
+/// a group's term or item would cut short.
 pub fn expand(sql: &str) -> Result<Cow<'_, str>, String> {
     if !sql.contains('{') {
         return Ok(Cow::Borrowed(sql));
@@ -69,6 +76,9 @@ pub fn expand(sql: &str) -> Result<Cow<'_, str>, String> {
     let mut budget = BUDGET;
     let read = reading(sql);
     let text = Text { src: sql.as_bytes(), read: &read };
+    if !text.balanced() {
+        return Ok(Cow::Borrowed(sql));
+    }
     let mut out = Piece::default();
     let mut term_start = 0;
     let mut depth = 0usize;
@@ -83,7 +93,6 @@ pub fn expand(sql: &str) -> Result<Cow<'_, str>, String> {
                     braced = true;
                     false
                 }
-                b'}' if depth == 0 => return Ok(Cow::Borrowed(sql)),
                 b'}' => {
                     depth -= 1;
                     false
@@ -101,15 +110,21 @@ pub fn expand(sql: &str) -> Result<Cow<'_, str>, String> {
             Class::Opaque => false,
         };
         if boundary {
-            push_term(&mut out, text.slice(term_start, i), braced, &mut budget)?;
+            let alts = push_term(&mut out, text.slice(term_start, i), braced, &mut budget)?;
+            // A term that stands for several ends here, at a space or
+            // comment, and a cast's type the engine reads on past it would
+            // reach only the last of them.
+            if alts > 1
+                && text.class(i) == Class::Space
+                && let Some(refusal) = text.cast_beyond(term_start, i, text.len())
+            {
+                return Err(refusal);
+            }
             out.push(text.slice(i, i + 1));
             term_start = i + 1;
             braced = false;
         }
         i += 1;
-    }
-    if depth != 0 {
-        return Ok(Cow::Borrowed(sql));
     }
     push_term(&mut out, text.slice(term_start, text.len()), braced, &mut budget)?;
     if out.src == sql.as_bytes() {
@@ -119,22 +134,43 @@ pub fn expand(sql: &str) -> Result<Cow<'_, str>, String> {
     // is UTF-8; and it goes out only if the engine reads it as it was built.
     match String::from_utf8(out.src) {
         Ok(expanded) if reading(&expanded) == out.read => Ok(Cow::Owned(expanded)),
-        _ => Ok(Cow::Borrowed(sql)),
+        Ok(expanded) => Err(misread(&out.read, &reading(&expanded)).into()),
+        Err(_) => Err(QUOTE.into()),
     }
 }
 
-fn push_term(out: &mut Piece, term: Text, braced: bool, budget: &mut usize) -> Result<(), String> {
+/// Why the engine would read an expansion another way than it was built,
+/// from the first byte where the two readings part.
+fn misread(built: &[u8], read: &[u8]) -> &'static str {
+    match built.iter().zip(read).map(|(a, b)| a ^ b).find(|&d| d != 0) {
+        Some(STRIPPED) => UNICODE_SPACE,
+        Some(ESCAPES) => STRING_ESCAPES,
+        _ => QUOTE,
+    }
+}
+
+const UNICODE_SPACE: &str = "brace expansion refused: the engine would read a Unicode space in this statement another way \
+     once its brace groups expand; write it as a plain space, or write the alternatives out";
+const STRING_ESCAPES: &str = "brace expansion refused: a string beside a brace group would gain or lose backslash escapes \
+     once the group expands; put a space between the group and the string, or write the alternatives out";
+const QUOTE: &str = "brace expansion refused: a string or dollar quote beside a brace group would begin or end elsewhere \
+     once the group expands; put a space between the group and the quote, or write the alternatives out";
+
+/// Writes a term's expansion to `out`; returns how many alternatives it
+/// stands for.
+fn push_term(out: &mut Piece, term: Text, braced: bool, budget: &mut usize) -> Result<usize, String> {
     if !braced {
         out.push(term);
-        return Ok(());
+        return Ok(1);
     }
-    for (k, alt) in alternatives(term, budget)?.iter().enumerate() {
+    let alts = alternatives(term, budget)?;
+    for (k, alt) in alts.iter().enumerate() {
         if k > 0 {
             out.push(Text { src: b", ", read: &[CODE, CODE] });
         }
         out.push(alt.text());
     }
-    Ok(())
+    Ok(alts.len())
 }
 
 /// Every piece of text a term stands for, in order. A term with no group
@@ -163,7 +199,7 @@ fn alternatives(term: Text, budget: &mut usize) -> Result<Vec<Piece>, String> {
             out.push(piece);
             continue;
         };
-        let items = text.items(lbrace + 1, rbrace);
+        let items = text.items(lbrace + 1, rbrace)?;
         if items.is_empty() {
             // `x.{}` stands for nothing; the engine can say so.
             out.push(piece);
@@ -391,10 +427,105 @@ impl<'a> Text<'a> {
         pairs
     }
 
+    /// Whether every `}` in code closes a `{`, and every `{` is closed.
+    fn balanced(&self) -> bool {
+        let mut depth = 0usize;
+        for i in 0..self.len() {
+            match self.code(i) {
+                Some(b'{') => depth += 1,
+                Some(b'}') if depth == 0 => return false,
+                Some(b'}') => depth -= 1,
+                _ => {}
+            }
+        }
+        depth == 0
+    }
+
+    /// A refusal when the word from `from` to `end` ends in a cast, `end` is
+    /// the space or comment after it, and the engine reads the cast's type on
+    /// past it, to the first thing after it before `to`: parameters,
+    /// `::DECIMAL (10,2)`; array bounds, `::INT []` or `::INT ARRAY`; or the
+    /// rest of a type of several words, `::DOUBLE PRECISION`. A brace group's
+    /// term or item ends at that space, so its alternatives would split the
+    /// type: the first cast to its name alone, or its rest an item of its own.
+    fn cast_beyond(&self, from: usize, end: usize, to: usize) -> Option<String> {
+        let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        // Back over the cast: array bounds, `[]` or `[3]`, then parameters
+        // the term kept, then the type's name and the `::` before it.
+        let mut j = end;
+        while j > from && self.code(j - 1) == Some(b']') {
+            let digits = (from..j - 1).rev().take_while(|&k| self.code(k).is_some_and(|c| c.is_ascii_digit())).count();
+            let open = j - 1 - digits;
+            if open == from || self.code(open - 1) != Some(b'[') {
+                return None;
+            }
+            j = open - 1;
+        }
+        let parameters = j > from && self.code(j - 1) == Some(b')');
+        if parameters {
+            let mut depth = 0usize;
+            loop {
+                j -= 1;
+                match self.code(j) {
+                    Some(b')') => depth += 1,
+                    Some(b'(') => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                if j == from {
+                    return None;
+                }
+            }
+        }
+        let name_len = (from..j).rev().take_while(|&k| self.code(k).is_some_and(word)).count();
+        let start = j - name_len;
+        if name_len == 0
+            || self.src[start].is_ascii_digit()
+            || start < from + 2
+            || self.code(start - 1) != Some(b':')
+            || self.code(start - 2) != Some(b':')
+        {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&self.src[start..j]);
+        let written = String::from_utf8_lossy(&self.src[start..end]);
+        // Forward past spaces and comments to what follows.
+        let next = (end..to).find(|&k| self.class(k) != Class::Space)?;
+        let (follows, list) = match self.code(next) {
+            Some(b'(') if !parameters => ("parameters", "(…)"),
+            Some(b'[') => ("array bounds", "[…]"),
+            _ => ("", ""),
+        };
+        if !follows.is_empty() {
+            return Some(format!(
+                "brace expansion refused: the space or comment after `::{written}` would split its {follows} from it \
+                 across a brace group's alternatives; write `::{written}{list}` with nothing between, \
+                 or cast each alternative on its own"
+            ));
+        }
+        let after = (next..to).take_while(|&k| self.code(k).is_some_and(word)).count();
+        let following = String::from_utf8_lossy(&self.src[next..next + after]);
+        let one_word = type_continues(&name, &following)?;
+        let fix = match one_word {
+            "" => String::new(),
+            "[]" => format!("write `::{written}[]`, or "),
+            one => format!("write `::{one}`, or "),
+        };
+        Some(format!(
+            "brace expansion refused: the space or comment after `::{written}` would split the type `{written} {following}` \
+             across a brace group's alternatives; {fix}cast each alternative on its own"
+        ))
+    }
+
     /// The items between `from` and `to`, split at top-level spaces, comments
     /// and commas; a nested group travels whole inside its item, as do a
-    /// cast's type parameters.
-    fn items(&self, from: usize, to: usize) -> Vec<Text<'a>> {
+    /// cast's type parameters. An error when an item ends inside a cast's
+    /// type ([`Text::cast_beyond`]).
+    fn items(&self, from: usize, to: usize) -> Result<Vec<Text<'a>>, String> {
         let mut items = Vec::new();
         let mut depth = 0usize;
         let mut start = from;
@@ -425,6 +556,11 @@ impl<'a> Text<'a> {
             };
             if split {
                 if i > start {
+                    if self.class(i) == Class::Space
+                        && let Some(refusal) = self.cast_beyond(start, i, to)
+                    {
+                        return Err(refusal);
+                    }
                     items.push(self.slice(start, i));
                 }
                 start = i + 1;
@@ -434,9 +570,40 @@ impl<'a> Text<'a> {
         if to > start {
             items.push(self.slice(start, to));
         }
-        items
+        Ok(items)
     }
 }
+
+/// When `following`, the word after a cast to `name`, is part of that type
+/// to the engine: the type's one-word name, `[]` for `ARRAY`, or nothing
+/// when it has none. Case aside, as the engine reads them: `ARRAY` after any
+/// type, `DOUBLE PRECISION`, `TIMESTAMP` and `TIME` `WITH` or `WITHOUT TIME
+/// ZONE`, `CHARACTER`, `CHAR`, `NCHAR` and `BIT VARYING`, `NATIONAL
+/// CHARACTER`, and an `INTERVAL`'s unit. Any other word after a type is an
+/// alias, or a word the engine refuses there.
+fn type_continues(name: &str, following: &str) -> Option<&'static str> {
+    let (name, next) = (name.to_ascii_uppercase(), following.to_ascii_uppercase());
+    let one_word = match (name.as_str(), next.as_str()) {
+        (_, "ARRAY") => "[]",
+        ("DOUBLE", "PRECISION") => "DOUBLE",
+        ("TIMESTAMP", "WITH") => "TIMESTAMPTZ",
+        ("TIME", "WITH") => "TIMETZ",
+        ("TIMESTAMP", "WITHOUT") => "TIMESTAMP",
+        ("TIME", "WITHOUT") => "TIME",
+        ("CHARACTER" | "CHAR" | "NCHAR", "VARYING") | ("NATIONAL", "CHARACTER" | "CHAR") => "VARCHAR",
+        ("BIT", "VARYING") => "BIT",
+        ("INTERVAL", unit) if INTERVAL_UNITS.contains(&unit) => "",
+        _ => return None,
+    };
+    Some(one_word)
+}
+
+/// The units the engine reads after `::INTERVAL` as part of the type.
+const INTERVAL_UNITS: &[&str] = &[
+    "YEAR", "YEARS", "MONTH", "MONTHS", "DAY", "DAYS", "HOUR", "HOURS", "MINUTE", "MINUTES", "SECOND", "SECONDS",
+    "MILLISECOND", "MILLISECONDS", "MICROSECOND", "MICROSECONDS", "WEEK", "WEEKS", "QUARTER", "QUARTERS", "DECADE",
+    "DECADES", "CENTURY", "CENTURIES", "MILLENNIUM", "MILLENNIA",
+];
 
 #[cfg(test)]
 mod tests {
@@ -532,33 +699,39 @@ mod tests {
 
     /// The statement is read once, and every alternative keeps that reading:
     /// a group in a string stays text, and an expansion the engine would
-    /// read another way is not made.
+    /// read another way is refused, saying what to write instead.
     #[test]
-    fn an_expansion_the_engine_would_misread_is_not_made() {
-        for sql in [
+    fn an_expansion_the_engine_would_misread_is_refused() {
+        for (sql, why) in [
             // `}E'` begins an E-string and `xE'` does not: read afresh, the
             // string after it would come out as `'a'` and `'b'`.
-            r"select {x}E'\'''{a,b}'",
+            (r"select {x}E'\'''{a,b}'", STRING_ESCAPES),
             // `$$` after a brace opens a dollar quote; after a word it does not.
-            "select r.{a,b}$$x.{c,d}$$",
+            ("select r.{a,b}$$x.{c,d}$$", QUOTE),
             // Two strings would run into one.
-            "select {'a' x}'b'",
+            ("select {'a' x}'b'", QUOTE),
             // An unterminated string would take in the next alternative.
-            "select {a b}'{",
+            ("select {a b}'{", QUOTE),
             // The engine's pre-pass misreads `E'\''`, and repeated, the
             // misreading flips: the U+00A0 in the string after it would be
             // stripped where it was kept.
-            "select {a,b}.E'\\'', 'x\u{a0}y'",
+            ("select {a,b}.E'\\'', 'x\u{a0}y'", UNICODE_SPACE),
             // An `E` that begins a word makes the string after it take
             // backslash escapes, whether or not one moves its end: `}'` is a
             // plain string and `E'` is not, `d'` is plain and `e'` is not,
             // `}e'` takes escapes and `xe'` does not.
-            r"select {E}'a\tb'",
-            r"select t.{d,e}'a\tb'",
-            r"select {x,y}e'a\tb'",
+            (r"select {E}'a\tb'", STRING_ESCAPES),
+            (r"select t.{d,e}'a\tb'", STRING_ESCAPES),
+            (r"select {x,y}e'a\tb'", STRING_ESCAPES),
         ] {
-            assert!(matches!(expand(sql), Ok(Cow::Borrowed(_))), "{sql:?}");
+            assert_eq!(expand(sql), Err(why.to_string()), "{sql:?}");
         }
+        // Each refusal's fix is one the engine reads as written.
+        assert_eq!(x(r"select {x} E'\'''{a,b}'"), r"select x E'\'''{a,b}'");
+        assert_eq!(x("select r.{a,b} $$x.{c,d}$$"), "select r.a, r.b $$x.{c,d}$$");
+        assert_eq!(x("select {'a' x} 'b'"), "select 'a', x 'b'");
+        assert_eq!(x("select {a,b}.E'\\'', 'x y'"), "select a.E'\\'', b.E'\\'', 'x y'");
+        assert_eq!(x(r"select t.{d,e} 'a\tb'"), r"select t.d, t.e 'a\tb'");
         // A misreading the expansion does not repeat changes nothing.
         assert_eq!(x("select /* ' */ r.{a,b}, 'x\u{a0}y'"), "select /* ' */ r.a, r.b, 'x\u{a0}y'");
         assert_eq!(x("select E'\\'', r.{a,b}, 'x\u{a0}y'"), "select E'\\'', r.a, r.b, 'x\u{a0}y'");
@@ -578,7 +751,9 @@ mod tests {
         assert_eq!(x("select round(r.{a,b}::DECIMAL(9,3), 1)"), "select round(r.a::DECIMAL(9,3), r.b::DECIMAL(9,3), 1)");
         // Anything else ends the term as ever: a call's parentheses, a
         // space (here after the `::`, which the engine then refuses), and
-        // the `AS` of a `CAST`, which it refuses too.
+        // the `AS` of a `CAST`, which it refuses too. A space between the
+        // name and its parameters is refused, as
+        // `a_cast_a_group_would_split_is_refused` shows.
         assert_eq!(x("select f(r.{a,b})"), "select f(r.a, r.b)");
         assert_eq!(x("select r.{a,b}:: DECIMAL(10,2)"), "select r.a::, r.b:: DECIMAL(10,2)");
         assert_eq!(x("select cast(x.{a,b} as DECIMAL(10,2))"), "select cast(x.a, x.b as DECIMAL(10,2))");
@@ -592,6 +767,66 @@ mod tests {
         assert_eq!(x(&open).len(), open.len() + 1);
         let open = format!("select r.{{{}}}", "x::a(".repeat(200_000));
         assert_eq!(x(&open).len(), open.len() - 2);
+    }
+
+    /// A type the engine reads on past a space or comment would be split
+    /// across the alternatives, the first cast to its name alone: such a
+    /// statement is refused, naming the type and the fix.
+    #[test]
+    fn a_cast_a_group_would_split_is_refused() {
+        let refusal = |sql: &str| expand(sql).expect_err(sql);
+        let parameters = "brace expansion refused: the space or comment after `::DECIMAL` would split its parameters \
+                          from it across a brace group's alternatives; write `::DECIMAL(…)` with nothing between, \
+                          or cast each alternative on its own";
+        assert_eq!(refusal("select x.{a,b}::DECIMAL (10,2) from t"), parameters);
+        assert_eq!(refusal("select x.{a,b}::DECIMAL/* p */(10,2) from t"), parameters);
+        assert_eq!(refusal("select x.{a,b}::DECIMAL\u{a0}(10,2) from t"), parameters);
+        assert_eq!(
+            refusal("select x.{a,b}::INT [] from t"),
+            "brace expansion refused: the space or comment after `::INT` would split its array bounds \
+             from it across a brace group's alternatives; write `::INT[…]` with nothing between, \
+             or cast each alternative on its own"
+        );
+        assert!(refusal("select x.{a,b}::INT[] [2]").contains("after `::INT[]` would split its array bounds"));
+        for (sql, typ, fix) in [
+            ("select x.{a,b}::DOUBLE PRECISION from t", "DOUBLE PRECISION", "write `::DOUBLE`, or "),
+            ("select x.{a,b}::timestamp with time zone", "timestamp with", "write `::TIMESTAMPTZ`, or "),
+            ("select x.{a,b}::TIME WITHOUT TIME ZONE", "TIME WITHOUT", "write `::TIME`, or "),
+            ("select x.{a,b}::CHARACTER VARYING(9)", "CHARACTER VARYING", "write `::VARCHAR`, or "),
+            ("select x.{a,b}::NATIONAL CHAR", "NATIONAL CHAR", "write `::VARCHAR`, or "),
+            ("select x.{a,b}::INT ARRAY", "INT ARRAY", "write `::INT[]`, or "),
+            ("select x.{a,b}::DECIMAL(10,2) ARRAY", "DECIMAL(10,2) ARRAY", "write `::DECIMAL(10,2)[]`, or "),
+            ("select x.{a,b}::INTERVAL -- c\n YEAR", "INTERVAL YEAR", ""),
+            ("select x.{a,b}::INT[3] ARRAY", "INT[3] ARRAY", "write `::INT[3][]`, or "),
+            // Inside a group the item ends there, and the type's rest would
+            // be an item of its own.
+            ("select r.{a::DOUBLE PRECISION, b} from t", "DOUBLE PRECISION", "write `::DOUBLE`, or "),
+            ("select r.{a::INTERVAL year} from t", "INTERVAL year", ""),
+        ] {
+            let got = refusal(sql);
+            assert!(got.starts_with("brace expansion refused: the space or comment after `::"), "{sql:?}: {got}");
+            assert!(got.ends_with(&format!("split the type `{typ}` across a brace group's alternatives; {fix}cast each alternative on its own")), "{sql:?}: {got}");
+        }
+        // Written without the space, the type is whole in every alternative;
+        // a group of one alternative splits nothing; an alias, or a word the
+        // engine reads as no part of the type, ends the term as ever; a
+        // struct literal and an unbalanced brace are left as they came.
+        assert_eq!(x("select x.{a,b}::INT[] from t"), "select x.a::INT[], x.b::INT[] from t");
+        assert_eq!(x("select x.{a}::DOUBLE PRECISION"), "select x.a::DOUBLE PRECISION");
+        assert_eq!(x("select x.{a}.{b}::DECIMAL (10,2)"), "select x.a.b::DECIMAL (10,2)");
+        assert_eq!(x("select x.{a,b}::INT year from t"), "select x.a::INT, x.b::INT year from t");
+        assert_eq!(x("select x.{a,b}::DOUBLE, c"), "select x.a::DOUBLE, x.b::DOUBLE, c");
+        assert_eq!(x("select x.{a,b}::DOUBLE\nfrom t"), "select x.a::DOUBLE, x.b::DOUBLE\nfrom t");
+        assert_eq!(x("select r.{a::INT array_col}"), "select r.a::INT, r.array_col");
+        for sql in [
+            "select {'k': 1}::STRUCT (k INT)",
+            "select {'k': 1}::DOUBLE PRECISION",
+            "select x.{a,b}::DECIMAL (10,2) }",
+            "select '{a,b}'::DOUBLE PRECISION",
+            "select 1::DECIMAL (10,2)",
+        ] {
+            assert!(matches!(expand(sql), Ok(Cow::Borrowed(_))), "{sql:?}");
+        }
     }
 
     #[test]
@@ -675,14 +910,18 @@ mod tests {
 
     /// The expansion worked out a second way, by recursion over the units of
     /// the statement's one reading: what it should become, and how the
-    /// engine should read that.
-    fn reference(sql: &str) -> (Vec<u8>, Vec<Tok>) {
+    /// engine should read that; `None` when a term or an item would end
+    /// inside a cast's type.
+    fn reference(sql: &str) -> Option<(Vec<u8>, Vec<Tok>)> {
         let units = units(sql);
-        let unchanged = || (sql.as_bytes().to_vec(), reading_of(&units));
+        let unchanged = || Some((sql.as_bytes().to_vec(), reading_of(&units)));
         let mut out: Vec<Unit> = Vec::new();
-        let (mut depth, mut term) = (0usize, Vec::new());
+        let (mut depth, mut term, mut split) = (0usize, Vec::new(), false);
+        // The term's alternatives written out; how many there were, or
+        // `None` when an item splits a cast.
         let flush = |out: &mut Vec<Unit>, term: &mut Vec<Unit>| {
-            let alts = if term.iter().any(|u| u.0 == Tok::Code(b'{')) { reference_alternatives(term) } else { vec![term.clone()] };
+            let alts = if term.iter().any(|u| u.0 == Tok::Code(b'{')) { reference_alternatives(term)? } else { vec![term.clone()] };
+            let n = alts.len();
             for (k, alt) in alts.into_iter().enumerate() {
                 if k > 0 {
                     out.push((Tok::Code(b','), b",".to_vec()));
@@ -691,6 +930,7 @@ mod tests {
                 out.extend(alt);
             }
             term.clear();
+            Some(n)
         };
         let mut k = 0;
         while k < units.len() {
@@ -708,7 +948,11 @@ mod tests {
             }
             let boundary = depth == 0 && (separates(&unit.0) || matches!(unit.0, Tok::Code(b',' | b'(' | b')' | b';')));
             if boundary {
-                flush(&mut out, &mut term);
+                let cast = separates(&unit.0) && reference_cast_beyond(&term, &units[k..]);
+                match flush(&mut out, &mut term) {
+                    Some(n) => split |= n > 1 && cast,
+                    None => split = true,
+                }
                 out.push(unit.clone());
             } else {
                 term.push(unit.clone());
@@ -718,8 +962,65 @@ mod tests {
         if depth != 0 {
             return unchanged();
         }
-        flush(&mut out, &mut term);
-        (out.iter().flat_map(|u| u.1.clone()).collect(), reading_of(&out))
+        if flush(&mut out, &mut term).is_none() || split {
+            return None;
+        }
+        Some((out.iter().flat_map(|u| u.1.clone()).collect(), reading_of(&out)))
+    }
+
+    /// Whether `word` ends in a cast whose type the engine reads on past the
+    /// separators that begin `rest`: `::name`, its parameters and array
+    /// bounds, then a `(` (when it has no parameters), a `[`, or a word that
+    /// continues the type.
+    fn reference_cast_beyond(word: &[Unit], rest: &[Unit]) -> bool {
+        let code = |u: &Unit| match u.0 {
+            Tok::Code(c) => Some(c),
+            _ => None,
+        };
+        let ident = |u: &Unit| code(u).is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_');
+        let mut n = word.len();
+        while n > 0 && code(&word[n - 1]) == Some(b']') {
+            let digits = word[..n - 1].iter().rev().take_while(|u| code(u).is_some_and(|c| c.is_ascii_digit())).count();
+            if n < digits + 2 || code(&word[n - 2 - digits]) != Some(b'[') {
+                return false;
+            }
+            n -= digits + 2;
+        }
+        let parameters = n > 0 && code(&word[n - 1]) == Some(b')');
+        if parameters {
+            let mut depth = 0;
+            loop {
+                n -= 1;
+                match code(&word[n]) {
+                    Some(b')') => depth += 1,
+                    Some(b'(') => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 {
+                    break;
+                }
+                if n == 0 {
+                    return false;
+                }
+            }
+        }
+        let name: Vec<u8> = word[..n].iter().rev().take_while(|u| ident(u)).filter_map(code).collect();
+        let at = n - name.len();
+        if name.is_empty() || name.last().unwrap().is_ascii_digit() || at < 2 || word[at - 2..at].iter().any(|u| code(u) != Some(b':')) {
+            return false;
+        }
+        let name: String = name.iter().rev().map(|&c| c as char).collect();
+        let Some(next) = rest.iter().position(|u| !separates(&u.0)) else {
+            return false;
+        };
+        match code(&rest[next]) {
+            Some(b'(') => !parameters,
+            Some(b'[') => true,
+            _ => {
+                let following: String = rest[next..].iter().take_while(|u| ident(u)).filter_map(code).map(|c| c as char).collect();
+                super::type_continues(&name, &following).is_some()
+            }
+        }
     }
 
     /// Where the parentheses that open at `units[open]` close, when they
@@ -755,7 +1056,7 @@ mod tests {
         None
     }
 
-    fn reference_alternatives(term: &[Unit]) -> Vec<Vec<Unit>> {
+    fn reference_alternatives(term: &[Unit]) -> Option<Vec<Vec<Unit>>> {
         let close = |open: usize| {
             let mut depth = 0;
             for (k, u) in term.iter().enumerate().skip(open) {
@@ -775,7 +1076,7 @@ mod tests {
         let mut open = 0;
         let group = loop {
             match term[open..].iter().position(|u| u.0 == Tok::Code(b'{')) {
-                None => return vec![term.to_vec()],
+                None => return Some(vec![term.to_vec()]),
                 Some(k) => {
                     let (o, c) = (open + k, close(open + k));
                     let inner = &term[o + 1..c];
@@ -815,6 +1116,9 @@ mod tests {
                 continue;
             }
             if depth == 0 && (separates(&u.0) || u.0 == Tok::Code(b',')) {
+                if separates(&u.0) && reference_cast_beyond(item, &inner[k..]) {
+                    return None;
+                }
                 items.push(Vec::new());
             } else {
                 item.push(u.clone());
@@ -823,21 +1127,23 @@ mod tests {
         }
         items.retain(|item| !item.is_empty());
         if items.is_empty() {
-            return vec![term.to_vec()];
+            return Some(vec![term.to_vec()]);
         }
-        items
-            .into_iter()
-            .flat_map(|item| reference_alternatives(&[&term[..o], &item[..], &term[c + 1..]].concat()))
-            .collect()
+        let mut alts = Vec::new();
+        for item in items {
+            alts.extend(reference_alternatives(&[&term[..o], &item[..], &term[c + 1..]].concat())?);
+        }
+        Some(alts)
     }
 
-    /// What a generated statement is made of: code, groups, the quotes the
-    /// engine knows and the ones its pre-pass misreads, comments, and the
+    /// What a generated statement is made of: code, groups, casts, the quotes
+    /// the engine knows and the ones its pre-pass misreads, comments, and the
     /// spaces, ASCII and Unicode, that it strips and that it keeps.
     const FRAGMENTS: &[&str] = &[
         "select ", "r", ".", "x", "e", "E", "a1", "é", "1", "1e5", ".5", ",", "(", ")", ";", ":", "::", "$", "\\", "_",
         "{", "}", "{a,b}", "{a b}", "r.{a,b}", "{'k': 1}", "{}", "{a,{b,c}}", "{a::INT b}", "{x}",
         "::DECIMAL(10,2)", "::T(", "::S(a {b} c)", "{a::V(1, 2) b}", "::X(E'\\', \"(\")", "2(",
+        "::DOUBLE", " PRECISION", "::INTERVAL", " year", " ARRAY", "::INT[]", "[2]", " [", "]", " (",
         "'", "'{a,b}'", "''", "'\\'", "E'\\''", "e'a\\\\b'", "\"", "\"{a,b}\"", "`", "`{a,b}`", "`it's`",
         "$$", "$$x.{a,b}$$", "$t$", "$t${a,b}$t$", "$t$t$",
         "--", "-- {a,b}\n", "/*", "*/", "/* ' */", "/* {a,b} */", "\n", "\r",
@@ -862,17 +1168,29 @@ mod tests {
         for _ in 0..n {
             let len = 1 + next() % 24;
             let sql: String = (0..len).map(|_| FRAGMENTS[(next() % FRAGMENTS.len() as u64) as usize]).collect();
-            let got = expand(&sql).unwrap();
-            let (want, read) = reference(&sql);
-            let want = String::from_utf8(want).unwrap();
-            let ok = if want == sql {
-                got == sql
-            } else if got == sql {
-                refused += 1;
-                reading_of(&units(&want)) != read
-            } else {
-                expanded += 1;
-                got == want && reading_of(&units(&got)) == read
+            let got = expand(&sql);
+            let (ok, want) = match (reference(&sql), &got) {
+                // A cast's type a term or an item would split.
+                (None, got) => {
+                    refused += 1;
+                    (got.as_ref().is_err_and(|e| e.contains("would split")), None)
+                }
+                (Some((want, read)), got) => {
+                    let want = String::from_utf8(want).unwrap();
+                    let ok = match got {
+                        _ if want == sql => *got == Ok(Cow::Borrowed(sql.as_str())),
+                        // One the engine would read another way.
+                        Err(e) => {
+                            refused += 1;
+                            [UNICODE_SPACE, STRING_ESCAPES, QUOTE].contains(&e.as_str()) && reading_of(&units(&want)) != read
+                        }
+                        Ok(got) => {
+                            expanded += 1;
+                            *got == want && reading_of(&units(got)) == read
+                        }
+                    };
+                    (ok, Some(want))
+                }
             };
             if !ok {
                 wrong += 1;
