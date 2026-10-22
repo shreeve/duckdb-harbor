@@ -5097,7 +5097,8 @@ pub(crate) fn learn_again(alone: RwLockWriteGuard<'static, ()>) {
 
 /// How long an ATTACH or DETACH that waits while the names are not all
 /// known lets readers in beside it and asks for the names, before it waits
-/// for the readers running and keeps out the ones that come after.
+/// for the readers running and keeps out the ones that come after, unless
+/// asking may yet learn them.
 const ASK_BESIDE: Duration = Duration::from_secs(1);
 
 /// How many listings `learn_again` has begun and not ended.
@@ -5488,8 +5489,8 @@ enum Passed {
 /// begun (`LEARNING`) and passes as the names it learned say; and an ATTACH
 /// or DETACH does not keep readers out while it waits, but asks for the
 /// names beside them (`learn_beside`), and waits as any once they are
-/// known, once asking cannot learn them for now, or once it has asked for
-/// [`ASK_BESIDE`]: readers that overlap would otherwise keep it out for as
+/// known, or once it has asked for [`ASK_BESIDE`] and asking cannot learn
+/// them for now: readers that overlap would otherwise keep it out for as
 /// long as they came, and the names may not read for longer, while a SQLite
 /// file stays locked.
 fn pass_gate(sql: &str, slot: &SlotState) -> Option<Passed> {
@@ -5499,14 +5500,14 @@ fn pass_gate(sql: &str, slot: &SlotState) -> Option<Passed> {
     match gate {
         Gate::Open => Some(Passed::Open),
         Gate::Changes => loop {
-            if names_complete() || asking.elapsed() >= ASK_BESIDE {
+            if names_complete() {
                 return Some(Passed::Changing(CATALOG_GATE.write().unwrap_or_else(PoisonError::into_inner)));
             }
             match CATALOG_GATE.try_write() {
                 Ok(guard) => return Some(Passed::Changing(guard)),
                 Err(TryLockError::Poisoned(p)) => return Some(Passed::Changing(p.into_inner())),
                 Err(TryLockError::WouldBlock) if slot.cancelled() => return None,
-                Err(TryLockError::WouldBlock) if !learn_beside() => {
+                Err(TryLockError::WouldBlock) if !learn_beside() && asking.elapsed() >= ASK_BESIDE => {
                     return Some(Passed::Changing(CATALOG_GATE.write().unwrap_or_else(PoisonError::into_inner)));
                 }
                 Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
