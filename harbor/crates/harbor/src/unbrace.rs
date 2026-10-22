@@ -19,7 +19,9 @@
 //! being whatever the engine takes for one: the ASCII spaces, the vertical
 //! tab among them, and the Unicode spaces it strips before it parses. A
 //! cast's type parameters, the `(10,2)` right after `::DECIMAL`, stay in
-//! the term, so `x.{a,b}::DECIMAL(10,2)` casts both. A type the engine
+//! the term, so `x.{a,b}::DECIMAL(10,2)` casts both; so does a subscript
+//! or slice right after a word, whatever it holds, `x.{a,b}[ 1 ]` or
+//! `x.{a,b}[i : j]`, and its `:` is no struct literal's. A type the engine
 //! reads on past a space or comment, as in `::DECIMAL (10,2)`, `::INT []`
 //! or `::DOUBLE PRECISION`, would reach only the last alternative, so a
 //! term or an item that ends inside one is refused. Items
@@ -103,7 +105,7 @@ fn expansion(sql: &str) -> Result<Option<Piece>, String> {
     let mut term_start = 0;
     let mut depth = 0usize;
     let mut braced = false;
-    let mut lists = None;
+    let (mut lists, mut brackets) = (None, None);
     let mut i = 0;
     while i < text.len() {
         let boundary = match text.class(i) {
@@ -123,6 +125,13 @@ fn expansion(sql: &str) -> Result<Option<Piece>, String> {
                         continue;
                     }
                     None => true,
+                },
+                b'[' if depth == 0 => match text.subscript(term_start, i, text.len(), &mut brackets) {
+                    Some(close) => {
+                        i = close + 1;
+                        continue;
+                    }
+                    None => false,
                 },
                 c => depth == 0 && matches!(c, b',' | b')' | b';'),
             },
@@ -452,14 +461,17 @@ impl<'a> Text<'a> {
         None
     }
 
-    /// A lone `:` at the top level of the group — `{'a': 1}`, never `::`.
+    /// A lone `:` at the top level of the group — `{'a': 1}`, never `::`,
+    /// nor a slice's in brackets, `{l[1:2]}`.
     fn is_struct_literal(&self, from: usize, to: usize) -> bool {
-        let mut depth = 0usize;
+        let (mut depth, mut square) = (0usize, 0usize);
         for i in from..to {
             match self.code(i) {
                 Some(b'{') => depth += 1,
                 Some(b'}') => depth = depth.saturating_sub(1),
-                Some(b':') if depth == 0 => {
+                Some(b'[') => square += 1,
+                Some(b']') => square = square.saturating_sub(1),
+                Some(b':') if depth == 0 && square == 0 => {
                     let before = i > from && self.code(i - 1) == Some(b':');
                     let after = i + 1 < to && self.code(i + 1) == Some(b':');
                     if !before && !after {
@@ -494,19 +506,34 @@ impl<'a> Text<'a> {
         {
             return None;
         }
-        let lists = lists.get_or_insert_with(|| self.paired_parentheses(from, to));
+        let lists = lists.get_or_insert_with(|| self.paired(from, to, b'(', b')'));
         lists.binary_search_by_key(&open, |pair| pair.0).ok().map(|k| lists[k].1)
     }
 
-    /// Each `(` in code between `from` and `to` beside the `)` that closes
-    /// it, ordered by the `(`. A brace or a `;` closes no list, and every one
-    /// open at it is left unpaired.
-    fn paired_parentheses(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+    /// Where a subscript or slice closes, when the `[` at `open` follows
+    /// something in the word from `from`: `l[ 1 ]`, `l[i : j]`, `m['k']`,
+    /// `::INT[ 3 ]`. What it holds belongs to the word before it, so neither
+    /// a term nor an item ends inside it. A `[` that begins a word is a list,
+    /// and is not taken; nor is one that holds a brace or a `;`, or does not
+    /// close before `to`. `brackets` holds the text's brackets, paired once,
+    /// as `lists` does its parentheses.
+    fn subscript(&self, from: usize, open: usize, to: usize, brackets: &mut Option<Vec<(usize, usize)>>) -> Option<usize> {
+        if open == from {
+            return None;
+        }
+        let brackets = brackets.get_or_insert_with(|| self.paired(from, to, b'[', b']'));
+        brackets.binary_search_by_key(&open, |pair| pair.0).ok().map(|k| brackets[k].1)
+    }
+
+    /// Each `left` in code between `from` and `to` beside the `right` that
+    /// closes it, ordered by the `left`. A brace or a `;` closes no pair, and
+    /// every one open at it is left unpaired.
+    fn paired(&self, from: usize, to: usize, left: u8, right: u8) -> Vec<(usize, usize)> {
         let (mut open, mut pairs) = (Vec::new(), Vec::new());
         for i in from..to {
             match self.code(i) {
-                Some(b'(') => open.push(i),
-                Some(b')') => pairs.extend(open.pop().map(|o| (o, i))),
+                Some(c) if c == left => open.push(i),
+                Some(c) if c == right => pairs.extend(open.pop().map(|o| (o, i))),
                 Some(b'{' | b'}' | b';') => open.clear(),
                 _ => {}
             }
@@ -542,7 +569,10 @@ impl<'a> Text<'a> {
         // the term kept, then the type's name and the `::` before it.
         let mut j = end;
         while j > from && self.code(j - 1) == Some(b']') {
-            let digits = (from..j - 1).rev().take_while(|&k| self.code(k).is_some_and(|c| c.is_ascii_digit())).count();
+            let digits = (from..j - 1)
+                .rev()
+                .take_while(|&k| self.class(k) == Class::Space || self.code(k).is_some_and(|c| c.is_ascii_digit()))
+                .count();
             let open = j - 1 - digits;
             if open == from || self.code(open - 1) != Some(b'[') {
                 return None;
@@ -617,7 +647,7 @@ impl<'a> Text<'a> {
         let mut items = Vec::new();
         let mut depth = 0usize;
         let mut start = from;
-        let mut lists = None;
+        let (mut lists, mut brackets) = (None, None);
         let mut i = from;
         while i < to {
             let split = match self.class(i) {
@@ -632,6 +662,13 @@ impl<'a> Text<'a> {
                     }
                     b'(' if depth == 0 => {
                         if let Some(close) = self.type_parameters(start, i, to, &mut lists) {
+                            i = close + 1;
+                            continue;
+                        }
+                        false
+                    }
+                    b'[' if depth == 0 => {
+                        if let Some(close) = self.subscript(start, i, to, &mut brackets) {
                             i = close + 1;
                             continue;
                         }
@@ -858,6 +895,36 @@ mod tests {
         assert_eq!(x(&open).len(), open.len() - 2);
     }
 
+    /// A subscript or slice belongs to the word before it, whatever it
+    /// holds: the expansion takes it to every alternative, never its first
+    /// half to one and the rest to another.
+    #[test]
+    fn a_subscript_stays_with_its_term() {
+        assert_eq!(x("select t.{l,m}[ 1 ] from t"), "select t.l[ 1 ], t.m[ 1 ] from t");
+        assert_eq!(x("select t.{l,m}[i : j], 2"), "select t.l[i : j], t.m[i : j], 2");
+        assert_eq!(x("select t.{l,m}[f(1, 2)]"), "select t.l[f(1, 2)], t.m[f(1, 2)]");
+        assert_eq!(x("select t.{l,m}[ 'k' ][ /* c */ 1 ]"), "select t.l[ 'k' ][ /* c */ 1 ], t.m[ 'k' ][ /* c */ 1 ]");
+        assert_eq!(x("select r.{a[ 1 ], b} from t"), "select r.a[ 1 ], r.b from t");
+        assert_eq!(x("select x.{a,b}::INT[ 3 ]"), "select x.a::INT[ 3 ], x.b::INT[ 3 ]");
+        // A slice's `:` is no struct literal's.
+        assert_eq!(x("select r.{a[1:2], b}"), "select r.a[1:2], r.b");
+        assert!(matches!(expand("select {'k': l[1:2]}"), Ok(Cow::Borrowed(_))));
+        // Bounds the engine reads on past a space are refused as ever.
+        assert!(expand("select x.{a,b}::INT[ 3 ] ARRAY").unwrap_err().contains("would split the type `INT[ 3 ] ARRAY`"));
+        // A list begins a word and is no subscript; a space before a bracket
+        // ends the term; a bracket that holds a group, or never closes, is
+        // not taken.
+        assert_eq!(x("select r.{a,b}, [1, 2]"), "select r.a, r.b, [1, 2]");
+        assert_eq!(x("select r.{a,b} [1]"), "select r.a, r.b [1]");
+        assert_eq!(x("select l[r.{a,b}]"), "select l[r.a], l[r.b]");
+        assert_eq!(x("select r.{a,b}[1"), "select r.a[1, r.b[1");
+        // Brackets that never close are paired once, as parentheses are.
+        let unclosed = "x[".repeat(200_000);
+        assert_eq!(x(&format!("select r.{{a,b}}{unclosed}")), format!("select r.a{unclosed}, r.b{unclosed}"));
+        let open = format!("select r.{{{}}}", "x[ ".repeat(200_000));
+        assert!(x(&open).len() > open.len());
+    }
+
     /// A type the engine reads on past a space or comment would be split
     /// across the alternatives, the first cast to its name alone: such a
     /// statement is refused, naming the type and the fix.
@@ -1030,7 +1097,8 @@ mod tests {
                 Tok::Code(b'}') => depth -= 1,
                 _ => {}
             }
-            if let Some(close) = (depth == 0).then(|| reference_type_parameters(&term, &units, k)).flatten() {
+            let close = (depth == 0).then(|| reference_type_parameters(&term, &units, k)).flatten();
+            if let Some(close) = close.or_else(|| (depth == 0 && !term.is_empty()).then(|| reference_subscript(&units, k)).flatten()) {
                 term.extend_from_slice(&units[k..=close]);
                 k = close + 1;
                 continue;
@@ -1069,7 +1137,7 @@ mod tests {
         let ident = |u: &Unit| code(u).is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_');
         let mut n = word.len();
         while n > 0 && code(&word[n - 1]) == Some(b']') {
-            let digits = word[..n - 1].iter().rev().take_while(|u| code(u).is_some_and(|c| c.is_ascii_digit())).count();
+            let digits = word[..n - 1].iter().rev().take_while(|u| separates(&u.0) || code(u).is_some_and(|c| c.is_ascii_digit())).count();
             if n < digits + 2 || code(&word[n - 2 - digits]) != Some(b'[') {
                 return false;
             }
@@ -1145,6 +1213,29 @@ mod tests {
         None
     }
 
+    /// Where the brackets that open at `units[open]` close, when they hold
+    /// no brace or `;`: a subscript or slice, part of the word before it.
+    fn reference_subscript(units: &[Unit], open: usize) -> Option<usize> {
+        if units[open].0 != Tok::Code(b'[') {
+            return None;
+        }
+        let mut depth = 0;
+        for (j, u) in units.iter().enumerate().skip(open) {
+            match u.0 {
+                Tok::Code(b'[') => depth += 1,
+                Tok::Code(b']') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                }
+                Tok::Code(b'{' | b'}' | b';') => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
     fn reference_alternatives(term: &[Unit]) -> Option<Vec<Vec<Unit>>> {
         let close = |open: usize| {
             let mut depth = 0;
@@ -1169,15 +1260,17 @@ mod tests {
                 Some(k) => {
                     let (o, c) = (open + k, close(open + k));
                     let inner = &term[o + 1..c];
-                    let mut depth = 0;
+                    let (mut depth, mut square) = (0, 0usize);
                     let colon = (0..inner.len()).any(|j| {
                         match inner[j].0 {
                             Tok::Code(b'{') => depth += 1,
                             Tok::Code(b'}') => depth -= 1,
+                            Tok::Code(b'[') => square += 1,
+                            Tok::Code(b']') => square = square.saturating_sub(1),
                             _ => {}
                         }
                         let colon = |j: usize| inner.get(j).is_some_and(|u| u.0 == Tok::Code(b':'));
-                        depth == 0 && colon(j) && !(j > 0 && colon(j - 1)) && !colon(j + 1)
+                        depth == 0 && square == 0 && colon(j) && !(j > 0 && colon(j - 1)) && !colon(j + 1)
                     });
                     if !colon {
                         break (o, c);
@@ -1199,7 +1292,8 @@ mod tests {
                 _ => {}
             }
             let item = items.last_mut().unwrap();
-            if let Some(close) = (depth == 0).then(|| reference_type_parameters(item, inner, k)).flatten() {
+            let close = (depth == 0).then(|| reference_type_parameters(item, inner, k)).flatten();
+            if let Some(close) = close.or_else(|| (depth == 0 && !item.is_empty()).then(|| reference_subscript(inner, k)).flatten()) {
                 item.extend_from_slice(&inner[k..=close]);
                 k = close + 1;
                 continue;
@@ -1233,6 +1327,7 @@ mod tests {
         "{", "}", "{a,b}", "{a b}", "r.{a,b}", "{'k': 1}", "{}", "{a,{b,c}}", "{a::INT b}", "{x}",
         "::DECIMAL(10,2)", "::T(", "::S(a {b} c)", "{a::V(1, 2) b}", "::X(E'\\', \"(\")", "2(",
         "::DOUBLE", " PRECISION", "::INTERVAL", " year", " ARRAY", "::INT[]", "[2]", " [", "]", " (",
+        "[", "[ 1 ]", "[i : j]", "[ 3 ]", "[f(1, 2)]", "['k']", "{l[1:2]}",
         "'", "'{a,b}'", "''", "'\\'", "E'\\''", "e'a\\\\b'", "\"", "\"{a,b}\"", "`", "`{a,b}`", "`it's`",
         "$$", "$$x.{a,b}$$", "$t$", "$t${a,b}$t$", "$t$t$",
         "--", "-- {a,b}\n", "/*", "*/", "/* ' */", "/* {a,b} */", "\n", "\r",

@@ -367,7 +367,9 @@ anywhere in a term — `orders_{2025,2026}`, `{first,last}Name`,
 parenthesis or a semicolon, whitespace being whatever the engine takes for it,
 the vertical tab and the Unicode spaces it strips among it. A cast's type
 parameters written right after its type name stay in the term, so
-`r.{a,b}::DECIMAL(10,2)` casts both. A type the engine reads on past a space
+`r.{a,b}::DECIMAL(10,2)` casts both, and a subscript or slice written right
+after a term stays in it whatever it holds, so `r.{a,b}[ 1 ]` and
+`r.{a,b}[i : j]` take it to both. A type the engine reads on past a space
 or comment, parameters or array bounds after one (`::DECIMAL (10,2)`,
 `::INT []`) or a type of several words (`::TIMESTAMP WITH TIME ZONE`,
 `::DOUBLE PRECISION`), would reach only the last alternative, so the

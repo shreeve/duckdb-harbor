@@ -16,7 +16,7 @@ checks it against the engine, which no reading of harbor's can stand in for.
 
 The grammar: select lists of paths whose groups nest three deep, items
 separated by commas, spaces, comments and the Unicode spaces the engine
-strips, suffixes (`::VARCHAR`, `::DECIMAL(10,2)`, `->>'$.k'`, `[1]`), and
+strips, suffixes (`::VARCHAR`, `::DECIMAL(10,2)`, `->>'$.k'`, `[1]`, `[ 1 ]`), and
 beside them struct literals, `MAP {…}`, lambdas, and strings and names that
 hold braces. It runs in two modes, since the engine's Unicode-space pre-pass
 misreads E-strings, backticks, dollar quotes and quotes in comments, and an
@@ -63,9 +63,13 @@ class Grammar:
         self.spaces = [" ", "  ", "\t", "\n", "\x0b", "\x0c", "\r\n"] + (UNICODE_SPACES if a else [])
         self.comments = ["/* c */", "/* {a,b} */", "/* /* nest */ */", "-- {x,y} \n", "-- c\r"]
         self.names = ["a", "b", "c_1", "é", "naïve", "x1", '"q{x}"', '"it\'\'s"', '"a b"', '"e"',
-                      "a::DECIMAL(9,3)", "b::STRUCT(k INT, v VARCHAR(4))"]
+                      "a::DECIMAL(9,3)", "b::STRUCT(k INT, v VARCHAR(4))", "a[ 1 ]", "b[1 : 2]", "c[ 'k' ][-1]"]
         self.suffixes = ["", "", "", "::VARCHAR", "->>'$.k'", "->>'{a,b}'", "[1]", "::INT[]",
-                         "::DECIMAL(10,2)", "::VARCHAR(20)", "::STRUCT(k INT, v DECIMAL(4,1))", "::DECIMAL(4,1)[]"]
+                         "::DECIMAL(10,2)", "::VARCHAR(20)", "::STRUCT(k INT, v DECIMAL(4,1))", "::DECIMAL(4,1)[]",
+                         "[ 1 ]", "[ /* c */ 2 ]", "::INT[ 3 ]"]
+        # After a cast a bracket is the type's array bounds, which must be
+        # constant: these follow names with no cast.
+        self.subscripts = ["[i : j]", "[ f(1, 2) ]", "[ 'k' ][ /* c */ 1 ]", "[ -1 ]"]
         self.joins = [",", ", ", " ,", " ", "\n  ", "\x0b", " /* , */ ", " -- }\n", ",\x0c"]
         self.leads = ["", "", "\n  ", " "]
         self.plain = ["'{a,b}'", "{'k': 1, 'j': {'m': 'n'}}", '"weird{n}"', "1", "{'a': [1,2]}", "'don''t'",
@@ -90,17 +94,18 @@ class Grammar:
             s += self.r.choice(self.comments) + self.r.choice(self.spaces[:5])
         return s
 
-    def group(self, depth=0):
+    def group(self, depth=0, names=None):
         r = self.r
+        names = names or self.names
         braced, expanded = [], []
         for _ in range(r.randint(1, 4)):
             if depth < 2 and r.random() < 0.25:
                 prefix = r.choice(self.names[:10]) + "."
-                gb, ge = self.group(depth + 1)
+                gb, ge = self.group(depth + 1, names)
                 braced.append(prefix + gb)
                 expanded.extend(prefix + x for x in ge)
             else:
-                name = r.choice(self.names)
+                name = r.choice(names)
                 braced.append(name)
                 expanded.append(name)
         body = braced[0] + "".join(r.choice(self.joins) + item for item in braced[1:])
@@ -120,8 +125,13 @@ class Grammar:
             gb, ge = self.group()
             return "coalesce(r." + gb + ")", "coalesce(" + ", ".join("r." + x for x in ge) + ")"
         if roll < 0.63:
+            base = r.choice(["r", "t.r"]) + "."
+            gb, ge = self.group(names=[n for n in self.names if "::" not in n])
+            suffix = r.choice(self.subscripts)
+            return base + gb + suffix, ", ".join(base + x + suffix for x in ge)
+        if roll < 0.65:
             return "{a,b}_x", "a_x, b_x"
-        if roll < 0.66:
+        if roll < 0.67:
             return "x_{1,2}", "x_1, x_2"
         p = r.choice(self.plain)
         return p, p
@@ -162,7 +172,7 @@ SPLIT_CASTS = [
     "::DECIMAL{gap}(10,2)", "::VARCHAR{gap}(20)", "::STRUCT{gap}(k INT)", "::INT{gap}[]", "::INT[]{gap}[2]",
     "::INT{gap}ARRAY", "::DECIMAL(9,3){gap}ARRAY", "::DOUBLE{gap}PRECISION", "::TIMESTAMP{gap}WITH TIME ZONE",
     "::time{gap}without time zone", "::CHARACTER{gap}VARYING", "::NATIONAL{gap}CHARACTER", "::BIT{gap}VARYING",
-    "::INTERVAL{gap}YEAR", "::INTERVAL{gap}day to second",
+    "::INTERVAL{gap}YEAR", "::INTERVAL{gap}day to second", "::INT[ 3 ]{gap}ARRAY",
 ]
 GAPS = [" ", "\t", "\n", "/* c */", " -- c\n", NBSP, IDEO]
 

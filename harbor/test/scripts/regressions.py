@@ -609,6 +609,14 @@ class CommitRaces(Harbor, unittest.TestCase):
         sql = "SELECT CAST(r.{a,b} AS DECIMAL(10,2))" + source
         self.assertIn("CAST(r.a, r.b AS", self.sql(sql, status=400)["message"])
 
+    def test_a_subscript_stays_with_every_alternative(self):
+        # `[ 1 ]` belongs to the word before it: cut at its space, the first
+        # alternative would end in `[`, and the engine would refuse it. A
+        # slice's `:` inside a group is no struct literal's.
+        source = " FROM (SELECT {'a': [10, 20, 30], 'b': [40, 50, 60]} AS r)"
+        doc = self.sql("SELECT r.{a,b}[ 1 ], r.{a,b}[2 : 3], r.{a[ -1 ], b[1:1]}" + source)
+        self.assertEqual(doc["data"], [[10, 40, [20, 30], [50, 60], 30, [40]]])
+
     def test_a_cast_a_brace_group_would_split_is_refused(self):
         # The engine reads `::DECIMAL (10,2)` and `::TIMESTAMP WITH TIME ZONE`
         # as one type, but a term ends at the space: expanded, the first
