@@ -738,36 +738,35 @@ mod network {
         assert!(&content[9..].starts_with('5')); // 5xx status code
     }
 
+    /// A pipelined request is handed out only once the response before it
+    /// is written, so it never runs beside the request ahead of it.
     #[test]
-    fn responses_reordered() {
+    fn a_pipelined_request_waits_for_the_response_before_it() {
         let (server, mut client) = support::new_one_server_one_client();
 
-        (write!(client, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")).unwrap();
+        (write!(client, "GET /1 HTTP/1.1\r\nHost: localhost\r\n\r\n")).unwrap();
         (write!(
             client,
-            "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            "GET /2 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
         ))
         .unwrap();
 
-        thread::spawn(move || {
-            let rq1 = support::recv(&server);
-            let rq2 = support::recv(&server);
-
-            thread::spawn(move || {
-                rq2.respond(justhttp::Response::from_string("second request".to_owned()))
-                    .unwrap();
-            });
-
-            thread::sleep(Duration::from_millis(100));
-
-            thread::spawn(move || {
-                rq1.respond(justhttp::Response::from_string("first request".to_owned()))
-                    .unwrap();
-            });
-        });
+        let rq1 = support::recv(&server);
+        let early = server.recv_timeout(Duration::from_millis(500)).unwrap();
+        rq1.respond(justhttp::Response::from_string("first request".to_owned()))
+            .unwrap();
+        assert!(early.is_none(), "the second request was handed out before the first was answered");
+        let rq2 = server
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .expect("the second request was not handed out once the first was answered");
+        assert_eq!(rq2.url(), "/2");
+        rq2.respond(justhttp::Response::from_string("second request".to_owned()))
+            .unwrap();
 
         let mut content = String::new();
         client.read_to_string(&mut content).unwrap();
+        assert!(content.contains("first request"));
         assert!(content.ends_with("second request"));
     }
 
@@ -1058,20 +1057,18 @@ mod prompt {
     mod prompt_pipelining {
         use super::*;
 
-        /// Check that pipelined requests on the same connection are received promptly.
+        /// Check that pipelined requests on the same connection are received
+        /// promptly, each once the one before it is answered.
         fn assert_requests_parsed_promptly(
             req_cnt: usize,
             req_body: &'static [u8],
             timeout: Duration,
             req_writer: impl FnOnce(&mut dyn Write) + Send + 'static,
         ) {
-            let resp_body = SlowByteSrc {
-                val: 42,
-                len: 1_000_000,
-            }; // very slow response body
-
             let server = Server::http("0.0.0.0:0").unwrap();
-            let mut client = TcpStream::connect(support::addr(&server)).unwrap();
+            let client = TcpStream::connect(support::addr(&server)).unwrap();
+            // Kept open to the end: the responses go to a client still there.
+            let mut writing = client.try_clone().unwrap();
             let (svr_send, svr_rcv) = channel();
 
             spawn(move || {
@@ -1081,21 +1078,20 @@ mod prompt {
                     let mut body = Vec::new();
                     req.as_reader().read_to_end(&mut body).unwrap();
                     assert_eq!(req_body, body.as_slice());
-                    // The next pipelined request should now be available for parsing,
-                    // while we send the (possibly slow) response in another thread
-                    spawn(move || {
-                        req.respond(Response::new(200.into(), Vec::new(), resp_body, Some(resp_body.len)))
-                    });
+                    // The next pipelined request is handed out once this one
+                    // is answered.
+                    req.respond(Response::from_string("x")).unwrap();
                 }
                 svr_send.send(()).unwrap();
             });
 
-            spawn(move || req_writer(&mut client));
+            spawn(move || req_writer(&mut writing));
 
             // requests must be sent and received quickly (before timeout expires)
             svr_rcv
                 .recv_timeout(timeout)
                 .expect("Server did not finish reading pipelined requests quickly enough");
+            drop(client);
         }
 
         #[test]
@@ -1541,24 +1537,24 @@ mod stall {
 
     // A response cut by its write timeout ends its connection: a client that
     // reads again finds the end at once, where it would otherwise wait out
-    // the idle timeout inside a chunk, and the response pipelined after it
-    // is not written after the cut, where it would read as chunk data.
+    // the idle timeout inside a chunk, and the request pipelined after it
+    // is not run, its response written after the cut as chunk data.
     #[test]
     fn a_response_cut_ends_its_connection() {
         let (server, mut client) = support::new_one_server_one_client();
 
         write!(client, "GET /first HTTP/1.1\r\nHost: x\r\n\r\nGET /second HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
         let first = support::recv(&server);
-        let second = support::recv(&server);
 
         // Chunked, and far beyond any kernel socket buffer.
         let body = vec![b'x'; 64 << 20];
-        let cut = std::thread::spawn(move || {
-            first.respond(justhttp::Response::new(200.into(), Vec::new(), Cursor::new(body), None))
-        });
-        let after = std::thread::spawn(move || second.respond(justhttp::Response::from_string("SECOND")));
-        assert!(cut.join().unwrap().is_err(), "the first response was written whole");
-        let _ = after.join().unwrap();
+        let cut = first.respond(justhttp::Response::new(200.into(), Vec::new(), Cursor::new(body), None));
+        assert!(cut.is_err(), "the first response was written whole");
+        // Nothing after the cut is answered, so nothing after it is handed out.
+        if let Some(second) = server.recv_timeout(Duration::from_secs(2)).unwrap() {
+            assert_eq!(second.url(), "/second");
+            panic!("the request pipelined after the cut was handed out");
+        }
 
         client.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let start = Instant::now();

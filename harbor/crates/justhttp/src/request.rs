@@ -47,19 +47,12 @@ const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// # Pipelining
 ///
-/// If a client sends multiple requests in a row (without waiting for the response), then you will
-/// get multiple `Request` objects simultaneously. This is called *requests pipelining*.
-/// justhttp automatically reorders the responses so that you don't need to worry about the
-/// order in which you call `respond`.
-///
-/// This mechanic is disabled if:
-///
-///  - The body of a request is large enough (handling pipelining requires storing the
-///    body of the request in a buffer ; if the body is too big, justhttp will avoid doing that)
-///  - A request sends a `Expect: 100-continue` header (which means that the client waits to
-///    know whether its body will be processed before sending it)
-///  - A request sends a `Connection: close` header, which indicates that this is the last
-///    request that will be received on this connection
+/// A client may send several requests in a row without waiting for the
+/// responses. This is called *requests pipelining*. They are handed out one
+/// at a time: the next request on a connection only once the response
+/// before it has been written, or its writer dropped. So a handler never
+/// runs beside the request ahead of it on its connection, and never holds
+/// what it took while its response waits behind that request's.
 ///
 /// # Automatic cleanup
 ///
@@ -110,8 +103,10 @@ pub struct Request {
 /// and after a `Connection: close` or HTTP/1.0 request by a read that
 /// discards what arrives until the response is done. Not while the request
 /// still holds a body it has not read to its end, since the stream is that
-/// body's until then; nor on a keep-alive connection after its idle timeout.
-/// In those spans `closed` stays false, which errs toward finishing the work.
+/// body's until then; nor while a request pipelined behind it waits for its
+/// turn, since that request's head is read and the connection waits to hand
+/// it out; nor on a keep-alive connection after its idle timeout. In those
+/// spans `closed` stays false, which errs toward finishing the work.
 ///
 /// Checking is one atomic load: poll it between units of work. Cloning is
 /// cheap, and a clone may outlive the request.
@@ -345,7 +340,7 @@ impl Request {
     }
 
     /// Extract the response `Writer` object from the Request. Dropping the
-    /// `Writer` unblocks the next pipelined response on the connection.
+    /// `Writer` hands out the next pipelined request on the connection.
     ///
     /// This may only be called once on a single request.
     fn extract_writer_impl(&mut self) -> Box<dyn Write + Send + 'static> {
