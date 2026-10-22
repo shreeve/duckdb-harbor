@@ -59,6 +59,10 @@ const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// again every five minutes instead of being taken once and kept.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How often a request pipelined behind another, waiting its turn, looks
+/// whether the client has left.
+const WATCH_TURN: Duration = Duration::from_millis(100);
+
 /// How long an ended connection keeps reading what the client still sends
 /// before it closes (see `ClientConnection::linger`). A single read may
 /// overrun it by up to the socket's read timeout.
@@ -350,14 +354,25 @@ impl ClientConnection {
         // wire, but each runs in its turn: one running beside the request
         // ahead of it would hold what it took, a lock or a worker, while its
         // response waited behind that request's, and the request ahead could
-        // be waiting on what it took.
-        self.sink.wait_answered();
+        // be waiting on what it took. While it waits, what the client sent
+        // after it is read ahead and kept, so the client's leaving is seen
+        // by the request ahead (`Socket::look_for_departure`).
+        while !self.sink.wait_answered_for(WATCH_TURN) {
+            self.socket.look_for_departure();
+        }
         // A response that failed to write ended the connection, and nothing
-        // after it is answered, so nothing after it runs.
+        // after it is answered, so nothing after it runs; nor after the
+        // client left.
         if self.socket.ended() {
             return Err(ReadError::ReadIoError(IoError::new(
                 ErrorKind::ConnectionAborted,
                 "the response before this request was cut",
+            )));
+        }
+        if self.socket.gone() {
+            return Err(ReadError::ReadIoError(IoError::new(
+                ErrorKind::ConnectionAborted,
+                "the client left before this request had its turn",
             )));
         }
 
@@ -638,7 +653,8 @@ mod sequential {
     use std::io::{Read, Write};
 
     use std::sync::mpsc::channel;
-    use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+    use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
+    use std::time::Duration;
     use std::sync::{Arc, Mutex, Weak};
 
     use std::mem;
@@ -722,11 +738,17 @@ mod sequential {
             }
         }
 
-        /// Waits until every writer handed out has finished.
-        pub fn wait_answered(&mut self) {
-            if let Some(last) = self.next_trigger.take() {
+        /// Waits at most `timeout` until every writer handed out has
+        /// finished, and says whether they have.
+        pub fn wait_answered_for(&mut self, timeout: Duration) -> bool {
+            match self.next_trigger.as_ref().map(|last| last.recv_timeout(timeout)) {
+                None => true,
+                Some(Err(RecvTimeoutError::Timeout)) => false,
                 // Its writer says when it is dropped, and is gone after.
-                let _ = last.recv();
+                Some(_) => {
+                    self.next_trigger = None;
+                    true
+                }
             }
         }
 

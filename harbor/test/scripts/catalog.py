@@ -819,11 +819,70 @@ def run_unlisted(base, work, seconds=5):
     eq("an ATTACH and a long answer pipelined behind it are both answered, whole",
        (2, True), (got.count(b"HTTP/1.1 200"), b'"rowCount":200000' in got))
     eq("and an ATTACH after them is answered", None, sql(base, "DETACH piped_mem"))
+
+    # Every statement that names anything shares the gate while the lock
+    # keeps the names unknown, and a long one holds an ATTACH for as long as
+    # it runs. The ATTACH gives up at its deadline, and when its client
+    # leaves, and the statements after it wait for it half a second at most.
+    def answer(statement, client_timeout=60, **extra):
+        """(HTTP status, error code or None, seconds) of one statement."""
+        body = json.dumps({"sql": statement, **extra}).encode()
+        req = urllib.request.Request(base + "/sql", data=body, method="POST",
+                                     headers={"Content-Type": "application/json"})
+        began = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=client_timeout) as r:
+                events = [json.loads(line) for line in r.read().decode().splitlines()]
+                code = next((e.get("code") for e in events if e.get("type") == "error"), None)
+                return r.status, code, time.time() - began
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}").get("code"), time.time() - began
+        except OSError:
+            return None, "left", time.time() - began
+
+    def long_one():
+        thread = threading.Thread(target=sql, args=(base, "SELECT sum(hash(i)) FROM range(1000000000) t(i)"))
+        thread.start()
+        time.sleep(0.3)
+        return thread
+
+    held = long_one()
+    status, code, took = answer("ATTACH ':memory:' AS late_mem", timeoutMs=1500)
+    if (status, code) == (499, "cancelled") and took < 4:
+        ok("an ATTACH that waits for a long statement while the names are unknown gives up at its deadline",
+           f"{took:.2f}s")
+    else:
+        bad("an ATTACH that waits for a long statement while the names are unknown gives up at its deadline",
+            f"{status} {code} {took:.2f}s")
+    waits = {}
+    attach = threading.Thread(target=lambda: waits.update(attach=answer("ATTACH ':memory:' AS late_mem")))
+    attach.start()
+    time.sleep(1.5)
+    status, code, took = answer("SELECT count(*) AS n FROM range(3)")
+    if status == 200 and code is None and took < 1.5:
+        ok("a statement after an ATTACH that keeps others out waits for it half a second at most", f"{took:.2f}s")
+    else:
+        bad("a statement after an ATTACH that keeps others out waits for it half a second at most",
+            f"{status} {code} {took:.2f}s")
+    held.join(timeout=60)
+    attach.join(timeout=60)
+    eq("and the ATTACH runs once the long one is over", (200, None), waits.get("attach", (None, "none"))[:2])
+    sql(base, "DETACH IF EXISTS late_mem")
+    held = long_one()
+    eq("an ATTACH whose client leaves while it waits", (None, "left"),
+       answer("ATTACH ':memory:' AS left_mem", client_timeout=1)[:2])
+    held.join(timeout=60)
+    time.sleep(0.3)
+    eq("is not run once the long one is over", None,
+       sql(base, "SELECT CASE WHEN count(*) = 0 THEN 1 ELSE error('attached') END "
+                 "FROM duckdb_databases() WHERE database_name = 'left_mem'"))
     locker.execute("ROLLBACK")
     locker.close()
     # Not yet read again, every statement shares the gate, and a long one
     # holds an ATTACH. The statements after the ATTACH do not wait for it:
-    # it asks for the views beside the long one, and they pass the gate by.
+    # it asks for the views beside the long one, and they pass the gate by,
+    # and once they are read, the long one reads nothing and holds no
+    # ATTACH.
     answers = {}
 
     def timed(key, statement):
@@ -844,9 +903,43 @@ def run_unlisted(base, work, seconds=5):
         ok("a statement after an ATTACH that waits on a long one does not wait", f"{took:.2f}s")
     else:
         bad("a statement after an ATTACH that waits on a long one does not wait", f"{took:.2f}s {refused}")
-    eq("and the ATTACH runs once the long one is over", (None, None),
+    eq("and the ATTACH runs", (None, None),
        (answers.get("attach", ("not answered",))[0], answers.get("long", ("not answered",))[0]))
+    took = answers.get("attach", (None, 60))[1]
+    if took < 2:
+        ok("without waiting for the long one, which reads nothing once the names are known", f"{took:.2f}s")
+    else:
+        bad("without waiting for the long one, which reads nothing once the names are known", f"{took:.2f}s")
     sql(base, "DETACH IF EXISTS busy_mem")
+
+    # The names are read again soon after a locked file reads again, with no
+    # ATTACH, DETACH or /catalog to ask.
+    log = os.path.join(work, "busy.duckdb.log")
+    relock = os.path.join(work, "relock.sqlite")
+    sqlite3.connect(relock).execute("CREATE TABLE r(a)")
+    locker = sqlite3.connect(relock, isolation_level=None)
+    locker.execute("BEGIN EXCLUSIVE")
+    time.sleep(1.2)
+    eq("another SQLite file attaches while it is locked", None, sql(base, f"ATTACH '{relock}' AS relock (TYPE sqlite)"))
+    read_again = open(log).read().count("are read from it")
+    unread = open(log).read().count("are not read while")
+    eq("and an in-memory database after it, whose views are not read", None, sql(base, "ATTACH ':memory:' AS relock_mem"))
+    began = time.time()
+    while time.time() - began < 3 and open(log).read().count("are not read while") == unread:
+        time.sleep(0.05)
+    eq("and the server says so", unread + 1, open(log).read().count("are not read while"))
+    locker.execute("ROLLBACK")
+    locker.close()
+    began = time.time()
+    while time.time() - began < 5 and open(log).read().count("are read from it") == read_again:
+        time.sleep(0.05)
+    took = time.time() - began
+    if took < 3:
+        ok("the views are read again soon after the lock is gone, nothing asking", f"{took:.2f}s")
+    else:
+        bad("the views are read again soon after the lock is gone, nothing asking", f"{took:.2f}s")
+    sql(base, "DETACH IF EXISTS relock_mem")
+    sql(base, "DETACH IF EXISTS relock")
     stop = threading.Event()
     counts, failures = [0, 0], []
 

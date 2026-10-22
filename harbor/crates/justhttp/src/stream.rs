@@ -194,12 +194,17 @@ mod listen {
 
 mod refined {
     use std::io::Result as IoResult;
-    use std::io::{Read, Write};
+    use std::io::{ErrorKind, Read, Write};
     use std::net::{Shutdown, SocketAddr};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use super::listen::Connection;
+
+    /// The most a look for the peer's departure reads ahead of the
+    /// connection's readers (`Socket::look_for_departure`).
+    const AHEAD_MAX: usize = 64 * 1024;
 
     /// One accepted socket, shared by the halves that read and write it and
     /// by the requests it carries: one descriptor per connection.
@@ -210,6 +215,11 @@ mod refined {
         ended: AtomicBool,
         /// The connection's reader saw the client close or reset it.
         gone: AtomicBool,
+        /// What a look for the peer's departure read, which the
+        /// connection's readers read before the socket.
+        ahead: Mutex<Vec<u8>>,
+        /// `ahead` holds something.
+        has_ahead: AtomicBool,
     }
 
     impl Socket {
@@ -243,6 +253,57 @@ mod refined {
         pub(crate) fn gone(&self) -> bool {
             self.gone.load(Ordering::Acquire)
         }
+
+        /// Looks whether the peer has closed or reset the connection, while
+        /// nothing reads it: what it sent is read ahead, up to
+        /// [`AHEAD_MAX`], and kept for the connection's readers, and an end
+        /// or a reset behind it is the peer's departure. Each read waits a
+        /// millisecond at most; then the socket's read timeout is
+        /// `READ_TIMEOUT` again.
+        pub(crate) fn look_for_departure(&self) {
+            if self.gone() {
+                return;
+            }
+            let mut ahead = self.ahead.lock().unwrap();
+            if ahead.len() >= AHEAD_MAX {
+                return;
+            }
+            // macOS refuses the option on a socket shut down both ways, as
+            // a unix socket is once its peer has gone, and its reads do not
+            // wait.
+            let _ = self.conn.set_read_timeout(Some(Duration::from_millis(1)));
+            let mut scratch = [0u8; 4096];
+            while ahead.len() < AHEAD_MAX {
+                match (&self.conn).read(&mut scratch) {
+                    Ok(0) => {
+                        self.depart();
+                        break;
+                    }
+                    Ok(n) => ahead.extend_from_slice(&scratch[..n]),
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => break,
+                    Err(_) => {
+                        self.depart();
+                        break;
+                    }
+                }
+            }
+            self.has_ahead.store(!ahead.is_empty(), Ordering::Release);
+            let _ = self.conn.set_read_timeout(Some(crate::READ_TIMEOUT));
+        }
+
+        /// Read what was read ahead, if anything was.
+        fn read_ahead(&self, buf: &mut [u8]) -> Option<usize> {
+            if !self.has_ahead.load(Ordering::Acquire) {
+                return None;
+            }
+            let mut ahead = self.ahead.lock().unwrap();
+            let n = buf.len().min(ahead.len());
+            buf[..n].copy_from_slice(&ahead[..n]);
+            ahead.drain(..n);
+            self.has_ahead.store(!ahead.is_empty(), Ordering::Release);
+            (n > 0).then_some(n)
+        }
     }
 
     /// One half of a connection: dropping it shuts its direction down.
@@ -261,6 +322,8 @@ mod refined {
                 conn: stream.into(),
                 ended: AtomicBool::new(false),
                 gone: AtomicBool::new(false),
+                ahead: Mutex::new(Vec::new()),
+                has_ahead: AtomicBool::new(false),
             });
 
             let read = RefinedTcpStream {
@@ -302,7 +365,10 @@ mod refined {
 
     impl Read for RefinedTcpStream {
         fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
-            (&self.socket.conn).read(buf)
+            match self.socket.read_ahead(buf) {
+                Some(n) => Ok(n),
+                None => (&self.socket.conn).read(buf),
+            }
         }
     }
 

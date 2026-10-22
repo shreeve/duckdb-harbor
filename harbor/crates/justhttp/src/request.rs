@@ -101,12 +101,13 @@ pub struct Request {
 /// The connection is read, and so watched, while a request is being
 /// answered: on a keep-alive connection by the wait for the next request,
 /// and after a `Connection: close` or HTTP/1.0 request by a read that
-/// discards what arrives until the response is done. Not while the request
-/// still holds a body it has not read to its end, since the stream is that
-/// body's until then; nor while a request pipelined behind it waits for its
-/// turn, since that request's head is read and the connection waits to hand
-/// it out; nor on a keep-alive connection after its idle timeout. In those
-/// spans `closed` stays false, which errs toward finishing the work.
+/// discards what arrives until the response is done; and while a request
+/// pipelined behind it waits for its turn, by reads ahead that keep what
+/// they read for that request, up to 64 KiB of it. Not watched while the
+/// request still holds a body it has not read to its end, since the stream
+/// is that body's until then; nor past what is read ahead; nor on a
+/// keep-alive connection after its idle timeout. In those spans `closed`
+/// stays false, which errs toward finishing the work.
 ///
 /// Checking is one atomic load: poll it between units of work. Cloning is
 /// cheap, and a clone may outlive the request.
