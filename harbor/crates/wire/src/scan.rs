@@ -38,7 +38,7 @@ pub struct Span {
 }
 
 /// A space to the engine's tokenizer: the ASCII set with the vertical tab.
-pub(crate) fn is_space(c: u8) -> bool {
+pub fn is_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t'..=b'\r')
 }
 
@@ -54,7 +54,7 @@ pub(crate) fn is_space(c: u8) -> bool {
 /// lexer: a reader that knew fewer spaces than the engine would take a
 /// statement behind one for part of a word, and one that knew more would
 /// end a word the engine keeps going.
-pub(crate) fn plain_spaces(b: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+pub fn plain_spaces(b: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     let lead = |c: &u8| matches!(c, 0xC2 | 0xE2 | 0xE3 | 0xEF);
     if !b.iter().any(lead) {
         return b.into();
@@ -219,7 +219,7 @@ pub fn scan(src: &str) -> Vec<Span> {
 }
 
 /// The spans of text whose spaces are already plain ([`plain_spaces`]).
-pub(crate) fn spans(b: &[u8]) -> Vec<Span> {
+pub fn spans(b: &[u8]) -> Vec<Span> {
     let (mut spans, mut code, mut i) = (Vec::new(), 0, 0);
     // Where the bare word the scan is in began, if it is in one.
     let mut word = None;
