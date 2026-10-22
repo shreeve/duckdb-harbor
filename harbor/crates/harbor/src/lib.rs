@@ -5032,11 +5032,12 @@ fn learn_listed(began: u64, listed: Result<Vec<String>, String>) {
     let rows = match listed {
         Ok(rows) => rows,
         Err(e) => {
-            eprintln!(
-                "harbor: the views and macros that read the catalog were not read from it, and until they are, \
-                 every statement waits on an ATTACH or DETACH: {e}"
-            );
-            UNLISTED.store(true, Ordering::Relaxed);
+            if !UNLISTED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "harbor: the views and macros that read the catalog were not read from it, and until they \
+                     are, an ATTACH or DETACH waits for every statement running: {e}"
+                );
+            }
             CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner).unsettle();
             return;
         }
@@ -5095,7 +5096,7 @@ pub(crate) fn learn_again(alone: RwLockWriteGuard<'static, ()>) {
             if !UNLISTED.swap(true, Ordering::Relaxed) {
                 eprintln!(
                     "harbor: the views and macros that read the catalog are not read while {why}, and until they \
-                     are, every statement waits on an ATTACH or DETACH"
+                     are, an ATTACH or DETACH waits for every statement running"
                 );
             }
             return;
@@ -5103,9 +5104,62 @@ pub(crate) fn learn_again(alone: RwLockWriteGuard<'static, ()>) {
     }
     // The learner is let go first: a statement holding the gate shared may
     // wait for it, and a share asked for while an ATTACH waits is not given.
+    // A statement that would share the gate only because the names are not
+    // all known waits for the listing (`LEARNING`), and then for what it
+    // learned, rather than hold the gate for as long as it runs.
+    let _learning = Learning::begin();
     drop(alone);
     let _reading = reading_catalog();
     learn_on_learner();
+}
+
+/// How many listings `learn_again` has begun and not ended.
+static LEARNING: AtomicUsize = AtomicUsize::new(0);
+
+/// A listing begun by `learn_again`, counted in [`LEARNING`] until it is
+/// learned, or failed.
+struct Learning;
+
+impl Learning {
+    fn begin() -> Self {
+        LEARNING.fetch_add(1, Ordering::SeqCst);
+        Learning
+    }
+}
+
+impl Drop for Learning {
+    fn drop(&mut self) {
+        LEARNING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Whether every view and macro is known (`CatalogNames::complete`).
+fn names_complete() -> bool {
+    CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner).complete
+}
+
+/// Learn again, when the names are not complete, for an ATTACH or DETACH
+/// that waits for the statements running, sharing the gate beside them: a
+/// listing that succeeds makes the names complete, and the statements that
+/// come after it, the catalog not read, pass the gate by rather than wait
+/// for the ATTACH. Asked no more often than [`ASK_AGAIN`] after a listing or
+/// a probe found a SQLite file busy, and never while an ATTACH or DETACH
+/// waits or another listing runs.
+fn learn_beside() {
+    let _reading = match CATALOG_GATE.try_read() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(TryLockError::WouldBlock) => return,
+    };
+    let Ok(mut learner) = LEARNER.try_lock() else { return };
+    let Some((conn, busy_at)) = learner.as_mut() else { return };
+    if names_complete() || busy_at.is_some_and(|at| at.elapsed() < ASK_AGAIN) {
+        return;
+    }
+    learn_catalog_names(conn);
+    if !names_complete() {
+        *busy_at = Some(Instant::now());
+    }
 }
 
 /// Learn again, when the names are not complete, after a `/catalog` read
@@ -5418,17 +5472,52 @@ enum Passed {
     Changing(RwLockWriteGuard<'static, ()>),
 }
 
-/// Pass the gate for the statement running on `slot`. A reader waits on an
-/// attach or detach, and gives up when the statement is cancelled while it
-/// waits: by its client, by leaving or by a deadline. One that attaches or
-/// detaches waits for the readers running, each a catalog read the engine
-/// answers from memory or a database's file, and readers that come after it
-/// wait for it.
-fn pass_gate(gate: Gate, slot: &SlotState) -> Option<Passed> {
+/// Pass the gate for `sql`, the statement running on `slot`. A reader
+/// waits on an attach or detach, and gives up when the statement is
+/// cancelled while it waits: by its client, by leaving or by a deadline.
+/// One that attaches or detaches waits for the readers running, each a
+/// catalog read the engine answers from memory or a database's file, and
+/// readers that come after it wait for it.
+///
+/// While the names are not all known (`CatalogNames::complete`), every
+/// statement is a reader, and a long one would hold an ATTACH, and every
+/// reader after it, for as long as it runs. So a reader waits for a listing
+/// begun (`LEARNING`) and passes as the names it learned say; and an ATTACH
+/// or DETACH does not keep readers out while it waits, but asks for the
+/// names beside them (`learn_beside`), and waits as any once they are known.
+fn pass_gate(sql: &str, slot: &SlotState) -> Option<Passed> {
+    let gate = catalog_gate(sql);
+    let mut unknown = gate == Gate::Reads && !names_complete();
     match gate {
         Gate::Open => Some(Passed::Open),
-        Gate::Changes => Some(Passed::Changing(CATALOG_GATE.write().unwrap_or_else(PoisonError::into_inner))),
+        Gate::Changes => loop {
+            if names_complete() {
+                return Some(Passed::Changing(CATALOG_GATE.write().unwrap_or_else(PoisonError::into_inner)));
+            }
+            match CATALOG_GATE.try_write() {
+                Ok(guard) => return Some(Passed::Changing(guard)),
+                Err(TryLockError::Poisoned(p)) => return Some(Passed::Changing(p.into_inner())),
+                Err(TryLockError::WouldBlock) if slot.cancelled() => return None,
+                Err(TryLockError::WouldBlock) => {
+                    learn_beside();
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        },
         Gate::Reads => loop {
+            if unknown && LEARNING.load(Ordering::SeqCst) > 0 {
+                if slot.cancelled() {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            if unknown && names_complete() {
+                unknown = false;
+                if catalog_gate(sql) == Gate::Open {
+                    return Some(Passed::Open);
+                }
+            }
             match CATALOG_GATE.try_read() {
                 Ok(guard) => return Some(Passed::Reading(guard)),
                 Err(TryLockError::Poisoned(p)) => return Some(Passed::Reading(p.into_inner())),
@@ -5993,7 +6082,7 @@ fn execute_jobs(
         learn_from_statement(&sql);
         let brings = brings_views(&sql);
         let probe = detached_name(&sql).or_else(|| attached_name(&sql)).is_some_and(|n| n.starts_with(PROBE.as_bytes()));
-        let Some(passed) = pass_gate(catalog_gate(&sql), &state) else {
+        let Some(passed) = pass_gate(&sql, &state) else {
             on_slot.finish();
             conn.abort_transaction();
             let _ = ready.send(Err(Refusal::cancelled()));
