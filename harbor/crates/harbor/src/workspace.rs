@@ -164,8 +164,8 @@ static SET_ASIDE: Mutex<Vec<SetAside>> = Mutex::new(Vec::new());
 static OURS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Held by a catalog read while it attaches a file set aside again, and by
-/// a client's `DETACH` of its name as it forgets it, so one does not undo
-/// the other.
+/// a client's `ATTACH` or `DETACH` of its name from before it runs until
+/// it is claimed, so one does not undo the other.
 static TAKING: Mutex<()> = Mutex::new(());
 
 /// Whether this server attached `name` from the record, with the options
@@ -179,10 +179,10 @@ pub fn taking() -> std::sync::MutexGuard<'static, ()> {
     TAKING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// A client detaches or attaches `name`: it is not this server's to attach
-/// again, and a file set aside under it is forgotten.
-pub fn claimed(name: &str) {
-    let _taking = taking();
+/// A client detached or attached `name`, holding [`taking`]: it is not
+/// this server's to attach again, and a file set aside under it is
+/// forgotten.
+pub fn claimed(name: &str, _taking: &std::sync::MutexGuard<'static, ()>) {
     OURS.lock().unwrap().retain(|n| !n.eq_ignore_ascii_case(name));
     taken_back(name);
 }

@@ -2689,6 +2689,9 @@ struct Job {
     /// Body bytes, in envelope-line batches. Bounded, so a slow client
     /// applies backpressure to the query instead of buffering the result.
     body: mpsc::SyncSender<Vec<u8>>,
+    /// A client's `ATTACH` or `DETACH` of a name: told, once the statement
+    /// is over, whether it changed what that name is (`Claiming`).
+    claims: Option<mpsc::SyncSender<bool>>,
 }
 
 impl Job {
@@ -2702,7 +2705,7 @@ impl Job {
         let (ready, ready_rx) = mpsc::sync_channel(1);
         let (body, body_rx) = mpsc::sync_channel(BODY_QUEUE);
         let deadline = timeout.map(|t| Instant::now() + t);
-        let job = Job { sql, params, shape, id: next_job_id(), deadline, reset: false, ready, body };
+        let job = Job { sql, params, shape, id: next_job_id(), deadline, reset: false, ready, body, claims: None };
         (job, ready_rx, body_rx)
     }
 }
@@ -4358,6 +4361,26 @@ fn respond_ready(req: Request, ok: bool, message: &str) -> u16 {
 /// A worker's executor: its jobs channel and its cancellation slot.
 type Executor<'a> = (&'a mpsc::SyncSender<Job>, &'a Arc<SlotState>);
 
+/// A client's `ATTACH` or `DETACH` of `name`, holding the files set aside
+/// ([`workspace::taking`]) from before it is sent until it is over, when
+/// its executor tells whether it ran (`Job::claims`) and the name is
+/// claimed ([`workspace::claimed`]). Dropped as its request ends, after the
+/// answer is written: the executor tells as the statement ends, and the
+/// answer may be all its executor holds.
+struct Claiming {
+    name: Vec<u8>,
+    ran: mpsc::Receiver<bool>,
+    taking: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for Claiming {
+    fn drop(&mut self) {
+        if self.ran.recv() == Ok(true) {
+            workspace::claimed(&String::from_utf8_lossy(&self.name), &self.taking);
+        }
+    }
+}
+
 /// `POST /sql` on a worker: the body read and parsed, then the statement run.
 fn run_sql_request(mut req: Request, exec: Executor) -> (bool, u16) {
     let parsed = read_request_body(&mut req)
@@ -4381,13 +4404,6 @@ fn run_sql(req: Request, mut parsed: SqlRequest, pooled: Option<Executor>) -> (b
         Ok(std::borrow::Cow::Borrowed(_)) => {}
         Err(e) => return refuse(req, Refusal::bad_request(e)),
     }
-    // A client's DETACH or ATTACH of a name is the client's: a file the
-    // server set aside under it, or one the server attached under it from
-    // the workspace's record, is not the server's to attach again.
-    if let Some(name) = detached_name(&parsed.sql).or_else(|| attached_name(&parsed.sql)) {
-        workspace::claimed(&String::from_utf8_lossy(&name));
-    }
-
     // `USE` sets the CURRENT DATABASE on the connection it runs on, and
     // outside a session that connection is a pooled one that goes back to the
     // pool when this request ends. Since a request carries exactly one
@@ -4436,8 +4452,19 @@ fn run_sql(req: Request, mut parsed: SqlRequest, pooled: Option<Executor>) -> (b
         (None, None) => return shed(req),
     };
 
-    let (job, ready, body) = Job::new(parsed.sql, parsed.params, shape, parsed.timeout);
+    // A client's DETACH or ATTACH of a name that ran is the client's: a
+    // file the server set aside under it, or one the server attached under
+    // it from the workspace's record, is not the server's to attach again.
+    // Claimed once the statement is over, when it ran, and with the files
+    // set aside held, so the server does not attach one again in between.
+    let named = detached_name(&parsed.sql).or_else(|| attached_name(&parsed.sql));
+    let (mut job, ready, body) = Job::new(parsed.sql, parsed.params, shape, parsed.timeout);
     let id = job.id;
+    let _claiming = named.map(|name| {
+        let (claims, ran) = mpsc::sync_channel(1);
+        job.claims = Some(claims);
+        Claiming { name, ran, taking: workspace::taking() }
+    });
 
     // Registered before the job is sent, so a Stop pressed the instant the
     // query goes out has something to find. `Cancellable` deregisters on drop,
@@ -5294,6 +5321,22 @@ fn attached_name(sql: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// Whether an `ATTACH` replaces a database of its name: `ATTACH OR
+/// REPLACE`.
+fn replaces(sql: &str) -> bool {
+    let mut tokens = Vec::new();
+    names_in_order(sql, &mut tokens);
+    let word = |at: usize, w: &str| matches!(tokens.get(at), Some(Token::Word(t)) if t == w.as_bytes());
+    (0..tokens.len()).find(|&at| word(at, "attach")).is_some_and(|at| word(at + 1, "or") && word(at + 2, "replace"))
+}
+
+/// Whether a database is attached as `name`, lowercased, on `conn`.
+fn attached(conn: &mut Connection, name: &[u8]) -> bool {
+    let name = wire::open::quote_literal(&String::from_utf8_lossy(name));
+    conn.query_strings(&format!("SELECT count(*)::VARCHAR FROM duckdb_databases() WHERE lower(database_name) = {name}"))
+        .is_ok_and(|rows| rows.first().is_some_and(|n| n != "0"))
+}
+
 /// A statement's leading tokens, as `made_name`, `detached_name` and
 /// `attached_name` read them.
 enum Token {
@@ -5464,6 +5507,7 @@ fn run_statement(
     ready: mpsc::SyncSender<Result<(), Refusal>>,
     body: mpsc::SyncSender<Vec<u8>>,
     started: Instant,
+    ended: &mut bool,
 ) -> bool {
     // Decided from the statement text before it runs, then widened below by
     // any path that ends the job early.
@@ -5796,6 +5840,7 @@ fn run_statement(
 
     // An abandoned or failed stream is the case that poisons a connection.
     needs_reset = needs_reset || gone || failure.is_some();
+    *ended = !gone && failure.is_none();
 
     match shape {
         Shape::Ndjson => {
@@ -5855,7 +5900,7 @@ fn execute_jobs(
     // including when a released lease is assigned to another caller.
     let mut must_reset = false;
     for job in jobs {
-        let Job { sql, params, shape, id, deadline, reset, ready, body } = job;
+        let Job { sql, params, shape, id, deadline, reset, ready, body, claims } = job;
         must_reset |= reset || (needs_reset && !pinned);
         if must_reset {
             if let Err(e) = conn.reset() {
@@ -5942,6 +5987,10 @@ fn execute_jobs(
         if brings && matches!(passed, Passed::Changing(_)) {
             CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner).unsettle();
         }
+        // An ATTACH of a name attached already changes it only when it
+        // replaces it: `IF NOT EXISTS` leaves it as it was.
+        let keeps = claims.is_some() && attached_name(&sql).is_some_and(|name| !replaces(&sql) && attached(&mut conn, &name));
+        let mut ended = false;
 
         // A panic below — an encoder invariant tripping, an FFI metadata
         // assert (the v2 paths return Err rather than panic, so this is the
@@ -5957,7 +6006,7 @@ fn execute_jobs(
         // job on a worker resets first.
         let ready_guard = ready.clone();
         needs_reset = match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            run_statement(&mut conn, &mut on_slot, sql, params, shape, ready, body, started)
+            run_statement(&mut conn, &mut on_slot, sql, params, shape, ready, body, started, &mut ended)
         })) {
             Ok(next_reset) => next_reset,
             Err(_) => {
@@ -5977,6 +6026,9 @@ fn execute_jobs(
         // are learned again when they are not all known (`learn_again`); the
         // ones an import or a copy of a database brings, under the gate
         // shared.
+        if let Some(claims) = claims {
+            let _ = claims.send(ended && !keeps);
+        }
         match passed {
             Passed::Changing(alone) if !probe => learn_again(alone),
             passed if brings => {
@@ -6546,7 +6598,7 @@ mod tests {
         let (body, _output) = std::sync::mpsc::sync_channel(1);
         super::run_statement(&mut conn, &mut slot,
             "CREATE TABLE must_not_exist(x INTEGER); SELECT 1".into(), vec![],
-            super::Shape::Json, ready, body, Instant::now());
+            super::Shape::Json, ready, body, Instant::now(), &mut false);
         assert_eq!(result.recv().unwrap().err().unwrap().status, 400);
         assert!(conn.execute_batch("SELECT * FROM must_not_exist").is_err());
     }
@@ -6572,7 +6624,7 @@ mod tests {
             let (body, output) = sync_channel(super::BODY_QUEUE);
             jobs.send(super::Job {
                 sql: sql.into(), params: vec![], shape: super::Shape::Ndjson, id: super::next_job_id(),
-                deadline: None, reset: false, ready, body,
+                deadline: None, reset: false, ready, body, claims: None,
             }).unwrap();
             match answered.recv().unwrap() {
                 Err(refusal) => Err((refusal.status, refusal.message)),
@@ -6662,7 +6714,7 @@ mod tests {
             let (ready, result) = sync_channel(1);
             let (body, _output) = sync_channel(1);
             super::run_statement(conn, &mut slot, sql.into(), vec![], super::Shape::Json,
-                ready, body, Instant::now());
+                ready, body, Instant::now(), &mut false);
             result.recv().unwrap().err().unwrap().status
         };
         assert_eq!(cancelled(&mut conn, 1, "INSERT INTO m VALUES (2)"), 499);
@@ -6685,7 +6737,7 @@ mod tests {
             let (ready, result) = sync_channel(1);
             let (body, output) = sync_channel(4);
             jobs.send(super::Job { sql: sql.into(), params: vec![], shape: super::Shape::Json, id,
-                deadline: None, reset: false, ready, body }).unwrap();
+                deadline: None, reset: false, ready, body, claims: None }).unwrap();
             answers.push((result, output));
         }
         drop(jobs);
@@ -6740,7 +6792,7 @@ mod tests {
             let (ready, result) = sync_channel(1);
             let (body, _output) = sync_channel(1);
             super::run_statement(&mut conn, &mut slot, sql, vec![], super::Shape::Json,
-                ready, body, Instant::now());
+                ready, body, Instant::now(), &mut false);
             drop(slot);
             over.store(true, Ordering::SeqCst);
             let said = canceller.join().unwrap();
@@ -6792,7 +6844,7 @@ mod tests {
         let (ready, result) = sync_channel(1);
         let (body, _output) = sync_channel(1);
         super::run_statement(&mut conn, &mut slot, sql.into(), vec![], super::Shape::Json,
-            ready, body, Instant::now());
+            ready, body, Instant::now(), &mut false);
         drop(slot);
         over.store(true, Ordering::SeqCst);
         let said = canceller.join().unwrap();
@@ -6822,7 +6874,7 @@ mod tests {
                 let (body, _output) = sync_channel(1);
                 super::run_statement(&mut conn, &mut slot,
                     "SELECT count(*) FROM range(1000000000000) t(i) WHERE i % 7 = 3".into(),
-                    vec![], super::Shape::Json, ready, body, Instant::now());
+                    vec![], super::Shape::Json, ready, body, Instant::now(), &mut false);
                 drop(slot);
                 Some(conn)
             })

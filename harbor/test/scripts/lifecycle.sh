@@ -961,6 +961,12 @@ out=$("$harbor" "$work/workspace.duckdb" --mode csv -c "SELECT count(*) FROM app
 kill "$locker" 2>/dev/null; wait "$locker" 2>/dev/null
 [[ $(catalog_lines) == *"attached app ['people'] None"* ]] && ok "and it is read anew once the lock is gone" \
   || bad "after the lock: $(catalog_lines)"
+# A client's ATTACH of its name that fails, or changes nothing, leaves it
+# the server's, attached again below once it reads.
+out=$("$harbor" "$work/workspace.duckdb" -c "ATTACH ':memory:' AS app" 2>&1)
+[[ $out == *"already exists"* ]] && ok "a client's ATTACH of its name fails" || bad "a client's ATTACH of its name: $out"
+check "and one IF NOT EXISTS changes nothing" 0 "" \
+  "$harbor" "$work/workspace.duckdb" -c "ATTACH IF NOT EXISTS ':memory:' AS app"
 # A recorded file that stops being SQLite: detached, listed with why, and,
 # since this server attached it from the record, attached again once it
 # reads.
