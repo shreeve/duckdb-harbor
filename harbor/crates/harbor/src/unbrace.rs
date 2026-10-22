@@ -17,7 +17,9 @@
 //! `{first,last}Name`, `x.{a,b}::VARCHAR` — where a term is a run of text
 //! between spaces, comments, commas, parentheses and semicolons, a space
 //! being whatever the engine takes for one: the ASCII spaces, the vertical
-//! tab among them, and the Unicode spaces it strips before it parses. Items
+//! tab among them, and the Unicode spaces it strips before it parses. A
+//! cast's type parameters, the `(10,2)` right after `::DECIMAL`, stay in
+//! the term, so `x.{a,b}::DECIMAL(10,2)` casts both. Items
 //! in a group are separated by commas; spaces and comments alone separate
 //! them too, so a comma is never required, only clearer. A group nests; two
 //! groups in one term multiply, as they do in a shell. The alternatives a
@@ -71,7 +73,8 @@ pub fn expand(sql: &str) -> Result<Cow<'_, str>, String> {
     let mut term_start = 0;
     let mut depth = 0usize;
     let mut braced = false;
-    for i in 0..text.len() {
+    let mut i = 0;
+    while i < text.len() {
         let boundary = match text.class(i) {
             Class::Code => match text.src[i] {
                 b'{' => {
@@ -84,7 +87,14 @@ pub fn expand(sql: &str) -> Result<Cow<'_, str>, String> {
                     depth -= 1;
                     false
                 }
-                c => depth == 0 && matches!(c, b',' | b'(' | b')' | b';'),
+                b'(' if depth == 0 => match text.type_parameters(term_start, i) {
+                    Some(close) => {
+                        i = close + 1;
+                        continue;
+                    }
+                    None => true,
+                },
+                c => depth == 0 && matches!(c, b',' | b')' | b';'),
             },
             Class::Space => depth == 0,
             Class::Opaque => false,
@@ -95,6 +105,7 @@ pub fn expand(sql: &str) -> Result<Cow<'_, str>, String> {
             term_start = i + 1;
             braced = false;
         }
+        i += 1;
     }
     if depth != 0 {
         return Ok(Cow::Borrowed(sql));
@@ -336,13 +347,51 @@ impl<'a> Text<'a> {
         false
     }
 
+    /// Where a cast's type parameters close, when the `(` at `open` follows
+    /// `::` and a type name, with nothing between, inside the text from
+    /// `from`: `::DECIMAL(10,2)`, `::STRUCT(a INT)`. They are part of the
+    /// word before them, so neither a term nor an item ends inside them. A
+    /// list that holds a brace or a `;`, or never closes, is not taken.
+    fn type_parameters(&self, from: usize, open: usize) -> Option<usize> {
+        let name = (from..open)
+            .rev()
+            .take_while(|&j| self.code(j).is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_'))
+            .count();
+        let start = open - name;
+        if name == 0
+            || self.src[start].is_ascii_digit()
+            || start < from + 2
+            || self.code(start - 1) != Some(b':')
+            || self.code(start - 2) != Some(b':')
+        {
+            return None;
+        }
+        let mut depth = 0usize;
+        for j in open..self.len() {
+            match self.code(j) {
+                Some(b'(') => depth += 1,
+                Some(b')') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                }
+                Some(b'{' | b'}' | b';') => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// The items between `from` and `to`, split at top-level spaces, comments
-    /// and commas; a nested group travels whole inside its item.
+    /// and commas; a nested group travels whole inside its item, as do a
+    /// cast's type parameters.
     fn items(&self, from: usize, to: usize) -> Vec<Text<'a>> {
         let mut items = Vec::new();
         let mut depth = 0usize;
         let mut start = from;
-        for i in from..to {
+        let mut i = from;
+        while i < to {
             let split = match self.class(i) {
                 Class::Code => match self.src[i] {
                     b'{' => {
@@ -351,6 +400,13 @@ impl<'a> Text<'a> {
                     }
                     b'}' => {
                         depth = depth.saturating_sub(1);
+                        false
+                    }
+                    b'(' if depth == 0 => {
+                        if let Some(close) = self.type_parameters(start, i) {
+                            i = close + 1;
+                            continue;
+                        }
                         false
                     }
                     c => depth == 0 && c == b',',
@@ -364,6 +420,7 @@ impl<'a> Text<'a> {
                 }
                 start = i + 1;
             }
+            i += 1;
         }
         if to > start {
             items.push(self.slice(start, to));
@@ -498,6 +555,29 @@ mod tests {
         assert_eq!(x("select E'\\'', r.{a,b}, 'x\u{a0}y'"), "select E'\\'', r.a, r.b, 'x\u{a0}y'");
     }
 
+    /// A cast's type parameters belong to the word before them: the
+    /// expansion casts every alternative, never only the last.
+    #[test]
+    fn a_cast_keeps_its_type_parameters() {
+        assert_eq!(x("select x.{a,b}::DECIMAL(10,2) from t"), "select x.a::DECIMAL(10,2), x.b::DECIMAL(10,2) from t");
+        assert_eq!(x("select x.{a,b}::VARCHAR(20)"), "select x.a::VARCHAR(20), x.b::VARCHAR(20)");
+        assert_eq!(
+            x("select x.{a,b}::STRUCT(k DECIMAL(4,1), v INT)[] y"),
+            "select x.a::STRUCT(k DECIMAL(4,1), v INT)[], x.b::STRUCT(k DECIMAL(4,1), v INT)[] y"
+        );
+        assert_eq!(x("select r.{a::DECIMAL(10,2), b} from t"), "select r.a::DECIMAL(10,2), r.b from t");
+        assert_eq!(x("select round(r.{a,b}::DECIMAL(9,3), 1)"), "select round(r.a::DECIMAL(9,3), r.b::DECIMAL(9,3), 1)");
+        // Anything else ends the term as ever: a call's parentheses, a
+        // space (here after the `::`, which the engine then refuses), and
+        // the `AS` of a `CAST`, which it refuses too.
+        assert_eq!(x("select f(r.{a,b})"), "select f(r.a, r.b)");
+        assert_eq!(x("select r.{a,b}:: DECIMAL(10,2)"), "select r.a::, r.b:: DECIMAL(10,2)");
+        assert_eq!(x("select cast(x.{a,b} as DECIMAL(10,2))"), "select cast(x.a, x.b as DECIMAL(10,2))");
+        // A list that holds a brace, or never closes, is not taken.
+        assert_eq!(x("select r.{a,b}::T({c})"), "select r.a::T, r.b::T(c)");
+        assert!(matches!(expand("select r.{a,b}::DECIMAL(10"), Ok(Cow::Owned(_))));
+    }
+
     #[test]
     fn an_unbalanced_brace_leaves_the_statement_as_it_came() {
         for sql in ["select r.{a,b from t", "select r.a} from t", "select r.{a,{b} from t", "select r.{a 'b} from t"] {
@@ -596,12 +676,19 @@ mod tests {
             }
             term.clear();
         };
-        for unit in &units {
+        let mut k = 0;
+        while k < units.len() {
+            let unit = &units[k];
             match unit.0 {
                 Tok::Code(b'{') => depth += 1,
                 Tok::Code(b'}') if depth == 0 => return unchanged(),
                 Tok::Code(b'}') => depth -= 1,
                 _ => {}
+            }
+            if let Some(close) = (depth == 0).then(|| reference_type_parameters(&term, &units, k)).flatten() {
+                term.extend_from_slice(&units[k..=close]);
+                k = close + 1;
+                continue;
             }
             let boundary = depth == 0 && (separates(&unit.0) || matches!(unit.0, Tok::Code(b',' | b'(' | b')' | b';')));
             if boundary {
@@ -610,12 +697,46 @@ mod tests {
             } else {
                 term.push(unit.clone());
             }
+            k += 1;
         }
         if depth != 0 {
             return unchanged();
         }
         flush(&mut out, &mut term);
         (out.iter().flat_map(|u| u.1.clone()).collect(), reading_of(&out))
+    }
+
+    /// Where the parentheses that open at `units[open]` close, when they
+    /// follow `::` and a type name that end `before`, and hold no brace or
+    /// `;`: a cast's type parameters, part of the word before them.
+    fn reference_type_parameters(before: &[Unit], units: &[Unit], open: usize) -> Option<usize> {
+        if units[open].0 != Tok::Code(b'(') {
+            return None;
+        }
+        let word = |u: &Unit| matches!(u.0, Tok::Code(c) if c.is_ascii_alphanumeric() || c == b'_');
+        let name = before.iter().rev().take_while(|u| word(u)).count();
+        let n = before.len();
+        if name == 0 || n < name + 2 || matches!(before[n - name].0, Tok::Code(c) if c.is_ascii_digit()) {
+            return None;
+        }
+        if before[n - name - 2..n - name].iter().any(|u| u.0 != Tok::Code(b':')) {
+            return None;
+        }
+        let mut depth = 0;
+        for (j, u) in units.iter().enumerate().skip(open) {
+            match u.0 {
+                Tok::Code(b'(') => depth += 1,
+                Tok::Code(b')') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                }
+                Tok::Code(b'{' | b'}' | b';') => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
     fn reference_alternatives(term: &[Unit]) -> Vec<Vec<Unit>> {
@@ -662,17 +783,27 @@ mod tests {
         let (o, c) = group;
         let mut items: Vec<Vec<Unit>> = vec![Vec::new()];
         let mut depth = 0;
-        for u in &term[o + 1..c] {
+        let inner = &term[o + 1..c];
+        let mut k = 0;
+        while k < inner.len() {
+            let u = &inner[k];
             match u.0 {
                 Tok::Code(b'{') => depth += 1,
                 Tok::Code(b'}') => depth -= 1,
                 _ => {}
             }
+            let item = items.last_mut().unwrap();
+            if let Some(close) = (depth == 0).then(|| reference_type_parameters(item, inner, k)).flatten() {
+                item.extend_from_slice(&inner[k..=close]);
+                k = close + 1;
+                continue;
+            }
             if depth == 0 && (separates(&u.0) || u.0 == Tok::Code(b',')) {
                 items.push(Vec::new());
             } else {
-                items.last_mut().unwrap().push(u.clone());
+                item.push(u.clone());
             }
+            k += 1;
         }
         items.retain(|item| !item.is_empty());
         if items.is_empty() {
@@ -690,6 +821,7 @@ mod tests {
     const FRAGMENTS: &[&str] = &[
         "select ", "r", ".", "x", "e", "E", "a1", "é", "1", "1e5", ".5", ",", "(", ")", ";", ":", "::", "$", "\\", "_",
         "{", "}", "{a,b}", "{a b}", "r.{a,b}", "{'k': 1}", "{}", "{a,{b,c}}", "{a::INT b}", "{x}",
+        "::DECIMAL(10,2)", "::T(", "::S(a {b} c)", "{a::V(1, 2) b}", "::X(E'\\', \"(\")", "2(",
         "'", "'{a,b}'", "''", "'\\'", "E'\\''", "e'a\\\\b'", "\"", "\"{a,b}\"", "`", "`{a,b}`", "`it's`",
         "$$", "$$x.{a,b}$$", "$t$", "$t${a,b}$t$", "$t$t$",
         "--", "-- {a,b}\n", "/*", "*/", "/* ' */", "/* {a,b} */", "\n", "\r",

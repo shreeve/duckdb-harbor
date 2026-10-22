@@ -565,6 +565,30 @@ class CommitRaces(Harbor, unittest.TestCase):
         sql = r"SELECT {x}E'\'''{a,b}'"
         self.assertIn(sql, self.sql(sql, status=400)["message"])
 
+    def test_a_string_keeps_its_escapes_through_an_expansion(self):
+        # An `E` that begins a word makes the string after it take backslash
+        # escapes. Expanded, `{E}'a\tb'` would be the E-string `E'a\tb'`,
+        # a tab where a backslash and a `t` were written, and `e'` after `d`
+        # a plain string where `e'` after `}` takes escapes. Each statement
+        # goes to the engine as it came, and its refusal quotes it.
+        for sql in (r"SELECT {E}'a\tb'", r"SELECT t.{d,e}'a\tb'", r"SELECT {x,y}e'a\tb'"):
+            with self.subTest(sql=sql):
+                self.assertIn(sql, self.sql(sql, status=400)["message"])
+
+    def test_a_cast_keeps_its_type_parameters_in_every_alternative(self):
+        # `(10,2)` belongs to `::DECIMAL`: split from it, the first column
+        # would be cast to the bare DECIMAL, DECIMAL(18,3).
+        source = " FROM (SELECT {'a': 1.2345, 'b': 2.5} AS r)"
+        doc = self.sql("SELECT r.{a,b}::DECIMAL(10,2)" + source)
+        self.assertEqual([c["duckdbType"] for c in doc["columns"]], ["DECIMAL(10,2)"] * 2)
+        self.assertEqual(doc["data"], [["1.23", "2.50"]])
+        doc = self.sql("SELECT r.{a::DECIMAL(4,1) b::VARCHAR(20)}" + source)
+        self.assertEqual([c["duckdbType"] for c in doc["columns"]], ["DECIMAL(4,1)", "VARCHAR"])
+        # The `AS` of a CAST is a word of its own: the expansion puts both
+        # columns inside the one CAST, and the engine refuses it.
+        sql = "SELECT CAST(r.{a,b} AS DECIMAL(10,2))" + source
+        self.assertIn("CAST(r.a, r.b AS", self.sql(sql, status=400)["message"])
+
     def test_a_null_param_is_typed_as_the_engine_types_a_null(self):
         # Bound untyped, as the engine's own EXECUTE p(NULL) binds it: the
         # statement types it, and where nothing does, a table made from it
