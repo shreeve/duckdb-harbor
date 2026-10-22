@@ -710,6 +710,52 @@ def run_tests(h, db, proc):
     )
 
     # -----------------------------------------------------------------------
+    section("A cancel waiting on the engine holds no worker")
+
+    # A cancel of a statement the engine runs to its end first waits for the
+    # engine's word, which a CHECKPOINT gives only when it is done: it checks
+    # for no interrupt as it writes. The wait is answered off the thread that
+    # took the DELETE, so on a berth of two workers, one in the CHECKPOINT,
+    # the other answers a SELECT 1 meanwhile. A DELETE answered before it had
+    # to wait proves nothing, so a few CHECKPOINTs are tried until two make
+    # it wait. A berth of its own, so no transaction elsewhere keeps the
+    # CHECKPOINT from running.
+    side, w, side_log = start_server(os.path.join(os.path.dirname(db), "wait.duckdb"),
+                                     pool_size=4, workers=2, port=free_port())
+    waits = []
+    try:
+        w.sql("SET checkpoint_threshold = '50GB'")
+        w.sql("CREATE TABLE heap AS SELECT i, i::VARCHAR || 'abcdefghijklmnopqrstuvwxyz' s FROM range(10000000) t(i)")
+        for attempt in range(8):
+            w.sql("UPDATE heap SET s = s || 'y'")
+            point = Background(w, statement="CHECKPOINT", query=f"point{attempt}")
+            time.sleep(0.03)
+            asked = {}
+
+            def ask(name=f"point{attempt}"):
+                asked["said"] = w.cancel(name)[1].get("cancelled")
+                asked["at"] = time.monotonic()
+
+            sent = time.monotonic()
+            canceller = threading.Thread(target=ask)
+            canceller.start()
+            time.sleep(0.01)
+            answered = (w.sql("SELECT 1", timeout=30)[0], time.monotonic())
+            canceller.join(60)
+            point.wait()
+            told = (asked.get("said"), point.status) in ((True, 499), (False, 200))
+            if asked["at"] - sent > 0.08:
+                waits.append((answered[0] == 200 and answered[1] + 0.03 < asked["at"], told))
+            if len(waits) >= 2:
+                break
+    finally:
+        stop_server(side)
+        side_log.close()
+    yes("a DELETE waited on a CHECKPOINT", len(waits) > 0, f"{attempt + 1} tries")
+    eq("and the other worker answered meanwhile, the answer true to the CHECKPOINT",
+       [(True, True)] * len(waits), waits)
+
+    # -----------------------------------------------------------------------
     section("A session needs no free worker")
 
     # Every worker busy with a long scan: a session's statements, COMMIT

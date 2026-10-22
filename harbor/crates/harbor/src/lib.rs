@@ -236,9 +236,6 @@ static STOPPED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 struct SlotState {
     interrupt: Arc<InterruptHandle>,
     run: Mutex<SlotRun>,
-    /// Signalled when a retained statement's outcome is known, for the
-    /// canceller waiting on it (`SlotRun::told`).
-    settled: Condvar,
 }
 
 struct SlotRun {
@@ -410,7 +407,7 @@ impl SlotRun {
 
 impl SlotState {
     fn new(interrupt: Arc<InterruptHandle>) -> Arc<Self> {
-        Arc::new(SlotState { interrupt, run: Mutex::new(SlotRun::idle()), settled: Condvar::new() })
+        Arc::new(SlotState { interrupt, run: Mutex::new(SlotRun::idle()) })
     }
 
     fn begin(&self, job: u64, deadline: Option<Instant>) -> bool {
@@ -422,8 +419,13 @@ impl SlotState {
     /// window described above: once this returns, no interrupt aimed at this
     /// job can still be in flight.
     fn end(&self) -> bool {
-        let cancelled = self.run.lock().unwrap().end();
-        self.settled.notify_all();
+        let mut run = self.run.lock().unwrap();
+        let asked = run.told.is_some();
+        let cancelled = run.end();
+        drop(run);
+        if asked {
+            Asked::said();
+        }
         cancelled
     }
 
@@ -435,8 +437,13 @@ impl SlotState {
 
     /// A retained statement's first fetch came back; see `SlotRun::keep`.
     fn keep(&self) {
-        self.run.lock().unwrap().keep();
-        self.settled.notify_all();
+        let mut run = self.run.lock().unwrap();
+        let asked = run.told.is_some();
+        run.keep();
+        drop(run);
+        if asked {
+            Asked::said();
+        }
     }
 
     /// Whether a canceller has reached the statement now running.
@@ -457,23 +464,30 @@ impl SlotState {
     /// that asked is told. Fired at a statement harbor stops itself, the
     /// answer is known at once: one that has not begun never runs, and one
     /// that has is answered 499 at its next step or at its end. Fired at a
-    /// retained statement in the engine, it is the engine's, and this waits
-    /// for the statement's first fetch: an INSERT the interrupt did not
-    /// reach in time has run, in autocommit committed, and the cancel
-    /// stopped nothing. The wait is as long as the engine takes to notice
-    /// the interrupt or to finish, and the statement's executor waits on
-    /// nothing but the engine meanwhile.
-    fn cancel_and_say(&self, job: u64) -> bool {
+    /// retained statement in the engine, it is the engine's, and is told at
+    /// the statement's first fetch: an INSERT the interrupt did not reach in
+    /// time has run, in autocommit committed, and the cancel stopped
+    /// nothing. That is as long as the engine takes to notice the interrupt
+    /// or to finish, and the statement's executor waits on nothing but the
+    /// engine meanwhile.
+    fn cancel_and_tell(&self, job: u64) -> Said {
         let mut run = self.run.lock().unwrap();
         if !self.fire(&mut run, Some(job)) {
-            return false;
+            return Said::Now(false);
         }
         if !(run.job == job && run.retained) {
-            return true;
+            return Said::Now(true);
         }
-        let told = Arc::clone(run.told.get_or_insert_with(Default::default));
-        let _run = self.settled.wait_while(run, |_| told.get().is_none()).unwrap();
-        *told.get().unwrap()
+        Said::Later(Arc::clone(run.told.get_or_insert_with(Default::default)))
+    }
+
+    /// `cancel_and_tell`, waited for on this thread.
+    #[cfg(test)]
+    fn cancel_and_say(&self, job: u64) -> bool {
+        match self.cancel_and_tell(job) {
+            Said::Now(stopped) => stopped,
+            Said::Later(told) => Asked::wait(&told),
+        }
     }
 
     fn fire(&self, run: &mut SlotRun, job: Option<u64>) -> bool {
@@ -525,6 +539,92 @@ impl SlotState {
     fn current_job(&self) -> u64 {
         self.run.lock().unwrap().job
     }
+}
+
+/// Whether a cancel stopped its statement: known when it fired, or told at
+/// a retained statement's first fetch (`SlotRun::told`).
+enum Said {
+    Now(bool),
+    Later(Arc<OnceLock<bool>>),
+}
+
+/// A `DELETE /sql/queries/<id>` waiting to be told whether its cancel
+/// stopped a retained statement. One thread answers them all
+/// (`answer_cancels`), so a wait holds neither a worker nor the probe lane,
+/// which answers `/ready`, renewals, releases and other cancels: the wait is
+/// the engine's longest stretch without an interrupt check, a commit that
+/// checkpoints or a `CHECKPOINT`, and the lane must not stand behind it.
+struct Asked {
+    told: Arc<OnceLock<bool>>,
+    req: Request,
+    line: Option<LogLine>,
+}
+
+/// The cancels waiting to be told, and the signal a statement gives when it
+/// tells one: at its first fetch (`SlotState::keep`) or its end.
+static ASKED: (Mutex<Vec<Asked>>, Condvar) = (Mutex::new(Vec::new()), Condvar::new());
+
+impl Asked {
+    /// A statement told its canceller. Signalled under the lock the waiters
+    /// check under, so none checks before the telling and sleeps after it.
+    fn said() {
+        let _asked = ASKED.0.lock().unwrap();
+        ASKED.1.notify_all();
+    }
+
+    /// Wait on this thread until `told` is.
+    fn wait(told: &OnceLock<bool>) -> bool {
+        let (asked, said) = &ASKED;
+        let _asked = said.wait_while(asked.lock().unwrap(), |_| told.get().is_none()).unwrap();
+        *told.get().unwrap()
+    }
+}
+
+/// Answer the cancels in ASKED as their statements tell them, for the life
+/// of the process. A statement harbor abandoned at a stop never tells, and
+/// its cancel is left unanswered, as its statement is.
+fn answer_cancels() {
+    let (asked, said) = &ASKED;
+    loop {
+        let mut waiting = said
+            .wait_while(asked.lock().unwrap(), |w| !w.iter().any(|a| a.told.get().is_some()))
+            .unwrap();
+        let (told, rest): (Vec<Asked>, Vec<Asked>) =
+            std::mem::take(&mut *waiting).into_iter().partition(|a| a.told.get().is_some());
+        *waiting = rest;
+        drop(waiting);
+        for Asked { told, req, line } in told {
+            let status = answer_cancel(req, *told.get().unwrap()).1;
+            if let Some(line) = line {
+                line.write(status);
+            }
+        }
+    }
+}
+
+/// Answer `req`, a cancel that must wait for its statement's first fetch,
+/// from `answer_cancels`, or on this thread when that cannot start.
+fn await_cancel(req: Request, told: Arc<OnceLock<bool>>, line: Option<LogLine>) -> bool {
+    static ANSWERING: OnceLock<bool> = OnceLock::new();
+    let answering = *ANSWERING.get_or_init(|| {
+        thread::Builder::new().name("harbor-cancel".to_string()).spawn(answer_cancels).is_ok()
+    });
+    if answering {
+        ASKED.0.lock().unwrap().push(Asked { told, req, line });
+        ASKED.1.notify_all();
+        return true;
+    }
+    let status = answer_cancel(req, Asked::wait(&told)).1;
+    if let Some(line) = line {
+        line.write(status);
+    }
+    true
+}
+
+fn answer_cancel(req: Request, cancelled: bool) -> (bool, u16) {
+    let body = serde_json::to_string(&wire::CancelledResponse { cancelled }).unwrap();
+    let _ = req.respond(json_response(200, &body));
+    (true, 200)
 }
 
 /// Every executor's slot, worker and lease alike, for the life of the server.
@@ -609,14 +709,14 @@ impl Drop for Cancellable {
 
 /// Cancel by the id the client chose. The slot and job are looked up together,
 /// so a `queryId` reused after its statement finished cancels nothing.
-fn cancel_query(id: &str) -> bool {
+fn cancel_query(id: &str) -> Said {
     let target = {
         let guard = QUERIES.lock().unwrap();
         guard.as_ref().and_then(|q| q.get(id).map(|(s, j)| (Arc::clone(s), *j)))
     };
     match target {
-        Some((slot, job)) => slot.cancel_and_say(job),
-        None => false,
+        Some((slot, job)) => slot.cancel_and_tell(job),
+        None => Said::Now(false),
     }
 }
 
@@ -1988,12 +2088,14 @@ fn handle(req: Request, exec: Option<Executor>, log: bool) -> bool {
             // deliberately unexciting: cancelling something that already
             // finished is `false`, not an error, because by the time a Stop
             // button is pressed the query it refers to may well be over —
-            // its rows may still be on their way, and they all arrive.
+            // its rows may still be on their way, and they all arrive. One
+            // that must wait for the engine's word is answered off this
+            // thread (`Asked`).
             (Method::Delete, p) if p.starts_with("/sql/queries/") => {
-                let cancelled = cancel_query(&percent_decoded(&p["/sql/queries/".len()..]));
-                let body = serde_json::to_string(&wire::CancelledResponse { cancelled }).unwrap();
-                let _ = req.respond(json_response(200, &body));
-                (true, 200)
+                match cancel_query(&percent_decoded(&p["/sql/queries/".len()..])) {
+                    Said::Now(cancelled) => answer_cancel(req, cancelled),
+                    Said::Later(told) => return await_cancel(req, told, line),
+                }
             }
             // What is holding a connection, and for how long. The question an
             // operator asks when everything is suddenly waiting, and the reason
