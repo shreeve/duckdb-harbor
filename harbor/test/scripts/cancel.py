@@ -592,6 +592,78 @@ def run_tests(h, db, proc):
     eq("and every answer arrives whole", [[(499, None), (200, 6000)]] * 10, drawn)
 
     # -----------------------------------------------------------------------
+    section("A client that leaves while a request waits its turn stops its statement")
+
+    # Nothing reads the connection while the pipelined request waits, and
+    # what the client sent is read ahead for it, so its leaving is seen and
+    # the statement ahead is stopped as any departed client's is.
+    s = socket.create_connection(("127.0.0.1", int(h.base.rsplit(":", 1)[1])), timeout=30)
+    s.sendall(post(json.dumps({"sql": LONG, "queryId": "left_ahead"}))
+              + post(json.dumps({"sql": "SELECT 1", "queryId": "left_behind"})))
+    time.sleep(0.5)
+    s.close()
+    began = time.monotonic()
+    while time.monotonic() - began < baseline and h.sql("SELECT 1", query="left_ahead")[0] == 409:
+        time.sleep(0.05)
+    took = time.monotonic() - began
+    yes("the statement ahead stops", took < baseline / 2, f"{took:.2f}s of a {baseline:.1f}s query")
+
+    # -----------------------------------------------------------------------
+    section("A cancel's answer a client does not read keeps no other's waiting")
+
+    # One client keeps its connection and reads nothing: an answer that
+    # fills its socket's buffers, then its cancel of a retained INSERT,
+    # whose answer cannot be written. Another client's cancel is answered
+    # meanwhile, by another of the threads that answer them.
+    import glob
+    sock = (glob.glob(os.path.join(os.environ["HARBOR_HOME"], "runtime", "cancel.duckdb-*.sock")) or [None])[0]
+    if sock is None:
+        ok("no unix socket here to fill; not checked")
+    else:
+        h.sql("CREATE TABLE IF NOT EXISTS unread(i BIGINT)")
+        insert = "INSERT INTO unread SELECT i FROM range(400000000) r(i)"
+        # How much the socket holds unread, from a long answer.
+        probe = socket.socket(socket.AF_UNIX)
+        probe.connect(sock)
+        probe.sendall(post(json.dumps({"sql": "SELECT repeat('x', 1000000) AS v"})))
+        time.sleep(1.0)
+        held = len(probe.recv(1 << 22))
+        probe.close()
+        # An answer of a row of n characters is n plus the same bytes
+        # around it at any n: measured, then sized to leave less room than
+        # a cancel's answer needs.
+        probe = socket.socket(socket.AF_UNIX)
+        probe.connect(sock)
+        probe.sendall(post(json.dumps({"sql": "SELECT repeat('x', 1000) AS v"}), last=True))
+        around = b""
+        while chunk := probe.recv(65536):
+            around += chunk
+        probe.close()
+        around = len(around) - 1000
+        unread_by = Background(h, statement=insert, query="unread_x")
+        time.sleep(0.5)
+        slow = socket.socket(socket.AF_UNIX)
+        slow.connect(sock)
+        slow.sendall(post(json.dumps({"sql": f"SELECT repeat('x', {held - around - 40}) AS v"}))
+                     + b"DELETE /sql/queries/unread_x HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        time.sleep(0.5)
+        other = Background(h, statement=insert, query="unread_y")
+        time.sleep(0.5)
+        began = time.monotonic()
+        st, doc, _ = h.cancel("unread_y")
+        took = time.monotonic() - began
+        unread_by.wait()
+        other.wait()
+        slow.setblocking(False)
+        try:
+            waiting = slow.recv(1 << 22).count(b"HTTP/1.1 ")
+        except BlockingIOError:
+            waiting = 0
+        slow.close()
+        eq("the other client's cancel is answered", (200, True), (st, doc.get("cancelled")))
+        yes("at once", took < 1.0, f"{took:.2f}s, with {waiting} answer(s) of the first client's written")
+
+    # -----------------------------------------------------------------------
     section("A cancel says truly whether it stopped a write")
 
     # An autocommit INSERT has run and committed by the time its first chunk

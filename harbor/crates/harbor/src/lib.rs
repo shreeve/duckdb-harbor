@@ -6937,6 +6937,30 @@ mod tests {
     use super::{Cancel, SlotRun};
     use std::time::{Duration, Instant};
 
+    /// An ATTACH that waits keeps new shares out, but a share that waits
+    /// half a second passes beside it while a share it found is held, and
+    /// not after: what it waits for then is only what came after it.
+    #[test]
+    fn a_waiting_attach_holds_later_shares_only_while_it_waits_for_earlier_ones() {
+        use super::{GateState, PASS_BESIDE};
+        let soon = Duration::ZERO;
+        let mut gate = GateState::new();
+        let long = gate.give();
+        assert!(!gate.take_alone(), "held alone beside a share");
+        gate.keep();
+        assert!(!gate.shares_now(soon), "a share given beside an ATTACH that keeps them out");
+        assert!(gate.shares_now(PASS_BESIDE), "a share kept out for as long as the long one runs");
+        let beside = gate.give();
+        gate.let_go(long);
+        assert!(!gate.shares_now(PASS_BESIDE), "a share passed beside after the share found was let go");
+        gate.let_go(beside);
+        assert!(gate.take_alone());
+        gate.keeping -= 1;
+        assert!(!gate.shares_now(PASS_BESIDE), "a share beside the gate held alone");
+        gate.alone = false;
+        assert!(gate.shares_now(soon));
+    }
+
     #[test]
     fn attaching_and_reading_the_catalog_pass_the_gate_apart() {
         use super::{CatalogNames, Gate, gate_of};
