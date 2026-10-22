@@ -4494,6 +4494,10 @@ fn run_sql(req: Request, mut parsed: SqlRequest, pooled: Option<Executor>) -> (b
         return refuse(req, Refusal::sql(lost));
     }
 
+    if let Some(reserved) = reserved_attachment(&parsed.sql) {
+        return refuse(req, Refusal::sql(reserved));
+    }
+
     let shape = if wants_one_shot(&req) { Shape::Json } else { Shape::Ndjson };
 
     // A statement naming a lease goes to that lease's connection, wherever it
@@ -4725,6 +4729,20 @@ fn lost_without_session(sql: &str) -> Option<&'static str> {
         ),
         _ => None,
     }
+}
+
+/// Refuse a client ATTACH or DETACH of a `harbor_probe_*` name. Those are
+/// the learner's hidden probes of the attached SQLite files (`PROBE`), by
+/// which it learns which of them read: a client detaching one would leave
+/// the learner holding an entry whose file is gone, failing every probe
+/// read until a listing, and attaching one first would take a name the
+/// learner then cannot. The prefix is the server's alone.
+fn reserved_attachment(sql: &str) -> Option<&'static str> {
+    let reserved = |name: Option<Vec<u8>>| name.is_some_and(|n| n.starts_with(PROBE.as_bytes()));
+    (reserved(attached_name(sql)) || reserved(detached_name(sql))).then_some(
+        "a database named harbor_probe_… is Harbor's own: it attaches hidden probes under that prefix \
+         to learn which SQLite files read, so attach and detach your databases under other names",
+    )
 }
 
 /// Statements that can leave connection-local state need a fresh connection
@@ -5598,7 +5616,9 @@ const LEARN_PATIENCE: Duration = Duration::from_millis(20);
 /// statements running (`learn_on_probes`), or as `learn_again` asks, once
 /// the gate is free for it within [`LEARN_PATIENCE`]. After a listing that
 /// failed, asked half as often each time, up to [`LEARN_LONGEST`]. Once the
-/// names are complete, the probes kept are let go when the gate is free.
+/// names are complete, the probes kept are let go, the readers running kept
+/// out once until they drain, so steady overlapping readers do not keep the
+/// probes attached.
 fn learn_while_unknown(stop: Arc<AtomicBool>) {
     let mut every = LEARN_EVERY;
     let mut asked = Instant::now();
@@ -5611,7 +5631,13 @@ fn learn_while_unknown(stop: Arc<AtomicBool>) {
         if names_complete() {
             every = LEARN_EVERY;
             let kept = LEARNER.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(|l| !l.probes.is_empty());
-            if kept && let Some(alone) = hold_alone(None, Some(LEARN_PATIENCE), || true) {
+            // Keep new shares out and wait for the readers running to drain,
+            // then detach the probes. One wait, bounded by those readers,
+            // rather than a 20 ms hold-out retried each second, which under
+            // steady overlapping readers never finds its gap, so the probes
+            // would linger and new readers stall 20 ms every second. A stop
+            // drains the readers, so this does not hold the learner at it.
+            if kept && let Some(alone) = hold_alone(None, None, || true) {
                 learn_again(alone);
             }
             continue;
@@ -6970,6 +6996,29 @@ mod tests {
             "EXPLAIN (FORMAT JSON) BEGIN", "EXPLAIN (FORMAT JSON) ANALYZE BEGIN",
         ] {
             assert!(lost_without_session(sql).is_none(), "should pass: {sql:?}");
+        }
+    }
+
+    #[test]
+    fn a_client_cannot_attach_or_detach_the_learner_s_probe_names() {
+        use super::reserved_attachment;
+        for sql in [
+            "ATTACH '/x/s.sqlite' AS harbor_probe_7 (TYPE sqlite)",
+            "attach '/x/s.sqlite' as \"harbor_probe_7\"",
+            "DETACH harbor_probe_7",
+            "detach database if exists harbor_probe_7",
+            "ATTACH '/x/harbor_probe_9.sqlite'",
+        ] {
+            assert!(reserved_attachment(sql).is_some(), "should be refused: {sql:?}");
+        }
+        for sql in [
+            "ATTACH '/x/s.sqlite' AS s (TYPE sqlite)",
+            "DETACH s",
+            "ATTACH '/x/harbor_probe.sqlite' AS probe",
+            "SELECT * FROM harbor_probe_7",
+            "CREATE TABLE harbor_probe_7(i INT)",
+        ] {
+            assert!(reserved_attachment(sql).is_none(), "should pass: {sql:?}");
         }
     }
 
