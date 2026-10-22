@@ -17,7 +17,9 @@
 //! `{first,last}Name`, `x.{a,b}::VARCHAR` — where a term is a run of text
 //! between spaces, comments, commas, parentheses and semicolons, a space
 //! being whatever the engine takes for one: the ASCII spaces, the vertical
-//! tab among them, and the Unicode spaces it strips before it parses. Items
+//! tab among them, and the Unicode spaces it strips before it parses. A
+//! cast's type parameters, the `(10,2)` right after `::DECIMAL`, stay in
+//! the term, so `x.{a,b}::DECIMAL(10,2)` casts both. Items
 //! in a group are separated by commas; spaces and comments alone separate
 //! them too, so a comma is never required, only clearer. A group nests; two
 //! groups in one term multiply, as they do in a shell. The alternatives a
@@ -37,8 +39,9 @@
 //! afresh, and a quote its pre-pass misreads can change where it strips a
 //! Unicode space; an expansion the engine would read in any way other than
 //! byte for byte as the statement it came from (a string's bytes taken for
-//! code, two strings run into one, a space stripped in one and kept in the
-//! other) leaves the whole statement as it came.
+//! code, two strings run into one, a string that takes backslash escapes in
+//! one and not in the other, a space stripped in one and kept in the other)
+//! leaves the whole statement as it came.
 //!
 //! Each group multiplies, so a short statement can stand for an enormous one:
 //! thirty two-item groups in a term are a billion alternatives. Expansion
@@ -70,7 +73,9 @@ pub fn expand(sql: &str) -> Result<Cow<'_, str>, String> {
     let mut term_start = 0;
     let mut depth = 0usize;
     let mut braced = false;
-    for i in 0..text.len() {
+    let mut lists = None;
+    let mut i = 0;
+    while i < text.len() {
         let boundary = match text.class(i) {
             Class::Code => match text.src[i] {
                 b'{' => {
@@ -83,7 +88,14 @@ pub fn expand(sql: &str) -> Result<Cow<'_, str>, String> {
                     depth -= 1;
                     false
                 }
-                c => depth == 0 && matches!(c, b',' | b'(' | b')' | b';'),
+                b'(' if depth == 0 => match text.type_parameters(term_start, i, text.len(), &mut lists) {
+                    Some(close) => {
+                        i = close + 1;
+                        continue;
+                    }
+                    None => true,
+                },
+                c => depth == 0 && matches!(c, b',' | b')' | b';'),
             },
             Class::Space => depth == 0,
             Class::Opaque => false,
@@ -94,6 +106,7 @@ pub fn expand(sql: &str) -> Result<Cow<'_, str>, String> {
             term_start = i + 1;
             braced = false;
         }
+        i += 1;
     }
     if depth != 0 {
         return Ok(Cow::Borrowed(sql));
@@ -176,8 +189,9 @@ fn alternatives(term: Text, budget: &mut usize) -> Result<Vec<Piece>, String> {
 }
 
 // How the engine reads a byte, packed in one: the kind of span it falls in,
-// whether it begins a string, quoted name, dollar quote or comment, and
-// whether the engine's pre-pass turns it into a space.
+// whether it begins a string, quoted name, dollar quote or comment, whether
+// the string it begins takes backslash escapes, and whether the engine's
+// pre-pass turns it into a space.
 const CODE: u8 = 0;
 const STR: u8 = 1;
 const DOLLAR: u8 = 2;
@@ -186,6 +200,7 @@ const BLOCK_COMMENT: u8 = 4;
 const KIND: u8 = 7;
 const BEGINS: u8 = 8;
 const STRIPPED: u8 = 16;
+const ESCAPES: u8 = 32;
 
 /// The engine's reading of each byte of `src`. Two texts with the same bytes
 /// that agree here are one statement to the engine.
@@ -202,6 +217,9 @@ fn reading(src: &str) -> Vec<u8> {
         };
         read[span.start..span.end].fill(kind);
         read[span.start] |= BEGINS;
+        if span.escapes {
+            read[span.start] |= ESCAPES;
+        }
     }
     for (r, (a, b)) in read.iter_mut().zip(src.bytes().zip(plain.iter())) {
         if a != *b {
@@ -330,13 +348,59 @@ impl<'a> Text<'a> {
         false
     }
 
+    /// Where a cast's type parameters close, when the `(` at `open` follows
+    /// `::` and a type name, with nothing between, inside the text from
+    /// `from`: `::DECIMAL(10,2)`, `::STRUCT(a INT)`. They are part of the
+    /// word before them, so neither a term nor an item ends inside them. A
+    /// list that holds a brace or a `;`, or does not close before `to`, is
+    /// not taken. `lists` holds the text's parentheses, paired once when
+    /// first needed: a scan forward from each `(` would make thousands of
+    /// unclosed ones quadratic.
+    fn type_parameters(&self, from: usize, open: usize, to: usize, lists: &mut Option<Vec<(usize, usize)>>) -> Option<usize> {
+        let name = (from..open)
+            .rev()
+            .take_while(|&j| self.code(j).is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_'))
+            .count();
+        let start = open - name;
+        if name == 0
+            || self.src[start].is_ascii_digit()
+            || start < from + 2
+            || self.code(start - 1) != Some(b':')
+            || self.code(start - 2) != Some(b':')
+        {
+            return None;
+        }
+        let lists = lists.get_or_insert_with(|| self.paired_parentheses(from, to));
+        lists.binary_search_by_key(&open, |pair| pair.0).ok().map(|k| lists[k].1)
+    }
+
+    /// Each `(` in code between `from` and `to` beside the `)` that closes
+    /// it, ordered by the `(`. A brace or a `;` closes no list, and every one
+    /// open at it is left unpaired.
+    fn paired_parentheses(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let (mut open, mut pairs) = (Vec::new(), Vec::new());
+        for i in from..to {
+            match self.code(i) {
+                Some(b'(') => open.push(i),
+                Some(b')') => pairs.extend(open.pop().map(|o| (o, i))),
+                Some(b'{' | b'}' | b';') => open.clear(),
+                _ => {}
+            }
+        }
+        pairs.sort_unstable();
+        pairs
+    }
+
     /// The items between `from` and `to`, split at top-level spaces, comments
-    /// and commas; a nested group travels whole inside its item.
+    /// and commas; a nested group travels whole inside its item, as do a
+    /// cast's type parameters.
     fn items(&self, from: usize, to: usize) -> Vec<Text<'a>> {
         let mut items = Vec::new();
         let mut depth = 0usize;
         let mut start = from;
-        for i in from..to {
+        let mut lists = None;
+        let mut i = from;
+        while i < to {
             let split = match self.class(i) {
                 Class::Code => match self.src[i] {
                     b'{' => {
@@ -345,6 +409,13 @@ impl<'a> Text<'a> {
                     }
                     b'}' => {
                         depth = depth.saturating_sub(1);
+                        false
+                    }
+                    b'(' if depth == 0 => {
+                        if let Some(close) = self.type_parameters(start, i, to, &mut lists) {
+                            i = close + 1;
+                            continue;
+                        }
                         false
                     }
                     c => depth == 0 && c == b',',
@@ -358,6 +429,7 @@ impl<'a> Text<'a> {
                 }
                 start = i + 1;
             }
+            i += 1;
         }
         if to > start {
             items.push(self.slice(start, to));
@@ -477,12 +549,49 @@ mod tests {
             // misreading flips: the U+00A0 in the string after it would be
             // stripped where it was kept.
             "select {a,b}.E'\\'', 'x\u{a0}y'",
+            // An `E` that begins a word makes the string after it take
+            // backslash escapes, whether or not one moves its end: `}'` is a
+            // plain string and `E'` is not, `d'` is plain and `e'` is not,
+            // `}e'` takes escapes and `xe'` does not.
+            r"select {E}'a\tb'",
+            r"select t.{d,e}'a\tb'",
+            r"select {x,y}e'a\tb'",
         ] {
             assert!(matches!(expand(sql), Ok(Cow::Borrowed(_))), "{sql:?}");
         }
         // A misreading the expansion does not repeat changes nothing.
         assert_eq!(x("select /* ' */ r.{a,b}, 'x\u{a0}y'"), "select /* ' */ r.a, r.b, 'x\u{a0}y'");
         assert_eq!(x("select E'\\'', r.{a,b}, 'x\u{a0}y'"), "select E'\\'', r.a, r.b, 'x\u{a0}y'");
+    }
+
+    /// A cast's type parameters belong to the word before them: the
+    /// expansion casts every alternative, never only the last.
+    #[test]
+    fn a_cast_keeps_its_type_parameters() {
+        assert_eq!(x("select x.{a,b}::DECIMAL(10,2) from t"), "select x.a::DECIMAL(10,2), x.b::DECIMAL(10,2) from t");
+        assert_eq!(x("select x.{a,b}::VARCHAR(20)"), "select x.a::VARCHAR(20), x.b::VARCHAR(20)");
+        assert_eq!(
+            x("select x.{a,b}::STRUCT(k DECIMAL(4,1), v INT)[] y"),
+            "select x.a::STRUCT(k DECIMAL(4,1), v INT)[], x.b::STRUCT(k DECIMAL(4,1), v INT)[] y"
+        );
+        assert_eq!(x("select r.{a::DECIMAL(10,2), b} from t"), "select r.a::DECIMAL(10,2), r.b from t");
+        assert_eq!(x("select round(r.{a,b}::DECIMAL(9,3), 1)"), "select round(r.a::DECIMAL(9,3), r.b::DECIMAL(9,3), 1)");
+        // Anything else ends the term as ever: a call's parentheses, a
+        // space (here after the `::`, which the engine then refuses), and
+        // the `AS` of a `CAST`, which it refuses too.
+        assert_eq!(x("select f(r.{a,b})"), "select f(r.a, r.b)");
+        assert_eq!(x("select r.{a,b}:: DECIMAL(10,2)"), "select r.a::, r.b:: DECIMAL(10,2)");
+        assert_eq!(x("select cast(x.{a,b} as DECIMAL(10,2))"), "select cast(x.a, x.b as DECIMAL(10,2))");
+        // A list that holds a brace, or never closes, is not taken.
+        assert_eq!(x("select r.{a,b}::T({c})"), "select r.a::T, r.b::T(c)");
+        assert!(matches!(expand("select r.{a,b}::DECIMAL(10"), Ok(Cow::Owned(_))));
+        // Lists that never close are paired once, not each scanned to the
+        // end: a megabyte of them expands at once, where a scan from each
+        // would take minutes.
+        let open = format!("select r.{{a,b}} {}", "x::a(".repeat(200_000));
+        assert_eq!(x(&open).len(), open.len() + 1);
+        let open = format!("select r.{{{}}}", "x::a(".repeat(200_000));
+        assert_eq!(x(&open).len(), open.len() - 2);
     }
 
     #[test]
@@ -517,14 +626,14 @@ mod tests {
     }
 
     /// A statement as the engine reads it, one unit at a time: a string,
-    /// quoted name, dollar quote or comment whole, each other byte alone,
-    /// and a space as a space whatever its bytes. Each unit keeps the bytes
-    /// it was read from.
+    /// quoted name, dollar quote or comment whole, with whether a string
+    /// takes backslash escapes, each other byte alone, and a space as a space
+    /// whatever its bytes. Each unit keeps the bytes it was read from.
     #[derive(Clone, PartialEq, Debug)]
     enum Tok {
         Space,
         Code(u8),
-        Quoted(Kind, Vec<u8>),
+        Quoted(Kind, bool, Vec<u8>),
         Comment(Vec<u8>),
     }
 
@@ -543,7 +652,7 @@ mod tests {
                     }
                 }
                 Kind::LineComment | Kind::BlockComment => out.push((Tok::Comment(read), raw)),
-                kind => out.push((Tok::Quoted(kind, read), raw)),
+                kind => out.push((Tok::Quoted(kind, sp.escapes, read), raw)),
             }
         }
         out
@@ -583,12 +692,19 @@ mod tests {
             }
             term.clear();
         };
-        for unit in &units {
+        let mut k = 0;
+        while k < units.len() {
+            let unit = &units[k];
             match unit.0 {
                 Tok::Code(b'{') => depth += 1,
                 Tok::Code(b'}') if depth == 0 => return unchanged(),
                 Tok::Code(b'}') => depth -= 1,
                 _ => {}
+            }
+            if let Some(close) = (depth == 0).then(|| reference_type_parameters(&term, &units, k)).flatten() {
+                term.extend_from_slice(&units[k..=close]);
+                k = close + 1;
+                continue;
             }
             let boundary = depth == 0 && (separates(&unit.0) || matches!(unit.0, Tok::Code(b',' | b'(' | b')' | b';')));
             if boundary {
@@ -597,12 +713,46 @@ mod tests {
             } else {
                 term.push(unit.clone());
             }
+            k += 1;
         }
         if depth != 0 {
             return unchanged();
         }
         flush(&mut out, &mut term);
         (out.iter().flat_map(|u| u.1.clone()).collect(), reading_of(&out))
+    }
+
+    /// Where the parentheses that open at `units[open]` close, when they
+    /// follow `::` and a type name that end `before`, and hold no brace or
+    /// `;`: a cast's type parameters, part of the word before them.
+    fn reference_type_parameters(before: &[Unit], units: &[Unit], open: usize) -> Option<usize> {
+        if units[open].0 != Tok::Code(b'(') {
+            return None;
+        }
+        let word = |u: &Unit| matches!(u.0, Tok::Code(c) if c.is_ascii_alphanumeric() || c == b'_');
+        let name = before.iter().rev().take_while(|u| word(u)).count();
+        let n = before.len();
+        if name == 0 || n < name + 2 || matches!(before[n - name].0, Tok::Code(c) if c.is_ascii_digit()) {
+            return None;
+        }
+        if before[n - name - 2..n - name].iter().any(|u| u.0 != Tok::Code(b':')) {
+            return None;
+        }
+        let mut depth = 0;
+        for (j, u) in units.iter().enumerate().skip(open) {
+            match u.0 {
+                Tok::Code(b'(') => depth += 1,
+                Tok::Code(b')') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                }
+                Tok::Code(b'{' | b'}' | b';') => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
     fn reference_alternatives(term: &[Unit]) -> Vec<Vec<Unit>> {
@@ -649,17 +799,27 @@ mod tests {
         let (o, c) = group;
         let mut items: Vec<Vec<Unit>> = vec![Vec::new()];
         let mut depth = 0;
-        for u in &term[o + 1..c] {
+        let inner = &term[o + 1..c];
+        let mut k = 0;
+        while k < inner.len() {
+            let u = &inner[k];
             match u.0 {
                 Tok::Code(b'{') => depth += 1,
                 Tok::Code(b'}') => depth -= 1,
                 _ => {}
             }
+            let item = items.last_mut().unwrap();
+            if let Some(close) = (depth == 0).then(|| reference_type_parameters(item, inner, k)).flatten() {
+                item.extend_from_slice(&inner[k..=close]);
+                k = close + 1;
+                continue;
+            }
             if depth == 0 && (separates(&u.0) || u.0 == Tok::Code(b',')) {
                 items.push(Vec::new());
             } else {
-                items.last_mut().unwrap().push(u.clone());
+                item.push(u.clone());
             }
+            k += 1;
         }
         items.retain(|item| !item.is_empty());
         if items.is_empty() {
@@ -677,6 +837,7 @@ mod tests {
     const FRAGMENTS: &[&str] = &[
         "select ", "r", ".", "x", "e", "E", "a1", "é", "1", "1e5", ".5", ",", "(", ")", ";", ":", "::", "$", "\\", "_",
         "{", "}", "{a,b}", "{a b}", "r.{a,b}", "{'k': 1}", "{}", "{a,{b,c}}", "{a::INT b}", "{x}",
+        "::DECIMAL(10,2)", "::T(", "::S(a {b} c)", "{a::V(1, 2) b}", "::X(E'\\', \"(\")", "2(",
         "'", "'{a,b}'", "''", "'\\'", "E'\\''", "e'a\\\\b'", "\"", "\"{a,b}\"", "`", "`{a,b}`", "`it's`",
         "$$", "$$x.{a,b}$$", "$t$", "$t${a,b}$t$", "$t$t$",
         "--", "-- {a,b}\n", "/*", "*/", "/* ' */", "/* {a,b} */", "\n", "\r",
@@ -730,6 +891,31 @@ mod tests {
         // The fragments are chosen to make trouble, so a refusal is common;
         // both answers are exercised.
         assert!(expanded > 2_000 && refused > 1_000, "{expanded} expanded, {refused} refused");
+    }
+
+    /// Harbor's half of `test/scripts/braces.py`, which has the engine
+    /// parse what this writes: each NUL-ended statement in the file
+    /// `UNBRACE_IN`, expanded into the file `UNBRACE_OUT`, NUL-ended and led
+    /// by `X` (expanded), `S` (left as it came) or `R` (refused, and the
+    /// refusal). Without the two names it does nothing.
+    #[test]
+    #[ignore]
+    fn expand_a_file() {
+        let (Ok(input), Ok(output)) = (std::env::var("UNBRACE_IN"), std::env::var("UNBRACE_OUT")) else {
+            return;
+        };
+        let input = std::fs::read(input).unwrap();
+        let mut out = Vec::new();
+        for sql in input.strip_suffix(b"\0").unwrap_or(&input).split(|&b| b == 0) {
+            let sql = std::str::from_utf8(sql).unwrap();
+            match expand(sql) {
+                Ok(Cow::Owned(expanded)) => out.extend([b"X", expanded.as_bytes()].concat()),
+                Ok(Cow::Borrowed(same)) => out.extend([b"S", same.as_bytes()].concat()),
+                Err(refusal) => out.extend([b"R", refusal.as_bytes()].concat()),
+            }
+            out.push(0);
+        }
+        std::fs::write(output, out).unwrap();
     }
 
     /// The long run: `UNBRACE_FUZZ=<count>[:<seed>] cargo test --release -p
