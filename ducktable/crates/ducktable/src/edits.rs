@@ -1241,6 +1241,13 @@ impl Plan {
         self.claims.as_ref().map(|(sql, params)| (sql.as_str(), params.as_slice()))
     }
 
+    /// This plan with nothing to read: it runs as `ordered(&[])` orders it.
+    #[cfg(test)]
+    pub fn unread(mut self) -> Self {
+        self.claims = None;
+        self
+    }
+
     /// The statements in the order they run: each after the steps that
     /// free what it takes, a key as typed or a value `learned` from the
     /// claims, and each change to a row after the duplicates that read it.
