@@ -444,6 +444,19 @@ impl Conn {
     pub fn tunnel_up(&self) -> Option<bool> {
         self.tunnel.as_ref().map(|tunnel| tunnel.ensure_running().is_ok())
     }
+
+    /// Whether the server answers `/ready` on this connection's own
+    /// transport, each read given `patience`. Through a tunnel this is the
+    /// server's word, not the SSH process's, which outlives a server that
+    /// exits on its machine.
+    pub fn answers(&self, patience: Duration) -> bool {
+        self.transport().is_ok_and(|transport| {
+            matches!(
+                crate::http::request(transport, &wire::endpoint::READY, None, Some(patience)),
+                Ok(r) if r.status == 200
+            )
+        })
+    }
 }
 
 /// Connect to the configured remote called `name`, and to nothing else: a

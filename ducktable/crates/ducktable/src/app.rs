@@ -46,22 +46,43 @@ fn active_key<'a>(connecting: Option<&'a DbKey>, connected: Option<&'a DbKey>) -
 /// remote on this machine, whose servers it probes (a miss of the one on
 /// screen is checked again, `lost`). It never dials a
 /// tunnel, so for the tunneled remote on screen (`tunnel_up` is `Some`)
-/// the tunnel's SSH process answers: running, the row is; exited, it is not.
-fn shown_state(surveyed: State, tunnel_up: Option<bool>) -> State {
+/// the tunnel answers: running while its SSH process runs and its server
+/// is `answering` through it (`watch_tunnel`), stopped once either is not.
+fn shown_state(surveyed: State, tunnel_up: Option<bool>, answering: bool) -> State {
     match tunnel_up {
-        Some(true) => State::Running,
-        Some(false) => State::Stopped,
+        Some(true) if answering => State::Running,
+        Some(_) => State::Stopped,
         None => surveyed,
     }
 }
 
+/// How often the tunneled remote on screen is asked `/ready` through its
+/// tunnel, how long each read of the answer may take, and how many misses
+/// in a row show it as not answering. A slow link that answers, or misses
+/// once, stays green; a server gone from its machine shows dim by the
+/// second probe, within about thirty seconds.
+const PROBE_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+const PROBE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+const MISSES: u32 = 2;
+
+/// Whether the tunneled remote on screen answers, after `unanswered`
+/// probes in a row went without an answer.
+fn answering(unanswered: u32) -> bool {
+    unanswered < MISSES
+}
+
 /// Whether the connection on screen has lost its server. For a tunneled
-/// remote the survey's word stands: the tunnel's SSH process gave it. For
-/// any other the survey gives each server two seconds, which a busy one can
-/// miss, so a miss is checked with `/ready` on the connection's own
-/// transport, and only a server that fails that too has stopped.
-fn lost(surveyed_live: bool, tunneled: bool, ready: impl FnOnce() -> bool) -> bool {
-    !surveyed_live && (tunneled || !ready())
+/// remote (`tunnel_up` is `Some`) the SSH process's word stands: a server
+/// that does not answer through a running tunnel is shown dim and kept,
+/// and comes back green once it answers. For any other the survey gives
+/// each server two seconds, which a busy one can miss, so a miss is
+/// checked with `/ready` on the connection's own transport, and only a
+/// server that fails that too has stopped.
+fn lost(surveyed_live: bool, tunnel_up: Option<bool>, ready: impl FnOnce() -> bool) -> bool {
+    match tunnel_up {
+        Some(up) => !up,
+        None => !surveyed_live && !ready(),
+    }
 }
 
 /// What runs when the quit dialog is cancelled.
@@ -672,6 +693,9 @@ pub struct DuckTable {
     /// refresh, so installing a newer binary lights up the upgrade badge
     /// without a restart of the app. `None` until the first probe answers.
     pub(crate) installed_version: Option<String>,
+    /// The probes in a row that the tunneled remote on screen left without
+    /// an answer (`watch_tunnel`); zero at every phase change.
+    unanswered: u32,
 }
 
 impl DuckTable {
@@ -749,6 +773,7 @@ impl DuckTable {
             leaving: std::collections::HashSet::new(),
             path_copy: None,
             installed_version: None,
+            unanswered: 0,
         };
         // Every way out of the app gives its sessions back, the ones that
         // ask nothing included: Quit from the Dock, a logout, the updater's
@@ -1237,9 +1262,9 @@ impl DuckTable {
         let fence = self.refresh_seq;
         // The connected berth's catalog is already in hand; its row must
         // not pay a second connect + catalog download just for a count.
-        let connected: Option<(DbKey, usize, Option<bool>)> = match &self.phase {
+        let connected: Option<(DbKey, usize, Option<bool>, bool)> = match &self.phase {
             Phase::Connected { conn, catalog, .. } => {
-                Some((DbKey::of_conn(conn), relations(catalog), conn.tunnel_up()))
+                Some((DbKey::of_conn(conn), relations(catalog), conn.tunnel_up(), answering(self.unanswered)))
             }
             _ => None,
         };
@@ -1271,9 +1296,9 @@ impl DuckTable {
                         // database: the same file, or the same remote.
                         let key = DbKey::of_row(&row.name, row.path.as_deref());
                         let here = known.filter(|(connected, ..)| *connected == key);
-                        let tunnel_up = here.as_ref().and_then(|(.., tunnel_up)| *tunnel_up);
+                        let (tunnel_up, answering) = here.as_ref().map_or((None, true), |(.., up, answering)| (*up, *answering));
                         let tables = match here {
-                            Some((_, count, _)) => Some(count),
+                            Some((_, count, ..)) => Some(count),
                             None => row
                                 .state
                                 .is_live()
@@ -1297,8 +1322,9 @@ impl DuckTable {
                         RowVm {
                             // A server that exited under the connection, or its
                             // tunnel, shows as stopped, and the reconciliation
-                            // below lets the connection go.
-                            state: shown_state(row.state, tunnel_up),
+                            // below lets the connection go. One that does not
+                            // answer through its tunnel shows as stopped too.
+                            state: shown_state(row.state, tunnel_up, answering),
                             attached: row.attached,
                             autostart: row.autostart,
                             path: row.path,
@@ -1322,12 +1348,11 @@ impl DuckTable {
             // that a busy server's missed survey would have dropped is asked
             // again on its own transport, and its row shows what it answers.
             let lost = match (connected, conn) {
-                (Some((key, _, tunnel_up)), Some(conn)) => {
+                (Some((key, _, tunnel_up, _)), Some(conn)) => {
                     let surveyed = rows.iter().any(|r| r.key == key && r.state.is_live());
                     let ready = move || conn.transport().is_ok_and(harbor_client::http::ready);
-                    let tunneled = tunnel_up.is_some();
-                    let gone = cx.background_executor().spawn(async move { lost(surveyed, tunneled, ready) }).await;
-                    if !gone && !surveyed {
+                    let gone = cx.background_executor().spawn(async move { lost(surveyed, tunnel_up, ready) }).await;
+                    if !gone && !surveyed && tunnel_up.is_none() {
                         rows.iter_mut().filter(|r| r.key == key).for_each(|r| r.state = State::Running);
                     }
                     gone.then_some(key)
@@ -1376,13 +1401,14 @@ impl DuckTable {
                 // dropping it takes the grid and the Query view down, and
                 // Cancel must find them where they were. The refresh that
                 // follows a cancel reconciles.
-                if let Some((name, key, tunneled)) = connected
-                    && !state.asking_to_quit
-                    && lost.as_ref() == Some(&key)
-                {
-                    state.drop_connection(cx);
-                    let gone = if tunneled { "lost its SSH tunnel" } else { "stopped" };
-                    state.warning = Some(format!("{name} {gone} — click it to reconnect"));
+                if let Some((name, key, tunneled)) = connected {
+                    if !state.asking_to_quit && lost.as_ref() == Some(&key) {
+                        state.drop_connection(cx);
+                        let gone = if tunneled { "lost its SSH tunnel" } else { "stopped" };
+                        state.warning = Some(format!("{name} {gone} — click it to reconnect"));
+                    } else if tunneled && !answering(state.unanswered) {
+                        state.warning = Some(format!("{name} is not answering over SSH"));
+                    }
                 }
                 cx.notify();
             })
@@ -1615,6 +1641,7 @@ impl DuckTable {
                 state.deferred_select = None;
                 state.select_seq += 1;
                 state.connection += 1;
+                state.unanswered = 0;
                 // The database's one Query scratchpad (docs/QUERY.md law 1)
                 // is there as soon as it connects, tables or none.
                 state.query = outcome.as_ref().ok().map(|(conn, info, ..)| {
@@ -1633,6 +1660,7 @@ impl DuckTable {
                     Err(message) => Phase::Failed { name: clone_str(&shown), message, aim },
                 };
                 state.sync_path_copy(cx);
+                state.watch_tunnel(cx);
                 state.refresh(cx);
                 state.opened(opened, window, cx);
                 cx.notify();
@@ -1673,6 +1701,67 @@ impl DuckTable {
         }
     }
 
+    /// Ask the tunneled remote on screen `/ready` through its tunnel every
+    /// `PROBE_EVERY`: its SSH process can outlive a server that exits on its
+    /// machine, and the row would show green until a request failed. A
+    /// change either way refreshes the list, which draws the row from
+    /// `unanswered` (`shown_state`), and an SSH process found exited is
+    /// lost there, as a refresh finds it. Nothing is asked while a
+    /// statement, a page, a commit or an export is on the connection: what
+    /// it brings back says whether the server answers, and a probe beside
+    /// it would be slowed by it. One watcher per connection; it ends with it.
+    fn watch_tunnel(&mut self, cx: &mut Context<Self>) {
+        let Phase::Connected { conn, .. } = &self.phase else { return };
+        if conn.tunnel_up().is_none() {
+            return;
+        }
+        let connection = self.connection;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(PROBE_EVERY).await;
+            let asked = this.update(cx, |state, cx| match &state.phase {
+                Phase::Connected { conn, .. } if state.connection == connection => {
+                    Some((!state.busy(cx)).then(|| conn.clone()))
+                }
+                _ => None,
+            });
+            let conn = match asked {
+                Ok(Some(Some(conn))) => conn,
+                Ok(Some(None)) => continue,
+                _ => break,
+            };
+            let (answered, tunnel_up) = cx
+                .background_executor()
+                .spawn(async move { (conn.answers(PROBE_PATIENCE), conn.tunnel_up()) })
+                .await;
+            let watching = this.update(cx, |state, cx| {
+                if state.connection != connection {
+                    return false;
+                }
+                let was = answering(state.unanswered);
+                state.unanswered = if answered { 0 } else { state.unanswered.saturating_add(1) };
+                if answering(state.unanswered) != was || tunnel_up == Some(false) {
+                    state.refresh(cx);
+                }
+                true
+            });
+            if !matches!(watching, Ok(true)) {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// Whether a request is on the connection on screen: a statement in the
+    /// Query view, a page or a commit in the grid, or an export.
+    fn busy(&self, cx: &App) -> bool {
+        self.query.as_ref().is_some_and(|q| q.read(cx).is_running())
+            || self.grid.as_ref().is_some_and(|g| {
+                let grid = g.read(cx);
+                grid.committing || grid.table_facts(cx).2
+            })
+            || crate::export::running(cx)
+    }
+
     /// Clear the connected world back to Idle, forgetting its table, grid
     /// and query; its staged edits are parked for the database
     /// (`park_grid`). Shared by Stop and by refresh's reconciliation when
@@ -1682,6 +1771,7 @@ impl DuckTable {
     fn drop_connection(&mut self, cx: &mut Context<Self>) {
         self.park_grid(cx);
         self.connection += 1;
+        self.unanswered = 0;
         self.phase = Phase::Idle;
         self.selected_table = None;
         self.query = None;
@@ -2084,12 +2174,25 @@ mod tests {
     fn a_row_shows_the_survey_unless_it_is_the_tunnel_on_screen() {
         // A file, or a remote on this machine: the survey's probe stands,
         // connected or not, so a server gone under the connection is stopped.
-        assert_eq!(shown_state(State::Stopped, None), State::Stopped);
-        assert_eq!(shown_state(State::Running, None), State::Running);
+        assert_eq!(shown_state(State::Stopped, None, true), State::Stopped);
+        assert_eq!(shown_state(State::Running, None, false), State::Running);
         // The tunneled remote on screen, which the survey never dials: its
-        // SSH process says whether it is up.
-        assert_eq!(shown_state(State::Stopped, Some(true)), State::Running);
-        assert_eq!(shown_state(State::Stopped, Some(false)), State::Stopped);
+        // SSH process says whether it is up, and its server whether it
+        // answers through it.
+        assert_eq!(shown_state(State::Stopped, Some(true), true), State::Running);
+        assert_eq!(shown_state(State::Stopped, Some(false), true), State::Stopped);
+        assert_eq!(shown_state(State::Running, Some(true), false), State::Stopped);
+    }
+
+    #[test]
+    fn a_tunneled_server_shows_dim_only_after_misses_in_a_row() {
+        use super::{answering, MISSES, PROBE_EVERY};
+        // One miss, a slow link's, is not enough; the second in a row is.
+        assert!(answering(0));
+        assert!(answering(1));
+        assert!(!answering(2));
+        // Gone, it shows dim within about thirty seconds.
+        assert!(PROBE_EVERY * MISSES <= std::time::Duration::from_secs(30));
     }
 
     #[test]
@@ -2104,15 +2207,18 @@ mod tests {
             }
         };
         // Seen running: nothing is asked.
-        assert!(!lost(true, false, answers(false)));
+        assert!(!lost(true, None, answers(false)));
         assert_eq!(asked.get(), 0);
         // Missed by a survey, yet answering on its own transport: kept.
-        assert!(!lost(false, false, answers(true)));
+        assert!(!lost(false, None, answers(true)));
         // Missed, and not answering either: gone.
-        assert!(lost(false, false, answers(false)));
+        assert!(lost(false, None, answers(false)));
         assert_eq!(asked.get(), 2);
         // A tunnel whose SSH process exited is gone without asking.
-        assert!(lost(false, true, answers(true)));
+        assert!(lost(false, Some(false), answers(true)));
+        // One whose SSH process runs is kept, its server answering or not:
+        // its row shows which, and it comes back when the server does.
+        assert!(!lost(false, Some(true), answers(false)));
         assert_eq!(asked.get(), 2);
     }
 

@@ -59,6 +59,12 @@ DuckDB  -- ATTACH/scanners reach SQLite, Postgres, MySQL, Parquet, CSV, ...
   A launch removes the sockets of tunnels whose app is not running.
   `-S none` makes that process the owner, `BatchMode=yes` keeps failures
   visible rather than interactive, and SSH keepalives detect a dead path.
+  A server can exit on its machine while SSH stays up, so the tunneled
+  remote on screen is asked `/ready` through its tunnel every fifteen
+  seconds, each read given ten, while nothing else is on the connection.
+  Two misses in a row show its row dim, with a line saying it is not
+  answering, and keep the connection; the next answer shows it green. A
+  slow link that answers stays green.
 - **A connected berth is kept alive by presence, not pulses.** A held
   connection is the keepalive. The lifetime rule is Harbor's own: one `start`
   verb, two lifetimes. A plain start is persistent and runs until stopped; an
