@@ -14,14 +14,22 @@
 //! canceller fires while holding the lock, and `Conn::drop` disconnects and
 //! nulls the slot under the same lock — so an interrupt can never land on a
 //! freed handle, and a late canceller aims at nothing.
+//!
+//! What a connection hands out borrows it: a `Stream`, the `Chunk`s it
+//! yields and the `Json` caster live no longer than the `Conn`, and the
+//! `Reader`s of a chunk no longer than the chunk, so the borrow checker keeps
+//! each from outliving the handles it points into. A `Stmt` owns its parse
+//! outright and borrows nothing.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
-use super::encode::{Type, result_columns};
+use super::encode::{Json, Reader, Type, result_columns};
 use super::{Engine, Error, destroy_value, ffi};
 
 fn str_of(s: &str) -> ffi::str_t {
@@ -110,15 +118,16 @@ pub struct Conn {
     /// The cross-thread cancellation slot. A canceller holds this lock
     /// across its connection_interrupt call, and drop holds it across
     /// disconnect — so an interrupt can never land on a freed handle.
-    interrupt: Arc<Mutex<ffi::connection_handle>>,
+    interrupt: Arc<Mutex<Slot>>,
     /// Parsed-statement cache: SQL text → statements, LRU by tick.
     cache: HashMap<String, CacheEntry>,
     cache_bytes: usize,
     tick: u64,
     /// Logical types by the text that names them, made on first use and
     /// destroyed with the connection: JSON (the VARIANT caster's target),
-    /// VARIANT, and the types params bind as.
-    types: HashMap<String, ffi::logical_type_handle>,
+    /// VARIANT, and the types params bind as. A cell, so the caster can be
+    /// made through the shared borrow it is lent under.
+    types: RefCell<HashMap<String, ffi::logical_type_handle>>,
 }
 
 unsafe impl Send for Conn {}
@@ -153,11 +162,11 @@ impl Conn {
             db,
             conn,
             factory,
-            interrupt: Arc::new(Mutex::new(conn)),
+            interrupt: Arc::new(Mutex::new(Slot(conn))),
             cache: HashMap::new(),
             cache_bytes: 0,
             tick: 0,
-            types: HashMap::new(),
+            types: RefCell::new(HashMap::new()),
         })
     }
 
@@ -176,8 +185,8 @@ impl Conn {
         // No caller can interrupt either handle during the replacement.
         std::mem::swap(&mut self.conn, &mut fresh.conn);
         std::mem::swap(&mut self.factory, &mut fresh.factory);
-        *slot = self.conn;
-        *fresh.interrupt.lock().unwrap_or_else(PoisonError::into_inner) = fresh.conn;
+        slot.0 = self.conn;
+        fresh.interrupt.lock().unwrap_or_else(PoisonError::into_inner).0 = fresh.conn;
         self.cache.clear();
         self.cache_bytes = 0;
         self.tick = 0;
@@ -189,9 +198,13 @@ impl Conn {
     }
 
     /// The VARIANT-to-JSON caster for results of this connection, made on
-    /// first use. Hand it to [`encode::emit_cell`](super::encode::emit_cell).
-    pub fn json(&mut self) -> Result<super::encode::Json, Error> {
-        Ok(super::encode::Json { factory: self.factory, ty: self.type_named("JSON")? })
+    /// first use and lent for as long as the connection is borrowed. Hand it
+    /// to [`encode::emit_cell`](super::encode::emit_cell).
+    pub fn json(&self) -> Result<Json<'_>, Error> {
+        let ty = self.type_named("JSON")?;
+        // The factory and the type are this connection's, and only its
+        // drop or a reset destroys them, which the borrow keeps away.
+        Ok(unsafe { Json::new(self.factory, ty) })
     }
 
     /// The logical type `text` names, made by this connection's factory once
@@ -199,21 +212,21 @@ impl Conn {
     /// microseconds. A type the catalog holds, such as JSON, is looked up in
     /// the connection's transaction, which refuses inside an aborted one;
     /// nothing is kept of a refusal, and the next call asks again.
-    fn type_named(&mut self, text: &str) -> Result<ffi::logical_type_handle, Error> {
-        if let Some(&ty) = self.types.get(text) {
+    fn type_named(&self, text: &str) -> Result<ffi::logical_type_handle, Error> {
+        if let Some(&ty) = self.types.borrow().get(text) {
             return Ok(ty);
         }
         let api = &self.eng.api;
         let mut ty: ffi::logical_type_handle = std::ptr::null_mut();
         call!(api, factory_create_type_from_text(self.factory, &str_of(text), &mut ty));
-        self.types.insert(text.to_string(), ty);
+        self.types.borrow_mut().insert(text.to_string(), ty);
         Ok(ty)
     }
 
     /// How many logical types this connection has made and keeps.
     #[doc(hidden)]
     pub fn types_kept(&self) -> usize {
-        self.types.len()
+        self.types.borrow().len()
     }
 
     pub fn engine_version(&self) -> &'static str {
@@ -234,18 +247,20 @@ impl Conn {
         for stmt in stmts.iter() {
             // In place, no fetch thread: boot-time helpers read a handful
             // of rows and should not depend on spawn succeeding.
-            let Some((mut fetcher, mut held, columns)) = self.open_result(stmt, &[], |_| true)? else {
+            let Some(Opened { mut fetcher, mut held, columns }) = self.open_result(stmt, &[], |_| true)? else {
                 continue;
             };
             // `held` first, then the rest: it is a chunk already taken off
             // the result, not a chunk still to come.
-            while let Some(chunk) = match held.take() {
+            while let Some(fetched) = match held.take() {
                 Some(c) => Some(c),
                 None => fetcher.next_chunk()?,
             } {
+                let mut chunk = fetched.lent(self);
+                let rows = chunk.rows();
                 let readers = chunk.readers(columns.len().min(1))?;
                 if let (Some(reader), Some((_, ty))) = (readers.first(), columns.first()) {
-                    for row in 0..chunk.rows {
+                    for row in 0..rows {
                         let mut cell = String::new();
                         super::encode::emit_cell(&mut cell, api, None, reader, ty, row)?;
                         // The helper reads VARCHAR columns; strip the JSON
@@ -350,7 +365,7 @@ impl Conn {
         stmt: &Stmt,
         values: &[ffi::value_handle],
         wanted: impl FnOnce(bool) -> bool,
-    ) -> Result<Option<(Fetcher, Option<Chunk>, Vec<(String, Type)>)>, Error> {
+    ) -> Result<Option<Opened>, Error> {
         let api = &self.eng.api;
 
         // Params go in as values, positional ($1 = element 0).
@@ -386,16 +401,18 @@ impl Conn {
         //
         // Keyed on the engine's code, not on the statement type: the set of
         // group-expanding statements is DuckDB's to grow.
-        match result_columns(api, result) {
-            Ok(columns) => Ok(Some((fetcher, None, columns))),
+        //
+        // The fetcher keeps the result alive across both asks.
+        match unsafe { result_columns(api, result) } {
+            Ok(columns) => Ok(Some(Opened { fetcher, held: None, columns })),
             Err(first) if first.code == ffi::ERROR_INPUT_METADATA_DEFERRED => {
                 // A step that fails carries the REAL complaint — the group's
                 // own error, the one naming the table or the file. The
                 // deferral above is only how it reached us, so it is dropped
                 // rather than reported over the top of it.
                 let held = fetcher.next_chunk()?;
-                let columns = result_columns(api, result)?;
-                Ok(Some((fetcher, held, columns)))
+                let columns = unsafe { result_columns(api, result) }?;
+                Ok(Some(Opened { fetcher, held, columns }))
             }
             Err(e) => Err(e),
         }
@@ -508,10 +525,15 @@ impl Conn {
     /// engine, so a caller that can be cancelled asks there, and one that
     /// cancels after it is heard. It is told whether the statement is
     /// retained: run to its end before its first chunk comes back.
-    pub fn execute(&self, stmt: &Stmt, bound: Bound, wanted: impl FnOnce(bool) -> bool) -> Result<Option<Stream>, Error> {
+    pub fn execute(
+        &self,
+        stmt: &Stmt,
+        bound: Bound,
+        wanted: impl FnOnce(bool) -> bool,
+    ) -> Result<Option<Stream<'_>>, Error> {
         let opened = self.open_result(stmt, &bound.values, wanted);
         drop(bound);
-        let Some((fetcher, pending, columns)) = opened? else {
+        let Some(Opened { fetcher, held: pending, columns }) = opened? else {
             return Ok(None);
         };
         let (tx, rx) = mpsc::sync_channel(PREFETCH);
@@ -528,6 +550,7 @@ impl Conn {
             rx: Some(rx),
             join: Some(join),
             interrupt: Interrupt { eng: self.eng, conn: self.interrupt.clone() },
+            _conn: PhantomData,
         }))
     }
 
@@ -580,7 +603,7 @@ impl Drop for Conn {
     fn drop(&mut self) {
         self.cache.clear();
         if let Some(f) = self.eng.api.logical_type_destroy {
-            for (_, mut ty) in self.types.drain() {
+            for (_, mut ty) in self.types.get_mut().drain() {
                 unsafe { f(&mut ty) };
             }
         }
@@ -592,8 +615,16 @@ impl Drop for Conn {
                 f(&mut self.conn);
             }
         }
-        *slot = std::ptr::null_mut();
+        slot.0 = std::ptr::null_mut();
     }
+}
+
+/// A result just opened: the Fetcher that owns it, a chunk already taken off
+/// it (see [`Conn::open_result`]), and its columns.
+struct Opened {
+    fetcher: Fetcher,
+    held: Option<Fetched>,
+    columns: Vec<(String, Type)>,
 }
 
 /// Whether the engine runs the result's statement to its end before it
@@ -631,7 +662,9 @@ impl Drop for Bound {
     }
 }
 
-/// An owned parsed statement.
+/// An owned parsed statement. The spec makes each statement the parse yields
+/// independently owned, and statement_execute runs a copy of it, so it
+/// borrows nothing: not the connection that parsed it, nor one that runs it.
 pub struct Stmt {
     eng: &'static Engine,
     raw: ffi::sql_statement_handle,
@@ -671,7 +704,10 @@ const PREFETCH: usize = 4;
 /// fetch thread, the engine produces chunk
 /// N+1 (on its full worker pool) while the consumer encodes chunk N; a
 /// nap only costs wall time when the consumer has nothing left to chew.
-pub struct Stream {
+///
+/// It borrows its Conn for `'c`: the fetch thread steps a result of that
+/// connection, and the connection is not dropped or reset under it.
+pub struct Stream<'c> {
     /// The result's columns. Public so a caller can `mem::take` them and
     /// keep them across the mutable borrows the chunk loop needs.
     pub columns: Vec<(String, Type)>,
@@ -679,11 +715,11 @@ pub struct Stream {
     /// it — see open_result. Handed out before anything from the channel,
     /// because it came off the result first; a stream that skipped it
     /// would drop its own opening rows.
-    pending: Option<Chunk>,
+    pending: Option<Fetched>,
     /// Taken on the stream's terminal message (end or error) and on drop —
     /// dropping the receiver is what makes the fetch thread's next send
     /// fail and stop fetching.
-    rx: Option<mpsc::Receiver<Result<Option<Chunk>, Error>>>,
+    rx: Option<mpsc::Receiver<Result<Option<Fetched>, Error>>>,
     join: Option<thread::JoinHandle<()>>,
     /// Fired on drop when the fetch thread is still mid-query: an
     /// abandoned stream must not leave the fetch thread blocked inside the
@@ -692,14 +728,14 @@ pub struct Stream {
     /// (ClientContext::InitialCleanup), so a stray interrupt cannot poison
     /// the statement after this one.
     ///
-    /// A Stream must not outlive its Conn: Conn::drop nulls the interrupt
-    /// slot, after which an abandoned stream's join waits for the query's
-    /// natural end, uninterruptible. Every current caller scopes streams
-    /// inside the connection; keep it that way.
+    /// The stream cannot outlive its Conn, whose drop nulls the interrupt
+    /// slot: after that an abandoned stream's join would wait for the
+    /// query's natural end, uninterruptible.
     interrupt: Interrupt,
+    _conn: PhantomData<&'c Conn>,
 }
 
-impl Stream {
+impl<'c> Stream<'c> {
     /// The next chunk, or None at end-of-stream. An interrupted query
     /// surfaces here as ERROR_RUNTIME_INTERRUPT.
     ///
@@ -708,15 +744,15 @@ impl Stream {
     /// must surface as an error, never as a clean end. The alternative is
     /// the worst failure a result stream can have: a truncated result
     /// wearing a well-formed end record.
-    pub fn next_chunk(&mut self) -> Result<Option<Chunk>, Error> {
-        if let Some(chunk) = self.pending.take() {
-            return Ok(Some(chunk));
+    pub fn next_chunk(&mut self) -> Result<Option<Chunk<'c>>, Error> {
+        if let Some(fetched) = self.pending.take() {
+            return Ok(Some(Chunk { fetched, _conn: PhantomData }));
         }
         let Some(rx) = self.rx.as_ref() else {
             return Ok(None);
         };
         match rx.recv() {
-            Ok(Ok(Some(chunk))) => Ok(Some(chunk)),
+            Ok(Ok(Some(fetched))) => Ok(Some(Chunk { fetched, _conn: PhantomData })),
             Ok(Ok(None)) => {
                 self.rx = None;
                 Ok(None)
@@ -763,7 +799,7 @@ impl Stream {
     }
 }
 
-impl Drop for Stream {
+impl Drop for Stream<'_> {
     fn drop(&mut self) {
         // Close the channel first: the fetch thread's next send fails and
         // it destroys the result. If it is still inside the engine —
@@ -797,7 +833,7 @@ impl Fetcher {
     /// an error are explicit messages, and a panic out of the FFI takes the
     /// channel down with it, which the consumer reads as a dead thread (see
     /// Stream::next_chunk); the unwind has printed its own message.
-    fn run(self, tx: mpsc::SyncSender<Result<Option<Chunk>, Error>>) {
+    fn run(self, tx: mpsc::SyncSender<Result<Option<Fetched>, Error>>) {
         let mut this = std::panic::AssertUnwindSafe(self);
         let _ = std::panic::catch_unwind(move || {
             loop {
@@ -844,7 +880,7 @@ impl Fetcher {
     /// Counting steps does not work as a budget: a step's work unit is far
     /// smaller than a chunk's production, so any count small enough to
     /// protect heavy queries trips constantly on streaming ones.
-    fn next_chunk(&mut self) -> Result<Option<Chunk>, Error> {
+    fn next_chunk(&mut self) -> Result<Option<Fetched>, Error> {
         use std::time::{Duration, Instant};
         // Sized to clear a streaming query's most expensive chunk — the
         // first, which carries execution start-up (measured ~2ms on shapes
@@ -867,7 +903,7 @@ impl Fetcher {
             let mut err: ffi::error_info_handle = std::ptr::null_mut();
             let code = unsafe { step(self.result, &mut chunk, &mut status, &mut err) };
             if code != ffi::ERROR_NONE {
-                return Err(Error::take(api, code, err));
+                return Err(unsafe { Error::take(api, code, err) });
             }
             match status {
                 ffi::RESULT_STEP_STATUS_CHUNK => return self.sized(chunk),
@@ -884,7 +920,7 @@ impl Fetcher {
                 _ => std::thread::yield_now(),
             }
             n += 1;
-            if n % CLOCK_EVERY == 0 && start.elapsed() >= STEP_BUDGET {
+            if n.is_multiple_of(CLOCK_EVERY) && start.elapsed() >= STEP_BUDGET {
                 return self.next_chunk_blocking();
             }
         }
@@ -893,7 +929,7 @@ impl Fetcher {
     /// The engine's own blocking fetch: full worker-pool parallelism, at
     /// the cost of the WaitForTask nap. The heavy-shape half of
     /// next_chunk, and the whole path for a build without result_step.
-    fn next_chunk_blocking(&mut self) -> Result<Option<Chunk>, Error> {
+    fn next_chunk_blocking(&mut self) -> Result<Option<Fetched>, Error> {
         let api = &self.eng.api;
         let mut chunk: ffi::data_chunk_handle = std::ptr::null_mut();
         call!(api, result_fetch_chunk(self.result, &mut chunk));
@@ -904,7 +940,7 @@ impl Fetcher {
     }
 
     /// Wrap a non-null chunk handle with its row count.
-    fn sized(&self, mut chunk: ffi::data_chunk_handle) -> Result<Option<Chunk>, Error> {
+    fn sized(&self, mut chunk: ffi::data_chunk_handle) -> Result<Option<Fetched>, Error> {
         let api = &self.eng.api;
         let mut rows: ffi::idx_t = 0;
         let sized = (|| -> Result<(), Error> {
@@ -912,7 +948,7 @@ impl Fetcher {
             Ok(())
         })();
         match sized {
-            Ok(()) => Ok(Some(Chunk { eng: self.eng, raw: chunk, rows: rows as usize })),
+            Ok(()) => Ok(Some(Fetched { eng: self.eng, raw: chunk, rows: rows as usize })),
             Err(e) => {
                 if let Some(f) = api.data_chunk_destroy {
                     unsafe { f(&mut chunk) };
@@ -933,33 +969,27 @@ impl Drop for Fetcher {
     }
 }
 
-/// One caller-owned chunk of rows.
-pub struct Chunk {
+/// A chunk of rows as the fetcher takes it off the result: caller-owned by
+/// the spec, and tied to nothing yet, so the fetch thread can carry it to
+/// the stream, which lends it out as a [`Chunk`].
+struct Fetched {
     eng: &'static Engine,
     raw: ffi::data_chunk_handle,
-    pub rows: usize,
+    rows: usize,
 }
 
 // Owned exclusively by whoever holds it; the fetch thread produces chunks
 // and hands them across the channel to the consumer.
-unsafe impl Send for Chunk {}
+unsafe impl Send for Fetched {}
 
-impl Chunk {
-    /// Build the readers for the chunk's columns. They point into the chunk
-    /// and nothing ties them to it, so the caller drops them before it.
-    pub fn readers(&self, count: usize) -> Result<Vec<super::encode::Reader>, Error> {
-        let api = &self.eng.api;
-        let mut readers = Vec::with_capacity(count);
-        for i in 0..count {
-            let mut vector: ffi::vector_handle = std::ptr::null_mut();
-            call!(api, data_chunk_get_vector(self.raw, i as ffi::idx_t, &mut vector));
-            readers.push(super::encode::Reader::of(api, vector)?);
-        }
-        Ok(readers)
+impl Fetched {
+    /// The chunk, borrowing the connection whose result it came off.
+    fn lent(self, _conn: &Conn) -> Chunk<'_> {
+        Chunk { fetched: self, _conn: PhantomData }
     }
 }
 
-impl Drop for Chunk {
+impl Drop for Fetched {
     fn drop(&mut self) {
         unsafe {
             if let Some(f) = self.eng.api.data_chunk_destroy {
@@ -969,19 +999,55 @@ impl Drop for Chunk {
     }
 }
 
+/// One caller-owned chunk of rows, which borrows the connection whose result
+/// it came off for `'c`: its vectors can pin blocks of that connection's
+/// database (an overflow string's, say), so it goes before the connection
+/// does.
+pub struct Chunk<'c> {
+    fetched: Fetched,
+    _conn: PhantomData<&'c Conn>,
+}
+
+impl Chunk<'_> {
+    /// How many rows the chunk holds.
+    pub fn rows(&self) -> usize {
+        self.fetched.rows
+    }
+
+    /// Build the readers for the chunk's columns. They borrow the chunk,
+    /// mutably: reading a vector can reshape it in place (a flatten, or a
+    /// dictionary's child flattened), which would leave an earlier reader's
+    /// pointers dangling.
+    pub fn readers(&mut self, count: usize) -> Result<Vec<Reader<'_>>, Error> {
+        let api = &self.fetched.eng.api;
+        let mut readers = Vec::with_capacity(count);
+        for i in 0..count {
+            let mut vector: ffi::vector_handle = std::ptr::null_mut();
+            call!(api, data_chunk_get_vector(self.fetched.raw, i as ffi::idx_t, &mut vector));
+            // Borrowed from this chunk, which the readers borrow in turn.
+            readers.push(unsafe { Reader::of(api, vector) }?);
+        }
+        Ok(readers)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cancellation
 // ---------------------------------------------------------------------------
 
+/// A connection handle as the cancellation slot holds it, null once the
+/// connection is gone.
+struct Slot(ffi::connection_handle);
+
+// The spec commits connection_interrupt to any-thread use, and the slot's
+// lock keeps the handle alive across each call.
+unsafe impl Send for Slot {}
+
 /// Cross-thread cancellation for one connection.
 pub struct Interrupt {
     eng: &'static Engine,
-    conn: Arc<Mutex<ffi::connection_handle>>,
+    conn: Arc<Mutex<Slot>>,
 }
-
-// The spec commits connection_interrupt to any-thread use.
-unsafe impl Send for Interrupt {}
-unsafe impl Sync for Interrupt {}
 
 impl Interrupt {
     /// Interrupt whatever runs on the connection right now. A no-op when
@@ -991,16 +1057,16 @@ impl Interrupt {
     /// flag, so the hold is momentary.
     pub fn interrupt(&self) {
         let slot = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
-        if slot.is_null() {
+        if slot.0.is_null() {
             return;
         }
         if let Some(f) = self.eng.api.connection_interrupt {
             let mut err: ffi::error_info_handle = std::ptr::null_mut();
-            unsafe { f(*slot, &mut err) };
-            if !err.is_null() {
-                if let Some(d) = self.eng.api.error_info_destroy {
-                    unsafe { d(&mut err) };
-                }
+            unsafe { f(slot.0, &mut err) };
+            if !err.is_null()
+                && let Some(d) = self.eng.api.error_info_destroy
+            {
+                unsafe { d(&mut err) };
             }
         }
     }

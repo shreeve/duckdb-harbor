@@ -6213,19 +6213,23 @@ fn run_statement(
     };
     let mut stream = match conn.execute(last, bound, wanted) {
         Ok(Some(s)) => s,
-        Ok(None) => {
-            let _ = ready.send(Err(on_slot.refuse(conn, String::new())));
-            return needs_reset;
-        }
-        Err(e) => {
-            // A group's first step failed (`Conn::execute`): what it did
-            // is the error's, as at a first fetch below.
-            if awaiting && !e.interrupted() {
-                on_slot.slot.keep();
+        // Nothing to stream. What came back borrows the connection while it
+        // lives, so it is taken apart before the connection is handed on.
+        executed => match executed.err() {
+            None => {
+                let _ = ready.send(Err(on_slot.refuse(conn, String::new())));
+                return needs_reset;
             }
-            let _ = ready.send(Err(on_slot.refuse(conn, e.into_text())));
-            return true;
-        }
+            Some(e) => {
+                // A group's first step failed (`Conn::execute`): what it did
+                // is the error's, as at a first fetch below.
+                if awaiting && !e.interrupted() {
+                    on_slot.slot.keep();
+                }
+                let _ = ready.send(Err(on_slot.refuse(conn, e.into_text())));
+                return true;
+            }
+        },
     };
     let columns = std::mem::take(&mut stream.columns);
     let api = conn.api();
@@ -6308,11 +6312,18 @@ fn run_statement(
             on_slot.slot.keep();
             awaiting = false;
         }
-        let fetched = next.and_then(|next| match next {
-            None => Ok(None),
-            Some(chunk) => chunk.readers(columns.len()).map(|r| Some((chunk, r))),
-        });
-        let (chunk, readers) = match fetched {
+        // The chunk is held out here, for the readers to borrow.
+        let mut held = None;
+        let fetched = match next {
+            Ok(Some(chunk)) => {
+                let chunk = held.insert(chunk);
+                let rows = chunk.rows();
+                chunk.readers(columns.len()).map(|r| Some((rows, r)))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        };
+        let (rows, readers) = match fetched {
             Ok(Some(pair)) => pair,
             // The end, where the statement is retired. One a canceller
             // reached first is answered as cancelled: the engine can finish
@@ -6358,7 +6369,7 @@ fn run_statement(
             }
         };
 
-        for row in 0..chunk.rows {
+        for row in 0..rows {
             // Encoded straight into `buf` behind a mark: a failing cell
             // discards the half-written row with truncate(). Cells are read
             // from vector views, and an engine failure mid-cell surfaces as
