@@ -517,12 +517,12 @@ and DuckTable 0.23.0 record.
 
 ## Open items
 
-- **Installed:** `live` and this Mac run harbor 2.0.0 (`live` upgraded
-  2026-10-21 with `harbor update --restart`, after a `backup`). The local
-  medlabs server runs under its login item and keeps the code it started
-  with until it restarts; a login item written before 2.0.1 runs at
-  launchd's Background priority until `harbor medlabs autostart restart`
-  rewrites it.
+- **Installed:** `live` runs harbor 2.0.0 (upgraded 2026-10-21 with
+  `harbor update --restart`, after a `backup`); this Mac runs 2.0.1, and
+  the local medlabs server keeps the code it started with until it
+  restarts. DuckTable 2.0.1 is released. A login item written before 2.0.1
+  runs at launchd's Background priority until `harbor medlabs autostart
+  restart` rewrites it.
 - **Left from the port to DuckDB 2.0.0:** harbor tracks DuckDB's official
   releases. The `engine-alpha42289` release stays as history, and the
   `DUCKDB_LIB_BUILD` repository variable is read by nothing; removing the
