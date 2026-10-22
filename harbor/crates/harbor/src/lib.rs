@@ -549,20 +549,35 @@ enum Said {
 }
 
 /// A `DELETE /sql/queries/<id>` waiting to be told whether its cancel
-/// stopped a retained statement. One thread answers them all
-/// (`answer_cancels`), so a wait holds neither a worker nor the probe lane,
-/// which answers `/ready`, renewals, releases and other cancels: the wait is
-/// the engine's longest stretch without an interrupt check, a commit that
-/// checkpoints or a `CHECKPOINT`, and the lane must not stand behind it.
+/// stopped a retained statement, or one the probe lane answers. A few
+/// threads answer them all (`answer_cancels`), so a wait holds neither a
+/// worker nor the probe lane, which answers `/ready`, renewals, releases and
+/// other cancels: the wait is the engine's longest stretch without an
+/// interrupt check, a commit that checkpoints or a `CHECKPOINT`, and the
+/// lane must not stand behind it, nor behind a client that does not read.
 struct Asked {
     told: Arc<OnceLock<bool>>,
     req: Request,
     line: Option<LogLine>,
 }
 
-/// The cancels waiting to be told, and the signal a statement gives when it
-/// tells one: at its first fetch (`SlotState::keep`) or its end.
-static ASKED: (Mutex<Vec<Asked>>, Condvar) = (Mutex::new(Vec::new()), Condvar::new());
+/// The cancels waiting to be told and answered, and which server's threads
+/// answer them.
+struct Asking {
+    waiting: Vec<Asked>,
+    /// The server whose `answer_cancels` threads answer, numbered from one,
+    /// or zero when none does.
+    serving: u64,
+}
+
+/// The cancels waiting, and the signal a statement gives when it tells one:
+/// at its first fetch (`SlotState::keep`) or its end.
+static ASKED: (Mutex<Asking>, Condvar) = (Mutex::new(Asking { waiting: Vec::new(), serving: 0 }), Condvar::new());
+
+/// How many threads answer the cancels told. Each answer is written whole by
+/// one of them, which a client that does not read its answer holds for as
+/// long as its socket's write timeout, while the others go on answering.
+const CANCEL_WRITERS: usize = 4;
 
 impl Asked {
     /// A statement told its canceller. Signalled under the lock the waiters
@@ -580,42 +595,66 @@ impl Asked {
     }
 }
 
-/// Answer the cancels in ASKED as their statements tell them, for the life
-/// of the process. A statement harbor abandoned at a stop never tells, and
-/// its cancel is left unanswered, as its statement is. A cancel is handed
-/// out only once the response before it on its connection is written, so
-/// its answer waits on no statement.
-fn answer_cancels() {
+/// Answer the cancels in ASKED as their statements tell them, one at a
+/// time, while `serving` is the server's; then the ones told, and end. A
+/// statement harbor abandoned at a stop never tells, and its cancel is left
+/// unanswered, as its statement is. A cancel is handed out only once the
+/// response before it on its connection is written, so its answer waits on
+/// no statement.
+fn answer_cancels(serving: u64) {
     let (asked, said) = &ASKED;
     loop {
-        let mut waiting = said
-            .wait_while(asked.lock().unwrap(), |w| !w.iter().any(|a| a.told.get().is_some()))
+        let mut asking = said
+            .wait_while(asked.lock().unwrap(), |a| {
+                a.serving == serving && !a.waiting.iter().any(|a| a.told.get().is_some())
+            })
             .unwrap();
-        let (told, rest): (Vec<Asked>, Vec<Asked>) =
-            std::mem::take(&mut *waiting).into_iter().partition(|a| a.told.get().is_some());
-        *waiting = rest;
-        drop(waiting);
-        for Asked { told, req, line } in told {
-            let status = answer_cancel(req, *told.get().unwrap()).1;
-            if let Some(line) = line {
-                line.write(status);
-            }
+        let Some(at) = asking.waiting.iter().position(|a| a.told.get().is_some()) else { return };
+        let Asked { told, req, line } = asking.waiting.swap_remove(at);
+        drop(asking);
+        let status = answer_cancel(req, *told.get().unwrap()).1;
+        if let Some(line) = line {
+            line.write(status);
         }
     }
 }
 
-/// Answer `req`, a cancel that must wait for its statement's first fetch,
-/// from `answer_cancels`, or on this thread when that cannot start.
+/// Start the threads that answer cancels for a server, numbered `serving`.
+fn spawn_answering(serving: u64) -> std::io::Result<Vec<JoinHandle<()>>> {
+    ASKED.0.lock().unwrap().serving = serving;
+    (0..CANCEL_WRITERS)
+        .map(|i| thread::Builder::new().name(format!("harbor-cancel-{i}")).spawn(move || answer_cancels(serving)))
+        .collect()
+}
+
+/// Let the threads that answer cancels end once each told is answered, and
+/// wait up to `patience` for them: one writing to a client that does not
+/// read is let go of, as a worker is.
+fn end_answering(answering: Vec<JoinHandle<()>>, patience: Duration) {
+    ASKED.0.lock().unwrap().serving = 0;
+    ASKED.1.notify_all();
+    let started = Instant::now();
+    for h in answering {
+        while !h.is_finished() && started.elapsed() < patience {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if h.is_finished() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Answer `req`, a cancel told or to be told by `told`, from
+/// `answer_cancels`, or on this thread when no server's threads answer.
 fn await_cancel(req: Request, told: Arc<OnceLock<bool>>, line: Option<LogLine>) -> bool {
-    static ANSWERING: OnceLock<bool> = OnceLock::new();
-    let answering = *ANSWERING.get_or_init(|| {
-        thread::Builder::new().name("harbor-cancel".to_string()).spawn(answer_cancels).is_ok()
-    });
-    if answering {
-        ASKED.0.lock().unwrap().push(Asked { told, req, line });
+    let mut asking = ASKED.0.lock().unwrap();
+    if asking.serving != 0 {
+        asking.waiting.push(Asked { told, req, line });
+        drop(asking);
         ASKED.1.notify_all();
         return true;
     }
+    drop(asking);
     let status = answer_cancel(req, Asked::wait(&told)).1;
     if let Some(line) = line {
         line.write(status);
@@ -1265,6 +1304,8 @@ struct Running {
     /// The saturation-proof lane: answers /ready and the control plane when
     /// every worker is busy, and relays sessions' statements. See probe_worker.
     probe: Option<JoinHandle<()>>,
+    /// The threads that answer cancels (`answer_cancels`).
+    answering: Vec<JoinHandle<()>>,
     addr: String,
 }
 
@@ -1407,6 +1448,7 @@ pub fn start(listen: Listen, workers: usize, log: bool) -> Result<String, String
         leases: Vec::new(),
         reaper: None,
         probe: None,
+        answering: Vec::new(),
         addr: addr.clone(),
     };
     let spawned = spawn_threads(&mut r, conns, lease_conns, log);
@@ -1423,7 +1465,8 @@ pub fn start(listen: Listen, workers: usize, log: bool) -> Result<String, String
 }
 
 /// Every thread of a server, into `r` as each starts: the workers, an
-/// executor per lease connection, the reaper and the probe lane.
+/// executor per lease connection, the reaper, the threads that answer
+/// cancels and the probe lane.
 fn spawn_threads(
     r: &mut Running,
     conns: Vec<Connection>,
@@ -1511,6 +1554,9 @@ fn spawn_threads(
     // is relayed to the session's own connection, and work that needs a
     // worker gets an immediate honest 503 — shedding load instead of
     // queueing it invisibly.
+    static SERVING: AtomicU64 = AtomicU64::new(1);
+    r.answering = spawn_answering(SERVING.fetch_add(1, Ordering::SeqCst))?;
+
     let (server, stop) = (Arc::clone(&r.server), Arc::clone(&r.stop));
     r.probe = Some(
         thread::Builder::new()
@@ -1719,6 +1765,10 @@ fn stop_with(mut running: std::sync::MutexGuard<'_, Option<Running>>) -> Result<
             );
         }
     }
+
+    // The cancels told by the statements drained are answered before the
+    // server says it has stopped, and the process may leave.
+    end_answering(r.answering, Duration::from_secs(10));
 
     *SERVER.lock().unwrap() = None;
     let (lock, cv) = &STOPPED;
@@ -2117,6 +2167,11 @@ fn handle(req: Request, exec: Option<Executor>, log: bool) -> bool {
             // thread (`Asked`).
             (Method::Delete, p) if p.starts_with("/sql/queries/") => {
                 match cancel_query(&percent_decoded(&p["/sql/queries/".len()..])) {
+                    // The probe lane hands its answer off too, so a client
+                    // that does not read holds no lane.
+                    Said::Now(cancelled) if exec.is_none() => {
+                        return await_cancel(req, Arc::new(OnceLock::from(cancelled)), line);
+                    }
                     Said::Now(cancelled) => answer_cancel(req, cancelled),
                     Said::Later(told) => return await_cancel(req, told, line),
                 }
