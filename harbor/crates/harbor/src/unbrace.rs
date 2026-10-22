@@ -73,6 +73,7 @@ pub fn expand(sql: &str) -> Result<Cow<'_, str>, String> {
     let mut term_start = 0;
     let mut depth = 0usize;
     let mut braced = false;
+    let mut lists = None;
     let mut i = 0;
     while i < text.len() {
         let boundary = match text.class(i) {
@@ -87,7 +88,7 @@ pub fn expand(sql: &str) -> Result<Cow<'_, str>, String> {
                     depth -= 1;
                     false
                 }
-                b'(' if depth == 0 => match text.type_parameters(term_start, i) {
+                b'(' if depth == 0 => match text.type_parameters(term_start, i, text.len(), &mut lists) {
                     Some(close) => {
                         i = close + 1;
                         continue;
@@ -351,8 +352,11 @@ impl<'a> Text<'a> {
     /// `::` and a type name, with nothing between, inside the text from
     /// `from`: `::DECIMAL(10,2)`, `::STRUCT(a INT)`. They are part of the
     /// word before them, so neither a term nor an item ends inside them. A
-    /// list that holds a brace or a `;`, or never closes, is not taken.
-    fn type_parameters(&self, from: usize, open: usize) -> Option<usize> {
+    /// list that holds a brace or a `;`, or does not close before `to`, is
+    /// not taken. `lists` holds the text's parentheses, paired once when
+    /// first needed: a scan forward from each `(` would make thousands of
+    /// unclosed ones quadratic.
+    fn type_parameters(&self, from: usize, open: usize, to: usize, lists: &mut Option<Vec<(usize, usize)>>) -> Option<usize> {
         let name = (from..open)
             .rev()
             .take_while(|&j| self.code(j).is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_'))
@@ -366,21 +370,25 @@ impl<'a> Text<'a> {
         {
             return None;
         }
-        let mut depth = 0usize;
-        for j in open..self.len() {
-            match self.code(j) {
-                Some(b'(') => depth += 1,
-                Some(b')') => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(j);
-                    }
-                }
-                Some(b'{' | b'}' | b';') => return None,
+        let lists = lists.get_or_insert_with(|| self.paired_parentheses(from, to));
+        lists.binary_search_by_key(&open, |pair| pair.0).ok().map(|k| lists[k].1)
+    }
+
+    /// Each `(` in code between `from` and `to` beside the `)` that closes
+    /// it, ordered by the `(`. A brace or a `;` closes no list, and every one
+    /// open at it is left unpaired.
+    fn paired_parentheses(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let (mut open, mut pairs) = (Vec::new(), Vec::new());
+        for i in from..to {
+            match self.code(i) {
+                Some(b'(') => open.push(i),
+                Some(b')') => pairs.extend(open.pop().map(|o| (o, i))),
+                Some(b'{' | b'}' | b';') => open.clear(),
                 _ => {}
             }
         }
-        None
+        pairs.sort_unstable();
+        pairs
     }
 
     /// The items between `from` and `to`, split at top-level spaces, comments
@@ -390,6 +398,7 @@ impl<'a> Text<'a> {
         let mut items = Vec::new();
         let mut depth = 0usize;
         let mut start = from;
+        let mut lists = None;
         let mut i = from;
         while i < to {
             let split = match self.class(i) {
@@ -403,7 +412,7 @@ impl<'a> Text<'a> {
                         false
                     }
                     b'(' if depth == 0 => {
-                        if let Some(close) = self.type_parameters(start, i) {
+                        if let Some(close) = self.type_parameters(start, i, to, &mut lists) {
                             i = close + 1;
                             continue;
                         }
@@ -576,6 +585,13 @@ mod tests {
         // A list that holds a brace, or never closes, is not taken.
         assert_eq!(x("select r.{a,b}::T({c})"), "select r.a::T, r.b::T(c)");
         assert!(matches!(expand("select r.{a,b}::DECIMAL(10"), Ok(Cow::Owned(_))));
+        // Lists that never close are paired once, not each scanned to the
+        // end: a megabyte of them expands at once, where a scan from each
+        // would take minutes.
+        let open = format!("select r.{{a,b}} {}", "x::a(".repeat(200_000));
+        assert_eq!(x(&open).len(), open.len() + 1);
+        let open = format!("select r.{{{}}}", "x::a(".repeat(200_000));
+        assert_eq!(x(&open).len(), open.len() - 2);
     }
 
     #[test]
