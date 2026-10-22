@@ -21,6 +21,17 @@ date, newest first.
   answering, and the next answer shows it green. A slow link that answers
   stays green, and the connection is kept, so a server restarted on its
   machine comes back without a reconnect.
+- **A commit frees a value before another row takes it, on every unique
+  column.** ⌘S reads, before its transaction, which staged change takes a key
+  or a `UNIQUE` value which other change frees, each typed value cast to its
+  column's type and matched as the engine matches it, and runs each change
+  after the one it waits on. A chain of re-keys typed in another spelling than
+  the grid shows (`1.5` for a `DECIMAL`'s `1.50`, a `DATE` or a `TIMESTAMP`
+  written another way), moves on a `UNIQUE` column, a composite `UNIQUE` or a
+  unique index (`a` to `b` while `b` goes to `c`), and a duplicate of a
+  changed row that takes a key or a value a delete frees all commit; each was
+  refused, edits kept. A swap is still refused, as is a duplicate that takes
+  the value its own source row gives up.
 
 ## 2.0.0 — 2026-10-21
 

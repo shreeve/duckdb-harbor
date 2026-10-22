@@ -557,9 +557,6 @@ and DuckTable 0.23.0 record.
   stopping a Windows server, and macOS symbol promotion with a real
   extension loaded.
 - **Small, known, deferred:**
-  - DuckTable's commit order does not recognize a key move typed differently
-    from the wire's spelling of it, or a UNIQUE column that is not the key
-    (EDITING.md says so).
   - Ctrl-C during a restore's final shutdown-and-move step is not honored;
     the restore completes.
   - A `GEOMETRY[]` column reports `lossless: true` on the list while its
