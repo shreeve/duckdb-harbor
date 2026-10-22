@@ -330,8 +330,10 @@ fn install_later(con: &Conn, extensions: Vec<&'static str>, records: Vec<Record>
         for record in records {
             let attached = match &sqlite {
                 Ok(()) => {
-                    let _alone = crate::changing_catalog();
-                    attach(&mut own, &record)
+                    let alone = crate::changing_catalog();
+                    let attached = attach(&mut own, &record);
+                    crate::learn_again(alone);
+                    attached
                 }
                 Err(reason) => Err(reason.clone()),
             };

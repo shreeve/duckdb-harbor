@@ -1279,11 +1279,10 @@ pub fn open_pool(mut con: Connection) -> Result<(), String> {
 
     lock_operator_settings(&mut con)?;
     // What --init and the workspace attached are in place, and attaching in
-    // the background may still be under way.
-    {
-        let _reading = reading_catalog();
-        learn_catalog_names(&mut con);
-    }
+    // the background may still be under way. A SQLite file locked at the
+    // start leaves the names to a later chance, not the start to its wait.
+    *LEARNER.lock().unwrap_or_else(PoisonError::into_inner) = Some((con.try_clone().map_err(|e| format!("harbor: {e}"))?, None));
+    learn_again(changing_catalog());
 
     for _ in 0..configured_pool_size() {
         pool.push(con.try_clone().map_err(|e| format!("harbor: {e}"))?);
@@ -3569,7 +3568,7 @@ fn reads_alone(
             Err(failure) => Err(failure),
         };
     }
-    let probe = format!("harbor_probe_{}", next_job_id());
+    let probe = format!("{PROBE}{}", next_job_id());
     let attach = format!(
         "ATTACH {} AS {} (TYPE sqlite, READ_ONLY, BUSY_TIMEOUT {PROBE_BUSY_MS}, HIDDEN)",
         quote(path),
@@ -3892,6 +3891,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         LAST_CATALOG.lock().unwrap().1 = Some(inventory.clone());
         BUSY.lock().unwrap().clear();
         let _ = req.respond(json_response(200, &serde_json::to_string(&inventory).unwrap()));
+        learn_after_reading();
         return (true, 200);
     }
 
@@ -4239,6 +4239,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
     LAST_CATALOG.lock().unwrap().0 = Some(catalog);
     BUSY.lock().unwrap().clear();
     let _ = req.respond(json_response(200, &body));
+    learn_after_reading();
     (true, 200)
 }
 
@@ -4639,7 +4640,9 @@ enum Gate {
 /// called, which run a statement or read a table named in a string; or a
 /// view, macro or prepared statement whose body reads it (`CatalogNames`).
 /// A name in a string or a comment does not count, and neither does a
-/// column named `query`.
+/// column named `query`. While the views and macros are not all learned
+/// (`CatalogNames::complete`), every statement reads the catalog, since
+/// any name may be one that does.
 fn catalog_gate(sql: &str) -> Gate {
     gate_of(sql, &CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner))
 }
@@ -4652,6 +4655,7 @@ fn gate_of(sql: &str, names: &CatalogNames) -> Gate {
     }
     match names_in(sql, |name| catalog_word(name) || names.reads.contains(name)) {
         true => Gate::Reads,
+        false if !names.complete => Gate::Reads,
         false => Gate::Open,
     }
 }
@@ -4750,6 +4754,15 @@ fn called(bytes: &[u8], spans: &[wire::scan::Span], from: usize) -> bool {
 /// `schema.sql` an `IMPORT DATABASE` runs, before it runs. A name is never
 /// forgotten: one dropped, or kept by another schema's view of its name,
 /// costs a statement that names it the shared gate and nothing else.
+///
+/// The engine's listing reads every attached database's catalog, and one
+/// SQLite file locked fails it after the file's wait. Until a listing
+/// succeeds, and from before a statement that brings views runs until
+/// they are read, the names are not all known (`complete`), and every
+/// statement shares the gate: an ATTACH or DETACH waits for the statements
+/// running, and nothing reads the catalog unseen. Learning is tried again
+/// after each ATTACH and DETACH (`learn_again`) and each `/catalog` read
+/// that succeeds (`learn_after_reading`).
 #[derive(Default)]
 struct CatalogNames {
     /// Each name, lowercased, with the names its bodies use.
@@ -4759,6 +4772,12 @@ struct CatalogNames {
     /// The names whose bodies read the catalog, themselves or through
     /// another such name.
     reads: std::collections::HashSet<Vec<u8>>,
+    /// Every view and macro the engine lists was learned by the last
+    /// listing, and nothing since brought one unread.
+    complete: bool,
+    /// How many times the names were found incomplete (`unsettle`), so a
+    /// listing read before the last time cannot call them complete.
+    unsettled: u64,
 }
 
 static CATALOG_NAMES: std::sync::LazyLock<RwLock<CatalogNames>> = std::sync::LazyLock::new(Default::default);
@@ -4774,10 +4793,22 @@ fn used_names(body: &str) -> std::collections::HashSet<Vec<u8>> {
 }
 
 impl CatalogNames {
+    /// Names whose listing succeeded, holding none yet.
+    #[cfg(test)]
+    fn listed() -> Self {
+        CatalogNames { complete: true, ..Default::default() }
+    }
+
     /// `name`, whose body is `body`.
     #[cfg(test)]
     fn learn(&mut self, name: &[u8], body: &str) {
         self.learn_all(vec![(name.to_vec(), used_names(body))]);
+    }
+
+    /// Not all learned: a listing failed, or a statement brings views.
+    fn unsettle(&mut self) {
+        self.complete = false;
+        self.unsettled += 1;
     }
 
     /// Each name with the names its body uses ([`used_names`]), then what
@@ -4890,19 +4921,37 @@ fn statements_of(script: &str) -> Vec<String> {
     statements
 }
 
+/// What lists every view and macro with its body, one JSON pair a row.
+const LISTING: &str = "SELECT json_array(view_name, sql)::VARCHAR FROM duckdb_views() WHERE sql IS NOT NULL \
+                       UNION ALL SELECT json_array(function_name, macro_definition)::VARCHAR FROM duckdb_functions() \
+                       WHERE function_type IN ('macro', 'table_macro') AND macro_definition IS NOT NULL";
+
 /// Learn every view and macro the engine lists on `conn` (`CatalogNames`).
 /// Its catalog is read, so the caller holds the gate. Said in the log when
-/// the catalog does not read; what was learned stays.
-pub(crate) fn learn_catalog_names(conn: &mut Connection) {
-    let listed = conn.query_strings(
-        "SELECT json_array(view_name, sql)::VARCHAR FROM duckdb_views() WHERE sql IS NOT NULL \
-         UNION ALL SELECT json_array(function_name, macro_definition)::VARCHAR FROM duckdb_functions() \
-         WHERE function_type IN ('macro', 'table_macro') AND macro_definition IS NOT NULL",
-    );
+/// the catalog does not read; what was learned stays, and the names are
+/// not complete until a listing succeeds.
+fn learn_catalog_names(conn: &mut Connection) {
+    let began = CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner).unsettled;
+    let listed = conn.query_strings(LISTING).map_err(|e| e.into_text());
+    learn_listed(began, listed);
+}
+
+/// Whether the last listing failed, so the next that succeeds says so.
+static UNLISTED: AtomicBool = AtomicBool::new(false);
+
+/// Learn the rows of a listing begun when the names had been unsettled
+/// `began` times: complete when it succeeded and nothing unsettled them
+/// since.
+fn learn_listed(began: u64, listed: Result<Vec<String>, String>) {
     let rows = match listed {
         Ok(rows) => rows,
         Err(e) => {
-            eprintln!("harbor: the views and macros that read the catalog were not read from it: {}", e.into_text());
+            eprintln!(
+                "harbor: the views and macros that read the catalog were not read from it, and until they are, \
+                 every statement waits on an ATTACH or DETACH: {e}"
+            );
+            UNLISTED.store(true, Ordering::Relaxed);
+            CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner).unsettle();
             return;
         }
     };
@@ -4912,7 +4961,111 @@ pub(crate) fn learn_catalog_names(conn: &mut Connection) {
         .filter_map(|row| serde_json::from_str::<(String, String)>(row).ok())
         .map(|(name, body)| (name.into_bytes(), used_names(&body)))
         .collect();
-    CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner).learn_all(learned);
+    let mut names = CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner);
+    names.learn_all(learned);
+    if names.unsettled == began {
+        names.complete = true;
+        if UNLISTED.swap(false, Ordering::Relaxed) {
+            eprintln!("harbor: the views and macros that read the catalog are read from it");
+        }
+    }
+}
+
+/// The connection the views and macros are learned on after the pool
+/// opens: one of its own, outside every session's transaction; and when
+/// `learn_again` last found a SQLite file busy.
+static LEARNER: Mutex<Option<(Connection, Option<Instant>)>> = Mutex::new(None);
+
+/// How long `learn_again` waits after it found a SQLite file busy before it
+/// asks again.
+const ASK_AGAIN: Duration = Duration::from_secs(1);
+
+/// What a probe of a SQLite file is attached as, before a number: hidden
+/// from the catalog functions, and no client's.
+const PROBE: &str = "harbor_probe_";
+
+/// Learn again, when the names are not complete, after an ATTACH or a
+/// DETACH, holding the gate alone as `alone`. The listing waits out a
+/// SQLite file's lock, five seconds by default, so each attached SQLite
+/// file is asked first, waiting [`PROBE_BUSY_MS`] on a lock (`busy_sqlite`),
+/// and while one does not read, learning waits for a later chance, and asks
+/// again no sooner than [`ASK_AGAIN`], so a client attaching and detaching
+/// over and over does not hold the gate for the asking. Then the gate is
+/// shared for the listing: statements run beside it, and only an ATTACH or
+/// DETACH waits.
+pub(crate) fn learn_again(alone: RwLockWriteGuard<'static, ()>) {
+    if CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner).complete {
+        return;
+    }
+    {
+        let mut learner = LEARNER.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some((conn, busy_at)) = learner.as_mut() else { return };
+        if busy_at.is_some_and(|at| at.elapsed() < ASK_AGAIN) {
+            return;
+        }
+        *busy_at = None;
+        if let Some(why) = busy_sqlite(conn) {
+            *busy_at = Some(Instant::now());
+            if !UNLISTED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "harbor: the views and macros that read the catalog are not read while {why}, and until they \
+                     are, every statement waits on an ATTACH or DETACH"
+                );
+            }
+            return;
+        }
+    }
+    // The learner is let go first: a statement holding the gate shared may
+    // wait for it, and a share asked for while an ATTACH waits is not given.
+    drop(alone);
+    let _reading = reading_catalog();
+    learn_on_learner();
+}
+
+/// Learn again, when the names are not complete, after a `/catalog` read
+/// that succeeded, which read every attached database's catalog.
+fn learn_after_reading() {
+    if CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner).complete {
+        return;
+    }
+    let _reading = reading_catalog();
+    learn_on_learner();
+}
+
+/// Learn on [`LEARNER`], under the gate the caller holds.
+fn learn_on_learner() {
+    let mut learner = LEARNER.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((conn, _)) = learner.as_mut() {
+        learn_catalog_names(conn);
+    }
+}
+
+/// An attached SQLite file that does not read for the moment, and why: each
+/// asked as `reads_alone` asks it, on an attachment of its own that waits
+/// [`PROBE_BUSY_MS`] on a lock, under the gate held alone.
+fn busy_sqlite(conn: &mut Connection) -> Option<String> {
+    let paths = match conn.query_strings(
+        "SELECT path FROM duckdb_databases() WHERE type = 'sqlite' AND path IS NOT NULL AND path NOT IN ('', ':memory:')",
+    ) {
+        Ok(paths) => paths,
+        Err(e) => return Some(format!("the attached databases do not list: {}", e.into_text())),
+    };
+    let quote = wire::open::quote_literal;
+    paths.iter().find_map(|path| {
+        let probe = format!("{PROBE}{}", next_job_id());
+        let name = wire::open::quote_ident(&probe);
+        let attach = format!("ATTACH {} AS {name} (TYPE sqlite, READ_ONLY, BUSY_TIMEOUT {PROBE_BUSY_MS}, HIDDEN)", quote(path));
+        let read = conn.execute_batch(&attach).and_then(|()| {
+            let read = conn.query_strings(&format!(
+                "SELECT count(*)::VARCHAR FROM sqlite_query({}, 'SELECT count(*) FROM sqlite_master')",
+                quote(&probe)
+            ));
+            let _ = conn.execute_batch(&format!("DETACH {name}"));
+            read
+        });
+        let why = |e: crate::engine::Error| e.into_text().split("\nLINE ").next().unwrap_or_default().trim().to_string();
+        read.err().map(|e| format!("{path} does not read ({})", why(e)))
+    })
 }
 
 /// Whether a statement brings views and macros the engine makes, read from
@@ -5731,15 +5884,20 @@ fn execute_jobs(
         // An ATTACH or DETACH runs alone against the catalog's readers
         // (CATALOG_GATE). A reader cancelled while it waits did not run, and
         // its transaction is left aborted, as for a cancel before it began.
-        // A view or macro the statement makes is known to the gate first.
+        // A view or macro the statement makes is known to the gate first,
+        // and the views an ATTACH brings are unknown until they are read.
         learn_from_statement(&sql);
         let brings = brings_views(&sql);
-        let Some(_passed) = pass_gate(catalog_gate(&sql), &state) else {
+        let probe = detached_name(&sql).or_else(|| attached_name(&sql)).is_some_and(|n| n.starts_with(PROBE.as_bytes()));
+        let Some(passed) = pass_gate(catalog_gate(&sql), &state) else {
             on_slot.finish();
             conn.abort_transaction();
             let _ = ready.send(Err(Refusal::cancelled()));
             continue;
         };
+        if brings && matches!(passed, Passed::Changing(_)) {
+            CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner).unsettle();
+        }
 
         // A panic below — an encoder invariant tripping, an FFI metadata
         // assert (the v2 paths return Err rather than panic, so this is the
@@ -5771,11 +5929,17 @@ fn execute_jobs(
                 true
             }
         };
-        // The views and macros a database attached or imported brings, read
-        // under the gate: still held alone after an ATTACH.
-        if brings {
-            let _reading = matches!(_passed, Passed::Open).then(reading_catalog);
-            learn_catalog_names(&mut conn);
+        // After an ATTACH or DETACH, a probe's but, the views and macros
+        // are learned again when they are not all known (`learn_again`); the
+        // ones an import or a copy of a database brings, under the gate
+        // shared.
+        match passed {
+            Passed::Changing(alone) if !probe => learn_again(alone),
+            passed if brings => {
+                let _reading = matches!(passed, Passed::Open).then(reading_catalog);
+                learn_on_learner();
+            }
+            _ => {}
         }
     }
     // And once more on the way out, so a connection going back to the pool for
@@ -6055,7 +6219,9 @@ mod tests {
 
     #[test]
     fn attaching_and_reading_the_catalog_pass_the_gate_apart() {
-        use super::{Gate, catalog_gate};
+        use super::{CatalogNames, Gate, gate_of};
+        let names = CatalogNames::listed();
+        let catalog_gate = |sql| gate_of(sql, &names);
         for sql in [
             "ATTACH '/x/a.sqlite' AS a (TYPE sqlite)",
             "  /* c */ detach a",
@@ -6091,13 +6257,16 @@ mod tests {
             "INSERT INTO attached VALUES (1)",
         ] {
             assert_eq!(catalog_gate(sql), Gate::Open, "{sql}");
+            // Every statement reads it while the names are not all known.
+            assert_eq!(gate_of(sql, &CatalogNames::default()), Gate::Reads, "{sql}");
         }
+        assert_eq!(gate_of("DETACH a", &CatalogNames::default()), Gate::Changes);
     }
 
     #[test]
     fn a_view_or_macro_whose_body_reads_the_catalog_reads_it() {
         use super::{CatalogNames, Gate, Made, gate_of, made_name};
-        let mut names = CatalogNames::default();
+        let mut names = CatalogNames::listed();
         names.learn(b"v", "CREATE VIEW v AS SELECT * FROM duckdb_tables()");
         names.learn(b"plain", "CREATE VIEW plain AS SELECT 1");
         // Through another view, learned before or after the one it reads.

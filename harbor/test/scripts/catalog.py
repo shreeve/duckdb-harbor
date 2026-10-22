@@ -265,6 +265,7 @@ def main():
     try:
         if sqlite_ok:
             run_busy(base, work)
+            run_unlisted(base, work)
     finally:
         stop_server(proc)
         log.close()
@@ -751,6 +752,88 @@ def run_busy(base, work):
        ("unable to open" in (a["error"] or ""), a["tables"]))
     os.replace(app + ".away", app)
     sql(base, "DETACH IF EXISTS app")
+
+
+def run_unlisted(base, work, seconds=5):
+    # -----------------------------------------------------------------------
+    section("A view attached while a SQLite file is locked")
+    # -----------------------------------------------------------------------
+    # The server learns which views read the catalog from the engine's
+    # listing of them, which a locked SQLite file fails after its wait.
+    # Until a listing reads, every statement is kept apart from an ATTACH
+    # or DETACH, the ATTACH does not hold the others for the lock's wait,
+    # and the listing is read again at a later ATTACH or DETACH: a view
+    # attached meanwhile that reads the catalog, raced against a SQLite
+    # ATTACH/DETACH loop, does not bring the server down.
+    import sqlite3
+    import threading
+    app = os.path.join(work, "busy.sqlite")
+    other = os.path.join(work, "other.sqlite")
+    sqlite3.connect(other).close()
+    dv = os.path.join(work, "busy_views.duckdb")
+    subprocess.run(["duckdb", "-no-init", dv, "-c", "CREATE VIEW busy_catview AS SELECT count(*) n FROM duckdb_tables()"],
+                   check=True, stdout=subprocess.DEVNULL)
+    eq("a SQLite file attaches, waiting on a lock as the engine does", None,
+       sql(base, f"ATTACH '{app}' AS app (TYPE sqlite)"))
+    locker = sqlite3.connect(app, isolation_level=None)
+    locker.execute("BEGIN EXCLUSIVE")
+    eq("while it is locked, a DuckDB file with a view over the catalog attaches", None,
+       sql(base, f"ATTACH '{dv}' AS dv (READ_ONLY)"))
+    started = time.time()
+    sql(base, "SELECT count(*) FROM pragma_database_list")
+    took = time.time() - started
+    if took < 1:
+        ok("and a catalog read after it does not wait out the lock", f"{took:.2f}s")
+    else:
+        bad("and a catalog read after it does not wait out the lock", f"{took:.2f}s")
+    locker.execute("ROLLBACK")
+    locker.close()
+    stop = threading.Event()
+    counts, failures = [0, 0], []
+
+    def reader():
+        while not stop.is_set():
+            try:
+                refused = sql(base, "SELECT n FROM dv.busy_catview")
+            except (urllib.error.URLError, ConnectionError, OSError) as e:
+                failures.append(str(e))
+                return
+            if refused is not None:
+                failures.append(refused)
+            counts[0] += 1
+
+    def churner():
+        while not stop.is_set():
+            try:
+                for statement in (f"ATTACH '{other}' AS lite_other (TYPE sqlite)", "DETACH lite_other"):
+                    refused = sql(base, statement)
+                    if refused is not None:
+                        failures.append(refused)
+            except (urllib.error.URLError, ConnectionError, OSError) as e:
+                failures.append(str(e))
+                return
+            counts[1] += 1
+
+    threads = [threading.Thread(target=reader, daemon=True), threading.Thread(target=reader, daemon=True),
+               threading.Thread(target=churner, daemon=True)]
+    for thread in threads:
+        thread.start()
+    time.sleep(seconds)
+    stop.set()
+    for thread in threads:
+        thread.join(timeout=30)
+    eq(f"the lock gone, {counts[0]} reads of the view raced against {counts[1]} SQLite ATTACH/DETACH: failures",
+       0, len(failures))
+    if failures:
+        print(f"     \033[2mfirst: {failures[0][:300]}\033[0m")
+    try:
+        alive = sql(base, "SELECT 42")
+    except (urllib.error.URLError, ConnectionError, OSError) as e:
+        alive = str(e)
+    eq("and the server answers after", None, alive)
+    if alive is None:
+        sql(base, "DETACH IF EXISTS dv")
+        sql(base, "DETACH IF EXISTS app")
 
 
 def run_race(base, work, sqlite_ok, rounds=300):
