@@ -557,23 +557,43 @@ class CommitRaces(Harbor, unittest.TestCase):
                 doc = self.sql("SELECT r.{a,b}" + gap + "FROM (SELECT {'a': 1, 'b': 2} AS r)")
                 self.assertEqual(doc["data"], [[1, 2]])
 
+    def brace_refusal(self, sql):
+        # Harbor's own 400, before the engine sees anything.
+        doc = self.sql(sql, status=400)
+        self.assertEqual(doc["code"], "bad_request", (sql, doc))
+        self.assertTrue(doc["message"].startswith("brace expansion refused: "), (sql, doc))
+        return doc["message"]
+
     def test_a_string_is_never_rewritten_by_an_expansion_read_afresh(self):
-        # `}E'` begins an E-string and `xE'` does not: read afresh, the
-        # expansion of `{x}` would turn the string after it into a group.
-        # The statement goes to the engine as it came, and its refusal
-        # quotes it.
-        sql = r"SELECT {x}E'\'''{a,b}'"
-        self.assertIn(sql, self.sql(sql, status=400)["message"])
+        # `}E'` begins an E-string and `VARCHARE'` does not: read afresh,
+        # the expansion of `{VARCHAR}` would turn the string after it into a
+        # group. Harbor refuses it, saying how to write it; written so, it
+        # runs.
+        message = self.brace_refusal(r"SELECT {VARCHAR}E'\'''{a,b}'")
+        self.assertIn("put a space between the group and the string", message)
+        self.assertEqual(self.sql(r"SELECT {VARCHAR} E'\'''{a,b}'")["data"],
+                         self.sql(r"SELECT VARCHAR E'\'''{a,b}'")["data"])
+        # A `$$` after a brace opens a dollar quote; after a word it does not.
+        source = " FROM (SELECT {'a': 1, 'b': 2} AS r)"
+        message = self.brace_refusal("SELECT r.{a,b}$$x$$" + source)
+        self.assertIn("put a space between the group and the quote", message)
+        self.assertEqual(self.sql("SELECT r.{a,b} || $$x$$" + source)["data"], [[1, "2x"]])
 
     def test_a_string_keeps_its_escapes_through_an_expansion(self):
         # An `E` that begins a word makes the string after it take backslash
         # escapes. Expanded, `{E}'a\tb'` would be the E-string `E'a\tb'`,
         # a tab where a backslash and a `t` were written, and `e'` after `d`
-        # a plain string where `e'` after `}` takes escapes. Each statement
-        # goes to the engine as it came, and its refusal quotes it.
+        # a plain string where `e'` after `}` takes escapes. Each is refused.
         for sql in (r"SELECT {E}'a\tb'", r"SELECT t.{d,e}'a\tb'", r"SELECT {x,y}e'a\tb'"):
             with self.subTest(sql=sql):
-                self.assertIn(sql, self.sql(sql, status=400)["message"])
+                self.assertIn("would gain or lose backslash escapes", self.brace_refusal(sql))
+
+    def test_a_unicode_space_an_expansion_would_misread_is_refused(self):
+        # The engine's pre-pass misreads `E'\''`; repeated by the expansion,
+        # its misreading flips, and the U+00A0 kept in the string after it
+        # would be stripped.
+        sql = "SELECT r.{a,b}.E'\\'', 'x y' FROM (SELECT 1 AS r)"
+        self.assertIn("write it as a plain space", self.brace_refusal(sql))
 
     def test_a_cast_keeps_its_type_parameters_in_every_alternative(self):
         # `(10,2)` belongs to `::DECIMAL`: split from it, the first column
@@ -588,6 +608,28 @@ class CommitRaces(Harbor, unittest.TestCase):
         # columns inside the one CAST, and the engine refuses it.
         sql = "SELECT CAST(r.{a,b} AS DECIMAL(10,2))" + source
         self.assertIn("CAST(r.a, r.b AS", self.sql(sql, status=400)["message"])
+
+    def test_a_cast_a_brace_group_would_split_is_refused(self):
+        # The engine reads `::DECIMAL (10,2)` and `::TIMESTAMP WITH TIME ZONE`
+        # as one type, but a term ends at the space: expanded, the first
+        # column would be cast to the bare DECIMAL or TIMESTAMP. Harbor
+        # refuses it, naming the fix, and the fix runs.
+        source = " FROM (SELECT {'a': 1.2345, 'b': 2.5} AS r)"
+        for sql, fix in (("SELECT r.{a,b}::DECIMAL (10,2)", "write `::DECIMAL(…)` with nothing between"),
+                         ("SELECT r.{a,b}::DECIMAL/* p */(10,2)", "write `::DECIMAL(…)` with nothing between"),
+                         ("SELECT r.{a,b}::INT []", "write `::INT[…]` with nothing between"),
+                         ("SELECT r.{a,b}::TIMESTAMP WITH TIME ZONE", "write `::TIMESTAMPTZ`"),
+                         ("SELECT r.{a,b}::DOUBLE PRECISION", "write `::DOUBLE`"),
+                         ("SELECT r.{a::DOUBLE PRECISION, b}", "write `::DOUBLE`")):
+            with self.subTest(sql=sql):
+                message = self.brace_refusal(sql + source)
+                self.assertIn(fix, message)
+                self.assertTrue(message.endswith("cast each alternative on its own"), message)
+        doc = self.sql("SELECT r.{a,b}::DOUBLE" + source)
+        self.assertEqual([c["duckdbType"] for c in doc["columns"]], ["DOUBLE"] * 2)
+        # One alternative splits nothing, and a struct literal is no group.
+        doc = self.sql("SELECT r.{a}::DECIMAL (10,2), {'k': 1}::STRUCT (k DOUBLE) AS s" + source)
+        self.assertEqual([c["duckdbType"] for c in doc["columns"]], ["DECIMAL(10,2)", "STRUCT(k DOUBLE)"])
 
     def test_a_null_param_is_typed_as_the_engine_types_a_null(self):
         # Bound untyped, as the engine's own EXECUTE p(NULL) binds it: the
