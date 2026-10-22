@@ -15,7 +15,8 @@ Harbor releases, and are not included here.
   was kept; a write that had already run is answered `false`, with its
   rows, and a write that fails with an error of its own after a cancel
   gets that error and a `false`. Waiting for the engine's word holds no
-  worker, and not the lane that answers `/ready`, renewals and releases. A
+  worker, not the lane that answers `/ready`, renewals and releases, and
+  not another client's cancel. A
   SELECT that a cancel reached before its end ends with the cancel (499,
   the error record in NDJSON) instead of an ordinary end; inside a session
   that aborts the transaction, so a Ctrl-C landing as a SELECT finishes
@@ -47,16 +48,23 @@ Harbor releases, and are not included here.
   a prepared statement, or a view made by `IMPORT DATABASE` or `COPY FROM
   DATABASE` went unseen, and a DuckDB file attached `AS sqlite` counted as
   SQLite. Each of these killed 2.0.0 within a second beside an
-  ATTACH/DETACH loop and ran 60 s clean on 2.0.1. Twenty thousand views
-  start in 0.4 s.
+  ATTACH/DETACH loop and ran 60 s clean on 2.0.1. So did a view attached,
+  or present at the start, while an attached SQLite file was locked, when
+  the server cannot read which views read the catalog: until it can,
+  every statement waits its turn beside an ATTACH or DETACH, and it reads
+  them again at the next ATTACH, DETACH or `/catalog`, without holding
+  the others for the lock's five-second wait. `query` and `query_table`
+  count only when called, so a column named `query` costs nothing. Twenty
+  thousand views start in 0.4 s.
 - **One unreadable SQLite file no longer fails every `/catalog`.** One gone
   for good (replaced by a file that is not SQLite, or a read-only file
   deleted) is detached and listed under `attached` with why; the workspace
   attaches it again from its record once it reads, and one a client
-  attached is the client's to attach again. One only busy stays attached,
-  and `/catalog` answers as last read, the file's entry saying it is busy
-  and may be stale; before any good read it answers the 400 naming the
-  file, as 2.0.0 did.
+  attached, or attached again over it, is the client's to attach again.
+  One only busy stays attached, and `/catalog` answers as last read, the
+  file's entry saying it is busy, and a `stale` field at the document's
+  end saying every database in it may be stale; before any good read it
+  answers the 400 naming the file, as 2.0.0 did.
 - **A workspace start does not wait on an extension download.** With
   `sqlite_scanner` or `spatial` not installed and the extension repository
   not answering, a start waited on the engine's install before serving. The
