@@ -55,9 +55,9 @@ Harbor releases, and are not included here.
   ATTACH/DETACH loop and ran 60 s clean on 2.0.1. So did a view attached,
   or present at the start, while an attached SQLite file was locked, when
   the server cannot read which views read the catalog: until it can, an
-  ATTACH or DETACH waits for every statement running, and while it waits
-  reads them again beside them, so the statements that come after it do
-  not wait for it; they are read again at each ATTACH, DETACH and
+  ATTACH or DETACH waits for every statement running, and for up to a
+  second reads them again beside them, so the statements that come after
+  it need not wait for it; they are read again at each ATTACH, DETACH and
   `/catalog` too, without holding the others for the lock's five-second
   wait. `query` and `query_table`
   count only when called, so a column named `query` costs nothing. Twenty
@@ -97,6 +97,10 @@ Harbor releases, and are not included here.
   the answer was cut, so a client that reads again finds the end at once,
   where it waited out the idle timeout inside a chunk, and an answer
   pipelined behind it is not written after the cut.
+- **Requests pipelined on one connection run one at a time.** Each is
+  read as it arrives and run once the answer before it is written, so a
+  request never runs beside the one ahead of it, holding a worker or the
+  catalog while its answer waits behind that one's.
 - **Two changes DuckDB 2.0.0 made, for anyone coming from 0.46.0.** A
   VARIANT object reads back with its keys sorted, so `{"p":1,"a":2}` comes
   back `{"a":2,"p":1}`, the values unchanged. A bare table name is not a
