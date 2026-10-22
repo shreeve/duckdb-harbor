@@ -223,37 +223,68 @@ pub fn scan(src: &str) -> Vec<Span> {
 
 /// The spans of text whose spaces are already plain ([`plain_spaces`]).
 pub fn spans(b: &[u8]) -> Vec<Span> {
-    let (mut spans, mut code, mut i) = (Vec::new(), 0, 0);
+    each_span(b).collect()
+}
+
+/// [`spans`] one at a time, as the scan finds them, for a reader that needs
+/// no more than one at once: a statement of a million strings is a million
+/// spans, and held together they would weigh several times the statement.
+pub fn each_span(b: &[u8]) -> impl Iterator<Item = Span> + '_ {
+    Spans { b, code: 0, i: 0, word: None, held: None }
+}
+
+struct Spans<'a> {
+    b: &'a [u8],
+    // Where the code span the scan is in began.
+    code: usize,
+    i: usize,
     // Where the bare word the scan is in began, if it is in one.
-    let mut word = None;
-    while i < b.len() {
-        if let Some(span) = comment_at(b, i).or_else(|| quote_at(b, i, word)) {
-            if i > code {
-                spans.push(Span { start: code, end: i, kind: Kind::Code, terminated: true, escapes: false });
+    word: Option<usize>,
+    // A span found after the code before it, given out next.
+    held: Option<Span>,
+}
+
+impl Iterator for Spans<'_> {
+    type Item = Span;
+
+    fn next(&mut self) -> Option<Span> {
+        if let Some(span) = self.held.take() {
+            return Some(span);
+        }
+        let b = self.b;
+        while self.i < b.len() {
+            let i = self.i;
+            if let Some(span) = comment_at(b, i).or_else(|| quote_at(b, i, self.word)) {
+                let code = self.code;
+                (self.i, self.code, self.word) = (span.end, span.end, None);
+                if i > code {
+                    self.held = Some(span);
+                    return Some(Span { start: code, end: i, kind: Kind::Code, terminated: true, escapes: false });
+                }
+                return Some(span);
             }
-            spans.push(span);
-            (i, code, word) = (span.end, span.end, None);
-            continue;
+            // A number begins at a `.` anywhere and at a digit outside a word,
+            // and ends no word but the one a `.` ends: what follows it is read
+            // afresh, so `1$t$x$t$` is a number and a quote.
+            if b[i] == b'.' || (self.word.is_none() && b[i].is_ascii_digit()) {
+                (self.i, self.word) = (number_end(b, i), None);
+                continue;
+            }
+            self.word = match b[i] {
+                // A `$` continues a word but begins none: `$1` is a parameter.
+                b'$' => self.word,
+                c if is_word_byte(c) => self.word.or(Some(i)),
+                _ => None,
+            };
+            self.i += 1;
         }
-        // A number begins at a `.` anywhere and at a digit outside a word,
-        // and ends no word but the one a `.` ends: what follows it is read
-        // afresh, so `1$t$x$t$` is a number and a quote.
-        if b[i] == b'.' || (word.is_none() && b[i].is_ascii_digit()) {
-            (i, word) = (number_end(b, i), None);
-            continue;
+        if b.len() > self.code {
+            let code = self.code;
+            self.code = b.len();
+            return Some(Span { start: code, end: b.len(), kind: Kind::Code, terminated: true, escapes: false });
         }
-        word = match b[i] {
-            // A `$` continues a word but begins none: `$1` is a parameter.
-            b'$' => word,
-            c if is_word_byte(c) => word.or(Some(i)),
-            _ => None,
-        };
-        i += 1;
+        None
     }
-    if b.len() > code {
-        spans.push(Span { start: code, end: b.len(), kind: Kind::Code, terminated: true, escapes: false });
-    }
-    spans
 }
 
 #[cfg(test)]
