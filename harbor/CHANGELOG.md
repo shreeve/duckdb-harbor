@@ -31,13 +31,17 @@ Harbor releases, and are not included here.
   the comment into each alternative. The statement is read once, as the
   engine reads it, each alternative is cut from the source so every byte
   keeps its reading, and a result the engine would read differently, a
-  string that would gain or lose backslash escapes among them, is sent as
-  written. Of 200,000 generated statements 2.0.0 expanded 49,701 wrongly;
-  2.0.1 expands 1,000,000 with none.
+  string that would gain or lose backslash escapes among them, is refused
+  with a 400 that says what to write instead. Of 200,000 generated
+  statements 2.0.0 expanded 49,701 wrongly; 2.0.1 expands 1,000,000 with
+  none.
 - **Brace expansion keeps a cast's type parameters with every
   alternative.** `x.{a,b}::DECIMAL(10,2)` cast the first column to the
-  bare `DECIMAL`; both are `DECIMAL(10,2)`. A `braces` suite checks
-  expansion against the engine's own parser.
+  bare `DECIMAL`; both are `DECIMAL(10,2)`. A type the engine reads on past
+  a space or comment, `::DECIMAL (10,2)`, `::INT []`, `::TIMESTAMP WITH
+  TIME ZONE` or `::DOUBLE PRECISION`, cast all but the last alternative to
+  its first word; such a statement is refused with a 400 that names the
+  fix. A `braces` suite checks expansion against the engine's own parser.
 - **A list, array, struct, map or union is `lossless` only when its members
   are.** The schema line called every container lossless, so a
   `GEOMETRY[]` said `true` while its child said `false`.
