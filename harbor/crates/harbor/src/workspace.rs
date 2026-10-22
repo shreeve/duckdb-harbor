@@ -7,9 +7,10 @@
 //! reads with `ST_Read` reads only in a server that has loaded `spatial`,
 //! which the engine does not load on demand. So a server that opens the
 //! workspace, before it serves anyone, loads the extensions its views call
-//! into (installing in the background one that is not installed) and
-//! attaches each recorded file again ([`open`]), and when it stops
-//! it rewrites the record from what is attached then ([`record`]), so an
+//! into and attaches each recorded file again ([`open`]), installing in the
+//! background an extension that is not installed, `sqlite` among them, and
+//! attaching there the SQLite files that wait on it; and when it stops it
+//! rewrites the record from what is attached then ([`record`]), so an
 //! `ATTACH` or `DETACH` from any client lasts as the client meant it.
 //!
 //! A recorded file that is gone, that the engine will not attach, or whose
@@ -165,22 +166,35 @@ pub fn open(con: &mut Conn) {
     // Installed by whoever made the view, and loaded here from the disk. One
     // that is not installed (a fresh extension directory, an engine of
     // another version) is installed in the background, since an install is
-    // a download, and a repository that does not answer would
-    // hold the start, and every client waiting on it, for as long as a
-    // connection takes to time out. Until it is loaded, the views that need
-    // it say so in the engine's words.
+    // a download, and a repository that does not answer would hold the
+    // start, and every client waiting on it, for as long as a connection
+    // takes to time out; and so is one the engine would install on demand,
+    // as `LOAD` does and as attaching a SQLite file does `sqlite`. Until it
+    // is loaded, the views that need it say so in the engine's words, and
+    // the SQLite files that wait on it are listed with why.
     let mut install = Vec::new();
     for &extension in &plan.loads {
-        if let Err(e) = con.execute_batch(&format!("LOAD {extension}")) {
-            eprintln!("harbor: workspace: {extension} did not load, and is installed in the background: {e}");
-            install.push(extension);
+        match installed(con, extension) {
+            true => {
+                if let Err(e) = con.execute_batch(&format!("LOAD {extension}")) {
+                    eprintln!("harbor: workspace: {extension} did not load: {e}");
+                }
+            }
+            false => {
+                eprintln!("harbor: workspace: {extension} is not installed, and is installed in the background");
+                install.push(extension);
+            }
         }
     }
-    if !install.is_empty() {
-        install_later(con, install);
+    let sqlite = plan.attaches.iter().any(|r| r.storage == "sqlite") && !installed(con, "sqlite_scanner");
+    let (later, now): (Vec<Record>, Vec<Record>) =
+        plan.attaches.into_iter().partition(|r| sqlite && r.storage == "sqlite");
+    if !later.is_empty() {
+        eprintln!("harbor: workspace: sqlite is not installed, and is installed in the background");
+        install.push("sqlite_scanner");
     }
     let mut unattached = plan.unattached;
-    for record in plan.attaches {
+    for record in now {
         if let Err(reason) = attach(con, &record) {
             unattached.push(Unattached { record, reason });
         }
@@ -188,30 +202,93 @@ pub fn open(con: &mut Conn) {
     for u in &unattached {
         eprintln!("harbor: workspace: {} is not attached — {}", u.record.name, u.reason);
     }
+    unattached.extend(later.iter().map(|record| Unattached { record: record.clone(), reason: WAITING.to_string() }));
     *SERVING.lock().unwrap() = Some(unattached);
+    if !install.is_empty() {
+        install_later(con, install, later);
+    }
+}
+
+/// Why a recorded SQLite file is not attached while the extension that
+/// attaches it is installed.
+const WAITING: &str = "attached once sqlite, which is not installed here, is installed in the background";
+
+/// Whether `extension` is installed, or loaded, as the engine finds it on
+/// the disk, which asks no repository.
+fn installed(con: &mut Conn, extension: &str) -> bool {
+    con.query_strings(&format!(
+        "SELECT (installed OR loaded)::VARCHAR FROM duckdb_extensions() WHERE extension_name = {}",
+        open::quote_literal(extension)
+    ))
+    .is_ok_and(|rows| rows.first().is_some_and(|v| v == "true"))
 }
 
 /// Install and load `extensions` on a connection of their own, on a thread
-/// of their own: a load is the whole instance's. Said in the server's log,
-/// done or not.
-fn install_later(con: &Conn, extensions: Vec<&'static str>) {
+/// of their own: a load is the whole instance's. Then attach `records`, the
+/// SQLite files that waited on one of them, each alone against the
+/// catalog's readers, as any `ATTACH` is. Said in the server's log, done or
+/// not, and what does not attach in `/catalog`.
+fn install_later(con: &Conn, extensions: Vec<&'static str>, records: Vec<Record>) {
+    let named = extensions.join(", ");
+    let failed = |records: &[Record], reason: String| {
+        for record in records {
+            attached_or(&record.name, Some(reason.clone()));
+        }
+    };
     let mut own = match con.try_clone() {
         Ok(own) => own,
         Err(e) => {
-            eprintln!("harbor: workspace: no connection to install {} on: {e}", extensions.join(", "));
+            eprintln!("harbor: workspace: no connection to install {named} on: {e}");
+            failed(&records, format!("no connection to install sqlite on: {e}"));
             return;
         }
     };
+    let waiting = records.clone();
     let spawned = std::thread::Builder::new().name("harbor-install".to_string()).spawn(move || {
+        let mut sqlite = Ok(());
         for extension in extensions {
             match own.execute_batch(&format!("INSTALL {extension}; LOAD {extension}")) {
                 Ok(()) => eprintln!("harbor: workspace: {extension} installed and loaded"),
-                Err(e) => eprintln!("harbor: workspace: {extension} did not install, and the views that need it say so: {e}"),
+                Err(e) => {
+                    eprintln!("harbor: workspace: {extension} did not install, and what needs it says so: {e}");
+                    if extension == "sqlite_scanner" {
+                        sqlite = Err(format!("sqlite did not install: {e}"));
+                    }
+                }
             }
+        }
+        for record in records {
+            let attached = match &sqlite {
+                Ok(()) => {
+                    let _alone = crate::changing_catalog();
+                    attach(&mut own, &record)
+                }
+                Err(reason) => Err(reason.clone()),
+            };
+            match &attached {
+                Ok(()) => eprintln!("harbor: workspace: {} is attached", record.name),
+                Err(reason) => eprintln!("harbor: workspace: {} is not attached — {reason}", record.name),
+            }
+            attached_or(&record.name, attached.err());
         }
     });
     if let Err(e) = spawned {
-        eprintln!("harbor: workspace: no thread to install on: {e}");
+        eprintln!("harbor: workspace: no thread to install {named} on: {e}");
+        failed(&waiting, format!("no thread to install sqlite on: {e}"));
+    }
+}
+
+/// The recorded file `name` attached, given `None`, or not, and why.
+fn attached_or(name: &str, reason: Option<String>) {
+    let mut serving = SERVING.lock().unwrap();
+    let Some(unattached) = serving.as_mut() else { return };
+    match reason {
+        None => unattached.retain(|u| u.record.name != name),
+        Some(reason) => {
+            for u in unattached.iter_mut().filter(|u| u.record.name == name) {
+                u.reason = reason.clone();
+            }
+        }
     }
 }
 

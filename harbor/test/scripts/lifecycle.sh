@@ -988,19 +988,24 @@ if (( spatial )); then
   # An install is a download, and never stands between the database and the
   # socket: a repository that does not answer holds the start for as long as
   # a connection takes to time out. The SQLite file the workspace records
-  # would attach through an extension the engine installs on demand, from
-  # the same repository, so installing on demand is off: what is measured
-  # is the view's extension, which harbor installs.
+  # attaches through an extension the engine would install on demand, from
+  # the same repository, and is attached in the background too.
   mkdir -p "$work/noext"
   started=$(python3 -c 'import time; print(time.time())')
-  workspace_start --init "SET extension_directory='$work/noext'; SET custom_extension_repository='http://10.255.255.1'; SET autoinstall_known_extensions=false"
+  workspace_start --init "SET extension_directory='$work/noext'; SET custom_extension_repository='http://10.255.255.1'"
   took=$(python3 -c "import time, sys; print(round(time.time() - float(sys.argv[1]), 2))" "$started")
   python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 5 else 1)" "$took" \
     && ok "a start whose extension repository does not answer serves at once (${took}s)" \
     || bad "the start took ${took}s"
-  [[ $(catalog_lines) == *"view parks "*"spatial"* ]] && ok "and the view that needs it says why it does not read" \
-    || bad "the spatial view without spatial: $(catalog_lines)"
+  lines=$(catalog_lines)
+  [[ $lines == *"view parks "*"spatial"* ]] && ok "and the view that needs it says why it does not read" \
+    || bad "the spatial view without spatial: $lines"
+  [[ $lines == *"attached notsq [] attached once sqlite"*"in the background"* ]] \
+    && ok "and the SQLite file the workspace records says it waits on sqlite" || bad "the SQLite file without sqlite: $lines"
   workspace_stop
+  check "and its row stays in the record" 0 "1" \
+    "$harbor" "$work/workspace.duckdb" --mode csv -c "SELECT count(*) FROM _harbor.attached WHERE name = 'notsq'"
+  wait_gone
 fi
 
 echo

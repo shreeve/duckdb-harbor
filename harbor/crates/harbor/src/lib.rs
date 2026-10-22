@@ -4250,6 +4250,12 @@ pub(crate) fn reading_catalog() -> RwLockReadGuard<'static, ()> {
     CATALOG_GATE.read().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The gate held alone, for harbor's own attaching off the pool's
+/// executors: the workspace's SQLite files, attached in the background.
+pub(crate) fn changing_catalog() -> RwLockWriteGuard<'static, ()> {
+    CATALOG_GATE.write().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Final rollback during server shutdown, before returning connections.
 fn reset_transaction(conn: &mut Connection) {
     let _ = conn.execute_batch("ROLLBACK");

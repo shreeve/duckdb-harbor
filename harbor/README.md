@@ -621,7 +621,11 @@ whichever client summoned it: it loads `spatial` when a view calls an `ST_`
 function, since `spatial` does not load on demand (`excel`, `json`, `parquet`
 and `sqlite` do), and installs it in the background when it is not installed,
 never between the database and the socket, since an install is a download (the
-views that need it say why they do not read until it loads); and it attaches
+views that need it say why they do not read until it loads). The SQLite files
+it records attach through `sqlite`, which the engine installs on demand, so
+when `sqlite` is not installed it is installed in the background too, and those
+files are attached there once it loads, each listed in `/catalog` with why
+until then; and it attaches
 again each database file the workspace records. The record is the table
 `_harbor.attached` (`name`, `path`, `type`, `read_only`) in the workspace
 itself: `harbor <SQLite file>` writes its row, and the server rewrites it from
