@@ -234,7 +234,7 @@ impl Conn {
         for stmt in stmts.iter() {
             // In place, no fetch thread: boot-time helpers read a handful
             // of rows and should not depend on spawn succeeding.
-            let Some((mut fetcher, mut held, columns)) = self.open_result(stmt, &[], || true)? else {
+            let Some((mut fetcher, mut held, columns)) = self.open_result(stmt, &[], |_| true)? else {
                 continue;
             };
             // `held` first, then the rest: it is a chunk already taken off
@@ -335,7 +335,8 @@ impl Conn {
     /// front half of `execute` (which pipelines it) and `drain` (which
     /// consumes it in place). None when `wanted`, asked once the statement
     /// is submitted and before any of it runs, says no: the result is
-    /// destroyed unrun.
+    /// destroyed unrun. `wanted` is told whether the statement is retained
+    /// (see `retained`).
     ///
     /// The held chunk is normally None. It is Some only for a statement
     /// that expands to a GROUP of statements — `COPY FROM DATABASE`,
@@ -348,7 +349,7 @@ impl Conn {
         &self,
         stmt: &Stmt,
         values: &[ffi::value_handle],
-        wanted: impl FnOnce() -> bool,
+        wanted: impl FnOnce(bool) -> bool,
     ) -> Result<Option<(Fetcher, Option<Chunk>, Vec<(String, Type)>)>, Error> {
         let api = &self.eng.api;
 
@@ -372,7 +373,7 @@ impl Conn {
         // Submitting cleared any interrupt aimed at the connection before
         // it, and nothing runs until the result is stepped: an interrupt
         // from here on lands, and one that came before is asked about here.
-        if !wanted() {
+        if !wanted(retained(api, result)) {
             return Ok(None);
         }
 
@@ -505,8 +506,9 @@ impl Conn {
     /// it runs, and None says it answered no and nothing ran. An interrupt
     /// that reaches the connection before submission is dropped by the
     /// engine, so a caller that can be cancelled asks there, and one that
-    /// cancels after it is heard.
-    pub fn execute(&self, stmt: &Stmt, bound: Bound, wanted: impl FnOnce() -> bool) -> Result<Option<Stream>, Error> {
+    /// cancels after it is heard. It is told whether the statement is
+    /// retained: run to its end before its first chunk comes back.
+    pub fn execute(&self, stmt: &Stmt, bound: Bound, wanted: impl FnOnce(bool) -> bool) -> Result<Option<Stream>, Error> {
         let opened = self.open_result(stmt, &bound.values, wanted);
         drop(bound);
         let Some((fetcher, pending, columns)) = opened? else {
@@ -592,6 +594,27 @@ impl Drop for Conn {
         }
         *slot = std::ptr::null_mut();
     }
+}
+
+/// Whether the engine runs the result's statement to its end before it
+/// hands back a chunk. It does for every statement but a SELECT with a query
+/// result (the engine's `StreamsByDefault`): an INSERT, its RETURNING rows
+/// included, has run, and in autocommit committed, by the time its first
+/// chunk or its end comes back, and an interrupt that reaches it after that
+/// stops nothing. So whether a cancel stopped one is known only from that
+/// first fetch. A result that cannot say is taken as retained.
+fn retained(api: &ffi::Api, result: ffi::result_handle) -> bool {
+    let streams = || -> Result<bool, Error> {
+        let mut statement: ffi::STATEMENT_TYPE = ffi::STATEMENT_TYPE_INVALID;
+        call!(api, result_get_statement_type(result, &mut statement));
+        if statement != ffi::STATEMENT_TYPE_SELECT {
+            return Ok(false);
+        }
+        let mut returns: ffi::RESULT_TYPE = ffi::RESULT_TYPE_NOTHING;
+        call!(api, result_get_result_type(result, &mut returns));
+        Ok(returns == ffi::RESULT_TYPE_QUERY_RESULT)
+    };
+    !streams().unwrap_or(false)
 }
 
 /// A statement's params as engine values, positional, from [`Conn::bind`].
@@ -728,6 +751,14 @@ impl Stream {
                 Err(e) => return e,
             }
         }
+    }
+
+    /// Interrupt the statement and say whether it had run to its end
+    /// already: its first fetch came back as a chunk or as its end, not as
+    /// the interrupt or an error. For a stream given up before it was read.
+    pub fn stop(&mut self) -> bool {
+        self.interrupt.interrupt();
+        self.next_chunk().is_ok()
     }
 }
 

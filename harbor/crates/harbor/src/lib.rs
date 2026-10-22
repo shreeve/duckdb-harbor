@@ -236,6 +236,9 @@ static STOPPED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 struct SlotState {
     interrupt: Arc<InterruptHandle>,
     run: Mutex<SlotRun>,
+    /// Signalled when a retained statement's outcome is known, for the
+    /// canceller waiting on it (`SlotRun::told`).
+    settled: Condvar,
 }
 
 struct SlotRun {
@@ -264,6 +267,21 @@ struct SlotRun {
     /// is a message, not an interface, and a client should not learn why its
     /// query stopped from prose that may be reworded upstream.
     cancelled: bool,
+    /// The statement is in the engine, which runs it to its end before it
+    /// hands back a chunk (`Conn::execute`'s retained statement), and its
+    /// first fetch has not come back. An interrupt that reaches it in this
+    /// stretch may stop it or may come too late, with the statement done
+    /// and, in autocommit, committed, and only that fetch says which. A
+    /// canceller who fires in it waits for the fetch, so a cancel is
+    /// answered true only when the statement was stopped and nothing of it
+    /// was kept.
+    retained: bool,
+    /// A retained statement's first fetch came back: what it did is done,
+    /// and a cancel from here stops nothing.
+    kept: bool,
+    /// Where a canceller waiting on a retained statement is told whether it
+    /// stopped: true when it ended cancelled, false when it was kept.
+    told: Option<Arc<OnceLock<bool>>>,
     /// When this statement must stop, if anything asked for a limit.
     deadline: Option<Instant>,
     /// While this worker handles an HTTP request with no statement of its
@@ -295,7 +313,18 @@ enum Cancel {
 
 impl SlotRun {
     fn idle() -> Self {
-        SlotRun { job: 0, last: 0, started: Instant::now(), pending: None, cancelled: false, deadline: None, wedged_at: None }
+        SlotRun {
+            job: 0,
+            last: 0,
+            started: Instant::now(),
+            pending: None,
+            cancelled: false,
+            retained: false,
+            kept: false,
+            told: None,
+            deadline: None,
+            wedged_at: None,
+        }
     }
 
     /// Claim this slot for `job`. Returns true when the statement was already
@@ -305,6 +334,8 @@ impl SlotRun {
         self.last = job;
         self.started = Instant::now();
         self.deadline = deadline;
+        self.retained = false;
+        self.kept = false;
         // Any held cancel is consumed here whether or not it matches: it named
         // a statement that is now either this one or one that will never start,
         // and either way it has had its say.
@@ -315,7 +346,42 @@ impl SlotRun {
     fn end(&mut self) -> bool {
         self.job = 0;
         self.deadline = None;
-        std::mem::replace(&mut self.cancelled, false)
+        self.retained = false;
+        self.kept = false;
+        let cancelled = std::mem::replace(&mut self.cancelled, false);
+        // A retained statement that ends before its first fetch came back
+        // ends cancelled, as a 499, only when a canceller reached it.
+        self.tell(cancelled);
+        cancelled
+    }
+
+    /// The statement is submitted and about to run. False when a canceller
+    /// has reached it already, and it must not run.
+    fn submitted(&mut self, retained: bool) -> bool {
+        if self.cancelled {
+            return false;
+        }
+        self.retained = retained && self.job != 0;
+        true
+    }
+
+    /// A retained statement's first fetch came back: it ran to its end. A
+    /// cancel that fired at it came too late and stopped nothing, so it is
+    /// cleared, and the statement is answered as what it did.
+    fn keep(&mut self) {
+        if !self.retained {
+            return;
+        }
+        self.retained = false;
+        self.kept = true;
+        self.cancelled = false;
+        self.tell(false);
+    }
+
+    fn tell(&mut self, stopped: bool) {
+        if let Some(told) = self.told.take() {
+            let _ = told.set(stopped);
+        }
     }
 
     fn arm(&mut self, job: Option<u64>) -> Cancel {
@@ -329,7 +395,7 @@ impl SlotRun {
                 self.pending = Some(want);
                 Cancel::Held
             }
-            _ if self.job == 0 => Cancel::Nothing,
+            _ if self.job == 0 || self.kept => Cancel::Nothing,
             _ => {
                 self.cancelled = true;
                 Cancel::Fire
@@ -344,7 +410,7 @@ impl SlotRun {
 
 impl SlotState {
     fn new(interrupt: Arc<InterruptHandle>) -> Arc<Self> {
-        Arc::new(SlotState { interrupt, run: Mutex::new(SlotRun::idle()) })
+        Arc::new(SlotState { interrupt, run: Mutex::new(SlotRun::idle()), settled: Condvar::new() })
     }
 
     fn begin(&self, job: u64, deadline: Option<Instant>) -> bool {
@@ -356,7 +422,21 @@ impl SlotState {
     /// window described above: once this returns, no interrupt aimed at this
     /// job can still be in flight.
     fn end(&self) -> bool {
-        self.run.lock().unwrap().end()
+        let cancelled = self.run.lock().unwrap().end();
+        self.settled.notify_all();
+        cancelled
+    }
+
+    /// Mark the statement submitted, unless a canceller has reached it; see
+    /// `SlotRun::submitted`.
+    fn submitted(&self, retained: bool) -> bool {
+        self.run.lock().unwrap().submitted(retained)
+    }
+
+    /// A retained statement's first fetch came back; see `SlotRun::keep`.
+    fn keep(&self) {
+        self.run.lock().unwrap().keep();
+        self.settled.notify_all();
     }
 
     /// Whether a canceller has reached the statement now running.
@@ -365,10 +445,38 @@ impl SlotState {
     }
 
     /// Interrupt the running statement if it is still `job` — or whatever is
-    /// running, when `job` is None. Returns whether it stopped, or will stop,
-    /// a statement.
+    /// running, when `job` is None. Returns whether it fired, or held the
+    /// cancel for a statement yet to begin: what the reapers, deadlines and
+    /// departures that call it need, none of which waits on the answer.
     fn cancel(&self, job: Option<u64>) -> bool {
         let mut run = self.run.lock().unwrap();
+        self.fire(&mut run, job)
+    }
+
+    /// Cancel `job` and say whether that stopped it, which is what a client
+    /// that asked is told. Fired at a statement harbor stops itself, the
+    /// answer is known at once: one that has not begun never runs, and one
+    /// that has is answered 499 at its next step or at its end. Fired at a
+    /// retained statement in the engine, it is the engine's, and this waits
+    /// for the statement's first fetch: an INSERT the interrupt did not
+    /// reach in time has run, in autocommit committed, and the cancel
+    /// stopped nothing. The wait is as long as the engine takes to notice
+    /// the interrupt or to finish, and the statement's executor waits on
+    /// nothing but the engine meanwhile.
+    fn cancel_and_say(&self, job: u64) -> bool {
+        let mut run = self.run.lock().unwrap();
+        if !self.fire(&mut run, Some(job)) {
+            return false;
+        }
+        if !(run.job == job && run.retained) {
+            return true;
+        }
+        let told = Arc::clone(run.told.get_or_insert_with(Default::default));
+        let _run = self.settled.wait_while(run, |_| told.get().is_none()).unwrap();
+        *told.get().unwrap()
+    }
+
+    fn fire(&self, run: &mut SlotRun, job: Option<u64>) -> bool {
         match run.arm(job) {
             Cancel::Nothing => false,
             Cancel::Held => true,
@@ -501,7 +609,7 @@ fn cancel_query(id: &str) -> bool {
         guard.as_ref().and_then(|q| q.get(id).map(|(s, j)| (Arc::clone(s), *j)))
     };
     match target {
-        Some((slot, job)) => slot.cancel(Some(job)),
+        Some((slot, job)) => slot.cancel_and_say(job),
         None => false,
     }
 }
@@ -4147,7 +4255,14 @@ fn run_statement(
     // any statement whose result holds no VARIANT, and refuses the rest
     // rather than send display text under a schema line that promised JSON.
     let json = conn.json();
-    let wanted = || !on_slot.slot.cancelled();
+    // A retained statement (see `SlotRun::retained`) is awaited until its
+    // first fetch comes back.
+    let mut awaiting = false;
+    let wanted = |retained| {
+        let wanted = on_slot.slot.submitted(retained);
+        awaiting = wanted && retained;
+        wanted
+    };
     let mut stream = match conn.execute(last, bound, wanted) {
         Ok(Some(s)) => s,
         Ok(None) => {
@@ -4165,6 +4280,9 @@ fn run_statement(
         Ok(j) => Some(j),
         Err(e) => {
             if columns.iter().any(|(_, ty)| crate::engine::encode::holds_variant(ty)) {
+                if awaiting && stream.stop() {
+                    on_slot.slot.keep();
+                }
                 drop(stream);
                 let _ = ready.send(Err(on_slot.refuse(conn, e.into_text())));
                 return needs_reset;
@@ -4179,6 +4297,9 @@ fn run_statement(
     // to be a 400 rather than a 200 with an apology inside it. The
     // handshake therefore moves to the bottom of the loop in that shape.
     if shape == Shape::Ndjson && ready.send(Ok(())).is_err() {
+        if awaiting && stream.stop() {
+            on_slot.slot.keep();
+        }
         return true;
     }
 
@@ -4223,7 +4344,14 @@ fn run_statement(
         // A fetch failure is the SQL-failed / cancelled path: v2 reports a
         // cancellation as ERROR_RUNTIME_INTERRUPT on the fetch, and only the
         // slot knows which of the two this was.
-        let fetched = stream.next_chunk().and_then(|next| match next {
+        let next = stream.next_chunk();
+        // A retained statement's first fetch: a chunk or its end says it
+        // ran to its end, and a cancel that fired at it stopped nothing.
+        if awaiting && next.is_ok() {
+            on_slot.slot.keep();
+            awaiting = false;
+        }
+        let fetched = next.and_then(|next| match next {
             None => Ok(None),
             Some(chunk) => chunk.readers(columns.len()).map(|r| Some((chunk, r))),
         });
@@ -5044,6 +5172,62 @@ mod tests {
         assert!(answer.is_ok() && body.contains(r#""data":[[0]]"#), "{body}");
     }
 
+    /// A cancel is answered true only when it stopped its statement and
+    /// nothing of it was kept. An autocommit INSERT has run and committed by
+    /// the time its first chunk comes back, its RETURNING rows included, so
+    /// a cancel the engine did not reach in time is answered false, and the
+    /// statement as what it did. Cancels are asked until answered, from a
+    /// little later each time, across the statement's life.
+    #[test]
+    fn a_cancel_is_answered_true_only_when_nothing_was_kept() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc::sync_channel};
+        if crate::engine::engine().is_err() { return; }
+        let mut conn = crate::engine::conn::open(std::path::Path::new(":memory:"), &[]).unwrap();
+        conn.execute_batch("CREATE TABLE r(k INTEGER, i BIGINT)").unwrap();
+        let state = super::SlotState::new(conn.interrupt_handle());
+        let (mut stopped, mut kept) = (0, 0);
+        for k in 0..400u64 {
+            let id = super::next_job_id();
+            let returning = if k % 2 == 1 { " RETURNING i" } else { "" };
+            let sql = format!("INSERT INTO r SELECT {k}, i FROM range(5000) t(i){returning}");
+            state.begin(id, None);
+            let over = Arc::new(AtomicBool::new(false));
+            let canceller = {
+                let (state, over) = (Arc::clone(&state), Arc::clone(&over));
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_micros(k * 13 % 1500));
+                    loop {
+                        if state.cancel_and_say(id) {
+                            return true;
+                        }
+                        if over.load(Ordering::SeqCst) {
+                            return false;
+                        }
+                    }
+                })
+            };
+            let mut slot = super::OnSlot { slot: &state, done: false };
+            let (ready, result) = sync_channel(1);
+            let (body, _output) = sync_channel(1);
+            super::run_statement(&mut conn, &mut slot, sql, vec![], super::Shape::Json,
+                ready, body, Instant::now());
+            drop(slot);
+            over.store(true, Ordering::SeqCst);
+            let said = canceller.join().unwrap();
+            let answer = result.recv().unwrap().map_err(|r| r.status);
+            let rows = conn.query_strings(&format!("SELECT count(*)::VARCHAR FROM r WHERE k = {k}")).unwrap();
+            if said {
+                stopped += 1;
+                assert_eq!((answer, rows[0].as_str()), (Err(499), "0"), "run {k}: told it was cancelled");
+            } else {
+                kept += 1;
+                assert_eq!((answer, rows[0].as_str()), (Ok(()), "5000"), "run {k}: told it was not");
+            }
+        }
+        // Both answers were given, or the test proved nothing about one.
+        assert!(stopped > 0 && kept > 0, "{stopped} stopped, {kept} kept");
+    }
+
     #[test]
     fn a_document_param_nests_at_most_100_levels() {
         let request = |param: String| {
@@ -5164,6 +5348,40 @@ mod tests {
         let mut run = SlotRun::idle();
         assert_eq!(run.arm(Some(4)), Cancel::Held);
         assert!(run.begin(4, None), "job 4 ran despite being cancelled before it started");
+    }
+
+    /// A retained statement's cancel is told by its first fetch. One that
+    /// fired and came too late is cleared, stopped nothing and says so, and
+    /// nothing reaches the statement after it; one the statement ended on is
+    /// told it stopped it.
+    #[test]
+    fn a_retained_statement_tells_its_canceller_what_happened() {
+        use std::sync::{Arc, OnceLock};
+        let mut run = SlotRun::idle();
+        run.begin(3, None);
+        assert!(run.submitted(true));
+        assert_eq!(run.arm(Some(3)), Cancel::Fire);
+        let told = Arc::clone(run.told.get_or_insert_with(Arc::<OnceLock<bool>>::default));
+        run.keep();
+        assert_eq!(told.get(), Some(&false));
+        assert_eq!(run.arm(Some(3)), Cancel::Nothing, "a kept statement was cancelled");
+        assert!(!run.end(), "a kept statement reported itself cancelled");
+
+        run.begin(4, None);
+        assert!(run.submitted(true));
+        assert_eq!(run.arm(None), Cancel::Fire);
+        let told = Arc::clone(run.told.get_or_insert_with(Arc::<OnceLock<bool>>::default));
+        assert!(run.end());
+        assert_eq!(told.get(), Some(&true));
+
+        // A cancel that reached the statement before it was submitted keeps
+        // it from running, and a slot with nothing running retains nothing.
+        run.begin(5, None);
+        assert_eq!(run.arm(Some(5)), Cancel::Fire);
+        assert!(!run.submitted(true));
+        assert!(run.end());
+        assert!(run.submitted(true));
+        assert!(!run.retained);
     }
 
     #[test]
