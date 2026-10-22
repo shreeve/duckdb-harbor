@@ -370,13 +370,17 @@ impl Request {
 
         let do_not_send_body = self.method == Method::Head;
 
-        Self::ignore_client_closing_errors(response.raw_print(
-            writer.by_ref(),
-            self.http_version,
-            do_not_send_body,
-        ))?;
-
-        Self::ignore_client_closing_errors(writer.flush())
+        // A response that failed to write is cut where the write failed,
+        // inside a chunk or short of its length, and the client cannot tell
+        // where it ends: the connection ends with it, so the client sees the
+        // end at once, and no response after it is written.
+        let written = response
+            .raw_print(writer.by_ref(), self.http_version, do_not_send_body)
+            .and_then(|()| writer.flush());
+        if written.is_err() {
+            self.socket.end();
+        }
+        Self::ignore_client_closing_errors(written)
     }
 
     fn ignore_client_closing_errors(result: io::Result<()>) -> io::Result<()> {

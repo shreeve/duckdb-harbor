@@ -1538,4 +1538,34 @@ mod stall {
         );
         drop(client);
     }
+
+    // A response cut by its write timeout ends its connection: a client that
+    // reads again finds the end at once, where it would otherwise wait out
+    // the idle timeout inside a chunk, and the response pipelined after it
+    // is not written after the cut, where it would read as chunk data.
+    #[test]
+    fn a_response_cut_ends_its_connection() {
+        let (server, mut client) = support::new_one_server_one_client();
+
+        write!(client, "GET /first HTTP/1.1\r\nHost: x\r\n\r\nGET /second HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let first = support::recv(&server);
+        let second = support::recv(&server);
+
+        // Chunked, and far beyond any kernel socket buffer.
+        let body = vec![b'x'; 64 << 20];
+        let cut = std::thread::spawn(move || {
+            first.respond(justhttp::Response::new(200.into(), Vec::new(), Cursor::new(body), None))
+        });
+        let after = std::thread::spawn(move || second.respond(justhttp::Response::from_string("SECOND")));
+        assert!(cut.join().unwrap().is_err(), "the first response was written whole");
+        let _ = after.join().unwrap();
+
+        client.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let start = Instant::now();
+        let mut got = Vec::new();
+        let ended = std::io::Read::read_to_end(&mut client, &mut got);
+        assert!(ended.is_ok(), "the connection stayed open after the cut: {ended:?} after {:?}", start.elapsed());
+        assert_eq!(got.windows(9).filter(|w| w == b"HTTP/1.1 ").count(), 1, "a response was written after the cut");
+        assert!(!got.windows(6).any(|w| w == b"SECOND"), "the pipelined response was written after the cut");
+    }
 }
