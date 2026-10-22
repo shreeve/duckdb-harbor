@@ -20,6 +20,8 @@ date, newest first.
   stays in view in a short editor, and dialogs animate out as they animate
   in.
 
+## 0.24.1 — 2026-10-11
+
 - **DuckTable draws with gpui-kit 0.7.1.** The kit's fixes are rebuilt on
   upstream gpui-kit 0.7.1 and its GPUI snapshot (`gpui-pre` 0.3.8), with
   upstream's own fixes along: a completion list that latched at the first
