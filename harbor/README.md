@@ -442,22 +442,29 @@ another engine's carry `rowCount: null`, since a count there reads every row.
 On the workspace, a file it records as attached and could not attach at its
 start, or whose catalog did not read once attached, is listed too, holding
 nothing, with why in `error` (`"/data/app.sqlite: no such file"`); `error` is
-`null` for a database that is attached. An attached SQLite file whose catalog
-does not read — not SQLite after all, or held locked by another program —
-fails the whole read with a `400` that names it and says why, since the
-engine reads every attached database's catalog together and lists none while
-one does not; it reads again once that file does, or once it is detached. A
-SQLite file harbor attaches waits a second on a lock (`BUSY_TIMEOUT 1000`;
-the engine's own default is five), so a locked one fails a read in about a
-second rather than holding it.
+`null` for a database that is attached. The engine reads every attached
+database's catalog together and lists none while one does not, so an
+attached SQLite file whose catalog does not read — not SQLite after all,
+replaced, or held locked by another program — is detached by the read that
+finds it, on any server, and listed the same way, holding nothing, with the
+engine's reason in `error`, while the rest of the catalog lists; the first
+read after it reads attaches it again under its name, as harbor attaches a
+SQLite file. While it is detached a read asks it on an attachment of its own
+that waits a tenth of a second on a lock, and the workspace records it as
+attached. A SQLite file harbor attaches waits a second on a lock
+(`BUSY_TIMEOUT 1000`; the engine's own default is five), so the read that
+finds a locked one waits about a second on it.
 A table or view another client drops, or a database it detaches, while the
 catalog is being read is left out; it never fails the read. An `ATTACH` or
 `DETACH` runs alone against every statement that reads the catalog — `/catalog`
 itself, the `duckdb_…` and `pragma_…` functions, `information_schema`, `SHOW`,
 `DESCRIBE` and the engine's completer — waiting for those running and holding
 back those that come after, since the engine brings itself down when a SQLite
-database is detached while a catalog read walks it. A view whose body reads the
-catalog is not seen as reading it.
+database is detached while a catalog read walks it. A view or macro whose body
+reads the catalog, itself or through another, reads it too: the server learns
+each one's body from the engine's catalog when it starts and after each
+`ATTACH`, and from each `CREATE VIEW`, `CREATE MACRO` and `ALTER VIEW … RENAME`
+before it runs.
 
 The document is stable — same database, same bytes — so clients can diff it.
 A client that only wants an inventory asks `GET /catalog?style=lite` and gets
@@ -624,7 +631,11 @@ whichever client summoned it: it loads `spatial` when a view calls an `ST_`
 function, since `spatial` does not load on demand (`excel`, `json`, `parquet`
 and `sqlite` do), and installs it in the background when it is not installed,
 never between the database and the socket, since an install is a download (the
-views that need it say why they do not read until it loads); and it attaches
+views that need it say why they do not read until it loads). The SQLite files
+it records attach through `sqlite`, which the engine installs on demand, so
+when `sqlite` is not installed it is installed in the background too, and those
+files are attached there once it loads, each listed in `/catalog` with why
+until then; and it attaches
 again each database file the workspace records. The record is the table
 `_harbor.attached` (`name`, `path`, `type`, `read_only`) in the workspace
 itself: `harbor <SQLite file>` writes its row, and the server rewrites it from

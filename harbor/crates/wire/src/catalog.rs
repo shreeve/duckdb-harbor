@@ -67,8 +67,10 @@ pub struct Attached {
     pub storage: String,
     pub read_only: bool,
     /// Why it is not attached, when it is a file the workspace records and
-    /// its server could not attach at its start: the file gone, or the
-    /// engine's refusal. It then holds nothing. None for a database that is
+    /// its server could not attach at its start, the file gone or the
+    /// engine's refusal, or a SQLite file the server detached because its
+    /// catalog stopped reading, locked or replaced, which it attaches again
+    /// once it reads. It then holds nothing. None for a database that is
     /// attached.
     pub error: Option<String>,
     /// By (schema, name), in the served database's shape. `rowCount` is
