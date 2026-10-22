@@ -163,10 +163,17 @@ static SET_ASIDE: Mutex<Vec<SetAside>> = Mutex::new(Vec::new());
 /// background, and no client has detached since.
 static OURS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// Held by a catalog read while it attaches a file set aside again, and by
-/// a client's `ATTACH` or `DETACH` of its name from before it runs until
-/// it is claimed, so one does not undo the other.
+/// Held by a catalog read while it attaches a file set aside again, and
+/// for a moment by a client's `ATTACH` or `DETACH` of its name, as it is
+/// marked pending before it runs ([`pending`]) and as it is claimed once it
+/// ran ([`claimed`]), so one does not undo the other.
 static TAKING: Mutex<()> = Mutex::new(());
+
+/// The names a client's `ATTACH` or `DETACH` names, from before it runs
+/// until it is claimed or found not to have run: a catalog read does not
+/// attach a file set aside under one of them again. Once for each
+/// statement, so two of one name are each counted.
+static PENDING: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Whether this server attached `name` from the record, with the options
 /// the record attaches it with, and no client has detached it since.
@@ -179,10 +186,38 @@ pub fn taking() -> std::sync::MutexGuard<'static, ()> {
     TAKING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// A client's `ATTACH` or `DETACH` of `name` is about to run: until it is
+/// [`settled`], a file set aside under `name` is not attached again
+/// ([`is_pending`]). Waits only for a file set aside being attached again
+/// at this moment, so the statement runs after it.
+pub fn pending(name: &str) {
+    let _taking = taking();
+    PENDING.lock().unwrap().push(name.to_string());
+}
+
+/// Whether a client's `ATTACH` or `DETACH` of `name` is pending, asked
+/// holding [`taking`].
+pub fn is_pending(name: &str, _taking: &std::sync::MutexGuard<'static, ()>) -> bool {
+    PENDING.lock().unwrap().iter().any(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// A client's `ATTACH` or `DETACH` of `name`, [`pending`], is over, and
+/// changed what `name` is when `ran`: then it is [`claimed`].
+pub fn settled(name: &str, ran: bool) {
+    let taking = taking();
+    if ran {
+        claimed(name, &taking);
+    }
+    let mut pending = PENDING.lock().unwrap();
+    if let Some(at) = pending.iter().position(|n| n == name) {
+        pending.swap_remove(at);
+    }
+}
+
 /// A client detached or attached `name`, holding [`taking`]: it is not
 /// this server's to attach again, and a file set aside under it is
 /// forgotten.
-pub fn claimed(name: &str, _taking: &std::sync::MutexGuard<'static, ()>) {
+fn claimed(name: &str, _taking: &std::sync::MutexGuard<'static, ()>) {
     OURS.lock().unwrap().retain(|n| !n.eq_ignore_ascii_case(name));
     taken_back(name);
 }

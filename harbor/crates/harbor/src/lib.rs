@@ -3679,9 +3679,12 @@ fn take_back(exec: Executor, peer: &justhttp::Peer) -> Result<(), CatalogFailure
         if !std::path::Path::new(&record.path).is_file() || reads_alone(exec, peer, &record.name, &record.path)?.is_err() {
             continue;
         }
-        // A client's DETACH of its name since forgot it.
-        let _taking = workspace::taking();
-        if !workspace::set_aside_now().iter().any(|s| s.unattached.record.name == record.name) {
+        // A client's DETACH of its name since forgot it, and one of its
+        // name that has not yet been claimed may.
+        let taking = workspace::taking();
+        if !workspace::set_aside_now().iter().any(|s| s.unattached.record.name == record.name)
+            || workspace::is_pending(&record.name, &taking)
+        {
             continue;
         }
         match catalog_rows(exec, peer, &record.attach_sql()) {
@@ -4361,23 +4364,30 @@ fn respond_ready(req: Request, ok: bool, message: &str) -> u16 {
 /// A worker's executor: its jobs channel and its cancellation slot.
 type Executor<'a> = (&'a mpsc::SyncSender<Job>, &'a Arc<SlotState>);
 
-/// A client's `ATTACH` or `DETACH` of `name`, holding the files set aside
-/// ([`workspace::taking`]) from before it is sent until it is over, when
+/// A client's `ATTACH` or `DETACH` of `name`, pending
+/// ([`workspace::pending`]) from before it is sent until it is over, when
 /// its executor tells whether it ran (`Job::claims`) and the name is
-/// claimed ([`workspace::claimed`]). Dropped as its request ends, after the
-/// answer is written: the executor tells as the statement ends, and the
-/// answer may be all its executor holds.
+/// claimed when it did ([`workspace::settled`]). No lock is held between:
+/// a catalog read passes a file set aside under a pending name by, and
+/// waits for nothing. Dropped as its request ends, after the answer is
+/// written: the executor tells as the statement ends, and the answer may be
+/// all its executor holds.
 struct Claiming {
-    name: Vec<u8>,
+    name: String,
     ran: mpsc::Receiver<bool>,
-    taking: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Claiming {
+    fn new(name: &[u8], ran: mpsc::Receiver<bool>) -> Self {
+        let name = String::from_utf8_lossy(name).into_owned();
+        workspace::pending(&name);
+        Claiming { name, ran }
+    }
 }
 
 impl Drop for Claiming {
     fn drop(&mut self) {
-        if self.ran.recv() == Ok(true) {
-            workspace::claimed(&String::from_utf8_lossy(&self.name), &self.taking);
-        }
+        workspace::settled(&self.name, self.ran.recv() == Ok(true));
     }
 }
 
@@ -4455,15 +4465,15 @@ fn run_sql(req: Request, mut parsed: SqlRequest, pooled: Option<Executor>) -> (b
     // A client's DETACH or ATTACH of a name that ran is the client's: a
     // file the server set aside under it, or one the server attached under
     // it from the workspace's record, is not the server's to attach again.
-    // Claimed once the statement is over, when it ran, and with the files
-    // set aside held, so the server does not attach one again in between.
+    // Claimed once the statement is over, when it ran, and pending until
+    // then, so the server does not attach one again in between.
     let named = detached_name(&parsed.sql).or_else(|| attached_name(&parsed.sql));
     let (mut job, ready, body) = Job::new(parsed.sql, parsed.params, shape, parsed.timeout);
     let id = job.id;
     let _claiming = named.map(|name| {
         let (claims, ran) = mpsc::sync_channel(1);
         job.claims = Some(claims);
-        Claiming { name, ran, taking: workspace::taking() }
+        Claiming::new(&name, ran)
     });
 
     // Registered before the job is sent, so a Stop pressed the instant the
@@ -4473,7 +4483,12 @@ fn run_sql(req: Request, mut parsed: SqlRequest, pooled: Option<Executor>) -> (b
         None => None,
         Some(name) => match Cancellable::register(name, slot, id) {
             Ok(guard) => Some(guard),
-            Err(refusal) => return refuse(req, refusal),
+            // The job goes first, and with it what tells `Claiming` that
+            // it did not run.
+            Err(refusal) => {
+                drop(job);
+                return refuse(req, refusal);
+            }
         },
     };
 
